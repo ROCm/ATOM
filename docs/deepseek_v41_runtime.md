@@ -113,8 +113,8 @@ with `enforce_eager=False` and `CompilationConfig(level=0, ...)`:
   it. The scorer reads its bounds off the device, so there is nothing here for
   a capture to freeze. Prefill stays eager -- the runner only ever captures
   decode shapes.
-- `cudagraph_mode=CUDAGraphMode.PIECEWISE` records the compiled dense pieces
-  and leaves attention eager between them.
+- `cudagraph_mode=CUDAGraphMode.TR_HYBRID` records the forward as token
+  graphs, attention running eagerly between their segments.
 
 Under either mode a decode forward runs the width the step declares --
 `running_bs` requests and `running_tokens` rows -- rather than the scheduled
@@ -301,8 +301,8 @@ row at position `i` reads `[max(s, i - W + 1), i]`, `s` the tail's first
 position. A forward that does not finish its prompt
 (`ScheduledBatch.is_final_chunk`) runs nothing past the encoder but layer 20's
 compression: no kernel of the decoder's attention or FFN -- except under DP
-attention, where, while another rank has decoder work, it runs the decoder on
-one placeholder row so every MoE collective has all ranks (see below). Layer 39's queries
+attention, where, while another rank runs the decoder, it runs the decoder on
+its tail of padding so every MoE collective has all ranks (see below). Layer 39's queries
 are fewer than its KV rows (`QueryRows`): the rows are gathered in one launch
 (`token_layout.gather_rows`), the index lists built over all KV rows with every
 other row's batch id -1, so the queries' lists come out adjacent, and attention
@@ -330,22 +330,34 @@ With `--no-decoder-swa-bounded-replay` the runtime model compiles its forward
 as one graph (`runtime._Backbone`), as before. Otherwise layers 0..19 and
 21..38 are two graphs (`_EarlyLayers`, `_LateLayers`, each with its own
 compile-cache key) and layers 20 and 39 run between and after them, where a
-replay cuts their rows. Decode, warmup, draft, TBO-split and padded steps run
-every layer on every row.
+replay cuts their rows. Decode, warmup, draft and TBO-split steps run every
+layer on every row.
+
+The tail is a request bucket. The backend lays it out for the step's
+`running_bs` requests, `W` rows each (`bounded_replay.tail_width`, within the
+token buffer): the finishing requests' rows first, then zero-length padding
+requests and rows no request owns, which repeat a real row
+(`lay_out_tail`, `DeepseekV41MetadataBuilder._publish_decoder`). Every step of
+a `running_bs` publishes at the same addresses, so the decoder -- layer 20's
+attention and FFN through layer 39 -- records once per bucket as a `ReqGraph`
+(`decoder_graph.DecoderGraph`, at `ATOM_DECODER_GRAPH_SIZES`) and replays
+with no Python; any other `running_bs`, a step with image rows, an FP8 index
+plane, or a decoder reading a selection carried off the encoder runs the same
+layout eagerly. The runner records the buckets after the token graphs
+(`ModelRunner._record_prefill_req_graphs`).
 
 Under DP attention a prefill replays too. The decoder's MoE collectives are
-sized by every rank's token count, which a tail changes, so each rank decides
-from its batch (`bounded_replay.replays_batch`) and reports its decoder and
-layer-39 token counts in the step's one packed DP sync
-(`AttentionMetadataBuilder.dp_stage_report` -> `sync_dp_metadata`). The
-group's per-stage `DPMetadata` is built with the forward context
-(`ForwardContext.dp_stages`), and each stage runs under its own
-(`ForwardContext.use_dp_stage`, `bounded_replay.run_decoder_stages`). A rank
-that does not replay runs all its rows under the same tables; one with no tail
-joins on one placeholder row while any rank has decoder work, and when none
-has every rank skips the decoder. The forward checks it runs the counts its
-rank reported. After a replay only each finishing request's last row of
-the model output is defined; the LM head reads only those.
+sized by every rank's rows, which a tail changes. `running_bs` is the group's,
+so every prefilling rank runs the same tail width and request count, and a rank
+still decoding runs its own rows: each derives that table from the step's one
+packed DP sync, which carries every rank's prefill flag and the requests whose
+prompt it finishes (`sync_dp_metadata`), and runs each stage under it
+(`bounded_replay.decoder_stages`, `run_decoder_stages`,
+`ForwardContext.use_dp_stage`). While any rank runs the decoder -- one finishing
+a prompt, or one still decoding -- a rank finishing none runs it on its tail of
+padding (a recording of its own under DP); when none does, every rank skips
+it. After a replay only each finishing request's last row of the model output
+is defined; the LM head reads only those.
 
 Accuracy: this is not a full prefill. In every decoder layer the tail's rows
 see a window truncated at the tail start, so from layer 21 on even the last

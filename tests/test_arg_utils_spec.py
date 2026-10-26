@@ -32,7 +32,7 @@ if _atom_config_stub is not None:
 
         _atom_config_stub.CUDAGraphMode = _enum.Enum(
             "CUDAGraphMode",
-            {"NONE": 0, "PIECEWISE": 1, "FULL": 2, "FULL_AND_PIECEWISE": 3},
+            {"NONE": 0, "TR_HYBRID": 1, "FULL": 2, "FULL_AND_TR_HYBRID": 3},
         )
     if not hasattr(_atom_config_stub, "DSparkConfig"):
         # arg_utils imports DSparkConfig and calls DSparkConfig.from_dict() to

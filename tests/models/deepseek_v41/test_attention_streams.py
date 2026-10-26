@@ -65,13 +65,17 @@ def recorded(monkeypatch):
         index=RecordingStream(log, "index"),
     )
 
+    current = [streams.main]
+
     @contextlib.contextmanager
     def enter(stream):
         log.append(f"enter {stream.name}")
+        current.append(stream)
         yield
+        current.pop()
         log.append(f"leave {stream.name}")
 
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: streams.main)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current[-1])
     monkeypatch.setattr(torch.cuda, "stream", enter)
     return log, streams
 
@@ -89,9 +93,17 @@ def context(monkeypatch, main, *, in_hipgraph):
     )
 
 
+# hidden, qr, qr_scale, cache, step, rope: a step with a request to score.
+SELECT_ARGS = (None, None, None, None, SimpleNamespace(requests=(0,)), None)
+# hidden, cache, step, rope
+COMPRESS_ARGS = (None, None, SELECT_ARGS[4], None)
+
+
 def stub(log, *, compress=None, index=None, indexer=True):
-    """An attention whose work only says that it ran, and in what order."""
-    return SimpleNamespace(
+    """An attention whose work only says that it ran, and in what order.
+
+    The fork helpers call the real regions, bound to this stub."""
+    instance = SimpleNamespace(
         indexer=(
             SimpleNamespace(
                 project=lambda *args: (log.append("project"), ("q", "w"))[1],
@@ -104,6 +116,9 @@ def stub(log, *, compress=None, index=None, indexer=True):
         index_stream=index,
         _compress_batch=lambda *args: log.append("compress"),
     )
+    instance._compress = lambda *a: Attention._compress(instance, *a)
+    instance._select = lambda *a: Attention._select(instance, *a)
+    return instance
 
 
 class RecordingAttention(torch.nn.Module):
@@ -174,7 +189,9 @@ def test_compressor_forks_before_the_projections(monkeypatch, recorded):
     log, streams = recorded
     context(monkeypatch, streams.main, in_hipgraph=True)
 
-    forked = Attention._fork_compress(stub(log, compress=streams.compress), *[None] * 4)
+    forked = Attention._fork_compress(
+        stub(log, compress=streams.compress), *COMPRESS_ARGS
+    )
 
     assert log == [
         "compress waits main",
@@ -193,7 +210,7 @@ def test_indexer_forks_and_carries_the_compressor_join_into_its_own_stream(
     context(monkeypatch, streams.main, in_hipgraph=True)
     instance = stub(log, compress=streams.compress, index=streams.index)
 
-    joined = Attention._fork_select(instance, *[None] * 6, compressed=True)
+    Attention._fork_select(instance, *SELECT_ARGS, compressed=True)
 
     # The compressor is waited for between the two halves: after the
     # projections that do not read what it wrote, before the scorer that
@@ -206,7 +223,30 @@ def test_indexer_forks_and_carries_the_compressor_join_into_its_own_stream(
         "score",
         "leave index",
     ]
-    assert joined is streams.main
+
+
+def test_a_compressor_forked_alone_is_joined_before_attention(monkeypatch, recorded):
+    """`ATOM_DSV41_SIDE_STREAMS` 1 forks the compressor and no scorer: the
+    layer still joins it, or a TR recording ends with it pending."""
+    log, streams = recorded
+    context(monkeypatch, streams.main, in_hipgraph=True)
+    instance = stub(log, compress=streams.compress)
+    instance._fork_compress = lambda *a: Attention._fork_compress(instance, *a)
+    instance._fork_select = lambda *a, **k: Attention._fork_select(instance, *a, **k)
+    instance.project_qkv = lambda *a: (None, None)
+    instance.qk_norm = lambda *a: (None, None, None)
+    instance.wq_b = lambda *a, **k: torch.zeros(1, 4)
+    instance.heads, instance.head_dim = 2, 2
+    instance.spec = SimpleNamespace(layer_id=0)
+    instance._attend = lambda query, *a: (log.append("attend"), query)[1]
+    instance._project_out = lambda *a: None
+    cache = SimpleNamespace(
+        rope_quant_window=lambda *a: (None, None), rope_positions=lambda step: None
+    )
+
+    Attention.forward(instance, None, None, cache, SELECT_ARGS[4], None)
+
+    assert log.index("main waits compress") < log.index("attend")
 
 
 def test_a_layer_without_an_indexer_forks_nothing_to_select(monkeypatch, recorded):
@@ -216,7 +256,7 @@ def test_a_layer_without_an_indexer_forks_nothing_to_select(monkeypatch, recorde
     context(monkeypatch, streams.main, in_hipgraph=True)
     instance = stub(log, compress=streams.compress, index=streams.index, indexer=None)
 
-    assert Attention._fork_select(instance, *[None] * 6, compressed=False) is None
+    Attention._fork_select(instance, *SELECT_ARGS, compressed=False)
     assert log == []
 
 
@@ -242,12 +282,11 @@ def test_neither_forks_when_it_may_not(
         index=streams.index if streamed else None,
     )
 
-    forked = Attention._fork_compress(instance, *[None] * 4)
-    joined = Attention._fork_select(instance, *[None] * 6, compressed=forked)
+    forked = Attention._fork_compress(instance, *COMPRESS_ARGS)
+    Attention._fork_select(instance, *SELECT_ARGS, compressed=forked)
 
     assert log == ["compress", "project", "score"], reason
     assert forked is False, reason
-    assert joined is None, reason
 
 
 def test_the_shipped_level_is_the_one_that_measured_fastest(monkeypatch):
