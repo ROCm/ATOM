@@ -63,8 +63,6 @@ class PrefixProjection:
     kv_hashes: bytes
     page_chunk: int = 0
     page_digests: bytes = b""
-    reused_blocks: int = 0
-    reused_pages: int = 0
     version: int = 1
 
     @property
@@ -81,8 +79,6 @@ class PrefixProjection:
                     self.num_tokens,
                     self.fingerprint,
                     self.page_chunk,
-                    self.reused_blocks,
-                    self.reused_pages,
                     self.version,
                 )
             )
@@ -110,8 +106,6 @@ class PrefixProjection:
                 if self.page_chunk
                 else b""
             ),
-            reused_blocks=0,
-            reused_pages=0,
         )
 
     def matches(self, tokens):
@@ -220,6 +214,4 @@ def project_prefix(
         packed.tobytes(),
         page_chunk,
         bytes(pages),
-        keep,
-        keep_pages,
     )

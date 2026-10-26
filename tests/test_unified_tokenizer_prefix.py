@@ -3,6 +3,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from test_admission_host_overhead import over_ipc, published
@@ -72,13 +73,20 @@ def prompt():
     return "<U>" + "alpha beta gamma delta " * 1000 + "<A><think>"
 
 
-def assert_projection(encoded, tokenizer, text, block, seed=-1, page=256):
+def assert_projection(encoded, tokenizer, text, block, seed=-1):
     ids = tokenizer.encode(text)
     assert encoded.token_ids == ids
     projected = encoded.projection
     assert projected is not None and projected.matches(ids)
     assert list(projected.kv_array()) == ph.chained_block_hashes(
         ids, block, 0, len(ids) // block, seed
+    )
+
+
+def shared_token_count(left, right):
+    return next(
+        (i for i, (a, b) in enumerate(zip(left, right)) if a != b),
+        min(len(left), len(right)),
     )
 
 
@@ -92,38 +100,24 @@ def test_rewrites_forks_mid_edits_and_wrapped_tails(tokenizer, block, page, seed
     texts += [text.replace("gamma", "world", 1), text[:20000] + "delta<END><U>hello<A>"]
     for text in texts:
         result = cache.encode_with_prefix(text, block, seed, page)
-        assert_projection(result, tokenizer, text, block, seed, page)
+        assert_projection(result, tokenizer, text, block, seed)
     assert cache.enabled and cache._lru.bytes <= cache._lru.budget
 
 
-def test_only_new_complete_blocks_are_hashed(tokenizer, monkeypatch):
+def test_only_new_complete_blocks_are_hashed(tokenizer):
     cache = st.SegmentTokenizer(tokenizer, 8 << 20)
-    cache.encode_with_prefix(prompt(), 16, page_chunk=256)
-    counts = [0, 0]
-    link, page_link = ph._link, pp.page_link
-
-    def kv(*args):
-        counts[0] += 1
-        return link(*args)
-
-    def page(*args):
-        counts[1] += 1
-        return page_link(*args)
-
-    with monkeypatch.context() as m:
-        m.setattr(ph, "_link", kv)
-        m.setattr(pp, "page_link", page)
-        result = cache.encode_with_prefix(
-            prompt().replace("<think>", "</think>") + "hello<END><U>beta<A>",
-            16,
-            page_chunk=256,
-        )
-    p = result.projection
-    assert p.reused_blocks > 100 and p.reused_pages > 10
-    assert counts == [
-        len(result.token_ids) // 16 - p.reused_blocks,
-        len(result.token_ids) // 256 - p.reused_pages,
-    ]
+    before = cache.encode_with_prefix(prompt(), 16, page_chunk=256)
+    text = prompt().replace("<think>", "</think>") + "hello<END><U>beta<A>"
+    with (
+        patch.object(ph, "_link", wraps=ph._link) as kv,
+        patch.object(pp, "page_link", wraps=pp.page_link) as page,
+    ):
+        result = cache.encode_with_prefix(text, 16, page_chunk=256)
+    shared = shared_token_count(before.token_ids, result.token_ids)
+    assert shared // 16 > 100 and shared // 256 > 10
+    assert kv.call_count == len(result.token_ids) // 16 - shared // 16
+    assert page.call_count == len(result.token_ids) // 256 - shared // 256
+    assert_projection(result, tokenizer, text, 16)
 
 
 def test_same_budget_owns_hashes_and_eviction_cannot_change_outputs(tokenizer):
@@ -131,7 +125,7 @@ def test_same_budget_owns_hashes_and_eviction_cannot_change_outputs(tokenizer):
     for i in range(12):
         text = prompt().replace("gamma", str(i), 1) + "hello<END><U>world<A>"
         result = cache.encode_with_prefix(text, 4, page_chunk=16)
-        assert_projection(result, tokenizer, text, 4, page=16)
+        assert_projection(result, tokenizer, text, 4)
         assert cache._lru.bytes <= cache._lru.budget
         assert cache._lru.bytes == sum(cost for _, cost in cache._lru._items.values())
         for key, (entry, cost) in cache._lru._items.items():
@@ -144,7 +138,7 @@ def test_same_budget_owns_hashes_and_eviction_cannot_change_outputs(tokenizer):
     # A request never exposes mutable arrays retained by the shared record.
     result.token_ids[0] = 123456
     again = cache.encode_with_prefix(text, 4, page_chunk=16)
-    assert_projection(again, tokenizer, text, 4, page=16)
+    assert_projection(again, tokenizer, text, 4)
 
 
 def test_concurrent_forks_do_not_share_mutable_hash_or_token_arrays(tokenizer):
@@ -154,7 +148,7 @@ def test_concurrent_forks_do_not_share_mutable_hash_or_token_arrays(tokenizer):
     def run(i):
         text = prompt() + "hello<END><U>" + str(i) + "<A>"
         encoded = cache.encode_with_prefix(text, 16, page_chunk=64)
-        assert_projection(encoded, tokenizer, text, 16, page=64)
+        assert_projection(encoded, tokenizer, text, 16)
 
     with ThreadPoolExecutor(6) as pool:
         list(pool.map(run, range(24)))
@@ -183,12 +177,18 @@ def test_disable_during_encode_drops_the_hint_and_cached_hashes(tokenizer, monke
 
 def test_seed_and_geometry_switch_recomputes_only_incompatible_view(tokenizer):
     cache = st.SegmentTokenizer(tokenizer, 8 << 20)
-    cache.encode_with_prefix(prompt(), 16, -1, 256)
+    before = cache.encode_with_prefix(prompt(), 16, -1, 256)
     text = prompt() + "hello<END><U>world<A>"
-    result = cache.encode_with_prefix(text, 48, 917, 256)
+    with (
+        patch.object(ph, "_link", wraps=ph._link) as kv,
+        patch.object(pp, "page_link", wraps=pp.page_link) as page,
+    ):
+        result = cache.encode_with_prefix(text, 48, 917, 256)
+    shared = shared_token_count(before.token_ids, result.token_ids)
+    assert kv.call_count == len(result.token_ids) // 48
+    assert shared // 256 > 0
+    assert page.call_count == len(result.token_ids) // 256 - shared // 256
     assert_projection(result, tokenizer, text, 48, 917)
-    assert result.projection.reused_blocks == 0
-    assert result.projection.reused_pages > 0
 
 
 def test_ipc_hbm_adoption_does_not_turn_content_into_residency():
@@ -217,8 +217,9 @@ def test_real_frontend_fanout_uses_one_prefix_record(tokenizer):
     text = prompt()
     proc.preprocess_fanout(text, SamplingParams())
     text += "hello<END><U>beta<A>"
-    siblings = proc.preprocess_fanout(text, SamplingParams(n=2))
-    assert siblings[0].prompt_prefix.reused_blocks > 0
+    with patch.object(ph, "_link", wraps=ph._link) as kv:
+        siblings = proc.preprocess_fanout(text, SamplingParams(n=2))
+    assert kv.call_count < len(siblings[0].prompt_hash_chain.hashes)
     assert siblings[0].prompt_prefix is siblings[1].prompt_prefix
     for seq in over_ipc(siblings):
         assert seq.prompt_prefix.matches(seq.prompt_token_ids)

@@ -95,7 +95,6 @@ class _Prefix(NamedTuple):
 class PrefixEncoding(NamedTuple):
     token_ids: list[int]
     projection: PrefixProjection | None
-    projection_seconds: float = 0.0
 
 
 def _shared_chars(a: str, b: str, limit: int) -> int:
@@ -278,16 +277,13 @@ class SegmentTokenizer:
         out = body.tolist()
 
         projection = None
-        projection_seconds = 0.0
         if projection_spec is not None:
-            t_hash = time.perf_counter()
             projection = project_prefix(
                 body,
                 *projection_spec,
                 base=None if base is None else base.projection,
                 shared_tokens=(len(split.head) + n_base if base is not None else 0),
             )
-            projection_seconds = time.perf_counter() - t_hash
 
         # With no added token past the reused cut, the new entry would be a
         # part of `base`, which already serves it.
@@ -297,11 +293,7 @@ class SegmentTokenizer:
             )
         fresh_ids = sum(len(v) for v in fresh.values())
         self._count(len(out) - fresh_ids, fresh_ids, time.perf_counter() - t0, base)
-        return (
-            out
-            if projection_spec is None
-            else PrefixEncoding(out, projection, projection_seconds)
-        )
+        return out if projection_spec is None else PrefixEncoding(out, projection)
 
     def _find_prefix(self, prompt: str):
         """`(entry, k)`: the stored prompt sharing the most with `prompt` and
