@@ -222,7 +222,7 @@ def _assert_region_view_geometry(transfer):
         assert view.numel() * view.element_size() == region.total_bytes
 
 
-def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
+def test_mha_builder_publishes_gqa_and_index_views_without_tp_collapse(
     mha_export_method,
 ):
     num_blocks = 3
@@ -235,7 +235,7 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
         extra_fields=(EntryField("index", 1, (128 * 128,), torch.uint8),),
     )
     pool.allocate(num_blocks, "cpu")
-    builder = SimpleNamespace(kv_pools={"gqa4": pool})
+    builder = SimpleNamespace(kv_pools={"gqa4": pool}, _has_sparse_attention=False)
 
     transfer = mha_export_method(builder)
     transfer.set_block_count(num_blocks)

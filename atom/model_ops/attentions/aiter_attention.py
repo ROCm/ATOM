@@ -778,6 +778,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         if not self.kv_pools:
             return None
+        if self._has_sparse_attention:
+            return KVTransferTensors(
+                pages=self._minimax_m3_transfer_pages(),
+                tp_replication_factor=1,
+                roles_are_global=True,
+            )
         return KVTransferTensors(
             # Every field of every pool, indexer cache included: a unit per
             # (pool, field, layer), in declared order. The geometry is in the
@@ -793,6 +799,38 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # whole-object TP collapse is unsafe for this PAGE layout.
             tp_replication_factor=1,
         )
+
+    def _minimax_m3_transfer_pages(self) -> list:
+        """MiniMax-M3's PAGE units, named by global layer so a PP stage pairs
+        them with the decode's, and split by KV head so a TP1 stage can hand a
+        TP-sharded decode rank its own: a sparse layer writes through page-16
+        SHUFFLE views (`to_page16_shuffle`), so each run is 16 tokens, a dense
+        layer's one pool block. The indexer key is replicated, moved whole."""
+        from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.model_ops.minimax_m3.sparse_attn import ASM_PAGE_SIZE
+
+        index_layers = {r: m for m, r in self.pool_rows.get(INDEX_ROWS, {}).items()}
+        pages = []
+        for geometry, pool in self.kv_pools.items():
+            kv_layers = {r: m for m, r in self.pool_rows[geometry].items()}
+            for role, tensor in pool.region_tensors():
+                field, row = role.rsplit(".layer_", 1)
+                runs = None
+                if field == "index":
+                    module = index_layers[int(row)]
+                else:
+                    module = kv_layers[int(row)]
+                    sparse = _is_indexed_sparse_attention(module)
+                    page = ASM_PAGE_SIZE if sparse else pool.block_size
+                    runs = (self.model_runner.block_size // page, pool.num_kv_heads)
+                pages.append(
+                    page_region(
+                        tensor,
+                        semantic_role=f"m3.layer_{module.layer_num}.{field}",
+                        head_major_runs=runs,
+                    )
+                )
+        return pages
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
         """Build or refresh aiter's FlyDSL work plan for this forward.

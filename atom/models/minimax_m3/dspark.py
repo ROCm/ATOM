@@ -181,6 +181,8 @@ class KVCacheBinding(nn.Module):
 
     base_attention = None
     use_mla = False
+    # Read and written through page-16 SHUFFLE views (`_bound_cache`).
+    shuffle_page_tokens = ASM_PAGE_SIZE
 
     def __init__(self, layer_num: int) -> None:
         super().__init__()

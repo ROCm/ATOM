@@ -219,6 +219,9 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
+    # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
+    # `heads` KV heads one after another. None: not per head (replicated).
+    head_major_runs: tuple[int, int] | None = None
 
 
 @dataclass
@@ -302,6 +305,9 @@ class KVTransferTensors:
     # those are ordinary PAGE KV, never part of the state image. None means
     # every region. Appended for positional compatibility.
     paged_state_region_count: int | None = None
+    # Every PAGE role names one region of the whole model, not of this PP
+    # stage, so a stage pairs its regions with the consumer's by role.
+    roles_are_global: bool = False
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is
@@ -335,6 +341,7 @@ class KVTransferTensors:
         self.tp_replication_factor = math.gcd(
             self.tp_replication_factor, other.tp_replication_factor
         )
+        self.roles_are_global = self.roles_are_global and other.roles_are_global
 
     def set_block_count(self, num_blocks: int) -> None:
         """Fix the block id space, and check every region is in it.

@@ -36,6 +36,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.mha_head_transfer import consumer_head_slices
 from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     MLA_LANDING_CREDIT_WAIT_S,
     MLA_LANDING_MIN_SLOTS,
@@ -693,6 +694,9 @@ class MooncakeConnector(KVConnectorBase):
     # ``__init__`` aborted before the matched-rail block; both must fall back to
     # the single shared ``transfer_engine`` instead of raising AttributeError.
     _rail_pool: RailEnginePool | None = None
+    # Set by `register_kv_caches`; until then nothing is cut or paired by role.
+    _block_head_major_runs: tuple = ()
+    _roles_are_global: bool = False
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1144,6 +1148,8 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
+        self._block_head_major_runs = [page.head_major_runs for page in tt.pages]
+        self._roles_are_global = tt.roles_are_global
         self._fp4_index_layout = any(
             role is not None and role.startswith(INDEX_CACHE_FP4_PREFIX)
             for role in self._block_region_roles
@@ -1577,6 +1583,9 @@ class MooncakeConnector(KVConnectorBase):
                 # check its per-region plan lands on the same kind of region.
                 "consumer_region_roles": self._block_region_roles,
                 "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
+                # For a producer at another TP size to cut its units by head.
+                "consumer_head_major_runs": self._block_head_major_runs,
+                "consumer_tp_rank": self.tp_rank,
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
@@ -2363,6 +2372,39 @@ class MooncakeConnector(KVConnectorBase):
             )
         return cmap
 
+    def _consumer_indices_by_role(self, consumer_roles: list | None) -> list[int]:
+        """Each block region's consumer index, found by its global role: a PP
+        stage holds only some of the regions, so its positions say nothing."""
+        by_role = {role: idx for idx, role in enumerate(consumer_roles or [])}
+        missing = [role for role in self._block_region_roles if role not in by_role]
+        if missing or len(by_role) != len(consumer_roles):
+            raise RuntimeError(
+                "Cannot pair block regions by role: the consumer's roles are not "
+                f"unique or lack {missing[:3]}"
+            )
+        return [by_role[role] for role in self._block_region_roles]
+
+    def _consumer_head_cut(self, request_data: dict, consumer_dcp_size: int):
+        """``(consumer head runs, consumer rank, consumer TP)`` when a consumer
+        at another TP size needs per-head units cut, else None. Only a TP1
+        producer holds every head (and is the rank every consumer is sent to)."""
+        if not any(self._block_head_major_runs):
+            return None
+        consumer_tp = int(request_data.get("consumer_tp_size", self.tp_size))
+        if consumer_tp == self.tp_size:
+            return None
+        if self.tp_size != 1 or self.dcp_size != 1 or consumer_dcp_size != 1:
+            raise RuntimeError(
+                "Cutting KV heads between TP sizes needs a TP1 producer and no "
+                f"DCP; got producer TP {self.tp_size} DCP {self.dcp_size}, "
+                f"consumer TP {consumer_tp} DCP {consumer_dcp_size}"
+            )
+        return (
+            request_data["consumer_head_major_runs"],
+            int(request_data["consumer_tp_rank"]),
+            consumer_tp,
+        )
+
     def _execute_block_transfer(
         self,
         request_data: dict,
@@ -2405,11 +2447,16 @@ class MooncakeConnector(KVConnectorBase):
             return True
 
         num_regions = len(self.kv_caches_base_addr)
+        consumer_roles = request_data.get("consumer_region_roles")
         cmap = self._consumer_region_map(
             num_regions,
             len(consumer_base_addrs),
             request_data.get("consumer_num_layers"),
-            self._block_region_consumer_indices,
+            (
+                self._consumer_indices_by_role(consumer_roles)
+                if self._roles_are_global
+                else self._block_region_consumer_indices
+            ),
         )
         # Under DCP the consumer rank owns only part of each block, so
         # whole-block descriptors no longer line up and the push becomes the
@@ -2467,8 +2514,8 @@ class MooncakeConnector(KVConnectorBase):
         # cmap[region_idx], and equal region counts do not make the two orders
         # match. Validate both semantic role and physical width so incompatible
         # producer/consumer layouts fail instead of silently corrupting KV.
-        consumer_roles = request_data.get("consumer_region_roles")
         consumer_bpb = request_data.get("consumer_block_bpb")
+        head_cut = self._consumer_head_cut(request_data, dcp_size)
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
@@ -2480,6 +2527,55 @@ class MooncakeConnector(KVConnectorBase):
                     f"{region_idx} is {role!r}, but consumer region "
                     f"{cmap[region_idx]} is {consumer_roles[cmap[region_idx]]!r}"
                 )
+            if head_cut is not None:
+                # The consumer rank holds its share of the heads: write it that
+                # share of every head-major run of each unit.
+                all_runs, rank, tp = head_cut
+                dst_runs, dst_bpb = (
+                    all_runs[cmap[region_idx]],
+                    consumer_bpb[cmap[region_idx]],
+                )
+                cuts = np.array(
+                    consumer_head_slices(
+                        bpb,
+                        dst_bpb,
+                        self._block_head_major_runs[region_idx],
+                        dst_runs and tuple(dst_runs),
+                        rank,
+                        tp,
+                    ),
+                    dtype=np.int64,
+                )
+                src = np.asarray(src_block_ids, np.int64)[:, None] * bpb + cuts[:, 0]
+                dst = (
+                    np.asarray(dst_block_ids, np.int64)[:, None] * dst_bpb + cuts[:, 1]
+                )
+                src = (src_base + src).ravel().tolist()
+                dst = (dst_base + dst).ravel().tolist()
+                cut_sizes = np.broadcast_to(cuts[:, 2], (len(src_block_ids), len(cuts)))
+                cut_sizes = cut_sizes.ravel().tolist()
+                start = 0
+                while start < len(src):
+                    stop = min(
+                        len(src),
+                        start + self._MAX_RDMA_ENTRIES_PER_BATCH - len(src_addrs),
+                    )
+                    src_addrs.extend(src[start:stop])
+                    dst_addrs.extend(dst[start:stop])
+                    sizes.extend(cut_sizes[start:stop])
+                    block_descriptor_count += stop - start
+                    if debug_block_transfer:
+                        total_block_bytes += sum(cut_sizes[start:stop])
+                    start = stop
+                    if (
+                        len(src_addrs) == self._MAX_RDMA_ENTRIES_PER_BATCH
+                        and not flush_block_descriptors()
+                    ):
+                        logger.error(
+                            "[PRODUCER] block transfer failed for req %s", req_id
+                        )
+                        return False
+                continue
             if consumer_bpb is not None and consumer_bpb[cmap[region_idx]] != bpb:
                 raise RuntimeError(
                     f"Region byte-size mismatch for req {req_id}: producer "
