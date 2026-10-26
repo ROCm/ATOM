@@ -6,7 +6,8 @@ import torch
 
 pytest.importorskip("aiter", reason="the sampler and rejection sampler are AITER ops")
 
-from atom.model_ops.rejection_sampler import rejection_sample
+from atom.model_ops.dspark_markov_sample import SparseQStore
+from atom.model_ops.rejection_sampler import RatioDraftQ, rejection_sample
 from atom.model_ops.sampler import Sampler
 
 ANCHOR = 7  # never a target below: a draft read from an anchor's slot is rejected
@@ -38,6 +39,18 @@ def bonus_rows(widths):
 def draw(probabilities, rows):
     """`rows` ids drawn from the two-token distribution ``probabilities``."""
     return (torch.rand(rows, device="cuda") >= probabilities[0]).to(torch.int32)
+
+
+def two_token_q(q, drafts, width):
+    """``q`` as the ratio verify reads it: one stored row per draft, both
+    ids, the drafted one at xslot, plus a dense row per request."""
+    rows = drafts.numel()
+    store = SparseQStore(
+        torch.tensor([0, 1], device="cuda", dtype=torch.int32).repeat(rows, 1),
+        q.expand(rows, 2).contiguous(),
+        torch.stack((torch.full_like(drafts, 2), drafts), 1),
+    )
+    return RatioDraftQ(store, torch.empty(rows // width, 2, device="cuda"))
 
 
 def two_token_batch(probabilities, drafts, width):
@@ -258,7 +271,7 @@ def test_ratio_acceptance_emits_the_target_law_from_a_draft_that_drew_another():
     )
     output, (accepted, _, _) = rejection_sample(
         **two_token_batch(p, drafts, 2),
-        draft_probs=q.expand(n * 2, -1).contiguous(),
+        draft_probs=two_token_q(q, drafts, 2),
         temperatures=torch.ones(n, device="cuda"),
     )
     marginal = torch.bincount(output[:, 0].long(), minlength=2).float() / n
@@ -290,7 +303,7 @@ def test_ratio_acceptance_accepts_at_least_as_often_as_exact_match(q0):
     batch = two_token_batch(p, drafts, 2)
     _, (ratio_accepted, _, _) = rejection_sample(
         **batch,
-        draft_probs=q.expand(n * 2, -1).contiguous(),
+        draft_probs=two_token_q(q, drafts, 2),
         temperatures=torch.ones(n, device="cuda"),
     )
     # The same drafts against the target's own draw, which is what the default

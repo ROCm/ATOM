@@ -79,7 +79,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
-from atom.models.dspark_draft import DSparkDraftModel
+from atom.models.dspark_draft import DraftSampling, DSparkDraftModel
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _effective_layer_quant
 from atom.utils import envs
 
@@ -173,23 +173,19 @@ class DSparkMarkovHead(nn.Module):
         token_ids: torch.Tensor,  # [B]   x_{k-1}
         base_logits: torch.Tensor,  # [B, V]
         out: torch.Tensor,  # [B]   destination for x_k
-        q_store: torch.Tensor,  # [rows, V] fp32 persistent q
-        q_row_base: torch.Tensor,  # [B] int32, first q_store row per batch row
+        sampling: "DraftSampling",  # the bound store, scratch and row inputs
+        bs: int,  # rows of the per-row inputs this block runs
         position: int,  # k: this position's row is q_row_base + k
-        temperatures: torch.Tensor,  # [B]
-        greedy_mask: torch.Tensor,  # [B] int32
-        seed: torch.Tensor,  # [1] int32, device
         noise_offset: int,
-        scratch=None,  # SamplingScratch for the op's partials, or None
     ) -> torch.Tensor:
-        """One sampled block position: draw ``x_k ~ softmax(biased / T)`` and
-        write that q out.
+        """One sampled block position: draw ``x_k`` from the top of
+        ``softmax(biased / T)`` and write exactly that q out.
 
         A separate entry point from ``sample_next`` rather than a flag on it:
-        the two have different outputs (this one publishes a ``[B, V]``
-        distribution the other exists not to materialize), so a caller that
-        takes the wrong one fails loudly rather than silently drafting under a
-        policy the accept rule does not match.
+        the two have different outputs (this one publishes a distribution the
+        other exists not to materialize), so a caller that takes the wrong one
+        fails loudly rather than silently drafting under a policy the accept
+        rule does not match.
         """
         return dspark_markov_sample(
             base_logits,
@@ -197,15 +193,18 @@ class DSparkMarkovHead(nn.Module):
             self.markov_w1.weight,
             self.markov_w2.weight,
             out,
-            q_store,
-            q_row_base,
+            *sampling.q_store,
+            sampling.s_scratch,
+            sampling.q_row_base[:bs],
             position,
-            temperatures,
-            greedy_mask,
-            seed,
+            sampling.temperatures[:bs],
+            sampling.greedy_mask[:bs],
+            sampling.top_k[:bs],
+            sampling.top_p[:bs],
+            sampling.seed,
             noise_offset,
-            None if scratch is None else scratch.f32,
-            None if scratch is None else scratch.i32,
+            sampling.scratch.f32,
+            sampling.scratch.i32,
         )
 
 
@@ -865,8 +864,8 @@ class KimiK3DSpark(DSparkDraftModel):
         """The sampled twin of `_sample_block`:
 
             logits_k <- U_k + B(x_{k-1}, .)
-            q_k      <- softmax(logits_k / T)   -- written to q_store[base + k]
-            x_k      <- q_k                     -- drawn, not argmaxed
+            q_k      <- top of softmax(logits_k / T) -- stored at q_store[base + k]
+            x_k      <- q_k                          -- drawn, not argmaxed
 
         Each row writes its q straight into the persistent row block its
         request owns, ``draft_sampling.q_row_base`` naming the block; the
@@ -874,9 +873,9 @@ class KimiK3DSpark(DSparkDraftModel):
         """
         sampling = self.draft_sampling
         bs, num_draft, vocab = base_logits.shape
-        assert sampling.q_store.shape[1] == vocab, (
-            f"q store rows are {sampling.q_store.shape[1]} wide but the block "
-            f"scores {vocab} ids; the accept kernel indexes the two as one"
+        assert sampling.s_scratch.shape[1] == vocab, (
+            f"the score scratch is {sampling.s_scratch.shape[1]} wide but the "
+            f"block scores {vocab} ids"
         )
         # The noise counter stride is the buffer's max batch, not this step's,
         # so the uniform a (position, row, id) draws does not move with the
@@ -889,13 +888,9 @@ class KimiK3DSpark(DSparkDraftModel):
                 out_ids[:, k],
                 base_logits[:, k],
                 out_ids[:, k + 1],
-                sampling.q_store,
-                sampling.q_row_base[:bs],
+                sampling,
+                bs,
                 k,
-                sampling.temperatures[:bs],
-                sampling.greedy_mask[:bs],
-                sampling.seed,
                 k * position_stride,
-                sampling.scratch,
             )
         return out_ids[:, 1:]

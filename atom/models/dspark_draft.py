@@ -32,6 +32,7 @@ import torch
 from torch import nn
 
 if TYPE_CHECKING:
+    from atom.model_ops.dspark_markov_sample import SparseQStore
     from atom.model_ops.sampling_scratch import SamplingScratch
 
 
@@ -49,11 +50,14 @@ class DraftSampling:
     ``running_bs <= max_num_seqs`` and slices.
     """
 
-    #: [slots * T, V] fp32 -- q, the distribution each draft token was drawn
-    #: from, one block of T rows per live request. Read a step later by the
-    #: accept kernel, so it outlives the pass and cannot live in the graph's
-    #: private pool.
-    q_store: torch.Tensor
+    #: [slots * T, K] -- q, the distribution each draft token was drawn from
+    #: (its top K entries; see `SparseQStore`), one block of T rows per live
+    #: request. Read a step later by the accept kernel, so it outlives the pass
+    #: and cannot live in the graph's private pool.
+    q_store: "SparseQStore"
+    #: [max_bs, V] fp32, the scaled scores between the sampled op's launches.
+    #: Dense and per batch row, so it is reused by every block position.
+    s_scratch: torch.Tensor
     #: [max_bs] int32, the first ``q_store`` row each batch row writes; block
     #: position k goes to row ``base + k``. Negative writes nothing.
     q_row_base: torch.Tensor
@@ -63,6 +67,10 @@ class DraftSampling:
     #: temperature was at or below ``SAMPLER_EPS`` before the clamp, the same
     #: predicate ``Sampler`` itself tests.
     greedy_mask: torch.Tensor
+    #: [max_bs] int32, the request's top-k the draft samples within; 0 is off.
+    top_k: torch.Tensor
+    #: [max_bs] fp32, the request's top-p, applied after top-k; 1.0 is off.
+    top_p: torch.Tensor
     #: [1] int32, the Philox key. Must hold the same value on every TP rank.
     seed: torch.Tensor
     #: Preallocated partials for the sampled op (`dspark_markov_sample_scratch`),

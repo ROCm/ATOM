@@ -612,13 +612,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused greedy kernel (and publish no q), but at the sampled block's step
     # latency, so greedy traffic pays that latency too.
     #
-    # Costs what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid: q is a
-    # full-vocab fp32 row per draft position and has to cross the step
-    # boundary, so the draft writes it into a persistent store of
-    # 2 x max_num_seqs per-request row blocks -- 2 * max_num_seqs * T * V * 4
-    # bytes, allocated before the KV cache is sized (1.25 GiB at max_num_seqs=64,
-    # T=16; 3.1 GiB at 512, T=5; 10 GiB at 512, T=16, for V=163840). The two
-    # ops' per-step scratch is allocated once alongside it.
+    # Costs part of what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
+    # q has to cross the step boundary, so the draft stores each position's top
+    # K entries (ATOM_SPEC_LOSSLESS_Q_TOPK) as fp32 probability + int32 id in a
+    # persistent store of 2 x max_num_seqs per-request row blocks --
+    # 2 * max_num_seqs * T * (8 * K + 8) bytes (128 MiB at max_num_seqs=512,
+    # T=16, K=1024) -- plus a dense [max_num_seqs, V] fp32 score scratch
+    # (320 MiB at 512, V=163840; the verify reuses it to spread a rejecting
+    # request's q over the vocab), all allocated before the KV cache is sized.
+    # The two ops' per-step scratch is allocated once alongside them.
     #
     # Only a draft model that declares `supports_lossless_draft` honours it;
     # any other flavor silently keeps the greedy pair. Mutually exclusive with
@@ -628,6 +630,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # construction, so it must be set before the server starts.
     "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
         os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
+    ),
+    # How many entries of each draft position's q the lossless draft keeps
+    # (the K above). The draft samples from exactly the stored entries,
+    # renormalized, so any K is exact; a smaller one only gives up q's tail
+    # mass, i.e. some acceptance. Clamped to the vocab size, so a K >= V
+    # stores everything drawable: the full-q baseline for acceptance-length
+    # studies, not for throughput ones -- one program per row normalizes and
+    # draws from the stored entries, which at K = V is ~200-400 us per draft
+    # position on MI355X (vs ~5-20 us at 1024). Read at drafter construction.
+    "ATOM_SPEC_LOSSLESS_Q_TOPK": lambda: int(
+        os.getenv("ATOM_SPEC_LOSSLESS_Q_TOPK", "1024")
     ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding

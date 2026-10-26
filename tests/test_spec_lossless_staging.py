@@ -29,6 +29,8 @@ LOSSLESS = (
     "draft_temperatures",
     "draft_greedy_mask",
     "draft_sample_seed",
+    "draft_top_k",
+    "draft_top_p",
     "draft_q_row_base",
     "verify_q_row_base",
 )
@@ -110,10 +112,32 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
         assert prop.metadata_buffers[name].publication_group == "sampling", name
     sampling = prop.model.bound
     assert sampling.q_row_base is prop._draft_row_base_buf.gpu
-    assert sampling.q_store.shape == (2 * MAX_BS * T, VOCAB)
-    # Unpublished rows are harmless from the start: no destination, T=1.
+    assert sampling.top_k is prop._draft_top_k_buf.gpu
+    assert sampling.top_p is prop._draft_top_p_buf.gpu
+    # Unpublished rows are harmless from the start: no destination, T=1, no
+    # filter.
     assert dest(prop) == [-1] * MAX_BS and verify(prop) == [-1] * MAX_BS
     assert prop._draft_temps_buf.np.tolist() == [1.0] * MAX_BS
+    assert prop._draft_top_k_buf.gpu.tolist() == [0] * MAX_BS
+    assert prop._draft_top_p_buf.gpu.tolist() == [1.0] * MAX_BS
+
+
+@pytest.mark.parametrize("topk, width", [(None, VOCAB), ("5", 5), ("99999", VOCAB)])
+def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk, width):
+    if topk is not None:
+        monkeypatch.setenv("ATOM_SPEC_LOSSLESS_Q_TOPK", topk)
+    sampling = proposer(monkeypatch).model.bound
+    store = sampling.q_store
+    assert store.ids.shape == store.probs.shape == (2 * MAX_BS * T, width)
+    assert store.meta.shape == (2 * MAX_BS * T, 2)
+    # The draft's dense scores are per batch row, whatever K is.
+    assert sampling.s_scratch.shape == (MAX_BS, VOCAB)
+
+
+def test_a_q_store_of_no_entries_is_refused(monkeypatch):
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_Q_TOPK", "0")
+    with pytest.raises(ValueError, match="ATOM_SPEC_LOSSLESS_Q_TOPK"):
+        proposer(monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -220,8 +244,11 @@ def test_only_an_unfiltered_batch_reaches_the_ratio_rule(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
     q, base, scratch = prop.lossless_verify_inputs(2, has_filter=False)
-    assert q is prop._q_store and base.shape == (2,)
-    assert scratch is prop._verify_scratch
+    # The sparse store itself, and the draft's score scratch to spread a
+    # rejecting request's row into: one dense row per batch row, V wide.
+    assert q.store is prop._q_store and q.dense is prop._s_scratch
+    assert q.dense.shape == (MAX_BS, VOCAB)
+    assert base.shape == (2,) and scratch is prop._verify_scratch
     assert prop.lossless_verify_inputs(2, has_filter=True) == (None, None, None)
 
 

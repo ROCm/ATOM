@@ -1,4 +1,5 @@
 from math import prod
+from typing import NamedTuple
 
 import torch
 import triton
@@ -6,6 +7,7 @@ import triton.language as tl
 from aiter import topk_select
 from torch import nn
 
+from atom.model_ops.dspark_markov_sample import SparseQStore
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.sampling_scratch import SamplingScratch, take
 from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
@@ -66,6 +68,13 @@ def _synthetic_generator(device: torch.device) -> torch.Generator:
 # p at one id per position, `exp(l(x) / T - max) / Z`, and only a rejecting row
 # is read across V again, by the residual race.
 #
+# q arrives sparse (`SparseQStore`: each draft row's stored ids, their
+# probabilities and the slot of the id it emitted), and is 0 off the stored
+# set. The accept walk reads q(x) at the emitted slot. The residual needs q at
+# every id, so each rejecting request's one row is first spread into a dense
+# scratch row of its own (zeroed, then the stored entries written at their
+# ids); the race and its fallback then read that row as they would a dense q.
+#
 # Residual: an exponential race rather than a CDF walk. `argmax_v r(v) / E_v`
 # with i.i.d. `E_v ~ Exp(1)` selects v with probability `r(v) / sum r`, so the
 # residual needs no normalizer, no prefix sum, and no agreement between two
@@ -92,6 +101,18 @@ _RATIO_RESIDUAL_KEY = 2 << 32
 
 # Vocab tile every ratio kernel walks in.
 _RATIO_BLOCK_V = 4096
+# Stored q entries one lookup or densify iteration covers.
+_RATIO_BLOCK_Q = 1024
+
+
+class RatioDraftQ(NamedTuple):
+    """The q a ratio verify reads: the draft's sparse store, plus a dense
+    ``[>= batch_size, V]`` fp32 scratch a rejecting request's q row is spread
+    into for the residual. Its contents are overwritten; nothing else may need
+    them across the verify."""
+
+    store: SparseQStore
+    dense: torch.Tensor
 
 
 def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
@@ -109,6 +130,7 @@ def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
         (num_tokens,),  # row_argmax
         (tiles, num_tokens),  # part_amax_idx
         (batch_size,),  # residual_row
+        (batch_size,),  # residual_q_row
         (tiles, batch_size),  # part_idx
     ]
     return f32, i32
@@ -183,7 +205,21 @@ def _ratio_stats_kernel(
     tl.store(part_amax_idx_ptr + part, raw_idx)
 
 
-@triton.jit(do_not_specialize=["num_spec_steps", "accept_seed"])
+@triton.jit
+def _stored_q_of(q_ids_ptr, q_probs_ptr, q_row, n, x, BLOCK_Q: tl.constexpr):
+    """x's q in one stored row: its probability among the first ``n``
+    entries, 0 when it is not one of them."""
+    q = 0.0
+    for start in range(0, n, BLOCK_Q):
+        offs = start + tl.arange(0, BLOCK_Q)
+        mask = offs < n
+        ids = tl.load(q_ids_ptr + q_row + offs, mask=mask, other=-1)
+        probs = tl.load(q_probs_ptr + q_row + offs, mask=mask, other=0.0)
+        q += tl.sum(tl.where(mask & (ids == x), probs, 0.0), axis=0)
+    return q
+
+
+@triton.jit(do_not_specialize=["num_spec_steps", "q_width", "accept_seed"])
 def _ratio_accept_kernel(
     output_token_ids_ptr,  # [batch_size, num_spec_steps + 1]
     verdict_ptr,  # [3, batch_size]: accepted drafts, rejected, anchor row
@@ -196,15 +232,19 @@ def _ratio_accept_kernel(
     row_max_ptr,  # [num_tokens] fp32
     row_inv_z_ptr,  # [num_tokens] fp32
     row_argmax_ptr,  # [num_tokens] int32, lowest id
-    q_ptr,  # [num_q_rows, V] fp32, the q each draft token was drawn from
+    q_ids_ptr,  # [num_q_rows, q_width] int32, the stored ids of each q row
+    q_probs_ptr,  # [num_q_rows, q_width] fp32, their q
+    q_meta_ptr,  # [num_q_rows, 2] int32: (n, slot of the emitted id)
     q_row_base_ptr,  # [batch_size] int32, this request's first q row, or < 0
     bonus_token_ids_ptr,  # [batch_size]
     bonus_logits_indices_ptr,  # [batch_size]
     num_spec_steps,
-    vocab_size,
+    q_width,
     logits_row_stride,
     greedy_temperature,
     accept_seed,
+    BLOCK_T: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
 ):
     """One request: walk its drafts until the first rejection.
 
@@ -229,6 +269,21 @@ def _ratio_accept_kernel(
     has_q = q_base >= 0
     out_row = output_token_ids_ptr + req_idx * (num_spec_steps + 1)
 
+    # Every position's (n, xslot) and the entry at xslot, in vector loads up
+    # front, so the walk below does not chain three dependent loads per
+    # position. A slot outside the stored entries reads as no entry.
+    offs_t = tl.arange(0, BLOCK_T)
+    t_mask = (offs_t < num_draft_tokens) & has_q & (temp > greedy_temperature)
+    q_rows = (q_base + offs_t).to(tl.int64)
+    stored_n = tl.load(q_meta_ptr + q_rows * 2, mask=t_mask, other=0)
+    stored_n = tl.minimum(tl.maximum(stored_n, 0), q_width)
+    xslots = tl.load(q_meta_ptr + q_rows * 2 + 1, mask=t_mask, other=-1)
+    slot_mask = t_mask & (xslots >= 0) & (xslots < stored_n)
+    slot_ids = tl.load(q_ids_ptr + q_rows * q_width + xslots, mask=slot_mask, other=-1)
+    slot_qs = tl.load(
+        q_probs_ptr + q_rows * q_width + xslots, mask=slot_mask, other=0.0
+    )
+
     INVALID_TOKEN: tl.constexpr = -1
     rejected = False
     reject_pos = -1
@@ -247,11 +302,20 @@ def _ratio_accept_kernel(
                 p = tl.exp(
                     logit.to(tl.float32) / temp - tl.load(row_max_ptr + row)
                 ) * tl.load(row_inv_z_ptr + row)
-                q = tl.load(
-                    q_ptr + (q_base + pos).to(tl.int64) * vocab_size + x,
-                    mask=has_q,
-                    other=0.0,
-                )
+                at_pos = offs_t == pos
+                q = tl.sum(tl.where(at_pos, slot_qs, 0.0), axis=0)
+                if tl.sum(tl.where(at_pos, slot_ids, 0), axis=0) != x:
+                    # The emitted slot does not hold x (or there is no q).
+                    # Not a reject on that alone: the rule needs x's true q,
+                    # so look x up among the stored entries (0 if absent).
+                    q = _stored_q_of(
+                        q_ids_ptr,
+                        q_probs_ptr,
+                        (q_base + pos).to(tl.int64) * q_width,
+                        tl.sum(tl.where(at_pos, stored_n, 0), axis=0),
+                        x,
+                        BLOCK_Q,
+                    )
                 u = tl.rand(accept_seed, row)
                 # x was drawn from q, so q(x) must be a positive probability;
                 # anything else is not the row x came from. `u * q < p` rather
@@ -284,16 +348,81 @@ def _ratio_accept_kernel(
     )
 
 
+@triton.jit
+def _ratio_densify_clear_kernel(
+    residual_row_ptr,  # [batch_size] int32, the rejecting row, or -1
+    q_row_base_ptr,  # [batch_size] int32
+    dense_ptr,  # [>= batch_size, V] fp32 out: request r's q row at row r
+    vocab_size,
+    BLOCK_V: tl.constexpr,
+):
+    """One (request, V tile): zero the dense row of a rejecting request that
+    has a q; every other program returns at once."""
+    req_idx = tl.program_id(0)
+    tile = tl.program_id(1)
+    row = tl.load(residual_row_ptr + req_idx)
+    if (row >= 0) & (tl.load(q_row_base_ptr + req_idx) >= 0):
+        offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+        tl.store(
+            dense_ptr + req_idx.to(tl.int64) * vocab_size + offs,
+            tl.zeros((BLOCK_V,), dtype=tl.float32),
+            mask=offs < vocab_size,
+        )
+
+
+@triton.jit(do_not_specialize=["q_width"])
+def _ratio_densify_scatter_kernel(
+    residual_row_ptr,  # [batch_size] int32, the rejecting row, or -1
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    q_ids_ptr,  # [num_q_rows, q_width] int32
+    q_probs_ptr,  # [num_q_rows, q_width] fp32
+    q_meta_ptr,  # [num_q_rows, 2] int32
+    q_row_base_ptr,  # [batch_size] int32
+    dense_ptr,  # [>= batch_size, V] fp32, zeroed where it will be read
+    residual_q_row_ptr,  # [batch_size] int32 out: the dense row the residual reads
+    q_width,
+    vocab_size,
+    BLOCK_Q: tl.constexpr,
+):
+    """One request: write the rejecting row's stored entries into its zeroed
+    dense row, and name that row for the residual race. -1 for every other
+    request, so the race reads q as 0 where there is none (as the accept walk
+    did)."""
+    req_idx = tl.program_id(0)
+    row = tl.load(residual_row_ptr + req_idx)
+    q_base = tl.load(q_row_base_ptr + req_idx)
+    residual_q_row = -1
+    if (row >= 0) & (q_base >= 0):
+        if req_idx == 0:
+            start_idx = 0
+        else:
+            start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+        pos = row - start_idx
+        q_row = (q_base + pos).to(tl.int64)
+        n = tl.minimum(tl.maximum(tl.load(q_meta_ptr + q_row * 2), 0), q_width)
+        dense_row = dense_ptr + req_idx.to(tl.int64) * vocab_size
+        for start in range(0, n, BLOCK_Q):
+            offs = start + tl.arange(0, BLOCK_Q)
+            mask = offs < n
+            ids = tl.load(q_ids_ptr + q_row * q_width + offs, mask=mask, other=-1)
+            probs = tl.load(q_probs_ptr + q_row * q_width + offs, mask=mask)
+            # An id outside the vocab is no q at all; never a write past the row.
+            tl.store(
+                dense_row + ids, probs, mask=mask & (ids >= 0) & (ids < vocab_size)
+            )
+        residual_q_row = req_idx
+    tl.store(residual_q_row_ptr + req_idx, residual_q_row)
+
+
 @triton.jit(do_not_specialize=["residual_seed"])
 def _ratio_residual_race_kernel(
     residual_row_ptr,  # [batch_size] int32, the rejecting row, or -1
-    cu_num_draft_tokens_ptr,  # [batch_size]
     logits_ptr,  # [num_tokens, V] raw target logits
     temperatures_ptr,  # [batch_size] fp32
     row_max_ptr,  # [num_tokens] fp32
     row_inv_z_ptr,  # [num_tokens] fp32
     q_ptr,  # [num_q_rows, V] fp32
-    q_row_base_ptr,  # [batch_size] int32
+    q_row_ptr,  # [batch_size] int32, the rejecting position's q row, or < 0
     part_key_ptr,  # [n_tiles, batch_size] fp32: best residual key
     part_idx_ptr,  # [n_tiles, batch_size] int32: its lowest id
     batch_size,
@@ -310,13 +439,9 @@ def _ratio_residual_race_kernel(
     tile = tl.program_id(1)
     row = tl.load(residual_row_ptr + req_idx)
     if row >= 0:
-        if req_idx == 0:
-            start_idx = 0
-        else:
-            start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
         temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
-        q_base = tl.load(q_row_base_ptr + req_idx)
-        has_q = q_base >= 0
+        q_row = tl.load(q_row_ptr + req_idx)
+        has_q = q_row >= 0
         offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
         vmask = offs < vocab_size
         x = tl.load(
@@ -327,7 +452,7 @@ def _ratio_residual_race_kernel(
         p = tl.exp(x / temp - tl.load(row_max_ptr + row)) * tl.load(row_inv_z_ptr + row)
         p = tl.where(vmask, p, 0.0)
         q = tl.load(
-            q_ptr + (q_base + row - start_idx).to(tl.int64) * vocab_size + offs,
+            q_ptr + q_row.to(tl.int64) * vocab_size + offs,
             mask=vmask & has_q,
             other=0.0,
         )
@@ -433,7 +558,7 @@ def _ratio_sample(
     target_logits_indices: torch.Tensor,
     target_logits: torch.Tensor,  # [num_tokens, V] raw
     temperatures: torch.Tensor,  # [batch_size] fp32, pre-clamped
-    draft_probs: torch.Tensor,  # [num_q_rows, V] fp32
+    draft_q: RatioDraftQ,
     q_row_base: torch.Tensor,  # [batch_size] int32
     bonus_token_ids: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
@@ -441,7 +566,8 @@ def _ratio_sample(
     ratio_step: int,
     scratch: SamplingScratch | None = None,
 ) -> None:
-    """Launch the probability-ratio verify: stats, combine, accept, residual.
+    """Launch the probability-ratio verify: stats, combine, accept, densify,
+    residual.
 
     Its scratch comes out of ``scratch`` when given (the serving path) and is
     allocated per call otherwise."""
@@ -452,11 +578,13 @@ def _ratio_sample(
     stride = target_logits.stride(0)
     temperatures = temperatures.to(torch.float32).contiguous()
     q_row_base = q_row_base.contiguous()
+    store, dense = draft_q
+    q_width = store.ids.shape[1]
 
     f32_shapes, i32_shapes = _ratio_scratch_shapes(num_tokens, batch_size, vocab_size)
     (
         (row_max, row_inv_z, part_max, part_sum, part_amax_val, part_key),
-        (row_argmax, part_amax_idx, residual_row, part_idx),
+        (row_argmax, part_amax_idx, residual_row, residual_q_row, part_idx),
     ) = take(
         f32_shapes,
         i32_shapes,
@@ -507,26 +635,50 @@ def _ratio_sample(
         row_max,
         row_inv_z,
         row_argmax,
-        draft_probs,
+        *store,
         q_row_base,
         bonus_token_ids,
         bonus_logits_indices,
         num_spec_steps,
-        vocab_size,
+        q_width,
         stride,
         SAMPLER_EPS,
         _RATIO_ACCEPT_KEY | ratio_step,
+        BLOCK_T=triton.next_power_of_2(max(num_spec_steps, 1)),
+        BLOCK_Q=min(triton.next_power_of_2(q_width), _RATIO_BLOCK_Q),
         num_warps=1,
+    )
+    # The residual reads q across V: spread each rejecting request's stored
+    # row into its own dense row first. Two launches, so every zero lands
+    # before any stored entry does.
+    _ratio_densify_clear_kernel[(batch_size, n_tiles)](
+        residual_row,
+        q_row_base,
+        dense,
+        vocab_size,
+        BLOCK_V=_RATIO_BLOCK_V,
+        num_warps=8,
+    )
+    _ratio_densify_scatter_kernel[(batch_size,)](
+        residual_row,
+        cu_num_draft_tokens,
+        *store,
+        q_row_base,
+        dense,
+        residual_q_row,
+        q_width,
+        vocab_size,
+        BLOCK_Q=min(triton.next_power_of_2(q_width), _RATIO_BLOCK_Q),
+        num_warps=4,
     )
     _ratio_residual_race_kernel[(batch_size, n_tiles)](
         residual_row,
-        cu_num_draft_tokens,
         target_logits,
         temperatures,
         row_max,
         row_inv_z,
-        draft_probs,
-        q_row_base,
+        dense,
+        residual_q_row,
         part_key,
         part_idx,
         batch_size,
@@ -649,10 +801,11 @@ class RejectionSampler(nn.Module):
         *,
         target_token_ids: torch.Tensor | None = None,
         # ---- probability-ratio path ----------------------------------------
-        # [num_q_rows, vocab_size] fp32: the q each draft token was drawn from.
-        # None selects exact-match acceptance. Never given for a top-k/top-p
-        # batch (`DSparkProposer.lossless_verify_inputs`): p here is unfiltered.
-        draft_probs: torch.Tensor | None = None,
+        # The q each draft token was drawn from (sparse, plus the dense scratch
+        # the residual reads it through). None selects exact-match acceptance.
+        # Never given for a top-k/top-p batch
+        # (`DSparkProposer.lossless_verify_inputs`): p here is unfiltered.
+        draft_probs: RatioDraftQ | None = None,
         # [batch_size] int32: first q row of each request. Negative means "no
         # live q"; see `_ratio_accept_kernel`.
         draft_probs_row_base: torch.Tensor | None = None,
@@ -702,10 +855,10 @@ def rejection_sample(
     num_spec_steps: int,
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
-    # [num_q_rows, vocab_size] fp32, or None. The q each draft token was drawn
-    # from; None keeps the exact-match acceptance below. Rows are reached
-    # through `draft_probs_row_base`, not `start_idx`.
-    draft_probs: torch.Tensor | None,
+    # The q each draft token was drawn from (`RatioDraftQ`), or None, which
+    # keeps the exact-match acceptance below. Store rows are reached through
+    # `draft_probs_row_base`, not `start_idx`.
+    draft_probs: RatioDraftQ | None,
     # [num_tokens, vocab_size] raw target logits
     target_logits: torch.Tensor,
     # [batch_size, 1]
@@ -724,7 +877,7 @@ def rejection_sample(
     # [batch_size] fp32, pre-clamped to SAMPLER_EPS. The ratio rule compares
     # against p = softmax(target_logits / T).
     temperatures: torch.Tensor | None = None,
-    # [batch_size] int32: this request's first row in `draft_probs`, or a
+    # [batch_size] int32: this request's first row in `draft_probs.store`, or a
     # negative sentinel when it has no live q. Required with draft_probs.
     draft_probs_row_base: torch.Tensor | None = None,
     # Per-step key for the (rank-consistent) accept coins and residual race,
@@ -734,7 +887,6 @@ def rejection_sample(
     ratio_scratch: SamplingScratch | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
-    assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
     assert target_logits.ndim == 2
 
@@ -743,14 +895,24 @@ def rejection_sample(
     vocab_size = target_logits.shape[-1]
     device = target_logits.device
     assert input_ids.is_contiguous() and target_logits_indices.is_contiguous()
-    assert draft_probs is None or draft_probs.is_contiguous()
     assert target_logits.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_logits.shape == (num_tokens, vocab_size)
     if draft_probs is not None:
-        assert draft_probs.shape[-1] == vocab_size, (
-            f"draft q covers {draft_probs.shape[-1]} ids but the target scored "
+        store, dense = draft_probs
+        assert all(t.is_contiguous() for t in store) and dense.is_contiguous()
+        assert store.ids.shape == store.probs.shape and store.meta.shape == (
+            store.ids.shape[0],
+            2,
+        )
+        assert dense.ndim == 2 and dense.dtype == torch.float32
+        assert dense.shape[-1] == vocab_size, (
+            f"draft q covers {dense.shape[-1]} ids but the target scored "
             f"{vocab_size}; the ratio rule indexes both rows with the same id"
+        )
+        assert dense.shape[0] >= batch_size, (
+            f"{batch_size} requests but dense q scratch for {dense.shape[0]}: "
+            "each request's rejecting row is spread into a row of its own"
         )
         assert temperatures is not None, (
             "the probability-ratio path needs the target temperatures: p is "

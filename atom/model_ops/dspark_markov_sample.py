@@ -49,6 +49,7 @@ shape. See ``docs/environment_variables.md``.
 """
 
 from math import prod
+from typing import NamedTuple
 
 import torch
 import triton
@@ -537,40 +538,69 @@ def dspark_markov_argmax_tp(
 
 
 # ---------------------------------------------------------------------------
-# Sampled variant: the same bias GEMV, but drawing x_k ~ softmax(logits_k / T)
-# and publishing that q.
+# Sampled variant: the same bias GEMV, but drawing x_k from the top of
+# softmax(logits_k / T) and publishing that q.
 # ---------------------------------------------------------------------------
 #
-# This deliberately gives up the property the op above exists for. q has to
-# leave the kernel for the probability-ratio accept rule to have anything to
-# test, and q is `[B, V]` -- a full-vocab fp32 row per request and block
-# position, the one thing the module docstring says this is written not to
-# materialize. See `envs.ATOM_SPEC_LOSSLESS_SAMPLING` for the trade, and
+# This deliberately gives up part of the property the op above exists for: q
+# has to leave the kernel for the probability-ratio accept rule to have
+# anything to test. It leaves as its top K entries only -- ids and
+# probabilities, renormalized over the stored set -- and the draft samples from
+# exactly those, so q is 0 for every id not stored and the ratio rule stays
+# exact against it. What the truncation costs is q's tail mass, i.e. a little
+# acceptance, never correctness. See `envs.ATOM_SPEC_LOSSLESS_SAMPLING` and
+# `ATOM_SPEC_LOSSLESS_Q_TOPK` for the trade, and
 # `atom/model_ops/rejection_sampler.py` for the consumer.
 #
-# Arithmetic: `probs = softmax(step_logits.float() / temperatures[:, None])`,
-# then `probs.div_(noise).argmax(-1)` with `noise = where(greedy_mask, 1.0,
-# exp_noise)` and `exp_noise ~ Exp(1)`. Dividing a categorical by i.i.d. Exp(1)
-# and taking the argmax is a multinomial draw (the exponential race / Gumbel-max
-# trick), so this and `torch.multinomial` are one sampler. A greedy row is one
-# whose temperature was at or below `SAMPLER_EPS` before the caller clamped it;
-# `greedy_mask` carries that and the row falls out as a plain argmax.
+# The store (`SparseQStore`), per draft row R = q_row_base[b] + position:
+#   ids   [R, :n]  distinct vocab ids (ascending, as compaction emits them);
+#   probs [R, :n]  their q, > 0 and summing to 1 in one fixed-order reduction;
+#   meta  [R]      (n, xslot): how many are stored, and the slot of the token
+#                  the draft emitted. Slots >= n are never read.
+# A row that drafts a deterministic token (greedy, a non-finite or otherwise
+# degenerate row) stores the delta on it: n = 1, ids[0] = x, probs[0] = 1.
+# A negative base writes nothing -- pad rows, a dummy forward, an align-only
+# propose, and rows whose q nobody reads (greedy requests, requests still
+# mid-prompt) -- and such a row drafts its logits' argmax, as a greedy row does.
 #
-# Where q goes. Each row writes its distribution straight into the persistent
-# q store, at row `q_row_base[row] + position`: the block that row's request
-# owns. A negative base writes nothing -- pad rows, a dummy forward, an
-# align-only propose, and rows whose q nobody reads (greedy requests, requests
-# still mid-prompt) -- and such a row drafts its logits' argmax, as a greedy
-# row does.
+# Which K. A top-K by exact value would need a sort or a radix select over V
+# per row; instead every id gets a level, its gap below the row max in 1/8
+# nats (0 for the max itself), and the cut is made by level: everything below
+# the boundary level, then the boundary level's lowest ids until exactly
+# n = min(K, the request's top-k, ids within 19 nats of the max) are taken.
+# Ids more than 19 nats down (q < 6e-9 of the max) are never stored. The
+# set is not the exact top-K -- within one level the lowest ids win rather than
+# the largest values -- which, like the level-granular top-p, only moves
+# acceptance: the draft samples from what is stored, whatever that is.
 #
-# The noise is drawn in-kernel from Philox rather than handed in as a `[B, V]`
-# tensor, and the softmax is online (per-tile max and sumexp combined in a
-# second launch, `softmax_tiles`), so V is read once per block position.
+# Six launches per block position:
+#   1. GEMV + base + 1/T into the dense ``s`` scratch, with per-tile softmax
+#      and raw-argmax partials (the greedy op's stage 1, plus the scaling);
+#   2. `softmax_combine_kernel`: the row max (and the raw argmax);
+#   3. histogram: per (row, V tile), how many ids sit at each level;
+#   4. cut: per row, the boundary level and each tile's output slot range;
+#   5. compact: per (row, V tile), write the chosen ids and exp(s - max);
+#   6. finalize: per row, normalize, run the exponential race over the stored
+#      entries, emit x and its slot.
+# Levels come from one helper (`_q_level`) in 3 and 5, so the counts the cut
+# is made on and the lanes compaction selects cannot disagree. Every reduction
+# is a fixed-order tree, with no atomics: TP ranks run this redundantly and
+# must store, and draw, bit for bit the same.
 #
-# CUDA-graph safety. The seed and the row bases are device tensors whose
-# addresses are baked at capture and whose values are refreshed outside the
-# recording; the position and noise offset are host ints fixed by the block
-# width. No host RNG, no `.item()`, no data-dependent shape.
+# Arithmetic of the draw: dividing a categorical by i.i.d. Exp(1) and taking
+# the argmax is a multinomial draw (the exponential race / Gumbel-max trick),
+# so this and `torch.multinomial` over the stored probabilities are one
+# sampler. A greedy row is one whose temperature was at or below `SAMPLER_EPS`
+# before the caller clamped it; `greedy_mask` carries that.
+#
+# The noise is drawn in-kernel from Philox rather than handed in, at the same
+# counter per (position, batch row, vocab id) as a full-vocab race would use.
+#
+# CUDA-graph safety. The seed, row bases and request filters are device
+# tensors whose addresses are baked at capture and whose values are refreshed
+# outside the recording; the position and noise offset are host ints fixed by
+# the block width. No host RNG, no `.item()`, no data-dependent shape -- n
+# bounds loops inside the kernels, never a grid.
 #
 # TP determinism. Every rank must draw the same uniforms or the drafts fork.
 # Philox keyed on an SPMD step counter gives that. The key's high word is 0
@@ -578,11 +608,39 @@ def dspark_markov_argmax_tp(
 # the two can never share a stream whatever their counters do.
 #
 # Addressing is int64 throughout: `[max_bs, T, V]` logits and a
-# `[2 * max_bs * T, V]` store both pass 2**31 elements at serving sizes.
+# `[2 * max_bs * T, K]` store at K = V both pass 2**31 elements at serving
+# sizes.
 
-# Bandwidth-bound over V rather than MFMA-bound, so a wider V tile than the
-# GEMV's.
-_SAMPLE_BLOCK_V = 1024
+# Stages 3 and 5 tile V identically (the cut hands each tile a slot range).
+# 256 bins at 4096 / 4 warps measured fastest for the histogram on gfx950.
+_Q_BLOCK_V = 4096
+_Q_BINS = 256
+# Level = 1 + floor(gap * 8) for a gap in (0, 19] nats: at most 153, so
+# everything fits below the last bin, which collects the rest (and NaN/inf).
+_Q_LEVELS_PER_NAT = 8.0
+_Q_MAX_GAP = 19.0
+# Stored entries one finalize iteration covers.
+_Q_FINAL_BLOCK = 1024
+
+
+class SparseQStore(NamedTuple):
+    """The persistent draft q, ``rows`` draft rows of up to ``width`` entries;
+    see the module notes for the contract."""
+
+    ids: torch.Tensor  # [rows, width] int32
+    probs: torch.Tensor  # [rows, width] fp32
+    meta: torch.Tensor  # [rows, 2] int32: (n, xslot)
+
+    @classmethod
+    def allocate(cls, rows: int, width: int, device) -> "SparseQStore":
+        return cls(
+            torch.empty((rows, width), dtype=torch.int32, device=device),
+            torch.empty((rows, width), dtype=torch.float32, device=device),
+            torch.empty((rows, 2), dtype=torch.int32, device=device),
+        )
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self)
 
 
 @triton.jit
@@ -594,7 +652,7 @@ def _dspark_markov_sample_stage1(
     temperatures_ptr,
     q_row_base_ptr,
     embed_out_ptr,
-    q_ptr,
+    s_ptr,
     part_max_ptr,
     part_sum_ptr,
     part_amax_val_ptr,
@@ -602,22 +660,19 @@ def _dspark_markov_sample_stage1(
     num_rows,
     vocab_size,
     rank,
-    position,
     stride_base_row,
     stride_prev,
     stride_w1_vocab,
     stride_embed_row,
     stride_w2_vocab,
+    stride_s_row,
     BLOCK_ROW: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """One (V tile, row tile): bias GEMV, add base, scale by 1/T, write ``s``
-    into the row's q row and publish this tile's (max, sum exp(s - max)), plus
-    the unscaled logits' (max, lowest id) a greedy row drafts from.
-
-    ``s`` lands in q itself, which stage 3 then normalizes in place: the
-    alternative is a second `[B, V]` scratch for no gain.
+    into the row's scratch row and publish this tile's (max, sum exp(s - max)),
+    plus the unscaled logits' (max, lowest id) a greedy row drafts from.
     """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
@@ -654,7 +709,7 @@ def _dspark_markov_sample_stage1(
         other=0.0,
     )
     # Pre-clamped by the caller to SAMPLER_EPS, so no row divides by zero. A
-    # greedy row's scores are only scratch: stage 3 publishes the exact delta
+    # greedy row's scores are only scratch: finalize publishes the exact delta
     # on its argmax instead.
     logits = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
     # The greedy op's own (max, lowest id), taken before the division: a
@@ -670,10 +725,10 @@ def _dspark_markov_sample_stage1(
     tl.store(part_amax_idx_ptr + tile * num_rows + offs_row, raw_idx, mask=row_mask)
     temperature = tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0)
     scaled = logits / temperature[:, None]
+    # Only a row with a destination is read back; the rest draft the argmax.
     q_base = tl.load(q_row_base_ptr + offs_row, mask=row_mask, other=-1)
-    q_row = (q_base + position).to(tl.int64) * vocab_size
     tl.store(
-        q_ptr + q_row[:, None] + offs_v[None, :],
+        s_ptr + offs_row[:, None].to(tl.int64) * stride_s_row + offs_v[None, :],
         scaled,
         mask=(row_mask & (q_base >= 0))[:, None] & v_mask[None, :],
     )
@@ -684,76 +739,279 @@ def _dspark_markov_sample_stage1(
 
 
 @triton.jit
-def _dspark_markov_sample_stage3(
-    q_ptr,
-    q_row_base_ptr,
-    row_max_ptr,
-    row_inv_z_ptr,
-    row_argmax_ptr,
-    greedy_mask_ptr,
-    seed_ptr,
-    part_key_ptr,
-    part_idx_ptr,
-    num_rows,
-    vocab_size,
-    position,
-    noise_offset,
-    BLOCK_V: tl.constexpr,
+def _q_level(
+    s,
+    row_max,
+    valid,
+    NUM_BINS: tl.constexpr,
+    LEVELS_PER_NAT: tl.constexpr,
+    MAX_GAP: tl.constexpr,
 ):
-    """One (row, V tile): normalize ``s`` into q in place, then run the
-    exponential race over this tile.
-
-    ``probs.div_(noise).argmax(-1)``. A greedy row publishes the exact delta on
-    its logits' lowest-id argmax instead of ``softmax(s)``, which on a tie is
-    1/n per tied id: the id is the argmax, not a draw from that softmax, and
-    the accept rule must see the distribution the id actually came from.
-
-    One row per program, deliberately: this stage only streams, so its live tile
-    is ``[1, BLOCK_V]`` of fp32 rather than stage 1's MFMA accumulator. Tiling
-    it ``[BLOCK_ROW, BLOCK_V]`` instead puts enough VGPR/lane in flight to
-    spill, which costs far more than the extra programs save.
+    """Each score's level: 0 at the row max, ``1 + floor(gap * LEVELS_PER_NAT)``
+    for a gap in (0, MAX_GAP] nats, and the last bin for everything else --
+    farther down, masked, NaN, or any score of a row whose max is not finite
+    (every gap is then NaN or inf). The one definition the histogram and the
+    compaction share; they must agree lane for lane.
     """
+    gap = row_max - s
+    # Truncation is floor here: the gap is >= 0 wherever the level is kept.
+    level = 1 + (gap * LEVELS_PER_NAT).to(tl.int32)
+    level = tl.where(gap == 0.0, 0, level)
+    keep = valid & (gap >= 0.0) & (gap <= MAX_GAP)
+    return tl.where(keep, level, NUM_BINS - 1)
+
+
+@triton.jit
+def _dspark_q_histogram(
+    s_ptr,
+    row_max_ptr,
+    q_row_base_ptr,
+    greedy_mask_ptr,
+    hist_ptr,
+    vocab_size,
+    stride_s_row,
+    num_tiles,
+    BLOCK_V: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    LEVELS_PER_NAT: tl.constexpr,
+    MAX_GAP: tl.constexpr,
+):
+    """One (row, V tile): how many of the tile's ids sit at each level."""
     row = tl.program_id(0)
     tile = tl.program_id(1)
+    # Rows that store nothing stop here, and in the cut and compaction too.
+    if (tl.load(q_row_base_ptr + row) < 0) | (tl.load(greedy_mask_ptr + row) != 0):
+        return
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     v_mask = offs_v < vocab_size
+    s = tl.load(
+        s_ptr + row.to(tl.int64) * stride_s_row + offs_v,
+        mask=v_mask,
+        other=float("-inf"),
+    )
+    level = _q_level(
+        s, tl.load(row_max_ptr + row), v_mask, NUM_BINS, LEVELS_PER_NAT, MAX_GAP
+    )
+    counts = tl.histogram(level, NUM_BINS)
+    tl.store(
+        hist_ptr + (row * num_tiles + tile) * NUM_BINS + tl.arange(0, NUM_BINS),
+        counts,
+    )
 
+
+@triton.jit
+def _dspark_q_cut(
+    hist_ptr,
+    q_row_base_ptr,
+    greedy_mask_ptr,
+    top_k_ptr,
+    top_p_ptr,
+    tile_off_ptr,
+    tile_quota_ptr,
+    row_cut_ptr,
+    row_n_ptr,
+    num_tiles,
+    store_width,
+    BLOCK_TILE: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    LEVELS_PER_NAT: tl.constexpr,
+):
+    """One row: how many to store, the boundary level, and each tile's slots.
+
+    n = min(store width, the request's top-k, ids within reach of the max),
+    then the request's top-p at level granularity. The boundary level is the
+    lowest one whose cumulative count reaches n; its ids are taken lowest id
+    first, so each tile's share of them (its quota) is what the tiles before
+    it leave over, and each tile's first output slot is the running total of
+    the tiles before it. Exactly n ids are then stored.
+    """
+    row = tl.program_id(0)
+    if (tl.load(q_row_base_ptr + row) < 0) | (tl.load(greedy_mask_ptr + row) != 0):
+        return
+    offs_tile = tl.arange(0, BLOCK_TILE)
+    tile_mask = offs_tile < num_tiles
+    bins = tl.arange(0, NUM_BINS)
+    table = tl.load(
+        hist_ptr + (row * num_tiles + offs_tile[:, None]) * NUM_BINS + bins[None, :],
+        mask=tile_mask[:, None],
+        other=0,
+    )
+    # The last bin holds what can never be stored.
+    counts = tl.where(bins < NUM_BINS - 1, tl.sum(table, axis=0), 0)
+    cum = tl.cumsum(counts, axis=0)
+    top_k = tl.load(top_k_ptr + row)
+    limit = tl.where(top_k > 0, tl.minimum(top_k, store_width), store_width)
+    n = tl.minimum(limit, tl.sum(counts, axis=0))
+    # Top-p over what top-k keeps (the order `Sampler` applies them in), each
+    # level's mass approximated by its count at the level's mid gap. Keeps
+    # every level the threshold has not been reached before.
+    kept = tl.minimum(counts, tl.maximum(limit - (cum - counts), 0))
+    mid_gap = tl.where(bins == 0, 0.0, (bins.to(tl.float32) - 0.5) / LEVELS_PER_NAT)
+    mass = kept.to(tl.float32) * tl.exp(-mid_gap)
+    mass_before = tl.cumsum(mass, axis=0) - mass
+    top_p = tl.load(top_p_ptr + row)
+    nucleus = tl.sum(
+        tl.where(mass_before < top_p * tl.sum(mass, axis=0), kept, 0), axis=0
+    )
+    n = tl.where(top_p < 1.0, tl.minimum(n, nucleus), n)
+
+    cut = tl.sum((cum < n).to(tl.int32), axis=0)
+    quota = n - tl.sum(tl.where(bins < cut, counts, 0), axis=0)
+    tile_below = tl.sum(tl.where(bins[None, :] < cut, table, 0), axis=1)
+    # The boundary level's column, read back rather than reduced out of the
+    # table: one program per row runs this, so every full-table pass shows.
+    tile_edge = tl.load(
+        hist_ptr + (row * num_tiles + offs_tile) * NUM_BINS + cut,
+        mask=tile_mask,
+        other=0,
+    )
+    edge_before = tl.cumsum(tile_edge, axis=0) - tile_edge
+    tile_quota = tl.minimum(tile_edge, tl.maximum(quota - edge_before, 0))
+    tile_n = tile_below + tile_quota
+    tile_off = tl.cumsum(tile_n, axis=0) - tile_n
+    tl.store(tile_off_ptr + row * num_tiles + offs_tile, tile_off, mask=tile_mask)
+    tl.store(tile_quota_ptr + row * num_tiles + offs_tile, tile_quota, mask=tile_mask)
+    tl.store(row_cut_ptr + row, cut)
+    tl.store(row_n_ptr + row, n)
+
+
+@triton.jit
+def _dspark_q_compact(
+    s_ptr,
+    row_max_ptr,
+    q_row_base_ptr,
+    greedy_mask_ptr,
+    tile_off_ptr,
+    tile_quota_ptr,
+    row_cut_ptr,
+    q_ids_ptr,
+    q_probs_ptr,
+    vocab_size,
+    stride_s_row,
+    num_tiles,
+    store_width,
+    position,
+    BLOCK_V: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    LEVELS_PER_NAT: tl.constexpr,
+    MAX_GAP: tl.constexpr,
+):
+    """One (row, V tile): store the tile's chosen ids and their unnormalized
+    weights ``exp(s - max)`` at its slot range, in id order."""
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    q_base = tl.load(q_row_base_ptr + row)
+    if (q_base < 0) | (tl.load(greedy_mask_ptr + row) != 0):
+        return
+    offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    v_mask = offs_v < vocab_size
+    s = tl.load(
+        s_ptr + row.to(tl.int64) * stride_s_row + offs_v,
+        mask=v_mask,
+        other=float("-inf"),
+    )
+    row_max = tl.load(row_max_ptr + row)
+    level = _q_level(s, row_max, v_mask, NUM_BINS, LEVELS_PER_NAT, MAX_GAP)
+    cut = tl.load(row_cut_ptr + row)
+    quota = tl.load(tile_quota_ptr + row * num_tiles + tile)
+    edge = level == cut
+    take = (level < cut) | (edge & (tl.cumsum(edge.to(tl.int32), axis=0) <= quota))
+    slot = tl.load(tile_off_ptr + row * num_tiles + tile) + (
+        tl.cumsum(take.to(tl.int32), axis=0) - 1
+    )
+    dest = (q_base + position).to(tl.int64) * store_width + slot
+    tl.store(q_ids_ptr + dest, offs_v, mask=take)
+    tl.store(q_probs_ptr + dest, tl.exp(s - row_max), mask=take)
+
+
+@triton.jit
+def _dspark_q_finalize(
+    q_ids_ptr,
+    q_probs_ptr,
+    q_meta_ptr,
+    q_row_base_ptr,
+    greedy_mask_ptr,
+    row_argmax_ptr,
+    row_n_ptr,
+    seed_ptr,
+    out_ptr,
+    vocab_size,
+    store_width,
+    position,
+    noise_offset,
+    stride_out,
+    BLOCK: tl.constexpr,
+):
+    """One row: normalize the stored weights into q, draw x from them, record
+    x's slot.
+
+    ``probs.div_(noise).argmax()`` over the stored entries, lowest id on a tie.
+    A greedy row, or one with nothing stored or no positive race key, drafts
+    its logits' lowest-id raw argmax and, if it has a destination, stores the
+    exact delta on it: the id is not a draw from any softmax, and the accept
+    rule must see the distribution it actually came from.
+    """
+    row = tl.program_id(0)
     q_base = tl.load(q_row_base_ptr + row)
     has_q = q_base >= 0
-    offs = (tl.where(has_q, q_base, 0) + position).to(tl.int64) * vocab_size + offs_v
-    scaled = tl.load(q_ptr + offs, mask=v_mask & has_q, other=float("-inf"))
-    row_max = tl.load(row_max_ptr + row)
-    inv_z = tl.load(row_inv_z_ptr + row)
-    greedy = tl.load(greedy_mask_ptr + row) != 0
-    # A row with no destination publishes nothing and drafts its argmax, like
-    # a greedy one: its drafts are meant to be dropped, but if one ever were
-    # verified it would be a sensible block, not a run of id 0.
-    delta = greedy | (q_base < 0)
-    if delta:
-        argmax = tl.load(row_argmax_ptr + row)
-        probs = tl.where(v_mask & (offs_v == argmax), 1.0, 0.0)
-    else:
-        probs = tl.where(v_mask & has_q, tl.exp(scaled - row_max) * inv_z, 0.0)
-    tl.store(q_ptr + offs, probs, mask=v_mask & has_q)
+    sampled = has_q & (tl.load(greedy_mask_ptr + row) == 0)
+    n = tl.where(sampled, tl.load(row_n_ptr + row), 0)
+    base = (tl.where(has_q, q_base, 0) + position).to(tl.int64) * store_width
+    offs = tl.arange(0, BLOCK)
+
+    # One fixed-order sum, so every rank normalizes by the same number.
+    total = 0.0
+    for start in range(0, n, BLOCK):
+        mask = start + offs < n
+        total += tl.sum(
+            tl.load(q_probs_ptr + base + start + offs, mask=mask, other=0.0), axis=0
+        )
+    inv_total = 1.0 / total
 
     # Philox, keyed on a device scalar every rank fills with the same SPMD step
-    # counter. The flat element index is the counter, so a given (step,
-    # position, row, id) draws one uniform, the same one on every rank.
+    # counter, counter = the vocab id's flat index: a given (step, position,
+    # row, id) draws one uniform, the same one on every rank.
     seed = tl.load(seed_ptr)
-    u = tl.rand(seed, noise_offset + row.to(tl.int64) * vocab_size + offs_v)
-    # `-log(u)` rather than `-log(1 - u)`: tl.rand is [0, 1), so E = -log(u) is
-    # in (0, inf] and the key probs / E is always finite (u == 0 gives key 0,
-    # which simply loses the race).
-    exp_noise = -tl.log(u)
-    denom = tl.where(delta, 1.0, exp_noise)
-    key = tl.where(v_mask, probs / denom, -1.0)
+    noise_base = noise_offset + row.to(tl.int64) * vocab_size
+    best = 0.0
+    best_id = 2147483647
+    best_slot = 0
+    for start in range(0, n, BLOCK):
+        slots = start + offs
+        mask = slots < n
+        probs = tl.load(q_probs_ptr + base + slots, mask=mask, other=0.0) * inv_total
+        tl.store(q_probs_ptr + base + slots, probs, mask=mask)
+        ids = tl.load(q_ids_ptr + base + slots, mask=mask, other=0)
+        # `-log(u)` rather than `-log(1 - u)`: tl.rand is [0, 1), so E is in
+        # (0, inf] and the key is always finite (u == 0 gives key 0, which
+        # simply loses the race).
+        key = tl.where(mask, probs / -tl.log(tl.rand(seed, noise_base + ids)), -1.0)
+        chunk_best = tl.max(key, axis=0)
+        chunk_id = tl.min(tl.where(mask & (key == chunk_best), ids, 2147483647), axis=0)
+        chunk_slot = tl.min(
+            tl.where(mask & (ids == chunk_id), slots, 2147483647), axis=0
+        )
+        better = (chunk_best > best) | ((chunk_best == best) & (chunk_id < best_id))
+        best = tl.where(better, chunk_best, best)
+        best_id = tl.where(better, chunk_id, best_id)
+        best_slot = tl.where(better, chunk_slot, best_slot)
 
-    tile_best = tl.max(key, axis=0)
-    # Lowest index among equal keys, within the tile and then across them, so
-    # the greedy rows reproduce `torch.argmax` exactly.
-    cand = tl.where((key == tile_best) & v_mask, offs_v, vocab_size)
-    tl.store(part_key_ptr + tile * num_rows + row, tile_best)
-    tl.store(part_idx_ptr + tile * num_rows + row, tl.min(cand, axis=0))
+    drawn = best > 0.0
+    # An all-NaN row's tiles reduce to -inf with stage 1's out-of-range id
+    # (tl.max skips NaN, so no lane equals it), and the combine keeps that id.
+    # Answer 0, in range, as the greedy op does for such a row.
+    argmax = tl.load(row_argmax_ptr + row)
+    x = tl.where(drawn, best_id, tl.where(argmax < vocab_size, argmax, 0))
+    tl.store(q_ids_ptr + base, x, mask=has_q & ~drawn)
+    tl.store(q_probs_ptr + base, 1.0, mask=has_q & ~drawn)
+    tl.store(q_meta_ptr + (q_base + position).to(tl.int64) * 2, n, mask=has_q & drawn)
+    tl.store(q_meta_ptr + (q_base + position).to(tl.int64) * 2, 1, mask=has_q & ~drawn)
+    tl.store(
+        q_meta_ptr + (q_base + position).to(tl.int64) * 2 + 1,
+        tl.where(drawn, best_slot, 0),
+        mask=has_q,
+    )
+    tl.store(out_ptr + row * stride_out, x.to(out_ptr.dtype.element_ty))
 
 
 def _dspark_markov_sample_fake(
@@ -762,11 +1020,16 @@ def _dspark_markov_sample_fake(
     markov_w1: torch.Tensor,
     markov_w2: torch.Tensor,
     out: torch.Tensor,
-    q_store: torch.Tensor,
+    q_ids: torch.Tensor,
+    q_probs: torch.Tensor,
+    q_meta: torch.Tensor,
+    s_scratch: torch.Tensor,
     q_row_base: torch.Tensor,
     position: int,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
     seed: torch.Tensor,
     noise_offset: int,
     scratch_f32: torch.Tensor | None = None,
@@ -780,6 +1043,56 @@ def _dspark_markov_sample_fake(
     )
 
 
+def sparse_q_reference(
+    s: torch.Tensor,
+    store_width: int,
+    top_k: torch.Tensor | None = None,
+    top_p: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The q the sampled op stores for scores ``s`` [B, V] fp32, densified:
+    ``[B, V]``, 0 off the stored set. For tests.
+
+    Selects by (level, id) with a stable sort rather than through per-tile
+    quotas, so it checks the kernels' bookkeeping rather than repeating it.
+    The normalization sums in another order, so probabilities agree with the
+    kernels' to rounding, the set exactly (the top-p cut sums level masses in
+    another order too, so at a top-p it may differ by a level on a near tie).
+    A row with nothing to store gets the delta on its lowest-id max.
+    """
+    rows, vocab = s.shape
+    row_max = s.max(dim=-1, keepdim=True).values
+    gap = row_max - s
+    level = (1 + torch.floor(gap * _Q_LEVELS_PER_NAT)).to(torch.int64)
+    level = torch.where(gap == 0, 0, level)
+    sink = _Q_BINS - 1
+    level = torch.where((gap >= 0) & (gap <= _Q_MAX_GAP), level, sink)
+    counts = torch.zeros(rows, _Q_BINS, dtype=torch.int64, device=s.device)
+    counts.scatter_add_(1, level, torch.ones_like(level))
+    counts[:, sink] = 0
+    limit = torch.full((rows,), store_width, dtype=torch.int64, device=s.device)
+    if top_k is not None:
+        limit = torch.where(top_k > 0, torch.minimum(top_k.long(), limit), limit)
+    n = torch.minimum(limit, counts.sum(-1))
+    if top_p is not None:
+        cum = counts.cumsum(-1)
+        kept = torch.minimum(counts, (limit[:, None] - (cum - counts)).clamp(min=0))
+        bins = torch.arange(_Q_BINS, device=s.device, dtype=torch.float32)
+        mid_gap = torch.where(bins == 0, 0.0, (bins - 0.5) / _Q_LEVELS_PER_NAT)
+        mass = kept.float() * torch.exp(-mid_gap)
+        before = mass.cumsum(-1) - mass
+        inside = before < top_p[:, None].float() * mass.sum(-1, keepdim=True)
+        nucleus = torch.where(inside, kept, 0).sum(-1)
+        n = torch.where(top_p < 1.0, torch.minimum(n, nucleus), n)
+    order = torch.sort(level, dim=-1, stable=True).indices
+    chosen = torch.arange(vocab, device=s.device)[None, :] < n[:, None]
+    weights = torch.zeros_like(s)
+    weights.scatter_(1, order, torch.where(chosen, 1.0, 0.0))
+    weights = torch.where(weights > 0, torch.exp(s - row_max), 0.0)
+    q = weights / weights.sum(-1, keepdim=True)
+    delta = torch.zeros_like(s).scatter_(1, s.argmax(-1, keepdim=True), 1.0)
+    return torch.where((n > 0)[:, None], q, delta)
+
+
 def dspark_markov_sample_reference(
     base_logits: torch.Tensor,
     prev_ids: torch.Tensor,
@@ -788,18 +1101,26 @@ def dspark_markov_sample_reference(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
     exp_noise: torch.Tensor,
+    store_width: int,
+    top_k: torch.Tensor | None = None,
+    top_p: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The eager spelling of the op, for tests: ``(ids [B], q [B, V])``.
+    """The eager spelling of the op, for tests: ``(ids [B], q [B, V])`` with q
+    densified (`sparse_q_reference`), a greedy row's the delta on its argmax.
 
     Takes its ``[B, V]`` Exp(1) noise as an argument rather than drawing it,
     so a test can feed it the same draws the kernel would make, or none.
     """
     markov_embed = markov_w1[prev_ids]
     bias = torch.matmul(markov_embed.float(), markov_w2.float().t())
-    q = torch.softmax(
-        (base_logits.float() + bias) / temperatures[:, None].float(), dim=-1
+    logits = base_logits.float() + bias
+    q = sparse_q_reference(
+        logits / temperatures[:, None].float(), store_width, top_k, top_p
     )
-    noise = torch.where(greedy_mask.bool()[:, None], 1.0, exp_noise)
+    greedy = greedy_mask.bool()
+    argmax = logits.argmax(dim=-1, keepdim=True)
+    q = torch.where(greedy[:, None], torch.zeros_like(q).scatter_(1, argmax, 1.0), q)
+    noise = torch.where(greedy[:, None], 1.0, exp_noise)
     return (q / noise).argmax(dim=-1), q
 
 
@@ -828,32 +1149,45 @@ def dspark_markov_sample_unsupported(
 def _sample_scratch_shapes(num_rows: int, vocab_size: int):
     """fp32 and int32 shapes one `dspark_markov_sample` call needs, in order."""
     gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
-    sample_tiles = triton.cdiv(vocab_size, _SAMPLE_BLOCK_V)
+    q_tiles = triton.cdiv(vocab_size, _Q_BLOCK_V)
     f32 = [
         (gemv_tiles, num_rows),  # part_max
         (gemv_tiles, num_rows),  # part_sum
         (gemv_tiles, num_rows),  # part_amax_val
         (num_rows,),  # row_max
         (num_rows,),  # row_inv_z
-        (sample_tiles, num_rows),  # part_key
     ]
     i32 = [
         (gemv_tiles, num_rows),  # part_amax_idx
         (num_rows,),  # row_argmax
-        (sample_tiles, num_rows),  # part_idx
+        (num_rows, q_tiles, _Q_BINS),  # hist
+        (num_rows, q_tiles),  # tile_off
+        (num_rows, q_tiles),  # tile_quota
+        (num_rows,),  # row_cut
+        (num_rows,),  # row_n
     ]
     return f32, i32
 
 
 def dspark_markov_sample_scratch(max_rows: int, vocab_size: int, device):
     """Scratch for any `dspark_markov_sample` call of up to ``max_rows`` rows,
-    allocated once. One call runs at a time, so a block's positions share it."""
+    allocated once. One call runs at a time, so a block's positions share it.
+    The dense ``s`` scratch is not part of it: it is the caller's, sized
+    ``[max_rows, V]``."""
     f32, i32 = _sample_scratch_shapes(max_rows, vocab_size)
     return SamplingScratch(sum(prod(x) for x in f32), sum(prod(x) for x in i32), device)
 
 
+def _check_rows(name, t, rows, dtype):
+    if t.shape != (rows,) or t.dtype is not dtype or t.stride(0) != 1:
+        raise ValueError(
+            f"{name} {tuple(t.shape)} {t.dtype} is not a contiguous [{rows}] {dtype}"
+        )
+
+
 @torch_compile_guard(
-    gen_fake=_dspark_markov_sample_fake, mutates_args=["out", "q_store"]
+    gen_fake=_dspark_markov_sample_fake,
+    mutates_args=["out", "q_ids", "q_probs", "q_meta", "s_scratch"],
 )
 def dspark_markov_sample(
     base_logits: torch.Tensor,
@@ -861,18 +1195,23 @@ def dspark_markov_sample(
     markov_w1: torch.Tensor,
     markov_w2: torch.Tensor,
     out: torch.Tensor,
-    q_store: torch.Tensor,
+    q_ids: torch.Tensor,
+    q_probs: torch.Tensor,
+    q_meta: torch.Tensor,
+    s_scratch: torch.Tensor,
     q_row_base: torch.Tensor,
     position: int,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
     seed: torch.Tensor,
     noise_offset: int,
     scratch_f32: torch.Tensor | None = None,
     scratch_i32: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Draw ``x_k ~ softmax((base_logits + W1[prev_ids] @ W2^T) / T)`` and
-    publish that distribution.
+    """Draw ``x_k`` from the top of ``softmax((base_logits + W1[prev_ids] @
+    W2^T) / T)`` and publish exactly the q it was drawn from.
 
     Args:
         base_logits:  [B, V]  this block position's base logits.
@@ -882,13 +1221,17 @@ def dspark_markov_sample(
         out:          [B]     int32/int64 destination for the ids. A strided
                               view is fine -- that is how the caller's own
                               `[B, T + 1]` block becomes the destination.
-        q_store:      [N, V]  fp32 persistent q; row ``q_row_base[b] +
-                              position`` receives row b's distribution. Used as
-                              scratch for the unnormalized scores first.
+        q_ids, q_probs, q_meta:
+                              a `SparseQStore`'s three tensors; row
+                              ``q_row_base[b] + position`` receives row b's q.
+                              Their width K bounds how many ids a row stores.
+        s_scratch:    [>=B, V] fp32, the scaled scores between launches.
         q_row_base:   [B]     int32; negative writes nothing.
         position:             host int, this block position.
         temperatures: [B]     fp32, pre-clamped away from 0 by the caller.
         greedy_mask:  [B]     int32, nonzero where the draw is an argmax.
+        top_k:        [B]     int32, the request's top-k; 0 is off.
+        top_p:        [B]     fp32, the request's top-p; 1.0 is off.
         seed:         [1]     int32 device scalar. Must hold the same value on
                               every TP rank; see the module notes.
         noise_offset:         host int, the Philox counter base for this block
@@ -918,25 +1261,37 @@ def dspark_markov_sample(
             f"out {tuple(out.shape)} {out.dtype} is not the [{num_rows}] int32 "
             "or int64 an id block is made of"
         )
+    store_rows, store_width = q_ids.shape if q_ids.dim() == 2 else (0, 0)
     if (
-        q_store.dim() != 2
-        or q_store.shape[1] != vocab_size
-        or q_store.dtype is not torch.float32
-        or not q_store.is_contiguous()
+        store_width < 1
+        or q_ids.dtype is not torch.int32
+        or q_probs.shape != q_ids.shape
+        or q_probs.dtype is not torch.float32
+        or q_meta.shape != (store_rows, 2)
+        or q_meta.dtype is not torch.int32
+        or not (q_ids.is_contiguous() and q_probs.is_contiguous())
+        or not q_meta.is_contiguous()
     ):
         raise ValueError(
-            f"q_store {tuple(q_store.shape)} {q_store.dtype} is not a contiguous "
-            f"[N, {vocab_size}] fp32 store the accept kernel reads q from"
+            f"q_ids {tuple(q_ids.shape)} {q_ids.dtype}, q_probs "
+            f"{tuple(q_probs.shape)} {q_probs.dtype}, q_meta "
+            f"{tuple(q_meta.shape)} {q_meta.dtype} are not a contiguous "
+            "[N, K] int32 / [N, K] fp32 / [N, 2] int32 SparseQStore"
         )
     if (
-        q_row_base.shape != (num_rows,)
-        or q_row_base.dtype is not torch.int32
-        or q_row_base.stride(0) != 1
+        s_scratch.dim() != 2
+        or s_scratch.shape[0] < num_rows
+        or s_scratch.shape[1] != vocab_size
+        or s_scratch.dtype is not torch.float32
+        or not s_scratch.is_contiguous()
     ):
         raise ValueError(
-            f"q_row_base {tuple(q_row_base.shape)} {q_row_base.dtype} is not a "
-            f"contiguous [{num_rows}] int32"
+            f"s_scratch {tuple(s_scratch.shape)} {s_scratch.dtype} is not a "
+            f"contiguous [>= {num_rows}, {vocab_size}] fp32"
         )
+    _check_rows("q_row_base", q_row_base, num_rows, torch.int32)
+    _check_rows("top_k", top_k, num_rows, torch.int32)
+    _check_rows("top_p", top_p, num_rows, torch.float32)
     if base_logits.stride(1) != 1:
         raise ValueError("base_logits rows must be contiguous over the vocab axis")
     why = dspark_markov_sample_unsupported(markov_w1, markov_w2)
@@ -952,12 +1307,13 @@ def dspark_markov_sample(
     row_tiles = triton.cdiv(num_rows, block_row)
 
     # Stage 1's GEMV keeps the greedy op's narrow V tile (its accumulator is the
-    # MFMA one); stage 3's is wide, because it only streams.
+    # MFMA one); the q stages tile wide, because they only stream.
     gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
+    q_tiles = triton.cdiv(vocab_size, _Q_BLOCK_V)
     f32_shapes, i32_shapes = _sample_scratch_shapes(num_rows, vocab_size)
     (
-        (part_max, part_sum, part_amax_val, row_max, row_inv_z, part_key),
-        (part_amax_idx, row_argmax, part_idx),
+        (part_max, part_sum, part_amax_val, row_max, row_inv_z),
+        (part_amax_idx, row_argmax, hist, tile_off, tile_quota, row_cut, row_n),
     ) = take(f32_shapes, i32_shapes, device, scratch_f32, scratch_i32)
 
     _dspark_markov_sample_stage1[(gemv_tiles, row_tiles)](
@@ -968,7 +1324,7 @@ def dspark_markov_sample(
         temperatures,
         q_row_base,
         markov_embed,
-        q_store,
+        s_scratch,
         part_max,
         part_sum,
         part_amax_val,
@@ -976,12 +1332,12 @@ def dspark_markov_sample(
         num_rows,
         vocab_size,
         rank,
-        position,
         stride_base_row=base_logits.stride(0),
         stride_prev=prev_ids.stride(0),
         stride_w1_vocab=markov_w1.stride(0),
         stride_embed_row=markov_embed.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
+        stride_s_row=s_scratch.stride(0),
         BLOCK_ROW=block_row,
         BLOCK_V=_BLOCK_V,
         BLOCK_K=_BLOCK_K,
@@ -1003,42 +1359,76 @@ def dspark_markov_sample(
         num_warps=4,
         num_stages=1,
     )
-
-    sample_tiles = triton.cdiv(vocab_size, _SAMPLE_BLOCK_V)
-    _dspark_markov_sample_stage3[(num_rows, sample_tiles)](
-        q_store,
-        q_row_base,
+    levels = {
+        "NUM_BINS": _Q_BINS,
+        "LEVELS_PER_NAT": _Q_LEVELS_PER_NAT,
+        "MAX_GAP": _Q_MAX_GAP,
+    }
+    _dspark_q_histogram[(num_rows, q_tiles)](
+        s_scratch,
         row_max,
-        row_inv_z,
-        row_argmax,
+        q_row_base,
         greedy_mask,
-        seed,
-        part_key,
-        part_idx,
-        num_rows,
+        hist,
         vocab_size,
+        s_scratch.stride(0),
+        q_tiles,
+        BLOCK_V=_Q_BLOCK_V,
+        **levels,
+        num_warps=4,
+    )
+    _dspark_q_cut[(num_rows,)](
+        hist,
+        q_row_base,
+        greedy_mask,
+        top_k,
+        top_p,
+        tile_off,
+        tile_quota,
+        row_cut,
+        row_n,
+        q_tiles,
+        store_width,
+        BLOCK_TILE=triton.next_power_of_2(q_tiles),
+        NUM_BINS=_Q_BINS,
+        LEVELS_PER_NAT=_Q_LEVELS_PER_NAT,
+        num_warps=8,
+    )
+    _dspark_q_compact[(num_rows, q_tiles)](
+        s_scratch,
+        row_max,
+        q_row_base,
+        greedy_mask,
+        tile_off,
+        tile_quota,
+        row_cut,
+        q_ids,
+        q_probs,
+        vocab_size,
+        s_scratch.stride(0),
+        q_tiles,
+        store_width,
+        position,
+        BLOCK_V=_Q_BLOCK_V,
+        **levels,
+        num_warps=4,
+    )
+    _dspark_q_finalize[(num_rows,)](
+        q_ids,
+        q_probs,
+        q_meta,
+        q_row_base,
+        greedy_mask,
+        row_argmax,
+        row_n,
+        seed,
+        out,
+        vocab_size,
+        store_width,
         position,
         noise_offset,
-        BLOCK_V=_SAMPLE_BLOCK_V,
-        num_warps=4,
-        num_stages=2,
-    )
-    # Stage 4 is the greedy op's stage 2: "pick the winning V tile, lowest id
-    # among tiles that tie" is the same reduction over a different key. Driven
-    # in its non-packed form, where `part_key` stands in for the unused
-    # `packed_ptr` that branch never dereferences.
-    _dspark_markov_argmax_stage2[(num_rows,)](
-        part_key,
-        part_idx,
-        out,
-        num_rows,
-        sample_tiles,
-        vocab_size,
         out.stride(0),
-        part_key,
-        BLOCK_TILE=triton.next_power_of_2(sample_tiles),
-        PACKED=False,
+        BLOCK=_Q_FINAL_BLOCK,
         num_warps=4,
-        num_stages=1,
     )
     return markov_embed

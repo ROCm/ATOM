@@ -3300,6 +3300,14 @@ class ModelRunner:
             # below, because it decides whether that sample is needed at all.
             # An all-greedy batch always verifies by exact match, so it never
             # asks. `top_ks`/`top_ps` are None exactly when no row filters.
+            #
+            # The ratio verify spreads a rejecting request's q into the draft's
+            # score scratch, which the draft head rewrites on every propose.
+            # Safe because both run here, in `postprocess`, on the one current
+            # stream -- this verify after the previous step's propose, and
+            # before this step's (`propose_draft_token_ids` below) -- and the
+            # forward that may run on another stream (the disaggregated decode
+            # runner's) touches neither. Keep the two on one stream.
             draft_probs = draft_probs_row_base = ratio_scratch = None
             drafter = getattr(self, "drafter", None)
             if drafter is not None and not all_greedy:
