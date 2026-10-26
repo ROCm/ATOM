@@ -181,12 +181,16 @@ meta_path, diff_path, out_path, project_root = (pathlib.Path(a) for a in sys.arg
 meta = json.loads(meta_path.read_text())
 paths = [f["path"] for f in meta.get("files", [])]
 
-# Checked in this order: a .md under csrc/ is documentation, and op_tests/ is neither
+# Checked in this order: a .md under atom/ is documentation, and tests/ is neither
 # runtime nor documentation.
-TEST_PREFIXES = ("op_tests/",)
+TEST_PREFIXES = ("tests/",)
 STATIC_PREFIXES = (".github/", ".claude/", ".cursor/", "bin/", "docs/")
 STATIC_SUFFIXES = (".md", ".rst", ".txt", ".toml", ".cfg", ".ini", ".gitignore")
-RUNTIME_PREFIXES = ("csrc/", "hsa/", "aiter/", "gradlib/")
+# atom/ is named explicitly, even though the fallback below would already catch it, so this
+# constant states ATOM's own runtime surface rather than another project's directory names.
+# The suffix list stays broad (not just .py): it is what keeps a future C++/HIP kernel under
+# atom/ runtime even if nobody updates this list, the same way RUNTIME_PREFIXES does today.
+RUNTIME_PREFIXES = ("atom/",)
 RUNTIME_SUFFIXES = (".cu", ".cuh", ".hip", ".cpp", ".cc", ".c", ".h", ".hpp", ".s", ".asm")
 
 
@@ -199,8 +203,9 @@ def classify(path):
         return "runtime"
     # Unclassified counts as runtime, deliberately. The error to avoid is clearing a kernel
     # change because nobody put its directory on a list; demanding evidence that turns out
-    # to be unnecessary only costs a run. Note this makes `aiter/configs/*.csv` tuned-shape
-    # edits and `aiter/jit/**` build config runtime, which is correct: both reroute kernels.
+    # to be unnecessary only costs a run. This also makes tuned-shape config tables and
+    # codegen/build manifests runtime by default, which is correct wherever they live: both
+    # reroute what actually executes, even though neither is itself executed as source.
     return "runtime"
 
 
