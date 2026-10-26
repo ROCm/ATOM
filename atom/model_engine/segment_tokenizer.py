@@ -39,6 +39,7 @@ from typing import NamedTuple
 import numpy as np
 
 from atom.model_engine.byte_lru import ByteLRU
+from atom.model_engine.prefix_projection import PrefixProjection, project_prefix
 from atom.model_engine.segment_split import AddedTokenSplitter
 
 logger = logging.getLogger("atom")
@@ -74,6 +75,7 @@ class _Prefix(NamedTuple):
     ids: np.ndarray  # int32, without the BOS/EOS `encode` wraps a prompt in
     cut_chars: np.ndarray  # int64, ascending; the last is `len_chars`
     cut_ids: np.ndarray  # int64
+    projection: PrefixProjection | None = None
 
     @property
     def payload_bytes(self) -> int:
@@ -86,7 +88,14 @@ class _Prefix(NamedTuple):
             + sys.getsizeof(self.ids)
             + sys.getsizeof(self.cut_chars)
             + sys.getsizeof(self.cut_ids)
+            + (self.projection.payload_bytes if self.projection is not None else 0)
         )
+
+
+class PrefixEncoding(NamedTuple):
+    token_ids: list[int]
+    projection: PrefixProjection | None
+    projection_seconds: float = 0.0
 
 
 def _shared_chars(a: str, b: str, limit: int) -> int:
@@ -152,13 +161,33 @@ class SegmentTokenizer:
     # -- public ------------------------------------------------------------
 
     def encode(self, prompt: str) -> list[int]:
+        return self._checked_encode(prompt)
+
+    def encode_with_prefix(self, prompt, block_size, seed=-1, page_chunk=0):
+        """Encode and extend the same stored prefix's HBM/PAGE hash views.
+
+        Token IDs and projections are verified and evicted as one record.
+        Unsupported/short/disabled paths return no hint; ordinary hashing
+        remains available to the caller.
+        """
+        return self._checked_encode(prompt, (block_size, seed, page_chunk))
+
+    def _checked_encode(self, prompt, projection_spec=None):
+        def plain(ids):
+            return ids if projection_spec is None else PrefixEncoding(ids, None)
+
         if not self.enabled or len(prompt) < _MIN_CACHED_CHARS:
-            return self._tokenizer.encode(prompt)
+            return plain(self._tokenizer.encode(prompt))
         # Decided before encoding: a request either checks its own result or
         # was admitted once enough others had.
         with self._lock:
             verify = self._verified < _VERIFY_FIRST
-        ids = self._encode_cached(prompt)
+        result = (
+            self._encode_cached(prompt)
+            if projection_spec is None
+            else self._encode_cached(prompt, projection_spec)
+        )
+        ids = result if projection_spec is None else result.token_ids
         if verify:
             ref = self._tokenizer.encode(prompt)
             with self._lock:
@@ -175,15 +204,16 @@ class SegmentTokenizer:
                     self._buckets.clear()
                 elif self.enabled:
                     self._verified += 1
-            return ref
+                enabled = self.enabled
+            return result if enabled else plain(ref)
         with self._lock:
             enabled = self.enabled
         # Turned off while this request encoded: its ids are unchecked.
-        return ids if enabled else self._tokenizer.encode(prompt)
+        return result if enabled else plain(self._tokenizer.encode(prompt))
 
     # -- the two levels ----------------------------------------------------
 
-    def _encode_cached(self, prompt: str) -> list[int]:
+    def _encode_cached(self, prompt: str, projection_spec=None):
         t0 = time.perf_counter()
         split = self._split
         base, k = self._find_prefix(prompt)
@@ -247,13 +277,31 @@ class SegmentTokenizer:
         body = np.concatenate(chunks)
         out = body.tolist()
 
+        projection = None
+        projection_seconds = 0.0
+        if projection_spec is not None:
+            t_hash = time.perf_counter()
+            projection = project_prefix(
+                body,
+                *projection_spec,
+                base=None if base is None else base.projection,
+                shared_tokens=(len(split.head) + n_base if base is not None else 0),
+            )
+            projection_seconds = time.perf_counter() - t_hash
+
         # With no added token past the reused cut, the new entry would be a
         # part of `base`, which already serves it.
         if new_cut_chars:
-            self._store_prefix(prompt, body, base, k, new_cut_chars, new_cut_ids)
+            self._store_prefix(
+                prompt, body, base, k, new_cut_chars, new_cut_ids, projection=projection
+            )
         fresh_ids = sum(len(v) for v in fresh.values())
         self._count(len(out) - fresh_ids, fresh_ids, time.perf_counter() - t0, base)
-        return out
+        return (
+            out
+            if projection_spec is None
+            else PrefixEncoding(out, projection, projection_seconds)
+        )
 
     def _find_prefix(self, prompt: str):
         """`(entry, k)`: the stored prompt sharing the most with `prompt` and
@@ -285,7 +333,9 @@ class SegmentTokenizer:
                 self._lru.get(("p", best_pid))
         return best, best_k
 
-    def _store_prefix(self, prompt, body, base, k, new_cut_chars, new_cut_ids):
+    def _store_prefix(
+        self, prompt, body, base, k, new_cut_chars, new_cut_ids, projection=None
+    ):
         """Keep `prompt` for later turns; it replaces `base` if it extends it
         whole, and sits beside it otherwise (another conversation with the
         same start, a fork)."""
@@ -310,6 +360,11 @@ class SegmentTokenizer:
             body[head : head + int(cut_ids[-1])].copy(),
             cut_chars,
             cut_ids,
+            (
+                projection.for_stored_prefix(body, head + int(cut_ids[-1]))
+                if projection is not None
+                else None
+            ),
         )
         # The new prompt supersedes `base` when what it does not share of
         # `base` is added tokens only, no text: the previous turn's generation
