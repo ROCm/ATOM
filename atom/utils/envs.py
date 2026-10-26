@@ -879,6 +879,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # Record decode-step expert load into a separate window and log its realized
+    # per-step imbalance (max/mean) every ATOM_EPLB_DECODE_LOG_INTERVAL
+    # pure-decode steps. Measurement only: rebalancing still uses prefill load.
+    "ATOM_EPLB_RECORD_DECODE": lambda: os.getenv("ATOM_EPLB_RECORD_DECODE", "0") == "1",
+    "ATOM_EPLB_DECODE_LOG_INTERVAL": lambda: _int_env(
+        "ATOM_EPLB_DECODE_LOG_INTERVAL", 200
+    ),
+    # Optional file the EP-rank-0 process appends per-step decode loads to (JSONL).
+    "ATOM_EPLB_DECODE_DUMP": lambda: os.getenv("ATOM_EPLB_DECODE_DUMP", ""),
+    # Directory each DP rank appends a per-forward activity log to (dp<rank>.jsonl:
+    # prefill/decode tokens and seqs, dummy flag). Measurement only; "" = off.
+    "ATOM_DP_STEP_DUMP": lambda: os.getenv("ATOM_DP_STEP_DUMP", ""),
+    "ATOM_DP_STEP_DUMP_BLOCK": lambda: _int_env("ATOM_DP_STEP_DUMP_BLOCK", 500),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"

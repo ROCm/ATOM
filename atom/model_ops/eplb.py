@@ -1494,6 +1494,18 @@ class ExpertLoadMonitor:
         self._step_load_window: torch.Tensor | None = None
         self._step_slot = 0
         self._step_filled = 0
+        # Decode load (ATOM_EPLB_RECORD_DECODE=1): measurement only, kept apart
+        # from the prefill windows above and never fed to the planner. One row
+        # per group-wide pure-decode step, flushed (reduced + logged) every
+        # ATOM_EPLB_DECODE_LOG_INTERVAL steps.
+        self.record_decode = envs.ATOM_EPLB_RECORD_DECODE
+        self._decode_interval = max(1, envs.ATOM_EPLB_DECODE_LOG_INTERVAL)
+        self._decode_gpu_window: torch.Tensor | None = None
+        self._decode_tokens: torch.Tensor | None = None
+        self._decode_slot = 0
+        # Routed slots per token (top_k, plus a routed shared column), set by
+        # the fused record path; turns slot counts back into token rows.
+        self.topk_cols = 0
 
     def set_load_group(self, group: Any) -> None:
         self._load_group = group
@@ -1553,6 +1565,17 @@ class ExpertLoadMonitor:
         )
         if self.keep_full_step_load:
             self._step_load_window = torch.zeros_like(self._expert_load_window)
+        if self.record_decode:
+            self._decode_gpu_window = torch.zeros(
+                (self._decode_interval, num_layers, num_gpus),
+                dtype=torch.int32,
+                device=device,
+            )
+            # [:, 0] real decode tokens of this rank, [:, 1] routed slots this
+            # rank dispatched in layer 0 (cudagraph pad rows included).
+            self._decode_tokens = torch.zeros(
+                (self._decode_interval, 2), dtype=torch.int32, device=device
+            )
         self._num_gpus = num_gpus
         self._num_layers = num_layers
         self._num_physical = num_physical
@@ -1673,6 +1696,37 @@ class ExpertLoadMonitor:
                 self._step_load_window[slot].zero_()
         self._step_slot = (slot + 1) % self.window_size
         self._step_filled = min(self._step_filled + 1, self.window_size)
+
+    def commit_decode_step(self, local_decode_tokens: int) -> bool:
+        """Commit one group-wide pure-decode step to the decode window. Every
+        rank of the group calls this on the same steps (a dummy rank still
+        dispatches its pad rows, so its load counts). Returns True when the
+        window is full and ``dump_global_decode`` is due on every rank."""
+        if self._decode_gpu_window is None or self._cur_pass_count is None:
+            return False
+        slot = self._decode_slot
+        self._decode_gpu_window[slot].copy_(
+            self._cur_pass_count.view(self._num_layers, self._num_gpus, -1).sum(-1)
+        )
+        self._decode_tokens[slot, 0].fill_(int(local_decode_tokens))
+        self._decode_tokens[slot, 1].copy_(self._cur_pass_count[0].sum())
+        self._decode_slot = (slot + 1) % self._decode_interval
+        return self._decode_slot == 0
+
+    def dump_global_decode(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Group-summed decode window: per-GPU load [S, L, num_gpus] and
+        [S, 2] (real decode tokens, layer-0 routed slots), both int64."""
+        if self._decode_gpu_window is None:
+            return None
+        load = self._decode_gpu_window.to(torch.int64)
+        tokens = self._decode_tokens.to(torch.int64)
+        group = self._load_group if self._load_group is not None else get_tp_group()
+        if int(getattr(group, "world_size", 1)) > 1:
+            device_group = getattr(group, "device_group", None)
+            assert device_group is not None, "decode EPLB load needs a device group"
+            torch.distributed.all_reduce(load, group=device_group)
+            torch.distributed.all_reduce(tokens, group=device_group)
+        return load, tokens
 
     def dump_global_step_gpu_load(self) -> torch.Tensor | None:
         """Group-summed load per step and GPU, oldest first: [S, L, num_gpus]."""
@@ -1841,6 +1895,12 @@ class EPLBManager:
         # 0 = rebalance for the life of the process.
         self.max_rebalances = max(0, envs.ATOM_EPLB_MAX_REBALANCES)
         self._rebalancing_stopped = False
+        # LOCAL MEASUREMENT PATCH: keep stepping after the stop to log frozen balance.
+        import os
+
+        self._frozen_log_every = int(
+            os.environ.get("ATOM_EPLB_FROZEN_LOG_INTERVAL", "0")
+        )
         self._gen = self._entrypoint()
         self._rebalance_count = 0
         self._last_balancedness: float | None = None
@@ -2252,11 +2312,14 @@ class EPLBManager:
         local_has_prefill: bool,
         dp_any_has_prefill: bool | None = None,
         local_step_load: bool = False,
+        local_decode_tokens: int = 0,
     ) -> None:
         # Once stopped there is nothing left to schedule, so skip the per-step
         # has-prefill reduction too. The stop latches on the same step on every
         # rank (rebalance counts move in lockstep), so all ranks skip it together.
-        if not self.enabled or self._rebalancing_stopped:
+        # Decode recording still needs the flag to find pure-decode steps.
+        idle = self._rebalancing_stopped and self._frozen_log_every <= 0
+        if not self.enabled or (idle and not self.monitor.record_decode):
             return
 
         # Resolve a migration-group-uniform has-prefill flag.
@@ -2277,9 +2340,67 @@ class EPLBManager:
 
         if not has_prefill:
             # Pure-decode step across the migration group: do not advance.
+            if self.monitor.record_decode and self.monitor.commit_decode_step(
+                local_decode_tokens
+            ):
+                self._log_decode_balance()
+            return
+        if idle:
             return
         self.monitor.commit_step(local_step_load)
         next(self._gen)
+
+    def _log_decode_balance(self) -> None:
+        """Log the realized decode imbalance of the live placement over the
+        last ATOM_EPLB_DECODE_LOG_INTERVAL pure-decode steps (collective)."""
+        reduced = self.monitor.dump_global_decode()
+        meta = self.live_metadata
+        if reduced is None or meta is None or meta.ep_rank != 0:
+            return
+        load, tokens = reduced
+        per_gpu = load.to(torch.float64)
+        peak = per_gpu.max(-1).values.sum(-1)
+        mean = per_gpu.mean(-1).sum(-1)
+        step_imb = peak / mean.clamp(min=1e-9)
+        p50, p90 = torch.quantile(
+            step_imb, torch.tensor([0.5, 0.9], dtype=torch.float64, device=load.device)
+        ).tolist()
+        k = max(1, self.monitor.topk_cols)
+        real = tokens[:, 0].tolist()
+        slots = tokens[:, 1].tolist()
+        logger.info(
+            "EPLB decode step imbalance (policy=%s, rebalances=%d, steps=%d): %.4f "
+            "[per-step p50 %.4f p90 %.4f max %.4f] tokens/step real %.1f "
+            "dispatched %.1f",
+            self.placement_policy,
+            self._rebalance_count,
+            load.shape[0],
+            float(peak.sum() / mean.sum()) if float(mean.sum()) > 0 else 1.0,
+            p50,
+            p90,
+            float(step_imb.max()),
+            sum(real) / len(real),
+            sum(slots) / len(slots) / k,
+        )
+        path = envs.ATOM_EPLB_DECODE_DUMP
+        if path:
+            import json
+
+            with open(path, "a") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "policy": self.placement_policy,
+                            "rebalances": self._rebalance_count,
+                            "k": k,
+                            "real": real,
+                            "slots": slots,
+                            # [S, num_gpus], layer-summed tokens each GPU received
+                            "gpu_load": load.sum(1).tolist(),
+                        }
+                    )
+                    + "\n"
+                )
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
         if not self.enabled:
@@ -2309,8 +2430,32 @@ class EPLBManager:
                 yield
         self._stop_rebalancing()
         # Never finish: a caller that still advances the generator idles here.
+        # LOCAL MEASUREMENT PATCH (not for commit): log the frozen placement's
+        # realized per-step imbalance every ATOM_EPLB_FROZEN_LOG_INTERVAL steps.
+        import os
+
+        log_every = int(os.environ.get("ATOM_EPLB_FROZEN_LOG_INTERVAL", "0"))
         while True:
-            yield
+            if log_every <= 0:
+                yield
+                continue
+            for _ in range(log_every):
+                yield
+            step_gpu_load = self.monitor.dump_global_step_gpu_load()
+            meta = self.live_metadata
+            if step_gpu_load is None or meta is None or meta.ep_rank != 0:
+                continue
+            # Oldest first: keep only the steps since the previous sample.
+            step_gpu_load = step_gpu_load[-log_every:]
+            per_gpu = step_gpu_load.to(torch.float64)
+            peak = float(per_gpu.max(-1).values.sum())
+            mean = float(per_gpu.mean(-1).sum())
+            logger.info(
+                "EPLB frozen step imbalance (policy=%s, steps=%d): %.4f",
+                self.placement_policy,
+                step_gpu_load.shape[0],
+                peak / mean if mean > 0 else 1.0,
+            )
 
     def _max_rebalances_reached(self) -> bool:
         return 0 < self.max_rebalances <= self._rebalance_count
@@ -2747,9 +2892,64 @@ def with_eplb_forward_monitor(fn):
                 local_has_prefill,
                 dp_any_has_prefill,
                 local_step_load=is_pure_prefill and not is_dummy_run,
+                local_decode_tokens=(
+                    0
+                    if is_dummy_run
+                    else getattr(batch, "total_tokens_num_decode", 0)
+                ),
             )
+            if _DP_STEP_LOG.enabled:
+                _DP_STEP_LOG.record(batch, is_dummy_run)
 
     return wrapper
+
+
+class _DpStepLog:
+    """Per-forward DP-rank activity log (ATOM_DP_STEP_DUMP=<dir>): measurement
+    only. Each DP rank appends its own ``dp<rank>.jsonl`` in blocks of
+    ATOM_DP_STEP_DUMP_BLOCK forwards; DP forwards run in lockstep, so line i /
+    entry j is the same step on every rank. Host-side ints only, no GPU sync."""
+
+    _FIELDS = ("t", "pt", "dt", "ps", "ds", "dummy")
+
+    def __init__(self) -> None:
+        self.dir = envs.ATOM_DP_STEP_DUMP
+        self.enabled = bool(self.dir)
+        self.block = max(1, envs.ATOM_DP_STEP_DUMP_BLOCK)
+        self._rows: dict[str, list] = {k: [] for k in self._FIELDS}
+        self._path: str | None = None
+        self._step = 0
+
+    def record(self, batch: Any, is_dummy_run: bool) -> None:
+        import time
+
+        rows = self._rows
+        rows["t"].append(round(time.time(), 4))
+        rows["pt"].append(int(getattr(batch, "total_tokens_num_prefill", 0)))
+        rows["dt"].append(int(getattr(batch, "total_tokens_num_decode", 0)))
+        rows["ps"].append(int(getattr(batch, "total_seqs_num_prefill", 0)))
+        rows["ds"].append(int(getattr(batch, "total_seqs_num_decode", 0)))
+        rows["dummy"].append(1 if is_dummy_run else 0)
+        if len(rows["t"]) >= self.block:
+            self._flush()
+
+    def _flush(self) -> None:
+        import json
+        import os
+
+        if self._path is None:
+            from aiter.dist.parallel_state import get_dp_group
+
+            os.makedirs(self.dir, exist_ok=True)
+            rank = int(get_dp_group().rank_in_group)
+            self._path = os.path.join(self.dir, f"dp{rank}.jsonl")
+        with open(self._path, "a") as f:
+            f.write(json.dumps({"step0": self._step, **self._rows}) + "\n")
+        self._step += len(self._rows["t"])
+        self._rows = {k: [] for k in self._FIELDS}
+
+
+_DP_STEP_LOG = _DpStepLog()
 
 
 def _eplb_owns_layer(meta: Any, layer_id: Any) -> bool:
@@ -2984,6 +3184,7 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
             enabled=True, window_size=atom_cfg.eplb_config.load_window_size
         )
         load_buf = monitor.pass_count_buffer(layer_id, num_physical)
+        monitor.topk_cols = top_k
     record = load_buf is not None
 
     out = torch.empty_like(topk_ids)
