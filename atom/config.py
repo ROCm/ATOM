@@ -1414,10 +1414,12 @@ class SpeculativeConfig:
 
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
-        :func:`_normalize_draft_dspark_config`, which runs from
-        :meth:`hf_config_override` when the draft's architecture is in
-        ``_STANDALONE_DSPARK_ARCHS``, so it is set for exactly the configs that went
-        through that normalization.
+        :func:`_normalize_draft_dspark_config`, which :meth:`hf_config_override`
+        runs for every architecture in ``_STANDALONE_DSPARK_ARCHS`` AND for a
+        SpecForge DFlash draft (``DSparkDraftModel`` with a ``dflash_config``,
+        renamed to ``K3DFlashModel``, which is not in that set). So it is set for
+        exactly the configs that went through that normalization -- ask this, not
+        set membership.
         """
         cfg = self.draft_model_hf_config
         return bool(getattr(cfg, "dspark_with_draft", False))

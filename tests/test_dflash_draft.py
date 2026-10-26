@@ -883,11 +883,16 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 
 
 def _guard_refuses(draft_hf):
-    """Mirror of `config.py` 2352-2358, the predicate under the DCP guard."""
+    """Mirror of the predicate under `Config`'s DCP guard (`atom/config.py`):
+    `owns_sibling_pool and not uses_dflash_pool(draft_hf)`."""
     # get_attn_backend resolves to aiter_attention, which imports aiter at module
-    # load. Skip per test, not per module, so the source-only guard test below
-    # still runs on the CPU-only CI runner.
-    pytest.importorskip("aiter")
+    # load and probes the GPU arch there. Skip per test, not per module, so the
+    # source-only guard test below still runs on the CPU-only CI runner.
+    pytest.importorskip(
+        "atom.model_ops.attentions.aiter_attention",
+        reason="backend imports aiter, which probes the GPU arch at load",
+        exc_type=(ImportError, RuntimeError, TypeError),
+    )
     from atom.spec_decode.draft_kv import uses_dflash_pool
     from atom.utils.selector import attn_family, get_attn_backend
 
@@ -982,8 +987,12 @@ def _entry_tokens(block_size, dcp, non_causal_gqa):
     """Call the real property against a minimal stub."""
     # dspark_proposer imports triton at module load; the CPU-only CI runner has
     # none. The pure-arithmetic mirrors below do not need it and keep running.
-    pytest.importorskip("triton")
-    from atom.spec_decode.dspark_proposer import DSparkProposer
+    proposer = pytest.importorskip(
+        "atom.spec_decode.dspark_proposer",
+        reason="the proposer imports aiter/triton at module load",
+        exc_type=(ImportError, RuntimeError, TypeError),
+    )
+    DSparkProposer = proposer.DSparkProposer
 
     stub = types.SimpleNamespace(
         runner=types.SimpleNamespace(block_size=block_size),
@@ -1117,9 +1126,13 @@ def test_block_fold_puts_every_row_on_its_own_kv_head(bs, T, hkv, g):
     assert torch.equal(out, tag)
 
 
-def _reference_block_attn(q, k_pool, v_pool, block_tables, kv_lens, scale, hkv):
-    """Bidirectional GQA attention of each request's T rows over its pool rows,
-    in fp32, gathered slot by slot from the block table."""
+def _reference_block_attn(
+    q, k_pool, v_pool, block_tables, kv_lens, scale, hkv, causal=False
+):
+    """GQA attention of each request's T rows over its pool rows, in fp32,
+    gathered slot by slot from the block table. Bidirectional by default;
+    `causal` masks block row t to keys `< kv_len - T + t + 1`, the mask a
+    non-folded read of the same block would apply."""
     import torch
 
     bs = kv_lens.shape[0]
@@ -1134,6 +1147,10 @@ def _reference_block_attn(q, k_pool, v_pool, block_tables, kv_lens, scale, hkv):
         v = v_pool[ent, pos % E].float()
         qb = q[b * T : (b + 1) * T].float().view(T, hkv, g, d)
         s = torch.einsum("thgd,nhd->thgn", qb, k) * scale
+        if causal:
+            last = n - T + torch.arange(T, device=q.device)  # [T]
+            hide = pos.view(1, n) > last.view(T, 1)  # [T, n]
+            s = s.masked_fill(hide.view(T, 1, 1, n), float("-inf"))
         p = torch.softmax(s, dim=-1)
         out[b * T : (b + 1) * T] = torch.einsum("thgn,nhd->thgd", p, v).reshape(
             T, hq, d
@@ -1148,8 +1165,13 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
 
     Draft shape at TP8: 8 q / 2 kv heads, head_dim 64, T = 7, an entry of
     `block_size 128 * dcp 8 = 1024` tokens. Requests of different lengths, one
-    ending mid-entry, so a causal mask -- which a non-folded read would apply
-    -- would change every row but the last.
+    ending mid-entry.
+
+    Over ~1000 random keys the softmax is nearly flat, so a causal mask -- it
+    hides at most T - 1 keys from a row -- moves the output by about as much as
+    a loose tolerance allows. Hence the second check: the read must sit far
+    closer to the bidirectional reference than to the causal one, which holds
+    whatever the draw.
 
     `far_entries` puts a request's pages past entry 16384, where
     `entry * page_stride` (1024 * 2 * 64 per entry) passes 2**31: the boundary
@@ -1188,8 +1210,14 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     one = torch.ones(1, dtype=torch.float32, device=dev)
     read(q, k_pool, v_pool, block_tables, kv_lens, o, scale, 1.0, 1.0, one, one)
 
-    ref = _reference_block_attn(q, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
-    torch.testing.assert_close(o.float(), ref, atol=2e-2, rtol=2e-2)
+    args = (q, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
+    ref = _reference_block_attn(*args)
+    torch.testing.assert_close(o.float(), ref, atol=3e-3, rtol=2e-2)
+
+    causal = _reference_block_attn(*args, causal=True)
+    err_bidir = (o.float() - ref).abs().max().item()
+    err_causal = (o.float() - causal).abs().max().item()
+    assert err_causal > 4 * err_bidir, (err_bidir, err_causal)
 
 
 def test_the_read_needs_no_csr_from_the_proposer():

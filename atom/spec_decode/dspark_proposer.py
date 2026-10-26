@@ -739,11 +739,12 @@ class DSparkProposer(Drafter):
 
         NO HOST SYNC, and no host-side array either. Every input is already on
         the device: `cu_seqlens_q` is uploaded for every step by
-        `publish_cu_seqlens_q` (backends.py:696) and is the only thing needed to
+        `publish_cu_seqlens_q` (`model_ops/attentions/backends.py`) and is the only thing needed to
         resolve a token to its request -- `searchsorted` over its tail does on
         the device what `build_batch_ids` does with `np.repeat` on the host.
-        The block tables are re-published rather than assumed: `publish` is
-        revision-guarded (`utils/block_tables.py:189-204`), so this is free on
+        The block tables are re-published rather than assumed:
+        `BlockTableState.publish` is revision-guarded
+        (`utils/block_tables.py`), so this is free on
         the steps that already uploaded them and correct on the ones that did
         not -- a cache-miss prefill never publishes them
         (`_prefill_block_table_rows` answers None), and this hook runs after
@@ -989,9 +990,9 @@ class DSparkProposer(Drafter):
         # the tensor it was given and rejects a mismatched pair. Left unset, the
         # pass inherits whatever the TARGET's metadata was carrying.
         # MLA only. `dtype_q` is read by attention_mla's decode to allocate
-        # q_out and match the fused rope-concat-and-cache write; the MHA path
-        # never reads it, and `_resolve_dtype_q` reaches through
-        # `layers[0].self_attn.mla_attn`, which a GQA draft does not have.
+        # q_out and match the fused rope-concat-and-cache write; the DFlash
+        # draft's `unified_attention` read never reads it, so there is nothing
+        # to resolve.
         dtype_q = None
         if not self._draft_uses_dflash_pool:
             dtype_q = self._blk_dtype_q
