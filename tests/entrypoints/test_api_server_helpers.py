@@ -815,3 +815,33 @@ class TestTheCensusEndpointKeepsTheLoopFree:
             )
 
         assert asyncio.run(call()) == [False, False], "two walks ran at once"
+
+
+def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
+    events = []
+    loop_thread = threading.get_ident()
+
+    def initialize():
+        assert threading.get_ident() != loop_thread
+        events.append("initialize")
+
+    for name in (
+        "tune_gc",
+        "maybe_attach_gc_debug_callback",
+        "freeze_gc_heap",
+        "arm_reclaim_watch",
+    ):
+        monkeypatch.setattr(api_server, name, lambda *a, **k: None)
+    monkeypatch.setattr(api_server, "engine", None)
+    monkeypatch.setattr(api_server, "initialize_tracing", initialize)
+    monkeypatch.setattr(
+        api_server, "shutdown_tracing", lambda: events.append("shutdown")
+    )
+
+    async def drive():
+        async with api_server.lifespan(api_server.app):
+            assert events == ["initialize"]
+            events.append("serving")
+
+    asyncio.run(drive())
+    assert events == ["initialize", "serving", "shutdown"]

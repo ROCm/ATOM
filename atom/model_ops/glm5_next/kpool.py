@@ -469,8 +469,6 @@ def pool_slot_mapping(
 def _expand_pools_and_append_tail_kernel(
     pool_ids_ptr,
     seq_lens_ptr,
-    pool_base_ptr,
-    tok_base_ptr,
     out_ptr,
     topk,
     out_cols,
@@ -478,8 +476,6 @@ def _expand_pools_and_append_tail_kernel(
     out_s0,
     POOL_SIZE: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
-    HAS_POOL_BASE: tl.constexpr,
-    HAS_TOK_BASE: tl.constexpr,
 ):
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -490,13 +486,6 @@ def _expand_pools_and_append_tail_kernel(
     pool_len = seq_len // POOL_SIZE
     tail_start = pool_len * POOL_SIZE
     tail_count = seq_len - tail_start  # in [0, POOL_SIZE)
-
-    # Prefill scores one buffer holding EVERY request's pools, so the selected
-    # ids are batch-global and the token ids the converter wants are
-    # request-local plus that request's key offset. Both rebases are folded in
-    # here rather than costing a separate pass over a [rows, 2176] int32 array.
-    pool_base = tl.load(pool_base_ptr + row) if HAS_POOL_BASE else 0
-    tok_base = tl.load(tok_base_ptr + row) if HAS_TOK_BASE else 0
 
     # The row is consumed RAGGEDLY: `sparse_kv_indptr` gives each row exactly
     # `min(pool_len, n_groups) * POOL_SIZE + tail_count` entries and nothing
@@ -512,18 +501,13 @@ def _expand_pools_and_append_tail_kernel(
     g = cols // POOL_SIZE
     o = cols % POOL_SIZE
     pid = tl.load(pool_ids_ptr + row * pid_s0 + g, mask=mask & is_history, other=-1)
-    local_pid = pid - pool_base
-    hist_out = tl.where(
-        (pid >= 0) & (local_pid >= 0),
-        (local_pid * POOL_SIZE + o + tok_base).to(tl.int32),
-        -1,
-    )
+    hist_out = tl.where(pid >= 0, (pid * POOL_SIZE + o).to(tl.int32), -1)
 
     # Tail: the request's trailing incomplete pool, never scored
     # (index_kpool_always_select_tail).
     tail_off = cols - hist_end
     is_tail = (tail_off >= 0) & (tail_off < tail_count)
-    tail_out = tl.where(is_tail, (tail_start + tail_off + tok_base).to(tl.int32), -1)
+    tail_out = tl.where(is_tail, (tail_start + tail_off).to(tl.int32), -1)
 
     tl.store(
         out_ptr + row * out_s0 + cols,
@@ -537,8 +521,6 @@ def expand_pools_and_append_tail(
     seq_lens: torch.Tensor,
     pool_size: int,
     out: torch.Tensor | None = None,
-    pool_base: torch.Tensor | None = None,
-    tok_base: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused ``expand_pools_to_tokens`` + ``append_tail_to_topk``.
 
@@ -546,11 +528,6 @@ def expand_pools_and_append_tail(
         pool_ids:  ``[rows, topk // pool_size]`` selected pool indices, -1 padded.
         seq_lens:  ``[rows]`` int32 TOKEN-granular sequence length (pos + 1).
         out:       optional preallocated ``[rows, topk + pool_size - 1]`` int32.
-        pool_base: optional ``[rows]`` int32 subtracted from each selected pool
-                   id to make it request-local (prefill scores one batch-wide
-                   pool buffer).
-        tok_base:  optional ``[rows]`` int32 added to every emitted token id
-                   (the request's offset in the converter's key space).
 
     Returns ``[rows, topk + pool_size - 1]`` int32 token indices, -1 where
     invalid. One launch instead of the ~25 elementwise kernels the torch
@@ -568,8 +545,6 @@ def expand_pools_and_append_tail(
     _expand_pools_and_append_tail_kernel[(rows, triton.cdiv(out_cols, block_cols))](
         pool_ids,
         seq_lens,
-        pool_base if pool_base is not None else pool_ids,
-        tok_base if tok_base is not None else pool_ids,
         out,
         topk,
         out_cols,
@@ -577,8 +552,6 @@ def expand_pools_and_append_tail(
         out.stride(0),
         POOL_SIZE=pool_size,
         BLOCK_COLS=block_cols,
-        HAS_POOL_BASE=pool_base is not None,
-        HAS_TOK_BASE=tok_base is not None,
     )
     return out
 

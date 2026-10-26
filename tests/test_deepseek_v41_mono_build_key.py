@@ -35,15 +35,15 @@ BUILDS = {
          "timeline": True, "diag_off": DIAG, "tok_par": True},
     ),
     "k2b": (
-        k2b.build_moe, k2b.ABI, MoeBuild(tokens=6),
+        k2b.build_moe, k2b.ABI, MoeBuild(tokens=6, tp=1),
         {"tokens": 12, "experts": 128, "topk": 3, "tp": 2, "timeline": True,
-         "diag_off": DIAG, "ug_groups": 1},
+         "diag_off": DIAG, "ug_groups": 1, "ep": 2, "dp_attention": True},
     ),
     "k2": (
-        k2.build_layer_post, k2.ABI, k2.LayerPostBuild(tokens=12),
+        k2.build_layer_post, k2.ABI, k2.LayerPostBuild(tokens=12, tp=1),
         {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "experts": 128,
          "topk": 3, "tp": 2, "timeline": True, "diag_off": DIAG, "ug_groups": 1,
-         "tok_par": True},
+         "tok_par": True, "ep": 2, "moe_tp": 2},
     ),
 }  # fmt: skip
 CASES = [(b, f) for b, (_, _, _, other) in BUILDS.items() for f in sorted(other)]
