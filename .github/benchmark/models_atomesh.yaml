@@ -1611,6 +1611,31 @@ models:
           name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c48
           concurrency: [48]
 
+        # Full target + draft + P/D replay of the stalled batch's lengths.
+        # Eight prefix primers, then eight concurrent one-token requests.
+        - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-stalled-lengths-replay
+          concurrency: [8]
+          osl: 1
+          runner:
+            time_limit: '00:20:00'
+          benchmark:
+            kind: minimax_full_model_replay
+            wait_server_timeout: 1100
+            wait_router_timeout: 60
+
+        - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-stalled-lengths-gated-replay
+          concurrency: [8]
+          osl: 1
+          runner:
+            time_limit: '00:20:00'
+          benchmark:
+            kind: minimax_full_model_replay
+            replay_gate: true
+            wait_server_timeout: 1100
+            wait_router_timeout: 60
+
         - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
           name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c40
           concurrency: [40]

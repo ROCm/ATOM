@@ -373,6 +373,44 @@ apply_prefixed_env() {
   done < <(env)
 }
 
+# The checkout is mounted read-only. Instrument a container-local package copy
+# and launch both services from it so `python -m` resolves the patched package.
+# Keep the patch and per-role diagnostics in uploaded artifacts.
+if [[ "${ATOMESH_M3_REPLAY_GATE:-false}" == "true" ]]; then
+  if [[ "${BENCHMARK_KIND}" != "minimax_full_model_replay" || "${ATOMESH_ATOM_SOURCE}" != "mounted" || "${SINGLE_NODE_PD}" != "1" ]]; then
+    echo "ERROR: gated replay requires its dedicated kind and a mounted single-node P/D service" >&2
+    exit 2
+  fi
+  ATOMESH_M3_REPLAY_DIR="${RUN_DIR}/benchmark_results/stalled-lengths-replay/diagnostics"
+  ATOMESH_M3_REPLAY_PIPE_DIR="$(mktemp -d /tmp/atomesh-m3-replay.XXXXXX)"
+  ATOMESH_M3_REPLAY_SOURCE="$(mktemp -d /tmp/atomesh-m3-source.XXXXXX)"
+  mkdir -p "${ATOMESH_M3_REPLAY_DIR}"/{prefill,decode} "${ATOMESH_M3_REPLAY_PIPE_DIR}"/{prefill,decode}
+  python3 "${ATOMESH_SCRIPT_DIR}/prepare_minimax_replay_debug.py" \
+    --root "${PWD}" --runtime-root "${ATOMESH_M3_REPLAY_SOURCE}" --output "${ATOMESH_M3_REPLAY_DIR}"
+  ATOM_SOURCE_ENV=(--chdir="${ATOMESH_M3_REPLAY_SOURCE}")
+  replay_atom_origin="$(env "${ATOM_SOURCE_ENV[@]}" python3 -c \
+    'import importlib.util as u; print(u.find_spec("atom").origin)')"
+  if [[ "${replay_atom_origin}" != "${ATOMESH_M3_REPLAY_SOURCE}/atom/__init__.py" ]]; then
+    echo "ERROR: gated replay resolves the wrong ATOM package: ${replay_atom_origin}" >&2
+    exit 2
+  fi
+  echo "[replay-debug] Runtime package=${replay_atom_origin}; mounted checkout remains read-only"
+  export ATOMESH_PREFILL_ENV_ATOM_M3_REPLAY_DIR="${ATOMESH_M3_REPLAY_DIR}"
+  export ATOMESH_DECODE_ENV_ATOM_M3_REPLAY_DIR="${ATOMESH_M3_REPLAY_DIR}"
+  export ATOMESH_PREFILL_ENV_ATOM_M3_REPLAY_ROLE=prefill
+  export ATOMESH_DECODE_ENV_ATOM_M3_REPLAY_ROLE=decode
+  export ATOMESH_PREFILL_ENV_ATOM_M3_REPLAY_GATE=1
+  export ATOMESH_DECODE_ENV_ATOM_M3_REPLAY_GATE=0
+  for replay_role in PREFILL DECODE; do
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_TRACE_BUFFER_SIZE=8192"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_DUMP_ON_TIMEOUT=1"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_TRACE_CPP_STACK=1"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_ENABLE_TIMING=1"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_DEBUG_INFO_TEMP_FILE=${ATOMESH_M3_REPLAY_DIR}/${replay_role,,}/nccl-trace-"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_DEBUG_INFO_PIPE_FILE=${ATOMESH_M3_REPLAY_PIPE_DIR}/${replay_role,,}/nccl-pipe-"
+  done
+fi
+
 # Observe the original C32 workload without changing its model or scheduling.
 # This flag currently belongs only to the C32 LMCache host-preparation case.
 minimax_runtime_sampler_pid=""
@@ -489,7 +527,7 @@ apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 prepare_kv_connector || exit 2
 
 # GPU timing is opt-in; agentic reports need it on both service roles.
-if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
+if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" || "${BENCHMARK_KIND}" == "minimax_full_model_replay" ]]; then
   export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
   export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
 fi
@@ -2156,6 +2194,19 @@ start_router() {
 }
 
 run_benchmark() {
+  if [[ "${BENCHMARK_KIND}" == "minimax_full_model_replay" ]]; then
+    local -a replay_args=()
+    if [[ "${ATOMESH_M3_REPLAY_GATE:-false}" == "true" ]]; then
+      replay_args=(--gate-dir "${ATOMESH_M3_REPLAY_DIR}" --nccl-pipe-dir "${ATOMESH_M3_REPLAY_PIPE_DIR}" --target-timeout 75)
+    fi
+    python3 -u "${ATOMESH_SCRIPT_DIR}/minimax_full_model_replay.py" \
+      --model "${MODEL_PATH}" \
+      --base-url "http://127.0.0.1:${ROUTER_PORT}" \
+      --output-dir "${RUN_DIR}/benchmark_results/stalled-lengths-replay" \
+      --prefill-log "${RUNTIME_LOG_DIR}/prefill-rank-0.log" \
+      "${replay_args[@]}"
+    return
+  fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
     run_aiperf_agentic_benchmark
     return
