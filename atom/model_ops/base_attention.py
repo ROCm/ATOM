@@ -740,7 +740,8 @@ def cp_mha_gather_cache_kernel(
     CACHE_FORMAT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    # Packed KV output offsets can exceed int32 for long cached batches.
+    token_id = tl.program_id(0).to(tl.int64)
     head_id = tl.program_id(1)
     # BLOCK_SIZE is rounded up to next pow2 at the call site (tl.arange requires
     # pow2); col_mask guards stores/loads when head_size is non-pow2 (e.g. MiMo SWA=192).
