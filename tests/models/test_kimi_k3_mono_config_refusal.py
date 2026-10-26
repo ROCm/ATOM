@@ -79,9 +79,7 @@ def _atom_config(**hf_overrides):
         kv_transfer_config=None,
         compilation_config=SimpleNamespace(
             level=3,
-            cudagraph_mode=SimpleNamespace(
-                requires_piecewise_compilation=lambda: False
-            ),
+            cudagraph_mode=SimpleNamespace(uses_tr_hybrid=lambda: False),
         ),
         speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=3),
     )

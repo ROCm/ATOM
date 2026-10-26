@@ -550,8 +550,12 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             num_accepted_tokens=attn_metadata.gdn_metadata.num_accepted_tokens,
         )
 
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
-        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
+        attn_metadata, positions = super().prepare_prefill(
+            batch, running_bs, running_tokens
+        )
         num_reqs = batch.total_seqs_num_prefill
         num_tokens = batch.total_tokens_num_prefill
         # QSA reads the compressed cache through the block table on every

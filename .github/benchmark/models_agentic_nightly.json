@@ -42,6 +42,24 @@
             4,
             8
           ]
+        },
+        {
+          "label": "DSpark5 DTP2 AL3.51",
+          "suffix": "-agentic-dspark5-dtp2-al351",
+          "extra_args": "-tp 2 --enable-dp-attention",
+          "env_vars": "HIP_VISIBLE_DEVICES=0,1",
+          "concurrency": [
+            128
+          ]
+        },
+        {
+          "label": "DSpark5 DEP2 AL3.51",
+          "suffix": "-agentic-dspark5-dep2-al351",
+          "extra_args": "-tp 2 --enable-dp-attention --enable-expert-parallel",
+          "env_vars": "HIP_VISIBLE_DEVICES=0,1",
+          "concurrency": [
+            128
+          ]
         }
       ]
     }

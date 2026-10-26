@@ -89,7 +89,7 @@ def test_the_batch_and_the_token_count_do_not_read_each_other(monkeypatch):
         peers=[_with(0, 99)],
         **_base(scheduled_tokens=10, scheduled_bs=3),
     )
-    assert int(r.num_tokens_across_dp.max()) == 99
+    assert int(r.scheduled_tokens_per_dp_rank.max()) == 99
     assert r.max_bs_across_dp == 3
 
 
@@ -145,7 +145,7 @@ def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
     # One rank that cannot split vetoes the whole group.
     vetoed = _sync(
         monkeypatch,
-        peers=[_with(5, 0)],
+        peers=[_with(6, 0)],
         **_base(
             tbo_on=True,
             local_meets_min_tokens=True,
@@ -165,7 +165,7 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
     shifted offset reads one of the head's fields and reports it.
     """
     for tbo_on in (False, True):
-        head = 8 if tbo_on else 4
+        head = 9 if tbo_on else 5
         r = _sync(
             monkeypatch,
             peers=[_with(head, 9)],
@@ -176,62 +176,30 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
         assert alone.max_seqlen_q_across_dp == 3, f"tbo_on={tbo_on}"
 
 
-# ── stage rows (DeepSeek-V4.1 decoder bounded replay) ─────────────────────
+def test_the_prefill_flags_come_back_per_rank_in_dp_order(monkeypatch):
+    """Not only OR-reduced: a model whose prefill runs some layers on other
+    rows sizes a decoding peer's collectives by that peer's own rows."""
+    sync = _sync(monkeypatch, peers=[_with(2, 0)], **_base(is_prefill=True))
+    assert sync.prefill_across_dp == (True, False)
 
 
-def test_stage_rows_ride_the_same_collective(monkeypatch):
-    """A replaying prefill rank beside a decoding peer: the table comes back
-    in DP order, and the step still issues one all_gather."""
-    calls = []
-
-    def peer(local):
-        calls.append(1)
-        out = local.clone()
-        out[2] = 0  # the peer decodes
-        out[-4:] = torch.tensor([0, 1, 40, 40], dtype=torch.int32)
-        return out
-
-    sync = _sync(
+def test_final_requests_are_max_reduced_from_their_own_row(monkeypatch):
+    """Between the eager flag and the TBO block, with a value no neighbor
+    holds: a shifted row reads a flag or a TBO field instead."""
+    r = _sync(
         monkeypatch,
-        peers=[peer],
-        **_base(is_prefill=True, dp_stage_row=(1, 1, 128, 1)),
+        peers=[_with(4, 6)],
+        **_base(
+            is_prefill=True,
+            final_requests=3,
+            tbo_on=True,
+            local_meets_min_tokens=True,
+            local_can_split=True,
+            local_ub_tokens=(4, 7),
+        ),
     )
-    assert sync.dp_stage_rows == ((1, 0), (1, 1), (128, 40), (1, 40))
-    assert len(calls) == 1
-
-
-def test_no_replaying_rank_carries_no_table(monkeypatch):
-    sync = _sync(
-        monkeypatch,
-        peers=[_with(2, 1)],
-        **_base(is_prefill=True, dp_stage_row=(0, 1, 500, 500)),
-    )
-    assert sync.dp_stage_rows is None
-
-
-def test_a_decode_only_group_carries_no_table(monkeypatch):
-    sync = _sync(
-        monkeypatch, peers=[_with(0, 10)], **_base(dp_stage_row=(1, 0, 10, 10))
-    )
-    assert sync.dp_stage_rows is None
-
-
-def test_stage_rows_follow_the_dspark_row(monkeypatch):
-    sync = _sync(
-        monkeypatch,
-        peers=[_with(2, 1)],
-        **_base(is_prefill=True, max_seqlen_q=6, dp_stage_row=(1, 1, 128, 1)),
-    )
-    assert sync.max_seqlen_q_across_dp == 6
-    assert sync.dp_stage_rows[2] == (128, 128)
-
-
-def test_a_stage_row_is_as_long_as_the_model_makes_it(monkeypatch):
-    """The shared sync knows nothing of a model's stages: it carries whatever
-    row the model reports and only reads its leading applies flag."""
-    sync = _sync(
-        monkeypatch,
-        peers=[_with(2, 1)],
-        **_base(is_prefill=True, dp_stage_row=(1, 1, 7, 6, 5)),
-    )
-    assert sync.dp_stage_rows == ((1, 1), (1, 1), (7, 7), (6, 6), (5, 5))
+    assert r.max_final_requests_across_dp == 6
+    assert not r.any_rank_needs_eager
+    assert r.ub_max_tokens_across_dp == (4, 7)
+    alone = _sync(monkeypatch, peers=[], **_base(final_requests=3))
+    assert alone.max_final_requests_across_dp == 3

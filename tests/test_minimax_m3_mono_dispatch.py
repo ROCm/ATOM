@@ -18,7 +18,7 @@ class _Mode:
     def __init__(self, piecewise):
         self.piecewise = piecewise
 
-    def requires_piecewise_compilation(self):
+    def uses_tr_hybrid(self):
         return self.piecewise
 
 
@@ -28,6 +28,7 @@ def _atom_config(**overrides):
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
         "enable_expert_parallel": False,
+        "enable_dp_attention": False,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         "kv_cache_dtype": "fp8",
@@ -61,6 +62,16 @@ def test_supported_deployment_has_no_refusal(native):
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP"),
         ({"pipeline_parallel_size": 2}, "PP"),
         ({"enable_expert_parallel": True}, "expert parallel"),
+        # M3's `Dims` has no DP-attention form: refused, never built.
+        (
+            {
+                "tensor_parallel_size": 1,
+                "parallel_config": SimpleNamespace(data_parallel_size=4),
+                "enable_dp_attention": True,
+                "enable_expert_parallel": True,
+            },
+            "DP attention 4",
+        ),
         ({"decode_context_parallel_size": 2}, "decode CP"),
         ({"prefill_context_parallel_size": 2}, "prefill CP"),
         ({"kv_cache_dtype": "bf16"}, "kv cache"),
@@ -70,7 +81,7 @@ def test_supported_deployment_has_no_refusal(native):
         ({"enable_tbo_decode": True}, "TBO"),
         (
             {"compilation_config": SimpleNamespace(cudagraph_mode=_Mode(True))},
-            "piecewise",
+            "TR_HYBRID",
         ),
         # `model_runner` wraps the model and the drafter in
         # `torch.compile(fullgraph=True)` at this level only, and mono calls

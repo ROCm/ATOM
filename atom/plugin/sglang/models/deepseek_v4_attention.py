@@ -12,6 +12,10 @@ import types
 import torch
 from torch import nn
 
+from atom.model_ops.indexer import score_topk
+from atom.plugin.deepseek_v4_index_rows import v4_concat_rows, v4_paged_rows
+from atom.utils.forward_context import AttnState
+
 _draft_extend_fused_swa_ctx = contextvars.ContextVar(
     "atom_sglang_dsv4_draft_extend_fused_swa_ctx",
     default=None,
@@ -129,8 +133,6 @@ def _install_draft_extend_fused_swa_patch() -> None:
 
     original_qk_norm_rope_maybe_quant = dsv4.qk_norm_rope_maybe_quant
     original_swa_write = dsv4.swa_write
-    original_indexer_score_topk = dsv4.Indexer.indexer_score_topk
-    original_score_topk_decode = dsv4.Indexer._score_topk_decode
 
     def qk_norm_rope_maybe_quant(*args, **kwargs):
         ctx = _draft_extend_fused_swa_ctx.get()
@@ -163,85 +165,23 @@ def _install_draft_extend_fused_swa_patch() -> None:
         return original_swa_write(*args, **kwargs)
 
     def indexer_score_topk(self, q_quant, weights, q_scale, topk):
-        # q_quant: FP8, or packed FP4 (uint8) when the FP4 indexer is on; q_scale
-        # is the paired FP4 e8m0 scale (None for FP8, this verify-graph path).
-        # Delegated to base for the FP4 branch.
-        fc = dsv4.get_forward_context()
-        if bool(
-            getattr(fc.attn_metadata, "use_decode_indexer_for_verify_graph", False)
+        # The bridge publishes the step's tensors rather than its rows. Decode
+        # and target verify score paged, each row off its own table row --
+        # graph-safe, a verify being extend-shaped elsewhere; a prefill scores
+        # against its requests' committed keys gathered end to end. FP8 only:
+        # no bridge binds an FP4 index cache.
+        md = dsv4.get_forward_context().attn_metadata
+        if md.state is AttnState.DECODE or getattr(
+            md, "use_decode_indexer_for_verify_graph", False
         ):
-            indexer_meta = fc.attn_metadata.indexer_meta
-            block_tables = fc.attn_metadata.block_tables
-            return self._score_topk_decode(
-                q_quant, weights, block_tables, indexer_meta, topk
-            )
-        return original_indexer_score_topk(self, q_quant, weights, q_scale, topk)
-
-    def _score_topk_decode(self, q_fp8, weights, block_tables, indexer_meta, topk):
-        fc = dsv4.get_forward_context()
-        if not bool(
-            getattr(fc.attn_metadata, "use_decode_indexer_for_verify_graph", False)
-        ):
-            return original_score_topk_decode(
-                self, q_fp8, weights, block_tables, indexer_meta, topk
-            )
-
-        total_tokens = q_fp8.size(0)
-        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]
-        next_n = max(1, int(fc.attn_metadata.max_seqlen_q))
-        bs = total_tokens // next_n
-        q_4d = q_fp8.view(bs, next_n, self.n_heads, self.head_dim)
-        kv_cache_4d = self.kv_cache.unsqueeze(-2)
-        logits = torch.empty(
-            total_tokens,
-            self._max_model_len_idx,
-            dtype=torch.float32,
-            device=q_fp8.device,
-        )
-        dsv4.deepgemm_fp8_paged_mqa_logits(
-            q_4d,
-            kv_cache_4d,
-            weights,
-            logits,
-            n_committed_per_seq_gpu,
-            block_tables,
-            self._max_model_len_idx,
-            KVBlockSize=self.kv_cache.size(1),
-            Preshuffle=True,
-        )
-
-        cu_starts = indexer_meta.get("cu_starts_gpu")
-        cu_ends = indexer_meta.get("cu_ends_gpu")
-        if cu_starts is None or cu_ends is None:
-            return original_score_topk_decode(
-                self, q_fp8, weights, block_tables, indexer_meta, topk
-            )
-
-        topk_local = torch.empty(
-            total_tokens,
-            self.index_topk,
-            dtype=torch.int32,
-            device=q_fp8.device,
-        )
-        local_starts = torch.zeros_like(cu_starts)
-        local_ends = (cu_ends - cu_starts).clamp_min_(0)
-        dsv4.top_k_per_row_prefill(
-            logits,
-            local_starts,
-            local_ends,
-            topk_local,
-            None,
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
-        )
-        return topk_local
+            rows = v4_paged_rows(md, q_quant.size(0), self._max_model_len_idx)
+        else:
+            rows = v4_concat_rows(md.indexer_meta, md.block_tables)
+        return score_topk(q_quant, weights, self.index_cache, rows, topk=topk)
 
     dsv4.qk_norm_rope_maybe_quant = qk_norm_rope_maybe_quant
     dsv4.swa_write = swa_write
     dsv4.Indexer.indexer_score_topk = indexer_score_topk
-    dsv4.Indexer._score_topk_decode = _score_topk_decode
     dsv4._atom_sglang_draft_extend_fused_swa_patched = True
 
 
@@ -341,12 +281,7 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
                 indexer_meta = getattr(sliced_md, "indexer_meta", None)
                 if isinstance(indexer_meta, dict):
                     indexer_meta = dict(indexer_meta)
-                    for key in (
-                        "batch_id_per_q_token",
-                        "seq_base_per_token_gpu",
-                        "cu_starts_gpu",
-                        "cu_ends_gpu",
-                    ):
+                    for key in ("cu_starts_gpu", "visible_gpu"):
                         value = indexer_meta.get(key)
                         if torch.is_tensor(value):
                             indexer_meta[key] = value[:num_real]

@@ -2,22 +2,25 @@
 
 """A side-stream D2H must keep its default-stream source out of the allocator.
 
-`tokenIDProcessor` copies the sampled ids and the MTP verdict (`num_rejected`,
-`num_bonus`) to the host on `async_copy_stream`. The sources are fresh
-default-stream allocations that the caller drops right after queuing the copy.
-Unless the source is recorded on the copy stream, the caching allocator hands
-its block to the next default-stream allocation, and a copy that runs late --
-anything already queued on the copy stream -- reads that tensor instead. Under
-MTP the stale `num_bonus` turns into `num_accepted_tokens`, which the GDN conv
-kernel adds to the state offset unchecked: an out-of-bounds read.
+`tokenIDProcessor` copies the sampled ids, the MTP verdict (`spec_counts`, a
+view of the sampler's `verdict`) and the draft ids to the host on
+`async_copy_stream`. The sources are fresh default-stream allocations that the
+caller drops right after queuing the copy. Unless the source is recorded on the
+copy stream, the caching allocator hands its block to the next default-stream
+allocation, and a copy that runs late -- anything already queued on the copy
+stream -- reads that tensor instead. Under MTP the stale bonus count turns into
+`num_accepted_tokens`, which the GDN conv kernel adds to the state offset
+unchecked: an out-of-bounds read.
 
-Each case queues a large D2H on the copy stream first, so the copy under test
-cannot run before the next allocation is written. The positive control shows
-the scenario does race when the hold is disabled; without it a pass would say
-nothing.
+Each case first parks the copy stream on a spin kernel that outlasts the
+case's host work, so the copy under test cannot run before the next
+allocation is written. The positive control shows each scenario does race
+when `record_stream` is disabled; without it a pass would say nothing.
 """
 
 from __future__ import annotations
+
+import time
 
 import pytest
 import torch
@@ -29,28 +32,59 @@ from atom.model_engine.model_runner import tokenIDProcessor
 
 DEV = torch.device("cuda:0")
 BS = 32
+NUM_SPEC = 3
 GOOD = 2
 STALE = 16385
 TRIALS = 20
+# ~20 ms on MI355X; one case's host work takes well under 1 ms.
+BLOCK_CYCLES = 50_000_000
 
-_BIG = None
+_COPY_STREAM = None
+
+
+def _copy_stream():
+    """A stream that does not share a hardware queue with the default stream.
+
+    HIP maps streams onto a few hardware queues. On one that shares the default
+    stream's queue, the next step's write waits behind the parked copy, so the
+    race cannot happen there and the positive control would fail for that
+    reason alone.
+    """
+    global _COPY_STREAM
+    if _COPY_STREAM is not None:
+        return _COPY_STREAM
+    probe = torch.empty(1, device=DEV)
+    for _ in range(64):
+        stream = torch.cuda.Stream(DEV)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(BLOCK_CYCLES)
+        probe.fill_(0)
+        done = torch.cuda.Event()
+        done.record()
+        deadline = time.monotonic() + 0.005
+        while not done.query() and time.monotonic() < deadline:
+            pass
+        own_queue = done.query() and not stream.query()
+        stream.synchronize()
+        if own_queue:
+            _COPY_STREAM = stream
+            return stream
+    pytest.skip("no stream with its own hardware queue")
 
 
 def _processor():
     proc = object.__new__(tokenIDProcessor)
-    proc.async_copy_stream = torch.cuda.Stream(DEV)
+    proc.async_copy_stream = _copy_stream()
+    proc._output_request_capacity = BS
+    proc.num_spec_tokens = NUM_SPEC
     proc.clean()
     return proc
 
 
 def _block_copy_stream(proc):
-    global _BIG
-    if _BIG is None:
-        dev = torch.empty(256 << 20, dtype=torch.uint8, device=DEV)
-        _BIG = (dev, torch.empty(dev.shape, dtype=torch.uint8).pin_memory())
-    dev, host = _BIG
     with torch.cuda.stream(proc.async_copy_stream):
-        host.copy_(dev, non_blocking=True)
+        torch.cuda._sleep(BLOCK_CYCLES)
 
 
 def _next_step_allocation():
@@ -59,18 +93,18 @@ def _next_step_allocation():
     return nxt
 
 
-def _mtp_status_trial(proc):
+def _spec_status_trial(proc):
     torch.cuda.synchronize()
     _block_copy_stream(proc)
     verdict = torch.empty((3, BS), dtype=torch.int32, device=DEV)
     verdict.fill_(GOOD)
     ready = torch.cuda.Event()
     ready.record()
-    proc.send_mtp_status_to_cpu_async(verdict[1], verdict[0], ready)
+    proc.spec_status_queue.send(verdict[:2], ready=ready)
     del verdict
     _next_step_allocation()
-    num_rejected, num_bonus = proc.recv_mtp_status_async()
-    return (num_rejected == GOOD).all() and (num_bonus == GOOD).all()
+    num_rejected, num_bonus = proc.recv_spec_status()
+    return bool((num_rejected == GOOD).all() and (num_bonus == GOOD).all())
 
 
 def _sampled_ids_trial(proc):
@@ -91,16 +125,16 @@ def _sampled_ids_trial(proc):
 def _draft_ids_trial(proc):
     torch.cuda.synchronize()
     _block_copy_stream(proc)
-    draft = torch.empty((3, BS), dtype=torch.int32, device=DEV)
+    draft = torch.empty((BS, NUM_SPEC), dtype=torch.int32, device=DEV)
     draft.fill_(GOOD)
-    proc.send_to_cpu_async_draft(draft)
+    proc.send_draft_token_ids_to_cpu(draft)
     del draft
     _next_step_allocation()
-    return bool((proc.recv_async_output_draft() == GOOD).all())
+    return bool((proc.recv_draft_token_ids() == GOOD).all())
 
 
 TRIAL_FNS = {
-    "mtp_status": _mtp_status_trial,
+    "spec_status": _spec_status_trial,
     "sampled_ids": _sampled_ids_trial,
     "draft_ids": _draft_ids_trial,
 }
@@ -114,12 +148,14 @@ def test_a_late_copy_still_reads_its_own_step(path):
     assert bad == 0, f"{path}: {bad}/{TRIALS} copies read the next step's tensor"
 
 
-def test_without_the_hold_the_scenario_races(monkeypatch):
+@pytest.mark.parametrize("path", list(TRIAL_FNS))
+def test_without_the_hold_the_scenario_races(monkeypatch, path):
     """Positive control: the copy really does run after the next allocation."""
-    monkeypatch.setattr(tokenIDProcessor, "_hold_for_copy_stream", lambda *a: None)
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda *a: None)
     proc = _processor()
-    bad = sum(not _mtp_status_trial(proc) for _ in range(TRIALS))
+    trial = TRIAL_FNS[path]
+    bad = sum(not trial(proc) for _ in range(TRIALS))
     assert bad > 0, (
-        "no copy read a reused block with the hold disabled, so nothing here "
-        "exercises the race and the test above proves nothing"
+        f"{path}: no copy read a reused block with record_stream disabled, so "
+        "nothing here exercises the race and the test above proves nothing"
     )

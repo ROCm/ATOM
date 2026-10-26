@@ -45,6 +45,7 @@ from atom.models.utils import (
 )
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 logger = logging.getLogger("atom")
 
@@ -474,6 +475,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
 
 
+@token_graph
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
