@@ -75,21 +75,38 @@ class ShippedChain(NamedTuple):
     num_prompt_tokens: int
     fingerprint: int  # `prompt_fingerprint`
     hashes: array.array  # "Q"
+    projection: object = None  # immutable shared tokenizer/HBM/PAGE record
 
 
-def ship_prompt_hash_chain(seq, hash_block_size: int) -> None:
+def ship_prompt_hash_chain(seq, hash_block_size: int, *, projection=None) -> None:
     """Attach `seq`'s chain for `BlockManager._adopt_shipped_chain`."""
     if not envs.ATOM_FRONTEND_PREFIX_HASH or hash_block_size <= 0:
         return
     n = full_prompt_blocks(seq, hash_block_size)
-    chain = chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed)
+    from atom.model_engine.prefix_projection import PrefixProjection
+
+    if (
+        isinstance(projection, PrefixProjection)
+        and (projection.block_size, projection.seed)
+        == (hash_block_size, seq.cache_seed)
+        and len(projection.kv_hashes) == n * 8
+        and projection.matches(seq.token_ids[: seq.num_prompt_tokens])
+    ):
+        chain = projection.kv_array()
+    else:
+        projection = None
+        chain = chained_block_hashes(
+            seq.token_ids, hash_block_size, 0, n, seq.cache_seed
+        )
     seq.prompt_hash_chain = ShippedChain(
         hash_block_size,
         seq.cache_seed,
         seq.num_prompt_tokens,
         prompt_fingerprint(seq),
         array.array("Q", chain),
+        projection,
     )
+    seq.prompt_prefix = projection
 
 
 def take_shipped_chains(seqs) -> list | None:
@@ -101,6 +118,7 @@ def take_shipped_chains(seqs) -> list | None:
         return None
     for seq in seqs:
         seq.prompt_hash_chain = None
+        seq.prompt_prefix = None
     return chains
 
 
@@ -109,3 +127,4 @@ def attach_shipped_chains(seqs, chains=None) -> None:
     if chains:
         for seq, chain in zip(seqs, chains, strict=True):
             seq.prompt_hash_chain = chain
+            seq.prompt_prefix = getattr(chain, "projection", None)

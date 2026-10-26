@@ -719,6 +719,12 @@ class InputOutputProcessor:
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
+        self._unified_prefix = envs.ATOM_UNIFIED_PREFIX_CACHE
+        from atom.model_engine.prefix_projection import page_chunk_from_config
+
+        self._prefix_page_chunk = page_chunk_from_config(
+            getattr(config, "kv_transfer_config", None)
+        )
         if getattr(config, "enable_prefix_caching", False):
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
@@ -823,11 +829,25 @@ class InputOutputProcessor:
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
+        prefix_encoding = None
         segment_tokenizer = getattr(self, "segment_tokenizer", None)
         if not isinstance(prompt_or_tokens, str):
             tokens = prompt_or_tokens
         elif segment_tokenizer is not None:
-            tokens = segment_tokenizer.encode(prompt_or_tokens)
+            if (
+                getattr(self, "_unified_prefix", False)
+                and self.prefix_hash_block_size
+                and envs.ATOM_FRONTEND_PREFIX_HASH
+                and multimodal_data is None
+            ):
+                prefix_encoding = segment_tokenizer.encode_with_prefix(
+                    prompt_or_tokens,
+                    self.prefix_hash_block_size,
+                    page_chunk=getattr(self, "_prefix_page_chunk", 0),
+                )
+                tokens = prefix_encoding.token_ids
+            else:
+                tokens = segment_tokenizer.encode(prompt_or_tokens)
         else:
             tokens = self.tokenizer.encode(prompt_or_tokens)
         mrope_positions = None
@@ -891,9 +911,16 @@ class InputOutputProcessor:
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.
         if self.prefix_hash_block_size:
-            ship_prompt_hash_chain(seqs[0], self.prefix_hash_block_size)
+            ship_prompt_hash_chain(
+                seqs[0],
+                self.prefix_hash_block_size,
+                projection=(
+                    None if prefix_encoding is None else prefix_encoding.projection
+                ),
+            )
             for seq in seqs[1:]:
                 seq.prompt_hash_chain = seqs[0].prompt_hash_chain
+                seq.prompt_prefix = seqs[0].prompt_prefix
 
         if n == 1:
             logger.info(
