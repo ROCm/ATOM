@@ -112,6 +112,49 @@ def test_qwen4_exp_rtp_gdn_decode_does_not_build_prefill_schedule(monkeypatch):
     assert metadata.flydsl_prefill_metadata is None
 
 
+def test_qwen4_exp_rtp_gdn_decode_supports_non_128_head_dimensions(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    layer = SimpleNamespace(
+        allow_aiter_flydsl=True,
+        dt_bias=torch.empty((), dtype=torch.bfloat16),
+    )
+    metadata = SimpleNamespace(num_prefills=0, num_spec_decodes=0)
+    monkeypatch.setattr(
+        qwen4_exp_context,
+        "select_policy",
+        lambda **kwargs: GDNFlyDSLPolicy(prefill=False, decode=True),
+    )
+    state = torch.empty((4, 2, 64, 128)).transpose(-1, -2)
+    RTPQwen4ExpContext._configure_gdn_backends(
+        metadata,
+        {3: layer},
+        {"layer_3": SimpleNamespace(v_cache=state)},
+        SimpleNamespace(input_lengths=torch.tensor([1], dtype=torch.int32)),
+    )
+    assert layer.gdn_flydsl_policy.decode is True
+
+
+def test_qwen4_exp_mtp_graph_rejects_verify_batch_above_buffer_capacity(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    buffers = {
+        "query_start_loc": torch.empty(2, dtype=torch.int32),
+        "target_read_slots_i32": torch.empty((1, 3), dtype=torch.int32),
+        "target_write_slots_i32": torch.empty((1, 3), dtype=torch.int32),
+        "target_invalid_live_rows": torch.empty(1, dtype=torch.int32),
+    }
+    inputs = SimpleNamespace(
+        is_target_verify=True,
+        input_lengths=torch.tensor([3, 3], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.empty((2, 4), dtype=torch.int32),
+        sequence_lengths_plus_1_device=torch.tensor([8, 8], dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="buffers are too small"):
+        RTPQwen4ExpContext._build_gdn_metadata(
+            inputs, seq_size_per_block=16, num_tokens=6, cg_bufs=buffers
+        )
+
+
 @pytest.mark.parametrize(
     ("decode_enabled", "mtp_target", "mtp_draft"),
     [
@@ -174,54 +217,130 @@ def test_qwen4_exp_graph_uses_device_block_tables_only():
     assert _Qwen4ExpAttnPyObj.requires_host_block_table_mirror is False
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("draft_steps", [1, 2, 3])
-def test_qwen4_exp_ple_writes_every_verify_prefix_in_reverse_order(
-    monkeypatch, draft_steps
+@pytest.mark.parametrize("second_has_initial", [False, True])
+def test_qwen4_exp_ple_candidate_snapshots_match_prefix_reruns(
+    monkeypatch, draft_steps, second_has_initial
 ):
+    from dataclasses import replace
+
+    from atom.model_ops.qwen4_exp.ops.ple import (
+        advance_ngram_state,
+        dilated_causal_conv1d,
+    )
+
+    device = torch.device("cuda")
     width = draft_steps + 1
     write_slots = torch.tensor(
-        [list(range(10, 10 + width)), list(range(20, 20 + width))],
+        [[9] + list(range(10, 9 + width)), [19] + list(range(20, 19 + width))],
+        device=device,
         dtype=torch.int32,
     )
-    metadata = Qwen4ExpPLEMetadata(
-        state_indices_out=write_slots[:, -1],
-        query_start_loc=torch.arange(0, 2 * width + 1, width, dtype=torch.int32),
-        ngram_state=torch.empty(0),
-        state_indices_in=torch.tensor([9, 19], dtype=torch.int32),
-        has_initial_state=torch.ones(2, dtype=torch.bool),
-        conv_state=torch.empty(0),
+    write_slots[:, 0] = torch.tensor([9, 19], device=device, dtype=torch.int32)
+    ngram_initial = torch.arange(32 * 3, device=device, dtype=torch.int64).reshape(
+        32, 3
     )
-    metadata.rtp_spec_state_indices = write_slots
+    conv_initial = torch.arange(32 * 4, device=device, dtype=torch.float32).reshape(
+        32, 4, 1
+    )
+
+    def make_metadata():
+        result = Qwen4ExpPLEMetadata(
+            state_indices_out=write_slots[:, -1],
+            query_start_loc=torch.arange(
+                0, 2 * width + 1, width, device=device, dtype=torch.int32
+            ),
+            ngram_state=ngram_initial.clone(),
+            state_indices_in=torch.tensor([9, 19], device=device, dtype=torch.int32),
+            has_initial_state=torch.tensor(
+                [True, second_has_initial], device=device, dtype=torch.bool
+            ),
+            conv_state=conv_initial.clone(),
+        )
+        result.rtp_spec_state_indices = write_slots
+        return result
+
+    class PLE:
+        ple_embedding = SimpleNamespace(ngram_size=4, eos_token_id=0)
+        norm_conv = None
+        conv_state_len = 1
+
+        def gated_memory(self, hidden, ids, starts, context):
+            return hidden.unsqueeze(1)
+
+        def _apply_norm(self, norm, value):
+            return value
+
+        def _short_conv(self, normalized, starts, state, src, dst, has, accepted):
+            return dilated_causal_conv1d(
+                normalized,
+                torch.ones((4, 2), device=device),
+                state,
+                starts,
+                src,
+                dst,
+                has,
+                1,
+                accepted,
+            )
+
+        def forward_with_state(self, hidden, ids, meta):
+            advance_ngram_state(
+                ids,
+                meta.query_start_loc,
+                meta.ngram_state,
+                meta.state_indices_in,
+                meta.state_indices_out,
+                meta.has_initial_state,
+                0,
+                history_width=3,
+            )
+            return hidden + self._short_conv(
+                hidden,
+                meta.query_start_loc,
+                meta.conv_state,
+                meta.state_indices_in,
+                meta.state_indices_out,
+                meta.has_initial_state,
+                None,
+            )
+
+    layer = SimpleNamespace(ple=PLE())
+    ids = torch.arange(2 * width, device=device, dtype=torch.int64) + 101
+    hidden = torch.arange(2 * width * 4, device=device, dtype=torch.float32).reshape(
+        2 * width, 4
+    )
+    reference = make_metadata()
+    expected = hidden + layer.ple.forward_with_state(hidden, ids, reference)
+    for prefix_len in range(width - 1, 0, -1):
+        prefix_metadata = replace(
+            reference,
+            query_start_loc=torch.arange(
+                0, (2 + 1) * prefix_len, prefix_len, device=device, dtype=torch.int32
+            ),
+            state_indices_out=write_slots[:, prefix_len - 1],
+        )
+        layer.ple.forward_with_state(
+            hidden.reshape(2, width, 4)[:, :prefix_len]
+            .reshape(2 * prefix_len, 4)
+            .contiguous(),
+            ids.reshape(2, width)[:, :prefix_len].reshape(-1).contiguous(),
+            prefix_metadata,
+        )
+
+    actual = make_metadata()
     monkeypatch.setattr(
         qwen4_exp_mtp_hooks,
         "get_forward_context",
-        lambda: SimpleNamespace(attn_metadata=SimpleNamespace(ple_metadata=metadata)),
+        lambda: SimpleNamespace(attn_metadata=SimpleNamespace(ple_metadata=actual)),
     )
-    calls = []
-
-    def forward_with_state(hidden, ids, call_metadata):
-        calls.append(
-            (
-                ids.tolist(),
-                call_metadata.query_start_loc.tolist(),
-                call_metadata.state_indices_out.tolist(),
-            )
-        )
-        return torch.ones_like(hidden)
-
-    layer = SimpleNamespace(ple=SimpleNamespace(forward_with_state=forward_with_state))
-    ids = torch.arange(2 * width)
-    hidden = torch.zeros(2 * width, 3)
-    result = _rtp_apply_ple(layer, hidden, ids)
-
-    assert torch.equal(result, torch.ones_like(hidden))
-    assert [len(call[0]) // 2 for call in calls] == list(range(width, 0, -1))
-    for prefix_len, (called_ids, starts, slots) in zip(range(width, 0, -1), calls):
-        assert called_ids == (
-            list(range(prefix_len)) + list(range(width, width + prefix_len))
-        )
-        assert starts == [0, prefix_len, 2 * prefix_len]
-        assert slots == [10 + prefix_len - 1, 20 + prefix_len - 1]
+    output = _rtp_apply_ple(layer, hidden, ids)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual.ngram_state, reference.ngram_state, rtol=0, atol=0
+    )
+    torch.testing.assert_close(actual.conv_state, reference.conv_state, rtol=0, atol=0)
 
 
 def test_qwen4_exp_mtp_spec_conv_uses_rtp_block_map(monkeypatch):
@@ -260,7 +379,8 @@ def test_qwen4_exp_mtp_spec_conv_uses_rtp_block_map(monkeypatch):
     )
 
     assert seen["inputs"].shape == (2, 8, 3)
-    assert seen["inputs"].is_contiguous()
+    assert seen["inputs"].stride(1) == 1
+    assert not seen["inputs"].is_contiguous()
     assert seen["block_map"] is block_map
     assert seen["sequence_lengths"] is lengths
     assert seen["seq_size_per_block"] == 64
@@ -436,8 +556,6 @@ def test_qwen4_exp_mtp_draft_marks_forward_context(
             assert inputs_embeds is None
             assert ids.tolist() == ([42] if multimodal else [1])
             assert positions.tolist() == ([[9], [10], [11]] if multimodal else [4])
-            if multimodal:
-                assert context.positions.tolist() == [[8], [9], [10]]
             return hc_input
 
         def _head_input(self, hc):

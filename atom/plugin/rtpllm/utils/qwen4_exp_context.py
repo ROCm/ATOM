@@ -121,6 +121,16 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 raise RuntimeError(
                     "Qwen4Exp MTP target Graph requires prewarmed buffers"
                 )
+            if (
+                batch_size > cg_bufs["target_read_slots_i32"].shape[0]
+                or batch_size > cg_bufs["target_write_slots_i32"].shape[0]
+                or query_len > cg_bufs["target_read_slots_i32"].shape[1]
+                or query_len > cg_bufs["target_write_slots_i32"].shape[1]
+                or batch_size + 1 > cg_bufs["query_start_loc"].numel()
+                or triton.cdiv(batch_size, 128)
+                > cg_bufs["target_invalid_live_rows"].numel()
+            ):
+                raise ValueError("Qwen4Exp MTP target Graph buffers are too small")
             query_start_loc = cg_bufs["query_start_loc"][: batch_size + 1]
             read_slots = cg_bufs["target_read_slots_i32"][:batch_size]
             write_slots = cg_bufs["target_write_slots_i32"][:batch_size]
@@ -342,7 +352,8 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 decode=(
                     policy.decode
                     and getattr(metadata, "num_spec_decodes", 0) == 0
-                    and state.stride()[1:] == (128 * 128, 1, 128)
+                    and state.stride()[1:]
+                    == (state.shape[-2] * state.shape[-1], 1, state.shape[-2])
                 ),
             )
             enabled |= policy.prefill

@@ -280,8 +280,6 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             MultimodalEmbeddingInjector,
         )
 
-        from atom.utils.forward_context import get_forward_context
-
         model_device = self._get_model_device()
         input_ids = inputs.input_ids
         if input_ids is not None and input_ids.numel() > 0:
@@ -324,7 +322,6 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             cg_max_seq_len=int(self._cg_max_seq_len),
             cg_bufs=self._graph_buffers_for_inputs(inputs.attention_inputs),
         ):
-            get_forward_context().context.positions = rope_positions
             hidden_states = self.model(
                 input_ids=input_ids,
                 positions=rope_positions,
@@ -459,15 +456,24 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                     "Qwen4Exp requires one logical cache position per token"
                 )
             return logical
+        raw_positions = getattr(attn_inputs, "combo_position_ids", None)
+        if raw_positions is None or raw_positions.numel() == 0:
+            raw_positions = getattr(inputs, "combo_position_ids", None)
+        if (
+            raw_positions is not None
+            and token_num > 0
+            and raw_positions.numel() == 3 * token_num
+        ):
+            return self._parse_rtp_mrope_positions(
+                raw_positions, model_device, token_num
+            )[0]
         positions = super()._extract_positions(inputs, model_device, token_num)
-        # RTP may package text MRoPE as three equal rows. The QSA slot-index
-        # bridge is text-only and needs one logical position per token.
-        if positions.ndim == 1 and token_num > 0 and positions.numel() == 3 * token_num:
-            positions = positions.reshape(3, token_num)
-        if positions.ndim == 2:
-            if positions.shape[0] != 3:
-                raise ValueError("Qwen4Exp RTP text positions require three MRoPE rows")
-            positions = positions[0]
+        # The text QSA path needs one logical position per token. RTP stores
+        # MRoPE triples in token-major order, also for text-only checkpoints.
+        if token_num > 0 and positions.numel() == 3 * token_num:
+            positions = self._parse_rtp_mrope_positions(
+                positions, model_device, token_num
+            )[0]
         return positions.contiguous()
 
     def _logical_positions(self, attn_inputs, model_device):
@@ -491,6 +497,19 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         return self._build_positions_from_attention_inputs(attn_inputs, model_device)
 
     @staticmethod
+    def _parse_rtp_mrope_positions(positions, model_device, token_num):
+        positions = positions.to(device=model_device, dtype=torch.int32)
+        # RTP's gatherer uses [token, T/H/W]. Prioritize that documented
+        # layout when N == 3 makes both 2-D shapes superficially identical.
+        if positions.ndim == 2 and positions.shape == (token_num, 3):
+            return positions.transpose(0, 1).contiguous()
+        if positions.ndim == 2 and positions.shape == (3, token_num):
+            return positions.contiguous()
+        if positions.numel() != 3 * token_num:
+            raise ValueError("Qwen4Exp MRoPE requires three positions per token")
+        return positions.reshape(token_num, 3).transpose(0, 1).contiguous()
+
+    @staticmethod
     def _rope_positions(inputs, model_device, token_num):
         attn_inputs = inputs.attention_inputs
         # RTP's CudaGraphRunner::updateInputs explicitly copies the live
@@ -501,13 +520,9 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             positions = getattr(inputs, "combo_position_ids", None)
         if positions is None or positions.numel() == 0:
             raise ValueError("Qwen4Exp vision requires RTP MRoPE position IDs")
-        positions = positions.to(device=model_device, dtype=torch.int32)
-        if positions.ndim == 2 and positions.shape == (3, token_num):
-            return positions.contiguous()
-        if positions.numel() != 3 * token_num:
-            raise ValueError("Qwen4Exp MRoPE requires three positions per token")
-        # RTP's gatherer writes consecutive T/H/W values for each token.
-        return positions.reshape(token_num, 3).transpose(0, 1).contiguous()
+        return _ATOMQwen4ExpRuntime._parse_rtp_mrope_positions(
+            positions, model_device, token_num
+        )
 
 
 class ATOMQwen4Exp(ATOMQwen35Moe):
@@ -840,8 +855,6 @@ class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
             from atom.utils.forward_context import get_forward_context
 
             get_forward_context().context.is_draft = True
-            if is_multimodal:
-                get_forward_context().context.positions = rope_positions
             with use_custom_atom_config(self.model.atom_config):
                 draft_embeds = self._draft_vision_embeddings(
                     input_ids, self.model.model.embed_tokens, is_multimodal

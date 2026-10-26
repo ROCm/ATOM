@@ -163,6 +163,36 @@ def test_rtp_interleaved_mrope_uses_token_major_order(positions):
     assert torch.equal(actual, torch.tensor([[0, 1], [0, 2], [0, 3]]))
 
 
+def test_rtp_text_and_rope_positions_share_token_major_parser(monkeypatch):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime._rtp_model_config = SimpleNamespace(
+        mm_model_config=SimpleNamespace(is_multimodal=False), is_mtp=False
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    # N=3 is deliberately ambiguous if the two-dimensional shape is used
+    # to guess whether rows or tokens come first.
+    triples = torch.tensor([[10, 20, 30], [11, 21, 31], [12, 22, 32]])
+    inputs = SimpleNamespace(
+        attention_inputs=SimpleNamespace(
+            is_prefill=True, combo_position_ids=triples.reshape(-1)
+        ),
+        combo_position_ids=None,
+    )
+    assert runtime._extract_positions(inputs, torch.device("cpu"), 3).tolist() == [
+        10,
+        11,
+        12,
+    ]
+    assert runtime._rope_positions(inputs, torch.device("cpu"), 3).tolist() == [
+        [10, 11, 12],
+        [20, 21, 22],
+        [30, 31, 32],
+    ]
+    assert runtime._parse_rtp_mrope_positions(
+        triples, torch.device("cpu"), 3
+    ).tolist() == [[10, 11, 12], [20, 21, 22], [30, 31, 32]]
+
+
 def test_logical_cache_position_is_not_image_rope_position():
     runtime = object.__new__(_ATOMQwen4ExpRuntime)
     attn_inputs = SimpleNamespace(
