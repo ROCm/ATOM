@@ -1,0 +1,12 @@
+# atom-bot failure-class -> owner. One line per class: <class> <login> <what is wrong>.
+# '#' starts a comment. This file is the single source of truth; _notify.py reads it.
+#
+# It lives in version control, not in repo variables, on purpose: changing who gets
+# paged is then an auditable PR rather than an edit in repo settings that nobody sees.
+# If on-call rotation ever has to be changed by someone without commit rights, add an
+# override channel back -- but add it deliberately, not by default.
+flow     zufayu   the review pipeline itself (bot logic / prompts)
+env      zufayu   the runner environment (gh, token, git, disk)
+glm      zufayu   the model backend serving the review agent
+atom     zufayu   the ATOM serving framework
+machine  zufayu   the machine (GPU, disk, network, OS)

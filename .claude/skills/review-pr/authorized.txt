@@ -1,0 +1,8 @@
+# atom-bot trigger allowlist -- only the GitHub logins here may use @rocm-atom-bot review.
+# One login per line (case-insensitive). '#' starts a comment. Edit this file (a maintainer
+# commit) to change who is allowed -- version-controlled and auditable. Reviews run on a
+# shared box; keep it curated.
+#
+# P0 is a staging run on a fork, so this starts at one login. The ATOM reviewer roster
+# goes in at P3, when the bot moves to ROCm/ATOM.
+zufayu
