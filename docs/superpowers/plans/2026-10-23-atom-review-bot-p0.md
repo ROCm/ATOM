@@ -987,11 +987,16 @@ grep -n "_OWNER\|OWNER_OVERRIDE" .github/workflows/atom-review-bot.yml
 
 - [ ] **Step 3: P0 降级 —— claim 👀 与 publish 的 token 依赖**
 
-claim 步骤加条件，让它在无 token 时跳过而不是失败：
+claim 步骤加条件，让它在无 token 时跳过而不是失败。**不要直接在 `if:` 里读 `secrets`**
+——该上下文在 step 级 `if` 表达式里不可靠。把 secret 绑到 step 的 `env`，再测那个变量：
 
 ```yaml
-        if: ${{ secrets.ATOM_BOT_TOKEN != '' }}
+        env:
+          TOK: ${{ secrets.ATOM_BOT_TOKEN }}
+        if: env.TOK != ''
 ```
+
+这样写的好处是 P0.5 把 secret 配上的当天，这一步自动变活，不用再改 workflow。
 
 publish 步骤去掉 `--post`（`_publish.py` 默认 dry-run），并在其上方加注释说明这是刻意降级：
 
