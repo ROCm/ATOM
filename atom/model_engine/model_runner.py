@@ -3029,8 +3029,20 @@ class ModelRunner:
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
         # Profiler label. Kind (prefix) distinguishes real/dummy and
-        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
-        # `build_run_label`.
+        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches; `tok`
+        # shows the rows padded past the scheduled ones and `dp` what every DP
+        # rank scheduled. See `build_run_label`.
+        sync = forward_mode.sync
+        # The sync's rows are the DP group, a group of one's its own row.
+        dp, dp_rank = None, 0
+        if len(sync.prefill_across_dp) > 1:
+            dp = tuple(
+                zip(
+                    sync.scheduled_tokens_per_dp_rank.tolist(),
+                    sync.prefill_across_dp,
+                )
+            )
+            dp_rank = self.config.parallel_config.data_parallel_rank
         label = build_run_label(
             is_prefill=is_prefill,
             use_cudagraph=forward_mode.use_cudagraph,
@@ -3040,6 +3052,9 @@ class ModelRunner:
             running_bs=context.running_bs,
             batch=batch,
             detailed_suffix=self._detailed_label_suffix(batch),
+            running_tokens=forward_mode.running_tokens,
+            dp=dp,
+            dp_rank=dp_rank,
         )
 
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
