@@ -12,6 +12,7 @@ try:
         balanced_packing,
         rebalance_experts,
         replicate_experts,
+        step_peak_rebalance,
     )
 except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
     skip_if_dependency_missing(_e, "requires full atom import env")
@@ -175,3 +176,46 @@ def test_rebalance_experts_hierarchical_invariants():
     assert l2p.shape[0] == 1 and l2p.shape[1] == 8
     assert int(logcnt.sum().item()) == 8
     assert sorted(p2l[0].tolist()) == list(range(8))
+
+
+def _step_peak_gpu_loads(step_load, p2l, num_gpus):
+    """[S, num_gpus] per-step GPU load of one layer, replicas sharing evenly."""
+    counts = torch.bincount(p2l, minlength=step_load.shape[-1]).to(torch.float64)
+    per_replica = step_load[:, 0].to(torch.float64) / counts
+    return per_replica[:, p2l].view(step_load.shape[0], num_gpus, -1).sum(-1)
+
+
+@pytest.mark.parametrize("num_physical", [6, 8])
+def test_step_peak_never_copies_idle_experts_on_a_tied_peak(num_physical):
+    # After expert 2's first copy, experts 1 and 2 tie at the peak (10 per
+    # replica): no single copy lowers it, so every candidate costs the same.
+    # The copy must go to a loaded expert, not to idle expert 0.
+    step_load = torch.tensor([[[0, 10, 20, 0]]])
+    p2l = step_peak_rebalance(step_load, num_physical=num_physical, num_gpus=2)[0]
+    counts = torch.bincount(p2l, minlength=4).tolist()
+    assert counts[0] == 1 and counts[3] == 1
+    assert _step_peak_gpu_loads(step_load, p2l, 2).tolist() == [[15.0, 15.0]]
+
+
+def test_step_peak_packs_alternating_hotspots_together():
+    # A and B are hot on alternate steps, C and D steady; the window sums are
+    # all equal. Pairing A with B keeps every step at 20 per GPU, where any
+    # pairing of a hot expert with a steady one peaks at 30.
+    step_load = torch.tensor([[[20, 0, 10, 10]], [[0, 20, 10, 10]]])
+    p2l = step_peak_rebalance(step_load, num_physical=4, num_gpus=2)[0]
+    assert {frozenset(p2l[:2].tolist()), frozenset(p2l[2:].tolist())} == {
+        frozenset({0, 1}),
+        frozenset({2, 3}),
+    }
+    assert _step_peak_gpu_loads(step_load, p2l, 2).max().item() == 20.0
+
+
+@pytest.mark.parametrize("num_gpus,num_physical", [(2, 8), (4, 12), (4, 16)])
+def test_step_peak_invariants(num_gpus, num_physical):
+    gen = torch.Generator().manual_seed(num_physical)
+    step_load = torch.randint(0, 50, (6, 3, 8), generator=gen)
+    p2l = step_peak_rebalance(step_load, num_physical=num_physical, num_gpus=num_gpus)
+    assert tuple(p2l.shape) == (3, num_physical)
+    for row in p2l:
+        counts = torch.bincount(row, minlength=8)
+        assert int(counts.min()) >= 1 and int(counts.sum()) == num_physical

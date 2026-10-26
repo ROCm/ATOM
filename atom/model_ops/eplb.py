@@ -436,19 +436,25 @@ def step_peak_rebalance(
     p2l = torch.empty((num_layers, num_physical), dtype=torch.int64, device=device)
     p2l[:, :num_logical] = arange_logical
     logcnt = torch.ones((num_layers, num_logical), dtype=torch.float64, device=device)
-    # Distinct scores keep the argmax unique; ties then favor the lower id.
-    tie_broken = tokens + arange_logical * 1e-4
     for i in range(num_physical - num_logical):
-        score = tie_broken / logcnt
-        score_added = tokens / (logcnt + 1)
-        # A copy of expert j only changes a step's peak if j is that step's
-        # argmax, so the per-step peak after copying j is the old peak except
-        # at the argmax, where it is the max with j's score replaced.
-        values, idx = score.max(-1, keepdim=True)
-        values = values.expand_as(score).contiguous()
-        score.scatter_(-1, idx, score_added.gather(-1, idx))
-        values.scatter_(-1, idx, score.max(-1, keepdim=True).values)
-        pick = values.sum(0).argmin(-1)
+        score = tokens / logcnt
+        # A copy of expert j changes a step's peak only if j alone holds it:
+        # the new peak is max(second highest, j's per-replica load with the
+        # copy). When the peak is tied, no single copy lowers it.
+        top = score.topk(min(2, num_logical), dim=-1)
+        first = top.values[..., :1]
+        second = top.values[..., -1:]
+        peak = first.expand_as(score).clone()
+        lead = top.indices[..., :1]
+        peak.scatter_(
+            -1, lead, torch.maximum(second, (tokens / (logcnt + 1)).gather(-1, lead))
+        )
+        cost = peak.sum(0)  # [L, Lg]: sum of per-step peaks if j gets the copy
+        # Among equal-cost candidates take the one with the highest per-replica
+        # load over the window (then the lowest id), never an arbitrary idle
+        # expert: a copy of an expert that carries no load lowers no step.
+        best = cost == cost.min(-1, keepdim=True).values
+        pick = torch.where(best, score.sum(0), -1.0).argmax(-1)
         p2l[:, num_logical + i] = pick
         logcnt[layers, pick] += 1
     capacity = num_physical // num_gpus
