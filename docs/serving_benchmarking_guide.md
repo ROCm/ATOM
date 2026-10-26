@@ -753,6 +753,7 @@ the programmatic API.
 | `ATOM_PROFILER_MORE=1` env var | Enables detailed profiling: `record_shapes`, `with_stack`, `profile_memory` |
 | `ATOM_PROFILER_RECORD_SHAPES`, `ATOM_PROFILER_WITH_STACK`, `ATOM_PROFILER_PROFILE_MEMORY` env vars | Set to `1`/`0` to enable/disable one detailed option; takes precedence over `ATOM_PROFILER_MORE`, which applies when unset |
 | `ATOM_PROFILER_TIMEOUT=<seconds>` env var | Overrides the `stop_profile` timeout; default is 300 seconds |
+| `ATOM_PROFILER_ASYNC_GZIP=1` env var | Gzips traces on a background thread, so `stop_profile` returns before the `.gz` is complete; wait until the raw `.pt.trace.json` is gone before collecting |
 | `ATOM_ENABLE_DETAILED_ANNOTATION=1` env var | Appends attention FLOP aggregates (`sqsq`, `sqsk`, `sk`) to the `prefill[]`/`decode[]` trace labels while profiling is active (see [CUDA-graph capture traces](#cuda-graph-capture-traces)) |
 
 When a profiler directory is configured, each worker saves traces to a

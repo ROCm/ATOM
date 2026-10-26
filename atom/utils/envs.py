@@ -812,6 +812,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
+    # Off by default: a caller that collects traces as soon as stop_profile
+    # returns would find the raw JSON with its .gz still being written.
+    "ATOM_PROFILER_ASYNC_GZIP": lambda: os.getenv("ATOM_PROFILER_ASYNC_GZIP", "0")
+    == "1",
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # Level name for the "atom" logger and its console handler (DEBUG, INFO,
     # WARNING, ...); applied by atom.utils.set_atom_log_level(), which turns
