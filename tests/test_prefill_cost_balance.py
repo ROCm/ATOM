@@ -54,8 +54,10 @@ def _sched(
     max_tokens=64,
     dp_size=8,
     prefix_caching=False,
+    cost_cap=0,
 ):
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", str(weight))
+    monkeypatch.setenv("ATOM_DP_PREFILL_COST_CAP", str(cost_cap))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_SLACK", str(slack))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", str(min_tokens))
     return Scheduler(
@@ -194,6 +196,37 @@ def test_cheaper_rank_keeps_its_chunk_without_room_to_grow(monkeypatch, seq_fact
     sched.set_prefill_delayer(_Delayer(others=[1e9] * 7))
     sched.add(seq_factory(list(range(100, 164))))
     assert _prefill_tokens(sched) == 64
+
+
+def test_lone_prefilling_rank_keeps_its_chunk_without_a_cap(monkeypatch, seq_factory):
+    sched = _sched(monkeypatch)
+    sched.set_prefill_delayer(_Delayer(others=[0.0] * 7))
+    sched.add(seq_factory(list(range(100, 164))))
+    assert _prefill_tokens(sched) == 64
+
+
+def test_cost_cap_bounds_a_lone_prefilling_rank(monkeypatch, seq_factory):
+    # Only this rank prefills, so the balanced target is its own 2048; the
+    # 800 cap lowers it: k * k / 2 <= 800, i.e. 40 tokens.
+    sched = _sched(monkeypatch, cost_cap=800)
+    sched.set_prefill_delayer(_Delayer(others=[0.0] * 7))
+    sched.add(seq_factory(list(range(100, 164))))
+    assert _prefill_tokens(sched) == 40
+
+
+def test_cost_cap_lowers_an_already_balanced_target(monkeypatch, seq_factory):
+    # Every rank at 2048: balanced target 2048, capped to 512, i.e. 32 tokens.
+    sched = _sched(monkeypatch, cost_cap=512)
+    sched.set_prefill_delayer(_Delayer(others=[2048.0] * 7))
+    sched.add(seq_factory(list(range(100, 164))))
+    assert _prefill_tokens(sched) == 32
+
+
+def test_cost_cap_respects_the_floor(monkeypatch, seq_factory):
+    sched = _sched(monkeypatch, cost_cap=8, min_tokens=16)
+    sched.set_prefill_delayer(_Delayer(others=[0.0] * 7))
+    sched.add(seq_factory(list(range(100, 164))))
+    assert _prefill_tokens(sched) == 16
 
 
 def test_idle_rank_reports_no_cost(monkeypatch):

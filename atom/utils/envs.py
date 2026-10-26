@@ -213,6 +213,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_PREFILL_BALANCE_MIN_TOKENS": lambda: _int_env(
         "ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", 4096
     ),
+    # Absolute ceiling on one DP prefill step's chunk cost (same units as the
+    # cost above). Under DP attention a prefill step stalls decode on every
+    # rank for as long as the costliest rank's chunk takes, so a long-context
+    # chunk at the full token budget freezes all decode streams for its whole
+    # duration. The cap bounds that: the step target becomes min(target, CAP),
+    # also when only one rank prefills. Short-context chunks stay at the full
+    # token budget. 0 (default) = no ceiling.
+    "ATOM_DP_PREFILL_COST_CAP": lambda: float(
+        os.getenv("ATOM_DP_PREFILL_COST_CAP", "0") or "0"
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force

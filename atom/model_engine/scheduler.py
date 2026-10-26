@@ -655,6 +655,7 @@ class Scheduler:
         self._balance_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
         self._balance_slack = envs.ATOM_DP_PREFILL_BALANCE_SLACK
         self._balance_min_tokens = envs.ATOM_DP_PREFILL_BALANCE_MIN_TOKENS
+        self._balance_cost_cap = envs.ATOM_DP_PREFILL_COST_CAP
         # This tick's prefill cost limit and what admission has spent of it;
         # see `_prefill_room`.
         self._tick_cost_limit = math.inf
@@ -1207,12 +1208,15 @@ class Scheduler:
         The costs rode the delayer's all_reduce this tick (`own` is this rank's,
         0 when it estimated none), so every rank sees the same list. The target
         is the costliest chunk, lowered to `1 + slack` times the mean over the
-        ranks that prefill: a rank above it shrinks its chunk. No rank
+        ranks that prefill and to ATOM_DP_PREFILL_COST_CAP when set: a rank
+        above it shrinks its chunk. No rank
         reporting a cost means no rank has prefill work: nothing to balance."""
         costs = [c for c in self.prefill_delayer.rank_prefill_costs if c > 0]
         if not costs:
             return
         target = min(max(costs), sum(costs) / len(costs) * (1 + self._balance_slack))
+        if self._balance_cost_cap > 0:
+            target = min(target, self._balance_cost_cap)
         self._tick_cost_limit = target
         st = self._balance_stats
         st[0] += 1
