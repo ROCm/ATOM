@@ -450,6 +450,12 @@ fi
 host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
+
+# Resolve nested drafts after the shared HF cache environment is exported.
+if [[ -n "${DRAFT_MODEL_PATH}" ]]; then
+  DRAFT_MODEL_PATH="$(python3 "${ATOMESH_SCRIPT_DIR}/resolve_draft_model.py" \
+    --model "${MODEL_PATH}" --draft "${DRAFT_MODEL_PATH}")"
+fi
 prepare_kv_connector || exit 2
 
 # GPU timing is opt-in; agentic reports need it on both service roles.
