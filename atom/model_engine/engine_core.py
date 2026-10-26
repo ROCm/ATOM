@@ -63,6 +63,16 @@ KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
 class EngineCore:
+    # How long an idle `busy_loop` blocks for input before its next pass.
+    # Spinning instead keeps this thread runnable, so the input thread waits
+    # for the GIL switch interval (5 ms) before it can queue a request: that
+    # was added to every request's TTFT on an idle server. The wait releases
+    # the GIL and returns as soon as the input thread queues anything; the
+    # timeout only paces the loop's periodic work (metrics push, heartbeat).
+    # 0 keeps spinning -- for subclasses whose other threads feed the loop
+    # without setting `_input_ready`.
+    _idle_wait_s = 0.01
+
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
     # its own interpreter; `_setup_engine_process` is the only writer.
@@ -80,6 +90,9 @@ class EngineCore:
         self._has_pending_utility = (
             False  # Flag to avoid checking empty queue every loop
         )
+        # Set by the input thread after it queues a request or a utility
+        # command; an idle `busy_loop` waits on it instead of spinning.
+        self._input_ready = threading.Event()
         self._is_rl_weights_offloaded = (
             False  # True when weights are offloaded for RL training
         )
@@ -430,6 +443,9 @@ class EngineCore:
                     next_metrics_push = now + metrics_interval
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
+                # Cleared before the queue is read, so a request queued after
+                # this point keeps the event set for the wait below.
+                self._input_ready.clear()
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
@@ -439,6 +455,8 @@ class EngineCore:
                     self._process_engine_step()
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
+                elif self._idle_wait_s > 0:
+                    self._input_ready.wait(self._idle_wait_s)
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -781,14 +799,17 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
+                        self._input_ready.set()
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
+                        self._input_ready.set()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
+                        self._input_ready.set()
                         alive = False
                         reason = request_type
             logger.debug(f"{self.label}: input thread exit due to {reason}")
@@ -1015,6 +1036,10 @@ class PrefillEngineCore(EngineCore):
       its forward pass writes directly into decode's GPU buffer.
     - Does NOT sample tokens; completed sequences are discarded here.
     """
+    # Block assignments / prefill-done notices arrive on their own threads,
+    # which do not set `_input_ready`; keep the spinning loop.
+    _idle_wait_s = 0.0
+
 
     def __init__(self, config: Config, input_address: str, output_address: str):
 
@@ -1256,6 +1281,10 @@ class DecodeEngineCore(EngineCore):
     - Exports the kv_cache IPC handle to prefill at startup.
     - Runs normal CUDA-graph-accelerated decode.
     """
+    # Block assignments / prefill-done notices arrive on their own threads,
+    # which do not set `_input_ready`; keep the spinning loop.
+    _idle_wait_s = 0.0
+
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self._disagg_d2p_addr = config.disagg_d2p_addr  # PUSH: send BlockAssignment
