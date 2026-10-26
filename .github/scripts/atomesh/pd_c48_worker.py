@@ -107,13 +107,81 @@ def mooncake_hca(local_rank, environ=os.environ):
 
 def nic_limits(device):
     """The firmware-set MR limits (max_mr, max_mr_size, page_size_cap) that bound Mooncake registrations."""
-    import subprocess
+    import ctypes
+    # struct ibv_device_attr through max_mr; the image has libibverbs but no ibv_devinfo (job 10092).
+    fields = [("fw_ver", ctypes.c_char * 64), ("node_guid", ctypes.c_uint64), ("sys_image_guid", ctypes.c_uint64),
+              ("max_mr_size", ctypes.c_uint64), ("page_size_cap", ctypes.c_uint64)]
+    fields += [(name, ctypes.c_int) for name in ("vendor_id", "vendor_part_id", "hw_ver", "max_qp", "max_qp_wr",
+                                                 "device_cap_flags", "max_sge", "max_sge_rd", "max_cq", "max_cqe", "max_mr")]
+    attr = type("DeviceAttr", (ctypes.Structure,), {"_fields_": fields + [("rest", ctypes.c_byte * 512)]})()
     try:
-        out = subprocess.run(["ibv_devinfo", "-v", "-d", device], capture_output=True, text=True, timeout=30).stdout
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        lib = ctypes.CDLL("libibverbs.so.1")
+    except OSError as exc:
         return f"unavailable ({exc})"
-    keys = ("fw_ver", "max_mr_size", "page_size_cap", "max_mr")
-    return " ".join(" ".join(line.split()) for line in out.splitlines() if line.strip().split(":")[0] in keys) or out[:200]
+    lib.ibv_get_device_list.restype = ctypes.POINTER(ctypes.c_void_p)
+    lib.ibv_get_device_name.restype = ctypes.c_char_p
+    lib.ibv_get_device_name.argtypes = lib.ibv_open_device.argtypes = lib.ibv_close_device.argtypes = [ctypes.c_void_p]
+    lib.ibv_open_device.restype = ctypes.c_void_p
+    lib.ibv_query_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    count = ctypes.c_int()
+    devices = lib.ibv_get_device_list(ctypes.byref(count))
+    try:
+        names = [lib.ibv_get_device_name(devices[i]).decode() for i in range(count.value)]
+        if device not in names:
+            return f"unavailable ({device} not in {names})"
+        context = lib.ibv_open_device(devices[names.index(device)])
+        if not context:
+            return f"unavailable (ibv_open_device {device} failed)"
+        rc = lib.ibv_query_device(context, ctypes.byref(attr))
+        lib.ibv_close_device(context)
+    finally:
+        if devices:
+            lib.ibv_free_device_list(devices)
+    if rc:
+        return f"unavailable (ibv_query_device rc={rc})"
+    return (f"fw_ver: {attr.fw_ver.decode()} max_mr_size: {attr.max_mr_size:#x} "
+            f"page_size_cap: {attr.page_size_cap:#x} max_mr: {attr.max_mr}")
+
+
+def prepare_store_memory(worker):
+    """ATOM's Store memory recipe (pd_server_atom.sh prepare_mooncake_store_memory), once per node before the
+    embedded segments pin: evict the models' page cache, then fault each NUMA node's share as THP from one bound
+    thread. Mooncake pre-touches from many threads whose racing compactions leave 4 KiB pages, and ionic maps a
+    whole MR at 4 KiB for one of them (job 10077)."""
+    import fcntl
+    import subprocess
+    import sys
+    import time
+    here, out = Path(__file__).resolve().parent, Path(os.environ["C48_DIAG_DIR"])
+    out.mkdir(parents=True, exist_ok=True)
+    with open(out / "mooncake-store-memory.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        done = out / "mooncake-store-memory.done"
+        if done.exists():
+            return
+        from drop_page_cache import drop_page_cache
+        spec = worker.vllm_config.speculative_config
+        models = [worker.vllm_config.model_config.model] + ([spec.model] if spec and spec.model else [])
+        root, start = os.path.commonpath(models), time.monotonic()
+        drop_page_cache(root)
+        print(f"[C48] Store memory: dropped the page cache of {root} in {time.monotonic() - start:.0f} s", flush=True)
+        segments = (json.loads(Path(os.environ["MOONCAKE_CONFIG_PATH"]).read_text())["global_segment_size"]
+                    * worker.parallel_config.world_size)
+        nodes = [p for p in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")) if (p / "cpulist").read_text().strip()]
+        for node in nodes:
+            info = {f[2].rstrip(":"): int(f[3]) << 10 for f in map(str.split, (node / "meminfo").read_text().splitlines())
+                    if len(f) == 5}
+            # A process bound to a node is killed out of memory past what the node can free; the workers hold theirs.
+            gib = min(segments / len(nodes), info["MemFree"] + info["Active(file)"] + info["Inactive(file)"] - (64 << 30)) / 2**30
+            print(f"[C48] Store memory: compacting {node.name} for {gib:.0f} of {segments / len(nodes) / 2**30:.0f} GiB", flush=True)
+            if gib < 1:
+                continue
+            try:
+                subprocess.run([sys.executable, str(here / "numa_exec.py"), node.name.removeprefix("node"), sys.executable,
+                                str(here / "compact_huge_pages.py"), f"{gib:.0f}"], check=False, timeout=1800)
+            except subprocess.TimeoutExpired:
+                print(f"[C48][WARN] Store memory: compacting {node.name} did not finish in 1800 s", flush=True)
+        done.touch()
 
 
 class ManifestWorker(Worker):
@@ -132,8 +200,17 @@ class ManifestWorker(Worker):
             if self.local_rank == 0:
                 print(f"[C48] Mooncake {os.environ['MC_TE_FILTERS']} limits: {nic_limits(os.environ['MC_TE_FILTERS'])}",
                       flush=True)
+        store = os.environ.get("C48_MOONCAKE_STORE_COMPACT") == "1"
+        if store:
+            prepare_store_memory(self)
         with startup_stage(self, "initialize_from_config"):
-            return super().initialize_from_config(kv_cache_config)
+            try:
+                return super().initialize_from_config(kv_cache_config)
+            finally:
+                if store:
+                    with open("/proc/self/smaps_rollup") as f:
+                        huge = next((" ".join(line.split()) for line in f if line.startswith("AnonHugePages:")), "?")
+                    print(f"[C48] Store rank={self.rank} {huge}", flush=True)
 
     def annotate_profile(self, scheduler_output):
         original = super().annotate_profile(scheduler_output)

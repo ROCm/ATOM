@@ -48,7 +48,8 @@ class LaunchTest(unittest.TestCase):
                          "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600", "MC_MAX_MR_SIZE": str(256 << 20),
                          "C48_MOONCAKE_HCA_PER_GPU": "1"}
                 if store and role == "prefill":
-                    added.update(GLIBC_TUNABLES="glibc.malloc.hugetlb=1", MC_MAX_MR_SIZE=str(4 << 20))
+                    added.update(GLIBC_TUNABLES="glibc.malloc.hugetlb=1", MC_MAX_MR_SIZE=str(1 << 30),
+                                 C48_MOONCAKE_STORE_COMPACT="1")
                 self.assertEqual({k: v for k, v in mc_env.items() if k not in src_env}, added)
                 self.assertEqual({k: v for k, v in src_env.items()}, {k: mc_env[k] for k in src_env})
                 t = transfer(mc_argv)
@@ -70,18 +71,48 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(mooncake_hca(1, {"HIP_VISIBLE_DEVICES": "4,5,6,7"}), "rdma5")
         self.assertEqual(mooncake_hca(0, {"ROCR_VISIBLE_DEVICES": "6", "HIP_VISIBLE_DEVICES": "0"}), "rdma6")
 
-    def test_nic_limits_keeps_mr_lines(self):
+    def test_nic_limits_degrades_without_verbs(self):
         sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
-        import subprocess
+        import ctypes
         from unittest import mock
         from pd_c48_worker import nic_limits
-        out = "hca_id:\trdma3\n\tfw_ver:\t\t1.2\n\tmax_mr_size:\t\t0x380000000\n\tpage_size_cap:\t\t0x40201000\n" \
-              "\tmax_qp:\t\t4096\n\tmax_mr:\t\t\t131072\n\tmax_mr_size_extra:\t\t1\n"
-        with mock.patch.object(subprocess, "run", return_value=types.SimpleNamespace(stdout=out)):
-            self.assertEqual(nic_limits("rdma3"),
-                             "fw_ver: 1.2 max_mr_size: 0x380000000 page_size_cap: 0x40201000 max_mr: 131072")
-        with mock.patch.object(subprocess, "run", side_effect=FileNotFoundError("ibv_devinfo")):
+        with mock.patch.object(ctypes, "CDLL", side_effect=OSError("libibverbs.so.1")):
             self.assertTrue(nic_limits("rdma3").startswith("unavailable"))
+
+    def test_store_memory_compacts_each_node_once(self):
+        sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
+        import os
+        import subprocess
+        import tempfile
+        from unittest import mock
+        import pd_c48_worker
+        worker = types.SimpleNamespace(
+            vllm_config=types.SimpleNamespace(model_config=types.SimpleNamespace(model="/m/a/K3"),
+                                              speculative_config=types.SimpleNamespace(model="/m/b/D")),
+            parallel_config=types.SimpleNamespace(world_size=8))
+        with tempfile.TemporaryDirectory() as tmp:
+            sysfs, gib = Path(tmp, "node"), 1 << 30
+            for n, free in ((0, 900), (1, 200)):
+                d = sysfs / f"node{n}"
+                d.mkdir(parents=True)
+                (d / "cpulist").write_text("0-1\n")
+                (d / "meminfo").write_text(f"Node {n} MemFree: {free * gib >> 10} kB\nNode {n} Active(file): "
+                                           f"{100 * gib >> 10} kB\nNode {n} Inactive(file): 0 kB\nNode {n} HugePages_Total: 0\n")
+            (sysfs / "node2").mkdir()
+            (sysfs / "node2" / "cpulist").write_text("\n")
+            Path(tmp, "store.json").write_text(json.dumps({"global_segment_size": 100 * gib}))
+            env = {"C48_DIAG_DIR": str(Path(tmp, "diag")), "MOONCAKE_CONFIG_PATH": str(Path(tmp, "store.json"))}
+            real_path = pd_c48_worker.Path
+            fake_path = lambda p, *a: real_path(str(p).replace("/sys/devices/system/node", str(sysfs)), *a)
+            dropped = []
+            sys.modules["drop_page_cache"] = types.SimpleNamespace(drop_page_cache=dropped.append)
+            with mock.patch.dict(os.environ, env), mock.patch.object(pd_c48_worker, "Path", fake_path), \
+                    mock.patch.object(subprocess, "run") as run:
+                pd_c48_worker.prepare_store_memory(worker)
+                pd_c48_worker.prepare_store_memory(worker)
+            del sys.modules["drop_page_cache"]
+        self.assertEqual(dropped, ["/m"])
+        self.assertEqual([(c.args[0][2], c.args[0][-1]) for c in run.call_args_list], [("0", "400"), ("1", "236")])
 
     def test_simple_cpu_case_ignores_lmcache_port(self):
         config = json.loads((GAP / "V-QD.json").read_text())
