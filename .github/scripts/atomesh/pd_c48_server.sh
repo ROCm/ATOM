@@ -46,11 +46,61 @@ PY
   env "${lmcache_env[@]}" python3 -c 'import lmcache.cuda_ops'
 }
 
+# Install the pinned ROCm Mooncake wheel (the workflow downloads it) over the
+# image, and on Prefill start the embedded Store's master when the case has one.
+c48_start_mooncake() {
+  local role="$1" config="$2" site="/tmp/atomesh-c48-mooncake"
+  local wheel sha store digest
+  read -r wheel sha store < <(python3 -c 'import json, sys
+m = json.load(open(sys.argv[1]))["mooncake"]
+print(m["wheel"]["name"], m["wheel"]["sha256"], int("store" in m))' "${config}") || return 2
+  wheel="${ATOMESH_SCRIPT_DIR}/mooncake-dist/${wheel}"
+  digest="$(sha256sum "${wheel}")" || return 2
+  [[ "${digest%% *}" == "${sha}" ]] || { echo "ERROR: Mooncake wheel ${wheel} is not ${sha}" >&2; return 2; }
+  rm -rf "${site}"
+  python3 -m pip install --quiet --no-cache-dir --no-deps --target "${site}" "${wheel}" || return $?
+  export PYTHONPATH="${site}${PYTHONPATH:+:${PYTHONPATH}}"
+  export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  python3 -c 'import sys, mooncake.engine as e; assert e.__file__.startswith(sys.argv[1]) and e.SUPPORT_HIP, e.__file__' "${site}" || return 2
+  export VLLM_MOONCAKE_BOOTSTRAP_PORT=$((18998 + ATOMESH_SERVICE_PORT_OFFSET))
+  echo "[mooncake] ${role} wheel=${wheel##*/} bootstrap=${VLLM_MOONCAKE_BOOTSTRAP_PORT} store=${store}"
+  [[ "${role}" == prefill && "${store}" == 1 ]] || return 0
+  local master_port=$((19051 + ATOMESH_SERVICE_PORT_OFFSET))
+  export MOONCAKE_CONFIG_PATH="${RUNTIME_LOG_DIR}/mooncake-store.json"
+  python3 -c 'import json, sys
+c = json.load(open(sys.argv[1]))["mooncake"]["store"]
+print(json.dumps({**c, "master_server_address": "127.0.0.1:" + sys.argv[2]}))' "${config}" "${master_port}" \
+    > "${MOONCAKE_CONFIG_PATH}" || return 2
+  start_logged_process mooncake_master_pid "${RUNTIME_LOG_DIR}/mooncake-master.log" \
+    "${site}/mooncake/mooncake_master" --rpc_port "${master_port}" \
+    --metrics_port $((19151 + ATOMESH_SERVICE_PORT_OFFSET))
+  local deadline=$((SECONDS + 60))
+  until (exec 3<>"/dev/tcp/127.0.0.1/${master_port}") 2>/dev/null; do
+    process_is_running "${mooncake_master_pid}" && (( SECONDS < deadline )) || { echo "ERROR: mooncake_master did not listen on ${master_port}" >&2; return 2; }
+    sleep 1
+  done
+  echo "[mooncake] master pid=${mooncake_master_pid} port=${master_port} config=$(cat "${MOONCAKE_CONFIG_PATH}")"
+}
+
+if [[ "${ATOMESH_C48_CASE}" == *-MC ]]; then
+  # vllm-router in Mooncake mode needs static P/D URLs; the host side starts it on request.
+  start_router() {
+    router_pid=""
+    local request="${RUN_DIR}/mooncake-router-${ATOMESH_EXECUTION_PHASE:-combined}.args"
+    printf '%s\n' --prefill "http://${prefill_ips[0]}:${prefill_ports[0]}" "${VLLM_MOONCAKE_BOOTSTRAP_PORT}" \
+      --decode "http://${decode_ips[0]}:${decode_ports[0]}" > "${request}.tmp" && mv "${request}.tmp" "${request}"
+    echo "[router] requested Mooncake vllm-router: $(tr '\n' ' ' < "${request}")"
+  }
+fi
+
 start_vllm_server() {
   local role="$1" log_name="$2" port="$3"
   local config="${ATOMESH_SCRIPT_DIR}/../../benchmark/c48-model-gap/${ATOMESH_C48_CASE}.json"
   local -a cache_env=() lmcache_args=()
   build_server_cache_env "${role}" "${port}" cache_env
+  if [[ "${ATOMESH_C48_CASE}" == *-MC ]]; then
+    c48_start_mooncake "${role}" "${config}" || return $?
+  fi
   if [[ "${role}" == "prefill" ]] && python3 -c 'import json, sys; sys.exit("lmcache" not in json.load(open(sys.argv[1])))' "${config}"; then
     c48_start_lmcache "${config}"
     lmcache_args=(--lmcache-port "${C48_LMCACHE_PORT}")

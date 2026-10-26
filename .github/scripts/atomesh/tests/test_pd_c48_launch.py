@@ -27,6 +27,37 @@ class LaunchTest(unittest.TestCase):
             render(config, "prefill", *ADDR)
         self.assertNotIn("LMCache", json.dumps(transfer(render(config, "decode", *ADDR)[0])))
 
+    def test_mooncake_cases_change_only_transfer_and_offload(self):
+        sources = {"DG5-PNT-SWB-C48-MC": "DG5-PNT", "DG5-PNT-SWB-C56-MC": "DG5-PNT-SWB-C56-CPU26",
+                   "DG5-PNT-SWB-C88-MC": "DG5-PNT-SWB-C88-CPU26"}
+        prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-"
+        cases = sorted(GAP.glob(prefix + "*-MC.json"))
+        self.assertEqual(len(cases), 8)
+        for path in cases:
+            suffix = path.stem.removeprefix(prefix)
+            mc = json.loads(path.read_text())
+            src = json.loads((GAP / (prefix + sources.get(suffix, suffix.removesuffix("-MC")) + ".json")).read_text())
+            for role in ("prefill", "decode"):
+                mc_argv, mc_env = render(mc, role, *ADDR)
+                src_argv, src_env = render(src, role, *ADDR)
+                i = mc_argv.index("--kv-transfer-config") + 1
+                self.assertEqual(mc_argv[:i] + mc_argv[i + 1:], src_argv[:i] + src_argv[i + 1:])
+                self.assertEqual({k: v for k, v in mc_env.items() if k not in src_env},
+                                 {"MC_GID_INDEX": "1", "MC_MAX_CONCURRENT_REG_MR": "1",
+                                  "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600"})
+                self.assertEqual({k: v for k, v in src_env.items()}, {k: mc_env[k] for k in src_env})
+                t = transfer(mc_argv)
+                names = [c["kv_connector"] for c in t["kv_connector_extra_config"].get("connectors", [t])]
+                store = "store" in mc["mooncake"]
+                expected = (["MooncakeConnector", "MooncakeStoreConnector"] if store else ["MooncakeConnector"]
+                            ) if role == "prefill" else ["MooncakeConnector"]
+                self.assertEqual(names, expected)
+            if store:
+                cpu = transfer(render(src, "prefill", *ADDR)[0])["kv_connector_extra_config"]["connectors"][1]
+                self.assertEqual(mc["mooncake"]["store"]["global_segment_size"] * 8,
+                                 cpu["kv_connector_extra_config"]["cpu_bytes_to_use"])
+                self.assertEqual(mc["mooncake"]["store"]["protocol"], "rdma")
+
     def test_simple_cpu_case_ignores_lmcache_port(self):
         config = json.loads((GAP / "V-QD.json").read_text())
         self.assertEqual(render(config, "prefill", *ADDR)[0], render(config, "prefill", *ADDR, lmcache_port=6655)[0])

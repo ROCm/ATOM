@@ -189,13 +189,17 @@ start_vllm_router() {
   local container="$1"
   local log_file="$2"
   local port_offset="$3"
+  shift 3
   local image="${ATOMESH_VLLM_ROUTER_IMAGE:?vllm.router.image is required}"
   local discovery_port=$((ATOMESH_VLLM_ROUTER_DISCOVERY_PORT + port_offset))
   local port=$((ROUTER_PORT + port_offset))
+  # Extra arguments select Mooncake static P/D URLs instead of MoRIIO discovery.
+  local -a mode_args=(--kv-connector moriio --vllm-discovery-address "0.0.0.0:${discovery_port}")
+  (( $# )) && mode_args=(--kv-connector mooncake "$@")
 
   bounded_docker_rm "${container}"
   docker pull "${image}" || return $?
-  echo "[router] ${container} port=${port} discovery=${discovery_port} log=${log_file}"
+  echo "[router] ${container} port=${port} ${mode_args[*]} log=${log_file}"
   docker run -d --name "${container}" \
     --user "$(id -u):$(id -g)" \
     --network host \
@@ -203,8 +207,7 @@ start_vllm_router() {
     "${image}" \
     vllm-router \
     --vllm-pd-disaggregation \
-    --kv-connector moriio \
-    --vllm-discovery-address "0.0.0.0:${discovery_port}" \
+    "${mode_args[@]}" \
     --host 0.0.0.0 \
     --port "${port}" \
     --policy "${ROUTER_POLICY}" \
@@ -345,14 +348,21 @@ EOF
   fi
 
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
-  local router_container=""
+  local router_container="" mooncake_router_request=""
   if [[ "${rank}" -eq 0 && "${BACKEND}" == "atom" ]]; then
     mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
   elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" ]]; then
     router_container="${container}-router"
-    start_vllm_router "${router_container}" \
-      "${rank_dir}/router${phase_suffix}.log" "${service_port_offset}" || return $?
+    if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-MC ]]; then
+      # The Mooncake router reads P's bootstrap server once at startup, so the
+      # container requests it after P and D report healthy (pd_c48_server.sh).
+      mooncake_router_request="${RUN_DIR}/mooncake-router-${execution_phase}.args"
+      rm -f "${mooncake_router_request}"
+    else
+      start_vllm_router "${router_container}" \
+        "${rank_dir}/router${phase_suffix}.log" "${service_port_offset}" || return $?
+    fi
   fi
 
   docker_args=(
@@ -475,7 +485,15 @@ EOF
   local docker_pid=$!
   local peer_rc=1
   while kill -0 "${docker_pid}" 2>/dev/null; do
-    if [[ -n "${router_container}" ]] && ! vllm_router_running \
+    if [[ -n "${mooncake_router_request}" && -s "${mooncake_router_request}" ]]; then
+      local -a mooncake_router_args=()
+      mapfile -t mooncake_router_args < "${mooncake_router_request}"
+      mooncake_router_request=""
+      # A failed start leaves no running sidecar, which the check below reports.
+      start_vllm_router "${router_container}" "${rank_dir}/router${phase_suffix}.log" \
+        "${service_port_offset}" "${mooncake_router_args[@]}"
+    fi
+    if [[ -n "${router_container}" && -z "${mooncake_router_request}" ]] && ! vllm_router_running \
         "${router_container}" "${rank_dir}/router${phase_suffix}.log"; then
       echo "[router-failure] stopping this rank's ${container} after sidecar exit" >&2
       peer_rc=2

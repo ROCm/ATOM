@@ -42,7 +42,10 @@ def startup_stage(worker, stage):
         "stack_after_seconds": 300,
         "repeat": False,
     }
+    import torch
     record["meminfo_before"] = Path("/proc/meminfo").read_text()
+    # Free/total VRAM shows whether KV registration (e.g. RDMA dma-buf pins) is charged twice.
+    record["hip_mem_before"] = list(torch.cuda.mem_get_info(worker.device))
     path = directory / (prefix + ".json")
     path.write_text(json.dumps(record) + "\n")
     print(
@@ -62,6 +65,10 @@ def startup_stage(worker, stage):
             record["end_unix_ns"] = time.time_ns()
             record["elapsed_seconds"] = (record["end_unix_ns"] - begin) / 1e9
             record["meminfo_after"] = Path("/proc/meminfo").read_text()
+            try:
+                record["hip_mem_after"] = list(torch.cuda.mem_get_info(worker.device))
+            except Exception as exc:  # must not mask the stage's own failure
+                record["hip_mem_after"] = [repr(exc), None]
             path.write_text(json.dumps(record) + "\n")
             print(
                 "[C48-STARTUP] "
@@ -71,6 +78,7 @@ def startup_stage(worker, stage):
                         "rank": worker.rank,
                         "elapsed_seconds": record["elapsed_seconds"],
                         "exception_type": record.get("exception_type"),
+                        "hip_free_before_after": [record["hip_mem_before"][0], record["hip_mem_after"][0]],
                     }
                 ),
                 flush=True,

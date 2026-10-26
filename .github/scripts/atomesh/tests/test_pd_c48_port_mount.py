@@ -117,6 +117,23 @@ class PortMountTest(unittest.TestCase):
             self.assertEqual(mounts("V-QD-CPUREF2-FP8ATTN-FQ2", temp)[0], 0)
             self.assertEqual(mounts(FQ3_CASE, temp)[0], 2)
 
+    def test_mooncake_cases_add_only_multi_connector(self):
+        prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-"
+        for path in sorted((REPO / ".github/benchmark/c48-model-gap").glob(prefix + "*-MC.json")):
+            case = path.stem
+            rc, mc = mounts(case)
+            self.assertEqual(rc, 0)
+            self.assertTrue(mc[1].endswith("/kv_connector/v1/multi_connector.py,readonly"))
+            self.assertIn("/c48-model-gap/mooncake-multi-connector/multi_connector.py,", mc[1])
+            self.assertEqual(mc[:1] + mc[2:], mounts(case.removesuffix("-MC"))[1])
+        with tempfile.TemporaryDirectory() as temp:
+            gap = Path(temp) / ".github/benchmark/c48-model-gap"
+            shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
+            with open(gap / "mooncake-multi-connector/multi_connector.py", "a") as f:
+                f.write("\n")
+            self.assertEqual(mounts(prefix + "SW-C1", temp)[0], 0)
+            self.assertEqual(mounts(prefix + "SW-C1-MC", temp)[0], 2)
+
     def test_cpuref_rejects_changed_manager(self):
         for case, fix_dir in CPUREF.items():
             with tempfile.TemporaryDirectory() as temp:

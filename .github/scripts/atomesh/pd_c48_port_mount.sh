@@ -13,6 +13,15 @@ c48_append_port_mount() {
   docker_args+=(--mount "type=bind,source=${c48_source},target=${c48_target},readonly")
   # The loading fix is fixed to this experiment branch and mounted read-only.
   local c48_fix_source c48_fix_target c48_fix_digest
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-MC ]]; then
+    # MooncakeStoreConnector reports stats without a Prometheus exporter; upstream MultiConnector asserts on it.
+    c48_fix_source="$1/.github/benchmark/c48-model-gap/mooncake-multi-connector/multi_connector.py"
+    c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py"
+    [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
+    c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
+    [[ "${c48_fix_digest%% *}" == "397e20f11593dfa652d7338a848945db0ab90c4f5424c9b129068278518c5646" ]] || return 2
+    docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+  fi
   local c48_kda_dir=online-quant-fix c48_kda_sha=8318855c6eede76b8072bc7ba744523a331c6ebe2bd3d145b6e6e3c1722518ed
   if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-INPAD || "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-INPAD-* ]]; then
     c48_kda_dir=inproj-pad128

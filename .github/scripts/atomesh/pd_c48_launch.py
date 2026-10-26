@@ -93,7 +93,8 @@ def main() -> None:
         from pd_c48_port_patch import verify_port_patch
         record["vllm_file"] = vllm.__file__
         record["versions"] = {}
-        for name in ("vllm", "torch", "triton", "aiter", "mori", "amd-aiter", "amd_mori", "fastsafetensors", "lmcache"):
+        for name in ("vllm", "torch", "triton", "aiter", "mori", "amd-aiter", "amd_mori", "fastsafetensors", "lmcache",
+                     "mooncake-transfer-engine-rocm"):
             try:
                 record["versions"][name] = importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError:
@@ -134,7 +135,7 @@ def main() -> None:
             metadata_path.write_text(json.dumps(metadata) + "\n")
             record["model_files"][str(root)]["checkpoint_metadata_artifact"] = str(metadata_path)
         record["platform_environment"] = {key: value for key, value in os.environ.items()
-            if key.startswith(("NCCL_", "MORI_", "HSA_", "HIP_", "GLOO_"))}
+            if key.startswith(("NCCL_", "MORI_", "HSA_", "HIP_", "GLOO_", "MC_", "MOONCAKE_", "VLLM_MOONCAKE_"))}
     options.output.write_text(json.dumps(record, indent=2) + "\n")
     print("[C48] " + json.dumps(record), flush=True)
     if options.execute:
