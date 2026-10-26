@@ -23,6 +23,16 @@ logger = logging.getLogger("atom")
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
 _PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices")
+# And a drafter's taps on their way to the last stage (`pp_aux_relay`).
+PP_DRAFT_AUX_PREFIX = "draft_aux_"
+
+
+def _stage_payload(it: IntermediateTensors) -> dict:
+    return {
+        k: v
+        for k, v in it.tensors.items()
+        if k in _PP_PROXY_KEYS or k.startswith(PP_DRAFT_AUX_PREFIX)
+    }
 
 
 def pp_send_allgather_group():
@@ -96,7 +106,7 @@ def init_pp_aware_dist_env(
 def send_intermediate_tensors(it: IntermediateTensors) -> None:
     """Blocking send of hidden_states/residual to the next PP stage."""
     pp = get_pp_group()
-    tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
+    tensors = _stage_payload(it)
     dst = (pp.rank_in_group + 1) % pp.world_size
     pp.send_tensor_dict(tensors, dst=dst, all_gather_group=pp_send_allgather_group())
 
@@ -132,7 +142,7 @@ def async_send_intermediate_tensors(
     dst_local = (pp.rank_in_group + 1) % pp.world_size
     dst_global = pp.ranks[dst_local]
 
-    tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
+    tensors = _stage_payload(it)
     metadata_list, tensor_list = _split_tensor_dict(tensors)
 
     works = _async_send_object(metadata_list, dst_global, pp.cpu_group)

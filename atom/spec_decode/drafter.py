@@ -175,6 +175,7 @@ class Drafter(abc.ABC):
         # Drafter-owned aux capture state (armed by arm_aux_capture).
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
+        self._aux_layer_ids: tuple[int, ...] = ()
 
         self.metadata_buffers = self._allocate_metadata_buffers(
             self.config.max_num_seqs, self.mtp_k, self.device
@@ -415,6 +416,7 @@ class Drafter(abc.ABC):
             else:
                 module.register_forward_hook(hook)
         self._captures_aux = True
+        self._aux_layer_ids = tuple(spec.layer_ids)
         # A target that runs some layers on a subset of rows (V4.1 bounded
         # replay) moves those layers' captures to their forward rows itself.
         # The hooks above bind these buffers now, so the target gets the same
@@ -429,7 +431,12 @@ class Drafter(abc.ABC):
         )
 
     def _make_aux_hook(self, buf_idx: int, extract):
-        buffer = self._aux_buffers[buf_idx]
+        return Drafter.aux_capture_hook(self._aux_buffers[buf_idx], extract)
+
+    @staticmethod
+    def aux_capture_hook(buffer: torch.Tensor, extract):
+        """The forward hook writing a tapped layer's aux tensor into ``buffer``;
+        also armed by a PP stage relaying its taps (`PPAuxRelay`)."""
 
         def _hook(module, _inputs, output):
             ctx = get_forward_context().context
@@ -449,6 +456,12 @@ class Drafter(abc.ABC):
             buffer[off : off + tensor.shape[0]].copy_(tensor)
 
         return _hook
+
+    def accept_relayed_aux(self, layer_id: int, tensor: torch.Tensor) -> None:
+        """Take a tap an earlier PP stage captured (`PPAuxRelay`): its own hook
+        sits on a placeholder here and never fires."""
+        buffer = self._aux_buffers[self._aux_layer_ids.index(layer_id)]
+        buffer[: tensor.shape[0]].copy_(tensor)
 
     def aux_for(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor] | None:
         """The target aux hidden states captured during the last forward,
