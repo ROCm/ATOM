@@ -1,0 +1,44 @@
+{
+  "name": "upstream_form_pnt_and_aiter_gemm_warmup",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "PNT as in vllm-project/vllm#63720: CacheConfig.mamba_prompt_tail_checkpoint (default True) + --mamba-prompt-tail-checkpoint; the scheduler's prompt-tail stop is gated on mamba_prompt_tail_checkpoint while mamba_partial_cache_hit (and ckpt_block_size) stay unchanged. Replaces the harness C48_P_NO_TAIL_SPLIT=1 hook, which cleared mamba_partial_cache_hit",
+    "WARM as in vllm-project/vllm#63730: KernelConfig.enable_rocm_aiter_gemm_warmup runs one _dummy_run sweep over AITER getPaddedM buckets + multiples of 8 to 512 + max_m-1 inside kernel_warmup, before cudagraph capture. Replaces the harness C48_P_GEMM_WARMUP=1 hook (two sweeps after compile_or_warm_up_model)",
+    "scheduler.py/cache.py hunks are hand-ported to 81198 context; arg_utils.py, kernel.py and kernel_warmup.py apply the PR diffs cleanly"
+  ],
+  "cases": [
+    "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS"
+  ],
+  "files": [
+    {
+      "relative_path": "v1/core/sched/scheduler.py",
+      "mount_source": "scheduler.py",
+      "base_sha256": "8bf1909e14569e1cb2bc5884a8e98e5dbc09e6b71bb095035898eb3033828630",
+      "patched_sha256": "d837782f13a817560d9fefc9761782169e368ddf3d0202a019c7f89631f81f65"
+    },
+    {
+      "relative_path": "config/cache.py",
+      "mount_source": "cache.py",
+      "base_sha256": "3b82b219cda967d4a3def0c01a14b04b3fa9e8ffa918dd25d85537f909ad1b7f",
+      "patched_sha256": "98be7b321955acc1b58ad3add88d96f5e8fe68ccae584ee08f5f577153db7a0a"
+    },
+    {
+      "relative_path": "engine/arg_utils.py",
+      "mount_source": "arg_utils.py",
+      "base_sha256": "7224cbde233e8e145498ef2f2fdbadf3b234e6712774616a495361a593c67877",
+      "patched_sha256": "b4df8e27ab7a66dbb7e776ae9a429f80dfef8c237d5740a74e1d907cbd990025"
+    },
+    {
+      "relative_path": "config/kernel.py",
+      "mount_source": "kernel.py",
+      "base_sha256": "dedb58b73dd702834d16f9183845ab40098c1f43a13ec70e9063d745e54a12fe",
+      "patched_sha256": "085386a15098069ed14ac427505c5144a5cd7ddba7f70b6716f17369184d6765"
+    },
+    {
+      "relative_path": "model_executor/warmup/kernel_warmup.py",
+      "mount_source": "kernel_warmup.py",
+      "base_sha256": "c99b79e748aa01e9b8d84caaab71cfd53955c0510dda1bacaaa75fcd22ea1cfc",
+      "patched_sha256": "7d2fb9b1e46828fb90ec526d2c242486fcc582e01789112d74d7cafa49ed96bb"
+    }
+  ]
+}

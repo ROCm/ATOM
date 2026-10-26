@@ -1,4 +1,4 @@
-"""Three bounded P-only captures inside the unchanged full C48 replay."""
+"""Three bounded single-role (P or D) captures inside the unchanged full C48 replay."""
 
 import argparse
 import json
@@ -9,11 +9,11 @@ from pathlib import Path
 from pd_agentic_profile import PHASE_START, Capture
 
 
-class PrefillCapture(Capture):
+class RoleCapture(Capture):
     def __init__(self, args):
-        args.decode = ""  # Base methods operate on the overridden endpoint map.
         super().__init__(args)
-        self.endpoints = {"prefill": args.prefill}
+        # Base methods operate on the overridden endpoint map.
+        self.endpoints = {role: url for role, url in self.endpoints.items() if url}
 
     def run(self, command):
         self.event("workload_start", argv=command)
@@ -87,7 +87,7 @@ class PrefillCapture(Capture):
             "complete": not errors
             and rc == 0
             and len(windows) == self.args.ranks * len(self.args.offsets),
-            "note": "P-only profiler windows and export perturb latency; use the unprofiled control for performance.",
+            "note": "Single-role profiler windows and export perturb latency; use the unprofiled control for performance.",
         }
         (self.args.output / "result.json").write_text(
             json.dumps(result, indent=2) + "\n"
@@ -103,7 +103,9 @@ class PrefillCapture(Capture):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prefill", required=True)
+    role = parser.add_mutually_exclusive_group(required=True)
+    role.add_argument("--prefill")
+    role.add_argument("--decode")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--traces", type=Path, required=True)
     parser.add_argument("--timeline", type=Path, required=True)
@@ -117,12 +119,12 @@ def main():
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command or not 0 < args.seconds <= 20 or args.ranks != 8:
-        parser.error("Require the full workload, <=20s captures and eight P ranks")
+        parser.error("Require the full workload, <=20s captures and eight ranks")
     if args.offsets != sorted(set(args.offsets)) or not all(
         60 <= x <= 3300 for x in args.offsets
     ):
         parser.error("Offsets must be unique, ordered and within the full send window")
-    raise SystemExit(PrefillCapture(args).run(command))
+    raise SystemExit(RoleCapture(args).run(command))
 
 
 if __name__ == "__main__":

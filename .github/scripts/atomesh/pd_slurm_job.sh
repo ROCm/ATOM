@@ -69,6 +69,8 @@ if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
     || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
+  # C48 accuracy cases skip the hour-long agentic replay.
+  [[ "${ATOMESH_ENV_ATOMESH_C48_EVAL_ONLY:-0}" != "1" ]] || EXECUTION_PHASES=(eval)
 fi
 if [[ "${ATOMESH_ENV_ATOMESH_AGENTIC_TORCH_PROFILE:-0}" == "1" ]]; then
   EXECUTION_PHASES=(benchmark)
@@ -331,7 +333,7 @@ EOF
   echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
 
   bounded_docker_rm "${container}"
-  if [[ "${execution_phase}" != "eval" ]]; then
+  if [[ "${execution_phase}" == "${EXECUTION_PHASES[0]}" ]]; then
     if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
       {
         date -u
@@ -846,7 +848,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         docker kill "${container}" >/dev/null 2>&1 || true
         docker rm -f "${container}" >/dev/null 2>&1 || true
       fi
-      if [[ "${execution_phase}" != "eval" ]]; then
+      if [[ "${execution_phase}" == "'"${EXECUTION_PHASES[0]}"'" ]]; then
         docker pull "'"${DOCKER_IMAGE}"'"
       fi
       mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"

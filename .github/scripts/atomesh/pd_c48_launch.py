@@ -36,8 +36,8 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
             connector["kv_connector_extra_config"]["lmcache.mp.port"] = lmcache_port
     args.update(host="0.0.0.0", port=port, **{"worker-cls": "pd_c48_worker.ManifestWorker"})
     if "profiler-config" in args:
-        if not trace_dir or role != "prefill":
-            raise ValueError("C48 profiler requires an explicit Prefill trace directory")
+        if not trace_dir:
+            raise ValueError("C48 profiler requires an explicit trace directory")
         args["profiler-config"]["torch_profiler_dir"] = trace_dir
     argv = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", model]
     for key, value in args.items():
@@ -56,7 +56,8 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
     env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
     env["C48_DIAG_ROLE"] = role
     env["C48_DIAG_PTPC"] = str(int("quantization-config" in args))
-    env["C48_DIAG_AL"] = str(args["speculative-config"]["synthetic_acceptance_length"])
+    # 0 marks a standard-rejection (accuracy) case.
+    env["C48_DIAG_AL"] = str(args["speculative-config"].get("synthetic_acceptance_length", 0))
     env["C48_DIAG_DRAFT_TOKENS"] = str(args["speculative-config"]["num_speculative_tokens"])
     return argv, env
 

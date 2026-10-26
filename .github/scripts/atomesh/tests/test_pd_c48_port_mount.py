@@ -34,8 +34,24 @@ CPUREF = {
     **{f"V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-SW-C{c}": "cpu-lru-refresh-v3"
        for c in (1, 4, 16, 32, 48, 56, 72, 88)},
     **{f"V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-{t}": "cpu-lru-refresh-v3"
-       for t in ("C4D8", "C16", "C32", "C56", "C72", "C88", "C56-CPU26", "C72-CPU26", "C88-CPU26")},
+       for t in ("C4D8", "C16", "C32", "C56", "C72", "C88", "C56-CPU26", "C72-CPU26", "C88-CPU26",
+                 "C72-MLA96", "C72-MLA96-DPROF")},
+    "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS": "cpu-lru-refresh-v3",
+    "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-MLA96-GSM8K": "cpu-lru-refresh-v3",
 }
+VLLM = "/usr/local/lib/python3.12/dist-packages/vllm/"
+MLA96 = {"mla-dcp96/rocm_aiter_mla.py": "v1/attention/backends/mla/rocm_aiter_mla.py"}
+UPS = {
+    "ups-pnt-warm/scheduler.py": "v1/core/sched/scheduler.py",
+    "ups-pnt-warm/cache.py": "config/cache.py",
+    "ups-pnt-warm/arg_utils.py": "engine/arg_utils.py",
+    "ups-pnt-warm/kernel.py": "config/kernel.py",
+    "ups-pnt-warm/kernel_warmup.py": "model_executor/warmup/kernel_warmup.py",
+}
+
+
+def extra_overlays(case):
+    return {**(MLA96 if "-MLA96" in case else {}), **(UPS if case.endswith("-UPS") else {})}
 FP8ATTN = "/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py,readonly"
 LDFP4_CASE = "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4"
 LDFP4 = "/vllm/models/kimi_k3/amd/linear.py,readonly"
@@ -72,7 +88,8 @@ class PortMountTest(unittest.TestCase):
             self.assertIn(f"/c48-model-gap/{fix_dir}/manager.py,", cpuref[3])
             fp8 = "-FP8ATTN" in case
             ldfp4 = "-PQ-LDFP4" in case
-            self.assertEqual(len(cpuref), 4 + fp8 + ldfp4)
+            extra = extra_overlays(case)
+            self.assertEqual(len(cpuref), 4 + fp8 + ldfp4 + len(extra))
             if fp8:
                 self.assertTrue(cpuref[4].endswith(FP8ATTN))
                 fp8_dir = "mla-prefill-fp8-fusedq" if "-FQ3" in case else "mla-prefill-fp8"
@@ -80,6 +97,21 @@ class PortMountTest(unittest.TestCase):
             if ldfp4:
                 self.assertTrue(cpuref[5].endswith(LDFP4))
                 self.assertIn("/c48-model-gap/latent-down-mxfp4/", cpuref[5])
+            for arg, (source, target) in zip(cpuref[6:], extra.items()):
+                self.assertIn(f"/c48-model-gap/{source},", arg)
+                self.assertTrue(arg.endswith(f"target={VLLM}{target},readonly"), arg)
+
+    def test_extra_overlays_reject_changed_file(self):
+        for case in ("V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72-MLA96",
+                     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS"):
+            for source in extra_overlays(case):
+                with tempfile.TemporaryDirectory() as temp:
+                    gap = Path(temp) / ".github/benchmark/c48-model-gap"
+                    shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
+                    with open(gap / source, "a") as f:
+                        f.write("\n")
+                    self.assertEqual(mounts("V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT", temp)[0], 0)
+                    self.assertEqual(mounts(case, temp)[0], 2)
 
     def test_ldfp4_rejects_changed_overlay(self):
         with tempfile.TemporaryDirectory() as temp:

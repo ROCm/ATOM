@@ -37,6 +37,8 @@ def create_scheduler(*args, **kwargs):
         "manager_shared_prefix_checkpoint": manager.mamba_shared_prefix_checkpoint,
         "partial_hash_hits": coordinator.enable_partial_hash_hits,
         "mamba_partial_cache_hit": scheduler.mamba_partial_cache_hit,
+        # Present only with the upstream-form scheduler overlay.
+        "mamba_prompt_tail_checkpoint": getattr(scheduler, "mamba_prompt_tail_checkpoint", None),
         "scheduler_block_size": scheduler.block_size,
         "max_num_scheduled_tokens": scheduler.max_num_scheduled_tokens,
         "max_num_batched_tokens": config.scheduler_config.max_num_batched_tokens,

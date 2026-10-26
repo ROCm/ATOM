@@ -38,7 +38,7 @@ c48_append_port_mount() {
     V-QD-CPUREF2|V-QD-CPUREF2-LPT3072|V-QD-CPUREF2-LPT6144|V-QD-CPUREF2-FP8ATTN|V-QD-CPUREF2-FP8ATTN-PROFILE|V-QD-CPUREF2-FP8ATTN-FQ|V-QD-CPUREF2-FP8ATTN-FQ2|V-QD-CPUREF2-FP8ATTN-FQ2-PQ|V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4|V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4-INPAD|V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4-INPAD-WARM|V-QD-CPUREF2-FP8ATTN-FQ3|V-QD-CPUREF2-FP8ATTN-FQ2-WARM|V-QD-CPUREF2-FP8ATTN-FQ2-WARM1|V-QD-CPUREF2-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM)
       c48_fix_dir=cpu-lru-refresh-v2
       c48_fix_sha=76e038dc1bcfdf0fbe95e6a87844e8409ac45dd7f85f115267bc85d6e84f739c ;;
-    V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-PNT|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-SW-C*|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C*)
+    V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-PNT|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-SW-C*|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-*)
       c48_fix_dir=cpu-lru-refresh-v3
       c48_fix_sha=18da014b1eed073f6b227b92fc0163baa1e7a6a5fbcbcb31364a4696fa1cbd3f ;;
     *) return 0 ;;
@@ -70,4 +70,27 @@ c48_append_port_mount() {
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
   [[ "${c48_fix_digest%% *}" == "aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+  # "<overlay file> <vllm-relative target> <sha256>", see each overlay's manifest.json.
+  local -a c48_extra=()
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-MLA96 || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-MLA96-* ]]; then
+    c48_extra+=("mla-dcp96/rocm_aiter_mla.py v1/attention/backends/mla/rocm_aiter_mla.py e680861fe486b9f3adb565720cfd0d7ca1c4be534570e92dedf3ecda326843cf")
+  fi
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-UPS || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-UPS-* ]]; then
+    c48_extra+=(
+      "ups-pnt-warm/scheduler.py v1/core/sched/scheduler.py d837782f13a817560d9fefc9761782169e368ddf3d0202a019c7f89631f81f65"
+      "ups-pnt-warm/cache.py config/cache.py 98be7b321955acc1b58ad3add88d96f5e8fe68ccae584ee08f5f577153db7a0a"
+      "ups-pnt-warm/arg_utils.py engine/arg_utils.py b4df8e27ab7a66dbb7e776ae9a429f80dfef8c237d5740a74e1d907cbd990025"
+      "ups-pnt-warm/kernel.py config/kernel.py 085386a15098069ed14ac427505c5144a5cd7ddba7f70b6716f17369184d6765"
+      "ups-pnt-warm/kernel_warmup.py model_executor/warmup/kernel_warmup.py 7d2fb9b1e46828fb90ec526d2c242486fcc582e01789112d74d7cafa49ed96bb"
+    )
+  fi
+  local c48_entry c48_rel c48_sha
+  for c48_entry in "${c48_extra[@]}"; do
+    read -r c48_fix_source c48_rel c48_sha <<< "${c48_entry}"
+    c48_fix_source="$1/.github/benchmark/c48-model-gap/${c48_fix_source}"
+    [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
+    c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
+    [[ "${c48_fix_digest%% *}" == "${c48_sha}" ]] || return 2
+    docker_args+=(--mount "type=bind,source=${c48_fix_source},target=/usr/local/lib/python3.12/dist-packages/vllm/${c48_rel},readonly")
+  done
 }

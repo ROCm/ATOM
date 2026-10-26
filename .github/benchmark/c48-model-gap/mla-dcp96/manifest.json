@@ -1,0 +1,20 @@
+{
+  "name": "rocm_aiter_mla_dcp_verify_96_heads",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "_asm_dcp_verify_heads keeps 96 DCP-gathered heads (no pad to 128) when the KV cache is fp8 and 1+num_speculative_tokens <= 6. AITER asm_mla.cu (v0.1.24.post1) dispatches gfx950 fp8 persistent gqa 96 at qlen<=6 to the same mla_a8w8_qh32_qseqlen4_gqaratio32[_lse]_cprr_ps kernel as gqa 128, so the pad only adds work: DSpark4 verify packs 96x5=480 rows (4 tiles of 128) instead of 128x5=640 (5 tiles)",
+    "Local gfx950 check (aiter 0.1.21.post2, same dispatch): 96-head output/LSE bit-identical to the first 96 heads of the padded 128-head run; both 1.9% rel. L2 vs an fp32 round-robin reference (mla96/cprr96_check.py)",
+    "DSpark draft layers are non-causal (PLAIN route) and never use cprr; only their metadata sizing follows the 96-head count"
+  ],
+  "cases": [
+    "*-MLA96*"
+  ],
+  "files": [
+    {
+      "relative_path": "v1/attention/backends/mla/rocm_aiter_mla.py",
+      "mount_source": "rocm_aiter_mla.py",
+      "base_sha256": "b4dab21d55803d6ef42e0f7eccaee04975d5e55dd876fb61168a60dbd46c3784",
+      "patched_sha256": "e680861fe486b9f3adb565720cfd0d7ca1c4be534570e92dedf3ecda326843cf"
+    }
+  ]
+}

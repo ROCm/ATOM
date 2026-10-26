@@ -73,12 +73,17 @@ run_aiperf_agentic_benchmark() {
   git -C "${AIPERF_DIR}" rev-parse HEAD > "${out_dir}/aiperf-commit.txt"
   "${AIPERF_VENV}/bin/python" -m pip freeze > "${out_dir}/client-packages.txt"
   snapshot_eval_metrics "${out_dir}" before
-  local -a profile_wrapper=()
+  local -a profile_wrapper=() profile_target=()
   if [[ "${ATOMESH_C48_PREFILL_PROFILE:-0}" == "1" ]]; then
+    profile_target=(prefill "http://${prefill_ips[0]}:${prefill_ports[0]}")
+  elif [[ "${ATOMESH_C48_DECODE_PROFILE:-0}" == "1" ]]; then
+    profile_target=(decode "http://${decode_ips[0]}:${decode_ports[0]}")
+  fi
+  if [[ ${#profile_target[@]} -eq 2 ]]; then
     profile_wrapper=("${AIPERF_VENV}/bin/python" "${ATOMESH_SCRIPT_DIR}/pd_c48_profile.py"
-      --prefill "http://${prefill_ips[0]}:${prefill_ports[0]}"
-      --output "${out_dir}/prefill-profile" --traces "${RUN_DIR}/traces"
-      --timeline "${RUNTIME_LOG_DIR}/prefill-timeline"
+      "--${profile_target[0]}" "${profile_target[1]}"
+      --output "${out_dir}/${profile_target[0]}-profile" --traces "${RUN_DIR}/traces"
+      --timeline "${RUNTIME_LOG_DIR}/${profile_target[0]}-timeline"
       --aiperf-log "${out_dir}/logs/aiperf.log"
       --seconds 10 --offsets 600 1500 3000 --ranks 8
       --phase-timeout 7200 --finish-timeout 5400 --)

@@ -37,7 +37,12 @@ def inspect_model(model):
 def inspect_speculative(spec, expected_drafts, expected_al):
     rates = spec.synthetic_acceptance_rates
     resolved_al = 1 + sum(rates) if rates is not None else None
-    if (spec.rejection_sample_method != "synthetic" or rates is None
+    if expected_al == 0:
+        if (spec.rejection_sample_method != "standard" or rates is not None
+                or spec.num_speculative_tokens != expected_drafts):
+            raise ValueError(f"C48 standard rejection mismatch: method={spec.rejection_sample_method}, "
+                             f"drafts={spec.num_speculative_tokens}, rates={rates}")
+    elif (spec.rejection_sample_method != "synthetic" or rates is None
             or spec.num_speculative_tokens != expected_drafts
             or len(rates) != expected_drafts
             or not math.isclose(resolved_al, expected_al, rel_tol=0, abs_tol=1e-9)):
