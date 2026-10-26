@@ -2887,17 +2887,6 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
-            if (seq.kv_transfer_params or {}).get("chunked_transfer"):
-                # All TP/PP writers have drained. Discard the failed receive
-                # allocation and remote generation state before local prefill.
-                logger.info(
-                    "Chunked P/D receive failed for %s; falling back to local prefill",
-                    seq.id,
-                )
-                self.block_manager.deallocate(seq)
-                seq.num_cached_tokens = 0
-                for key in ("first_token_id", "draft_token_ids", "chunked_transfer"):
-                    seq.kv_transfer_params.pop(key, None)
         if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:
             # The state never arrived, so the boundary is not this request's
             # history. Disown it exactly as `BlockManager.allocate` does at
@@ -2975,13 +2964,12 @@ class Scheduler:
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
 
-        Legacy decode does not prefill a P/D request itself: it is sized and
-        compiled for decode, and the request's block table is still the one
-        the transfer was writing, which re-admission cannot allocate over. The
-        connector reports a failure only once no producer write can still land
-        in those blocks (``ATOM_PD_FAILED_WRITE_HOLD_S``), so they are freed at
-        once. Chunked receives fall back to local prefill after the same write
-        hold; offload load failures (``failed_loading``) also resume local prefill.
+        Decode is sized and compiled for decode, so a failed P/D transfer must
+        not turn into a potentially unbounded local prefill. This also applies
+        to chunked admission timeouts. The connector reports failure only after
+        all expected writers finish and the failed-write safety hold elapses
+        (``ATOM_PD_FAILED_WRITE_HOLD_S``), so the reservation can now be freed.
+        Offload load failures (``failed_loading``) still resume local prefill.
         """
         seq = next(
             (
@@ -2998,11 +2986,6 @@ class Scheduler:
                 "nothing to abort",
                 req_id,
             )
-            return
-        if (seq.kv_transfer_params or {}).get("chunked_transfer"):
-            # Admission ordering avoids capacity cycles, but transfers can still
-            # fail. Preserve local recovery after the connector's write hold.
-            self.failed_recving_kv_req_ids.append(seq.id)
             return
         logger.error("KV receive failed for request %s; aborting it", req_id)
         self.waiting.remove(seq)

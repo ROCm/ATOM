@@ -207,7 +207,9 @@ jobs:
         env:
           # Build the reviewed source in a separate setup container. Use the
           # existing release profile for both benchmark and eval services.
-          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
+          # Mounted Python also needs the matching router protocol; accuracy
+          # cases must not silently use the image's older Mesh binary.
+          ATOMESH_BUILD_MESH: ${{ (inputs.atom_source == 'mounted' || matrix.benchmark.kind == 'aiperf_agentic') && 'true' || 'false' }}
           ATOMESH_MESH_BUILD_PROFILE: release
           ATOMESH_ATOM_SOURCE: ${{ inputs.atom_source }}
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}

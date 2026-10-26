@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import re
 import threading
@@ -461,7 +462,14 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "enable_chunked_transfer", False
         )
         self._chunked_receiving: dict[ReqId, Sequence] = {}
-        self._chunked_waiting: dict[ReqId, Sequence] = {}
+        self._chunked_admission_timeout_s = float(
+            kv_transfer_config.get("chunked_admission_timeout_s", 300)
+        )
+        if not math.isfinite(self._chunked_admission_timeout_s) or (
+            self._chunked_admission_timeout_s <= 0
+        ):
+            raise ValueError("chunked_admission_timeout_s must be finite and positive")
+        self._chunked_waiting: dict[ReqId, tuple[Sequence, float]] = {}
         self._chunked_ready: set[ReqId] = set()
         self._pending_chunked_admissions: dict[ReqId, TransferId] = {}
         self.host_ip = get_ip()
@@ -520,6 +528,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         return 0, False
 
     def build_connector_meta(self) -> ConnectorMetadata:
+        # Sweep even behind a capacity-blocked head, and on idle PP ticks.
+        # Expiry queues the existing cancellation protocol; it never frees D's
+        # advertised pages or an admitted producer's source allocation here.
+        now = time.monotonic()
+        for seq, deadline in list(self._chunked_waiting.values()):
+            self._expire_chunked_admission(seq, deadline, now)
         meta = ConnectorMetadata()
         meta.request_id_to_transfer_id = self.request_id_to_transfer_id
         meta.chunked_admissions = self._pending_chunked_admissions
@@ -771,10 +785,34 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
         if str(seq.id) in self._awaiting_send:
             return True  # Already admitted; e.g. resuming a MultiConnector load.
+        if seq.status == SequenceStatus.ABORTED:
+            return False
+        now = time.monotonic()
         if seq.id not in self._chunked_waiting:
-            self._chunked_waiting[seq.id] = seq
+            self._chunked_waiting[seq.id] = (
+                seq,
+                now + self._chunked_admission_timeout_s,
+            )
             self._pending_chunked_admissions[seq.id] = params["transfer_id"]
+        _, deadline = self._chunked_waiting[seq.id]
+        if self._expire_chunked_admission(seq, deadline, now):
+            return False
         return seq.id in self._chunked_ready
+
+    def _expire_chunked_admission(
+        self, seq: Sequence, deadline: float, now: float
+    ) -> bool:
+        if now < deadline:
+            return False
+        logger.warning(
+            "Chunked P/D admission timed out for request %s before source allocation",
+            seq.id,
+        )
+        seq.status = SequenceStatus.ABORTED
+        seq.leave_reason = "aborted"
+        self.request_finished(seq)
+        self._pending_chunked_admissions.pop(seq.id, None)
+        return True
 
     def source_blocks_released(self, seq: Sequence) -> None:
         """No block-lifetime state remains after the send claim is retired."""
@@ -785,8 +823,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 output.finished_sending.add(completion.operation_id)
                 output.connector_completions.discard(completion)
             elif completion.channel == "pd_admission_ready":
-                seq = self._chunked_waiting.get(completion.operation_id)
-                if seq is not None:
+                pending = self._chunked_waiting.get(completion.operation_id)
+                if pending is not None:
+                    seq, _ = pending
                     if completion.succeeded:
                         self._chunked_ready.add(seq.id)
                     else:
@@ -2685,7 +2724,7 @@ class MooncakeConnector(KVConnectorBase):
     ) -> None:
         """Send an already-claimed source; only the dispatcher admits readers."""
         try:
-            # D's reservation may wait indefinitely for P capacity. Start the
+            # The admission deadline covers waiting for P capacity. Start the
             # write window only once a send worker actually starts this reader.
             request_data["_deadline"] = time.monotonic() + PD_TRANSFER_DEADLINE_S
             if request_data.get("write_ack"):

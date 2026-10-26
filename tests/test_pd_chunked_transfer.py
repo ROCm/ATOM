@@ -441,7 +441,9 @@ def test_tp_failure_or_metadata_disagreement_discards_partial_handoff(bad_metada
     assert not agg._received_handoffs
 
 
-def scheduler_connector(monkeypatch, is_producer, pp_size=1, dcp_size=1):
+def scheduler_connector(
+    monkeypatch, is_producer, pp_size=1, dcp_size=1, admission_timeout_s=300
+):
     monkeypatch.setattr(mc, "get_ip", lambda: "127.0.0.1")
     monkeypatch.setattr(mc, "get_open_port", lambda: 6400)
     return mc.MooncakeConnectorScheduler(
@@ -449,6 +451,7 @@ def scheduler_connector(monkeypatch, is_producer, pp_size=1, dcp_size=1):
             kv_transfer_config={
                 "kv_role": "kv_producer" if is_producer else "kv_consumer",
                 "enable_chunked_transfer": True,
+                "chunked_admission_timeout_s": admission_timeout_s,
             },
             tensor_parallel_size=1,
             pipeline_parallel_size=pp_size,
@@ -1550,8 +1553,9 @@ def test_capacity_wait_does_not_expire_ready_or_queued_requests(
             ),
         )
     p._update_from_kv_xfer_finished(worker.get_finished())
+    # Beyond the orphan lookup timeout, but within the admission deadline.
     now = mc.time.monotonic()
-    monkeypatch.setattr(mc.time, "monotonic", lambda: now + 1000)
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now + 120)
     for _ in range(2):
         batch, scheduled = p.schedule()
         assert not scheduled and not batch.connector_meta_output.has_work()
@@ -1572,7 +1576,7 @@ def test_capacity_wait_does_not_expire_ready_or_queued_requests(
     worker._ack_write_request.assert_called_once()
     assert (
         worker._ack_write_request.call_args.args[0]["_deadline"]
-        == now + 1000 + mc.PD_TRANSFER_DEADLINE_S
+        == now + 120 + mc.PD_TRANSFER_DEADLINE_S
     )
     assert len(worker._pending_chunked_requests) == 2
 
@@ -1640,12 +1644,12 @@ def test_reusing_live_transfer_id_cannot_cancel_original(monkeypatch, seq_factor
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
-def test_d_transfer_failure_waits_for_write_hold_before_local_recovery(
+def test_d_transfer_failure_waits_for_write_hold_before_abort(
     monkeypatch, seq_factory, cancelled
 ):
     from conftest import MockConfig
 
-    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.model_engine.scheduler import Scheduler
 
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "30")
     now = [mc.time.monotonic()]
@@ -1676,38 +1680,25 @@ def test_d_transfer_failure_waits_for_write_hold_before_local_recovery(
 
     now[0] += 2
     d._update_from_kv_xfer_finished(worker.get_finished())
-    if cancelled:
-        # A cancelled request drains safely without starting local prefill.
-        assert seq.leave_reason == "aborted"
-        assert not seq.block_table and d.block_manager.kv.num_free == 3
-    else:
-        assert seq.block_table
-        deallocate.assert_not_called()
-        # Any partial handoff must not influence the local generation.
-        seq.kv_transfer_params.update(first_token_id=42, draft_token_ids=[43])
-        batch, scheduled = d.schedule()
-        assert list(scheduled) == [seq.id]
-        assert batch.total_seqs_num_prefill == 1 and batch.total_seqs_num_decode == 0
-        assert seq.num_cached_tokens == 0
-        for key in ("chunked_transfer", "first_token_id", "draft_token_ids"):
-            assert key not in seq.kv_transfer_params
-        deallocate.assert_called_once_with(seq)
-        d.postprocess(
-            list(scheduled.values()),
-            ScheduledBatchOutput([seq.id], [(44,)], None, None, None),
-            batch=batch,
-        )
-        batch, scheduled = d.schedule()
-        assert batch.total_seqs_num_decode == 1
-        assert d.postprocess(
-            list(scheduled.values()),
-            ScheduledBatchOutput([seq.id], [(45,)], None, None, None),
-            batch=batch,
-        ) == [seq]
-        assert list(seq.output_tokens) == [44, 45]
-        assert not seq.block_table and d.block_manager.kv.num_free == 3
+    assert seq.leave_reason == "aborted"
+    assert not seq.block_table and d.block_manager.kv.num_free == 3
+    deallocate.assert_called_once_with(seq)
     assert not d.waiting and not d.running and not d.deferred_free_blocks
-    assert not d.failed_recving_kv_req_ids
+    batch, scheduled = d.schedule()
+    assert not scheduled and batch.total_seqs_num_prefill == 0
+    assert not worker._pending_recv and not worker._held_failures
+    assert worker.transfer_engine.writes.empty()
+
+    # A later request can reserve the reclaimed pool and decode a new handoff.
+    following = pd_sequence(seq_factory, "after-failure", producer=False)
+    d.add(following)
+    batch, scheduled = d.schedule()
+    assert not scheduled and len(following.block_table) == 3
+    following.kv_transfer_params["first_token_id"] = 44
+    d._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={following.id}))
+    batch, scheduled = d.schedule()
+    assert list(scheduled) == [following.id]
+    assert batch.total_seqs_num_prefill == 0 and batch.total_seqs_num_decode == 1
 
 
 @pytest.mark.parametrize("producer_side", [False, True])
@@ -1874,34 +1865,6 @@ def test_admitted_source_can_resume_offload_load_without_another_ready(
     assert not connector.build_connector_meta().has_work()
 
 
-@pytest.mark.parametrize("chunked", [False, True])
-def test_failed_receive_cleanup_is_limited_to_chunked_requests(chunked, seq_factory):
-    from conftest import MockConfig
-
-    from atom.model_engine.scheduler import Scheduler
-
-    sched = Scheduler(MockConfig(num_kvcache_blocks=8))
-    seq = seq_factory(
-        list(range(8)),
-        kv_transfer_params={
-            "chunked_transfer": chunked,
-            "first_token_id": 42,
-            "draft_token_ids": [43],
-        },
-    )
-    assert sched.block_manager.allocate(seq)
-    blocks = list(seq.block_table)
-    sched.failed_recving_kv_req_ids.append(seq.id)
-    assert sched._consume_failed_remote_kv(seq)
-    if chunked:
-        assert not seq.block_table
-        assert not seq.kv_transfer_params
-    else:
-        assert list(seq.block_table) == blocks
-        assert seq.kv_transfer_params["first_token_id"] == 42
-        assert seq.kv_transfer_params["draft_token_ids"] == [43]
-
-
 @pytest.mark.parametrize("received_metadata", [False, True])
 def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
     monkeypatch, seq_factory, received_metadata
@@ -1941,3 +1904,185 @@ def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
     assert not p.kv_connector._reqs_need_save
     assert not worker._chunked_admissions
     assert not worker._chunked_local_ids and not worker._pending_chunked_requests
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_chunked_admission_timeout_must_be_finite_and_positive(monkeypatch, timeout):
+    with pytest.raises(ValueError, match="finite and positive"):
+        scheduler_connector(monkeypatch, True, admission_timeout_s=timeout)
+
+
+@pytest.mark.parametrize("pp_size", [1, 3])
+@pytest.mark.parametrize("idle_sweep", [False, True])
+def test_admission_timeout_without_decode_retires_all_stages(
+    monkeypatch, seq_factory, pp_size, idle_sweep
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.sequence import SequenceStatus
+
+    now = [100.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    p = Scheduler(MockConfig(pipeline_parallel_size=pp_size))
+    p.kv_connector = scheduler_connector(
+        monkeypatch, True, pp_size, admission_timeout_s=10
+    )
+    seq = pd_sequence(seq_factory)
+    p.add(seq)
+    registration = p.kv_connector.build_connector_meta()
+    workers = [idle_producer(rank, pp_size)[0] for rank in range(pp_size)]
+    for worker in workers:
+        worker.start_load_kv(registration)
+    now[0] = 109.0
+    assert not p.kv_connector.admission_ready(seq)
+    assert not p.kv_connector.build_connector_meta().has_work()
+    now[0] = 110.0
+    if not idle_sweep:
+        assert not p.kv_connector.admission_ready(seq)
+    cancellation = p.kv_connector.build_connector_meta()
+    assert seq.status == SequenceStatus.ABORTED
+    assert cancellation.reqs_to_save[seq.id].prefill_aborted
+    assert not cancellation.chunked_admissions
+    assert not seq.block_table and not p.deferred_free_blocks
+    assert not p.kv_connector.admission_ready(seq)
+    pp = PPKVAggregator(pp_size)
+    for rank, worker in enumerate(workers):
+        worker.start_load_kv(cancellation)
+        # A delayed ready notification and delayed D write request cannot
+        # allocate or write a source after the scheduler's deadline.
+        p._update_from_kv_xfer_finished(
+            pp.ingest(
+                rank,
+                KVConnectorOutput(
+                    connector_completions={
+                        ConnectorCompletion("pd_admission_ready", seq.id, True)
+                    }
+                ),
+            )
+        )
+        _, request, _, _ = idle_producer(rank, pp_size)
+        dispatch(worker, request)
+        worker.get_finished()
+        assert not worker._chunked_admissions and not worker._chunked_local_ids
+        assert not worker._chunked_prefills and not worker._pending_chunked_requests
+        assert worker.transfer_engine.writes.empty()
+    assert not p.kv_connector._chunked_waiting and not p.kv_connector._chunked_ready
+    _, scheduled = p.schedule()
+    assert not scheduled and not p.waiting and not seq.block_table
+    assert seq.leave_reason == "aborted"
+
+
+@pytest.mark.parametrize("pp_size", [1, 3])
+@pytest.mark.parametrize("cancel_decode", [False, True])
+def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
+    monkeypatch, seq_factory, pp_size, cancel_decode
+):
+    import msgpack
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "30")
+    now = [100.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    p = Scheduler(MockConfig(num_kvcache_blocks=3, pipeline_parallel_size=pp_size))
+    d = Scheduler(MockConfig(num_kvcache_blocks=3))
+    p.kv_connector = scheduler_connector(
+        monkeypatch, True, pp_size, admission_timeout_s=10
+    )
+    d.kv_connector = scheduler_connector(monkeypatch, False)
+    occupied = seq_factory(list(range(10)))
+    assert p.block_manager.allocate(occupied)
+    ps = [pd_sequence(seq_factory, f"wait-{i}") for i in range(3)]
+    ds = pd_sequence(seq_factory, "wait-0", False)
+    ds.kv_transfer_params["remote_pp_size"] = pp_size
+    p.extend(ps)
+    d.add(ds)
+    workers = [idle_producer(rank, pp_size)[0] for rank in range(pp_size)]
+    dw = decode_worker((ctypes.c_ubyte * 48)())
+    registration = p.kv_connector.build_connector_meta()
+    for rank, worker in enumerate(workers):
+        worker.start_load_kv(registration)
+        worker._notify_transfer_result.side_effect = lambda data, success, rank=rank: (
+            dw._record_write_done(
+                data["request_id"], rank, 0, data["write_nonce"], success=success
+            )
+        )
+    dw._send_on_socket.side_effect = lambda _addr, message: [
+        dispatch(worker, msgpack.loads(message[1])) for worker in workers
+    ]
+    batch, scheduled = d.schedule()
+    assert not scheduled and len(ds.block_table) == 3
+    dw.start_load_kv(batch.connector_meta_output)
+    post_write_requests(dw, monkeypatch)
+    pp = PPKVAggregator(pp_size)
+    for rank, worker in enumerate(workers):
+        p._update_from_kv_xfer_finished(pp.ingest(rank, worker.get_finished()))
+    assert p.kv_connector.admission_ready(ps[0])
+    now[0] = 109.0
+    # Repeated readiness does not refresh the original admission deadline.
+    p._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion("pd_admission_ready", ps[0].id, True)
+            }
+        )
+    )
+    _, scheduled = p.schedule()
+    assert not scheduled and all(not seq.block_table for seq in ps)
+    now[0] = 110.0
+    cancellation = p.kv_connector.build_connector_meta()
+    assert set(cancellation.reqs_to_save) == {seq.id for seq in ps}
+    if cancel_decode:
+        assert d.abort_request(ds.id)
+    for rank, worker in enumerate(workers):
+        worker.start_load_kv(cancellation)
+        worker.get_finished()
+        assert worker.transfer_engine.writes.empty()
+        d._update_from_kv_xfer_finished(dw.get_finished())
+        assert ds.block_table and d.block_manager.kv.num_free == 0
+    now[0] = 139.0
+    d._update_from_kv_xfer_finished(dw.get_finished())
+    assert ds.block_table and d.block_manager.kv.num_free == 0
+    now[0] = 140.0
+    d._update_from_kv_xfer_finished(dw.get_finished())
+    assert not ds.block_table and d.block_manager.kv.num_free == 3
+    assert ds.leave_reason == "aborted"
+    batch, scheduled = d.schedule()
+    assert not scheduled and batch.total_seqs_num_prefill == 0
+    assert not d.waiting and not d.running and not d.deferred_free_blocks
+    assert not dw._pending_recv and not dw._pending_recv_expected
+    assert not dw._held_failures
+    assert not p.kv_connector._chunked_waiting and not p.kv_connector._chunked_ready
+    _, scheduled = p.schedule()
+    assert not scheduled and not p.waiting and not p.deferred_free_blocks
+    assert occupied.block_table  # The timeout cannot free another source owner.
+
+
+def test_admission_deadline_stops_at_source_allocation(monkeypatch, seq_factory):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    now = [100.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    p = Scheduler(MockConfig(max_num_batched_tokens=4))
+    p.kv_connector = scheduler_connector(monkeypatch, True, admission_timeout_s=10)
+    seq = pd_sequence(seq_factory)
+    p.add(seq)
+    worker, request, _, _ = idle_producer()
+    worker.start_load_kv(p.kv_connector.build_connector_meta())
+    dispatch(worker, request)
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    batch, scheduled = p.schedule()
+    assert list(scheduled) == [seq.id]
+    worker.start_load_kv(batch.connector_meta_output)
+    assert not p.kv_connector._chunked_waiting
+    blocks = list(seq.block_table)
+    now[0] = 111.0
+    assert not p.kv_connector.build_connector_meta().has_work()
+    assert p.kv_connector.admission_ready(seq)
+    assert list(seq.block_table) == blocks
+    assert not seq.kv_transfer_params.get("prefill_aborted")
+    assert str(seq.id) in p.kv_connector._awaiting_send
