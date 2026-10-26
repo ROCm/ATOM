@@ -1991,6 +1991,13 @@ class Config:
     enable_log_stats: bool = True
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
+    # Forwards between engine-status lines, replacing the clock above when
+    # positive. For offline / MLPerf runs that compare one DP rank's lines
+    # against another's: wall-clock sampling lands on a different step number
+    # on each rank, a forward count lands on the same one (DP attention is
+    # lockstep, so every rank runs one forward per pass -- a dummy when it has
+    # nothing of its own).
+    throughput_log_interval_steps: int = 0
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
@@ -2128,6 +2135,40 @@ class Config:
         if len(sizes) == 1:
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
+
+    def _resolve_throughput_step_interval(self) -> None:
+        """Keep the step trigger to the loops that actually feed its counter.
+
+        `EngineCore.busy_loop` and the DP one call `bump_step`; the P/D and PP
+        engines override or replace those loops and never reach it. Left armed
+        there, `window_expired` would consult a counter that stays 0 and the
+        status line would never be emitted again -- the engine would announce
+        a logging mode and then go silent, which is worse than either working
+        or refusing. Fall back to the clock and say so.
+
+        Degrade rather than raise: this is an observability knob, and a stale
+        flag in a shared launch script must not stop a server from starting.
+        """
+        if self.throughput_log_interval_steps <= 0:
+            self.throughput_log_interval_steps = 0
+            return
+        if self.pipeline_parallel_size > 1:
+            reason = f"pipeline_parallel_size is {self.pipeline_parallel_size}"
+        elif self.enable_rapidserve:
+            reason = "RapidServe runs its own engine step"
+        elif (self.kv_transfer_config or {}).get("kv_role"):
+            reason = "a P/D engine replaces the busy loop that counts the forwards"
+        else:
+            return
+        logger.warning(
+            "throughput_log_interval_steps=%d ignored because %s; the "
+            "engine-status line stays on the %.1fs clock. Step-aligned "
+            "windows are supported on the base and DP engines only.",
+            self.throughput_log_interval_steps,
+            reason,
+            self.throughput_log_interval,
+        )
+        self.throughput_log_interval_steps = 0
 
     def __post_init__(self):
         self.moe_all2all_backend = (
@@ -2409,6 +2450,10 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        # After the block above: `kv_transfer_config` arrives as a JSON string
+        # from the CLI and only becomes a dict there, and the P/D clause below
+        # reads `kv_role` off it.
+        self._resolve_throughput_step_interval()
         if self.kv_transfer_config:
             # The offload namespace hashes the model's cache geometry. A worker
             # normalises `hf_config` while it builds the model (Kimi-K3 derives

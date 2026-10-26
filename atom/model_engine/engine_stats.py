@@ -44,6 +44,16 @@ class EngineStats:
           throughput: 0.3 tokens/s, Running: 6 reqs, Waiting: 0 reqs, GPU KV
           cache usage: 0.0%, Prefix cache hit rate: 0.0%
 
+      ...or every ``throughput_log_interval_steps`` forwards (count-based,
+      like the two sections above) when that is set. The clock is the wrong
+      trigger for comparing DP ranks to each other: they read it at the same
+      moment but are at different step numbers. ``bump_step`` is fed one
+      forward per busy-loop pass on every rank -- a dummy where a rank has no
+      work -- so a count closes the window on the same engine-wide step
+      everywhere, and the line carries that step::
+
+          Engine 000: step 40: Avg prompt throughput: ...
+
     A disabled section's ``update_*`` / ``maybe_log_*`` entry points are
     no-ops, so callers need not guard on the feature flag.
     """
@@ -67,6 +77,7 @@ class EngineStats:
         "_spec_interval_draft_tokens",
         "_spec_log_interval",
         "_throughput_last_log_time",
+        "_throughput_steps",
         "block_manager",
         "cache_enabled",
         "distribution",
@@ -78,6 +89,7 @@ class EngineStats:
         "spec_enabled",
         "throughput_enabled",
         "throughput_log_interval_s",
+        "throughput_log_interval_steps",
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_draft_tokens",
@@ -102,6 +114,7 @@ class EngineStats:
         cache_hit_rate_window: int = 1000,
         pool_pressure: Callable[[], dict[str, int]] | None = None,
         throughput_log_interval_s: float = 10.0,
+        throughput_log_interval_steps: int = 0,
     ):
         self.spec_enabled = use_spec
         self.cache_enabled = enable_prefix_caching
@@ -196,7 +209,11 @@ class EngineStats:
         # usually log to the same place. "" for the aggregated engine.
         self.label = label
         self.throughput_log_interval_s = throughput_log_interval_s
+        # 0 keeps the wall-clock trigger. A positive value closes the window on
+        # a count of executed forwards instead -- see `window_expired`.
+        self.throughput_log_interval_steps = max(0, int(throughput_log_interval_steps))
         self._throughput_last_log_time = time.monotonic()
+        self._throughput_steps = 0
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0
 
@@ -725,6 +742,24 @@ class EngineStats:
         self.num_prompt_tokens += num_prompt_tokens
         self.num_generation_tokens += num_generation_tokens
 
+    def bump_step(self) -> None:
+        """Count one executed forward.
+
+        Called once per forward from each busy loop, INCLUDING the dummy a
+        DP rank runs when it has nothing of its own. That inclusion is the
+        whole point: DP attention is lockstep, so "forwards executed" is the
+        one quantity every rank agrees on, and a window closed on it closes on
+        the same engine-wide step on every rank. A counter that skipped the
+        dummy would drift apart exactly when the ranks are unbalanced -- which
+        is when cross-rank comparison matters.
+
+        Note this counts FORWARDS, not decode steps. Under imbalance the ranks
+        genuinely execute different numbers of real decode steps; no counter
+        can align that, because it is not a property the ranks share.
+        """
+        if self.throughput_enabled:
+            self._throughput_steps += 1
+
     def window_expired(self, now: float) -> bool:
         """Whether the throughput window is due to close.
 
@@ -732,11 +767,17 @@ class EngineStats:
         queues or the KV pool. The busy loops call that on *every* pass, busy
         or idle, so this runs at loop frequency and says no all but once per
         interval; it takes the `now` the loop already read.
+
+        A positive `throughput_log_interval_steps` replaces the clock with
+        `bump_step`'s count. Offline and MLPerf runs compare one rank's line
+        against another's, and wall-clock sampling lands on a different step
+        number on each rank; a step count lands on the same one.
         """
-        return (
-            self.throughput_enabled
-            and now - self._throughput_last_log_time >= self.throughput_log_interval_s
-        )
+        if not self.throughput_enabled:
+            return False
+        if self.throughput_log_interval_steps:
+            return self._throughput_steps >= self.throughput_log_interval_steps
+        return now - self._throughput_last_log_time >= self.throughput_log_interval_s
 
     def maybe_log_throughput(
         self,
@@ -748,11 +789,12 @@ class EngineStats:
             return
         now = time.monotonic()
         elapsed = now - self._throughput_last_log_time
-        # `elapsed <= 0` is unreachable while the interval holds the positive
-        # value `__init__` validated, but the interval is a public attribute
-        # and the division is two lines below; one compare keeps that division
-        # safe whatever the attribute has been set to since.
-        if elapsed < self.throughput_log_interval_s or elapsed <= 0:
+        # Re-check the same predicate `window_expired` answered, so a caller
+        # that reached here without it still cannot divide by a window that
+        # has not opened. In step mode the clock says nothing about whether
+        # the window is due, so only the count is consulted -- but `elapsed`
+        # still has to be positive, since it is the divisor either way.
+        if not self.window_expired(now) or elapsed <= 0:
             return
         if (
             self.num_prompt_tokens == 0
@@ -761,6 +803,7 @@ class EngineStats:
             and num_waiting_reqs == 0
         ):
             self._throughput_last_log_time = now
+            self._throughput_steps = 0
             return
         prompt_throughput = self.num_prompt_tokens / elapsed
         generation_throughput = self.num_generation_tokens / elapsed
@@ -772,13 +815,24 @@ class EngineStats:
         prefix_cache_hit_rate = (
             self.recent_cache_hit_rate if self.cache_enabled else None
         )
+        # The step count leads the line in step mode: it is the field the
+        # reader lines two ranks up by, so it is no use buried at the end.
+        # Absent in time mode rather than always-on, because there it is a
+        # number nothing agrees on across ranks and inviting that comparison
+        # is the failure this whole option exists to avoid.
+        step_prefix = (
+            f"step {self._throughput_steps}: "
+            if self.throughput_log_interval_steps
+            else ""
+        )
         logger.info(
-            "%sEngine %03d: Avg prompt throughput: %.1f tokens/s, "
+            "%sEngine %03d: %sAvg prompt throughput: %.1f tokens/s, "
             "Avg generation throughput: %.1f tokens/s, Running: %d reqs, "
             "Waiting: %d reqs, GPU KV cache usage: %s, "
             "Prefix cache hit rate: %s",
             self.label,
             self.engine_index,
+            step_prefix,
             prompt_throughput,
             generation_throughput,
             num_running_reqs,
@@ -791,5 +845,6 @@ class EngineStats:
             ),
         )
         self._throughput_last_log_time = now
+        self._throughput_steps = 0
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0

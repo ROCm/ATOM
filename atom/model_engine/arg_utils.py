@@ -145,6 +145,7 @@ class EngineArgs:
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
+    throughput_log_interval_steps: int = 0
     cache_hit_rate_window: int = 1000
     enable_dynamic_chunking: bool = False
     # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
@@ -588,7 +589,19 @@ class EngineArgs:
             type=float,
             default=10.0,
             help="Seconds between engine-status lines (default: 10, matching "
-            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats, and "
+            "superseded by --throughput-log-interval-steps when that is set.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval-steps",
+            type=int,
+            default=0,
+            help="Forwards between engine-status lines, replacing the "
+            "--throughput-log-interval clock when > 0 (default: 0, use the "
+            "clock). For offline / MLPerf runs that compare one DP rank's "
+            "lines against another's: wall-clock sampling lands on a "
+            "different step number on each rank, a forward count lands on "
+            "the same one. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--cache-hit-rate-window",

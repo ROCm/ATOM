@@ -436,7 +436,14 @@ class EngineCore:
                 if self._is_idle_rl_weights_offloaded():
                     continue
                 if not self.scheduler.is_finished():
-                    self._process_engine_step()
+                    # Gated on the return, which is True only where a forward
+                    # really ran: `_process_engine_step_inner` answers False
+                    # for an empty schedule and for an empty batch, and this
+                    # loop has no dummy to run in their place. Counting the
+                    # call instead of the forward would make the interval mean
+                    # something different here than it does under DP.
+                    if self._process_engine_step():
+                        self.scheduler.engine_stats.bump_step()
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
         finally:
@@ -938,6 +945,14 @@ class DPEngineCoreProc(EngineCore):
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()
+                # AFTER the pair, so the dummy counts too. Exactly one forward
+                # ran on this rank on this pass, and DP attention is lockstep,
+                # so every rank reaches here with the same count -- which is
+                # what lets `--throughput-log-interval-steps` close its window
+                # on the same engine-wide step on all of them. Counting inside
+                # `_process_engine_step` instead would skip the idle rank and
+                # drift the ranks apart exactly when load is unbalanced.
+                self.scheduler.engine_stats.bump_step()
 
                 self.engines_running = global_has_unfinished
         finally:
