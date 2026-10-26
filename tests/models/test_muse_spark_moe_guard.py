@@ -5,7 +5,7 @@
 
 CPU-only. The MoE runs top-1 FusedMoE over ``tokens * top_k`` slot rows whose
 expert ids are preselected (``_slot_routing``). The Triton, DP attention, DP +
-EP all2all, mega and fake-EPLB paths cannot run them, and must fail at init with
+EP all2all, mega, fake-EPLB and context-parallel paths cannot run them, and must fail at init with
 an actionable message instead of misrouting or asserting in warmup.
 """
 
@@ -25,9 +25,13 @@ def _experts(use_triton=None, dp_size=1, use_ep=False, use_triton_ep=False):
     return SimpleNamespace(quant_method=quant_method, dp_size=dp_size, use_ep=use_ep)
 
 
-def _config(dp_attention=False, moe_backend="standard", fake_eplb=False):
+def _config(dp_attention=False, moe_backend="standard", fake_eplb=False, pcp=1, dcp=1):
     return SimpleNamespace(
-        enable_dp_attention=dp_attention, moe_backend=moe_backend, fake_eplb=fake_eplb
+        enable_dp_attention=dp_attention,
+        moe_backend=moe_backend,
+        fake_eplb=fake_eplb,
+        prefill_context_parallel_size=pcp,
+        decode_context_parallel_size=dcp,
     )
 
 
@@ -54,6 +58,8 @@ def test_supported_paths(experts, dp_attention):
         (_experts(dp_size=2, use_ep=True), _config(), "DP without expert parallel"),
         (_experts(use_ep=True), _config(moe_backend="mega"), "--moe-backend standard"),
         (_experts(), _config(fake_eplb=True), "--fake-eplb"),
+        (_experts(), _config(pcp=2), "-pcp 1"),
+        (_experts(use_ep=True), _config(dcp=2), "-dcp 1"),
     ],
 )
 def test_unsupported_paths_are_rejected(experts, config, hint):

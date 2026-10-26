@@ -86,7 +86,11 @@ def _slot_moe_unsupported(experts, atom_config) -> str | None:
     - ``--moe-backend mega`` is sized for one row per token and does its own
       weighted combine;
     - ``--fake-eplb`` replaces the router logits (here the expert ids) with a
-      balance table.
+      balance table;
+    - prefill context parallel shards the experts over the TP x PCP ranks but
+      the slots are reduced over the TP group only, and decode context parallel
+      reaches MHA metadata that indexes the DCP-local block tables by global
+      positions.
     """
     if getattr(experts.quant_method, "use_triton", False) or getattr(
         experts.quant_method, "use_triton_ep", False
@@ -118,6 +122,16 @@ def _slot_moe_unsupported(experts, atom_config) -> str | None:
         return (
             "Muse Spark does not support --fake-eplb: it replaces the "
             "preselected expert ids with a balance table. Run without it."
+        )
+    if (
+        atom_config.prefill_context_parallel_size > 1
+        or atom_config.decode_context_parallel_size > 1
+    ):
+        return (
+            "Muse Spark does not support prefill or decode context parallel "
+            "yet: its expert slots are reduced over the TP group only, and its "
+            "MHA path does not index DCP-local block tables. Set -pcp 1 and "
+            "-dcp 1."
         )
     return None
 
