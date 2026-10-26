@@ -97,6 +97,14 @@ def warm_gemm_m_buckets(worker):
     print(summary + " ".join(f"M={m}:{d:.2f}s" for d, m in slowest), flush=True)
 
 
+def mooncake_hca(local_rank, environ=os.environ):
+    """ATOM's rail choice: rdma<N> for physical GPU N (ROCR masks before HIP)."""
+    visible = (environ.get("ROCR_VISIBLE_DEVICES") or environ.get("HIP_VISIBLE_DEVICES")
+               or environ.get("CUDA_VISIBLE_DEVICES") or "")
+    devices = [d for d in visible.split(",") if d]
+    return f"rdma{int(devices[local_rank]) if devices else local_rank}"
+
+
 class ManifestWorker(Worker):
     def compile_or_warm_up_model(self):
         result = super().compile_or_warm_up_model()
@@ -106,6 +114,10 @@ class ManifestWorker(Worker):
 
     def initialize_from_config(self, kv_cache_config):
         from pd_c48_timeline import startup_stage
+        if os.environ.get("C48_MOONCAKE_HCA_PER_GPU") == "1":
+            # Read by every Mooncake TE discovery in this process; the connectors are built below.
+            os.environ["MC_TE_FILTERS"] = mooncake_hca(self.local_rank)
+            print(f"[C48] Mooncake rank={self.rank} MC_TE_FILTERS={os.environ['MC_TE_FILTERS']}", flush=True)
         with startup_stage(self, "initialize_from_config"):
             return super().initialize_from_config(kv_cache_config)
 

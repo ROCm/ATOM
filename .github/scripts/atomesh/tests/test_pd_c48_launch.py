@@ -2,6 +2,7 @@
 
 import json
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -37,18 +38,21 @@ class LaunchTest(unittest.TestCase):
             suffix = path.stem.removeprefix(prefix)
             mc = json.loads(path.read_text())
             src = json.loads((GAP / (prefix + sources.get(suffix, suffix.removesuffix("-MC")) + ".json")).read_text())
+            store = "store" in mc["mooncake"]
             for role in ("prefill", "decode"):
                 mc_argv, mc_env = render(mc, role, *ADDR)
                 src_argv, src_env = render(src, role, *ADDR)
                 i = mc_argv.index("--kv-transfer-config") + 1
                 self.assertEqual(mc_argv[:i] + mc_argv[i + 1:], src_argv[:i] + src_argv[i + 1:])
-                self.assertEqual({k: v for k, v in mc_env.items() if k not in src_env},
-                                 {"MC_GID_INDEX": "1", "MC_MAX_CONCURRENT_REG_MR": "1",
-                                  "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600"})
+                added = {"MC_GID_INDEX": "1", "MC_MAX_CONCURRENT_REG_MR": "1",
+                         "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600", "MC_MAX_MR_SIZE": str(256 << 20),
+                         "C48_MOONCAKE_HCA_PER_GPU": "1"}
+                if store and role == "prefill":
+                    added["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
+                self.assertEqual({k: v for k, v in mc_env.items() if k not in src_env}, added)
                 self.assertEqual({k: v for k, v in src_env.items()}, {k: mc_env[k] for k in src_env})
                 t = transfer(mc_argv)
                 names = [c["kv_connector"] for c in t["kv_connector_extra_config"].get("connectors", [t])]
-                store = "store" in mc["mooncake"]
                 expected = (["MooncakeConnector", "MooncakeStoreConnector"] if store else ["MooncakeConnector"]
                             ) if role == "prefill" else ["MooncakeConnector"]
                 self.assertEqual(names, expected)
@@ -57,6 +61,14 @@ class LaunchTest(unittest.TestCase):
                 self.assertEqual(mc["mooncake"]["store"]["global_segment_size"] * 8,
                                  cpu["kv_connector_extra_config"]["cpu_bytes_to_use"])
                 self.assertEqual(mc["mooncake"]["store"]["protocol"], "rdma")
+                self.assertEqual(mc["mooncake"]["store"]["local_buffer_size"], 64 << 20)
+
+    def test_mooncake_hca_follows_physical_gpu(self):
+        sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
+        from pd_c48_worker import mooncake_hca
+        self.assertEqual(mooncake_hca(3, {}), "rdma3")
+        self.assertEqual(mooncake_hca(1, {"HIP_VISIBLE_DEVICES": "4,5,6,7"}), "rdma5")
+        self.assertEqual(mooncake_hca(0, {"ROCR_VISIBLE_DEVICES": "6", "HIP_VISIBLE_DEVICES": "0"}), "rdma6")
 
     def test_simple_cpu_case_ignores_lmcache_port(self):
         config = json.loads((GAP / "V-QD.json").read_text())

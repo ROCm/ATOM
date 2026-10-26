@@ -185,7 +185,10 @@
         "C48_P_NO_TAIL_SPLIT": "1",
         "MC_GID_INDEX": "1",
         "MC_MAX_CONCURRENT_REG_MR": "1",
-        "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600"
+        "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
+        "MC_MAX_MR_SIZE": "268435456",
+        "C48_MOONCAKE_HCA_PER_GPU": "1",
+        "GLIBC_TUNABLES": "glibc.malloc.hugetlb=1"
       }
     },
     "decode": {
@@ -450,7 +453,9 @@
         "MORI_IO_TC_DISABLE": "0",
         "MC_GID_INDEX": "1",
         "MC_MAX_CONCURRENT_REG_MR": "1",
-        "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600"
+        "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
+        "MC_MAX_MR_SIZE": "268435456",
+        "C48_MOONCAKE_HCA_PER_GPU": "1"
       }
     }
   },
@@ -516,7 +521,7 @@
       "mode": "embedded",
       "metadata_server": "P2PHANDSHAKE",
       "global_segment_size": 224875000000,
-      "local_buffer_size": 1073741824,
+      "local_buffer_size": 67108864,
       "protocol": "rdma",
       "device_name": "",
       "enable_offload": false

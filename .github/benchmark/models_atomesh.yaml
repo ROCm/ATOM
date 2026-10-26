@@ -5843,6 +5843,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
             HSA_NO_SCRATCH_RECLAIM: '0'
             VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
             C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":513,"Mxfp4OnlineLinearMethod":92}'
@@ -5878,6 +5880,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
         prefill:
           workers: 1
           tp: 8
@@ -5937,6 +5941,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
             HSA_NO_SCRATCH_RECLAIM: '0'
             VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
             C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":513,"Mxfp4OnlineLinearMethod":92}'
@@ -5972,6 +5978,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
         prefill:
           workers: 1
           tp: 8
@@ -6031,6 +6039,9 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
+            GLIBC_TUNABLES: 'glibc.malloc.hugetlb=1'
             HSA_NO_SCRATCH_RECLAIM: '0'
             VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
             C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":513,"Mxfp4OnlineLinearMethod":92}'
@@ -6067,6 +6078,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
         prefill:
           workers: 1
           tp: 8
@@ -6126,6 +6139,9 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
+            GLIBC_TUNABLES: 'glibc.malloc.hugetlb=1'
             HSA_NO_SCRATCH_RECLAIM: '0'
             VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
             C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":513,"Mxfp4OnlineLinearMethod":92}'
@@ -6162,6 +6178,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
         prefill:
           workers: 1
           tp: 8
@@ -6221,6 +6239,9 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
+            GLIBC_TUNABLES: 'glibc.malloc.hugetlb=1'
             HSA_NO_SCRATCH_RECLAIM: '0'
             VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
             C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":513,"Mxfp4OnlineLinearMethod":92}'
@@ -6257,6 +6278,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
         prefill:
           workers: 1
           tp: 8
@@ -6335,6 +6358,9 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
+            GLIBC_TUNABLES: 'glibc.malloc.hugetlb=1'
             HSA_NO_SCRATCH_RECLAIM: '0'
             VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
             C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":513,"Mxfp4OnlineLinearMethod":92}'
@@ -6371,6 +6397,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
         prefill:
           workers: 1
           tp: 8
@@ -6430,6 +6458,9 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
+            GLIBC_TUNABLES: 'glibc.malloc.hugetlb=1'
             HSA_NO_SCRATCH_RECLAIM: '0'
             VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
             C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":513,"Mxfp4OnlineLinearMethod":92}'
@@ -6466,6 +6497,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
         prefill:
           workers: 1
           tp: 8
@@ -6525,6 +6558,9 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
+            GLIBC_TUNABLES: 'glibc.malloc.hugetlb=1'
             HSA_NO_SCRATCH_RECLAIM: '0'
             VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
             C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":513,"Mxfp4OnlineLinearMethod":92}'
@@ -6561,6 +6597,8 @@ models:
             MC_GID_INDEX: '1'
             MC_MAX_CONCURRENT_REG_MR: '1'
             VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
         prefill:
           workers: 1
           tp: 8
