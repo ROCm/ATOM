@@ -42,6 +42,7 @@ on:
           - mooncake_store
           - accuracy
           - profile
+          - scatter_bounds
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
         required: false
@@ -227,6 +228,19 @@ on:
         required: false
         default: false
         type: boolean
+      aiter_ref:
+        description: 'ROCm/aiter ref for suite=scatter_bounds (install_aiter_from_ref / setup.py develop)'
+        required: false
+        default: '5eb866a95d66a38d64eecf151ac4ef3567a07ac5'
+        type: string
+      scatter_install_mode:
+        description: 'suite=scatter_bounds: aiter_ref reinstalls from GitHub; patch applies .github/patches/aiter_moe_scatter_reduce_bounds.patch'
+        required: false
+        default: aiter_ref
+        type: choice
+        options:
+          - aiter_ref
+          - patch
 
 env:
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
@@ -380,7 +394,7 @@ jobs:
             if [[ -n "${CASE_NAMES}" ]]; then
               CASE_NAME="${CASE_NAMES}"
             elif [[ "${RUN_ALL_MODELS}" != "true" ]]; then
-              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" ]]; then
+              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" && "${SUITE}" != "scatter_bounds" ]]; then
                 echo "::error::Set run_all_models=true, provide model_names, or provide case_names."
                 exit 1
               fi
@@ -388,7 +402,7 @@ jobs:
             fi
           fi
 
-          if [[ "${SUITE}" == "smoke" && -z "${CASE_NAME}" && -z "${MODEL_NAME}" && "${RUN_ALL_MODELS}" != "true" ]]; then
+          if [[ ("${SUITE}" == "smoke" || "${SUITE}" == "scatter_bounds") && -z "${CASE_NAME}" && -z "${MODEL_NAME}" && "${RUN_ALL_MODELS}" != "true" ]]; then
             python3 - <<'PY'
           import json
           import os
@@ -402,7 +416,8 @@ jobs:
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
               output.write('matrix_json={"include":[]}\n')
               output.write("has_matrix=false\n")
-          print("RDMA smoke workflow: skipping benchmark matrix generation")
+          suite = os.environ.get("SUITE", "")
+          print(f"{suite} workflow: skipping benchmark matrix generation")
           PY
             cat atomesh-matrix.json
             exit 0
@@ -465,6 +480,7 @@ jobs:
               --github-output
           fi
           cat atomesh-matrix.json
+
 
       - name: Group benchmark matrix by configuration
         id: groups
@@ -1523,6 +1539,237 @@ jobs:
 
           echo "RDMA smoke summary written to ${summary_path}"
 
+  # Verifies moe_scatter_reduce max_sorted bounds on atomesh-cicd → Slurm,
+  # not on bare self-hosted GPU Actions runners (those hit EACCES cleaning
+  # leftover benchmark-bundles/ workspaces; see run 38518074363).
+  verify-scatter-bounds:
+    name: Verify aiter scatter_reduce bounds
+    needs: [load-config]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'scatter_bounds' }}
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    timeout-minutes: 180
+    env:
+      SCATTER_IMAGE: ${{ needs.load-config.outputs.image }}
+      AITER_GIT_REF: ${{ inputs.aiter_ref }}
+      SCATTER_INSTALL_MODE: ${{ inputs.scatter_install_mode }}
+      SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Preflight scatter_bounds script syntax
+        run: |
+          set -euo pipefail
+          # Catch nested-quote / parse errors before burning a Slurm GPU allocation
+          # (runs 38532471586, 38535702939 failed only after sbatch).
+          bash .github/scripts/atomesh/check_scatter_bounds_syntax.sh
+          python3 -m unittest discover -s tests -p test_scatter_bounds_ci.py
+
+      - name: Submit scatter_bounds Slurm verify
+        id: scatter-bounds
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+          if [[ -z "${SCATTER_IMAGE}" ]]; then
+            echo "::error::No ATOM image was resolved for scatter_bounds verify."
+            exit 1
+          fi
+
+          current_user="$(id -un 2>/dev/null || id -u)"
+          log_root="${ATOMESH_LOG_ROOT//\$\{USER\}/${current_user}}"
+          log_root="${log_root//\$USER/${current_user}}"
+          if [[ "$(hostname -s)" == "pit2-vm-amd-xl-02" ]]; then
+            log_root="/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
+          fi
+          run_dir="${log_root%/}/scatter-bounds-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${run_dir}"
+          chmod 0777 "${run_dir}"
+          echo "run_dir=${run_dir}" >> "${GITHUB_OUTPUT}"
+          workspace_out="${GITHUB_WORKSPACE}/scatter-bounds-out"
+          mkdir -p "${workspace_out}"
+          echo "workspace_out=${workspace_out}" >> "${GITHUB_OUTPUT}"
+
+          # GPU nodes must see the checkout; mirror onto NFS (same pattern as
+          # atomesh-cicd-mi350 shared workspace), even on TW where the Actions
+          # workspace may not be node-visible.
+          shared_repo="${run_dir}/repo"
+          rm -rf "${shared_repo}"
+          mkdir -p "${shared_repo}"
+          if command -v rsync >/dev/null 2>&1; then
+            rsync -a --delete "${GITHUB_WORKSPACE}/" "${shared_repo}/"
+          else
+            tar -C "${GITHUB_WORKSPACE}" -cf - . | tar -C "${shared_repo}" -xf -
+          fi
+          chmod -R a+rX "${shared_repo}"
+          chmod +x "${shared_repo}/.github/scripts/atomesh/"*.sh \
+            "${shared_repo}/.github/scripts/"*.sh 2>/dev/null || true
+
+          export SCATTER_REPO_ROOT="${shared_repo}"
+          export SCATTER_OUT_DIR="${run_dir}/out"
+          mkdir -p "${SCATTER_OUT_DIR}"
+          chmod 0777 "${SCATTER_OUT_DIR}"
+
+          CURRENT_USER="${current_user}"
+          ATOMESH_CELL_ID="scatter-bounds"
+          RESULT_DIR="${run_dir}"
+          SLURM_JOB_NAME="scatter-bounds-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SLURM_OUTPUT="${run_dir}/slurm-%j.out"
+          SLURM_ERROR="${run_dir}/slurm-%j.err"
+          SLURM_CANCEL_HELPER="${run_dir}/slurm-cancel.sh"
+          SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-15}"
+          SLURM_ACCOUNT="${ATOMESH_SLURM_ACCOUNT:-}"
+          SLURM_PARTITION="${ATOMESH_SLURM_PARTITION:-}"
+          SLURM_QOS=""
+          USES_SPUR_CONTROLLER=0
+          SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            USES_SPUR_CONTROLLER=1
+            SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
+          elif [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+            USES_SPUR_CONTROLLER=1
+            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
+            SLURM_ACCOUNT="amd-aifw-dev"
+            SLURM_PARTITION=""
+            SLURM_QOS="amd-aifw-dev-qos"
+          fi
+          if [[ "$(hostname -s)" == "pit2-vm-amd-xl-02" ]]; then
+            SLURM_PARTITION="amd-spur"
+            SLURM_QOS="amd-frameworks-qos"
+          fi
+          if [[ "${SLURM_ACCOUNT}" == "amd-atom" ]]; then
+            SLURM_QOS="amd-atom-qos"
+          fi
+          source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
+          detect_slurm_backend
+          install_slurm_cancel_traps
+
+          rank_script="${run_dir}/run-scatter-bounds-rank.sh"
+          cat > "${rank_script}" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export SCATTER_IMAGE="${SCATTER_IMAGE}"
+          export SCATTER_REPO_ROOT="${SCATTER_REPO_ROOT}"
+          export SCATTER_OUT_DIR="${SCATTER_OUT_DIR}"
+          export AITER_GIT_REF="${AITER_GIT_REF}"
+          export SCATTER_INSTALL_MODE="${SCATTER_INSTALL_MODE}"
+          exec bash "${SCATTER_REPO_ROOT}/.github/scripts/atomesh/run_scatter_bounds_verify.sh"
+          EOF
+          chmod +x "${rank_script}"
+
+          batch_script="${run_dir}/scatter-bounds.sbatch.sh"
+          cat > "${batch_script}" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          set +e
+          srun --nodes=1 --ntasks=1 --ntasks-per-node=1 "${rank_script}"
+          srun_rc=\$?
+          set -e
+          printf '%s\n' "\${srun_rc}" > "${run_dir}/slurm-job.rc.tmp"
+          mv "${run_dir}/slurm-job.rc.tmp" "${run_dir}/slurm-job.rc"
+          exit "\${srun_rc}"
+          EOF
+          chmod +x "${batch_script}"
+
+          node_count=1
+          nodes="${ATOMESH_SINGLE_NODE:-}"
+          if [[ "${nodes}" == "auto" ]]; then
+            nodes=""
+          fi
+          sbatch_cmd=(
+            sbatch
+            --parsable
+            --exclusive
+            --export=ALL
+            --job-name "${SLURM_JOB_NAME}"
+            --nodes 1
+            --ntasks 1
+            --ntasks-per-node 1
+            --time 02:30:00
+            --output "${SLURM_OUTPUT}"
+            --error "${SLURM_ERROR}"
+          )
+          if [[ -n "${nodes}" ]]; then
+            slurm_node_selection_args "${nodes}" "${node_count}"
+            sbatch_cmd+=("${SLURM_NODE_SELECTION_ARGS[@]}")
+          fi
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            sbatch_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+          else
+            [[ -z "${SLURM_ACCOUNT}" ]] || sbatch_cmd+=(--account "${SLURM_ACCOUNT}")
+            [[ -z "${SLURM_PARTITION}" ]] || sbatch_cmd+=(--partition "${SLURM_PARTITION}")
+            [[ -z "${SLURM_QOS}" ]] || sbatch_cmd+=(--qos "${SLURM_QOS}")
+            sbatch_cmd+=(--gres gpu:1)
+            if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
+              sbatch_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+            fi
+          fi
+          sbatch_cmd+=("${batch_script}")
+
+          printf ' %q' "${sbatch_cmd[@]}"
+          echo
+          write_slurm_cancel_helper ""
+          set +e
+          sbatch_output="$("${sbatch_cmd[@]}")"
+          sbatch_rc=$?
+          set -e
+          echo "${sbatch_output}"
+          if [[ "${sbatch_rc}" -ne 0 ]]; then
+            echo "sbatch submit exit code: ${sbatch_rc}"
+            exit "${sbatch_rc}"
+          fi
+
+          JOB_ID="$(parse_sbatch_job_id "${sbatch_output}")"
+          SLURM_JOB_ACTIVE=1
+          echo "${JOB_ID}" | tee "${run_dir}/slurm-job-id"
+          write_slurm_cancel_helper "${JOB_ID}"
+          set_slurm_job_log_paths "${JOB_ID}"
+          SLURM_STATUS_DIR="${run_dir}"
+          SLURM_STATUS_RANKS=1
+          monitor_slurm_job "${JOB_ID}"
+
+          # Same fail-closed pattern as rdma-smoke: monitor_slurm_job only waits
+          # for a terminal state; read_slurm_exit_code turns FAILED into a
+          # non-zero Actions step exit (run 38520975962 stayed green otherwise).
+          SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-180}"
+          read_slurm_exit_code "${JOB_ID}"
+          read_slurm_status_files "${run_dir}" 1
+          SLURM_JOB_ACTIVE=0
+          echo "slurm_state=${SLURM_STATE}"
+          echo "slurm_exit_code=${SLURM_EXIT_CODE}"
+          echo "slurm job exit code: ${SLURM_JOB_RC}"
+
+          echo "=== scatter_bounds logs ==="
+          tail -n 80 "${SCATTER_OUT_DIR}/rank.log" 2>/dev/null || true
+          tail -n 40 "${SCATTER_OUT_DIR}/pytest_atom_scatter.log" 2>/dev/null || true
+          # Copy onto the Actions workspace so upload-artifact can see them.
+          cp -a "${SCATTER_OUT_DIR}/." "${workspace_out}/" 2>/dev/null || true
+          cp -a "${run_dir}/"slurm-*.out "${run_dir}/"slurm-*.err "${workspace_out}/" 2>/dev/null || true
+
+          if [[ -f "${SCATTER_OUT_DIR}/rank-rc" ]]; then
+            rank_rc="$(cat "${SCATTER_OUT_DIR}/rank-rc")"
+            echo "rank_rc=${rank_rc}"
+            if [[ "${rank_rc}" != "0" ]]; then
+              echo "::error::scatter_bounds rank exited ${rank_rc}"
+              exit "${rank_rc}"
+            fi
+          else
+            echo "::warning::scatter_bounds rank-rc missing; relying on Slurm exit code ${SLURM_JOB_RC}"
+          fi
+          if [[ "${SLURM_JOB_RC}" != "0" ]]; then
+            echo "::error::scatter_bounds Slurm job ${JOB_ID} failed with rc=${SLURM_JOB_RC} state=${SLURM_STATE}"
+          fi
+          exit "${SLURM_JOB_RC}"
+
+      - name: Upload scatter_bounds logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scatter-bounds-${{ github.run_id }}
+          path: scatter-bounds-out/
+          if-no-files-found: warn
+          retention-days: 14
+
   run-model-benchmark:
     name: ${{ matrix.group.name }}
     needs: [load-config]
@@ -1545,6 +1792,7 @@ jobs:
       atom_source: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_source || 'mounted' }}
       model_root: ${{ needs.load-config.outputs.model_root }}
       dashboard_hardware: ${{ needs.load-config.outputs.dashboard_hardware }}
+
 
   summarize-results:
     name: Summarize ATOMesh benchmark results

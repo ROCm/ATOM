@@ -1,0 +1,555 @@
+diff --git a/aiter/fused_moe.py b/aiter/fused_moe.py
+index 5d01cf80..015052a4 100644
+--- a/aiter/fused_moe.py
++++ b/aiter/fused_moe.py
+@@ -167,7 +167,10 @@ def _adaptive_moe_sort(
+     sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
+     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+-    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
++    # -1 is the scatter_reduce "skip" sentinel (EP remote / dropped). Filling
++    # here means any slot the sort kernel does not overwrite stays safe for
++    # the gather rather than carrying an uninitialized index past flat_out.
++    reverse_sorted = torch.full((M * topk,), -1, dtype=dtypes.i32, device=device)
+     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+     moe_buf = (
+         torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+@@ -490,13 +493,11 @@ def _moe_sorting_impl(
+             max_num_tokens_padded, dtype=dtypes.i32, device=device
+         )
+         # The sort writes local routes only; EP leaves remote routes at -1,
+-        # which the scatter reduce skips.
+-        if expert_mask is not None:
+-            aux_reverse_sorted = torch.full(
+-                (M * topk,), -1, dtype=dtypes.i32, device=device
+-            )
+-        else:
+-            aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
++        # which the scatter reduce skips. Always start at -1 so any slot the
++        # sort does not overwrite stays a safe skip for scatter_reduce.
++        aux_reverse_sorted = torch.full(
++            (M * topk,), -1, dtype=dtypes.i32, device=device
++        )
+ 
+     if use_opus:
+         ws_size = aiter.moe_sorting_opus_get_workspace_size(
+diff --git a/csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py b/csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py
+index d8a0c929..600c889a 100755
+--- a/csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py
++++ b/csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py
+@@ -168,12 +168,14 @@ AUX_SORT_SCALES_PARAMS = """    int            M,
+     void*          a_scale_sorted_shuffled"""
+ 
+ AUX_SCATTER_PARAMS = """    int            M,
++    int            max_sorted,
+     const void*    flat_out,
+     const int32_t* reverse_sorted,
+     const float*   sorted_weights,
+     void*          out"""
+ 
+ AUX_SCATTER_Q_PARAMS = """    int            M,
++    int            max_sorted,
+     const void*    flat_out_q,
+     const void*    flat_out_scale,
+     const int32_t* reverse_sorted,
+@@ -258,7 +260,7 @@ def _aux_scatter_body(h, topk, nt):
+     return (
+         f"    aiter::mxfp4_moe::moe_scatter_reduce::launch<\n"
+         f"        {h}, {topk}, kThreadsScatterReduce, kColsPerThread, {str(nt).lower()}>(\n"
+-        f"            stream, M,\n"
++        f"            stream, M, max_sorted,\n"
+         f"            reinterpret_cast<const __hip_bfloat16*>(flat_out),\n"
+         f"            reverse_sorted, sorted_weights,\n"
+         f"            reinterpret_cast<__hip_bfloat16*>(out));"
+@@ -269,7 +271,7 @@ def _aux_scatter_q_body(h, topk, nt):
+     return (
+         f"    aiter::mxfp4_moe::moe_scatter_reduce::launch_mxfp4<\n"
+         f"        {h}, {topk}, kThreadsScatterReduceQ, kColsPerThreadQ, {str(nt).lower()}>(\n"
+-        f"            stream, M,\n"
++        f"            stream, M, max_sorted,\n"
+         f"            reinterpret_cast<const uint8_t*>(flat_out_q),\n"
+         f"            reinterpret_cast<const uint8_t*>(flat_out_scale),\n"
+         f"            reverse_sorted, sorted_weights,\n"
+diff --git a/csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h b/csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h
+index 54da002e..048afaee 100644
+--- a/csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h
++++ b/csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h
+@@ -101,6 +101,7 @@ using SortScalesFn = void (*)(
+ using ScatterReduceFn = void (*)(
+     hipStream_t stream,
+     int            M,
++    int            max_sorted,
+     const void*    flat_out,
+     const int32_t* reverse_sorted,
+     const float*   sorted_weights,
+@@ -109,6 +110,7 @@ using ScatterReduceFn = void (*)(
+ using ScatterReduceQFn = void (*)(
+     hipStream_t stream,
+     int            M,
++    int            max_sorted,
+     const void*    flat_out_q,
+     const void*    flat_out_scale,
+     const int32_t* reverse_sorted,
+diff --git a/csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh b/csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh
+index fae1270e..b4aa2e13 100644
+--- a/csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh
++++ b/csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh
+@@ -29,7 +29,12 @@ __global__ void sort_count_kernel_impl(
+     const int end     = min(start + per_cta, total_pairs);
+ 
+     for (int i = start + tid; i < end; i += THREADS_PER_CTA) {
+-        atomicAdd(&local_count[topk_ids[i]], 1);
++        const int eid = topk_ids[i];
++        // Drop illegal expert ids: counting them would OOB local_count and
++        // later write a garbage reverse_sorted entry that scatter_reduce
++        // nontemporal-loads past flat_out.
++        if (static_cast<unsigned>(eid) < static_cast<unsigned>(NE))
++            atomicAdd(&local_count[eid], 1);
+     }
+     __syncthreads();
+ 
+@@ -126,6 +131,11 @@ __global__ void sort_place_pad_kernel_impl(
+ 
+     for (int i = start + tid; i < end; i += THREADS_PER_CTA) {
+         int eid = topk_ids[i];
++        if (static_cast<unsigned>(eid) >= static_cast<unsigned>(NE)) {
++            // Match EP's "no local row" sentinel so scatter_reduce skips.
++            reverse_sorted[i] = -1;
++            continue;
++        }
+         int sp  = atomicAdd(&local_offsets[eid], 1);
+         int token_id = i / TOPK;
+         int topk_id  = i % TOPK;
+diff --git a/csrc/kernels/mxfp4_moe/moe_aux/moe_scatter_reduce.cuh b/csrc/kernels/mxfp4_moe/moe_aux/moe_scatter_reduce.cuh
+index 9ce8f71e..58b14efb 100644
+--- a/csrc/kernels/mxfp4_moe/moe_aux/moe_scatter_reduce.cuh
++++ b/csrc/kernels/mxfp4_moe/moe_aux/moe_scatter_reduce.cuh
+@@ -13,9 +13,19 @@ namespace aiter::mxfp4_moe::moe_scatter_reduce {
+ 
+ using opus::i32x4_t;
+ 
++// Gather-reduce per token over TOPK sorted rows.
++//
++// reverse_sorted[token * TOPK + i] indexes into flat_out / sorted_weights.
++// A negative index means "skip" (EP remote / dropped route). Any index
++// >= max_sorted is also skipped: without that upper bound, a corrupt or
++// uninitialized reverse map + nontemporal loads (NT_HINTS) fault with
++// HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION (seen on MiniMax-M3 TP4 at
++// M=32768 with the #5812 scatter epilog).
++
+ template <int D_HIDDEN, int TOPK, int COLS_PER_THREAD, bool NT_HINTS>
+ __global__ void scatter_reduce_kernel_impl(
+     int M,
++    int max_sorted,
+     const __hip_bfloat16 *__restrict__ flat_out,
+     const int *__restrict__ reverse_sorted,
+     const float *__restrict__ sorted_weights,
+@@ -37,7 +47,8 @@ __global__ void scatter_reduce_kernel_impl(
+     #pragma unroll
+     for (int i = 0; i < TOPK; i++) {
+         int sorted_pos = reverse_sorted[token * TOPK + i];
+-        if (sorted_pos < 0) continue; // EP: route to a remote expert
++        // < 0: EP remote / dropped. >= max_sorted: corrupt reverse map.
++        if (sorted_pos < 0 || sorted_pos >= max_sorted) continue;
+         const float w = sorted_weights[sorted_pos];
+ 
+         #pragma unroll
+@@ -85,7 +96,7 @@ __global__ void scatter_reduce_kernel_impl(
+ 
+ template <int D_HIDDEN, int TOPK, int THREADS_PER_CTA, int COLS_PER_THREAD, bool NT_HINTS>
+ inline void launch(
+-    hipStream_t stream, int M,
++    hipStream_t stream, int M, int max_sorted,
+     const __hip_bfloat16 *flat_out, const int32_t *reverse_sorted,
+     const float *sorted_weights, __hip_bfloat16 *out)
+ {
+@@ -93,12 +104,14 @@ inline void launch(
+     dim3 grid((D_HIDDEN + cols_per_block - 1) / cols_per_block, M);
+ 
+     scatter_reduce_kernel_impl<D_HIDDEN, TOPK, COLS_PER_THREAD, NT_HINTS>
+-        <<<grid, THREADS_PER_CTA, 0, stream>>>(M, flat_out, reverse_sorted, sorted_weights, out);
++        <<<grid, THREADS_PER_CTA, 0, stream>>>(
++            M, max_sorted, flat_out, reverse_sorted, sorted_weights, out);
+ }
+ 
+ template <int D_HIDDEN, int TOPK, int COLS_PER_THREAD, bool NT_HINTS>
+ __global__ void scatter_reduce_mxfp4_kernel(
+     int M,
++    int max_sorted,
+     const uint8_t *__restrict__ flat_out_q,
+     const uint8_t *__restrict__ flat_out_scale,
+     const int *__restrict__ reverse_sorted,
+@@ -125,7 +138,7 @@ __global__ void scatter_reduce_mxfp4_kernel(
+     #pragma unroll
+     for (int i = 0; i < TOPK; i++) {
+         const int sorted_pos = reverse_sorted[token * TOPK + i];
+-        if (sorted_pos < 0) continue; // EP: route to a remote expert
++        if (sorted_pos < 0 || sorted_pos >= max_sorted) continue;
+         const float w = sorted_weights[sorted_pos];
+         const uint32_t sw = *reinterpret_cast<const uint32_t*>(
+             &flat_out_scale[(long long)sorted_pos * SCOLS + (blk & ~3)]);
+@@ -154,7 +167,7 @@ __global__ void scatter_reduce_mxfp4_kernel(
+ 
+ template <int D_HIDDEN, int TOPK, int THREADS_PER_CTA, int COLS_PER_THREAD, bool NT_HINTS>
+ inline void launch_mxfp4(
+-    hipStream_t stream, int M,
++    hipStream_t stream, int M, int max_sorted,
+     const uint8_t *flat_out_q, const uint8_t *flat_out_scale,
+     const int32_t *reverse_sorted, const float *sorted_weights, __hip_bfloat16 *out)
+ {
+@@ -163,7 +176,7 @@ inline void launch_mxfp4(
+ 
+     scatter_reduce_mxfp4_kernel<D_HIDDEN, TOPK, COLS_PER_THREAD, NT_HINTS>
+         <<<grid, THREADS_PER_CTA, 0, stream>>>(
+-            M, flat_out_q, flat_out_scale, reverse_sorted, sorted_weights, out);
++            M, max_sorted, flat_out_q, flat_out_scale, reverse_sorted, sorted_weights, out);
+ }
+ 
+ } // namespace aiter::mxfp4_moe::moe_scatter_reduce
+diff --git a/csrc/kernels/mxfp4_moe/moe_aux/moe_sort_quant.cuh b/csrc/kernels/mxfp4_moe/moe_aux/moe_sort_quant.cuh
+index b8af8e58..9bd37b22 100644
+--- a/csrc/kernels/mxfp4_moe/moe_aux/moe_sort_quant.cuh
++++ b/csrc/kernels/mxfp4_moe/moe_aux/moe_sort_quant.cuh
+@@ -80,14 +80,19 @@ __device__ __forceinline__ void count_tokens_per_expert(int *__restrict__ count,
+ 
+     for (int i = tid * 4; i < total_aligned; i += THREADS_PER_CTA * 4) {
+         int4 ids = topk_vec[i / 4];
+-        atomicAdd(&count[ids.x], 1);
+-        atomicAdd(&count[ids.y], 1);
+-        atomicAdd(&count[ids.z], 1);
+-        atomicAdd(&count[ids.w], 1);
++        if (static_cast<unsigned>(ids.x) < static_cast<unsigned>(NUM_EXPERTS))
++            atomicAdd(&count[ids.x], 1);
++        if (static_cast<unsigned>(ids.y) < static_cast<unsigned>(NUM_EXPERTS))
++            atomicAdd(&count[ids.y], 1);
++        if (static_cast<unsigned>(ids.z) < static_cast<unsigned>(NUM_EXPERTS))
++            atomicAdd(&count[ids.z], 1);
++        if (static_cast<unsigned>(ids.w) < static_cast<unsigned>(NUM_EXPERTS))
++            atomicAdd(&count[ids.w], 1);
+     }
+     for (int i = total_aligned + tid; i < total_pairs; i += THREADS_PER_CTA) {
+         int eid = topk_ids[i];
+-        atomicAdd(&count[eid], 1);
++        if (static_cast<unsigned>(eid) < static_cast<unsigned>(NUM_EXPERTS))
++            atomicAdd(&count[eid], 1);
+     }
+ 
+     __syncthreads();
+@@ -130,7 +135,7 @@ __device__ __forceinline__ void parallel_cumsum(int *__restrict__ count, int *__
+     __syncthreads();
+ }
+ 
+-template <int TOPK, int THREADS_PER_CTA>
++template <int NUM_EXPERTS, int TOPK, int THREADS_PER_CTA>
+ __device__ __forceinline__ void place_tokens(int *__restrict__ cumsum, int *__restrict__ counter,
+                                              const int *__restrict__ topk_ids,
+                                              const float *__restrict__ topk_weight,
+@@ -147,12 +152,16 @@ __device__ __forceinline__ void place_tokens(int *__restrict__ cumsum, int *__re
+ 
+     for (int i = tid; i < total_pairs; i += THREADS_PER_CTA) {
+         int eid = topk_ids[i];
+-        int pos = atomicAdd(&counter[eid], 1);
+-        int sp = cumsum[eid] + pos;
+-        sorted_token_ids[sp] = (token_id & 0x00FFFFFF) | ((topk_id & 0xFF) << 24);
+-        m_indices[sp] = token_id & 0x00FFFFFF;
+-        sorted_weights[sp] = topk_weight[i];
+-        reverse_sorted[i] = sp;
++        if (static_cast<unsigned>(eid) >= static_cast<unsigned>(NUM_EXPERTS)) {
++            reverse_sorted[i] = -1;
++        } else {
++            int pos = atomicAdd(&counter[eid], 1);
++            int sp = cumsum[eid] + pos;
++            sorted_token_ids[sp] = (token_id & 0x00FFFFFF) | ((topk_id & 0xFF) << 24);
++            m_indices[sp] = token_id & 0x00FFFFFF;
++            sorted_weights[sp] = topk_weight[i];
++            reverse_sorted[i] = sp;
++        }
+ 
+         token_id += stride_tok;
+         topk_id += stride_rem;
+@@ -203,7 +212,7 @@ sort_subkernel(const int32_t *topk_ids, const float *topk_weight, int32_t *sorte
+ 
+     count_tokens_per_expert<NUM_EXPERTS, THREADS_PER_CTA>(count, topk_ids, total_pairs);
+     parallel_cumsum<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, counter);
+-    place_tokens<TOPK, THREADS_PER_CTA>(cumsum, counter, topk_ids, topk_weight, sorted_token_ids, sorted_weights, reverse_sorted, m_indices, total_pairs);
++    place_tokens<NUM_EXPERTS, TOPK, THREADS_PER_CTA>(cumsum, counter, topk_ids, topk_weight, sorted_token_ids, sorted_weights, reverse_sorted, m_indices, total_pairs);
+     fill_padding_gaps<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, sorted_token_ids, sorted_expert_ids, m_indices, sorted_weights, M);
+ 
+     if (tid == 0) {
+diff --git a/csrc/kernels/mxfp4_moe/moe_mxfp4_aux.cu b/csrc/kernels/mxfp4_moe/moe_mxfp4_aux.cu
+index 74e0e24b..2e6162bf 100644
+--- a/csrc/kernels/mxfp4_moe/moe_mxfp4_aux.cu
++++ b/csrc/kernels/mxfp4_moe/moe_mxfp4_aux.cu
+@@ -289,6 +289,17 @@ void mxfp4_moe_scatter_reduce_kernel(
+     HipDeviceGuard guard(flat_out.device_id);
+     const hipStream_t stream = aiter::getCurrentHIPStream();
+     const int M = static_cast<int>(out.size(0));
++    // Staging rows the reverse map may legally index. Passing this into the
++    // kernel lets it skip corrupt / uninitialized reverse_sorted entries
++    // instead of nontemporal-loading past the buffer (aperture violation).
++    const int max_sorted = static_cast<int>(flat_out.size(0));
++    AITER_CHECK(
++        static_cast<int64_t>(sorted_weights.numel()) >= max_sorted,
++        "mxfp4_moe_scatter_reduce: sorted_weights shorter than flat_out rows");
++    AITER_CHECK(
++        static_cast<int64_t>(reverse_sorted.numel()) >=
++            static_cast<int64_t>(M) * TOPK,
++        "mxfp4_moe_scatter_reduce: reverse_sorted shorter than M*TOPK");
+ 
+     // nt_hints on only at BM=128: large M is DRAM-bound, smaller M fits L2.
+     const int nt = (MB >= 128) ? 1 : 0;
+@@ -296,7 +307,7 @@ void mxfp4_moe_scatter_reduce_kernel(
+     const std::string key = "aux_scatter_H" + std::to_string(D_HIDDEN)
+         + "_TOPK" + std::to_string(TOPK) + "_NT" + std::to_string(nt);
+     aux_find(scatter_reduce_lookup(), key, "mxfp4_moe_scatter_reduce")(
+-        stream, M,
++        stream, M, max_sorted,
+         flat_out.data_ptr(),
+         static_cast<int32_t*>(reverse_sorted.data_ptr()),
+         static_cast<float*>(sorted_weights.data_ptr()),
+@@ -320,13 +331,21 @@ void mxfp4_moe_scatter_reduce_q_kernel(
+     HipDeviceGuard guard(flat_out_q.device_id);
+     const hipStream_t stream = aiter::getCurrentHIPStream();
+     const int M = static_cast<int>(out.size(0));
++    const int max_sorted = static_cast<int>(flat_out_q.size(0));
++    AITER_CHECK(
++        static_cast<int64_t>(sorted_weights.numel()) >= max_sorted,
++        "mxfp4_moe_scatter_reduce_q: sorted_weights shorter than flat_out_q rows");
++    AITER_CHECK(
++        static_cast<int64_t>(reverse_sorted.numel()) >=
++            static_cast<int64_t>(M) * TOPK,
++        "mxfp4_moe_scatter_reduce_q: reverse_sorted shorter than M*TOPK");
+ 
+     const int nt = (MB >= 128) ? 1 : 0;
+ 
+     const std::string key = "aux_scatterq_H" + std::to_string(D_HIDDEN)
+         + "_TOPK" + std::to_string(TOPK) + "_NT" + std::to_string(nt);
+     aux_find(scatter_reduce_q_lookup(), key, "mxfp4_moe_scatter_reduce_q")(
+-        stream, M,
++        stream, M, max_sorted,
+         flat_out_q.data_ptr(), flat_out_scale.data_ptr(),
+         static_cast<int32_t*>(reverse_sorted.data_ptr()),
+         static_cast<float*>(sorted_weights.data_ptr()),
+diff --git a/op_tests/test_moe_scatter_reduce.py b/op_tests/test_moe_scatter_reduce.py
+new file mode 100644
+index 00000000..074a556c
+--- /dev/null
++++ b/op_tests/test_moe_scatter_reduce.py
+@@ -0,0 +1,217 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++"""Correctness and bounds safety for ``mxfp4_moe_scatter_reduce``.
++
++MiniMax-M3 C40 (TP4, H=6144, TOPK=5, M=32768, BM=128) faulted in
++``scatter_reduce_kernel_impl`` with ``MEMORY_APERTURE_VIOLATION`` when a
++corrupt / uninitialized ``reverse_sorted`` index was nontemporal-loaded past
++``flat_out``. The kernel must:
++
++  * match a torch reference on legal reverse maps;
++  * skip ``sorted_pos < 0`` (EP) and ``sorted_pos >= max_sorted`` (corrupt)
++    without a GPU fault, including the BM>=128 NT path.
++
++    pytest op_tests/test_moe_scatter_reduce.py -q
++"""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++if not torch.cuda.is_available() or torch.version.hip is None:
++    pytest.skip("ROCm GPU required", allow_module_level=True)
++
++aiter = pytest.importorskip("aiter")
++
++pytest.importorskip("aiter.ops.moe_mxfp4_aux", reason="mxfp4 MoE aux module")
++
++# MiniMax-M3 TP4 shape from gen_instances.SHAPES / the C40 fault.
++M3_H = 6144
++M3_TOPK = 5
++# Keep unit-test M small; coverage of the NT path is via MB>=128, not M.
++M3_MS = (1, 3, 8, 64)
++
++
++def _reference(flat_out, reverse_sorted, sorted_weights, M, topk, max_sorted):
++    """fp32 gather-reduce matching the kernel's skip rules."""
++    D = flat_out.shape[1]
++    out = torch.zeros(M, D, dtype=torch.float32, device=flat_out.device)
++    rs = reverse_sorted.view(M, topk)
++    for t in range(M):
++        acc = torch.zeros(D, dtype=torch.float32, device=flat_out.device)
++        for k in range(topk):
++            sp = int(rs[t, k].item())
++            if sp < 0 or sp >= max_sorted:
++                continue
++            acc = acc + flat_out[sp].float() * float(sorted_weights[sp].item())
++        out[t] = acc
++    return out
++
++
++def _assert_bf16_matches(out, ref, *, exact=False):
++    assert torch.isfinite(out).all(), "output has non-finite values"
++    # Compare at the output precision. Weighted FP32 FMA can cross a BF16
++    # rounding midpoint relative to separate multiply/add, so allow one ULP.
++    # Unit-weight sums use the same FP32 additions and must match exactly.
++    torch.testing.assert_close(
++        out,
++        ref.to(out.dtype),
++        rtol=0 if exact else torch.finfo(out.dtype).eps,
++        atol=0 if exact else 1e-5,
++    )
++
++
++def _raise_pending_launch_error():
++    try:
++        torch.ones(1, device="cuda").add_(1)
++    except RuntimeError as exc:
++        pytest.fail(f"a kernel launch failed silently: {exc}")
++
++
++def _run_scatter(flat_out, reverse_sorted, sorted_weights, out, topk, mb):
++    aiter.mxfp4_moe_scatter_reduce(
++        flat_out=flat_out,
++        reverse_sorted=reverse_sorted,
++        sorted_weights=sorted_weights,
++        out=out,
++        NE=129,  # dispatch key ignores NE; H/TOPK/NT matter
++        TOPK=topk,
++        D_HIDDEN=flat_out.shape[1],
++        MB=mb,
++    )
++    _raise_pending_launch_error()
++    torch.cuda.synchronize()
++
++
++@pytest.mark.parametrize("mb", (16, 64, 128), ids=("nt0_bm16", "nt0_bm64", "nt1_bm128"))
++@pytest.mark.parametrize("M", M3_MS)
++def test_scatter_reduce_matches_reference(M, mb):
++    torch.manual_seed(M * 17 + mb)
++    D, topk = M3_H, M3_TOPK
++    # Enough staging rows for a dense (token, topk) map with BM padding headroom.
++    max_sorted = ((M * topk + mb - 1) // mb) * mb + mb
++    flat = torch.randn(max_sorted, D, dtype=torch.bfloat16, device="cuda")
++    weights = torch.rand(max_sorted, dtype=torch.float32, device="cuda")
++    # Identity-ish reverse map: token t's k-th route -> row t*topk + k.
++    rs = torch.arange(M * topk, dtype=torch.int32, device="cuda")
++    out = torch.full((M, D), float("nan"), dtype=torch.bfloat16, device="cuda")
++
++    _run_scatter(flat, rs, weights, out, topk, mb)
++    ref = _reference(flat, rs, weights, M, topk, max_sorted)
++    _assert_bf16_matches(out, ref)
++
++
++@pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
++def test_scatter_reduce_skips_negative_and_oob_indices(mb):
++    """Corrupt reverse map must not aperture-fault; skipped routes contribute 0."""
++    torch.manual_seed(mb)
++    M, D, topk = 4, M3_H, M3_TOPK
++    max_sorted = 32
++    flat = torch.randn(max_sorted, D, dtype=torch.bfloat16, device="cuda")
++    weights = torch.ones(max_sorted, dtype=torch.float32, device="cuda")
++    # Mix of legal, EP-skip (-1), and past-the-end indices.
++    rs = torch.tensor(
++        [
++            0,
++            -1,
++            max_sorted,  # == max_sorted: must skip
++            max_sorted + 7,  # well past flat_out
++            1,
++            -3,
++            2**20,  # huge garbage
++            3,
++            4,
++            5,
++            6,
++            7,
++            8,
++            9,
++            10,
++            11,
++            12,
++            13,
++            14,
++            15,
++        ],
++        dtype=torch.int32,
++        device="cuda",
++    )
++    assert rs.numel() == M * topk
++    out = torch.full((M, D), float("nan"), dtype=torch.bfloat16, device="cuda")
++
++    _run_scatter(flat, rs, weights, out, topk, mb)
++    ref = _reference(flat, rs, weights, M, topk, max_sorted)
++    _assert_bf16_matches(out, ref, exact=True)
++
++
++@pytest.mark.parametrize("mb", (128,), ids=("nt1_bm128",))
++def test_scatter_reduce_m3_warmup_shape_smoke(mb):
++    """M=256 stand-in for the 32K warmup: same H/TOPK/NT, tractable memory.
++
++    Full M=32768 needs ~2 GB of staging alone; this covers the dispatch key
++    and NT path the C40 fault used without OOM on a shared CI GPU.
++    """
++    torch.manual_seed(0)
++    M, D, topk = 256, M3_H, M3_TOPK
++    max_sorted = ((M * topk + mb - 1) // mb) * mb
++    flat = torch.randn(max_sorted, D, dtype=torch.bfloat16, device="cuda") * 0.01
++    weights = torch.rand(max_sorted, dtype=torch.float32, device="cuda")
++    rs = torch.arange(M * topk, dtype=torch.int32, device="cuda") % max_sorted
++    out = torch.empty(M, D, dtype=torch.bfloat16, device="cuda")
++    _run_scatter(flat, rs, weights, out, topk, mb)
++    assert torch.isfinite(out).all()
++
++
++@pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
++def test_scatter_reduce_mxfp4_bounds_and_reference(mb):
++    """Exercise packed FP4 data and varying E8M0 scales, including OOB skips."""
++    torch.manual_seed(mb)
++    M, rows, D, topk = 6, 32, M3_H, M3_TOPK
++    packed = torch.randint(0, 256, (rows, D // 2), dtype=torch.uint8, device="cuda")
++    scales = torch.randint(125, 130, (rows, D // 32), dtype=torch.uint8, device="cuda")
++    lut = torch.tensor(
++        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
++        device="cuda",
++    )
++    decoded = torch.stack((lut[(packed & 15).long()], lut[(packed >> 4).long()]), -1)
++    decoded = decoded.reshape(rows, D) * torch.exp2(
++        scales.float() - 127
++    ).repeat_interleave(32, dim=1)
++    weights = torch.rand(rows, device="cuda")
++    rs = torch.arange(M * topk, dtype=torch.int32, device="cuda")
++    rs[:5] = torch.tensor([-1, -7, rows, rows + 7, 2**20], device="cuda")
++    rs[5] = rows - 1
++    out = torch.full((M, D), float("nan"), dtype=torch.bfloat16, device="cuda")
++    aiter.mxfp4_moe_scatter_reduce_q(
++        flat_out_q=packed,
++        flat_out_scale=scales,
++        reverse_sorted=rs,
++        sorted_weights=weights,
++        out=out,
++        NE=129,
++        TOPK=topk,
++        D_HIDDEN=D,
++        MB=mb,
++    )
++    _raise_pending_launch_error()
++    torch.cuda.synchronize()
++    _assert_bf16_matches(out, _reference(decoded, rs, weights, M, topk, rows))
++    assert torch.count_nonzero(out[0]) == 0
++
++
++@pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
++def test_scatter_reduce_last_row_and_all_skipped(mb):
++    rows, D, topk = 32, M3_H, M3_TOPK
++    flat = torch.full((rows, D), float("nan"), dtype=torch.bfloat16, device="cuda")
++    flat[-1] = 2
++    weights = torch.ones(rows, device="cuda")
++    rs = torch.tensor(
++        [-1, -7, rows, rows + 7, 2**20, rows - 1, -1, rows, -1, -1],
++        dtype=torch.int32,
++        device="cuda",
++    )
++    out = torch.full((2, D), float("nan"), dtype=torch.bfloat16, device="cuda")
++    _run_scatter(flat, rs, weights, out, topk, mb)
++    torch.testing.assert_close(out[0], torch.zeros_like(out[0]), rtol=0, atol=0)
++    torch.testing.assert_close(out[1], torch.full_like(out[1], 2), rtol=0, atol=0)

@@ -33,6 +33,17 @@ if [[ -z "${atom_origin}" ]] \
   exit 1
 fi
 
+# The common case env is still prefixed at this point (before apply_role_env).
+# Load the pinned source into a writable directory for the P/D regression;
+# the runtime JIT builds it using the image's existing Python/pybind11 ABI.
+scatter_aiter_ref="${ATOMESH_ENV_ATOM_AITER_SCATTER_REF:-${ATOM_AITER_SCATTER_REF:-}}"
+if [[ -n "${scatter_aiter_ref}" ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/prepare_scatter_aiter_source.sh" "${scatter_aiter_ref}"
+elif [[ "${ATOMESH_ENV_ATOM_APPLY_AITER_SCATTER_BOUNDS_PATCH:-${ATOM_APPLY_AITER_SCATTER_BOUNDS_PATCH:-0}}" == "1" ]]; then
+  REPO_ROOT="${PWD}" bash "${ATOMESH_SCRIPT_DIR}/../apply_aiter_scatter_reduce_bounds_patch.sh"
+  export AITER_REBUILD=1
+fi
+
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"
