@@ -1554,8 +1554,8 @@ models:
             prefill: &m31_flash_mcstore_prefill_env
               HIP_VISIBLE_DEVICES: "0,1,2,3"
               MOONCAKE_STORE: "1"
-              # TW MI355X: 1.5 TiB Store, two owners; reserve host RAM for traces.
-              MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+              # TW MI355X: 1 TiB Store, two owners; reserve host RAM for traces.
+              MOONCAKE_STORE_OWNERS: "0:512:rdma4,rdma5;1:512:rdma6,rdma7"
               MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"
