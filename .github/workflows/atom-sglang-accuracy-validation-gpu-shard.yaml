@@ -188,6 +188,7 @@ jobs:
           }
 
           cache_roots=(
+            /share_nfs/models
             /mnt/dcgpuval
             /shared/data/WRH/models
             /shared_nfs/models
