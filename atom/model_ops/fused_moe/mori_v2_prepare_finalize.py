@@ -806,6 +806,9 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         ), "mori does not support apply_router_weight_on_input=True now."
         self._assert_recipe_matches(mega, kwargs)
 
+        fused = getattr(self, "_fused_topk_result", None)
+        self._fused_topk_result = None
+        fused_routing = fused is not None and fused[0] is topk_ids
         ids = topk_ids.to(torch.int32).contiguous()
         out = mega(
             hidden_states.contiguous(),
@@ -823,6 +826,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
             combine_quant=self.prepare_finalize.combine_quant_for_step(),
+            recv_counter_is_zero=fused_routing,
         )
         return out
 
