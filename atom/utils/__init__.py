@@ -1042,22 +1042,47 @@ def _patch_torch_dynamo_metrics_config_logging() -> None:
     dynamo_utils._get_dynamo_config_for_logging = wrapped_get_dynamo_config_for_logging
 
 
+_CONSOLE_HANDLER_NAME = "atom.console"
+
+
+def set_atom_log_level(level_name: str) -> str:
+    """Set the atom logger and its console handler to the same level.
+
+    They must match: a logger at DEBUG feeding a handler at INFO still builds
+    a LogRecord per logger.debug() call and then discards it -- 10.4% of the
+    API server's CPU at c=2048. Any name logging knows is accepted, in any case
+    and with its aliases (WARN, FATAL). NOTSET and unknown names fall back to
+    INFO instead of preventing process startup; NOTSET would hand the level
+    back to the root logger, which is what the atom logger is isolated from.
+    Other handlers attached to the atom logger keep their own levels.
+
+    Returns the canonical name of the level applied.
+    """
+    try:
+        logger.setLevel(level_name.strip().upper())
+    except ValueError:
+        logger.setLevel(logging.INFO)
+    if logger.level == logging.NOTSET:
+        logger.setLevel(logging.INFO)
+    for handler in logger.handlers:
+        if handler.get_name() == _CONSOLE_HANDLER_NAME:
+            handler.setLevel(logger.level)
+    return logging.getLevelName(logger.level)
+
+
 def getLogger():
     if not logger.handlers:
-        # Must match the handler level below: a logger at DEBUG feeding a
-        # handler at INFO still builds a LogRecord per logger.debug() call
-        # and then discards it -- 10.4% of the API server's CPU at c=2048.
-        logger.setLevel(logging.INFO)
-
         # Never propagate to the root logger. atom attaches its own handler
-        # below, so propagation only ever caused DEBUG records to be re-emitted
-        # by whatever permissive root handler the embedding app installed
-        # (the harness basicConfig) -> multi-GB per-token log floods.
+        # below, so propagation re-emitted every record through whatever root
+        # handler the embedding app installed (a logging.basicConfig(), for
+        # example), printing each line twice. Apps that collect logs through
+        # the root logger must attach their handler to the "atom" logger.
         # This runs on import in EVERY process (front + spawned EngineCore /
         # ModelRunner), unlike a setLevel() applied only in the parent.
         logger.propagate = False
 
         console_handler = logging.StreamHandler()
+        console_handler.set_name(_CONSOLE_HANDLER_NAME)
         from atom.utils import envs as _envs
 
         if _envs.ATOM_LOG_MORE:
@@ -1071,20 +1096,8 @@ def getLogger():
                 datefmt="%H:%M:%S",
             )
         console_handler.setFormatter(formatter)
-        console_handler.setLevel(logging.INFO)
-
-        # Let logging parse the name so its standard aliases (for example WARN
-        # and FATAL) keep the same behavior as Logger.setLevel. Invalid names
-        # retain the INFO defaults above instead of preventing process startup.
-        level_name = os.getenv("ATOM_LOG_LEVEL", "INFO").strip().upper()
-        try:
-            logger.setLevel(level_name)
-            console_handler.setLevel(level_name)
-        except ValueError:
-            logger.setLevel(logging.INFO)
-            console_handler.setLevel(logging.INFO)
-
         logger.addHandler(console_handler)
+        set_atom_log_level(_envs.ATOM_LOG_LEVEL)
         ignored_logger_methods = {
             logging.Logger.info,
             logging.Logger.warning,

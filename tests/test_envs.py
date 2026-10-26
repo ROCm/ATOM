@@ -34,6 +34,7 @@ _ATOM_ENV_VARS = [
     "ATOM_PROFILER_PROFILE_MEMORY",
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
+    "ATOM_LOG_LEVEL",
     "ATOM_DISABLE_MMAP",
     "ATOM_ONLINE_QUANT_STREAMING",
     "ATOM_DISABLE_VLLM_PLUGIN",
@@ -122,6 +123,9 @@ class TestEnvsDefaults:
 
     def test_log_more_default(self):
         assert _get_envs().ATOM_LOG_MORE is False
+
+    def test_log_level_default(self):
+        assert _get_envs().ATOM_LOG_LEVEL == "INFO"
 
     def test_disable_mmap_default(self):
         assert _get_envs().ATOM_DISABLE_MMAP is False

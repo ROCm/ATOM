@@ -105,8 +105,29 @@ def test_atom_log_level_sets_logger_and_handler(level_name, expected_level):
     assert state["handler_levels"] == [expected_level]
 
 
-def test_invalid_atom_log_level_falls_back_to_info():
-    state = _fresh_logger_state("not-a-logging-level")
+@pytest.mark.parametrize("level_name", ["not-a-logging-level", "NOTSET"])
+def test_invalid_or_notset_atom_log_level_falls_back_to_info(level_name):
+    # NOTSET would make the atom logger defer to the root logger's level.
+    state = _fresh_logger_state(level_name)
 
     assert state["level"] == logging.INFO
     assert state["handler_levels"] == [logging.INFO]
+
+
+def test_set_atom_log_level_moves_only_atoms_console_handler():
+    from atom.utils import getLogger, set_atom_log_level
+
+    atom_logger = getLogger()
+    app_handler = logging.NullHandler()
+    app_handler.setLevel(logging.ERROR)
+    atom_logger.addHandler(app_handler)
+    restore = logging.getLevelName(atom_logger.level)
+    try:
+        assert set_atom_log_level(" warn ") == "WARNING"
+        assert atom_logger.level == logging.WARNING
+        console = [h for h in atom_logger.handlers if h is not app_handler]
+        assert [h.level for h in console] == [logging.WARNING]
+        assert app_handler.level == logging.ERROR
+    finally:
+        atom_logger.removeHandler(app_handler)
+        set_atom_log_level(restore)
