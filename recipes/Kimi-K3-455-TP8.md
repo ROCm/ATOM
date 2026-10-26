@@ -23,7 +23,7 @@ same launcher and GEMM tables on the 20261016 image, with `K3_MOE=ep` (CT15 + CT
 | **Memory** | `peak_torch` 190 GB and `available_for_kv` about 143 GB per GPU at `--gpu-memory-utilization 0.90` |
 | Gate | B0 text; chat `17 * 23` answers `391`; decode matches prefill |
 | Cold start | 12–13 min in a fresh container, mostly aiter JIT builds; about 4 min warm; 22–24 min when one tray has 1 TB of RAM |
-| AgentX | `K3_MODE=agentx` is in the launcher; not run on this image |
+| AgentX | `K3_MODE=agentx` in the launcher, and ATOM CI's aiperf client, as in the wide-EP recipe. Not run on this image |
 
 Contents:
 
@@ -52,7 +52,8 @@ Contents:
 | aiter, `/app/aiter` | `3145069b` ([`zejun/k3-tp8-image-20261022`](https://github.com/ROCm/aiter/tree/zejun/k3-tp8-image-20261022)) | The 20261016 image's aiter: `main` `dee019f6` + [#6525](https://github.com/ROCm/aiter/pull/6525) + [#6530](https://github.com/ROCm/aiter/pull/6530). Plus the grouped-MoE k-tile fit (`cc8d4ff12`) and the K3 TP8 tables below |
 | mori, `/app/mori` | `695d4c03` | the base's |
 
-FlyDSL 0.4.0, torch, Triton and ROCm 10.1 (TheRock wheels, Python 3.12) come from the base. aiperf is on `PATH`.
+FlyDSL 0.4.0, torch, Triton and ROCm 10.1 (TheRock wheels, Python 3.12) come from the base. So does aiperf 0.12.0
+(SemiAnalysis aiperf `754356e9`, in `/opt/aiperf-venv`, on `PATH`); see [Installing aiperf](#installing-aiperf).
 
 **The K3 TP8 tables** are in `/app/aiter/aiter/configs/model_configs/`.
 - aiter merges them with its own tables at first use.
@@ -274,6 +275,27 @@ Not measured yet on this image, with `K3_MOE=tp`, or with the custom all-reduce.
 
 ## AgentX
 
+**Method: ATOM CI's agentic benchmark, unchanged.** It is the same method as the wide-EP recipe's
+[Agentic (AgentX)](https://github.com/ROCm/ATOM/blob/recipe-k3-455-wideep/recipes/Kimi-K3-455-wideEP.md#agentic-agentx):
+- **The script** is `.github/scripts/aiperf_agentic.sh`, run the way `.github/scripts/atom_test.sh` runs it. The
+  image's copy, `/app/ATOM/.github/scripts/aiperf_agentic.sh`, is ATOM `main`'s, unchanged since `dcf790be` (#2387).
+- **The client** is SemiAnalysis aiperf at the pinned commit `754356e9` (aiperf 0.12.0). See
+  [Installing aiperf](#installing-aiperf).
+- **The workload** is `semianalysis_cc_traces_weka_062126`: real Claude Code sessions, with a median ISL of about
+  100k tokens. It is replayed with the scenario `inferencex-agentx-mvp`. The first run downloads the dataset (public,
+  1.85 GB) into `HF_HOME`.
+
+Defaults:
+- **3600 s of profiling.**
+  - `AIPERF_BENCHMARK_DURATION=1800` gives 30 min, as in the wide-EP recipe's 2026-10-16 points.
+  - Under the scenario's 900 s floor, the script adds `--unsafe-override` and the run is stamped
+    `submission_valid=false`: a smoke test, not a result.
+- **10 warm-up requests per lane.**
+- **No session headers.** `agentic_prepare` turns them on only when `SERVER_ARGS` contains `--enable-dp-attention`,
+  and TP8 runs one engine.
+
+### AgentX server
+
 **What `K3_MODE=agentx` sets.** It runs the TP8 + DCP8 server options of [Agentic-Kimi-K3.md](Agentic-Kimi-K3.md),
 which was written for MI355X:
 - prefix caching;
@@ -284,33 +306,85 @@ which was written for MI355X:
 It leaves out the rest of that recipe: LMCache, `--block-size 128`, ReplaySSM, FlyDSL FP8 prefill attention, the
 PrefillDelayer and synthetic acceptance.
 
-**Server.** Start a fresh server for every concurrency, with `K3_MAX_SEQS` = 2 × concurrency:
+**Start a fresh server for every concurrency,** with `K3_MAX_SEQS` = 2 × concurrency. The wide-EP recipe runs
+concurrency 16, 32 and 64.
 
 ```bash
-CONC=32
+CONC=32   # 16, 32 or 64
 docker exec -d -e K3_MODE=agentx -e K3_MAX_SEQS=$((2 * CONC)) k3tp8 \
   bash -c 'bash /opt/k3/k3_455_tp8dcp8_server.sh <0|4> <node0 IP> > /root/.cache/tp8_agentx.log 2>&1'
 ```
 
-- **DSpark:** add `-e K3_DSPARK=<N>`, with the draft length that recipe lists for the concurrency.
+- **DSpark:** add `-e K3_DSPARK=<N>`, with the draft length that Agentic-Kimi-K3.md lists for the concurrency.
   - At concurrency 1–4 that recipe also runs DCP 1, which this launcher does not.
   - The launcher on the 20261016 image, with `K3_MOE=tp` and N=7, gave GSM8K strict-match 0.9545 and 4.75 tokens
     per forward.
 
-**Client.** Use ATOM CI's wrapper, inside node0's container. It uses the image's aiperf, and its first run downloads
-the public dataset into `HF_HOME`.
+### Installing aiperf
+
+- **This image has it.**
+  - It is in `/opt/aiperf-venv`, and on `PATH` as `/usr/local/bin/aiperf`. `aiperf --version` prints 0.12.0.
+  - `aiperf_agentic.sh` uses any aiperf on `PATH` that is 0.12.0 or newer, and then installs nothing.
+- **Without it,** `aiperf_agentic.sh` installs aiperf itself:
+  - it clones `SemiAnalysisAI/aiperf` into `AIPERF_DIR` and checks out `754356e9`;
+  - it pip-installs that checkout into a new venv at `AIPERF_VENV`.
+  - The defaults are `/tmp/atom-aiperf` and `/tmp/atom-aiperf-venv`. Set both under `/root/.cache` to keep the
+    install across containers, as the client command below does.
+  - This needs a Python with `ensurepip`.
+- **By hand,** the way the K3 images install it. Their Python has the venv module but no `ensurepip`, so pip comes
+  from get-pip:
 
 ```bash
-CONC=32; OUT=/root/.cache/results/agentic/c${CONC}_$(date +%m%d-%H%M%S)
-export MODEL_PATH=/models/Kimi-K3 AIPERF_MODEL=moonshotai/Kimi-K3 HF_HOME=/root/.cache/huggingface
-cd /tmp && source /app/ATOM/.github/scripts/aiperf_agentic.sh && agentic_prepare
-run_aiperf_agentic http://127.0.0.1:8000 $CONC $OUT http://127.0.0.1:8000/metrics
+git clone https://github.com/SemiAnalysisAI/aiperf.git /root/.cache/aiperf-src
+git -C /root/.cache/aiperf-src checkout --detach 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+python3 -m venv --without-pip /root/.cache/aiperf-venv
+curl -sSfL https://bootstrap.pypa.io/get-pip.py | /root/.cache/aiperf-venv/bin/python - -q
+/root/.cache/aiperf-venv/bin/pip install -q /root/.cache/aiperf-src
+ln -sf /root/.cache/aiperf-venv/bin/aiperf /usr/local/bin/aiperf
+aiperf --version     # 0.12.0
 ```
 
-- **Workload:** it replays `semianalysis_cc_traces_weka_062126` with the scenario `inferencex-agentx-mvp`.
-- **Duration:** 10 warm-up requests per lane, then 3600 s of profiling.
-- **Results:** the summary is `$OUT/profile_export_aiperf.json`.
-- **Not run end to end on this image yet.**
+### AgentX client
+
+Run this inside node0's container once `/health` answers. It is the wide-EP recipe's command, with TP8's
+`SERVER_ARGS`:
+
+```bash
+export MODEL_PATH=/models/Kimi-K3 AIPERF_MODEL=moonshotai/Kimi-K3 HF_HOME=/root/.cache/huggingface
+CONC=32   # the server's concurrency; it runs with K3_MAX_SEQS = 2 x CONC
+# What the launcher runs in agentx mode; with K3_MOE=tp, drop --enable-expert-parallel
+export SERVER_ARGS="--model /models/Kimi-K3 --served-model-name moonshotai/Kimi-K3 --trust-remote-code -tp 8 \
+--tensor-parallel-size-local 4 --decode-context-parallel-size 8 --enable-expert-parallel \
+--kv_cache_dtype fp8 --cudagraph-mode FULL --max-num-seqs $((2 * CONC)) --gpu-memory-utilization 0.90 \
+--max-num-batched-tokens 8192 --enable_prefix_caching --state-checkpoint-interval-tokens -1 \
+--disable_uvicorn_access_log"
+export AIPERF_DIR=/root/.cache/aiperf-src AIPERF_VENV=/root/.cache/aiperf-venv   # used only without aiperf >= 0.12.0
+OUT=/root/.cache/results/agentic/c${CONC}_$(date +%m%d-%H%M%S); mkdir -p $OUT; cd /tmp
+source /app/ATOM/.github/scripts/aiperf_agentic.sh
+agentic_prepare
+run_aiperf_agentic http://127.0.0.1:8000 $CONC $OUT http://127.0.0.1:8000/metrics
+python3 /app/ATOM/.github/scripts/atomesh/interactivity.py $OUT     # both P90 interactivities
+```
+
+- **`SERVER_ARGS`.** `agentic_prepare` reads it only to decide the session headers. It is set here to what the
+  launcher runs.
+- **Results, in `$OUT`:**
+  - `profile_export_aiperf.json`: aiperf's summary (throughput, TTFT and ITL percentiles). `run_aiperf_agentic`
+    returns non-zero when it is missing. That is the only reliable sign that a run produced nothing: aiperf itself
+    exits 0 even when every request failed;
+  - `profile_export.jsonl`: one record per request;
+  - `aiperf.log`: the live stats.
+- **Validity.** aiperf discards a run unless its last first token or its last completed response lands in the final
+  5% of the window (`ProfileMetricCoverageError`, `submission_valid=False`).
+- **Interactivity** follows ATOM's definitions in `.github/scripts/atomesh/interactivity.py`, computed per request
+  from `profile_export.jsonl`:
+  - E2E-normalized, the dashboard default: `1 / p90(ITL + TTFT/OSL)`;
+  - `1 / p90(ITL)`, which is InferenceX's `p90_intvty`.
+
+  Neither is aiperf's own per-user p90.
+- **Throughput per GPU** is aiperf's `total_token_throughput` (input plus output tokens) over the 8 GPUs.
+- **Not run end to end on this image yet.** On an earlier TP8 + DCP8 build with LMCache MP, a concurrency-128 run hung
+  after about an hour; the cause is unknown.
 
 ---
 
