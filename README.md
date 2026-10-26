@@ -261,6 +261,7 @@ lm_eval --model local-completions \
 | Compilation | torch.compile levels, CUDA graphs, piecewise compilation | [Compilation Guide](docs/compilation_cudagraph_guide.md) |
 | Distributed | Tensor/data/expert parallelism, multi-GPU deployment | [Distributed Guide](docs/distributed_guide.md) |
 | Serving & Benchmarks | OpenAI API server, benchmarking, profiling, speculative decoding | [Serving Guide](docs/serving_benchmarking_guide.md) |
+| Observability (experimental) | Opt-in request tracing, configuration and test tools | [OpenTelemetry Guide](docs/observability/README.md) |
 | Environment Variables | All `ATOM_*` variable definitions | [Env Vars](docs/environment_variables.md) |
 
 **Deployment Recipes:**

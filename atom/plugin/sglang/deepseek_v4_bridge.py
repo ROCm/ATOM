@@ -1345,9 +1345,8 @@ class _V4SGLangVerifyGraphBuffers:
         self.skip_prefix_len_csa = i32(t)
         self.chunk_start_per_seq = i32(s)
 
-        self.indexer_cu_committed = i32(s + 1)
-        self.indexer_seq_base = i32(t)
-        self.indexer_cu_ends = i32(t)
+        self.csa_n_committed_per_token = i32(t)
+        self.block_tables_per_token = i32(t, self.max_blocks)
 
         self.plan_buffers = {
             CSA_RATIO: {
@@ -1500,14 +1499,6 @@ def _make_verify_graph_compress_plans_from_positions(pos_np, batch_np, bs: int, 
             [ragged_ids, batch_np, pos_np, window_lens], axis=1
         ).astype(np.int32)
         compress_plan = plan_rows[(pos_np + 1) % ratio == 0]
-        compress_counts = (
-            np.bincount(compress_plan[:, 1], minlength=bs).astype(np.int32)
-            if compress_plan.size
-            else np.zeros(bs, dtype=np.int32)
-        )
-        cu_compress = np.empty(bs + 1, dtype=np.int32)
-        cu_compress[0] = 0
-        np.cumsum(compress_counts, out=cu_compress[1:])
 
         write_starts = np.maximum(0, context_after - K).astype(np.int32)
         write_plan = plan_rows[pos_np >= write_starts[batch_np]]
@@ -1533,8 +1524,6 @@ def _make_verify_graph_compress_plans_from_positions(pos_np, batch_np, bs: int, 
             write_plan_gpu=wbuf.copy_to_gpu(),
             num_compress=n_compress,
             num_write=n_write,
-            cu_compress_cpu=cu_compress,
-            compress_plan_cpu=compress_plan if n_compress else None,
         )
     return out
 
@@ -1812,28 +1801,6 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     if proxy_pool.use_fp8_kv:
         _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
     _publish_empty_kv_indptr(md, t_pad, bufs=bufs)
-    cu_committed_cpu = np.concatenate(
-        [
-            np.zeros(1, dtype=np.int32),
-            np.cumsum(md.n_committed_csa_per_seq_cpu, dtype=np.int32),
-        ]
-    )
-    cu_committed_cpu[-1] = max(int(cu_committed_cpu[-1]), 1)
-    cu_committed_gpu = torch.from_numpy(cu_committed_cpu).to(
-        device=device, dtype=torch.int32
-    )
-    safe_batch_id = md.batch_id_per_q_token.clamp_min(0)
-    seq_base = cu_committed_gpu[safe_batch_id].to(torch.int32)
-    visible_end = seq_base + visible_csa(positions_gpu.to(torch.int32))
-    md.indexer_meta = {
-        "total_committed": int(cu_committed_cpu[-1]),
-        "cu_committed_gpu": cu_committed_gpu,
-        "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_q_token": md.batch_id_per_q_token,
-        "seq_base_per_token_gpu": seq_base,
-        "cu_starts_gpu": seq_base,
-        "cu_ends_gpu": visible_end,
-    }
     return md
 
 
@@ -2095,29 +2062,18 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.skip_prefix_len_csa = skip_prefix_len_csa
     md.chunk_start_per_seq_cpu = chunk_start_per_seq.astype(np.int32)
 
-    cu_committed_cpu = np.concatenate(
-        [np.zeros(1, dtype=np.int32), np.cumsum(n_csa, dtype=np.int32)]
+    # The indexer scores a verify's rows as decode does, graph-safe: each row
+    # off its own table row to its own visibility. NOTE: the only surviving
+    # per-sequence bound on this axis. It disagrees with the `csa_valid_k`
+    # sizing above, which drops it -- resolve before trusting either.
+    visible_np = np.minimum(visible_csa(pos_np), n_csa[batch_np]).astype(np.int32)
+    md.csa_n_committed_per_token = bufs.stage(
+        bufs.csa_n_committed_per_token, visible_np, total
     )
-    cu_committed_cpu[-1] = max(int(cu_committed_cpu[-1]), 1)
-    cu_committed_gpu = bufs.stage(bufs.indexer_cu_committed, cu_committed_cpu, bs + 1)
-    seq_base_cpu = cu_committed_cpu[batch_np].astype(np.int32)
-    # NOTE: the only surviving per-sequence bound on this axis. It disagrees
-    # with the `csa_valid_k` sizing above, which drops it -- resolve before
-    # trusting either.
-    visible_end_cpu = seq_base_cpu + np.minimum(
-        visible_csa(pos_np), n_csa[batch_np]
-    ).astype(np.int32)
-    seq_base_gpu = bufs.stage(bufs.indexer_seq_base, seq_base_cpu, total)
-    visible_end_gpu = bufs.stage(bufs.indexer_cu_ends, visible_end_cpu, total)
-    md.indexer_meta = {
-        "total_committed": int(cu_committed_cpu[-1]),
-        "cu_committed_gpu": cu_committed_gpu,
-        "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_q_token": md.batch_id_per_q_token,
-        "seq_base_per_token_gpu": seq_base_gpu,
-        "cu_starts_gpu": seq_base_gpu,
-        "cu_ends_gpu": visible_end_gpu,
-    }
+    block_rows = bufs.block_tables_per_token.gpu[:total, : md.block_tables.shape[1]]
+    safe_batch_ids = md.batch_id_per_q_token[:total].clamp_min(0).long()
+    torch.index_select(md.block_tables, 0, safe_batch_ids, out=block_rows)
+    md.block_tables_per_token = block_rows
     _publish_empty_kv_indptr(md, total, bufs=bufs)
     return md
 
@@ -2273,7 +2229,8 @@ def build_atom_v4_attention_metadata_from_sglang(
         _publish_empty_kv_indptr(md, total)
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
-    _populate_indexer(md, batch_np, positions[:total], device)
+        # A decode scores paged off the per-token fields and reads none.
+        _populate_indexer(md, positions[:total], device)
     return md
 
 
@@ -2475,33 +2432,18 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
     md.chunk_start_per_seq_cpu = chunk_start_per_seq.astype(np.int32)
 
 
-def _populate_indexer(md, batch_np, positions, device) -> None:
+def _populate_indexer(md, positions, device) -> None:
+    """A prefill's index keys (`v4_concat_rows`): its requests' committed keys
+    gathered end to end, and each row's first key and visible count there."""
     n_csa = md.n_committed_csa_per_seq_cpu
     cu = np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(n_csa, dtype=np.int32)])
     cu[-1] = max(int(cu[-1]), 1)
     cu_gpu = torch.from_numpy(cu).to(device=device, dtype=torch.int32)
-    bid = md.batch_id_per_q_token
-    if bid.numel() == 0:
-        md.indexer_meta = {
-            "total_committed": int(cu[-1]),
-            "cu_committed_gpu": cu_gpu,
-            "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-            "batch_id_per_q_token": bid,
-            "seq_base_per_token_gpu": None,
-            "cu_starts_gpu": None,
-            "cu_ends_gpu": None,
-        }
-        return
-    base = cu_gpu[bid].to(torch.int32)
-    end = base + visible_csa(positions.to(torch.int32))
     md.indexer_meta = {
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,
-        "n_committed_per_seq_gpu": md.n_committed_csa_per_seq,
-        "batch_id_per_q_token": bid,
-        "seq_base_per_token_gpu": base,
-        "cu_starts_gpu": base,
-        "cu_ends_gpu": end,
+        "cu_starts_gpu": cu_gpu[md.batch_id_per_q_token].to(torch.int32),
+        "visible_gpu": visible_csa(positions.to(torch.int32)),
     }
 
 

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import torch
 
 from atom.models.deepseek_v41.config import AttentionMode
+from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.plan.shard import Shard
 from atom.mono.runtime.consensus import MonoUnsupported
 
@@ -46,18 +47,25 @@ def _fp8(rows: int, cols: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]
 
 
 def expected(
-    config, mode: AttentionMode, tp: int
+    config, mode: AttentionMode, dims: Dims, moe_tp: int = 1
 ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-    """(shape, dtype) of the TP ``tp`` shard of every tensor a layer in ``mode``
-    has, by parameter name."""
+    """(shape, dtype) of a rank's share (``dims``: its TP shard, and under
+    expert parallel its routed experts; ``moe_tp``: DP attention's ranks the
+    routed experts' width is split over, the shared expert replicated) of
+    every tensor a layer in ``mode`` has, by parameter name."""
     hidden, hc = config.hidden_size, config.hc_mult
-    shard = Shard(tp)
+    shard = Shard(dims.tp)
     heads = shard.split(config.num_attention_heads, "query heads")
     groups = shard.split(config.o_groups, "wo_a groups")
     q_rank, head_dim, o_rank = config.q_lora_rank, config.head_dim, config.o_lora_rank
+    # the router scores every expert; the rank holds its own (expert parallel)
     experts = config.n_routed_experts
-    inter = shard.split(config.moe_intermediate_size, "routed intermediate")
+    local = Shard(dims.ep).split(experts, "routed experts")
+    inter = Shard(dims.tp * moe_tp).split(
+        config.moe_intermediate_size, "routed intermediate"
+    )
     inter_padded = -(-inter // MOE_PAD) * MOE_PAD
+    sh_inter = shard.split(config.moe_intermediate_size, "shared intermediate")
     mix = hc * (hc + 2)
     table = {
         "attn_norm.weight": ((hidden,), BF16),
@@ -68,8 +76,8 @@ def expected(
         "ffn.gate.weight": ((experts, hidden), BF16),
         "ffn.gate.e_score_correction_bias": ((experts,), F32),
         # MXFP4, K packed two a byte; scales in aiter's shuffle_scale order
-        "ffn.experts.w13_weight": ((experts, 2 * inter_padded, hidden // 2), FP4X2),
-        "ffn.experts.w2_weight": ((experts, hidden, inter_padded // 2), FP4X2),
+        "ffn.experts.w13_weight": ((local, 2 * inter_padded, hidden // 2), FP4X2),
+        "ffn.experts.w2_weight": ((local, hidden, inter_padded // 2), FP4X2),
     }
     linears = {
         "attn.wqkv_a": (q_rank + head_dim, hidden),
@@ -79,8 +87,8 @@ def expected(
             config.num_attention_heads * head_dim // config.o_groups,
         ),
         "attn.wo_b": (hidden, groups * o_rank),
-        "ffn.shared_experts.gate_up_proj": (2 * inter, hidden),
-        "ffn.shared_experts.w2": (hidden, inter),
+        "ffn.shared_experts.gate_up_proj": (2 * sh_inter, hidden),
+        "ffn.shared_experts.w2": (hidden, sh_inter),
     }
     if mode in (AttentionMode.FULL, AttentionMode.REINDEX):
         index_heads, index_dim = config.index_n_heads, config.index_head_dim
@@ -96,7 +104,7 @@ def expected(
     return table
 
 
-def bind_layer(block, config, tp: int) -> LayerWeights:
+def bind_layer(block, config, dims: Dims, moe_tp: int = 1) -> LayerWeights:
     """``block``'s parameters, each checked against ``expected``."""
     spec = block.attn.spec
     method = block.ffn.experts.quant_method
@@ -111,7 +119,7 @@ def bind_layer(block, config, tp: int) -> LayerWeights:
             "rows, MXFP8 activations)"
         )
     params = dict(block.named_parameters())
-    for name, (shape, dtype) in expected(config, spec.mode, tp).items():
+    for name, (shape, dtype) in expected(config, spec.mode, dims, moe_tp).items():
         tensor = params.get(name)
         if tensor is None:
             raise MonoUnsupported(f"layer {spec.layer_id}: no {name}")
@@ -125,6 +133,6 @@ def bind_layer(block, config, tp: int) -> LayerWeights:
     return LayerWeights(spec.layer_id, spec.mode, params)
 
 
-def bind_model(model, tp: int) -> list[LayerWeights]:
+def bind_model(model, dims: Dims, moe_tp: int = 1) -> list[LayerWeights]:
     """Every decoder block of the V4.1 runtime model, in layer order."""
-    return [bind_layer(block, model.config, tp) for block in model.layers]
+    return [bind_layer(block, model.config, dims, moe_tp) for block in model.layers]

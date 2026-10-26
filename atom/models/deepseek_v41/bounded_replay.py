@@ -8,9 +8,7 @@ decoder's global KV comes from the encoder's output: its one KV source, layer
 onward -- reuses that KV and its selections and owns nothing but a
 sliding-window ring. So, as the V4.1 report's SWA Bounded Replay prescribes,
 the forward that finishes a prompt runs the decoder over its last ``W`` rows
-alone (the tail; ``W`` is the window), and one that does not runs none of it
-(under DP attention, while a peer has decoder work, it runs the decoder on one
-placeholder row to join the MoE collectives; see "DP attention" below):
+alone (the tail; ``W`` is the window), and one that does not runs none of it:
 
 - the encoder, and layer 20's compression (global KV, index keys): every row;
 - layers 20-38: the tail;
@@ -25,13 +23,19 @@ global KV and the encoder's window rows stay as the cache has them, and the
 rows from where the forward resumed read those rows, exact; only what the rows
 feed the decoder is new.
 
-DP attention. The decoder's MoE collectives are sized by every DP rank's token
-count, which a tail changes. Each rank therefore decides from its batch
-(``replays_batch``) and reports its decoder and layer-39 counts in the step's
-one DP sync (``decoder_stage_report``); the group's tables come back with the
-forward context, and each stage runs under its own (``run_decoder_stages``). A
-rank with no tail joins on one placeholder row while any rank has decoder work;
-when none has, every rank skips the decoder. TBO-split steps compute every row.
+The tail is a request bucket. Its rows are laid out for the step's
+``running_bs`` requests, ``W`` each (``tail_width``): the finishing requests'
+first, then zero-length padding requests and rows no request owns
+(``lay_out_tail``). One shape per ``running_bs`` is what lets the decoder
+record as a request graph (`decoder_graph.DecoderGraph`).
+
+DP attention. The decoder's MoE collectives are sized by every rank's rows,
+which the tail changes. ``running_bs`` is the group's, so every prefilling
+rank runs the same tail width and request count, and a rank still decoding
+its own rows; each derives that table from the step's DP sync
+(``decoder_stages``). While any rank runs the decoder, a rank finishing no
+prompt runs it on its tail of padding alone, to join the collectives. TBO-split
+steps compute every row.
 
 On by default (``--no-decoder-swa-bounded-replay`` turns it off). The runtime
 model compiles layers 0-19 and 21-38 as two graphs (``runtime._EarlyLayers`` /
@@ -51,9 +55,9 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
+from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
-from atom.utils import upload_numpy
+from atom.utils.forward_context import DPStage
 
 
 def late_layer_start(hf_config) -> int:
@@ -86,27 +90,21 @@ def _gather_rows(rows, *tensors, dim=0):
     return gather_rows(rows, *tensors, dim=dim)
 
 
-def replayable(forward, num_tokens: int) -> bool:
-    """Whether this forward may compute fewer than all of its rows.
+def replayable(forward, running_tokens: int) -> bool:
+    """Whether this forward may compute fewer than all of its rows: a prefill
+    the backend published a decoder for (`BatchStep.decoder`) -- every
+    serving prefill, an idle DP rank's dummy one included, never a warmup's.
 
-    A prefill may, image rows and input embeddings included (the decoder's
-    only image-aware op, the MoE router, reads its rows' slice of the mask;
-    see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
-    row, and so do padded steps.
-
-    Under DP attention the decision is not made here: each rank decided from
-    its batch before the step (`replays_batch`) and told its group, and it
-    acts on that report (`ForwardContext.dp_stages.applies`), so what it
-    forwards is what its peers' collectives expect.
+    Image rows and input embeddings replay too (the decoder's only image-aware
+    op, the MoE router, reads its rows' slice of the mask; see `rows_of`). A
+    prefill padded to a token-graph bucket replays like any other: its padding
+    rows belong to no request, so no tail picks them. Draft passes and TBO
+    microbatches compute every row.
     """
-    if getattr(forward, "dp_metadata", None) is not None:
-        stages = getattr(forward, "dp_stages", None)
-        return stages is not None and stages.applies
     context, metadata = forward.context, forward.attn_metadata
     if (
         context is None
         or not context.is_prefill
-        or context.is_dummy_run
         or context.is_draft
         or forward.ubatch_slices is not None
     ):
@@ -118,92 +116,64 @@ def replayable(forward, num_tokens: int) -> bool:
     if tbo_active():
         return False
     step = getattr(metadata, "step", None)
-    return not (
-        step is None
-        or step.decode
-        or num_tokens != step.width
-        or step.width != step.scheduled
+    return (
+        step is not None
+        and step.decoder is not None
+        and not step.decode
+        and running_tokens == step.width
     )
 
 
-# The stages past the decoder's KV source whose MoE token counts a DP group
-# agrees on: layer 20's FFN through layer 38, and layer 39.
-DECODER_STAGES = ("decoder", "last_layer")
+def tail_width(requests: int, window: int, capacity: int) -> int:
+    """The rows of a tail laid out for ``requests``: ``window`` each, within
+    the ``capacity`` its buffers hold -- which every finishing request's rows
+    fit in, since they are rows of the forward."""
+    return min(requests * window, capacity)
 
 
-def replays_batch(batch) -> bool:
-    """Whether a DP rank replays this step, from its batch alone: a real,
-    all-prefill step. The one decision for both the report the rank sends
-    its group and the forward it runs (`replayable`); TBO-split steps are
-    taken out by the group sync itself."""
-    total = int(batch.total_tokens_num)
-    return not batch.is_dummy_run and 0 < int(batch.total_tokens_num_prefill) == total
+@dataclass(frozen=True)
+class TailLayout:
+    """A tail's rows on the host (`lay_out_tail`). ``rows``: [width] each
+    tail row's row of the forward, padding repeating a real one (or row 0).
+    ``query_ids``: [width] layer 39's batch id at each finishing request's last
+    tail row, -1 elsewhere. ``last``: [requests] layer 39's query rows, a
+    padding request's the tail's last. ``query_ptrs``: [requests + 1] where
+    each query's indptr is read, a padding request's past the end, so its list
+    is empty and its predecessor's is whole. ``last_rows``: [finishing] the
+    forward rows layer 39's outputs go to. ``filled``: the tail rows that are
+    real, which lead."""
+
+    rows: np.ndarray
+    query_ids: np.ndarray
+    last: np.ndarray
+    query_ptrs: np.ndarray
+    last_rows: np.ndarray
+    filled: int
 
 
-def decoder_stage_report(batch, window: int):
-    """This rank's `BoundedReplayDPReport` for the step: its decoder and last-layer
-    token counts, whether it replays, and whether it has decoder work.
-
-    A rank that does not replay runs all its rows through both stages. One
-    that replays runs each finishing request's last ``window`` rows through
-    the decoder and its last row through layer 39 -- or, when nothing
-    finishes, one placeholder row while a peer has decoder work
-    (`run_decoder_stages`)."""
-    from atom.utils.forward_context import BoundedReplayDPReport
-
-    total = int(batch.total_tokens_num)
-    if not replays_batch(batch):
-        return BoundedReplayDPReport(DECODER_STAGES, (total, total), applies=False)
-    lengths = batch.num_scheduled_tokens
-    finals = batch.is_final_chunk
-    tails = [
-        min(int(n), window)
-        for i, n in enumerate(lengths)
-        if n and (finals is None or finals[i])
-    ]
-    if not tails:
-        return BoundedReplayDPReport(DECODER_STAGES, (1, 1), applies=True, active=False)
-    return BoundedReplayDPReport(DECODER_STAGES, (sum(tails), len(tails)), applies=True)
-
-
-def planned_stage_tokens(plan, num_tokens: int) -> tuple[int, int]:
-    """The decoder and last-layer tokens the forward will run, from its plan."""
-    if plan is None:
-        return num_tokens, num_tokens
-    if plan.tail is None:
-        return 1, 1
-    return plan.tail.scheduled, len(plan.tail.requests)
-
-
-def run_decoder_stages(forward, first, middle, last):
-    """Run the layers past the decoder's KV source, each under its DP stage.
-
-    ``first`` (layer 20 after its compression) and ``middle`` (21..38) run
-    under the ``decoder`` counts, ``last`` (layer 39) under ``last_layer``,
-    so every MoE collective is sized the way the group agreed. Outside a DP
-    replay the stages are absent and this is a plain call chain."""
-    with forward.use_dp_stage("decoder"):
-        state = middle(first())
-        with forward.use_dp_stage("last_layer"):
-            return last(state)
-
-
-@contextlib.contextmanager
-def placeholder_rows_of(metadata, rows):
-    """A request-less step over ``rows`` of the forward while this block runs.
-
-    For a rank that joins its peers' decoder collectives without work of its
-    own: attention sees no requests (`v41_attention` returns zeros and writes
-    no cache), there are no layer-39 queries, and the image mask -- which the
-    MoE router reads row for row -- is cut to the same rows."""
-    outer = metadata.step, metadata.queries, metadata.image_mask
-    metadata.step, metadata.queries = replace(outer[0], requests=()), None
-    if outer[2] is not None:
-        metadata.image_mask = outer[2].index_select(1, rows)
-    try:
-        yield
-    finally:
-        metadata.step, metadata.queries, metadata.image_mask = outer
+def lay_out_tail(picks, requests: int, width: int) -> TailLayout:
+    """``picks`` (`tail_spans`) laid out as a tail of ``requests`` requests and
+    ``width`` rows."""
+    lengths = np.asarray([n for _, n, _ in picks], dtype=np.int64)
+    ends = np.cumsum(lengths)
+    filled = int(ends[-1]) if len(ends) else 0
+    rows = np.zeros(width, dtype=np.int64)
+    for (span, n, _), end in zip(picks, ends):
+        rows[end - n : end] = span.offset + span.length - n + np.arange(n)
+    if filled:
+        rows[filled:] = rows[filled - 1]
+    finals = ends - 1
+    query_ids = np.full(width, -1, dtype=np.int64)
+    query_ids[finals] = build_batch_ids(lengths)[finals]
+    padding = requests - len(picks)
+    return TailLayout(
+        rows=rows,
+        query_ids=query_ids,
+        last=np.concatenate([finals, np.full(padding, width - 1)]),
+        query_ptrs=np.concatenate([finals, np.full(padding + 1, width)]),
+        last_rows=rows[finals],
+        filled=filled,
+    )
 
 
 @dataclass(frozen=True)
@@ -226,120 +196,120 @@ class QueryRows:
         return _gather_rows(self.rows, *tensors, dim=1)
 
     def indices(self, cache, spec):
-        """`cache.attention_indices` for the queries alone."""
-        prefix, pptr, extend, eptr = cache.attention_indices(spec, self.index)
+        """`cache.attention_indices` for the queries alone: built afresh, never
+        the index group its step's other layers already built over every row."""
+        prefix, pptr, extend, eptr = cache.attention_indices(
+            spec, replace(self.index, group_indices={})
+        )
         return prefix, pptr[self.ptr_rows], extend, eptr[self.ptr_rows]
 
 
 @dataclass(frozen=True)
 class ReplayPlan:
-    """A replayed prefill's parts (the module docstring); all None when no
-    request finishes its prompt. ``tail``: the decoder's rows, the last
-    layer's queries ``q39``; ``tail_rows`` and ``last_rows`` are their rows of
-    the forward."""
+    """The decoder's rows of a replayed prefill, on the device at the
+    addresses every step of its request bucket publishes (`TailLayout`).
+    ``tail``: their step."""
 
-    tail: BatchStep | None = None
-    tail_rows: torch.Tensor | None = None
-    q39: QueryRows | None = None
-    last_rows: torch.Tensor | None = None
+    tail: BatchStep
+    tail_rows: torch.Tensor
+    query_ids: torch.Tensor
+    last: torch.Tensor
+    query_ptrs: torch.Tensor
+    last_rows: torch.Tensor
+    filled: int
+
+    def queries(self) -> QueryRows:
+        """Layer 39's queries. Built where they are read, so a recording reads
+        them through the tail's addresses."""
+        tail = self.tail
+        return QueryRows(
+            self.last,
+            tail.positions.index_select(0, self.last),
+            replace(tail, batch_ids=self.query_ids),
+            self.query_ptrs,
+        )
 
 
-def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
-    """``step``'s tail: each finishing request's last ``window`` rows, a step
-    of their own over its requests, PAGEs and slots, with no compress plan
-    (their compression ran over ``step``). Laid out on the host and uploaded
-    in one copy per dtype."""
-    picks = [
+def tail_spans(step: BatchStep, window: int):
+    """``step``'s tail, as ``(span, rows, index)``: each finishing request's
+    last ``window`` rows, ``index`` its request's in ``step``."""
+    return [
         (span, min(span.length, window), i)
         for i, span in enumerate(step.requests)
         if step.request_finals[i]
     ]
-    if not picks:
-        return ReplayPlan()
-    lengths = np.asarray([n for _, n, _ in picks])
-    ends = np.cumsum(lengths)
-    rows = np.concatenate(
-        [s.offset + s.length - np.arange(n, 0, -1) for s, n, _ in picks]
-    )
-    positions = np.concatenate([s.end - np.arange(n, 0, -1) for s, n, _ in picks])
-    starts = positions[ends - lengths]
-    batch_ids = build_batch_ids(lengths)
-    # layer 39's queries: each tail's last row
-    last = ends - 1
-    query_ids = np.full(len(rows), -1, np.int64)
-    query_ids[last] = batch_ids[last]
-    device = step.positions.device
-    up = _upload(
-        device,
-        torch.int32,
-        rows=rows,
-        cu=np.concatenate(([0], ends)),
-        batch_ids=batch_ids,
-        # no window row below its first, in the layers it runs
-        floors=starts,
-        cached_until=np.zeros(len(picks)),
-        slots=[s.slot for s, _, _ in picks],
-        requests=[i for _, _, i in picks],
-        last=last,
-        query_ids=query_ids,
-        query_ptrs=np.append(last, len(rows)),
-        last_rows=rows[last],
-    )
-    up |= _upload(
-        device,
-        step.positions.dtype,
-        positions=positions,
-        last_positions=positions[last],
-    )
-    tail = BatchStep(
-        tuple(
-            RequestSpan(s.request_id, int(start), int(end - n), n, s.slot)
-            for (s, n, _), start, end in zip(picks, starts, ends)
-        ),
-        up["positions"],
-        up["cu"],
-        up["slots"],
-        up["batch_ids"],
-        step.block_tables.index_select(0, up["requests"]),
-        scheduled=int(ends[-1]),
-        max_q_len=int(lengths.max()),
-        visible=dict(
-            zip(step.visible, _gather_rows(up["rows"], *step.visible.values()))
-        ),
-        request_positions=starts.astype(np.int32),
-        swa_replay_start=up["floors"],
-        swa_cached_until=up["cached_until"],
-    )
-    return ReplayPlan(
-        tail=tail,
-        tail_rows=up["rows"],
-        q39=QueryRows(
-            up["last"],
-            up["last_positions"],
-            replace(tail, batch_ids=up["query_ids"]),
-            up["query_ptrs"],
-        ),
-        last_rows=up["last_rows"],
-    )
 
 
-def _upload(device, dtype, **arrays):
-    """``arrays`` on ``device`` as ``dtype``, in one copy."""
-    names = list(arrays)
-    host = np.concatenate([np.asarray(arrays[k]) for k in names]).astype(
-        torch.empty(0, dtype=dtype).numpy().dtype
-    )
-    return dict(
-        zip(
-            names,
-            upload_numpy(host, device).split([len(arrays[k]) for k in names]),
-        )
-    )
+def decoder_runs(forward) -> bool:
+    """Whether this replaying forward runs the decoder: some rank of the
+    group -- this one, or a peer whose collectives count on this rank --
+    finishes a prompt, or still decodes every row. A capture context, which
+    declares its shape rather than reading one, runs it."""
+    mode = forward.context.forward_mode
+    if mode is None:
+        return True
+    sync = mode.sync
+    return sync.max_final_requests_across_dp > 0 or not all(sync.prefill_across_dp)
+
+
+def decoder_stages(forward, parallel_config, width: int, requests: int, replaying):
+    """The DP stages of layer 20's FFN through layer 38 and of layer 39, or
+    ``(None, None)`` where every MoE layer runs the step's own rows.
+
+    A prefilling rank replays and runs ``width`` and ``requests`` rows -- the
+    same on every one, since the group's ``running_bs`` fixes both
+    (`tail_width`) -- and a rank still decoding runs its own rows. Every rank
+    of a step with no prefill or a TBO-split one runs its own rows, and so does
+    a warmup's (``replaying`` False on a prefill: no rank replays). A capture
+    context, which declares its shape, has every rank recording this one's
+    step -- a prefill's or a decode's."""
+    context = forward.context
+    if forward.dp_metadata is None or (context.is_prefill and not replaying):
+        return None, None
+    mode = context.forward_mode
+    across = context.running_tokens_across_dp
+    if mode is None:
+        prefill = (context.is_prefill,) * len(across)
+    elif mode.sync.tbo_collective_active:
+        return None, None
+    else:
+        prefill = mode.sync.prefill_across_dp
+    if not any(prefill):
+        return None, None
+
+    def stage(rows):
+        tokens = [rows if p else n for p, n in zip(prefill, across)]
+        return DPStage.make(parallel_config, tokens)
+
+    return stage(width), stage(requests)
+
+
+def run_decoder_stages(forward, stages, first, middle, last):
+    """Run the layers past the decoder's KV source, each under its DP stage
+    (`decoder_stages`): ``first`` (layer 20 after its compression) and
+    ``middle`` (21..38) under the decoder's, ``last`` (layer 39) under its own,
+    so every MoE collective is sized the way the group runs it."""
+    decoder, last_layer = stages
+    with forward.use_dp_stage(decoder):
+        state = middle(first())
+        with forward.use_dp_stage(last_layer):
+            return last(state)
 
 
 def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
     """What the decoder reads off the encoder -- a REUSE layer's owner's
     selection, a candidate source's candidates -- at the tail's rows."""
+    owners, sources = carried_layers(parent, specs)
+    rows, tail = plan.tail_rows, plan.tail
+    taken = _gather_rows(rows, *(parent.selected[o] for o in owners), dim=1)
+    tail.selected.update(zip(owners, taken))
+    taken = _gather_rows(rows, *(parent.candidates[s] for s in sources))
+    tail.candidates.update(zip(sources, taken))
+
+
+def carried_layers(parent: BatchStep, specs):
+    """The encoder layers whose selections (owners) and candidates (sources)
+    the decoder ``specs`` read, as `carry_selections` carries them."""
     own = {s.layer_id for s in specs}
     owners = sorted(
         ({s.topk_owner for s in specs} - {None} - own) & parent.selected.keys()
@@ -347,11 +317,7 @@ def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
     sources = sorted(
         ({s.candidate_source for s in specs} - {None} - own) & parent.candidates.keys()
     )
-    rows, tail = plan.tail_rows, plan.tail
-    taken = _gather_rows(rows, *(parent.selected[o] for o in owners), dim=1)
-    tail.selected.update(zip(owners, taken))
-    taken = _gather_rows(rows, *(parent.candidates[s] for s in sources))
-    tail.candidates.update(zip(sources, taken))
+    return owners, sources
 
 
 @contextlib.contextmanager
@@ -360,19 +326,15 @@ def rows_of(metadata, step, queries=None, rows=None):
     block run, and so is the image mask at ``rows`` of the outer one's: the
     rows an MoE router routes here.
 
-    Filling the step's indptrs rewrites the cache's shared indptr buffers, and
-    a REINDEX layer rewrites its tile workspace. When the outer step is
-    restored its indptrs and memoized tiles are cleared, since those buffers
-    now hold the inner step's contents: a reader after this fails loudly
-    instead of reading them; the next forward's ``begin_step`` rebuilds both.
+    The inner step's indptrs are filled by its first reader, into the
+    cache's shared indptr buffers, and a REINDEX layer rewrites its tile
+    workspace. When the outer step is restored its indptrs and memoized tiles
+    are cleared, since those buffers now hold the inner step's contents: a
+    reader after this fills them again.
     """
-    # Triton-backed; imported here so this module imports without it.
-    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
-
     indexed = step if queries is None else queries.index
-    indexed.indptrs = fill_step_indptrs(
-        indexed, metadata.cache.geometry, metadata.cache.indptr_buffers
-    )
+    # Dropped on every entry, so each pass of a capture records the fill.
+    indexed.indptrs = {}
     outer = metadata.step, metadata.queries, metadata.image_mask
     metadata.step, metadata.queries = step, queries
     if rows is not None and outer[2] is not None:
@@ -382,5 +344,11 @@ def rows_of(metadata, step, queries=None, rows=None):
         yield
     finally:
         metadata.step, metadata.queries, metadata.image_mask = outer
-        outer[0].indptrs = {}
-        outer[0].tiles.clear()
+        release_outer(outer[0])
+
+
+def release_outer(step: BatchStep) -> None:
+    """Drop ``step``'s indptrs and memoized tiles once an inner step's rows
+    have overwritten their buffers (`rows_of`)."""
+    step.indptrs = {}
+    step.tiles.clear()

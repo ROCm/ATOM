@@ -197,22 +197,22 @@ def config_refusal(atom_config) -> str | None:
     linear = getattr(hf, "linear_attn_config", None) or {}
     spec = atom_config.speculative_config
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
-    # `piecewise_cudagraph_required` is left at its default True, which refuses
-    # PIECEWISE. That is NOT what a CLI launch gets: `cudagraph_mode` defaults
-    # to "FULL" (`model_engine/arg_utils.py:145`, converted at :768), so mono
-    # arms from the CLI without `--cudagraph-mode` being passed. The
-    # `None -> PIECEWISE` default at `config.py:2393` is reached only by a
-    # config built without `arg_utils`, i.e. plugin mode, which this refusal
+    # `refuse_tr_hybrid` is left at its default True, which refuses
+    # TR_HYBRID. That is NOT what a CLI launch gets: `EngineArgs.cudagraph_mode`
+    # defaults to "FULL", so mono arms from the CLI without `--cudagraph-mode`
+    # being passed. The `None -> TR_HYBRID` default in `Config.__post_init__`
+    # is reached only by a config built without `arg_utils`, i.e. plugin
+    # mode, which this refusal
     # then turns mono off for. `recipes/Kimi-K3.md` says the same.
     #
     # Structurally K3 could drop this refusal the way GLM-5.2 does: the
     # installer wraps the *uncompiled* `KimiK3ForConditionalGeneration` and the
     # runner drives `inner.layers` one at a time, so the compiled
-    # `KimiLinearModel.forward` never runs underneath mono and no piecewise
-    # graph of it can conflict. It is kept only because K3 mono has never been
-    # run under PIECEWISE -- every measurement to date used FULL -- and arming
+    # `KimiLinearModel.forward` never runs underneath mono and no token graph
+    # of it can conflict. It is kept only because K3 mono has never been
+    # run under TR_HYBRID -- every measurement to date used FULL -- and arming
     # an untested path is worse than requiring one documented flag. Drop it
-    # when there is a PIECEWISE run to point at, not before.
+    # when there is a TR_HYBRID run to point at, not before.
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP) + [
         # the kernels are one CTA a CU with every CTA resident: a spin wait on
         # another CTA only makes progress while that CTA runs

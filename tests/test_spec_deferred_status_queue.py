@@ -18,6 +18,7 @@ from atom.model_engine.model_runner import (
     tokenIDProcessor,
 )
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.spec_decode.status import SpecStatusQueue
 from atom.utils.selector import Family
 
 
@@ -107,7 +108,7 @@ def _processor() -> tokenIDProcessor:
         gpu=np.zeros(8, dtype=np.int32),
         copy_to_gpu=mock.Mock(),
     )
-    processor.recv_mtp_status_async = mock.Mock(
+    processor.recv_spec_status = mock.Mock(
         return_value=(
             np.array([2], dtype=np.int32),
             np.array([1], dtype=np.int32),
@@ -142,7 +143,9 @@ def test_detects_remote_prefill_producer(kv_config, expected):
 
 def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
     runner = SimpleNamespace(
-        config=SimpleNamespace(pipeline_parallel_size=1, kv_transfer_config=kv_config),
+        config=SimpleNamespace(
+            pipeline_parallel_size=1, kv_transfer_config=kv_config, max_num_seqs=8
+        ),
         attn_family=family,
         device="cuda",
     )
@@ -176,13 +179,15 @@ def test_a_consumer_keeps_deferred_output():
         (Family.V4, True),
         (Family.MLA, True),
         (Family.MHA, True),
-        (Family.CSA2, True),
+        (Family.CSA2, False),
     ],
 )
 def test_only_recurrent_state_producers_give_up_deferred_output(family, expected):
     """A paged write lands at T0's own position, so the consumer repeating it
     changes nothing -- V4 and the other paged models stay on the path they
-    used before P/D handoff existed."""
+    used before P/D handoff existed. CSA2 (DeepSeek-V4.1) hands off a STATE
+    slot whose cursor, compressor rings and Engram history advance per token,
+    so like the recurrent families its producer emits T0 from the prefill."""
     processor = _processor_for(kv_config={"kv_role": "kv_producer"}, family=family)
     assert processor.is_deferred_out is expected
 
@@ -265,18 +270,18 @@ def _graph_runner(*, is_pd_producer: bool, drafter: bool = True) -> ModelRunner:
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
     if drafter:
         runner.drafter = SimpleNamespace(mtp_k=3)
-    runner.enforce_eager = False
-    runner._piecewise_cg_active = lambda: False
-    runner.graphs = {(8, 4): object()}
+    runner._tr_hybrid_active = lambda: False
+    # mtp_k=3: the request bucket of 8 requests verifying 3 drafts each
+    runner.req_graph = {(8, 3)}
     return runner
 
 
 def test_only_a_producer_with_a_drafter_may_miss_a_recording():
-    """Everywhere else a missing `(bs, q)` is a capture gap, and handing
+    """Everywhere else a missing request bucket is a capture gap, and handing
     `decide` no shapes keeps it a `KeyError` at replay instead of a silent
     eager step."""
     producer = _graph_runner(is_pd_producer=True)
-    assert set(ModelRunner._producer_graph_shapes(producer)) == {(8, 4)}
+    assert (8, 3) in ModelRunner._producer_graph_shapes(producer)
 
     assert (
         ModelRunner._producer_graph_shapes(_graph_runner(is_pd_producer=False)) is None
@@ -288,7 +293,7 @@ def test_only_a_producer_with_a_drafter_may_miss_a_recording():
         is None
     )
 
-    producer.enforce_eager = True
+    producer.req_graph = None  # enforce_eager: nothing recorded
     assert ModelRunner._producer_graph_shapes(producer) is None
 
 
@@ -323,11 +328,11 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor = _processor()
 
     # Pure middle chunks skip postprocess, so neither the deferred-token queue
-    # nor its matching MTP-status queue may advance.
+    # nor its matching speculative-status queue may advance.
     tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False]), 1)
     tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, False]), 1)
 
-    processor.recv_mtp_status_async.assert_not_called()
+    processor.recv_spec_status.assert_not_called()
     np.testing.assert_array_equal(processor.prev_rejected_num, [7])
     np.testing.assert_array_equal(processor.prev_bonus_num, [8])
 
@@ -336,7 +341,7 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     # request in the same batch is still a middle chunk.
     tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, True]), 1)
 
-    processor.recv_mtp_status_async.assert_called_once_with()
+    processor.recv_spec_status.assert_called_once_with()
     np.testing.assert_array_equal(processor.prev_rejected_num, [2])
     np.testing.assert_array_equal(processor.prev_bonus_num, [1])
 
@@ -367,7 +372,7 @@ def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
     processor.prev_rejected_num = None
     processor.prev_bonus_num = None
     processor.pre_num_decode_token_per_seq = 1
-    processor.pending_mtp_status_copies = []
+    processor.spec_status_queue = SpecStatusQueue(8, mock.Mock())
     processor.prev_token_ids = np.zeros(bs, dtype=np.int32)
     processor.draft_token_ids = None
     forward_vars = {"cu_seqlens_q": SimpleNamespace(np=cu_seqlens_q, gpu=cu_seqlens_q)}

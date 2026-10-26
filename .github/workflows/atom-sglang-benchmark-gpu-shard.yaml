@@ -92,17 +92,37 @@ jobs:
       - name: Detect container engine
         run: |
           set -euo pipefail
+          echo "Runner: ${RUNNER_NAME:-unknown}"
+          id
+
+          check_container_engine() {
+            local engine="$1"
+            local status=0
+            echo "::group::Checking ${engine}"
+            if command -v "$engine"; then
+              "$engine" info || status=$?
+              if [[ "$status" -ne 0 ]]; then
+                echo "${engine} info failed with exit code ${status}."
+              fi
+            else
+              echo "${engine} is not installed or not on PATH."
+              status=127
+            fi
+            echo "::endgroup::"
+            return "$status"
+          }
+
           # Prefer podman when usable + --group-add keep-groups; otherwise docker + --group-add video.
-          if command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+          if check_container_engine podman; then
             echo "CONTAINER_ENGINE=podman" >> "$GITHUB_ENV"
             echo "CONTAINER_GROUP_ADD=--group-add keep-groups" >> "$GITHUB_ENV"
             echo "Container engine: podman (--group-add keep-groups)"
-          elif docker info > /dev/null 2>&1; then
+          elif check_container_engine docker; then
             echo "CONTAINER_ENGINE=docker" >> "$GITHUB_ENV"
             echo "CONTAINER_GROUP_ADD=--group-add video" >> "$GITHUB_ENV"
             echo "Container engine: docker (--group-add video)"
           else
-            echo "ERROR: Neither a working podman nor docker is available on this runner."
+            echo "::error::Neither a working podman nor docker is available on this runner. See the engine checks above."
             exit 1
           fi
 
@@ -662,12 +682,16 @@ jobs:
       - name: Clean up SGLang benchmark container
         if: always()
         run: |
-          $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
-          $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
-          $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
+          if [[ -z "${CONTAINER_ENGINE:-}" ]]; then
+            echo "Skipping cleanup: container engine was not initialized."
+            exit 0
+          fi
+
+          "$CONTAINER_ENGINE" exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          "$CONTAINER_ENGINE" stop "$CONTAINER_NAME" || true
+          "$CONTAINER_ENGINE" rm "$CONTAINER_NAME" || true
           if [[ "${SGLANG_IMAGE_SOURCE}" == "rebuild" ]]; then
-            $CONTAINER_ENGINE rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
+            "$CONTAINER_ENGINE" rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
           else
             echo "Keeping prebuilt SGLang image cached on runner: ${SGLANG_IMAGE_TAG}"
           fi
-
