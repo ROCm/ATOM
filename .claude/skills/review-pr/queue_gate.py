@@ -17,7 +17,10 @@ here and have the same remedy, so the message does not pretend to tell them apar
 
 Usage (from the gate job): python3 .claude/skills/review-pr/queue_gate.py
 Reads AUTHORIZED, PR, GH_TOKEN, ATOM_BOT_TOKEN, OWNER_OVERRIDE, the tuning below, and the
-GITHUB_* that Actions sets for every step. Writes `ok` to GITHUB_OUTPUT.
+GITHUB_* that Actions sets for every step. Writes `ok` to GITHUB_OUTPUT. OWNER_OVERRIDE is read
+but nothing in the workflow sets it -- ATOM's injection of it was removed along with the
+repo-variable override channel (owners.txt is now the only map) -- so this always falls back
+to the hardcoded owner below.
 """
 
 import datetime
@@ -176,7 +179,8 @@ def run(api, env, now=None, sleep=time.sleep):
         owner = (env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"
         status = api.comment(repo, env["PR"], message(verdict, ahead, eta, owner))
         if not 200 <= status < 300:
-            print("::warning::could not post the queue notice: %s" % status)
+            print("::warning::could not post the queue notice: %s%s" % (
+                status, " -- %s" % api.last_error_detail if api.last_error_detail else ""))
         return finish(verdict == "queued", verdict)
     except Exception as e:                                  # noqa: BLE001 - degrade, not crash
         print("::warning::the queue check failed (%s: %s); proceeding" % (type(e).__name__, e))

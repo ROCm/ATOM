@@ -15,7 +15,9 @@ this on a PR branch -- watchdog_test.py drives it instead, against a fake API an
 
 Usage (from the workflow): python3 .claude/skills/review-pr/watchdog.py
 Reads STUCK_MINUTES, PR, GH_TOKEN, ATOM_BOT_TOKEN, OWNER_OVERRIDE, and the GITHUB_* that
-Actions sets for every step.
+Actions sets for every step. OWNER_OVERRIDE is read but nothing in the workflow sets it --
+ATOM's injection of it was removed along with the repo-variable override channel (owners.txt
+is now the only map) -- so this always falls back to the hardcoded owner below.
 """
 
 import json
@@ -43,6 +45,12 @@ class GitHub:
     def __init__(self, token, bot_token=""):
         self._token = token
         self._bot_token = bot_token or token
+        # Set on a failed _request so a caller that only gets a status back (comment()'s
+        # contract predates this and transport_checks pins it to a bare int) can still show
+        # what GitHub actually said. _notify.py gets this for free from urllib's exception
+        # message; these three scripts go through _post's bare status, so it has to be
+        # threaded through separately instead.
+        self.last_error_detail = ""
 
     def _request(self, path, method="GET", body=None, token=None):
         req = urllib.request.Request(
@@ -55,6 +63,10 @@ class GitHub:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.status, json.load(r) if r.status != 204 else None
         except urllib.error.HTTPError as e:
+            try:
+                self.last_error_detail = e.read().decode("utf-8", errors="replace").strip()
+            except Exception:                                     # noqa: BLE001 - best effort
+                self.last_error_detail = ""
             return e.code, None
 
     def _get(self, path):
@@ -177,7 +189,8 @@ def run(api, env, sleep=time.sleep, clock=time.monotonic):
     shown = int(mins) if float(mins).is_integer() else mins
     status = api.comment(repo, env["PR"], stuck_body(shown, owner))
     if not 200 <= status < 300:
-        warning("could not post the stuck-review notice: %s" % status)
+        warning("could not post the stuck-review notice: %s%s" % (
+            status, " -- %s" % api.last_error_detail if api.last_error_detail else ""))
     return failed("no runner claimed this review in %s min" % shown)
 
 

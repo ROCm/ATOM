@@ -12,9 +12,17 @@ review job ended badly AND left no sign that it had already reported. It is the 
 watchdog, moved to the other end: the watchdog covers a review that never started, this covers
 one that started and then disappeared.
 
+What lands here is "the job said nothing and the cause is in the log" -- a triage job, not
+necessarily a box problem -- so aiter's workflow pages the FLOW owner here, not the runner
+owner it pages from the watchdog. ATOM's workflow injection for OWNER_OVERRIDE was removed along
+with the repo-variable channel (owners.txt is now the only map), so this script's fallback is
+the only owner that is ever paged here; nothing currently populates OWNER_OVERRIDE for any of
+the three scripts that read it.
+
 Usage (from the report job): python3 .claude/skills/review-pr/lost_review.py
 Reads REVIEW_RESULT, NOTIFIED, PR, RUN_URL, GH_TOKEN, ATOM_BOT_TOKEN, OWNER_OVERRIDE and the
-GITHUB_* that Actions sets.
+GITHUB_* that Actions sets. OWNER_OVERRIDE is read but nothing in the workflow sets it, so this
+always falls back to the hardcoded owner below.
 """
 
 import os
@@ -53,7 +61,8 @@ def run(api, env):
     status = api.comment(env["GITHUB_REPOSITORY"], env["PR"],
                          body(result, owner, (env.get("RUN_URL") or "").strip()))
     if not 200 <= status < 300:
-        print("::warning::could not post the lost-review notice: %s" % status)
+        print("::warning::could not post the lost-review notice: %s%s" % (
+            status, " -- %s" % api.last_error_detail if api.last_error_detail else ""))
     print("::error::the review job ended as %s with nothing reported" % result)
     return 1
 
