@@ -184,7 +184,11 @@ paths = [f["path"] for f in meta.get("files", [])]
 # Checked in this order: a .md under atom/ is documentation, and tests/ is neither
 # runtime nor documentation.
 TEST_PREFIXES = ("tests/",)
-STATIC_PREFIXES = (".github/", ".claude/", ".cursor/", "bin/", "docs/")
+# bin/ was dropped from this list: it is a plausible home for a future runtime script, and
+# classifying it "static" (no validation needed) would be silent the day that happens. .cursor/
+# stays -- it is genuinely static wherever it lives, unlike a directory name that could hold
+# anything.
+STATIC_PREFIXES = (".github/", ".claude/", ".cursor/", "docs/")
 STATIC_SUFFIXES = (".md", ".rst", ".txt", ".toml", ".cfg", ".ini", ".gitignore")
 # atom/ is named explicitly, even though the fallback below would already catch it, so this
 # constant states ATOM's own runtime surface rather than another project's directory names.
@@ -839,12 +843,12 @@ fi
 "$SKILLS_ROOT/review-pr/triage.py" perfclaims "$WORK/pr_meta.json" \
   | tee "$WORK/perf_claims.txt"
 
-# Whether a CI job will ever run the tests this PR adds. Computed from .github/ rather
-# than hardcoded: op_tests is shard-scanned at maxdepth 1 and op_tests/triton_tests
-# recursively, so op_tests/flydsl_tests/ (5 files in tree) is scanned by nothing and
-# op_tests/multigpu_tests/ (29) needs the `multigpu` label. 9% of open PRs add a test that
-# never runs. A path merely NAMED in a workflow does not count -- pr-title-tags.yaml names
-# these directories to pick a label.
+# Whether a CI job will ever run the tests this PR adds -- on aiter's tree, where this was
+# written: op_tests shard-scanned at maxdepth 1 and op_tests/triton_tests recursively, so
+# op_tests/flydsl_tests/ is scanned by nothing and op_tests/multigpu_tests/ needs the
+# `multigpu` label. ATOM has neither split_tests.sh nor op_tests/, so citest reports itself
+# NOT APPLICABLE here rather than reuse aiter's coverage rule on a tree it was never written
+# for; P1 owns deriving ATOM's own coverage rule.
 "$SKILLS_ROOT/review-pr/triage.py" citest "$WORK/pr.diff" "$PROJECT_ROOT" \
   | tee "$WORK/ci_coverage.txt"
 
@@ -861,12 +865,11 @@ fi
 # the judgement; this puts their evidence on screen instead of asking for a second look.
 "$SKILLS_ROOT/review-pr/triage.py" testquality "$WORK/pr.diff" | tee "$WORK/test_quality.txt"
 
-# New kernel files against the tests this PR adds. HK6 already fires on new-kernel, but it
-# was prose and the reader had to establish the absence themselves; 6.5% of 600 open PRs
-# add a kernel with no test pytest would collect. Collectibility is judged by filename --
-# an op_tests/-only whitelist called aiter#3991 untested while it added five test files
-# under aiter/aot/flydsl/tests/. Whether CI runs them is citest's question, not this one.
-"$SKILLS_ROOT/review-pr/triage.py" kerneltest "$WORK/pr.diff" \
+# New kernel files against the tests this PR adds -- on aiter's tree, where KERNEL_DIRS was
+# written (aiter/ops/triton/, csrc/kernels/, ...). None of those directories exist under ATOM,
+# so kerneltest reports itself NOT APPLICABLE here rather than print a dead-green all-clear;
+# P1 owns porting KERNEL_DIRS to ATOM's own kernel source tree.
+"$SKILLS_ROOT/review-pr/triage.py" kerneltest "$WORK/pr.diff" "$PROJECT_ROOT" \
   | tee "$WORK/kernel_tests.txt"
 
 # A variant of a changed function, in the same file, still carrying a line this PR changed.

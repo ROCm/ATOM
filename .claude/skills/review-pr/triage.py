@@ -231,6 +231,30 @@ KERNEL_DIRS = ("aiter/ops/triton/", "_triton_kernels/", "_gluon_kernels/", "/glu
                "aiter/ops/flydsl/", "csrc/kernels/", "csrc/py_itfs_cu/")
 
 
+def kerneltest_applicability(root):
+    """Whether KERNEL_DIRS names a directory that actually exists in this tree.
+
+    KERNEL_DIRS is aiter's kernel source layout. None of those paths exist under ATOM, so
+    untested_new_kernel's `new` filter can never match a file: `new` is always `[]`, and
+    render_untested_kernel prints the affirmative "no new kernel file without a collectible
+    test" on every single PR -- the all-clear for a check that structurally cannot run,
+    which is the exact failure this project exists to catch. Saying NOT APPLICABLE instead
+    of the dead-green all-clear is this function's whole job. Do not try to make KERNEL_DIRS
+    work against ATOM here -- porting it to ATOM's own kernel tree is P1's job, and a guess
+    now would just move the falsehood instead of removing it."""
+    root = pathlib.Path(root)
+    if any((root / d.rstrip("/")).is_dir() for d in KERNEL_DIRS):
+        return True, None
+    return False, (
+        "NOT APPLICABLE: new-kernel-without-test coverage is unverified for ATOM -- "
+        "KERNEL_DIRS names aiter's kernel source layout (aiter/ops/triton/, "
+        "csrc/kernels/, csrc/py_itfs_cu/, ...), and none of those directories exist in "
+        "this tree, so untested_new_kernel can never match a file here. Reporting the "
+        "all-clear below anyway would be a check that cannot run reading as a check that "
+        "passed. P1 owns porting KERNEL_DIRS to ATOM's own kernel source tree."
+    )
+
+
 def untested_new_kernel(diff_text):
     """New kernel files when the PR adds no test pytest will collect.
 
@@ -267,7 +291,9 @@ def render_untested_kernel(new):
         return "KERNEL TESTS: no new kernel file without a collectible test"
     out = ["NEW KERNEL, NO COLLECTIBLE TEST -- %d file(s). Collectible means a test_*.py" % len(new),
            "or *_test.py anywhere in the tree; benchmark dirs and bench_* files were not",
-           "counted. HK6 is the rule; this is its evidence."]
+           "counted. This is evidence for the reviewer's own judgement, not a rule citation --"
+           " no current rule id names an untested new kernel file precisely; HK6 is test-"
+           "reference dtype promotion, an unrelated rule, and citing it here was wrong."]
     out += ["  %s" % p for p in new]
     return "\n".join(out)
 
@@ -1102,10 +1128,19 @@ def derive(files, title="", raw_diff=""):
 # list and not emitted by any family is unreachable: documented, and read by nobody, ever.
 # The failure is invisible from inside a review -- the ledger only ever sees rules that
 # were derived -- so `triage.py mapping` is what surfaces it.
-# P0: empty. ATOM has no scanner-backed rules yet (no scan_index_width.py / citest /
-# structabi equivalent producing its own evidence file ahead of the rule pass) -- P1
-# fills this in as those scanners are ported.
-UNREACHABLE_BY_DESIGN = {}
+#
+# These 21 ids are rules.md bodies with no corresponding family in derive(): the P0 minimal
+# deriver emits only ALL_RULES's 19 ids, and these are the rest. Carried over verbatim from
+# the pre-pipeline SKILL.md prose, same as every rule here -- they are not dead weight, they
+# are P1's raw material for regrowing ATOM's own rule-family axis from real review history.
+# Do not trim rules.md to make this list shrink; the gap is the thing to see, not to hide.
+_P1_FAMILY_AXIS = ("the P0 minimal deriver does not emit this family; P1 owns regrowing "
+                   "ATOM's full rule-family axis from real ATOM review history, and this "
+                   "body is its raw material, not dead text")
+UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
+    "B3", "B4", "C3", "D1b", "D2", "D5", "D6", "D7", "D8", "D9", "F1", "G1", "G1b",
+    "P1", "P2", "P3", "P4", "P5", "HK3", "HK6", "HK7",
+)}
 
 ALL_RULES = "A1 A2 A3 B1 B2 B5 B6 C1 C2 D1 D4 E1 E2 E3 HK1 HK2 HK4 HK5 STEP4"
 
@@ -1746,6 +1781,31 @@ def near_duplicates(diff_text, root, threshold=0.60):
 
 
 # --------------------------------------------------------------- ci coverage
+def citest_applicability(root):
+    """Whether this tree matches the CI shape uncovered_test_paths was written to read.
+
+    aiter derives coverage from `.github/scripts/split_tests.sh`'s TEST_DIR declarations plus
+    the op_tests/ shard layout those name. ATOM has neither: no split_tests.sh, no op_tests/
+    tree. It runs `.github/scripts/run_unit_tests.sh` over `tests/` instead -- a shape this
+    function has never been taught to read. Without this guard, uncovered_test_paths sees no
+    covered_top and no covered_trees for every ATOM diff and reports every test_*.py the diff
+    adds as UNRUN-TEST, naming op_tests paths that do not exist here and handing the reviewing
+    model a false claim as evidence. Saying NOT APPLICABLE instead of guessing at ATOM's rule
+    is this function's whole job; P1 owns deriving ATOM's actual CI coverage rule from ATOM's
+    own CI and review history."""
+    root = pathlib.Path(root)
+    if (root / ".github" / "scripts" / "split_tests.sh").is_file():
+        return True, None
+    return False, (
+        "NOT APPLICABLE: CI coverage is unverified for ATOM -- this check derives coverage "
+        "from aiter's .github/scripts/split_tests.sh and the op_tests/ shard layout it "
+        "names, and neither exists in this tree. ATOM instead runs "
+        ".github/scripts/run_unit_tests.sh over tests/, a shape this forensic has not been "
+        "taught to read; reporting a result anyway would be a guess dressed as fact. P1 "
+        "owns deriving ATOM's actual coverage rule from ATOM's own CI."
+    )
+
+
 def uncovered_test_paths(diff_text, root):
     """Test files the diff adds that no CI job will run, and why.
 
@@ -2402,7 +2462,7 @@ if __name__ == "__main__":
               "       triage.py structabi <diff> <root>\n"
               "       triage.py commentonly <diff>\n"
               "       triage.py corefiles <core_files.txt> <diff> [root]\n"
-              "       triage.py kerneltest <diff>\n"
+              "       triage.py kerneltest <diff> [root]\n"
               "       triage.py siblings <diff> <root>\n"
               "       triage.py guards <diff>\n"
               "       triage.py refutations <refutations.txt> <diff> <card.md>\n"
@@ -2454,6 +2514,11 @@ if __name__ == "__main__":
                                                  tree_root(sys.argv[3]))))
         sys.exit(0)
     if mode == "kerneltest":
+        root = tree_root(sys.argv[3] if len(sys.argv) > 3 else ".")
+        applicable, reason = kerneltest_applicability(root)
+        if not applicable:
+            print(reason)
+            sys.exit(0)
         print(render_untested_kernel(untested_new_kernel(open(sys.argv[2]).read())))
         sys.exit(0)
     if mode == "corefiles":
@@ -2568,6 +2633,10 @@ if __name__ == "__main__":
 
     if mode == "citest":
         root = tree_root(sys.argv[3] if len(sys.argv) > 3 else ".")
+        applicable, reason = citest_applicability(root)
+        if not applicable:
+            print(reason)
+            raise SystemExit(0)
         diff_src = open(sys.argv[2], errors="replace").read()
         rows = uncovered_test_paths(diff_src, root)
         added = [f for f in changed_paths(diff_src)

@@ -105,6 +105,14 @@ _Answer:_
 
 ## Step 3 — PR Type Classification
 
+**The rule set this PR is actually adjudicated against is `$WORK/rules.txt`**, derived by
+`triage.py rules` in Step 1b and adjudicated in Step 7. Every rule id this step's checklist
+names below is pre-pipeline prose, carried over from before Step 1b existed: it is a reading
+aid for the human classifying the PR, not a derivation, and several of the ids it names
+(HK3, the P-family) are not emitted by the current deriver at all -- see `MAPPING.md`'s
+"deliberately never derived" list, which P1 owns closing. Treat this checklist as a prompt
+for what to look for, not as a citation of what will appear on the card.
+
 - [ ] **Performance optimization** → P1 (benchmark numbers), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
 - [ ] **New aiter op usage / aiter API change** → E1 (aiter dep), B5 (param added/removed/renamed propagation), B6 (new kwarg unhandled by all ATOM dispatch branches?), E3 (dead param)
 - [ ] **API signature change** (param added / removed / renamed in an ATOM function or base class, default or return type changed) → B5 (propagation to all receivers), E1 (aiter dep if aiter-side), E2 (plugin bridge sync)

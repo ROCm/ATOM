@@ -21,3 +21,27 @@ disagreement between this file and the deriver is caught.
 | `incomplete-code`     | HK4 |
 | `scattered-diff`      | HK2 |
 | `generic-code`        | A1 B1 D4 |
+
+Documented but deliberately never derived:
+
+- **B3** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **B4** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **C3** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **D1b** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **D2** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **D5** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **D6** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **D7** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **D8** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **D9** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **F1** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **G1** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **G1b** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **HK3** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **HK6** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **HK7** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **P1** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **P2** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **P3** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **P4** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text
+- **P5** — the P0 minimal deriver does not emit this family; P1 owns regrowing ATOM's full rule-family axis from real ATOM review history, and this body is its raw material, not dead text

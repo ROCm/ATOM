@@ -243,7 +243,13 @@ Real example (ATOM#789): `loop.call_soon_threadsafe` routes incremental detokeni
 
 ---
 
-### Performance Evidence (always check)
+### Performance Evidence
+
+Not derived by the current pipeline -- P1-P5 are in `UNREACHABLE_BY_DESIGN`
+(see `triage.py` and `MAPPING.md`): the P0 minimal deriver does not emit this
+family, so nothing puts these on `$WORK/rules.txt` today. "Always check"
+described SKILL.md's pre-pipeline prose checklist, not what the deriver
+does; kept here as the rule bodies P1 regrows the family from.
 
 **P1 — Perf PR without benchmark numbers** ⚠️
 Trigger words: perf, optimize, fuse, faster, improve, +X%, replace kernel, OOM fix that changes algo.
