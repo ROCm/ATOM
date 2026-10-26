@@ -49,6 +49,11 @@ class MonoDSparkProposer(DSparkProposer):
             context.scheduled_tokens = context.running_tokens = (
                 bs * self.draft_tokens_per_seq
             )
+            # The draft pass's count, as `Drafter.warmup_draft_graphs` points
+            # it: not the target's, which would run past these rows.
+            context.scheduled_tokens_gpu = self.runner.forward_vars["batch_info"].gpu[
+                2:3
+            ]
             set_forward_context(
                 attn_metadata=attn_metadata,
                 atom_config=self.config,
@@ -195,6 +200,7 @@ class MonoDSparkProposer(DSparkProposer):
             scheduled_tokens=bs * width,
             running_tokens=running_bs * width,
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
         if not native_initialization:
 
