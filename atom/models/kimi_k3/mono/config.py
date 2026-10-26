@@ -137,8 +137,8 @@ SUPPORTED_TP = (8,)
 # 8. Both kernels still take one slab -- i.e. the whole row, exactly as before
 # -- at every row count up to 8.
 #
-# **16 rows is correct and faster; the default stays at 8 anyway, pending a
-# task-level accuracy run.** Three classes of 8-row assumption have been found
+# **16 rows is correct and faster; the default stays at 8 so existing
+# deployments do not change** (paired GSM8K: recipes/Kimi-K3.md). Three classes of 8-row assumption have been found
 # and fixed:
 #
 #   * ``MAX_U = 8 * TOPK`` sized the expert union while ``load_route`` wrote an
@@ -164,11 +164,11 @@ SUPPORTED_TP = (8,)
 # issues the same MFMAs at both widths while the staging does not. Nothing above
 # 16 is measured; do not extrapolate the trend.
 #
-# The default stays 8 because **no task-level accuracy run exists at any
-# width**, and K2's latent MoE carries a real, unsettled precision cost
-# (rel_L2 1.7e-1 .. 3.0e-1: the expert intermediate is bf16 in the reference and
-# MXFP4 here). Raising the cap also arms mono for every CUDA-graph capture size
-# inside it, so it is a decision to make on accuracy evidence, not on speed.
+# The default stays 8 so existing deployments do not change. Paired GSM8K at 16
+# rows showed no regression (recipes/Kimi-K3.md), but K2's latent MoE still
+# carries an unsettled MXFP4 activation-quant precision cost (rel_L2 1.7e-1 ..
+# 3.0e-1: the expert intermediate is bf16 in the reference and MXFP4 here).
+# Raising the cap also arms mono for every CUDA-graph capture size inside it.
 # ``ATOM_MONO_K3_MAX_ROWS`` makes that decision per deployment.
 #
 # the caps whose kernels are built and measured; any other value is refused

@@ -498,14 +498,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 mono: the most rows (requests x query length) a step may have and
     # still run on the kernels. 8 serves one request at k=7; 16 also serves two
     # (bs=2 x MTP7), including the bs=2 CUDA graph. Read once at import; only 8
-    # and 16 are built and measured, anything else turns mono off by name. Off
-    # (8) by default until a task-level accuracy run exists.
+    # and 16 are built and measured, anything else turns mono off by name. 8 by
+    # default so existing deployments keep their buffers; GSM8K: recipes/Kimi-K3.md.
     "ATOM_MONO_K3_MAX_ROWS": lambda: int(os.getenv("ATOM_MONO_K3_MAX_ROWS", "8")),
     # Kimi-K3 mono: also run K2 (o_proj, its all-reduce, the MLP AttnRes seam and
     # the latent MoE) on the 24 full-attention (MLA) layers. Their attention stays
-    # on the production path. Off by default until a task-level accuracy run
-    # exists: K2's latent MoE carries an unsettled MXFP4 precision cost, and this
-    # applies it to 24 more layers.
+    # on the production path. Off by default: K2's latent MoE has an unsettled
+    # MXFP4 activation-quant precision cost, applied here to 24 more layers
+    # (GSM8K: recipes/Kimi-K3.md).
     "ATOM_MONO_K3_MLA_K2": lambda: os.getenv("ATOM_MONO_K3_MLA_K2", "0") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
