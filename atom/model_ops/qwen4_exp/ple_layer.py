@@ -230,10 +230,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embedding_cls = _Qwen4ExpFP8Embedding
         elif embedding_dtype not in (None, "bfloat16"):
             raise ValueError(f"unsupported ple_embedding_dtype: {embedding_dtype}")
-        elif embedding_dtype is None and policy is not None and policy.is_quantized:
-            # Older checkpoints specify PLE storage through the FP8 policy.
-            if quant_config.quant_method != "fp8":
-                raise ValueError("PLE embedding supports BF16 or FP8 checkpoints")
+        elif (
+            embedding_dtype is None
+            and policy is not None
+            and policy.is_quantized
+            and quant_config.quant_method == "fp8"
+        ):
+            # Older FP8 checkpoints specify PLE storage through the FP8 policy.
+            # Other formats (e.g. Quark) only quantize linear layers and keep
+            # the embedding BF16; the shard loader rejects any dtype mismatch.
             # PLE uses a global scalar, independently of the linear block scales.
             embedding_cls = _Qwen4ExpFP8Embedding
         self.ngram_embedding = embedding_cls(

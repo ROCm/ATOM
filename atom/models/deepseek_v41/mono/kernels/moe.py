@@ -8,15 +8,17 @@ draft's 128 / 3). The rank holds every routed expert's 1/TP of the
 intermediate width (TP-sharded MoE) and the shared expert's 1/TP (``Dims``).
 Stages, with TP4's task counts:
 
-    xq      (S): the row as MXFP8 for the routed experts (aiter
-            ``fused_mx_quant_moe_sort``: amax seeded 1e-10) and for the shared
-            one (ATOM ``quantize_fp8``: amax floored 1e-4) -> X8R, X8 (plain
-            words, then the token's flag X8RDY)
+    xq      (S): the row as MXFP8 (amax floored ``AMAX_FLOOR``, the ceil
+            code) for the routed experts (aiter ``fused_mx_quant_moe_sort``) and
+            for the shared one (ATOM ``quantize_fp8``): one rule, so one copy
+            -> X8 (plain words, then the token's flag X8RDY)
     router  (E / 16 x 4, 16 rows x a quarter of K): bf16 GEMV -> the part's
             f32 sum -> LOGIT
     route   (S): the parts summed in order -> bf16 logits; aiter
             ``topk_gating_kernel_opt`` (sqrtsoftplus + bias, top-k, renormalized
-            x 1.5), one wave a token -> ROUTE
+            x 1.5), one wave a token -> ROUTE (DP attention: router and route on
+            the rank's own step's rows alone, the routes pushed to every rank's
+            RT, ``peer_layout``)
     shared  (36, 16 gate + 16 up rows): FP8 GEMV -> bf16 -> aiter silu_and_mul
             (gate <= 10, up in [-10, 10], ocml exp) -> bf16 -> SMID
     ug      (|U| x 9, 2 x (32 gate + 32 up) rows of one expert of the union U of
@@ -27,8 +29,9 @@ Stages, with TP4's task counts:
             B operand from LDS read once for both), the slices summed
             pairwise; then its epilogue:
             clamp, silu x up, bf16,
-            and the stage-2 input quant to MXFP8 (amax seeded 1e-10, the ceil
-            code) -> MID (plain words at device scope, then the task's flag, UGF)
+            and the stage-2 input quant to MXFP8 (amax floored AMAX_FLOOR, the
+            ceil code) -> MID (plain words at device scope, then the task's
+            flag, UGF; down by unit: the CTA's after its last task, UGC)
     down    (320, 16 rows; a CTA's two run together): per expert of U the MXFP4
             x MXFP8 GEMV of its intermediate (x its routing weight -> bf16),
             summed in each token's top-k order, rounded to bf16 at every add
@@ -55,12 +58,12 @@ from atom.model_ops.deepseek_v41.router import (
     router_x_loads,
 )
 from atom.models.deepseek_v41.mono import moe_plan as mplan
+from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 
 # helpers the kernel calls are imported by name: FlyDSL keys a build by the
 # source of the same-directory functions it names, never through a module
 from atom.models.deepseek_v41.mono.kernels.attn_pre import (
-    MAX_TOKENS,
     TILE,
     gemv_fp8_loads,
     gemv_fp8_mfmas,
@@ -73,13 +76,17 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     token_tiles,
 )
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
-from atom.models.deepseek_v41.mono.kernels.dims import UG_PART
+from atom.models.deepseek_v41.mono.kernels.dims import (
+    ROUTE_COPIES,
+    SHARED_INTER,
+    UG_PART,
+)
 from atom.models.deepseek_v41.mono.kernels.moe_shape import (
-    MASK_WORDS,
     SORT_NETS,
     MoeBuild,
     route_shape,
 )
+from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
 from atom.models.deepseek_v41.mono.sources import SOURCES
@@ -99,6 +106,7 @@ from atom.mono.device.ops import (
     CM_NT,
     _hw_f32,
     ballot,
+    bf16_pair,
     bf16_round,
     bf_hi,
     bf_lo,
@@ -116,6 +124,7 @@ from atom.mono.device.ops import (
     row_sum,
     rsrc,
     traced,
+    uniform,
 )
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
@@ -135,6 +144,10 @@ LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
 ROWS = k1.ROWS
 DOWN_TASKS = HIDDEN // ROWS  # 320
+# a down unit's hidden block (``down_units``): a wave DOWN_WAVE_TASKS adjacent
+# 16-row tasks (one 32-row scale block), WAVES waves
+DOWN_WAVE_TASKS = 2
+DOWN_UNIT_BLOCKS = DOWN_TASKS // (WAVES * DOWN_WAVE_TASKS)  # 20
 # (task, slot) scale blocks a down wave holds a round (``stage_down``): 3 took
 # no less time, 4 spills
 DOWN_R_MAX = 2
@@ -144,9 +157,6 @@ DOWN_CHAINS = 2
 # pass a round trip in series (32: 1-2 passes, S=48 -1 us)
 RED_COLS = 32
 RED_TASKS = HIDDEN // RED_COLS  # 160
-# CTA b polls route copy b % ROUTE_COPIES: every CTA on one small region
-# serializes on its lines (K2b S=24 -0.5 us)
-ROUTE_COPIES = 8
 X8_WORDS = HIDDEN // 4
 TAGS = 256  # mailbox tags (a layer's K1 / K2a / K2b each own one): the ug queues
 
@@ -174,13 +184,11 @@ def scratch_layout(key: MoeBuild) -> dict[str, tuple[int, int]]:
     rs = route_shape(key)
     d = rs.dims
     pairs = {
-        # the routed experts' MXFP8 x (aiter's fused_mx_quant_moe_sort) and the
-        # shared expert's (ATOM quantize_fp8): their amax floors differ
-        "x8r": tokens * X8_WORDS // 2,
-        "x8rs": tokens * HIDDEN // 32 // 2,
+        # the MXFP8 x of the routed experts (aiter fused_mx_quant_moe_sort) and
+        # of the shared one (ATOM quantize_fp8): one rule (``xq_quant``)
         "x8": tokens * X8_WORDS // 2,
         "x8s": tokens * HIDDEN // 32 // 2,
-        # a token's four MXFP8 regions written (plain words): ``stage_xq``
+        # a token's two MXFP8 regions written (plain words): ``stage_xq``
         "x8rdy": tokens,
         "logit": tokens * experts * ROUTER_PARTS,
         "route": ROUTE_COPIES * tokens * 2 * topk,
@@ -198,6 +206,14 @@ def scratch_layout(key: MoeBuild) -> dict[str, tuple[int, int]]:
         "ugq": TAGS // 2,
         # the down stage's arrival count, a word a tag (``take_down_rank``)
         "dq": TAGS // 2,
+        # the down unit queue, a word a tag (``take_down_unit``)
+        "dnq": TAGS // 2,
+        # down by unit: each pick's bf16 contribution [pick][HIDDEN] (packed
+        # pairs), and a CTA's units-done flag (``down_units``)
+        "dcon": rs.picks * HIDDEN // 4,
+        "dnf": BLOCKS,
+        # down by unit: a CTA's ug-tasks-done flag (``down_by_unit``)
+        "ugc": BLOCKS,
     }
     return pair_layout(pairs.items())
 
@@ -214,16 +230,13 @@ def region_pair(src, t, s, col):
 @traced
 def stage_xq(c, t):
     """Token t, a group of 32 a thread."""
-    tid = c["tid"]
-    a = c["args"]
     # thread g < 160 owns the 32 values of group g; the rest mirror thread 159
-    g = fx.min(tid, HIDDEN // 32 - 1)
-    mine = tid < HIDDEN // 32
+    g = fx.min(c["tid"], HIDDEN // 32 - 1)
     # 32 bf16 as four 16-byte loads (a load an element made the stage issue bound)
     words = [
         fx.Vector(
             bo.buffer_load(
-                rsrc(a["x"]),
+                rsrc(c["args"]["x"]),
                 (t * HIDDEN + g * 32) // 2 + 4 * q,
                 vec_width=4,
                 dtype=T.i32,
@@ -232,15 +245,30 @@ def stage_xq(c, t):
         )
         for q in range(4)
     ]
-    v = [(bf_lo if i % 2 == 0 else bf_hi)(words[i // 8][i % 8 // 2]) for i in range(32)]
-    amax = fx.Float32(1e-10)
+    xq_quant(c, t, g, [words[i // 4][i % 4] for i in range(16)])
+
+
+@traced
+def stage_xq_pushed(c, t):
+    """DP attention: token t another rank's, its row read where the owner
+    pushed it (XG) -- no copy into x, no flag between (``layer_post.push_x``)."""
+    g = fx.min(c["tid"], HIDDEN // 32 - 1)
+    xg = preg(c["sym"], c["peer"]["xg"], "xg")
+    got = c["poll"]([(xg, t * (HIDDEN // 2) + g * 16 + 2 * k, 2) for k in range(8)])
+    xq_quant(c, t, g, [got[i // 2][i % 2] for i in range(16)])
+
+
+@traced
+def xq_quant(c, t, g, words):
+    """Token t's group g (16 words of bf16 pairs) as MXFP8: the routed
+    experts' and the shared one's (one rule)."""
+    mine = c["tid"] < HIDDEN // 32
+    v = [(bf_lo if i % 2 == 0 else bf_hi)(words[i // 2]) for i in range(32)]
+    amax = fx.Float32(AMAX_FLOOR)
     for y in v:
         amax = fx.max(amax, abs(y))
-    # the routed experts' (aiter fused_mx_quant_moe_sort): amax floored 1e-10;
-    # the shared expert's (ATOM quantize_fp8): floored 1e-4
     if mine:
-        put_mxfp8_group(c, "x8r", "x8rs", t, g, v, amax)
-        put_mxfp8_group(c, "x8", "x8s", t, g, v, fx.max(amax, fx.Float32(1e-4)))
+        put_mxfp8_group(c, "x8", "x8s", t, g, v, amax)
 
 
 def put_mxfp8_group(c, words_mb, codes_mb, t, g, v, amax):
@@ -398,10 +426,13 @@ def stage_route(c, t):
             my_id = (lane == k).select(win_id, my_id)
         scale = fx.Float32(SCALE) / fx.max(total, fx.Float32(1e-20))
         if lane < topk:
-            for r in range_constexpr(ROUTE_COPIES):
-                at = (r * c["S"] + t) * 2 * topk + lane
-                c["put"](c["route"], at, my_id)
-                c["put"](c["route"], at + topk, my_w * scale)
+            # token t of the routed rows is the step's row ``route_t0`` + t
+            tg = plus(c["route_t0"], t)
+            for dst in c["route_dsts"]:
+                for r in range_constexpr(ROUTE_COPIES):
+                    at = (r * c["route_rows"] + tg) * 2 * topk + lane
+                    c["put"](dst, at, my_id)
+                    c["put"](dst, at + topk, my_w * scale)
     gpu.barrier()
 
 
@@ -420,31 +451,35 @@ def load_route(c, tab):
     ORs land in, so every CTA derives the same pick order."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rs = c["rs"]
-    topk, max_u, experts = rs.topk, rs.max_u, rs.experts
+    topk, experts = rs.topk, rs.experts
     n = s * topk
-    assert s <= 32 * MASK_WORDS
+    mw = rs.mask_words
     # a thread's route words in one poll batch: a pass each was a round trip
     # each in series past 256 picks (48 rows: 5 us from the last route to the
     # table); a word past 2n re-reads the last and is not stored
     idxs = [plus(pas, tid) for pas in range(0, 2 * n, THREADS)]
     copy_at = c["bid"] % ROUTE_COPIES * (2 * n)
-    got = c["poll"]([(c["route"], copy_at + fx.min(idx, 2 * n - 1), 1) for idx in idxs])
+    got = c["poll"](
+        [(c["route_src"], copy_at + fx.min(idx, 2 * n - 1), 1) for idx in idxs]
+    )
     for i in range_constexpr(len(idxs)):
         if idxs[i] < 2 * n:
             fx.ptr_store(got[i][0], tab + idxs[i])
-    for pas in range_constexpr(0, MASK_WORDS * experts, THREADS):
+    for pas in range_constexpr(0, mw * experts, THREADS):
         idx = plus(pas, tid)
-        if idx < MASK_WORDS * experts:
+        if idx < mw * experts:
             fx.ptr_store(fx.Int32(0), tab + (rs.mask0 + idx))
     gpu.barrier()
-    if tid < n:
-        t = tid // topk
-        eid = fx.ptr_load(tab + (t * 2 * topk + tid % topk))
-        fx.llvm.atomic_or(
-            tab + (rs.mask0 + eid * MASK_WORDS + t // 32),
-            fx.Int32(1) << (t % 32),
-            syncscope="workgroup",
-        )
+    # a pick a thread, past THREADS picks a pass each
+    for p0 in range_constexpr(0, n, THREADS):
+        pick = plus(p0, tid)
+        if pick < n:
+            t = pick // topk
+            eid = fx.ptr_load(tab + (t * 2 * topk + pick % topk))
+            # expert parallel: another rank's experts keep an empty bitmap, so
+            # they never enter U and their picks no slot
+            if const_expr(rs.ep == 1) or is_local(c, eid):
+                mark_pick(tab, rs, t, eid)
     gpu.barrier()
     base = 2 * n
     # a chunk of 64 experts a wave (wave 0 alone through 6 chunks in series
@@ -456,8 +491,8 @@ def load_route(c, tab):
     sums = c["red"]
     e = lane + 64 * fx.min(wave, chunks - 1)
     count = fx.Int32(0)
-    for w in range_constexpr(MASK_WORDS):
-        word = fx.ptr_load(tab + (rs.mask0 + e * MASK_WORDS + w))
+    for w in range_constexpr(mw):
+        word = fx.ptr_load(tab + (rs.mask0 + e * mw + w))
         count = count + popcount(word)
     ball = ballot(count != 0)
     # this chunk's inclusive prefixes, lanes ascending: picks, and pick tiles
@@ -494,28 +529,61 @@ def load_route(c, tab):
     if (wave == chunks - 1) & (lane == 0):
         n_all = n_u + totals[0]
         fx.ptr_store(n_all, tab + base)
-        fx.ptr_store(fx.Int32(n), tab + (rs.first0 + n_all))
+        # the picks of U: every pick under TP
+        fx.ptr_store(first + totals[1], tab + (rs.first0 + n_all))
         if const_expr(rs.multi):
             fx.ptr_store(tile0 + totals[2], tab + (rs.tile_first0 + n_all))
     gpu.barrier()
-    if tid < n:
-        t = tid // topk
-        eid = fx.ptr_load(tab + (t * 2 * topk + tid % topk))
-        slot = fx.ptr_load(tab + (rs.expert_slot0 + eid))
-        fx.ptr_store(slot, tab + (base + 1 + max_u + tid))
-        # the tokens below t that picked this expert: the picks before tid in it
-        rank = fx.Int32(0)
-        for w in range_constexpr(MASK_WORDS):
-            word = fx.ptr_load(tab + (rs.mask0 + eid * MASK_WORDS + w))
-            lo = t - 32 * w
-            keep = (lo >= 32).select(
-                fx.Int32(-1),
-                (lo > 0).select((fx.Int32(1) << fx.max(lo, 0)) - 1, fx.Int32(0)),
-            )
-            rank = rank + popcount(word & keep)
-        pos = fx.ptr_load(tab + (rs.first0 + slot)) + rank
-        fx.ptr_store(tid, tab + (rs.order0 + pos))
+    for p0 in range_constexpr(0, n, THREADS):
+        pick = plus(p0, tid)
+        if pick < n:
+            t = pick // topk
+            eid = fx.ptr_load(tab + (t * 2 * topk + pick % topk))
+            if const_expr(rs.ep == 1) or is_local(c, eid):
+                place_pick(c, tab, pick, t, eid)
     gpu.barrier()
+
+
+def mark_pick(tab, rs, t, eid):
+    """Token t into expert eid's token bitmap (``load_route``)."""
+    fx.llvm.atomic_or(
+        tab + (rs.mask0 + eid * rs.mask_words + t // 32),
+        fx.Int32(1) << (t % 32),
+        syncscope="workgroup",
+    )
+
+
+@traced
+def place_pick(c, tab, tid, t, eid):
+    """Pick ``tid`` (token t, expert eid of U): its slot of U, and its position
+    in the pick order (``load_route``)."""
+    rs = c["rs"]
+    slot = fx.ptr_load(tab + (rs.expert_slot0 + eid))
+    fx.ptr_store(slot, tab + (2 * rs.picks + 1 + rs.max_u + tid))
+    # the tokens below t that picked this expert: the picks before tid in it
+    rank = fx.Int32(0)
+    for w in range_constexpr(rs.mask_words):
+        word = fx.ptr_load(tab + (rs.mask0 + eid * rs.mask_words + w))
+        lo = t - 32 * w
+        keep = (lo >= 32).select(
+            fx.Int32(-1),
+            (lo > 0).select((fx.Int32(1) << fx.max(lo, 0)) - 1, fx.Int32(0)),
+        )
+        rank = rank + popcount(word & keep)
+    pos = fx.ptr_load(tab + (rs.first0 + slot)) + rank
+    fx.ptr_store(tid, tab + (rs.order0 + pos))
+
+
+def local_expert(c, e):
+    """Routed expert e's index among this rank's weights (expert parallel:
+    from its first, ``e0``)."""
+    return e if const_expr(c["rs"].ep == 1) else e - c["e0"]
+
+
+def is_local(c, eid):
+    """Whether routed expert ``eid`` is this rank's (expert parallel)."""
+    e0 = c["e0"]
+    return (eid >= e0) & (eid < e0 + c["rs"].local_experts)
 
 
 def lane_prefix(v, lane):
@@ -552,7 +620,7 @@ def stage_shared(c, task, gops, t0, n):
     if tid < ROWS * n:
         gate = row_sum(red, tid % ROWS, tid // ROWS)
     gpu.barrier()
-    uops = gemv_fp8_loads(c, a["sgu"], a["sgu_s"], HIDDEN, d.shared_tasks + task)
+    uops = gemv_fp8_loads(c, a["sgu"], a["sgu_s"], HIDDEN, plus(c["sh_up0"], task))
     gemv_fp8_mfmas(c, HIDDEN, c["xl"], c["xsl"], red, uops, rows=rows)
     gpu.barrier()
     if tid < ROWS * n:
@@ -571,8 +639,8 @@ def stage_shared(c, task, gops, t0, n):
 @traced
 def smid_quant(c, task, t0, n):
     """Odd shared task ``task``: its 16 columns (LDS ``pair``) and the even
-    task's (SMID) are a quantize_fp8 group of 32 (amax floored 1e-4, the ceil
-    code) -> SMQ / SMC, a thread a token. Once here, not in each of the 256 CTAs
+    task's (SMID) are a quantize_fp8 group of 32 (amax floored AMAX_FLOOR, the
+    ceil code) -> SMQ / SMC, a thread a token. Once here, not in each of the 256 CTAs
     whose down stage reads them: that took a down CTA 14 us at 48 rows."""
     tid, sh = c["tid"], c["d"].sh_inter
     assert c["d"].shared_tasks % 2 == 0  # tasks pair into groups
@@ -584,7 +652,7 @@ def smid_quant(c, task, t0, n):
         vals = [got[r][0].bitcast(fx.Float32) for r in range(ROWS)] + [
             fx.ptr_load(c["pair"] + (tid * ROWS + r)) for r in range(ROWS)
         ]
-        amax = fx.Float32(1e-4)
+        amax = fx.Float32(AMAX_FLOOR)
         for y in vals:
             amax = fx.max(amax, abs(y))
         code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
@@ -607,7 +675,7 @@ def gemv_fp4_pair(c, w, ws, e, n_rows, k, rg0, ks, xl, xsl, scale_cols, col):
     a task share x, so a wave a tile over all of K read it once a tile.
     """
     lane, wave = c["lane"], c["wave"]
-    sl = c["wsl"] + wave * wsl_words(c["d"])
+    sl = c["wsl"] + wave * UG_WSL_WORDS
     slices = c["rs"].ug_k_slices
     rounds = ug_rounds(k, ks, slices)
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
@@ -716,10 +784,14 @@ def down_scale_words(d) -> int:
     return down_lds_words(d.down_scale_cols * 8)
 
 
-def wsl_words(d) -> int:
-    """A wave's LDS scale words: an ug batch's 256, or a down round's blocks --
-    a (task, slot) each, ``DOWN_R_MAX`` at most (``stage_down``)."""
-    return max(256, DOWN_R_MAX * down_scale_words(d))
+# a wave's LDS scale words in the ug stage: a batch's 256
+UG_WSL_WORDS = 256
+
+
+def down_wsl_words(d) -> int:
+    """A wave's LDS scale words in the down stage: a round's blocks -- a (task,
+    slot) each, ``DOWN_R_MAX`` at most (``stage_down``)."""
+    return DOWN_R_MAX * down_scale_words(d)
 
 
 def scale_block_store(c, svs, sl):
@@ -906,11 +978,13 @@ def stage_ug_tile(c, task, total):
     gather_x8r(c, first, count)
     ug_pass(c, e, part0, first, count, fx.min(lane % 16, count - 1))
     nxt = (total > BLOCKS).select(take_ug_task(c) + BLOCKS, total)
-    # the epilogue's MID stores done before the flag
-    rocdl.s_waitcnt(vmcnt=0)
-    gpu.barrier()
-    if tid == 0:
-        c["put"](c["ugf"], task, 1)
+    if const_expr(not down_by_unit(c)):
+        # the epilogue's MID stores done before the task's flag (down by unit:
+        # the CTA's flag after its last task, ``run_moe``)
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        if tid == 0:
+            c["put"](c["ugf"], task, 1)
     return nxt
 
 
@@ -926,7 +1000,7 @@ def ug_pass(c, e, part0, first, count, col):
     acc = fx.Vector.filled(8, 0.0, fx.Float32)
     if real:
         acc = gemv_fp4_pair(
-            c, a["w13"], a["w13_s"], e, 2 * d.inter, HIDDEN, rg0, ks, c["xl"],
+            c, a["w13"], a["w13_s"], local_expert(c, e), 2 * d.inter, HIDDEN, rg0, ks, c["xl"],
             c["xsl"], HIDDEN // 32, col,
         )  # fmt: skip
     for t in range_constexpr(2):
@@ -974,7 +1048,7 @@ def load_x8_rows(c, words_mb, codes_mb, xl, xsl, token_of, live):
 
 
 def gather_x8r(c, first, count):
-    """The X8R rows and codes of the slot's picks first .. first + min(count, 16)
+    """The X8 rows and codes of the slot's picks first .. first + min(count, 16)
     into LDS rows 0 .. (only those rows: an ug pass reads a pick's row, the
     columns past them repeat the last one's)."""
     tab, topk = c["tab"], c["rs"].topk
@@ -982,7 +1056,7 @@ def gather_x8r(c, first, count):
     def token(j):
         return c["rs"].pick_at(tab, first + fx.min(j, count - 1)) // topk
 
-    load_x8_rows(c, "x8r", "x8rs", c["x8rl"], c["x8rsl"], token, fx.min(count, TILE))
+    load_x8_rows(c, "x8", "x8s", c["x8rl"], c["x8rsl"], token, fx.min(count, TILE))
 
 
 @traced
@@ -1013,10 +1087,12 @@ def ug_epilogue(c, part0, idx, first, count):
         uc = fx.max(fx.min(up, fx.Float32(LIMIT)), fx.Float32(-LIMIT))
         sig = hw_rcp(fx.Float32(1.0) + hw_exp2(gc * fx.Float32(-LOG2E)))
         # the stage-1 kernel stores the intermediate as bf16; the stage-2 input
-        # quant (fused_mx_quant_moe_sort) makes it MXFP8: amax floored 1e-10,
-        # the ceil code, x / scale clamped, RNE
+        # quant (fused_mx_quant_moe_sort) makes it MXFP8: amax floored
+        # AMAX_FLOOR, the ceil code, x / scale clamped, RNE
         v = bf16_round(gc * sig * uc)
-        amax = fx.max(butterfly(abs(v), (1, 2, 4, 8, 16), fx.max), fx.Float32(1e-10))
+        amax = fx.max(
+            butterfly(abs(v), (1, 2, 4, 8, 16), fx.max), fx.Float32(AMAX_FLOOR)
+        )
         code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
         q8 = clamp_fp8(v * rcp_pow2(code))
         nb = [
@@ -1042,7 +1118,7 @@ def stage_down(c, tasks):
     s, wave, tab, d = c["S"], c["wave"], c["tab"], c["d"]
     n = len(tasks)
     nu = c["rs"].n_union(tab, s)
-    sl = c["wsl"] + wave * wsl_words(d)
+    sl = c["wsl"] + wave * down_wsl_words(d)
     sw = down_scale_words(d)
     # slots of U a round: the loads of a round stay the same
     slots = DOWN_R_MAX // n
@@ -1051,6 +1127,9 @@ def stage_down(c, tasks):
     # before the routed results, which a CTA mostly waits on here; after the
     # rounds it sat on the path past the last ug task
     down_shared(c, tasks)
+    if const_expr(down_parts(d) > 1):
+        stage_down_parts(c, tasks, nu, sl, sw, slots, per_round)
+        return
     for rnd in range(0, (nu + per_round - 1) // per_round, 1):
         # the round's slots of U (wave, wave + WAVES, ...), every load of them
         # and of every task in flight before the first wait: the weights and
@@ -1086,10 +1165,346 @@ def stage_down(c, tasks):
                                 firsts[i] + j0, counts[i] - j0, avs[j * slots + i],
                                 us[i] < nu,
                             )  # fmt: skip
+    down_finish(c, tasks)
+
+
+@traced
+def down_finish(c, tasks):
+    """Every contribution of ``tasks`` stored: combine them, token tile by
+    token tile."""
     gpu.barrier()
-    for t0, nn in token_tiles(s):
+    repeated = "second_live" in c  # ``RouteShape.down_one_call``
+    for t0, nn in token_tiles(c["S"]):
+        for j in range_constexpr(len(tasks)):
+            if const_expr(j == 1 and repeated):
+                if c["second_live"]:
+                    down_combine(c, tasks[j], j, t0, nn)
+            else:
+                down_combine(c, tasks[j], j, t0, nn)
+
+
+def down_by_unit(c) -> bool:
+    """Whether the down stage runs by unit (``down_by_units``): a CTA's down
+    tasks in one call (``RouteShape.down_one_call``) with K in parts. It waits
+    for every ug task at once, so the ug stage flags a CTA (UGC), not a task
+    (EP 32 / 48 rows -1.3 / -1.5 us)."""
+    return c["rs"].down_one_call and down_parts(c["d"]) > 1
+
+
+@traced
+def down_by_units(c, tasks, after_units):
+    """Down past MAX_ROWS with K in parts: once every CTA's ug tasks are done
+    (UGC), the units of every CTA (``down_units``), ``after_units()``, the
+    shared expert's rows of the CTA's ``tasks`` (in the time it would wait for
+    the other CTAs' units: its input ready long before), then those tasks
+    combined (``down_units_combine``)."""
+    nu = c["rs"].n_union(c["tab"], c["S"])
+    for f in range(c["tid"], BLOCKS, THREADS):
+        c["poll"]([(c["ugc"], f, 1)])
+    gpu.barrier()
+    down_units(c, nu)
+    after_units()
+    down_shared(c, tasks)
+    down_units_combine(c, tasks)
+
+
+@traced
+def down_units(c, nu):
+    """Down by unit: a unit is (pick tile of U, hidden block of
+    DOWN_UNIT_BLOCKS), its cost at most one tile's, CTAs a unit each then from
+    a queue (``take_down_unit``: a fixed placement left CTAs 64 us apart); a
+    wave its DOWN_WAVE_TASKS tasks' chains over K, each pick's contribution to
+    DCON. Then the CTA's flag (DNF)."""
+    d = c["d"]
+    parts = down_parts(d, True)
+    nst = d.inter // 128 // parts
+    sl = c["wsl"] + c["wave"] * down_wsl_words(d)
+    total = c["rs"].tile_first(c["tab"], nu) * DOWN_UNIT_BLOCKS
+    unit = first_task(c["bid"], DOWN0)
+    while unit < total:
+        unit = down_unit_next(c, unit, sl, parts, nst, total)
+    publish(c["put"], c["dnf"], c["bid"], 1, c["tid"] == 0)
+
+
+@traced
+def down_unit_next(c, unit, sl, parts, nst, total):
+    """Down unit ``unit``, then this CTA's next from the queue (past the first
+    round)."""
+    down_unit(c, unit, sl, parts, nst)
+    return (total > BLOCKS).select(take_down_unit(c) + BLOCKS, total)
+
+
+@traced
+def take_down_unit(c):
+    """This CTA's next down unit past the first round, from the launch's queue
+    (``dnq``, a word a tag, counting from 0), as ``take_ug_task``."""
+    if c["tid"] == 0:
+        at = c["dnq"].value + fx.Int64(c["tag"] * 4)
+        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), at)
+        unit = fx.llvm.atomic_add(ptr, fx.Int32(1), syncscope="agent")
+        fx.ptr_store(fx.Int32(unit), c["tab"] + c["rs"].queue0)
+    gpu.barrier()
+    return fx.ptr_load(c["tab"] + c["rs"].queue0)
+
+
+@traced
+def down_unit(c, unit, sl, parts, nst):
+    """A wave's share of down unit ``unit``: its DOWN_WAVE_TASKS adjacent
+    16-row tasks (one 32-row scale block) on the unit's pick tile."""
+    v = unit // DOWN_UNIT_BLOCKS
+    task0 = (unit % DOWN_UNIT_BLOCKS * WAVES + c["wave"]) * DOWN_WAVE_TASKS
+    u = c["rs"].tile_slot(c["tab"], v)
+    e = local_expert(c, c["rs"].union_expert(c["tab"], c["S"], u))
+    first = mplan.tile_pick0(
+        c["rs"].slot_first(c["tab"], u), v, c["rs"].tile_first(c["tab"], u)
+    )
+    count = c["rs"].slot_first(c["tab"], u + 1) - first
+    sv = scale_block_loads(
+        c, c["args"]["w2_s"], e * HIDDEN + task0 * 16, c["d"].down_scale_cols
+    )
+    scale_block_store(c, sv, sl)
+    down_unit_tile(c, e, task0, sl, first, fx.min(fx.Int32(TILE), count), parts, nst)
+
+
+@traced
+def down_unit_tile(c, e, task0, sl, first, count, parts, nst):
+    """Tasks task0 .. task0 + DOWN_WAVE_TASKS of expert e on picks first ..
+    first + count: their chains over K in parts (the picks' MID operands
+    shared), part p + 1's loads before part p's MFMAs, each pick's
+    contribution to DCON."""
+    d, a = c["d"], c["args"]
+    n = DOWN_WAVE_TASKS
+    tasks = [task0 + j for j in range(n)]
+
+    def weights(st0):
+        return [
+            fp4_tile_weights(c, a["w2"], e, HIDDEN, d.inter, t, st0, nst, d.inter_real)
+            for t in tasks
+        ]
+
+    accs = [down_zero() for _ in range(n)]
+    avs = weights(0)
+    mids = mid_operands(c, first, count, 0, nst)
+    for part in range_constexpr(parts):
+        st0 = part * nst
+        if const_expr(part + 1 < parts):
+            avs_n = weights(st0 + nst)
+            mids_n = mid_operands(c, first, count, st0 + nst, nst)
         for j in range_constexpr(n):
-            down_combine(c, tasks[j], j, t0, nn)
+            accs[j] = down_chains(c, tasks[j], sl, mids, avs[j], accs[j], st0)
+        if const_expr(part + 1 < parts):
+            avs, mids = avs_n, mids_n
+    for j in range_constexpr(n):
+        down_store_dcon(c, accs[j], tasks[j], first, count)
+
+
+@traced
+def down_store_dcon(c, accs, task, first, count):
+    """``down_store`` into DCON: each of picks first .. first + count's
+    contribution to rows 16 task .. (bf16(v w), packed pairs)."""
+    lane, tab, s, rs = c["lane"], c["tab"], c["S"], c["rs"]
+    jj = lane % 16
+    col = fx.min(jj, count - 1)
+    acc = accs[0]
+    for h in range_constexpr(1, DOWN_CHAINS):
+        acc = acc + accs[h]
+    pick = rs.pick_at(tab, first + col)
+    w = rs.route_w(tab, s, pick // rs.topk, pick % rs.topk)
+    for q in range_constexpr(0, 4, 2):
+        r = 4 * (lane // 16) + q
+        if jj < count:
+            word = bf16_pair(acc[q] * w, acc[q + 1] * w).bitcast(fx.Int32)
+            st_dev(word, c["dcon"], pick * (HIDDEN // 2) + (task * ROWS + r) // 2)
+
+
+@traced
+def down_units_combine(c, tasks):
+    """Every CTA's units done (DNF), then ``down_finish`` from DCON in one
+    pass: a thread a (task, token, row pair), pushed straight (no LDS pair
+    round, no barrier a token tile)."""
+    for f in range(c["tid"], BLOCKS, THREADS):
+        c["poll"]([(c["dnf"], f, 1)])
+    gpu.barrier()
+    n_pairs = len(tasks) * c["S"] * (ROWS // 2)
+    for pas in range_constexpr(0, n_pairs, THREADS):
+        idx = plus(pas, c["tid"])
+        if idx < n_pairs:
+            dcon_pair(c, tasks, idx)
+    gpu.barrier()
+
+
+@traced
+def dcon_pair(c, tasks, idx):
+    """``down_units_combine``'s pair ``idx``: rows 2 rp, 2 rp + 1 of a task's
+    16 for one token, summed as ``down_combine`` (top-k order, a bf16 rounding
+    an add, local picks only, then the shared expert's), every routed
+    contribution's load issued together."""
+    s, tab, d = c["S"], c["tab"], c["d"]
+    topk = c["rs"].topk
+    per_task = s * (ROWS // 2)
+    j = idx // per_task
+    rem = idx % per_task
+    t = rem // (ROWS // 2)
+    rp = rem % (ROWS // 2)
+    task = tasks[0]
+    live = j == 0
+    if const_expr(len(tasks) > 1):
+        task = (j == 0).select(tasks[0], tasks[1])
+        live = (j == 0) | c["second_live"]
+    col = task * ROWS + 2 * rp
+    words = [
+        fx.Int32(
+            bo.buffer_load(
+                rsrc(c["dcon"].value),
+                (t * topk + k) * (HIDDEN // 2) + col // 2,
+                vec_width=1,
+                dtype=T.i32,
+                cache_modifier=CM_DEV,
+            )
+        )
+        for k in range(topk)
+    ]
+    r0, r1 = fx.Float32(0.0), fx.Float32(0.0)
+    for k in range_constexpr(topk):
+        local = is_local(c, c["rs"].route_id(tab, s, t, k))
+        r0 = local.select(bf16_round(r0 + bf_lo(words[k])), r0)
+        r1 = local.select(bf16_round(r1 + bf_hi(words[k])), r1)
+    base = (j * s + t) * ROWS + 2 * rp
+    sh0 = fx.ptr_load(c["sdl"] + base).bitcast(fx.Float32)
+    sh1 = fx.ptr_load(c["sdl"] + (base + 1)).bitcast(fx.Float32)
+    v0 = bf16_round(r0 + sh0)
+    v1 = bf16_round(r1 + sh1)
+    if const_expr(c["tok_par"]):
+        # to the token's owner only, at its own token index there
+        own_n = own_count(s, d.ranks)
+        owner = t // own_n
+        for p in range_constexpr(d.ranks):
+            if live & (owner == p):
+                dst = preg(c["peer_addr"](p), c["peer"]["ffn"], "ffn")
+                pair = region_pair(c["rank"], t - p * own_n, own_n, col)
+                c["put_bf"](dst, 2 * pair, [v0, v1])
+    else:
+        for p in range_constexpr(d.ranks):
+            if live:
+                dst = preg(c["peer_addr"](p), c["peer"]["ffn"], "ffn")
+                c["put_bf"](dst, 2 * region_pair(c["rank"], t, s, col), [v0, v1])
+
+
+# a down pass's K steps at most: TP2's whole intermediate. Past it the slots'
+# operands outgrow the VGPRs (expert parallel's whole width: 18 steps spilled
+# 624 B a lane at 12 rows), so K runs in parts of DOWN_PART_STEPS, one after
+# another (two parts of 9 still spilled 84 B: the accumulators and the next
+# part's loads stay live across a part)
+DOWN_PASS_STEPS = 9
+DOWN_PART_STEPS = 6
+# pipelined parts (``down_pipelined``): part p + 1's weights and MID loaded
+# before part p's MFMAs. Two parts in flight at once, so half the steps a part
+# (6 a part spilled 48-472 B)
+DOWN_PIPE_STEPS = 3
+
+
+def down_pipelined(n) -> bool:
+    """Whether a down call of ``n`` tasks pipelines its K parts: for a CTA's
+    two tasks (EP 12 / 24 rows -1.8 / -5.9 us). A one-task call holds twice the
+    slots a round: pipelined, it spilled 20-56 B."""
+    return n == 2
+
+
+def down_parts(d, pipelined=False) -> int:
+    """The K parts of a down slot (``DOWN_PASS_STEPS``, ``DOWN_PART_STEPS``,
+    ``DOWN_PIPE_STEPS``)."""
+    steps = d.inter // 128
+    if steps <= DOWN_PASS_STEPS:
+        return 1
+    parts = -(-steps // (DOWN_PIPE_STEPS if pipelined else DOWN_PART_STEPS))
+    assert steps % parts == 0, f"{steps} K steps in {parts} parts"
+    return parts
+
+
+@traced
+def stage_down_parts(c, tasks, nu, sl, sw, slots, per_round):
+    """``stage_down``'s rounds with K in ``down_parts``: each (task, slot)'s
+    accumulators carried through the parts in step order (the chains as one
+    pass over K keeps them: the same sums), each part's weights and MID
+    operands loaded at its start, or pipelined (``down_pipelined``) at the
+    start of the part before. The first part's weights and every scale block
+    load before the round's ug flags, as one pass's do."""
+    s, wave, tab, d = c["S"], c["wave"], c["tab"], c["d"]
+    n = len(tasks)
+    pipe = down_pipelined(n)
+    parts = down_parts(d, pipe)
+    nst = d.inter // 128 // parts
+    for rnd in range(0, (nu + per_round - 1) // per_round, 1):
+        us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
+        ucs = [fx.min(u, nu - 1) for u in us]
+        firsts = [c["rs"].slot_first(tab, u) for u in ucs]
+        svs, avs = down_weights(c, tasks, rnd, slots, nu, 0, nst)
+        c["poll"]([(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)])
+        counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
+        for q in range_constexpr(len(svs)):
+            scale_block_store(c, svs[q], sl + q * sw)
+        accs = [down_zero() for _ in range(n * slots)]
+        mids = [mid_operands(c, f, k, 0, nst) for f, k in zip(firsts, counts)]
+        for part in range_constexpr(parts):
+            st0 = part * nst
+            # a part's loads at its start, or (pipelined) at the start of the
+            # part before
+            at = part + 1 if pipe else part
+            if const_expr(0 < at < parts):
+                _, avs_n = down_weights(c, tasks, rnd, slots, nu, at * nst, nst)
+                mids_n = [
+                    mid_operands(c, f, k, at * nst, nst) for f, k in zip(firsts, counts)
+                ]
+                if const_expr(not pipe):
+                    avs, mids = avs_n, mids_n
+            for i in range_constexpr(slots):
+                for j in range_constexpr(n):
+                    q = j * slots + i
+                    accs[q] = down_chains(
+                        c, tasks[j], sl + q * sw, mids[i], avs[q], accs[q], st0
+                    )
+            if const_expr(pipe and part + 1 < parts):
+                avs, mids = avs_n, mids_n
+        for i in range_constexpr(slots):
+            for j in range_constexpr(n):
+                down_store(c, j, accs[j * slots + i], firsts[i], counts[i], us[i] < nu)
+            # a slot of more than 16 picks: its next pick tile's rows, every
+            # part's weights again (L2 hits)
+            if const_expr(s > TILE):
+                for j0 in range(TILE, counts[i], TILE):
+                    down_tile_parts(
+                        c, tasks, rnd, slots, nu, i, sl, sw, firsts[i] + j0,
+                        counts[i] - j0, us[i] < nu,
+                    )  # fmt: skip
+    down_finish(c, tasks)
+
+
+@traced
+def down_tile_parts(c, tasks, rnd, slots, nu, i, sl, sw, first, count, live):
+    """``stage_down_parts``' pick tile past a slot's first: slot i of the round,
+    picks first .., through every K part."""
+    n = len(tasks)
+    pipe = down_pipelined(n)
+    parts = down_parts(c["d"], pipe)
+    nst = c["d"].inter // 128 // parts
+    accs = [down_zero() for _ in range(n)]
+    _, avs = down_weights(c, tasks, rnd, slots, nu, 0, nst)
+    more = mid_operands(c, first, count, 0, nst)
+    for part in range_constexpr(parts):
+        st0 = part * nst
+        at = part + 1 if pipe else part
+        if const_expr(0 < at < parts):
+            _, avs_n = down_weights(c, tasks, rnd, slots, nu, at * nst, nst)
+            more_n = mid_operands(c, first, count, at * nst, nst)
+            if const_expr(not pipe):
+                avs, more = avs_n, more_n
+        for j in range_constexpr(n):
+            q = j * slots + i
+            accs[j] = down_chains(c, tasks[j], sl + q * sw, more, avs[q], accs[j], st0)
+        if const_expr(pipe and part + 1 < parts):
+            avs, more = avs_n, more_n
+    for j in range_constexpr(n):
+        down_store(c, j, accs[j], first, count, live)
 
 
 @traced
@@ -1106,37 +1521,37 @@ def take_down_rank(c):
     return fx.ptr_load(c["tab"] + c["rs"].queue0)
 
 
-def down_weights(c, tasks, rnd, slots, nu):
+def down_weights(c, tasks, rnd, slots, nu, st0=0, nst=None):
     """Round ``rnd``'s weights of ``stage_down``: each (task, slot)'s scale block
-    and weight operands, this wave's slots of U (a slot past U: the last's).
-    Loads only."""
+    and weight operands of K steps st0 .. st0 + nst (all of K by default), this
+    wave's slots of U (a slot past U: the last's). Loads only."""
     s, wave, tab, a, d = c["S"], c["wave"], c["tab"], c["args"], c["d"]
+    nst = d.inter // 128 if nst is None else nst
     us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
-    es = [c["rs"].union_expert(tab, s, fx.min(u, nu - 1)) for u in us]
+    es = [local_expert(c, c["rs"].union_expert(tab, s, fx.min(u, nu - 1))) for u in us]
     svs = [
         scale_block_loads(c, a["w2_s"], e * HIDDEN + task * 16, d.down_scale_cols)
         for task in tasks
         for e in es
     ]
     avs = [
-        fp4_tile_weights(
-            c, a["w2"], e, HIDDEN, d.inter, task, 0, d.inter // 128, d.inter_real
-        )
+        fp4_tile_weights(c, a["w2"], e, HIDDEN, d.inter, task, st0, nst, d.inter_real)
         for task in tasks
         for e in es
     ]
     return svs, avs
 
 
-def mid_operands(c, first, count):
+def mid_operands(c, first, count, st0=0, nst=None):
     """The MFMA B operands of picks first .. first + min(count, 16) (column
-    lane % 16 the pick, past them the last): each K step's two 16-byte halves
-    of the lane's MID row and its group's code, loaded at device scope straight into
-    registers -- no LDS block a slot, so a round holds more slots."""
+    lane % 16 the pick, past them the last) over K steps st0 .. st0 + nst (all
+    of K by default): each K step's two 16-byte halves of the lane's MID row
+    and its group's code, loaded at device scope straight into registers -- no
+    LDS block a slot, so a round holds more slots."""
     lane, d = c["lane"], c["d"]
     j = lane // 16
     row = first + fx.min(lane % 16, count - 1)
-    steps = d.inter // 128
+    nst = d.inter // 128 if nst is None else nst
     # the step's constant after an opaque lane word folds into the immediate
     # offset; summed with j * 4 it was a hoisted VGPR a step (spill)
     lane_word = fresh(row * d.mid_words + j * 4)
@@ -1153,18 +1568,18 @@ def mid_operands(c, first, count):
                 for h in range(2)
             ]
         )
-        for st in range(steps)
+        for st in range(st0, st0 + nst)
     ]
     # this lane's codes, one a K step: contiguous in MIDS (``mid_code_index``),
     # 4 a load -- a load a step was 5 of a slot's 16 load instructions, and the
     # stage is load-issue bound (probe ``harness/down_probe.py``: -8 %)
     base = mid_code_index(d, row, j)
     sbs = []
-    for w0 in range_constexpr(0, steps, 4):
-        n = min(4, steps - w0)
+    for w0 in range_constexpr(0, nst, 4):
+        n = min(4, nst - w0)
         v = bo.buffer_load(
             rsrc(c["mids"].value),
-            base + w0,
+            base + (st0 + w0),
             vec_width=n,
             dtype=T.i32,
             cache_modifier=CM_DEV,
@@ -1224,10 +1639,7 @@ def down_shared(c, tasks):
     token, bf16 -> LDS ``sdl`` [task][token][16 rows] (``down_combine``):
     every task's weights in flight first."""
     s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
-    a = c["args"]
-    shops = [
-        gemv_fp8_loads(c, a["sw2"], a["sw2_s"], d.sh_inter, task) for task in tasks
-    ]
+    shops = [shared_down_loads(c, task) for task in tasks]
     for t0, nn in token_tiles(s):
         load_smid_tile(c, t0, nn, d.sh_inter // 32)
         for j in range_constexpr(len(tasks)):
@@ -1240,27 +1652,46 @@ def down_shared(c, tasks):
             gpu.barrier()
 
 
+def shared_down_loads(c, task):
+    """The shared expert's down rows 16 task .. over this rank's part of its
+    intermediate: the replicated weight's columns of it under DP
+    attention."""
+    a, d = c["args"], c["d"]
+    if const_expr(not c["rs"].dpa):
+        return gemv_fp8_loads(c, a["sw2"], a["sw2_s"], d.sh_inter, task)
+    return gemv_fp8_loads(
+        c, a["sw2"], a["sw2_s"], d.sh_inter, task,
+        k_row=SHARED_INTER, st0=c["rank"] * (d.sh_inter // 128),
+    )  # fmt: skip
+
+
 @traced
 def down_combine(c, task, j, t0, n):
     """Down task ``task`` (the CTA's j-th) for tokens t0 .. t0 + n: the routed
-    contributions summed in bf16 in each token's top-k order, plus the shared expert's
-    (``down_shared``), the sum pushed to every rank (token parallel: to the
-    token's owner)."""
+    contributions summed in bf16 in each token's top-k order (expert parallel:
+    of this rank's experts), plus the shared expert's (``down_shared``), the sum
+    pushed to every rank (token parallel: to the token's owner)."""
     s, tid, d, tab = c["S"], c["tid"], c["d"], c["tab"]
     topk = c["rs"].topk
     if tid < ROWS * n:
-        r = tid % ROWS
-        tl = tid // ROWS
+        r = tid & (ROWS - 1)
+        tl = tid >> 4
         t = plus(t0, tl)
         shared = fx.ptr_load(c["sdl"] + ((j * s + t) * ROWS + r)).bitcast(fx.Float32)
         # aiter's stage 2 adds each bf16(v * w) into a bf16 buffer: a rounding
         # at every add (its order is the atomics'; here top-k order)
         routed = fx.Float32(0.0)
         for k in range_constexpr(topk):
-            w = c["rs"].route_w(tab, s, t, k)
-            v = contrib_load(c, j, (t * topk + k) * 16 + r)
-            routed = bf16_round(routed + bf16_round(v * w))
-        fx.ptr_store(bf16_round(routed + shared), c["pair"] + tid)
+            added = bf16_round(routed + contrib_load(c, j, t * topk + k, r))
+            if const_expr(c["rs"].ep > 1):
+                # another rank's pick: no contribution here (its LDS word
+                # never written: selected away, not multiplied by zero)
+                local = is_local(c, c["rs"].route_id(tab, s, t, k))
+                added = local.select(added, routed)
+            routed = added
+        # the address afresh: hoisted, it was held a VGPR across every tile's
+        # and task's combine (expert parallel, 12 rows a rank: a spill)
+        fx.ptr_store(bf16_round(routed + shared), c["pair"] + fresh(tid))
     gpu.barrier()
     if tid < ROWS * n // 2:
         rp = tid % (ROWS // 2)
@@ -1271,15 +1702,15 @@ def down_combine(c, task, j, t0, n):
         col = task * ROWS + 2 * rp
         if const_expr(c["tok_par"]):
             # to the token's owner only, at its own token index there
-            own_n = own_count(s, d.tp)
+            own_n = own_count(s, d.ranks)
             owner = t // own_n
-            for p in range_constexpr(d.tp):
+            for p in range_constexpr(d.ranks):
                 if owner == p:
                     dst = preg(c["peer_addr"](p), c["peer"]["ffn"], "ffn")
                     pair = region_pair(c["rank"], t - p * own_n, own_n, col)
                     c["put_bf"](dst, 2 * pair, [v0, v1])
         else:
-            for p in range_constexpr(d.tp):
+            for p in range_constexpr(d.ranks):
                 dst = preg(c["peer_addr"](p), c["peer"]["ffn"], "ffn")
                 c["put_bf"](dst, 2 * region_pair(c["rank"], t, s, col), [v0, v1])
     gpu.barrier()
@@ -1290,36 +1721,62 @@ def down_mfma(c, j, task, sl, mid, first, count, av, live):
     """Down task ``task`` (the CTA's j-th) on a slot of U: the routed MFMA of its
     picks first .. first + min(count, 16) (their B operands ``mid``:
     ``mid_operands``; the scale block in ``sl``), each pick's contribution."""
-    lane, tab, d = c["lane"], c["tab"], c["d"]
+    accs = down_chains(c, task, sl, mid, av, down_zero())
+    down_store(c, j, accs, first, count, live)
+
+
+def down_zero():
+    """A down slot's accumulators: the K steps on DOWN_CHAINS of them in turn,
+    summed in order (``down_store``): one chain put every FP8-rate MFMA's
+    latency in series."""
+    return [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(DOWN_CHAINS)]
+
+
+def down_chains(c, task, sl, mid, av, accs, st0=0):
+    """``accs`` through K steps st0 .. st0 + len(av) of down task ``task`` on a
+    slot (weights ``av``, B operands ``mid``, the scale block in ``sl``): step
+    i on chain i % DOWN_CHAINS, wherever a part of K starts."""
+    lane, d = c["lane"], c["d"]
     sas = lds_scales(
-        sl, task % 2 * 16 + lane % 16, lane, 0, d.inter // 128, d.down_scale_cols
+        sl, task % 2 * 16 + lane % 16, lane, st0, len(av), d.down_scale_cols
     )
+    bvs, sbs = mid
+    accs = list(accs)
+    for i in range_constexpr(len(av)):
+        h = (st0 + i) % DOWN_CHAINS
+        accs[h] = mfma_scaled(av[i], bvs[i], accs[h], sas[i], sbs[i], FP4, FP8)
+    return accs
+
+
+@traced
+def down_store(c, j, accs, first, count, live):
+    """The chains summed in order: each of picks first .. first + min(count,
+    16)'s contribution (task j's)."""
+    lane, tab, s, rs = c["lane"], c["tab"], c["S"], c["rs"]
     jj = lane % 16
     col = fx.min(jj, count - 1)
-    bvs, sbs = mid
-    # the K steps on DOWN_CHAINS accumulators in turn, summed in order: one
-    # chain put every FP8-rate MFMA's latency in series
-    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(DOWN_CHAINS)]
-    for i in range_constexpr(len(av)):
-        h = i % DOWN_CHAINS
-        accs[h] = mfma_scaled(av[i], bvs[i], accs[h], sas[i], sbs[i], FP4, FP8)
     acc = accs[0]
     for h in range_constexpr(1, DOWN_CHAINS):
         acc = acc + accs[h]
-    pick = c["rs"].pick_at(tab, first + col)
-    for q in range_constexpr(4):
+    pick = rs.pick_at(tab, first + col)
+    w = rs.route_w(tab, s, pick // rs.topk, pick % rs.topk)
+    for q in range_constexpr(0, 4, 2):
         r = 4 * (lane // 16) + q
         if live & (jj < count):
-            contrib_store(c, j, pick * 16 + r, acc[q])
+            word = bf16_pair(acc[q] * w, acc[q + 1] * w).bitcast(fx.Int32)
+            contrib_store(c, j, pick * 8 + r // 2, word)
 
 
-def contrib_store(c, j, i, v):
-    """Task j's routed contribution word i ([pick (t, k)][16 rows] f32 bits)."""
-    fx.ptr_store(v.bitcast(fx.Int32), c["contrib"] + (j * c["rs"].picks * 16 + i))
+def contrib_store(c, j, i, word):
+    """Task j's routed contribution word i ([pick (t, k)][8 words]: rows 2i,
+    2i + 1 of bf16(v w), packed)."""
+    fx.ptr_store(word, c["contrib"] + (j * c["rs"].picks * 8 + i))
 
 
-def contrib_load(c, j, i):
-    return fx.ptr_load(c["contrib"] + (j * c["rs"].picks * 16 + i)).bitcast(fx.Float32)
+def contrib_load(c, j, pick, r):
+    """Row r of task j's contribution of ``pick``: bf16(v w) as f32."""
+    word = fx.ptr_load(c["contrib"] + (j * c["rs"].picks * 8 + pick * 8 + (r >> 1)))
+    return ((r & 1) == 0).select(bf_lo(word), bf_hi(word))
 
 
 # ---------------------------------------------------------------- loaders
@@ -1354,7 +1811,7 @@ def stage_reduce(c, task):
 @traced
 def reduce_pair(c, task, idx):
     """Thread ``idx``'s column pair of token idx / 64."""
-    s, tp = c["S"], c["d"].tp
+    s, tp = c["S"], c["d"].ranks
     a = c["args"]
     if idx < s * RED_COLS // 2:
         t = idx // (RED_COLS // 2)
@@ -1385,31 +1842,34 @@ def moe_smem(s, rs, timeline):
 
 def stage_lds(s, rs):
     """Word offsets into ``Smem.stage`` of the buffers only one stage reads: the
-    shared stage's MXFP8 x tile; the waves' scale blocks (``wsl``, the ug and
-    down stages'), then the ug stage's routed MXFP8 x tile, or the down stage's
-    token tile of the shared expert's MXFP8 intermediate (``load_smid_tile``),
-    each down task's routed contributions (``contrib_store``) and its shared
-    expert rows (``down_shared``). A barrier ends every stage."""
+    shared stage's MXFP8 x tile; the waves' scale blocks (``wsl``: the ug
+    stage's ``UG_WSL_WORDS`` a wave, the down stage's ``down_wsl_words``), then
+    the ug stage's routed MXFP8 x tile, or the down stage's token tile of the
+    shared expert's MXFP8 intermediate (``load_smid_tile``), each down task's
+    routed contributions (``contrib_store``) and its shared expert rows
+    (``down_shared``). A barrier ends every stage."""
     d = rs.dims
     # the x tile the shared / ug stages hold (every token's up to one tile)
     rows = tile_rows(s)
     x8 = rows * lds_row(X8_WORDS)
     groups = rows * lds_row(HIDDEN // 32)
-    wsl = WAVES * wsl_words(d)
+    ug_wsl = WAVES * UG_WSL_WORDS
+    down_wsl = WAVES * down_wsl_words(d)
     sxl = rows * lds_row(d.sh_inter // 4) + lds_tail(d.sh_inter)
     sxsl = rows * lds_row(d.sh_inter // 32)
-    contrib = 2 * rs.picks * 16  # two down tasks' at most
+    # a CTA's two down tasks' contributions, a pick's 16 rows of bf16 a task
+    contrib = 2 * rs.picks * 8
     offsets = {
         "x8l": 0, "x8sl": x8,
-        "wsl": 0, "x8rl": wsl, "x8rsl": wsl + x8,
-        "sxl": wsl, "sxsl": wsl + sxl,
-        "contrib": wsl + sxl + sxsl,
-        "sdl": wsl + sxl + sxsl + contrib,
+        "wsl": 0, "x8rl": ug_wsl, "x8rsl": ug_wsl + x8,
+        "sxl": down_wsl, "sxsl": down_wsl + sxl,
+        "contrib": down_wsl + sxl + sxsl,
+        "sdl": down_wsl + sxl + sxsl + contrib,
     }  # fmt: skip
     words = {
         "shared": x8 + groups,
-        "ug": wsl + x8 + groups,
-        "down": wsl + sxl + sxsl + contrib + 2 * s * ROWS,
+        "ug": ug_wsl + x8 + groups,
+        "down": down_wsl + sxl + sxsl + contrib + 2 * s * ROWS,
     }
     return {"offsets": offsets, "words": {"all": max(words.values())}}
 
@@ -1417,25 +1877,50 @@ def stage_lds(s, rs):
 def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
     """K2b's stage context: LDS, mailbox, scratch regions, arguments. Its lane math
     starts from a ``fresh`` thread id: in the merged K2 it is not K2a's, held
-    from K2a's stages on."""
+    from K2a's stages on. The lane by a mask: the signed ``%`` of an id LLVM
+    cannot see is non-negative kept its sign fix-up live in VGPRs through the
+    ug loop (expert parallel: a spill). The wave a VGPR here, an SGPR in the ug
+    stage only (``run_moe``)."""
     tid = fresh(fx.thread_idx.x)
     c = {
-        "S": s, "tid": tid, "bid": fx.block_idx.x, "lane": tid % 64,
+        "S": s, "tid": tid, "bid": fx.block_idx.x, "lane": tid & 63,
         "wave": tid // 64,
         "red": lds.red.ptr, "tab": lds.tab.ptr, "pair": lds.pair.ptr,
         "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
         "poll": mb.poll, "tag": mb.tag, "peer_addr": lambda p: bases[p],
-        "rank": rank, "sym": sym, "peer": peer_offsets(s, rs.tp), "rs": rs,
+        "rank": rank, "sym": sym, "peer": peer_offsets(s, rs.dims), "rs": rs,
         "d": rs.dims, "args": args,
         # x (``ffn_normed``) before this launch: plain loads, no readiness wait
         "x_cm": 0, "x_ready": False,
         # token parallel (``layer_post``): the FFN sums reduce-scattered
         "tok_par": False,
+        # ... into ``out`` from its first row (DP attention: a rank's own rows
+        # are its own step's), not from the rank's first token's
+        "out_local": False,
     }  # fmt: skip
+    d = rs.dims
+    # expert parallel: this rank's first routed expert
+    c["e0"] = rank * rs.local_experts if const_expr(rs.ep > 1) else 0
+    if const_expr(rs.dpa):
+        # DP attention: its part of the replicated shared expert, gate row
+        # tiles from rank part, up tiles past every gate tile
+        c["sh_gate0"] = rank * d.shared_tasks
+        c["sh_up0"] = SHARED_INTER // ROWS + rank * d.shared_tasks
+    else:
+        c["sh_gate0"], c["sh_up0"] = 0, d.shared_tasks
     for name, off in stage_lds(s, rs)["offsets"].items():
         c[name] = lds.stage.ptr + off
     for region, (off, _) in layout.items():
         c[region] = sreg(scratch, off, region)
+    # where routes go and are read: this launch's scratch, every row routed here
+    c["route_dsts"], c["route_src"] = [c["route"]], c["route"]
+    c["route_rows"], c["route_t0"] = s, 0
+    if const_expr(rs.dpa):
+        # DP attention: each rank routes its own step's rows and pushes them to
+        # every rank's RT (``run_moe``)
+        rt = c["peer"]["rt"]
+        c["route_src"] = preg(sym, rt, "rt")
+        c["route_dsts"] = [preg(bases[p], rt, "rt") for p in range(rs.dims.ranks)]
     return c
 
 
@@ -1447,9 +1932,8 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
     s, timeline, tid = key.tokens, key.timeline, c["tid"]
     router_tasks = c["rs"].router_tasks
     route0, shared0 = c["rs"].route0, c["rs"].shared0
-    shared_tasks = c["d"].shared_tasks
     ug_tasks = c["rs"].max_u * c["rs"].ug_parts
-    if const_expr(c.get("gather_x") is not None):
+    if const_expr(c.get("gather_x") is not None and not c["rs"].dpa):
         # a token-parallel launch: the other ranks' rows land first, each on
         # the CTA whose xq then takes it
         enter_stage("k2b.gather")
@@ -1457,46 +1941,50 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
             gather_rows(c, t)
     enter_stage("k2b.xq")
     for t in range(first_task(bid, XQ0), s, BLOCKS):
-        await_x(c, [t])
-        stage_xq(c, t)
+        if const_expr(c["rs"].dpa):
+            # another rank's token: quantized straight from its push
+            xq_token_dpa(c, t)
+        else:
+            await_x(c, [t])
+            stage_xq(c, t)
         publish(c["put"], c["x8rdy"], t, 1, tid == 0)
     stamp(timeline, tls, tid, tl0 + 1)
     multi = len(token_tiles(s)) > 1
     enter_stage("k2b.router")
+    # DP attention: the router and route on this rank's own rows alone (their
+    # rows' x ready without the other ranks'), the routes pushed to every rank
+    cr = c
+    if const_expr(c["rs"].dpa):
+        cr = own_view(c, ("x",))
+        cr["route_t0"] = cr["t0"]
+    rows = cr["S"]
+    mine = [plus(cr.get("t0", 0), t) for t in range(rows)]
     for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):
-        if const_expr(s >= ROUTER_EARLY_FROM):
+        if const_expr(rows >= ROUTER_EARLY_FROM):
             # the task's weights in flight through x's wait
-            wvs = router_weights(c, task)
-            await_x(c, list(range(s)))
-            stage_router(c, task, wvs)
+            wvs = router_weights(cr, task)
+            await_x(c, mine)
+            stage_router(cr, task, wvs)
         else:
-            await_x(c, list(range(s)))
-            stage_router(c, task, router_weights(c, task))
+            await_x(c, mine)
+            stage_router(cr, task, router_weights(cr, task))
     stamp(timeline, tls, tid, tl0 + 2)
     enter_stage("k2b.route")
-    for t in range(first_task(bid, route0), s, BLOCKS):
-        stage_route(c, t)
+    for t in range(first_task(bid, route0), rows, BLOCKS):
+        stage_route(cr, t)
     stamp(timeline, tls, tid, tl0 + 3)
     enter_stage("k2b.shared")
     c["xl"], c["xsl"] = c["x8l"], c["x8sl"]
-    # a CTA's one shared unit (task, token tile) at most: straight-line code,
+    # a CTA's one shared unit (task, token tile) a round: straight-line code,
     # whose tile loads LLVM does not hoist into one live set as it would out of
     # a task loop (spills). A task's tiles in series on one CTA put three tiles'
-    # latency on the path down waits on (the weights read again a tile: L2 hits)
-    assert c["rs"].shared_units <= BLOCKS
-    unit = first_task(bid, shared0)
-    if unit < c["rs"].shared_units:
-        # the gate weights in flight before x's wait
-        a = c["args"]
-        gops = gemv_fp8_loads(c, a["sgu"], a["sgu_s"], HIDDEN, unit % shared_tasks)
-        if const_expr(not multi):
-            load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: j, s)
-            stage_shared(c, unit, gops, 0, s)
-        else:
-            t0 = unit // shared_tasks * TILE
-            n = fx.min(fx.Int32(TILE), s - t0)
-            load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
-            stage_shared(c, unit % shared_tasks, gops, t0, n)
+    # latency on the path down waits on (the weights read again a tile: L2 hits).
+    # Past BLOCKS units (DP attention's MoE over every rank's rows) a second round
+    units = c["rs"].shared_units
+    for k in range_constexpr(-(-units // BLOCKS)):
+        unit = first_task(bid, shared0) + k * BLOCKS
+        if unit < units:
+            shared_unit(c, unit, multi)
     stamp(timeline, tls, tid, tl0 + 4)
     late = before_ug is not None
     if const_expr(late):
@@ -1507,6 +1995,11 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
     shift = int(late)
     enter_stage("k2b.ug")
     c["xl"], c["xsl"] = c["x8rl"], c["x8rsl"]
+    # the ug stage's wave an SGPR: the signed // of an id LLVM cannot see is
+    # non-negative kept its fix-up live in VGPRs through the ug loop (TP 2,
+    # 12 rows: a spill). Elsewhere a VGPR: as an SGPR it slowed down (TP 4,
+    # 48 rows +4 us)
+    cu = {**c, "wave": uniform(c["tid"] >> 6)}
     if const_expr(multi):
         # past one token tile a task gathers its pick tile's rows itself. The
         # first round placed (the shared units' CTAs take its last tasks); the
@@ -1517,18 +2010,20 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
         ug_total = mplan.ug_tasks(n_tiles, c["rs"].ug_parts)
         task = first_task(bid, c["rs"].ug0)
         while task < ug_total:
-            task = stage_ug_tile(c, task, ug_total)
+            task = stage_ug_tile(cu, task, ug_total)
+        if const_expr(down_by_unit(c)):
+            publish(c["put"], c["ugc"], bid, 1, tid == 0)
     else:
         # one token tile: every task placed (its x in LDS once a CTA)
         loaded = fx.Int32(0)
         for task in range(first_task(bid, c["rs"].ug0), ug_tasks, BLOCKS):
             if loaded == 0:
-                # X8R (ready long before the routing) first: after the routing
+                # X8 (ready long before the routing) first: after the routing
                 # lands only its own poll remains
-                load_x8_rows(c, "x8r", "x8rs", c["x8rl"], c["x8rsl"], lambda j: j, s)
+                load_x8_rows(c, "x8", "x8s", c["x8rl"], c["x8rsl"], lambda j: j, s)
                 load_route(c, c["tab"])
             loaded = fx.Int32(1)
-            stage_ug(c, task)
+            stage_ug(cu, task)
     stamp(timeline, tls, tid, tl0 + shift + 5)
     enter_stage("k2b.down")
     assert BLOCKS < DOWN_TASKS <= 2 * BLOCKS
@@ -1542,23 +2037,70 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
     # two tiles and ended the stage)
     down_task = first_task(bid, DOWN0)
     rank = take_down_rank(c)
-    if rank < DOWN_TASKS - BLOCKS:
+    has_second = rank < DOWN_TASKS - BLOCKS
+    by_unit = down_by_unit(c)
+    if const_expr(by_unit):
+        # the down stamp at the units' end: the combine is timed in the reduce
+        second = has_second.select(BLOCKS + rank, down_task)
+        down_by_units(
+            {**c, "second_live": has_second}, [down_task, second],
+            lambda: stamp(timeline, tls, tid, tl0 + shift + 6),
+        )  # fmt: skip
+    elif const_expr(c["rs"].down_one_call):
+        # a CTA without a second runs its own again (L2 hits), pushed once
+        second = has_second.select(BLOCKS + rank, down_task)
+        stage_down({**c, "second_live": has_second}, [down_task, second])
+    elif has_second:
         stage_down(c, [down_task, BLOCKS + rank])
     else:
         stage_down(c, [down_task])
-    stamp(timeline, tls, tid, tl0 + shift + 6)
+    if const_expr(not by_unit):
+        stamp(timeline, tls, tid, tl0 + shift + 6)
     enter_stage("k2b.reduce")
-    # token parallel: this rank's tokens' sums only (``out`` from its first row)
-    cr = own_view(c, ("out",)) if const_expr(c["tok_par"]) else c
+    # token parallel: this rank's tokens' sums only (``out`` from its first
+    # token's row, or from row 0: ``out_local``)
+    if const_expr(c["tok_par"]):
+        cr = own_view(c, () if c["out_local"] else ("out",))
+    else:
+        cr = c
     for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
         stage_reduce(cr, task)
     stamp(timeline, tls, tid, tl0 + shift + 7)
 
 
 @traced
+def shared_unit(c, unit, multi):
+    """Shared unit ``unit`` (task, token tile): its gate weights in flight
+    before x's wait, the tile's rows, ``stage_shared``."""
+    s, shared_tasks, a = c["S"], c["d"].shared_tasks, c["args"]
+    gops = gemv_fp8_loads(
+        c, a["sgu"], a["sgu_s"], HIDDEN, plus(c["sh_gate0"], unit % shared_tasks)
+    )
+    if const_expr(not multi):
+        load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: j, s)
+        stage_shared(c, unit, gops, 0, s)
+    else:
+        t0 = unit // shared_tasks * TILE
+        n = fx.min(fx.Int32(TILE), s - t0)
+        load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
+        stage_shared(c, unit % shared_tasks, gops, t0, n)
+
+
+@traced
+def xq_token_dpa(c, t):
+    """DP attention's xq of token t: this rank's own after its norm, another
+    rank's from its push."""
+    if t // c["rs"].router_rows == c["rank"]:
+        await_x(c, [t])
+        stage_xq(c, t)
+    else:
+        stage_xq_pushed(c, t)
+
+
+@traced
 def gather_rows(c, t):
     """Token t, when another rank owns it: its row here (``gather_x``)."""
-    if t // own_count(c["S"], c["d"].tp) != c["rank"]:
+    if t // own_count(c["S"], c["d"].ranks) != c["rank"]:
         c["gather_x"](t)
 
 
@@ -1578,7 +2120,7 @@ def moe_args(*values) -> dict:
 def build_moe(key: MoeBuild):
     s = key.tokens
     timeline = key.timeline
-    assert 1 <= s <= MAX_TOKENS
+    assert 1 <= s <= MAX_MOE_ROWS
     rs = route_shape(key)
     assert rs.experts // 64 in SORT_NETS
     layout = scratch_layout(key)
@@ -1603,7 +2145,7 @@ def build_moe(key: MoeBuild):
         )
         c = moe_context(
             s, rs, lds, mailbox(layer, scratch, key.diag_off, layout),
-            peer_bases(peers, key.tp), layout, scratch, args,
+            peer_bases(peers, rs.dims.ranks), layout, scratch, args,
             rank, sym,
         )  # fmt: skip
         tls = lds.tls.ptr

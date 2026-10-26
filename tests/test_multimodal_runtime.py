@@ -5,16 +5,20 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 
-from atom.model_engine.engine_core import EngineCore
-from atom.model_engine.multimodal_runtime import (
-    VisionEmbeddingCache,
-    embed_multimodal_batch,
-)
-from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceStatus
-from atom.sampling_params import SamplingParams
+# `engine_core` reaches `async_proc`, which needs a real AITER build at import
+# time; a CPU runner has none.
+with stubbed_aiter():
+    from atom.model_engine.engine_core import EngineCore
+    from atom.model_engine.multimodal_runtime import (
+        VisionEmbeddingCache,
+        embed_multimodal_batch,
+    )
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.model_engine.sequence import Sequence, SequenceStatus
+    from atom.sampling_params import SamplingParams
 
 
 def payload(seed=9):

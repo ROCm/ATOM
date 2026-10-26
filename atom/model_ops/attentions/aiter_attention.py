@@ -21,7 +21,7 @@ from atom.utils.block_convert import (
 )
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
-from atom.utils.tbo import TokenSplitPrefillState
+from atom.utils.tbo import TokenSplitPrefillState, decode_ubatch_request_ranges
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 from .mha_kv_pool import MhaKvPool
@@ -931,7 +931,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # From base_attention, not duplicated: the op checks the same bound.
         from aiter.ops.flydsl.pa_decode import plan_pa_decode
 
-        from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH
+        from atom.model_ops.base_attention import (
+            _FLYDSL_PLAN_MAX_BATCH,
+            flydsl_plan_shape,
+        )
 
         n = int(context_lens.shape[0])
         if not 1 <= n <= _FLYDSL_PLAN_MAX_BATCH:
@@ -946,9 +949,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ):
             return None
 
-        # `max_partitions` omitted on purpose: that takes plan_pa_decode's own
-        # default. Setting it from the static split count clamps every request
-        # alike and removes the planner's mechanism -- this tree did that once.
+        # `max_partitions` is never the static split count: that clamps every
+        # request alike and removes the planner's mechanism -- this tree did
+        # that once. It takes plan_pa_decode's own default, except at head_dim
+        # 256, where `flydsl_plan_shape` caps it at 64 with a 256-workgroup
+        # budget to keep aiter's reducer off its slow serial path; remove that
+        # once aiter #5949 is in the image. The shape is fixed per builder (its
+        # KV pools are), so the key needs no part of it; the op's runtime plans
+        # take the same shape from the call's own head size.
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None and not create:
@@ -973,7 +981,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             return None
         if plan is None:
-            plan = plan_pa_decode(context_lens, self._flydsl_kv_heads, query_length=1)
+            # One head size across this builder's pools, or aiter's defaults.
+            head_dims = {geometry.head_dim for geometry in self.kv_pools}
+            plan = plan_pa_decode(
+                context_lens,
+                self._flydsl_kv_heads,
+                query_length=1,
+                **flydsl_plan_shape(head_dims.pop() if len(head_dims) == 1 else None),
+            )
             self._flydsl_plans[key] = plan
             logger.info(
                 "flydsl work plan: num_seqs=%d kv_heads=%d max_partitions=%d "
@@ -1098,9 +1113,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return workinfos
 
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(
-            self, batch, running_bs
+            self, batch, running_bs, running_tokens
         )
         if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill
@@ -1329,14 +1346,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 self.model_runner.block_size,
                 scratch=self.token_axis_scratch,
             )
-        else:
-            # One token per sequence reduces the gather to its last row, and
-            # `last_block_num_tokens` names the offset without a position.
+        elif not batch.is_dummy_run:
+            # One token per sequence reduces the gather to its last position's
+            # block. Indexed by position, not `block_table[-1]`: under MTP the
+            # table also holds the draft round's lookahead blocks past the last
+            # token (`draft_kv_lookahead`). A dummy run's synthetic lengths can
+            # point past its rows, and it writes nowhere anyway.
+            bsz = self.model_runner.block_size
             slots = [
-                block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                for block_table, last_block_num in zip(
-                    block_tables, batch.last_block_num_tokens
-                )
+                block_table[(n - 1) // bsz] * bsz + (n - 1) % bsz
+                for block_table, n in zip(block_tables, context_lens.tolist())
             ]
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:scheduled_tokens] = slots[:scheduled_tokens]
@@ -1441,6 +1460,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 running_bs,
                 max_seqlen_q,
                 context_lens,
+                split_bs=self._ubatch_split_bs,
             )
 
         return attn_metadata, positions
@@ -1451,19 +1471,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         bs: int,
         max_seqlen_q: int,
         context_lens: np.ndarray,
+        *,
+        split_bs: int | None = None,
     ):
-        """Compute per-ubatch forward_vars for CUDAGraph TBO.
+        """Compute per-ubatch forward_vars for TBO decode.
 
-        Splits the full-batch data into per-ubatch CpuGpuBuffers.
-        The split point is bs // 2 to match CUDAGraph's baked-in token slices.
+        Splits the full-batch data into per-ubatch CpuGpuBuffers, one per
+        micro-batch the step runs (`decode_ubatch_request_ranges` of
+        ``split_bs``, the step's `_ubatch_split_bs`; None: the scheduled
+        requests): a replayed TBO graph's halves of the bucket, or an eager
+        split's halves of the scheduled requests. Each is padded to its half
+        of the padded batch, which covers either.
         """
         self._check_metadata_writable("ub0_mha_metadata", "ub1_mha_metadata")
         var = self.model_runner.forward_vars
         N = self._NUM_TBO_UBATCHES
-        half = bs // N
 
-        ub_ranges = [(0, half), (half, bs)]
-        running_bs_list = [half, bs - half]
+        ub_ranges = decode_ubatch_request_ranges(split_bs or scheduled_bs, N)
+        running_bs_list = [
+            end - start for start, end in decode_ubatch_request_ranges(bs, N)
+        ]
 
         for ub_idx, ((req_start, req_end), running_bs) in enumerate(
             zip(ub_ranges, running_bs_list)

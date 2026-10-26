@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
@@ -20,6 +20,7 @@ from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
+    checkpoint_copy_ops_per_batch,
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
@@ -46,44 +47,15 @@ from atom.utils.tbo.ubatch_splitting import (
 from atom.utils.tbo.ubatching import tbo_enabled
 
 logger = logging.getLogger("atom")
-T = TypeVar("T", bound="BroadcastableModelInput")
+T = TypeVar("T")
 
 # "Written nowhere" -- see `_write_prefill_slots`. Same value the cache kernels
 # and `fla_ops.replayssm` skip on.
 PAD_SLOT_ID = -1
 
 
-class BroadcastableModelInput(ABC):
-
-    @abstractmethod
-    def as_broadcastable_tensor_dict(self) -> dict[str, Any]:
-        """
-        Extract broadcastable fields. Override for fields that require some
-        custom deserialization.
-        """
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def from_broadcasted_tensor_dict(
-        cls: type[T],
-        tensor_dict: dict[str, Any],
-        attn_backend: Optional["AttentionBackend"] = None,
-    ) -> T:
-        """
-        Pop fields from the given tensor_dict and populate a new instance of
-        BroadcastableModelInput.
-        """
-        raise NotImplementedError
-
-
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
-
-    # For some attention backends, we allocate an output tensor before
-    # calling the custom op. When piecewise cudagraph is enabled, this
-    # makes sure the output tensor is allocated inside the cudagraph.
-    accept_output_buffer: bool = False
 
     #: Whether a *draft* of this flavor caches into a pool of its own. False
     #: means its rows are the target's -- an MLA draft's latent is the target's
@@ -144,7 +116,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
         raise NotImplementedError
 
     @abstractmethod
@@ -154,6 +128,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        *,
+        ubatch_split_bs: int | None = None,
     ):
         raise NotImplementedError
 
@@ -392,7 +368,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         because allocating pinned memory is itself a synchronizing call.
 
         A step can carry at most one store and one restore per sequence, so two
-        per sequence bounds it. The caller checks that bound rather than growing
+        per sequence bounds it (`checkpoint_copy_ops_per_batch`, the same budget
+        the coordinator begins queued midstep stores within). The caller checks that bound rather than growing
         on demand: a descriptor that did not fit would otherwise be silently
         truncated into a copy of the wrong shape.
 
@@ -409,7 +386,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         staging = getattr(self, "_checkpoint_staging_cache", None)
         if staging is None:
             plan = self._checkpoint_copy_plan()
-            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            # The same budget the scheduler's coordinator begins stores within.
+            max_ops = checkpoint_copy_ops_per_batch(
+                self.model_runner.config.max_num_seqs
+            )
             staging = self._checkpoint_staging_cache = DescriptorStaging(
                 max_ops * plan.num_spans, self._checkpoint_descriptor_device()
             )
@@ -599,12 +579,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         attn_metadata["seq_starts"].cpu.zero_()
         attn_metadata["seq_starts"].copy_to_gpu()
         self.model_runner.forward_vars.update(attn_metadata)
-        self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def _publish_dcp_token_block_tables(
+    def _publish_token_block_tables(
         self, attn_metadata, running_bs: int, max_seqlen_q: int
     ) -> None:
-        """Nothing to publish: this backend has no DCP sparse indexer.
+        """Nothing to publish: this backend has no sparse indexer.
 
         `EagleProposer` publishes on whatever builder the target uses, so every
         backend a draft can run against has to answer. Only the MLA one
@@ -894,7 +873,9 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         return ctx
 
     @h2d_producer("prefill", "positions", runner="model_runner")
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
         scheduled_bs = batch.total_seqs_num_prefill
         scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
@@ -1023,8 +1004,14 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        *,
+        ubatch_split_bs: int | None = None,
     ):
         """Build this step's metadata at the shape `prepare_inputs` settled.
+
+        ``ubatch_split_bs`` is the decode batch the step's TBO micro-batches
+        are cut from (`ForwardMode.ubatch_split_bs`), which a backend's
+        per-ubatch metadata covers (`_ubatch_split_bs`).
 
         The step's two units and nothing else: `running_bs` sizes everything
         per-sequence, `running_tokens` everything per-row. Both arrive as
@@ -1033,13 +1020,16 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         neither is derivable from the other, since a ragged step replays a flat
         token bucket rather than a `running_bs * q` grid.
 
-        Prefill takes only the first: its rows are the prompt's, so there is no
-        `running_tokens` to hand it, but its per-sequence tail still pads to
-        `running_bs` for the draft pass that follows. That padding is visible
+        Prefill and decode take both alike. A prefill's rows are the prompt's,
+        so `running_tokens` exceeds them only when the step padded it to a
+        token-graph bucket, which only a builder with `supports_token_graph`
+        builds; its per-sequence tail still pads to `running_bs` for the draft
+        pass that follows. That padding is visible
         past attention -- `cu_seqlens_q` doubles as the selector for the
         sampler's rows, so the LM head emits `running_bs` of them. `postprocess`
         cuts back to the scheduled batch, and that is the one place it does.
         """
+        self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
         if state_ops.relocations:
@@ -1050,9 +1040,31 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
-            return self.prepare_prefill(batch, running_bs)
+            if (
+                running_tokens != batch.total_tokens_num
+                and not self.supports_token_graph
+            ):
+                raise ValueError(
+                    f"{type(self).__name__} cannot pad a prefill to a "
+                    "token-graph bucket"
+                )
+            return self.prepare_prefill(batch, running_bs, running_tokens)
         else:
             return self.prepare_decode(batch, running_bs, running_tokens, max_seqlen_q)
+
+    # The decode batch this step's TBO micro-batches are cut from (`build`).
+    # None: they cut the scheduled requests, as an eager split does.
+    _ubatch_split_bs: int | None = None
+
+    # Whether `prepare_prefill` builds a prefill padded past its scheduled rows
+    # (`running_tokens`), as a token-graph bucket pads it
+    # (`ForwardMode.token_graph`).
+    supports_token_graph = False
+
+    # The `running_bs` a prefill's model records some of its layers at as
+    # `ReqGraph`s, each on `build_for_req_graph_capture`'s step
+    # (`ModelRunner._record_prefill_req_graphs`). Empty: none.
+    prefill_req_graph_sizes: tuple[int, ...] = ()
 
 
 class AttentionImpl(nn.Module):

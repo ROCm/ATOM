@@ -95,6 +95,42 @@ def mha_page_unit_stream_sizes(
     return np.tile(regions[1], units)
 
 
+def mha_page_unit_segments(
+    regions: tuple[np.ndarray, np.ndarray],
+    unit_ids,
+    *,
+    entries: int,
+    image_bytes: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Addresses and byte sizes of the stream ``mha_page_unit_views`` names.
+
+    Same order and the same ``image_bytes`` trim, without one tensor view per
+    (unit, region). An image is ~10k segments, and building those views held
+    the store thread's GIL for tens of milliseconds per checkpoint, which the
+    scheduler thread then waited out.
+    """
+
+    ids = np.asarray(unit_ids, dtype=np.int64).reshape(-1)
+    if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= entries):
+        raise IndexError(f"PAGE unit outside the pool's {entries} scheduler blocks")
+    ptrs = mha_page_unit_bases(regions, ids[None, :])[0]
+    sizes = mha_page_unit_stream_sizes(regions, ids.size)
+    budget = int(image_bytes or 0)
+    if budget <= 0:
+        return ptrs, sizes
+    ends = np.cumsum(sizes)
+    if not ends.size or ends[-1] < budget:
+        held = int(ends[-1]) if ends.size else 0
+        raise RuntimeError(
+            f"a checkpoint image is {budget} B but its {sizes.size} unit "
+            f"segments hold {held} B"
+        )
+    last = int(np.searchsorted(ends, budget))
+    sizes = sizes[: last + 1].copy()
+    sizes[-1] -= int(ends[last]) - budget
+    return ptrs[: last + 1], sizes
+
+
 def mha_page_unit_views(
     pools: Iterable, unit_ids, *, image_bytes: int = 0
 ) -> list[torch.Tensor]:

@@ -7,6 +7,7 @@ import torch
 
 from atom.plugin.sglang.attention_backend.backend_resolver import real_batch_size
 from atom.plugin.sglang.qwen4_exp_bridge import (
+    _CHECKPOINT_CONTEXT_LEN,
     _DECODE_GRAPH,
     _DRAFT_QSA,
     _NO_WRITE,
@@ -26,9 +27,11 @@ from atom.plugin.sglang.qwen4_exp_bridge import (
 def _reset_decode_graph():
     _DECODE_GRAPH.reset()
     _DRAFT_QSA.reset()
+    _CHECKPOINT_CONTEXT_LEN.clear()
     yield
     _DECODE_GRAPH.reset()
     _DRAFT_QSA.reset()
+    _CHECKPOINT_CONTEXT_LEN.clear()
 
 
 class _DecodeMode:
@@ -1157,3 +1160,135 @@ def test_eager_prefill_max_seq_len_ignores_stale_decode_graph_flag(monkeypatch):
     )
     assert qsa is not None
     assert qsa.max_seq_len == 4096
+
+
+def _flash_checkpoint_config(*, max_position_embeddings=262144, max_model_len=None):
+    """Flash text config: top-k is 2048, context is max_position_embeddings."""
+    return SimpleNamespace(
+        max_model_len=max_model_len,
+        hf_config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                model_type="qwen4_exp_text",
+                max_position_embeddings=max_position_embeddings,
+                indexer_budget=2048,
+                indexer_compress_ratio=4,
+            )
+        ),
+    )
+
+
+def test_serving_context_reads_checkpoint_when_cli_omitted(monkeypatch):
+    """Omitting --context-length must not collapse QSA to indexer_budget."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    bridge._serving_context_len._logged = False
+    config = _flash_checkpoint_config()
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(context_length=None, max_model_len=None, page_size=64),
+    )
+    assert bridge._serving_context_len(config, 2048) == 262144
+
+    # A root max_model_len of 8192 is Config's missing-field default. The
+    # text config is the length SGLang actually serves.
+    nested = _flash_checkpoint_config(max_model_len=8192)
+    assert bridge._serving_context_len(nested, 2048) == 262144
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            context_length=132096, max_model_len=None, page_size=64
+        ),
+    )
+    assert bridge._serving_context_len(config, 2048) == 132096
+
+
+def test_serving_context_rope_and_sglang_model_config(monkeypatch):
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(bridge, "_server_args", lambda: None)
+    scaled = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            max_position_embeddings=32768,
+            rope_scaling={"factor": 8.0, "rope_type": "yarn"},
+            indexer_budget=2048,
+        )
+    )
+    assert bridge._serving_context_len(scaled, 2048) == 262144
+    unscaled = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            max_position_embeddings=32768,
+            rope_scaling={
+                "factor": 8.0,
+                "rope_type": "yarn",
+                "original_max_position_embeddings": 32768,
+            },
+        )
+    )
+    assert bridge._serving_context_len(unscaled, 2048) == 32768
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            context_length=None,
+            max_model_len=None,
+            model_config=SimpleNamespace(context_len=262144),
+        ),
+    )
+    bare = SimpleNamespace(
+        hf_config=SimpleNamespace(indexer_budget=2048, indexer_compress_ratio=4)
+    )
+    assert bridge._serving_context_len(bare, 2048) == 262144
+    monkeypatch.setattr(bridge, "_server_args", lambda: None)
+    assert (
+        bridge._serving_context_len(SimpleNamespace(hf_config=SimpleNamespace()), 2048)
+        == 2048
+    )
+
+
+def test_graph_and_draft_pages_follow_checkpoint_context(monkeypatch):
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            context_length=None,
+            max_model_len=None,
+            cuda_graph_config=None,
+            cuda_graph_max_bs_decode=8,
+            max_running_requests=8,
+            speculative_num_draft_tokens=1,
+            page_size=64,
+        ),
+    )
+    config = _flash_checkpoint_config()
+    fb = SimpleNamespace(batch_size=1, device=torch.device("cpu"), page_size=64)
+    _bs, _tokens, pages, device = bridge._decode_graph_capacity(config, fb)
+    assert pages == 262144 // 64
+    assert device == torch.device("cpu")
+    bridge._ensure_draft_qsa(device, 64, bridge._serving_context_len(config, 2048))
+    assert bridge._DRAFT_QSA.max_pages == 262144 // 64
+
+
+def test_checkpoint_context_resolved_once_per_config(monkeypatch):
+    """Every decode replay and draft step asks; only the first walks the config."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(bridge, "_server_args", lambda: None)
+    real = bridge._hf_context_len
+    walks = []
+    monkeypatch.setattr(bridge, "_hf_context_len", lambda c: walks.append(c) or real(c))
+    config = _flash_checkpoint_config()
+    assert bridge._serving_context_len(config, 2048) == 262144
+    first = len(walks)
+    assert first > 0
+    assert bridge._serving_context_len(config, 2048) == 262144
+    assert len(walks) == first
+
+    other = _flash_checkpoint_config(max_position_embeddings=32768)
+    assert bridge._serving_context_len(other, 2048) == 32768
+    assert len(walks) > first

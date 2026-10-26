@@ -14,6 +14,7 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
+from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
@@ -177,6 +178,24 @@ _FLYDSL_PA_BLOCK_SIZES = (16, 64, 128)
 _FLYDSL_PA_ARCHS = ("gfx942", "gfx950")
 _flydsl_pa_routed: set[tuple] = set()
 _flydsl_plan_refused: set[tuple] = set()
+
+
+def flydsl_plan_shape(head_dim) -> dict:
+    """plan_pa_decode shape kwargs for a head size: empty, i.e. aiter's
+    defaults, except at head_dim 256.
+
+    aiter's planned reducer for head_dim 256 has a fast per-lane shuffle path
+    only up to 64 partitions and a slow serial loop above it. At the default
+    ceiling (CU count, 256 on MI355X) a long request splits into up to 256
+    partials and the reduce costs up to 40 us per call, against about 4 us
+    capped at 64 with a 256-workgroup budget: 1.21x per layer (geo-mean over
+    19 Qwen3.5 TP4 MTP-3 shapes, same error against the reference). Remove
+    once aiter #5949, a parallel head-256 reducer above 64 partitions, is in
+    the image.
+    """
+    if head_dim == 256:
+        return {"max_partitions": 64, "workgroup_budget": 256}
+    return {}
 
 
 @functools.lru_cache(maxsize=1)
@@ -412,9 +431,11 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
 ):
-    """Return the explicit plan aiter #5809 requires, at aiter's default budget.
+    """Return the explicit plan aiter #5809 requires.
 
-    ``plan_partition_cap``: None takes aiter's default partition ceiling.
+    ``plan_partition_cap``: None takes ``flydsl_plan_shape``, i.e. aiter's
+    defaults except at head_dim 256; a caller's cap is kept, with aiter's
+    default budget.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
     Plans are window-free: the gate rejects sliding windows.
@@ -423,12 +444,14 @@ def _flydsl_prepare_explicit_plan(
 
     device = q.device
     num_kv_heads = int(k_cache.shape[1])
+    shape = {} if plan_partition_cap is not None else flydsl_plan_shape(q.shape[-1])
     if existing_plan is not None:
         max_partitions = int(existing_plan.max_partitions)
     elif plan_partition_cap is not None:
         max_partitions = int(plan_partition_cap)
     else:
-        max_partitions = None
+        max_partitions = shape.get("max_partitions")
+    workgroup_budget = shape.get("workgroup_budget")
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
@@ -449,6 +472,7 @@ def _flydsl_prepare_explicit_plan(
         num_kv_heads,
         query_length,
         max_partitions,
+        workgroup_budget,
         device.index,
         plan_step_owner is not None,
     )
@@ -463,11 +487,15 @@ def _flydsl_prepare_explicit_plan(
             return plan
         refreshed.add(mark)
     if plan is None:
+        budget = (
+            {} if workgroup_budget is None else {"workgroup_budget": workgroup_budget}
+        )
         plan = plan_pa_decode(
             lengths,
             num_kv_heads,
             max_partitions=max_partitions,
             query_length=query_length,
+            **budget,
         )
         _FLYDSL_RUNTIME_PLANS[plan_key] = plan
         logger.info(
@@ -555,15 +583,15 @@ def run_pa_decode(
         if context_bound < max_seqlen_q:
             flydsl_seqs = None
     # Inside the guard, not before it: this runs 63 times per decode step and
-    # attention is a piecewise split op, so graph replay does not elide it. A
-    # deployment that never enables FlyDSL should pay nothing here.
+    # attention is an eager region of the token graphs, so replay does not
+    # elide it. A deployment that never enables FlyDSL should pay nothing here.
     #
     # Bounded on purpose: the row counts vary per step -- the sparse sites see a
     # new one on every prefill tail -- so keying on them leaks one entry and one
     # log line per distinct length for the life of the process.
     # `is not False` distinguishes the two falsy cases the `and` above produces:
     # False means FlyDSL is off (log nothing -- such a deployment must not pay
-    # for it, and this runs 63x per step on a piecewise split op that graph
+    # for it, and this runs 63x per step in an eager region that token-graph
     # replay does not elide), None means it is on and the capability check
     # rejected, which is exactly what the log exists to show.
     # The residual cost when off is one envs read; hoisting that to a module
@@ -575,8 +603,7 @@ def run_pa_decode(
     ):
         _flydsl_pa_routed.add(route_sig)
         logger.info(
-            "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d "
-            "head_dim=%d %s)",
+            "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d head_dim=%d %s)",
             f"flydsl[{flydsl_seqs} seqs]" if flydsl_seqs else "gluon",
             q.shape[0],
             max_seqlen_q,
@@ -713,7 +740,8 @@ def cp_mha_gather_cache_kernel(
     CACHE_FORMAT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    # Packed KV output offsets can exceed int32 for long cached batches.
+    token_id = tl.program_id(0).to(tl.int64)
     head_id = tl.program_id(1)
     # BLOCK_SIZE is rounded up to next pow2 at the call site (tl.arange requires
     # pow2); col_mask guards stores/loads when head_size is non-pow2 (e.g. MiMo SWA=192).
@@ -905,6 +933,7 @@ def fake_(
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
+@eager_region()
 def unified_attention_with_output_base(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,
@@ -951,6 +980,7 @@ def linear_attention_with_output_base_fake(
     gen_fake=linear_attention_with_output_base_fake,
     mutates_args=[],
 )
+@eager_region()
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,

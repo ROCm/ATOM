@@ -26,9 +26,8 @@ class SpurDispatchTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         self.script = scripts / JOB_SCRIPT.name
         shutil.copyfile(JOB_SCRIPT, self.script)
-        shutil.copyfile(
-            JOB_SCRIPT.with_name("pd_job_result.py"), scripts / "pd_job_result.py"
-        )
+        for helper in ("pd_job_result.py", "cap_log.py"):
+            shutil.copyfile(JOB_SCRIPT.with_name(helper), scripts / helper)
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
@@ -55,6 +54,10 @@ class SpurDispatchTest(unittest.TestCase):
             from pathlib import Path
 
             root = Path(os.environ["TEST_ROOT"])
+            if "--spur-preflight" in sys.argv:
+                with (root / "preflight.json").open("x") as stream:
+                    json.dump(sys.argv[1:], stream)
+                sys.exit(int(os.environ.get("PREFLIGHT_RC", "0")))
             # A recursive worker dispatch must fail, rather than fork forever.
             with (root / "dispatch.json").open("x") as stream:
                 json.dump(sys.argv[1:], stream)
@@ -70,6 +73,24 @@ class SpurDispatchTest(unittest.TestCase):
                 workers.append(subprocess.Popen(command, env=env))
             codes = [worker.wait() for worker in workers]
             sys.exit(next((code for code in codes if code), 0))
+            """,
+        )
+        self.write_tool(
+            "scontrol",
+            """
+            import os
+            import sys
+            from pathlib import Path
+
+            counter = Path(os.environ["TEST_ROOT"]) / "scontrol.count"
+            index = int(counter.read_text()) if counter.exists() else 0
+            counter.write_text(str(index + 1))
+            states = os.environ.get("SCONTROL_STATES", "RUNNING").split(",")
+            state = states[min(index, len(states) - 1)]
+            if state == "FAIL":
+                sys.exit(1)
+            job = sys.argv[sys.argv.index("job") + 1]
+            print(f"JobId={job} JobName=test\\n   JobState={state} Reason=None")
             """,
         )
         self.write_tool(
@@ -194,6 +215,10 @@ class SpurDispatchTest(unittest.TestCase):
             interface = "eno0" if rank == 0 else "enp5s0"
             self.assertIn(f"NCCL_SOCKET_IFNAME=={interface}", runs[0])
             self.assertIn(f"MORI_SOCKET_IFNAME={interface}", runs[0])
+            # MoRI reads neither NCCL_IB_HCA nor NCCL_IB_GID_INDEX.
+            hcas = ",".join(f"ionic_{index}" for index in range(8))
+            self.assertIn(f"MORI_RDMA_DEVICES={hcas}", runs[0])
+            self.assertIn("MORI_IB_GID_INDEX=1", runs[0])
             self.assertIn(["rm", "-f", f"atomesh-test-cell-42-{rank}"], calls)
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "0\n")
             result = json.loads(
@@ -215,9 +240,66 @@ class SpurDispatchTest(unittest.TestCase):
         self.assertEqual(result["status"], "running")
         self.assertIn(["rm", "-f", "atomesh-test-cell-42-1"], self.docker_calls(1))
 
+    def scontrol_queries(self):
+        counter = self.root / "scontrol.count"
+        return int(counter.read_text()) if counter.exists() else 0
+
+    def test_dispatch_waits_until_controller_reports_running(self):
+        result = self.run_job(
+            SCONTROL_STATES="PENDING,CONFIGURING,RUNNING",
+            ATOMESH_SPUR_RUNNING_POLL_INTERVAL="0",
+        )
+        self.assertEqual(self.scontrol_queries(), 3)
+        self.assertIn("controller state is now RUNNING", result.stdout)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_dispatch_proceeds_after_pending_timeout(self):
+        result = self.run_job(
+            SCONTROL_STATES="PENDING", ATOMESH_SPUR_RUNNING_TIMEOUT="0"
+        )
+        self.assertIn("still PENDING after 0s", result.stderr)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_unavailable_controller_does_not_delay_dispatch(self):
+        self.run_job(SCONTROL_STATES="FAIL")
+        self.assertEqual(self.scontrol_queries(), 1)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_worker_does_not_query_controller(self):
+        self.run_job("--spur-worker", SCONTROL_STATES="PENDING")
+        self.assertEqual(self.scontrol_queries(), 0)
+
     def test_dispatch_failure_is_not_reported_as_success(self):
         self.run_job(expected_rc=9, DISPATCH_RC="9")
         self.assertFalse((self.root / "docker-0.jsonl").exists())
+
+    def test_preflight_runs_on_every_node_before_dispatch(self):
+        self.run_job()
+        preflight = json.loads((self.root / "preflight.json").read_text())
+        for option in ("--nodes=2", "--ntasks=2", "--ntasks-per-node=1"):
+            self.assertIn(option, preflight)
+
+    def test_preflight_failure_stops_before_workers(self):
+        self.run_job(expected_rc=1, PREFLIGHT_RC="1")
+        self.assertFalse((self.root / "dispatch.json").exists())
+        self.assertFalse((self.root / "docker-0.jsonl").exists())
+        self.assertEqual(
+            (self.run_dir / ".spur-dispatch-test-submission/rc").read_text(), "1\n"
+        )
+
+    def test_preflight_records_busy_gpu_host(self):
+        self.write_tool(
+            "amd-smi",
+            """
+            print("GPU  XCP  VRAM_USED   VRAM_FREE  VRAM_TOTAL    VRAM%")
+            print("  0    0   84003 MB   210589 MB   294592 MB  28.52 %")
+            """,
+        )
+        result = self.run_job(
+            "--spur-preflight", expected_rc=1, ATOMESH_GPU_IDLE_WAIT_SECONDS="0"
+        )
+        self.assertIn("GPU 0 already uses 84003 MB VRAM", result.stderr)
+        self.assertEqual(len(list((self.run_dir / "gpu-busy").iterdir())), 1)
 
     def test_large_container_output_stays_in_shared_log(self):
         size = 33 * 1024 * 1024
@@ -251,6 +333,21 @@ class SpurDispatchTest(unittest.TestCase):
         self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "7\n")
         status = json.loads((self.run_dir / "rank-workload-0.json").read_text())
         self.assertEqual(status["status"], "running")
+
+    def test_runaway_container_log_is_capped_and_container_killed(self):
+        limit = 1024 * 1024
+        result = self.run_job(
+            "--spur-worker",
+            CONTAINER_LOG_BYTES=str(8 * limit),
+            ATOMESH_CONTAINER_LOG_MAX_BYTES=str(limit),
+        )
+        content = (self.run_dir / "rank-0/container.log").read_bytes()
+        self.assertTrue(content.startswith(b"container stdout start\n"))
+        self.assertIn(b"container log reached 1048576 bytes", content)
+        self.assertLess(len(content), limit + 1024)
+        self.assertNotIn(b"container stderr end", content)
+        self.assertIn("log exceeded 1048576 bytes", result.stderr)
+        self.assertIn(["kill", "atomesh-test-cell-42-0"], self.docker_calls(0))
 
     def test_log_summary_failure_does_not_replace_container_exit_code(self):
         self.write_tool("tail", "raise SystemExit(23)")

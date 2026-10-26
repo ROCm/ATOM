@@ -34,11 +34,12 @@ def test_a_replay_pool_resumes_any_hit():
     assert pool.resumable_hit(seq, 0, []) == 0
 
 
-def _manager(transfer, min_final_rows=0):
+def _manager(transfer, min_final_rows=0, replay_tokens=0):
     manager = SimpleNamespace(
         state=SimpleNamespace(transfer=transfer),
         hash_block_size=128,
         min_final_prefill_rows=min_final_rows,
+        state_replay_tokens=replay_tokens,
     )
     manager.replay_start = lambda seq, start, hit: BlockManager.replay_start(
         manager, seq, start, hit=hit
@@ -76,6 +77,20 @@ def test_a_short_last_forward_backs_off_one_block_to_its_window():
     assert replay.replay_start(_seq(20000), 16384, hit=True) == 16256
 
 
+def test_a_dsv4_bounded_replay_hit_rebuilds_its_state_from_its_field_below():
+    # `can_allocate` admitted the hit at 9984 with no checkpoint behind it
+    manager = _manager(StateTransfer.copy("layout"), replay_tokens=7875)
+    seq = _seq(20000)
+    seq.replays_hit = True
+    assert manager.replay_start(seq, 9984, hit=True) == 2109
+    assert manager.replay_start(seq, 4096, hit=True) == 0
+    # a chunk boundary carries its state along: nothing to rebuild
+    assert manager.replay_start(seq, 9984, hit=False) == 9984
+    # a hit restored from its checkpoint
+    seq.replays_hit = False
+    assert manager.replay_start(seq, 9984, hit=True) == 9984
+
+
 def test_a_resume_off_the_block_grid_backs_off_onto_it():
     """A chunk cut off the hash-block grid (a long-prefill threshold that is no
     multiple of it) still backs off: to the grid, at least its window."""
@@ -102,7 +117,7 @@ def test_resuming_records_where_the_forward_resumed():
     s = seq(16584, 16384)
     Scheduler._resume_prefill(scheduler, s, 16256, hit=True)
     assert s.num_cached_tokens == 16256
-    assert s.replay == Replay(16384, True, (16253, 16254, 16255))
+    assert s.replay == Replay(16384, True, (16253, 16254, 16255), 16256)
     # a chunk boundary keeps its state: the rows below are not the state
     s = seq(16584, 16384)
     Scheduler._resume_prefill(scheduler, s, 16256, hit=False)
@@ -122,9 +137,11 @@ def test_a_backed_off_chunk_has_to_pass_where_it_resumed():
         max_num_batched_tokens=16384,
         block_manager=SimpleNamespace(block_size=128),
         _tick_cost_limit=math.inf,  # no DP prefill cost balancing
+        _dynamic_chunk_limit=lambda history_len, kind: None,
     )
-    scheduler._chunked_prefill_size = lambda *a: Scheduler._chunked_prefill_size(
-        scheduler, *a
+    scheduler._chunk_alignment = lambda: Scheduler._chunk_alignment(scheduler)
+    scheduler._chunked_prefill_size = lambda *a, **kw: Scheduler._chunked_prefill_size(
+        scheduler, *a, **kw
     )
     scheduler._prefill_room = lambda *a: Scheduler._prefill_room(scheduler, *a)
     seq = SimpleNamespace(num_tokens=16484)
@@ -148,10 +165,14 @@ def test_a_backed_off_forward_places_checkpoints_from_where_it_resumed():
         return 0
 
     scheduler = SimpleNamespace(
-        block_manager=SimpleNamespace(checkpoint_cut=checkpoint_cut),
+        block_manager=SimpleNamespace(
+            checkpoint_cut=checkpoint_cut,
+            # not a midstep-readable class: an uncut chunk keeps its length
+            align_midstep_chunk=lambda seq, start, chunk: chunk,
+        ),
         _requires_atomic_prefill=lambda seq: False,
     )
-    seq = SimpleNamespace(replay_until=6784, state_fork_src=-1)
+    seq = SimpleNamespace(replay_until=6784, replays_hit=False, state_fork_src=-1)
     assert Scheduler._finalize_prefill_chunk(scheduler, seq, 6528, 272) == 272
     assert Scheduler._preview_prefill_chunk(scheduler, seq, 6528, 6784, 272) == 272
     assert calls == [(6784, 6800), (6784, 6800)]
@@ -167,7 +188,7 @@ def test_a_batch_carries_only_the_forwards_starting_below_their_resume():
         seq.num_cached_tokens, seq.replay = cached, replay
         return seq
 
-    replay = Replay(256, True, (126, 127, 128))
+    replay = Replay(256, True, (126, 127, 128), 128)
     # a rebuilt hit, a cold prefill, and one whose resume was already passed
     seqs = [prefill(128, replay), prefill(0), prefill(256, replay._replace())]
     batch = ScheduledBatch(

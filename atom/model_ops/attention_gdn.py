@@ -384,6 +384,12 @@ class GatedDeltaNet(nn.Module):
                 # rejected drafts of the previous step are undone simply by
                 # `write_pos` never having advanced past them.
                 nsd = gdn_metadata.num_spec_decodes
+                # Pure spec-decode batch: the spec tokens are exactly the
+                # first num_actual_tokens rows, so write straight into the
+                # result and skip the merge copy below.
+                spec_only = (
+                    gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0
+                )
                 core_attn_out_spec = replayssm_gated_delta_rule(
                     q=query_spec,
                     k=key_spec,
@@ -401,6 +407,7 @@ class GatedDeltaNet(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
+                    o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
                 )
                 last_recurrent_state = None
             else:
@@ -533,25 +540,32 @@ class GatedDeltaNet(nn.Module):
                 )
 
                 h = flydsl_h if use_flydsl_prefill else pop_last_intermediate_states()
-                if h is not None:
-                    # One launch for both halves. `conv_state` is
-                    # [slot, conv_dim, state_len] by here (see the transpose
-                    # above) and shares `slots` with the SSM half, so the two
-                    # always describe the same token position.
-                    write_state_checkpoints(
-                        h,
-                        ssm_state,
-                        mixed_qkv_non_spec,
-                        conv_state,
-                        ckpt["rows"],
-                        ckpt["slots"],
-                        ckpt["offs"],
-                        ckpt["is_end"],
-                        ckpt["runtime"],
-                        gdn_metadata.ssm_chunk_offsets,
-                        non_spec_query_start_loc,
-                        CHUNK_SIZE,
+                # Raise rather than skip: the scheduler publishes every target
+                # after this forward, written or not.
+                if h is None:
+                    raise RuntimeError(
+                        "GDN state checkpoints reserved but the prefill kernel "
+                        "kept no intermediate states to copy them from"
                     )
+                # One launch for both halves. `conv_state` is
+                # [slot, conv_dim, state_len] by here (see the transpose
+                # above) and shares `slots` with the SSM half, so the two
+                # always describe the same token position.
+                write_state_checkpoints(
+                    h,
+                    ssm_state,
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    ckpt["rows"],
+                    ckpt["slots"],
+                    ckpt["offs"],
+                    ckpt["is_end"],
+                    ckpt["runtime"],
+                    gdn_metadata.ssm_chunk_offsets,
+                    non_spec_query_start_loc,
+                    CHUNK_SIZE,
+                    gdn_metadata.ssm_conv_state_len,
+                )
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes
             core_attn_out_non_spec = replayssm_gated_delta_rule(
@@ -645,7 +659,8 @@ class GatedDeltaNet(nn.Module):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if core_attn_out_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 

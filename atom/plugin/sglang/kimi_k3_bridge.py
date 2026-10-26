@@ -264,7 +264,10 @@ def install_kimi_k3_pool_patch() -> None:
 def kimi_k3_native_attention_construction():
     """Construct K3 full-attention layers with native ATOM attention."""
 
-    from atom.models import kimi_k3
+    # the module, not the package: `KimiFullAttention` resolves `Attention` in
+    # `atom.models.kimi_k3.model`'s globals, and an assignment on the package
+    # would bind a name nothing reads
+    from atom.models.kimi_k3 import model as kimi_k3
 
     previous = kimi_k3.Attention
     kimi_k3.Attention = SGLangATOMKimiK3Attention

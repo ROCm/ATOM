@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A runner's kernels, one build per step width (its rows)."""
+"""A runner's kernels, one build per step width."""
 
 import logging
 
@@ -11,7 +11,7 @@ logger = logging.getLogger("atom")
 
 
 class WidthBuilds:
-    """``build(rows)`` on a width's first step, its kernels (``kernels(built)``:
+    """``build(width)`` on a width's first step, its kernels (``kernels(built)``:
     ``(launcher, abi)`` pairs) compiled there without a launch: that step is a
     warmup forward before the width's graph capture, which then only records.
 
@@ -31,43 +31,52 @@ class WidthBuilds:
         self._built = {}
         self._refused = set()
 
-    def prepare(self, rows: int) -> bool:
-        """Whether every rank holds the ``rows`` build."""
-        if rows in self._built:
+    def prepare(self, width: int) -> bool:
+        """Whether every rank holds the ``width`` build.
+
+        ``width`` is whatever the model keys its builds by, not necessarily a
+        row count: Kimi-K3 packs the rows *and* the query length into one int
+        (``kimi_k3.mono.runner.width_key``), so a 16-row step at query length 8
+        is width 280. Reporting it as "rows" sent one reader hunting for a
+        280-row step that does not exist.
+        """
+        if width in self._built:
             return True
-        if rows in self._refused:
+        if width in self._refused:
             return False
         built = None
         try:
-            built = self._build(rows)
+            built = self._build(width)
             launchers = compile_kernels(self._kernels(built))
-            if not self._scratch_free(launchers, rows):
+            if not self._scratch_free(launchers, width):
                 built = None
         except Exception:
-            logger.exception("%s: building the %d-row kernels failed", self._what, rows)
+            logger.exception(
+                "%s: building the width-%d kernels failed", self._what, width
+            )
             built = None
         if not tp_agree(built is not None, self._group):
-            self._refused.add(rows)
+            self._refused.add(width)
             return False
-        self._built[rows] = built
-        logger.info("%s kernels built for %d rows", self._what, rows)
+        self._built[width] = built
+        logger.info("%s kernels built for width %d", self._what, width)
         return True
 
-    def _scratch_free(self, launchers, rows: int) -> bool:
+    def _scratch_free(self, launchers, width: int) -> bool:
         for launcher in launchers:
             scratch = scratch_bytes(launcher)
             if scratch:
                 logger.warning(
-                    "%s: a %d-row kernel needs %d B of scratch a lane, which can"
-                    " leave its CTAs partly resident and waiting for ever: %d-row"
-                    " steps take the original path",
+                    "%s: the width-%d kernel needs %d B of scratch a lane, which"
+                    " can leave its CTAs partly resident and waiting for ever:"
+                    " width-%d steps take the original path",
                     self._what,
-                    rows,
+                    width,
                     scratch,
-                    rows,
+                    width,
                 )
                 return False
         return True
 
-    def __getitem__(self, rows: int):
-        return self._built[rows]
+    def __getitem__(self, width: int):
+        return self._built[width]

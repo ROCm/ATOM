@@ -438,6 +438,7 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        builder.kv_pools = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
 
         assert builder.refresh_flydsl_plan(_fake_ctx(8), create=True) is not None
@@ -463,10 +464,54 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        builder.kv_pools = {}
         assert builder.refresh_flydsl_plan(_fake_ctx(8), create=True) is not None
         with caplog.at_level(logging.WARNING, logger="atom"):
             ba._warn_removed_flydsl_plan_env()
         assert "ATOM_PA_FLYDSL_PLAN is no longer used" in caplog.text
+
+    @pytest.mark.parametrize(
+        "head_dims, shape",
+        [
+            ((256,), {"max_partitions": 64, "workgroup_budget": 256}),
+            ((128,), {}),
+            # A builder over two head sizes keeps aiter's defaults.
+            ((256, 128), {}),
+        ],
+    )
+    def test_head_256_capture_plan_is_capped(self, monkeypatch, head_dims, shape):
+        """aiter's head-256 reducer is serial above 64 partitions.
+
+        Only head_dim 256 gets max_partitions=64 and workgroup_budget=256;
+        every other builder calls plan_pa_decode exactly as before. Drop the
+        cap, and this test, once aiter #5949 is in the image.
+        """
+        from atom.model_ops.attentions import aiter_attention as aa
+        from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
+
+        seen = []
+
+        def fake_plan(context_lens, num_kv_heads, **kwargs):
+            seen.append(kwargs)
+            return _FakePlan()
+
+        monkeypatch.setattr(
+            importlib.import_module("aiter.ops.flydsl.pa_decode"),
+            "plan_pa_decode",
+            fake_plan,
+        )
+        builder = aa.AiterAttentionMetadataBuilder.__new__(
+            aa.AiterAttentionMetadataBuilder
+        )
+        builder._flydsl_kv_heads = 1
+        builder._flydsl_plans = {}
+        builder.kv_pools = {KvGeometry(1, d): None for d in head_dims}
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
+
+        plan = builder.refresh_flydsl_plan(_fake_ctx(8), create=True)
+        assert seen == [{"query_length": 1, **shape}], seen
+        builder.refresh_flydsl_plan(_fake_ctx(8))
+        assert seen[1] == {"query_length": 1, "plan": plan}, "a refresh keeps it"
 
     def test_batch_past_the_planner_limit_falls_back(self, monkeypatch):
         """M3's sparse prefill-as-decode folds query tokens into num_seqs.
@@ -601,6 +646,7 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        builder.kv_pools = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
 
         ctx = _fake_ctx
@@ -713,6 +759,7 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        builder.kv_pools = {}
         builder._flydsl_plan_unplanned = False
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
 
@@ -746,6 +793,7 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
+        builder.kv_pools = {}
         builder._flydsl_plan_unplanned = False
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
 
@@ -977,12 +1025,12 @@ class TestExplicitPlan:
         )
         return ba, built
 
-    def _call(self, ba, owner=None, existing_plan=None, cap=8):
+    def _call(self, ba, owner=None, existing_plan=None, cap=8, head_dim=128):
         import torch
 
         n = 16
         return ba._flydsl_prepare_explicit_plan(
-            q=torch.empty((n, 16, 128), dtype=torch.bfloat16, device="meta"),
+            q=torch.empty((n, 16, head_dim), dtype=torch.bfloat16, device="meta"),
             k_cache=torch.empty((64, 1, 8, 16, 16), device="meta"),
             context_lens=_Ctx(n),
             num_seqs=n,
@@ -1057,6 +1105,30 @@ class TestExplicitPlan:
         assert built[-1].get("max_partitions") is None, built[-1]
         self._call(ba, cap=8)
         assert built[-1].get("max_partitions") == 8, built[-1]
+
+    def test_head_256_runtime_plan_matches_the_capture_plan(self, monkeypatch):
+        """Same head-256 shape as the builder's plans; a caller's cap is kept."""
+        ba, built = self._setup(monkeypatch)
+        self._call(ba, cap=None, head_dim=256)
+        assert built[-1] == {
+            "max_partitions": 64,
+            "query_length": 1,
+            "workgroup_budget": 256,
+        }, built[-1]
+        self._call(ba, cap=None, head_dim=128)
+        assert built[-1] == {"max_partitions": None, "query_length": 1}, built[-1]
+        self._call(ba, cap=8, head_dim=256)
+        assert built[-1] == {"max_partitions": 8, "query_length": 1}, built[-1]
+
+    def test_runtime_plan_key_carries_the_budget(self, monkeypatch):
+        """Same ceiling, different budget: two plans, never one shared."""
+        ba, built = self._setup(monkeypatch)
+        refused = _CountingPlan(8)  # wrong batch: rebuilt at its own ceiling
+        refused.max_partitions = 64
+        capped = self._call(ba, existing_plan=refused, cap=None, head_dim=256)
+        uncapped = self._call(ba, cap=64, head_dim=128)
+        assert capped is not uncapped
+        assert [kw.get("workgroup_budget") for kw in built] == [256, None], built
 
     @staticmethod
     def _call_kwargs(relpath, func):

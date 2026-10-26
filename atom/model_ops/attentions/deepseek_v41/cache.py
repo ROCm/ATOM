@@ -45,7 +45,34 @@ from .speculative import TentativeState
 
 
 class PagedAttentionCache:
-    def __init__(self, geometry, pages, slots, device, max_tokens=0, workspace=None):
+    def _allocate_backing(self, size, device):
+        """This cache's whole pool, as one flat uint8 arena.
+
+        The one seam a caller that already owns the bytes overrides. PAGE and
+        STATE share a single address space here because
+        :meth:`V41PoolGeometry.window` states a slot's ring as an offset past
+        the absolute end of the paged region, and the ``_indices`` kernels
+        dereference page rows and window rows against one base -- so the pool
+        is handed over whole or not at all, and an override returns the whole
+        arena rather than the paged part of it.
+
+        What an override has to return is what this returns: zeroed, flat
+        uint8, contiguous, on ``device``, and exactly ``size`` elements. Every
+        region below is a `view` of it with its own strides, which neither a
+        short arena nor a longer tail would divide, and the cursor reset plus
+        every cold read assume the zeros.
+        """
+        return torch.zeros(size, dtype=torch.uint8, device=device)
+
+    def __init__(
+        self,
+        geometry,
+        pages,
+        slots,
+        device,
+        max_tokens=0,
+        workspace=None,
+    ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
@@ -56,7 +83,7 @@ class PagedAttentionCache:
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         index_offsets, boundary = geometry.paged_extents(pages)
         size = boundary + slots * geometry.state_bytes
-        self.backing = torch.zeros(size, dtype=torch.uint8, device=device)
+        self.backing = self._allocate_backing(size, device)
         main_bytes = self.num_pages * geometry.page_bytes
         self.pages = EntryMajorArena(
             geometry.page_fields,
@@ -325,22 +352,31 @@ class PagedAttentionCache:
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.
+
+        # Held so a reader that cannot be handed this object still finds it.
+        # Under vLLM's breakable capture an eager break is replayed with the
+        # arguments it was captured with, so attention cannot take `step` as a
+        # parameter and see this step -- it would see the one recorded with the
+        # graph. The cache outlives every step, so reading it from here is live.
+        self.current_step = step
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)
         # Before the indptrs, which count each row's window from its floor.
         self.publish_replay_layout(step, count if running_bs is None else running_bs)
-        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
         return step
 
-    def publish_replay_layout(self, step, running_bs):
+    def publish_replay_layout(self, step, running_bs, floors=None):
         """`step.swa_replay_start` and `swa_cached_until` from its host
         `request_floors` and `request_cached_until`, indexed by the step's own
         batch rows: the fixed zeros unless a request recomputes rows below
-        where it resumed."""
+        where it resumed. ``floors``: the floors already published at fixed
+        addresses, a bounded-replay tail's, whose rows no ring holds."""
         zeros = self._replay_start_zeros(running_bs)
         step.swa_replay_start = step.swa_cached_until = zeros
-        if step.request_floors.any() and not step.decode:
+        if floors is not None:
+            step.swa_replay_start = floors
+        elif step.request_floors.any() and not step.decode:
             step.swa_replay_start, step.swa_cached_until = upload_numpy(
                 np.stack((step.request_floors, step.request_cached_until)),
                 step.positions.device,
@@ -406,6 +442,7 @@ class PagedAttentionCache:
         if not wrong.size:
             return
         first = int(wrong[0])
+
         raise ValueError(
             f"Request {requests[first]} needs state at {starts[first]}, "
             f"found {int(cursors[first, 0])}; replay from a recoverable boundary"
@@ -584,12 +621,23 @@ class PagedAttentionCache:
             rope=rope,
         )
 
+    def indptrs(self, step):
+        """`step`'s `{ratio: (prefix indptr, extend indptr, reserved top-k)}`
+        (`fill_step_indptrs`), into its fixed buffers: a TBO microbatch's own,
+        else the cache's. Memoized as `unit_tiles` is, so a forward that builds
+        no index (mono's) fills none."""
+        if not step.indptrs:
+            step.indptrs = fill_step_indptrs(
+                step, self.geometry, step.indptr_buffers or self.indptr_buffers
+            )
+        return step.indptrs
+
     def unit_tiles(self, step, ratio):
         """Tile ids per query token: one table per ratio, shared by its owners.
 
         Memoized on the step and dropped by `begin_forward` rather than built
-        with it, unlike the indptrs: a table built outside the graph is one a
-        replay reads without rebuilding. With a `workspace` the table is its
+        with it: a table built outside the graph is one a replay reads without
+        rebuilding. With a `workspace` the table is its
         ratio's fixed rows, rewritten each step; without one, a fresh
         allocation.
         """
@@ -727,6 +775,7 @@ class PagedAttentionCache:
         (`rotate_query`).
         """
         dim, packed = self.geometry.head_dim, self.packed
+
         if not step.width:
             return (None, None) if step.decode else (torch.empty_like(kv), None)
         seam = (
@@ -814,20 +863,17 @@ class PagedAttentionCache:
         """This layer's `(prefix, pptr, second, sptr)`: rows into the pool, and
         rows into the attention's second source.
 
-        A prefill's second source is its own KV (`extend`), its rows built for
-        this layer alone: it pays work rather than dispatch. A decode builds
-        its index group's in one launch: every layer's prefix, window
-        included, or on a split decode (`splits_window`) the selection alone,
-        one plane the group shares, its second source the layer's ring
-        (`ring_view`) and the window rows one list for every layer.
+        Prefill and decode alike build their index group's in one launch:
+        every layer's prefix, window included, or on a split decode
+        (`splits_window`) the selection alone, one plane the group shares. A
+        prefill's second source is its own KV (`extend`, one list for the
+        group); a decode's is the layer's ring (`ring_view`), and a split
+        decode's window rows one list for every layer.
 
         The group's first layer is also the layer that owns its selection, so
         by the time anyone asks, every input the run shares already exists.
         Later layers find theirs written and launch nothing.
         """
-        if not step.decode:
-            prefix, pptr, extend, eptr = self._index_group(spec, step, spec.layer_id, 1)
-            return prefix[0], pptr, extend, eptr
         # a spec that declares no group never names a start: its own
         first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
         split = splits_window(step, self.geometry)
@@ -864,6 +910,7 @@ class PagedAttentionCache:
         )
         return build_indices(
             step.selected[spec.topk_owner] if spec.ratio else None,
+            self.indptrs(step)[spec.ratio],
             step,
             self.geometry,
             window,

@@ -43,6 +43,9 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
+from atom.observability.tracing import TraceMiddleware, set_request_id
+from atom.observability.tracing import initialize as initialize_tracing
+from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -655,9 +658,14 @@ def _get_multimodal_processor():
             _get_engine_config(), tokenizer, custom_message_encoder
         )
         if processor is None:
+            # The checkpoint path: model_name may be --served-model-name.
             processor = AutoProcessor.from_pretrained(
-                model_name, trust_remote_code=True
+                _get_engine_config().model, trust_remote_code=True
             )
+            # A checkpoint that ships its template for the tokenizer only
+            # (MiniMax-M3.1) renders with the server's, --chat-template included.
+            if processor.chat_template is None:
+                processor.chat_template = tokenizer.chat_template
     return processor
 
 
@@ -1527,6 +1535,7 @@ async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    await asyncio.to_thread(initialize_tracing)
     metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
@@ -1556,8 +1565,11 @@ async def lifespan(app: FastAPI):
         _background_tasks.clear()
         await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
-        if engine is not None:
-            engine.close()
+        try:
+            if engine is not None:
+                engine.close()
+        finally:
+            await asyncio.to_thread(shutdown_tracing)
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1565,6 +1577,7 @@ app.add_middleware(
     RequestTimingMiddleware,
     observe_ttft=_request_metrics.observe_time_to_first_token,
 )
+app.add_middleware(TraceMiddleware, model=lambda: model_name)
 
 
 # ---- Error handlers ----
@@ -1654,6 +1667,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        set_request_id(request_id)
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -1899,6 +1913,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
+        set_request_id(request_id)
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -2086,6 +2101,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         request_id = uuid.uuid4().hex[:24]
+        set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
         input_tokens = len(tokenizer.encode(prompt))
 
@@ -2505,6 +2521,7 @@ async def responses_create(raw_request: Request):
         )
 
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
+        set_request_id(request_id)
         input_tokens = len(tokenizer.encode(prompt))
 
         max_ctx = 30720

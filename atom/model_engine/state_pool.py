@@ -265,7 +265,11 @@ class StateSlotPool:
         resume point should do. Whether to demote at all is the caller's
         separate question; see `publish_midstep` for `seq=None`.
         """
-        pos = getattr(seq, "checkpoint_end_pos", 0) if seq is not None else 0
+        pos = 0
+        if seq is not None:
+            pos = getattr(seq, "midstep_anchor_pos", 0) or getattr(
+                seq, "checkpoint_end_pos", 0
+            )
         return pos or None
 
     def promote(self, slot: int) -> None:

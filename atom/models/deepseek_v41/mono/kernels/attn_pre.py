@@ -65,7 +65,7 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
 from atom.models.deepseek_v41.mono.kernels.index_query import (
     scratch_pairs as indexer_pairs,
 )
-from atom.models.deepseek_v41.mono.kernels.mx import code_round, fp8_value
+from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR, code_round, fp8_value
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.token_par import own_view
 from atom.models.deepseek_v41.mono.sources import SOURCES
@@ -144,6 +144,9 @@ IW0 = 0
 IQ_TASKS = IDX_ROWS // ROWS  # 256
 IQ0 = IW_TASKS
 IQUANT0 = 0
+# a CTA's wq_b tasks whose weights stay in registers through every token tile
+# (TP 2's 4; TP 1's 8 held, with an indexer layer's iq task, spilled)
+WQB_HELD = 4
 
 _CURRENT_STREAM = fx.Stream(None)
 
@@ -564,7 +567,7 @@ def stage_gate(c, t):
 def stage_norm(c, t):
     """The seam's RMSNorm (rstd = rsq(fma(sum, 1/H, eps)), bf16((x rstd) w); 256
     threads, 3 chunks of 8 at 8 t + 2048 c), then ATOM's quantize_fp8 of the bf16
-    row (amax floored at 1e-4, the ceil code, x / scale) -> x8 words and codes;
+    row (amax floored at AMAX_FLOOR, the ceil code, x / scale) -> x8 words and codes;
     the FFN seam (``ffn``, whose x8 K2b quantizes itself) stores the bf16 row as
     ``normed`` instead. A layer that feeds its indexer (``index``) stores it as
     ``normed`` too and puts it in NB. Threads 256.. mirror thread 255 and store
@@ -607,7 +610,7 @@ def stage_norm(c, t):
         amax = fx.Float32(0.0)
         for y in ys:
             amax = fx.max(amax, abs(y))
-        amax = fx.max(butterfly(amax, (1, 2), fx.max), fx.Float32(1e-4))
+        amax = fx.max(butterfly(amax, (1, 2), fx.max), fx.Float32(AMAX_FLOOR))
         code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
         step = pow2(code)
         if mine & (cols[ch] < HIDDEN):
@@ -754,21 +757,30 @@ def _gemv_steps(c, k, split, tiled=False):
     return [(part * per + i, None) for i in range(per)]
 
 
-def gemv_fp8_loads(c, w, ws, k, rg, split=None, tiled=False):
+def gemv_fp8_loads(c, w, ws, k, rg, split=None, tiled=False, k_row=None, st0=0):
     """The weight operands of ``gemv_fp8``'s rows for this wave, every one in
     flight at once (a step's latency each would put them in series): loads
     only. A step past the end loads the last step. ``tiled`` (split x tiles =
-    WAVES): row groups rg .., one a group of ``split`` waves."""
+    WAVES): row groups rg .., one a group of ``split`` waves. ``k_row``: the
+    weight's rows are this long, its K steps st0 .. the ``k`` taken (a part of
+    K: ``Dims.wob_parts``)."""
     steps = (k + 127) // 128
     r_w, r_ws = rsrc(w), rsrc(ws)
     if const_expr(tiled):
         assert WAVES % split == 0
         rg = rg + c["wave"] // split
-    return [
-        _fp8_step_load(
-            c, r_w, r_ws, k, rg, st if live is None else fx.min(st, steps - 1)
-        )
+    if k_row is None:
+        k_row = k
+    # st0 may be traced (a rank's part): a part's steps never cross a row
+    offset = not (isinstance(st0, int) and st0 == 0)
+    assert not offset or (k % 128 == 0 and k_row % 128 == 0)
+    sts = [
+        st if live is None else fx.min(st, steps - 1)
         for st, live in _gemv_steps(c, k, split, tiled)
+    ]
+    return [
+        _fp8_step_load(c, r_w, r_ws, k_row, rg, st0 + st if offset else st)
+        for st in sts
     ]
 
 
@@ -935,7 +947,7 @@ def stage_qkv(c, t):
     amax = fx.Float32(0.0)
     for y in ys:
         amax = fx.max(amax, abs(y))
-    code = code_round(butterfly(amax, (1, 2), fx.max))
+    code = code_round(fx.max(butterfly(amax, (1, 2), fx.max), fx.Float32(AMAX_FLOOR)))
     mul = pow2(254 - code)
     if mine & (tt * 8 < Q_RANK):
         w0 = fp8_pack4(*[ys[i] * mul for i in range(4)])
@@ -968,7 +980,9 @@ def stage_qkv(c, t):
     e0 = bf16_round(kn[0] * cs - kn[1] * sn)
     e1 = bf16_round(kn[0] * sn + kn[1] * cs)
     amax = butterfly(fx.max(abs(e0), abs(e1)), (1, 2, 4, 8), fx.max)
-    step = pow2(code_ceil(fx.max(amax, fx.Float32(1e-4)) * fx.Float32(1.0 / FP8_MAX)))
+    step = pow2(
+        code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
+    )
     qat = [fp8_value(clamp_fp8(v / step)) * step for v in (e0, e1)]
     # the ring row of a [rows, 512] bf16 pool: the step's row of this token (int32,
     # -1: none) past the layer's ring start
@@ -1209,7 +1223,7 @@ def build_attn_pre(key: AttnPreBuild):
         if const_expr(key.tok_par):
             bases = peer_bases(peers, key.tp)
             c["peer_addr"] = lambda p: bases[p]
-            pl = peer_offsets(s, key.tp)
+            pl = peer_offsets(s, dims)
             co = own_view(c, K1_OWN)
             co["tok_par"] = True
             # qkv pushes its token's q latent to every rank's QG / QGS and its
@@ -1306,7 +1320,13 @@ def build_attn_pre(key: AttnPreBuild):
                 t0, n,
             )  # fmt: skip
             for b in range_constexpr(0, wqb_per_cta, 2):
-                if const_expr(b > 0 and t0 == 0):
+                if const_expr(b >= WQB_HELD):
+                    # past the held tasks: loaded again each token tile (L2 hits)
+                    wqb_all[b:] = [
+                        gemv_fp8_loads(c, wqb, wqb_s, Q_RANK, nth_task(wqb_task, b + i))
+                        for i in range(min(2, wqb_per_cta - b))
+                    ]
+                elif const_expr(b > 0 and t0 == 0):
                     wqb_all += [
                         gemv_fp8_loads(c, wqb, wqb_s, Q_RANK, nth_task(wqb_task, b + i))
                         for i in range(min(2, wqb_per_cta - b))

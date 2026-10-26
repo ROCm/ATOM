@@ -383,6 +383,28 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 return True
         return False
 
+    def _sub_methods(self, name: str) -> list:
+        """Bound `name` of every sub-connector that implements it."""
+        methods = (getattr(c, name, None) for c in self._connectors)
+        return [m for m in methods if callable(m)]
+
+    def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        """True only if every sub-connector with a tier lookup can detach it."""
+        checks = self._sub_methods("can_detach_lookup")
+        return bool(checks) and all(check(seq, num_hbm_tokens) for check in checks)
+
+    def detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        """Detach the lookup on every sub-connector.
+
+        Called after `can_detach_lookup` agreed, so every sub-connector is
+        asked rather than stopping at the first refusal.
+        """
+        results = [
+            bool(detach(seq, num_hbm_tokens))
+            for detach in self._sub_methods("detach_lookup")
+        ]
+        return all(results)
+
     def prefetch_lookups(self, seqs: Any) -> None:
         """Let each sub send its external-tier lookups ahead of admission."""
         seqs = list(seqs)

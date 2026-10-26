@@ -132,8 +132,10 @@ jobs:
 
               cell = remap_model_paths(cell)
               cell["runner"]["log_root"] = "/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"
+              # TW atomesh CI submits only as amd-atom.
+              cell["runner"]["slurm_account"] = "amd-atom"
               cell["runner"]["slurm_partition"] = "amd-spur"
-              cell["runner"]["slurm_qos"] = "amd-frameworks-qos"
+              cell["runner"]["slurm_qos"] = "amd-atom-qos"
 
           if (
               cell["runner"].get("slurm_account") == "amd-atom"
