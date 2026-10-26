@@ -31,7 +31,9 @@ bounds do not impose a hard end-to-end TTFT limit.
 It is NOT about mixing prefill+decode in one forward. It DOES preserve cross-DP
 phase alignment: it only releases when every rank is prefill-ready (so all ranks
 enter prefill together and the MoE collective stays aligned), except when a
-must-fire bound forces release regardless or the queue stops growing.
+must-fire bound forces release regardless. The opt-in cost gate can also
+release an unaligned group when the queue stops growing or its measured
+waiting cost no longer pays off.
 
 Decision (evaluated every tick, on every rank, in lockstep)
 -----------------------------------------------------------
@@ -55,7 +57,8 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   if any_queue_hot:                             FIRE   # queue age bound
   if hold_ticks >= ttft_max_ticks:                FIRE   # TTFT bound
   if any_partial and hold_ticks >= partial_max_ticks: FIRE  # partial holds KV — tight bound
-  # -- adaptive give-up: queue stopped growing, waiting longer is futile --
+  if n_prefillable < dp_size and not cost_gate:    HOLD
+  # -- adaptive give-up for aligned groups or the opt-in cost policy --
   if G_pending <= prev_G_pending:  stall += 1  else  stall = 0
   # -- alignment gate: hold while some rank lacks prefill (anti-skew) --
   if n_prefillable < dp_size:
@@ -558,8 +561,15 @@ class PrefillDelayer:
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
             return self._fire("partial", g_pending)
 
-        # The queue stopped growing: nothing more is arriving to align with or
-        # to fill the forward, so further holding only adds TTFT.
+        # A capped pending-token count can stay flat while decoding peers
+        # finish requests and free client concurrency for their next prefill.
+        # Keep those peers aligned unless a must-fire bound above releases us.
+        # The measured cost policy remains an explicit alternative.
+        if n_prefillable < self.dp_size and not self._cost_gate:
+            return self._hold(g_pending)
+
+        # Once aligned, a flat queue can release an underfilled forward. The
+        # opt-in cost policy also uses this bound before alignment.
         if g_pending <= self._prev_pending:
             self._stall_count += 1
         else:

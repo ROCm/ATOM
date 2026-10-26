@@ -1106,9 +1106,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS": lambda: int(
         os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "100")
     ),
-    # Consecutive non-growing ticks after which the coalescer gives up waiting
-    # (burst ended, more won't come) and releases, including while some DP rank
-    # has no prefill.
+    # Consecutive non-growing ticks after which an aligned coalescer releases
+    # an underfilled forward. The opt-in cost gate also applies this bound
+    # while some DP rank has no prefill.
     "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
         os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "10")
     ),
@@ -1117,7 +1117,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # can't pay for the requests it delays, or once they have waited as long
     # as the decode stall of one unaligned prefill step.
     "ATOM_PREFILL_DELAYER_COST_GATE": lambda: (
-        os.getenv("ATOM_PREFILL_DELAYER_COST_GATE", "1").lower() in ("1", "true")
+        os.getenv("ATOM_PREFILL_DELAYER_COST_GATE", "0").lower() in ("1", "true")
     ),
     # KV high watermark: at/above this KV usage a prefillable rank force-releases
     # (can't accumulate a bigger batch anyway).

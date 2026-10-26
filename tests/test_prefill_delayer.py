@@ -276,16 +276,32 @@ class TestAlignmentGate:
         assert call(d, pending_tokens=MAX_BATCHED, reduce=mixed) is True  # ttft
         assert d._stat_fire_ttft == 1
 
-    def test_mixed_released_by_stall(self):
-        # One rank's lone request, the other decoding: nothing more arrives, so
-        # the gate gives up after stall_ticks instead of waiting out ttft.
-        d = make_delayer(dp_size=2, ttft_max_ticks=1000, stall_ticks=2)
+    def test_mixed_flat_queue_waits_until_ttft(self):
+        # A decoding peer can receive its next request only after a completion.
+        # A flat queue before then does not justify another prefill forward.
+        d = make_delayer(dp_size=2, ttft_max_ticks=4, stall_ticks=2)
         skip_first(d)
         mixed = _add_rank({2: 64})
-        assert call(d, pending_tokens=500, reduce=mixed) is False  # grew
-        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 1
-        assert call(d, pending_tokens=500, reduce=mixed) is True  # stall 2
-        assert d._stat_fire_stall == 1
+        for _ in range(4):
+            assert call(d, pending_tokens=500, reduce=mixed) is False
+        assert call(d, pending_tokens=500, reduce=mixed) is True
+        assert d._stat_fire_ttft == 1
+        assert d._stat_fire_stall == 0
+
+    def test_capped_pending_waits_for_decoding_peer_to_refill(self):
+        d = make_delayer(dp_size=8, ttft_max_ticks=8, stall_ticks=2)
+        skip_first(d)
+        # Seven ranks have prefill, one still decodes. The sum is already
+        # above the fill target, but every local probe caps pending tokens.
+        mixed = _add_rank({0: 6, 1: 6 * MAX_BATCHED, 2: 7 * 16})
+        for _ in range(5):
+            assert call(d, pending_tokens=MAX_BATCHED, reduce=mixed) is False
+        # The peer completes and receives a replacement. Its admission flag
+        # changes even though capped aggregate pending stays exactly flat.
+        aligned = _add_rank({0: 7, 1: 6 * MAX_BATCHED, 2: 7 * 16})
+        assert call(d, pending_tokens=MAX_BATCHED, reduce=aligned) is True
+        assert d._stat_fire_fill == 1
+        assert d._stat_fire_stall == 0
 
     def test_mixed_holds_while_growing(self):
         d = make_delayer(dp_size=2, ttft_max_ticks=1000, stall_ticks=2)
