@@ -223,6 +223,11 @@ on:
         required: false
         default: true
         type: boolean
+      collect_m31_run:
+        description: 'Read existing MiniMax M3.1 PD shared logs; set run_model_benchmark=false'
+        required: false
+        default: ''
+        type: string
       publish_dashboard:
         description: 'Publish workflow_dispatch results to the benchmark dashboard'
         required: false
@@ -1546,6 +1551,36 @@ jobs:
       atom_source: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_source || 'mounted' }}
       model_root: ${{ needs.load-config.outputs.model_root }}
       dashboard_hardware: ${{ needs.load-config.outputs.dashboard_hardware }}
+
+  collect-m31-logs:
+    name: Collect existing MiniMax M3.1 PD logs
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && inputs.collect_m31_run != ''
+      && !inputs.run_model_benchmark
+    runs-on: atomesh-cicd
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Read existing shared logs and scheduler state
+        env:
+          TARGET_RUN_ID: ${{ inputs.collect_m31_run }}
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:${PATH}"
+          source .github/scripts/slurm_submit_helpers.sh
+          detect_slurm_backend
+          export USES_SPUR_CONTROLLER SPUR_CONTROLLER_ADDR
+          python3 .github/scripts/atomesh/collect_m31_pd_logs.py \
+            "$TARGET_RUN_ID" --output m31-pd-logs
+      - name: Upload existing run logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: m31-pd-logs-${{ inputs.collect_m31_run }}
+          path: m31-pd-logs/
+          if-no-files-found: error
+          retention-days: 7
 
   summarize-results:
     name: Summarize ATOMesh benchmark results
