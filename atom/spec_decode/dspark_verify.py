@@ -177,6 +177,7 @@ class VerifyScheduler:
             copy_stream.wait_stream(default_stream)
             cpu_buf.copy_(ell, non_blocking=True)
             event.record(copy_stream)
+        self.runner.tokenID_processor._hold_for_copy_stream(ell)
         # Bind the event to the ring slot this copy is landing in, so the slot
         # is not handed out again until the DMA completes. This outlives the
         # `_ell_pending` entry on purpose: the eviction below drops bookkeeping,

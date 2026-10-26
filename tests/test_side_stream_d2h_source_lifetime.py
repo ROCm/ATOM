@@ -4,9 +4,10 @@
 
 `tokenIDProcessor` copies the sampled ids, the MTP verdict (`spec_counts`, a
 view of the sampler's `verdict`) and the draft ids to the host on
-`async_copy_stream`. The sources are fresh default-stream allocations that the
-caller drops right after queuing the copy. Unless the source is recorded on the
-copy stream, the caching allocator hands its block to the next default-stream
+`async_copy_stream`; DSpark's `VerifyScheduler.record_ell` copies `ell` on the
+same stream. The sources are fresh default-stream allocations that the caller
+drops right after queuing the copy. Unless the source is recorded on the copy
+stream, the caching allocator hands its block to the next default-stream
 allocation, and a copy that runs late -- anything already queued on the copy
 stream -- reads that tensor instead. Under MTP the stale bonus count turns into
 `num_accepted_tokens`, which the GDN conv kernel adds to the state offset
@@ -21,6 +22,7 @@ when `record_stream` is disabled; without it a pass would say nothing.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +31,8 @@ if not torch.cuda.is_available():
     pytest.skip("needs a real GPU", allow_module_level=True)
 
 from atom.model_engine.model_runner import tokenIDProcessor
+from atom.spec_decode import dspark_verify
+from atom.spec_decode.dspark_verify import VerifyScheduler
 
 DEV = torch.device("cuda:0")
 BS = 32
@@ -82,6 +86,21 @@ def _processor():
     return proc
 
 
+def _verify_scheduler(proc):
+    vs = object.__new__(VerifyScheduler)
+    vs.runner = SimpleNamespace(
+        tokenID_processor=proc, config=SimpleNamespace(max_num_seqs=BS)
+    )
+    vs._last_ell = None
+    vs._ell_pending = []
+    vs._ell_map = {}
+    vs._ell_stage_ring = None
+    vs._ell_stage_idx = 0
+    vs._ell_slot_event = [None] * dspark_verify._MAX_ELL_INFLIGHT
+    vs._ell_last_slot = None
+    return vs
+
+
 def _block_copy_stream(proc):
     with torch.cuda.stream(proc.async_copy_stream):
         torch.cuda._sleep(BLOCK_CYCLES)
@@ -133,10 +152,27 @@ def _draft_ids_trial(proc):
     return bool((proc.recv_draft_token_ids() == GOOD).all())
 
 
+def _ell_trial(proc):
+    torch.cuda.synchronize()
+    vs = _verify_scheduler(proc)
+    _block_copy_stream(proc)
+    ell = torch.empty(BS, dtype=torch.int64, device=DEV)
+    ell.fill_(GOOD)
+    vs.set_last_ell(ell)
+    vs.record_ell(list(range(BS)))
+    del ell
+    vs._last_ell = None
+    _next_step_allocation()
+    event, cpu_buf, _ = vs._ell_pending[-1]
+    event.synchronize()
+    return bool((cpu_buf == GOOD).all())
+
+
 TRIAL_FNS = {
     "spec_status": _spec_status_trial,
     "sampled_ids": _sampled_ids_trial,
     "draft_ids": _draft_ids_trial,
+    "dspark_ell": _ell_trial,
 }
 
 
