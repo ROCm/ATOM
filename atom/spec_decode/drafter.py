@@ -10,7 +10,7 @@ import torch
 from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, standalone_draft_quant_config
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
@@ -323,9 +323,8 @@ class Drafter(abc.ABC):
         with ``--draft-model``) already clone the config to swap ``hf_config``;
         this is the quant half of that same swap, shared so the two cannot drift.
         """
-        return QuantizationConfig(
-            self.speculative_config.draft_model_hf_config,
-            self.config.quant_config.online_quant_config_raw,
+        return standalone_draft_quant_config(
+            self.speculative_config.draft_model_hf_config, self.config.quant_config
         )
 
     def _build_draft_model(self, model_class) -> nn.Module:

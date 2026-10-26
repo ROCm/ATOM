@@ -181,3 +181,30 @@ def test_standalone_draft_still_gets_the_online_override():
     qc = Drafter.standalone_draft_quant_config(_drafter_double(online))
     assert qc.online_quant
     assert qc.online_quant_config_raw == online
+
+
+class _ForeignQuantType:
+    """A QuantType member as a differently identified aiter import yields it in
+    a plugin process: same value, but unequal (and unhashable-equal) to this
+    import's members -- and to each other."""
+
+    def __init__(self, member):
+        self.value = member.value
+        self.name = member.name
+
+    def __eq__(self, other):
+        return self is other
+
+    def __hash__(self):
+        return id(self)
+
+
+def test_fp8_fusion_accepts_quant_types_from_another_aiter_import():
+    attn = _kda_double(QuantType.per_Token)
+    for proj in (attn.in_proj, attn.b_proj, attn.f_a_proj):
+        proj.quant_type = _ForeignQuantType(QuantType.per_Token)  # one each
+    want_s = torch.cat(
+        [p.weight_scale.data for p in (attn.in_proj, attn.b_proj, attn.f_a_proj)]
+    )
+    KimiKDAAttention.process_weights_after_loading(attn)
+    assert torch.equal(attn.in_proj.weight_scale.data, want_s)

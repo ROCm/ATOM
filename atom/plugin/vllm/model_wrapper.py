@@ -360,6 +360,36 @@ def _patch_required_act_dtype_post_load_hooks(
     return patched
 
 
+def _standalone_draft_atom_config(vllm_config, draft_hf_config, is_dspark_draft: bool):
+    """The ATOM config a standalone draft (eagle3, or DSpark with a separate
+    draft checkpoint) is built with under vLLM.
+
+    It starts from the TARGET's config, so two halves are swapped for the
+    draft's own: the model description, and the static quant spec -- otherwise
+    an MXFP4 target declares a bf16 draft's weights fp4 and the load fails.
+    Same quant rebuild as the native proposers; it has to happen before the
+    caller's remap.
+    """
+    from atom.config import standalone_draft_quant_config
+
+    atom_config = _generate_atom_config_from_vllm_config(vllm_config)
+    # Prefer ATOM's normalized copy: building the atom_config ran
+    # `hf_config_override`, which maps a standalone draft's checkpoint field
+    # names onto the canonical ones the ATOM model reads (e.g. DSpark's
+    # `mask_token_id` -> `dspark_noise_token_id`). vLLM's own copy never sees that.
+    atom_spec_config = getattr(atom_config, "speculative_config", None)
+    normalized_hf_config = getattr(atom_spec_config, "draft_model_hf_config", None)
+    atom_config.hf_config = (
+        normalized_hf_config
+        if is_dspark_draft and normalized_hf_config is not None
+        else draft_hf_config
+    )
+    atom_config.quant_config = standalone_draft_quant_config(
+        atom_config.hf_config, atom_config.quant_config
+    )
+    return atom_config
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 
@@ -443,20 +473,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
             self.atom_config.hf_config = main_atom_config.hf_config
         elif self._is_standalone_draft:
-            self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
-            # Prefer ATOM's normalized copy: building the atom_config ran
-            # `hf_config_override`, which maps a standalone draft's checkpoint
-            # field names onto the canonical ones the ATOM model reads (e.g.
-            # DSpark's `mask_token_id` -> `dspark_noise_token_id`). vLLM's own
-            # copy never sees that.
-            atom_spec_config = getattr(self.atom_config, "speculative_config", None)
-            normalized_hf_config = getattr(
-                atom_spec_config, "draft_model_hf_config", None
-            )
-            self.atom_config.hf_config = (
-                normalized_hf_config
-                if self.is_dspark_draft_model and normalized_hf_config is not None
-                else draft_hf_config
+            self.atom_config = _standalone_draft_atom_config(
+                vllm_config, draft_hf_config, self.is_dspark_draft_model
             )
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)

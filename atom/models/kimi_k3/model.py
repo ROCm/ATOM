@@ -1137,21 +1137,24 @@ class KimiKDAAttention(nn.Module):
         # b_proj and f_a_proj are appended as the two tails.
         tails = (self.b_proj, self.f_a_proj)
         mods = (self.in_proj, *tails)
-        quant_types = {m.quant_type for m in mods}
-        assert len(quant_types) == 1, (
+        # Compared by value: QuantType is a pybind enum, and in a plugin process
+        # members from differently identified aiter imports share a value but do
+        # not compare (or hash) equal -- see weight_is_stored_preshuffled.
+        quant_values = {m.quant_type.value for m in mods}
+        assert len(quant_values) == 1, (
             "KDA in-proj fusion needs one scheme across the projections it "
-            f"concatenates; got {sorted(t.name for t in quant_types)}."
+            f"concatenates; got {sorted({m.quant_type.name for m in mods})}."
         )
-        fused_quant_type = quant_types.pop()
-        assert fused_quant_type in (QuantType.No, QuantType.per_Token), (
+        fused_quant_value = quant_values.pop()
+        assert fused_quant_value in (QuantType.No.value, QuantType.per_Token.value), (
             "KDA in-proj fusion supports unquantized (bf16) or per-output-channel "
-            f"FP8 (per_Token) attention weights; got {fused_quant_type.name}."
+            f"FP8 (per_Token) attention weights; got {self.in_proj.quant_type.name}."
         )
         # Built BEFORE in_proj's weight is grown: the check below pairs each
         # scale against its own module's row count, and in_proj's stops being
         # the pre-fusion one the moment the wide weight is installed.
         fused_scale = None
-        if fused_quant_type == QuantType.per_Token:
+        if fused_quant_value == QuantType.per_Token.value:
             # per_Token's weight scale is indexed by output channel -- the same
             # axis this concatenates -- so a row keeps its own scale wherever it
             # lands and no requantization is needed. Concatenating the scales in
