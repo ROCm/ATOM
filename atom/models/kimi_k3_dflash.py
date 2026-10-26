@@ -219,9 +219,9 @@ class KimiK3DFlashAttention(nn.Module):
         # The block's read, built on the first forward that has a pool --
         # see `_attend_non_causal`.
         self._block_attn = None
-        # `(kv_cache_dtype_str, k_scale_dev, v_scale_dev, k_scale, v_scale)` for
-        # the pool this layer ends up bound to, resolved once on the first
-        # forward that has one -- see `_store_cfg`.
+        # `(kv_cache_dtype_str, k_scale_dev, v_scale_dev)` for the pool this
+        # layer ends up bound to, resolved once on the first forward that has
+        # one -- see `_store_cfg`.
         self._store = None
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -351,7 +351,7 @@ class KimiK3DFlashAttention(nn.Module):
         """
         import aiter
 
-        kind, k_dev, v_dev, _, _ = self._store_cfg(k_cache)
+        kind, k_dev, v_dev = self._store_cfg(k_cache)
         aiter.reshape_and_cache_flash(
             k.view(-1, self.num_kv_heads, self.head_dim),
             v.view(-1, self.num_kv_heads, self.head_dim),
@@ -364,12 +364,13 @@ class KimiK3DFlashAttention(nn.Module):
         )
 
     def _store_cfg(self, k_cache):
-        """How this layer writes its pool: `(kind, k_dev, v_dev, k_f, v_f)`.
+        """How this layer writes and reads its pool: `(kind, k_dev, v_dev)`.
 
         Resolved ONCE, on the first forward that has a bound pool, and cached:
         it reads `self.attn.k_scale` -- a python float the binder set -- and
         materializes the one-element device tensors
-        `aiter.reshape_and_cache_flash` types arg6/arg7 as. Doing it per forward
+        `aiter.reshape_and_cache_flash` types arg6/arg7 as, which the read
+        takes as its descales too. Doing it per forward
         would be a host allocation inside a cudagraph-captured region.
 
         Not resolvable at `__init__`: `warmup_model()` runs before
@@ -424,8 +425,6 @@ class KimiK3DFlashAttention(nn.Module):
             "fp8" if quantized else "auto",
             torch.tensor([k_f], dtype=torch.float32, device=dev),
             torch.tensor([v_f], dtype=torch.float32, device=dev),
-            k_f,
-            v_f,
         )
         return self._store
 
@@ -453,7 +452,7 @@ class KimiK3DFlashAttention(nn.Module):
             )
         # The SAME scales the write just quantized with, as the one-element
         # device tensors the write takes -- `_store_cfg` built them eagerly.
-        _, k_dev, v_dev, k_f, v_f = self._store_cfg(k_cache)
+        _, k_dev, v_dev = self._store_cfg(k_cache)
         bs = attn_metadata.block_tables.shape[0]
         q3 = q.view(-1, self.num_heads, self.head_dim)
         # Explicitly dense, NOT `empty_like`: `q` is a column slice of the
@@ -472,12 +471,8 @@ class KimiK3DFlashAttention(nn.Module):
             attn_metadata.context_lens[:bs],
             o,
             self.scaling,
-            k_f,
-            v_f,
             k_dev,
             v_dev,
-            k_ext=k.view(-1, self.num_kv_heads, self.head_dim),
-            v_ext=v.view(-1, self.num_kv_heads, self.head_dim),
         )
         return o.reshape(-1, self.num_heads * self.head_dim)
 
@@ -621,6 +616,11 @@ class KimiK3DFlash(DSparkDraftModel):
     DFlash draft and which collides with this module's own base class, so
     `SpeculativeConfig.hf_config_override` renames it.
     """
+
+    # GQA, read through `unified_attention` straight off `block_tables` /
+    # `context_lens`: no MLA decode plan and no CSR to build, and nothing for
+    # `prepare_paged_block` to add.
+    block_attention_is_mla = False
 
     packed_modules_mapping: ClassVar[dict[str, tuple]] = {
         "q_proj": ("qkv_proj", "q"),

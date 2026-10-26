@@ -21,10 +21,6 @@ head, so one KV tile serves all ``T * G`` of them, and the all-decode launch is
 the split-KV grid, so a long context is spread over segments instead of walked
 by one program. The block rows come back out of the pool with the prefix, so
 over an fp8 pool they are read quantized.
-
-The call signature is the one every page-table read for this block takes,
-``k_ext``/``v_ext`` included, so a read that takes the block's own K/V from the
-pre-cache tensors instead can sit behind the same call site.
 """
 
 from __future__ import annotations
@@ -67,14 +63,11 @@ def unfold_block_output(
 class DSparkDraftUnifiedAttention:
     """aiter ``unified_attention`` (3D split-KV) on the folded draft block."""
 
-    name = "aiter_ua"
-
     def __init__(self, device, max_bs: int = 0):
         from aiter.ops.triton.attention.unified_attention import unified_attention
 
         self.device = device
         self._ua = unified_attention
-        self._scales = {}
         # One query row per sequence: `cu_seqlens_q` is a constant ramp. Built
         # here, ahead of any capture, for the engine's widest batch, so a
         # replay slices storage the recording saw rather than allocating.
@@ -83,15 +76,6 @@ class DSparkDraftUnifiedAttention:
             if max_bs > 0
             else None
         )
-
-    def _scale(self, x: float) -> torch.Tensor:
-        # Inside a capture this tensor would stay unwritten until that graph
-        # replays, so callers that capture pass their own descales.
-        t = self._scales.get(x)
-        if t is None:
-            t = torch.full((1,), float(x), dtype=torch.float32, device=self.device)
-            self._scales[x] = t
-        return t
 
     def _cu_seqlens(self, bs: int) -> torch.Tensor:
         if self._cu_seqlens_q is None or self._cu_seqlens_q.shape[0] < bs + 1:
@@ -110,15 +94,9 @@ class DSparkDraftUnifiedAttention:
         kv_lens,  # [bs] keys each request attends, block rows included
         o,  # [bs * T, HQ, D] dense output
         sm_scale,
-        k_scale=1.0,
-        v_scale=1.0,
-        k_descale=None,
-        v_descale=None,
-        k_ext=None,
-        v_ext=None,
+        k_descale,  # [1] fp32, the pool's per-tensor scale
+        v_descale,  # [1] fp32
     ):
-        """``k_ext``/``v_ext`` are ignored: the block rows are read back out
-        of the pool with the prefix."""
         bs = kv_lens.shape[0]
         hkv = k_cache.shape[2]
         qf = fold_block_queries(q, bs, hkv)
@@ -139,7 +117,7 @@ class DSparkDraftUnifiedAttention:
             block_table=block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self._scale(k_scale) if k_descale is None else k_descale,
-            v_descale=self._scale(v_scale) if v_descale is None else v_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         return unfold_block_output(of, o, hkv)

@@ -989,18 +989,12 @@ class DSparkProposer(Drafter):
         # rope-concat-and-cache write, whose kernel derives the KV dtype from
         # the tensor it was given and rejects a mismatched pair. Left unset, the
         # pass inherits whatever the TARGET's metadata was carrying.
-        # MLA only. `dtype_q` is read by attention_mla's decode to allocate
-        # q_out and match the fused rope-concat-and-cache write; the DFlash
-        # draft's `unified_attention` read never reads it, so there is nothing
-        # to resolve.
-        dtype_q = None
-        if not self._draft_uses_dflash_pool:
-            dtype_q = self._blk_dtype_q
-            if dtype_q is None:
-                dtype_q, final = self._resolve_dtype_q(forward_context)
-                if final:
-                    self._blk_dtype_q = dtype_q
-            attn_metadata.dtype_q = dtype_q
+        dtype_q = self._blk_dtype_q
+        if dtype_q is None:
+            dtype_q, final = self._resolve_dtype_q(forward_context)
+            if final:
+                self._blk_dtype_q = dtype_q
+        attn_metadata.dtype_q = dtype_q
 
         if self._bound_draft_k_cache(forward_context) is None:
             # warmup_model() runs before allocate_kv_cache(), so there is no
@@ -1080,10 +1074,10 @@ class DSparkProposer(Drafter):
         # indices than the generator writes: `kv_indices_generate_kernel` masks
         # its store with `block_cols < n_cols` (block_convert.py), so entries
         # past the block table's width are simply skipped and the decode would
-        # read whatever the previous step left in `_blk_kv_indices`. The DFlash
-        # read, which builds no CSR, walks `block_tables` up to `ctx_lens`
-        # itself, so the same bound keeps it inside the table. The bound
-        # is each branch's own unit: `block_size` of THIS rank's tokens per
+        # read whatever the previous step left in `_blk_kv_indices`. A read that
+        # builds no CSR (the DFlash draft's) walks `block_tables` up to
+        # `ctx_lens` itself, so the same bound keeps it inside the table. The
+        # bound is each branch's own unit: `block_size` of THIS rank's tokens per
         # entry when the draft is DCP-sharded (a rank packs its round-robin
         # share of a virtual block densely into one page), the full
         # `entry_tokens` when it is not.
@@ -1105,15 +1099,25 @@ class DSparkProposer(Drafter):
         attn_metadata.context_lens = ctx_lens
         attn_metadata.max_seqlen_q = T
         attn_metadata.max_seqlen_k = max_seqlen_k
-        if self._draft_uses_dflash_pool:
-            # The DFlash read (`dspark_draft_attn`) takes `block_tables` and
-            # `context_lens` above as its own block table and key counts, the
-            # block rows included, and derives its own tiling: it reads no CSR
-            # and plans nothing, so neither is built. The CSR fields stay bound
-            # to their buffers so nothing downstream sees a stale step's.
+        if not self.model.block_attention_is_mla:
+            # A draft that attends its block another way builds what it reads
+            # itself: MiniMax-M3.1's per-row MHA decode its page-16 row tables,
+            # the DFlash read nothing beyond `block_tables`/`context_lens`
+            # above. Neither reads a CSR or an MLA decode plan, so neither is
+            # built. The CSR fields stay bound to the draft's buffers so no
+            # reader sees the target step's.
             attn_metadata.kv_indptr = self._blk_kv_indptr[: running_bs + 1]
             attn_metadata.kv_indices = self._blk_kv_indices
             attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
+            self.model.prepare_paged_block(
+                attn_metadata,
+                block_tables,
+                block_positions,
+                slots,
+                ctx_lens,
+                block_table_state(self.runner.forward_vars["block_tables"]).lengths,
+                scheduled_bs,
+            )
             return
         kv_indptr = self._blk_kv_indptr[: running_bs + 1]
         # kv_indptr[0] stays 0 (zero-init, never written). cumsum promotes
@@ -1161,21 +1165,6 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
-        if not self.model.block_attention_is_mla:
-            # A draft that attends its block another way (MiniMax-M3.1's per-row
-            # MHA decode) builds what it reads itself; there is no MLA decode
-            # to plan.
-            self.model.prepare_paged_block(
-                attn_metadata,
-                block_tables,
-                block_positions,
-                slots,
-                ctx_lens,
-                block_table_state(self.runner.forward_vars["block_tables"]).lengths,
-                scheduled_bs,
-            )
-            return
-
         # Build persistent (ps=1) MLA-decode metadata
         from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
 

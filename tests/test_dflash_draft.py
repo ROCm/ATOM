@@ -1208,7 +1208,7 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     read = dda.DSparkDraftUnifiedAttention(dev, max_bs=8)
     o = torch.empty_like(q)
     one = torch.ones(1, dtype=torch.float32, device=dev)
-    read(q, k_pool, v_pool, block_tables, kv_lens, o, scale, 1.0, 1.0, one, one)
+    read(q, k_pool, v_pool, block_tables, kv_lens, o, scale, one, one)
 
     args = (q, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
     ref = _reference_block_attn(*args)
@@ -1220,13 +1220,14 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     assert err_causal > 4 * err_bidir, (err_bidir, err_causal)
 
 
-def test_the_read_needs_no_csr_from_the_proposer():
-    """The DFlash path returns before the generic CSR build.
+def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan():
+    """The proposer's non-MLA hook returns before the generic CSR build.
 
-    Source-level, like the guard-message test above: the proposer's metadata
-    build is a method on a fully wired runner. What it pins is that the early
-    return for the DFlash pool sits AHEAD of the `kv_indices_generate_triton`
-    call, so the read's block table is the only addressing published for it.
+    Source-level, like the guard-message test above: the metadata build is a
+    method on a fully wired runner. It pins that `prepare_paged_block` -- the
+    hook every non-MLA block draft gets its addressing from -- runs and returns
+    AHEAD of `kv_indices_generate_triton`, so neither MiniMax-M3.1 nor the
+    DFlash draft pays for a CSR it never reads.
     """
     import os
 
@@ -1235,6 +1236,18 @@ def test_the_read_needs_no_csr_from_the_proposer():
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
     body = src[src.index("    def _build_paged_block_metadata(") :]
-    early = body.index("        if self._draft_uses_dflash_pool:\n")
-    assert early < body.index("kv_indices_generate_triton(")
-    assert "return" in body[early : body.index("kv_indices_generate_triton(")]
+    early = body.index("        if not self.model.block_attention_is_mla:\n")
+    csr = body.index("kv_indices_generate_triton(")
+    assert early < csr
+    assert "self.model.prepare_paged_block(" in body[early:csr]
+    assert "            return\n" in body[early:csr]
+
+
+def test_dflash_draft_declares_a_non_mla_block():
+    """KimiK3DFlash takes the proposer's non-MLA path, not the MLA plan."""
+    dflash = pytest.importorskip(
+        "atom.models.kimi_k3_dflash",
+        reason="the draft model imports aiter at module load",
+        exc_type=(ImportError, RuntimeError, TypeError),
+    )
+    assert dflash.KimiK3DFlash.block_attention_is_mla is False
