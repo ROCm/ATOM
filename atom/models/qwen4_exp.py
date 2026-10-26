@@ -42,7 +42,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.quant_spec import LayerQuantConfig
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -251,15 +250,11 @@ class _FusedSharedExpertConfig(_UnfusedSharedExpertConfig):
 
 
 def moe_pad_align(intermediate_size: int, tp_size: int) -> int | None:
-    """Expert-weight pad alignment passed to `FusedMoE` (MXFP4 only uses it).
+    """Expert pad alignment for `FusedMoE`: 128 if the shard needs no padding.
 
-    The MXFP4 default of 256 pads Qwen3.8-Flash-Next's 640 to 768 at TP1, so
-    a sixth of every expert's weights are zeros. 128 leaves a 128-multiple
-    shard unpadded; other shards keep the default. `ATOM_QWEN4_MOE_PAD_ALIGN`
-    overrides both.
+    TP1 keeps Qwen3.8-Flash-Next's 640 instead of padding it to 768; other
+    shards keep the MXFP4 default (256).
     """
-    if envs.ATOM_QWEN4_MOE_PAD_ALIGN:
-        return envs.ATOM_QWEN4_MOE_PAD_ALIGN
     return 128 if (intermediate_size // tp_size) % 128 == 0 else None
 
 

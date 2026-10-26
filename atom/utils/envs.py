@@ -869,11 +869,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
-    # Qwen4-Exp MXFP4 expert-weight pad alignment. 0 (default) = 128 when that
-    # leaves the per-rank intermediate unpadded, else the MXFP4 default (256).
-    "ATOM_QWEN4_MOE_PAD_ALIGN": lambda: int(
-        os.getenv("ATOM_QWEN4_MOE_PAD_ALIGN", "0") or "0"
-    ),
     # --- MoE all2all (MoRI) wire format ---
     "ATOM_MORI_FP4_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1"),
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;

@@ -47,16 +47,9 @@ def test_stacked_expert_loader_ignores_fused_shared_expert_map_tail():
     [(640, 1, 128), (640, 2, None), (640, 4, None), (640, 8, None), (1024, 4, 128)],
 )
 def test_moe_pad_align_skips_padding_only_for_128_multiple_shards(
-    monkeypatch, intermediate, tp, expected
+    intermediate, tp, expected
 ):
-    monkeypatch.delenv("ATOM_QWEN4_MOE_PAD_ALIGN", raising=False)
     assert qwen4_exp.moe_pad_align(intermediate, tp) == expected
-
-
-@pytest.mark.parametrize(("value", "expected"), [("256", 256), ("0", 128), ("", 128)])
-def test_moe_pad_align_env_override(monkeypatch, value, expected):
-    monkeypatch.setenv("ATOM_QWEN4_MOE_PAD_ALIGN", value)
-    assert qwen4_exp.moe_pad_align(640, 1) == expected
 
 
 def ptpc_config():
