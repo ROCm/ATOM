@@ -79,6 +79,11 @@ def mem_realtime():
     return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
 
 
+def abort_kernel():
+    """Raise a fatal HIP device error; a failed mailbox has no usable payload."""
+    llvm.call_intrinsic(None, "llvm.trap", [], [], [])
+
+
 def _hardware_f32(name, value):
     return fx.Float32(
         llvm.call_intrinsic(T.f32, name, [fx.Float32(value).ir_value()], [], [])

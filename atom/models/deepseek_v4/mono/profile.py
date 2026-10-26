@@ -22,6 +22,12 @@ class V4MonoProfile:
     variable_q: bool = False
     deployment_qualified: bool = True
 
+    def request_capacity(self, config) -> int:
+        limit = min(max(self.auto_request_widths), config.max_num_seqs)
+        if config.compilation_config.cudagraph_mode.name == "FULL":
+            return max(1, min(max(config.capture_sizes, default=1), limit))
+        return limit
+
     def capture_request_widths(self, declared) -> tuple[int, ...]:
         """Prepare C4's exact three-request tail without changing its ladder.
 

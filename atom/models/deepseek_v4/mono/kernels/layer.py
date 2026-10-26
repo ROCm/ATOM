@@ -56,6 +56,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v4.mono.config import (
     BLOCK_TOKENS,
+    EPS,
     HC_EPS,
     HC_SINKHORN_ITERS,
     HEAD_DIM,
@@ -64,8 +65,10 @@ from atom.models.deepseek_v4.mono.config import (
     N_EXPERTS,
     O_GROUPS,
     O_LORA,
+    POLL_TIMEOUT_US,
     Q_LORA,
     ROPE_DIM,
+    ROUTE_SCALE,
     SOFTMAX_SCALE,
     SWIGLU_LIMIT,
     TOP_K,
@@ -126,7 +129,7 @@ def build_dsv4_kernel(
     scale: float = SOFTMAX_SCALE,
     timeline: bool = False,
     moe_mode: MoeMode | str = MoeMode.A8W4,
-    poll_timeout_us: int | None = None,
+    poll_timeout_us: int = POLL_TIMEOUT_US,
     tokens_per_seq: int = 1,
     compressor_ring_rows: int | None = None,
     hidden: int = HIDDEN,
@@ -138,6 +141,9 @@ def build_dsv4_kernel(
     top_k: int = TOP_K,
     inter: int = INTER,
     swiglu_limit: float = SWIGLU_LIMIT,
+    eps: float = EPS,
+    rope_dim: int = ROPE_DIM,
+    route_scale: float = ROUTE_SCALE,
     hc_mult: int = 1,
     hc_sinkhorn_iters: int = HC_SINKHORN_ITERS,
     hc_eps: float = HC_EPS,
@@ -179,6 +185,9 @@ def build_dsv4_kernel(
     All phases retain the same ABI, scratch and epoch; advance only after
     the chain completes. The final attention phase publishes MoE's ``a``.
     """
+    if type(poll_timeout_us) is not int or poll_timeout_us <= 0:
+        raise ValueError("mailbox timeout must be a positive number of microseconds")
+    EPS, ROPE_DIM, ROUTE_SCALE = eps, rope_dim, route_scale
     # Draft block attention has forward-row dependencies. Keep it distinct
     # from target verify and require a completed producer launch before core.
     # V4's current draft stages have no compressor/indexer; compressed draft
@@ -893,6 +902,7 @@ def build_dsv4_kernel(
         index_topk_source_layer: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        _ = _cache_tag
         dsv4_kernel(
             h_in,
             x_out,
@@ -1034,6 +1044,7 @@ def build_advance_step(scr_pairs: int, sym_pairs: int):
     def advance_step(
         step: Int64, scratch: Int64, sym: Int64, stream: fx.Stream = fx.Stream(None)
     ):
+        _ = _cache_tag
         advance_kernel(step, scratch, sym).launch(
             grid=(1,), block=(THREADS,), stream=stream
         )

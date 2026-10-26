@@ -15,7 +15,7 @@ from itertools import pairwise
 import torch
 
 from atom.models.deepseek_v4.mono.binding import input_identity
-from atom.models.deepseek_v4.mono.cache import V4CacheAdapter
+from atom.models.deepseek_v4.mono.cache import V4CacheAdapter, V4MetadataStorage
 from atom.models.deepseek_v4.mono.contract import (
     BatchContinuation,
     ContinuationRow,
@@ -101,6 +101,7 @@ class V4MonoSession:
         )
         self.runner = self.adapter = None
         self._prepared_target = self._prepared_draft = None
+        self._metadata_storage = None
         self.armed = False
         self.disabled = False
         self.refusal = None
@@ -336,6 +337,7 @@ class V4MonoSession:
             if prepared is not None:
                 prepared.close()
         self._prepared_target = self._prepared_draft = None
+        self._metadata_storage = None
         self.draft_runner = None
         self._draft_metadata = {}
         self._draft_metadata_completion = None
@@ -1192,13 +1194,12 @@ class V4MonoSession:
             return
         self.require_graph_layout(key, layout)
 
-    def prepare_weights(self) -> bool:
-        """Retain only post-load weights during installation, before warmup.
+    def prepare_storage(self) -> bool:
+        """Allocate weights, arenas and metadata during installation.
 
-        The weight-only runners have no cache, aux, arena or execution lease.
-        Native warmup still runs before ``prepare`` binds execution, and the
-        existing KV planner sees these persistent bytes in its memory profile.
-        Repeated preparation reuses the same packed storage.
+        Native's existing warmup/KV profile counts this persistent storage,
+        including IPC allocations outside PyTorch. No cache is bound and no
+        Mono forward can run until ``prepare`` acquires the execution lease.
         """
         if self.disabled:
             return False
@@ -1247,32 +1248,6 @@ class V4MonoSession:
                     npes=8,
                     group=self.group,
                 )
-            logger.info(
-                "V4 Mono weights prepared before KV sizing on TP rank %d",
-                self.rank,
-            )
-            return True
-        except Exception as error:
-            self.refusal = str(error)
-            logger.exception("V4 Mono weight prepare refused before KV sizing")
-            self.close()
-            self.disabled = True
-            return False
-
-    def prepare(self, *, cache_rebound=False):
-        if self.disabled:
-            return False
-        # Retire an old execution binding before taking its cache/lease again.
-        # Installation's weight-only runners survive the first KV allocation.
-        if self.adapter is not None:
-            self.engine._retire_graphs()
-            self.close()
-        if not self.prepare_weights():
-            return False
-        try:
-            bind_agreed(self._acquire_lease, self.group)
-            self.runner, self._prepared_target = self._prepared_target, None
-            self.draft_runner, self._prepared_draft = self._prepared_draft, None
 
             def bind_aux():
                 drafter = getattr(self.builder.model_runner, "drafter", None)
@@ -1292,61 +1267,91 @@ class V4MonoSession:
                     taps = bind_aux_taps(drafter, spec.hidden_size)
                     if taps.layer_ids != spec.layer_ids:
                         raise MonoUnsupported("DSpark aux capture declaration changed")
-                    self.runner.bind_aux_outputs(taps.layer_ids, taps.buffers)
+                    self._prepared_target.bind_aux_outputs(taps.layer_ids, taps.buffers)
 
             bind_agreed(bind_aux, self.group)
-            if self.draft_runner is not None:
-                # Native draft recordings retain old cache pointers. Retire
-                # them before publishing the newly bound execution state.
-                self.builder.model_runner.drafter.block.release_graphs()
-            adapters = []
-            declared_capture_sizes = self.config.capture_sizes
-            max_declared_requests = max(declared_capture_sizes, default=1)
-            policy_request_limit = max(self.profile.auto_request_widths)
-            max_requests = (
-                # The declared ladder is not yet filtered by ModelRunner.
-                # Never allocate lanes for requests the scheduler cannot admit.
-                max(
-                    1,
-                    min(
-                        int(max_declared_requests),
-                        policy_request_limit,
-                        self.config.max_num_seqs,
+
+            def allocate_metadata():
+                capacity = self.profile.request_capacity(self.config)
+                configs = [w.cfg for w in self._prepared_target.weights]
+                self._metadata_storage = V4MetadataStorage(
+                    self.model.model,
+                    configs,
+                    self.builder.model_runner.forward_vars["block_tables"].gpu,
+                    max_rows=capacity * self.profile.tokens_per_seq,
+                    tokens_per_seq=self.profile.tokens_per_seq,
+                    max_requests=capacity,
+                    ragged=(self.profile.ragged or self.profile.variable_q),
+                    fused_metadata=self.profile.name.startswith("dspark_"),
+                    launch_rows=self.profile.launch_rows,
+                    request_widths=self.profile.capture_request_widths(
+                        w for w in (1, 2, 4, 8) if w <= capacity
                     ),
                 )
-                if self.config.compilation_config.cudagraph_mode.name == "FULL"
-                else policy_request_limit
+                cfg = configs[0]
+                shape = (
+                    (self._metadata_storage.max_rows, cfg.hidden)
+                    if cfg.hc_mult == 1
+                    else (self._metadata_storage.max_rows, cfg.hc_mult, cfg.hidden)
+                )
+                self.output = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+
+            bind_agreed(allocate_metadata, self.group)
+            if (
+                self._prepared_draft is not None
+                and not self._prepared_draft.prepare_requests(
+                    self._metadata_storage.max_requests
+                )
+            ):
+                raise MonoUnsupported("joint draft binary admission failed")
+            for (rows, q), buckets in self._metadata_storage._shape_buckets.items():
+                if not self._prepared_target.prepare(
+                    rows, tokens_per_seq=q, lanes=len(buckets)
+                ):
+                    raise MonoUnsupported(f"S{rows} binary admission failed")
+            logger.info(
+                "V4 Mono weights, arenas and metadata prepared before KV sizing "
+                "on TP rank %d",
+                self.rank,
             )
-            max_rows = max_requests * self.profile.tokens_per_seq
+            return True
+        except Exception as error:
+            self.refusal = str(error)
+            logger.exception("V4 Mono storage prepare refused before KV sizing")
+            self.close()
+            self.disabled = True
+            return False
+
+    def prepare(self, *, cache_rebound=False):
+        if self.disabled:
+            return False
+        # Retire an old execution binding before taking its cache/lease again.
+        # Installation's persistent storage survives the first KV allocation.
+        if self.adapter is not None:
+            self.engine._retire_graphs()
+            self.close()
+        if not self.prepare_storage():
+            return False
+        try:
+            bind_agreed(self._acquire_lease, self.group)
+            self.runner, self._prepared_target = self._prepared_target, None
+            self.draft_runner, self._prepared_draft = self._prepared_draft, None
+            if self.draft_runner is not None:
+                # Native draft recordings retain the previous cache pointers.
+                self.builder.model_runner.drafter.block.release_graphs()
+
+            adapters = []
             bind_agreed(
                 lambda: adapters.append(
                     V4CacheAdapter(
                         self.model.model,
                         self.builder,
-                        [w.cfg for w in self.runner.weights],
-                        max_rows=max_rows,
-                        tokens_per_seq=self.profile.tokens_per_seq,
-                        max_requests=max_requests,
-                        # Both packed ragged and uniform confidence-scheduled
-                        # q need q-specific lanes and the native live offsets.
-                        ragged=(self.profile.ragged or self.profile.variable_q),
-                        launch_rows=self.profile.launch_rows,
-                        fused_metadata=self.profile.name.startswith("dspark_"),
-                        request_widths=self.profile.capture_request_widths(
-                            tuple(
-                                width for width in (1, 2, 4, 8) if width <= max_requests
-                            )
-                        ),
+                        self._metadata_storage,
                     )
                 ),
                 self.group,
             )
             self.adapter = adapters[0]
-            if (
-                self.draft_runner is not None
-                and not self.draft_runner.prepare_requests(max_requests)
-            ):
-                raise MonoUnsupported("joint draft binary admission failed")
             from atom.models.deepseek_v4.mono.weights import _signature
 
             inner = self.model.model
@@ -1372,12 +1377,6 @@ class V4MonoSession:
             bind_agreed(bind_entry, self.group)
             for rows, q in self.adapter.prepared_shapes:
                 buckets = self.adapter.shape_buckets(rows, q)
-                if not self.runner.prepare(
-                    rows,
-                    tokens_per_seq=q,
-                    lanes=len(buckets),
-                ):
-                    raise MonoUnsupported(f"S{rows} binary admission failed")
                 for ordinal, bucket in enumerate(buckets):
                     build = self.runner._build_for((rows, q), ordinal)
                     bind_agreed(
@@ -1392,17 +1391,6 @@ class V4MonoSession:
                         ),
                         self.group,
                     )
-            cfg = self.runner.weights[0].cfg
-            shape = (
-                (self.adapter.max_rows, cfg.hidden)
-                if cfg.hc_mult == 1
-                else (self.adapter.max_rows, cfg.hc_mult, cfg.hidden)
-            )
-
-            def allocate_output():
-                self.output = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
-
-            bind_agreed(allocate_output, self.group)
             logger.info(
                 "V4 Mono profile %s exact-row widths %s real cache prepared on TP rank %d",
                 self.profile.name,

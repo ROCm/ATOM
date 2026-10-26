@@ -10,7 +10,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v4.mono.config import EPS
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.helpers import traced
 from atom.models.deepseek_v4.mono.kernels.plan import ROW_TILE, WAVES
@@ -32,6 +31,7 @@ from atom.models.deepseek_v4.mono.kernels.primitives import (
 def hc_attn_stages(ctx):
     """0. Hyper-connection pre-mix on the attention side; returns the mixers the FFN
     side reuses."""
+    EPS = ctx["EPS"]
     G = ctx["G"]
     HC = ctx["HC"]
     HC_COEF = ctx["HC_COEF"]

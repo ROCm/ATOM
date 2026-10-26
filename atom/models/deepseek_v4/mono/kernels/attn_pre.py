@@ -12,7 +12,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v4.mono.config import EPS, FP8_MAX, ROPE_DIM
+from atom.models.deepseek_v4.mono.config import FP8_MAX
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.common import pow2_ceil
 from atom.models.deepseek_v4.mono.kernels.helpers import traced
@@ -200,6 +200,7 @@ def compressor_helpers(ctx):
 @traced
 def qkv_handoff_stages(ctx):
     """QKV projections fed by one tagged, packed-BF16 normalized-input leg."""
+    EPS = ctx["EPS"]
     CW = ctx["CW"]
     G = ctx["G"]
     HC = ctx["HC"]
@@ -428,6 +429,8 @@ def qkv_handoff_stages(ctx):
 @traced
 def qkv_stages(ctx):
     """1-2b. q_a / kv GEMV, KV RMSNorm + RoPE -> sliding-window ring, and the KV compressor."""
+    EPS = ctx["EPS"]
+    ROPE_DIM = ctx["ROPE_DIM"]
     ctx["CMP_CHUNK"]
     ctx["CMP_CHUNK_T"]
     CR = ctx["CR"]

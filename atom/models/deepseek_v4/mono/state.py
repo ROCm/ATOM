@@ -13,6 +13,7 @@ import torch
 from atom.models.deepseek_v4.mono.build import _build_launches, kernel_kwargs
 from atom.models.deepseek_v4.mono.config import (
     LAUNCH_PHASES,
+    POLL_TIMEOUT_US,
     MoeMode,
     _variant_key,
     as_moe_mode,
@@ -44,7 +45,7 @@ class Dsv4Variant:
         group=None,
         timeline: bool = False,
         moe_mode: MoeMode | str = MoeMode.A8W4,
-        poll_timeout_us: int | None = None,
+        poll_timeout_us: int = POLL_TIMEOUT_US,
         tokens_per_seq: int = 1,
         launch_shape: str = "one",
         qkv_batch_limit: int | None = None,
@@ -57,6 +58,10 @@ class Dsv4Variant:
         if tokens_per_seq <= 0 or samples % tokens_per_seq:
             raise ValueError(
                 f"{samples} samples are not whole runs of {tokens_per_seq} tokens per sequence"
+            )
+        if type(poll_timeout_us) is not int or poll_timeout_us <= 0:
+            raise ValueError(
+                "mailbox timeout must be a positive number of microseconds"
             )
         self.poll_timeout_us = poll_timeout_us
         self.tokens_per_seq = tokens_per_seq
@@ -146,8 +151,8 @@ class Dsv4Variant:
         self.launches = self.launch_sets[
             cfg.index_topk_refresh if cfg.indexed else True
         ]
-        # the step advance clears mailbox pairs; the plain-f32 "xqd" region sits last and is skipped
-        self.scr_pairs = self.scr_layout["xqd"] // 8
+        # All scratch regions contain tagged pairs.
+        self.scr_pairs = self.scr_layout["_bytes"] // 8
         self.sym_pairs = self.sym_layout["_bytes"] // 8
         adv_key = (self.scr_pairs, self.sym_pairs)
         if adv_key not in Dsv4Variant._adv_cache:
