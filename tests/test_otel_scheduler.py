@@ -292,6 +292,7 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
         core._pending_prefix_hash = deque()
         core._defer_prefix_hash = False
         core.pp_size = pp_size
+        core.pp_max_inflight = pp_size
         completions = deque()
         core.pp_transport = SimpleNamespace(
             send_metadata=lambda batch: None,
@@ -374,7 +375,9 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
     )
     monkeypatch.setattr(cls, "_send_ready_signal", lambda *a: events.append("ready"))
     config = MockConfig(
-        parallel_config=SimpleNamespace(control_address="unused", data_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            control_address="unused", data_parallel_size=1, pipeline_parallel_rank=0
+        ),
         tp_world_size=1,
         prefill_context_parallel_size=1,
         runner_qualname="unused",
