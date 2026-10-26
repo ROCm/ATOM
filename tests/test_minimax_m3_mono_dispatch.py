@@ -269,6 +269,13 @@ def test_speculative_decoding_is_not_refused(native):
     assert dispatch._config_refusal(cfg) is None
 
 
+def test_dspark_is_refused(native):
+    # DSpark taps the decoder layers with forward hooks the mono kernels skip.
+    spec = SimpleNamespace(use_dspark=lambda: True)
+    cfg = _atom_config(speculative_config=spec)
+    assert dispatch._config_refusal(cfg) == "DSpark speculative decoding"
+
+
 @pytest.mark.parametrize("q, reqs", [(2, 1), (2, 2), (3, 1), (4, 1)])
 def test_speculative_verify_steps_are_taken(monkeypatch, q, reqs):
     slots = torch.zeros(q * reqs, dtype=torch.int64)

@@ -84,6 +84,67 @@ class AiterFlashAttentionMetadataForPluginMode:
 if triton is not None:
 
     @triton.jit
+    def _target_verify_state_slots_graph_kernel(
+        block_table,
+        sequence_lengths,
+        prefix_lengths,
+        read_slots,
+        write_slots,
+        invalid_live_rows,
+        rows,
+        table_stride_row,
+        table_stride_col,
+        table_cols: tl.constexpr,
+        block_size: tl.constexpr,
+        query_len: tl.constexpr,
+        tile: tl.constexpr,
+    ):
+        row = tl.program_id(0) * tile + tl.arange(0, tile)
+        live = row < rows
+        length = tl.load(sequence_lengths + row, live, 0)
+        read_col = tl.maximum(length - 2, 0) // block_size
+        write_col = tl.maximum(length - 1, 0) // block_size
+        # Speculative candidates have separate state slots even when their
+        # token positions fall in the same ordinary linear-cache block.
+        max_write_col = write_col + query_len - 1
+        # RTP frees old linear-cache pages, including column zero. It sets
+        # prefix length to zero only for Graph padding; a target verify always
+        # follows at least one real prompt token.
+        real = live & (tl.load(prefix_lengths + row, live, 0) > 0)
+        invalid = (
+            live & real & ((read_col >= table_cols) | (max_write_col >= table_cols))
+        )
+        for token in tl.static_range(query_len):
+            column = write_col + token
+            slot = tl.load(
+                block_table
+                + row * table_stride_row
+                + tl.minimum(column, table_cols - 1) * table_stride_col,
+                live & (column < table_cols) & (length >= 2),
+                -1,
+            )
+            invalid |= live & real & (slot < 0)
+            # RTP reserves and zeroes state block 0 for Graph padding. The
+            # recurrent consumer cannot safely dereference a negative slot.
+            tl.store(write_slots + row * query_len + token, tl.maximum(slot, 0), live)
+        previous = tl.load(
+            block_table
+            + row * table_stride_row
+            + tl.minimum(read_col, table_cols - 1) * table_stride_col,
+            live & (read_col < table_cols) & (length >= 2),
+            -1,
+        )
+        invalid |= live & real & (previous < 0)
+        invalid_count = tl.sum(invalid.to(tl.int32), 0)
+        # Each tile owns one flag, overwritten on every Graph replay. This
+        # avoids both an atomic update and a separate counter-reset kernel.
+        tl.store(invalid_live_rows + tl.program_id(0), invalid_count)
+        for token in tl.static_range(query_len):
+            tl.store(
+                read_slots + row * query_len + token, tl.maximum(previous, 0), live
+            )
+
+    @triton.jit
     def _previous_state_slots_graph_kernel(
         block_table,
         positions,
@@ -437,11 +498,14 @@ class RTPForwardContext:
         block_ratio = int(seq_size_per_block // kernel_seq_size_per_block)
         bs_now = int(kernel_block_table.shape[0])
         kernel_cols = int(kernel_block_table.shape[1])
-        if kernel_cols < block_ratio or kernel_cols % block_ratio != 0:
-            return kernel_block_table.to(
-                device=kernel_block_table.device, dtype=torch.int32, non_blocking=True
-            ).contiguous()
-        physical_cols = (kernel_cols + block_ratio - 1) // block_ratio
+        if kernel_cols < block_ratio:
+            raise ValueError(
+                "RTP plugin kernel block table has no complete physical page"
+            )
+        # MTP Graph tables can append reserved state columns that do not make
+        # up a full physical page. Never reinterpret those kernel block IDs as
+        # physical page IDs; only recover complete groups of block_ratio.
+        physical_cols = kernel_cols // block_ratio
         in_capture = torch.cuda.is_current_stream_capturing()
         if in_capture and cg_bufs is not None:
             if triton is None:
@@ -564,6 +628,8 @@ class RTPForwardContext:
             raise ValueError(
                 "RTP plugin requires kv_cache_kernel_block_id_device for GDN metadata."
             )
+        if getattr(attn_inputs, "is_target_verify", False):
+            raise ValueError("MTP target verification requires RTPQwen4ExpContext")
         target_device = block_table.device
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if (
@@ -2077,6 +2143,15 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             query_lengths,
             unit_query_length,
         )
+        if metadata.has_initial_state is not None:
+            # The non-FlyDSL prefill path gathers/scatters the recurrent state
+            # with int64 indices. Standalone builds these once in its metadata
+            # builder; RTP must do the same when it constructs the metadata.
+            metadata.no_initial_state = ~metadata.has_initial_state
+            metadata.non_spec_state_indices_i64 = output_slots.to(torch.int64)
+            metadata.non_spec_state_indices_in_i64 = (
+                metadata.non_spec_state_indices_in_tensor.to(torch.int64)
+            )
         return metadata
 
     @staticmethod
@@ -2176,7 +2251,27 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         return RTPForwardContext._select_block_table_for_layer(attn_inputs=attn_inputs)
 
     @staticmethod
+    def _is_fixed_mtp_draft_prefill(
+        attn_inputs: Any,
+        num_tokens: int,
+        batch_size: int,
+        cg_bufs: dict | None,
+    ) -> bool:
+        # A token-count multiple is not a model-role signal: generation-prefill
+        # and embedding Graph buckets can have the same geometry. Only the
+        # Qwen4Exp runtime's draft-prefill buffers carry this explicit marker.
+        width = (cg_bufs or {}).get("mtp_window_width")
+        return bool(
+            width in (2, 3, 4)
+            and getattr(attn_inputs, "is_prefill", False)
+            and not getattr(attn_inputs, "is_target_verify", False)
+            and getattr(attn_inputs, "prefill_cuda_graph_copy_params", None) is not None
+            and num_tokens == batch_size * width
+        )
+
+    @classmethod
     def _build_query_start_loc_for_plugin(
+        cls,
         *,
         attn_inputs: Any,
         seq_lens: torch.Tensor,
@@ -2191,6 +2286,44 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             )
 
         in_capture = torch.cuda.is_current_stream_capturing()
+        fixed_draft_prefill = cls._is_fixed_mtp_draft_prefill(
+            attn_inputs, num_tokens, batch_size, cg_bufs
+        )
+        draft_width = (cg_bufs or {}).get("mtp_window_width")
+        if (
+            draft_width in (2, 3, 4)
+            and getattr(attn_inputs, "is_prefill", False)
+            and not getattr(attn_inputs, "is_target_verify", False)
+            and getattr(attn_inputs, "prefill_cuda_graph_copy_params", None) is not None
+        ):
+            if not fixed_draft_prefill:
+                raise ValueError(
+                    "RTP MTP draft prefill requires batch_size * window_width tokens"
+                )
+            input_lengths = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "input_lengths_device", None), device=device
+            )
+            if input_lengths is None:
+                input_lengths = RTPForwardContext._non_empty_int32(
+                    getattr(attn_inputs, "input_lengths", None), device=device
+                )
+            if input_lengths is None or input_lengths.numel() != batch_size:
+                raise ValueError(
+                    "RTP MTP draft prefill requires one input length per request"
+                )
+            # RTP captures a fixed-capacity draft window, but live requests
+            # may have fewer valid tokens after acceptance. A zero-length row
+            # is Graph padding; no row may exceed the captured window.
+            valid_lengths = torch.all(
+                (input_lengths >= 0) & (input_lengths <= draft_width)
+            )
+            if in_capture:
+                torch._assert_async(
+                    valid_lengths,
+                    "RTP MTP draft prefill length exceeds capture window",
+                )
+            elif not bool(valid_lengths):
+                raise ValueError("RTP MTP draft prefill length exceeds capture window")
         if in_capture and cg_bufs is not None:
             return cg_bufs["query_start_loc"][: batch_size + 1]
 
@@ -2198,6 +2331,15 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             raise ValueError(
                 "RTP plugin capture requires prewarmed cg_bufs for query_start_loc "
                 f"(batch={batch_size}, num_tokens={int(num_tokens)})."
+            )
+
+        if fixed_draft_prefill:
+            # RTP's draft prefill graph keeps Bmax*(gamma+1) HC rows even when some
+            # request rows are padding. Warmup must use the same geometry as
+            # capture/replay rather than the sum of live input_lengths.
+            width = num_tokens // batch_size
+            return torch.arange(
+                0, num_tokens + 1, width, dtype=torch.int32, device=device
             )
 
         qsl = RTPForwardContext._query_start_loc(attn_inputs, device=device)
@@ -2306,7 +2448,14 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
 
         is_dummy_warmup = False
         if in_capture:
-            max_query_len = 1
+            is_fixed_mtp_window = getattr(
+                attn_inputs, "is_target_verify", False
+            ) or cls._is_fixed_mtp_draft_prefill(
+                attn_inputs, num_actual_tokens, batch_size, cg_bufs
+            )
+            max_query_len = (
+                num_actual_tokens // batch_size if is_fixed_mtp_window else 1
+            )
             if cg_max_seq_len <= 0:
                 raise RuntimeError(
                     "RTP plugin cuda-graph capture requires cg_max_seq_len; "
@@ -2389,6 +2538,9 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             context=None,
         )
         plugin_md.rtp_cu_seqlens_q = query_start_loc
+        # PLE and QSA consume the same role-specific Graph buffers selected
+        # for this forward; the generic builder exposes this attribute too.
+        plugin_md.cg_bufs = cg_bufs
         plugin_md.is_dummy_warmup = bool(is_dummy_warmup)
         prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
         if (
