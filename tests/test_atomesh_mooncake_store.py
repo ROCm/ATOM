@@ -7,8 +7,9 @@ prefill workers' mooncake_store offload env.
 No Mooncake process starts: a ``python3`` stub on PATH stands in for
 numa_exec.py (and so for mooncake_master / mooncake_client), drop_page_cache.py
 and numa_memory_budget.py, and a ``curl`` stub for the master's metadata and
-metrics servers. The stub master listens on its RPC port, as the readiness
-check needs; each owner the stub starts adds its segment to the capacity the
+metrics servers. A NUMA sysfs tree with no HugeTLB pool stands in for the
+node's (hugetlb_pool() gives a node one). The stub master listens on its RPC
+port, as the readiness check needs; each owner the stub starts adds its segment to the capacity the
 metrics stub reports. The stub also answers the image check's
 ``python3 -c 'import mooncake.store'``.
 """
@@ -29,12 +30,13 @@ SERVER_SCRIPT = (
     Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_server_atom.sh"
 )
 
-PYTHON_STUB = textwrap.dedent("""\
+PYTHON_STUB = textwrap.dedent(
+    """\
     #!/usr/bin/env bash
     if [[ "${1:-}" == "-c" && "${2:-}" == "import mooncake.store" ]]; then
       exit "${STUB_STORE_IMPORT_RC:-0}"
     fi
-    echo "$$ HIP=${HIP_VISIBLE_DEVICES-unset} QP=${MC_NUM_QP_PER_EP-unset} THP=${GLIBC_TUNABLES-unset} BIND=${MC_TCP_BIND_ADDRESS-unset} MR=${MC_MAX_MR_SIZE-unset} $*" >> "${STUB_CALLS}"
+    echo "$$ HIP=${HIP_VISIBLE_DEVICES-unset} QP=${MC_NUM_QP_PER_EP-unset} THP=${GLIBC_TUNABLES-unset} BIND=${MC_TCP_BIND_ADDRESS-unset} MR=${MC_MAX_MR_SIZE-unset} HP=${MC_STORE_USE_HUGEPAGE-unset} $*" >> "${STUB_CALLS}"
     case " $* " in
       *" mooncake_master "*)
         touch "${STUB_DIR}/master-up"
@@ -61,9 +63,11 @@ PYTHON_STUB = textwrap.dedent("""\
       *"/numa_memory_budget.py "*) exit "${STUB_BUDGET_RC:-0}" ;;
     esac
     exit 0
-    """)
+    """
+)
 
-CURL_STUB = textwrap.dedent("""\
+CURL_STUB = textwrap.dedent(
+    """\
     #!/usr/bin/env bash
     url="${*: -1}"
     case "${url}" in
@@ -83,7 +87,8 @@ CURL_STUB = textwrap.dedent("""\
         ;;
       *) exit 7 ;;
     esac
-    """)
+    """
+)
 
 # The image check only looks the Store binaries up on PATH; the launcher runs
 # them through numa_exec.py, which the python3 stub stands in for.
@@ -101,6 +106,15 @@ def free_port():
     with socket.socket() as sock:
         sock.bind((HOST, 0))
         return sock.getsockname()[1]
+
+
+def free_master_port():
+    """A free port whose pools (100 apart, eight at most) stay clear of the
+    fixed owner, metadata and metrics ports the tests set from 50152 up."""
+    while True:
+        port = free_port()
+        if not 49000 <= port < 52000:
+            return port
 
 
 def prefixed_lines(stdout, prefix):
@@ -134,7 +148,11 @@ class MooncakeStoreTest(unittest.TestCase):
             (device / "ports/1/state").write_text("4: ACTIVE\n")
             (device / "device").mkdir()
             (device / "device/numa_node").write_text(f"{index // 4}\n")
-        self.master_port = free_port()
+        # NUMA nodes 0 and 1, neither with a HugeTLB pool.
+        self.numa = self.root / "node"
+        for node in (0, 1):
+            (self.numa / f"node{node}").mkdir(parents=True)
+        self.master_port = free_master_port()
         self.calls = self.root / "calls"
         self.calls.touch()
         self.path = f"{self.bin_dir}:{os.environ['PATH']}"
@@ -150,6 +168,11 @@ class MooncakeStoreTest(unittest.TestCase):
             ]
         )
         self.addCleanup(self.kill_stubs)
+
+    def hugetlb_pool(self, node, free_pages):
+        pool = self.numa / f"node{node}/hugepages/hugepages-2048kB"
+        pool.mkdir(parents=True, exist_ok=True)
+        (pool / "free_hugepages").write_text(f"{free_pages}\n")
 
     def kill_stubs(self):
         for pid in self.stub_pids():
@@ -197,6 +220,7 @@ class MooncakeStoreTest(unittest.TestCase):
                 "host_ip": HOST,
                 "ATOMESH_SCRIPT_DIR": "/scripts",
                 "ATOMESH_IB_SYSFS_ROOT": str(self.ib),
+                "ATOMESH_NUMA_SYSFS_ROOT": str(self.numa),
                 "MODEL_PATH": "/models/m",
                 "HIP_VISIBLE_DEVICES": "0,1,2,3",
                 "ATOMESH_MOONCAKE_MASTER_PORT": str(self.master_port),
@@ -370,7 +394,8 @@ stop_mooncake_store
             source.index("start_prefill() {") : source.index("start_router() {")
         ]
         result = self.run_shell(
-            servers + """
+            servers
+            + """
 # Records each server's command line, one argument per line.
 start_logged_process() {
   printf '%s\\n' "${@:3}" > "${STUB_DIR}/argv-$(basename "$2" .log)"
@@ -867,7 +892,8 @@ cleanup_processes $!
     def test_cleanup_signals_the_page_cache_dropper_only_while_it_runs(self):
         # The dropper exits on its own after --for; by cleanup, its pid may
         # name another process, here one the shell started after it.
-        result = self.run_shell("""
+        result = self.run_shell(
+            """
 start_mooncake_page_cache_dropper
 mooncake_page_cache_dropper_running && echo "DROPPER RUNS"
 kill -KILL "${mooncake_page_cache_dropper_pid}"
@@ -878,7 +904,8 @@ mooncake_page_cache_dropper_pid="${other}"
 stop_mooncake_store
 kill -0 "${other}" && echo "OTHER SURVIVES"
 kill -KILL "${other}"
-""")
+"""
+        )
         self.assertIn("DROPPER RUNS", result.stdout)
         self.assertIn("OTHER SURVIVES", result.stdout)
 
@@ -940,6 +967,96 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
             "--reserve-gib 128 --compact --compact-timeout 1800\n",
             calls,
         )
+
+    def test_owners_take_the_nodes_hugetlb_pool_when_it_fits(self):
+        # The Spur prolog's pool: Mooncake maps each owner's whole segment from
+        # it, so nothing is dropped or compacted, and no dropper runs.
+        self.hugetlb_pool(0, 64 * 512)
+        self.hugetlb_pool(1, 96 * 512 + 7)
+        result = self.run_shell(
+            """
+dump_launch_info() { echo "LAUNCH $*"; }
+start_mooncake_store
+mooncake_store_running
+stop_mooncake_store
+""",
+            MOONCAKE_STORE_OWNERS="0:64;1:96",
+        )
+        calls = self.calls.read_text()
+        self.assertNotIn("drop_page_cache.py", calls)
+        self.assertNotIn("numa_memory_budget.py", calls)
+        self.assertIn(
+            "NUMA node 0: owners take 32768 of 32768 free 2 MiB HugeTLB pages",
+            result.stdout,
+        )
+        self.assertIn(
+            "NUMA node 1: owners take 49152 of 49159 free 2 MiB HugeTLB pages",
+            result.stdout,
+        )
+        self.assertIn(
+            "LAUNCH MOONCAKE_OWNER HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 "
+            "MC_NUM_QP_PER_EP=1 MC_STORE_USE_HUGEPAGE=1 "
+            f"MC_MAX_MR_SIZE=68719476736 MC_TCP_BIND_ADDRESS={HOST} python3 ",
+            result.stdout,
+        )
+        owners = self.store_calls("mooncake_client")
+        self.assertEqual(len(owners), 2)
+        for call in owners:
+            self.assertIn(
+                f"HIP=-1 QP=1 THP=unset BIND={HOST} MR=68719476736 HP=1 ", call
+            )
+
+    def test_a_pool_short_of_the_owners_stops_the_start_before_the_master(self):
+        # The pool's memory is out of THP's reach too, so auto refuses it.
+        self.hugetlb_pool(0, 64 * 512)
+        self.hugetlb_pool(1, 96 * 512 - 1)
+        result = self.run_shell(
+            "start_mooncake_store\n",
+            expect_rc=2,
+            MOONCAKE_STORE_OWNERS="0:64;1:96",
+        )
+        self.assertIn("NUMA node 1 has 49151 free 2 MiB pages for 49152", result.stderr)
+        self.assertEqual(self.store_calls("mooncake_master"), [])
+
+    def test_owners_on_one_numa_node_add_up_against_its_pool(self):
+        self.hugetlb_pool(0, 2 * 240 * 512)
+        result = self.run_shell(
+            "start_mooncake_store\n",
+            expect_rc=2,
+            MOONCAKE_STORE_OWNERS="0:240:rdma0;0:240:rdma1;0:240:rdma2",
+            MOONCAKE_STORE_POOLS="per_nic",
+        )
+        self.assertIn(
+            "NUMA node 0 has 245760 free 2 MiB pages for 368640", result.stderr
+        )
+
+    def test_a_required_pool_must_be_there(self):
+        result = self.run_shell(
+            "start_mooncake_store\n",
+            expect_rc=2,
+            MOONCAKE_STORE_OWNERS="0:64;1:96",
+            MOONCAKE_STORE_HUGETLB="1",
+        )
+        self.assertIn("NUMA node 0 has 0 free 2 MiB pages for 32768", result.stderr)
+        self.assertEqual(self.store_calls("mooncake_master"), [])
+
+    def test_a_declined_pool_leaves_the_owners_on_transparent_huge_pages(self):
+        self.hugetlb_pool(0, 64 * 512)
+        self.hugetlb_pool(1, 96 * 512)
+        self.run_shell(
+            "start_mooncake_store\nstop_mooncake_store\n",
+            MOONCAKE_STORE_OWNERS="0:64;1:96",
+            MOONCAKE_STORE_HUGETLB="0",
+        )
+        self.assertIn(
+            "/scripts/numa_memory_budget.py --reserve-gib 128 --compact ",
+            self.calls.read_text(),
+        )
+        owners = self.store_calls("mooncake_client")
+        self.assertEqual(len(owners), 2)
+        for call in owners:
+            self.assertIn(" THP=glibc.malloc.hugetlb=1 ", call)
+            self.assertIn(" HP=unset ", call)
 
     def test_owner_devices_must_be_active_and_on_one_numa_node(self):
         (self.ib / "rdma6/ports/1/state").write_text("1: DOWN\n")
@@ -1010,6 +1127,10 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                     ("WAIT_TIMEOUT", "20m", "positive integer number"),
                     ("MASTER_NUMA", "-1", "integer number"),
                 )
+            ),
+            (
+                {"MOONCAKE_STORE_HUGETLB": "yes"},
+                "MOONCAKE_STORE_HUGETLB=yes is not auto, 1 or 0",
             ),
         ):
             with self.subTest(env=env):
