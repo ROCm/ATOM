@@ -30,6 +30,14 @@ class JobResultTest(unittest.TestCase):
             self.root, "3619", "this-run", 2, state, exit_code, rc, spur
         )
 
+    def test_result_writer_creates_missing_job_directory(self):
+        directory = self.root / "not-started" / "slurm_job-42"
+        result = RESULT.resolve(directory, "42", "token", 1, "FAILED", "2:0", 2, True)
+        RESULT.write_json(directory / "job-result.json", result)
+        saved = json.loads((directory / "job-result.json").read_text())
+        self.assertEqual(saved["result"]["return_code"], 2)
+        self.assertEqual(saved["workload"]["state"], "UNVERIFIED")
+
     def test_completed_workload_overrides_generic_spur_failure(self):
         result = self.resolve()
         self.assertEqual(

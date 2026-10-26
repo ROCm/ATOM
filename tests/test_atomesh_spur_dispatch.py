@@ -31,6 +31,9 @@ class SpurDispatchTest(unittest.TestCase):
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
+        # The upstream worker now checks GPU occupancy before startup. Keep
+        # these scheduler/Docker doubles independent of the host's live GPUs.
+        self.write_tool("amd-smi", 'print("GPU VRAM_USED")')
         self.write_tool(
             "ip",
             """
@@ -176,6 +179,84 @@ class SpurDispatchTest(unittest.TestCase):
             json.loads(line)
             for line in (self.root / f"docker-{rank}.jsonl").read_text().splitlines()
         ]
+
+    def test_host_memory_preparation_and_recovery_wrap_the_service(self):
+        scripts = self.script.parent
+        (scripts / "lmcache_hugetlb.py").write_text("""
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["TEST_ROOT"])
+with (root / "host-order.jsonl").open("a") as f:
+    f.write(json.dumps(["hugetlb", sys.argv[1]]) + "\\n")
+if sys.argv[1] == "restore" and os.environ.get("FAIL_RESTORE"):
+    sys.exit(2)
+""")
+        (scripts / "prepare_lmcache_host_memory.py").write_text("""
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["TEST_ROOT"])
+with (root / "host-order.jsonl").open("a") as f:
+    f.write(json.dumps(["memory", sys.argv[1:]]) + "\\n")
+sys.exit(int(os.environ.get("PREPARE_RC", "0")))
+""")
+        docker = self.bin_dir / "docker"
+        source = docker.read_text()
+        source += """
+if sys.argv[1] == "run" and os.environ.get("ATOMESH_PREPARE_LMCACHE_HOST_MEMORY") == "true":
+    env_file = Path(sys.argv[sys.argv.index("--env-file") + 1])
+    assert "ATOMESH_LMCACHE_HOST_PREPARED=true" in env_file.read_text()
+    with (Path(os.environ["TEST_ROOT"]) / "host-order.jsonl").open("a") as f:
+        f.write(json.dumps(["container", "run"]) + "\\n")
+"""
+        docker.write_text(source)
+        for prep_rc, restore_fails, model_fails, expected in (
+            (0, "", "", 0),
+            (2, "", "", 2),
+            (0, "1", "", 2),
+            (0, "", "0", 7),
+        ):
+            with self.subTest(
+                prep_rc=prep_rc, restore_fails=restore_fails, model_fails=model_fails
+            ):
+                if self.run_dir.exists():
+                    shutil.rmtree(self.run_dir)
+                order = self.root / "host-order.jsonl"
+                order.unlink(missing_ok=True)
+                (self.root / "docker-0.jsonl").unlink(missing_ok=True)
+                self.run_job(
+                    "--spur-worker",
+                    expected_rc=expected,
+                    NUM_NODES="1",
+                    SPUR_PEER_NODES="10.19.0.1:6818",
+                    SPUR_NODELIST="node0",
+                    ATOMESH_PD_WORKER_LAYOUT="single_node",
+                    ATOMESH_PREPARE_LMCACHE_HOST_MEMORY="true",
+                    ATOMESH_PREFILL_ENV_LMCACHE_LOCAL_CPU="True",
+                    ATOMESH_PREFILL_ENV_HIP_VISIBLE_DEVICES="0,1,2,3",
+                    ATOMESH_PREFILL_ENV_LMCACHE_MAX_LOCAL_CPU_SIZE="256",
+                    MODEL_PATH="/models/target model",
+                    DRAFT_MODEL_PATH="/models/draft model",
+                    PREPARE_RC=str(prep_rc),
+                    FAIL_RESTORE=restore_fails,
+                    FAIL_RANK=model_fails,
+                )
+                events = [json.loads(line) for line in order.read_text().splitlines()]
+                self.assertEqual(events[0], ["hugetlb", "prepare"])
+                self.assertEqual(events[1][0], "memory")
+                self.assertEqual(
+                    events[1][1][-2:], ["/models/target model", "/models/draft model"]
+                )
+                self.assertEqual(events[-1], ["hugetlb", "restore"])
+                runs = [call for call in self.docker_calls(0) if call[0] == "run"]
+                self.assertEqual(len(runs), 0 if prep_rc else 1)
+                self.assertEqual(
+                    (self.run_dir / "rank-rc-0").read_text(), f"{expected}\n"
+                )
+                if expected:
+                    workload = json.loads(
+                        (self.run_dir / "rank-workload-0.json").read_text()
+                    )
+                    self.assertNotEqual(workload["status"], "completed")
 
     def test_eval_only_pulls_image_and_runs_only_eval_on_both_workers(self):
         self.run_job(EVAL_ONLY="true", RUN_EVAL="true", EVAL_TASK="gsm8k")

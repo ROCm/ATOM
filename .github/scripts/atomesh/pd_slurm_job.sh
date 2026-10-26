@@ -483,6 +483,60 @@ EOF
   return "${docker_rc}"
 }
 
+# Only enabled by the single-node C32 case, inside its exclusive allocation.
+prepare_lmcache_memory_on_host() {
+  [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" ]] || return 0
+  local local_cpu="${ATOMESH_PREFILL_ENV_LMCACHE_LOCAL_CPU:-false}"
+  if [[ "${NUM_NODES}" != "1" || "${ATOMESH_PD_WORKER_LAYOUT:-}" != "single_node" \
+    || "${PREFILL_WORKERS}" != "1" || "${DECODE_WORKERS}" != "1" || "${local_cpu,,}" != "true" ]]; then
+    echo "ERROR: host memory preparation requires single-node 1P1D with LMCache CPU storage" >&2
+    return 2
+  fi
+  local scripts="${REPO_ROOT}/.github/scripts/atomesh"
+  local output="${RUN_DIR}/benchmark_results/lmcache-host-memory"
+  local -a cache_root_args=()
+  if [[ "${MODEL_PATH}" == /share_nfs/models/* && -d /share_nfs/models ]]; then
+    # fadvise drops only this host's clean pages; no files or mount settings change.
+    cache_root_args=(--cache-root /share_nfs/models)
+  fi
+  local -a model_dirs=("${MODEL_PATH}")
+  [[ -n "${DRAFT_MODEL_PATH:-}" ]] && model_dirs+=("${DRAFT_MODEL_PATH}")
+  local excluded_node
+  local -a excluded_nodes=()
+  IFS=',' read -r -a excluded_nodes <<< "${SLURM_EXCLUDE_NODES:-}"
+  for excluded_node in "${excluded_nodes[@]}"; do
+    if [[ "${excluded_node}" == "$(hostname -s)" ]]; then
+      echo "ERROR: scheduler selected excluded node ${excluded_node}; refusing memory preparation" >&2
+      return 2
+    fi
+  done
+  echo "[host-memory] Preparing on host $(hostname) as uid=$(id -u), before the service container"
+  python3 "${scripts}/lmcache_hugetlb.py" prepare --job-id "${JOB_ID}" \
+    --output "${output}/host" --gpus "${ATOMESH_PREFILL_ENV_HIP_VISIBLE_DEVICES}" \
+    --per-gpu-gib "${ATOMESH_PREFILL_ENV_LMCACHE_MAX_LOCAL_CPU_SIZE}" || return $?
+  python3 "${scripts}/prepare_lmcache_host_memory.py" \
+    --gpus "${ATOMESH_PREFILL_ENV_HIP_VISIBLE_DEVICES}" \
+    --per-gpu-gib "${ATOMESH_PREFILL_ENV_LMCACHE_MAX_LOCAL_CPU_SIZE}" \
+    --attempts 3 --timeout 300 --step-timeout 90 --reserve-gib 128 \
+    --output "${output}" "${cache_root_args[@]}" "${model_dirs[@]}" || return $?
+  export ATOMESH_LMCACHE_HOST_PREPARED=true
+}
+
+restore_lmcache_hugetlb_on_host() {
+  [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" ]] || return 0
+  # Do not restore a large pool while any of this job's model containers run.
+  local suffix running
+  for suffix in "" "-benchmark" "-eval"; do
+    running="$(docker ps -q --filter "name=^/atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}$")" || return 2
+    if [[ -n "${running}" ]]; then
+      echo "ERROR: model container still running; HugeTLB restoration requires node recovery" >&2
+      return 2
+    fi
+  done
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/lmcache_hugetlb.py" restore \
+    --job-id "${JOB_ID}" --output "${RUN_DIR}/benchmark_results/lmcache-host-memory/host"
+}
+
 run_spur_job() {
   if [[ -z "${SPUR_TASK_OFFSET:-}" || -z "${SPUR_PEER_NODES:-}" ]]; then
     echo "ERROR: Spur worker requires SPUR_TASK_OFFSET and SPUR_PEER_NODES" >&2
@@ -559,17 +613,32 @@ EOF
     echo "=== cleanup rank=${SPUR_NODE_RANK_FOR_CLEANUP} rc=${rc} ==="
     # Publish before cleanup: Spur accounting is unreliable, so the workflow
     # falls back to these per-rank codes.
-    publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
+    if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" != "true" ]]; then
+      publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
+    fi
     for suffix in "" "-benchmark" "-eval"; do
       bounded_docker_rm \
         "atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${SPUR_NODE_RANK_FOR_CLEANUP}${suffix}"
     done
+    if ! restore_lmcache_hugetlb_on_host; then
+      [[ "${rc}" -ne 0 ]] || rc=2
+    fi
+    publish_rank_rc "${SPUR_NODE_RANK_FOR_CLEANUP}" "${rc}"
     return "${rc}"
   }
   trap 'cleanup_spur $?' EXIT
   trap 'cleanup_spur 129; exit 129' HUP
   trap 'cleanup_spur 130; exit 130' INT
   trap 'cleanup_spur 143; exit 143' TERM
+
+  # Install cleanup traps before any host VM change, including failed setup.
+  local host_memory_log="${RUN_DIR}/rank-${node_rank}/host-memory.log"
+  local preparation_rc=0
+  mkdir -p "${RUN_DIR}/rank-${node_rank}"
+  prepare_lmcache_memory_on_host > "${host_memory_log}" 2>&1 || preparation_rc=$?
+  tail -c 16384 "${host_memory_log}" || true
+  [[ "${preparation_rc}" -eq 0 ]] || return "${preparation_rc}"
+  write_env_file "${env_file}"
 
   local execution_phase service_port_offset
   local rc=0
@@ -587,6 +656,9 @@ EOF
     fi
   done
 
+  if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" ]]; then
+    cleanup_spur 0 || return $?
+  fi
   echo "=== Spur rank ${node_rank} completed ==="
   find "${RUN_DIR}" -maxdepth 3 -type f | sort
   # Separate completed work from EXIT-trap/agent cleanup. An EXIT trap alone
@@ -719,6 +791,11 @@ if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NOD
     sleep 5
   done
   exit "$(cat "${DISPATCH_DIR}/rc")"
+fi
+
+if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" ]]; then
+  echo "ERROR: LMCache host preparation currently requires the Spur worker path" >&2
+  exit 2
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
