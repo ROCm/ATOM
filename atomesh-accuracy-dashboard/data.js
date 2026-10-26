@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792774370659,
+  "lastUpdate": 1793038119762,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4422,6 +4422,40 @@ window.BENCHMARK_DATA = {
             "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
             "value": 2.98,
             "unit": "tok/fwd"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "e893780f46331de3821aa7872b44501c45d890be",
+          "message": "feat(moe): route before the rows move; per-pass real row counts; V4.1 FP8 KV (#2725)\n\n* feat(v41): MXFP8 KV cache on the original path and in mono\n\n- Pool geometry takes kv_dtype bf16 / fp4 / fp8. An fp8 row is 512 e4m3\n  (RoPE dims included) then 16 E8M0 codes, 528 B, row-addressed; the\n  window ring is written and read by byte address.\n- Original path: sparse_attn_v41_paged_2src over aiter\n  mla_sparse_prefill_v41, q quantized to MXFP8 by rope_quant_window.\n- Mono: K1 writes the ring row as MXFP8. K2a's QK runs scaled FP8 MFMAs\n  with q quantized once a CTA by the KV row's rule; its PV dequantizes\n  the rows to bf16 and keeps the bf16 MFMAs.\n- Mono PV reads its V tile back with ds_read_tr16_b64 instead of\n  per-element LDS reads and shifts.\n- Mono MoE sums the routed contributions in f32 and rounds once, as the\n  reference MoE.forward does, instead of a bf16 rounding at every add.\n- Check-mode reference, hand-off contract and tests cover the fp8 pool.\n\nRequires aiter #6675 (mla_sparse_prefill_v41).\n\n* feat(moe): route before the rows move; per-pass real row counts\n\nMoE routing now runs on the rank that owns the rows, before any of them\nmove, and the routing kernels route the rows past the pass's real row count\nto expert -1, so padding is neither dispatched nor computed.\n\nRouting:\n- A MoE method splits into select_experts (logical routes), place_experts\n  (the EPLB remap and load record, the shared column in the layer's expert\n  layout) and apply(topk_weights, topk_ids, ..., x_scale). Rows are placed\n  after every gather: a gathered row picks the same EPLB replica on every\n  rank, and the legacy layout's prefilled shared ids are re-marked for the\n  rows' gathered positions (reassign_gathered_shared_ids).\n- The DP gather, the PCP gather (ATOM_PCP_MOE_MERGE, now inside\n  FusedMoE._run_experts) and the comm-fused DPA gather move hidden states\n  with their top-k weights and ids in one grouped all_gatherv, in the\n  method's RoutedRowsWire (MXFP8 where the experts take it, MXFP4 under\n  ATOM_MORI_FP4_DISPATCH), whose scales reach the experts as x_scale.\n- The EPLB remap, load record and shared-column append are one Triton\n  kernel; the forced-remote replica hash mixes in the DP rank for a rank's\n  own rows.\n- The TP Triton path sorts the routed ids through routing_from_dispatched.\n\nReal row counts:\n- forward_vars[\"batch_info\"] publishes each step's scheduled requests,\n  tokens and draft tokens; Context.scheduled_tokens_gpu points at the\n  pass's entry, read on device so a replayed graph follows its own step.\n  Captures stage their synthetic step's counts.\n- Only a consumer of the pass's whole rows gets the count\n  (pass_scheduled_tokens_gpu); a pass over other rows declares its own\n  (ForwardContext.use_pass_rows): V4.1's decoder over a prefill's tails\n  (ReplayPlan.filled_gpu / finishing_gpu). TBO micro-batches take theirs,\n  clamped to their rows.\n- The count reaches every routing kernel (num_valid_rows), fused_moe\n  (num_local_tokens) and the Triton experts (gate_valid).\n- Removes the DP pad-row mask (step_pad_rows, ATOM_MEGA_MASK_PAD_ROWS,\n  zero_pad_rows_); MegaMoE asks its combine to skip -1 slots.\n\nAlso: MoRI v1 decode launch geometry by token count; a PCP + DP-attention\nrefusal reworded; dead code removed (triton_kernel_moe_forward,\npcp_allgather_rankmajor); V4.1 CI and docs on the FP8 KV cache; the\nKimi-K2.7-Code-MXFP4 CI cases removed.\n\n* test: skip the routed-rows gather tests without aiter\n\n* fix(vllm-plugin): port V4.1's FP8-pool attention into the plugin's copy\n\n* fix(dsv4-mono): give the mono DSpark proposer's passes the draft row count",
+          "timestamp": "2026-10-26T15:48:46Z",
+          "url": "https://github.com/ROCm/ATOM/commit/e893780f46331de3821aa7872b44501c45d890be"
+        },
+        "date": 1793038118946,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40358287266 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610261558 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.0 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.9052,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40358287266 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610261558 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1751 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
