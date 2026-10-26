@@ -23,7 +23,12 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpHyperConnection
-from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul, sigmoid_rmsnorm
+from atom.model_ops.qwen4_exp.ops.gated import (
+    is_per_token_fp8_linear,
+    sigmoid_mul,
+    sigmoid_rmsnorm,
+    sigmoid_rmsnorm_quant,
+)
 from atom.model_ops.qwen4_exp.ops.moe_decode import moe_decode_single_token
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.model_ops.qwen4_exp.qsa_attention import (
@@ -129,6 +134,14 @@ class _Qwen4ExpQuantizationConfig:
 # intent head loads without the extra slot.
 
 
+def _is_dynamic_ptpc_fp8(policy: LayerQuantConfig) -> bool:
+    return (
+        policy.quant_type == QuantType.per_Token
+        and policy.quant_dtype == dtypes.fp8
+        and policy.is_dynamic
+    )
+
+
 class Qwen4ExpRMSNormGated(nn.Module):
     """GDN's sigmoid gate with the checkpoint's BF16 cast boundaries."""
 
@@ -139,6 +152,11 @@ class Qwen4ExpRMSNormGated(nn.Module):
 
     def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         return sigmoid_rmsnorm(x, z, self.weight, self.eps)
+
+    def forward_quant(
+        self, x: torch.Tensor, z: torch.Tensor, quant_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return sigmoid_rmsnorm_quant(x, z, self.weight, self.eps, quant_dtype)
 
 
 def install_stacked_expert_loaders(experts: FusedMoE) -> None:
@@ -416,6 +434,8 @@ class Qwen4ExpLinearAttention(nn.Module):
     existing MergedColumnParallelLinear at load time, with Q/K/V sharded
     independently. PTPC inputs use an FP8 QKVZ projection and a BF16 BA
     projection; unquantized inputs retain the single packed QKVZBA projection.
+    An online ptpc_fp8 target on QKV/Z selects the same split, with B/A left
+    at source precision whatever the online config says about them.
     """
 
     @property
@@ -446,9 +466,7 @@ class Qwen4ExpLinearAttention(nn.Module):
             )
             if self.quantized_inputs and not (
                 qkv == z
-                and qkv.quant_type == QuantType.per_Token
-                and qkv.quant_dtype == dtypes.fp8
-                and qkv.is_dynamic
+                and _is_dynamic_ptpc_fp8(qkv)
                 and not b.is_quantized
                 and not a.is_quantized
             ):
@@ -457,15 +475,19 @@ class Qwen4ExpLinearAttention(nn.Module):
                     "per-channel FP8 QKV/Z with unquantized B/A"
                 )
             if quant_config.online_quant:
-                for projection in ("qkv", "z", "b", "a"):
-                    name = f"{prefix}.in_proj_{projection}"
-                    policy = quant_config.get_layer_quant_config(
-                        name, use_online_quant=True
+                qkv, z = (
+                    quant_config.get_layer_quant_config(
+                        f"{prefix}.in_proj_{projection}", use_online_quant=True
                     )
-                    if policy.is_quantized:
+                    for projection in ("qkv", "z")
+                )
+                if qkv.is_quantized or z.is_quantized:
+                    if not (qkv == z and _is_dynamic_ptpc_fp8(qkv)):
                         raise ValueError(
-                            f"Qwen GDN input online quantization is not supported: {name}"
+                            "Qwen GDN input online quantization requires matching "
+                            f"ptpc_fp8 targets on {prefix}.in_proj_qkv / in_proj_z"
                         )
+                    self.quantized_inputs = True
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.config = config
@@ -574,11 +596,22 @@ class Qwen4ExpLinearAttention(nn.Module):
             allow_aiter_flydsl=True,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """`quantized` is an optional `(fp8, scale)` copy of `hidden_states`
+        that the FP8 QKVZ projection takes instead of quantizing it again."""
         num_tokens = hidden_states.shape[0]
         v_heads = self.num_v_heads // self.tp_size
         if self.quantized_inputs:
-            mixed_qkv, z = self.in_proj_qkvz(hidden_states).split(
+            qkvz = (
+                self.in_proj_qkvz(hidden_states)
+                if quantized is None
+                else self.in_proj_qkvz(quantized[0], x_scale=quantized[1])
+            )
+            mixed_qkv, z = qkvz.split(
                 [self.conv_dim // self.tp_size, self.value_dim // self.tp_size], dim=-1
             )
             b, a = self.in_proj_ba(hidden_states).chunk(2, dim=-1)
@@ -597,6 +630,11 @@ class Qwen4ExpLinearAttention(nn.Module):
 
         core_attn_out = torch.empty_like(z)
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
+        if is_per_token_fp8_linear(self.out_proj):
+            x, x_scale = self.norm.forward_quant(
+                core_attn_out, z, self.out_proj.params_dtype
+            )
+            return self.out_proj(x, x_scale=x_scale)
         core_attn_out = self.norm(core_attn_out, z)
         return self.out_proj(core_attn_out)
 
@@ -700,13 +738,22 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 )
                 pending = None
             hidden_states = self._apply_ple(hidden_states, input_ids)
-        mixed, (hidden_states, raw) = self.attn_hyper_connection.mix_fused(
-            hidden_states, pending
-        )
-        if self.layer_type == "linear_attention":
-            sub_output = self.linear_attn(mixed)
+        quant_dtype = self._attn_input_quant_dtype()
+        if quant_dtype is None:
+            mixed, (hidden_states, raw) = self.attn_hyper_connection.mix_fused(
+                hidden_states, pending
+            )
+            quantized = None
         else:
-            sub_output = self.self_attn(positions, mixed)
+            mixed, quantized, (hidden_states, raw) = (
+                self.attn_hyper_connection.mix_fused_quant(
+                    hidden_states, pending, quant_dtype
+                )
+            )
+        if self.layer_type == "linear_attention":
+            sub_output = self.linear_attn(mixed, quantized)
+        else:
+            sub_output = self.self_attn(positions, mixed, quantized)
         if self.tp_size > 1:
             sub_output = tensor_model_parallel_all_reduce(sub_output)
         mixed, (hidden_states, raw) = self.mlp_hyper_connection.mix_fused(
@@ -714,6 +761,17 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         # The MoE block owns its own all-reduce.
         return hidden_states, (self.mlp(mixed), raw)
+
+    def _attn_input_quant_dtype(self) -> torch.dtype | None:
+        """FP8 dtype of the per-token GEMM that reads the attention input, if
+        the attention hyper-connection should quantize it for that GEMM."""
+        if self.layer_type == "linear_attention":
+            proj = getattr(self.linear_attn, "in_proj_qkvz", None)
+        else:
+            proj = self.self_attn.qkv_proj
+        if proj is not None and is_per_token_fp8_linear(proj):
+            return proj.params_dtype
+        return None
 
     def _apply_ple(self, hidden_states, input_ids):
         ple_metadata = get_forward_context().attn_metadata.ple_metadata

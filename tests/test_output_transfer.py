@@ -2,6 +2,7 @@
 """D2H reuse, FIFO lifetime and owned outputs, independent of model imports."""
 
 import os
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
@@ -90,6 +91,66 @@ def test_pending_and_received_outputs_survive_slot_reuse(fake_cuda, status):
     del queue
     for output, source in zip(outputs, [*sources, sources[2]], strict=True):
         assert_owned_output(output, source.numpy(), status=status)
+
+
+def _alive_at_sync(slot, refs):
+    """Record, at each copy_done wait, which sources are still referenced."""
+    seen = []
+    slot.copy_done.synchronize.side_effect = lambda: seen.append(
+        [ref() is not None for ref in refs]
+    )
+    return seen
+
+
+@pytest.mark.parametrize("status", [False, True])
+def test_source_is_held_until_receive_has_waited_for_its_copy(fake_cuda, status):
+    """The side-stream copy reads the source after send returns.
+
+    Callers drop fresh sources (the sampler's verdict) right away; the slot
+    must keep it until copy_done has been waited on, or the allocator can
+    hand the block to the next allocation before a late copy reads it.
+    """
+    queue = (
+        SpecStatusQueue(4, fake_cuda.stream)
+        if status
+        else D2HQueue(8, fake_cuda.stream)
+    )
+    source = torch.arange(8, dtype=torch.int32).view(2, 4)
+    ref = weakref.ref(source)
+    queue.send(source)
+    seen = _alive_at_sync(queue._pending[0], [ref])
+    del source
+    assert ref() is not None
+    output = queue.receive()
+    assert seen == [[True]]
+    assert ref() is None
+    assert_owned_output(
+        output, np.arange(8, dtype=np.int32).reshape(2, 4), status=status
+    )
+
+
+@pytest.mark.parametrize("status", [False, True])
+def test_drain_waits_for_every_pending_copy_before_dropping_it(fake_cuda, status):
+    queue = (
+        SpecStatusQueue(4, fake_cuda.stream)
+        if status
+        else D2HQueue(8, fake_cuda.stream)
+    )
+    sources = [torch.arange(8, dtype=torch.int32).view(2, 4) + i for i in range(3)]
+    refs = [weakref.ref(s) for s in sources]
+    for source in sources:
+        queue.send(source)
+    seen = [
+        _alive_at_sync(slot, refs[i : i + 1]) for i, slot in enumerate(queue._pending)
+    ]
+    del source, sources
+    queue.drain()
+    assert seen == [[[True]]] * 3
+    assert all(ref() is None for ref in refs)
+    assert queue.receive() is None
+    # The drained slots are reused, not reallocated.
+    queue.send(torch.zeros((2, 4), dtype=torch.int32))
+    assert len(fake_cuda.allocations) == 3
 
 
 @pytest.mark.parametrize("status", [False, True])

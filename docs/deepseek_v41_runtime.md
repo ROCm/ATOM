@@ -137,7 +137,10 @@ speculative caches and multimodal speculation are rejected, as are
 PP/CP, DP without DP attention, decode TBO, KV transfer other than `lmcache_mp`, RapidServe
 and EPLB — all before loading. Plugin execution is no longer among them: V4.1
 runs on the vLLM plugin backend, described in
-[the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units and
+[the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units. With
+encoder SWA bounded replay (the default) it moves PAGE alone, and a tier load
+resumes like an HBM hit: the forward replays the hash block below it
+(`BlockManager.tier_resume_replays`). With `--no-encoder-swa-bounded-replay` it
 restores STATE through the same PAGE-backed checkpoint images the local prefix
 cache uses (`get_kv_transfer_tensors` publishes each plane of a unit, in
 `StateCopies` order).

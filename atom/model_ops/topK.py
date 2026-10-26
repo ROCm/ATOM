@@ -13,6 +13,7 @@ from atom.model_ops.triton_topk_softmax import (
     triton_topk_softmax_supported,
 )
 from atom.model_ops.utils import _has_module
+from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -66,7 +67,7 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
             shared_spec.quant_dtype == routed_spec.quant_dtype
             and shared_spec.quant_type == routed_spec.quant_type
             and shared_spec.is_dynamic == routed_spec.is_dynamic
-        )
+        ) or fuses_mxfp8_shared_into_mxfp4(shared_spec, routed_spec)
 
     # Resolve actual dtypes for shared experts vs routed experts.
     # Find a representative shared expert entry from the exclude list to

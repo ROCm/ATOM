@@ -518,11 +518,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 if p_d
                 else []
             ),
-            num_slots=int(state.shape[0]),
+            num_slots=int(state.shape[0]) if p_d else 0,
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=spec,
-            execute_paged_state_copies=self.execute_paged_state_copies,
+            # Under encoder SWA bounded replay there is no checkpoint to copy:
+            # `lmcache_mp` moves PAGE alone and every hit replays.
+            execute_paged_state_copies=(
+                None if spec is None else self.execute_paged_state_copies
+            ),
             paged_state_region_count=len(pages),
         )
 

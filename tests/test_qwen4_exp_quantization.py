@@ -180,8 +180,79 @@ def test_gdn_projection_storage_and_scales(monkeypatch, tp, rank, quantized):
     torch.testing.assert_close(layer.out_proj.weight_scale, out_scale)
 
 
+def online_config(global_spec, exclude_layers=()):
+    """A BF16 checkpoint with an online quantization config on top."""
+    config = QuantizationConfig()
+    config.online_quant = True
+    config.online_global_spec = global_spec
+    config.online_exclude_layers = list(exclude_layers)
+    return config
+
+
+ONLINE_PTPC = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
+
+
+@pytest.mark.parametrize("excluded", [False, True])
+def test_gdn_online_ptpc_splits_qkvz_from_bf16_ba(monkeypatch, excluded):
+    from atom.model_ops import linear
+
+    group = SimpleNamespace(world_size=1, rank_in_group=0)
+    monkeypatch.setattr(linear, "get_tp_group", lambda: group)
+    monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        qwen4_exp, "LinearAttention", lambda *args, **kwargs: torch.nn.Identity()
+    )
+    config = SimpleNamespace(
+        hidden_size=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+    )
+    # The global target also covers B/A; they stay BF16 regardless.
+    quant_config = online_config(
+        ONLINE_PTPC, ["*linear_attn.in_proj_*"] if excluded else []
+    )
+    layer = qwen4_exp.Qwen4ExpLinearAttention(
+        SimpleNamespace(torch_dtype=torch.bfloat16),
+        config,
+        qwen4_exp._Qwen4ExpQuantizationConfig(quant_config),
+        prefix="model.layers.0.linear_attn",
+    )
+    assert layer.quantized_inputs != excluded
+    if excluded:
+        assert layer.in_proj_qkvzba.weight.dtype == torch.bfloat16
+        return
+    # Loaded in the source precision, then quantized after load under the
+    # online policy of the QKVZ prefix.
+    qkvz = layer.in_proj_qkvz
+    assert qkvz.weight.dtype == torch.bfloat16
+    assert (
+        qkvz.quant_config.get_layer_quant_config(qkvz.prefix, use_online_quant=True)
+        == ONLINE_PTPC
+    )
+    assert layer.in_proj_ba.quant_config is None
+    assert layer.in_proj_ba.weight.dtype == torch.bfloat16
+    mapping = layer.packed_modules_mapping
+    assert mapping[".in_proj_qkv"] == (".in_proj_qkvz", (0, 1, 2))
+    assert mapping[".in_proj_z"] == (".in_proj_qkvz", 3)
+    assert mapping[".in_proj_b"] == (".in_proj_ba", 0)
+    assert mapping[".in_proj_a"] == (".in_proj_ba", 1)
+
+
 @pytest.mark.parametrize(
-    "unsupported", ["block_scales", "mixed_qkv_z", "quantized_b", "online"]
+    "unsupported",
+    [
+        "block_scales",
+        "mixed_qkv_z",
+        "quantized_b",
+        "online_block_scales",
+        "online_mixed_qkv_z",
+    ],
 )
 def test_gdn_rejects_unsupported_input_quantization(unsupported):
     config = ptpc_config()
@@ -194,9 +265,12 @@ def test_gdn_rejects_unsupported_input_quantization(unsupported):
         config.exclude_layers.append(prefix + ".in_proj_z")
     elif unsupported == "quantized_b":
         config.exclude_layers.remove(prefix + ".in_proj_b")
+    elif unsupported == "online_block_scales":
+        config = online_config(
+            LayerQuantConfig(quant_type=QuantType.per_1x128, quant_dtype=dtypes.fp8)
+        )
     else:
-        config.online_quant = True
-        config.online_global_spec = config.global_spec
+        config = online_config(ONLINE_PTPC, [prefix + ".in_proj_z"])
     with pytest.raises(ValueError, match="Qwen GDN"):
         qwen4_exp.Qwen4ExpLinearAttention(
             None,
