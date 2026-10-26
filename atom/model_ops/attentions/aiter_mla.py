@@ -2810,13 +2810,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # nothing here writes the host copy.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
 
-        # Plan only the scheduled requests: the persistent kernel is
-        # work_indptr-driven, so the padded tail gets no work item and its rows
-        # of o are left as allocated. Planning the tail is unsafe. A work item
-        # can read q[qo_start] and write o[qo_start] without bounds, and q/o
-        # need not have rows for the tail: while a DP peer prefills,
-        # running_tokens is this rank's own count. The cprr metadata kernel
-        # cannot take the 0-query tail either (num_qo_tiles=0 -> div-by-zero).
+        # scheduled_bs, not running_bs: a work item reads q[qo_start] and writes
+        # o[qo_start] unbounded, and the padded tail need not have rows -- while a
+        # DP peer prefills, running_tokens is this rank's own count. The cprr
+        # metadata kernel cannot take that tail either (num_qo_tiles=0 -> div-by-0).
         if is_sparse_mtp:
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 scheduled_bs, max_seqlen_q
