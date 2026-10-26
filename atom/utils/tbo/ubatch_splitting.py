@@ -298,6 +298,14 @@ def _get_tbo_cpu_lens(attn_metadata: AttentionMetaData, field_name: str):
     """
     cache_attr = "_tbo_cpu_lens_" + field_name
     if not hasattr(attn_metadata, cache_attr):
+        lengths = attn_metadata.prefill_request_lengths
+        if lengths is not None:
+            if field_name == "cu_seqlens_q":
+                return np.asarray(lengths.cu_q_lens, dtype=np.int64)
+            if field_name == "cu_seqlens_k":
+                return np.asarray(lengths.cu_k_lens, dtype=np.int64)
+            if field_name == "context_lens":
+                return np.diff(np.asarray(lengths.cu_k_lens, dtype=np.int64))
         t = getattr(attn_metadata, field_name, None)
         setattr(
             attn_metadata,
@@ -487,9 +495,21 @@ def split_attn_metadata(
             seg = np.clip(cuq_cpu[req_start : req_end + 1], ts.start, ts.stop)
             ub_max_seqlen_q = int(np.diff(seg).max())
 
+    ub_prefill_lengths = None
+    if attn_metadata.prefill_request_lengths is not None and ub_num_reqs > 0:
+        ub_prefill_lengths = attn_metadata.prefill_request_lengths.slice_requests(
+            request_start=req_start,
+            request_end=req_end,
+            q_token_start=ts.start,
+            q_token_end=ts.stop,
+            has_cached=attn_metadata.has_cached,
+        )
+
     ub_total_kv = None
     if attn_metadata.has_cached:
-        if ub_cu_seqlens_k is not None and ub_num_reqs > 0:
+        if ub_prefill_lengths is not None:
+            ub_total_kv = ub_prefill_lengths.cu_k_lens[-1]
+        elif ub_cu_seqlens_k is not None and ub_num_reqs > 0:
             ub_total_kv = int(ub_cu_seqlens_k[ub_num_reqs].item())
         elif ub_context_lens is not None and ub_num_reqs > 0:
             ub_total_kv = int(ub_context_lens[:ub_num_reqs].sum().item())
@@ -516,6 +536,7 @@ def split_attn_metadata(
         sparse_kv_indptr=ub_sparse_kv_indptr,
         has_cached=attn_metadata.has_cached,
         total_kv=ub_total_kv,
+        prefill_request_lengths=ub_prefill_lengths,
         batch_id_per_k_token=ub_batch_id_per_k_token,
         num_cached_tokens=ub_num_cached_tokens,
         seq_starts=ub_seq_starts,

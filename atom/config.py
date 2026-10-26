@@ -2000,6 +2000,8 @@ class Config:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
+    # Per-rank dense K+V budget for MHA/GQA cached prefill; 0 disables grouping.
+    gqa_prefill_kv_workspace_mb: int = 0
     # Tokens between rungs of the state-checkpoint ladder, shared by every
     # Pool.STATE class. Must be a multiple of the prefix-cache hash block size
     # (snapped, with a warning, in BlockManager).
@@ -2220,6 +2222,13 @@ class Config:
         return list(sizes)
 
     def __post_init__(self):
+        budget = self.gqa_prefill_kv_workspace_mb
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+            raise ValueError(
+                "gqa_prefill_kv_workspace_mb must be a non-negative integer"
+            )
+        if budget and self.prefill_context_parallel_size != 1:
+            raise ValueError("Prefill KV workspace grouping currently requires PCP=1")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
