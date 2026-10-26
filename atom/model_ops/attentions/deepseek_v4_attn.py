@@ -2656,9 +2656,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `cu_seqlens_q` comes from.
         with self.mixed_prefill_bank_active(batch):
             # Same reasoning as the `prepare_decode` call below: a mixed batch is
-            # never padded to a captured graph width, so the prefill segment's
-            # running_bs IS its scheduled seq count.
-            prefill_meta, prefill_positions = self.prepare_prefill(batch, n_p_seqs)
+            # never padded to a captured graph width or a token-graph bucket, so
+            # the prefill segment's running sizes ARE its scheduled ones.
+            prefill_meta, prefill_positions = self.prepare_prefill(
+                batch, running_bs=n_p_seqs, running_tokens=n_p_tokens
+            )
 
         # ---- Decode half: present rows [n_p_seqs:] as a standalone batch so
         # the unmodified prepare_decode builds decode metadata into shared

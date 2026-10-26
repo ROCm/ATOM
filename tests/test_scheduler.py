@@ -3472,6 +3472,36 @@ class TestMixedBatch:
         assert d.id not in scheduled and d.status == SequenceStatus.WAITING
         assert len(batch.block_tables) == batch.total_seqs_num
 
+    def test_mixed_final_prefill_chunk_completes_its_trace(self, seq_factory):
+        """With progress advanced at schedule time, a mixed step's final
+        prefill chunk closes its prefill span even though a decode row shares
+        the step: the loop covers prefill rows only, so the batch's decode
+        count says nothing about which rows are prefills."""
+        sched = self._mixed_scheduler()
+        decode_seq = self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        sched.advance_on_schedule = True
+        prefill_seq = seq_factory([5, 6, 7, 8])
+        sched.add(prefill_seq)
+        batch, _ = sched.schedule()
+        assert batch.is_mixed
+        assert batch.req_ids == [prefill_seq.id, decode_seq.id]
+
+        with mock.patch(
+            "atom.model_engine.scheduler.tracing.prefill_complete"
+        ) as prefill_complete:
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[prefill_seq.id, decode_seq.id],
+                    token_ids=[(10,), (11,)],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                batch=batch,
+            )
+        prefill_complete.assert_called_once_with(prefill_seq)
+
     def test_flag_off_full_budget_leaves_the_queue_order_alone(self, seq_factory):
         """As on main: once the budget is full, the loop stops before popping
         the next row, so a partial / PP-inflight row is not rotated to the

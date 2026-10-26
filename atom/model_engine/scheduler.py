@@ -4301,7 +4301,9 @@ class Scheduler:
                 )
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
-                elif i >= batch.total_seqs_num_decode:
+                else:
+                    # Every row here is a prefill row, so a final chunk is a
+                    # completed prefill whatever the batch's decode count.
                     tracing.prefill_complete(seq)
         elif batch is not None:
             for i, req_id in enumerate(batch.req_ids):
