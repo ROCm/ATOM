@@ -64,3 +64,17 @@ def test_reserve_does_not_shrink_a_lone_partial(monkeypatch, seq_factory):
     sched = _sched(monkeypatch, 0.25)
     long_seq = _start_long_prefill(sched, seq_factory)
     assert _step(sched) == {long_seq.id: 256}
+
+
+def test_reserve_keeps_large_uncached_prompts_waiting(monkeypatch, seq_factory):
+    # A 128-token uncached prompt does not fit the 64-token reserve: it waits
+    # for the partial as it would without the reserve, while a short prompt
+    # queued behind it still uses the reserve, and arrival order is kept.
+    sched = _sched(monkeypatch, 0.25)
+    long_seq = _start_long_prefill(sched, seq_factory)
+    big = seq_factory(list(range(3000, 3128)))
+    short = seq_factory(list(range(10, 18)))
+    sched.add(big)
+    sched.add(short)
+    assert _step(sched) == {long_seq.id: 192, short.id: 8}
+    assert sched.waiting[0] is big

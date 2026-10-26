@@ -2056,10 +2056,10 @@ class Scheduler:
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
+        # ATOM_PREFILL_WAITING_RESERVE: while new prefills wait, partials
+        # leave them a share of the token budget and the cost target.
+        reserve_tokens = 0
         if delayer_allows and self._partial_prefill_count > 0:
-            # ATOM_PREFILL_WAITING_RESERVE: while new prefills wait, partials
-            # leave them a share of the token budget and the cost target.
-            reserve_tokens = 0
             step_cost_limit = self._tick_cost_limit
             if (
                 self._waiting_reserve > 0
@@ -2095,6 +2095,8 @@ class Scheduler:
                 num_scheduled_tokens.append(chunk)
 
             self._tick_cost_limit = step_cost_limit
+            if not num_seqs_prefill:
+                reserve_tokens = 0
 
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
@@ -2339,6 +2341,14 @@ class Scheduler:
                     ),
                 )
             ):
+                prefix_waiters.append(seq)
+                continue
+            if reserve_tokens and num_new_tokens > reserve_tokens:
+                # The reserve is for short work beside a running long prefill.
+                # A large uncached prompt waits for it as it would without the
+                # reserve: under DP nothing else holds back a sibling whose
+                # prefix that prefill is still producing, and admitting it now
+                # would recompute the shared prefix instead of reusing it.
                 prefix_waiters.append(seq)
                 continue
             atomic_prefill = self._requires_atomic_prefill(seq)
