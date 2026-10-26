@@ -2172,18 +2172,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if tp <= 1:
             return 1
         tp_group = get_tp_group()
-        return indexer_qsplit_world(
-            tp,
-            physical_tp=torch.distributed.get_world_size(tp_group.device_group),
-            enabled=envs.ATOM_V4_INDEXER_QSPLIT,
-            pynccl=split_gather_comm_on_every_rank(tp_group),
-            plugin=is_plugin_mode(),
-            gfx1250_opus=self.indexer_layout == FP4_GFX1250_NATURAL,
-            dp_attention=bool(config.enable_dp_attention),
-            tbo=bool(config.enable_tbo or config.enable_tbo_decode),
-            pcp=get_pcp_world_size(),
-            dcp=int(config.decode_context_parallel_size),
-        )
+
+        def world(pynccl: bool) -> int:
+            return indexer_qsplit_world(
+                tp,
+                physical_tp=torch.distributed.get_world_size(tp_group.device_group),
+                enabled=envs.ATOM_V4_INDEXER_QSPLIT,
+                pynccl=pynccl,
+                plugin=is_plugin_mode(),
+                gfx1250_opus=self.indexer_layout == FP4_GFX1250_NATURAL,
+                dp_attention=bool(config.enable_dp_attention),
+                tbo=bool(config.enable_tbo or config.enable_tbo_decode),
+                pcp=get_pcp_world_size(),
+                dcp=int(config.decode_context_parallel_size),
+            )
+
+        # The rest of the gate is the same on every rank, so only a run that
+        # would split asks the ranks about pynccl (a collective).
+        if world(pynccl=True) == 1:
+            return 1
+        return world(pynccl=split_gather_comm_on_every_rank(tp_group))
 
     def _index_rows(
         self,

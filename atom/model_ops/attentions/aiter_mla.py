@@ -469,6 +469,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_rank = get_dcp_rank()
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         if self._publishes_dcp_local_lens:
+            # Imported here, not at the top: the GLM builder tests stub
+            # `atom.model_ops.indexer` without its `score` submodule.
             from atom.distributed.dcp_utils import get_dcp_group
             from atom.model_ops.indexer.score import split_gather_comm_on_every_rank
 

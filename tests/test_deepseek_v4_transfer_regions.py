@@ -1014,22 +1014,31 @@ def test_unsplit_prefill_rows_carry_no_split(v4_builder_cls, monkeypatch):
     assert builder._prefill_row_split(10) is None and _RecordingSplit.calls == []
 
 
-@pytest.mark.parametrize("pynccl, expected", [(True, 8), (False, 1)])
+@pytest.mark.parametrize(
+    "enabled, pynccl, expected, asks",
+    [("1", True, 8, True), ("1", False, 1, True), ("0", True, 1, False)],
+)
 def test_split_world_needs_the_tp_group_s_pynccl(
-    v4_builder_cls, monkeypatch, pynccl, expected
+    v4_builder_cls, monkeypatch, enabled, pynccl, expected, asks
 ):
     """The builder's gate reads the startup agreement on the TP group's
-    pynccl: without one the split stays off."""
+    pynccl: without one the split stays off. A run that would not split
+    anyway (here the flag is off) never asks, so it cannot fail on it."""
     module = v4_builder_cls._indexer_qsplit_world_size.__globals__
     monkeypatch.setitem(module, "get_tensor_model_parallel_world_size", lambda: 8)
     monkeypatch.setitem(
         module, "get_tp_group", lambda: SimpleNamespace(device_group="tp")
     )
     monkeypatch.setitem(module, "get_pcp_world_size", lambda: 1)
-    monkeypatch.setitem(module, "split_gather_comm_on_every_rank", lambda group: pynccl)
+    asked = []
+    monkeypatch.setitem(
+        module,
+        "split_gather_comm_on_every_rank",
+        lambda group: asked.append(group) or pynccl,
+    )
     monkeypatch.setitem(module, "is_plugin_mode", lambda: False)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 8)
-    monkeypatch.setenv("ATOM_V4_INDEXER_QSPLIT", "1")
+    monkeypatch.setenv("ATOM_V4_INDEXER_QSPLIT", enabled)
     builder = v4_builder_cls.__new__(v4_builder_cls)
     builder.indexer_layout = "fp8"
     config = SimpleNamespace(
@@ -1039,3 +1048,4 @@ def test_split_world_needs_the_tp_group_s_pynccl(
         decode_context_parallel_size=1,
     )
     assert builder._indexer_qsplit_world_size(config) == expected
+    assert bool(asked) == asks

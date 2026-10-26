@@ -2,11 +2,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """The indexer's row split gathered for real (`atom.model_ops.indexer.score`):
-each rank writes only its rows into its slot, the in-place all-gather runs on
-the TP group's pynccl communicator, and every rank ends up with every row in
-row order -- empty ranks (fewer rows than ranks) included. Needs 2+ GPUs."""
+the ranks agree on pynccl at startup, each rank writes only its rows into its
+slot, the in-place all-gather runs on the TP group's pynccl communicator, and
+every rank ends up with every row in row order -- empty ranks (fewer rows
+than ranks) included. Needs 2+ GPUs."""
 
 import multiprocessing as mp
+import time
 
 import pytest
 import torch
@@ -31,7 +33,11 @@ def _rank(rank, world, init_method, results):
     )
 
     from atom.model_ops.indexer import RowSplit
-    from atom.model_ops.indexer.score import _gather_split, split_gather_comm
+    from atom.model_ops.indexer.score import (
+        _gather_split,
+        split_gather_comm,
+        split_gather_comm_on_every_rank,
+    )
 
     torch.cuda.set_device(rank)
     init_distributed_environment(
@@ -40,6 +46,13 @@ def _rank(rank, world, init_method, results):
     ensure_model_parallel_initialized(world, 1)
     try:
         ok = split_gather_comm(get_tp_group()) is not None
+        # The startup agreement, under the CUDA default device the runner sets
+        # while it builds the attention builders.
+        torch.set_default_device("cuda")
+        try:
+            ok = ok and split_gather_comm_on_every_rank(get_tp_group())
+        finally:
+            torch.set_default_device(None)
         for rows in _ROWS:
             split = RowSplit.of(rows, rank, world, group="tp")
             out = torch.full(
@@ -75,7 +88,14 @@ def test_split_rows_gather_back_in_row_order_on_pynccl(world):
         ]
         for p in procs:
             p.start()
+        deadline = time.monotonic() + 300
         for p in procs:
-            p.join(timeout=300)
-        assert all(p.exitcode == 0 for p in procs)
+            p.join(timeout=max(0.0, deadline - time.monotonic()))
+        hung = [p for p in procs if p.is_alive()]
+        for p in hung:  # never leave a rank behind for interpreter exit to join
+            p.terminate()
+            p.join(timeout=10)
+            if p.is_alive():
+                p.kill()
+        assert not hung and all(p.exitcode == 0 for p in procs)
         assert dict(results) == {r: True for r in range(world)}

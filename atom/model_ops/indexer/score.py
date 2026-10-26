@@ -116,7 +116,9 @@ def split_gather_comm_on_every_rank(group) -> bool:
     while another uses the ProcessGroup (or does not split at all) hangs the
     group. Raises on disagreement."""
     usable = int(split_gather_comm(group) is not None)
-    votes = torch.tensor([usable, -usable], dtype=torch.int64)
+    # Explicitly on the host: builders run under the runner's CUDA default
+    # device, and the CPU group is gloo.
+    votes = torch.tensor([usable, -usable], dtype=torch.int64, device="cpu")
     torch.distributed.all_reduce(
         votes, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
     )
