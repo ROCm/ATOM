@@ -1111,6 +1111,33 @@ class PrefillEngineCore(DPEngineCoreProc):
         """
         return
 
+    def _maybe_attach_prefill_group_delayer(self, config: Config) -> None:
+        """Attach `PrefillGroupDelayer` to this rank's `PrefillScheduler`.
+
+        A different gate from the one declined above: not about admission,
+        but about whether THIS SCHEDULER fires a forward this tick for
+        sequences it already holds, so every rank's forward carries at least
+        `min_tokens` instead of firing the moment one sequence lands. Reuses
+        `self.dp_group` -- the same CPU gloo group `_sync_dp_state` already
+        drives every busy_loop tick -- rather than standing up a second one.
+        """
+        if not envs.ATOM_ENABLE_PREFILL_GROUP_DELAYER or self.scheduler is None:
+            return
+        from atom.model_engine.prefill_delayer import PrefillGroupDelayer
+
+        min_tokens = (
+            envs.ATOM_PREFILL_GROUP_DELAYER_MIN_TOKENS or config.max_num_batched_tokens
+        )
+        self.scheduler.set_prefill_group_delayer(
+            PrefillGroupDelayer(
+                dp_size=config.parallel_config.data_parallel_size,
+                cpu_group=getattr(self, "dp_group", None),
+                min_tokens=min_tokens,
+                ttft_max_ticks=envs.ATOM_PREFILL_GROUP_DELAYER_TTFT_MAX_TICKS,
+                stall_ticks=envs.ATOM_PREFILL_GROUP_DELAYER_STALL_TICKS,
+            )
+        )
+
     def __init__(self, config: Config, input_address: str, output_address: str):
 
         # Force eager mode — no CUDA graph capture on the prefill side.
@@ -1163,6 +1190,11 @@ class PrefillEngineCore(DPEngineCoreProc):
             config, disagg_cu_shm_name=config.disagg_cu_shm_name
         )
         self.utility_handler.scheduler = self.scheduler
+        # After both self.dp_group (set by DPEngineCoreProc.__init__ inside
+        # super().__init__ above) and self.scheduler exist -- this delayer
+        # reuses that same CPU gloo group, the one the MoE lockstep sync
+        # already uses, rather than standing up a second one.
+        self._maybe_attach_prefill_group_delayer(config)
 
 
     def _post_model_load_hook(self):
@@ -1417,6 +1449,17 @@ class PrefillEngineCore(DPEngineCoreProc):
         from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
 
         self._apply_pending_assignments()
+        # UNCONDITIONAL, and BEFORE has_requests(): see should_fire_this_tick's
+        # own docstring for why. In short -- has_requests() returns before
+        # schedule() is ever called on a rank with nothing locally ready, so a
+        # gate living inside schedule() would run on a busy rank but not an
+        # idle one, mismatching the collective call count every other rank's
+        # all_reduce expects and hanging the group. busy_loop's _sync_dp_state
+        # already guarantees this method is reached on every prefill rank or
+        # none, each tick -- this call has to sit inside that same guarantee,
+        # not behind a second, narrower one.
+        if not self.scheduler.should_fire_this_tick():
+            return False
         if not self.scheduler.has_requests():
             return False
         result = self.scheduler.schedule()

@@ -4518,6 +4518,68 @@ class PrefillScheduler:
             )
             logger.info("initialized shared memory")
         self._pending_lock = threading.Lock()
+        # Set post-construction by `PrefillEngineCore._maybe_attach_prefill_
+        # group_delayer`, once `self.dp_group` exists -- see
+        # `set_prefill_group_delayer`. A different gate from `PrefillDelayer`:
+        # that one lives on `DecodeScheduler` and holds back NEW admission;
+        # this one holds back THIS scheduler's own forward on sequences it
+        # already has.
+        self.prefill_group_delayer = None
+
+    def set_prefill_group_delayer(self, delayer) -> None:
+        self.prefill_group_delayer = delayer
+
+    @staticmethod
+    def _is_ready(seq: Sequence) -> bool:
+        """Has this seq's BlockAssignment fully landed?
+
+        BOTH halves, not just the block table. A `BlockAssignment` carries
+        `block_table` AND `state_slots`, and a model with a per-request cache
+        is unrunnable without the second: the batch's `state_slot_out` is
+        built from `[seq for seq in seqs.values() if seq.has_per_req_cache and
+        seq.state_slot >= 0]`, so a sequence admitted with blocks but no slot
+        silently drops out of that table while still occupying a row of the
+        grid. The draft block then indexes past the table's end -- "a Python
+        slice past the end truncates rather than raising, so the kernels got
+        a slot table shorter than their own grid and read past it" -- which
+        surfaces as a GPU memory access fault with no Python frame, not as an
+        error anyone can read.
+
+        One source of truth for `_schedule()`'s own admission filter and
+        `should_fire_this_tick()`'s pending-token scan, so the two can never
+        quietly disagree about what "ready" means.
+        """
+        return bool(seq.block_table) and (
+            not getattr(seq, "has_per_req_cache", False) or seq.state_slot >= 0
+        )
+
+    def should_fire_this_tick(self) -> bool:
+        """Gate for `PrefillGroupDelayer`: may this rank run a forward now?
+
+        MUST be called every tick `PrefillEngineCore._process_engine_step`
+        reaches, BEFORE the `has_requests()` short-circuit below it -- that
+        short-circuit returns before `schedule()` is ever called on a rank
+        with nothing locally ready, so a gate living inside `_schedule()`
+        would run on a busy rank but not an idle one, mismatching the
+        collective call count and hanging the group. `busy_loop`'s own
+        `_sync_dp_state` guarantees `_process_engine_step` is reached on every
+        prefill rank or none, each tick -- that is the invariant this relies
+        on, not anything local to this method.
+
+        True when no delayer is attached, so attaching one is the only way
+        this method's existence changes anything for an engine that never
+        opts in.
+        """
+        if self.prefill_group_delayer is None:
+            return True
+        pending = 0
+        any_ready = False
+        with self._pending_lock:
+            for seq in self.waiting:
+                if self._is_ready(seq):
+                    any_ready = True
+                    pending += seq.num_tokens - seq.num_cached_tokens
+        return self.prefill_group_delayer.should_allow_prefill(any_ready, pending)
 
     def decode_tokens(self) -> int:
         """Decode's in-flight token count on the paired rank, or 0."""
@@ -4593,27 +4655,9 @@ class PrefillScheduler:
         stores: list = []
 
         with self._pending_lock:
-            # Collect ready sequences (have received BlockAssignment from decode).
-            #
-            # BOTH halves of the assignment, not just the block table. A
-            # `BlockAssignment` carries `block_table` AND `state_slots`, and a
-            # model with a per-request cache is unrunnable without the second:
-            # the batch's `state_slot_out` is built from
-            # `[seq for seq in seqs.values()
-            #   if seq.has_per_req_cache and seq.state_slot >= 0]`,
-            # so a sequence admitted with blocks but no slot silently drops out
-            # of that table while still occupying a row of the grid. The draft
-            # block then indexes past the table's end -- "a Python slice past
-            # the end truncates rather than raising, so the kernels got a slot
-            # table shorter than their own grid and read past it" -- which
-            # surfaces as a GPU memory access fault with no Python frame, not
-            # as an error anyone can read.
-            ready = [
-                s
-                for s in self.waiting
-                if s.block_table
-                and (not getattr(s, "has_per_req_cache", False) or s.state_slot >= 0)
-            ]
+            # Collect ready sequences (have received BlockAssignment from
+            # decode) -- see `_is_ready` for what "ready" requires and why.
+            ready = [s for s in self.waiting if self._is_ready(s)]
 
             for seq in ready:
                 if num_seqs >= self.max_num_seqs:
