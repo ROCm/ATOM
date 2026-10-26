@@ -105,6 +105,17 @@ def mooncake_hca(local_rank, environ=os.environ):
     return f"rdma{int(devices[local_rank]) if devices else local_rank}"
 
 
+def nic_limits(device):
+    """The firmware-set MR limits (max_mr, max_mr_size, page_size_cap) that bound Mooncake registrations."""
+    import subprocess
+    try:
+        out = subprocess.run(["ibv_devinfo", "-v", "-d", device], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"unavailable ({exc})"
+    keys = ("fw_ver", "max_mr_size", "page_size_cap", "max_mr")
+    return " ".join(" ".join(line.split()) for line in out.splitlines() if line.strip().split(":")[0] in keys) or out[:200]
+
+
 class ManifestWorker(Worker):
     def compile_or_warm_up_model(self):
         result = super().compile_or_warm_up_model()
@@ -118,6 +129,9 @@ class ManifestWorker(Worker):
             # Read by every Mooncake TE discovery in this process; the connectors are built below.
             os.environ["MC_TE_FILTERS"] = mooncake_hca(self.local_rank)
             print(f"[C48] Mooncake rank={self.rank} MC_TE_FILTERS={os.environ['MC_TE_FILTERS']}", flush=True)
+            if self.local_rank == 0:
+                print(f"[C48] Mooncake {os.environ['MC_TE_FILTERS']} limits: {nic_limits(os.environ['MC_TE_FILTERS'])}",
+                      flush=True)
         with startup_stage(self, "initialize_from_config"):
             return super().initialize_from_config(kv_cache_config)
 

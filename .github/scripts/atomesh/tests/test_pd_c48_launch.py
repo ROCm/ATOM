@@ -48,7 +48,7 @@ class LaunchTest(unittest.TestCase):
                          "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600", "MC_MAX_MR_SIZE": str(256 << 20),
                          "C48_MOONCAKE_HCA_PER_GPU": "1"}
                 if store and role == "prefill":
-                    added["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
+                    added.update(GLIBC_TUNABLES="glibc.malloc.hugetlb=1", MC_MAX_MR_SIZE=str(4 << 20))
                 self.assertEqual({k: v for k, v in mc_env.items() if k not in src_env}, added)
                 self.assertEqual({k: v for k, v in src_env.items()}, {k: mc_env[k] for k in src_env})
                 t = transfer(mc_argv)
@@ -69,6 +69,19 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(mooncake_hca(3, {}), "rdma3")
         self.assertEqual(mooncake_hca(1, {"HIP_VISIBLE_DEVICES": "4,5,6,7"}), "rdma5")
         self.assertEqual(mooncake_hca(0, {"ROCR_VISIBLE_DEVICES": "6", "HIP_VISIBLE_DEVICES": "0"}), "rdma6")
+
+    def test_nic_limits_keeps_mr_lines(self):
+        sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
+        import subprocess
+        from unittest import mock
+        from pd_c48_worker import nic_limits
+        out = "hca_id:\trdma3\n\tfw_ver:\t\t1.2\n\tmax_mr_size:\t\t0x380000000\n\tpage_size_cap:\t\t0x40201000\n" \
+              "\tmax_qp:\t\t4096\n\tmax_mr:\t\t\t131072\n\tmax_mr_size_extra:\t\t1\n"
+        with mock.patch.object(subprocess, "run", return_value=types.SimpleNamespace(stdout=out)):
+            self.assertEqual(nic_limits("rdma3"),
+                             "fw_ver: 1.2 max_mr_size: 0x380000000 page_size_cap: 0x40201000 max_mr: 131072")
+        with mock.patch.object(subprocess, "run", side_effect=FileNotFoundError("ibv_devinfo")):
+            self.assertTrue(nic_limits("rdma3").startswith("unavailable"))
 
     def test_simple_cpu_case_ignores_lmcache_port(self):
         config = json.loads((GAP / "V-QD.json").read_text())
