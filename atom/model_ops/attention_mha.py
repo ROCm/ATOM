@@ -21,6 +21,7 @@ from atom.model_ops.base_attention import (
     run_pa_decode,
     run_pa_fwd_asm,
 )
+from atom.model_ops.prefill_workspace import run_grouped_prefill
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -99,6 +100,9 @@ class PagedAttentionImpl(nn.Module):
         self.use_flash_layout = False
 
         self.supports_quant_query_input = False
+        self.gqa_prefill_kv_workspace_bytes = (
+            get_current_atom_config().gqa_prefill_kv_workspace_mb * (1 << 20)
+        )
 
     def process_weights_after_loading(self):
         if (
@@ -866,7 +870,33 @@ class PagedAttentionImpl(nn.Module):
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
+        # Per-layer dispatch has selected dense MHA/GQA gather + FMHA here.
+        # Sparse/MLA/linear attention and direct paged reads never enter this
+        # wrapper. MHA (including Eagle's equal Q/KV head counts) is eligible.
+        if (
+            self.gqa_prefill_kv_workspace_bytes
+            and fwd_ctx.context.is_prefill
+            and fwd_ctx.attn_metadata.has_cached
+        ):
+            return run_grouped_prefill(
+                self._prefill_attention,
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                fwd_ctx,
+                self.gqa_prefill_kv_workspace_bytes,
+            )
+        return self._prefill_attention(
+            q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+        )
 
+    def _prefill_attention(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
         # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
         # Prefix-cache hit: gather cached+new KV from the paged cache into a

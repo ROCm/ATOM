@@ -70,6 +70,7 @@ def make_runner(
         kv_cache_dtype="bf16",
         index_cache_dtype="fp4" if fp4 else "fp8",
         attn_prefill_chunk_size=0,
+        gqa_prefill_kv_workspace_mb=0,
         compilation_config=SimpleNamespace(static_forward_context={}),
         speculative_config=SimpleNamespace(num_speculative_tokens=q - 1),
         hf_config=SimpleNamespace(
@@ -493,6 +494,8 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
     from atom.model_ops.attentions import aiter_mla
 
     runner, builder = make_runner(monkeypatch, pp=pp, sparse=True, tbo=False)
+    runner.config.gqa_prefill_kv_workspace_mb = 8192
+    snapshots = []
     monkeypatch.setattr(aiter_mla, "get_mla_metadata_v1", lambda *a, **kw: None)
     saved = []
     for step in range(4):
@@ -519,6 +522,15 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
             runner.forward_vars[name].gpu.fill_(-99)
         torch.cuda._sleep(3_000_000)
         md, _ = builder.prepare_prefill(batch, 4, batch.total_tokens_num)
+        # MLA metadata also feeds MHA Eagle layers. Keep real request lengths
+        # owned across staging-buffer reuse and exclude the two padded rows.
+        snapshots.append(
+            (
+                md.prefill_request_lengths,
+                (0, *map(int, np.cumsum(counts))),
+                (0, *map(int, np.cumsum(lens))),
+            )
+        )
         starts, bids, selected = [], [], []
         base = 0
         for i, (n, old) in enumerate(zip(counts, prefix)):
@@ -555,6 +567,9 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
     torch.cuda.synchronize()
     for actual, expected in saved:
         assert actual.cpu().tolist() == expected
+    for lengths, expected_q, expected_k in snapshots:
+        assert lengths.cu_q_lens == expected_q
+        assert lengths.cu_k_lens == expected_k
 
 
 @pytest.mark.parametrize("transport", ["direct", "packed"])
