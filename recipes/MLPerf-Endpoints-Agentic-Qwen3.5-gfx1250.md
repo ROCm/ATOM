@@ -105,5 +105,11 @@ points with points. `ep_drift.py <events.jsonl>` profiles a run in 5-minute bins
    fixed.
 2. DP4 + EP4 without the cap once hit a GPU memory fault on one rank a minute in and hung the
    others (`HSA_STATUS_ERROR_MEMORY_FAULT`); not seen with the cap.
-3. GSM8K with prefix caching on is not yet checked on this image (the image's own Qwen3.5 scripts
+3. With the 2026-10-26 heads of `alizaidy/gfx1250-qwen-support` (ATOM 3fd8f4a8, aiter 2fcdd108,
+   the fused MoE routing integration) on the 20261026 image, TP4 serving (MTP3, 8k prompts, c16)
+   faults in `moe_route_psum_fused` within minutes, with or without mono; DP4 + EP4 at c2048
+   passed the server checks. The image's own ATOM / aiter (c0883e9d9 / e64eb08eb) do not fault.
+   After switching aiter branches, delete the image's prebuilt `aiter/jit/*.so` so they rebuild:
+   the prebuilt `topk_softmax` does not take the new routing argument.
+4. GSM8K with prefix caching on is not yet checked on this image (the image's own Qwen3.5 scripts
    serve without prefix caching for accuracy at TP>1). The prefix-cache check above is the gate here.
