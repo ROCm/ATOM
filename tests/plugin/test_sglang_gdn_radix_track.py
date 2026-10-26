@@ -262,7 +262,7 @@ def _patched_decode_runner(monkeypatch):
 
     class _Runner:
         def __init__(self):
-            self.model_runner = SimpleNamespace(attn_backend="backend")
+            self.model_runner = SimpleNamespace(attn_backend="backend", model="model")
 
         def capture_one_shape(self, *args, **kwargs):
             return None
@@ -286,15 +286,27 @@ def _patched_decode_runner(monkeypatch):
 
 
 def test_decode_graph_epilogue_snapshots_after_replay(monkeypatch):
-    seen = []
+    """Both halves of a slot's state are snapshotted after replay: the GDN
+    state and Flash's PLE history, which lives in its own buffers."""
+    from atom.plugin.sglang import qwen4_exp_bridge
+
+    seen, ple_seen = [], []
     monkeypatch.setattr(
         attention_gdn,
         "track_mamba_radix_after_decode_graph",
         lambda fb, attn_backend: seen.append((fb, attn_backend)),
     )
+    monkeypatch.setattr(
+        qwen4_exp_bridge,
+        "track_ple_radix_slots",
+        lambda fb, attn_backend=None, model=None: ple_seen.append(
+            (fb, attn_backend, model)
+        ),
+    )
     runner = _patched_decode_runner(monkeypatch)
     assert runner.execute("fb") == ("replayed", "fb")
     assert seen == [("fb", "backend")]
+    assert ple_seen == [("fb", "backend", "model")]
 
 
 def test_decode_graph_epilogue_failure_is_not_swallowed(monkeypatch):

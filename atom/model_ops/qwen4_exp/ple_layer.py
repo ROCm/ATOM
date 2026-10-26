@@ -521,7 +521,6 @@ class Qwen4ExpPLELayer(nn.Module):
             hidden_states, input_ids, metadata.query_start_loc, ngram_context
         )
         normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
-        self._track_radix_state(metadata, input_ids, normalized)
         conv_output = self._short_conv(
             normalized,
             metadata.query_start_loc,
@@ -531,6 +530,11 @@ class Qwen4ExpPLELayer(nn.Module):
             metadata.has_initial_state,
             metadata.num_accepted_tokens,
         )
+        # After both halves advance: the n-gram history moved in
+        # ``advance_ngram_state`` above and the convolution window in
+        # ``_short_conv``, so a decode row copy would otherwise mix a window
+        # from before this token with ids from after it.
+        self._track_radix_state(metadata, input_ids, normalized)
         return gated_value.flatten(-2) + conv_output
 
     @staticmethod

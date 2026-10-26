@@ -189,6 +189,79 @@ def test_decode_track_slots_drop_graph_pad_rows(pad_slot):
     assert dst.tolist() == [6] and src.tolist() == [2]
 
 
+def _layer_stub(model, advance_conv_by):
+    """Minimal stand-in for the parts of the PLE layer `forward_with_state` uses.
+
+    `_short_conv` advances the working slot the way the real kernel does, so a
+    snapshot taken before it would capture the previous token's window.
+    """
+    return SimpleNamespace(
+        ple_embedding=SimpleNamespace(eos_token_id=EOS, ngram_size=NGRAM_WIDTH + 1),
+        norm_conv=None,
+        gated_memory=lambda *a, **k: torch.zeros(1, 1, CHANNELS),
+        _apply_norm=lambda norm, x: x,
+        _short_conv=lambda inputs, qsl, state, idx_in, idx_out, init, accepted: (
+            state.__setitem__(idx_out.long(), advance_conv_by),
+            torch.zeros(1, CHANNELS),
+        )[1],
+        _track_radix_state=Qwen4ExpPLELayer._track_radix_state,
+    )
+
+
+def test_decode_snapshot_runs_after_both_halves_advance(monkeypatch):
+    """The window and the n-gram ids must describe the same token position."""
+    from atom.model_ops.qwen4_exp import ple_layer as layer_mod
+
+    model = _model()
+    advanced_ngram = 21
+
+    def fake_advance(input_ids, qsl, state, idx_in, idx_out, *a, **k):
+        state[idx_out.long()] = advanced_ngram
+        return torch.zeros(1, NGRAM_WIDTH)
+
+    monkeypatch.setattr(layer_mod, "advance_ngram_state", fake_advance)
+    md = _metadata(model, track_dst=torch.tensor([7]), track_src=torch.tensor([0]))
+
+    Qwen4ExpPLELayer.forward_with_state(
+        _layer_stub(model, advance_conv_by=5.0),
+        torch.zeros(1, 1, CHANNELS),
+        torch.zeros(1, dtype=torch.long),
+        md,
+    )
+
+    assert model._atom_ple_conv_state[7].eq(5.0).all()
+    assert model._atom_ple_ngram_state[7].eq(advanced_ngram).all()
+
+
+def test_graph_epilogue_uses_live_slots_not_the_last_built_metadata():
+    """Replay does not rebuild PLE metadata, so the stale one would name the
+    slots of whatever forward ran eagerly before -- usually a prefill."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    model = _model()
+    model._atom_ple_conv_state[3] = 8.0
+    model._atom_ple_ngram_state[3] = 17
+    live = SimpleNamespace(
+        linear_attn_backend=SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                mamba_cache_indices=torch.tensor([3, 4], dtype=torch.int32)
+            )
+        )
+    )
+    fb = SimpleNamespace(
+        batch_size=2,
+        forward_mode=SimpleNamespace(is_decode_or_idle=lambda: True),
+        mamba_track_mask=torch.tensor([True, False]),
+        mamba_track_indices=torch.tensor([6, 7], dtype=torch.int32),
+    )
+
+    bridge.track_ple_radix_slots(fb, attn_backend=live, model=model)
+
+    assert model._atom_ple_conv_state[6].eq(8.0).all()
+    assert model._atom_ple_ngram_state[6].eq(17).all()
+    assert model._atom_ple_conv_state[7].abs().sum() == 0
+
+
 def test_decode_track_slots_absent_when_nothing_is_tracked():
     fb = SimpleNamespace(
         mamba_track_mask=torch.tensor([False, False]),

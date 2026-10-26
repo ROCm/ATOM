@@ -1475,26 +1475,48 @@ def _ple_decode_track_slots(
     return dst, src
 
 
-def track_ple_radix_slots(forward_batch: Any) -> None:
+def track_ple_radix_slots(
+    forward_batch: Any, attn_backend: Any = None, model: Any = None
+) -> None:
     """Post-replay PLE snapshot for a decode graph.
 
     Eager decode does this inside the PLE forward. A replayed graph cannot:
     the slots would be baked at capture, the same reason the GDN track skips
-    capture, so the epilogue re-runs it against the live metadata.
+    capture, so the epilogue re-runs it after replay.
+
+    Everything is resolved live. The last built PLE metadata is not usable
+    here: replay does not rebuild it, so it still describes whatever forward
+    ran eagerly before this one -- typically a prefill, with its own slot
+    vector and batch size.
     """
-    ple = _DECODE_GRAPH.last_ple
-    if ple is None or forward_batch is None:
+    if forward_batch is None or model is None:
         return
     mode = getattr(forward_batch, "forward_mode", None)
     if mode is None or not mode.is_decode_or_idle():
         return
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         return
-    dst, src = _ple_decode_track_slots(forward_batch, ple.state_indices_out)
+    conv_state = getattr(model, "_atom_ple_conv_state", None)
+    ngram_state = getattr(model, "_atom_ple_ngram_state", None)
+    if not torch.is_tensor(conv_state) or not torch.is_tensor(ngram_state):
+        return
+    from atom.plugin.sglang.attention_backend.attention_gdn import (
+        SGLangGDNForwardContext,
+    )
+
+    if attn_backend is None:
+        attn_backend = resolve_attn_backend(forward_batch)
+    linear = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+    metadata = getattr(linear, "forward_metadata", None)
+    cache_indices = getattr(metadata, "mamba_cache_indices", None)
+    if cache_indices is None:
+        return
+    bs = int(forward_batch.batch_size)
+    dst, src = _ple_decode_track_slots(forward_batch, cache_indices[:bs])
     if dst is None:
         return
-    ple.conv_state[dst] = ple.conv_state[src]
-    ple.ngram_state[dst] = ple.ngram_state[src]
+    conv_state[dst] = conv_state[src]
+    ngram_state[dst] = ngram_state[src]
 
 
 def _build_decode_graph_ple_metadata(
@@ -1631,7 +1653,7 @@ def build_ple_metadata(
         # epilogue calls ``track_ple_radix_slots`` with the live metadata.
         track_dst, track_src = _ple_decode_track_slots(forward_batch, idx)
 
-    _DECODE_GRAPH.last_ple = Qwen4ExpPLEMetadata(
+    return Qwen4ExpPLEMetadata(
         query_start_loc=query_start_loc,
         ngram_state=ngram_state,
         state_indices_in=idx_in,
@@ -1644,7 +1666,6 @@ def build_ple_metadata(
         track_conv_indices=track_conv,
         track_ngram_indices=track_ngram,
     )
-    return _DECODE_GRAPH.last_ple
 
 
 def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:

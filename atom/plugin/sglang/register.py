@@ -167,7 +167,11 @@ def _install_decode_graph_forward_context_patch() -> None:
             )
             # Flash keeps its PLE history beside the GDN state; a track slot
             # with only half of it resumes from a mismatched window.
-            track_ple_radix_slots(forward_batch)
+            track_ple_radix_slots(
+                forward_batch,
+                attn_backend=self.model_runner.attn_backend,
+                model=self.model_runner.model,
+            )
             return output
 
         DecodeCudaGraphRunner.execute = execute_with_mamba_track_epilogue
