@@ -793,7 +793,9 @@ models:
             cudagraph: none
             extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 512 --timeout-keep-alive 900"
           env:
-            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            common:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+              ATOM_ENABLE_METRICS_DEVICE_TIMER: "0"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
               VLLM_PP_LAYER_PARTITION: "20,20,20,18"
