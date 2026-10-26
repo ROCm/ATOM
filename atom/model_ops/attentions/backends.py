@@ -128,6 +128,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        *,
+        ubatch_split_bs: int | None = None,
     ):
         raise NotImplementedError
 
@@ -1002,8 +1004,14 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        *,
+        ubatch_split_bs: int | None = None,
     ):
         """Build this step's metadata at the shape `prepare_inputs` settled.
+
+        ``ubatch_split_bs`` is the decode batch the step's TBO micro-batches
+        are cut from (`ForwardMode.ubatch_split_bs`), which a backend's
+        per-ubatch metadata covers (`_ubatch_split_bs`).
 
         The step's two units and nothing else: `running_bs` sizes everything
         per-sequence, `running_tokens` everything per-row. Both arrive as
@@ -1021,6 +1029,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         sampler's rows, so the LM head emits `running_bs` of them. `postprocess`
         cuts back to the scheduled batch, and that is the one place it does.
         """
+        self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
         if state_ops.relocations:
@@ -1042,6 +1051,10 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             return self.prepare_prefill(batch, running_bs, running_tokens)
         else:
             return self.prepare_decode(batch, running_bs, running_tokens, max_seqlen_q)
+
+    # The decode batch this step's TBO micro-batches are cut from (`build`).
+    # None: they cut the scheduled requests, as an eager split does.
+    _ubatch_split_bs: int | None = None
 
     # Whether `prepare_prefill` builds a prefill padded past its scheduled rows
     # (`running_tokens`), as a token-graph bucket pads it

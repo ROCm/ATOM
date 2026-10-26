@@ -356,6 +356,8 @@ def test_device_walk_plan_is_the_host_plan(position_max):
             r: torch.full((CTAS, 4), -9, dtype=torch.int32, device="cuda")
             for r in ratios
         }
+        # a token-parallel step's rank plans its own rows (TP 4: rank 1's)
+        lo, n = (rows // 4, rows // 4) if rows % 4 == 0 else (0, rows)
         write_step_meta(
             step,
             SimpleNamespace(window_size=128),
@@ -363,14 +365,16 @@ def test_device_walk_plan_is_the_host_plan(position_max):
             torch.empty(rows, dtype=torch.int32, device="cuda"),
             torch.empty(rows, KMETA, dtype=torch.int32, device="cuda"),
             plans,
+            (lo, n),
         )
         for ratio, plan in plans.items():
             expected = np.full((CTAS, 4), -9, dtype=np.int32)
             ip.fill_walk_plan(
-                (np.asarray(positions) + 1) // ratio,
-                ip.walk_pieces(np.asarray(owners, dtype=np.int32)),
+                ((np.asarray(positions) + 1) // ratio)[lo : lo + n],
+                ip.walk_pieces(np.asarray(owners, dtype=np.int32)[lo : lo + n]),
                 expected,
             )
+            expected[expected[:, 1] > 0, 0] += lo
             assert plan.cpu().numpy().tolist() == expected.tolist(), (
                 ratio,
                 owners,
