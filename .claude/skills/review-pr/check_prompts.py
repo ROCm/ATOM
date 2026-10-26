@@ -80,7 +80,7 @@ def check_fail_classes():
     spec = importlib.util.spec_from_file_location("_notify", HERE / "_notify.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    known = set(mod.CLASSES)
+    known = set(mod.OWNERS)
     unknown = emitted - known
     if unknown:
         print(f"\u274c run_one.sh emits fail classes unknown to _notify.py: {sorted(unknown)}")
