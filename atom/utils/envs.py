@@ -223,6 +223,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_PREFILL_COST_CAP": lambda: float(
         os.getenv("ATOM_DP_PREFILL_COST_CAP", "0") or "0"
     ),
+    # Fraction of a prefill step's token budget (and, under DP cost balancing,
+    # of its cost target) that resumed partial prefills leave to waiting
+    # requests whenever any is admittable. Without it a long chunked prefill
+    # takes the whole step on every step until it finishes, and short turns
+    # queued behind it on the same rank wait out the entire prompt -- while
+    # the other DP ranks may be idle. Only applies while something waits, so
+    # a lone long prefill still runs at the full budget. 0 (default) = off.
+    "ATOM_PREFILL_WAITING_RESERVE": lambda: min(
+        max(float(os.getenv("ATOM_PREFILL_WAITING_RESERVE", "0") or "0"), 0.0), 0.9
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force

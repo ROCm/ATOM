@@ -656,6 +656,7 @@ class Scheduler:
         self._balance_slack = envs.ATOM_DP_PREFILL_BALANCE_SLACK
         self._balance_min_tokens = envs.ATOM_DP_PREFILL_BALANCE_MIN_TOKENS
         self._balance_cost_cap = envs.ATOM_DP_PREFILL_COST_CAP
+        self._waiting_reserve = envs.ATOM_PREFILL_WAITING_RESERVE
         # This tick's prefill cost limit and what admission has spent of it;
         # see `_prefill_room`.
         self._tick_cost_limit = math.inf
@@ -2056,6 +2057,17 @@ class Scheduler:
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
         if delayer_allows and self._partial_prefill_count > 0:
+            # ATOM_PREFILL_WAITING_RESERVE: while new prefills wait, partials
+            # leave them a share of the token budget and the cost target.
+            reserve_tokens = 0
+            step_cost_limit = self._tick_cost_limit
+            if (
+                self._waiting_reserve > 0
+                and next(self._waiting_prefills(), None) is not None
+            ):
+                reserve_tokens = int(self.max_num_batched_tokens * self._waiting_reserve)
+                if step_cost_limit < math.inf:
+                    self._tick_cost_limit = step_cost_limit * (1 - self._waiting_reserve)
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
@@ -2067,7 +2079,7 @@ class Scheduler:
                     seq,
                     start,
                     resume,
-                    num_batched_tokens,
+                    num_batched_tokens + reserve_tokens,
                     cap_from=max(resume, seq.replay_until),
                 )
                 if chunk:
@@ -2081,6 +2093,8 @@ class Scheduler:
                 seq.type = SequenceType.PREFILL
                 scheduled_seqs[seq.id] = seq
                 num_scheduled_tokens.append(chunk)
+
+            self._tick_cost_limit = step_cost_limit
 
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
