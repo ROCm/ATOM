@@ -167,7 +167,8 @@
         "MC_MAX_CONCURRENT_REG_MR": "1",
         "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
         "MC_MAX_MR_SIZE": "268435456",
-        "C48_MOONCAKE_HCA_PER_GPU": "1"
+        "C48_MOONCAKE_HCA_PER_GPU": "1",
+        "MC_IB_TC": "104"
       }
     },
     "decode": {
@@ -285,7 +286,8 @@
         "MC_MAX_CONCURRENT_REG_MR": "1",
         "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
         "MC_MAX_MR_SIZE": "268435456",
-        "C48_MOONCAKE_HCA_PER_GPU": "1"
+        "C48_MOONCAKE_HCA_PER_GPU": "1",
+        "MC_IB_TC": "104"
       }
     }
   },

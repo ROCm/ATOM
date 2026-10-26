@@ -46,7 +46,7 @@ class LaunchTest(unittest.TestCase):
                 self.assertEqual(mc_argv[:i] + mc_argv[i + 1:], src_argv[:i] + src_argv[i + 1:])
                 added = {"MC_GID_INDEX": "1", "MC_MAX_CONCURRENT_REG_MR": "1",
                          "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600", "MC_MAX_MR_SIZE": str(256 << 20),
-                         "C48_MOONCAKE_HCA_PER_GPU": "1"}
+                         "C48_MOONCAKE_HCA_PER_GPU": "1", "MC_IB_TC": "104"}
                 if store and role == "prefill":
                     added.update(GLIBC_TUNABLES="glibc.malloc.hugetlb=1", MC_MAX_MR_SIZE=str(1 << 30),
                                  C48_MOONCAKE_STORE_COMPACT="1")
