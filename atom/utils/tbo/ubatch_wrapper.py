@@ -3,16 +3,16 @@
 
 import logging
 import threading
-import traceback
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import TypeAlias
 
+import numpy as np
 import torch
 from torch import nn
 
 from atom.utils.forward_context import (
     Context,
+    DPMetadata,
     ForwardContext,
     _forward_context_local,
     get_forward_context,
@@ -24,15 +24,6 @@ from .ubatching import make_tbo_contexts
 logger = logging.getLogger("atom")
 
 UBatchModelOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
-
-
-@dataclass
-class TBOGraphData:
-    """Stores a captured CUDAGraph alongside objects that must stay alive."""
-
-    graph: torch.cuda.CUDAGraph
-    tbo_ctxs: list  # keep torch.Event objects alive for replay
-    output: UBatchModelOutput | None = None  # output reference from capture
 
 
 class UBatchWrapper(nn.Module):
@@ -51,8 +42,6 @@ class UBatchWrapper(nn.Module):
         self.comm_stream: torch.cuda.Stream | None = None
         # Barrier: ubatch threads + main thread
         self.ready_barrier = threading.Barrier(3)  # 2 ubatch threads + 1 main
-        # TBO CUDAGraph storage: keyed by (running_bs, max_q_len)
-        self.tbo_graphs: dict[tuple, TBOGraphData] = {}
 
         # Persistent ubatch worker pool. Previously every forward spawned + joined
         # 2 threads.
@@ -126,7 +115,9 @@ class UBatchWrapper(nn.Module):
         # When using DP gather/scatter (no EP/all2all), compute the
         # DP-synchronized per-ubatch row count so MoE's pad_for_all_gather can
         # just read context.running_tokens.  MORI path doesn't need this.
-        dp_size = self._get_dp_size() if self.dp_gather_scatter else 1
+        dp_size = (
+            len(ctx.context.running_tokens_across_dp) if self.dp_gather_scatter else 1
+        )
         ub_running_tokens_list = self._compute_ub_running_tokens(
             ctx,
             N,
@@ -259,143 +250,6 @@ class UBatchWrapper(nn.Module):
         sorted_results = [value for _, value in sorted(results)]
         return self._concat_ubatch_outputs(sorted_results)
 
-    def capture_tbo_graph(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        graph_pool,
-        capture_stream: torch.cuda.Stream,
-        output_buffer: torch.Tensor | None = None,
-    ) -> tuple[torch.cuda.CUDAGraph, UBatchModelOutput]:
-        """Capture a CUDAGraph for TBO ubatch execution.
-
-        Threads are started and cuBLAS is initialized BEFORE graph capture
-        begins (following vLLM's _capture_ubatches pattern). Only the model
-        forward execution happens during capture.
-
-        If output_buffer is provided, the concatenated output is copied into
-        it inside the graph capture so replay writes to the same buffer.
-
-        Returns (graph, output_tensor).
-        """
-        self._ensure_comm_stream()
-        ctx = get_forward_context()
-        N = len(ctx.ubatch_slices)
-        compute_stream = capture_stream
-
-        # Build per-ubatch ForwardContexts from pre-allocated forward_vars.
-        full_running_bs = ctx.context.running_bs
-        max_q = int(getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1)
-        ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
-        forward_contexts = []
-        ub_inputs = []
-        for i, ub_slice in enumerate(ctx.ubatch_slices):
-            if i < N - 1:
-                ub_running_bs = full_running_bs // N
-            else:
-                ub_running_bs = full_running_bs - (full_running_bs // N) * (N - 1)
-            ub_ctx = self._make_ubatch_context(
-                ctx,
-                ub_slice,
-                ub_running_bs,
-                i,
-                ub_running_tokens=ub_running_bs * max_q,
-                dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
-                running_tokens_across_dp=self._ub_tokens_across_dp(ctx, N, i),
-            )
-            forward_contexts.append(ub_ctx)
-            ub_inputs.append(
-                (
-                    input_ids[ub_slice.token_slice],
-                    positions[ub_slice.token_slice],
-                )
-            )
-
-        tbo_ctxs = make_tbo_contexts(
-            num_micro_batches=N,
-            compute_stream=compute_stream,
-            comm_stream=self.comm_stream,
-            forward_contexts=forward_contexts,
-            ready_barrier=self.ready_barrier,
-        )
-
-        results: list[tuple[int, UBatchModelOutput]] = []
-        errors: list[Exception | None] = [None] * N
-        device = input_ids.device
-
-        @torch.inference_mode()
-        def _capture_thread(idx):
-            try:
-                torch.cuda.set_device(device)
-                # Initialize cuBLAS on both streams BEFORE barrier.
-                # This prevents workspace allocation during graph capture.
-                with torch.cuda.stream(tbo_ctxs[idx].compute_stream):
-                    _ = torch.cuda.current_blas_handle()
-                with torch.cuda.stream(tbo_ctxs[idx].comm_stream):
-                    _ = torch.cuda.current_blas_handle()
-
-                ub_input_ids, ub_positions = ub_inputs[idx]
-                with tbo_ctxs[idx]:
-                    model_output = self.model(ub_input_ids, ub_positions)
-                results.append((idx, self._validate_ubatch_output(model_output)))
-            except Exception as e:
-                traceback.print_exc()
-                errors[idx] = e
-
-        saved_ctx = getattr(_forward_context_local, "ctx", None)
-        _forward_context_local.ctx = None
-
-        try:
-            # Start threads — cuBLAS init happens before barrier
-            threads = []
-            for i in range(N):
-                t = threading.Thread(target=_capture_thread, args=(i,))
-                threads.append(t)
-                t.start()
-
-            # Wait for all threads to be ready (past cuBLAS init, at barrier)
-            self.ready_barrier.wait()
-
-            # Capture the CUDAGraph
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=graph_pool, stream=capture_stream):
-                # Wake thread 0 — all GPU work from threads is captured
-                tbo_ctxs[0].cpu_wait_event.set()
-                for t in threads:
-                    t.join()
-                # Concatenate results (this op is captured too)
-                sorted_results = [v for _, v in sorted(results)]
-                output = self._concat_ubatch_outputs(sorted_results)
-                # capture_tbo_graph bypasses nn.Module.__call__, so registered
-                # forward hooks don't fire. Run them here (inside the graph) so
-                # drafter aux capture (EAGLE3 tuple-strip) writes its buffers as
-                # captured ops; a hook returning a value replaces the output,
-                # mirroring __call__ semantics.
-                for hook in self._forward_hooks.values():
-                    hooked = hook(self, (input_ids, positions), output)
-                    if hooked is not None:
-                        output = hooked
-                # Copy into caller's buffer so replay writes to the right place
-                if output_buffer is not None:
-                    output_buffer.copy_(self._primary_output(output))
-        finally:
-            _forward_context_local.ctx = saved_ctx
-
-        for e in errors:
-            if e is not None:
-                raise e
-
-        # Store TBOContext objects to keep torch.Event alive during replay
-        graph_key = (ctx.context.running_bs, ctx.attn_metadata.max_seqlen_q)
-        self.tbo_graphs[graph_key] = TBOGraphData(
-            graph=graph,
-            tbo_ctxs=tbo_ctxs,
-            output=output,
-        )
-        logger.info(f"[TBO] Captured CUDAGraph for {graph_key}")
-
-        return graph, output
-
     @staticmethod
     def _concat_ubatch_outputs(
         outputs: list[UBatchModelOutput],
@@ -421,13 +275,6 @@ class UBatchWrapper(nn.Module):
         return hidden_states, aux_hidden_states
 
     @staticmethod
-    def _primary_output(output: UBatchModelOutput) -> torch.Tensor:
-        """Return the tensor backed by ModelRunner's preallocated output buffer."""
-        if isinstance(output, tuple):
-            return output[0]
-        return output
-
-    @staticmethod
     def _validate_ubatch_output(output: object) -> UBatchModelOutput:
         """Accept only the TBO output contracts: Tensor or Eagle3 aux tuple."""
         if isinstance(output, torch.Tensor):
@@ -446,16 +293,6 @@ class UBatchWrapper(nn.Module):
             f"{type(output).__name__}"
         )
 
-    @staticmethod
-    def _get_dp_size() -> int:
-        """Return DP world size (1 if DP is not active)."""
-        try:
-            from aiter.dist.parallel_state import get_dp_group
-
-            return get_dp_group().world_size
-        except Exception:
-            return 1
-
     def _make_ubatch_dp_metadata(self, ctx: ForwardContext, N: int):
         """Build per-ubatch :class:`DPMetadata` so the MoE DP collective uses
         each ubatch's own per-rank token counts.
@@ -464,22 +301,16 @@ class UBatchWrapper(nn.Module):
         context (the shared metadata is then reused, which is correct for the
         single-rank case). Otherwise returns a list of length ``N``.
 
-        Each ubatch's per-rank token count is obtained with the same CPU
-        all_reduce that :meth:`DPMetadata.num_tokens_across_dp` uses, one per
-        ubatch. This is a CPU collective (cheap) and keeps every rank's
-        all_gatherv / reduce_scatterv consistently sized.
+        Each ubatch's per-rank tokens are the step's sync's own
+        (`ub_tokens_across_dp`): `local_tbo_precompute` sizes them exactly as
+        the slices are cut, so no collective of its own is needed.
         """
         if ctx.dp_metadata is None:
             return None
-        from atom.config import get_current_atom_config
-        from atom.utils.forward_context import DPMetadata
-
-        parallel_config = get_current_atom_config().parallel_config
-        metas = []
-        for ub_slice in ctx.ubatch_slices:
-            ub_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-            metas.append(DPMetadata.make(parallel_config, int(ub_tokens), None))
-        return metas
+        return [
+            DPMetadata(np.asarray(ctx.ub_tokens_across_dp[i], dtype=np.int32))
+            for i in range(N)
+        ]
 
     @staticmethod
     def _ub_tokens_across_dp(ctx: ForwardContext, N: int, i: int):
@@ -541,11 +372,11 @@ class UBatchWrapper(nn.Module):
             ):
                 # Precomputed via the packed DP reduce — no extra all_reduce.
                 return list(ctx.ub_max_tokens_across_dp)
-            ub_sizes = []
-            for ub_slice in ctx.ubatch_slices:
-                ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-                ub_sizes.append(ub_num_tokens)
-            return ub_sizes
+            # A prefill ubatch runs the rows it scheduled.
+            return [
+                ub_slice.token_slice.stop - ub_slice.token_slice.start
+                for ub_slice in ctx.ubatch_slices
+            ]
         max_q = int(getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1)
         return [
             UBatchWrapper._decode_ub_running_bs(ctx, i, N, full_running_bs) * max_q
@@ -581,11 +412,11 @@ class UBatchWrapper(nn.Module):
             )
 
         # Split Context
-        ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
+        ub_scheduled_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
         if ub_running_tokens is not None:
             running_tokens = ub_running_tokens
         elif ctx.context.is_prefill:
-            running_tokens = ub_num_tokens
+            running_tokens = ub_scheduled_tokens
         else:
             running_tokens = ub_running_bs * int(
                 getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
@@ -595,7 +426,7 @@ class UBatchWrapper(nn.Module):
             is_prefill=ctx.context.is_prefill,
             is_dummy_run=ctx.context.is_dummy_run,
             scheduled_bs=ub_num_reqs,
-            scheduled_tokens=ub_num_tokens,
+            scheduled_tokens=ub_scheduled_tokens,
             running_bs=ub_running_bs,
             running_tokens=running_tokens,
             running_tokens_across_dp=running_tokens_across_dp,

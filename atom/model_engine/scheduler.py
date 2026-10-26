@@ -45,6 +45,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Replay,
@@ -59,6 +60,7 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
 )
+from atom.observability import tracing
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -490,6 +492,18 @@ class ScheduledBatch:
             return True
         return any(self.is_final_chunk)
 
+    def final_prefill_requests(self) -> int:
+        """The requests whose prompt this batch's prefill finishes; none for a
+        dummy batch, whose rows belong to no request."""
+        if self.is_dummy_run or not self.total_seqs_num_prefill:
+            return 0
+        finals = self.is_final_chunk
+        return sum(
+            1
+            for i, n in enumerate(self.num_scheduled_tokens)
+            if n and (finals is None or finals[i])
+        )
+
 
 def _cut_floor(seq: Sequence, start: int, resume: int) -> int:
     """Where a checkpoint cut of a forward from `start` must land above: where
@@ -523,6 +537,11 @@ class ScheduledBatchOutput:
         num_rejected: Per-request count of rejected speculative tokens.
         num_bonus: Per-request count of bonus accepted tokens.
         is_deferred_out: Whether output was deferred from a previous step.
+
+    NumPy views are copied before the result enters the output queue. Views
+    returned by asynchronous D2H copies otherwise keep pinned tensor storage
+    alive until the transport thread replaces its previous result, putting
+    pinned-memory allocator work on the next result's serialization path.
     """
 
     def __init__(
@@ -539,9 +558,9 @@ class ScheduledBatchOutput:
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
-        self.draft_token_ids = draft_token_ids
-        self.num_rejected = num_rejected
-        self.num_bonus = num_bonus
+        self.draft_token_ids = self._copy_array_view(draft_token_ids)
+        self.num_rejected = self._copy_array_view(num_rejected)
+        self.num_bonus = self._copy_array_view(num_bonus)
         self.is_deferred_out = is_deferred_out
         self.is_prev_prefill = is_prev_prefill
         self.logprobs = logprobs  # Optional[dict[int, float]]
@@ -552,6 +571,14 @@ class ScheduledBatchOutput:
         self.dspark_ell = dspark_ell
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
+
+    @staticmethod
+    def _copy_array_view(value):
+        # Keep already-owned arrays and non-array values unchanged. In
+        # particular, this does not allocate anything for output-less batches.
+        if isinstance(value, np.ndarray) and not value.flags.owndata:
+            return value.copy()
+        return value
 
     def get_idx(self, req_id: int) -> int | None:
         """O(1) lookup of request index by id."""
@@ -586,7 +613,13 @@ class Scheduler:
         config: Config,
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+        prefill_token_graphs: bool = False,
     ):
+        # The runners recorded prefill token graphs
+        # (`ModelRunner.prefill_token_graphs`), not merely configured them: a
+        # backend without `supports_token_graph` records none, and its idle DP
+        # rank has no bucket to dummy-prefill on.
+        self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         # DP prefill cost balancing, on whenever DP attention runs more than
@@ -853,8 +886,25 @@ class Scheduler:
 
         # Set by EngineCore for cross-DP alignment or opt-in TP decode protection.
         self.prefill_delayer: PrefillDelayer | None = None
+        # requests added since the previous schedule, the delayer's to weigh
+        self._arrived_requests = 0
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
+        # This tick is the DP group's prefill step and this rank has none of its
+        # own: EngineCore runs a dummy prefill instead of a decode.
+        self.dummy_prefill = False
+
+    def _group_prefill_tick(self, decision: PrefillDecision) -> bool:
+        """Whether some DP rank prefills this tick, from the delayer's reduce.
+        Only with token graphs recorded: without them a rank's decode beside a
+        peer's prefill costs that peer nothing it was not already paying."""
+        # No delayer reports no prefillable rank.
+        return bool(
+            self.prefill_token_graphs
+            and decision.allow
+            and decision.prefillable_ranks > 0
+            and not self.prefill_delayer.is_local
+        )
 
     def set_prefill_delayer(self, delayer: PrefillDelayer | None) -> None:
         self.prefill_delayer = delayer
@@ -967,7 +1017,7 @@ class Scheduler:
                 resume = self._offload_prefill_start(seq)
                 # A replayed hit resumes as one, as admission starts it.
                 cached = self.block_manager.replay_start(
-                    seq, resume, hit=seq.replays_hit
+                    seq, resume, hit=self.block_manager.tier_resume_replays(seq)
                 )
             else:
                 if probed_tokens >= budget:
@@ -1130,7 +1180,7 @@ class Scheduler:
             if self._is_offload_prefill_resume(seq):
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(
-                    seq, resume, hit=seq.replays_hit
+                    seq, resume, hit=self.block_manager.tier_resume_replays(seq)
                 )
             else:
                 # Runs on every tick with prefill work, holds included: reuse
@@ -1449,15 +1499,19 @@ class Scheduler:
         )
 
     def add(self, seq: Sequence):
+        tracing.enqueue(seq)
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
+        self._arrived_requests += 1
 
     def extend(self, seqs: list[Sequence]):
+        tracing.enqueue_many(seqs)
         for seq in seqs:
             self.metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
+        self._arrived_requests += len(seqs)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
         seq = self.deferred_free_blocks.get(req_id)
@@ -1960,7 +2014,7 @@ class Scheduler:
                 if self.cost_balance and prefillable
                 else 0.0
             )
-            delayer_allows = self.prefill_delayer.should_allow_prefill(
+            decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
                 # decode-only: self.running also holds mid-chunked-prefill seqs,
@@ -1976,10 +2030,18 @@ class Scheduler:
                     else 0.0
                 ),
                 prefill_cost=prefill_cost,
+                waiting_requests=len(self.waiting) + self._partial_prefill_count,
+                arrived_requests=self._arrived_requests,
             )
         else:
-            delayer_allows = True
+            decision = PrefillDecision(allow=True, prefillable_ranks=0)
             prefill_cost = 0.0
+        self._arrived_requests = 0
+        delayer_allows = decision.allow
+
+        # Before the early return below: an idle rank keeps its peers' prefill
+        # company too.
+        self.dummy_prefill = self._group_prefill_tick(decision)
 
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
@@ -2070,6 +2132,7 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 seq.multimodal_data = None
+                tracing.finish(seq, reason=seq.leave_reason)
                 self._rejected.append(seq)
                 continue
 
@@ -2152,7 +2215,7 @@ class Scheduler:
                 # the forward replays below where the load left
                 # `num_cached_tokens` -- the KV-only reach, or the HBM hit if
                 # the load did not run (`Sequence.replay_kv_load`).
-                replayed = seq.replays_hit
+                replayed = self.block_manager.tier_resume_replays(seq)
                 start = self.block_manager.replay_start(
                     seq, seq.num_cached_tokens, hit=replayed
                 )
@@ -2597,6 +2660,12 @@ class Scheduler:
 
             return (prefill_batch, scheduled_seqs)
 
+        if self.dummy_prefill:
+            # The group's prefill step, with no prefill of this rank's own: it
+            # keeps its peers company on a dummy prefill rather than decode, so
+            # every rank's forward replays its token graph (`ForwardMode.decide`).
+            return None
+
         # --- Decode scheduling ---
         num_seqs_decode = 0
         num_decode_tokens = 0
@@ -2831,6 +2900,7 @@ class Scheduler:
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
         seq.multimodal_data = None
+        tracing.finish(seq, reason="aborted")
         self._rejected.append(seq)
         if not has_inflight_load:
             # A lookup can pin CPU KV before HBM allocation succeeds.
@@ -2942,8 +3012,7 @@ class Scheduler:
                     end_token=loaded,
                 )
                 logger.info(
-                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d "
-                    "gpu_indexed_tokens=%d",
+                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d gpu_indexed_tokens=%d",
                     seq.id,
                     load_start,
                     loaded,
@@ -3424,10 +3493,9 @@ class Scheduler:
     def _assert_positive_prefill_chunk(
         chunk: int, num_new_tokens: int, budget_remaining: int
     ) -> None:
-        assert chunk > 0, (
-            f"chunk must be positive: {chunk=}, "
-            f"{num_new_tokens=}, {budget_remaining=}"
-        )
+        assert (
+            chunk > 0
+        ), f"chunk must be positive: {chunk=}, {num_new_tokens=}, {budget_remaining=}"
 
     def _record_cache_reuse(self, seq: Sequence) -> None:
         """Account local prefix reuse at prefill or first PD decode admission."""
@@ -3953,6 +4021,8 @@ class Scheduler:
                 )
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
+                elif i >= batch.total_seqs_num_decode:
+                    tracing.prefill_complete(seq)
         elif batch is not None:
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -3987,6 +4057,8 @@ class Scheduler:
                 if now_partial != seq.is_partial_prefill:
                     self._partial_prefill_count += 1 if now_partial else -1
                     seq.is_partial_prefill = now_partial
+                if not now_partial:
+                    tracing.prefill_complete(seq)
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
@@ -4273,6 +4345,7 @@ class Scheduler:
             seq.num_finalized_tokens = num_tokens
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
+                tracing.first_token(seq)
 
             # Counted here, not from `len(token_ids)` above: `new_tokens` is
             # what reaches RequestOutput, and it differs from the forward's
@@ -4427,6 +4500,7 @@ class Scheduler:
         return finished_seqs
 
     def _mark_finished(self, seq, reason, num_tokens):
+        tracing.finish(seq, reason=reason, num_tokens=num_tokens)
         # Set the reason before the connector decides whether to claim the
         # source blocks. This runs exactly once, including early cancellation
         # without sampled output and requests without a stream queue.
@@ -4971,10 +5045,12 @@ class PrefillScheduler:
         pass
 
     def add(self, seq: Sequence):
+        tracing.enqueue(seq)
         self.metrics.enqueue(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list):
+        tracing.enqueue_many(seqs)
         for seq in seqs:
             self.metrics.enqueue(seq)
         self.waiting.extend(seqs)

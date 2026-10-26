@@ -27,7 +27,7 @@ see the [DPA and TBO configuration](deepseek_v41_runtime.md#data-parallel-attent
 The existing quality/development baseline uses TP4 with whole-expert EP at
 compilation level 0. Target execution can be eager or use whole-forward decode
 graphs (`FULL`); the draft has its own graph. The runtime also accepts
-`PIECEWISE` at level 0, and level 3 with FULL graphs or eager execution.
+`TR_HYBRID` at level 0, and level 3 with FULL graphs or eager execution.
 
 Fixed acceptance schedules use the common `--spec-decode-acceptance-length`
 or `--spec-decode-acceptance-rate` options and the shared rejection sampler.
@@ -64,8 +64,8 @@ config = Config(
 For target graphs, set `enforce_eager=False` and
 `compilation_config=CompilationConfig(level=0, cudagraph_mode=CUDAGraphMode.FULL)`.
 A decode step is then two replays: the draft's, keyed by request count, and the
-target's, keyed by `(batch size, query bucket)`. `PIECEWISE` remains available
-and records the dense pieces only. Capture must not bind warmup slots or another
+target's, keyed by `(batch size, query bucket)`. `TR_HYBRID` remains available
+and records token graphs only. Capture must not bind warmup slots or another
 request's window; `validate_runtime --graph` is what asserts it does not.
 
 ## State and sampling contracts

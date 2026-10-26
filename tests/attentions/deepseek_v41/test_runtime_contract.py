@@ -125,12 +125,25 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
-def test_lmcache_mp_is_the_only_kv_transfer_admitted():
+def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
     validate_runtime_config(
         runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
     )
-    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
-        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+    for role in ("kv_producer", "kv_consumer"):
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={"kv_connector": "mooncake", "kv_role": role}
+            )
+        )
+    # Mooncake's implicit producer default would escape producer detection.
+    with pytest.raises(ValueError, match="without an explicit kv_role"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
+        )
+    for connector in ("lmcache_offload", "moriio", "multi"):
+        with pytest.raises(
+            ValueError, match="KV transfer other than lmcache_mp or mooncake"
+        ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
             )
@@ -366,7 +379,7 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
             index_cache_dtype="fp8",
             enforce_eager=not graph,
             compilation_config=SimpleNamespace(
-                level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                level=0, cudagraph_mode=CUDAGraphMode.TR_HYBRID
             ),
         )
     )
@@ -403,7 +416,7 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         compilation_config=SimpleNamespace(
             level=level,
             cudagraph_mode=(
-                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.PIECEWISE
+                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.TR_HYBRID
             ),
         ),
         hf_config=SimpleNamespace(),
@@ -442,7 +455,7 @@ def test_level3_requires_full_graph_or_eager_runtime():
             runtime_config(
                 enforce_eager=False,
                 compilation_config=SimpleNamespace(
-                    level=3, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                    level=3, cudagraph_mode=CUDAGraphMode.TR_HYBRID
                 ),
             )
         )

@@ -99,7 +99,7 @@ occurs during input preparation, since replay does not execute Python.
 
 Startup capture uses the serving allocation and block 0 for synthetic
 requests. The runtime validator checks that capture preserves live cache pages.
-`PIECEWISE` is also accepted by the runtime; development and validation use
+`TR_HYBRID` is also accepted by the runtime; development and validation use
 level 0, and broader compiler support remains outside the supported scope.
 
 ## Memory and numerical limits
