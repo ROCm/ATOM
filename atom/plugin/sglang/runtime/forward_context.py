@@ -293,11 +293,6 @@ def _slice_v4_graph_metadata_for_capture(
             indexer_meta["n_committed_per_seq_gpu"] = value[:bs]
         md.indexer_meta = indexer_meta
 
-    from atom.plugin.sglang.deepseek_v4_bridge import (
-        _retarget_v4_decode_split_plans,
-    )
-
-    _retarget_v4_decode_split_plans(md, num_tokens)
     return md
 
 

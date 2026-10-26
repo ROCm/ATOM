@@ -309,9 +309,8 @@ def install_minimax_mono_plugin_refusal() -> None:
         return
     dispatch._config_refusal_native = dispatch._config_refusal
 
-    def _config_refusal(atom_config):
-        # #2479 dropped text_config; the call site passes atom_config only.
-        del atom_config
+    def _config_refusal(atom_config, text_config):
+        del atom_config, text_config
         return "plugin mode"
 
     dispatch._config_refusal = _config_refusal
