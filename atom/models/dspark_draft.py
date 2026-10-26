@@ -69,7 +69,8 @@ class DraftSampling:
     greedy_mask: torch.Tensor
     #: [max_bs] int32, the request's top-k the draft samples within; 0 is off.
     top_k: torch.Tensor
-    #: [max_bs] fp32, the request's top-p, applied after top-k; 1.0 is off.
+    #: [max_bs] fp32, the request's top-p, over the unfiltered q and
+    #: intersected with top-k (aiter's rule); 1.0 is off.
     top_p: torch.Tensor
     #: [1] int32, the Philox key. Must hold the same value on every TP rank.
     seed: torch.Tensor

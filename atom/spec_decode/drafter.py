@@ -366,18 +366,29 @@ class Drafter(abc.ABC):
     # the hooks unconditionally and gets None back.
 
     def stage_draft_sampling_host(
-        self, batch, bs: int, group, *, has_filter: bool, drafts_verifiable: bool
+        self, batch, bs: int, group, *, drafts_verifiable: bool
     ) -> None:
         """Stage the draft sampler's per-step inputs into pinned host buffers
         and claim their counts in `prepare_sample`'s own `sampling` H2D
         publication, which is what carries them to the device."""
         return
 
-    def lossless_verify_inputs(self, bs: int, *, has_filter: bool):
+    def lossless_verify_inputs(self, bs: int):
         """``(draft_probs, q_row_base, ratio_scratch)`` for the ratio accept
         rule (``draft_probs`` a `rejection_sampler.RatioDraftQ`), or all None
         for exact match."""
         return None, None, None
+
+    @property
+    def keeps_top_k_ties(self) -> bool:
+        """Must this engine's `Sampler` draws keep a top-k tie group whole?
+
+        True only where the ratio verify serves the request: there the bonus
+        and first tokens must follow the same p_f it verifies against. Off it,
+        every draw keeps `Sampler`'s flag-off law, as the exact-match verify
+        (`Sampler.sample_verification_tokens`) does.
+        """
+        return False
 
     @property
     def draft_kv_duplicates_propose(self) -> bool:

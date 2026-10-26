@@ -602,15 +602,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # are target-exact, but they are not the same draw), and the house
     # convention is that a behaviour-changing flag defaults off.
     #
-    # What stays as with the flag off is the accept rule, not the draft path.
-    # A batch with top-k/top-p on any row keeps exact-match acceptance against
-    # the target's filtered draw, and an all-greedy batch keeps the exact-match
-    # kernel; a greedy row of a mixed batch is matched exactly (lowest-id
-    # argmax) inside the ratio kernel, so a greedy request's tokens do not
-    # depend on its batch. The draft, however, always runs the de-fused sampled
-    # block once the flag is on: greedy rows draft the same argmax ids as the
-    # fused greedy kernel (and publish no q), but at the sampled block's step
-    # latency, so greedy traffic pays that latency too.
+    # A request with top-k/top-p is drafted within its own filters and verified
+    # against the target's p filtered as `Sampler` filters it, row by row. Its
+    # every `Sampler` draw (the first token after a prefill too, not only the
+    # bonus) then keeps a tie group at the top-k cut whole, as aiter's fused
+    # kernel does, instead of taking aiter's top-k-first path, which keeps
+    # exactly k ids (a uniform top-k <= 256 with a top-p, vocab >= 65536); on
+    # such a cut a filtered request's tokens can differ from the flag off.
+    # What stays as with the flag off is the accept rule, not the draft path:
+    # an all-greedy batch keeps the exact-match kernel; a greedy row of a mixed
+    # batch is matched exactly (lowest-id argmax) inside the ratio kernel, so a
+    # greedy request's tokens do not depend on its batch. The draft, however,
+    # always runs the de-fused sampled block once the flag is on: greedy rows
+    # draft the same argmax ids as the fused greedy kernel (and publish no q),
+    # but at the sampled block's step latency, so greedy traffic pays that
+    # latency too.
     #
     # Costs part of what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
     # q has to cross the step boundary, so the draft stores each position's top
@@ -625,9 +631,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Only a draft model that declares `supports_lossless_draft` honours it;
     # any other flavor silently keeps the greedy pair. Mutually exclusive with
     # ATOM_ENABLE_RELAXED_MTP (refused at drafter construction). Not used under
-    # PP or PCP, or on a P/D producer (which drafts for handoff and verifies
-    # nothing); those warn and keep the greedy pair. Read at drafter
-    # construction, so it must be set before the server starts.
+    # PP or PCP, on a P/D producer (which drafts for handoff and verifies
+    # nothing), or on a build without aiter's top-k/top-p sampling ops
+    # (`Sampler`'s native fallback filters by another rule than the verify's
+    # p_f); those warn and keep the greedy pair. A drafter that does not arm
+    # keeps Sampler's flag-off law as well: only a request the ratio verify
+    # serves (or, on a P/D producer, will serve) keeps top-k tie groups whole.
+    # Read at drafter construction, so it must be set before the server starts.
     "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
         os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
     ),

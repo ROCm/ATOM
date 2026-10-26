@@ -48,7 +48,6 @@ data-dependent *address* inside stage 1's W1 gather, never a data-dependent
 shape. See ``docs/environment_variables.md``.
 """
 
-from math import prod
 from typing import NamedTuple
 
 import torch
@@ -842,16 +841,17 @@ def _dspark_q_cut(
     top_k = tl.load(top_k_ptr + row)
     limit = tl.where(top_k > 0, tl.minimum(top_k, store_width), store_width)
     n = tl.minimum(limit, tl.sum(counts, axis=0))
-    # Top-p over what top-k keeps (the order `Sampler` applies them in), each
-    # level's mass approximated by its count at the level's mid gap. Keeps
-    # every level the threshold has not been reached before.
-    kept = tl.minimum(counts, tl.maximum(limit - (cum - counts), 0))
+    # Top-p over the unfiltered mass, then the smaller of the two cuts: the
+    # rule `Sampler`'s aiter kernels apply (an intersection, not top-p over
+    # the top-k survivors). Each level's mass is approximated by its count at
+    # the level's mid gap; every level the threshold has not been reached
+    # before is kept.
     mid_gap = tl.where(bins == 0, 0.0, (bins.to(tl.float32) - 0.5) / LEVELS_PER_NAT)
-    mass = kept.to(tl.float32) * tl.exp(-mid_gap)
+    mass = counts.to(tl.float32) * tl.exp(-mid_gap)
     mass_before = tl.cumsum(mass, axis=0) - mass
     top_p = tl.load(top_p_ptr + row)
     nucleus = tl.sum(
-        tl.where(mass_before < top_p * tl.sum(mass, axis=0), kept, 0), axis=0
+        tl.where(mass_before < top_p * tl.sum(mass, axis=0), counts, 0), axis=0
     )
     n = tl.where(top_p < 1.0, tl.minimum(n, nucleus), n)
 
@@ -1074,14 +1074,12 @@ def sparse_q_reference(
         limit = torch.where(top_k > 0, torch.minimum(top_k.long(), limit), limit)
     n = torch.minimum(limit, counts.sum(-1))
     if top_p is not None:
-        cum = counts.cumsum(-1)
-        kept = torch.minimum(counts, (limit[:, None] - (cum - counts)).clamp(min=0))
         bins = torch.arange(_Q_BINS, device=s.device, dtype=torch.float32)
         mid_gap = torch.where(bins == 0, 0.0, (bins - 0.5) / _Q_LEVELS_PER_NAT)
-        mass = kept.float() * torch.exp(-mid_gap)
+        mass = counts.float() * torch.exp(-mid_gap)
         before = mass.cumsum(-1) - mass
         inside = before < top_p[:, None].float() * mass.sum(-1, keepdim=True)
-        nucleus = torch.where(inside, kept, 0).sum(-1)
+        nucleus = torch.where(inside, counts, 0).sum(-1)
         n = torch.where(top_p < 1.0, torch.minimum(n, nucleus), n)
     order = torch.sort(level, dim=-1, stable=True).indices
     chosen = torch.arange(vocab, device=s.device)[None, :] < n[:, None]
@@ -1175,7 +1173,7 @@ def dspark_markov_sample_scratch(max_rows: int, vocab_size: int, device):
     The dense ``s`` scratch is not part of it: it is the caller's, sized
     ``[max_rows, V]``."""
     f32, i32 = _sample_scratch_shapes(max_rows, vocab_size)
-    return SamplingScratch(sum(prod(x) for x in f32), sum(prod(x) for x in i32), device)
+    return SamplingScratch.for_shapes(f32, i32, device)
 
 
 def _check_rows(name, t, rows, dtype):

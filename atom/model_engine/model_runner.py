@@ -2666,7 +2666,6 @@ class ModelRunner:
                 batch,
                 bs,
                 group,
-                has_filter=bool(needs_topk or needs_topp),
                 # A dummy forward's and an align-only propose's drafts are
                 # dropped, so they must not claim q slots or write q.
                 drafts_verifiable=not batch.is_dummy_run
@@ -3261,6 +3260,13 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        drafter = getattr(self, "drafter", None)
+        # Every draw for a request the ratio verify serves -- this step's
+        # bonus, and the first token after its prefill -- keeps a top-k tie
+        # group at the cut whole, as the p_f it is verified against does, or
+        # one request follows two laws. Keyed on the drafter's armed state,
+        # not the flag: a drafter that refused it verifies by exact match.
+        keep_ties = drafter is not None and drafter.keeps_top_k_ties
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3278,6 +3284,7 @@ class ModelRunner:
                 top_ps,
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
+                keep_top_k_ties=keep_ties,
             )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
@@ -3299,7 +3306,8 @@ class ModelRunner:
             # the target's own draw. Resolved before the verification sample
             # below, because it decides whether that sample is needed at all.
             # An all-greedy batch always verifies by exact match, so it never
-            # asks. `top_ks`/`top_ps` are None exactly when no row filters.
+            # asks. A filtered batch is verified against the p_f `Sampler`
+            # draws its bonus from, given the same `top_ks`/`top_ps`.
             #
             # The ratio verify spreads a rejecting request's q into the draft's
             # score scratch, which the draft head rewrites on every propose.
@@ -3309,12 +3317,9 @@ class ModelRunner:
             # forward that may run on another stream (the disaggregated decode
             # runner's) touches neither. Keep the two on one stream.
             draft_probs = draft_probs_row_base = ratio_scratch = None
-            drafter = getattr(self, "drafter", None)
             if drafter is not None and not all_greedy:
                 draft_probs, draft_probs_row_base, ratio_scratch = (
-                    drafter.lossless_verify_inputs(
-                        bs, has_filter=top_ks is not None or top_ps is not None
-                    )
+                    drafter.lossless_verify_inputs(bs)
                 )
             target_token_ids = None
             if RejectionSampler.needs_target_draw(all_greedy, draft_probs):
@@ -3334,6 +3339,7 @@ class ModelRunner:
                 top_ps=top_ps,
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
+                keep_top_k_ties=keep_ties,
             )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
@@ -3343,6 +3349,8 @@ class ModelRunner:
                 draft_probs=draft_probs,
                 draft_probs_row_base=draft_probs_row_base,
                 temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
                 ratio_scratch=ratio_scratch,
             )
             # PCP ranks decode redundantly and are consistent only while their
@@ -4980,7 +4988,17 @@ class RapidServeModelRunner(ModelRunner):
             self._mark_staging_h2d_enqueued()
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit
-            sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            sampled = self.sampler(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                # The decode side verifies this request's drafts; see
+                # `keep_ties` in `postprocess`.
+                keep_top_k_ties=hasattr(self, "drafter")
+                and self.drafter.keeps_top_k_ties,
+            )
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.

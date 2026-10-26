@@ -7,7 +7,8 @@
 * The probability-ratio verify (`rejection_sample` with ``draft_probs``): the
   emitted tokens follow the target's p whatever q the drafts came from, read
   from the sparse store exactly as a dense q would be read; greedy rows are
-  exact match; a request without q falls back to p.
+  exact match; a request without q falls back to p. A request with top-k /
+  top-p is served `Sampler`'s filtered p: the same ids kept, the same law.
 
 Statistical checks use fixed seeds and tolerances several standard errors
 wide, so they are deterministic on a given platform and fail only on a real
@@ -44,12 +45,15 @@ from atom.model_ops.rejection_sampler import (
     _finish_request,
     _ratio_residual_pick_kernel,
     _ratio_residual_race_kernel,
+    _ratio_scratch_shapes,
     _ratio_stats_kernel,
+    _ratio_target_p,
     _request_of_row,
     ratio_verify_scratch,
     rejection_sample,
 )
-from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.model_ops.sampling_scratch import take
 from atom.model_ops.softmax_tiles import softmax_combine_kernel
 
 DEV = "cuda"
@@ -801,22 +805,43 @@ def test_the_key_purpose_word_separates_streams_at_any_offset_width(wide):
             assert not torch.equal(streams[i], streams[j]), (i, j)
 
 
-def test_the_preallocated_scratch_verifies_exactly_what_allocation_does():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("filters", ["none", "per-row", "scalar"])
+def test_the_preallocated_scratch_verifies_exactly_what_allocation_does(dtype, filters):
+    """Production reuses one scratch, holding whatever the last step left in
+    it; no buffer of it, the filter's included, may be read before written."""
     torch.manual_seed(43)
     batch_n, width, vocab = 48, 5, 3000
-    logits = torch.randn(batch_n * width, vocab, device=DEV)
+    logits = torch.randn(batch_n * width, vocab, device=DEV).to(dtype)
     q_rows = torch.softmax(torch.randn(batch_n * width, vocab, device=DEV), -1)
     drafts = torch.multinomial(q_rows, 1).view(-1).to(torch.int32)
     temps = torch.ones(batch_n, device=DEV)
     temps[::4] = SAMPLER_EPS
+    top_ks = torch.randint(1, 300, (batch_n,), device=DEV, dtype=torch.int32)
+    top_ks[1::5] = -1
+    top_ps = torch.rand(batch_n, device=DEV) * 0.9 + 0.05
+    top_ps[2::5] = 1.0
+    ks, ps = {
+        "none": (None, None),
+        "per-row": (top_ks, top_ps),
+        "scalar": (int(top_ks[0]), float(top_ps[0])),
+    }[filters]
     args = verify_batch(drafts, width, logits, temps)
     q = draft_q(q_rows, drafts)
-    plain = rejection_sample(**args, draft_probs=q, ratio_step=11)
+    plain = rejection_sample(**args, draft_probs=q, ratio_step=11, top_ks=ks, top_ps=ps)
     scratch = ratio_verify_scratch(64, width, vocab, DEV)  # sized above the batch
-    reused = rejection_sample(
-        **args, draft_probs=q, ratio_step=11, ratio_scratch=scratch
-    )
-    assert torch.equal(plain[0], reused[0]) and torch.equal(plain[1], reused[1])
+    for garbage in (float("nan"), -1.0):
+        scratch.f32.fill_(garbage)
+        scratch.i32.random_(-(2**31), 2**31 - 1)
+        reused = rejection_sample(
+            **args,
+            draft_probs=q,
+            ratio_step=11,
+            top_ks=ks,
+            top_ps=ps,
+            ratio_scratch=scratch,
+        )
+        assert torch.equal(plain[0], reused[0]) and torch.equal(plain[1], reused[1])
 
 
 def test_the_same_key_gives_the_same_verdict():
@@ -1100,6 +1125,7 @@ def dense_verify(args, q_dense, ratio_step):
         temps,
         row_max,
         row_inv_z,
+        None,  # no floor: unfiltered
         q_dense,
         q_row,
         keys,
@@ -1109,6 +1135,7 @@ def dense_verify(args, q_dense, ratio_step):
         vocab,
         _RATIO_RESIDUAL_KEY | ratio_step,
         BLOCK_V=_RATIO_BLOCK_V,
+        FILTER=False,
         num_warps=8,
     )
     _ratio_residual_pick_kernel[(batch_n,)](
@@ -1121,6 +1148,8 @@ def dense_verify(args, q_dense, ratio_step):
         temps,
         row_max,
         row_inv_z,
+        row_argmax,
+        None,
         batch_n,
         tiles,
         steps,
@@ -1129,6 +1158,7 @@ def dense_verify(args, q_dense, ratio_step):
         _RATIO_RESIDUAL_KEY | ratio_step,
         BLOCK_TILE=triton.next_power_of_2(tiles),
         BLOCK_V=_RATIO_BLOCK_V,
+        FILTER=False,
         num_warps=1,
     )
     return out, verdict
@@ -1319,3 +1349,552 @@ def test_a_chained_block_follows_the_autoregressive_target(width):
         chi2 = ((counts - expected)[live] ** 2 / expected[live]).sum().item()
         dof = int(live.sum()) - 1
         assert chi2 < dof + 6 * (2 * dof) ** 0.5, (k, chi2, dof)
+
+
+# ---- verify: top-k / top-p, the target's filtered p ---------------------------
+
+
+def filtered_p(logits, temps, top_ks=None, top_ps=None, widths=None):
+    """`_ratio_target_p` over requests of ``widths`` draft rows each (one by
+    default), filters and temperatures per request: ``(kept, p_f)`` per row."""
+    rows, vocab = logits.shape
+    widths = torch.ones(rows, dtype=torch.int64) if widths is None else widths
+    cu = widths.cumsum(0).to(device=DEV, dtype=torch.int32)
+    assert int(cu[-1]) == rows
+    (
+        (row_max, row_inv_z, row_floor, part_max, part_sum, part_val, _, *filt_f32),
+        (row_argmax, part_idx, _, _, _, *filt_i32),
+    ) = take(*_ratio_scratch_shapes(rows, len(widths), vocab), DEV, None, None)
+    temps = temps.float().contiguous()
+    assert _ratio_target_p(
+        logits,
+        cu,
+        temps,
+        top_ks,
+        top_ps,
+        (row_max, row_inv_z, row_argmax, row_floor),
+        (
+            part_max,
+            part_sum,
+            part_val,
+            part_idx,
+            filt_f32[0],
+            filt_i32[0],
+            filt_f32[1],
+            filt_i32[1],
+        ),
+    )
+    x = logits.float()
+    kept = x >= row_floor[:, None]
+    temps = temps.repeat_interleave(widths.to(DEV))
+    p = torch.exp(x / temps[:, None] - row_max[:, None]) * row_inv_z[:, None]
+    return kept, torch.where(kept, p, 0.0)
+
+
+def sampler_kept(logits, temps, top_ks=None, top_ps=None):
+    """The ids `Sampler`'s aiter kernels may draw, and its filtered p: fewer
+    than top_k ids strictly above, whose p sums to less than top_p, both over
+    the unfiltered p `Sampler` computes (`_topk_topp_sample`). Per-row tensors
+    or None; -1 and 1.0 are off. Sums in double, so a row whose cut is within
+    rounding of its top_p is no check of the mass rule."""
+    rows, vocab = logits.shape
+    probs = (logits / temps[:, None]).softmax(dim=-1, dtype=torch.float32)
+    sorted_p, order = probs.sort(-1, descending=True)
+    starts = torch.ones_like(sorted_p, dtype=torch.bool)
+    starts[:, 1:] = sorted_p[:, 1:] != sorted_p[:, :-1]
+    slot = torch.arange(vocab, device=DEV).expand(rows, vocab)
+    # Ids strictly above each id: the slot its tie group starts at.
+    higher = torch.where(starts, slot, 0).cummax(-1).values
+    mass = (sorted_p.double().cumsum(-1) - sorted_p.double()).gather(1, higher)
+    k = vocab + 1 if top_ks is None else torch.where(top_ks > 0, top_ks, vocab + 1)
+    p = 2.0 if top_ps is None else torch.where(top_ps < 1, top_ps.double(), 2.0)
+    k = torch.as_tensor(k, device=DEV).view(-1, 1)
+    p = torch.as_tensor(p, device=DEV).view(-1, 1)
+    keep = torch.zeros_like(starts).scatter_(1, order, (higher < k) & (mass < p))
+    p_f = torch.where(keep, probs.double(), 0.0)
+    return keep, (p_f / p_f.sum(-1, keepdim=True)).float()
+
+
+def tied_rows(rows, vocab, seed, dtype=torch.bfloat16):
+    """Logits, every other row on a half-integer grid (ties everywhere, so
+    every cut lands in a tie group), none near 0 (where `Sampler`'s fp32 p
+    could round two distinct logits onto one value)."""
+    torch.manual_seed(seed)
+    logits = torch.randn(rows, vocab, device=DEV) * 2
+    logits[::2] = (logits[::2] * 2).round() / 2
+    logits = torch.where(logits.abs() < 0.05, 0.05, logits)
+    return logits.to(dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_the_kept_set_is_samplers_bit_for_bit(dtype):
+    """Top-k alone is a count, so the set is exact on every row (`tied_rows`
+    keeps clear of 0; see the test after next): cuts inside a tie group keep
+    the group whole, top_k = 1 keeps the max's group, top_k >=
+    V and -1 keep everything. Top-p is compared on the rows whose cut is not
+    within rounding of top_p; top-p 1.0 keeps everything. fp32 logits take
+    the 32-bit descent."""
+    rows, vocab = 96, 3 * _RATIO_BLOCK_V + 123
+    logits = tied_rows(rows, vocab, 113, dtype)
+    temps = torch.rand(rows, device=DEV) + 0.3
+    top_ks = torch.randint(1, 400, (rows,), device=DEV, dtype=torch.int32)
+    top_ks[::8], top_ks[1::8], top_ks[2::8], top_ks[3::8] = 1, vocab, vocab + 9, -1
+    top_ps = torch.rand(rows, device=DEV) * 0.98 + 0.01
+    top_ps[4::8] = 1.0
+    nudge = torch.full_like(top_ps, 1e-5)
+    for ks, ps in (
+        (top_ks, None),
+        (None, top_ps),
+        (top_ks, top_ps),
+        (int(top_ks[5]), None),
+        (None, float(top_ps[5])),
+        # `prepare_sample` picks scalar or per-row for each independently.
+        (top_ks, float(top_ps[5])),
+        (int(top_ks[5]), top_ps),
+    ):
+        kept, p_f = filtered_p(logits, temps, ks, ps)
+        k_rows = ks if ks is None or isinstance(ks, torch.Tensor) else top_ks * 0 + ks
+        p_rows = ps if ps is None or isinstance(ps, torch.Tensor) else top_ps * 0 + ps
+        ref, ref_p = sampler_kept(logits, temps, k_rows, p_rows)
+        robust = torch.ones(rows, dtype=torch.bool, device=DEV)
+        if p_rows is not None:
+            low = sampler_kept(logits, temps, k_rows, p_rows - nudge)[0]
+            high = sampler_kept(logits, temps, k_rows, p_rows + nudge)[0]
+            robust = (low == high).all(1)
+            assert robust.float().mean() > 0.8
+        assert torch.equal(kept[robust], ref[robust]), (ks, ps)
+        torch.testing.assert_close(p_f[robust], ref_p[robust], rtol=1e-4, atol=1e-7)
+        torch.testing.assert_close(
+            p_f.double().sum(-1),
+            torch.ones(rows, device=DEV).double(),
+            rtol=0,
+            atol=1e-5,
+        )
+    # `Sampler`'s own top-k kernel keeps that set too, tie for tie.
+    kept, _ = filtered_p(logits, temps, top_ks, None)
+    on = top_ks > 0
+    probs = (logits / temps[:, None]).softmax(dim=-1, dtype=torch.float32)
+    renorm = torch.ops.aiter.top_k_renorm_probs(
+        probs[on].contiguous(), top_ks[on].contiguous(), 0
+    )
+    assert torch.equal(renorm > 0, kept[on])
+
+
+def test_ragged_requests_each_keep_their_own_set_at_the_real_vocab():
+    """Requests of 0 to 7 draft rows, each with its own temperature, top-k and
+    top-p, at V=163840: every row keeps its own request's set. 64 rows split
+    the last count into programs of three tiles each, the last one ragged."""
+    vocab = 163840
+    widths = torch.tensor([3, 0, 7, 1, 5, 0, 2, 7, 4, 6, 0, 7, 7, 6, 2, 7])
+    rows, batch_n = int(widths.sum()), widths.numel()
+    logits = tied_rows(rows, vocab, 173)
+    temps = torch.rand(batch_n, device=DEV) + 0.3
+    top_ks = torch.randint(1, 400, (batch_n,), device=DEV, dtype=torch.int32)
+    top_ks[::5], top_ks[1::7] = -1, vocab
+    top_ps = torch.rand(batch_n, device=DEV) * 0.98 + 0.01
+    top_ps[2::5] = 1.0
+    nudge = torch.full((rows,), 1e-5, device=DEV)
+
+    def per_row(x):
+        return None if x is None else x.repeat_interleave(widths.to(DEV))
+
+    for ks, ps in ((top_ks, None), (None, top_ps), (top_ks, top_ps)):
+        kept, p_f = filtered_p(logits, temps, ks, ps, widths)
+        k_rows, p_rows = per_row(ks), per_row(ps)
+        ref, ref_p = sampler_kept(logits, per_row(temps), k_rows, p_rows)
+        robust = torch.ones(rows, dtype=torch.bool, device=DEV)
+        if p_rows is not None:
+            low = sampler_kept(logits, per_row(temps), k_rows, p_rows - nudge)[0]
+            high = sampler_kept(logits, per_row(temps), k_rows, p_rows + nudge)[0]
+            # A request's rows stand or fall together, and the real vocab's
+            # tie groups are heavy: fewer cuts clear the nudge than above.
+            robust = (low == high).all(1)
+            assert robust.float().mean() > 0.5
+        assert torch.equal(kept[robust], ref[robust]), (ks, ps)
+        torch.testing.assert_close(p_f[robust], ref_p[robust], rtol=1e-4, atol=1e-7)
+
+
+def test_a_cut_inside_a_tie_group_keeps_the_whole_group():
+    """Five ids tie for second: top-k 2 keeps all six, and top-p just past
+    the max's mass keeps them too (their mass above is the max's alone)."""
+    logits = torch.full((1, 64), -4.0, device=DEV)
+    logits[0, 9] = 3.0
+    logits[0, [2, 17, 33, 40, 63]] = 1.0
+    logits = logits.to(torch.bfloat16)
+    temps = torch.ones(1, device=DEV)
+    top = torch.softmax(logits.float(), -1)[0, 9].item()
+    for ks, ps in ((2, None), (None, top + 1e-3)):
+        kept, _ = filtered_p(logits, temps, ks, ps)
+        assert kept[0].nonzero().view(-1).tolist() == [2, 9, 17, 33, 40, 63]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_a_counted_top_k_keeps_what_the_descent_keeps(monkeypatch, dtype):
+    """A top-k of at most 256 alone is counted from the stats pass's run
+    maxima, not descended: the same floor bit for bit, and p_f to rounding,
+    over tied rows, top_k 1 to 256 (cuts past one gather of runs), masked,
+    NaN, +-inf and all--inf rows, an allow-list of 10 ids in -inf and
+    plateaus that tie thousands of runs at the k-th largest max, scalar and
+    per request, at the real vocab and at one whose last tile is ragged. A
+    top_p that is off (1.0, scalar or per request) changes nothing, the
+    +inf row included: it gets its top-k floor whatever its batch passes."""
+    import atom.model_ops.rejection_sampler as rs
+
+    for vocab in (163840, 3 * _RATIO_BLOCK_V + 123):
+        rows = 40
+        logits = tied_rows(rows, vocab, 191, torch.float32)
+        logits[0, torch.rand(vocab, device=DEV) < 0.3] = float("-inf")
+        logits[1, :7] = float("nan")
+        logits[2] = float("nan")
+        logits[3] = float("-inf")
+        logits[4, 11] = float("inf")
+        logits[5, 1::2] = 0.0
+        logits[5, ::2] = -0.0
+        logits[6, : vocab // 2] = logits[6].max()
+        logits[7] = float("-inf")
+        logits[7, torch.randperm(vocab, device=DEV)[:10]] = torch.randn(10, device=DEV)
+        logits[8] = 0.0
+        logits[8, 5] = 10.0
+        logits[9] = -1.0
+        logits[9, torch.randperm(vocab, device=DEV)[:30]] = torch.arange(
+            30, device=DEV, dtype=torch.float32
+        )
+        logits = logits.to(dtype)
+        temps = torch.rand(rows, device=DEV) + 0.3
+        top_ks = torch.randint(1, 257, (rows,), device=DEV, dtype=torch.int32)
+        top_ks[::7], top_ks[1::9], top_ks[2::11] = 1, 256, -1
+        for ks in (top_ks, 1, 20, 50, 256):
+            counted = filtered_p(logits, temps, ks)
+            with monkeypatch.context() as m:
+                m.setattr(rs, "_FILTER_COUNT_MAX_K", 0)
+                descended = filtered_p(logits, temps, ks)
+            assert torch.equal(counted[0], descended[0]), (vocab, ks)
+            torch.testing.assert_close(
+                counted[1], descended[1], rtol=1e-5, atol=1e-9, equal_nan=True
+            )
+            for ps in (1.0, torch.ones(rows, device=DEV)):
+                p_off = filtered_p(logits, temps, ks, ps)
+                assert torch.equal(p_off[0], counted[0]), (vocab, ks, ps)
+                assert torch.equal(p_off[1].isnan(), counted[1].isnan())
+
+
+def test_the_count_rule_splits_only_what_samplers_p_rounds_together():
+    """The descent ranks ids by logit, aiter by `Sampler`'s fp32 p, whose
+    ``logits / T - max`` rounds the distinct logits 2e-8 and 1e-8 onto one
+    value: aiter's top-k 3 keeps both as a tie, the floor only the higher.
+    Pinned so the gap stays the one the notes allow: every id the two
+    disagree on has the p of the lowest id the floor keeps."""
+    logits = torch.full((1, 4096), -20.0, device=DEV)
+    logits[0, :4] = torch.tensor([1.0, 3e-8, 2e-8, 1e-8], device=DEV)
+    logits = logits.to(torch.bfloat16)
+    temps = torch.ones(1, device=DEV)
+    ks = torch.tensor([3], dtype=torch.int32, device=DEV)
+    kept, _ = filtered_p(logits, temps, ks)
+    probs = (logits / temps[:, None]).softmax(dim=-1, dtype=torch.float32)
+    aiter_kept = torch.ops.aiter.top_k_renorm_probs(probs, ks, 0) > 0
+    assert kept[0].nonzero().view(-1).tolist() == [0, 1, 2]
+    assert aiter_kept[0].nonzero().view(-1).tolist() == [0, 1, 2, 3]
+    assert not (kept & ~aiter_kept).any()
+    assert (probs[aiter_kept & ~kept] == probs[kept].min()).all()
+
+
+def assert_draws_are(draws, kept, p_f):
+    """Draws from one row follow p_f, both ways: none lands outside the kept
+    set, every kept id worth 20 draws turns up (a set missing a tie group
+    would not), and each at its rate."""
+    n = draws.numel()
+    assert kept[draws].all(), "Sampler drew an id the verify filters out"
+    freq = torch.bincount(draws, minlength=kept.numel()).float() / n
+    assert (freq[p_f * n > 20] > 0).all(), "a kept id Sampler never draws"
+    torch.testing.assert_close(freq, p_f, rtol=0, atol=0.01)
+
+
+@pytest.mark.parametrize(
+    "top_k, top_p", [(30, None), (None, 0.7), (100, 0.6), (1000, 0.95)]
+)
+def test_samplers_draws_stay_in_the_kept_set_and_follow_p_f(top_k, top_p):
+    """Against `Sampler` itself (its aiter kernels, not a re-derivation), on
+    tied and untied rows: Sampler's draws follow p_f. aiter has no top-p mask
+    to compare sets with, so this is the top-p check against aiter itself."""
+    torch.manual_seed(127)
+    rows, n, vocab = 4, 40000, 4000
+    logits = tied_rows(rows, vocab, 131).repeat_interleave(n, 0)
+    temps = torch.full((rows * n,), 0.8, device=DEV)
+    ks = None if top_k is None else torch.full((rows * n,), top_k, device=DEV)
+    ps = None if top_p is None else torch.full((rows * n,), top_p, device=DEV)
+    ks = None if ks is None else ks.to(torch.int32)
+    draws = Sampler()(logits, temps, ks, ps).long().view(rows, n)
+    kept, p_f = filtered_p(
+        logits[::n],
+        temps[:rows],
+        None if ks is None else ks[:rows],
+        None if ps is None else ps[:rows],
+    )
+    for row in range(rows):
+        assert_draws_are(draws[row], kept[row], p_f[row])
+
+
+def test_the_bonus_draw_keeps_a_top_k_tie_group_whole_at_the_real_vocab():
+    """For a scalar top-k (small k, large vocab) with a top-p, aiter's joint
+    op takes a top-k-first path that keeps exactly k ids, splitting the tie
+    group at the cut. The ratio verify's p_f keeps the group whole, and so
+    does the bonus draw `Sampler` makes for it (``keep_top_k_ties``)."""
+    torch.manual_seed(163)
+    n, vocab = 10000, 163840
+    row = ((torch.randn(vocab, device=DEV) * 12).round() / 4).to(torch.bfloat16)
+    logits = row.expand(n, -1).contiguous()
+    temps = torch.full((n,), 0.8, device=DEV)
+    kept, p_f = filtered_p(logits[:1], temps[:1], 50, 0.95)
+    assert kept[0].sum() > 50, "the cut is not inside a tie group"
+    draws = Sampler()(logits, temps, 50, 0.95, keep_top_k_ties=True).long()
+    assert_draws_are(draws, kept[0], p_f[0])
+
+
+def first_token_law(target, temps, top_ks, top_ps, width=1024, step=41):
+    """Draft with each row's own filters (the draft spells "off" 0 and 1.0),
+    verify against the target's filtered p; ``(first token, accepted)``."""
+    n = temps.numel()
+    vocab = target.shape[-1]
+    _, prev, w1, w2 = tables(1, vocab, 32, seed=137)
+    base = (target.float() + torch.randn(vocab, device=DEV)).to(torch.bfloat16)
+    greedy = (temps <= SAMPLER_EPS).to(torch.int32)
+    store = empty_store(n, width)
+    drafts, _ = sample(
+        base.expand(n, -1).contiguous(),
+        prev.expand(n).contiguous(),
+        w1,
+        w2,
+        store,
+        torch.arange(n, dtype=torch.int32, device=DEV),
+        0,
+        temps,
+        greedy,
+        torch.tensor([step], dtype=torch.int32, device=DEV),
+        top_k=top_ks.clamp(min=0),
+        top_p=top_ps,
+    )
+    out, (accepted, _, _) = rejection_sample(
+        **verify_batch(drafts.to(torch.int32), 1, target.expand(n, -1), temps),
+        draft_probs=RatioDraftQ(store, stale(n, vocab)),
+        ratio_step=step,
+        top_ks=top_ks,
+        top_ps=top_ps,
+    )
+    return out[:, 0].long(), accepted
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "top_k, top_p", [(20, 1.0), (-1, 0.8), (50, 0.7)], ids=["top_k", "top_p", "both"]
+)
+def test_the_first_token_follows_samplers_filtered_p(top_k, top_p, dtype):
+    """End to end, draft and verify each filtering per row: the first token
+    follows p_f, never lands on a filtered-out id, and some drafts pass. fp32
+    logits take the longer, 32-bit descent."""
+    torch.manual_seed(139)
+    n, vocab = 40000, 6000
+    target = (torch.randn(vocab, device=DEV) * 3).to(dtype)
+    temps = torch.full((n,), 0.7, device=DEV)
+    ks = torch.full((n,), top_k, dtype=torch.int32, device=DEV)
+    ps = torch.full((n,), top_p, device=DEV)
+    first, accepted = first_token_law(target, temps, ks, ps)
+    kept, p_f = sampler_kept(target[None], temps[:1], ks[:1], ps[:1])
+    assert kept[0, first].all(), "emitted an id the filter removes"
+    freq = torch.bincount(first, minlength=vocab).float() / n
+    torch.testing.assert_close(freq, p_f[0], rtol=0, atol=0.01)
+    assert 0 < accepted.float().mean().item() < 1
+
+
+def test_a_mixed_batch_serves_each_request_its_own_p():
+    """Greedy, unfiltered, top-k, top-p and both, interleaved in one batch of
+    per-request filters: greedy requests get the argmax, the rest each their
+    own p_f."""
+    torch.manual_seed(149)
+    kinds = [(SAMPLER_EPS, -1, 1.0), (0.9, -1, 1.0), (0.9, 15, 1.0)]
+    kinds += [(0.9, -1, 0.75), (0.9, 40, 0.6)]
+    n, vocab = 60000, 3000
+    target = (torch.randn(vocab, device=DEV) * 3).to(torch.bfloat16)
+    temps, ks, ps = (
+        torch.tensor(column, device=DEV).repeat(n // len(kinds))
+        for column in zip(*kinds)
+    )
+    first, _ = first_token_law(target, temps, ks.to(torch.int32), ps)
+    for i, (temp, k, p) in enumerate(kinds):
+        got = first[i :: len(kinds)]
+        if temp <= SAMPLER_EPS:
+            assert (got == target.float().argmax()).all()
+            continue
+        kept, p_f = sampler_kept(
+            target[None],
+            temps[i : i + 1],
+            ks[i : i + 1].to(torch.int32),
+            ps[i : i + 1],
+        )
+        assert kept[0, got].all(), (temp, k, p)
+        freq = torch.bincount(got, minlength=vocab).float() / got.numel()
+        torch.testing.assert_close(freq, p_f[0], rtol=0, atol=0.015)
+
+
+def test_each_position_of_a_filtered_block_is_served_its_own_p_f():
+    """Three draft positions per request, each scoring its own logits, under
+    interleaved per-request filters (one kind unfiltered): every position a
+    request reaches emits an id its own row keeps, at that row's p_f."""
+    torch.manual_seed(179)
+    kinds = [(-1, 1.0), (15, 1.0), (-1, 0.75), (40, 0.6)]
+    n, width, vocab, support = 40000, 3, 3000, 64
+    target = (torch.randn(width, vocab, device=DEV) * 3).to(torch.bfloat16)
+    temps = torch.full((n,), 0.9, device=DEV)
+    ks, ps = (
+        torch.tensor(column, device=DEV).repeat(n // len(kinds))
+        for column in zip(*kinds)
+    )
+    ks = ks.to(torch.int32)
+    # Position k's q: the top of a noisy copy of its target, renormalized.
+    noise = torch.randn(width, vocab, device=DEV) * 0.3
+    noisy = torch.softmax((target.float() + noise) / 0.9, -1)
+    q_probs, q_ids = noisy.topk(support, -1)
+    q_probs = (q_probs / q_probs.sum(-1, keepdim=True)).repeat(n, 1)
+    q_ids = q_ids.repeat(n, 1).to(torch.int32)
+    slots = torch.multinomial(q_probs, 1)
+    drafts = q_ids.gather(1, slots).view(-1)
+    meta = torch.cat((torch.full_like(slots, support), slots), 1)
+    store = SparseQStore(q_ids, q_probs.contiguous(), meta.to(torch.int32))
+    out, (accepted, _, _) = rejection_sample(
+        **verify_batch(drafts, width, target.repeat(n, 1), temps),
+        draft_probs=RatioDraftQ(store, stale(n, vocab)),
+        ratio_step=53,
+        top_ks=ks,
+        top_ps=ps,
+    )
+    for i, kind in enumerate(kinds):
+        kept, p_f = sampler_kept(target, temps[:width], ks[i].expand(width), ps[i])
+        for k in range(width):
+            reached = accepted[i :: len(kinds)] >= k
+            got = out[i :: len(kinds), k][reached].long()
+            assert got.numel() > 2000, (kind, k)
+            assert kept[k, got].all(), (kind, k)
+            freq = torch.bincount(got, minlength=vocab).float() / got.numel()
+            torch.testing.assert_close(freq, p_f[k], rtol=0, atol=0.02)
+
+
+def test_a_filtered_out_draft_is_always_rejected():
+    """q all on an id top-k removes: p_f there is 0, so no coin accepts it,
+    and the replacement follows p_f (relu(p_f - q) is p_f)."""
+    torch.manual_seed(151)
+    n, vocab = 30000, 3000
+    target = (torch.randn(vocab, device=DEV) * 2).to(torch.bfloat16)
+    temps = torch.ones(n, device=DEV)
+    ks = torch.full((n,), 10, dtype=torch.int32, device=DEV)
+    kept, p_f = sampler_kept(target[None], temps[:1], ks[:1])
+    outside = int((~kept[0]).nonzero()[0])
+    store = empty_store(1, 4)
+    store.ids[0, 0], store.probs[0, 0] = outside, 1.0
+    store.meta[0] = torch.tensor([1, 0], device=DEV)
+    drafts = torch.full((n,), outside, dtype=torch.int32, device=DEV)
+    out, (accepted, _, _) = rejection_sample(
+        **verify_batch(
+            drafts,
+            1,
+            target.expand(n, -1),
+            temps,
+            row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
+        ),
+        draft_probs=RatioDraftQ(store, stale(n, vocab)),
+        ratio_step=43,
+        top_ks=ks,
+    )
+    assert (accepted == 0).all()
+    first = out[:, 0].long()
+    assert kept[0, first].all()
+    freq = torch.bincount(first, minlength=vocab).float() / n
+    torch.testing.assert_close(freq, p_f[0], rtol=0, atol=0.01)
+
+
+def test_a_filtered_residual_without_mass_falls_back_to_p_f():
+    """q a hair above p_f on every id top-k keeps (so no rounding of the
+    kernel's p_f leaves a residual; q need not sum to 1 for that), and the
+    draft on an id it removes: rejected, relu(p_f - q) is 0 everywhere, and
+    the fallback must still follow p_f, never landing where the filter cuts."""
+    torch.manual_seed(181)
+    n, vocab = 30000, 3000
+    target = (torch.randn(vocab, device=DEV) * 2).to(torch.bfloat16)
+    temps = torch.ones(n, device=DEV)
+    ks = torch.full((n,), 10, dtype=torch.int32, device=DEV)
+    kept, p_f = sampler_kept(target[None], temps[:1], ks[:1])
+    outside = int((~kept[0]).nonzero()[0])
+    q = torch.where(kept[0], p_f[0] * 1.001, 0.0)
+    q[outside] = 0.01
+    drafts = torch.full((n,), outside, dtype=torch.int32, device=DEV)
+    out, (accepted, _, _) = rejection_sample(
+        **verify_batch(drafts, 1, target.expand(n, -1), temps),
+        draft_probs=draft_q(q, drafts),
+        ratio_step=59,
+        top_ks=ks,
+    )
+    assert (accepted == 0).all()
+    first = out[:, 0].long()
+    assert kept[0, first].all(), "the fallback emitted an id the filter removes"
+    freq = torch.bincount(first, minlength=vocab).float() / n
+    torch.testing.assert_close(freq, p_f[0], rtol=0, atol=0.01)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_masked_and_nan_target_rows_filter_and_emit_inside_the_vocab(dtype):
+    """Filtered target rows with masked (-inf) ids, and an all-NaN one: the
+    masked row keeps `Sampler`'s set and its first token follows p_f, never
+    landing on an id p_f gives no mass; the NaN row emits an id inside the
+    vocab."""
+    torch.manual_seed(167)
+    n, vocab = 30000, 3000
+    target = torch.randn(2, vocab, device=DEV) * 3
+    target[0, torch.rand(vocab, device=DEV) < 0.3] = float("-inf")
+    target[1] = float("nan")
+    target = target.to(dtype)
+    temps = torch.full((2,), 0.8, device=DEV)
+    ks = torch.tensor([20, 20], dtype=torch.int32, device=DEV)
+    ps = torch.tensor([0.8, 0.8], device=DEV)
+    kept, p_f = filtered_p(target, temps, ks, ps)
+    ref, ref_p = sampler_kept(target[:1], temps[:1], ks[:1], ps[:1])
+    assert torch.equal(kept[0], ref[0])
+    torch.testing.assert_close(p_f[0], ref_p[0], rtol=1e-4, atol=1e-7)
+    q = sparse(vocab, {i: 1 / 50 for i in range(50)})
+    drafts = draw(q, 2 * n)
+    out, _ = rejection_sample(
+        **verify_batch(drafts, 1, target.repeat(n, 1), temps.repeat(n)),
+        draft_probs=draft_q(q, drafts),
+        ratio_step=47,
+        top_ks=ks.repeat(n),
+        top_ps=ps.repeat(n),
+    )
+    first = out[:, 0].long()
+    assert ((first >= 0) & (first < vocab)).all()
+    masked = first[0::2]
+    assert (p_f[0, masked] > 0).all(), "emitted an id p_f gives no mass"
+    freq = torch.bincount(masked, minlength=vocab).float() / n
+    torch.testing.assert_close(freq, p_f[0], rtol=0, atol=0.01)
+
+
+def test_filters_that_keep_everything_leave_the_verify_bit_for_bit():
+    """top_k >= V or -1 and top_p 1.0, as one value or per request: the same
+    tokens and verdicts as no filter at all, coin for coin."""
+    torch.manual_seed(157)
+    batch_n, width, vocab = 64, 4, 2 * _RATIO_BLOCK_V + 77
+    rows = batch_n * width
+    q_logits = torch.randn(rows, vocab, device=DEV) * 2
+    q_rows = top_of(q_logits, 30)
+    drafts = torch.multinomial(q_rows, 1).view(-1).to(torch.int32)
+    logits = (q_logits + torch.randn(rows, vocab, device=DEV)).to(torch.bfloat16)
+    temps = torch.tensor([1.0, 0.6, SAMPLER_EPS, 1.3], device=DEV).repeat(batch_n // 4)
+    args = verify_batch(drafts, width, logits, temps)
+    q = draft_q(q_rows, drafts, dense_rows=batch_n)
+    ref = rejection_sample(**args, draft_probs=q, ratio_step=3)
+    every_k = torch.tensor([-1, vocab, vocab + 5, -1], device=DEV, dtype=torch.int32)
+    for ks, ps in (
+        (every_k.repeat(batch_n // 4), torch.ones(batch_n, device=DEV)),
+        (vocab, None),
+        (None, 1.0),
+    ):
+        got = rejection_sample(
+            **args, draft_probs=q, ratio_step=3, top_ks=ks, top_ps=ps
+        )
+        assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1]), (ks, ps)

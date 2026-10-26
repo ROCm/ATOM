@@ -16,7 +16,7 @@ from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample_unsupported,
 )
 from atom.model_ops.rejection_sampler import RatioDraftQ, ratio_verify_scratch
-from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.draft_q_slots import DraftQSlots, DraftQStaging
@@ -65,10 +65,11 @@ class DSparkProposer(Drafter):
     """
 
     #: Lossless speculative sampling's binding; None keeps the greedy pair. The
-    #: two attributes every hook reads first, so a proposer that never ran
+    #: attributes every hook reads first, so a proposer that never ran
     #: `_init_lossless_sampling` (tests build them bare) answers "not armed".
     draft_sampling = None
     _q_store = None
+    _peer_verifies_losslessly = False
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
@@ -106,12 +107,58 @@ class DSparkProposer(Drafter):
         self._q_store = None
         # The host-side staging policy and slot map (`DraftQStaging`).
         self._staging = None
+        self._peer_verifies_losslessly = False
         if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             return
         model = getattr(self, "model", None)
         if model is None or not getattr(model, "supports_lossless_draft", False):
             # This flavor's block sampler has no sampled entry point. Silent,
             # because "not ported yet" is not an operator error.
+            return
+        if not AITER_TOPK_TOPP_AVAILABLE:
+            # The verify serves a filtered request aiter's kept set (whole tie
+            # groups, top-p over the unfiltered mass), the one `Sampler` draws
+            # the bonus token from with aiter. Without aiter's sampling ops
+            # `Sampler` cuts its own way, and the bonus and the verified
+            # tokens would follow two different p.
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING needs aiter's top-k/top-p sampling "
+                "ops, which this build lacks: the ratio verify filters as they "
+                "do, and Sampler's native fallback filters differently. Falling "
+                "back to greedy proposal with exact-match acceptance."
+            )
+            return
+        head = self.model.markov_head
+        unsupported = dspark_markov_sample_unsupported(
+            head.markov_w1.weight, head.markov_w2.weight
+        )
+        if unsupported is not None:
+            # Checked once here so the sampled op never has to fail mid-serve.
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING: the fused sampled draft cannot "
+                "run (%s). Falling back to greedy proposal with exact-match "
+                "acceptance.",
+                unsupported,
+            )
+            return
+        kv_cfg = getattr(self.config, "kv_transfer_config", None) or {}
+        if kv_config_has_producer(kv_cfg) or (
+            getattr(self.config, "enable_rapidserve", False)
+            and not getattr(self.config, "disagg_is_decode", False)
+        ):
+            # A P/D producer (or RapidServe's prefill process) drafts only to
+            # hand the drafts off; it never verifies, and the consumer has no
+            # q for a handed-off request anyway. Armed, it would allocate the
+            # q store, reserve scratch off its KV budget and run the de-fused
+            # draft every step for nothing.
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING is not used on a P/D producer "
+                "(prefill) engine: it drafts for handoff and verifies nothing. "
+                "Keeping the greedy draft here; the decode engine still arms."
+            )
+            # The peer that verifies these requests does arm, so this side's
+            # first-token draw must follow its law (`keeps_top_k_ties`).
+            self._peer_verifies_losslessly = True
             return
         if self.config.pipeline_parallel_size > 1:
             # The draft's sampling inputs ride the runner's `sampling`
@@ -141,35 +188,6 @@ class DSparkProposer(Drafter):
                 "the distribution they were drawn from is not. Falling back to "
                 "greedy proposal with exact-match acceptance.",
                 get_pcp_world_size(),
-            )
-            return
-        kv_cfg = getattr(self.config, "kv_transfer_config", None) or {}
-        if kv_config_has_producer(kv_cfg) or (
-            getattr(self.config, "enable_rapidserve", False)
-            and not getattr(self.config, "disagg_is_decode", False)
-        ):
-            # A P/D producer (or RapidServe's prefill process) drafts only to
-            # hand the drafts off; it never verifies, and the consumer has no
-            # q for a handed-off request anyway. Armed, it would allocate the
-            # q store, reserve scratch off its KV budget and run the de-fused
-            # draft every step for nothing.
-            logger.warning(
-                "ATOM_SPEC_LOSSLESS_SAMPLING is not used on a P/D producer "
-                "(prefill) engine: it drafts for handoff and verifies nothing. "
-                "Keeping the greedy draft here; the decode engine still arms."
-            )
-            return
-        head = self.model.markov_head
-        unsupported = dspark_markov_sample_unsupported(
-            head.markov_w1.weight, head.markov_w2.weight
-        )
-        if unsupported is not None:
-            # Checked once here so the sampled op never has to fail mid-serve.
-            logger.warning(
-                "ATOM_SPEC_LOSSLESS_SAMPLING: the fused sampled draft cannot "
-                "run (%s). Falling back to greedy proposal with exact-match "
-                "acceptance.",
-                unsupported,
             )
             return
         max_bs = self.config.max_num_seqs
@@ -255,6 +273,8 @@ class DSparkProposer(Drafter):
             DraftQSlots(q_slots, t),
             temperatures=self._draft_temps_buf.np,
             greedy_mask=self._draft_greedy_buf.np,
+            top_k=self._draft_top_k_buf.np,
+            top_p=self._draft_top_p_buf.np,
             seed=self._draft_seed_buf.np,
             dest_row_base=self._draft_row_base_buf.np,
             verify_row_base=self._verify_row_base_buf.np,
@@ -292,7 +312,7 @@ class DSparkProposer(Drafter):
             )
 
     def stage_draft_sampling_host(
-        self, batch, bs: int, group, *, has_filter: bool, drafts_verifiable: bool
+        self, batch, bs: int, group, *, drafts_verifiable: bool
     ) -> None:
         """Stage this step's draft sampling inputs and both q row bases.
 
@@ -300,19 +320,19 @@ class DSparkProposer(Drafter):
         preparation window, so every member rides that function's `sampling`
         H2D. The block head is captured and bakes these buffers' addresses;
         only their contents change, and only here. What goes in each row is
-        `DraftQStaging.stage`'s policy (see there for ``has_filter`` and
-        ``drafts_verifiable``); this method only publishes it.
+        `DraftQStaging.stage`'s policy (see there for ``drafts_verifiable``);
+        this method only publishes it.
         """
         if self.draft_sampling is None:
             return
-        rows = self._staging.stage(
-            batch, bs, has_filter=has_filter, drafts_verifiable=drafts_verifiable
-        )
+        rows = self._staging.stage(batch, bs, drafts_verifiable=drafts_verifiable)
         counts, index = group.counts, group.indices
         for name, key in (
             ("draft_sample_seed", "seed"),
             ("draft_temperatures", "temperatures"),
             ("draft_greedy_mask", "greedy_mask"),
+            ("draft_top_k", "top_k"),
+            ("draft_top_p", "top_p"),
             ("verify_q_row_base", "verify_row_base"),
             ("draft_q_row_base", "dest_row_base"),
         ):
@@ -324,7 +344,13 @@ class DSparkProposer(Drafter):
             return
         self._staging.consume()
 
-    def lossless_verify_inputs(self, bs: int, *, has_filter: bool):
+    @property
+    def keeps_top_k_ties(self) -> bool:
+        """Armed here, or on the decode peer of a P/D producer: that peer
+        verifies the requests whose first token this side draws."""
+        return self.draft_sampling is not None or self._peer_verifies_losslessly
+
+    def lossless_verify_inputs(self, bs: int):
         """The verify step's ``(draft_probs, q_row_base, ratio_scratch)``.
 
         All None keeps exact-match verification; anything else selects the
@@ -332,14 +358,11 @@ class DSparkProposer(Drafter):
         Asked only for a batch that is not all greedy: an all-greedy batch
         keeps the exact-match kernel, so its accept rule is the flag-off one
         (its draft still runs the sampled block, in greedy mode). A greedy row
-        inside a mixed batch is matched exactly by the ratio kernel itself.
-
-        A batch with top-k or top-p on any row keeps exact match: p in the
-        ratio path is a plain temperature softmax, and exact match against the
-        target's own filtered draw is lossless. The draft side pairs with it by
-        drafting such a batch greedily.
+        inside a mixed batch is matched exactly by the ratio kernel itself,
+        and a row with top-k or top-p is verified against `Sampler`'s
+        filtered p (`rejection_sampler._ratio_target_p`).
         """
-        if self.draft_sampling is None or has_filter:
+        if self.draft_sampling is None:
             return None, None, None
         return (
             RatioDraftQ(self._q_store, self._s_scratch),

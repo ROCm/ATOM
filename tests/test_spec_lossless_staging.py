@@ -77,21 +77,30 @@ def group(prop):
     )
 
 
-def batch(req_ids, temperatures=None, *, dummy=False, final_chunk=None):
-    temps = np.ones(len(req_ids), np.float32) if temperatures is None else temperatures
+def batch(
+    req_ids,
+    temperatures=None,
+    *,
+    top_ks=None,
+    top_ps=None,
+    dummy=False,
+    final_chunk=None,
+):
+    n = len(req_ids)
+    temps = np.ones(n, np.float32) if temperatures is None else temperatures
     return SimpleNamespace(
         req_ids=list(req_ids),
         temperatures=np.asarray(temps, np.float32),
+        top_ks=np.asarray([-1] * n if top_ks is None else top_ks, np.int32),
+        top_ps=np.asarray([1.0] * n if top_ps is None else top_ps, np.float32),
         is_dummy_run=dummy,
         is_final_chunk=final_chunk,
     )
 
 
-def stage(prop, b, *, has_filter=False, verifiable=True):
+def stage(prop, b, *, verifiable=True):
     g = group(prop)
-    prop.stage_draft_sampling_host(
-        b, len(b.req_ids), g, has_filter=has_filter, drafts_verifiable=verifiable
-    )
+    prop.stage_draft_sampling_host(b, len(b.req_ids), g, drafts_verifiable=verifiable)
     return {name: g.counts[g.indices[name]] for name in LOSSLESS}
 
 
@@ -165,11 +174,9 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
     assert prop.draft_sampling is None and prop._q_store is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
-    assert prop.lossless_verify_inputs(2, has_filter=False) == (None, None, None)
+    assert prop.lossless_verify_inputs(2) == (None, None, None)
     # Staging is a no-op rather than an error.
-    prop.stage_draft_sampling_host(
-        batch(["a"]), 1, None, has_filter=False, drafts_verifiable=True
-    )
+    prop.stage_draft_sampling_host(batch(["a"]), 1, None, drafts_verifiable=True)
 
 
 @pytest.mark.parametrize(
@@ -194,6 +201,66 @@ def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):
     )
     prop._init_lossless_sampling()
     assert prop.draft_sampling is None and prop.model.bound is None
+
+
+def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
+    """The verify's p_f is aiter's kept set; `Sampler`'s native fallback
+    would draw the bonus from another one."""
+    prop = proposer(monkeypatch, lossless=False)
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+    monkeypatch.setattr(dspark_proposer, "AITER_TOPK_TOPP_AVAILABLE", False)
+    prop._init_lossless_sampling()
+    assert prop.draft_sampling is None and prop.model.bound is None
+
+
+@pytest.mark.parametrize(
+    "kwargs, keeps",
+    [
+        ({}, True),
+        ({"lossless": False}, False),
+        ({"pp": 2}, False),
+        ({"pcp": 2}, False),
+        ({"model": SimpleNamespace(supports_lossless_draft=False)}, False),
+        # Never arms, but its decode peer verifies what it hands off, first
+        # token included.
+        ({"kv_transfer_config": {"kv_role": "kv_producer"}}, True),
+        ({"enable_rapidserve": True, "disagg_is_decode": False}, True),
+        ({"enable_rapidserve": True, "pp": 2, "disagg_is_decode": False}, True),
+    ],
+    ids=[
+        "armed",
+        "flag-off",
+        "pp",
+        "pcp",
+        "unported-flavor",
+        "pd-producer",
+        "rapidserve-prefill",
+        "rapidserve-prefill-pp",
+    ],
+)
+def test_sampler_keeps_top_k_ties_only_where_the_ratio_verify_serves(
+    monkeypatch, kwargs, keeps
+):
+    """A drafter that refused the flag verifies by exact match against
+    `Sampler`'s flag-off law, so its bonus and first tokens must keep it."""
+    assert proposer(monkeypatch, **kwargs).keeps_top_k_ties is keeps
+
+
+@pytest.mark.parametrize("refusal", ["aiter", "head"])
+def test_a_producer_whose_peer_cannot_arm_keeps_the_flag_off_law(monkeypatch, refusal):
+    """The peer runs the same build and checkpoint, so it refuses too."""
+    prop = proposer(
+        monkeypatch, lossless=False, kv_transfer_config={"kv_role": "kv_producer"}
+    )
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+    if refusal == "aiter":
+        monkeypatch.setattr(dspark_proposer, "AITER_TOPK_TOPP_AVAILABLE", False)
+    else:
+        monkeypatch.setattr(
+            dspark_proposer, "dspark_markov_sample_unsupported", lambda w1, w2: "no"
+        )
+    prop._init_lossless_sampling()
+    assert not prop.keeps_top_k_ties
 
 
 def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
@@ -227,6 +294,16 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     assert {"a", "b", "c"} <= set(prop._staging.slots._slot_of)
 
 
+def test_each_rows_filters_ride_the_publication(monkeypatch):
+    prop = proposer(monkeypatch)
+    counts = stage(prop, batch(["a", "b"], top_ks=[-1, 7], top_ps=[0.8, 1.0]))
+    assert counts["draft_top_k"] == counts["draft_top_p"] == 2
+    assert prop._draft_top_k_buf.np[:2].tolist() == [0, 7]
+    np.testing.assert_array_equal(prop._draft_top_p_buf.np[:2], np.float32([0.8, 1]))
+    # Neither row drafts greedily for a filter.
+    assert prop._draft_greedy_buf.np[:2].tolist() == [0, 0]
+
+
 def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
@@ -240,16 +317,15 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
 # ---- verify policy ----------------------------------------------------------
 
 
-def test_only_an_unfiltered_batch_reaches_the_ratio_rule(monkeypatch):
+def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
     prop = proposer(monkeypatch)
-    stage(prop, batch(["a", "b"]))
-    q, base, scratch = prop.lossless_verify_inputs(2, has_filter=False)
+    stage(prop, batch(["a", "b"], top_ks=[5, -1], top_ps=[1.0, 0.7]))
+    q, base, scratch = prop.lossless_verify_inputs(2)
     # The sparse store itself, and the draft's score scratch to spread a
     # rejecting request's row into: one dense row per batch row, V wide.
     assert q.store is prop._q_store and q.dense is prop._s_scratch
     assert q.dense.shape == (MAX_BS, VOCAB)
     assert base.shape == (2,) and scratch is prop._verify_scratch
-    assert prop.lossless_verify_inputs(2, has_filter=True) == (None, None, None)
 
 
 @pytest.mark.parametrize(
@@ -290,3 +366,10 @@ def test_relaxed_mtp_and_lossless_sampling_refuse_each_other_first(
         # Past the check, construction fails on the missing config instead.
         with pytest.raises(AttributeError):
             Drafter.__init__(drafter, None, None, None)
+
+
+def test_an_unported_drafter_keeps_samplers_flag_off_law(monkeypatch):
+    """MTP/EAGLE3 never reach the ratio verify, so the flag must not change
+    how their `Sampler` draws cut top-k."""
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+    assert _Bare.__new__(_Bare).keeps_top_k_ties is False

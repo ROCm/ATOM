@@ -4,8 +4,9 @@
 What staging owes the kernels: every row the captured block head runs names a
 destination (a slot its own request owns, or -1), every verifying request names
 the rows its drafts were drawn into (or -1), and the draft's temperature and
-greedy mask follow the target's. Numpy only, so this runs in the CPU unit job;
-`tests/test_spec_lossless_staging.py` covers the proposer wiring around it.
+greedy mask and filters follow the target's. Numpy only, so this runs in the
+CPU unit job; `tests/test_spec_lossless_staging.py` covers the proposer wiring
+around it.
 """
 
 from types import SimpleNamespace
@@ -24,6 +25,8 @@ def staging(slots=2 * MAX_BS):
     arrays = {
         "temperatures": np.ones(MAX_BS, np.float32),
         "greedy_mask": np.ones(MAX_BS, np.int32),
+        "top_k": np.zeros(MAX_BS, np.int32),
+        "top_p": np.ones(MAX_BS, np.float32),
         "seed": np.zeros(1, np.int32),
         "dest_row_base": np.full(MAX_BS, -1, np.int32),
         "verify_row_base": np.full(MAX_BS, -1, np.int32),
@@ -34,20 +37,30 @@ def staging(slots=2 * MAX_BS):
     )
 
 
-def batch(req_ids, temperatures=None, *, dummy=False, final_chunk=None):
-    temps = np.ones(len(req_ids), np.float32) if temperatures is None else temperatures
+def batch(
+    req_ids,
+    temperatures=None,
+    *,
+    top_ks=None,
+    top_ps=None,
+    dummy=False,
+    final_chunk=None,
+):
+    n = len(req_ids)
+    temps = np.ones(n, np.float32) if temperatures is None else temperatures
     return SimpleNamespace(
         req_ids=list(req_ids),
         temperatures=np.asarray(temps, np.float32),
+        # `ScheduledBatch`'s spelling: -1 and 1.0 are "off".
+        top_ks=np.asarray([-1] * n if top_ks is None else top_ks, np.int32),
+        top_ps=np.asarray([1.0] * n if top_ps is None else top_ps, np.float32),
         is_dummy_run=dummy,
         is_final_chunk=final_chunk,
     )
 
 
-def stage(st, b, *, has_filter=False, verifiable=True):
-    return st.stage(
-        b, len(b.req_ids), has_filter=has_filter, drafts_verifiable=verifiable
-    )
+def stage(st, b, *, verifiable=True):
+    return st.stage(b, len(b.req_ids), drafts_verifiable=verifiable)
 
 
 def test_a_verify_finds_the_rows_its_drafts_were_written_to():
@@ -88,10 +101,10 @@ def test_an_align_only_propose_writes_no_q_and_keeps_other_slots():
 
 def test_a_greedy_request_claims_no_slot_and_writes_no_q():
     """Its verify is exact match and never reads q; a sampled request beside
-    it, filtered batch or not, still gets the rows its q is read from."""
+    it, filtered or not, still gets the rows its q is read from."""
     st, a = staging()
-    for has_filter in (False, True):
-        stage(st, batch(["g", "s"], [0.0, 1.0]), has_filter=has_filter)
+    for top_k in (-1, 5):
+        stage(st, batch(["g", "s"], [0.0, 1.0], top_ks=[top_k, top_k]))
         assert a.dest_row_base[0] == -1 and a.dest_row_base[1] >= 0
         assert "g" not in st.slots and "s" in st.slots
     stage(st, batch(["g", "s"], [0.0, 1.0]))
@@ -122,13 +135,25 @@ def test_a_smaller_batch_clears_the_larger_ones_pad_rows():
     assert stage(st, batch(list("ab")))["dest_row_base"] == 2
 
 
-def test_a_filtered_batch_drafts_greedily():
-    """Only the mask changes: the delta q comes from the greedy draw itself,
-    so the temperatures stay the requests' own (clamped) ones."""
+def test_each_row_drafts_within_its_own_filters():
+    """A filter on one row changes nothing about the others: no row drafts
+    greedily for it, and each row's own top-k / top-p is staged, a top-k of
+    -1 as the draft's 0."""
     st, a = staging()
-    stage(st, batch(["a", "b"], [0.7, 1.3]), has_filter=True)
-    assert a.greedy_mask[:2].tolist() == [1, 1]
+    rows = stage(
+        st,
+        batch(
+            ["a", "b", "c"],
+            [0.7, 1.3, 0.0],
+            top_ks=[-1, 5, 1],
+            top_ps=[1.0, 0.9, 0.5],
+        ),
+    )
+    assert a.greedy_mask[:3].tolist() == [0, 0, 1]
     np.testing.assert_allclose(a.temperatures[:2], [0.7, 1.3], rtol=1e-6)
+    assert a.top_k[:3].tolist() == [0, 5, 1]
+    np.testing.assert_array_equal(a.top_p[:3], np.float32([1.0, 0.9, 0.5]))
+    assert rows["top_k"] == rows["top_p"] == 3
 
 
 def test_an_unfiltered_batch_keeps_each_rows_temperature_and_greedy_predicate():
