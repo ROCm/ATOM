@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""K2 on Kimi-K3's full-attention (MLA) layers, behind ``ATOM_MONO_K3_MLA_K2``.
+"""K2 on Kimi-K3's full-attention (MLA) layers.
 
-K2 is ``o_proj`` plus everything after it, none of which is KDA's. With the flag
-a full-attention layer keeps its production attention up to ``o_proj``'s input
+K2 is ``o_proj`` plus everything after it, none of which is KDA's. A
+full-attention layer keeps its production attention up to ``o_proj``'s input
 and hands the rest of the layer to K2. These tests pin the plain-Python parts:
-which layers bind, what a step does with them, and that the flag off changes
-nothing. Whether K2 is right on those layers (per-layer error, step time,
+which layers bind and what a step does with them. Whether K2 is right on those layers (per-layer error, step time,
 GSM8K) needs a GPU.
 """
 
@@ -22,16 +21,6 @@ LAYERS = 93  # Kimi-K3
 # the full-attention layers (config.json linear_attn_config.kda_layers is 1-based
 # and lists the others)
 MLA_LAYERS = [i for i in range(LAYERS) if i % 4 == 3] + [92]
-FLAG = "ATOM_MONO_K3_MLA_K2"
-
-
-def test_the_flag_is_off_unless_asked_for(monkeypatch):
-    from atom.utils import envs
-
-    monkeypatch.delenv(FLAG, raising=False)
-    assert envs.ATOM_MONO_K3_MLA_K2 is False
-    monkeypatch.setenv(FLAG, "1")
-    assert envs.ATOM_MONO_K3_MLA_K2 is True
 
 
 def test_no_full_attention_layer_closes_a_block():
@@ -90,15 +79,8 @@ def stub_binds(monkeypatch):
     return weights
 
 
-def test_the_flag_off_leaves_full_attention_layers_unbound(stub_binds):
+def test_full_attention_layers_get_k2_alone(stub_binds):
     plans = stub_binds.bind_model(_model(6), None, 0)
-    assert [p.mono for p in plans] == [False, True, True, False, True, True]
-    assert all(not p.ffn_only for p in plans)
-    assert (plans[3].kda, plans[3].moe) == (None, None)
-
-
-def test_the_flag_gives_them_k2_alone(stub_binds):
-    plans = stub_binds.bind_model(_model(6), None, 0, mla_k2=True)
     assert [p.mono for p in plans] == [False, True, True, False, True, True]
     assert [p.ffn_only for p in plans] == [False, False, False, True, False, False]
     assert plans[3].kda is None and plans[3].moe.layer_id == 3
@@ -111,7 +93,7 @@ def test_a_full_attention_layer_that_closes_a_block_keeps_production_k2(
 ):
     """One layer's refusal must not take the KDA layers' mono down with it."""
     with caplog.at_level("WARNING", logger="atom"):
-        plans = stub_binds.bind_model(_model(13, full=(3, 12)), None, 0, mla_k2=True)
+        plans = stub_binds.bind_model(_model(13, full=(3, 12)), None, 0)
     assert (plans[12].kda, plans[12].moe) == (None, None)
     assert plans[3].ffn_only and plans[1].mono
     assert "layer 12 keeps its production K2" in caplog.text
@@ -126,7 +108,7 @@ def test_the_block_check_runs_before_bind_moe_allocates(stub_binds, monkeypatch)
         lambda layer, lid, dims, rank: seen.append(lid)
         or SimpleNamespace(layer_id=lid, write_idx=layer_block(lid)[1]),
     )
-    stub_binds.bind_model(_model(13, full=(3, 12)), None, 0, mla_k2=True)
+    stub_binds.bind_model(_model(13, full=(3, 12)), None, 0)
     assert 12 not in seen and 3 in seen
 
 
@@ -141,17 +123,17 @@ def test_a_failing_bind_moe_on_a_full_attention_layer_falls_back_alone(
         return real(layer, lid, dims, rank)
 
     monkeypatch.setattr(stub_binds, "bind_moe", flaky)
-    plans = stub_binds.bind_model(_model(8, full=(3, 7)), None, 0, mla_k2=True)
+    plans = stub_binds.bind_model(_model(8, full=(3, 7)), None, 0)
     assert (plans[3].kda, plans[3].moe) == (None, None)
     assert plans[7].ffn_only and plans[1].mono and plans[4].mono
 
 
-def test_no_kda_layer_still_refuses_even_with_the_flag(stub_binds):
+def test_no_kda_layer_still_refuses(stub_binds):
     model = SimpleNamespace(
         layers=[_layer(linear=True, ffn=False), _layer(linear=False)]
     )
     with pytest.raises(MonoUnsupported, match="no layer takes the kernels"):
-        stub_binds.bind_model(model, None, 0, mla_k2=True)
+        stub_binds.bind_model(model, None, 0)
 
 
 # ------------------------------------------------------- _keep_hooked_layers

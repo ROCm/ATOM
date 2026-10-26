@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Kimi-K3 mono at 16 rows, behind ``ATOM_MONO_K3_MAX_ROWS``.
+"""Kimi-K3 mono at 16 rows.
 
-A bs=2 x MTP7 verify is 16 rows. At the default cap of 8 every such step, and
-the bs=2 CUDA graph's warmup and capture, is declined back to the production
-path; at 16 they run on the kernels. These tests pin the plain-Python parts of
-that switch: what the routing wrapper decides at each cap, that the buffers
-follow the cap, and the kernels' own arithmetic for the wider build. Whether
+A bs=2 x MTP7 verify is 16 rows. Under a cap of 8 every such step, and the
+bs=2 CUDA graph's warmup and capture, would be declined back to the production
+path; at the shipped cap of 16 they run on the kernels. These tests pin the
+plain-Python parts: what the routing wrapper decides at each cap (the cap is
+patched here), that the buffers follow the cap, and the kernels' own arithmetic for the wider build. Whether
 the 16-row kernels are right and faster on a GPU is not something they can say.
 """
 

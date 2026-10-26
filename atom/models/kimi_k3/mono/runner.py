@@ -17,9 +17,9 @@ kernels:
 Layer 0 and the full-attention layers take the original modules: the kernels
 have no attention of their own, so an MLA layer keeps its paged KV cache and its
 own path, and layer 0 has no AttnRes block behind it to mix. ``weights.bind_model``
-decides which is which; the two paths hand each other the same tensors. With
-``ATOM_MONO_K3_MLA_K2`` a full-attention layer also runs K2 for everything after
-its attention (``_pre_o_core``).
+decides which is which; the two paths hand each other the same tensors. A
+full-attention layer still runs K2 for everything after its attention
+(``_pre_o_core``), unless ``bind_model`` left it on the production path.
 
 The block-residual buffer is the one place the mono loop cannot reuse
 ``KimiDecoderLayer.forward``: ``AttnRes.maybe_close_block`` grows the candidates
@@ -132,12 +132,7 @@ class K3MonoDecodeRunner:
         self.debug = envs.ATOM_MONO_DEBUG
         self.inner = inner_model(model)
         self.plans = _keep_hooked_layers(
-            bind_model(
-                self.inner,
-                self.dims,
-                self.rank,
-                mla_k2=envs.ATOM_MONO_K3_MLA_K2,
-            ),
+            bind_model(self.inner, self.dims, self.rank),
             self.inner,
         )
         self.num_blocks = num_blocks(len(self.inner.layers))
@@ -381,7 +376,7 @@ class K3MonoDecodeRunner:
         return out
 
     def _pre_o_core(self, plan, positions, prefix, blocks, add, add2):
-        """A full-attention layer under ``ATOM_MONO_K3_MLA_K2``: the production
+        """A full-attention layer that runs K2: the production
         attention up to ``o_proj``'s input, to be handed to K2 in place of K1's.
 
         ``bind_model`` refuses a layer that closes a block, so ``before`` mixes

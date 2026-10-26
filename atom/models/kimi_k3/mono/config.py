@@ -137,9 +137,8 @@ SUPPORTED_TP = (8,)
 # 8. Both kernels still take one slab -- i.e. the whole row, exactly as before
 # -- at every row count up to 8.
 #
-# **16 rows is correct and faster; the default stays at 8 so existing
-# deployments do not change** (paired GSM8K: recipes/Kimi-K3.md). Three classes of 8-row assumption have been found
-# and fixed:
+# **16 rows is correct and faster** (paired GSM8K: recipes/Kimi-K3.md). Three
+# classes of 8-row assumption have been found and fixed:
 #
 #   * ``MAX_U = 8 * TOPK`` sized the expert union while ``load_route`` wrote an
 #     unclamped slot -- an out-of-bounds write past 8 rows.
@@ -164,16 +163,12 @@ SUPPORTED_TP = (8,)
 # issues the same MFMAs at both widths while the staging does not. Nothing above
 # 16 is measured; do not extrapolate the trend.
 #
-# The default stays 8 so existing deployments do not change. Paired GSM8K at 16
-# rows showed no regression (recipes/Kimi-K3.md), but K2's latent MoE still
-# carries an unsettled MXFP4 activation-quant precision cost (rel_L2 1.7e-1 ..
-# 3.0e-1: the expert intermediate is bf16 in the reference and MXFP4 here).
-# Raising the cap also arms mono for every CUDA-graph capture size inside it.
-# ``ATOM_MONO_K3_MAX_ROWS`` makes that decision per deployment.
-#
-# the caps whose kernels are built and measured; any other value is refused
-ROW_CAPS = (8, 16)
-MAX_ROWS = envs.ATOM_MONO_K3_MAX_ROWS
+# Paired GSM8K at 16 rows showed no regression (recipes/Kimi-K3.md), but K2's
+# latent MoE still carries an unsettled MXFP4 activation-quant precision cost
+# (rel_L2 1.7e-1 .. 3.0e-1: the expert intermediate is bf16 in the reference and
+# MXFP4 here). The cap also arms mono for every CUDA-graph capture size inside
+# it and sizes the peer buffer that every step zeroes. Nothing above 16 is built.
+MAX_ROWS = 16
 # tokens a request contributes at most (the conv rollback window the kernel
 # tiles for)
 MAX_QLEN = 16
@@ -318,10 +313,6 @@ def config_refusal(atom_config) -> str | None:
         # already states it (`deepseek_v41/mono/config.py`); another method
         # would be admitted here on a path never built or measured for it
         (spec is None or spec.method == "dspark", "not DSpark"),
-        (
-            MAX_ROWS in ROW_CAPS,
-            f"ATOM_MONO_K3_MAX_ROWS={MAX_ROWS} is not one of {ROW_CAPS}",
-        ),
         (
             spec is None or 0 < spec.num_speculative_tokens + 1 <= MAX_ROWS,
             f"speculative width past the {MAX_ROWS}-row buffers",

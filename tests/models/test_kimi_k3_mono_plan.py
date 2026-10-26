@@ -151,9 +151,9 @@ def _spec_metadata(requests: int, qlen: int):
     ("cap", "requests", "qlen", "served"),
     [
         (8, 1, 8, True),  # bs=1 x MTP7
-        (8, 2, 8, False),  # bs=2 x MTP7 declines at the default cap...
+        (8, 2, 8, False),  # bs=2 x MTP7 declines under a cap of 8...
         (16, 1, 8, True),
-        (16, 2, 8, True),  # ...and is served at 16, which is the bs=2 graph
+        (16, 2, 8, True),  # ...and is served at 16 (the shipped cap), the bs=2 graph
         (16, 1, 16, True),
         (16, 3, 8, False),  # 24 rows: past either cap
         (16, 2, 9, False),  # 18 rows
@@ -183,10 +183,10 @@ def test_width_key_round_trips(rows, qlen):
 
 
 def test_width_keys_stay_distinct_up_to_the_widest_cap():
-    from atom.models.kimi_k3.mono.config import MAX_QLEN, ROW_CAPS
+    from atom.models.kimi_k3.mono.config import MAX_QLEN, MAX_ROWS
     from atom.models.kimi_k3.mono.plan import width_key
 
-    rows = max(ROW_CAPS)
+    rows = MAX_ROWS
     keys = {width_key(r, q) for r in range(1, rows + 1) for q in range(1, MAX_QLEN + 1)}
     assert len(keys) == rows * MAX_QLEN
 

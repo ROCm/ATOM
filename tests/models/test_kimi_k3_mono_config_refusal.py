@@ -27,7 +27,6 @@ from atom.models.kimi_k3.mono.config import (
     KDA_HEADS,
     LATENT,
     MOE_INTER,
-    ROW_CAPS,
     SHARED_EXPERTS,
     SITU_BETA,
     SITU_LINEAR_BETA,
@@ -120,34 +119,17 @@ def test_a_router_the_route_stage_does_not_implement_is_refused(
 
 
 @pytest.mark.parametrize(
-    ("cap", "draft_tokens", "refused"),
+    ("draft_tokens", "refused"),
     [
-        (8, 7, False),  # 8 rows at the default cap
-        (8, 8, True),  # 9 rows
-        (16, 15, False),  # one request of 16 rows at cap 16
-        (16, 16, True),  # 17 rows
-        (12, 7, True),  # only the built caps are served
-        (4, 3, True),
+        (7, False),  # 8 rows: one request
+        (15, False),  # 16 rows: one request, the widest the buffers hold
+        (16, True),  # 17 rows
     ],
 )
-def test_the_row_cap_bounds_the_speculative_width(
-    servable, monkeypatch, cap, draft_tokens, refused
-):
-    monkeypatch.setattr(k3_config, "MAX_ROWS", cap)
+def test_the_row_cap_bounds_the_speculative_width(servable, draft_tokens, refused):
+    assert k3_config.MAX_ROWS == 16
     atom_config = _atom_config()
     atom_config.speculative_config = SimpleNamespace(
         method="dspark", num_speculative_tokens=draft_tokens
     )
-    why = config_refusal(atom_config)
-    assert (why is not None) is refused
-    if cap not in ROW_CAPS:
-        assert "ATOM_MONO_K3_MAX_ROWS" in why
-
-
-def test_the_row_cap_is_8_unless_asked_for(monkeypatch):
-    from atom.utils import envs
-
-    monkeypatch.delenv("ATOM_MONO_K3_MAX_ROWS", raising=False)
-    assert envs.ATOM_MONO_K3_MAX_ROWS == 8
-    monkeypatch.setenv("ATOM_MONO_K3_MAX_ROWS", "16")
-    assert envs.ATOM_MONO_K3_MAX_ROWS == 16
+    assert (config_refusal(atom_config) is not None) is refused
