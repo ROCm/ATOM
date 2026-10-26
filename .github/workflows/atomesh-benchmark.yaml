@@ -1576,6 +1576,7 @@ jobs:
       - name: Read failed job accounting and runner diagnostics
         if: ${{ inputs.collect_m31_run == '40271520115' }}
         run: |
+          set +e
           set -uo pipefail
           export PATH="/usr/local/slurm-24.05.5.1/bin:${PATH}"
           source .github/scripts/slurm_submit_helpers.sh
