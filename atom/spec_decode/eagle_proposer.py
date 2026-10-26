@@ -27,6 +27,11 @@ logger = logging.getLogger("atom")
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
+    # No model needs that gate when PCP is disabled. In particular, avoid
+    # importing DeepSeek-only optional kernels for Qwen MTP in this case.
+    if get_pcp_world_size() == 1:
+        return False
+
     from atom.models.deepseek_v2 import _pcp_active
 
     if _pcp_active():
@@ -395,7 +400,7 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def warmup_draft_graphs(self, build_context, stream) -> None:
+    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm every size from the state the target's capture left behind.
 
         `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
@@ -422,7 +427,7 @@ class EagleProposer(Drafter):
             return build_context(**kwargs)
 
         try:
-            super().warmup_draft_graphs(build_pristine_context, stream)
+            super().warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
             restore()
 
@@ -528,7 +533,7 @@ class EagleProposer(Drafter):
         # the verify step's has the right row count, wrong rows. Published
         # unconditionally: a prefill target (every step on a PD prefill node)
         # never built one, yet steps 1+ still reach the DCP sparse indexer.
-        builder._publish_dcp_token_block_tables(attn_metadata, running_bs, 1)
+        builder._publish_token_block_tables(attn_metadata, running_bs, 1)
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[

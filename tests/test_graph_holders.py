@@ -3,23 +3,16 @@
 
 """Reaching the cudagraphs no walk can find.
 
-A PIECEWISE capture -- `--level 3`, the default -- leaves its graphs in the
-per-piece `CUDAGraphWrapper`s, which the compile backend installs off both
-`_modules` and any path from the runner. Sleep has to drop them anyway, or it
-frees the KV pool those graphs replay the base of. So they register, and the
-release asks the registry.
-
-The registry itself imports nothing beyond `weakref`, which is what keeps these
-tests live on a CPU runner; the two tests that need the real holders skip there
-rather than taking the whole file with them.
+A module's token graphs sit in the module's own `__dict__`, wherever in the
+model it is, off any path from the runner. Sleep has to drop them anyway, or
+it frees the KV pool those graphs replay the base of. So they register, and
+the release asks the registry.
 """
 
 import gc
 import weakref
-from types import SimpleNamespace
 
 import pytest
-from import_guard import skip_if_dependency_missing
 
 from atom.utils import graph_holders
 from atom.utils.graph_holders import register_graph_holder, release_registered_graphs
@@ -81,59 +74,3 @@ def test_a_holder_that_cannot_be_kept_by_identity_is_refused_at_registration():
 
     with pytest.raises(TypeError):
         register_graph_holder(_Unhashable())
-
-
-def _cuda_graph_module():
-    """`atom/utils/cuda_graph.py` reaches aiter, which CI has no build of.
-
-    Per-test rather than at module level, so the registry's own behaviour above
-    is still checked where the release path runs without a GPU.
-
-    Not `importorskip`: the non-GPU runner has `aiter` as a NAMESPACE package, so
-    the failure is `cannot import name 'logger' from 'aiter'` -- an `ImportError`
-    that is not a `ModuleNotFoundError`, which pytest 9.1 (what CI runs) treats
-    as the caller's mistake and reports as a failure. `skip_if_dependency_missing`
-    asks the right question: an `ImportError` naming a third-party module is an
-    environment, and one naming ours is a bug that has to be seen.
-    """
-    try:
-        from atom.utils import cuda_graph
-    except ImportError as exc:
-        skip_if_dependency_missing(exc, "atom/utils/cuda_graph.py imports aiter")
-    return cuda_graph
-
-
-def test_the_per_piece_wrapper_registers_itself_and_drops_its_entries():
-    """The entry, not just the graph: `output` is a live reference into the
-    graph's private pool, which is the memory the release wants back."""
-    cg = _cuda_graph_module()
-    wrapper = cg.CUDAGraphWrapper(
-        runnable=lambda *args, **kwargs: None,
-        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace()),
-        runtime_mode=cg.CUDAGraphMode.PIECEWISE,
-    )
-    descriptor = cg.BatchDescriptor(num_tokens=8)
-    wrapper.concrete_cudagraph_entries[descriptor] = cg.CUDAGraphEntry(
-        batch_descriptor=descriptor, cudagraph=object(), output=object()
-    )
-    cg._graph_pools[8] = ("a", "pool handle")
-
-    assert release_registered_graphs() == 1
-    # Reached at all only because it registered; nothing else knows it exists.
-    assert wrapper.concrete_cudagraph_entries == {}
-    # Recapture must make a new pool rather than reuse the handle of one whose
-    # last graph has just gone away.
-    assert 8 not in cg._graph_pools
-
-
-def test_the_attention_core_runner_registers_itself_too():
-    """AF_PIECEWISE's captured attention core writes the KV it attends, so its
-    recordings hold the base of the pool the same way a decode graph does."""
-    cg = _cuda_graph_module()
-    runner = cg.CudagraphCaptureRunner()
-    runner._graphs["a key"] = {"graph": object(), "in": {}, "out": None}
-    runner._pool = "a pool handle"
-
-    assert release_registered_graphs() == 1
-    assert not runner.has_graph("a key")
-    assert runner._pool is None

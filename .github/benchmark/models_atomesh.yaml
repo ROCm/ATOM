@@ -188,6 +188,15 @@ models:
         MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
+    env_by_runner:
+      # Spur MI350X hosts have 1007 GiB per NUMA node and GPUs 0-3 all sit on
+      # NUMA0. Measured MoE staging is ~80-96 GiB/rank (~360 GiB for cpp4), so
+      # suites' 256 and the earlier 210 GiB/rank LMCache caps still overflow
+      # NUMA0 (4*212 + 360 > 1007). Cap at 160 GiB/rank (~647 GiB LMCache +
+      # staging fits with headroom).
+      atomesh-cicd-mi350:
+        prefill:
+          LMCACHE_MAX_LOCAL_CPU_SIZE: "160"
     service:
       prefill:
         cudagraph_mode: FULL
@@ -374,13 +383,34 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode: &glm52_cpp4_dcp4_decode_env
-              HIP_VISIBLE_DEVICES: "4,5,6,7"
-              # Ranks share identical communicator groups instead of creating
-              # duplicates, freeing decode memory for KV.
-              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            decode:
+              <<: &glm52_cpp4_dcp4_decode_env
+                HIP_VISIBLE_DEVICES: "4,5,6,7"
+                # Ranks share identical communicator groups instead of creating
+                # duplicates, freeing decode memory for KV.
+                AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+                DECODE_KV_TRANSFER_CONFIG: >-
+                  {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+              # Decode GPUs 4-7 sit on other rails than prefill GPUs 0-3, and
+              # Spur MI350X rails do not route to each other (QP->RTR times
+              # out). Registering decode memory on every HCA lets
+              # MC_ENABLE_DEST_DEVICE_AFFINITY pick the prefill GPU's rail.
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          env_by_runner:
+            # MI350X ionic NICs: under DCP4 load (every request fans out to
+            # all 4 decode ranks) Mooncake's default transport settings hit
+            # "ionic_comp_msn: wqe is not posted" after ~20 requests and then
+            # spin on CQ poll errors, flooding the log. One QP per endpoint
+            # alone does not avoid it; with a single worker per context, a
+            # smaller WR depth and no relaxed ordering it does not occur.
+            # Both sides must use the same QP count to connect.
+            atomesh-cicd-mi350:
+              common:
+                MC_NUM_QP_PER_EP: "1"
+                MC_WORKERS_PER_CTX: "1"
+                MC_MAX_WR: "64"
+                MC_IB_PCI_RELAXED_ORDERING: "0"
 
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c64
@@ -474,7 +504,7 @@ models:
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 5400
@@ -540,7 +570,7 @@ models:
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 5400
@@ -588,7 +618,7 @@ models:
               PYTHONNOUSERSITE: "1"
               MC_DISABLE_HIP: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
 
         - <<: *glm52_agentic_cpp4_tp4_mtp5
           name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16
@@ -1370,6 +1400,53 @@ models:
           run_eval: true
           eval_concurrency: [128, 768]
 
+      # gsm8k-only PD cell over MoRI IO. Prefill and decode each own a node, so
+      # the KV transfer crosses the ionic fabric rather than staying local.
+      accuracy:
+        - name: kimi-k25-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: >-
+              [8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+          server:
+            common_args:
+              decode_max_num_seqs: 256
+              # Kimi-K2.5 thinks by default. lm_eval scores message content,
+              # and a reasoning model cut off at max_gen_toks mid-thought
+              # returns none. The template's own switch is named "thinking".
+              extra_args: '--default-chat-template-kwargs {"thinking":false}'
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+            decode:
+              # Empty drops the model-level Mooncake JSON for the built-in config.
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy:
+            # Chat completions, so the template switch above applies.
+            task: gsm8k
+            fewshot: 5
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            max_gen_toks: 4096
+            apply_chat_template: true
+            threshold: 0.90
+
     accuracy:
       task: gsm8k
       fewshot: 3
@@ -1606,6 +1683,78 @@ models:
             wait_server_timeout: 1800
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
+
+        - name: minimax-m3-fp8-2p1d-tp8
+          topology: 2p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: minimax-m3-fp8-2p1d-dpa-tp8
+          topology: 2p1d_dpa
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+              online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo prefill"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: minimax-m3-fp8-2p1d-dpa-tp8-eagle3
+          topology: 2p1d_dpa_eagle3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+              method: eagle3
+              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              num_speculative_tokens: 3
+              online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo prefill"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
 
         - name: minimax-m3-fp8-1p1d-tp4-eagle3
           topology: 1p1d_eagle3
@@ -1855,3 +2004,84 @@ models:
             endpoint: chat/completions
             max_gen_toks: 4096
             apply_chat_template: true
+
+  # Bring-up model for the MoRI IO PD KV path. Text-only, ships a real
+  # tokenizer.json so the router can register one, and its FP8 weights keep
+  # quantization out of the picture -- but the KV path under test is the same
+  # 61-layer MLA as the MXFP4 models.
+  DeepSeek-V3:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V3/"
+    precision: FP8
+    env:
+      common:
+        # Mooncake's RoCE GID index. MoRI IO reads MORI_IB_GID_INDEX instead,
+        # so setting this once keeps the two cells below differing in nothing
+        # but KV_CONNECTOR.
+        MC_GID_INDEX: "1"
+        # MoRI IO only, set here for the same reason; see the Kimi-K2.5 cell.
+        ATOM_MORIIO_MODE: write
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        enable_prefix_caching: false
+        gpu_memory_utilization: 0.9
+        max_num_seqs: 256
+        max_num_batched_tokens: 32768
+        max_model_len: 32768
+        extra_args: ""
+    suites:
+      accuracy:
+        # A control and its variant. Neither sets a *_KV_TRANSFER_CONFIG, so
+        # both take the built-in config and the merge key makes the connector
+        # the only difference between them. A score gap therefore lands on the
+        # connector rather than on the model, the eval, or ATOM's PD layer.
+        - &dsv3_pd_gsm8k
+          name: ds-v3-1p1d-tp8-mooncake-gsm8k
+          topology: 1p1d_tp8_mooncake
+          display_topology: 1P1D-MOONCAKE-TP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[8,16,24,32,40,48,56,64]"
+          server:
+            common_args:
+              decode_max_num_seqs: 256
+          env:
+            common:
+              KV_CONNECTOR: mooncake
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy:
+            threshold: 0.90
+        - <<: *dsv3_pd_gsm8k
+          name: ds-v3-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          display_topology: 1P1D-MORIIO-TP8
+          env:
+            common:
+              KV_CONNECTOR: moriio
+
+    accuracy:
+      task: gsm8k
+      fewshot: 5
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      # V3 is not a reasoning model, so gsm8k answers are short.
+      max_gen_toks: 512
+      apply_chat_template: true

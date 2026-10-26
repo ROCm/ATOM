@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -390,6 +391,21 @@ class TestScheduleTicksTheWindow:
         sched.add(seq)
         sched.schedule()
         assert sched.engine_stats.num_prompt_tokens == 4
+
+
+class TestGroupPrefillTick:
+    """An idle DP rank dummy-prefills beside a peer's prefill only when the
+    runners recorded prefill token graphs, whatever ATOM_TOKEN_GRAPH_SIZES
+    says: a backend without `supports_token_graph` records none, and its
+    dummy prefill would have no bucket to run on."""
+
+    @pytest.mark.parametrize("recorded", [False, True])
+    def test_follows_recorded_graphs_not_the_env(self, monkeypatch, recorded):
+        monkeypatch.setenv("ATOM_TOKEN_GRAPH_SIZES", "256,512")
+        sched = Scheduler(MockConfig(), prefill_token_graphs=recorded)
+        sched.set_prefill_delayer(SimpleNamespace(is_local=False))
+        decision = PrefillDecision(allow=True, prefillable_ranks=1)
+        assert sched._group_prefill_tick(decision) is recorded
 
 
 # ── add / extend / query ───────────────────────────────────────────────────

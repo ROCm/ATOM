@@ -12,6 +12,10 @@ so a burst of long-context requests can push one allocation to tens of GiB
 owns the one rule they all need to agree on.
 """
 
+import torch
+
+from atom.utils import envs
+
 # A buffer resource descriptor addresses at most 2^31 bytes, so aiter's
 # fp8_mqa_logits drops to plain global load/store once the logits tensor reaches
 # 2 GiB. On gfx950 that USE_BUFFER_STORE=False specialization of the gluon kernel
@@ -57,6 +61,64 @@ def sparse_indexer_row_chunk(total_rows: int, row_width: int, budget_mb: int) ->
     return 1 << (max(1, max_rows).bit_length() - 1)
 
 
+def plane_rows(width):
+    """Query rows a `width`-column logits plane may hold at once.
+
+    Its readers reach a row as `row * stride` in int32, so a plane past 2**31
+    elements wraps to a negative address. `width` follows the model-length cap
+    and not the live context, so only a long-context configuration can get
+    there; wherever a batch already fits, this leaves it in one piece.
+    """
+    return max(1, (2**31 - 1) // width)
+
+
+def logits_rows(rows, width):
+    """One logits band's rows, shared by allocation and execution."""
+    return min(
+        plane_rows(width),
+        sparse_indexer_row_chunk(
+            rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+        ),
+    )
+
+
+def capped_logits_rows(rows, width, capacity, min_rows=1):
+    """`logits_rows` within a workspace of `capacity` rows of `width`; fails
+    when it cannot hold `min_rows`."""
+    if capacity < min_rows:
+        raise ValueError(
+            f"logits workspace holds {capacity} rows of {width} columns, "
+            f"fewer than {min_rows}"
+        )
+    return min(logits_rows(rows, width), capacity)
+
+
+def decode_band_rows(rows, width, next_n, capacity=None):
+    """Rows per decode band: `logits_rows` rounded down to whole requests of
+    `next_n` rows, never below one request, and within `capacity` rows when
+    given. A band that split a request would mis-slice its query and lengths.
+    No rows still gives a positive band, so a loop over them is empty."""
+    if rows <= 0:
+        return next_n
+    band = (
+        logits_rows(rows, width)
+        if capacity is None
+        else capped_logits_rows(rows, width, capacity, next_n)
+    )
+    return min(rows, max(next_n, band // next_n * next_n))
+
+
+def flat_view(flat, rows, width):
+    """`[rows, width]` view of the front of a flat buffer; fails rather than
+    growing past it."""
+    if rows * width > flat.numel():
+        raise ValueError(
+            f"a [{rows}, {width}] scorer temporary exceeds its workspace of "
+            f"{flat.numel()} elements"
+        )
+    return flat[: rows * width].view(rows, width)
+
+
 def dcp_qsplit_rows(
     num_rows: int, rank: int, world_size: int
 ) -> tuple[int, int, int, int]:
@@ -93,3 +155,40 @@ def dcp_qsplit_rows(
     row_lo = min(slot_lo, num_rows)
     row_hi = min(slot_lo + rows_per_rank, num_rows)
     return rows_per_rank, slot_lo, row_lo, row_hi
+
+
+class LogitsWorkspace:
+    """`capacity` fp32 elements every indexer of a model scores its bands
+    into, one layer after another: the logits plane, held for the server's
+    life.
+
+    A plane is as wide as a request may be long (`max_model_len // ratio`),
+    not as its live context. Allocated per forward it is multi-GiB at a height
+    that varies with the batch: the memory profile (a prefill) never sees it,
+    a token graph's pool keeps the largest bucket's, and the caching allocator
+    is left holding segments too small for the next long prefill. Sized from
+    the configuration, before the memory profile, it is counted in it and
+    never reallocated; scoring runs in bands of it."""
+
+    def __init__(self, capacity: int, device):
+        self.capacity = capacity
+        self._logits = torch.empty(capacity, dtype=torch.float32, device=device)
+
+    @classmethod
+    def for_rows(cls, rows: int, width: int, device) -> "LogitsWorkspace":
+        """A plane for `rows` query rows of `width` columns, in as many bands
+        as the logits budget asks."""
+        return cls(logits_rows(rows, width) * width, device)
+
+    @property
+    def nbytes(self) -> int:
+        return self._logits.numel() * self._logits.element_size()
+
+    def logits_rows(self, rows: int, width: int, group: int = 1) -> int:
+        """Rows of a `width`-column band: within the byte budget and this
+        allocation, whichever is smaller, in whole groups of `group` rows."""
+        return decode_band_rows(rows, width, group, self._logits.numel() // width)
+
+    def logits(self, rows: int, width: int) -> torch.Tensor:
+        """`[rows, width]` fp32, one band of the plane; fails past it."""
+        return flat_view(self._logits, rows, width)

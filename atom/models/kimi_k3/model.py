@@ -46,6 +46,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
+    uses_mxfp4_n32k4_scale,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -66,6 +67,7 @@ from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import eager_region, token_graph
 
 
 def _text_config(config):
@@ -570,7 +572,7 @@ class KimiSparseMoeBlock(nn.Module):
         """Unsummed dispatch target for `maybe_dual_stream_split_forward`.
 
         The split op reaches this whenever dual-stream is gated OFF for a given
-        call (above the token threshold, under TBO, mid piecewise capture), so
+        call (above the token threshold, under TBO, mid token-graph recording), so
         it has to defer exactly like the dual-stream target -- otherwise the
         deferral would silently stop above the threshold, where the [T, H] add
         it saves is largest.
@@ -834,9 +836,11 @@ class KimiFullAttention(nn.Module):
             o_type.value if self.fuse_sigmoid_mul_quant else QuantType.No.value
         )
 
-    def forward(
+    def _gated_core(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """sigmoid(g_proj) * attention output, i.e. ``o_proj``'s input, and its
+        activation scale when ``o_proj`` runs fp8 (else None)."""
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).
@@ -859,7 +863,7 @@ class KimiFullAttention(nn.Module):
             from atom.model_ops.linear import use_triton_gemm
             from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
 
-            if not use_triton_gemm():
+            if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
                 q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
                     q_c.shape[0]
                 )
@@ -889,7 +893,23 @@ class KimiFullAttention(nn.Module):
             quant=self.fuse_sigmoid_mul_quant,
             quant_type_value=self.o_proj_quant_type_value,
         )
+        return attn_out, attn_scale
+
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        attn_out, attn_scale = self._gated_core(positions, hidden_states)
         return self.o_proj(attn_out, x_scale=attn_scale)
+
+    def forward_pre_o(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """``forward`` without ``o_proj``: the bf16 gated core, for the mono K2
+        kernel that applies ``o_proj`` itself (``mono.weights.bind_moe`` refuses
+        a quantized ``o_proj``, so there is never an activation scale)."""
+        attn_out, attn_scale = self._gated_core(positions, hidden_states)
+        assert attn_scale is None, "o_proj is quantized; K2 reads it as bf16"
+        return attn_out
 
 
 def _kda_attention_with_output_fake(
@@ -909,6 +929,7 @@ def _kda_attention_with_output_fake(
     gen_fake=_kda_attention_with_output_fake,
     mutates_args=[],
 )
+@eager_region()
 def kda_attention_with_output(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor | None,
@@ -1698,6 +1719,7 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum
 
 
+@token_graph
 @support_torch_compile
 class KimiLinearModel(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):

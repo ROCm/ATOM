@@ -7,6 +7,8 @@ import pytest
 
 # All ATOM_* env vars that could affect default-value tests
 _ATOM_ENV_VARS = [
+    "ATOM_ENABLE_OTEL_TRACE",
+    "ATOM_TRACE_VERSION",
     "ATOM_DP_RANK",
     "ATOM_DP_RANK_LOCAL",
     "ATOM_DP_SIZE",
@@ -383,3 +385,19 @@ def test_malformed_offload_timeout_names_the_variable(monkeypatch):
     monkeypatch.setenv("OFFLOAD_PUBLICATION_TIMEOUT_S", "soon")
     with pytest.raises(ValueError, match="OFFLOAD_PUBLICATION_TIMEOUT_S must be"):
         _ = _get_envs().OFFLOAD_PUBLICATION_TIMEOUT_S
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, False), ("0", False), ("1", True), ("TRUE", True), ("false", False)],
+)
+def test_otel_enable_environment(value, expected, monkeypatch):
+    if value is not None:
+        monkeypatch.setenv("ATOM_ENABLE_OTEL_TRACE", value)
+    assert _get_envs().ATOM_ENABLE_OTEL_TRACE is expected
+
+
+def test_otel_version_environment(monkeypatch):
+    assert _get_envs().ATOM_TRACE_VERSION == "unknown"
+    monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
+    assert _get_envs().ATOM_TRACE_VERSION == "build-test"

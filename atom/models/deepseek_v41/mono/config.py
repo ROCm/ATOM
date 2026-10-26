@@ -10,12 +10,18 @@ from atom.utils import envs
 # the TP sizes the kernels are built for (``kernels.dims``): TP2 and TP4 run on
 # GPU; TP8's builds compile and fit, but the original path does not start there
 SUPPORTED_TP = (2, 4, 8)
+# DP attention ranks (attention TP 1, the MoE expert parallel over them,
+# ``kernels.dims``): the builds measured
+SUPPORTED_DPA = (2,)
 # the rows a step at most, the kernels' widest build (``kernels.attn_pre``): past
 # it TP2's shared expert outgrows one unit a CTA (72 tasks x 4 token tiles > 256
 # CTAs) and K1 / K2 spill VGPRs. Every row carries its own metadata, so a
 # target step is routed by its rows alone, however many requests they are and
 # however many rows each holds
 MAX_ROWS = 48
+# the MoE's rows at most (``kernels.moe``): DP attention runs every rank's
+# step through one MoE, up to MAX_ROWS a rank over two ranks
+MAX_MOE_ROWS = 96
 # the DSpark draft's blocks a pass at most
 MAX_REQUESTS = 8
 # a token's keys at most: the original decode's 64 splits of one 16-key tile
@@ -33,7 +39,7 @@ def config_refusal(atom_config) -> str | None:
     hf = atom_config.hf_config
     keys = hf.sliding_window + hf.index_topk
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
-    checks += common_refusals(atom_config, Dims, SUPPORTED_TP) + [
+    checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
         (
             atom_config.kv_cache_dtype == "bf16",
             f"kv cache {atom_config.kv_cache_dtype}",

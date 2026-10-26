@@ -773,6 +773,93 @@ def _host_positive_max(values: Any) -> int | None:
         return None
 
 
+# Same preference as SGLang ``get_context_length``. ``indexer_budget`` is the
+# QSA top-k window and must not appear here.
+_CONTEXT_LENGTH_KEYS = (
+    "max_sequence_length",
+    "seq_length",
+    "max_seq_len",
+    "model_max_length",
+    "max_position_embeddings",
+)
+
+
+def _positive_int(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, n)
+
+
+def _hf_context_len(config: Any) -> int:
+    """Checkpoint context, including linear rope scaling.
+
+    Returns 0 when none of the context keys are set. SGLang's own helper
+    falls back to 2048, which is Flash's ``indexer_budget`` and would hide
+    a missing config.
+    """
+    if config is None:
+        return 0
+    # SGLang stores the length it serves on the HF config and does not copy
+    # it back to ``server_args.context_length``.
+    explicit = _positive_int(getattr(config, "context_len", None))
+    base = 0
+    for key in _CONTEXT_LENGTH_KEYS:
+        base = _positive_int(getattr(config, key, None))
+        if base:
+            break
+    if not base:
+        return explicit
+    factor = 1.0
+    rope = getattr(config, "rope_scaling", None)
+    if isinstance(rope, dict) and rope:
+        if (
+            "original_max_position_embeddings" in rope
+            or rope.get("rope_type") == "llama3"
+        ):
+            factor = 1.0
+        else:
+            try:
+                factor = float(rope.get("factor", 1) or 1)
+            except (TypeError, ValueError):
+                factor = 1.0
+            if factor <= 0:
+                factor = 1.0
+    return max(explicit, int(factor * base))
+
+
+# id(atom_config) -> (atom_config, length). The config walk costs ~13 us and
+# runs on every decode replay and draft step. The checkpoint never changes,
+# and allocate_once already fixed the page tables to the first answer.
+_CHECKPOINT_CONTEXT_LEN: dict[int, tuple[Any, int]] = {}
+
+
+def _checkpoint_context_len(atom_config: Any) -> int:
+    """Model context when ``--context-length`` was omitted."""
+    cached = _CHECKPOINT_CONTEXT_LEN.get(id(atom_config))
+    if cached is not None and cached[0] is atom_config:
+        return cached[1]
+    hf = _hf_text_config(atom_config) if atom_config is not None else None
+    root = getattr(atom_config, "hf_config", None) if atom_config is not None else None
+    n = _hf_context_len(hf)
+    if root is not None and root is not hf:
+        n = max(n, _hf_context_len(root))
+    n = max(n, _positive_int(getattr(atom_config, "max_model_len", None)))
+    args = _server_args()
+    model_config = getattr(args, "model_config", None) if args is not None else None
+    if model_config is not None:
+        n = max(
+            n,
+            _positive_int(getattr(model_config, "context_len", None)),
+            _hf_context_len(getattr(model_config, "hf_text_config", None)),
+        )
+    _CHECKPOINT_CONTEXT_LEN[id(atom_config)] = (atom_config, n)
+    return n
+
+
 def _eager_qsa_max_seq_len(
     forward_batch: Any,
     seq_lens: torch.Tensor,
@@ -797,30 +884,46 @@ def _eager_qsa_max_seq_len(
     return max(int(ctx_len), 1)
 
 
-def _serving_context_len(indexer_budget: int) -> int:
-    ctx_len = indexer_budget
+def _serving_context_len(atom_config: Any, indexer_budget: int) -> int:
+    """Tokens the QSA page table and decode graph must cover.
+
+    ``--context-length`` is optional. SGLang derives the checkpoint length
+    (Flash is 262144) into ``ModelConfig.context_len`` and leaves
+    ``server_args.context_length`` as None. ``indexer_budget`` is only the
+    QSA top-k (2048). Using that top-k as the context builds a 2k page
+    table, so a ~4k prompt loses its recent tokens and stops following
+    the prompt. An explicit CLI length still wins, so a smaller serving
+    cap is preserved.
+    """
+    budget = max(int(indexer_budget), 1)
     args = _server_args()
-    if args is None:
-        return ctx_len
-    return max(
-        ctx_len,
-        int(getattr(args, "context_length", 0) or 0),
-        int(getattr(args, "max_model_len", 0) or 0),
-    )
+    cli = 0
+    if args is not None:
+        cli = max(
+            _positive_int(getattr(args, "context_length", None)),
+            _positive_int(getattr(args, "max_model_len", None)),
+        )
+    if cli:
+        return max(cli, budget)
+    model = _checkpoint_context_len(atom_config)
+    if model > budget and not getattr(_serving_context_len, "_logged", False):
+        logger.info(
+            "QSA context length %s from the checkpoint "
+            "(--context-length unset; indexer_budget=%s is the top-k, not the context)",
+            model,
+            budget,
+        )
+        _serving_context_len._logged = True  # type: ignore[attr-defined]
+    return max(model, budget)
 
 
-def _ensure_draft_qsa(device: torch.device, block_size: int) -> None:
+def _ensure_draft_qsa(device: torch.device, block_size: int, ctx_len: int) -> None:
     """Allocate the draft page tables once, at serving capacity."""
     args = _server_args()
     max_bs = 32
-    ctx = 1
     if args is not None:
         max_bs = max(int(getattr(args, "max_running_requests", 32) or 32), 1)
-        ctx = max(
-            int(getattr(args, "context_length", 0) or 0),
-            int(getattr(args, "max_model_len", 0) or 0),
-            1,
-        )
+    ctx = max(int(ctx_len), 1)
     tokens_per_req = _get_qsa_graph_max_tokens_per_req()
     pages = max(1, (ctx + block_size - 1) // block_size)
     _DRAFT_QSA.allocate_once(
@@ -956,7 +1059,7 @@ def build_qsa_metadata(
 
     live_bs = real_batch_size(forward_batch)
     indexer_budget = _indexer_budget(atom_config)
-    ctx_len = _serving_context_len(indexer_budget)
+    ctx_len = _serving_context_len(atom_config, indexer_budget)
     # Draft metadata used to take the eager path: one host sync of seq_lens
     # and a fresh page-table allocation on every step. That drains the GPU
     # between the graphed verify and each eager draft, which is most of the
@@ -968,7 +1071,7 @@ def build_qsa_metadata(
             and (mode.is_decode_or_idle() or _is_verify_or_draft_extend(forward_batch))
         )
         if packed:
-            _ensure_draft_qsa(device, block_size)
+            _ensure_draft_qsa(device, block_size, ctx_len)
             return _fill_qsa_like_native(
                 forward_batch=forward_batch,
                 positions=positions,
@@ -1453,7 +1556,7 @@ def _decode_graph_capacity(
     # QSA top-k still keeps only ``indexer_budget`` tokens, but those tokens
     # can sit anywhere in a 12k sequence; a 32-page (2k) table would clamp
     # logical_page and drop the recent context.
-    ctx_len = _serving_context_len(indexer_budget)
+    ctx_len = _serving_context_len(atom_config, indexer_budget)
     max_pages = max((ctx_len + block_size - 1) // block_size, 1)
     return max_bs, max_tokens, max_pages, torch.device(device)
 
