@@ -3449,9 +3449,6 @@ class ModelRunner:
         if callable(callback):
             callback(req_ids)
 
-    @_profile_runner_stage
-    @torch.inference_mode()
-    @with_eplb_forward_monitor
     def _settle_pcp_split_rows(self) -> None:
         """Cache whether the forward just run row-split for PCP.
 
@@ -3469,6 +3466,9 @@ class ModelRunner:
                 else False
             )
 
+    @_profile_runner_stage
+    @torch.inference_mode()
+    @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,

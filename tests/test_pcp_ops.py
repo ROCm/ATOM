@@ -458,3 +458,21 @@ def test_shared_expert_stays_on_tp_when_requantized_online():
     src = textwrap.dedent(inspect.getsource(v4.MoE.__init__))
     names = {n.id for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Name)}
     assert "_shared_expert_requantized_online" in names
+
+
+def test_settle_pcp_split_rows_takes_only_self(monkeypatch):
+    """Both forwards call it bare right after run_model; it must not have picked
+    up `forward`'s decorators, which expect a batch."""
+    mr = pytest.importorskip("atom.model_engine.model_runner")
+    assert hasattr(mr.ModelRunner.forward, "__wrapped__")
+    assert not hasattr(mr.ModelRunner._settle_pcp_split_rows, "__wrapped__")
+    ctx = SimpleNamespace(pcp_split_rows=None)
+    monkeypatch.setattr(mr, "get_forward_context", lambda: SimpleNamespace(context=ctx))
+    runner = SimpleNamespace(
+        drafter=object(), model=SimpleNamespace(pcp_split_active=lambda: True)
+    )
+    mr.ModelRunner._settle_pcp_split_rows(runner)
+    assert ctx.pcp_split_rows is True
+    runner.model = SimpleNamespace()
+    mr.ModelRunner._settle_pcp_split_rows(runner)
+    assert ctx.pcp_split_rows is False
