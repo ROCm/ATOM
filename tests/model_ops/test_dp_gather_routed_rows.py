@@ -7,8 +7,13 @@ tensor. CPU only: the group is a stand-in for two ranks, rank 1 holding
 from types import SimpleNamespace
 
 import torch
+from import_guard import skip_if_dependency_missing
 
-from atom.model_ops import moe
+try:
+    # aiter/triton absent under bare non-GPU pytest
+    from atom.model_ops import moe
+except ImportError as exc:
+    skip_if_dependency_missing(exc, "requires full atom import env")
 
 
 class _TwoRankGroup:
