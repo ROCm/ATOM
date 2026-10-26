@@ -207,7 +207,9 @@ def scratch_layout(key: AttnPostBuild) -> dict[str, tuple[int, int]]:
         **attention_pairs(tokens, d),
         "x8b": tokens * d.yb_words,
         "x8bs": tokens * d.o_rows // 32,
-        **(index_pairs(tokens, index_bound_max) if index_bound_max else {}),
+        **(
+            index_pairs(tokens, index_bound_max, key.tok_par) if index_bound_max else {}
+        ),
     }
     out = {name: base[name] for name in ("lin", "pmix", "x8", "x8s")}
     start = max(o + n for o, n in base.values())
@@ -588,6 +590,8 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
     }  # fmt: skip
     for region, (off, _) in layout.items():
         c[region] = sreg(scratch, off, region)
+    if const_expr(key.tok_par and key.index_bound_max > 0):
+        c["irdy"] = preg(sym, c["peer"]["irdy"], "irdy")
     c["sel_lds"] = {"keys": se.sk.ptr, "hist": se.sh.ptr, "buf": se.sb.ptr}
     return c
 

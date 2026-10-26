@@ -146,6 +146,7 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 from atom.utils.h2d import h2d_producer
+from atom.utils.tbo import decode_bucket_splits, decode_ubatch_request_ranges
 
 logger = logging.getLogger("atom")
 
@@ -2490,12 +2491,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._ubatch_decode_meta = None
         if (
             self.model_runner.config.enable_tbo_decode
-            and scheduled_bs > 2
+            and decode_bucket_splits(self._ubatch_split_bs or scheduled_bs)
             and not batch.is_dummy_run
         ):
             self._prepare_ubatch_decode(
                 scheduled_bs=scheduled_bs,
                 running_bs=running_bs,
+                split_bs=self._ubatch_split_bs,
                 max_seqlen_q=max_seqlen_q,
                 context_lens_np=context_lens_np,
                 state_slot_np=state_slot_np,
@@ -2517,6 +2519,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         state_slot_in_np: np.ndarray,
         positions_np: np.ndarray,
         extend_lens_np: np.ndarray,
+        split_bs: int | None = None,
     ) -> None:
         """Split a decode batch into two micro-batches (by request) and build
         each one's V4 decode metadata into ``ub{0,1}_`` prefixed buffers.
@@ -2534,33 +2537,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._check_ubatch_sources(f"ub{ub_idx}_")
         var = self.model_runner.forward_vars
         N = self._NUM_TBO_UBATCHES
-        enforce_eager = self.model_runner.enforce_eager
-        if enforce_eager:
-            split_total = scheduled_bs
-            half = scheduled_bs // N
-            padded_list = [half, scheduled_bs - half]
-            ub_ranges = [(0, half), (half, split_total)]
-        else:
-            from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
-
-            ctx = get_forward_context()
-            padded_list = [
-                UBatchWrapper._decode_ub_running_bs(ctx, i, N, running_bs)
-                for i in range(N)
-            ]
-            # Real-request ranges partition scheduled_bs; each ubatch owns up to
-            # its padded capacity, the tail ubatch takes the remainder. Pad rows
-            # beyond the real reqs carry sentinels (filled below).
-            ub_ranges = []
-            req_start = 0
-            for i in range(N):
-                if i == N - 1:
-                    req_end = scheduled_bs
-                else:
-                    req_end = min(scheduled_bs, req_start + padded_list[i])
-                ub_ranges.append((req_start, req_end))
-                req_start = req_end
-            split_total = scheduled_bs
+        # One ubatch per micro-batch the step runs (`decode_ubatch_request_ranges`
+        # of ``split_bs``, the step's `_ubatch_split_bs`; None: the scheduled
+        # requests), each as wide as its range: a replayed TBO graph's halves
+        # of the bucket, whose pad rows past the scheduled requests carry
+        # sentinels (filled below), or an eager split's halves of the
+        # scheduled requests.
+        ub_ranges = decode_ubatch_request_ranges(split_bs or scheduled_bs, N)
+        padded_list = [end - start for start, end in ub_ranges]
 
         metas: list = []
         token_offsets = np.zeros(scheduled_bs + 1, dtype=np.int32)
@@ -2569,14 +2553,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             p = f"ub{ub_idx}_"
             # THIS ubatch's width, not the step's -- the two are different
             # numbers and both are called a running_bs, so they get distinct
-            # names (cf. `UBatchWrapper._decode_ub_running_bs`, which supplies it).
+            # names.
             ub_running_bs = padded_list[ub_idx]
             # Real requests that fall into this ubatch's [req_start, req_end),
-            # clamped to scheduled_bs (cudagraph pad rows beyond scheduled_bs
-            # carry sentinels, exercised only during capture's synthetic batch).
+            # clamped to scheduled_bs: a replayed TBO graph's bucket pads past
+            # the scheduled requests, and its pad rows carry sentinels. Such a
+            # ubatch can start past them, where the token offsets end.
             ub_real_reqs = max(0, min(scheduled_bs, req_end) - req_start)
-            tok_start = int(token_offsets[req_start])
-            tok_end = int(token_offsets[req_start + ub_real_reqs])
+            real_start = min(req_start, scheduled_bs)
+            tok_start = int(token_offsets[real_start])
+            tok_end = int(token_offsets[real_start + ub_real_reqs])
             ub_real_tokens = tok_end - tok_start
             ub_extend_lens_np = extend_lens_np[req_start : req_start + ub_real_reqs]
 
@@ -4201,10 +4187,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             running_tokens=scheduled_tokens,
         )
 
-        if self.model_runner.config.enable_tbo_decode and bs > 2:
+        if self.model_runner.config.enable_tbo_decode and decode_bucket_splits(bs):
             self._prepare_ubatch_decode(
                 scheduled_bs=bs,
                 running_bs=bs,
+                # A recording splits its bucket (`ModelRunner.capture_cudagraph`).
+                split_bs=bs,
                 max_seqlen_q=max_q_len,
                 context_lens_np=context_lens_np,
                 state_slot_np=state_slot_np,

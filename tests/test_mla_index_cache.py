@@ -10,6 +10,7 @@ import torch
 
 from atom.models.utils import get_pp_indices
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+from atom.utils.tbo.ubatch_splitting import decode_ubatch_request_ranges
 
 try:
     import aiter  # noqa: F401
@@ -606,7 +607,7 @@ def _capture_metadata_builder(dcp_world_size, *, is_sparse):
     builder.indexes_by_token_table = indexes_by_token_table(
         is_sparse, dcp_world_size, builder.index_kpool
     )
-    builder._tbo_full_running_bs = 0
+    builder._tbo_ubatch_request_ranges = []
     builder.dtype_q = None
     builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
     return builder, var
@@ -644,9 +645,15 @@ def test_cudagraph_capture_keeps_non_sparse_dcp_paths_independent(
     assert metadata.dcp_local_context_lens is None
 
 
-def test_ubatch_metadata_views_full_dcp_local_context_buffer():
+@pytest.mark.parametrize(
+    ("scheduled_bs", "expected"),
+    # ubatch 1 starts where its micro-batch's requests do, not at half the
+    # padded batch: 3 scheduled requests split [0, 1) / [1, 3).
+    [(4, [13, 14]), (3, [12, 13])],
+)
+def test_ubatch_metadata_views_full_dcp_local_context_buffer(scheduled_bs, expected):
     builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
-    builder._tbo_full_running_bs = 4
+    builder._tbo_ubatch_request_ranges = decode_ubatch_request_ranges(scheduled_bs, 2)
     builder._set_ubatch_mla_buffers = lambda *args, **kwargs: None
     var["dcp_local_context_lens"].gpu.copy_(
         torch.tensor([11, 12, 13, 14], dtype=torch.int32)
@@ -678,7 +685,7 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer():
 
     torch.testing.assert_close(
         metadata.dcp_local_context_lens,
-        torch.tensor([13, 14], dtype=torch.int32),
+        torch.tensor(expected, dtype=torch.int32),
     )
     assert "ub1_dcp_local_context_lens" not in var
 
