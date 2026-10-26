@@ -259,23 +259,13 @@ def native_draft_steps(model, configs, anchors, slots, *, out=None, _prepared=Fa
     if any(left[1] > right[0] for left, right in pairwise(ordered)):
         raise MonoUnsupported("draft stages cannot share addressed cache bytes")
     if out is not None:
-        out = tuple(out)
-        if len(out) != len(steps):
-            raise MonoUnsupported("one static draft metadata destination per stage")
         destinations = []
         for target, source in zip(out, steps):
             old_cache = target.kv_cache
             new_cache = source.kv_cache
             old_planes = old_cache if isinstance(old_cache, tuple) else (old_cache,)
             new_planes = new_cache if isinstance(new_cache, tuple) else (new_cache,)
-            if len(old_planes) != len(new_planes) or any(
-                old.data_ptr() != new.data_ptr()
-                or old.shape != new.shape
-                or old.stride() != new.stride()
-                or old.dtype != new.dtype
-                or old.device != new.device
-                for old, new in zip(old_planes, new_planes)
-            ):
+            if input_identity(old_planes) != input_identity(new_planes):
                 raise MonoUnsupported("static draft cache binding changed")
             if target.block_tables is not None or target.state:
                 raise MonoUnsupported("static draft requires native window metadata")

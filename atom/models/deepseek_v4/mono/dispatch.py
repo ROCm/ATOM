@@ -104,19 +104,21 @@ def install_mono_decode(model, atom_config, drafter, metadata_builder):
         drafter.model.share_with_target(model, set())
     if profile.name.startswith("dspark_"):
         from atom.models.deepseek_v4.mono.norm import MonoRMSNorm
+        from atom.models.deepseek_v4.mono.proposer import MonoDSparkProposer
 
         last = drafter.model.model.mtp[-1]
         last.norm = MonoRMSNorm(last.norm)
+        block = drafter.block
+        native_callbacks = (block.forward, block.epilogue, block.warmup_inputs)
+        # The installed proposer owns the draft runner, not the target shape.
+        metadata_builder.model_runner.drafter = MonoDSparkProposer(drafter, session)
     # Bind only after read-only wrappers and shared draft modules are final.
     # Repack still precedes native warmup/KV sizing; binding earlier would
     # invalidate the draft embedding owner when it is shared again above.
     if not session.prepare_weights():
+        if profile.name.startswith("dspark_"):
+            metadata_builder.model_runner.drafter = drafter
+            block.forward, block.epilogue, block.warmup_inputs = native_callbacks
         return model
     metadata_builder._mono_session = session
-    if profile.name.startswith("dspark_"):
-        from atom.models.deepseek_v4.mono.proposer import (
-            MonoDSparkProposer,
-        )
-
-        metadata_builder.model_runner.drafter = MonoDSparkProposer(drafter, session)
     return MonoDecodeModel(model, session)

@@ -53,29 +53,26 @@ class MonoMetadataBuilder(DeepseekV4AttentionMetadataBuilder):
             self._mono_session.engine.shutdown()
         super().close()
 
-    def build(self, batch, running_bs, running_tokens, max_seqlen_q):
+    def build(self, batch, *args, **kwargs):
+        """Preserve the native build contract while ordering joint state writes."""
         self._mono_batch = batch
-        if (
-            self._mono_session is None
-            or not self._mono_session.profile.name.startswith("dspark_")
-        ):
-            return super().build(batch, running_bs, running_tokens, max_seqlen_q)
+        if self._mono_session is None or not self._mono_session._has_draft_resources():
+            return super().build(batch, *args, **kwargs)
         # Native owns the copy order, padding checks and both phase signatures.
         # A step that copies prefix/COW state runs that whole build after the
         # joint draft readers retire; empty maintenance still votes on all ranks.
         native_build = super().build
-        results = []
+        result = None
 
         def build_native():
-            results.append(
-                native_build(batch, running_bs, running_tokens, max_seqlen_q)
-            )
+            nonlocal result
+            result = native_build(batch, *args, **kwargs)
 
         empty = batch.state_maintenance_ops.empty
         self._mono_session.run_state_maintenance(build_native, empty=empty)
         if empty:
-            return native_build(batch, running_bs, running_tokens, max_seqlen_q)
-        return results[0]
+            return native_build(batch, *args, **kwargs)
+        return result
 
     def build_for_cudagraph_capture(self, bs, max_q_len=None):
         self._mono_batch = None

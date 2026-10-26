@@ -18,9 +18,12 @@ from atom.models.deepseek_v4.mono.binding import (
     input_identity,
     tensor_owners,
 )
-from atom.models.deepseek_v4.mono.build import kernel_kwargs, launch_plan
+from atom.models.deepseek_v4.mono.build import (
+    _build_launches,
+    kernel_kwargs,
+    launch_plan,
+)
 from atom.models.deepseek_v4.mono.config import (
-    LAUNCH_PHASES,
     MAX_LAYERS_PER_STEP,
     MoeMode,
     _variant_key,
@@ -50,11 +53,24 @@ __all__ = [
 
 @dataclass(frozen=True)
 class RowsBuild:
-    """One exact row width: two attention variants, independent layer owners."""
+    """Layer kernels and shared arenas for one exact rows/q lane."""
 
     layers: tuple[Dsv4MonoKernel, ...]
     variants: tuple[Dsv4Variant, ...]
     hidden: tuple[torch.Tensor, torch.Tensor]
+
+    def arena_write_views(self) -> tuple[torch.Tensor, ...]:
+        """Mutable epoch/peer arenas shared by target and draft capture."""
+        return tuple(
+            view
+            for variant in self.variants
+            for view in (
+                variant.scratch,
+                variant.step,
+                variant.hang,
+                variant.peer_buffer.storage,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -257,7 +273,6 @@ class V4MonoDecodeRunner:
         in one serving step receive separate stable lanes, so a faster TP rank
         cannot overwrite a peer mailbox that a slower rank is still consuming.
         """
-        from atom.models.deepseek_v4.mono.kernels.layer import build_dsv4_kernel
         from atom.models.deepseek_v4.mono.layer import Dsv4MonoKernel
 
         if self._closed:
@@ -292,17 +307,9 @@ class V4MonoDecodeRunner:
                 tokens_per_seq=tokens_per_seq,
                 attention_mode=self.attention_mode,
             )
-            for w in self.weights:
-                cfg = w.cfg
-                validate_shard(
-                    rows,
-                    cfg.heads,
-                    self.rank,
-                    self.npes,
-                    cfg.window,
-                    cfg.compress_ratio,
-                )
-                vk = _variant_key(
+
+            def variant_key(cfg):
+                return _variant_key(
                     cfg,
                     rows,
                     self.npes,
@@ -313,6 +320,18 @@ class V4MonoDecodeRunner:
                     attention_mode=self.attention_mode,
                     **plan,
                 )
+
+            for w in self.weights:
+                cfg = w.cfg
+                validate_shard(
+                    rows,
+                    cfg.heads,
+                    self.rank,
+                    self.npes,
+                    cfg.window,
+                    cfg.compress_ratio,
+                )
+                vk = variant_key(cfg)
                 cfgs.setdefault(vk, cfg)
             for vk, cfg in cfgs.items():
                 refresh_modes = (True, False) if cfg.indexed else (True,)
@@ -320,7 +339,6 @@ class V4MonoDecodeRunner:
                     cache_key = (vk, refresh)
                     launches = Dsv4Variant._cache.get(cache_key)
                     if launches is None:
-                        phases = LAUNCH_PHASES[plan["launch_shape"]]
                         kwargs = kernel_kwargs(
                             cfg,
                             tokens_per_seq=tokens_per_seq,
@@ -330,16 +348,12 @@ class V4MonoDecodeRunner:
                             attention_mode=self.attention_mode,
                             **{k: v for k, v in plan.items() if k != "launch_shape"},
                         )
-                        launches = tuple(
-                            build_dsv4_kernel(
-                                rows,
-                                cfg.heads,
-                                self.npes,
-                                cfg.window,
-                                phase=phase,
-                                **kwargs,
-                            )
-                            for phase in phases
+                        launches = _build_launches(
+                            cfg,
+                            rows,
+                            self.npes,
+                            launch_shape=plan["launch_shape"],
+                            **kwargs,
                         )
                     elif not isinstance(launches, tuple):
                         launches = (launches,)
@@ -362,7 +376,7 @@ class V4MonoDecodeRunner:
             self._refused.add(key)
             return False
         Dsv4Variant._cache.update(builds)
-        lane_builds = []
+        lane_builds, allocated_variants = [], []
         try:
             for _lane in range(lanes):
                 variants, layers = {}, []
@@ -379,6 +393,7 @@ class V4MonoDecodeRunner:
                         attention_mode=self.attention_mode,
                         **plan,
                     )
+                    allocated_variants.append(variants[vk])
                     bind_agreed(
                         lambda v=variants[vk]: self._compile(v._advance), self.group
                     )
@@ -388,17 +403,7 @@ class V4MonoDecodeRunner:
                 failure = None
                 try:
                     for w, packed_layer in zip(self.weights, self.packed):
-                        vk = _variant_key(
-                            w.cfg,
-                            rows,
-                            self.npes,
-                            self.moe_mode,
-                            self.timeline,
-                            None,
-                            tokens_per_seq,
-                            attention_mode=self.attention_mode,
-                            **plan,
-                        )
+                        vk = variant_key(w.cfg)
                         layers.append(
                             Dsv4MonoKernel(
                                 w,
@@ -435,14 +440,8 @@ class V4MonoDecodeRunner:
             self._lane_builds[key] = tuple(lane_builds)
             return True
         except Exception:
-            for build in lane_builds:
-                for variant in build.variants:
-                    variant.close()
-            for variant in locals().get("variants", {}).values():
-                if not any(
-                    variant is v for build in lane_builds for v in build.variants
-                ):
-                    variant.close()
+            for variant in allocated_variants:
+                variant.close()
             self._refused.add(key)
             raise
 
@@ -769,33 +768,14 @@ class V4MonoDecodeRunner:
         outputs = getattr(self, "_aux_outputs", {})
         if not outputs:
             return tuple({} for _ in entries)
-        protected = []
-        seen_tensors = set()
-
-        def tensors(value):
-            if isinstance(value, torch.Tensor):
-                # Shared metadata/pool tensors recur across layers. Deduplicate
-                # only the identical live object within this call: distinct
-                # views (including offset/empty aliases) still need checking.
-                identity = id(value)
-                if identity not in seen_tensors:
-                    seen_tensors.add(identity)
-                    protected.append(value)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    tensors(item)
-            elif isinstance(value, (tuple, list)):
-                for item in value:
-                    tensors(item)
-
-        tensors(protected_inputs)
+        sources = [protected_inputs]
         for h, build, steps, x_out, offset in entries:
             if type(offset) is not int or offset < 0:
                 raise MonoUnsupported("aux row offset must be a nonnegative integer")
-            tensors((h, *build.hidden, x_out))
-            for step in steps:
-                for value in vars(step).values():
-                    tensors(value)
+            sources.append(
+                (h, build.hidden, x_out, tuple(vars(step) for step in steps))
+            )
+        protected = list(tensor_owners(sources))
         for buffer in outputs.values():
             if any(
                 (
@@ -820,7 +800,7 @@ class V4MonoDecodeRunner:
                 raise MonoUnsupported(
                     "aux buffer aliases target input/output/cache storage"
                 )
-            tensors(buffer)
+            protected.extend(tensor_owners(buffer))
         return tuple(
             {
                 layer_id: buffer[offset : offset + h.shape[0]]

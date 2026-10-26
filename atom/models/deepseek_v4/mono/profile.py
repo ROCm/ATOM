@@ -34,23 +34,6 @@ class V4MonoProfile:
             widths.add(3)
         return tuple(sorted(widths, reverse=True))
 
-    def capture_query_lengths(self, declared) -> tuple[int, ...]:
-        """Startup coverage, never a change to the scheduler's q buckets.
-
-        Variable-q DSpark may publish shorter live request spans inside a
-        full-width engine rectangle. Prepare their graphs before serving even
-        when the declared outer graph ladder contains only the full width.
-        This does not qualify mixed-q lane multiplicity or the deployment.
-        """
-        declared = tuple(declared)
-        if any(
-            type(q) is not int or not 1 <= q <= self.tokens_per_seq for q in declared
-        ):
-            raise ValueError("capture query lengths must fit the target profile")
-        if self.name.startswith("dspark_") and self.variable_q:
-            return tuple(range(1, self.tokens_per_seq + 1))
-        return tuple(sorted(set(declared)))
-
     def accepts_graph(self, running_bs: int, max_seqlen_q: int) -> bool:
         if self.variable_q:
             valid_q = 1 <= max_seqlen_q <= self.tokens_per_seq

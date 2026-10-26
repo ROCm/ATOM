@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import threading
 import weakref
-from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import pairwise
 
@@ -895,15 +894,7 @@ class V4MonoSession:
                     timeline = getattr(layer, "timeline", None)
                     if timeline is not None:
                         views.append(timeline)
-                for variant in build.variants:
-                    views.extend(
-                        (
-                            variant.scratch,
-                            variant.step,
-                            variant.hang,
-                            variant.peer_buffer.storage,
-                        )
-                    )
+                views.extend(build.arena_write_views())
             self._snapshot_capture_views(views, snapshots)
             resolved.append((runner, steps, ids, positions, width, anchors[0]))
 
@@ -1201,48 +1192,6 @@ class V4MonoSession:
             return
         self.require_graph_layout(key, layout)
 
-    def supports_ragged_graph_layout(self, lengths, max_seqlen_q: int) -> bool:
-        """Agree prepared graph coverage before the scheduler rewrites tokens.
-
-        This is a shape feasibility gate, not a live publication authorization.
-        Slots, metadata addresses, epochs and execution order must still pass
-        the normal publication consensus after input preparation. Keep the
-        original FULL capacity key; never replay it for a different layout.
-        """
-        from atom.models.deepseek_v4.mono.verify_plan import plan_verify_launches
-
-        supported = False
-        try:
-            if (
-                not self.disabled
-                and self.owns_live_session()
-                and self.runner is not None
-                and self.adapter is not None
-                and self.profile.name.startswith("dspark_")
-                and self.profile.ragged
-                and 0 < len(lengths) <= self.profile.max_requests
-                and all(0 < length <= max_seqlen_q for length in lengths)
-            ):
-                self.adapter.assert_current()
-                ladder = self.builder.model_runner.capture_sizes
-                capacity = next((size for size in ladder if size >= len(lengths)), None)
-                key = (capacity, max_seqlen_q)
-                launches = plan_verify_launches(lengths, self.adapter.prepared_shapes)
-                supported = self.graph_is_current(key) and all(
-                    (launch.rows, launch.tokens_per_seq, launch.lane)
-                    in self.runner._lane_graphs
-                    and launch.lane
-                    < len(
-                        self.adapter.shape_buckets(launch.rows, launch.tokens_per_seq)
-                    )
-                    for launch in launches
-                )
-        except (AttributeError, TypeError, ValueError, MonoUnsupported):
-            supported = False
-        # A rank-local missing graph cannot let other TP ranks rewrite the
-        # request layout and subsequently enter a different launch sequence.
-        return tp_agree(bool(supported), self.group)
-
     def prepare_weights(self) -> bool:
         """Retain only post-load weights during installation, before warmup.
 
@@ -1265,7 +1214,10 @@ class V4MonoSession:
                 compressor_ring_extra=self.builder.max_spec_steps,
             )
 
-            if self.profile.name.startswith("dspark_"):
+            # Target-only execution keeps Native's draft ownership. Prepare
+            # Mono draft resources only for our installed joint proposer.
+            drafter = getattr(self.builder.model_runner, "drafter", None)
+            if getattr(drafter, "_mono_session", None) is self:
                 from atom.models.deepseek_v4.mono.draft_runner import V4MonoDraftRunner
 
                 draft_models = []
@@ -1390,9 +1342,10 @@ class V4MonoSession:
                 self.group,
             )
             self.adapter = adapters[0]
-            if self.profile.name.startswith(
-                "dspark_"
-            ) and not self.draft_runner.prepare_requests(max_requests):
+            if (
+                self.draft_runner is not None
+                and not self.draft_runner.prepare_requests(max_requests)
+            ):
                 raise MonoUnsupported("joint draft binary admission failed")
             from atom.models.deepseek_v4.mono.weights import _signature
 
@@ -1880,56 +1833,6 @@ class V4MonoSession:
         self.capture_published_lanes()
         return self.publish(input_ids, positions, context, capture=True)
 
-    @contextmanager
-    def preserve_tail_capture(self):
-        """Restore the added graph's write set even if startup capture fails."""
-        snapshots = []
-
-        def prepare():
-            self._snapshot_tail_capture(snapshots)
-
-        bind_agreed(prepare, self.group)
-        try:
-            yield
-        finally:
-            try:
-                self._restore_capture_views(snapshots)
-            except Exception:
-                # Contaminated state cannot safely fall back to native serving.
-                self.disabled = True
-                raise
-            finally:
-                self.finish_capture_publication()
-
-    def _snapshot_tail_capture(self, snapshots):
-        if (
-            self.live_started
-            or not self.capture_publication
-            or not self.armed
-            or not self.owns_live_session()
-            or self.execution_graph_key != (3, 1)
-            or self.profile.name != ORDINARY_PROFILE.name
-            or torch.cuda.is_current_stream_capturing()
-        ):
-            raise MonoUnsupported("tail snapshot requires its startup publication")
-        views = list(self.adapter.capture_write_views())
-        views.append(self.output)
-        for _, bucket in self.adapter.published_buckets:
-            build = self.runner._build_for(
-                (bucket.width, bucket.tokens_per_seq), bucket.ordinal
-            )
-            views.extend(build.hidden)
-            for variant in build.variants:
-                views.extend(
-                    (
-                        variant.scratch,
-                        variant.step,
-                        variant.hang,
-                        variant.peer_buffer.storage,
-                    )
-                )
-        self._snapshot_capture_views(views, snapshots)
-
     def capture_published_lanes(self) -> None:
         """Startup-only backbone capture, restoring the published write set.
 
@@ -1972,15 +1875,7 @@ class V4MonoSession:
                     (bucket.width, bucket.tokens_per_seq), bucket.ordinal
                 )
                 views.extend(build.hidden)
-                for variant in build.variants:
-                    views.extend(
-                        (
-                            variant.scratch,
-                            variant.step,
-                            variant.hang,
-                            variant.peer_buffer.storage,
-                        )
-                    )
+                views.extend(build.arena_write_views())
             views.extend(self.runner._aux_outputs.values())
             self._snapshot_capture_views(views, snapshots)
 
@@ -2073,9 +1968,12 @@ class V4MonoSession:
     def _restore_capture_views(self, snapshots):
         """Retire every rank's readers before restoring bytes and fence the copies."""
         bind_agreed(torch.cuda.synchronize, self.group)
-        bind_agreed(
-            lambda: [view.copy_(saved) for view, saved in snapshots], self.group
-        )
+
+        def restore():
+            for view, saved in snapshots:
+                view.copy_(saved)
+
+        bind_agreed(restore, self.group)
         bind_agreed(torch.cuda.synchronize, self.group)
 
     def forward(self, input_ids, positions):

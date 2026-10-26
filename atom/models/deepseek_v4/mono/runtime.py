@@ -35,8 +35,6 @@ def require_resident_grid(launcher, grid: int, threads: int) -> None:
     """
     import ctypes
 
-    import torch
-
     hip = ctypes.CDLL("libamdhip64.so")
     hip.hipModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
     hip.hipModuleGetFunction.argtypes = [

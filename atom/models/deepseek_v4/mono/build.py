@@ -3,7 +3,7 @@
 # Modifications: prepare-time plan/argument extraction for ATOM, 2026-10-22.
 """Prepare-time argument assembly shared by runner and prepared variants."""
 
-from atom.models.deepseek_v4.mono.config import shape_dims
+from atom.models.deepseek_v4.mono.config import LAUNCH_PHASES, shape_dims
 from atom.mono.runtime.consensus import MonoUnsupported
 
 
@@ -84,4 +84,14 @@ def kernel_kwargs(
         qkv_norm_handoff=qkv_norm_handoff,
         attention_mode=attention_mode,
         **shape_dims(cfg),
+    )
+
+
+def _build_launches(cfg, rows, npes, *, launch_shape, **kwargs):
+    """Build the planned phases; callers own compilation, cache and TP admission."""
+    from atom.models.deepseek_v4.mono.kernels.layer import build_dsv4_kernel
+
+    return tuple(
+        build_dsv4_kernel(rows, cfg.heads, npes, cfg.window, phase=phase, **kwargs)
+        for phase in LAUNCH_PHASES[launch_shape]
     )
