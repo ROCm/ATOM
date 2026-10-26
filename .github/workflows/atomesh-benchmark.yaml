@@ -530,7 +530,7 @@ jobs:
           set -euo pipefail
           python3 -m venv /tmp/m3-fixture-venv
           /tmp/m3-fixture-venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-          /tmp/m3-fixture-venv/bin/pip install pytest
+          /tmp/m3-fixture-venv/bin/pip install pytest numpy
           python3 - <<'PYFIXTURE'
           import json
           import re

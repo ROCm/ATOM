@@ -52,6 +52,7 @@ def make_rotary(dim, max_positions, device):
 
 
 def check_case(draft, qlen, klen, scalar=1.0, decode_graph=False):
+    import numpy as np
     import torch
 
     from atom.model_ops.attention_mha import PagedAttentionImpl
@@ -105,8 +106,9 @@ def check_case(draft, qlen, klen, scalar=1.0, decode_graph=False):
         cu_seqlens_q=torch.tensor([0, qlen, 999999], dtype=torch.int32, device=device),
         context_lens=torch.tensor([klen, 999999], dtype=torch.int32, device=device),
         slot_mapping=slots,
-        max_seqlen_q=qlen,
-        max_seqlen_k=klen,
+        # Match prepare_decode host metadata, including the eager path.
+        max_seqlen_q=np.int32(qlen),
+        max_seqlen_k=np.int32(klen),
     )
     ctx = SimpleNamespace(
         context=SimpleNamespace(is_prefill=True, is_draft=draft, scheduled_bs=1),
