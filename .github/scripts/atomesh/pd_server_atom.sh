@@ -1971,6 +1971,27 @@ start_prefill() {
     return 2
   fi
   start_mooncake_store
+  if [[ "${ATOMESH_M3_STORE_FUNCTIONAL_CHECK:-0}" == "1" && "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
+    # Refuse a skipped GPU check: this phase is a correctness gate.
+    python3 -c 'import torch, triton, pytest, mooncake.store; assert torch.cuda.is_available()'
+    env MC_NUM_QP_PER_EP=1 \
+      ATOM_TEST_MOONCAKE_STORE_MASTER="${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}" \
+      ATOM_TEST_MOONCAKE_STORE_METADATA="http://${host_ip}:${ATOMESH_MOONCAKE_METADATA_PORT}/metadata" \
+      ATOM_TEST_MOONCAKE_STORE_RDMA_DEVICE=rdma0 \
+      ATOM_TEST_MOONCAKE_STORE_LOCAL_HOSTNAME="${host_ip}" \
+      python3 -m pytest -q -rs tests/test_mooncake_store_offload_gpu_e2e.py -k m3 \
+      --junitxml="${RUNTIME_LOG_DIR}/m3-store-functional.xml" \
+      | tee "${RUNTIME_LOG_DIR}/m3-store-functional.log"
+    python3 - "${RUNTIME_LOG_DIR}/m3-store-functional.xml" <<'PY_CHECK'
+import sys
+import xml.etree.ElementTree as ET
+cases = ET.parse(sys.argv[1]).findall(".//testcase")
+assert len(cases) == 1 and not any(
+    case.find(tag) is not None
+    for case in cases for tag in ("skipped", "failure", "error")
+), "M3 Store GPU round-trip must pass, not skip"
+PY_CHECK
+  fi
   # On the env command line, not exported: decode starts from this same shell.
   local -a prefill_offload_env=()
   if mooncake_store_running; then
@@ -2804,7 +2825,8 @@ print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
 if threshold:
-    if not isinstance(score, (int, float)) or score < float(threshold):
+    import math
+    if not isinstance(score, (int, float)) or not math.isfinite(score) or score < float(threshold):
         raise SystemExit(
             f"[eval] FAIL: concurrent={eval_conc} gsm8k score {score} "
             f"is below threshold {float(threshold):.4f}"

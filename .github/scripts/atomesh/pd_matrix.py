@@ -377,6 +377,17 @@ def build_cell(
     accuracy_cfg = deep_merge(
         model_cfg.get("accuracy", {}), suite_cfg.get("accuracy", {})
     )
+    if (
+        suite_cfg.get("run_eval", False)
+        and accuracy_cfg.get("task", "gsm8k") == "gsm8k"
+        and accuracy_cfg.get("fewshot_as_multiturn", False)
+        and not accuracy_cfg.get("apply_chat_template", False)
+    ):
+        raise ValueError(
+            f"{suite_cfg.get('name', model_name)}: GSM8K fewshot_as_multiturn "
+            "requires apply_chat_template=true; set fewshot_as_multiturn=false "
+            "for evaluation without a chat template"
+        )
 
     concurrency = override_benchmark_concurrency or parse_int_list(
         suite_cfg.get("concurrency"), "concurrency"

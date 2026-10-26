@@ -145,6 +145,7 @@ exports = {
     "REQUEST_RATE": cell["request_rate"],
     "BENCH_NUM_PROMPTS_MULTIPLIER": cell["num_prompts_multiplier"],
     "BENCHMARK_KIND": benchmark.get("kind", "random"),
+    "ATOMESH_EVAL_BEFORE_BENCHMARK": str(benchmark.get("eval_before_benchmark", False)).lower(),
     "ATOMESH_M3_REPLAY_GATE": str(benchmark.get("replay_gate", False)).lower(),
     "ATOMESH_PREPARE_LMCACHE_HOST_MEMORY": str(benchmark.get("prepare_lmcache_host_memory", False)).lower(),
     "AIPERF_DIR": benchmark.get("aiperf_dir", ""),

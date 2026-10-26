@@ -499,6 +499,15 @@ jobs:
           fi
           cat atomesh-matrix.json
 
+      - name: Check M3 evaluation client before GPU allocation
+        if: ${{ contains(steps.matrix.outputs.matrix_json, 'minimax-m3-fp4-1p1d-cpp4-') }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/m3-eval-client-venv
+          /tmp/m3-eval-client-venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+          /tmp/m3-eval-client-venv/bin/pip install 'lm-eval[api]==0.4.13' 'transformers==5.16.1'
+          /tmp/m3-eval-client-venv/bin/python .github/scripts/atomesh/check_m3_eval_client.py --matrix atomesh-matrix.json
 
       - name: Group benchmark matrix by configuration
         id: groups

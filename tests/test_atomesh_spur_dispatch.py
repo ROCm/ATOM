@@ -523,6 +523,33 @@ if sys.argv[1] == "run" and os.environ.get("ATOMESH_PREPARE_LMCACHE_HOST_MEMORY"
             for run in runs:
                 self.assertIn(f"MORI_SOCKET_IFNAME={interface}", run)
 
+    def test_eval_first_uses_fresh_services(self):
+        self.run_job(
+            BENCHMARK_KIND="aiperf_agentic",
+            RUN_EVAL="true",
+            EVAL_TASK="gsm8k",
+            ATOMESH_EVAL_BEFORE_BENCHMARK="true",
+        )
+        for rank in range(2):
+            runs = [c for c in self.docker_calls(rank) if c[0] == "run"]
+            self.assertEqual(len(runs), 2)
+            self.assertIn("ATOMESH_EXECUTION_PHASE=eval", runs[0])
+            self.assertIn("ATOMESH_EXECUTION_PHASE=benchmark", runs[1])
+
+    def test_failed_eval_prevents_performance(self):
+        self.run_job(
+            BENCHMARK_KIND="aiperf_agentic",
+            RUN_EVAL="true",
+            EVAL_TASK="gsm8k",
+            ATOMESH_EVAL_BEFORE_BENCHMARK="true",
+            FAIL_PHASE="eval",
+            expected_rc=8,
+        )
+        for rank in range(2):
+            runs = [c for c in self.docker_calls(rank) if c[0] == "run"]
+            self.assertEqual(len(runs), 1)
+            self.assertIn("ATOMESH_EXECUTION_PHASE=eval", runs[0])
+
     def test_eval_failure_after_benchmark_does_not_publish_completion(self):
         self.run_job(
             BENCHMARK_KIND="aiperf_agentic",
