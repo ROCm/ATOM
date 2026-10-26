@@ -36,6 +36,7 @@ _ATOM_ENV_VARS = [
     "ATOM_PROFILER_WITH_STACK",
     "ATOM_PROFILER_PROFILE_MEMORY",
     "ATOM_PROFILER_TIMEOUT",
+    "ATOM_PROFILER_ASYNC_GZIP",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
     "ATOM_ONLINE_QUANT_STREAMING",
@@ -123,6 +124,9 @@ class TestEnvsDefaults:
 
     def test_profiler_timeout_default(self):
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
+
+    def test_profiler_async_gzip_default(self):
+        assert _get_envs().ATOM_PROFILER_ASYNC_GZIP is False
 
     def test_shutdown_timeout_default(self, caplog):
         assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == 5.0

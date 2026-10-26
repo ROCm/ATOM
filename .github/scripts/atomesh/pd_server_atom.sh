@@ -279,6 +279,11 @@ AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
 ATOMESH_TORCH_PROFILE_START="${ATOMESH_TORCH_PROFILE_START:-300}"
 ATOMESH_TORCH_PROFILE_DURATION="${ATOMESH_TORCH_PROFILE_DURATION:-0}"
 ATOMESH_TORCH_PROFILE_ROLES="${ATOMESH_TORCH_PROFILE_ROLES:-prefill,decode}"
+# wait_for_torch_traces waits for every rank's .gz, so stop_profile need not:
+# each PP stage's export holds up the one before it, and gzip is most of it.
+if (( ATOMESH_TORCH_PROFILE_DURATION > 0 )); then
+  export ATOM_PROFILER_ASYNC_GZIP="${ATOM_PROFILER_ASYNC_GZIP:-1}"
+fi
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
@@ -2130,7 +2135,7 @@ write_aiperf_chrome_trace() {
     || echo "[aiperf] WARNING: chrome trace conversion failed for ${out_dir}" >&2
 }
 
-# stop_profile holds each engine until its kineto export is on disk, so the tail
+# stop_profile holds each engine until its kineto trace is written, so the tail
 # of the window stalls the run: aiperf numbers from a profiled cell are not
 # comparable to an unprofiled one.
 run_torch_profile_window() {

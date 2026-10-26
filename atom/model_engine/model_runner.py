@@ -9,6 +9,7 @@ import inspect
 import logging
 import math
 import os
+import threading
 import time
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
@@ -1212,17 +1213,10 @@ class ModelRunner:
                 worker_name = f"{worker_name}_{safe_model_name}"
             output_prefix = os.path.join(self.profiler_dir, worker_name)
 
-            def _on_trace_ready(prof):
+            def _gzip_trace(tmp_json_path, output_path, t0):
                 import gzip as _gzip
 
-                # Use a short human-readable timestamp in file name.
-                ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-                ms = int((time.time() % 1) * 1000)
-                output_path = f"{output_prefix}_ts_{ts}_{ms:03d}.pt.trace.json.gz"
-                tmp_json_path = output_path[:-3]
                 try:
-                    t0 = time.monotonic()
-                    prof.export_chrome_trace(tmp_json_path)
                     # Chunked gzip: read 64 MB at a time to avoid loading
                     # the entire JSON (~30 GB) into memory at once.
                     with (
@@ -1249,6 +1243,35 @@ class ModelRunner:
                     for p in (tmp_json_path, output_path):
                         if os.path.exists(p):
                             os.remove(p)
+
+            def _on_trace_ready(prof):
+                # Use a short human-readable timestamp in file name.
+                ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                ms = int((time.time() % 1) * 1000)
+                output_path = f"{output_prefix}_ts_{ts}_{ms:03d}.pt.trace.json.gz"
+                tmp_json_path = output_path[:-3]
+                t0 = time.monotonic()
+                try:
+                    prof.export_chrome_trace(tmp_json_path)
+                except Exception:
+                    logger.exception(
+                        "Rank %d: failed to export trace to %s",
+                        self.rank,
+                        output_path,
+                    )
+                    if os.path.exists(tmp_json_path):
+                        os.remove(tmp_json_path)
+                    return
+                if not envs.ATOM_PROFILER_ASYNC_GZIP:
+                    _gzip_trace(tmp_json_path, output_path, t0)
+                    return
+                # Only gzip can leave the critical path: kineto's JSON export
+                # holds the GIL, while zlib and file I/O release it.
+                threading.Thread(
+                    target=_gzip_trace,
+                    args=(tmp_json_path, output_path, t0),
+                    name=f"trace-gzip-rank{self.rank}",
+                ).start()
 
             self.profiler = torch_profiler.profile(
                 activities=[
