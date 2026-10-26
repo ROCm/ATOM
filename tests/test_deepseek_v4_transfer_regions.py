@@ -132,6 +132,7 @@ def _stub_v4_runtime_imports():
     aiter_dist.__path__ = []
     parallel_state = types.ModuleType("aiter.dist.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 1
+    parallel_state.get_tp_group = lambda: None
 
     pcp_utils = types.ModuleType("atom.distributed.pcp_utils")
     for name in (
@@ -175,10 +176,12 @@ def _stub_v4_runtime_imports():
     # The indexer's scorer needs aiter's kernels; the builder only names them.
     indexer = types.ModuleType("atom.model_ops.indexer")
     indexer.NATURAL, indexer.PRESHUFFLE = "natural", "preshuffle"
-    for name in ("ConcatKeys", "IndexRows"):
+    for name in ("ConcatKeys", "DcpSplit", "IndexRows"):
         setattr(indexer, name, type(name, (), {}))
     for name in ("Fp4LaunchStorages", "concat_rows", "fp4_rows", "fp8_rows"):
         setattr(indexer, name, lambda *args, **kwargs: None)
+    indexer_score = types.ModuleType("atom.model_ops.indexer.score")
+    indexer_score.split_gather_comm = lambda group: None
     # Its sequences are aiter's FP4 MQA plan; the builder only names the type.
     ragged = types.ModuleType("atom.model_ops.fp4_mqa_ragged_metadata")
     ragged.Fp4MqaRaggedMetadata = type("Fp4MqaRaggedMetadata", (), {})
@@ -194,6 +197,7 @@ def _stub_v4_runtime_imports():
         "atom.model_ops.attentions.backends": backends,
         "atom.model_ops.fp4_mqa_ragged_metadata": ragged,
         "atom.model_ops.indexer": indexer,
+        "atom.model_ops.indexer.score": indexer_score,
         "atom.model_ops.v4_kernels": kernels,
     }
     previous = {name: sys.modules.get(name, _MISSING) for name in replacements}

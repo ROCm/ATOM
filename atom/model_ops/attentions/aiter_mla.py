@@ -2735,6 +2735,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows = len(row_ends)
         var["index_row_ends"].np[:rows] = row_ends
         ends = var["index_row_ends"].copy_to_gpu(rows)
+        # Potential optimization: the GLM indexer is replicated across TP as well
+        # (ReplicatedLinear projections, unsharded index heads), so at dcp=1 every
+        # TP rank scores the same rows. Splitting over TP here, as the V4 builder
+        # does (`DcpSplit.of(..., over_tp=True)`), would remove that; it also needs
+        # the `topk_indices` slack in deepseek_v2.py sized by the split's world,
+        # and the FP8 key all-gather there skipped (keys are already whole).
         split = DcpSplit.of(rows, self.dcp_rank, self.dcp_world_size)
         if not self._indexer_fp4:
             keys = ConcatKeys(
