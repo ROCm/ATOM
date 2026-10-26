@@ -234,6 +234,11 @@ on:
         required: false
         default: false
         type: boolean
+      collect_minimax_run:
+        description: 'Read-only snapshot of an existing TW MiniMax C32 run; use with run_model_benchmark=false'
+        required: false
+        default: ''
+        type: string
       aiter_ref:
         description: 'ROCm/aiter ref for suite=scatter_bounds (install_aiter_from_ref / setup.py develop)'
         required: false
@@ -1865,6 +1870,35 @@ jobs:
       model_root: ${{ needs.load-config.outputs.model_root }}
       dashboard_hardware: ${{ needs.load-config.outputs.dashboard_hardware }}
 
+  collect-minimax-live-logs:
+    name: Collect existing MiniMax C32 logs (no GPU allocation)
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && inputs.collect_minimax_run != ''
+      && !inputs.run_model_benchmark
+    runs-on: atomesh-cicd
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Read scheduler state and existing shared logs
+        env:
+          TARGET_RUN_ID: ${{ inputs.collect_minimax_run }}
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+          source .github/scripts/slurm_submit_helpers.sh
+          detect_slurm_backend
+          export USES_SPUR_CONTROLLER SPUR_CONTROLLER_ADDR
+          python3 .github/scripts/atomesh/collect_minimax_live_logs.py \
+            "$TARGET_RUN_ID" --output minimax-live-logs
+      - name: Upload existing run snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minimax-live-logs-${{ inputs.collect_minimax_run }}-${{ github.run_id }}
+          path: minimax-live-logs/
+          if-no-files-found: error
+          retention-days: 7
 
   summarize-results:
     name: Summarize ATOMesh benchmark results
