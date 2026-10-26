@@ -218,6 +218,18 @@ validate 不受影响。代价是网关配额——一次 review 要喂 SKILL.md
 **这是开发期风险，不是架构风险**：它影响迭代速度，不影响最终形态。
 P0 第一次真实 review 时应顺手记录 token 量，作为后续判断依据。
 
+**实测状态（2026-10-26，Task 9）：仍未测。** `run_one.sh` 要在 auto-mode 的 Claude
+会话里启动一个带 `--dangerously-skip-permissions` 的 headless 子 agent，而本环境的
+auto-mode 分类器把这个模式判为 "Create Unsafe Agents" 并拦下——这不是误报，`run_one.sh`
+脚本头部本身就写着同样的警告。因此 Task 9 只能跑完全部静态检查（pytest/selftest/
+check_prompts/actionlint/preflight 五项，见 task-9-report.md），**无法产出第一次真实
+token 用量与墙钟耗时**。这笔数字之所以重要：一次 review 要把 SKILL.md 全文、
+`rules_expanded.txt`、完整 diff 和十余个 artifact 喂给模型，worker 与 refuter 各一轮
+且可重试，而网关限流是 2M uncached input token / 60s——配额够不够、要不要降级重试
+策略，都要等这个数字才能判断。第一次在普通终端（非 auto-mode 会话）里跑通
+`run_one.sh` 就是产出这个数字的动作，留给 `P0-HANDOFF.md` 里描述的验收跑。
+**这里不编造估算值**——没测出来就留空，比一个看着像实测的估算更诚实。
+
 **最终形态（box308）**：review agent 指向该机已在运行的 GLM-5.3
 （`localhost:30000`），零配额问题。
 
@@ -533,7 +545,7 @@ PR 内容，aiter 专门把 token 挡在那一步之外。
 | 默认 GPU 子集 `6,7` 是否与同事冲突 | **待确认**：srdc-24 上是否有卡已被口头认领 |
 | atom-bot 账号 PAT | **待发放**。不阻塞 P0（评审链路不用 token），发布链路拆为 P0.5 |
 | box308 的 GPU 占用 | **已升级为必答项**：box308 既是最终目标机、其 8 卡又被 GLM-5.3 占死，故最终形态下 validate 无卡。P3 前必须在 §5.3 三个候选里选定 |
-| 开发期网关配额 | AMD 网关 2M uncached input token/60s。仅影响开发迭代速度，不影响最终形态（box308 用本地 GLM）。P0 首次真实 review 时记录 token 量 |
+| 开发期网关配额 | **仍未测（2026-10-26）**：auto-mode 分类器拦下了 `run_one.sh` 的 headless 子 agent（判为 "Create Unsafe Agents"，非误报），Task 9 没能跑验收。AMD 网关限流 2M uncached input token/60s，而一次 review 要喂 SKILL.md 全文 + `rules_expanded.txt` + 完整 diff + 十余个 artifact，worker/refuter 各一轮且可重试——配额够不够只有实测知道。首次在普通终端跑通 `run_one.sh` 就是产出这个数字的动作，不是精度问题而是"从未测过"；此处不写估算值。仅影响开发迭代速度，不影响最终形态（box308 用本地 GLM，零配额问题）|
 | validate 两轮总时长 | **未实测**，决定 §6 能否进 review job。P2 的第一个动作就是实测（§6.5） |
 | ~~maintainer 是否接受自建机 workflow~~ | 已消解：本项目作者即 ATOM team 成员。注意这与下一行的 repo admin 是两回事 |
 | refuter 跨家族 | aiter 自己承认 worker/refuter 同为 GLM 时对抗性偏弱；ATOM 新建时应一开始就把 refuter 指向 Opus（`ATOM_BOT_REFUTER_AGENT`） |
