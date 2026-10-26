@@ -35,7 +35,11 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.scheduler import SchedulerMetrics
-from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
+from atom.model_engine.block_manager import (
+    AdmissionProbe,
+    BlockManager,
+    draft_kv_lookahead,
+)
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     USEFUL_SHRINK_REFERENCE_CHUNKS,
@@ -2291,7 +2295,7 @@ class Scheduler:
                 and self._tier_hit(seq) != probed_tier_kv
             ):
                 hbm_probe = self._probe_hbm_prefix(seq)
-            num_cached_blocks, block_hashes = hbm_probe
+            num_cached_blocks = hbm_probe.num_cached_blocks
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
@@ -2351,7 +2355,7 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
-            self.block_manager.record_allocation(seq, num_cached_blocks, block_hashes)
+            self.block_manager.record_allocation(seq, hbm_probe)
             if not self.block_manager.allocate(seq, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
                 # risking a shared decoding sequence's blocks (finding #2).
@@ -3097,21 +3101,20 @@ class Scheduler:
             or (seq.kv_transfer_params or {}).get("do_remote_prefill")
         )
 
-    def _probe_hbm_prefix(self, seq: Sequence) -> tuple[int, list[int]]:
+    def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
         """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
-        request does not fit) and the hash chain it walked.
+        request does not fit), the hash chain it walked and the demand its fit
+        passed, which `record_allocation` commits.
 
         Done once per admission attempt; the result is shared by the detach
         decision and the admission itself, which run in the same pass with no
         pool change in between.
         """
-        block_hashes: list[int] = []
-        num_cached_blocks = self.block_manager.can_allocate(
-            seq,
-            record=False,
-            block_hashes=block_hashes,
+        probe = AdmissionProbe()
+        probe.num_cached_blocks = self.block_manager.can_allocate(
+            seq, record=False, probe=probe
         )
-        return num_cached_blocks, block_hashes
+        return probe
 
     @staticmethod
     def _tier_hit(seq: Sequence) -> tuple[int, int]:
@@ -3123,9 +3126,7 @@ class Scheduler:
             int(getattr(joint, "kv_only_tokens", 0) or 0),
         )
 
-    def _can_detach_tier_lookup(
-        self, seq: Sequence, hbm_probe: tuple[int, list[int]]
-    ) -> bool:
+    def _can_detach_tier_lookup(self, seq: Sequence, hbm_probe: AdmissionProbe) -> bool:
         """Whether admission may proceed without waiting for `seq`'s lookup.
 
         Side-effect free. Requires an HBM hit and the connector's consent
@@ -3133,7 +3134,7 @@ class Scheduler:
         probe is the one admission uses, so it sees the HBM prefix
         `_decide_load_after_alloc` will see.
         """
-        hit_blocks = hbm_probe[0]
+        hit_blocks = hbm_probe.num_cached_blocks
         if hit_blocks <= 0:
             return False
         num_hbm_tokens = hit_blocks * self.block_manager.hash_block_size

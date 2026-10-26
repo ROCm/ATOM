@@ -5,7 +5,7 @@ import array
 import logging
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 from math import inf, isinf
 from time import monotonic
@@ -119,6 +119,23 @@ class JointBoundaryDecision:
     claim_tokens: int = 0
     state_from_hbm: bool = False
     skip_reason: str | None = None
+
+
+@dataclass
+class AdmissionProbe:
+    """One `can_allocate` answer, carried to the `record_allocation` that
+    commits it.
+
+    `num_cached_blocks` is the hit (-1 if the seq did not fit) and
+    `block_hashes` the chain the probe walked. `num_new_blocks` is the
+    free-pool demand the probe's fit check passed, `None` when the probe
+    returned before that check. `_fit_joint` re-checks a joint against it and
+    skips the joint without it.
+    """
+
+    num_cached_blocks: int = -1
+    block_hashes: list[int] = field(default_factory=list)
+    num_new_blocks: int | None = None
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -1149,6 +1166,7 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
+        probe: AdmissionProbe | None = None,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -1156,9 +1174,11 @@ class BlockManager:
         joint-load fields or joint-boundary counters. Checkpoint demand/end,
         hit instrumentation and `Sequence.replays_hit` (whether the hit it
         returns replays, which `replay_start` reads for it) still refresh;
-        demand counters deduplicate per request. An optional `block_hashes` output
-        lets the scheduler defer `record_allocation` until after its wait and
-        token-budget checks, reusing this probe's chain without another walk.
+        demand counters deduplicate per request. An optional `block_hashes`
+        output receives the chain this probe walked. An optional `probe` output
+        receives the hit, the chain and the fit's demand, so the scheduler can
+        defer `record_allocation(seq, probe)` until after its wait and
+        token-budget checks without another walk.
         `_admission_walk` then `_evaluate`; `can_allocate_memoized` evaluates a
         memoised walk the same way.
 
@@ -1172,7 +1192,14 @@ class BlockManager:
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
         """
-        return self._evaluate(seq, self._admission_walk, record, block_hashes)
+        if probe is None:
+            return self._evaluate(seq, self._admission_walk, record, block_hashes)
+        assert block_hashes is None, "the probe carries its own chain"
+        probe.num_new_blocks = None
+        probe.num_cached_blocks = self._evaluate(
+            seq, self._admission_walk, record, probe.block_hashes, probe
+        )
+        return probe.num_cached_blocks
 
     def _evaluate(
         self,
@@ -1180,9 +1207,11 @@ class BlockManager:
         walk_of: Callable[[Sequence], _PrefixWalk],
         record: bool,
         block_hashes: list[int] | None,
+        probe: AdmissionProbe | None = None,
     ) -> int:
         """`can_allocate` over the walk `walk_of(seq)` returns; everything but
-        the walk is asked afresh on every call."""
+        the walk is asked afresh on every call. `probe.num_new_blocks` is set
+        once the fit passes."""
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         #
         # The full per-request width, because that is what `allocate` will take:
@@ -1258,14 +1287,16 @@ class BlockManager:
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
-        # walking the hit again. Set on every probe, including `record=False`,
-        # because the scheduler commits later with the same seq.
-        seq._admission_num_new_blocks = num_new_blocks
+        # walking the hit again.
+        if probe is not None:
+            probe.num_new_blocks = num_new_blocks
         # A direct admission commits its joint boundary here. The scheduler
         # probes first and calls record_allocation only after dependency and
         # budget checks; refused probes avoid the extra LMCache hash walk.
         if record:
-            self.record_allocation(seq, num_cached_blocks, block_hashes)
+            self.record_allocation(
+                seq, AdmissionProbe(num_cached_blocks, block_hashes, num_new_blocks)
+            )
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
         # 128k prompt queued behind a full pool paid ~2000 rounds per waiting
@@ -1281,11 +1312,7 @@ class BlockManager:
         return num_cached_blocks
 
     def _fit_joint(
-        self,
-        seq: Sequence,
-        decision: JointBoundaryDecision,
-        num_cached_blocks: int,
-        block_hashes: list[int],
+        self, decision: JointBoundaryDecision, probe: AdmissionProbe
     ) -> JointBoundaryDecision:
         """Drop a joint `allocate` cannot back without spending the state it pins.
 
@@ -1305,9 +1332,17 @@ class BlockManager:
         when `state_from_hbm`, and none otherwise: the hit image can be spent
         to fund a tier joint. A miss skips the joint before it is counted, so
         the request keeps the HBM hit. The check does not evict.
+
+        A probe without demand never passed that fit, so its joint is skipped
+        too (`no_probe_demand`).
         """
         if decision.skip_reason is not None:
             return decision
+        num_new_blocks = probe.num_new_blocks
+        if num_new_blocks is None:
+            return self._no_joint("no_probe_demand")
+        num_cached_blocks = probe.num_cached_blocks
+        block_hashes = probe.block_hashes
         hbs = self._hash_block_size()
         hbm_tokens = num_cached_blocks * hbs
         claim_tokens = decision.claim_tokens
@@ -1322,9 +1357,6 @@ class BlockManager:
         # protected hit image. A tier joint that does not add a private tail
         # has nothing new to reject.
         if not decision.state_from_hbm and extra == 0:
-            return decision
-        num_new_blocks = getattr(seq, "_admission_num_new_blocks", None)
-        if num_new_blocks is None:
             return decision
         protected = decision.boundary_hash if decision.state_from_hbm else None
         if self._has_page_units(num_new_blocks + extra, protected):
@@ -1504,13 +1536,13 @@ class BlockManager:
             or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
         )
 
-    def record_allocation(
-        self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
-    ) -> None:
+    def record_allocation(self, seq: Sequence, probe: AdmissionProbe) -> None:
         """Commit the fit probe before any allocation changes the pool."""
         if self.enable_prefix_caching:
-            decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
-            decision = self._fit_joint(seq, decision, num_cached_blocks, block_hashes)
+            decision = self._joint_kv_boundary(
+                seq, probe.num_cached_blocks, probe.block_hashes
+            )
+            decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
@@ -1533,13 +1565,23 @@ class BlockManager:
         hbm_blocks = hbm_tokens // hbs
         if seq.state_slot < 0 and seq.has_per_req_cache:
             return False
+        # The chain `can_allocate` walked, which may be the frontend's
+        # (`_adopt_shipped_chain`). Tokens are compared as the collision check.
+        prompt = self._prompt_hashes(seq)
         wanted: list[int] = []
         h = seq.cache_seed
         for i in range(hbm_blocks):
-            token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            h = self._block_hash(seq, prompt, i, h)
             block_id = self.kv.lookup(h)
-            if block_id < 0 or self.kv.block(block_id).token_ids != token_ids:
+            if block_id < 0 or self.kv.block(block_id).token_ids != (
+                self._hash_block_tokens(seq, i)
+            ):
+                logger.debug(
+                    "[JOINT-RETREAT] seq %s: HBM hit block %d of %d is gone",
+                    seq.id,
+                    i,
+                    hbm_blocks,
+                )
                 return False
             wanted.append(block_id)
         hit_hash = h

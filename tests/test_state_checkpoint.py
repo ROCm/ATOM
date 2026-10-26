@@ -19,13 +19,14 @@ from types import SimpleNamespace
 import pytest
 from conftest import MockConfig
 
-from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
 )
+from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
@@ -1863,13 +1864,10 @@ class TestPagedCopyCheckpoint:
                 bm.kv.allocate(block.block_id)
         self._occupy_vacant_until(bm, free_target)
 
-    def test_an_exact_fit_boundary_image_is_not_pinned_then_spent(self):
-        """The tail is cached-free, so it adds no demand, and the boundary
-        image is the unit `can_allocate` was counting on.
-
-        `allocate` pins that image before taking fresh blocks. Free was
-        `demand - units_per_checkpoint`, so the pin makes `_fresh_block`
-        raise. The joint is skipped first and the request keeps the HBM hit.
+    def _exact_fit_boundary_image_pool(self):
+        """A pool where pinning the joint's boundary image leaves `allocate`
+        one checkpoint short: HBM hit at 5 blocks, the tail cached-free, the
+        boundary image (8 blocks) in HBM, free `demand - units_per_checkpoint`.
         """
         chunk = 16
         bm = self._joint_bm(chunk=chunk)
@@ -1898,11 +1896,23 @@ class TestPagedCopyCheckpoint:
         probe.offload_joint.kv_prefix_tokens = len(PROMPT)
         # The probe commits. Roll it back and tighten the pool to the figure
         # it computed, minus the boundary image, then admit for real.
-        assert bm.can_allocate(probe) == 5
-        num_new = probe._admission_num_new_blocks
+        admission = AdmissionProbe()
+        assert bm.can_allocate(probe, probe=admission) == 5
+        num_new = admission.num_new_blocks
         self._reset_joint_counters(bm)
         units = bm.paged_state_checkpoints.store.units_per_checkpoint
         self._leave_free(bm, num_new - units, keep)
+        return bm
+
+    def test_an_exact_fit_boundary_image_is_not_pinned_then_spent(self):
+        """The tail is cached-free, so it adds no demand, and the boundary
+        image is the unit `can_allocate` was counting on.
+
+        `allocate` pins that image before taking fresh blocks. Free was
+        `demand - units_per_checkpoint`, so the pin makes `_fresh_block`
+        raise. The joint is skipped first and the request keeps the HBM hit.
+        """
+        bm = self._exact_fit_boundary_image_pool()
 
         second = stateful_seq(PROMPT)
         second.offload_joint.kv_prefix_tokens = len(PROMPT)
@@ -1913,6 +1923,86 @@ class TestPagedCopyCheckpoint:
         assert bm.joint_skips.get("partial_chunk_no_room") == 1
         assert bm.allocate(second, hbm_hit)
         assert second.num_cached_tokens == hbm_hit * BLOCK
+
+    def _probed_joint(self, bm):
+        """A `record=False` probe of PROMPT and the joint it would commit."""
+        seq = stateful_seq(PROMPT)
+        seq.offload_joint.kv_prefix_tokens = len(PROMPT)
+        probe = AdmissionProbe()
+        bm.can_allocate(seq, record=False, probe=probe)
+        decision = bm._joint_kv_boundary(
+            seq, probe.num_cached_blocks, probe.block_hashes
+        )
+        assert decision.skip_reason is None
+        return seq, probe, decision
+
+    def test_the_unchecked_exact_fit_joint_does_crash_allocate(self):
+        """What `_fit_joint` guards against, committed without it."""
+        bm = self._exact_fit_boundary_image_pool()
+        second, probe, decision = self._probed_joint(bm)
+        assert decision.state_from_hbm
+        bm._commit_joint_boundary(second, decision)
+        with pytest.raises(AssertionError, match="No PAGE unit available"):
+            bm.allocate(second, probe.num_cached_blocks)
+
+    def test_a_joint_without_probe_demand_is_skipped_not_committed(self):
+        """No demand means the joint never passed the fit: fail closed.
+
+        On the exact-fit pool the unchecked joint makes `allocate` raise (the
+        test above). Without the probe's demand `record_allocation` skips the
+        joint and the request keeps the HBM hit.
+        """
+        bm = self._exact_fit_boundary_image_pool()
+        second, probe, _ = self._probed_joint(bm)
+        assert probe.num_cached_blocks == 5
+        probe.num_new_blocks = None
+
+        bm.record_allocation(second, probe)
+
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips == {"no_probe_demand": 1}
+        assert second.offload_joint.boundary_tokens == 0
+        assert bm.allocate(second, 5)
+        assert second.num_cached_tokens == 5 * BLOCK
+
+    def test_a_tier_joint_without_probe_demand_is_skipped_too(self):
+        """A tier joint with no private tail skips the room check, since
+        `can_allocate` already counted its demand. Without a probe nothing
+        did, so it is skipped as well."""
+        bm = self._joint_bm()
+        first, h = self._prompt_with_a_rung_at(bm, 8)
+        victim = first.block_table[1]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        self._with_tier(bm, h)
+        bm.paged_state_checkpoints.unindex(h)
+        self._reset_joint_counters(bm)
+        seq, probe, decision = self._probed_joint(bm)
+        assert not decision.state_from_hbm
+        assert bm._fit_joint(decision, probe) == decision
+        probe.num_new_blocks = None
+
+        bm.record_allocation(seq, probe)
+
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips == {"no_probe_demand": 1}
+
+    def test_a_refused_probe_keeps_no_demand_from_an_earlier_one(self):
+        """Each probe resets the demand, so a reused probe cannot carry a
+        stale one past a fit that refused."""
+        bm = self._joint_bm()
+        first, _h = self._prompt_with_a_rung_at(bm, 8)
+        bm.deallocate(first)
+        seq = stateful_seq(PROMPT)
+        probe = AdmissionProbe()
+        assert bm.can_allocate(seq, record=False, probe=probe) >= 0
+        assert probe.num_new_blocks is not None
+
+        self._occupy_vacant_until(bm, 0)
+
+        assert bm.can_allocate(seq, record=False, probe=probe) == -1
+        assert probe.num_cached_blocks == -1
+        assert probe.num_new_blocks is None
 
     def test_an_aligned_hbm_boundary_is_protected_on_an_exact_fit_pool(self):
         """The same pin happens when the hit is already on the chunk grid.
@@ -1946,8 +2036,9 @@ class TestPagedCopyCheckpoint:
         bm.kv.claim(rung)
         probe = stateful_seq(PROMPT)
         probe.offload_joint.kv_prefix_tokens = len(PROMPT)
-        assert bm.can_allocate(probe) == 4
-        num_new = probe._admission_num_new_blocks
+        admission = AdmissionProbe()
+        assert bm.can_allocate(probe, probe=admission) == 4
+        num_new = admission.num_new_blocks
         self._reset_joint_counters(bm)
         units = bm.paged_state_checkpoints.store.units_per_checkpoint
         self._leave_free(bm, num_new - units, keep)
@@ -1995,8 +2086,9 @@ class TestPagedCopyCheckpoint:
         bm.kv.claim(shared_tail)
         probe = stateful_seq(PROMPT)
         probe.offload_joint.kv_prefix_tokens = len(PROMPT)
-        assert bm.can_allocate(probe) == 5
-        num_new = probe._admission_num_new_blocks
+        admission = AdmissionProbe()
+        assert bm.can_allocate(probe, probe=admission) == 5
+        num_new = admission.num_new_blocks
         # The probe claimed nothing; the manual claim on the tail remains.
         assert bm.kv.block(shared_tail).ref_count == 1
         self._reset_joint_counters(bm)
@@ -2013,14 +2105,23 @@ class TestPagedCopyCheckpoint:
         assert second.block_table[4] != shared_tail
         assert bm.kv.block(shared_tail).ref_count == 1
 
-    def test_a_failed_unaligned_joint_resumes_at_the_hbm_hit(self):
+    @pytest.mark.parametrize(
+        "shipped_chain", [False, True], ids=["local_chain", "shipped_chain"]
+    )
+    def test_a_failed_unaligned_joint_resumes_at_the_hbm_hit(self, shipped_chain):
         """The boundary image disappears between the probe and `allocate`.
 
         The joint cannot pin it. The HBM hit still has its image and its
         blocks, so the request resumes there instead of at token 0.
+
+        `shipped_chain`: the prompt chain is the frontend's and differs from
+        what this engine would hash from `cache_seed`. The retreat reads the
+        chain `can_allocate` walked, so it still finds the hit.
         """
         chunk = 16
         bm = self._joint_bm(chunk=chunk)
+        if shipped_chain:
+            bm._adopt_shipped_chain = self._foreign_chain(bm)
         first = self._admitted(bm, PROMPT)
         bm.hash_blocks(first, first.num_prompt_tokens)
         bm.take_state_maintenance_ops()
@@ -2046,6 +2147,8 @@ class TestPagedCopyCheckpoint:
         hbm_hit = bm.can_allocate(second)
         assert hbm_hit == 5
         assert second.offload_joint.claim_tokens == chunk
+        local = bm.compute_hash(bm._hash_block_tokens(second, 0), second.cache_seed)
+        assert (bm._prompt_hashes(second)[0] != local) == shipped_chain
         bm.paged_state_checkpoints.unindex(h_cpu)
         index.hashes.discard(h_cpu)
 
@@ -2055,6 +2158,21 @@ class TestPagedCopyCheckpoint:
         assert second.offload_joint.boundary_tokens == 0
         assert second.offload_joint.hbm_hit_tokens == 0
         assert bm.paged_state_checkpoints.restore_queued_for(second.state_slot)
+
+    @staticmethod
+    def _foreign_chain(bm):
+        """`_adopt_shipped_chain` for a frontend whose chain this engine would
+        not reproduce from `cache_seed` (here: a different seed)."""
+
+        def adopt(seq):
+            assert seq.cache_seed != 0x5A5A5A5A
+            chain, h = [], 0x5A5A5A5A
+            for i in range(full_prompt_blocks(seq, bm.hash_block_size)):
+                h = bm.compute_hash(bm._hash_block_tokens(seq, i), h)
+                chain.append(h)
+            return chain
+
+        return adopt
 
     def test_the_split_says_which_tier_the_state_leg_came_from(self):
         """`state_tier` is the only counter here that cannot be non-zero with
