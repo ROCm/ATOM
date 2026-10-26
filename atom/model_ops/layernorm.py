@@ -764,6 +764,45 @@ def fused_ar_gemma_per_group_supported() -> bool:
     return "gemma_norm" in inspect.signature(method).parameters
 
 
+# Inboxes and call counters of aiter's Gluon all-reduce, made on the first eager
+# call: every TP rank makes that call in the same forward, before graph capture.
+_gluon_ar_workspace = None
+
+
+def _gluon_fused_allreduce_gemma_rmsnorm_fake(
+    x: Tensor, residual: Tensor, weight: Tensor, eps: float
+) -> tuple[Tensor, Tensor]:
+    return torch.empty_like(x), torch.empty_like(x)
+
+
+@torch_compile_guard(gen_fake=_gluon_fused_allreduce_gemma_rmsnorm_fake)
+def gluon_fused_allreduce_gemma_rmsnorm(
+    x: Tensor, residual: Tensor, weight: Tensor, eps: float
+) -> tuple[Tensor, Tensor]:
+    """Returns the Gemma RMSNorm of residual + all-reduce(x), and residual +
+    all-reduce(x). Messages up to ATOM_GLUON_FUSED_AR_MAX_BYTES run aiter's
+    one-launch Gluon kernel (ROCm/aiter#6924, gfx1250, 4 ranks); larger ones run
+    aiter's fused all-reduce."""
+    from aiter.dist.parallel_state import get_tp_group
+    from aiter.ops.triton.comms.all_reduce import all_reduce_init
+    from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
+        all_reduce_rmsnorm_quant,
+    )
+
+    global _gluon_ar_workspace
+    group = get_tp_group().cpu_group
+    max_bytes = envs.ATOM_GLUON_FUSED_AR_MAX_BYTES
+    if _gluon_ar_workspace is None and not torch.cuda.is_current_stream_capturing():
+        _gluon_ar_workspace = all_reduce_init(group, max_bytes)
+    if _gluon_ar_workspace is None or x.numel() * x.element_size() > max_bytes:
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            x, residual, weight, eps, gemma_norm=True
+        )
+    return all_reduce_rmsnorm_quant(
+        x, residual, weight, eps, True, False, group, *_gluon_ar_workspace
+    )
+
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -941,6 +980,10 @@ class GemmaRMSNorm(nn.Module):
             out_fp8, res_out, out_scale = outs[:3]
             out_bf16 = outs[3] if self.write_bf16 else None
             return out_fp8, out_scale, out_bf16, res_out
+        if envs.ATOM_USE_GLUON_FUSED_ALLREDUCE_RMSNORM:
+            return gluon_fused_allreduce_gemma_rmsnorm(
+                x.contiguous(), residual, self.weight, self.variance_epsilon
+            )
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             x.contiguous(),
             residual,
