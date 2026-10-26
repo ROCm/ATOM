@@ -75,7 +75,7 @@ class ShippedChain(NamedTuple):
     num_prompt_tokens: int
     fingerprint: int  # `prompt_fingerprint`
     hashes: array.array  # "Q"
-    projection: object = None  # immutable shared tokenizer/HBM/PAGE record
+    projection: object = None  # immutable shared tokenizer/HBM record
 
 
 def ship_prompt_hash_chain(seq, hash_block_size: int, *, projection=None) -> None:

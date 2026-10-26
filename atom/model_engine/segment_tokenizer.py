@@ -162,14 +162,14 @@ class SegmentTokenizer:
     def encode(self, prompt: str) -> list[int]:
         return self._checked_encode(prompt)
 
-    def encode_with_prefix(self, prompt, block_size, seed=-1, page_chunk=0):
-        """Encode and extend the same stored prefix's HBM/PAGE hash views.
+    def encode_with_prefix(self, prompt, block_size, seed=-1):
+        """Encode and extend the same stored prefix's HBM hash view.
 
         Token IDs and projections are verified and evicted as one record.
         Unsupported/short/disabled paths return no hint; ordinary hashing
         remains available to the caller.
         """
-        return self._checked_encode(prompt, (block_size, seed, page_chunk))
+        return self._checked_encode(prompt, (block_size, seed))
 
     def _checked_encode(self, prompt, projection_spec=None):
         def plain(ids):

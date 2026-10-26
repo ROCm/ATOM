@@ -720,11 +720,6 @@ class InputOutputProcessor:
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
         self._unified_prefix = envs.ATOM_UNIFIED_PREFIX_CACHE
-        from atom.model_engine.prefix_projection import page_chunk_from_config
-
-        self._prefix_page_chunk = page_chunk_from_config(
-            getattr(config, "kv_transfer_config", None)
-        )
         if getattr(config, "enable_prefix_caching", False):
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
@@ -841,9 +836,7 @@ class InputOutputProcessor:
                 and multimodal_data is None
             ):
                 prefix_encoding = segment_tokenizer.encode_with_prefix(
-                    prompt_or_tokens,
-                    self.prefix_hash_block_size,
-                    page_chunk=getattr(self, "_prefix_page_chunk", 0),
+                    prompt_or_tokens, self.prefix_hash_block_size
                 )
                 tokens = prefix_encoding.token_ids
             else:
