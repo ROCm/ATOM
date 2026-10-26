@@ -496,8 +496,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         return None
 
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
-        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
+        attn_metadata, positions = super().prepare_prefill(
+            batch, running_bs, running_tokens
+        )
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions

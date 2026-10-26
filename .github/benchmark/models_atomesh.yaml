@@ -188,6 +188,15 @@ models:
         MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
+    env_by_runner:
+      # Spur MI350X hosts have 1007 GiB per NUMA node and GPUs 0-3 all sit on
+      # NUMA0. Measured MoE staging is ~80-96 GiB/rank (~360 GiB for cpp4), so
+      # suites' 256 and the earlier 210 GiB/rank LMCache caps still overflow
+      # NUMA0 (4*212 + 360 > 1007). Cap at 160 GiB/rank (~647 GiB LMCache +
+      # staging fits with headroom).
+      atomesh-cicd-mi350:
+        prefill:
+          LMCACHE_MAX_LOCAL_CPU_SIZE: "160"
     service:
       prefill:
         cudagraph_mode: FULL
@@ -374,13 +383,34 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode: &glm52_cpp4_dcp4_decode_env
-              HIP_VISIBLE_DEVICES: "4,5,6,7"
-              # Ranks share identical communicator groups instead of creating
-              # duplicates, freeing decode memory for KV.
-              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            decode:
+              <<: &glm52_cpp4_dcp4_decode_env
+                HIP_VISIBLE_DEVICES: "4,5,6,7"
+                # Ranks share identical communicator groups instead of creating
+                # duplicates, freeing decode memory for KV.
+                AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+                DECODE_KV_TRANSFER_CONFIG: >-
+                  {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+              # Decode GPUs 4-7 sit on other rails than prefill GPUs 0-3, and
+              # Spur MI350X rails do not route to each other (QP->RTR times
+              # out). Registering decode memory on every HCA lets
+              # MC_ENABLE_DEST_DEVICE_AFFINITY pick the prefill GPU's rail.
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          env_by_runner:
+            # MI350X ionic NICs: under DCP4 load (every request fans out to
+            # all 4 decode ranks) Mooncake's default transport settings hit
+            # "ionic_comp_msn: wqe is not posted" after ~20 requests and then
+            # spin on CQ poll errors, flooding the log. One QP per endpoint
+            # alone does not avoid it; with a single worker per context, a
+            # smaller WR depth and no relaxed ordering it does not occur.
+            # Both sides must use the same QP count to connect.
+            atomesh-cicd-mi350:
+              common:
+                MC_NUM_QP_PER_EP: "1"
+                MC_WORKERS_PER_CTX: "1"
+                MC_MAX_WR: "64"
+                MC_IB_PCI_RELAXED_ORDERING: "0"
 
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c64
@@ -474,7 +504,7 @@ models:
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 5400
@@ -540,7 +570,7 @@ models:
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 5400
@@ -588,7 +618,7 @@ models:
               PYTHONNOUSERSITE: "1"
               MC_DISABLE_HIP: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
 
         - <<: *glm52_agentic_cpp4_tp4_mtp5
           name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16

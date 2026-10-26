@@ -12,7 +12,7 @@ controls ATOM's runtime behaviour.
 | `Config` | Master dataclass — model path, memory, TP size, scheduler limits, KV cache, profiler, and references to all sub-configs |
 | `CompilationConfig` | Compilation level (0-3), CUDA graph capture sizes, piecewise splitting ops, inductor settings |
 | `CompilationLevel` | Integer constants for the four compilation levels |
-| `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (none / piecewise / full / hybrid) |
+| `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (`NONE` / `TR_HYBRID` token graphs / `FULL` / `FULL_AND_TR_HYBRID`) |
 | `QuantizationConfig` | Layer-wise quantization orchestrator: global config, per-layer overrides, exclude lists, layer name remapping |
 | `LayerQuantConfig` | Per-layer quantization spec (frozen dataclass): quant type, dtype, dynamic flag, method |
 | `ParallelConfig` | Data-parallel size, rank, master IP/port |
@@ -92,7 +92,7 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `NO_COMPILATION` | `0` | No compilation — pure eager execution |
 | `DYNAMO_AS_IS` | `1` | Use torch.compile / TorchDynamo as-is |
 | `DYNAMO_ONCE` | `2` | TorchDynamo with a single compilation pass |
-| `PIECEWISE` | `3` | Piecewise compilation with CUDA graph capture (recommended for production) |
+| `PIECEWISE` | `3` | Piecewise compilation: the graph is split at `splitting_ops` and each piece compiled by Inductor (recommended for production; CUDA graphs are chosen separately by `CUDAGraphMode`) |
 
 ### `CompilationConfig` fields
 
@@ -105,9 +105,9 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
-| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `PIECEWISE` automatically at level 3 |
+| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `TR_HYBRID` automatically at level 3 |
 | `splitting_ops` | `Optional[list[str]]` | `None` | Ops that split the graph into sub-graphs for piecewise compilation; auto-populated at level 3 with `["aiter.unified_attention_with_output", "aiter.mla_attention"]` |
-| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; only effective in PIECEWISE mode |
+| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; effective at level 3 whenever `cudagraph_mode` is not `NONE` |
 | `compile_sizes` | `Optional[list[Union[int, str]]]` | `None` | Sizes to compile for inductor; accepts integers and the string `"cudagraph_capture_sizes"` |
 | `inductor_compile_config` | `dict` | `{}` | Additional configuration passed to the inductor backend |
 
@@ -116,16 +116,16 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | Mode | Value | Description |
 |---|---|---|
 | `NONE` | `0` | No CUDA graph capture |
-| `PIECEWISE` | `1` | Piecewise CUDA graphs — attention ops stay outside the graph for flexibility (default at level 3) |
+| `TR_HYBRID` | `1` | Token graphs and request graphs mixed: a token graph per token bucket, breaking only where a launch depends on host data (default at level 3) |
 | `FULL` | `2` | Full CUDA graph capture for all batches; best for small models / short prompts |
 | `FULL_DECODE_ONLY` | `(FULL, NONE)` | Full CUDA graphs for decode batches only; mixed prefill-decode runs without graphs (useful in P/D setups) |
-| `FULL_AND_PIECEWISE` | `(FULL, PIECEWISE)` | Full graphs for decode, piecewise for prefill/mixed — most performant mode for most models |
+| `FULL_AND_TR_HYBRID` | `(FULL, TR_HYBRID)` | Recorded as `TR_HYBRID` by the native runner: decode replays token graphs too, no full decode graph |
 
 Helper methods on `CUDAGraphMode`:
 
 - `decode_mode()` — returns the mode used for pure decode batches.
 - `mixed_mode()` — returns the mode used for mixed prefill-decode batches.
-- `requires_piecewise_compilation()` — whether the mode needs piecewise compilation.
+- `uses_tr_hybrid()` — whether the mode records token graphs.
 - `has_full_cudagraphs()` — whether the mode includes full CUDA graph capture.
 - `separate_routine()` — whether decode and mixed batches use different routines.
 
@@ -455,14 +455,14 @@ Do you need torch.compile but no graph splitting?
   v
 Production inference on ROCm/HIP GPU?
   |-- Yes --> Level 3 (PIECEWISE) [default in EngineArgs]
-              - Auto-sets CUDAGraphMode.PIECEWISE
+              - Auto-sets CUDAGraphMode.TR_HYBRID
               - Auto-populates splitting_ops for attention ops
               - Pair with --cudagraph-capture-sizes for your batch profile
   |
   v
 Need maximum decode throughput?
-  |-- Yes --> Level 3 + set cudagraph_mode to FULL_AND_PIECEWISE
-              (full graphs for decode, piecewise for prefill)
+  |-- Yes --> set cudagraph_mode to FULL
+              (a whole-forward request graph per decode bucket)
 ```
 
 **Rules of thumb:**

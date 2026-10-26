@@ -345,38 +345,6 @@ class FusedMoEParallelConfig:
         )
 
 
-def naive_multicast_fake(
-    x: torch.Tensor, cu_tokens_across_dp_cpu: torch.Tensor
-) -> torch.Tensor:
-    assert len(x.shape) == 2
-    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
-    buffer = torch.empty(
-        (cu_tokens_across_dp_cpu[-1], x.size(1)), device=x.device, dtype=x.dtype
-    )
-    return buffer
-
-
-@torch_compile_guard()
-def naive_multicast(
-    x: torch.Tensor, cu_tokens_across_dp_cpu: torch.Tensor
-) -> torch.Tensor:
-    dp_rank = get_dp_group().rank_in_group
-    assert len(x.shape) == 2
-    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
-    buffer = torch.empty(
-        (cu_tokens_across_dp_cpu[-1], x.size(1)), device=x.device, dtype=x.dtype
-    )
-
-    start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[dp_rank - 1]
-    end = cu_tokens_across_dp_cpu[dp_rank]
-    buffer[start:end, :].copy_(x)
-    for idx in range(get_dp_group().world_size):
-        start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
-        end = cu_tokens_across_dp_cpu[idx]
-        get_dp_group().broadcast(buffer[start:end, :], idx)
-    return buffer
-
-
 def pad_for_all_gather(x: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Pad ``x`` up to the uniform all-gather height, and return both.
 
@@ -5272,15 +5240,6 @@ class FusedMoE(torch.nn.Module):
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
 
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
-            cu_tokens_across_dp_cpu = (
-                get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
-            )
-
-            hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
-            router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
-
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
@@ -5313,15 +5272,6 @@ class FusedMoE(torch.nn.Module):
 
         if dp_repeat > 1:
             final_hidden_states = final_hidden_states[:local_rows]
-
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
-            dp_rank = dp_group.rank_in_group
-            start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[dp_rank - 1]
-            end = cu_tokens_across_dp_cpu[dp_rank]
-
-            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-            final_hidden_states = all_hidden_states[start:end, :]
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

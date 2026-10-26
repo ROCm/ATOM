@@ -196,18 +196,18 @@ def test_agentx_batches_cover_every_admitted_query_length(
     assert glm5_kernel_samples(batch * query_length, query_length) == expected_chunk
 
 
-def test_piecewise_cudagraph_does_not_refuse_the_served_deployment():
+def test_tr_hybrid_cudagraph_does_not_refuse_the_served_deployment():
     # Review Focus 3 (fix round 1): the default `--level` 3 launch sets
-    # `compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE` for every
+    # `compilation_config.cudagraph_mode = CUDAGraphMode.TR_HYBRID` for every
     # model but deepseek_v41_text (atom/config.py:2373-2377), and GLM-5.2
-    # mono routes inside the *uncompiled* outer `GlmMoeDsaForCausalLM` -- a
-    # piecewise-compiled inner `DeepseekV2Model` never runs under it and
+    # mono routes inside the *uncompiled* outer `GlmMoeDsaForCausalLM` -- the
+    # inner `DeepseekV2Model`'s token graph never runs under it and
     # cannot conflict. A fixture that omits `compilation_config` entirely (as
     # the sibling test above does) cannot catch a regression here: it hides
-    # behind `_requires_piecewise_compilation`'s "absent means not piecewise"
-    # fallback instead of exercising the real, piecewise, served config.
-    compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE)
-    assert compilation_config.cudagraph_mode.requires_piecewise_compilation()
+    # behind `_uses_tr_hybrid`'s "absent means not TR_HYBRID"
+    # fallback instead of exercising the real, TR_HYBRID, served config.
+    compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.TR_HYBRID)
+    assert compilation_config.cudagraph_mode.uses_tr_hybrid()
     atom_config = _served_tp4_fp8_mtp4_config(compilation_config=compilation_config)
     assert config_refusal(atom_config) is None
 

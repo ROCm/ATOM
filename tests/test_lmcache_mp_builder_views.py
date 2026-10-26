@@ -135,8 +135,10 @@ def mla_builder_cls():
         ),
         "atom.distributed.pcp_utils": _module(
             "atom.distributed.pcp_utils",
+            get_pcp_rank=lambda: 0,
             get_pcp_world_size=lambda: 1,
             pcp_is_enabled=lambda: False,
+            pcp_owned_rows_by_request=noop,
             pcp_pad_dense=noop,
             pcp_pad_len=noop,
             pcp_round_robin_query_indices=noop,
@@ -155,6 +157,7 @@ def mla_builder_cls():
         "atom.model_ops.glm5_next.geometry": _module(
             "atom.model_ops.glm5_next.geometry",
             effective_kpool_size=noop,
+            pool_plane_width=noop,
             topk_output_width=noop,
         ),
         "atom.utils": _module(
@@ -181,6 +184,20 @@ def mla_builder_cls():
             "atom.utils.forward_context",
             AttentionMetaData=type("AttentionMetaData", (), {}),
             Context=type("Context", (), {}),
+            get_forward_context=noop,
+        ),
+        "atom.model_ops.fp4_mqa_ragged_metadata": _module(
+            "atom.model_ops.fp4_mqa_ragged_metadata", Fp4MqaRaggedMetadata=noop
+        ),
+        "atom.model_ops.indexer": _module(
+            "atom.model_ops.indexer",
+            ConcatKeys=noop,
+            DcpSplit=noop,
+            Fp4LaunchStorages=noop,
+            IndexRows=object,
+            concat_rows=noop,
+            fp4_rows=noop,
+            fp8_rows=noop,
         ),
         "atom.model_ops.attentions.backends": _builder_bases(),
         "atom.model_ops.attentions.pool_layout.sub_pool_spec": _sub_pool_module(),

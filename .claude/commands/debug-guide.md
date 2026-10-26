@@ -91,7 +91,7 @@
 ## ForwardContext
 
 - **"Forward context is not set":** `set_forward_context()` was not called before model forward. Lifecycle bug — check `ModelRunner` forward path
-- **[COMMON] DP metadata wrong:** `DPMetadata.make()` does CPU `all_reduce` via Gloo. If one rank has 0 tokens, mismatch causes NCCL hang
+- **[COMMON] DP metadata wrong:** `DPMetadata.gather_running_tokens()` does CPU `all_reduce` via Gloo. If one rank has 0 tokens, mismatch causes NCCL hang
 - **Stale context after exception:** If forward throws, `reset_forward_context()` may not be called. Wrap forward in try/finally
 
 ## Speculative Decoding / MTP
@@ -146,7 +146,7 @@
 | Block manager | `model_engine/block_manager.py` | KV cache block allocation |
 | Forward context | `utils/forward_context.py` | Module-level global, attn/DP metadata |
 | Compilation | `utils/backends.py` | VllmBackend, CompilerManager |
-| CUDA graph | `utils/cuda_graph.py` | CUDAGraphWrapper |
+| CUDA graph | `utils/region_graph.py` | TokenGraph, ReqGraph, eager_region |
 | MTP proposer | `spec_decode/eagle.py` | Safe to instrument |
 | MTP model (DeepSeek) | `models/deepseek_mtp.py` | **Compiled — do NOT modify** |
 | MTP model (Qwen3.5) | `models/qwen3_5_mtp.py` | **Compiled — do NOT modify** |

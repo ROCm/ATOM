@@ -238,7 +238,13 @@ def role_env(
     model_cfg: dict[str, Any],
     suite_cfg: dict[str, Any],
     role: str,
+    slurm_submit_runner: str = "",
 ) -> dict[str, str]:
+    # env_by_runner.<runner> overrides every plain env layer, so a hardware
+    # limit set on the model (e.g. host memory per NUMA node) also caps values
+    # that individual suites set.
+    model_runner_env = model_cfg.get("env_by_runner", {}).get(slurm_submit_runner, {})
+    suite_runner_env = suite_cfg.get("env_by_runner", {}).get(slurm_submit_runner, {})
     env = deep_merge(
         defaults.get("env", {}).get("common", {}),
         backend_cfg.get("env", {}).get("common", {}),
@@ -247,6 +253,10 @@ def role_env(
         backend_cfg.get("env", {}).get(role, {}),
         model_cfg.get("env", {}).get(role, {}),
         suite_cfg.get("env", {}).get(role, {}),
+        model_runner_env.get("common", {}),
+        suite_runner_env.get("common", {}),
+        model_runner_env.get(role, {}),
+        suite_runner_env.get(role, {}),
     )
     # ROLE_IP and HANDSHAKE_PORT are filled in by pd_server_atom.sh at
     # launch time (host IP and 6301 + ATOMESH_SERVICE_PORT_OFFSET).
@@ -433,10 +443,10 @@ def build_cell(
         },
         "server_args": server_args,
         "env": {
-            "common": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "common"),
-            "prefill": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "prefill"),
-            "decode": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "decode"),
-            "router": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "router"),
+            role: role_env(
+                defaults, backend_cfg, model_cfg, suite_cfg, role, slurm_submit_runner
+            )
+            for role in ("common", "prefill", "decode", "router")
         },
         "run_eval": bool(suite_cfg.get("run_eval", False)),
         "eval_only": eval_only,

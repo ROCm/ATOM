@@ -12,6 +12,9 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.fused_qk_norm_rope_cache_quant import minimax_qk_norm_rope
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -28,8 +31,7 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import PretrainedConfig
+from atom.utils.region_graph import token_graph
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 
@@ -366,6 +368,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@token_graph
 @support_torch_compile
 class MiniMaxM2Model(nn.Module):
     def __init__(
