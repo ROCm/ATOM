@@ -115,8 +115,9 @@ class RejectionSampler(nn.Module):
     def forward(
         self,
         metadata: SpecDecodeMetadata,
-        # [num_tokens, vocab_size]
-        target_logits: torch.Tensor,
+        # [num_tokens, vocab_size]; None when target_token_ids already holds the
+        # greedy argmax (an all-greedy step whose LM head reduced it)
+        target_logits: torch.Tensor | None,
         # [batch_size, 1]
         bonus_token_ids: torch.Tensor,
         *,
@@ -125,7 +126,8 @@ class RejectionSampler(nn.Module):
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
         # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
-        target_logits = target_logits.contiguous()
+        if target_logits is not None:
+            target_logits = target_logits.contiguous()
 
         output_token_ids = rejection_sample(
             metadata.input_ids,
@@ -158,8 +160,8 @@ def rejection_sample(
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
     draft_probs: torch.Tensor | None,
-    # [num_tokens, vocab_size]
-    target_probs: torch.Tensor,
+    # [num_tokens, vocab_size]; None iff target_token_ids is the greedy argmax
+    target_probs: torch.Tensor | None,
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     # [batch_size] -- each request's last row, the one its bonus is sampled at
@@ -174,17 +176,19 @@ def rejection_sample(
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
-    assert target_probs.ndim == 2
+    assert target_probs is not None or target_token_ids is not None
+    assert target_probs is None or target_probs.ndim == 2
 
     batch_size = len(cu_num_draft_tokens)
     num_tokens = target_logits_indices.shape[0]
-    vocab_size = target_probs.shape[-1]
-    device = target_probs.device
+    device = input_ids.device
     assert input_ids.is_contiguous() and target_logits_indices.is_contiguous()
     assert draft_probs is None or draft_probs.is_contiguous()
-    assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
-    assert target_probs.shape == (num_tokens, vocab_size)
+    if target_probs is not None:
+        vocab_size = target_probs.shape[-1]
+        assert target_probs.is_contiguous()
+        assert target_probs.shape == (num_tokens, vocab_size)
     if target_token_ids is not None:
         if target_token_ids.shape != target_logits_indices.shape:
             raise ValueError("Sampled target IDs must cover every verification row")
@@ -219,8 +223,11 @@ def rejection_sample(
         # target argmax as the correction token and stop (same output layout /
         # num_bonus_tokens semantics as the greedy path).
         cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
-        _, target_argmax = topk_select(target_probs, 1, tie="low")
-        target_argmax = target_argmax.view(-1)
+        if target_probs is None:  # the head already took the argmax
+            target_argmax = target_token_ids
+        else:
+            _, target_argmax = topk_select(target_probs, 1, tie="low")
+            target_argmax = target_argmax.view(-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
         # accept/reject pattern — and hence num_bonus_tokens — matches the
@@ -277,6 +284,7 @@ def rejection_sample(
     else:
         # Relaxed acceptance path: accept if draft is among top-N
         # candidates with prob >= (top1_prob - delta)
+        assert target_probs is not None, "relaxed MTP needs the target logits"
         probs = target_probs.softmax(dim=-1, dtype=torch.float32)
         # `sorted` is what puts the top-1 in slot 0 for `top1_probs` below.
         #

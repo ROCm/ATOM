@@ -157,11 +157,11 @@ class GPUForwardMetrics:
 
 def record_gpu_forward(func):
     @wraps(func)
-    def wrapped(self, input_ids, batch=None):
+    def wrapped(self, input_ids, batch=None, **kwargs):
         metrics = getattr(self, "gpu_forward_metrics", None)
         if metrics is None:
-            return func(self, input_ids, batch)
+            return func(self, input_ids, batch, **kwargs)
         with metrics.measure(batch):
-            return func(self, input_ids, batch)
+            return func(self, input_ids, batch, **kwargs)
 
     return wrapped
