@@ -2910,7 +2910,9 @@ class _DpStepLog:
     ATOM_DP_STEP_DUMP_BLOCK forwards; DP forwards run in lockstep, so line i /
     entry j is the same step on every rank. Host-side ints only, no GPU sync."""
 
-    _FIELDS = ("t", "pt", "dt", "ps", "ds", "dummy")
+    # pw: prefill attention work sum(new * (cached + new / 2)) / 1e9; pc: max
+    # prefill context (k tokens); dc: decode context sum (k tokens).
+    _FIELDS = ("t", "pt", "dt", "ps", "ds", "dummy", "pw", "pc", "dc")
 
     def __init__(self) -> None:
         self.dir = envs.ATOM_DP_STEP_DUMP
@@ -2930,6 +2932,21 @@ class _DpStepLog:
         rows["ps"].append(int(getattr(batch, "total_seqs_num_prefill", 0)))
         rows["ds"].append(int(getattr(batch, "total_seqs_num_decode", 0)))
         rows["dummy"].append(1 if is_dummy_run else 0)
+        pw = pc = dc = 0.0
+        if not is_dummy_run:
+            try:
+                ns = [int(x) for x in getattr(batch, "num_scheduled_tokens", [])]
+                if int(getattr(batch, "total_tokens_num_prefill", 0)) > 0:
+                    nc = [int(x) for x in getattr(batch, "num_cached_tokens", [])]
+                    pw = sum(n * (c + n / 2) for n, c in zip(ns, nc)) / 1e9
+                    pc = max(nc, default=0) / 1e3
+                else:
+                    dc = float(sum(int(x) for x in batch.context_lens)) / 1e3
+            except Exception:
+                pass
+        rows["pw"].append(round(pw, 4))
+        rows["pc"].append(round(pc, 1))
+        rows["dc"].append(round(dc, 1))
         if len(rows["t"]) >= self.block:
             self._flush()
 
