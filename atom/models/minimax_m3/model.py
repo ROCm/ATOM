@@ -48,6 +48,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -675,6 +676,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@token_graph
 @support_torch_compile
 class MiniMaxM3Model(nn.Module):
     def __init__(

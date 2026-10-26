@@ -15,6 +15,7 @@ target's capture left -- or a later size's `kv_indptr` runs backwards.
 import types
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 # Named on the module, not on "aiter", for the reason tests/test_dspark.py gives:
@@ -171,7 +172,7 @@ class _AdvancingPass:
         self.var = var
         self.seen = {}
 
-    def warmup(self, bs, *, pool=None, stream=None):
+    def warmup(self, bs):
         kv_indptr = self.var["kv_indptr"].gpu
         kv_indptr[: bs + 1] += torch.arange(bs + 1, dtype=kv_indptr.dtype)
         self.var["context_lens"].gpu[:bs] += 1
@@ -179,7 +180,6 @@ class _AdvancingPass:
             kv_indptr[: bs + 1].clone(),
             self.var["context_lens"].gpu[:bs].clone(),
         )
-        return pool
 
 
 def _warmup_all_sizes(warmup_draft_graphs, capture_sizes=(4, 2, 1)):
@@ -192,20 +192,27 @@ def _warmup_all_sizes(warmup_draft_graphs, capture_sizes=(4, 2, 1)):
     proposer.runner = types.SimpleNamespace(
         forward_vars=var,
         capture_sizes=list(capture_sizes),
-        graph_pool=None,
         rank=0,
+        running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
     )
     proposer.draft_graphs = (pass_,)
-    proposer.config = None
+    proposer.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(data_parallel_size=1)
+    )
 
     def build_context(bs):
         return types.SimpleNamespace(), types.SimpleNamespace()
 
+    forward_context = types.SimpleNamespace(context=types.SimpleNamespace())
     with (
         patch("atom.spec_decode.drafter.set_forward_context"),
+        patch(
+            "atom.spec_decode.drafter.get_forward_context",
+            return_value=forward_context,
+        ),
         patch("torch.cuda.synchronize"),
     ):
-        warmup_draft_graphs(proposer, build_context, stream=None)
+        warmup_draft_graphs(proposer, build_context)
     return var, pass_.seen
 
 

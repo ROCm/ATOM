@@ -457,7 +457,7 @@ def test_idle_dp_rank_refreshes_captured_pool_metadata(
         assert plan.write_plan_gpu.shape[0] == 24
         assert torch.all(plan.write_plan_gpu == -1)
     if device == "cuda":
-        for ratio, (prefix, _, _) in step.indptrs.items():
+        for ratio, (prefix, _, _) in cache.indptrs(step).items():
             assert prefix.data_ptr() == cache.indptr_buffers[ratio][0].data_ptr()
             assert torch.count_nonzero(prefix) == 0
     torch.testing.assert_close(cache.backing, before, rtol=0, atol=0)
@@ -543,7 +543,7 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
     cu.np[:2] = (0, length)
     cu.copy_to_gpu(2)
     if phase == "prefill":
-        metadata, positions = builder.prepare_prefill(batch, 1)
+        metadata, positions = builder.prepare_prefill(batch, 1, batch.total_tokens_num)
     else:
         metadata, positions = builder.prepare_decode(batch, 1, length, length)
     step = metadata.step
@@ -556,7 +556,7 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
     assert positions.tolist() == list(range(position, position + length))
     assert not hasattr(builder, "_tbo_storage")
     if device == "cuda":
-        for prefix, extend, _ in step.indptrs.values():
+        for prefix, extend, _ in metadata.cache.indptrs(step).values():
             # BF16 decode also splits the ring-window source from paged KV.
             assert prefix.data_ptr() != extend.data_ptr()
             if phase == "prefill":

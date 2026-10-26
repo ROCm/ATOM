@@ -207,8 +207,13 @@ def test_v4_tbo_plan_allocations_follow_actual_runner_slots(monkeypatch, transpo
                 extra_write=0,
                 buf_prefix_ubatch=f"ub{index}_",
             )
+            source = runner.forward_vars[f"ub{index}_v4_compress_plan_4"]
+            count = plans[4].num_compress
             per_step.append(
-                (plans[4].compress_plan_gpu.clone(), plans[4].compress_plan_cpu.copy())
+                (
+                    plans[4].compress_plan_gpu[:count].clone(),
+                    source.np[:count].copy(),
+                )
             )
         results.extend(per_step)
         runner._mark_staging_h2d_enqueued()
@@ -322,6 +327,8 @@ def test_v41_combined_publication_precedes_indptr_consumer(monkeypatch, pp_size)
         keys[runner._fv_idx] = blocks
         assert metadata.state_slot_out.shape == (4,)
         assert metadata.step.positions.shape == (16,)
+        # the forward's first index reader
+        builder.cache.indptrs(metadata.step)
         # A plan was already included in the combined publication: its own
         # group still rejects duplicate writes before touching pinned sources.
         with pytest.raises(PublicationError, match="republish_reason"):
@@ -331,6 +338,7 @@ def test_v41_combined_publication_precedes_indptr_consumer(monkeypatch, pp_size)
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
     torch.cuda.synchronize()
+    assert len(observed) == 8
     for fields in observed:
         for gpu, cpu in fields:
             assert torch.equal(gpu.cpu().view(torch.uint8), cpu.view(torch.uint8))

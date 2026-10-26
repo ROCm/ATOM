@@ -12,7 +12,6 @@ from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
@@ -90,20 +89,13 @@ class KVCacheConfig:
 
 
 class CUDAGraphMode(enum.Enum):
-    """Constants for the cudagraph mode in CompilationConfig.
-    Meanwhile, the subset enum `NONE`, `PIECEWISE` and `FULL` are also
-    treated as concrete runtime mode for cudagraph runtime dispatching.
-    """
+    """Constants for the cudagraph mode in CompilationConfig."""
 
     NONE = 0
-    PIECEWISE = 1
+    TR_HYBRID = 1
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
-    FULL_AND_PIECEWISE = (FULL, PIECEWISE)
-    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
-    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
-    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
-    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
+    FULL_AND_TR_HYBRID = (FULL, TR_HYBRID)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
@@ -111,15 +103,10 @@ class CUDAGraphMode(enum.Enum):
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
 
-    def is_attn_ffn_piecewise(self) -> bool:
-        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
-        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
-        return self is CUDAGraphMode.AF_PIECEWISE
-
-    def requires_piecewise_compilation(self) -> bool:
+    def uses_tr_hybrid(self) -> bool:
         return (
-            self.decode_mode() == CUDAGraphMode.PIECEWISE
-            or self.mixed_mode() == CUDAGraphMode.PIECEWISE
+            self.decode_mode() == CUDAGraphMode.TR_HYBRID
+            or self.mixed_mode() == CUDAGraphMode.TR_HYBRID
         )
 
     def max_cudagraph_mode(self) -> "CUDAGraphMode":
@@ -179,41 +166,32 @@ class CompilationConfig:
     The mode of the cudagraph:
 
     - NONE, no cudagraph capture.
-    - PIECEWISE. (v1 default)
+    - TR_HYBRID. (default at level 3)
     - FULL.
     - FULL_DECODE_ONLY.
-    - FULL_AND_PIECEWISE.
-    - AF_PIECEWISE.
+    - FULL_AND_TR_HYBRID.
 
-    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
-    core is ALSO captured into its own cudagraph with zero-copy public buffers
-    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
-    attention gap between the dense pieces. Falls back to plain PIECEWISE
-    behavior for models that don't implement the attention-core capture.
-
-    PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
-    incompatiable ops (i.e. some attention ops) outside the cudagraph
-    for general flexibility.
-    This is the default mode.
+    TR_HYBRID mode mixes token graphs and request graphs: the compiled forward
+    is recorded as a `TokenGraph` per token bucket, breaking only at the split
+    ops whose launches depend on host data (`eager_region`), which run between
+    its segments -- eagerly, or as a `ReqGraph` where the request bucket fixes
+    their launches.
 
     FULL mode: Capture full cudagraph for all batches. Can be good for small
     models or workloads with small prompts; not supported by many backends.
-    Generally for performance FULL_AND_PIECEWISE is better.
 
     FULL_DECODE_ONLY mode: Capture full cudagraph for decode batches only.
     Mixed prefill-decode batches are run without cudagraphs. Can be good for
     decode instances in a P/D setup where prefill is not as important so we
     can save some memory.
 
-    FULL_AND_PIECEWISE mode: Capture full cudagraph for decode batches and
-    piecewise cudagraph for prefill and mixed prefill-decode batches.
-    This is like the most performant mode for most models.
+    FULL_AND_TR_HYBRID mode: the native runner records it as TR_HYBRID --
+    decode replays token graphs too, not a full graph (`_tr_hybrid_active`).
 
-    Currently, the cudagraph mode is only used for the v1 engine.
     Note that the cudagraph logic is generally orthogonal to the
-    compilation logic. While piecewise cudagraphs require piecewise
-    compilation (level=PIECEWISE and non-empty splitting_ops), full
-    cudagraphs are supported with and without compilation.
+    compilation logic: full cudagraphs and token graphs are recorded with and
+    without compilation; piecewise compilation (level=PIECEWISE and non-empty
+    splitting_ops) only decides where the compiled pieces split.
 
     Warning: This flag is new and subject to change in addition
     more modes may be added.
@@ -233,7 +211,8 @@ class CompilationConfig:
     are always used, it can set this to False. Otherwise, it should
     set this to True, and the compiler will copy the input to an
     internally managed buffer. Default is False.
-    Note that this flag is only effective when cudagraph_mode is PIECEWISE.
+    Note that this flag is only effective at level 3, whenever cudagraph_mode
+    is not NONE (`VllmBackend`).
     """
 
     inductor_compile_config: dict = field(default_factory=dict)
@@ -1095,17 +1074,6 @@ class ParallelConfig:
             backend="gloo",
         )
         return dp_group
-
-    @staticmethod
-    def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
-        tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
-        # dp rank 0: has_unfinished_seqs=True
-        # dp rank 1: has_unfinished_seqs=False
-        # aggregated: has_unfinished_seqs=True
-        # so this is an OR operation, i.e. MAX in integers
-        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
-        aggregated_has_unfinished = bool(tensor.item())
-        return aggregated_has_unfinished
 
     def compute_hash(self):
         """
@@ -2313,8 +2281,7 @@ class Config:
             )
             if qrep_off is not None:
                 logger.warning(
-                    "dcp_config.enable_query_replication disabled: %s not "
-                    "supported.",
+                    "dcp_config.enable_query_replication disabled: %s not supported.",
                     qrep_off,
                 )
                 self.dcp_config.enable_query_replication = False
@@ -2412,14 +2379,14 @@ class Config:
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
         ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
             self.compilation_config.set_splitting_ops_for_v1()
-            # Default to PIECEWISE, except V4.1 whose Engram stream fork/join
+            # Default to TR_HYBRID, except V4.1 whose Engram stream fork/join
             # currently requires a FULL graph. Explicit choices are preserved.
             # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
                 self.compilation_config.cudagraph_mode = (
                     CUDAGraphMode.FULL
                     if self.hf_config.model_type == "deepseek_v41_text"
-                    else CUDAGraphMode.PIECEWISE
+                    else CUDAGraphMode.TR_HYBRID
                 )
             self.compilation_config.init_with_cudagraph_sizes()
 

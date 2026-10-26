@@ -340,12 +340,12 @@ class EngineArgs:
             "--cudagraph-mode",
             type=str,
             default="FULL",
-            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE", "AF_PIECEWISE"],
+            choices=["NONE", "TR_HYBRID", "FULL", "FULL_AND_TR_HYBRID"],
             help="CUDA graph runtime mode. FULL = manual whole-forward capture "
-            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
-            "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
-            "the attention core is also captured into its own cudagraph with "
-            "zero-copy buffers (DeepSeek-V4 DSpark).",
+            "(default, existing behavior). TR_HYBRID = a token graph per token "
+            "bucket, breaking only where a launch depends on host data, which "
+            "runs eagerly or as a request graph; recorded at any --level. "
+            "FULL_AND_TR_HYBRID is recorded as TR_HYBRID.",
         )
         parser.add_argument(
             "--load_dummy",
