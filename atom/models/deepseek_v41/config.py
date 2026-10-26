@@ -467,7 +467,8 @@ def validate_runtime_config(config):
             # into the slot before handing it over.
             "Mooncake P/D without an explicit kv_role",
             not on_vllm_plugin
-            and KVConnectorFactory.connector_name(config.kv_transfer_config) == "mooncake"
+            and KVConnectorFactory.connector_name(config.kv_transfer_config)
+            == "mooncake"
             and isinstance(config.kv_transfer_config, dict)
             and config.kv_transfer_config.get("kv_role")
             not in ("kv_producer", "kv_consumer"),
