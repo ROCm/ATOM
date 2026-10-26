@@ -215,6 +215,10 @@ class SpurDispatchTest(unittest.TestCase):
             interface = "eno0" if rank == 0 else "enp5s0"
             self.assertIn(f"NCCL_SOCKET_IFNAME=={interface}", runs[0])
             self.assertIn(f"MORI_SOCKET_IFNAME={interface}", runs[0])
+            # MoRI reads neither NCCL_IB_HCA nor NCCL_IB_GID_INDEX.
+            hcas = ",".join(f"ionic_{index}" for index in range(8))
+            self.assertIn(f"MORI_RDMA_DEVICES={hcas}", runs[0])
+            self.assertIn("MORI_IB_GID_INDEX=1", runs[0])
             self.assertIn(["rm", "-f", f"atomesh-test-cell-42-{rank}"], calls)
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "0\n")
             result = json.loads(

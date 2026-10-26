@@ -33,6 +33,7 @@ class QuantType(enum.IntEnum):
     per_Tensor = 2
     per_1x32 = 3
     per_1x128 = 4
+    iq2r_2bit = 5
 
 
 BF16 = "torch.bfloat16"
@@ -1310,6 +1311,70 @@ class TestWillOnlineRequant:
     def test_source_already_at_online_target_is_not_requantized(self):
         qcfg = self._m3_config()
         assert will_online_requant(qcfg, ATTENTION, QuantType.per_Token, FP8) is False
+
+
+# =========================================================================
+# Tests — IQ2R
+# =========================================================================
+
+
+# An IQ2R checkpoint's `quantization_config`: the listed MoE experts are IQ2R
+# and every other layer keeps the FP8 base format.
+IQ2R_SOURCE = {
+    "quant_method": "iq2r",
+    "iq2r_layout": "glm53-packed-v1",
+    "iq2r_modules": ["model.layers.3.mlp.experts"],
+    "base_quantization_config": {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+        "activation_scheme": "dynamic",
+        "modules_to_not_convert": ["model.layers.3.mlp.gate"],
+    },
+}
+IQ2R_EXPERTS = "model.layers.3.mlp.experts"
+IQ2R_ATTENTION = "model.layers.3.self_attn.q_a_proj"
+
+
+class TestIq2rParser:
+    def test_listed_modules_get_iq2r_and_the_rest_keep_the_base(self):
+        parsed = get_quant_parser("iq2r").parse(IQ2R_SOURCE)
+
+        assert parsed.global_spec.quant_type == QuantType.per_1x128
+        assert parsed.global_spec.quant_dtype == FP8
+        pattern, spec = parsed.layer_pattern_specs[0]
+        assert pattern == IQ2R_EXPERTS
+        assert spec.quant_type == QuantType.iq2r_2bit
+        assert spec.quant_method == "iq2r"
+        assert parsed.exclude_layers == ["model.layers.3.mlp.gate"]
+
+    @pytest.mark.parametrize(
+        "config,error",
+        [
+            ({"base_quantization_config": {"quant_method": "iq2r"}}, ValueError),
+            ({}, TypeError),
+            ({"iq2r_modules": []}, TypeError),
+            ({"iq2r_modules": "model.layers.*.mlp.experts"}, TypeError),
+        ],
+    )
+    def test_rejects_malformed_config(self, config, error):
+        with pytest.raises(error):
+            get_quant_parser("iq2r").parse({"quant_method": "iq2r", **config})
+
+    def test_online_quant_keeps_iq2r_layers(self):
+        # The online config does not exclude the experts. IQ2R weights cannot
+        # be requantized, so they keep the checkpoint format anyway.
+        qcfg = QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=IQ2R_SOURCE),
+            online_quant_config={"global_quant_config": "ptpc_fp8"},
+        )
+
+        def requantized(layer):
+            spec = qcfg.get_layer_quant_config(layer)
+            return will_online_requant(qcfg, layer, spec.quant_type, spec.quant_dtype)
+
+        assert qcfg.online_quant is True
+        assert requantized(IQ2R_EXPERTS) is False
+        assert requantized(IQ2R_ATTENTION) is True
 
 
 class TestBlockscaleE8m0Scale:
