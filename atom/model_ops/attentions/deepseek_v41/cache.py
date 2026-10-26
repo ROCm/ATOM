@@ -364,17 +364,19 @@ class PagedAttentionCache:
         self._reserve_indptrs(step.width)
         # Before the indptrs, which count each row's window from its floor.
         self.publish_replay_layout(step, count if running_bs is None else running_bs)
-        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
         return step
 
-    def publish_replay_layout(self, step, running_bs):
+    def publish_replay_layout(self, step, running_bs, floors=None):
         """`step.swa_replay_start` and `swa_cached_until` from its host
         `request_floors` and `request_cached_until`, indexed by the step's own
         batch rows: the fixed zeros unless a request recomputes rows below
-        where it resumed."""
+        where it resumed. ``floors``: the floors already published at fixed
+        addresses, a bounded-replay tail's, whose rows no ring holds."""
         zeros = self._replay_start_zeros(running_bs)
         step.swa_replay_start = step.swa_cached_until = zeros
-        if step.request_floors.any() and not step.decode:
+        if floors is not None:
+            step.swa_replay_start = floors
+        elif step.request_floors.any() and not step.decode:
             step.swa_replay_start, step.swa_cached_until = upload_numpy(
                 np.stack((step.request_floors, step.request_cached_until)),
                 step.positions.device,
@@ -619,12 +621,23 @@ class PagedAttentionCache:
             rope=rope,
         )
 
+    def indptrs(self, step):
+        """`step`'s `{ratio: (prefix indptr, extend indptr, reserved top-k)}`
+        (`fill_step_indptrs`), into its fixed buffers: a TBO microbatch's own,
+        else the cache's. Memoized as `unit_tiles` is, so a forward that builds
+        no index (mono's) fills none."""
+        if not step.indptrs:
+            step.indptrs = fill_step_indptrs(
+                step, self.geometry, step.indptr_buffers or self.indptr_buffers
+            )
+        return step.indptrs
+
     def unit_tiles(self, step, ratio):
         """Tile ids per query token: one table per ratio, shared by its owners.
 
         Memoized on the step and dropped by `begin_forward` rather than built
-        with it, unlike the indptrs: a table built outside the graph is one a
-        replay reads without rebuilding. With a `workspace` the table is its
+        with it: a table built outside the graph is one a replay reads without
+        rebuilding. With a `workspace` the table is its
         ratio's fixed rows, rewritten each step; without one, a fresh
         allocation.
         """
@@ -850,20 +863,17 @@ class PagedAttentionCache:
         """This layer's `(prefix, pptr, second, sptr)`: rows into the pool, and
         rows into the attention's second source.
 
-        A prefill's second source is its own KV (`extend`), its rows built for
-        this layer alone: it pays work rather than dispatch. A decode builds
-        its index group's in one launch: every layer's prefix, window
-        included, or on a split decode (`splits_window`) the selection alone,
-        one plane the group shares, its second source the layer's ring
-        (`ring_view`) and the window rows one list for every layer.
+        Prefill and decode alike build their index group's in one launch:
+        every layer's prefix, window included, or on a split decode
+        (`splits_window`) the selection alone, one plane the group shares. A
+        prefill's second source is its own KV (`extend`, one list for the
+        group); a decode's is the layer's ring (`ring_view`), and a split
+        decode's window rows one list for every layer.
 
         The group's first layer is also the layer that owns its selection, so
         by the time anyone asks, every input the run shares already exists.
         Later layers find theirs written and launch nothing.
         """
-        if not step.decode:
-            prefix, pptr, extend, eptr = self._index_group(spec, step, spec.layer_id, 1)
-            return prefix[0], pptr, extend, eptr
         # a spec that declares no group never names a start: its own
         first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
         split = splits_window(step, self.geometry)
@@ -900,6 +910,7 @@ class PagedAttentionCache:
         )
         return build_indices(
             step.selected[spec.topk_owner] if spec.ratio else None,
+            self.indptrs(step)[spec.ratio],
             step,
             self.geometry,
             window,

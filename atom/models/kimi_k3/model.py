@@ -46,6 +46,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
+    uses_mxfp4_n32k4_scale,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -66,6 +67,7 @@ from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import eager_region, token_graph
 
 
 def _text_config(config):
@@ -570,7 +572,7 @@ class KimiSparseMoeBlock(nn.Module):
         """Unsummed dispatch target for `maybe_dual_stream_split_forward`.
 
         The split op reaches this whenever dual-stream is gated OFF for a given
-        call (above the token threshold, under TBO, mid piecewise capture), so
+        call (above the token threshold, under TBO, mid token-graph recording), so
         it has to defer exactly like the dual-stream target -- otherwise the
         deferral would silently stop above the threshold, where the [T, H] add
         it saves is largest.
@@ -859,7 +861,7 @@ class KimiFullAttention(nn.Module):
             from atom.model_ops.linear import use_triton_gemm
             from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
 
-            if not use_triton_gemm():
+            if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
                 q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
                     q_c.shape[0]
                 )
@@ -909,6 +911,7 @@ def _kda_attention_with_output_fake(
     gen_fake=_kda_attention_with_output_fake,
     mutates_args=[],
 )
+@eager_region()
 def kda_attention_with_output(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor | None,
@@ -1257,7 +1260,13 @@ class KimiKDAAttention(nn.Module):
             f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
             gate = self.f_b_proj(f_a, x_scale=f_a_scale)
         else:
-            gate = self.f_b_proj(f_a_view.contiguous())
+            # Not .contiguous(): it returns a one-row view as is (size-1 dims
+            # ignore strides), handing the GEMM the fused row stride, which
+            # the gfx950 FlyDSL bf16 path rejects. A fresh buffer is aligned.
+            f_a = torch.empty(
+                f_a_view.shape, dtype=f_a_view.dtype, device=f_a_view.device
+            )
+            gate = self.f_b_proj(f_a.copy_(f_a_view))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         # Prefill returns its own contiguous output. Allocate this buffer only
         # for decode/spec-decode, where the recurrence writes into it directly.
@@ -1692,6 +1701,7 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum
 
 
+@token_graph
 @support_torch_compile
 class KimiLinearModel(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):

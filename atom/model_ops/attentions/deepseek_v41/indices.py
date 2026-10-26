@@ -232,7 +232,7 @@ def _indices(
         if PACKED:
             row = (row << 1) | 1
         tl.store(prefix + pend - window_count + i, row, i < window_count)
-    if not DECODE:
+    if not DECODE and layer == 0:  # one extend plane for the whole run
         count = tl.minimum(pos - history_end + 1, WINDOW)
         begin = tl.load(eptr + t)
         tl.store(extend + begin + i, t - count + 1 + i, i < count)
@@ -307,10 +307,9 @@ def _cached_until(step):
 def fill_step_indptrs(step, geometry, buffers):
     """`{ratio: (prefix indptr, extend indptr, reserved top-k)}` for this step.
 
-    Into the caller's fixed buffers, before any layer runs. Both halves are
-    load-bearing: a table a layer fills on a miss is one a capture's recorded
-    pass skips, and a table at a fresh address each forward is one its replay
-    reads at the capture's.
+    Into the caller's fixed buffers: a table at a fresh address each forward
+    is one its replay reads at the capture's. Filled by the forward's first
+    reader (`PagedAttentionCache.indptrs`), so a capture records the fill.
 
     A split decode (`splits_window`) counts the selection alone in the prefix
     and the window in the extend indptr, the same for every ratio.
@@ -368,21 +367,23 @@ def build_window_rows(step, geometry, window, eptr):
     return rows
 
 
-def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stride=0):
-    """`layers` consecutive layers' indices, starting at `window`'s.
+def build_indices(
+    selected, indptrs, step, geometry, window, owner, ratio, layers=1, stride=0
+):
+    """`layers` consecutive layers' indices, starting at `window`'s, laid out
+    by `indptrs`: `ratio`'s `(prefix, extend, reserved top-k)` of
+    `fill_step_indptrs`.
 
-    Only a decode groups: its `extend` is empty, so the run needs no second
-    plane, and it is the pass whose cost is the launch rather than the work.
-    A split decode (`splits_window`) writes the selection alone, which every
-    layer of a group shares, so it builds one plane for the group.
+    A prefill's `extend` is the same for every layer of the run -- this
+    forward's own rows -- so the run shares one plane of it. A split decode
+    (`splits_window`) writes the selection alone, which every layer of a group
+    shares, so it builds one plane for the group.
     """
-    if layers > 1 and not step.decode:
-        raise ValueError("Only a decode batches its index build across layers")
     history = not splits_window(step, geometry)
     if layers > 1 and not history:
         raise ValueError("A split decode's selection is one plane for the group")
     topk = 0 if selected is None else selected.shape[-1]
-    pptr, eptr, reserved = step.indptrs[ratio]
+    pptr, eptr, reserved = indptrs
     if topk != reserved:
         # Each row's reserve is closed-form in the width, and was taken before
         # any scorer ran. Another width leaves every row a hole its reader

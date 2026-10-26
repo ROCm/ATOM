@@ -73,6 +73,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    uses_mxfp4_n32k4_scale,
 )
 from atom.model_ops.mla_query_heads import mla_min_query_heads
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
@@ -456,7 +457,7 @@ class K3DSparkMLAAttention(nn.Module):
             from atom.model_ops.linear import use_triton_gemm
             from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
 
-            if not use_triton_gemm():
+            if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
                 q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
                     q_lora.shape[0]
                 )

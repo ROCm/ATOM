@@ -51,6 +51,7 @@ from atom.config import get_current_atom_config
 from atom.models.dspark_draft import DSparkDraftModel
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import eager_region
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -70,6 +71,7 @@ def _dspark_block_attention_fake(
 @mark_spliting_op(
     is_custom=True, gen_fake=_dspark_block_attention_fake, mutates_args=[]
 )
+@eager_region()
 def dspark_block_attention(
     x: torch.Tensor,  # [B, T, dim] per-block hidden (post attn_norm)
     positions: torch.Tensor,  # [B] anchor position per request
@@ -88,8 +90,8 @@ def dspark_block_attention(
     only be called once``.
 
     The V4 target calls the very same kernel and is fine precisely because its
-    call site (``DeepseekV4Attention._attn_compress``) is reachable only through
-    ``torch.ops.aiter.v4_attn_compress``, a splitting op. This mirrors that,
+    call site (``DeepseekV4Attention._launch_compressors``) is reachable only
+    through ``torch.ops.aiter.v4_attn_compress_launch``, a splitting op. This mirrors that,
     at the WIDE granularity (``v4_attention_with_output``): the whole attention
     sub-layer stays eager.
 

@@ -942,12 +942,8 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         if atom_config.pipeline_parallel_size > 1:
             raise ValueError("Qwen3.8-Flash-Next does not support pipeline parallelism")
         mode = atom_config.compilation_config.cudagraph_mode
-        if (
-            not atom_config.enforce_eager
-            and mode is not None
-            and mode.requires_piecewise_compilation()
-        ):
-            raise ValueError("Qwen3.8-Flash-Next has no piecewise compilation support")
+        if not atom_config.enforce_eager and mode is not None and mode.uses_tr_hybrid():
+            raise ValueError("Qwen3.8-Flash-Next has no TR_HYBRID graph support")
         if atom_config.torch_dtype != torch.bfloat16:
             raise ValueError("Qwen3.8-Flash-Next requires BF16 activations")
         if atom_config.hf_config.output_gate_type != "sigmoid":

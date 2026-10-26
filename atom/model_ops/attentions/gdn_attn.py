@@ -1884,8 +1884,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         self,
         batch: ScheduledBatch,
         running_bs: int,
+        running_tokens: int,
     ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
+        attn_metadata, positions = super().prepare_prefill(
+            batch, running_bs, running_tokens
+        )
         if batch.block_tables == []:
             if any(getattr(batch, "state_save_all", None) or ()):
                 raise RuntimeError(
