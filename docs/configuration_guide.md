@@ -44,6 +44,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
+| `throughput_log_interval_steps` | `int` | `0` | Forwards between engine-status lines, replacing the clock above when > 0. For offline / MLPerf runs comparing one DP rank's lines against another's: the clock lands on a different step number on each rank, a forward count lands on the same one (an idle DP rank counts its dummy). Base and DP engines only — pipeline parallel, RapidServe and P/D run their own busy loops and fall back to the clock with a warning |
 | `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
 | `enable_dynamic_chunking` | `bool` | `False` | Size pipeline-parallel prefill chunks from a calibrated equal-latency model. Needs `pipeline_parallel_size > 1` and chunked prefill, and does not apply to RapidServe or a P/D decode instance (`kv_role: kv_consumer`); otherwise the flag is turned off with a warning and chunking stays fixed |
 | `dynamic_chunking_smooth_factor` | `float \| None` | `None` | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). `None` takes `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR`, read only when the feature is on. Must be in `[0, 1]` when the feature is on |
@@ -369,6 +370,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
 | `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
 | `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
+| `--throughput-log-interval-steps` | | `int` | `0` | Forwards between engine-status lines instead of seconds; base and DP engines only |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
 | `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |

@@ -601,7 +601,9 @@ class EngineArgs:
             "clock). For offline / MLPerf runs that compare one DP rank's "
             "lines against another's: wall-clock sampling lands on a "
             "different step number on each rank, a forward count lands on "
-            "the same one. Ignored when --no-enable-log-stats.",
+            "the same one. Base and DP engines only -- pipeline parallel, "
+            "RapidServe and P/D run their own busy loops and fall back to "
+            "the clock with a warning. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--cache-hit-rate-window",
