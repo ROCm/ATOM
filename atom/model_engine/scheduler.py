@@ -560,6 +560,58 @@ class ScheduledBatchOutput:
         return self._req_id_to_idx.get(req_id)
 
 
+class _ReqTimingLog:
+    """Per-request prefill timing (measurement only; on with ATOM_DP_STEP_DUMP).
+
+    One JSONL row per request at its first token: prompt tokens, prefix-cache
+    hit at first admission, and wall times of API arrival, engine enqueue,
+    first prefill admission and first token. Appended in blocks to
+    ``<ATOM_DP_STEP_DUMP>/req_<pid>.jsonl``."""
+
+    def __init__(self) -> None:
+        import os
+
+        self.dir = os.environ.get("ATOM_DP_STEP_DUMP", "")
+        self.enabled = bool(self.dir)
+        self._t: dict[int, list] = {}
+        self._rows: list[str] = []
+
+    def enqueue(self, seq) -> None:
+        self._t.setdefault(seq.id, [time.time(), 0.0, -1])
+
+    def admitted(self, seq) -> None:
+        e = self._t.get(seq.id)
+        if e is not None and e[1] == 0.0:
+            e[1] = time.time()
+            e[2] = int(seq.num_cached_tokens)
+
+    def first_token(self, seq) -> None:
+        import json
+        import os
+
+        e = self._t.pop(seq.id, None)
+        if e is None:
+            return
+        self._rows.append(
+            json.dumps(
+                [
+                    seq.id,
+                    int(seq.num_prompt_tokens),
+                    e[2],
+                    round(float(getattr(seq, "arrive_time", 0.0) or 0.0), 4),
+                    round(e[0], 4),
+                    round(e[1], 4),
+                    round(float(seq.first_token_time), 4),
+                ]
+            )
+        )
+        if len(self._rows) >= 50:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(os.path.join(self.dir, f"req_{os.getpid()}.jsonl"), "a") as f:
+                f.write("\n".join(self._rows) + "\n")
+            self._rows = []
+
+
 class Scheduler:
     """Manages the lifecycle of inference requests through prefill and decode.
 
@@ -624,6 +676,7 @@ class Scheduler:
         # tokens a replaying forward carries from before it (`Replay.history_ids`)
         self.replay_history_tokens = getattr(config, "replay_history_tokens", 0)
         pc = getattr(config, "parallel_config", None)
+        self._req_timing = _ReqTimingLog()
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
             * getattr(config, "pipeline_parallel_size", 1)
@@ -1450,12 +1503,16 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self.metrics.enqueue(seq)
+        if self._req_timing.enabled:
+            self._req_timing.enqueue(seq)
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
             self.metrics.enqueue(seq)
+            if self._req_timing.enabled:
+                self._req_timing.enqueue(seq)
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
 
@@ -3480,6 +3537,8 @@ class Scheduler:
         num_batched_tokens: int,
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
+        if self._req_timing.enabled:
+            self._req_timing.admitted(seq)
         self._record_cache_reuse(seq)
         self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
         num_batched_tokens += chunk
@@ -4273,6 +4332,8 @@ class Scheduler:
             seq.num_finalized_tokens = num_tokens
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
+                if self._req_timing.enabled:
+                    self._req_timing.first_token(seq)
 
             # Counted here, not from `len(token_ids)` above: `new_tokens` is
             # what reaches RequestOutput, and it differs from the forward's

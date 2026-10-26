@@ -117,6 +117,7 @@ class PrefillDelayer:
         "_stat_fire_ttft",
         "_stat_fire_vacuous",
         "_stat_hold",
+        "_stat_hold_align",
         "_stat_hold_decode_interval",
         "_stat_log_every",
         "cpu_group",
@@ -246,6 +247,7 @@ class PrefillDelayer:
         self._stat_fire_vacuous = 0
         self._stat_hold = 0
         self._stat_hold_decode_interval = 0
+        self._stat_hold_align = 0
         self._stat_log_every = int(
             os.environ.get("ATOM_PREFILL_DELAYER_LOG_EVERY", "1000")
         )
@@ -445,6 +447,7 @@ class PrefillDelayer:
         # ---- alignment gate: never fire while a rank lacks prefill (anti-skew).
         # Hold to let stragglers catch up; the ttft bound above bounds the wait.
         if n_prefillable < self.dp_size:
+            self._stat_hold_align += 1
             return self._hold(g_pending)
 
         # ---- goal: fire once the aggregate fills a worthwhile forward ----
@@ -534,6 +537,7 @@ class PrefillDelayer:
                 f"fire_queue_ms={self._stat_fire_queue_ms} "
                 f"fire_vacuous={self._stat_fire_vacuous} "
                 f"hold_decode_interval={self._stat_hold_decode_interval} "
+                f"hold_align={self._stat_hold_align} "
                 f"hold={self._stat_hold} "
                 f"(hold_rate={self._stat_hold / total:.2%})"
             )
