@@ -422,3 +422,39 @@ def test_needs_id_sync_is_one_predicate_for_both_groups():
     assert mr._needs_id_sync(True, False) is True
     assert mr._needs_id_sync(False, True) is True
     assert mr._needs_id_sync(True, True) is True
+
+
+def test_shared_expert_stays_on_tp_when_requantized_online():
+    """Online re-quantization gathers on the real TP group, which cannot rebuild
+    a weight cut on the wider pcp*tp grid, so such a shared expert is not folded."""
+    import ast
+    import inspect
+    import textwrap
+
+    v4 = pytest.importorskip("atom.models.deepseek_v4")
+    from atom.quant_spec import LayerQuantConfig, QuantType
+
+    fp8 = LayerQuantConfig(
+        quant_type=QuantType.per_Token, quant_dtype=torch.float8_e4m3fn
+    )
+
+    class QC:
+        def __init__(self, online_quant, source, target):
+            self.online_quant = online_quant
+            self._source, self._target = source, target
+
+        def get_layer_quant_config(self, name, use_online_quant=False):
+            return self._target if use_online_quant else self._source
+
+    prefix = "layers.3.ffn.shared_experts"
+    bf16 = LayerQuantConfig.no_quant()
+    assert v4._shared_expert_requantized_online(QC(True, bf16, fp8), prefix)
+    assert not v4._shared_expert_requantized_online(QC(False, bf16, fp8), prefix)
+    # A source already in the online target's format keeps its checkpoint weight.
+    assert not v4._shared_expert_requantized_online(QC(True, fp8, fp8), prefix)
+    assert not v4._shared_expert_requantized_online(None, prefix)
+
+    # And MoE consults it before picking the grid.
+    src = textwrap.dedent(inspect.getsource(v4.MoE.__init__))
+    names = {n.id for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Name)}
+    assert "_shared_expert_requantized_online" in names

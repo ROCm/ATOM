@@ -123,6 +123,7 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
+from atom.quant_spec import will_online_requant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
@@ -2902,9 +2903,13 @@ class MoE(nn.Module):
             # reduce_scatter/all_reduce the routed experts already ride.
             # `align=128` is the same block-scale granularity the FusedMoE above
             # pads to; the grid steps down to a coarser divisor rather than hand
-            # the weight loader a shard that splits a scale block.
-            self._shared_pcp_grid = pcp_merged_tp_grid(
-                shard_dim=args.moe_inter_dim, align=128
+            # the weight loader a shard that splits a scale block. Online
+            # re-quantization gathers on the real TP group, which cannot rebuild
+            # a weight cut on the wider grid, so such a shared expert stays on TP.
+            self._shared_pcp_grid = (
+                None
+                if _shared_expert_requantized_online(qc, f"{prefix}.shared_experts")
+                else pcp_merged_tp_grid(shard_dim=args.moe_inter_dim, align=128)
             )
             self.shared_experts = Expert(
                 args.dim,
@@ -3642,6 +3647,18 @@ def _run_moe(moe: "MoE", x: torch.Tensor) -> torch.Tensor:
     if moe._use_dual_stream and 0 < num_tokens <= threshold:
         return moe.dual_stream_moe_forward(x)
     return moe.single_stream_moe_forward(x)
+
+
+def _shared_expert_requantized_online(qc, prefix: str) -> bool:
+    """Whether online quantization re-quantizes any of the shared expert's linears."""
+    for name in ("gate_up_proj", "w2"):
+        layer = f"{prefix}.{name}"
+        source = qc.get_layer_quant_config(layer) if qc is not None else None
+        if source is not None and will_online_requant(
+            qc, layer, source.quant_type, source.quant_dtype
+        ):
+            return True
+    return False
 
 
 def moe_pcp_merge_forward(
