@@ -3066,8 +3066,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 running_bs, max_seqlen_q
             )
+            # Plan the sparse per-token work over the REAL tokens only, as the
+            # cprr branch below does for its requests. A cudagraph-padded tail
+            # token has zero sparse KV, but get_mla_metadata_v1 still gives
+            # every row a work item, starting at sparse_kv_indptr[-1] -- the
+            # end of what this step wrote to the sparse-index buffer. With
+            # those items planned, the decode kernel memory-faults some tens of
+            # steps into a padded batch (gfx1250, FlyDSL PS1), presumably by
+            # reading indices past that end. The persistent kernel is
+            # work_indptr-driven, so the padded rows are simply left unplanned.
             ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
-                running_tokens
+                scheduled_tokens
             )
         else:
             # DCP + MTP (max_q_len>1) needs the round-robin global-position causal
