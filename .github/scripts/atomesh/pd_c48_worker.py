@@ -178,9 +178,9 @@ def prepare_store_memory(worker):
                 continue
             try:
                 subprocess.run([sys.executable, str(here / "numa_exec.py"), node.name.removeprefix("node"), sys.executable,
-                                str(here / "compact_huge_pages.py"), f"{gib:.0f}"], check=False, timeout=1800)
+                                str(here / "compact_huge_pages.py"), f"{gib:.0f}"], check=False, timeout=600)
             except subprocess.TimeoutExpired:
-                print(f"[C48][WARN] Store memory: compacting {node.name} did not finish in 1800 s", flush=True)
+                print(f"[C48][WARN] Store memory: compacting {node.name} did not finish in 600 s", flush=True)
         done.touch()
 
 

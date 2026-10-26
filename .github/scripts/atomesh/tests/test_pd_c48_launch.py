@@ -59,8 +59,8 @@ class LaunchTest(unittest.TestCase):
                 self.assertEqual(names, expected)
             if store:
                 cpu = transfer(render(src, "prefill", *ADDR)[0])["kv_connector_extra_config"]["connectors"][1]
-                self.assertEqual(mc["mooncake"]["store"]["global_segment_size"] * 8,
-                                 cpu["kv_connector_extra_config"]["cpu_bytes_to_use"])
+                segment = mc["mooncake"]["store"]["global_segment_size"]
+                self.assertEqual(segment, cpu["kv_connector_extra_config"]["cpu_bytes_to_use"] // 8 >> 21 << 21)
                 self.assertEqual(mc["mooncake"]["store"]["protocol"], "rdma")
                 self.assertEqual(mc["mooncake"]["store"]["local_buffer_size"], 64 << 20)
 
