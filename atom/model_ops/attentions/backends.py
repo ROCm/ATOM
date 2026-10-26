@@ -350,6 +350,24 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         A no-op here; `GDNAttentionMetadataBuilder` overrides it for its MHA pool.
         """
 
+    def clear_released_units(self, unit_ids: Sequence[int]) -> None:
+        """`clear_page_units`, marking the stream point the zeroing ends at."""
+        self.clear_page_units(unit_ids)
+        if torch.cuda.is_available():
+            if getattr(self, "_released_units_cleared", None) is None:
+                self._released_units_cleared = torch.cuda.Event()
+            self._released_units_cleared.record()
+
+    def wait_released_unit_clears(self) -> None:
+        """Block until every `clear_released_units` so far has run on the device.
+
+        For writers this stream does not order: a connector load fills its
+        blocks from its own threads and streams.
+        """
+        event = getattr(self, "_released_units_cleared", None)
+        if event is not None:
+            event.synchronize()
+
     def reserve_checkpoint_descriptors(self, descriptor_slots) -> None:
         """Allocate staging for out-of-band copy slots before serving.
 
@@ -1041,7 +1059,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         # Before the copies: a unit given back and reserved again in one pass
         # is cleared, then stored into.
         if state_ops.checkpoint_clears:
-            self.clear_page_units(state_ops.checkpoint_clears)
+            self.clear_released_units(state_ops.checkpoint_clears)
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:

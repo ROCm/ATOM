@@ -546,8 +546,17 @@ class BlockManager:
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
-            checkpoint_clears=self.kv.take_released_units(),
+            checkpoint_clears=self.take_checkpoint_clears(),
         )
+
+    def take_checkpoint_clears(self) -> tuple[int, ...]:
+        """PAGE units given back since the last call, for the worker to zero.
+
+        Drained by whichever reaches the worker first: this pass's connector
+        metadata (`Scheduler.carry_checkpoint_clears`), whose loads may land
+        in them, or its batch (`take_state_maintenance_ops`).
+        """
+        return self.kv.take_released_units()
 
     def state_checkpoint_fates(self) -> dict[str, int]:
         """Summed fates across every state class, for the periodic stats line.

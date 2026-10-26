@@ -436,10 +436,15 @@ class BlockPool:
     def take_released_units(self) -> tuple[int, ...]:
         """Units given back since the last call, for the worker to zero.
 
-        A release precedes the allocation that reuses a unit, and the batch
-        that allocation serves drains it, so no unit is read as KV before it
-        is cleared. Distinct ids, so the worker's id buffer of one slot per
-        block always fits.
+        A unit is handed out again as soon as it is free, often in the same
+        pass, so the zeroing has to reach the worker before anything that can
+        write it. A forward clears first (`CommonAttentionBuilder.build`). A
+        connector load does not wait for the forward: it is dispatched ahead
+        of it, from passes that run no forward at all too, and fills blocks
+        from its own threads. Cleared after such a load, a unit loses the KV
+        it was just given. So the connector metadata of a pass drains this
+        before its batch does (`Scheduler.carry_checkpoint_clears`). Distinct
+        ids, so the worker's id buffer of one slot per block always fits.
         """
         ids = tuple(dict.fromkeys(self._released_units))
         self._released_units = []

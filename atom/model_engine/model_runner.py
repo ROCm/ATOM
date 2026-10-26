@@ -3547,6 +3547,14 @@ class ModelRunner:
     def process_kvconnector_output(self, connector_meta_output):
         """Dispatch KV connector metadata to initiate async KV loading."""
         if connector_meta_output is not None:
+            # A load is ordered after nothing on this stream, so every unit it
+            # may fill is zeroed, and the zeroing done, before it starts.
+            builder = getattr(self, "attn_metadata_builder", None)
+            if builder is not None:
+                clears = getattr(connector_meta_output, "checkpoint_clears", ())
+                if clears:
+                    builder.clear_released_units(clears)
+                builder.wait_released_unit_clears()
             connector = get_kvconnector()
             if connector is not None:
                 connector.start_load_kv(connector_meta_output)

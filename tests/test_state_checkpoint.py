@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import MockConfig
 
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.engine_stats import EngineStats
@@ -27,7 +28,7 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
 )
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceType
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
@@ -3432,6 +3433,92 @@ class TestAGivenBackImageIsCleared:
         assert sorted(ops.checkpoint_clears) == sorted(op.unit_ids)
         assert not ops.empty
         assert bm.take_state_maintenance_ops().checkpoint_clears == ()
+
+
+class TestAGivenBackImageIsClearedBeforeALoadFillsIt:
+    """A unit given back is free at once, so a load can be handed it in the
+    same pass. The load fills it from the connector's own threads, dispatched
+    ahead of the batch's forward -- and in a pass where every request is
+    parked on a load there is no forward at all. Cleared by a later batch, the
+    unit would lose the KV the load just put there, so the units travel on
+    the connector metadata that starts the loads.
+    """
+
+    class _Connector:
+        """Matches nothing, so a fresh request just prefills."""
+
+        def __init__(self, meta):
+            self.meta = meta
+
+        def get_num_new_matched_tokens(self, seq):
+            return 0, False
+
+        def update_state_after_alloc(self, seq):
+            pass
+
+        def build_connector_meta(self):
+            return self.meta
+
+    def _scheduler(self, meta):
+        scheduler = make_scheduler(
+            paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME
+        )
+        scheduler.kv_connector = self._Connector(meta)
+        return scheduler
+
+    @staticmethod
+    def _give_back_an_image(scheduler) -> list[int]:
+        pool = scheduler.block_manager.kv
+        units = pool.reserve_units(3, owner="image")
+        pool.release_units(units, owner="image")
+        return sorted(units)
+
+    @staticmethod
+    def _metadata(*, loads: bool) -> ConnectorMetadata:
+        meta = ConnectorMetadata()
+        if loads:
+            meta.reqs_to_recv = {"parked": SimpleNamespace()}
+        return meta
+
+    def test_a_pass_with_every_request_parked_on_a_load(self):
+        meta = self._metadata(loads=True)
+        scheduler = self._scheduler(meta)
+        parked = stateful_seq(list(range(3, 3 + 4 * BLOCK)))
+        parked.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.waiting.append(parked)
+        units = self._give_back_an_image(scheduler)
+
+        batch, scheduled = scheduler.schedule()
+
+        assert not scheduled
+        # No forward, so no batch drains them; the loads start regardless.
+        assert batch.state_maintenance_ops.empty
+        assert batch.connector_meta_output is meta
+        assert sorted(meta.checkpoint_clears) == units
+        assert scheduler.block_manager.take_checkpoint_clears() == ()
+
+    def test_a_pass_with_a_forward_clears_them_ahead_of_its_loads(self):
+        meta = self._metadata(loads=True)
+        scheduler = self._scheduler(meta)
+        scheduler.add(stateful_seq(list(range(3, 3 + 4 * BLOCK))))
+        units = self._give_back_an_image(scheduler)
+
+        batch, scheduled = scheduler.schedule()
+
+        assert scheduled
+        assert sorted(meta.checkpoint_clears) == units
+        assert not set(units) & set(batch.state_maintenance_ops.checkpoint_clears)
+
+    def test_metadata_without_work_leaves_them_to_the_batch(self):
+        meta = self._metadata(loads=False)
+        scheduler = self._scheduler(meta)
+        scheduler.add(stateful_seq(list(range(3, 3 + 4 * BLOCK))))
+        units = self._give_back_an_image(scheduler)
+
+        batch, _ = scheduler.schedule()
+
+        assert meta.checkpoint_clears == ()
+        assert sorted(batch.state_maintenance_ops.checkpoint_clears) == units
 
 
 # ── midstep checkpoints ────────────────────────────────────────────────────

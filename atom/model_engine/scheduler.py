@@ -34,6 +34,7 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
 from atom.model_engine.dynamic_chunking import (
@@ -2594,6 +2595,7 @@ class Scheduler:
                 self._publish_state_loads()
                 self._publish_state_stores()
                 connector_meta_output = self.kv_connector.build_connector_meta()
+                self.carry_checkpoint_clears(connector_meta_output)
 
             # Freeze, per seq, whether this chunk is the last one this prefill
             # owes. Uses the pre-advance offsets so it is correct whether or not
@@ -2777,6 +2779,8 @@ class Scheduler:
             self._publish_state_loads()
             self._publish_state_stores()
             connector_meta_output = self.kv_connector.build_connector_meta()
+            # An empty pass too: its batch drains nothing, but its loads start.
+            self.carry_checkpoint_clears(connector_meta_output)
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
         decode_batch = ScheduledBatch(
@@ -3716,6 +3720,28 @@ class Scheduler:
             # `stores_refused`; the units must still be released, but the store
             # never reached a worker, so it is not a `stores_failed`.
             self.block_manager.settle_state_store(op, ok=False, attempted=False)
+
+    def carry_checkpoint_clears(self, metadata) -> None:
+        """Have the workers zero the PAGE units given back so far before
+        `metadata`'s loads start (`BlockPool.take_released_units`).
+
+        A unit freed this pass may already be one of the blocks a load fills,
+        and that load runs ahead of the batch's forward, or with no forward at
+        all when every request of the pass is parked on a load. Metadata with
+        no work is left alone: the engine may drop it, and with no load in it
+        the batch can clear these as usual.
+        """
+        if not connector_metadata_has_work(metadata):
+            return
+        # getattr: scheduler doubles without a block manager reach this.
+        take = getattr(
+            getattr(self, "block_manager", None), "take_checkpoint_clears", None
+        )
+        if take is None:
+            return
+        clears = take()
+        if clears:
+            metadata.checkpoint_clears = (*metadata.checkpoint_clears, *clears)
 
     def _publish_state_loads(self) -> None:
         """Hand this pass's state-tier loads to the connector, before it builds

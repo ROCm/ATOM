@@ -505,6 +505,12 @@ class ConnectorMetadata:
         "reqs_not_processed",
     )
 
+    #: PAGE units a state checkpoint gave back (`BlockPool.state_images`),
+    #: zeroed by the worker before this snapshot's loads start. Not a work
+    #: field: only a snapshot already being dispatched carries them
+    #: (`Scheduler.carry_checkpoint_clears`).
+    checkpoint_clears: tuple[int, ...] = ()
+
     def __init__(self) -> None:
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}

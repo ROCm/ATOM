@@ -248,3 +248,49 @@ def test_clear_page_units_zeroes_the_named_units_in_every_pool():
             raw = tensor.view(torch.uint8).reshape(tensor.shape[0], -1).cpu()
             assert raw[[1, 2, 4]].eq(0).all(), role
             assert raw[[0, 3, 5]].eq(0x7F).all(), role
+
+
+def test_the_worker_zeroes_given_back_units_before_starting_loads(monkeypatch):
+    """A load fills blocks from the connector's own threads, ordered after
+    nothing on the compute stream: the zeroing is issued, and has finished,
+    before `start_load_kv` hands the load over."""
+    pytest.importorskip("aiter", reason="model_runner imports AITER")
+    from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+    from atom.model_engine import model_runner as runner_module
+
+    calls = []
+    builder = SimpleNamespace(
+        clear_released_units=lambda ids: calls.append(("clear", tuple(ids))),
+        wait_released_unit_clears=lambda: calls.append(("wait",)),
+    )
+    connector = SimpleNamespace(start_load_kv=lambda meta: calls.append(("load",)))
+    monkeypatch.setattr(runner_module, "get_kvconnector", lambda: connector)
+    runner = SimpleNamespace(attn_metadata_builder=builder)
+
+    meta = ConnectorMetadata()
+    meta.checkpoint_clears = (4, 7)
+    runner_module.ModelRunner.process_kvconnector_output(runner, meta)
+    assert calls == [("clear", (4, 7)), ("wait",), ("load",)]
+
+    # Nothing new to zero still waits out a forward's clears.
+    calls.clear()
+    runner_module.ModelRunner.process_kvconnector_output(runner, ConnectorMetadata())
+    assert calls == [("wait",), ("load",)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="clears run on the GPU")
+def test_waiting_on_released_unit_clears_waits_for_the_device():
+    from atom.model_ops.attentions.backends import AttentionMetadataBuilder
+
+    units = torch.ones(4, 1 << 20, device="cuda")
+
+    def clear_page_units(ids):
+        torch.cuda._sleep(100_000_000)
+        units[list(ids)] = 0
+
+    builder = SimpleNamespace(clear_page_units=clear_page_units)
+    AttentionMetadataBuilder.wait_released_unit_clears(builder)  # none yet
+    AttentionMetadataBuilder.clear_released_units(builder, [1, 3])
+    AttentionMetadataBuilder.wait_released_unit_clears(builder)
+    assert builder._released_units_cleared.query()
+    assert units[[1, 3]].eq(0).all() and units[[0, 2]].eq(1).all()

@@ -290,6 +290,9 @@ class PPEngineCoreProc(EngineCore):
         meta = batch.connector_meta_output
         if not connector_metadata_has_work(meta):
             return
+        carry = getattr(self.scheduler, "carry_checkpoint_clears", None)
+        if carry is not None:
+            carry(meta)
         self.runner_mgr.call_func("process_kvconnector_output", meta)
         self.pp_transport.send_metadata(batch)
 

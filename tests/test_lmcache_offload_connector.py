@@ -5788,6 +5788,84 @@ def test_dispatch_skips_metadata_with_no_work_at_all():
     assert engine.pp_transport.sent == []
 
 
+class _GivenBackUnits:
+    """A block manager holding PAGE units given back since the last drain."""
+
+    def __init__(self, *units: int) -> None:
+        self.units = units
+
+    def take_checkpoint_clears(self) -> tuple[int, ...]:
+        units, self.units = self.units, ()
+        return units
+
+
+class _ClearsAtDispatch(_RecordingRunnerMgr):
+    """What the worker is told to zero, as of the dispatch itself."""
+
+    def call_func(self, name, *args, **kwargs):
+        self.calls.append((name, tuple(args[0].checkpoint_clears)))
+
+
+def _engine_modules(monkeypatch):
+    """`EngineCore` and `PPEngineCoreProc`, importable without AITER."""
+    fake_async_proc = types.ModuleType("atom.model_engine.async_proc")
+    fake_async_proc.AsyncIOProcManager = object
+    monkeypatch.setitem(sys.modules, "atom.model_engine.async_proc", fake_async_proc)
+    from atom.model_engine.engine_core import EngineCore
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    return EngineCore, PPEngineCoreProc
+
+
+def _idle_engine_with_given_back_units(meta, *units):
+    engine = _idle_engine(meta)
+    engine.runner_mgr = _ClearsAtDispatch()
+    owner = SimpleNamespace(block_manager=_GivenBackUnits(*units))
+    engine.scheduler.carry_checkpoint_clears = types.MethodType(
+        Scheduler.carry_checkpoint_clears, owner
+    )
+    return engine, owner.block_manager
+
+
+def test_idle_offload_dispatch_has_given_back_units_cleared_before_its_loads(
+    monkeypatch,
+):
+    # An idle dispatch starts loads with no forward behind it, so nothing else
+    # would zero these units before a load fills them.
+    EngineCore, _ = _engine_modules(monkeypatch)
+
+    engine, bm = _idle_engine_with_given_back_units(_idle_meta_with_only_unpins(), 5, 9)
+    EngineCore._dispatch_idle_offload_work(engine)
+
+    assert engine.runner_mgr.calls == [("process_kvconnector_output", (5, 9))]
+    assert bm.units == ()
+
+
+def test_pp_connector_only_dispatch_has_given_back_units_cleared_before_its_loads(
+    monkeypatch,
+):
+    _, PPEngineCoreProc = _engine_modules(monkeypatch)
+
+    engine, bm = _idle_engine_with_given_back_units(LMCacheOffloadMetadata(), 5, 9)
+    batch = SimpleNamespace(connector_meta_output=_idle_meta_with_only_unpins())
+    PPEngineCoreProc._dispatch_connector_only_batch(engine, batch)
+
+    assert engine.runner_mgr.calls == [("process_kvconnector_output", (5, 9))]
+    assert bm.units == ()
+
+
+def test_idle_metadata_with_no_work_leaves_given_back_units_to_the_batch(
+    monkeypatch,
+):
+    EngineCore, _ = _engine_modules(monkeypatch)
+
+    engine, bm = _idle_engine_with_given_back_units(LMCacheOffloadMetadata(), 5, 9)
+    EngineCore._dispatch_idle_offload_work(engine)
+
+    assert engine.runner_mgr.calls == []
+    assert bm.units == (5, 9)
+
+
 def test_multi_metadata_exposes_sub_meta_unpins():
     # The prefill node runs offload inside a `multi` connector, so the idle
     # dispatch only ever sees the wrapper. Without this aggregate it reads as
