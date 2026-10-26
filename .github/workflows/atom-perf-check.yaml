@@ -85,7 +85,12 @@ env:
   # view of the largest model, where memory, EP dispatch and long-sequence
   # behaviour would show first; the nightly still measures it every night on
   # real weights across the full concurrency band.
-  PERF_MODELS: deepseek-v4-pro,m3-mxfp8,glm-5-2-fp8
+  # glm-5-2-fp8 was the third entry until #2696 pruned every GLM before 5.3
+  # from this catalog; GLM-5.3 has accuracy entries but no ATOM-native
+  # benchmark one, and GLM's remaining perf coverage is on the SGLang, vLLM
+  # and OOT lines, which run a different server than atom_test.sh. Qwen3.5-397B
+  # FP8 replaces it: the nearest analogue still here, an FP8 MoE at tp=4.
+  PERF_MODELS: deepseek-v4-pro,m3-mxfp8,qwen35-397b-fp8
   PERF_ISL: 8192
   PERF_OSL: 1024
   PERF_RATIO: "0.8"
@@ -124,9 +129,11 @@ env:
   # Those figures were taken at c=256, and the first complete run at c=128
   # (38524500630) says they do not carry over unchanged. Three entries read
   # +0.0/+0.3, -0.1/+0.6 and +0.6/+0.1 across the two levels -- tighter than
-  # anything measured at c=256. GLM-5.2-FP8 read +5.3% at c=128, against the
-  # +2.2-2.4% it held across four runs at c=256, so the one entry that already
-  # carried a bias carries a larger one here. See WARMUP_MULT below.
+  # anything measured at c=256. The one outlier was GLM-5.2-FP8, at +5.3%
+  # against the +2.2-2.4% it held over four runs at c=256; #2696 has since
+  # removed that entry from the catalog, so the figure is history rather than
+  # a property of the shipped matrix. See WARMUP_MULT below for what it still
+  # implies.
   #
   # What it does not touch: the CONC * 2 `--num-warmups` atom_test.sh runs
   # before the measured window, nor launch and teardown. At c=256 that
@@ -156,9 +163,12 @@ env:
   # between settings, so n=2 cannot separate them. Both sit inside the +-2.5
   # RESIDUAL_SPREAD_PCT this check documents.
   #
-  # One entry argues against this setting and is not yet explained. On the
-  # first complete matrix (run 38020010709) the other four sat inside +-0.5%
-  # at both levels, and GLM-5.2-FP8 did this:
+  # One entry argued against this setting and was never explained. It is no
+  # longer in the matrix -- #2696 pruned every GLM before 5.3 -- but the
+  # measurement is kept because it is the only evidence about what this
+  # setting costs, and nothing says the next entry cannot do the same.
+  # On the first complete matrix (run 38020010709) the other four sat inside
+  # +-0.5% at both levels, and GLM-5.2-FP8 did this:
   #
   #   GLM-5.2-FP8  c=256  +2.4 / +2.1 / +2.3 / +2.2%   (four runs)
   #   GLM-5.2-FP8  c=32   +3.1 / +2.9%
@@ -170,19 +180,22 @@ env:
   # than the level. It is the second-half advantage the warmup exists to
   # remove, still present at this length for this model.
   #
-  # Kept at 1 anyway, which is a decision rather than an oversight, and it
-  # costs something specific that grew when the matrix moved to c=128: a
-  # GLM-5.2-FP8 regression now has to be about 4.1 points deeper before the
-  # family median reads as down, and 5.3 at c=128 itself, so detection for
-  # that entry starts near -7.3% at that level rather than -2.0%. It is also
-  # past RESIDUAL_SPREAD_PCT, which no longer covers it. What it does not do is invent
-  # one -- the bias is positive, so it hides rather than fabricates, which is
+  # Kept at 1 anyway, which is a decision rather than an oversight. On the
+  # entry that showed it, the cost was concrete and grew when the matrix moved
+  # to c=128: the regression had to be about 4.1 points deeper before the
+  # family median read as down, and 5.3 at c=128 itself, putting detection
+  # near -7.3% at that level rather than -2.0% -- past RESIDUAL_SPREAD_PCT,
+  # which no longer covered it. What a bias like that does not do is invent a
+  # regression: it is positive, so it hides rather than fabricates, which is
   # the direction an advisory check should fail in, and the nightly measures
-  # this model on real weights every night. The alternative buys those points
-  # back by turning the warmup into a third full-length phase, taking the
-  # longest job from about 30 minutes to 50. One entry's bias is not worth the
-  # whole run's schedule.
-  # Revisit if a second entry does the same, or if this one grows.
+  # every one of these models on real weights nightly. The alternative buys
+  # those points back by turning the warmup into a third full-length phase,
+  # taking the longest job from about 30 minutes to 50 -- not worth it for one
+  # entry's bias.
+  #
+  # No entry in the current matrix has been shown to carry this, and none has
+  # been shown not to: the four here have never been measured for it at
+  # WARMUP_MULT 1 across repeated runs. Revisit if one does the same.
   #
   # Kimi-K3, back when it was still in the matrix, read -12.1% and -11.6% on
   # TTFT at c=32 in two runs and looked like

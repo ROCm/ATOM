@@ -33,16 +33,21 @@ from catalog import build_cells, load_variants
 
 CATALOG = ".github/benchmark/models.json"
 
-# The check measures the BASE variant of each selected model, plus one paired
-# variant: DeepSeek-V4-Pro MTP3 alongside its base. The pair is what separates
-# a regression in the speculative-decode path from one in the model's general
-# path -- only MTP3 moves, or both do.
+# The check measures one PRIMARY variant of each selected model, plus one
+# paired variant: MiniMax-M3-MXFP8 EAGLE3 alongside its base. The pair is what
+# separates a regression in the speculative-decode path from one in the model's
+# general path -- only the speculative entry moves, or both do.
+#
+# The pair was DeepSeek-V4-Pro MTP3 until #2696 pruned that variant from the
+# catalog along with every GLM. V4-Pro's remaining speculative variant,
+# DPA DSpark, starts at conc_min=64 and so cannot reach the c=32 level this
+# line judges at; M3-MXFP8 EAGLE3 spans 1..256 and its base is already here.
 #
 # Every other catalog variant is deliberately absent: DPA, TBO, DPA TBO,
-# DPA MTP3, DPA DSpark, DSpark, EAGLE3, MegaMoE. They are separate code paths
-# and this line does not watch them; the nightly does. Adding one is a line
-# here plus the GPU jobs it costs, not a change to the criterion.
-PAIRED_VARIANTS = {"deepseek-v4-pro": "-mtp3"}
+# DPA DSpark, DSpark, MegaMoE. They are separate code paths and this line does
+# not watch them; the nightly does. Adding one is a line here plus the GPU jobs
+# it costs, not a change to the criterion.
+PAIRED_VARIANTS = {"m3-mxfp8": "-eagle3"}
 
 # How many prompts a measured phase runs, as a multiple of its concurrency
 # level, for levels that should not run the default. The default is what the

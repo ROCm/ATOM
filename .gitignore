@@ -69,3 +69,8 @@ perf-pair/
 aa-*.json
 aa-*.log
 aa-*.md
+
+# pytest-cov writes this into the repo root on every local run of the perf
+# check's suite. Ignored rather than remembered: a 53KB binary reached this
+# PR exactly that way.
+.coverage
