@@ -402,7 +402,6 @@ class Drafter(abc.ABC):
                 def pre_hook(module, inputs, hook=hook):
                     hook(module, (), inputs)
 
-                pre_hook.is_aux_capture = True
                 module.register_forward_pre_hook(pre_hook)
             else:
                 module.register_forward_hook(hook)
@@ -440,9 +439,6 @@ class Drafter(abc.ABC):
             off = ctx.ubatch_token_offset
             buffer[off : off + tensor.shape[0]].copy_(tensor)
 
-        # K3 mono fills these buffers itself and does not hold a layer back for
-        # this hook (``kimi_k3.mono.plan._keep_hooked_layers``).
-        _hook.is_aux_capture = True
         return _hook
 
     def aux_for(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor] | None:

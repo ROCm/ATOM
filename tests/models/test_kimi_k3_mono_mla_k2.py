@@ -136,51 +136,6 @@ def test_no_kda_layer_still_refuses(stub_binds):
         stub_binds.bind_model(model, None, 0)
 
 
-# ------------------------------------------------------- _keep_hooked_layers
-def _plans_and_layers(hook_on: tuple[int, ...], marked: bool = False):
-    from torch import nn
-
-    from atom.models.kimi_k3.mono.weights import LayerPlan
-
-    layers = [nn.Module() for _ in range(3)]
-    for i in hook_on:
-        hook = (lambda *a: None) if not marked else _aux_hook
-        layers[i].register_forward_hook(hook)
-    moe = object()
-    plans = [
-        LayerPlan(0, object(), moe),  # K1 + K2
-        LayerPlan(1, None, moe),  # K2 alone
-        LayerPlan(2, object(), moe),
-    ]
-    return plans, SimpleNamespace(layers=layers)
-
-
-def _aux_hook(*args):
-    """The drafter's hook, as ``Drafter._make_aux_hook`` marks it."""
-
-
-_aux_hook.is_aux_capture = True
-
-
-def test_a_foreign_hook_takes_k2_off_a_full_attention_layer_too():
-    from atom.models.kimi_k3.mono.plan import _keep_hooked_layers
-
-    plans, inner = _plans_and_layers((1,))
-    kept = _keep_hooked_layers(plans, inner)
-    assert [(p.kda is None, p.moe is None) for p in kept] == [
-        (False, False),
-        (True, True),
-        (False, False),
-    ]
-
-
-def test_the_drafter_s_hook_leaves_a_full_attention_layer_on_k2():
-    from atom.models.kimi_k3.mono.plan import _keep_hooked_layers
-
-    plans, inner = _plans_and_layers((1,), marked=True)
-    assert _keep_hooked_layers(plans, inner) is plans
-
-
 # ------------------------------------------------------------------- runner
 @pytest.fixture
 def runner_module():

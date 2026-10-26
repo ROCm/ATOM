@@ -52,7 +52,6 @@ from atom.models.kimi_k3.mono.config import (
 from atom.models.kimi_k3.mono.kernels import layer as k2
 from atom.models.kimi_k3.mono.kernels.attention import kda as k1
 from atom.models.kimi_k3.mono.plan import (
-    _keep_hooked_layers,
     _width,
     kda_metadata,
     width_key,
@@ -131,10 +130,7 @@ class K3MonoDecodeRunner:
         self.dims = Dims(self.tp)
         self.debug = envs.ATOM_MONO_DEBUG
         self.inner = inner_model(model)
-        self.plans = _keep_hooked_layers(
-            bind_model(self.inner, self.dims, self.rank),
-            self.inner,
-        )
+        self.plans = bind_model(self.inner, self.dims, self.rank)
         self.num_blocks = num_blocks(len(self.inner.layers))
         # K3 mono requires DSpark (`config_refusal`), so in an armed deployment
         # there is always a drafter and always taps to keep current.
