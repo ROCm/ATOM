@@ -32,6 +32,7 @@ def _single_rank(monkeypatch):
     )
 
 
+from atom.model_ops.engram import host_memory
 from atom.model_ops.engram.host import (
     EngramHost,
     EngramPrefetchCache,
@@ -641,7 +642,7 @@ def scaled_table() -> HostEmbeddingTable:
     tensors can share a page, and a shared page is registered only once.
     """
     codes = torch.full((1 << 20,), 127, dtype=torch.uint8)  # 2**0 == 1.0
-    scale = codes[:8].view(torch.float8_e8m0fnu).view(4, 2)
+    scale = codes[4096:4104].view(torch.float8_e8m0fnu).view(4, 2)
     return HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8, scale=scale)
 
 
@@ -1272,7 +1273,7 @@ def adjacent_tables(rows=1000, width=8):
     whole by a rank that holds every hash head (one DP-attention rank per GPU).
     """
     buf = torch.ones(2 * rows, width)
-    assert (rows * width * buf.element_size()) % HostEmbeddingTable._PAGE
+    assert (rows * width * buf.element_size()) % host_memory._PAGE
     return buf, [
         HostEmbeddingTable(buf[i * rows : (i + 1) * rows], rows, width)
         for i in range(2)
@@ -1300,10 +1301,10 @@ def test_refused_registration_releases_the_shared_runs(monkeypatch, fresh_page_r
     held = dict(cudart.ranges)
     # Something outside the registry already holds the second table's tail.
     tail = second._tensor.data_ptr() + second._tensor.nbytes - 1
-    cudart.ranges[tail - tail % HostEmbeddingTable._PAGE] = tail + 1
+    cudart.ranges[tail - tail % host_memory._PAGE] = tail + 1
     assert second.enable_uva() is False
     assert second._uva is None
-    del cudart.ranges[tail - tail % HostEmbeddingTable._PAGE]
+    del cudart.ranges[tail - tail % host_memory._PAGE]
     assert cudart.ranges == held  # the first table's pages are untouched
     first.disable_uva()
     assert cudart.ranges == {}
@@ -1322,7 +1323,7 @@ def test_refused_registration_leaves_pinned_allocation_working(fresh_page_runs):
     """A refused `cudaHostRegister` must not poison the host-path fallback."""
     buf, (table, _) = adjacent_tables(rows=4099, width=128)
     rt = torch.cuda.cudart()
-    page = HostEmbeddingTable._PAGE
+    page = host_memory._PAGE
     base = buf.data_ptr() - buf.data_ptr() % page
     assert int(rt.cudaHostRegister(base, page, 0)) == 0
     try:

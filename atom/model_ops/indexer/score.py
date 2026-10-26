@@ -35,7 +35,6 @@ from atom.utils.region_graph import eager_region
 
 from .rows import NATURAL, IndexCache, IndexRows
 
-
 _fp8_paged_mqa_logits = (
     flydsl_fp8_paged_mqa_logits
     if get_gfx() == "gfx1250"
