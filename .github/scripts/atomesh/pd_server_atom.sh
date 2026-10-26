@@ -2367,7 +2367,8 @@ run_torch_profile_window() {
 # stop_profile returns once TP rank 0 has exported, while the other ranks may
 # still be writing. Each rank writes a raw .pt.trace.json, gzips it, then
 # removes the raw file, so a rank is done once it holds a .gz newer than the
-# window start and no raw .json.
+# window start and no raw .json. Every subdirectory of a worker dir is one
+# rank: ModelRunner names it rank_<tp>, dp<d>_tp<tp>, or pp<k>_<either> under PP.
 wait_for_torch_traces() {
   local marker="$1"
   shift
@@ -2394,7 +2395,7 @@ wait_for_torch_traces() {
     pending=0
     ranks=0
     for worker_dir in "${!worker_dirs[@]}"; do
-      for rank_dir in "${worker_dir}"/rank_*/; do
+      for rank_dir in "${worker_dir}"/*/; do
         ranks=$(( ranks + 1 ))
         if [[ ! -d "${rank_dir}" ]] \
           || [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
