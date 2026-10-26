@@ -286,3 +286,51 @@ Counter-example (does NOT trigger P5): aiter#4166 preshuffles the static weight 
 | Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ HK6: reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
 | New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 HK7: new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
 
+
+## Refutation
+
+Step 7.6 attacks each finding before it is reported. What to attack, in the order that has
+actually killed things in the sibling aiter review skill's history (ATOM has not yet run this
+skill long enough to have its own refutation incidents on record — these are borrowed, not
+fabricated as ATOM's own):
+
+1. **The premise.** aiter's sibling skill once reported most rows of a tuned-config table as
+   unreachable, marked `[verified]`, reasoning about a padding chain — but the real lookup
+   function tried the exact value first, so the rows were reachable and the finding was false.
+   Ten seconds in the lookup function would have ended it. Read the code the claim depends on,
+   not the code the claim is about.
+2. **The tree you read.** A local worktree is not the merge target. Anchor line numbers with
+   `git show <base>:<path>`; `base_head.txt` has the sha.
+3. **Reachability.** Can the trigger you named actually occur, or does something upstream
+   already prevent it — a caller that never passes that value, a guard added since, an arch
+   gate?
+4. **Suspicion versus defect.** "This looks wrong" is not a finding. If you cannot name
+   inputs that produce a wrong result, it is a question, and 📝 is where questions go.
+5. **Severity.** A 🔴 asserts a wrong result or a crash. Without a reachable triggering case
+   it is ⚠️ at most.
+
+Write one line per attempt to `$WORK/refutations.txt`:
+`RED|WARN|NOTE SURVIVED|KILLED -- what you opened and what it said`. Name a file, a symbol
+or a command. "I checked" is rejected by the gate, because a refutation nobody can repeat is
+not one.
+
+**This is the weaker of the two tiers, and aiter's numbers say how much weaker.** Across 200
+PRs in four waves on the aiter sibling skill, Step 7.6 killed 260–280 candidates per 50 PRs
+before they reached a card -- and 28% of what survived it was still killed by an independent
+reader told the findings were false until defended. Refuting your own finding catches a
+premise you never tested. It does not catch a conclusion you are committed to, and
+instructing yourself more firmly is not a substitute for a reader who was never committed.
+ATOM has not measured this on its own review history yet; treat the numbers above as aiter's
+until ATOM has its own.
+
+That is why Step 7.7 is a step and not a suggestion. It needs no ability to spawn anything:
+hand over the card, the diff and the merge-target path with none of your reasoning attached,
+and record what comes back. When no such reader exists, say so on the card -- a review that
+had one and a review that did not are different objects, and a reader of the card cannot
+tell them apart unless it is written down.
+
+**A caveat that belongs next to that 28%:** it is the rate at which an adversary instructed
+to assume falsity judged a finding dead. That adversary has not itself been audited, so the
+number is an upper bound on the error rate, not a measurement of it. It says nothing about
+false *clearance* -- reporting nothing when something is wrong. That number has never been
+measured here at all.

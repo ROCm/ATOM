@@ -89,7 +89,7 @@ def check_fail_classes():
     return 0
 
 
-WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "aiter-review-bot.yml"
+WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "atom-review-bot.yml"
 
 
 def _notify_mod():
@@ -111,14 +111,14 @@ def check_budget_fits():
         return 0
     run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
     wf = WORKFLOW.read_text(encoding="utf-8")
-    m = re.search(r'^: "\$\{AITER_RUN_BUDGET:=(\d+)\}"', run_one, re.M)
+    m = re.search(r'^: "\$\{ATOM_RUN_BUDGET:=(\d+)\}"', run_one, re.M)
     j = re.search(r"^  review:.*?^    timeout-minutes: (\d+)", wf, re.M | re.S)
     if not m or not j:
-        print("\u274c cannot read AITER_RUN_BUDGET or the review job's timeout-minutes")
+        print("\u274c cannot read ATOM_RUN_BUDGET or the review job's timeout-minutes")
         return 1
     budget, cap = int(m.group(1)), int(j.group(1)) * 60
     if budget >= cap:
-        print(f"\u274c AITER_RUN_BUDGET={budget}s does not fit the review job's {cap}s cap")
+        print(f"\u274c ATOM_RUN_BUDGET={budget}s does not fit the review job's {cap}s cap")
         return 1
     print(f"\u2705 run budget fits the job cap: {budget}s < {cap}s")
     return 0
@@ -178,7 +178,7 @@ def check_no_self_trigger():
               f"{[p.name for p in miss]}")
         return 0
     wf = WORKFLOW.read_text(encoding="utf-8")
-    if not re.search(r"github\.event\.comment\.user\.login != 'aiter-bot'", wf):
+    if not re.search(r"github\.event\.comment\.user\.login != 'rocm-atom-bot'", wf):
         print("\u274c the gate does not exclude the bot's own comments; every notice it posts "
               "will start a run that competes with real requests")
         return 1
@@ -234,9 +234,9 @@ def check_runner_label_exclusive():
                     if q != WORKFLOW and label in q.read_text(encoding="utf-8"))
     if others:
         print(f"\u274c runner label '{label}' is also targeted by {others}; the watchdog's busy "
-              "check only sees aiter-review-bot runs and would page about a busy, healthy box")
+              "check only sees atom-review-bot runs and would page about a busy, healthy box")
         return 1
-    print(f"\u2705 runner label '{label}' is exclusive to aiter-review-bot.yml")
+    print(f"\u2705 runner label '{label}' is exclusive to atom-review-bot.yml")
     return 0
 
 
