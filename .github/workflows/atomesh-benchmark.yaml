@@ -1573,6 +1573,47 @@ jobs:
           export USES_SPUR_CONTROLLER SPUR_CONTROLLER_ADDR
           python3 .github/scripts/atomesh/collect_m31_pd_logs.py \
             "$TARGET_RUN_ID" --output m31-pd-logs
+      - name: Read failed job accounting and runner diagnostics
+        if: ${{ inputs.collect_m31_run == '40271520115' }}
+        run: |
+          set -uo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:${PATH}"
+          source .github/scripts/slurm_submit_helpers.sh
+          detect_slurm_backend
+          {
+            query_slurm_controller_job 10064
+            query_slurm_accounting_job 10064
+            hostname
+            df -h /share_nfs /tmp
+            free -h
+          } > m31-pd-logs/accounting.txt 2>&1
+          journalctl -k --since '2026-10-26 04:55:00 UTC' --until '2026-10-26 05:20:00 UTC' --no-pager \
+            | grep -Ei 'out of memory|killed process|oom|blocked for|segfault|nfs|I/O error|no space' \
+            | tail -100 > m31-pd-logs/runner-kernel.txt
+          python3 - <<'PYDIAG'
+          import re
+          from pathlib import Path
+          root = Path('/share_nfs/ATOMESH_RUNNER/atomesh-runner-04')
+          out = Path('m31-pd-logs')
+          lines = [f'runner root exists: {root.exists()}']
+          for path in sorted((root / '_diag').glob('*20261026*.log')):
+              with path.open('rb') as f:
+                  data = f.read(8 << 20).decode(errors='replace')
+              selected = []
+              for line in data.splitlines():
+                  if not re.search(r'2026-10-26 0[45]:', line):
+                      continue
+                  if re.search(r'error|exception|fail|out of memory|killed|exit code|40271520115|10064|121405532246', line, re.I):
+                      if not re.search(r'token|authorization|secret|password|sig=', line, re.I):
+                          selected.append(line[:2000])
+              if selected:
+                  lines += [str(path), *selected[-150:]]
+          results = root / '_work/ATOM/ATOM/atomesh-results'
+          for path in sorted(results.glob('*minimax-m31*')):
+              if path.suffix in {'.json', '.log-root', '.slurm-job-id'} and path.stat().st_size < 65536:
+                  lines += [str(path), path.read_text(errors='replace')]
+          (out / 'runner-local-diagnostics.txt').write_text('\n'.join(lines) + '\n')
+          PYDIAG
       - name: Upload existing run logs
         if: always()
         uses: actions/upload-artifact@v7
