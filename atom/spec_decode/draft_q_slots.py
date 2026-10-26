@@ -33,10 +33,23 @@ class DraftQSlots:
     The victim is usually a dead request, but nothing guarantees it. A request
     waiting through a long prefill-first burst is not refreshed while more than
     ``num_slots - live`` new ids claim slots, which a stream of prefill-only
-    (``max_tokens=1``) requests can do. ``evictions`` counts expiries of
-    entries that were drafted for, so a live-eviction rate shows up as a
-    number rather than as an unexplained acceptance dip.
+    (``max_tokens=1``) requests can do.
+
+    Two counters tell the cases apart. ``evictions`` counts every expiry, most
+    of them a finished request's slot being reused, so it grows with the
+    requests served whether or not anything was lost. ``live_expiries`` counts
+    the ones that cost a step: an expired request that came back and found the
+    sentinel. ``verifies`` counts the lookups that found their rows, so
+    ``live_expiries / (verifies + live_expiries)`` is the fraction of lookups
+    that lost their q. Expired ids are remembered for the last
+    ``_EXPIRED_MEMORY * num_slots`` expiries only; a request that waits out
+    more than that is missed, so under extreme churn the count is a lower
+    bound. A preempted request that expired while waiting counts too, though
+    its first step back recomputes the prompt and has no drafts to lose.
     """
+
+    # How many expired ids `live_expiries` remembers, per slot.
+    _EXPIRED_MEMORY = 16
 
     def __init__(self, num_slots: int, rows_per_slot: int):
         if num_slots <= 0 or rows_per_slot <= 0:
@@ -50,7 +63,12 @@ class DraftQSlots:
         self._slot_of: dict = {}
         self._free = list(range(num_slots - 1, -1, -1))
         self.evictions = 0
+        self.live_expiries = 0
+        self.verifies = 0
+        # Insertion-ordered set of expired ids, oldest first.
+        self._expired: dict = {}
         self._next_eviction_log = 1
+        self._next_lookup_log = 1024
 
     def __len__(self) -> int:
         return len(self._slot_of)
@@ -67,10 +85,29 @@ class DraftQSlots:
         that rewrites a slot because both run on the one compute stream.
         """
         rows = self.rows_per_slot
-        get = self._slot_of.get
-        out[: len(req_ids)] = [
-            -1 if slot is None else slot * rows for slot in map(get, req_ids)
-        ]
+        found = list(map(self._slot_of.get, req_ids))
+        out[: len(req_ids)] = [-1 if slot is None else slot * rows for slot in found]
+        missing = found.count(None)
+        self.verifies += len(found) - missing
+        if missing and self._expired:
+            pop = self._expired.pop
+            self.live_expiries += sum(
+                1
+                for req_id, slot in zip(req_ids, found)
+                if slot is None and pop(req_id, False)
+            )
+        lookups = self.verifies + self.live_expiries
+        if lookups >= self._next_lookup_log:
+            # Powers of two again: a handful of lines over a long run.
+            self._next_lookup_log *= 2
+            logger.info(
+                "draft q slots: %d of %d lookups lost their q to an expiry "
+                "(%d expiries in all, %d slots)",
+                self.live_expiries,
+                lookups,
+                self.evictions,
+                self.num_slots,
+            )
 
     def claim_bases(self, req_ids, out, skip=None) -> None:
         """Give every request a slot to draft into and write its first row.
@@ -115,7 +152,11 @@ class DraftQSlots:
                 self.evictions,
                 self.num_slots,
             )
-        return self._slot_of.pop(next(iter(self._slot_of)))
+        victim = next(iter(self._slot_of))
+        self._expired[victim] = True
+        if len(self._expired) > self._EXPIRED_MEMORY * self.num_slots:
+            del self._expired[next(iter(self._expired))]
+        return self._slot_of.pop(victim)
 
 
 class DraftQStaging:

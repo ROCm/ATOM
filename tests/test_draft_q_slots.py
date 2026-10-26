@@ -121,6 +121,34 @@ def test_skipped_requests_claim_nothing():
     assert "g" not in slots and len(slots) == 2
 
 
+def test_only_an_expired_request_that_comes_back_counts_as_a_live_expiry():
+    """A finished request's slot being reused is free; one still running that
+    finds the sentinel lost a step. New ids missing a slot cost nothing."""
+    slots = DraftQSlots(2, T)
+    bases(slots, ["a", "b"], claim=True)
+    bases(slots, ["c", "d"], claim=False)  # new requests: no slot yet
+    bases(slots, ["c", "d"], claim=True)  # a and b expire
+    assert (slots.evictions, slots.live_expiries) == (2, 0)
+    bases(slots, ["c", "d"], claim=False)
+    assert slots.verifies == 2
+    bases(slots, ["a", "c"], claim=False)  # a was still running
+    assert (slots.live_expiries, slots.verifies) == (1, 3)
+    bases(slots, ["a"], claim=False)  # counted once, not on every miss
+    assert slots.live_expiries == 1
+
+
+def test_the_expired_id_memory_is_bounded():
+    slots = DraftQSlots(1, T)
+    for i in range(5 * DraftQSlots._EXPIRED_MEMORY):
+        bases(slots, [f"r{i}"], claim=True)
+    assert len(slots._expired) <= DraftQSlots._EXPIRED_MEMORY
+    # The oldest have been forgotten, the latest are still remembered.
+    bases(slots, ["r0"], claim=False)
+    assert slots.live_expiries == 0
+    bases(slots, [f"r{5 * DraftQSlots._EXPIRED_MEMORY - 2}"], claim=False)
+    assert slots.live_expiries == 1
+
+
 def test_sizes_must_be_positive():
     with pytest.raises(ValueError):
         DraftQSlots(0, T)
