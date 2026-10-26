@@ -89,11 +89,10 @@ class LLMEngine:
             )
             config.enable_tbo = False
             config.enable_tbo_decode = False
-        # PCP and DP-attention are not yet compatible: PCP stripe-splits
-        # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
-        # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
-        # the FULL (un-split) token count, so all_gatherv asserts
-        # `1/pcp_size != full`.
+        # PCP and DP-attention together are unverified. The refusal's original
+        # cause, a DP all-gather of the hash-routing input ids sized for the
+        # un-split token count, is gone: the MoE now routes before its DP
+        # gather, on rank-local ids.
         if config.enable_dp_attention and config.pipeline_parallel_size > 1:
             raise ValueError(
                 "--enable-dp-attention and pipeline-parallel (pp>1) "
@@ -103,11 +102,9 @@ class LLMEngine:
             raise ValueError(
                 "prefill_context_parallel_size > 1 (-pcp) combined with "
                 "--enable-dp-attention is not supported yet (may be supported "
-                "in a future release): PCP splits tokens to 1/pcp_size while "
-                "DP-attention's id-gather expects the full token count, "
-                "causing an all_gatherv size mismatch. For now, disable one of "
-                "them (use -tp N -pcp M without DP-attention, or -dp N "
-                "--enable-dp-attention without -pcp)."
+                "in a future release): the combination is unverified. For "
+                "now, disable one of them (use -tp N -pcp M without "
+                "DP-attention, or -dp N --enable-dp-attention without -pcp)."
             )
         # PCP + TBO prefill: supported via coordinated splitting.
         # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under

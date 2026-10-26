@@ -250,8 +250,17 @@ class tokenIDProcessor:
             device=device,
             publication_group="input_ids",
         )
+        # [scheduled requests, scheduled tokens, scheduled draft tokens]: each
+        # pass's real row count (its `Context.scheduled_tokens_gpu` is the
+        # entry). Not `cu_seqlens_q[-1]`: a token-graph bucket was recorded at
+        # its own request count.
+        self.batch_info = CpuGpuBuffer(
+            3, dtype=torch.int32, device=device, publication_group="input_ids"
+        )
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
+        # The drafter's `draft_tokens_per_seq`, set once it is loaded.
+        self.draft_tokens_per_seq = 0
         # Block-drafter warmup fabricates at least two requests, even when
         # the service admits only one. Real batches/graphs obey max_num_seqs.
         self._output_request_capacity = max(runner.config.max_num_seqs, 2)
@@ -481,9 +490,11 @@ class tokenIDProcessor:
 
     def _publish_input_ids(self, count, group):
         if group is None:
+            self.batch_info.copy_to_gpu()
             return self.input_ids.copy_to_gpu(count)
         group.counts[group.indices["input_ids"]] = count
         group.counts[group.indices["decode_src"]] = None
+        group.counts[group.indices["batch_info"]] = 3
         group.publish(group.counts)
         return self.input_ids.gpu[:count]
 
@@ -504,6 +515,12 @@ class tokenIDProcessor:
         GPU still works; only what follows (the attention metadata, through
         `num_rejected`) reads the status.
         """
+        bs = batch.total_seqs_num
+        self.batch_info.np[:] = (
+            bs,
+            batch.total_tokens_num,
+            bs * self.draft_tokens_per_seq,
+        )
         input_ids, locs = self._stage_input_ids(batch, max_seqlen_q, publication_group)
         # The speculative status queue is filled in postprocess but drained here, so a
         # step whose postprocess is skipped must not drain it: `forward()` bails
@@ -646,6 +663,7 @@ class tokenIDProcessor:
         counts = group.counts
         counts[group.indices["input_ids"]] = total_tokens_decode
         counts[group.indices["decode_src"]] = bs
+        counts[group.indices["batch_info"]] = 3
         group.publish(counts)
         # How wide the forward reads: a replayed decode graph takes a fixed
         # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
@@ -863,6 +881,10 @@ class ModelRunner:
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+            # A block drafter's width reads the loaded draft model's window.
+            self.tokenID_processor.draft_tokens_per_seq = (
+                self.drafter.draft_tokens_per_seq
+            )
             # NOTE: aux-hidden-state capture is armed AFTER the optional TBO wrap
             # below, so the drafter's capture hook lands on the object whose
             # forward returns the final (concatenated) output. See arm_aux_capture.
@@ -1410,6 +1432,7 @@ class ModelRunner:
         self.forward_vars = {
             "input_ids": self.tokenID_processor.input_ids,
             "decode_src": self.tokenID_processor.decode_src,
+            "batch_info": self.tokenID_processor.batch_info,
             "positions": CpuGpuBuffer(
                 self.max_num_batched_tokens, publication_group="positions", **i64_kwargs
             ),
@@ -1587,6 +1610,7 @@ class ModelRunner:
         # payload and source-index mirrors from this slot before writing.
         self.tokenID_processor.input_ids = self.forward_vars["input_ids"]
         self.tokenID_processor.decode_src = self.forward_vars["decode_src"]
+        self.tokenID_processor.batch_info = self.forward_vars["batch_info"]
 
     @_profile_runner_stage
     def _gate_staging_reuse(self):
@@ -2582,6 +2606,7 @@ class ModelRunner:
             running_tokens=running_tokens,
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
+            scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
         pcp_size = self.config.prefill_context_parallel_size
@@ -2871,11 +2896,6 @@ class ModelRunner:
         # context.positions = local per-group concat so _make_ubatch_context
         # slices each ubatch's forward positions correctly.
         forward_context.context.positions = positions
-        # Hash MoE: local per-group-concat ids. Each ForCausalLM.forward
-        # allgathers its ubatch's slice (g_i local, H_i/pcp) across pcp ranks →
-        # H_i ids, matching moe_pcp_merge_forward's per-ubatch hidden allgather.
-        if envs.ATOM_PCP_MOE_MERGE:
-            forward_context.context.input_ids = input_ids
         return input_ids, positions
 
     def _restore_pcp_balanced_output(
@@ -4303,6 +4323,15 @@ class ModelRunner:
         self.h2d_owner.begin()
         try:
             built = build(*args, **kwargs)
+            context = built[1]
+            # The synthetic step's own counts, not the last real step's: a
+            # stale count past these rows would send the MoE sort out of
+            # bounds. The draft slot stays 0, as the capture never looks up
+            # the drafter.
+            batch_info = self.forward_vars["batch_info"]
+            batch_info.np[:] = (context.scheduled_bs, context.scheduled_tokens, 0)
+            batch_info.copy_to_gpu()
+            context.scheduled_tokens_gpu = batch_info.gpu[1:2]
             self.h2d_owner.finish()
         except BaseException:
             self.h2d_owner.fail()
@@ -4375,10 +4404,13 @@ class ModelRunner:
             replay = partial(self.req_graph.replay, key=key)
             B = bs * max_q_len
             # Every row of the recording is real here: time the whole of it
-            # (the DP pad-row mask reads the real token count from here).
+            # (routing reads the real token count from `batch_info`).
             cu = self.forward_vars["cu_seqlens_q"]
             cu.np[: bs + 1] = np.arange(0, B + 1, max_q_len, dtype=np.int32)
             cu.copy_to_gpu(bs + 1)
+            batch_info = self.forward_vars["batch_info"]
+            batch_info.np[:] = (bs, B, 0)
+            batch_info.copy_to_gpu()
             # Warm replay, then timed replays (median for robustness to jitter).
             replay()
             torch.cuda.synchronize()

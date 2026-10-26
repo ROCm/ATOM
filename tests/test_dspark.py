@@ -861,6 +861,9 @@ def _proposer_with_graph_bs(
             row_ids=torch.arange(p.config.max_num_seqs + 1, dtype=torch.int32)
         ),
         running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
+        forward_vars={
+            "batch_info": types.SimpleNamespace(gpu=torch.zeros(3, dtype=torch.int32))
+        },
     )
     p._build_draft_graphs()
     return p
@@ -1098,6 +1101,7 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
         scheduled_tokens=308,
         running_tokens=336,
         running_tokens_are_unified=False,
+        scheduled_tokens_gpu=torch.zeros(1, dtype=torch.int32),
     )
     assert fc.context.running_tokens_are_unified is False
     assert asked == [336], "a ragged height is discovered, and it is what RUNS"
@@ -1108,6 +1112,7 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
         scheduled_tokens=308,
         running_tokens=336,
         running_tokens_are_unified=True,
+        scheduled_tokens_gpu=torch.zeros(1, dtype=torch.int32),
     )
     assert fc.context.running_tokens_are_unified is True
     assert asked == [336], "an agreed height is worth no ask"
@@ -1126,24 +1131,27 @@ def test_publishing_a_shape_does_not_decide_whether_it_is_a_prefill():
     fc.context.is_prefill = True
 
     # dp_size 1: no metadata to build, so nothing but the flag is under test.
+    scheduled_tokens_gpu = torch.zeros(1, dtype=torch.int32)
     _bare_drafter(1)._publish_draft_shape(
         fc,
         scheduled_tokens=337,
         running_tokens=337,
         running_tokens_are_unified=False,
+        scheduled_tokens_gpu=scheduled_tokens_gpu,
     )
 
     assert fc.context.is_prefill is True
+    assert fc.context.scheduled_tokens_gpu is scheduled_tokens_gpu
 
 
 def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):
     """EPLB is not a reason to decline the padding, though it used to be.
 
-    The stated reason was the expert-load histogram: a pad row routes through
-    the draft's MoE and `select_experts_with_record` counts it. But the TARGET
-    pads on every cudagraph decode step and its rows reach the same recorder
-    (`eplb_map_and_record_fused` masks nothing), in far greater volume -- so
-    declining here protected nothing and only cost the draft its warmed shape.
+    The stated reason was the expert-load histogram: a pad row would route
+    through the draft's MoE and be counted. But the TARGET pads on every
+    cudagraph decode step, in far greater volume -- so declining here protected
+    nothing and only cost the draft its warmed shape. (Pad rows now route to -1,
+    which the recorder skips.)
 
     Asserting the two are EQUAL, not that either is 48: a future term that
     reads the config back into the width fails here whichever way it leans.
@@ -2165,7 +2173,10 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
     block_tables = torch.zeros(p.config.max_num_seqs, n_cols, dtype=torch.int32)
     p.runner = types.SimpleNamespace(
         block_size=block_size,
-        forward_vars={"block_tables": types.SimpleNamespace(gpu=block_tables)},
+        forward_vars={
+            "block_tables": types.SimpleNamespace(gpu=block_tables),
+            "batch_info": types.SimpleNamespace(gpu=torch.zeros(3, dtype=torch.int32)),
+        },
     )
     p._init_draft_block_buffers()
 

@@ -534,6 +534,15 @@ class Context:
     # whole-forward buffer from inside the model must add it, or the ubatches
     # land on each other's rows. Read per-thread (the context is thread-local).
     ubatch_token_offset: int = 0
+    # This pass's rows are this rank's round-robin 1/pcp shard of the tokens.
+    # Set where the split is made; FusedMoE reads it to gather its routed rows
+    # across the PCP group (`ATOM_PCP_MOE_MERGE`).
+    pcp_split: bool = False
+    # `scheduled_tokens` on the device (`[1]` int32), an entry of the step's
+    # `forward_vars["batch_info"]` read in place, so a replay reads its own
+    # step whatever shape it was recorded at. A draft re-points it with
+    # `scheduled_tokens` (`Drafter._publish_draft_shape`).
+    scheduled_tokens_gpu: torch.Tensor | None = None
 
     # Optional speculative-decoding inputs staged alongside the target
     # forward's other host-to-device copies. Keeping these on the per-forward
@@ -556,6 +565,8 @@ class Context:
         input_ids: torch.Tensor | None = None,
         ubatch_token_offset: int = 0,
         draft_anchor_overrides: torch.Tensor | None = None,
+        pcp_split: bool = False,
+        scheduled_tokens_gpu: torch.Tensor | None = None,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -571,6 +582,8 @@ class Context:
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
         self.draft_anchor_overrides = draft_anchor_overrides
+        self.pcp_split = pcp_split
+        self.scheduled_tokens_gpu = scheduled_tokens_gpu
 
 
 @dataclass
@@ -846,9 +859,6 @@ class ForwardContext:
     # recording for its rows then runs as it always did.
     tr_graph: str | None = None
 
-    # The DP pad-row work this forward already did (see `step_pad_rows`).
-    pad_rows_done: set = field(default_factory=set)
-
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -885,6 +895,23 @@ class ForwardContext:
                 context.running_tokens_across_dp,
             ) = outer
 
+    @contextmanager
+    def use_pass_rows(
+        self, running_tokens: int, scheduled_tokens_gpu: torch.Tensor | None
+    ):
+        """Run this block as a pass of its own over other rows than its step's
+        -- a decoder over the step's tails: ``running_tokens`` rows, the
+        leading ``scheduled_tokens_gpu`` of them real
+        (`pass_scheduled_tokens_gpu`). Both are restored on exit."""
+        context = self.context
+        outer = context.running_tokens, context.scheduled_tokens_gpu
+        context.running_tokens = running_tokens
+        context.scheduled_tokens_gpu = scheduled_tokens_gpu
+        try:
+            yield
+        finally:
+            context.running_tokens, context.scheduled_tokens_gpu = outer
+
 
 _forward_context: ForwardContext | None = ForwardContext()
 _forward_kv_cache_context: ForwardContext | None = ForwardContext()
@@ -892,87 +919,6 @@ _forward_kv_cache_context: ForwardContext | None = ForwardContext()
 # Cached once at module import — CUDA availability does not change at
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
 _CUDA_AVAILABLE: bool = torch.cuda.is_available()
-
-# DP pad-row mask for consumers recorded into CUDA graphs (MegaMoE). A replay
-# runs no Python, so each pass derives its mask on the device, on its first call,
-# from buffers every step already refreshes -- never from a host count:
-#   target pass: rows at or past `cu_seqlens_q[running_bs]` (padded requests
-#     have length 0, so that entry is this rank's real token count);
-#   draft pass (`[running_bs, q]` rows): rows at or past q times the real request
-#     count the step's target pass recorded.
-# A target pass records that count first thing, whatever else it decides, so a
-# draft never reads an older step's; one that cannot tell (no cu_seqlens_q, a TBO
-# micro-batch) records "no padding". The buffers are persistent because graphs,
-# and the segments of a token graph, record their addresses.
-_NO_PADDING = 1 << 30
-_row_index_device: torch.Tensor | None = None
-_pad_rows_device: torch.Tensor | None = None
-_real_requests_device: torch.Tensor | None = None
-
-
-def enable_pad_rows_device(num_rows: int, device: torch.device) -> None:
-    """Allocate (or grow) the mask buffers. Call before any capture."""
-    global _row_index_device, _pad_rows_device, _real_requests_device
-    if _pad_rows_device is None or _pad_rows_device.shape[0] < num_rows:
-        # int64: the draft threshold (requests x q, or _NO_PADDING x q) is a 0-d
-        # int64 tensor, which would be cast to the row index's dtype.
-        _row_index_device = torch.arange(
-            num_rows, dtype=torch.int64, device=device
-        ).unsqueeze(1)
-        _pad_rows_device = torch.zeros((num_rows, 1), dtype=torch.bool, device=device)
-        _logger.info("DP pad-row mask enabled for %d rows", num_rows)
-    if _real_requests_device is None:
-        _real_requests_device = torch.full(
-            (), _NO_PADDING, dtype=torch.int64, device=device
-        )
-
-
-def step_pad_rows(num_rows: int) -> torch.Tensor | None:
-    """The `[num_rows, 1]` DP pad-row mask for this pass, or None when no row can
-    be padding: masking is off, a TBO micro-batch, the rows are not the pass's
-    `running_tokens` (a PCP shard, a sub-slice), or an eager pass has no padding.
-    While capturing it always returns the mask, so each replay follows its step."""
-    from atom.utils.tbo.ubatching import tbo_active
-
-    forward_context = get_forward_context()
-    context = forward_context.context
-    if context is None or _pad_rows_device is None:
-        return None
-    capturing = torch.cuda.is_current_stream_capturing()
-    done = forward_context.pad_rows_done
-    cu = getattr(forward_context.attn_metadata, "cu_seqlens_q", None)
-    running_bs = context.running_bs
-    tbo = tbo_active()
-    if not context.is_draft and ("requests", capturing) not in done:
-        done.add(("requests", capturing))
-        if tbo or cu is None or not 0 < running_bs < cu.shape[0]:
-            _real_requests_device.fill_(_NO_PADDING)
-        else:
-            _real_requests_device.copy_(
-                (cu[1 : running_bs + 1] > cu[:running_bs]).sum()
-            )
-    if tbo or num_rows != context.running_tokens:
-        return None
-    if not capturing and context.scheduled_tokens >= num_rows:
-        return None
-    if _pad_rows_device.shape[0] < num_rows:
-        return None
-    pad_rows = _pad_rows_device[:num_rows]
-    key = ("mask", context.is_draft, num_rows, capturing)
-    if key not in done:
-        rows = _row_index_device[:num_rows]
-        if context.is_draft:
-            if running_bs <= 0 or num_rows % running_bs:
-                return None
-            torch.ge(
-                rows, _real_requests_device * (num_rows // running_bs), out=pad_rows
-            )
-        else:
-            if cu is None or not 0 < running_bs < cu.shape[0]:
-                return None
-            torch.ge(rows, cu[running_bs], out=pad_rows)
-        done.add(key)
-    return pad_rows
 
 
 # Thread-local storage for TBO dual-thread execution
@@ -992,6 +938,19 @@ def get_forward_context() -> ForwardContext:
         "Please use `set_forward_context` to set the forward context."
     )
     return _forward_context
+
+
+def pass_scheduled_tokens_gpu(rows: int) -> torch.Tensor | None:
+    """`Context.scheduled_tokens_gpu` for a consumer of `rows` rows, or None.
+    Only the pass's whole rows (`running_tokens`) are counted by it; rows of
+    another pass declare it (`ForwardContext.use_pass_rows`, as a decoder over
+    the step's tails does), and any other subset -- a PCP shard -- gets None
+    and runs every row, as the MoE sort reads the count as its row count and
+    would run past a subset's rows. None too outside an ATOM forward."""
+    context = get_forward_context().context
+    if context is None or rows != context.running_tokens:
+        return None
+    return context.scheduled_tokens_gpu
 
 
 @contextmanager

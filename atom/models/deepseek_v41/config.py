@@ -400,7 +400,7 @@ def validate_runtime_config(config):
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
             # scorer's page-8 layout (`index_plane`). The main pool stays
-            # independent of it and takes bf16 or fp4 either way.
+            # independent of it and takes bf16, fp8 or fp4 either way.
             "an index plane other than fp8 or fp4",
             config.index_cache_dtype not in ("fp8", "fp4"),
         ),
