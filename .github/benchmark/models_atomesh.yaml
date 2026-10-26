@@ -773,6 +773,52 @@ models:
           prefill: *glm52_agentic_cpp8_prefill
           env: *glm52_agentic_cpp8_env
 
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: gsm8k_1p1d_cpp4_dcp4_c32
+          display_topology: 1P1D-CPP4-DCP4-MTP3
+          isl: [4096]
+          osl: 1024
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_args
+              max_model_len: 8192
+              max_num_seqs: 64
+              decode_max_num_seqs: 64
+              enable_prefix_caching: false
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3"
+          prefill:
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 512 --timeout-keep-alive 900"
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            decode:
+              <<: *glm52_cpp4_dcp4_decode_env
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            # Select main's source Mesh build; eval_only skips the benchmark.
+            kind: aiperf_agentic
+            wait_server_timeout: 5400
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            eval_concurrency: [32]
+            model_type: local-completions
+            endpoint: completions
+            max_gen_toks: 1024
+            threshold: 0.92
+
       # The nightly lmcache-1m cells with their prefix tier in a Mooncake Store
       # and no LMCache anywhere: ATOM's mooncake_store offload connector moves
       # each PP stage's 256-token KV chunks between its GPU and the Store, and
