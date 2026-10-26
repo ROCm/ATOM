@@ -72,8 +72,6 @@ class SGLangPluginUBatchWrapper(UBatchWrapper):
             ub_max_tokens_across_dp=None,
             main_stream=ctx.main_stream,
             in_hipgraph=ctx.in_hipgraph,
-            cudagraph_runtime_mode=ctx.cudagraph_runtime_mode,
-            batch_descriptor=ctx.batch_descriptor,
         )
 
     @staticmethod

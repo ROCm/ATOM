@@ -5,13 +5,10 @@ import ast
 from pathlib import Path
 
 ATOM_ROOT = Path(__file__).resolve().parents[1] / "atom"
-# Prefill scores through the varqlen (`_prefill`) family by module; decode
-# takes its ragged rows through `aiter.ops.flydsl`'s exports
-# (`Fp4MqaRaggedMetadata`), not a kernel module. Widen this only alongside a
-# caller.
-CURRENT_MODULES = {
-    "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
-}
+# Every FP4 scorer takes its rows through `aiter.ops.flydsl`'s exports
+# (`Fp4MqaRaggedMetadata`), prefill and decode alike, never a kernel module.
+# Widen this only alongside a caller.
+CURRENT_MODULES: set[str] = set()
 
 
 def _fp4_aiter_imports() -> list[tuple[Path, int, str]]:

@@ -25,15 +25,20 @@ def _gather_rows(rows, sources, outputs, WIDTHS: tl.constexpr, BLOCK: tl.constex
         _copy_row(sources[i], outputs[i], row, out, WIDTHS[i], BLOCK)
 
 
-def gather_rows(rows, *tensors, dim=0):
+def gather_rows(rows, *tensors, dim=0, out=None):
     """Each of `tensors` at `rows` of its token axis `dim`, every dim before
-    it of size 1. A row is copied as 32-bit words, whatever its dtype."""
+    it of size 1. A row is copied as 32-bit words, whatever its dtype. `out`:
+    contiguous tensors, one per tensor, to write into instead of new ones."""
     if not tensors:
         return ()
     count = rows.numel()
-    outputs = tuple(
-        t.new_empty(*t.shape[:dim], count, *t.shape[dim + 1 :]) for t in tensors
-    )
+    shapes = [(*t.shape[:dim], count, *t.shape[dim + 1 :]) for t in tensors]
+    if out is None:
+        outputs = tuple(t.new_empty(shape) for t, shape in zip(tensors, shapes))
+    else:
+        outputs = tuple(out)
+        if [tuple(o.shape) for o in outputs] != shapes:
+            raise ValueError("gather_rows outputs disagree with the rows they take")
     if count:
         _gather_rows[(count,)](
             rows,

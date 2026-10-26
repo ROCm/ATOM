@@ -38,6 +38,7 @@ from atom.utils import envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
+    DPMetadata,
     _forward_kv_cache_context,
     get_forward_context,
     reset_forward_context,
@@ -872,6 +873,12 @@ class SGLangGDNForwardContext:
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(query_start_loc)
             )
+            # GatedDeltaNet's prefill reads these once-per-step fields (#2534)
+            # instead of casting per layer. The native builder fills them; a
+            # None here makes the non-FlyDSL prefill (e.g. ReplaySSM under MTP)
+            # and the state write-back fail. Read and write slots are the same.
+            idx_i64 = idx.long()
+            no_initial_state = None if has_initial_state is None else ~has_initial_state
             return GDNAttentionMetadata(
                 num_prefills=bs,
                 num_prefill_tokens=seq_sum,
@@ -882,6 +889,9 @@ class SGLangGDNForwardContext:
                 nums_dict=nums_dict,
                 batch_ptr=batch_ptr,
                 token_chunk_offset_ptr=token_chunk_offset_ptr,
+                no_initial_state=no_initial_state,
+                non_spec_state_indices_i64=idx_i64,
+                non_spec_state_indices_in_i64=idx_i64,
                 flydsl_prefill_metadata=_flydsl_prefill_metadata(
                     query_start_loc, forward_batch
                 ),
@@ -970,7 +980,10 @@ class SGLangGDNForwardContext:
                     attn_metadata=attn_md,
                     atom_config=get_current_atom_config(),
                     context=forward_context.context,
-                    num_tokens=forward_context.num_tokens,
+                    running_tokens_per_dp_rank=DPMetadata.gather_running_tokens(
+                        get_current_atom_config().parallel_config,
+                        forward_context.num_tokens,
+                    ),
                 )
             yield
         finally:

@@ -2,7 +2,6 @@
 """V4 indexer/PCP producers use the forward slot through late TBO prepare."""
 
 import os
-import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,13 +16,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def make_runner(monkeypatch, *, pp_size=1, opus=False, base=None):
+def make_runner(monkeypatch, *, pp_size=1, base=None):
     import atom.config
     from atom.model_engine.model_runner import ModelRunner
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
     )
-    from atom.model_ops.attentions.pool_layout.v4_pool_fields import FP4_GFX1250_NATURAL
 
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
@@ -64,7 +62,7 @@ def make_runner(monkeypatch, *, pp_size=1, opus=False, base=None):
     builder.max_spec_steps = 2
     builder._unique_compress_ratios_overlap = [(4, True)]
     builder._indexer_fp4 = False
-    builder.indexer_layout = FP4_GFX1250_NATURAL if opus else "fp8"
+    builder.indexer_layout = "fp8"
     builder.pool_geometry = SimpleNamespace(slot_positions=4)
     builder._alloc_v4_metadata_buffers()
     runner.attn_metadata_builder = builder
@@ -115,8 +113,8 @@ def make_metadata(builder, lengths=(3, 5, 3), starts=(8, 16, 0), *, stage_map=Tr
             md.state_slot_out_cpu,
             len(lengths),
             len(positions),
+            running_tokens=len(positions),
         )
-    md.indexer_meta = {}
     for name, value in (
         ("cu_seqlens_q", cu),
         ("cu_seqlens_k", cu),
@@ -163,7 +161,7 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         expected_cu[-1] = max(expected_cu[-1], 1)
         saved.append(
             (
-                md.indexer_meta["cu_committed_gpu"].clone(),
+                md.index_rows.concat.cu_committed.clone(),
                 expected_cu,
                 md.batch_id_per_q_token.clone(),
                 md.kv_indices_extend.clone(),
@@ -172,13 +170,7 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         )
         before = buf.cpu.clone()
         with pytest.raises(PublicationError, match="republish_reason"):
-            builder._build_v4_indexer_meta(
-                attn_metadata=md,
-                positions_gpu=local,
-                scheduled_bs=3,
-                total_tokens=3,
-                device=runner.device,
-            )
+            builder._build_v4_prefill_index_rows(md, local, 3, 3, None, "")
         assert torch.equal(buf.cpu, before)
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
@@ -212,7 +204,7 @@ def test_prepare_prefill_defers_indexer_only_for_real_pcp(monkeypatch, balanced,
         state_slots_committed=[],
         state_fork_srcs=None,
     )
-    actual, _ = builder.prepare_prefill(batch, 3)
+    actual, _ = builder.prepare_prefill(batch, 3, batch.total_tokens_num)
     binding = runner.forward_vars["v4_indexer_cu_committed"]._publication
     assert (binding._epoch == runner.h2d_owner.epoch) == (dummy or not balanced)
     assert len(actual.batch_id_per_q_token) == (11 if dummy or balanced else 3)
@@ -257,7 +249,7 @@ def test_token_split_tbo_resumes_epoch_and_preserves_both_prefixes(
                 == runner.forward_vars[f"ub{index}_batch_id_per_q_token"].gpu.data_ptr()
             )
             assert (
-                ub.indexer_meta["cu_committed_gpu"].data_ptr()
+                ub.index_rows.concat.cu_committed.data_ptr()
                 == runner.forward_vars[
                     f"ub{index}_v4_indexer_cu_committed"
                 ].gpu.data_ptr()
@@ -266,7 +258,7 @@ def test_token_split_tbo_resumes_epoch_and_preserves_both_prefixes(
                 (
                     index,
                     ub.cu_seqlens_q.clone(),
-                    ub.indexer_meta["cu_committed_gpu"].clone(),
+                    ub.index_rows.concat.cu_committed.clone(),
                     step,
                 )
             )
@@ -303,12 +295,12 @@ def test_balanced_pcp_tbo_uses_separate_indexer_buffers(monkeypatch, rank):
         torch.cuda._sleep(5_000_000)
         ubatches.append(builder.build_ubatch_prefill_metadata(md, None, 2, index))
     runner.h2d_owner.completion.synchronize()
-    assert ubatches[0].indexer_meta["cu_committed_gpu"].cpu().tolist() == [0, 2, 7]
-    assert ubatches[1].indexer_meta["cu_committed_gpu"].cpu().tolist() == [0, 7, 18]
+    assert ubatches[0].index_rows.concat.cu_committed.cpu().tolist() == [0, 2, 7]
+    assert ubatches[1].index_rows.concat.cu_committed.cpu().tolist() == [0, 7, 18]
     assert [ub.max_seqlen_q for ub in ubatches] == [5, 4]
     for index, ub in enumerate(ubatches):
         assert (
-            ub.indexer_meta["cu_committed_gpu"].data_ptr()
+            ub.index_rows.concat.cu_committed.data_ptr()
             == runner.forward_vars[f"ub{index}_v4_indexer_cu_committed"].gpu.data_ptr()
         )
     assert runner.forward_vars["v4_indexer_cu_committed"]._publication._epoch == -1
@@ -319,123 +311,6 @@ def test_balanced_pcp_tbo_uses_separate_indexer_buffers(monkeypatch, rank):
             ]._publication._epoch
             == runner.h2d_owner.epoch
         )
-
-
-def mock_opus(monkeypatch):
-    name = "aiter.ops.opus.pa_mqa_logits_mxfp4"
-
-    def plan(cu, ends, **kwargs):
-        return (cu.clone(), ends.clone(), kwargs["row_to_batch"].clone())
-
-    monkeypatch.setitem(
-        sys.modules, name, SimpleNamespace(pa_mqa_logits_mxfp4_plan=plan)
-    )
-
-
-@pytest.mark.parametrize("prefix", ["", "ub0_", "ub1_"])
-def test_opus_chunks_are_one_checked_upload_with_independent_ranges(
-    monkeypatch, prefix
-):
-    from atom.model_ops.attentions import deepseek_v4_attn as module
-
-    mock_opus(monkeypatch)
-    monkeypatch.setattr(module, "sparse_indexer_row_chunk", lambda *args: 2)
-    runner, builder = make_runner(monkeypatch, opus=True)
-    runner._gate_staging_reuse()
-    buf = runner.forward_vars[f"{prefix}v4_indexer_chunk_cu"]
-    buf.gpu.fill_(77)
-    cu = np.array([0, 0, 3, 3, 8], dtype=np.int32)
-    md = SimpleNamespace(
-        n_committed_csa_per_seq_cpu=np.array([0, 2, 0, 4], dtype=np.int32),
-        batch_id_per_q_token=torch.tensor(
-            [1, 1, 1, 3, 3, 3, 3, 3], device="cuda", dtype=torch.int32
-        ),
-    )
-    ends = torch.arange(8, dtype=torch.int32, device="cuda")
-    meta = {}
-    torch.cuda._sleep(5_000_000)
-    builder._build_fp4_opus_prefill_plans(
-        attn_metadata=md,
-        meta=meta,
-        total_tokens=8,
-        scheduled_bs=4,
-        visible_end_gpu=ends,
-        cu_seqlens_q_cpu=cu,
-        reuse_cu_seqlens_q=False,
-        plan_total_tokens=None,
-        buf_prefix_ubatch=prefix,
-    )
-    assert buf._publication._epoch == runner.h2d_owner.epoch
-    runner._mark_staging_h2d_enqueued()
-    runner.h2d_owner.completion.synchronize()
-    entries = 0
-    for start, end, plan in meta["fp4_opus_prefill_chunks"]:
-        expected = module._chunk_cu_seqlens(cu, start, end)
-        np.testing.assert_array_equal(plan[0].cpu().numpy(), expected)
-        entries += len(expected)
-    assert torch.all(buf.gpu[entries:] == 77)
-
-
-def test_opus_full_prefix_reuse_does_not_publish_chunk_storage(monkeypatch):
-    from atom.model_ops.attentions import deepseek_v4_attn as module
-
-    mock_opus(monkeypatch)
-    monkeypatch.setattr(module, "sparse_indexer_row_chunk", lambda *args: 32)
-    runner, builder = make_runner(monkeypatch, opus=True)
-    runner._gate_staging_reuse()
-    md, pos, cu, _ = make_metadata(builder)
-    meta = {}
-    builder._build_fp4_opus_prefill_plans(
-        attn_metadata=md,
-        meta=meta,
-        total_tokens=11,
-        scheduled_bs=3,
-        visible_end_gpu=pos.to(torch.int32),
-        cu_seqlens_q_cpu=cu,
-        reuse_cu_seqlens_q=True,
-        plan_total_tokens=None,
-    )
-    assert runner.forward_vars["v4_indexer_chunk_cu"]._publication._epoch == -1
-    assert torch.equal(meta["fp4_opus_prefill_chunks"][0][2][0], md.cu_seqlens_q)
-    runner._mark_staging_h2d_enqueued()
-
-
-def test_opus_packed_source_reuse_and_capacity_check(monkeypatch):
-    from atom.model_ops.attentions import deepseek_v4_attn as module
-
-    mock_opus(monkeypatch)
-    monkeypatch.setattr(module, "sparse_indexer_row_chunk", lambda *args: 1)
-    runner, builder = make_runner(monkeypatch, opus=True)
-    saved = []
-    for step in range(5):
-        runner._gate_staging_reuse()
-        md, pos, cu, _ = make_metadata(builder, (step + 1, 4), (8, 20))
-        buf = runner.forward_vars["v4_indexer_chunk_cu"]
-        before = buf.cpu.clone()
-        kwargs = {
-            "attn_metadata": md,
-            "total_tokens": len(pos),
-            "scheduled_bs": 2,
-            "visible_end_gpu": pos.to(torch.int32),
-            "cu_seqlens_q_cpu": cu,
-            "reuse_cu_seqlens_q": False,
-        }
-        with pytest.raises(ValueError, match="capacity"):
-            builder._build_fp4_opus_prefill_plans(
-                meta={}, plan_total_tokens=100, **kwargs
-            )
-        assert torch.equal(buf.cpu, before)
-        assert buf._publication._epoch != runner.h2d_owner.epoch
-        torch.cuda._sleep(5_000_000)
-        meta = {}
-        builder._build_fp4_opus_prefill_plans(
-            meta=meta, plan_total_tokens=None, **kwargs
-        )
-        saved.append(meta["fp4_opus_prefill_chunks"])
-        runner._mark_staging_h2d_enqueued()
-    torch.cuda.synchronize()
-    for chunks in saved:
-        assert all(plan[0].cpu().tolist() == [0, 1] for _, _, plan in chunks)
 
 
 def test_late_ubatch_failure_poisoning_and_wrong_stream_rejection(monkeypatch):
@@ -456,7 +331,7 @@ def test_late_ubatch_failure_poisoning_and_wrong_stream_rejection(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("indexer consumer failed")
 
-    monkeypatch.setattr(builder, "_attach_v4_indexer_meta", fail)
+    monkeypatch.setattr(builder, "_attach_v4_index_rows", fail)
     with pytest.raises(RuntimeError, match="consumer failed"):
         builder.build_ubatch_prefill_metadata(md, sl, 1, 0)
     assert runner.h2d_owner._state == "failed"

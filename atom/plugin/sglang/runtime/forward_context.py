@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -111,18 +112,17 @@ def _trim_hidden_states_for_output(hidden_states, num_tokens: int):
     return hidden_states
 
 
-def _resolve_num_tokens_across_dp(
+def _resolve_running_tokens_per_dp_rank(
     atom_config: Any,
     forward_batch: ForwardBatch,
     num_tokens: int,
-) -> torch.Tensor:
-    """Resolve per-DP token counts for ATOM's CPU-side DPMetadata."""
+) -> np.ndarray:
+    """The rows every DP rank's forward runs, from SGLang's dp-attention
+    counts, for ATOM's CPU-side DPMetadata."""
 
     global_num_tokens_cpu = getattr(forward_batch, "global_num_tokens_cpu", None)
     if global_num_tokens_cpu is not None:
-        num_tokens_across_dp = torch.tensor(
-            global_num_tokens_cpu, dtype=torch.int32, device="cpu"
-        )
+        running_tokens_per_dp_rank = np.array(global_num_tokens_cpu, dtype=np.int32)
     else:
         dp_size = atom_config.parallel_config.data_parallel_size
         global_num_tokens_gpu = getattr(forward_batch, "global_num_tokens_gpu", None)
@@ -141,15 +141,13 @@ def _resolve_num_tokens_across_dp(
         # Static batches, such as CUDA graph capture batches, may only keep
         # global token counts on GPU. Avoid GPU-to-CPU reads here and mirror
         # their same-shape layout directly for ATOM's CPU DPMetadata.
-        num_tokens_across_dp = torch.full(
-            (dp_size,), num_tokens, dtype=torch.int32, device="cpu"
-        )
+        running_tokens_per_dp_rank = np.full(dp_size, num_tokens, dtype=np.int32)
 
     # SGLang reports idle ranks as 0 tokens, but ATOM materializes every idle
     # rank as one physical dummy token. Normalize the complete vector on every
     # rank so collectives and DPMetadata use identical sizes.
-    num_tokens_across_dp.clamp_min_(1)
-    return num_tokens_across_dp
+    np.maximum(running_tokens_per_dp_rank, 1, out=running_tokens_per_dp_rank)
+    return running_tokens_per_dp_rank
 
 
 def _resolve_running_tokens_are_unified(
@@ -279,18 +277,10 @@ def _slice_v4_graph_metadata_for_capture(
     indexer_meta = getattr(md, "indexer_meta", None)
     if isinstance(indexer_meta, dict):
         indexer_meta = dict(indexer_meta)
-        for key in (
-            "batch_id_per_q_token",
-            "seq_base_per_token_gpu",
-            "cu_starts_gpu",
-            "cu_ends_gpu",
-        ):
+        for key in ("cu_starts_gpu", "visible_gpu"):
             value = indexer_meta.get(key)
             if torch.is_tensor(value):
                 indexer_meta[key] = value[:num_tokens]
-        value = indexer_meta.get("n_committed_per_seq_gpu")
-        if torch.is_tensor(value):
-            indexer_meta["n_committed_per_seq_gpu"] = value[:bs]
         md.indexer_meta = indexer_meta
 
     return md
@@ -718,6 +708,7 @@ def _set_atom_forward_context(
 
     from atom.utils.forward_context import (
         Context,
+        DPMetadata,
         set_forward_context,
     )
 
@@ -800,13 +791,15 @@ def _set_atom_forward_context(
     max_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
     enable_dp_attention = bool(atom_config.enable_dp_attention)
     if enable_dp_attention:
-        num_tokens_across_dp = _resolve_num_tokens_across_dp(
+        running_tokens_per_dp_rank = _resolve_running_tokens_per_dp_rank(
             atom_config, forward_batch, num_tokens
         )
         # Already TOKENS, and already the group max -- what MoE pads to.
-        running_tokens = int(torch.max(num_tokens_across_dp).item())
+        running_tokens = int(running_tokens_per_dp_rank.max())
     else:
-        num_tokens_across_dp = None
+        running_tokens_per_dp_rank = DPMetadata.gather_running_tokens(
+            atom_config.parallel_config, num_tokens
+        )
         running_tokens = num_tokens if is_prefill else batch_size * max_q
     # Sequences, per the field's contract -- the TBO split divides this into
     # per-ubatch request counts, so handing it a token count would make each
@@ -830,8 +823,7 @@ def _set_atom_forward_context(
         attn_metadata=attn_metadata,
         atom_config=atom_config,
         context=context,
-        num_tokens=num_tokens,
-        num_tokens_across_dp=num_tokens_across_dp,
+        running_tokens_per_dp_rank=running_tokens_per_dp_rank,
     )
 
 
