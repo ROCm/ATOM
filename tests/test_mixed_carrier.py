@@ -90,3 +90,62 @@ def test_both_builders_assemble_the_carrier_through_the_helper(fn):
     src = ast.unparse(body)
     assert "_mixed_carrier(" in src
     assert "AttentionMetaData_DSV4(" not in src
+
+
+def test_prepare_mixed_calls_both_halves_with_their_real_signatures(monkeypatch):
+    """Drives `prepare_mixed` with the two halves stubbed, each binding its
+    arguments against the real method. A builder signature change that the
+    mixed call does not follow then fails here instead of on the first mixed
+    GPU step (`prepare_prefill` gained `running_tokens` and the call kept two)."""
+    import contextlib
+    import inspect
+
+    import numpy as np
+
+    from atom.model_ops.attentions import deepseek_v4_attn as v4
+
+    builder_cls = v4.DeepseekV4AttentionMetadataBuilder
+    n_p, n_d, p_tokens = 2, 3, 16
+    batch = _batch(n_p=n_p, n_d=n_d)
+    batch.total_seqs_num_prefill = n_p
+    calls = {}
+
+    def _stub(name, positions):
+        sig = inspect.signature(getattr(builder_cls, name))
+
+        def run(self, *args, **kwargs):
+            calls[name] = sig.bind(self, *args, **kwargs).arguments
+            return SimpleNamespace(), positions
+
+        return run
+
+    cu = np.arange(n_d + 1, dtype=np.int32)  # one decode token per row
+    builder = builder_cls.__new__(builder_cls)
+    builder.model_runner = SimpleNamespace(
+        forward_vars={"cu_seqlens_q": SimpleNamespace(np=cu)}
+    )
+    monkeypatch.setattr(
+        builder_cls,
+        "mixed_prefill_bank_active",
+        lambda self, b: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        builder_cls, "prepare_prefill", _stub("prepare_prefill", torch.arange(16))
+    )
+    monkeypatch.setattr(
+        builder_cls, "prepare_decode", _stub("prepare_decode", torch.arange(3))
+    )
+    monkeypatch.setattr(v4, "_mixed_carrier", lambda *a: SimpleNamespace(args=a))
+
+    merged, positions = builder.prepare_mixed(batch, n_p + n_d)
+
+    pre = calls["prepare_prefill"]
+    assert (pre["running_bs"], pre["running_tokens"]) == (n_p, p_tokens)
+    dec = calls["prepare_decode"]
+    assert (dec["running_bs"], dec["running_tokens"], dec["max_seqlen_q"]) == (
+        n_d,
+        n_d,
+        1,
+    )
+    assert positions.numel() == p_tokens + n_d
+    assert merged.args[2:6] == (n_p, n_d, p_tokens, n_d)
