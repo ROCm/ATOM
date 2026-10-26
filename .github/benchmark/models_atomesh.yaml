@@ -1258,6 +1258,55 @@ models:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
 
+      # gsm8k-only PD cell over MoRI IO, prefill and decode on a node each. No
+      # DSpark, so it needs no draft model and has no ReplaySSM record buffers,
+      # which the MoRIIO connector refuses: it moves the MLA KV by block and the
+      # KDA recurrent state by slot.
+      accuracy:
+        - name: kimi-k3-mxfp4-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          display_topology: 1P1D-MORIIO-TP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              # As in the reference accuracy config (models_accuracy.json),
+              # which disables prefix caching for Kimi-K3.
+              enable_prefix_caching: false
+              # Kimi-K3 thinks by default. lm_eval scores message content, and
+              # a reasoning model cut off at max_gen_toks mid-thought returns
+              # none. The template's own switch is named "thinking".
+              extra_args: '--default-chat-template-kwargs {"thinking":false}'
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+            # The dense 2..64 range the TP8 DSpark cells already capture.
+            cudagraph: auto
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              # MoRI IO moves the KDA state only when prefill pushes it.
+              ATOM_MORIIO_MODE: write
+              # The connector refuses ReplaySSM buffers; pinned, not inherited.
+              ATOM_ENABLE_REPLAYSSM: "0"
+          benchmark:
+            # A cold read of the weights from NFS plus online FP8 quantization
+            # takes about an hour on the Spur lane, before kernel builds and
+            # graph capture; 4500 s left prefill a few minutes short.
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32]
+          accuracy:
+            threshold: 0.90
+
     accuracy:
       task: gsm8k
       fewshot: 5
