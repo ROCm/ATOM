@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import triton
@@ -67,6 +68,28 @@ class DSparkProposer(Drafter):
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
+        # Opt-in probabilistic drafting (ATOM_DSPARK_PROB_DRAFT=1). Allocated
+        # here, before any draft graph is captured, so the graph bakes these
+        # addresses; the model's head reads them through `_prob_draft`.
+        self._prob_state = None
+        if (
+            os.environ.get("ATOM_DSPARK_PROB_DRAFT", "0") == "1"
+            and not self._with_draft
+            and hasattr(type(self.model), "_head_and_sample_prob")
+        ):
+            from atom.model_ops.dspark_prob_sample import ProbDraftState
+
+            self._prob_state = ProbDraftState.allocate(
+                int(self.config.max_num_seqs),
+                int(self.draft_tokens_per_seq),
+                int(self.model.vocab_size),
+                device,
+            )
+            self.model._prob_draft = self._prob_state
+            logger.info(
+                "DSpark probabilistic drafting ON (q buffer %s)",
+                tuple(self._prob_state.q.shape),
+            )
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.
@@ -725,6 +748,10 @@ class DSparkProposer(Drafter):
             running_tokens_are_unified=True,
             scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
+        if self._prob_state is not None:
+            self._prob_state.begin_draft(
+                getattr(self.runner, "_dspark_draft_temps", None), scheduled_bs
+            )
         label = self.block.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
             draft_token_ids, confidence = self.block.run(running_bs, **staged)

@@ -579,9 +579,75 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     def head_and_sample(self, out, anchor_ids, num_draft):
         # `num_draft` is the shared surface's; the width rides `out[1]`.
+        # ATOM_DSPARK_PROB_DRAFT=1: the drafter attached a ProbDraftState;
+        # sample the block from q instead of taking its argmax (see
+        # atom/model_ops/dspark_prob_sample.py). Unset => unchanged.
+        prob_state = self.__dict__.get("_prob_draft")
+        if prob_state is not None:
+            return self._head_and_sample_prob(*out, anchor_ids, prob_state)
         if self._sharded_markov_sample():
             return self._head_and_sample_sharded(*out, anchor_ids)
         return self._head_and_sample(*out, anchor_ids)
+
+    def _head_and_sample_prob(self, normed, hc_hidden, anchor_ids, st):
+        """Probabilistic block sampling (ATOM_DSPARK_PROB_DRAFT=1).
+
+        With the sharded LM head (when the greedy path would take it) each
+        rank scores its vocab shard and the ranks agree on one (score, id) per
+        row, exactly like ``_head_and_sample_sharded``; otherwise every rank
+        samples the all-gathered vocab. Same seed and same inputs on every
+        rank, so every rank draws the same ids. The biased logits each
+        position was drawn from are left in ``st.q`` (this rank's columns,
+        layout in ``st.set_layout``) and the ids in ``st.ids`` for the
+        runner's probability-ratio verification of this block.
+        """
+        from atom.model_ops.dspark_prob_sample import (
+            SHARDED_DRAFT,
+            prob_markov_sample,
+        )
+
+        B, T, _ = hc_hidden.shape
+        if B > st.q.shape[0] or T > st.q.shape[1]:
+            # Outside the buffers: greedy block, and no stored q matches it.
+            st.ids.fill_(-1)
+            if self._sharded_markov_sample():
+                return self._head_and_sample_sharded(normed, hc_hidden, anchor_ids)
+            return self._head_and_sample(normed, hc_hidden, anchor_ids)
+        last, head = self.mtp[-1], self.head
+        sharded = SHARDED_DRAFT and self._sharded_markov_sample()
+        if sharded:
+            base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B,T,V/tp]
+            tp_group = get_tp_group()
+            st.set_layout(head.vocab_start_idx, base_logits.shape[-1], tp_group.world_size)
+        else:
+            base_logits = head.get_logits(normed).view(B, T, -1)  # [B, T, V]
+            tp_group = None
+            st.set_layout(0, base_logits.shape[-1], 1)
+        assert base_logits.shape[-1] <= st.q.shape[-1]
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        markov_w1 = last.markov_head.markov_w1.weight
+        markov_w2 = last.markov_head.markov_w2.weight
+        out_ids = anchor_ids.new_empty(B, T)
+        markov_embeds = markov_w1.new_empty(B, T, markov_w1.shape[1])
+        for k in range(T):
+            prob_markov_sample(
+                base_logits[:, k],
+                anchor_ids if k == 0 else out_ids[:, k - 1],
+                markov_w1,
+                markov_w2,
+                out_ids[:, k],
+                st.q[:B, k],
+                st.temps[:B],
+                st.seed,
+                k,
+                markov_embeds[:, k],
+                vocab_start=head.vocab_start_idx if sharded else 0,
+                tp_group=tp_group,
+                use_custom=use_custom,
+            )
+        st.ids[:B].copy_(out_ids)
+        confidence = last.confidence_head(hc_hidden, markov_embeds)
+        return out_ids, confidence
 
     def _sharded_markov_sample(self) -> bool:
         """Whether the block is sampled off this rank's vocab shard.
