@@ -350,6 +350,49 @@ def mla_dcp_kernel_num_heads(
     return gathered
 
 
+# Gathered widths a persistent fp8 cprr decode serves faster as 32-head
+# pseudo-requests over the same KV, {width: pseudo-requests per request}.
+# aiter runs 96 heads at qlen 4 natively on the qh32 kernel (no fold), 1.9x
+# slower than three 32-head pseudo-requests on the Kimi-K3 C88 decode shape.
+# Other widths are unmeasured.
+_MLA_DCP_HEAD_FOLDS = {96: 3}
+
+
+def mla_dcp_head_fold(
+    kernel_num_heads: int, dcp_world_size: int, *, persistent: bool, fp8: bool
+) -> int:
+    """Pseudo-requests per request for a DCP decode with draft tokens; 1 is none."""
+    if not envs.ATOM_MLA_DCP_HEAD_FOLD or dcp_world_size <= 1:
+        return 1
+    if not (persistent and fp8):
+        return 1
+    return _MLA_DCP_HEAD_FOLDS.get(kernel_num_heads, 1)
+
+
+def fold_decode_heads(x: torch.Tensor, fold: int, qlen: int) -> torch.Tensor:
+    """[B*qlen, fold*h, ...] -> [B*fold*qlen, h, ...].
+
+    Head group g of request b becomes pseudo-request b*fold+g, its qlen rows
+    contiguous, which is the order `fold_decode_csr` lays the CSR out in.
+    """
+    t, h, *rest = x.shape
+    return (
+        x.reshape(t // qlen, qlen, fold, h // fold, *rest)
+        .transpose(1, 2)
+        .reshape(t * fold, h // fold, *rest)
+    )
+
+
+def unfold_decode_heads(x: torch.Tensor, fold: int, qlen: int) -> torch.Tensor:
+    """Inverse of `fold_decode_heads`."""
+    t, h, *rest = x.shape
+    return (
+        x.reshape(t // (fold * qlen), fold, qlen, h, *rest)
+        .transpose(1, 2)
+        .reshape(t // fold, h * fold, *rest)
+    )
+
+
 def mla_dcp_sparse_prefill_num_heads(
     num_heads: int,
     dcp_world_size: int,
@@ -2755,10 +2798,25 @@ class MLAAttention(nn.Module):
                 )
 
             seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
+            fold = (
+                getattr(attn_metadata, "mla_head_fold", 1)
+                if g_kv_indptr is not None
+                else 1
+            )
+            kernel_o = o
+            if fold > 1:
+                # The builder planned this step for fold*B pseudo-requests.
+                q = fold_decode_heads(q, fold, max_q_len)
+                kernel_o = o.view(q.shape[0], q.shape[1], -1)
+                paged_cu_seqlens_q = attn_metadata.fold_cu_seqlens_q
+                paged_kv_indptr = attn_metadata.fold_kv_indptr
+                paged_kv_indices = attn_metadata.fold_kv_indices
+                paged_kv_last_page_lens = attn_metadata.fold_kv_last_page_lens
+                g_kv_indptr = attn_metadata.fold_g_kv_indptr
             _, final_lse = mla_decode_fwd(
                 q,
                 seg_kv_buffer_4d,
-                o,
+                kernel_o,
                 paged_cu_seqlens_q,
                 paged_kv_indptr,
                 paged_kv_indices,
@@ -2783,6 +2841,10 @@ class MLAAttention(nn.Module):
                 cp_rank=cp_rank,
                 causal=causal,
             )
+            if fold > 1:
+                o = unfold_decode_heads(kernel_o, fold, max_q_len)
+                if final_lse is not None:
+                    final_lse = unfold_decode_heads(final_lse, fold, max_q_len)
 
         o = self._restore_decode_query_heads(o, num_heads_q)
         if final_lse is not None:

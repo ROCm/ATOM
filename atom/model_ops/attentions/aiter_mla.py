@@ -48,6 +48,7 @@ from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
+    mla_dcp_head_fold,
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
     mla_kernel_num_heads,
@@ -297,6 +298,45 @@ def decode_row_ends(
     return ends
 
 
+def fold_decode_csr(
+    kv_lens: np.ndarray,
+    g_kv_lens: np.ndarray,
+    last_page_lens: np.ndarray,
+    qlen: int,
+    fold: int,
+    padded_bs: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(cu_seqlens_q, kv_indptr, g_kv_indptr, kv_last_page_lens) for a
+    head-folded decode of len(kv_lens) requests padded to `padded_bs`.
+
+    Pseudo-request b*fold+g is head group g of request b over b's own KV, so
+    every per-request entry repeats `fold` times, and the KV list holds `fold`
+    copies of each request's indices. Padding folds to empty pseudo-requests.
+    """
+    n = fold * padded_bs
+    k = fold * len(kv_lens)
+
+    def indptr(lens):
+        out = np.zeros(n + 1, dtype=np.int32)
+        out[1 : k + 1] = np.cumsum(np.repeat(lens, fold), dtype=np.int32)
+        out[k + 1 :] = out[k]
+        return out
+
+    cu_q = np.zeros(n + 1, dtype=np.int32)
+    cu_q[: k + 1] = np.arange(k + 1, dtype=np.int32) * qlen
+    cu_q[k + 1 :] = cu_q[k]
+    last = np.zeros(n, dtype=np.int32)
+    last[:k] = np.repeat(last_page_lens, fold)
+    return cu_q, indptr(kv_lens), indptr(g_kv_lens), last
+
+
+def _max_shape(a, b) -> tuple[int, ...]:
+    a = (a,) if isinstance(a, int) else tuple(a)
+    b = (b,) if isinstance(b, int) else tuple(b)
+    assert len(a) == len(b), f"metadata buffer ranks differ: {a} vs {b}"
+    return tuple(max(x, y) for x, y in zip(a, b))
+
+
 def indexes_by_token_table(is_sparse: bool, dcp_world_size: int, kpool: int) -> bool:
     """Whether the sparse indexer reads its keys off a block-table row per
     query token: the DCP decode exchange, and a pooled indexer (kpool), whose
@@ -517,6 +557,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
+        # Pseudo-requests per request in a DCP decode with draft tokens; see
+        # `_publish_decode_fold`. TBO splits the step's plan per ubatch, which
+        # the folded plan does not cover.
+        spec = config.speculative_config
+        self.mla_head_fold = (
+            mla_dcp_head_fold(
+                self.persistent_num_heads,
+                self.dcp_world_size,
+                persistent=dcp_persistent and not self.is_sparse,
+                fp8=self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
+            )
+            if not config.enable_tbo_decode and (spec is None or spec.use_dspark())
+            else 1
+        )
 
         nonps_args = (
             self.dcp_world_size,
@@ -570,6 +624,31 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
+
+        def metadata_info(bs, num_heads):
+            return get_mla_metadata_info_v1(
+                bs,
+                max_seqlen_qo,
+                num_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=self.is_sparse,
+                fast_mode=True,
+                **_mla_seg_meta_kwargs(),
+            )
+
+        meta_info = metadata_info(self.max_bs, self.persistent_num_heads)
+        if self.mla_head_fold > 1:
+            # The same buffers also hold the unfolded plans of the passes
+            # that do not fold.
+            folded = metadata_info(
+                self.max_bs * self.mla_head_fold,
+                self.persistent_num_heads // self.mla_head_fold,
+            )
+            meta_info = [
+                (_max_shape(size, fsize), dtype)
+                for (size, dtype), (fsize, _) in zip(meta_info, folded)
+            ]
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -577,16 +656,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            self.max_bs,
-            max_seqlen_qo,
-            self.persistent_num_heads,
-            self.dtype_q,
-            self.dtype_kv,
-            is_sparse=self.is_sparse,
-            fast_mode=True,
-            **_mla_seg_meta_kwargs(),
-        )
+        ) = meta_info
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
         mla_metadata = {
@@ -636,6 +706,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             mla_metadata["dcp_local_context_lens"] = CpuGpuBuffer(
                 self.max_bs * max_seqlen_qo, publication_group="mla_csr", **i32_kwargs
             )
+        if self.mla_head_fold > 1:
+            n = self.mla_head_fold * self.max_bs
+            for name in ("fold_cu_seqlens_q", "fold_kv_indptr", "fold_g_kv_indptr"):
+                mla_metadata[name] = CpuGpuBuffer(
+                    n + 1, publication_group="mla_csr", **i32_kwargs
+                )
+            mla_metadata["fold_kv_last_page_lens"] = CpuGpuBuffer(
+                n, publication_group="mla_csr", **i32_kwargs
+            )
+            # Round-robin leaves a rank at most ceil(len / dcp) of a request's
+            # KV, rounded up to the interleave, plus the step's draft tokens.
+            local_per_seq = (
+                cdiv(self.max_num_blocks_per_seq, self.dcp_world_size)
+                + self.cp_kv_cache_interleave_size
+                + max_seqlen_qo
+            )
+            mla_metadata["fold_kv_indices"] = torch.empty(
+                n * local_per_seq, **i32_kwargs
+            )
+            mla_metadata["fold_rows"] = torch.arange(
+                self.max_bs, **i32_kwargs
+            ).repeat_interleave(self.mla_head_fold)
         if self.is_sparse:
             # The indexer's key bound for each query row, local to its request,
             # derived once per step and read by every full layer.
@@ -1065,6 +1157,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_reject_tokens: torch.Tensor = None,
         sparse_decode: bool = False,
         is_cp_round_robin: bool = False,
+        head_fold: int = 1,
     ):
         if self.kv_shuffled:
             return {}
@@ -1123,6 +1216,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if use_sparse_meta
             else var["kv_last_page_lens"].gpu[:bs]
         )
+        cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
+        num_heads = self.persistent_num_heads
+        if head_fold > 1:
+            # Plan the pseudo-requests `_publish_decode_fold` laid out.
+            assert is_cp_round_robin and not only_update and not use_sparse_meta
+            bs *= head_fold
+            num_heads //= head_fold
+            cu_seqlens_q = var["fold_cu_seqlens_q"].gpu[: bs + 1]
+            kv_indptr_for_metadata = var["fold_kv_indptr"].gpu[: bs + 1]
+            kv_last_page_lens_for_metadata = var["fold_kv_last_page_lens"].gpu[:bs]
         if only_update:
             decode_update_mla_metadata_v1(
                 var["cu_seqlens_q"].gpu[: bs + 1],
@@ -1146,10 +1249,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         else:
             get_mla_metadata_v1(
-                var["cu_seqlens_q"].gpu[: bs + 1],
+                cu_seqlens_q,
                 kv_indptr_for_metadata,
                 kv_last_page_lens_for_metadata,
-                self.persistent_num_heads,
+                num_heads,
                 1,  # nhead_kv,
                 True,
                 work_meta_data,
@@ -1172,6 +1275,52 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "reduce_final_map": reduce_final_map,
             "reduce_partial_map": reduce_partial_map,
         }
+
+    def _publish_decode_fold(
+        self,
+        running_bs: int,
+        max_seqlen_q: int,
+        kv_lens: np.ndarray,
+        g_kv_lens: np.ndarray,
+        last_page_lens: np.ndarray,
+        block_tables: torch.Tensor | None = None,
+        max_seqlen_k: int = 0,
+    ) -> dict:
+        """Lay the step out as `mla_head_fold` pseudo-requests per request.
+
+        Uploads their CSR (`fold_decode_csr`) and KV list and returns the
+        fields the target's attention reads; the caller plans the same
+        pseudo-requests with `set_mla_persistent_worker_buffers(head_fold=)`.
+        Without `block_tables` every KV entry is slot 0, as capture lays out.
+        """
+        fold = self.mla_head_fold
+        var = self.model_runner.forward_vars
+        n = fold * running_bs
+        names = (
+            "fold_cu_seqlens_q",
+            "fold_kv_indptr",
+            "fold_g_kv_indptr",
+            "fold_kv_last_page_lens",
+        )
+        arrays = fold_decode_csr(
+            kv_lens, g_kv_lens, last_page_lens, max_seqlen_q, fold, running_bs
+        )
+        out = {"mla_head_fold": fold}
+        for name, arr in zip(names, arrays):
+            var[name].np[: arr.size] = arr
+            out[name] = var[name].copy_to_gpu(arr.size)
+        if block_tables is None:
+            var["fold_kv_indices"].zero_()
+        else:
+            kv_indices_generate_triton(
+                block_tables.index_select(0, var["fold_rows"][:n]),
+                var["fold_kv_indices"],
+                out["fold_kv_indptr"],
+                self.block_ratio,
+                max_seqlen_k,
+            )
+        out["fold_kv_indices"] = var["fold_kv_indices"]
+        return out
 
     def prepare_mtp_decode(
         self,
@@ -3059,6 +3208,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_ratio,
             max_seqlen_k,
         )
+        fold = self.mla_head_fold if self.dcp_world_size > 1 and max_seqlen_q > 1 else 1
+        if fold > 1:
+            fold_fields = self._publish_decode_fold(
+                running_bs,
+                max_seqlen_q,
+                num_blocks_per_seq,
+                context_lens[:scheduled_bs],
+                var["kv_last_page_lens"].np[:scheduled_bs],
+                ctx["block_tables"],
+                max_seqlen_k,
+            )
 
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
         # metadata copies on main stream
@@ -3091,7 +3251,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # batch pads off the graph path too.
             meta_bs = scheduled_bs if cp_round_robin else running_bs
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
-                meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
+                meta_bs,
+                max_seqlen_q,
+                is_cp_round_robin=cp_round_robin,
+                head_fold=fold,
             )
             ctx_mla_ps_sparse = None
         ctx.update(ctx_mla_ps)
@@ -3111,6 +3274,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.dcp_world_size > 1
             else None
         )
+        if fold > 1:
+            for k, v in fold_fields.items():
+                setattr(attn_metadata, k, v)
 
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
@@ -3408,8 +3574,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 scheduled_tokens
             )
         else:
+            fold = self.mla_head_fold if cp_round_robin else 1
+            if fold > 1:
+                ones = np.ones(bs, dtype=np.int32)
+                fold_fields = self._publish_decode_fold(
+                    bs, max_q_len, ones, ones * self.dcp_world_size, ones
+                )
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
-                bs, max_q_len, is_cp_round_robin=cp_round_robin
+                bs, max_q_len, is_cp_round_robin=cp_round_robin, head_fold=fold
             )
             ctx_mla_ps_sparse = None
         attn_metadata = AttentionMetaData(
@@ -3434,6 +3606,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
+                setattr(attn_metadata, k, v)
+        elif fold > 1:
+            for k, v in fold_fields.items():
                 setattr(attn_metadata, k, v)
         if is_sparse_mtp or self._indexer_fp4:
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
