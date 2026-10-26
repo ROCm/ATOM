@@ -192,9 +192,16 @@ class DSparkDraftModel(nn.Module):
 
     @property
     def first_attention_layer_num(self) -> int:
-        """The ``kv_cache_data`` key of the draft's first attention layer in the
-        engine's paged pool, for drafts that keep their KV there."""
-        raise NotImplementedError
+        """``kv_cache_data`` key of this draft's first attention layer.
+
+        Paged MLA drafts bind that layer on ``layers[0].self_attn.mla_attn``;
+        this is the lookup ``DSparkProposer`` used before the hook existed, so
+        Kimi-K3 and every other MLA draft keep resolving without an override.
+        A draft whose attention module lives somewhere else (MiniMax-M3.1's
+        ``KVCacheBinding``) overrides this. Inline drafts that keep a private
+        KV window never reach the call site.
+        """
+        return self.layers[0].self_attn.mla_attn.layer_num
 
     def prepare_paged_block(
         self,

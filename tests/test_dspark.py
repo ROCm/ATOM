@@ -2087,6 +2087,56 @@ def test_sparse_attention_sizes_on_the_q_not_positions():
 # ---- the paged block's metadata build (Kimi-K3) ------------------------------
 
 
+def test_paged_mla_drafts_keep_the_historical_layer_num_lookup():
+    """The proposer used to read ``layers[0].self_attn.mla_attn.layer_num``.
+
+    That lookup is the base default, so an MLA draft that does not override
+    it still resolves its paged KV. Only a different module layout overrides.
+    """
+    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+    from atom.models.dspark_draft import DSparkDraftModel
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
+    from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    attn = types.SimpleNamespace(layer_num=17)
+    layer = types.SimpleNamespace(self_attn=types.SimpleNamespace(mla_attn=attn))
+
+    class _MlaDraft(DSparkDraftModel):
+        def __init__(self):
+            super().__init__()
+            self.layers = [layer]
+
+    draft = _MlaDraft()
+    assert draft.first_attention_layer_num == 17
+    cache = types.SimpleNamespace(k_cache=torch.zeros(2))
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.model = draft
+    assert (
+        proposer._bound_draft_k_cache(
+            types.SimpleNamespace(kv_cache_data={"layer_17": cache})
+        )
+        is cache.k_cache
+    )
+    # Kimi-K3 is that MLA layout. MiniMax-M3.1 binds a plain KV cache and
+    # must keep its own override; inheriting the default would look up
+    # ``mla_attn`` and fail.
+    assert (
+        KimiK3DSpark.first_attention_layer_num
+        is DSparkDraftModel.first_attention_layer_num
+    )
+    for draft_cls in (DeepseekV4DSpark, DeepseekV41DSpark):
+        assert (
+            draft_cls.first_attention_layer_num
+            is DSparkDraftModel.first_attention_layer_num
+        ), draft_cls.__name__
+    assert (
+        MiniMaxM3DSpark.first_attention_layer_num
+        is not DSparkDraftModel.first_attention_layer_num
+    )
+
+
 def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
     """A DSparkProposer carrying only what `_build_paged_block_metadata` reads.
 

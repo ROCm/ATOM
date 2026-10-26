@@ -3052,8 +3052,8 @@ class ModelRunner:
                 inputs_embeds = None
                 if (
                     is_prefill
-                    and get_pp_group().is_first_rank
                     and hasattr(self.model, "get_vision_embeddings")
+                    and get_pp_group().is_first_rank
                     and batch is not None
                     and hasattr(batch, "multimodal_data")
                     and batch.multimodal_data

@@ -625,10 +625,6 @@ class KimiK3DSpark(DSparkDraftModel):
         """
         return self.layers
 
-    @property
-    def first_attention_layer_num(self) -> int:
-        return self.layers[0].self_attn.mla_attn.layer_num
-
     def forward_spec(
         self,
         input_ids: torch.Tensor,  # [B]   verified anchor token per request
