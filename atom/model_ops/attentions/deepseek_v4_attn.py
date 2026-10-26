@@ -130,7 +130,7 @@ from atom.model_ops.indexer import (
     fp4_rows,
     fp8_rows,
 )
-from atom.model_ops.indexer.score import split_gather_comm
+from atom.model_ops.indexer.score import split_gather_comm_on_every_rank
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace, indexer_qsplit_world
 from atom.model_ops.v4_kernels import (
     build_v4_paged_decode_indptr,
@@ -2125,14 +2125,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         n_committed = attn_metadata.n_committed_csa_per_seq_cpu[:scheduled_bs]
         visible_end = visible_csa(positions_gpu[:total_tokens]).to(torch.int32)
-        split = None
-        if self._indexer_qsplit_world > 1:
-            split = RowSplit.of(
-                total_tokens,
-                get_tp_group().rank_in_group,
-                self._indexer_qsplit_world,
-                group="tp",
-            )
+        split = self._prefill_row_split(total_tokens)
         if self._indexer_fp4:
             return self._index_rows(
                 attn_metadata,
@@ -2162,6 +2155,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return concat_rows(visible_end, keys, split)
 
+    def _prefill_row_split(self, total_tokens: int) -> RowSplit | None:
+        """This TP rank's share of a prefill's index rows, or None unsplit."""
+        if self._indexer_qsplit_world <= 1:
+            return None
+        return RowSplit.of(
+            total_tokens,
+            get_tp_group().rank_in_group,
+            self._indexer_qsplit_world,
+            group="tp",
+        )
+
     def _indexer_qsplit_world_size(self, config) -> int:
         """See `indexer_qsplit_world`; read once, its inputs are fixed per run."""
         tp = get_tensor_model_parallel_world_size()
@@ -2172,7 +2176,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             tp,
             physical_tp=torch.distributed.get_world_size(tp_group.device_group),
             enabled=envs.ATOM_V4_INDEXER_QSPLIT,
-            pynccl=split_gather_comm(tp_group) is not None,
+            pynccl=split_gather_comm_on_every_rank(tp_group),
             plugin=is_plugin_mode(),
             gfx1250_opus=self.indexer_layout == FP4_GFX1250_NATURAL,
             dp_attention=bool(config.enable_dp_attention),
@@ -2198,6 +2202,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         prefill's rows this TP rank scores (FP4 only; FP8 prefill rows are
         concatenated, see `_build_v4_prefill_index_rows`)."""
         if not self._indexer_fp4:
+            assert split is None, "FP8 prefill rows are concatenated, not paged"
             return fp8_rows(row_ends, width, self.index_logits_workspace, row_tables)
         storage = None if recorded_as is None else self._fp4_launches[recorded_as]
         sequences = Fp4MqaRaggedMetadata(

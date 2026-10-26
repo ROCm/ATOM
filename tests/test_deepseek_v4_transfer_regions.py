@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 import torch
@@ -181,7 +182,7 @@ def _stub_v4_runtime_imports():
     for name in ("Fp4LaunchStorages", "concat_rows", "fp4_rows", "fp8_rows"):
         setattr(indexer, name, lambda *args, **kwargs: None)
     indexer_score = types.ModuleType("atom.model_ops.indexer.score")
-    indexer_score.split_gather_comm = lambda group: None
+    indexer_score.split_gather_comm_on_every_rank = lambda group: False
     # Its sequences are aiter's FP4 MQA plan; the builder only names the type.
     ragged = types.ModuleType("atom.model_ops.fp4_mqa_ragged_metadata")
     ragged.Fp4MqaRaggedMetadata = type("Fp4MqaRaggedMetadata", (), {})
@@ -949,3 +950,92 @@ def test_v4_sidecar_offload_rejects_pipeline_parallelism_before_registration(
         ),
     ):
         builder.get_kv_transfer_tensors()
+
+
+# ---- The prefill indexer's row split across TP, as the builder wires it -------
+
+
+class _RecordingSplit:
+    """Stands in for `RowSplit`: records how the builder asks for its split."""
+
+    calls: ClassVar[list] = []
+
+    @classmethod
+    def of(cls, *args, **kwargs):
+        cls.calls.append((args, kwargs))
+        return ("split", args, kwargs)
+
+
+def _split_builder(v4_builder_cls, monkeypatch, *, world, rank=3, fp4):
+    # The fixture loads the builder module off `sys.modules`; its globals are
+    # reachable through any of its functions.
+    module = v4_builder_cls._prefill_row_split.__globals__
+    _RecordingSplit.calls = []
+    monkeypatch.setitem(module, "RowSplit", _RecordingSplit)
+    monkeypatch.setitem(
+        module, "get_tp_group", lambda: SimpleNamespace(rank_in_group=rank)
+    )
+    monkeypatch.setitem(module, "visible_csa", lambda positions: positions)
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder._indexer_qsplit_world = world
+    builder._indexer_fp4 = fp4
+    return builder, module
+
+
+@pytest.mark.parametrize("fp4", [True, False])
+def test_prefill_rows_carry_this_tp_rank_s_split(v4_builder_cls, monkeypatch, fp4):
+    """Under the TP split the prefill rows the builder publishes (FP4 paged or
+    FP8 concatenated) are this TP rank's share: `RowSplit.of(rows, tp_rank,
+    tp, group="tp")`, handed on to the rows."""
+    builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=fp4)
+    handed = {}
+    builder._index_rows = lambda *args, **kwargs: handed.setdefault(
+        "split", kwargs["split"]
+    )
+    monkeypatch.setitem(
+        module,
+        "concat_rows",
+        lambda ends, keys, split: handed.setdefault("split", split),
+    )
+    monkeypatch.setitem(module, "ConcatKeys", lambda **kwargs: kwargs)
+    builder._stage = lambda name, values: torch.as_tensor(values)
+    metadata = SimpleNamespace(
+        n_committed_csa_per_seq_cpu=torch.tensor([5, 9]).numpy(),
+        batch_id_per_q_token=torch.zeros(10, dtype=torch.long),
+        block_tables=None,
+    )
+    builder._build_v4_prefill_index_rows(metadata, torch.arange(10), 2, 10, None, "")
+    assert _RecordingSplit.calls == [((10, 3, 8), {"group": "tp"})]
+    assert handed["split"][0] == "split"
+
+
+def test_unsplit_prefill_rows_carry_no_split(v4_builder_cls, monkeypatch):
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=1, fp4=True)
+    assert builder._prefill_row_split(10) is None and _RecordingSplit.calls == []
+
+
+@pytest.mark.parametrize("pynccl, expected", [(True, 8), (False, 1)])
+def test_split_world_needs_the_tp_group_s_pynccl(
+    v4_builder_cls, monkeypatch, pynccl, expected
+):
+    """The builder's gate reads the startup agreement on the TP group's
+    pynccl: without one the split stays off."""
+    module = v4_builder_cls._indexer_qsplit_world_size.__globals__
+    monkeypatch.setitem(module, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setitem(
+        module, "get_tp_group", lambda: SimpleNamespace(device_group="tp")
+    )
+    monkeypatch.setitem(module, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setitem(module, "split_gather_comm_on_every_rank", lambda group: pynccl)
+    monkeypatch.setitem(module, "is_plugin_mode", lambda: False)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 8)
+    monkeypatch.setenv("ATOM_V4_INDEXER_QSPLIT", "1")
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder.indexer_layout = "fp8"
+    config = SimpleNamespace(
+        enable_dp_attention=False,
+        enable_tbo=False,
+        enable_tbo_decode=False,
+        decode_context_parallel_size=1,
+    )
+    assert builder._indexer_qsplit_world_size(config) == expected

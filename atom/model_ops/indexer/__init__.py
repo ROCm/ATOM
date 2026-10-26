@@ -6,7 +6,8 @@
 A model owns its query projection, how it writes index keys, and what it does
 with the selection; the attention builder publishes the step's rows once,
 cut to the logits plane it owns (`IndexRows.workspace`). Scoring and top-k --
-under DCP, each rank's share of the rows and their all-gather -- are here."""
+split across DCP or TP ranks, each rank's share of the rows and their
+all-gather -- are here."""
 
 from .query import fold_query_scale, quantize_query, quantize_query_rows
 from .rows import (

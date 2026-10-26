@@ -5,7 +5,7 @@
 them. The attention builder binds the first and publishes the second once a
 step (`attn_metadata.index_rows`); a model reads both and computes neither."""
 
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import torch
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
@@ -65,13 +65,20 @@ class RowSplit(NamedTuple):
     slot: int
     stride: int
     world: int
-    group: str = "dcp"
+    group: Literal["dcp", "tp"] = "dcp"
 
     @classmethod
     def of(
-        cls, rows: int, rank: int = 0, world: int = 1, *, group: str = "dcp"
+        cls,
+        rows: int,
+        rank: int = 0,
+        world: int = 1,
+        *,
+        group: Literal["dcp", "tp"] = "dcp",
     ) -> "RowSplit":
         """This rank's split of `rows`."""
+        if group not in ("dcp", "tp"):
+            raise ValueError(f"RowSplit group must be 'dcp' or 'tp', got {group!r}")
         stride, slot, first, end = qsplit_rows(rows, rank, world)
         return cls(first, end, slot, stride, world, group)
 
@@ -106,8 +113,8 @@ class IndexRows(NamedTuple):
 
     @property
     def out_rows(self) -> int:
-        """Rows of the selection: every rank's whole slot, under DCP the last
-        one's past the rows."""
+        """Rows of the selection: every rank's whole slot, under a split the
+        last one's past the rows."""
         return self.split.stride * self.split.world
 
 
@@ -193,7 +200,7 @@ def fp8_rows(row_ends, width, workspace, row_tables, *, next_n=1) -> IndexRows:
 def concat_rows(row_ends, keys: ConcatKeys, split: RowSplit | None = None):
     """FP8 prefill rows against their requests' gathered keys, banded by the
     logits budget alone: a prefill's temporaries are allocated as it runs.
-    This DCP rank's rows of them, `split` (every row by default)."""
+    This rank's rows of them, `split` (every row by default)."""
     split = split or RowSplit.of(row_ends.shape[0])
     band = max(1, logits_rows(split.end - split.first, keys.total))
     return IndexRows(
@@ -230,7 +237,7 @@ def fp4_rows(
     starting at `row_starts` (`[rows + 1]`, 0 .. rows). Rows a graph records
     keep each launch's per-step arguments in `storage`.
 
-    Banded over the workspace's plane (this DCP rank's rows of it, `split`,
+    Banded over the workspace's plane (this rank's rows of it, `split`,
     every row by default) unless `bands` are given -- with `packed_offsets`,
     where each band's rows were packed."""
     rows = row_ends.shape[0]

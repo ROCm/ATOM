@@ -12,8 +12,9 @@ instead gathers its requests' keys end to end and scores them densely
 way rows run in bands of the plane they were cut to, each band top-k'd as
 soon as it is scored, so nothing wider than one band is ever live. The result
 is `[rows, topk]` int32 column ids local to the row's request, `-1` past a
-row's bound; under DCP each rank scores its share of the rows and the
-selections are all-gathered in place.
+row's bound; split across ranks (`RowSplit`: DCP, or TP for a TP-replicated
+indexer) each rank scores its share of the rows and the selections are
+all-gathered in place.
 
 Under a token graph only the FP4 launch breaks: its plan follows the step's
 requests, which a token bucket does not fix. Everything else -- the bands, the
@@ -91,6 +92,9 @@ def _gather_split(out, split):
     group = get_tp_group() if split.group == "tp" else get_dcp_group()
     pynccl = split_gather_comm(group)
     if pynccl is not None:
+        # pynccl reads raw pointers and counts, so a strided view would be
+        # gathered wrong without an error (the ProcessGroup would refuse it).
+        assert region.is_contiguous(), "split gather needs contiguous rows"
         pynccl.all_gather(region, mine)
     else:
         torch.distributed.all_gather_into_tensor(region, mine, group=group.device_group)
@@ -98,10 +102,30 @@ def _gather_split(out, split):
 
 def split_gather_comm(group):
     """`group`'s pynccl communicator when it is usable, else None. Decided
-    at the group's construction, so the same on every rank of it."""
+    at the group's construction; `split_gather_comm_on_every_rank` checks
+    the ranks agree."""
     communicator = getattr(group, "device_communicator", None)
     pynccl = getattr(communicator, "pynccl_comm", None)
     return None if pynccl is None or pynccl.disabled else pynccl
+
+
+def split_gather_comm_on_every_rank(group) -> bool:
+    """Whether every rank of `group` has a usable pynccl communicator, checked
+    once at startup over the CPU group. aiter builds it per rank and only warns
+    when that fails, so ranks could disagree -- and a rank gathering on pynccl
+    while another uses the ProcessGroup (or does not split at all) hangs the
+    group. Raises on disagreement."""
+    usable = int(split_gather_comm(group) is not None)
+    votes = torch.tensor([usable, -usable], dtype=torch.int64)
+    torch.distributed.all_reduce(
+        votes, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    if int(votes[0]) != -int(votes[1]):
+        raise RuntimeError(
+            "pynccl is usable on some ranks of the group and not on others; "
+            "the indexer row split's gather needs the same transport on every rank"
+        )
+    return bool(usable)
 
 
 def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_band, out):

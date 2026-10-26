@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """The shared indexer's step rows (`atom.model_ops.indexer.rows`): how a step's
-query rows are cut into bands, grouped by request, and split across DCP ranks.
+query rows are cut into bands, grouped by request, and split across ranks.
 Host arithmetic only."""
 
 import numpy as np
@@ -95,9 +95,10 @@ def test_recorded_fp4_bands_keep_their_launch_arguments_in_place():
 
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("count", [1, 7, 12, 4097])
-def test_dcp_split_bands_only_this_rank_s_rows(world, count):
-    """Under DCP a rank scores its stride of the rows alone, and its slot of
-    the gathered selection is a whole stride whether or not it has rows."""
+def test_row_split_bands_only_this_rank_s_rows(world, count):
+    """Split across ranks, a rank scores its stride of the rows alone, and its
+    slot of the gathered selection is a whole stride whether or not it has
+    rows."""
     keys = rows_module.ConcatKeys(None, None, 1 << 20, None)
     covered = []
     for rank in range(world):
@@ -205,3 +206,36 @@ def test_unsplit_rows_gather_nothing(monkeypatch):
     torch_calls = _groups(monkeypatch, tp, dcp)
     score_module._gather_split(torch.zeros(5, 4), rows_module.RowSplit.of(5))
     assert torch_calls == [] and tp.calls == [] and dcp.calls == []
+
+
+def test_row_split_refuses_an_unknown_group():
+    """Anything but "dcp" / "tp" would otherwise gather on the DCP group."""
+    with pytest.raises(ValueError):
+        rows_module.RowSplit.of(8, 0, 2, group="TP")
+
+
+@pytest.mark.parametrize(
+    "usable_on_ranks, expected",
+    [((1, 1), True), ((0, 0), False), ((1, 0), RuntimeError), ((0, 1), RuntimeError)],
+)
+def test_ranks_must_agree_on_the_gather_transport(
+    monkeypatch, usable_on_ranks, expected
+):
+    """pynccl is built per rank and only warns on failure: ranks that disagree
+    would gather over different transports (or not split at all) and hang, so
+    the startup check raises instead. The fake all_reduce folds in the other
+    rank's vote the way MIN over the CPU group would."""
+    mine, other = usable_on_ranks
+    group = _Group("tp", _Pynccl() if mine else None)
+    group.cpu_group = "cpu"
+
+    def all_reduce(votes, op, group):
+        assert group == "cpu"
+        votes.copy_(torch.minimum(votes, torch.tensor([other, -other])))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    if expected is RuntimeError:
+        with pytest.raises(RuntimeError):
+            score_module.split_gather_comm_on_every_rank(group)
+    else:
+        assert score_module.split_gather_comm_on_every_rank(group) is expected

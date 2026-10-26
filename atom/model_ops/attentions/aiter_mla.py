@@ -468,6 +468,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
+        if self._publishes_dcp_local_lens:
+            from atom.distributed.dcp_utils import get_dcp_group
+            from atom.model_ops.indexer.score import split_gather_comm_on_every_rank
+
+            # The indexer's row split gathers on pynccl where the group has it,
+            # so every DCP rank must agree on that (raises otherwise).
+            split_gather_comm_on_every_rank(get_dcp_group())
         self.indexes_by_token_table = indexes_by_token_table(
             self.is_sparse, self.dcp_world_size, self.index_kpool
         )
