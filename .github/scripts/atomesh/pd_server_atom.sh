@@ -2498,7 +2498,7 @@ run_aiperf_agentic_benchmark() {
     # Allow faulthandler to flush, then stop AIPerf instead of waiting 9000s.
     (
       while kill -0 "${aiperf_pid}" 2>/dev/null; do
-        if grep -lE 'Memory access fault by GPU|proc died unexpectedly \(exitcode=' \
+        if grep -lE 'Memory access fault by GPU|proc died unexpectedly \(exitcode=|M3 sparse PA bounds validation failed' \
           "${RUN_DIR}"/logs/*-rank-*.log > "${out_dir}/gpu-fault-logs.txt" 2>/dev/null; then
           echo "[gpu-fault] server worker crashed; stopping diagnostic load generator" >&2
           sleep 5
