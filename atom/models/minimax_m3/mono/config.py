@@ -10,15 +10,57 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# One CTA per MI355X CU; the kernels rely on every CTA being co-resident.
-BLOCKS = 256
-THREADS = 512
-WAVES = THREADS // 64
+from atom.mono.plan.shard import Shard, ShardError
 
+# the execution model (one CTA per CU, all co-resident) is the framework's
+
+# the model's full widths
+Q_HEADS = 64
+KV_HEADS = 4
+INDEX_HEADS = 4
+EXPERT_INTER = 3072  # a routed expert's intermediate width
+DENSE_INTER_FULL = 12288  # the dense layers' MLP intermediate width
+
+
+@dataclass(frozen=True)
+class Dims:
+    """A TP rank's share of M3's widths. The kernels hold one k / v head and one
+    index q head a rank: a TP size that gives a rank another count is refused."""
+
+    tp: int
+
+    def __post_init__(self):
+        shard = Shard(self.tp)
+        shard.split(Q_HEADS, "query heads")
+        shard.split(EXPERT_INTER, "expert intermediate")
+        shard.split(DENSE_INTER_FULL, "dense intermediate")
+        for full, what in ((KV_HEADS, "kv heads"), (INDEX_HEADS, "index heads")):
+            if shard.split(full, what) != 1:
+                raise ShardError(
+                    f"{full // self.tp} {what} a rank at TP {self.tp}: the kernels"
+                    " hold one"
+                )
+
+    @property
+    def q_heads(self) -> int:
+        return Q_HEADS // self.tp
+
+    @property
+    def inter(self) -> int:
+        return EXPERT_INTER // self.tp
+
+    @property
+    def dense_inter(self) -> int:
+        return DENSE_INTER_FULL // self.tp
+
+
+# the TP sizes the kernels are built for
+SUPPORTED_TP = (4,)
+TP = 4
 HIDDEN = 6144
 HEAD_DIM = 128
 ROTARY_DIM = 64
-LOCAL_Q_HEADS = 16
+LOCAL_Q_HEADS = Dims(TP).q_heads
 
 
 def qkv_rows(idx_heads: int) -> int:
@@ -34,7 +76,8 @@ N_ROUTED = 128
 TOP_K = 4
 SHARED_EXPERT = N_ROUTED  # the fused shared expert's id
 MOE_SLOTS = TOP_K + 1
-INTER = 768  # expert intermediate per rank
+INTER = Dims(TP).inter  # expert intermediate per rank
+DENSE_INTER = Dims(TP).dense_inter  # dense MLP intermediate per rank
 
 SPARSE_BLOCK = 128
 TOPK_BLOCKS = 16
@@ -45,14 +88,12 @@ MAX_INDEX_BLOCKS = MAX_CONTEXT // SPARSE_BLOCK
 PAGE16 = 16
 
 MAX_TOKENS = 16  # tokens one mono step serves (the MFMA B operand holds 16)
-TP = 4
 # indexer context parallelism: a rank computes every index q head
 MAX_QKV_ROWS = qkv_rows(TP)
-# indexer context parallelism serves a step's requests past this many index
-# blocks: its selection costs a fixed ~7 us (S = 1: ~43.5 us/layer at any length)
-# that the one-head path's O(n^2) ranking passes between 258 and 297 blocks
-# (S = 1 and S = 16 alike; logs/cp_threshold*.log)
-INDEX_CP_FROM_BLOCKS = 288
+# a request past this many index blocks is selected by the split stage's long
+# path (with every index head: context-parallel); up to it one CTA ranks every
+# block, one a thread (THREADS: a second a thread slows every context)
+LONG_FROM_BLOCKS = 512
 
 
 @dataclass(frozen=True)
@@ -82,9 +123,3 @@ class IndexHeads:
 
 # without indexer context parallelism: the rank's own index q head only
 ONE_INDEX_HEAD = IndexHeads()
-
-LAYER_SLOTS = 128  # mailbox epochs: step * LAYER_SLOTS + layer + 1
-
-
-class MonoUnsupported(Exception):
-    """The loaded model or runtime configuration is outside what mono serves."""

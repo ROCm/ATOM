@@ -11,17 +11,23 @@ and throughput require validation for the deployment workload.
 
 ## Supported configuration
 
-DSpark requires BF16 KV, the FP8 index plane and text requests. Tensor
+DSpark requires BF16 KV and text requests. The index plane is FP8 by default
+or FP4. Tensor
 parallelism follows the model's dimension-divisibility checks, with no TP4-only
 admission gate. Configuration tests cover TP1/2/4/8; the GPU benchmark evidence
 covers TP2 and TP4 without EP at level 3 FULL. See the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) for commands and the
 fixed acceptance length used in those measurements.
 
+Data-parallel attention is also supported with BF16 KV and the FP8
+index plane. Text prefill can use TBO with tensor-sharded experts or the
+validated DPA4 + MORI EP4 high-throughput configuration (16 GiB MoRI heap);
+see the [DPA and TBO configuration](deepseek_v41_runtime.md#data-parallel-attention).
+
 The existing quality/development baseline uses TP4 with whole-expert EP at
 compilation level 0. Target execution can be eager or use whole-forward decode
 graphs (`FULL`); the draft has its own graph. The runtime also accepts
-`PIECEWISE` at level 0, and level 3 with FULL graphs or eager execution.
+`TR_HYBRID` at level 0, and level 3 with FULL graphs or eager execution.
 
 Fixed acceptance schedules use the common `--spec-decode-acceptance-length`
 or `--spec-decode-acceptance-rate` options and the shared rejection sampler.
@@ -58,8 +64,8 @@ config = Config(
 For target graphs, set `enforce_eager=False` and
 `compilation_config=CompilationConfig(level=0, cudagraph_mode=CUDAGraphMode.FULL)`.
 A decode step is then two replays: the draft's, keyed by request count, and the
-target's, keyed by `(batch size, query bucket)`. `PIECEWISE` remains available
-and records the dense pieces only. Capture must not bind warmup slots or another
+target's, keyed by `(batch size, query bucket)`. `TR_HYBRID` remains available
+and records token graphs only. Capture must not bind warmup slots or another
 request's window; `validate_runtime --graph` is what asserts it does not.
 
 ## State and sampling contracts

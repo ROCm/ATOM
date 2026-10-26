@@ -1,6 +1,6 @@
 import fnmatch
 import re
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -22,13 +22,20 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.qwen4_exp.hyperconnection import (
-    Qwen4ExpHyperConnection,
+from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpHyperConnection
+from atom.model_ops.qwen4_exp.ops.gated import (
+    is_per_token_fp8_linear,
+    sigmoid_mul,
+    sigmoid_rmsnorm,
+    sigmoid_rmsnorm_quant,
 )
-from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul, sigmoid_rmsnorm
+from atom.model_ops.qwen4_exp.ops.moe_decode import moe_decode_single_token
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.model_ops.qwen4_exp.qsa_attention import (
     Qwen4ExpAttention,
+)
+from atom.model_ops.topK import (
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_next import Qwen3NextMLP, mamba_v2_sharded_weight_loader
@@ -41,6 +48,19 @@ from atom.models.utils import (
 )
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.forward_context import get_forward_context
+
+
+def qwen4_exp_packed_modules_mapping(
+    base_mapping: dict[str, Any], split_ngram_parts: int
+) -> dict[str, Any]:
+    """Add the checkpoint's n-gram shards to this model's packed mapping."""
+    return {
+        **base_mapping,
+        **{
+            f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
+            for shard in range(int(split_ngram_parts))
+        },
+    }
 
 
 class _Qwen4ExpQuantizationConfig:
@@ -107,6 +127,21 @@ class _Qwen4ExpQuantizationConfig:
         return getattr(self._config, field + "global_spec")
 
 
+# The sigmoid-gated shared expert rides through the fused MoE as expert
+# `num_experts` (top-k + 1) and batch-1 MoE goes through
+# `moe_decode_single_token`; both are the default for the served model. MTP
+# builds its own block, and keeps the standalone shared expert because its
+# intent head loads without the extra slot.
+
+
+def _is_dynamic_ptpc_fp8(policy: LayerQuantConfig) -> bool:
+    return (
+        policy.quant_type == QuantType.per_Token
+        and policy.quant_dtype == dtypes.fp8
+        and policy.is_dynamic
+    )
+
+
 class Qwen4ExpRMSNormGated(nn.Module):
     """GDN's sigmoid gate with the checkpoint's BF16 cast boundaries."""
 
@@ -117,6 +152,11 @@ class Qwen4ExpRMSNormGated(nn.Module):
 
     def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         return sigmoid_rmsnorm(x, z, self.weight, self.eps)
+
+    def forward_quant(
+        self, x: torch.Tensor, z: torch.Tensor, quant_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return sigmoid_rmsnorm_quant(x, z, self.weight, self.eps, quant_dtype)
 
 
 def install_stacked_expert_loaders(experts: FusedMoE) -> None:
@@ -148,9 +188,13 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
     tp_rank = moe_parallel.tp_rank
     expert_map = getattr(experts, "expert_map", None)
     if expert_map is None:
-        expert_slice = slice(None)
+        # A fused shared expert occupies slots past the routed ones.
+        expert_slice = slice(0, experts.expert_layout.num_routed)
     else:
-        local = torch.nonzero(expert_map >= 0).flatten()
+        # The map can append a fused shared expert and an AITER sentinel.
+        # Stacked checkpoint tensors contain routed experts only.
+        routed_map = expert_map[: experts.expert_layout.num_routed]
+        local = torch.nonzero(routed_map >= 0).flatten()
         first, last = int(local[0]), int(local[-1])
         if last - first + 1 != local.numel():
             raise NotImplementedError(
@@ -214,6 +258,15 @@ class _UnfusedSharedExpertConfig:
         return getattr(self._config, name)
 
 
+class _FusedSharedExpertConfig(_UnfusedSharedExpertConfig):
+    """Config view exposing exactly one fused shared expert."""
+
+    def __getattr__(self, name: str):
+        if name == "n_shared_experts":
+            return 1
+        return getattr(self._config, name)
+
+
 class Qwen4ExpSparseMoeBlock(nn.Module):
     """512 routed experts, top-10, plus one sigmoid-gated shared expert.
 
@@ -222,11 +275,21 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
     column is the shared expert's gate.
     """
 
-    def __init__(self, config, quant_config, prefix: str = "") -> None:
+    def __init__(
+        self, config, quant_config, prefix: str = "", fuse_shared_expert: bool = False
+    ) -> None:
         super().__init__()
         self.prefix = prefix
         self.tp_size = get_tensor_model_parallel_world_size()
         self.n_routed_experts = int(config.num_experts)
+        self.fuse_shared = (
+            fuse_shared_expert
+            and is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                quant_config,
+                shared_expert_prefix=f"{prefix}.shared_expert",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
         if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"TP {self.tp_size} exceeds the expert count {self.n_routed_experts}"
@@ -239,13 +302,17 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        self.shared_expert = Qwen3NextMLP(
-            config.hidden_size,
-            config.shared_expert_intermediate_size,
-            config.hidden_act,
-            reduce_results=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.shared_expert",
+        self.shared_expert = (
+            None
+            if self.fuse_shared
+            else Qwen3NextMLP(
+                config.hidden_size,
+                config.shared_expert_intermediate_size,
+                config.hidden_act,
+                reduce_results=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.shared_expert",
+            )
         )
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -258,15 +325,52 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
             has_bias=False,
             prefix=f"{prefix}.experts",
-            config=_UnfusedSharedExpertConfig(config),
+            config=(
+                _FusedSharedExpertConfig(config)
+                if self.fuse_shared
+                else _UnfusedSharedExpertConfig(config)
+            ),
+            shared_expert_scoring_func="sigmoid" if self.fuse_shared else None,
             shared_expert_prefix=f"{prefix}.shared_expert",
         )
         install_stacked_expert_loaders(self.experts)
+        self._single_token_ok: bool | None = None
+
+    def _single_token_supported(self) -> bool:
+        """Whether `moe_decode_single_token` can read these experts.
+
+        It indexes global expert ids into the local weights, hard-codes a
+        320-wide intermediate, and reads FP8 weights with per-channel scales.
+        """
+        if self._single_token_ok is None:
+            ex = self.experts
+            s13 = getattr(ex, "w13_weight_scale", None)
+            s2 = getattr(ex, "w2_weight_scale", None)
+            n, two_inter = ex.w13_weight.shape[:2]
+            self._single_token_ok = (
+                ex.expert_map is None
+                and s13 is not None
+                and s2 is not None
+                and ex.w13_weight.dtype == dtypes.fp8
+                and ex.w2_weight.shape[-1] == 320
+                and s13.numel() == n * two_inter
+                and s2.numel() == n * ex.w2_weight.shape[1]
+            )
+        return self._single_token_ok
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         logits = self.gate(hidden_states)
+        if self.fuse_shared:
+            # The tail logit is the shared expert's sigmoid gate.
+            if hidden_states.shape[0] == 1 and self._single_token_supported():
+                out = self._single_token_experts(hidden_states, logits)
+            else:
+                out = self.experts(hidden_states=hidden_states, router_logits=logits)
+            if self.tp_size > 1:
+                out = tensor_model_parallel_all_reduce(out)
+            return out.view(orig_shape)
         routed = self.experts(
             hidden_states=hidden_states,
             router_logits=logits[:, : self.n_routed_experts],
@@ -277,6 +381,50 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             out = tensor_model_parallel_all_reduce(out)
         return out.view(orig_shape)
 
+    def _single_token_experts(self, hidden_states, logits):
+        ex = self.experts
+        n = ex.w13_weight.shape[0]
+        weights = (
+            ex.w13_weight,
+            ex.w13_weight_scale.view(n, -1),
+            ex.w2_weight,
+            ex.w2_weight_scale.view(n, -1),
+        )
+        if (
+            ex.renormalize
+            and ex.scoring_func == "softmax"
+            and not ex.use_grouped_topk
+            and ex.custom_routing_function is None
+            and ex.e_score_correction_bias is None
+            and ex.routed_scaling_factor == 1.0
+            and n == self.n_routed_experts + 1
+        ):
+            return moe_decode_single_token(
+                hidden_states,
+                None,
+                None,
+                *weights,
+                router_logits=logits,
+                top_k=ex.top_k,
+            )
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=hidden_states,
+            router_logits=logits,
+            use_grouped_topk=ex.use_grouped_topk,
+            top_k=ex.top_k,
+            renormalize=ex.renormalize,
+            topk_group=ex.topk_group,
+            num_expert_group=ex.num_expert_group,
+            custom_routing_function=ex.custom_routing_function,
+            scoring_func=ex.scoring_func,
+            e_score_correction_bias=ex.e_score_correction_bias,
+            fused_shared_experts_scoring_func=ex.shared_expert_scoring_func,
+            num_routing_experts=ex.global_num_experts,
+            num_fused_shared_experts=ex.num_fused_shared_experts,
+            routed_scaling_factor=ex.routed_scaling_factor,
+        )
+        return moe_decode_single_token(hidden_states, topk_ids, topk_weights, *weights)
+
 
 class Qwen4ExpLinearAttention(nn.Module):
     """Gated DeltaNet, on the 36 `linear_attention` layers.
@@ -286,6 +434,8 @@ class Qwen4ExpLinearAttention(nn.Module):
     existing MergedColumnParallelLinear at load time, with Q/K/V sharded
     independently. PTPC inputs use an FP8 QKVZ projection and a BF16 BA
     projection; unquantized inputs retain the single packed QKVZBA projection.
+    An online ptpc_fp8 target on QKV/Z selects the same split, with B/A left
+    at source precision whatever the online config says about them.
     """
 
     @property
@@ -316,9 +466,7 @@ class Qwen4ExpLinearAttention(nn.Module):
             )
             if self.quantized_inputs and not (
                 qkv == z
-                and qkv.quant_type == QuantType.per_Token
-                and qkv.quant_dtype == dtypes.fp8
-                and qkv.is_dynamic
+                and _is_dynamic_ptpc_fp8(qkv)
                 and not b.is_quantized
                 and not a.is_quantized
             ):
@@ -327,15 +475,19 @@ class Qwen4ExpLinearAttention(nn.Module):
                     "per-channel FP8 QKV/Z with unquantized B/A"
                 )
             if quant_config.online_quant:
-                for projection in ("qkv", "z", "b", "a"):
-                    name = f"{prefix}.in_proj_{projection}"
-                    policy = quant_config.get_layer_quant_config(
-                        name, use_online_quant=True
+                qkv, z = (
+                    quant_config.get_layer_quant_config(
+                        f"{prefix}.in_proj_{projection}", use_online_quant=True
                     )
-                    if policy.is_quantized:
+                    for projection in ("qkv", "z")
+                )
+                if qkv.is_quantized or z.is_quantized:
+                    if not (qkv == z and _is_dynamic_ptpc_fp8(qkv)):
                         raise ValueError(
-                            f"Qwen GDN input online quantization is not supported: {name}"
+                            "Qwen GDN input online quantization requires matching "
+                            f"ptpc_fp8 targets on {prefix}.in_proj_qkv / in_proj_z"
                         )
+                    self.quantized_inputs = True
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.config = config
@@ -444,11 +596,22 @@ class Qwen4ExpLinearAttention(nn.Module):
             allow_aiter_flydsl=True,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """`quantized` is an optional `(fp8, scale)` copy of `hidden_states`
+        that the FP8 QKVZ projection takes instead of quantizing it again."""
         num_tokens = hidden_states.shape[0]
         v_heads = self.num_v_heads // self.tp_size
         if self.quantized_inputs:
-            mixed_qkv, z = self.in_proj_qkvz(hidden_states).split(
+            qkvz = (
+                self.in_proj_qkvz(hidden_states)
+                if quantized is None
+                else self.in_proj_qkvz(quantized[0], x_scale=quantized[1])
+            )
+            mixed_qkv, z = qkvz.split(
                 [self.conv_dim // self.tp_size, self.value_dim // self.tp_size], dim=-1
             )
             b, a = self.in_proj_ba(hidden_states).chunk(2, dim=-1)
@@ -467,6 +630,11 @@ class Qwen4ExpLinearAttention(nn.Module):
 
         core_attn_out = torch.empty_like(z)
         core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
+        if is_per_token_fp8_linear(self.out_proj):
+            x, x_scale = self.norm.forward_quant(
+                core_attn_out, z, self.out_proj.params_dtype
+            )
+            return self.out_proj(x, x_scale=x_scale)
         core_attn_out = self.norm(core_attn_out, z)
         return self.out_proj(core_attn_out)
 
@@ -486,9 +654,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         prefix: str = "",
         layer_num: int = 0,
         quant_config=None,
+        fused_hc: bool = False,
+        fuse_shared_expert: bool = False,
     ) -> None:
         super().__init__()
         config = atom_config.hf_config
+        self.fused_hc = fused_hc
         self.layer_type = layer_type
         self.layer_idx = layer_num
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -541,9 +712,85 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
-        self.mlp = Qwen4ExpSparseMoeBlock(config, quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = Qwen4ExpSparseMoeBlock(
+            config,
+            quant_config,
+            prefix=f"{prefix}.mlp",
+            fuse_shared_expert=fuse_shared_expert,
+        )
 
     def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pending: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
+        """Fused: returns `(streams, pending)` where `pending` is this layer's
+        MLP combine, deferred into the next hyper-connection. Unfused: returns
+        the streams; the MTP drafter runs its single layer this way."""
+        if not self.fused_hc:
+            return self._forward_unfused(positions, hidden_states, input_ids)
+        if self.ple is not None:
+            if pending is not None:
+                hidden_states = self.attn_hyper_connection.apply_pending(
+                    hidden_states, pending
+                )
+                pending = None
+            hidden_states = self._apply_ple(hidden_states, input_ids)
+        quant_dtype = self._attn_input_quant_dtype()
+        if quant_dtype is None:
+            mixed, (hidden_states, raw) = self.attn_hyper_connection.mix_fused(
+                hidden_states, pending
+            )
+            quantized = None
+        else:
+            mixed, quantized, (hidden_states, raw) = (
+                self.attn_hyper_connection.mix_fused_quant(
+                    hidden_states, pending, quant_dtype
+                )
+            )
+        if self.layer_type == "linear_attention":
+            sub_output = self.linear_attn(mixed, quantized)
+        else:
+            sub_output = self.self_attn(positions, mixed, quantized)
+        if self.tp_size > 1:
+            sub_output = tensor_model_parallel_all_reduce(sub_output)
+        mixed, (hidden_states, raw) = self.mlp_hyper_connection.mix_fused(
+            hidden_states, (sub_output, raw)
+        )
+        # The MoE block owns its own all-reduce.
+        return hidden_states, (self.mlp(mixed), raw)
+
+    def _attn_input_quant_dtype(self) -> torch.dtype | None:
+        """FP8 dtype of the per-token GEMM that reads the attention input, if
+        the attention hyper-connection should quantize it for that GEMM."""
+        if self.layer_type == "linear_attention":
+            proj = getattr(self.linear_attn, "in_proj_qkvz", None)
+        else:
+            proj = self.self_attn.qkv_proj
+        if proj is not None and is_per_token_fp8_linear(proj):
+            return proj.params_dtype
+        return None
+
+    def _apply_ple(self, hidden_states, input_ids):
+        ple_metadata = get_forward_context().attn_metadata.ple_metadata
+        if ple_metadata is not None:
+            return hidden_states + self.ple.forward_with_state(
+                hidden_states, input_ids, ple_metadata
+            )
+        starts = torch.tensor(
+            [0, hidden_states.shape[0]], device=hidden_states.device, dtype=torch.int32
+        )
+        context = torch.full(
+            (1, self.ple.short_conv_dilation - 1),
+            self.ple.ple_embedding.eos_token_id,
+            device=hidden_states.device,
+            dtype=torch.int64,
+        )
+        return hidden_states + self.ple(hidden_states, input_ids, starts, context)
+
+    def _forward_unfused(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -616,6 +863,8 @@ class Qwen4ExpModel(nn.Module):
                 prefix=prefix,
                 layer_num=layer_num,
                 quant_config=quant_config,
+                fused_hc=True,
+                fuse_shared_expert=True,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
@@ -656,12 +905,15 @@ class Qwen4ExpModel(nn.Module):
             else self.get_input_embeddings(input_ids)
         ).repeat(1, self.hc_count)
 
+        pending = None
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states = layer(positions, hidden_states, input_ids)
-
+            hidden_states, pending = layer(positions, hidden_states, input_ids, pending)
         if self.return_hc_state:
+            hidden_states = self.hyper_connection_mixer.apply_pending(
+                hidden_states, pending
+            )
             return hidden_states.view(-1, self.hc_count, self.config.hidden_size)
-        mixed, _ = self.hyper_connection_mixer.mix(hidden_states)
+        mixed, _ = self.hyper_connection_mixer.mix_fused(hidden_states, pending)
         return mixed
 
 
@@ -748,12 +1000,8 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         if atom_config.pipeline_parallel_size > 1:
             raise ValueError("Qwen3.8-Flash-Next does not support pipeline parallelism")
         mode = atom_config.compilation_config.cudagraph_mode
-        if (
-            not atom_config.enforce_eager
-            and mode is not None
-            and mode.requires_piecewise_compilation()
-        ):
-            raise ValueError("Qwen3.8-Flash-Next has no piecewise compilation support")
+        if not atom_config.enforce_eager and mode is not None and mode.uses_tr_hybrid():
+            raise ValueError("Qwen3.8-Flash-Next has no TR_HYBRID graph support")
         if atom_config.torch_dtype != torch.bfloat16:
             raise ValueError("Qwen3.8-Flash-Next requires BF16 activations")
         if atom_config.hf_config.output_gate_type != "sigmoid":
@@ -766,13 +1014,9 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             if atom_config.speculative_config is not None
             else ()
         )
-        self.packed_modules_mapping = {
-            **self.packed_modules_mapping,
-            **{
-                f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
-                for shard in range(int(config.split_ngram_parts))
-            },
-        }
+        self.packed_modules_mapping = qwen4_exp_packed_modules_mapping(
+            self.packed_modules_mapping, int(config.split_ngram_parts)
+        )
         self.atom_config = atom_config
         self.quant_config = (
             _Qwen4ExpQuantizationConfig(atom_config.quant_config)
@@ -801,6 +1045,14 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             prefix=maybe_prefix(prefix, "model"),
             quant_config=self.quant_config,
         )
+        self.fused_shared_experts = int(
+            any(
+                getattr(m, "fuse_shared", False)
+                for m in self.model.modules()
+                if isinstance(m, Qwen4ExpSparseMoeBlock)
+            )
+        )
+        self.disable_fused_shared_loading = not self.fused_shared_experts
         for module in self.model.modules():
             if isinstance(module, Qwen4ExpLinearAttention):
                 for source, (target, shard) in module.packed_modules_mapping.items():
@@ -882,5 +1134,5 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=int(self.config.num_experts),
+            num_experts=int(self.config.num_experts) + self.fused_shared_experts,
         )

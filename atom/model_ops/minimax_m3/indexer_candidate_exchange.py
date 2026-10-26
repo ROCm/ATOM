@@ -174,8 +174,13 @@ def _merge_topk(
             0,
             128,
             PAGES_PER_BLOCK,
-            NUM_KV_HEADS,
-            BLOCK_SIZE_T,
+            # This path's cache has its blocks back to back, so the stride
+            # equals the pages a block fills. Passed by keyword: the parameter
+            # sits between `pages_per_block` and `NUM_KV_HEADS`, so a
+            # positional list silently shifts the two constexprs after it.
+            block_page_stride=PAGES_PER_BLOCK,
+            NUM_KV_HEADS=NUM_KV_HEADS,
+            BLOCK_SIZE_T=BLOCK_SIZE_T,
         )
 
 

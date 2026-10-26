@@ -101,6 +101,7 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 # GLM-5.3-Flash's MLA is NoPE (`qk_rope_head_dim == 0`), but the ROCm stack
 # assumes DeepSeek's geometry throughout: ATOM allocates the paged MLA entry at
@@ -645,7 +646,7 @@ class Glm5NextIndexer(Indexer):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
-    ) -> torch.Tensor:
+    ) -> None:
         from atom.utils.forward_context import get_forward_context
 
         forward_context = get_forward_context()
@@ -720,7 +721,7 @@ class Glm5NextIndexer(Indexer):
                 )
             if state_slot_idx_in is None:
                 state_slot_idx_in = state_slot_idx
-            out = torch.ops.aiter.sparse_attn_indexer_kpool(
+            torch.ops.aiter.sparse_attn_indexer_kpool(
                 hidden_states,
                 self.k_cache.kv_cache[0],
                 q_fp8,
@@ -738,14 +739,14 @@ class Glm5NextIndexer(Indexer):
                 self.topk_tokens,
                 self.index_kpool,
                 self.head_dim,
-                self.max_model_len,
+                self.is_mtp,
                 self.topk_out_width,
                 self.scale_fmt,
                 self.stable_topk,
             )
-            return out
+            return
 
-        out = self.sparse_attn_indexer_impl(
+        self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
@@ -774,7 +775,6 @@ class Glm5NextIndexer(Indexer):
             False,
             self.stable_topk,
         )
-        return out
 
 
 class _ZeroRopePad:
@@ -1078,6 +1078,7 @@ class Glm5NextDecoderLayer(nn.Module):
         return self.hc.post_expand(x, residual, post, comb)
 
 
+@token_graph
 @support_torch_compile
 class Glm5NextModel(nn.Module):
     def __init__(self, *, atom_config: Config, prefix: str = "") -> None:

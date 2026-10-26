@@ -450,7 +450,7 @@ def test_actual_chat_handler_merges_controls_before_encoding(
 ):
     invoke, prompts = chat_endpoint
     response = invoke(**controls)
-    message = response.choices[0]["message"]
+    message = json.loads(response.body)["choices"][0]["message"]
     assert message["content"] == "answer"
     assert bool(message.get("reasoning_content")) == (budget is not None)
     if budget is None:

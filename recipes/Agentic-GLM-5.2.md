@@ -45,19 +45,40 @@ The validated prefill and decode configurations are:
 | Parallelism | TP1 × PP4 | TP4 × DCP4 |
 | PP partition | `20,20,20,18` | N/A |
 | KV cache | FP8, block size 16 | FP8, block size 16 |
-| GPU memory utilization | 0.85 | 0.85 |
+| GPU memory utilization | 0.85 | 0.94 |
 | Maximum sequences | 512 | 512 |
 | Compilation | Level 3, enforce eager | Level 3 |
 | CUDAGraph | Disabled by enforce eager | Full mode, configured sizes up to 256 |
-| Batched-token budget | 8192 | 16384 (default) |
-| LMCache | 256 GiB CPU tier, 256-token chunks | Disabled |
+| Batched-token budget | 8192 | 2048 |
+| LMCache | 256 GiB CPU tier, 256-token chunks, lookup server on every PP stage | Disabled |
+| HTTP keep-alive | 900 s | 900 s |
 | Native prefix caching | Enabled | Enabled |
 | Speculative decoding | MTP3, forced AL 2.99 | MTP3, forced AL 2.99 |
 
 Both nodes use MXFP4 weights, online PTPC FP8 quantization,
 `ATOM_MLA_PAGE_SIZE=1`, `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047`,
 `ATOM_ONLINE_QUANT_STREAMING=0`, and `ATOM_USE_TRITON_MLA=0`. The prefill node
-enables `OFFLOAD_PROFILE=1` and `OFFLOAD_MIN_LOAD_TOKENS=0`.
+enables `OFFLOAD_PROFILE=1` and `OFFLOAD_MIN_LOAD_TOKENS=0`. The decode node sets
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1`.
+
+Why these settings matter at high concurrency (c48 and above):
+
+- **`LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3` (prefill).** Run an LMCache
+  lookup server on every PP stage. If only stage 0 looks up, stages 1-3 never
+  refresh their LRU and evict in FIFO order. Once the CPU tier fills, the
+  stages disagree on which chunks exist, and loads fail all-or-nothing.
+- **`--timeout-keep-alive 900` (prefill and decode).** uvicorn's 5 s default
+  is shorter than the router's 50 s idle-connection timeout. The router can
+  reuse a socket the server just closed. It then retries both prefill and
+  decode, and the first prefill's KV is orphaned.
+- **Decode memory bundle.** Three decode settings together raise decode KV
+  blocks from about 154K to about 196K (+28%):
+  - `--gpu-memory-utilization 0.94`
+  - `--max-num-batched-tokens 2048`; MTP decode batches stay far below it.
+  - `AITER_REUSE_IDENTICAL_COMM_GROUPS=1`
+
+  Once prefill keeps up, decode KV caps the request rate. The retained prefix
+  pool also keeps P->D re-pulls down.
 
 #### Start the PD Deployment
 
@@ -90,6 +111,7 @@ export PYTHONHASHSEED=0
 export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MONO_ENABLE=0
 export ATOM_MLA_PAGE_SIZE=1
 export ATOM_ONLINE_QUANT_STREAMING=0
 export ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047
@@ -106,6 +128,7 @@ env \
   LMCACHE_NUMA_MODE=auto \
   LMCACHE_MAX_LOCAL_CPU_SIZE=256 \
   LMCACHE_CHUNK_SIZE=256 \
+  LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3 \
   OFFLOAD_PROFILE=1 \
   OFFLOAD_MIN_LOAD_TOKENS=0 \
   nohup python3 -m atom.entrypoints.openai_server \
@@ -128,6 +151,7 @@ env \
     --pipeline-parallel-size 4 \
     --enforce-eager \
     --max-num-batched-tokens 8192 \
+    --timeout-keep-alive 900 \
     --kv-transfer-config \
       '{"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"127.0.0.1","handshake_port":6301,"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}' \
     >prefill.log 2>&1 &
@@ -143,6 +167,7 @@ export PYTHONHASHSEED=0
 export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MONO_ENABLE=0
 export ATOM_MLA_PAGE_SIZE=1
 export ATOM_ONLINE_QUANT_STREAMING=0
 export ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047
@@ -154,13 +179,14 @@ export LD_LIBRARY_PATH="$(python3 -c \
 
 env \
   HIP_VISIBLE_DEVICES=4,5,6,7 \
+  AITER_REUSE_IDENTICAL_COMM_GROUPS=1 \
   nohup python3 -m atom.entrypoints.openai_server \
     --model "${MODEL_PATH}" \
     --host 0.0.0.0 \
     --trust-remote-code \
     --kv_cache_dtype fp8 \
     --block-size 16 \
-    --gpu-memory-utilization 0.85 \
+    --gpu-memory-utilization 0.94 \
     --max-num-seqs 512 \
     --enable_prefix_caching \
     --online_quant_config \
@@ -175,6 +201,8 @@ env \
     --cudagraph-mode FULL \
     --cudagraph-capture-sizes \
       '[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]' \
+    --max-num-batched-tokens 2048 \
+    --timeout-keep-alive 900 \
     --kv-transfer-config \
       '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"127.0.0.1","handshake_port":6301,"protocol":"rdma"}' \
     >decode.log 2>&1 &
@@ -227,7 +255,8 @@ depth is chosen per concurrency point.
 
 | Concurrency | Parallelism | `--num-speculative-tokens` | `--spec-decode-acceptance-length` |
 |---|---|---:|---:|
-| C2, C4, C8 | TP4 | 5 | `3.61` |
+| C1, C2 | TP4, mono decode | 3 | `2.99` |
+| C4, C8 | TP4 | 5 | `3.61` |
 | C10 | TP4 | 4 | `3.33` |
 | C16, C24, C32, C40 | TP4 + DCP4 | 4 | `3.33` |
 | C48 | TP4 + DCP4 | 3 | `2.99` |
@@ -238,10 +267,27 @@ Acceptance lengths are the golden values from
 
 #### GLM-5.2 MXFP4 with TP + MTP (small concurrency)
 
-For small-concurrency runs, `C2`-`C8` use five speculative tokens and `C10` uses
-four; the case block resolves both the draft depth and its golden AL from
+For small-concurrency runs, `C1` and `C2` run the GLM-5.2 MonoKernel decode
+with three speculative tokens, `C4`-`C8` use five and `C10` uses four; the
+script resolves the draft depth, its golden AL and whether mono is on from
 `CONC`. These points run on the native GPU prefix cache alone -- LMCache CPU
-offload is only used from `C16` upwards.
+offload is only used from `C16` upwards. `C1` and `C2` cap the server at exactly
+`CONC` running sequences (`--max-num-seqs` 1 and 2); the other points admit
+2x `CONC`.
+
+Mono's per-step cost grows with the verify width, so it is fastest at the
+shallowest served draft, while the production path is fastest at MTP5. In a C2
+AgentX sweep (TP4, 1800 s per point, golden AL per depth), mono at MTP3 reached
+239.82 output tok/s/user against 206.95 for the production path at MTP5
+(+15.9%; ROCm/ATOM#2535). C1 uses the same depth: swept on mono alone, it was
+also fastest at MTP3. C4 and above stay on the production path because the
+current multi-chunk native schedule is slower. Set `ENABLE_MONO=0` to run C1/C2
+on the production path (MTP5, AL 3.61) for an A/B.
+
+Check the server log before using a mono number: an armed run logs
+`GLM-5.2 MonoKernel on: S=<width> ...` on its first served step, and a refused
+deployment logs `GLM-5.2 MonoKernel off: <why>` and serves on the production
+path without any other sign.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -252,11 +298,21 @@ export AITER_USE_FLYDSL_MOE_SORTING=1
 
 export TP=${TP:-4}
 export CONC=${CONC:-8}
+export ENABLE_MONO=${ENABLE_MONO:-1}
+ATOM_MONO_ENABLE=0
+
+# Admission is 2x CONC, except C1/C2, which admit exactly CONC sequences and
+# capture graphs only up to it.
+MAX_NUM_SEQS=$((CONC * 2))
 
 # MTP_K and MTP_AL move together: the AL is the golden value for that depth.
 case "${CONC}" in
-  1)  CUDAGRAPH_CAPTURE_SIZES='[1,2]';                       MTP_K=5; MTP_AL=3.61 ;;
-  2)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4]';                     MTP_K=5; MTP_AL=3.61 ;;
+  1)
+    CUDAGRAPH_CAPTURE_SIZES='[1]'; MAX_NUM_SEQS=1; MTP_K=5; MTP_AL=3.61
+    ;;
+  2)
+    CUDAGRAPH_CAPTURE_SIZES='[1,2]'; MAX_NUM_SEQS=2; MTP_K=5; MTP_AL=3.61
+    ;;
   4)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8]';                   MTP_K=5; MTP_AL=3.61 ;;
   8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]';             MTP_K=5; MTP_AL=3.61 ;;
   10) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20]';          MTP_K=4; MTP_AL=3.33 ;;
@@ -266,6 +322,16 @@ case "${CONC}" in
     exit 2
     ;;
 esac
+
+# C1/C2 run mono decode at MTP3, mono's fastest depth; 2.99 is MTP3's golden
+# AL. ENABLE_MONO=0 keeps them on the production path (MTP5 above).
+if [[ "${ENABLE_MONO}" == "1" && ( "${CONC}" == "1" || "${CONC}" == "2" ) ]]; then
+  MTP_K=3
+  MTP_AL=2.99
+  ATOM_MONO_ENABLE=1
+fi
+
+export ATOM_MONO_ENABLE
 
 python -m atom.entrypoints.openai_server \
   --model "${MODEL_PATH}" \
@@ -278,7 +344,7 @@ python -m atom.entrypoints.openai_server \
   --online_quant_config \
     '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
   --tensor-parallel-size "${TP}" \
-  --max-num-seqs "$((CONC * 2))" \
+  --max-num-seqs "${MAX_NUM_SEQS}" \
   --cudagraph-capture-sizes "${CUDAGRAPH_CAPTURE_SIZES}" \
   --num-speculative-tokens "${MTP_K}" \
   --method mtp \
@@ -307,12 +373,26 @@ decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
 > so the mxfp4 gate does not apply) and adds its own separate KV cost, on top
 > of the ~3.7% above — see `enable_query_replication` in
 > [Context Parallel Guide](../docs/context_parallel_guide.md#enable_query_replication-qrep)
-> for that cost's typical size (~5% on DeepSeek-R1 tp8/dcp8). **This exact
-> combination — MXFP4 weights + TP4/DCP4 + MTP + QREP — has not been run
-> end-to-end**; only GLM-5.2 FP8 tp8/dcp8 has. If `--gpu-memory-utilization
-> 0.95` runs tight at your concurrency, lower it or pass
-> `--dcp-config '{"enable_query_replication": false}'` to opt back out.
+> for that cost's typical size (~5% on DeepSeek-R1 tp8/dcp8). If
+> `--gpu-memory-utilization 0.95` runs tight at your concurrency, lower it or
+> pass `--dcp-config '{"enable_query_replication": false}'` to opt back out.
 > Compare MTP and non-MTP runs at the same concurrency and QREP setting.
+>
+> Sparse prefill uses two DCP optimizations: `ATOM_DCP_PREFILL_QREP=1` builds
+> the DCP group's query heads locally instead of all-gathering them, and the
+> non-persistent fp8 gqa64 MLA kernel (`ATOM_DCP_SPARSE_PREFILL_NONPS`, on by
+> default) needs no work metadata; it needs an aiter with ROCm/aiter#6132 and
+> `--max-num-batched-tokens` <= 32768. Together they cut prefill latency by ~20%
+> on MI355X TP4/DCP4 (64K prompt: 4.73 s to 3.74 s; 16K: 1.23 s to 1.00 s), measured
+> as the time to the first token of a unique prompt with `max_tokens=1`, mean of
+> 4 runs per setting; the per-flag breakdown is in ROCm/ATOM#2506.
+>
+> The sparse-prefill indexer is also split across the DCP group by query row
+> instead of by key (ROCm/ATOM#2496). This has no switch and is always on under
+> DCP. On this configuration (AgentX, 3600 s per arm, the two arms differing
+> only in that commit) it cut per-request latency by a paired median of 4.15%
+> at C32 and 5.53% at C48, raised p90 ITL interactivity by 8.3% and 8.9%, and
+> raised throughput per GPU by 3.5% and 5.1%.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -320,6 +400,10 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 export PYTHONNOUSERSITE=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MONO_ENABLE=0
+
+# DCP sparse prefill: local query heads (QREP); the non-persistent MLA kernel is on by default
+export ATOM_DCP_PREFILL_QREP=1
 
 # LMCache-related settings
 export PYTHONHASHSEED=0
@@ -397,6 +481,7 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MONO_ENABLE=0
 
 # LMCache-related settings
 export PYTHONHASHSEED=0
@@ -540,6 +625,14 @@ local-chat-completions ({'model': '/shared/data/amd_int/models/GLM-5.2-MXFP4', '
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9704|±  |0.0047|
 |     |       |strict-match    |     5|exact_match|↑  |0.9712|±  |0.0046|
 ```
+
+The decode memory bundle was checked with full GSM8K (1319 samples, 20-shot
+`local-completions`, real MTP3 without forced acceptance), with and without the
+bundle. The decode configuration matches the one above. The prefill was the
+two-NUMA LMCache MP variant from the stacked PR. The results were strict 0.9287
+vs 0.9340 and flexible 0.9280 vs 0.9356. A paired McNemar test on the
+same questions gives p=0.53 (strict) and p=0.34 (flexible), so the difference
+is not significant.
 
 Validated GSM8K 5-shot accuracy for the PD-disaggregated deployment above
 (full 1319 samples, real MTP3 without synthetic acceptance):

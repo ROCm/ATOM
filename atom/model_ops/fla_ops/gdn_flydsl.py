@@ -295,17 +295,29 @@ def decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
     )
 
 
-def decode(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
-    """Fused gating/normalization/recurrence, zero-copy logical KV state view."""
+def decode(q, k, v, a, b, state, A_log, dt_bias, reads, writes, out=None):
+    """Fused gating/normalization/recurrence, zero-copy logical KV state view.
+
+    `out`, a contiguous `[batch, hv, 128]` buffer, receives the result
+    directly when the kernel writes every row itself.
+    """
     if not decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
         raise ValueError("Unsupported AITER FlyDSL decode inputs")
     _log_dispatch("decode (zero-copy VK state)")
     batch, hv = v.shape[1:3]
     fn = ops()[0]
-    allocate = (
-        torch.empty if getattr(fn, "zeroes_invalid_output", False) else torch.zeros
-    )
-    output = allocate((batch, 1, hv, 128), device=q.device, dtype=q.dtype)
+    writes_all_rows = getattr(fn, "zeroes_invalid_output", False)
+    if (
+        out is not None
+        and writes_all_rows
+        and out.is_contiguous()
+        and out.shape == (batch, hv, 128)
+        and out.dtype == q.dtype
+    ):
+        output = out.view(batch, 1, hv, 128)
+    else:
+        allocate = torch.empty if writes_all_rows else torch.zeros
+        output = allocate((batch, 1, hv, 128), device=q.device, dtype=q.dtype)
     fn(
         query=q.transpose(0, 1),
         key=k.transpose(0, 1),

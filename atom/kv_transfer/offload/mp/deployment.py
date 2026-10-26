@@ -263,8 +263,15 @@ def _server_urls(config: Any) -> list[str]:
     return urls
 
 
-def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
-    """Build a model/layout namespace shared by scheduler and workers."""
+def _model_namespace(
+    config: Any, *, checkpoint_spec: Any = None, images: bool = True
+) -> str:
+    """Build a model/layout namespace shared by scheduler and workers.
+
+    A native-state layout without images (`images=False`: PAGE KV alone, no
+    image group) gets a namespace of its own, so a scheduler and workers that
+    disagree about images find nothing rather than each other's objects.
+    """
 
     cfg = offcfg.build_lmcache_config(_storage_kv_transfer_config(config))
     world_size = offcfg.lmcache_replica_world_size(config)
@@ -286,7 +293,8 @@ def _model_namespace(config: Any, *, checkpoint_spec: Any = None) -> str:
         fingerprint = hashlib.sha256(
             json.dumps(document, sort_keys=True).encode()
         ).hexdigest()[:32]
-        namespace += f"::native-state-v1-{fingerprint}"
+        kind = "native-state" if images else "native-page"
+        namespace += f"::{kind}-v1-{fingerprint}"
     return namespace
 
 
@@ -306,7 +314,9 @@ def _parallel_strategy(config: Any, worker_id: int) -> Any:
     )
 
 
-def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
+def _make_scheduler_adapter(
+    config: Any, *, checkpoint_spec: Any = None, images: bool = True
+) -> Any:
     import zmq
     from lmcache.integration.atom import AtomMPSchedulerAdapter
 
@@ -323,14 +333,18 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
     return _ReaderAwareSchedulerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(config, checkpoint_spec=checkpoint_spec),
+        model_name=_model_namespace(
+            config, checkpoint_spec=checkpoint_spec, images=images
+        ),
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, 0),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
     )
 
 
-def _make_worker_adapter(config: Any, rank: int, *, checkpoint_spec: Any = None) -> Any:
+def _make_worker_adapter(
+    config: Any, rank: int, *, checkpoint_spec: Any = None, images: bool = True
+) -> Any:
     import zmq
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
@@ -338,7 +352,9 @@ def _make_worker_adapter(config: Any, rank: int, *, checkpoint_spec: Any = None)
     return AtomMPWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(config, checkpoint_spec=checkpoint_spec),
+        model_name=_model_namespace(
+            config, checkpoint_spec=checkpoint_spec, images=images
+        ),
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),

@@ -11,6 +11,7 @@ import torch
 import torch as _torch
 
 from atom.spec_decode.dspark_scheduler import (
+    apply_q_bucket,
     build_sps_table,
     calibrate_confidence,
     expected_throughput,
@@ -536,6 +537,8 @@ def _fresh_scheduler():
     vs._ell_stage_ring = None
     vs._ell_stage_idx = 0
     vs._ell_slot_event = [None] * 4
+    vs._ell_slot_source = [None] * 4
+    vs._ell_oneoff_inflight = []
     vs._ell_last_slot = None
     return vs
 
@@ -705,6 +708,111 @@ def test_ell_stage_never_reuses_a_slot_whose_copy_is_still_in_flight():
     assert vs._ell_stage_idx == 1
 
 
+class _FakeCopyEvent(_FakeSlotEvent):
+    """The event `record_ell` creates for its copy; lands when the test says."""
+
+    def __init__(self):
+        super().__init__(landed=False)
+
+    def record(self, stream=None):
+        pass
+
+
+def _ell_copy_scheduler(monkeypatch):
+    """A scheduler whose record_ell runs on CPU, with its copy events exposed."""
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest import mock
+
+    events = []
+
+    def event():
+        events.append(_FakeCopyEvent())
+        return events[-1]
+
+    monkeypatch.setattr(_torch.cuda, "Event", event)
+    monkeypatch.setattr(_torch.cuda, "current_stream", mock.Mock)
+    monkeypatch.setattr(_torch.cuda, "stream", lambda stream: nullcontext())
+    # One-off buffers ask for pinned memory, which a CPU-only build cannot give.
+    zeros = _torch.zeros
+    monkeypatch.setattr(
+        _torch, "zeros", lambda *a, pin_memory=False, **kw: zeros(*a, **kw)
+    )
+    vs = _fresh_scheduler()
+    vs.runner = SimpleNamespace(
+        tokenID_processor=SimpleNamespace(async_copy_stream=mock.Mock()),
+        config=SimpleNamespace(max_num_seqs=8),
+    )
+    vs._ell_stage_ring = _torch.zeros(4, 8, dtype=_torch.int64)
+    return vs, events
+
+
+def _record(vs, value):
+    ell = _torch.full((2,), value, dtype=_torch.int64)
+    vs.set_last_ell(ell)
+    vs.record_ell(["A", "B"])
+    vs.set_last_ell(None)
+    return value
+
+
+def _held(vs):
+    """Values of the ell tensors still referenced, slots first."""
+    held = [int(t[0]) for t in vs._ell_slot_source if t is not None]
+    return held + [int(t[0]) for _, t in vs._ell_oneoff_inflight]
+
+
+def test_ell_source_outlives_its_pending_entry_until_the_slot_is_reused(monkeypatch):
+    """The copy reads ell on the shared side stream, after record_ell returns.
+
+    `_ell_pending` evicts entries whose copy may still be in flight, and the
+    setter clears it outright, so ell is held with its ring slot's event and
+    released only when `_ell_stage` hands that slot out again after the event.
+    """
+    vs, events = _ell_copy_scheduler(monkeypatch)
+    values = [_record(vs, v) for v in range(4)]
+    assert _held(vs) == values
+    assert vs._ell_slot_event == events
+
+    vs.ell_by_req = {}  # drops every pending entry, not the copies
+    assert vs._ell_pending == []
+    assert _held(vs) == values
+
+    # Slot 0 still busy: the next copy takes a one-off buffer and evicts
+    # nothing it does not own.
+    oneoff = _record(vs, 4)
+    assert vs._ell_last_slot is None
+    assert _held(vs) == values + [oneoff]
+    assert vs._ell_oneoff_inflight[0][0] is events[4]
+
+    # Slot 0's copy lands: reusing the slot releases its ell, and only that.
+    events[0].landed = True
+    newest = _record(vs, 5)
+    assert vs._ell_last_slot == 0
+    assert _held(vs) == [newest, *values[1:], oneoff]
+
+
+def test_oneoff_ell_is_held_until_its_own_copy_event_lands(monkeypatch):
+    vs, events = _ell_copy_scheduler(monkeypatch)
+    for v in range(4):
+        _record(vs, v)
+    first = _record(vs, 4)
+    second = _record(vs, 5)
+    assert [int(t[0]) for _, t in vs._ell_oneoff_inflight] == [first, second]
+    # The one-off copy reuses the event record_ell made for it.
+    assert [e for e, _ in vs._ell_oneoff_inflight] == events[4:6]
+    assert len(events) == 6
+
+    events[4].landed = True
+    third = _record(vs, 6)
+    assert [int(t[0]) for _, t in vs._ell_oneoff_inflight] == [second, third]
+    events[5].landed = events[6].landed = True
+    vs.set_last_ell(None)
+    vs.record_ell(["A"])  # no ell this step: nothing new, nothing released
+    assert len(vs._ell_oneoff_inflight) == 2
+    _record(vs, 7)  # lands in the one-off list too, after pruning
+    assert len(vs._ell_oneoff_inflight) == 1
+
+
 # ---------------------------------------------------------------------------
 # Ragged verify length is bounded on BOTH sides. Violating either desyncs the
 # batch layout from what the scheduler reserved, and surfaces far downstream as
@@ -818,3 +926,55 @@ def test_one_unrepresentable_request_aborts_the_batch():
     assert (
         ragged_verify_lens([1, 1], FULL_Q, np.array([0, 3]), np.array([6, 2])) is None
     )
+
+
+def _q_bucket_runner():
+    """The slice of a runner `_dspark_apply_q_bucket` actually reads."""
+    from types import SimpleNamespace
+
+    drafter = SimpleNamespace(
+        uses_confidence_schedule=True,
+        mtp_k=3,
+        verify_scheduler=SimpleNamespace(ell_by_req={7: 1}),
+    )
+    config = SimpleNamespace(dspark=SimpleNamespace(ragged=False, q_buckets="1,2,4"))
+    return SimpleNamespace(drafter=drafter, config=config)
+
+
+def _decode_batch(width, num_spec_step):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        total_tokens_num_prefill=0,
+        total_seqs_num_decode=1,
+        total_tokens_num_decode=width,
+        total_tokens_num=width,
+        num_spec_step=num_spec_step,
+        req_ids=[7],
+        num_scheduled_tokens=np.array([width], dtype=np.int32),
+        scheduled_tokens=np.arange(width, dtype=np.int32),
+        num_bonus=None,
+        scheduled_spec_decode_tokens=np.zeros((1, max(width - 1, 0)), dtype=np.int32),
+    )
+
+
+def test_q_bucket_leaves_a_target_only_decode_at_width_one():
+    """Producer decode is scheduled q=1 while the drafter still says mtp_k=3.
+
+    ell=1 and buckets 1,2,4 would otherwise quantize up to q=2 and read past
+    the one reserved token.
+    """
+    runner = _q_bucket_runner()
+    batch = _decode_batch(width=1, num_spec_step=0)
+    assert apply_q_bucket(batch, runner.drafter, runner.config.dspark) is None
+    assert batch.num_scheduled_tokens.tolist() == [1]
+    assert batch.scheduled_tokens.tolist() == [0]
+
+
+def test_q_bucket_still_shrinks_a_verifying_decode():
+    """The same ell and buckets, on a batch that reserved the full width."""
+    runner = _q_bucket_runner()
+    batch = _decode_batch(width=4, num_spec_step=3)
+    assert apply_q_bucket(batch, runner.drafter, runner.config.dspark) == 2
+    assert batch.num_scheduled_tokens.tolist() == [2]
+    assert batch.total_tokens_num_decode == 2

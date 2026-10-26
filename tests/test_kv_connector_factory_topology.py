@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.kv_transfer.disaggregation.base import KVConnectorBase
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
 
@@ -26,6 +27,27 @@ def _names(config):
     return None if leaves is None else [name for name, _ in leaves]
 
 
+class _PoolBackend(KVConnectorBase):
+    """A transport whose `register_kv_caches` would allocate `pool_bytes`."""
+
+    @classmethod
+    def kv_budget_reserve_bytes(cls, config):
+        return config.kv_transfer_config["pool_bytes"]
+
+
+@pytest.fixture
+def pool_backend(monkeypatch):
+    """Register `_PoolBackend` as "pool_probe" for one test."""
+    entry = {
+        "worker_module": __name__,
+        "worker_class": "_PoolBackend",
+        "scheduler_module": __name__,
+        "scheduler_class": "_PoolBackend",
+    }
+    monkeypatch.setitem(KVConnectorFactory._registry, "pool_probe", entry)
+    monkeypatch.setitem(KVConnectorFactory._aliases, "pool_probe", "pool_probe")
+
+
 @pytest.mark.parametrize("kv_transfer_config", [None, {}])
 def test_no_transfer_config_runs_no_transport(kv_transfer_config):
     config = _config(kv_transfer_config)
@@ -34,6 +56,7 @@ def test_no_transfer_config_runs_no_transport(kv_transfer_config):
     assert _names(config) == []
     assert not KVConnectorFactory.topology_reads_block_regions(config)
     assert not KVConnectorFactory.topology_region_readers_copy_whole_blocks(config)
+    assert KVConnectorFactory.kv_budget_reserve_bytes(config) == 0
 
 
 def test_names_resolve_through_aliases():
@@ -73,6 +96,24 @@ def test_unparsable_multi_is_not_read_as_no_transport(connectors):
     assert KVConnectorFactory.leaf_connectors(config) is None
     assert KVConnectorFactory.topology_reads_block_regions(config)
     assert not KVConnectorFactory.topology_region_readers_copy_whole_blocks(config)
+    # Nothing to hold back: the build raises before any buffer exists.
+    assert KVConnectorFactory.kv_budget_reserve_bytes(config) == 0
+
+
+def test_kv_budget_reserve_is_what_each_transport_allocates(pool_backend):
+    """The KV cache is sized before any connector exists, so each transport's
+    worker class answers for its own config and a `multi` sums them."""
+    pool = {"kv_connector": "pool_probe", "pool_bytes": 3 << 20}
+    offload = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+
+    assert KVConnectorFactory.kv_budget_reserve_bytes(_config(pool)) == 3 << 20
+    # A backend that allocates nothing after the KV cache keeps the default.
+    assert KVConnectorFactory.kv_budget_reserve_bytes(_config(offload)) == 0
+    multi = {
+        "kv_connector": "multi",
+        "connectors": [pool, offload, {**pool, "pool_bytes": 5 << 20}],
+    }
+    assert KVConnectorFactory.kv_budget_reserve_bytes(_config(multi)) == 8 << 20
 
 
 @pytest.mark.parametrize(

@@ -11,10 +11,14 @@ from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
+from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
+    pack_mhc_fn,
+    pre_delayed,
+)
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram.device.layer import EngramOp
+from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
@@ -60,19 +64,8 @@ class Block(nn.Module):
             quant_config=moe_quant_config,
             alt_stream=alt_stream,
         )
-        # Where `wqkv_a` is the norm's only reader, the norm emits the
-        # `(e4m3, e8m0 group-32)` pair that GEMM would otherwise have made for
-        # itself -- one launch instead of two. A layer whose compressor or
-        # indexer also projects this tensor keeps the BF16 it needs.
-        self.attn_norm = RMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            **(
-                {}
-                if spec.shares_attention_input
-                else {"fused_quant": True, "quant_config": native_quant_config()}
-            ),
-        )
+        # Weights only: each norm runs inside its seam (`pre_delayed`).
+        self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # `post_mult` is the 2.0 in the post gate's `2 * sigmoid(...)`, which
         # the AITER stages take as a parameter where the torch body has it
@@ -94,6 +87,7 @@ class Block(nn.Module):
                     f"hc_{sublayer}_{suffix}",
                     atom_parameter(torch.empty(shape, dtype=torch.float32)),
                 )
+            self.register_buffer(f"hc_{sublayer}_fn_packed", None, persistent=False)
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
             width = (
@@ -110,17 +104,23 @@ class Block(nn.Module):
                 quant_config=native_quant_config(),
             )
 
-    def attention_forward(self, hidden, cache, step, rope):
-        """Norm this sublayer's input, then run it.
+    def process_weights_after_loading(self):
+        for sublayer in ("attn", "ffn"):
+            # Mono kernels still consume FP32 fn. Keep one read-only HIP pack
+            # per weight, shared by all token counts and execution streams.
+            setattr(
+                self,
+                f"hc_{sublayer}_fn_packed",
+                pack_mhc_fn(getattr(self, f"hc_{sublayer}_fn")),
+            )
 
-        The norm stays on this side of the guarded op rather than in
-        `prepare_attention` so its quantized pair never has to cross one: the
-        op is declared over a single BF16 tensor, and what leaves it is the
-        attention output rather than anything shaped like its input.
-        """
-        normed = self.attn_norm(hidden)
+    def attention_forward(self, normed, cache, step, rope):
+        """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
         if isinstance(normed, tuple):
-            return self.attn(*normed, cache, step, rope)
+            hidden, hidden_fp8, hidden_scale = normed
+            return self.attn(
+                hidden, hidden_scale, cache, step, rope, hidden_fp8=hidden_fp8
+            )
         return self.attn(normed, None, cache, step, rope)
 
     def engram_forward(self, residual, embeddings, image_mask):
@@ -140,51 +140,69 @@ class Block(nn.Module):
                 state,
                 residual=self.engram_forward(state.residual, embeddings, image_mask),
             )
-        residual, hidden, pre, post, comb = pre_delayed(
+        hc_fn = self.hc_attn_fn_packed
+        residual, normed, pre, post, comb = pre_delayed(
             state.residual,
             state.pre_mix,
-            self.hc_attn_fn,
+            hc_fn if hc_fn is not None else self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
+            self.attn_norm.weight,
             **self.hc_options,
+            norm_eps=self.attn_norm.eps,
+            w_preshuffle_bf16=hc_fn is not None,
+            fuse_quant=hc_fn is not None,
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,
         )
-        return hidden, residual, pre, post, comb
+        return normed, residual, pre, post, comb
 
     def prepare_ffn(self, output, residual, pre, post, comb):
-        # The attention post folds into this pre, which is the shape the seam
-        # has: AITER computes the new residual and projects it in one kernel,
-        # and drops back to the two when its own heuristic says to.
-        residual, hidden, pre, post, comb = pre_delayed(
+        # The attention post folds into this seam: the delayed kernel computes the
+        # new residual, the gates and the normed FFN input.
+        hc_fn = self.hc_ffn_fn_packed
+        residual, normed, pre, post, comb = pre_delayed(
             residual,
             pre,
-            self.hc_ffn_fn,
+            hc_fn if hc_fn is not None else self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            self.ffn_norm.weight,
             **self.hc_options,
+            norm_eps=self.ffn_norm.eps,
+            w_preshuffle_bf16=hc_fn is not None,
             sublayer_output=output,
             post_mix=post,
             combination=comb,
         )
-        return self.ffn_norm(hidden), residual, pre, post, comb
+        return normed, residual, pre, post, comb
 
     def finish_ffn(self, output, residual, pre, post, comb):
         # Owed, not applied: the next block's pre folds this post into its own
         # projection.
         return SinglePassHCState(residual, pre, output, post, comb)
 
-    def forward(self, state, cache, step, rope, embeddings=None, image_mask=None):
-        hidden, residual, pre, post, comb = self.prepare_attention(
+    def forward(
+        self, state, cache, step, rope, embeddings=None, image_mask=None, queries=None
+    ):
+        """``queries``: bounded replay's `QueryRows`, the rows the rest of the
+        layer runs on, those the attention outputs (the runtime's reads them
+        off the forward context, `runtime.v41_attention`)."""
+        normed, residual, pre, post, comb = self.prepare_attention(
             state, embeddings, image_mask
         )
-        output = self.attention_forward(hidden, cache, step, rope)
-        hidden, residual, pre, post, comb = self.prepare_ffn(
+        output = self.attention_forward(normed, cache, step, rope)
+        if queries is not None:
+            residual, pre, post, comb = queries.take(residual, pre, post, comb)
+        return self.ffn_forward(output, residual, pre, post, comb)
+
+    def ffn_forward(self, output, residual, pre, post, comb):
+        """The layer after its attention: ``output`` and the seam's state."""
+        normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
-        output = self.ffn(hidden)
-        return self.finish_ffn(output, residual, pre, post, comb)
+        return self.finish_ffn(self.ffn(normed), residual, pre, post, comb)
 
 
 class DeepseekV41ForCausalLM(nn.Module):
@@ -321,12 +339,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
 
     def begin_forward(self, hidden, engram_embeddings):
-        stage = getattr(engram_embeddings, "stage", None)
-        if stage is not None:
-            stage()
+        if isinstance(engram_embeddings, EngramStagedRows):
+            engram_embeddings.stage()
 
     def end_forward(self, hidden, engram_embeddings):
-        if getattr(engram_embeddings, "stage", None) is not None:
+        if isinstance(engram_embeddings, EngramStagedRows):
             engram_embeddings.join()
 
     def forward_hidden(

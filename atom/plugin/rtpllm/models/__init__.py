@@ -1,10 +1,11 @@
 try:
-    from .base_model_wrapper import ATOMGlm5Moe, ATOMQwen35Moe
+    from .base_model_wrapper import ATOMGlm5Moe, ATOMQwen4Exp, ATOMQwen35Moe
 except ModuleNotFoundError as exc:
     if not (exc.name or "").startswith("rtp_llm"):
         raise
     ATOMGlm5Moe = None
     ATOMQwen35Moe = None
+    ATOMQwen4Exp = None
 else:
     try:
         from atom.models.deepseek_v2 import GlmMoeDsaForCausalLM
@@ -16,4 +17,4 @@ else:
     else:
         _ATOM_SUPPORTED_MODELS.setdefault("GlmMoeDsaForCausalLM", GlmMoeDsaForCausalLM)
 
-__all__ = ["ATOMGlm5Moe", "ATOMQwen35Moe"]
+__all__ = ["ATOMGlm5Moe", "ATOMQwen4Exp", "ATOMQwen35Moe"]

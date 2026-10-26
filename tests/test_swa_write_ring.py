@@ -303,3 +303,32 @@ def test_scatter_rows_ignores_a_row_past_the_plane(geometry, batch):
     swa_scatter_rows(batch["kv"], dest, bid, plane)
     torch.cuda.synchronize()
     assert not plane.any(), "an out-of-plane dest row still wrote into the pool"
+
+
+@pytest.mark.parametrize("ratio", RATIO_IDS)
+def test_rows_below_cached_until_stay_as_the_ring_holds_them(geometry, batch, ratio):
+    """`cached_until`: a seq's rows below it are not written (V4.1 decoder
+    bounded replay recomputes rows its ring already holds); the rest are, as
+    without it."""
+    params = geometry.window_params(ratio)
+    plane = (geometry.plane_rows, HEAD_DIM)
+    args = (batch["kv"], batch["positions"], batch["cu"], batch["slots"])
+    whole = torch.zeros(*plane, dtype=torch.bfloat16, device=DEV)
+    swa_write(*args, whole, params, RING_SLOTS)
+    # seq 1 keeps everything below its fourth row; the others nothing
+    cached = [0, START_POS[1] + 3, 0]
+    got = torch.full(plane, 7.0, dtype=torch.bfloat16, device=DEV)
+    swa_write(
+        *args,
+        got,
+        params,
+        RING_SLOTS,
+        cached_until=torch.tensor(cached, dtype=torch.int32, device=DEV),
+    )
+    torch.cuda.synchronize()
+    for b in range(BS):
+        last = START_POS[b] + TOK_COUNTS[b]
+        for pos in range(max(START_POS[b], last - RING_SLOTS), last):
+            row = params.index(SLOTS[b], pos)
+            want = whole[row] if pos >= cached[b] else torch.full_like(got[row], 7.0)
+            assert torch.equal(got[row], want), (b, pos)

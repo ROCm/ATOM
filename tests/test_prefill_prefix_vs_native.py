@@ -3,7 +3,7 @@
 
 """Splitting a token's keys into prefix + extend must not change its output.
 
-`sparse_attn_v4_paged_prefill` takes each query token's keys in two pieces: the
+`sparse_attn_v4_paged_2src` takes each query token's keys in two pieces: the
 `prefix` rows it reads out of the paged pool, and the `extend` rows carried in
 this forward's own KV tensor. Which keys land in which piece is decided by
 where the prompt was cut, not by anything the attention itself cares about --
@@ -30,7 +30,7 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.v4_kernels.paged_prefill import sparse_attn_v4_paged_prefill
+from atom.model_ops.v4_kernels.paged_2src import sparse_attn_v4_paged_2src
 
 DEV = "cuda"
 H = 64
@@ -84,7 +84,7 @@ def _run_split(q, keys, keys_per_token, n_prefix):
     e_idx = torch.tensor(
         [c for row in extend_rows for c in row] or [0], dtype=torch.int32, device=DEV
     )
-    out = sparse_attn_v4_paged_prefill(
+    out = sparse_attn_v4_paged_2src(
         q,
         pool,
         p_idx,

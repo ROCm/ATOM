@@ -29,6 +29,17 @@ class KVConnectorBase(ABC):
 
     is_producer: bool
 
+    @classmethod
+    def kv_budget_reserve_bytes(cls, config: Any) -> int:
+        """GPU bytes this backend allocates once the KV cache is sized.
+
+        The model runner holds them back from the KV cache budget (see
+        :meth:`KVConnectorFactory.kv_budget_reserve_bytes`). It asks before
+        any connector is built, so the answer comes from ``config`` alone.
+        Backends that allocate nothing in ``register_kv_caches`` keep 0.
+        """
+        return 0
+
     @abstractmethod
     def register_kv_caches(
         self,

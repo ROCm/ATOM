@@ -48,8 +48,9 @@ def _unit_table_kernel(
     tl.store(out + token * out_stride + offsets, tile, mask=mask)
 
 
-def unit_table(block_tables, batch_ids, units_per_page):
-    """`[tokens, columns * units_per_page]` int32 tile ids.
+def unit_table(block_tables, batch_ids, units_per_page, workspace=None, ratio=None):
+    """`[tokens, columns * units_per_page]` int32 tile ids, in `workspace`'s
+    table for `ratio` (`ScoreWorkspace.unit_table`) when given.
 
     A PAGE holds `units_per_page` consecutive tiles, so entry `(t, c, u)` is
     tile `u` of the PAGE that request's column `c` names -- the translation
@@ -62,8 +63,15 @@ def unit_table(block_tables, batch_ids, units_per_page):
     that assumed one could not be told apart by comparing the two.
     """
     tokens, columns = batch_ids.numel(), block_tables.shape[1]
-    out = torch.empty(
-        tokens, columns * units_per_page, dtype=torch.int32, device=block_tables.device
+    out = (
+        torch.empty(
+            tokens,
+            columns * units_per_page,
+            dtype=torch.int32,
+            device=block_tables.device,
+        )
+        if workspace is None
+        else workspace.unit_table(ratio, tokens, columns * units_per_page)
     )
     if not tokens:
         return out

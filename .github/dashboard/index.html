@@ -559,12 +559,15 @@ function atomeshHardwareKey(value) {
 }
 
 // process_result.py names the interactivity column after the definition that
-// produced it ("Interactivity (P90 E2E Normalized)"), so the key is not a fixed
-// string. Everything else in the table has a stable header.
+// produced it ("P90 E2E Normalized Interactivity", formerly "Interactivity (P90
+// E2E Normalized)"), so the key is not a fixed string. "P90 Interactivity" is a
+// separate fixed column (1/p90 ITL) and must not be mistaken for it.
 const ATOMESH_INTERACTIVITY_KEY = 'interactivity';
+const ATOMESH_P90_INTERACTIVITY_KEY = 'p90interactivity';
 
 function atomeshSummaryInteractivityKey(headers) {
-  return headers.find(header => header.startsWith(ATOMESH_INTERACTIVITY_KEY))
+  return headers.find(header => header.includes(ATOMESH_INTERACTIVITY_KEY)
+    && header !== ATOMESH_P90_INTERACTIVITY_KEY)
     || ATOMESH_INTERACTIVITY_KEY;
 }
 
@@ -620,6 +623,7 @@ function parseAtomeshSummaryRows(markdown) {
         concurrency: parseAtomeshNumber(raw.concurrency),
         interactivity,
         interactivityMethod: atomeshInteractivityMethod(raw.intvtydef || headerMethod),
+        interactivityP90Itl: parseAtomeshNumber(raw[ATOMESH_P90_INTERACTIVITY_KEY]),
         totalTput: parseAtomeshNumber(raw.totaltoks),
         inputTput: parseAtomeshNumber(raw.inputtoks),
         outputTput: parseAtomeshNumber(raw.outputtoks),
@@ -1292,7 +1296,7 @@ const PERF_METRICS = [
 const ATOMESH_INTERACTIVITY_METRICS = [
   {
     key: 'e2e_normalized',
-    label: 'E2E Normalized Interactivity',
+    label: 'P90 E2E Normalized Interactivity',
     formula: '1 / p90(ITL + TTFT / output tokens) — amortizes prefill over the turn',
     emptyHint: 'It is derived from every run, so an empty chart here means the selected rows have no throughput/latency data at all.',
     value: row => row.interactivity,
@@ -1300,9 +1304,9 @@ const ATOMESH_INTERACTIVITY_METRICS = [
   },
   {
     key: 'p90_itl',
-    label: 'Interactivity',
+    label: 'P90 Interactivity',
     formula: '1 / p90(ITL) — decode speed only, matching InferenceX p90_intvty',
-    emptyHint: 'It is recorded only for agentic runs published after this metric was added; older points carry E2E Normalized Interactivity only.',
+    emptyHint: 'It is recorded only for agentic runs published after this metric was added; older points carry P90 E2E Normalized Interactivity only.',
     value: row => row.interactivityP90Itl,
     frontierEligible: row => Number.isFinite(row.interactivityP90Itl),
   },
@@ -3234,13 +3238,13 @@ function atomeshInteractivityRowHTML(row) {
   const isP90 = row.interactivityMethod === 'p90_e2e_normalized';
   // Same wording as the markdown summary's column header, so the two read as
   // the same metric rather than two that happen to share a name.
-  const definition = isP90 ? 'P90 E2E Normalized' : '1 / median_tpot_s';
-  let html = `<div class="pop-row"><span class="pop-key">Interactivity (${definition}) (tok/s/user)</span><span class="pop-val">${atomeshDetailValue(row.interactivity, v => fmtNum(v, 3))}</span></div>`;
+  const definition = isP90 ? 'P90 E2E Normalized Interactivity' : 'Interactivity (1 / median_tpot_s)';
+  let html = `<div class="pop-row"><span class="pop-key">${definition} (tok/s/user)</span><span class="pop-val">${atomeshDetailValue(row.interactivity, v => fmtNum(v, 3))}</span></div>`;
   // Second row only when the plain metric was actually measured: rendering an
   // em dash for every legacy point would suggest a value went missing rather
   // than that the run predates the metric.
   if (Number.isFinite(row.interactivityP90Itl)) {
-    html += `<div class="pop-row"><span class="pop-key">Interactivity p90 (tok/s/user)</span><span class="pop-val">${atomeshDetailValue(row.interactivityP90Itl, v => fmtNum(v, 3))}</span></div>`;
+    html += `<div class="pop-row"><span class="pop-key">P90 Interactivity (tok/s/user)</span><span class="pop-val">${atomeshDetailValue(row.interactivityP90Itl, v => fmtNum(v, 3))}</span></div>`;
   }
   return html;
 }
@@ -4012,7 +4016,7 @@ function renderAtomeshPerformanceTab() {
   html += `<div class="section-container"><div class="section-header"><span class="section-title">Detail Table</span></div>
   <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
     <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
-    <th class="num">E2E Norm. Intvty</th><th class="num">Intvty</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
+    <th class="num">P90 E2E Normalized Interactivity</th><th class="num">P90 Interactivity</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
     <th class="num">Total tok/s/GPU</th><th class="num">Input tok/s/GPU</th><th class="num">Output tok/s/GPU</th>
     <th class="num">TTFT ms</th><th class="num">TPOT ms</th><th class="num">E2E ms</th><th class="num">Accuracy</th><th>Run</th>
   </tr></thead><tbody>`;

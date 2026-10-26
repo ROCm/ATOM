@@ -10,6 +10,7 @@ import torch
 
 from atom.utils import CpuGpuBuffer
 from atom.utils.h2d import PublicationError
+from atom.utils.tbo.ubatching import sync_dp_metadata
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
@@ -33,6 +34,7 @@ def runner_with_buffers(monkeypatch, transport, pp_size=1, speculative=False):
     runner.model = SimpleNamespace()
     runner.use_mrope = True
     runner.enforce_eager = True
+    runner.running_tokens_per_dp_rank = np.zeros(1, dtype=np.int32)
     runner.tokenID_processor = tokenIDProcessor(runner, 64)
     if speculative:
         from atom.spec_decode.drafter import Drafter
@@ -189,6 +191,7 @@ def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_siz
             total_tokens_num_prefill=2 if prefill else 0,
             total_tokens_num_decode=0 if prefill else 2,
             total_seqs_num_prefill=1 if prefill else 0,
+            num_spec_step=0,
             produces_output=lambda: False,
         )
         torch.cuda._sleep(2_000_000)
@@ -246,21 +249,16 @@ def test_mrope_padding_is_final_before_its_only_publication(monkeypatch, pp_size
     [("direct", False), ("packed", False), ("packed", True)],
 )
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_speculative_indices_publish_before_index_select(
+def test_speculative_indices_publish_before_verification_reads(
     monkeypatch, transport, coalesce, pp_size
 ):
     from atom.spec_decode.drafter import Drafter
 
     runner = runner_with_buffers(monkeypatch, transport, pp_size, speculative=True)
-    scratch = runner.forward_vars["verification_draft_token_ids"]
     saved = []
     for step, lengths in enumerate(([3, 1, 2], [1, 1], [4] * 8, [1, 3, 1]) * 2):
         runner._advance_forward_vars()
         runner._gate_staging_reuse()
-        # Device writes and sampler reads are ordered on the forward stream,
-        # including across PP slots; no pinned host scratch is involved.
-        assert runner.forward_vars["verification_draft_token_ids"] is scratch
-        scratch.fill_(-123)
         lengths = np.array(lengths, dtype=np.int32)
         ends = np.cumsum(lengths)
         ids = torch.arange(int(ends[-1]), device="cuda", dtype=torch.int32) + step * 100
@@ -275,21 +273,20 @@ def test_speculative_indices_publish_before_index_select(
         )
         if coalesce:
             assert runner.h2d_groups["spec_decode"]._backend is None
-        assert (
-            metadata.draft_token_ids.untyped_storage().data_ptr() == scratch.data_ptr()
-        )
-        saved_tail = scratch[metadata.draft_token_ids.numel() :].clone()
+        assert metadata.input_ids is ids
+        # The verification read, as the rejection sampler makes it: right
+        # after publication, behind the sleep, so unpublished indices show.
+        drafts = ids[metadata.target_logits_indices + 1]
         anchors = Drafter.anchors_to_gpu(runner.drafter, [-1] * len(lengths))
         saved.append(
             (
-                metadata.draft_token_ids.clone(),
+                drafts,
                 metadata.target_logits_indices.clone(),
                 metadata.bonus_logits_indices.clone(),
                 metadata.cu_num_draft_tokens.clone(),
                 anchors.clone(),
                 lengths,
                 step,
-                saved_tail,
             )
         )
         # Even a zero-draft step explicitly published its empty index prefix.
@@ -298,7 +295,7 @@ def test_speculative_indices_publish_before_index_select(
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
     torch.cuda.synchronize()
-    for drafts, targets, bonus, cu, anchors, lengths, step, tail in saved:
+    for drafts, targets, bonus, cu, anchors, lengths, step in saved:
         offsets = np.cumsum(lengths) - lengths
         expected_targets = [
             int(start + j)
@@ -310,7 +307,18 @@ def test_speculative_indices_publish_before_index_select(
         assert bonus.cpu().tolist() == (np.cumsum(lengths) - 1).tolist()
         assert cu.cpu().tolist() == np.cumsum(lengths - 1).tolist()
         assert anchors.cpu().tolist() == [-1] * len(lengths)
-        assert torch.all(tail.cpu() == -123)
+
+
+def _one_rank_sync():
+    """A group of one's step exchange: its own row, nothing exchanged."""
+    return sync_dp_metadata(
+        dp_group=None,
+        dp_size=1,
+        scheduled_tokens=3,
+        scheduled_bs=3,
+        is_prefill=False,
+        tbo_on=False,
+    )
 
 
 @pytest.mark.parametrize("phase", ["prefill", "first_decode", "deferred"])
@@ -325,10 +333,10 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
     runner.config.enable_tbo = False
     runner.capture_sizes_np = np.array([1, 2, 4, 8])
     runner._dspark_apply_q_bucket = lambda batch: None
-    runner._piecewise_cg_active = lambda: False
+    runner._tr_hybrid_active = lambda: False
     runner._local_tbo_eligibility = lambda batch: False
     runner.prepare_inputs = lambda *args, **kwargs: None
-    mode = SimpleNamespace(sync=None, max_seqlen_q=1, running_bs=4)
+    mode = SimpleNamespace(sync=_one_rank_sync(), max_seqlen_q=1, running_bs=4)
     monkeypatch.setattr(model_runner.ForwardMode, "decide", lambda **kwargs: mode)
     processor = runner.tokenID_processor
     prefill = phase == "prefill"
@@ -390,9 +398,9 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
     runner.config.enable_tbo = False
     runner.capture_sizes_np = np.array([1, 2, 4, 8])
     runner._dspark_apply_q_bucket = lambda batch: None
-    runner._piecewise_cg_active = lambda: False
+    runner._tr_hybrid_active = lambda: False
     runner._local_tbo_eligibility = lambda batch: False
-    mode = SimpleNamespace(sync=None, max_seqlen_q=4, running_bs=4)
+    mode = SimpleNamespace(sync=_one_rank_sync(), max_seqlen_q=4, running_bs=4)
     monkeypatch.setattr(model_runner.ForwardMode, "decide", lambda **kwargs: mode)
     monkeypatch.setattr(model_runner, "get_forward_context", lambda: None)
     saved = []
@@ -409,7 +417,7 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
         metadata = runner.drafter.calc_spec_decode_metadata(
             lens, cu[1:], ids, prepared_indices=spec_decode_indices
         )
-        saved.append(metadata.draft_token_ids.clone())
+        saved.append(ids[metadata.target_logits_indices + 1])
         assert runner.h2d_groups["spec_decode"]._backend is None
 
     runner.prepare_inputs = consume
@@ -461,13 +469,8 @@ def test_mrope_producer_and_padded_model_view_share_axis_stride(
     builder._build_mrope_decode_positions(
         batch, np.array([12, 22]), 2, running_tokens=8
     )
-    _, positions = runner._padded_decode_inputs(
-        SimpleNamespace(
-            is_prefill=False,
-            running_tokens_are_unified=True,
-            scheduled_tokens=4,
-            running_tokens=8,
-        )
+    _, positions = runner._padded_inputs(
+        SimpleNamespace(scheduled_tokens=4, running_tokens=8)
     )
     observed = positions.clone()
     runner._mark_staging_h2d_enqueued()

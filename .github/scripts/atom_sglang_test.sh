@@ -280,6 +280,37 @@ PY
   fi
 }
 
+pin_lm_eval_datasets() {
+  # datasets>=5.1 imports HfFileSystemResolvedBucketPath, added in
+  # huggingface-hub>=1.31. SGLang images pin huggingface-hub==1.5.0 for
+  # transformers 5.16.1, so keep datasets on 5.0.x. Serving itself does not
+  # import datasets; only lm_eval does.
+  python3 - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+from packaging.version import Version
+
+def pkg_version(name):
+    try:
+        return Version(version(name))
+    except PackageNotFoundError:
+        return None
+
+hub = pkg_version("huggingface-hub")
+datasets = pkg_version("datasets")
+if hub is not None and hub < Version("1.31.0") and (datasets is None or datasets >= Version("5.1.0")):
+    raise SystemExit(2)
+raise SystemExit(0)
+PY
+  local rc=$?
+  if [[ "${rc}" -eq 2 ]]; then
+    echo "========== Pinning datasets==5.0.0 for huggingface-hub<1.31 =========="
+    pip install 'datasets==5.0.0'
+  elif [[ "${rc}" -ne 0 ]]; then
+    echo "ERROR: failed to check datasets/huggingface-hub versions" >&2
+    return "${rc}"
+  fi
+}
+
 run_accuracy() {
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${MODEL_PATH}")
@@ -288,8 +319,9 @@ run_accuracy() {
 
   if ! command -v lm_eval >/dev/null 2>&1; then
     echo "========== Installing lm-eval =========="
-    pip install 'lm-eval[api]'
+    pip install 'lm-eval[api]' 'datasets==5.0.0'
   fi
+  pin_lm_eval_datasets
 
   mkdir -p "${RESULT_DIR}"
   : > "${ACCURACY_LOG_FILE}"

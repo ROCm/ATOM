@@ -46,7 +46,7 @@ Quant modes (constexpr-selected by the `quant` arg of the Python wrapper):
 
 Output: side-effecting only — cache scatter IS the only output. The earlier
 caller-visible `[num_compress, head_dim]` BF16 return tensor was vestigial
-(paged_decode/paged_prefill read the scattered compress entries directly
+(paged_decode/paged_2src read the scattered compress entries directly
 from `unified_kv` (Main) or the FP8 indexer pool, not from the kernel
 return).
 """
@@ -334,7 +334,7 @@ def _fused_compress_attn_kernel(
 
     # ── 4. Cache scatter (paged) ───────────────────────────────────────
     # The Compressor's BF16 return value was historically consumed by sparse
-    # attention but is now vestigial — paged_decode/paged_prefill read the
+    # attention but is now vestigial — paged_decode/paged_2src read the
     # scattered compress entries directly from `unified_kv` (Main) or the FP8
     # indexer pool. So no caller-visible `out` write; the cache scatter IS
     # the only output.
@@ -475,7 +475,7 @@ def fused_compress_attn(
         `cp_gather_indexer_k_quant_cache` (cache_kernels.cu:1145+).
 
     Side-effecting: cache scatter IS the only output (Main path's BF16
-    return tensor was vestigial — paged_decode/paged_prefill read directly
+    return tensor was vestigial — paged_decode/paged_2src read directly
     from `unified_kv` and the indexer FP8 pool, not from the kernel return).
     Grid is always `plan_capacity` (CUDAGraph-safe); inactive plan rows are
     sentinel-skipped (`position == -1`) inside the kernel.

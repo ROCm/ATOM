@@ -14,6 +14,8 @@ def config():
     return SimpleNamespace(
         model="/model",
         tensor_parallel_size=4,
+        enable_dp_attention=False,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
         kv_cache_dtype="bf16",
         index_cache_dtype="fp8",
         hf_config=SimpleNamespace(),
@@ -101,3 +103,68 @@ def test_native_and_fixed_acceptance_schedules_are_admitted(tp_size, rates):
     cfg.tensor_parallel_size = tp_size
     cfg.speculative_config.synthetic_acceptance_rates = rates
     validate_speculative_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "tp,dp", [(1, 1), (2, 1), (4, 1), (8, 1), (1, 2), (1, 4), (1, 8), (2, 2), (4, 2)]
+)
+def test_dpa_dspark_admission_does_not_fix_parallel_width(tp, dp):
+    value = config()
+    value.enable_dp_attention = True
+    value.tensor_parallel_size = tp
+    value.parallel_config.data_parallel_size = dp
+    validate_speculative_config(value)
+
+
+@pytest.mark.parametrize("dpa", [False, True])
+@pytest.mark.parametrize("draft_tokens", [0, 5])
+@pytest.mark.parametrize("media", [None, {"image": 1}])
+def test_request_admission_checks_dpa_independently_of_dspark(dpa, draft_tokens, media):
+    cfg = DeepseekV41TextConfig()
+    kwargs = {
+        "num_draft_tokens": draft_tokens,
+        "multimodal_data": media,
+        "enable_dp_attention": dpa,
+    }
+    if media and (dpa or draft_tokens):
+        with pytest.raises(ValueError, match="text requests only"):
+            cfg.validate_request(**kwargs)
+    else:
+        cfg.validate_request(**kwargs)
+
+
+@pytest.mark.parametrize("draft_tokens", [0, 5])
+@pytest.mark.parametrize("entry", ["preprocess", "preprocess_fanout", "add_request"])
+def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
+    draft_tokens, entry
+):
+    from atom.model_engine.llm_engine import InputOutputProcessor
+
+    def unexpected_encode(prompt):
+        pytest.fail("Unsupported media reached tokenization")
+
+    processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor.__dict__.update(
+        config=SimpleNamespace(
+            hf_config=DeepseekV41TextConfig(), enable_dp_attention=True
+        ),
+        num_speculative_tokens=draft_tokens,
+        tokenizer=SimpleNamespace(encode=unexpected_encode),
+    )
+    with pytest.raises(ValueError, match="DP attention supports text requests only"):
+        if entry == "add_request":
+            from atom.model_engine.llm_engine import LLMEngine
+
+            engine = SimpleNamespace(io_processor=processor)
+            LLMEngine.add_request(
+                engine,
+                ["image prompt"],
+                SimpleNamespace(n=2),
+                multimodal_data_list=[{"image": 1}],
+            )
+        else:
+            getattr(processor, entry)(
+                "image prompt",
+                SimpleNamespace(n=1 if entry == "preprocess" else 2),
+                multimodal_data={"image": 1},
+            )

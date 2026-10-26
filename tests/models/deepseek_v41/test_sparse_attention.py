@@ -9,8 +9,8 @@ from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 pytest.importorskip("aiter", reason="the V4 kernels import the AITER runtime")
 
 from atom.model_ops.v4_kernels import (
+    sparse_attn_v4_paged_2src,
     sparse_attn_v4_paged_decode,
-    sparse_attn_v4_paged_prefill,
 )
 from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 
@@ -55,16 +55,15 @@ def test_v4_bf16_counts_sink_once_for_swa_and_global(small_config, length):
     q = torch.zeros(2 * length, 8, 512, dtype=torch.bfloat16, device="cuda")
     kv = torch.full((1, 2 * length, 512), 6.0, dtype=torch.bfloat16, device="cuda")
     sink = torch.zeros(8, device="cuda")
-    prefix, pptr, extend, eptr = cache.attention_indices(spec, step)
+    prefix, pptr, second, sptr = cache.attention_indices(spec, step)
     if length == 1:
         cache.write_window(spec.layer_id, kv, step)
-        output = sparse_attn_v4_paged_decode(
-            q, cache.pool, prefix, pptr, sink, 512**-0.5
-        )
+        source = cache.ring_view(spec.layer_id)
     else:
-        output = sparse_attn_v4_paged_prefill(
-            q, cache.pool, prefix, pptr, kv.flatten(0, 1), extend, eptr, sink, 512**-0.5
-        )
+        source = kv.flatten(0, 1)
+    output = sparse_attn_v4_paged_2src(
+        q, cache.pool, prefix, pptr, source, second, sptr, sink, 512**-0.5
+    )
     expected = torch.tensor(
         [4.0] if length == 1 else [4.0, 4.5], device="cuda", dtype=torch.bfloat16
     )
@@ -113,7 +112,7 @@ def test_v4_bf16_sparse_attention_matches_independent_oracle(length, count):
         eptr = torch.arange(batch * length + 1, device="cuda", dtype=torch.int32) * (
             count - prefix_count
         )
-        actual = sparse_attn_v4_paged_prefill(
+        actual = sparse_attn_v4_paged_2src(
             q.flatten(0, 1),
             kv.flatten(0, 1),
             prefix,

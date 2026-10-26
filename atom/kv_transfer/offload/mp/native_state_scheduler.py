@@ -20,11 +20,12 @@ from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
     validated_kv_role,
 )
-from atom.kv_transfer.offload.metadata import NativeStateTransfer
+from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     require_native_state_server,
+    stores_state_images,
 )
 from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
@@ -38,7 +39,8 @@ _MAX_SAVE_ATTEMPTS = 3
 @dataclass
 class _NativeSave:
     seq: Any
-    source: StateStoreOperationId
+    # The checkpoint lease the image is read from; None for a PAGE-only save.
+    source: StateStoreOperationId | None
     saved_before: int
     boundary: int
 
@@ -87,7 +89,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             raise ValueError(
                 "native-state LMCache MP requires PAGE checkpoint geometry"
             )
-        super().__init__(self._config, checkpoint_spec=coordinator.store.spec)
+        # Images or PAGE alone is settled before the adapter connects: the
+        # namespace names it, and every worker answers the same question from
+        # the same `Config.state_replay_tokens` (`stores_state_images`).
+        replay_tokens = int(getattr(self._config, "state_replay_tokens", 0) or 0)
+        images = stores_state_images(replay_tokens)
+        super().__init__(
+            self._config, checkpoint_spec=coordinator.store.spec, images=images
+        )
         try:
             require_native_state_server(self._mp_adapter, self._config)
             self._hash_block_size = int(block_manager.hash_block_size)
@@ -119,6 +128,29 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # hold a finished request forever.
         self._save_failures: dict[str, tuple[Any, int, int]] = {}
         self._retired_requests: dict[str, Any] = {}
+        # Bounded replay (`Sequence.replay_kv_load`): tokens one replays, or 0
+        # when it is off.
+        self._replay_tokens = replay_tokens
+        # PAGE alone (the default whenever a replay runs): saves store the PAGE
+        # KV at any chunk boundary, the layout has no image group, so the
+        # server's hit is the PAGE KV's extent, and every hit is a KV-only load
+        # plus a replay.
+        self._page_only = not images
+        if self._page_only:
+            logger.info(
+                "LMCache MP: state images off; saves store PAGE KV alone and "
+                "every hit replays %d tokens below the KV it loads.",
+                self._replay_tokens,
+            )
+        # sid -> (seq, KV-only reach in tokens) of the request's lookup, from
+        # its answer until admission weighs it. The lookup keeps the PAGE KV
+        # locked up to the reach meanwhile, so nothing releases it before then.
+        self._kv_reach: dict[str, tuple[Any, int]] = {}
+        # Requests parked for a load the next dispatch has yet to send, and
+        # those whose load it dropped instead: nothing will ever report on
+        # those, so `process_completions` wakes them as failed loads.
+        self._parked_loads: dict[str, Any] = {}
+        self._dropped_parked_loads: set[Any] = set()
 
     def can_partially_deallocate_state(self, seq: Any) -> bool:
         """The checkpoint coordinator owns state sources past request free.
@@ -169,7 +201,122 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         previous = self._native_load_operations.get(str(seq.id))
         if previous is not None:
             return 0, False
-        return super().get_num_new_matched_tokens(seq)
+        matched = super().get_num_new_matched_tokens(seq)
+        seq.offload_joint.kv_only_tokens = self._kv_only_reach(seq)
+        return matched
+
+    # -- KV-only reach, for a bounded replay -------------------------------
+    #
+    # With images, a lookup's hit is the longest prefix whose PAGE KV is
+    # present AND whose state image sits at its end. Without them the layout
+    # has PAGE alone, so the server's hit is how far the PAGE KV reaches (the
+    # reach): no image ends it, so the state-carrying hit is 0 and the reach is
+    # a replay's to use. The lookup keeps the PAGE KV locked up to it, and
+    # `BlockManager._replay_hit` weighs it at admission.
+
+    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
+        if not self._page_only:
+            return super()._fresh_tier_lookup(seq, sid)
+        # A lookup this request still holds (one whose reach was never weighed,
+        # say) goes back first: asking again replaces the server's record of
+        # what the earlier one locked.
+        self._kv_reach.pop(sid, None)
+        if self._lookup_client.hit_tokens(sid) is not None:
+            self._lookup_client.clear_lookup_status(sid)
+        reach = super()._fresh_tier_lookup(seq, sid)
+        if reach is None:
+            return None
+        self._kv_reach[sid] = (seq, int(reach))
+        # Kept on the request past admission, for a later admission that
+        # reuses this answer instead of asking again (the save floor).
+        seq._mp_page_reach = int(reach)
+        # The base recorded the reach as the hit; there is no image behind it.
+        self._lookup_results[sid] = (seq, 0)
+        self._remember_tier_hit(seq, sid, 0)
+        return 0
+
+    def _kv_only_reach(self, seq: Any) -> int:
+        """This request's KV-only reach in tokens, or 0 if unknown."""
+        entry = self._kv_reach.get(str(seq.id))
+        if entry is None or entry[0] is not seq:
+            return 0
+        return entry[1]
+
+    def _release_lookup(self, sid: str) -> None:
+        if sid in self._kv_reach:
+            # Its reach is not weighed yet (admission does that), and its
+            # locks are what back a load to it: `update_state_after_alloc`
+            # decides, and releases the lookup if nothing loads under it.
+            return
+        super()._release_lookup(sid)
+
+    def _begin_load_lifecycle(self, seq: Any) -> None:
+        entry = self._kv_reach.get(str(seq.id))
+        if entry is not None and entry[0] is not seq:
+            # An earlier lifecycle's reach: its lookup goes with it.
+            del self._kv_reach[str(seq.id)]
+        super()._begin_load_lifecycle(seq)
+
+    def update_state_after_alloc(self, seq: Any) -> None:
+        sid = str(seq.id)
+        entry = self._kv_reach.pop(sid, None)
+        mine = entry is not None and entry[0] is seq
+        if seq.replay_kv_load and mine:
+            # Load the PAGE KV alone, up to the reach (where `_replay_hit` ended
+            # the replay), under the locks the lookup took for it (they pass to
+            # the retrieve in `build_connector_meta`).
+            reach = int(entry[1])
+            self._load_specs[sid] = LoadSpec(
+                hbm_cached_tokens=int(seq.num_cached_tokens),
+                lmcache_cached_tokens=reach,
+            )
+            self._hit_save_floors[sid] = reach
+        else:
+            if getattr(seq, "replay_kv_load", False):
+                # Nothing here backs that load (a stale reach from an earlier
+                # admission): replay from the HBM hit instead.
+                self._block_manager.fall_back_to_hbm_replay(seq)
+            if mine and sid not in self._load_specs:
+                # Nothing loads under the lookup: its locks, to the reach, go
+                # back now. An ordinary load keeps them; its retrieve hands
+                # back the part past the hit (`prepare_retrieve`).
+                super()._release_lookup(sid)
+        if self._page_only:
+            # The base saves from the lookup's hit, which needs an image at its
+            # end and so is 0 here: every request would store its whole prompt
+            # again (a c384 run copied 6.3x the tokens). LMCache already holds
+            # the PAGE KV up to the reach, so the save starts there.
+            reach = self._chunk_floor(int(getattr(seq, "_mp_page_reach", 0) or 0))
+            if reach > int(self._hit_save_floors.get(sid, 0)):
+                self._hit_save_floors[sid] = reach
+        super().update_state_after_alloc(seq)
+
+    def should_park_for_load_after_alloc(self, seq: Any) -> bool:
+        parks = super().should_park_for_load_after_alloc(seq)
+        if parks:
+            self._parked_loads[str(seq.id)] = seq
+        elif getattr(seq, "replay_kv_load", False):
+            # The load was refused (and `_clear_pending_load` gave its locks
+            # back): the slot is fresh and the KV past the HBM hit is missing,
+            # so replay below the HBM hit.
+            self._block_manager.fall_back_to_hbm_replay(seq)
+        return parks
+
+    def _ensure_lookup_pin(self, seq: Any, sid: str, spec) -> bool:
+        operation = self._native_load_operations.get(sid)
+        lease = self._native_loads.get(operation)
+        if lease is None or lease.seq is not seq or not lease.transfer.kv_only:
+            pinned = super()._ensure_lookup_pin(seq, sid, spec)
+            # Admission already weighed this request: a lookup run just now
+            # has no reach left to weigh.
+            self._kv_reach.pop(sid, None)
+            return pinned
+        # A KV-only load reads under its lookup, whose locks nothing has
+        # released since it answered (no dispatch unpins it). Asking again --
+        # what the base does for a load admitted on a remembered hit -- would
+        # weigh a hit of 0 (no image), and drop the load.
+        reach = self._lookup_client.hit_tokens(sid)
+        return reach is not None and int(reach) >= int(spec.lmcache_cached_tokens)
 
     def _save_frontier(self, seq: Any) -> int:
         if not getattr(seq, "has_per_req_cache", False):
@@ -184,6 +331,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             else 0
         )
         floor = self._save_floor(exhausted)
+        if self._page_only:
+            # No image to wait for: any computed chunk boundary will do.
+            return frontier if frontier > floor else 0
         # Every tracked request asks every step. The answer changes only when
         # its frontier moves or one of ITS boundary checkpoints is published or
         # dropped, so rescan only then -- not whenever any request's
@@ -223,6 +373,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     def _late_save_frontier(self, seq: Any, saved: int, available: int) -> int:
         available = self._chunk_floor(available)
+        if self._page_only:
+            return available if available > self._save_floor(saved) else saved
         for boundary in range(available, self._save_floor(saved), -self.chunk_size):
             if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
                 return boundary
@@ -237,6 +389,15 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if not self._may_emit_save():
             return None
         prefix_hash = self._boundary_hash(seq, aligned)
+        if self._page_only:
+            request = super()._build_save_request(
+                seq, saved, aligned, operation, block_ids, is_last_prefill
+            )
+            request.native_state = NativeStateTransfer(
+                (), aligned, prefix_hash, kv_only=True
+            )
+            self._native_saves[operation] = _NativeSave(seq, None, saved, aligned)
+            return request
         source = self._checkpoints.acquire_checkpoint_source(
             prefix_hash, max_inflight=self._max_pending_saves
         )
@@ -274,8 +435,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         )
         # The image pin is released on the terminal only: no PAGE chunk
         # milestone proves the server has finished reading the STATE groups.
-        self._checkpoints.release_offload_store_source(lease.source)
-        self._checkpoints.settle_offload_store(lease.source)
+        if lease.source is not None:
+            self._checkpoints.release_offload_store_source(lease.source)
+            self._checkpoints.settle_offload_store(lease.source)
         sid = str(operation.req_id)
         if succeeded:
             self._save_failures.pop(sid, None)
@@ -307,9 +469,26 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         return True
 
     def _decide_load_after_alloc(self, seq: Any, load_spec):
+        if getattr(seq, "replays_hit", False) and not getattr(
+            seq, "replay_kv_load", False
+        ):
+            # A replay from the HBM hit loads nothing: a load would raise
+            # `num_cached_tokens` past the hit, and the forward would resume
+            # there with a fresh state slot and nothing to rebuild it.
+            hbm = int(seq.num_cached_tokens)
+            lmc = int(load_spec.lmcache_cached_tokens)
+            chunk = int(self.chunk_size)
+            return False, "replay_from_hbm", hbm, lmc, lmc - hbm, chunk
         decision = super()._decide_load_after_alloc(seq, load_spec)
-        should_load, _reason, hbm, lmc, need, chunk = decision
+        should_load, reason, hbm, lmc, need, chunk = decision
         if not should_load:
+            if reason == "unaligned_hbm_prefill" and getattr(
+                seq, "replay_kv_load", False
+            ):
+                # A KV-only load cannot start at an HBM hit off the chunk grid,
+                # and the unaligned hand-off would hold the lookup's locks for a
+                # load that never comes: the replay rebuilds from the HBM hit.
+                return False, "replay_unaligned_hbm", hbm, lmc, need, chunk
             return decision
         if not getattr(seq, "has_per_req_cache", False) or seq.state_slot < 0:
             return False, "native_destination_missing", hbm, lmc, need, chunk
@@ -325,6 +504,23 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         prefix_hash = self._boundary_hash(seq, lmc)
         operation = LoadOperationId(seq.id, self._load_nonce)
         self._load_nonce += 1
+        if getattr(seq, "replay_kv_load", False):
+            if lmc != int(seq.offload_joint.kv_only_tokens):
+                return False, "replay_reach_moved", hbm, lmc, need, chunk
+            # PAGE alone: no image units, nothing restored. The replay that
+            # follows rebuilds the window state into the fresh slot.
+            self._native_loads[operation] = _NativeLoad(
+                seq,
+                NativeStateTransfer((), lmc, prefix_hash, kv_only=True),
+                hbm,
+            )
+            self._native_load_operations[sid] = operation
+            self._active_load_operations[sid] = (seq, operation)
+            seq._load_operation = operation
+            return decision
+        if self._page_only:
+            # Nothing stores images, so no hit carries one to restore.
+            return False, "native_no_images", hbm, lmc, need, chunk
         # No byte budget on top of the PAGE pool: one load per request bounds
         # these by the admitted batch, and a pool without room for an image
         # refuses here. A refusal recomputes the prefix, which costs far more
@@ -369,6 +565,23 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     def build_connector_meta(self):
         metadata = super().build_connector_meta()
+        # Every load parked since the last dispatch was sent or dropped just
+        # now. A dropped one leaves its request parked with no transfer to
+        # report on it.
+        sent = {
+            request.req_id
+            for request in metadata.requests
+            if request.load_operation is not None
+        }
+        for seq in self._parked_loads.values():
+            if seq.id not in sent and not self._has_active_load(seq):
+                logger.warning(
+                    "LMCache MP load for parked request %s was dropped at "
+                    "dispatch; waking it to prefill",
+                    seq.id,
+                )
+                self._dropped_parked_loads.add(seq.id)
+        self._parked_loads.clear()
         for request in metadata.requests:
             if request.load_operation is not None:
                 request.native_state = self._native_loads[
@@ -409,7 +622,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         ):
             return False
         lease = self._native_loads[operation]
-        if succeeded:
+        if lease.transfer.kv_only:
+            # No image, no units: the retrieve is closed with any other load's.
+            self._release_native_load(operation, release_units=False)
+        elif succeeded:
             if not self._checkpoints.adopt_transfer_units(
                 operation, lease.transfer.prefix_hash
             ):
@@ -455,7 +671,14 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         lease = self._native_loads.get(operation)
         if lease is not None and lease.seq is seq and lease.dispatched:
             return  # A request cancellation does not cancel an MP DMA.
+        self._forget_kv_reach(seq)
         super().cancel_pending_load(seq)
+
+    def _forget_kv_reach(self, seq: Any) -> None:
+        """Stop holding `seq`'s lookup for its reach; the base releases it."""
+        entry = self._kv_reach.get(str(seq.id))
+        if entry is not None and entry[0] is seq:
+            del self._kv_reach[str(seq.id)]
 
     def request_finished(self, seq: Any) -> None:
         sid = str(seq.id)
@@ -464,6 +687,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         lease = self._native_loads.get(operation)
         if lease is not None and lease.seq is seq and lease.dispatched:
             return
+        # Aborted while waiting: the lookup held for its reach goes back too.
+        self._forget_kv_reach(seq)
         super().request_finished(seq)
         self._finish_retired_request(sid)
 
@@ -501,6 +726,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             if not self.should_defer_free(seq):
                 output.finished_saving.add(seq.id)
                 self._finish_retired_request(sid)
+        # The scheduler wakes a failed load to prefill (a KV-only one to
+        # replay below its HBM hit), exactly as it would a transfer that ran.
+        output.failed_loading.update(self._dropped_parked_loads)
+        self._dropped_parked_loads.clear()
         return output
 
     def _live_transfers(self) -> set[Any]:

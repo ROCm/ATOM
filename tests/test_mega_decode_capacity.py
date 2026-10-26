@@ -13,6 +13,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("triton", reason="MegaMoE imports its Triton row-zeroing kernel")
+
 from atom.model_ops.fused_moe import flydsl_mega_experts as mega
 from atom.plugin import prepare as plugin_prepare
 
@@ -264,6 +266,18 @@ def test_capacity_boundary_uses_the_published_row_count(
 
     assert _forwarded(runtime) == [expected_capacity]
     assert torch.all(output == expected_capacity)
+
+
+@pytest.mark.parametrize("decode_mtpr", [256, 512, 1024])
+def test_configured_decode_capacity_moves_the_boundary(
+    runtime, monkeypatch, decode_mtpr
+):
+    monkeypatch.setattr(mega, "_MEGA_DECODE_MTPR", decode_mtpr)
+    runtime.run(_context(decode_mtpr))
+    runtime.run(_context(decode_mtpr + 1))
+
+    assert _forwarded(runtime) == [decode_mtpr, LARGE_CAPACITY]
+    assert _built(runtime) == [LARGE_CAPACITY, decode_mtpr]
 
 
 def test_missing_context_retains_original_capacity(runtime):

@@ -112,7 +112,6 @@ jobs:
           # to the job owner rather than decided here.
           atomesh_levels = {
               "DeepSeek-R1-0528": "main",
-              "DeepSeek-V4-Pro MTP": "nightly",
               "gpt-oss-120b": "nightly",
           }
           filtered = [m for m in models if atomesh_levels.get(m["model_name"], "skip") in allowed]

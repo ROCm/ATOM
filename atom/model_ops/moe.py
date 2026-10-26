@@ -58,6 +58,7 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
     resolve_mori_dispatch,
 )
+from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
 from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
@@ -78,6 +79,7 @@ from atom.quant_spec import (
     NVFP4_DTYPE,
     NVFP4_GROUP_SIZE,
     LayerQuantConfig,
+    fuses_mxfp8_shared_into_mxfp4,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -343,38 +345,6 @@ class FusedMoEParallelConfig:
             requested_all2all_backend=requested_all2all_backend,
             low_latency=low_latency,
         )
-
-
-def naive_multicast_fake(
-    x: torch.Tensor, cu_tokens_across_dp_cpu: torch.Tensor
-) -> torch.Tensor:
-    assert len(x.shape) == 2
-    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
-    buffer = torch.empty(
-        (cu_tokens_across_dp_cpu[-1], x.size(1)), device=x.device, dtype=x.dtype
-    )
-    return buffer
-
-
-@torch_compile_guard()
-def naive_multicast(
-    x: torch.Tensor, cu_tokens_across_dp_cpu: torch.Tensor
-) -> torch.Tensor:
-    dp_rank = get_dp_group().rank_in_group
-    assert len(x.shape) == 2
-    # print(f"cu_tokens_across_dp_cpu: {cu_tokens_across_dp_cpu}")
-    buffer = torch.empty(
-        (cu_tokens_across_dp_cpu[-1], x.size(1)), device=x.device, dtype=x.dtype
-    )
-
-    start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[dp_rank - 1]
-    end = cu_tokens_across_dp_cpu[dp_rank]
-    buffer[start:end, :].copy_(x)
-    for idx in range(get_dp_group().world_size):
-        start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
-        end = cu_tokens_across_dp_cpu[idx]
-        get_dp_group().broadcast(buffer[start:end, :], idx)
-    return buffer
 
 
 def pad_for_all_gather(x: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -740,17 +710,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 for slot in range(num_mori_ops)
             ]
 
-            # Off the op, not re-derived: the mapping is aiter's.
-            kernel_name = mori_ops[0].config.kernel_type.name
-            logger.info(
-                "[MORI] EP all2all kernel=%s internode=%s low_latency=%s "
-                "tbo_ubatch_ops=%d",
-                kernel_name,
-                all2all_manager.internode,
-                low_latency,
-                len(mori_ops) if tbo_is_enabled else 0,
-            )
-
             prepare_finalize = MoriPrepareAndFinalize(
                 mori_ops,
                 max_tokens_per_rank=moe.max_num_tokens,
@@ -771,8 +730,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         else:
             return None
 
-    # Note: init_prepare_finalize should only be called by
-    # prepare_communication_buffer_for_model.
+    # Called once after weight post-processing and before graph capture.
     def init_prepare_finalize(self, layer: torch.nn.Module):
         # print("init_prepare_finalize")
         assert self.moe is not None
@@ -818,6 +776,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
             if bind_mega is not None:
                 bind_mega(layer, self)
+
+        comm_fused = getattr(layer, "_comm_fused_moe", None)
+        if comm_fused is not None:
+            comm_fused.initialize(layer)
 
     @property
     def using_modular_kernel(self) -> bool:
@@ -942,6 +904,237 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             expert_mask=layer.expert_mask,
             activation=activation,
         )
+
+
+# One GLM-5.3 IQ2R workspace per device and shape, shared by every MoE layer:
+# layers run serially on a rank, so a fixed buffer set is also graph-safe.
+_IQ2R_GLM53_WORKSPACES: dict[tuple[torch.device, int, int], object] = {}
+# The kernels' N tile; checkpoints record theirs as `iq2r_tN`.
+_IQ2R_GLM53_TILE_N = 128
+
+
+class Iq2rMoEMethod(FusedMoEMethodBase):
+    """AITER IQ2R experts in the ``glm53-packed-v1`` layout.
+
+    The layout covers GLM-5.3 with the shared expert fused as expert 256, at
+    TP4/TP8. The checkpoint holds full layers; each rank slices its share of
+    the intermediate dimension as it loads.
+    """
+
+    def __init__(
+        self,
+        quant_config: LayerQuantConfig,
+        moe: FusedMoEConfig,
+        layout: str | None = None,
+    ):
+        super().__init__(moe)
+        self.quant_config = quant_config
+        if layout != "glm53-packed-v1":
+            raise ValueError(
+                f"unsupported IQ2R layout {layout!r}; ATOM runs only "
+                "'glm53-packed-v1' checkpoints"
+            )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        # The layout fixes the model shapes and load_weight checks every
+        # buffer against them, so only the parallel setup is checked here.
+        parallel = self.moe.moe_parallel_config
+        if (
+            parallel.tp_size not in (4, 8)
+            or parallel.ep_size != 1
+            or layer.has_bias
+            or layer.num_fused_shared_experts != 1
+        ):
+            raise NotImplementedError(
+                "the glm53-packed-v1 IQ2R layout runs at TP4/TP8 without EP, "
+                "with the shared expert fused"
+            )
+        self.tp_size = parallel.tp_size
+        self.tp_rank = parallel.tp_rank
+
+        from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes
+        from aiter.ops.iq2r_format import IQ2RMetadata
+
+        gate_metadata = IQ2RMetadata(
+            logical_n=2 * intermediate_size_per_partition,
+            logical_k=hidden_size,
+        )
+        down_metadata = IQ2RMetadata(
+            logical_n=hidden_size,
+            logical_k=intermediate_size_per_partition,
+        )
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        layer.iq2r_down_metadata = down_metadata
+        shapes = {
+            "w13_weight": iq2r_glm53_gate_bytes(gate_metadata.logical_n),
+            "w13_weight_scale": gate_metadata.auxiliary_bytes,
+            "w2_weight": down_metadata.data_bytes,
+            "w2_weight_scale": down_metadata.auxiliary_bytes,
+        }
+        tensors = {
+            name: torch.empty((num_experts, nbytes), dtype=torch.uint8)
+            for name, nbytes in shapes.items()
+        }
+        # The compiler also records the N tile it packed each projection for.
+        for name in ("w13_iq2r_tile_n", "w2_iq2r_tile_n"):
+            tensors[name] = torch.empty(1, dtype=torch.int32)
+        for name, tensor in tensors.items():
+            parameter = atom_parameter(tensor)
+            layer.register_parameter(name, parameter)
+            set_weight_attrs(parameter, extra_weight_attrs)
+            parameter.iq2r_name = name
+
+    def load_weight(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        name = param.iq2r_name
+        if name.endswith("_iq2r_tile_n"):
+            if loaded_weight.tolist() != [_IQ2R_GLM53_TILE_N]:
+                raise ValueError(
+                    f"IQ2R {name} is {loaded_weight.tolist()}, but the "
+                    f"glm53-packed-v1 kernels need {_IQ2R_GLM53_TILE_N}"
+                )
+        elif self.tp_size > 1:
+            loaded_weight = self._glm53_tp_slice(name, loaded_weight)
+        if tuple(param.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                f"IQ2R {name} shape mismatch: target={tuple(param.shape)}, "
+                f"checkpoint={tuple(loaded_weight.shape)}"
+            )
+        param.data.copy_(loaded_weight)
+
+    def _glm53_tp_slice(self, name: str, weight: torch.Tensor) -> torch.Tensor:
+        """This rank's intermediate-dimension shard of a full packed layer."""
+        from aiter.iq2r_glm53 import iq2r_glm53_slice_gate
+        from aiter.ops.iq2r_format import (
+            IQ2RMetadata,
+            iq2r_slice_input_data,
+            iq2r_slice_output_auxiliary,
+        )
+
+        shard = self.intermediate_size
+        full = shard * self.tp_size
+        if name == "w13_weight":
+            return iq2r_glm53_slice_gate(weight, 2 * shard * self.tp_rank, 2 * shard)
+        if name == "w13_weight_scale":
+            return iq2r_slice_output_auxiliary(
+                weight,
+                IQ2RMetadata(logical_n=2 * full, logical_k=self.hidden_size),
+                2 * shard * self.tp_rank,
+                2 * shard,
+            )
+        if name == "w2_weight":
+            return iq2r_slice_input_data(
+                weight,
+                IQ2RMetadata(logical_n=self.hidden_size, logical_k=full),
+                shard * self.tp_rank,
+                shard,
+            )
+        # Down codebooks and exponents cover all output columns.
+        return weight
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from aiter.ops.iq2r_format import iq2r_validate_expert_weights
+
+        # Only the down records keep the canonical layout the validator checks.
+        # `--load_dummy` writes no codebooks, so their reserved all-zero entry
+        # is checked only for checkpoint weights.
+        iq2r_validate_expert_weights(
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            layer.iq2r_down_metadata,
+            expert_count=self.num_experts,
+            verify_reserved_zero=not get_current_atom_config().load_dummy,
+        )
+        self._glm53_workspace(layer.w13_weight.device)
+
+    def _glm53_workspace(self, device: torch.device):
+        from aiter.iq2r_glm53 import IQ2RGlm53Workspace
+
+        key = (device, self.moe.max_num_tokens, self.intermediate_size)
+        workspace = _IQ2R_GLM53_WORKSPACES.get(key)
+        if workspace is None:
+            workspace = IQ2RGlm53Workspace.allocate(
+                self.moe.max_num_tokens, self.intermediate_size, device=device
+            )
+            _IQ2R_GLM53_WORKSPACES[key] = workspace
+        return workspace
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        return None
+
+    @mark_trace(prefix="iq2r_moe", torch_compile=False)
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: int | None = None,
+        num_expert_group: int | None = None,
+        global_num_experts: int = -1,
+        expert_map: torch.Tensor | None = None,
+        custom_routing_function: Callable | None = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: torch.Tensor | None = None,
+        fused_shared_experts_scoring_func: str | None = None,
+        apply_router_weight_on_input: bool = False,
+        activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
+    ) -> torch.Tensor:
+        if activation != ActivationType.Silu:
+            raise ValueError(f"IQ2R does not support {activation} here")
+
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_routing_experts=global_num_experts,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+
+        from aiter.iq2r_glm53 import iq2r_glm53_moe_out
+
+        output = torch.empty_like(x)
+        iq2r_glm53_moe_out(
+            x,
+            layer.w13_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+            output,
+            self._glm53_workspace(x.device),
+        )
+        return output
 
 
 def rocm_asm_moe_impl(
@@ -1263,7 +1456,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
-        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
+        self.fp8_activations = moe.mxfp4_fp8_activations
+        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
         self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
@@ -2061,6 +2255,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
+        if self.fp8_activations:
+            moe_extra_args["quant_dtype_a"] = dtypes.fp8
         if activation == ActivationType.Situv2:
             moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
             moe_extra_args["linear_beta"] = getattr(
@@ -3294,6 +3490,9 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    # Set in __init__ for an MXFP8 shared expert fused into MXFP4 experts.
+    shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
+
     def __init__(
         self,
         num_experts: int,  # Global number of experts
@@ -3323,6 +3522,7 @@ class FusedMoE(torch.nn.Module):
         shared_expert_prefix: str | None = None,
         pad_align: int | None = None,
         enable_comm_fused: bool = False,
+        mxfp4_fp8_activations: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3385,6 +3585,19 @@ class FusedMoE(torch.nn.Module):
         )
         num_fused_shared_experts = (
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
+        )
+
+        # An MXFP8 shared expert fused into MXFP4 routed experts is staged
+        # while loading and re-quantized into its slot afterwards.
+        stage_shared_mxfp8 = bool(
+            num_fused_shared_experts
+            and layer_quant_config is not None
+            and fuses_mxfp8_shared_into_mxfp4(
+                quant_config.get_layer_quant_config(
+                    shared_expert_prefix, check_children=True
+                ),
+                layer_quant_config,
+            )
         )
 
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
@@ -3555,6 +3768,7 @@ class FusedMoE(torch.nn.Module):
             expert_layout=self.expert_layout,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,
+            mxfp4_fp8_activations=mxfp4_fp8_activations,
             max_num_tokens=moe_token_capacity,
             has_bias=self.has_bias,
             # is_act_and_mul=True,
@@ -3570,6 +3784,12 @@ class FusedMoE(torch.nn.Module):
         if layer_quant_config is None or layer_quant_config.quant_type == QuantType.No:
             self.quant_method: QuantizeMethodBase | None = UnquantizedFusedMoEMethod(
                 moe
+            )
+        elif quant_method_str == "iq2r":
+            self.quant_method = Iq2rMoEMethod(
+                layer_quant_config,
+                moe,
+                layout=(quant_config.hf_quant_config or {}).get("iq2r_layout"),
             )
         elif (
             quant_method_str == "compressed-tensors"
@@ -3589,6 +3809,11 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
+        if self._comm_fused_moe is not None:
+            # This must precede create_weights and process_weights_after_loading:
+            # comm-fused runners consume the Aiter/FlyDSL layout, while the
+            # Triton paths rewrite the same MXFP4 parameters incompatibly.
+            self._comm_fused_moe.configure_quant_method(self.quant_method)
         if self.expert_layout.uses_all2all_fusion and not isinstance(
             self.quant_method, (Mxfp4MoEMethod, Nvfp4MoEMethod)
         ):
@@ -3620,6 +3845,13 @@ class FusedMoE(torch.nn.Module):
         )
         self._load_device = torch.empty(0).device if self._stream_online_quant else None
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
+        self.shared_mxfp8_into_mxfp4 = (
+            Mxfp8SharedIntoMxfp4(
+                self, quant_config, hidden_size, self.intermediate_size_per_partition
+            )
+            if stage_shared_mxfp8
+            else None
+        )
         compilation_config = atom_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -3706,9 +3938,9 @@ class FusedMoE(torch.nn.Module):
 
     def process_weights_after_loading(self):
         self._online_quant()
+        if self.shared_mxfp8_into_mxfp4 is not None:
+            self.shared_mxfp8_into_mxfp4.fuse(self)
         self._validate_moe_backend()
-        if self._comm_fused_moe is not None:
-            self._comm_fused_moe.initialize(self)
 
     def _validate_moe_backend(self) -> None:
         if get_current_atom_config().moe_backend != "mega":
@@ -4884,6 +5116,10 @@ class FusedMoE(torch.nn.Module):
         shard_id: str = "",
         expert_id: int = 0,
     ) -> None:
+        if isinstance(self.quant_method, Iq2rMoEMethod):
+            self.quant_method.load_weight(param, loaded_weight)
+            return
+
         is_nvfp4 = bool(
             self.layer_quant_config is not None
             and self.layer_quant_config.quant_dtype == NVFP4_DTYPE
@@ -4899,6 +5135,12 @@ class FusedMoE(torch.nn.Module):
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
+            return
+        # getattr: test doubles borrow this loader without subclassing FusedMoE.
+        shared_mxfp8 = getattr(self, "shared_mxfp8_into_mxfp4", None)
+        if shared_mxfp8 is not None and shared_mxfp8.load(
+            self, param, loaded_weight, shard_id, expert_id
+        ):
             return
         if is_nvfp4 and self._load_nvfp4_global_scale(
             param, loaded_weight, shard_id, expert_id
@@ -5136,7 +5378,8 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[[], torch.Tensor] | None = None,
+        before_stage2_for_rows: Callable[[int], torch.Tensor] | None = None,
+        before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Return ``(output, complete)`` after fused or ordinary dispatch.
@@ -5144,14 +5387,21 @@ class FusedMoE(torch.nn.Module):
         A complete output already contains the shared expert and TP reduction.
         """
         backend = self._comm_fused_moe
-        if backend is not None and backend.supports(hidden_states.shape[0]):
+        if (
+            backend is not None
+            and (
+                self.custom_routing_function is None or backend.supports_custom_routing
+            )
+            and backend.supports(hidden_states.shape[0])
+        ):
             return (
                 backend.forward(
                     self,
                     hidden_states,
                     router_logits,
                     shared_partial,
-                    before_stage2=before_stage2,
+                    before_stage2_for_rows=before_stage2_for_rows,
+                    before_shared_add=before_shared_add,
                     stage2_stream=stage2_stream,
                 ),
                 True,
@@ -5264,15 +5514,6 @@ class FusedMoE(torch.nn.Module):
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
 
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
-            cu_tokens_across_dp_cpu = (
-                get_forward_context().dp_metadata.cu_tokens_across_dp_cpu
-            )
-
-            hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
-            router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
-
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
@@ -5305,15 +5546,6 @@ class FusedMoE(torch.nn.Module):
 
         if dp_repeat > 1:
             final_hidden_states = final_hidden_states[:local_rows]
-
-        dp_group = get_dp_group()
-        if dp_group.world_size > 1:
-            dp_rank = dp_group.rank_in_group
-            start = 0 if dp_rank == 0 else cu_tokens_across_dp_cpu[dp_rank - 1]
-            end = cu_tokens_across_dp_cpu[dp_rank]
-
-            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-            final_hidden_states = all_hidden_states[start:end, :]
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
