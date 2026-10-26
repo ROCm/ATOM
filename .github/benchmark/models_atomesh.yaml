@@ -1452,6 +1452,74 @@ models:
       fewshot: 3
       limit: null
 
+  MiniMax-M3.1-Flash-Quark-MXFP4:
+    backend: atom
+    model_path: amd/MiniMax-M3.1-Flash-Quark-MXFP4
+    precision: MXFP4
+    env:
+      common:
+        ATOM_FORCE_ATTN_TRITON: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
+        # Share Hugging Face downloads between P/D and retain them across CI runs.
+        HF_HUB_CACHE: "${ATOMESH_MODEL_ROOT}/.huggingface/hub"
+        HF_HUB_DOWNLOAD_TIMEOUT: "120"
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 128
+        enable_prefix_caching: false
+        gpu_memory_utilization: 0.8
+        max_model_len: 32768
+        max_num_seqs: 64
+        max_num_batched_tokens: 32768
+        # Reserve and bound dense cached-prefill K+V to 8 GiB per rank on P/D.
+        extra_args: "--gqa-prefill-kv-workspace-mb 8192"
+    service:
+      decode:
+        cudagraph: "[1,2,4,8,16,24,32,40,48,56,64]"
+    suites:
+      accuracy:
+        - name: minimax-m31-flash-mxfp4-1p1d-tp4-gsm8k-20shot-c32
+          topology: 1p1d
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [4096]
+          osl: 1024
+          concurrency: [32]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            common:
+              # Match the existing single-node MiniMax RDMA transport.
+              MC_DISABLE_HIP: "1"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32]
+    accuracy:
+      task: gsm8k
+      fewshot: 20
+      limit: null
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      batch_size: 65
+      max_gen_toks: 16384
+      apply_chat_template: true
+      fewshot_as_multiturn: true
+
   MiniMax-M3-MXFP4:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3-MXFP4"
