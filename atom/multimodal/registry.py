@@ -32,6 +32,9 @@ _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
         "atom.models.deepseek_v41.image_processing.build_inputs"
     ),
     "KimiK3ForConditionalGeneration": "atom.models.kimi_k3_vl.build_kimi_k3_inputs",
+    "MiniMaxM3SparseForConditionalGeneration": (
+        "atom.models.minimax_m3.image_processing.build_minimax_m3_inputs"
+    ),
 }
 
 # Architectures whose checkpoint ships its own processor rather than one

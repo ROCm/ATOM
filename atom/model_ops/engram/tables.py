@@ -6,86 +6,10 @@ registered shard lives in `device.uva`, so that the prefetch runtime can import
 this module on a machine with no Triton.
 """
 
-import ctypes
-import functools
-
 import numpy as np
 import torch
 
-
-@functools.cache
-def _hip_runtime():
-    """The HIP runtime torch already loaded (e.g. a wheel's libamdhip64.so.7)."""
-    try:
-        with open("/proc/self/maps") as maps:
-            for line in maps:
-                if "libamdhip64" in line:
-                    return ctypes.CDLL(line.split()[-1])
-    except OSError:
-        pass
-    return None
-
-
-def _clear_last_error() -> None:
-    """Reset HIP's last error after a refused registration.
-
-    `cudaHostRegister` reports the refusal through its return code but also
-    leaves it as the runtime's last error, and torch raises that at its next
-    kernel-launch check -- so the host-path fallback would die there ("part or
-    all of the requested memory range is already mapped").
-    """
-    hip = _hip_runtime()
-    if hip is not None:
-        hip.hipGetLastError()
-
-
-class _PageRuns:
-    """Page-locked runs of this process, reference-counted.
-
-    `cudaHostRegister` refuses any range that overlaps one already registered,
-    and a table widens each range to page boundaries. Ranges stored back to
-    back want the page they share: a layer's scales sit right before its
-    values in the checkpoint shard, and a rank that holds every hash head (one
-    DP-attention rank per GPU) registers both whole. A run is registered once
-    and released with its last user.
-    """
-
-    def __init__(self):
-        self._runs: dict[int, list[int]] = {}  # base -> [end, users]
-
-    def acquire(self, rt, lo: int, hi: int) -> list[int] | None:
-        """Reference the runs covering `[lo, hi)`, registering the uncovered
-        gaps; their bases, or None (holding nothing) if a registration is
-        refused."""
-        held: list[int] = []
-        cursor = lo
-        overlapping = sorted(b for b, (e, _) in self._runs.items() if b < hi and e > lo)
-        for base in overlapping + [None]:
-            gap_end = hi if base is None else base
-            if cursor < gap_end:
-                if int(rt.cudaHostRegister(cursor, gap_end - cursor, 0)) != 0:
-                    _clear_last_error()
-                    self.release(rt, held)
-                    return None
-                self._runs[cursor] = [gap_end, 1]
-                held.append(cursor)
-            if base is None:
-                break
-            self._runs[base][1] += 1
-            held.append(base)
-            cursor = max(cursor, self._runs[base][0])
-        return held
-
-    def release(self, rt, bases) -> None:
-        for base in bases:
-            run = self._runs[base]
-            run[1] -= 1
-            if run[1] == 0:
-                rt.cudaHostUnregister(base)
-                del self._runs[base]
-
-
-_PAGE_RUNS = _PageRuns()
+from atom.model_ops.engram import host_memory
 
 
 class HostEmbeddingTable:
@@ -115,10 +39,10 @@ class HostEmbeddingTable:
         self.head_dim = head_dim
         self._scale = scale
         self.block_size = 0
-        # The registered row range, and the page-locked runs (see `_PageRuns`)
-        # this table holds a reference on for it.
+        # The page-locked row range and its rows (values, then scales), as
+        # `host_memory.pin_rows` returned them; the tensors own the memory.
         self._uva: tuple[int, int] | None = None
-        self._pinned: tuple[int, ...] = ()
+        self._shard: tuple[torch.Tensor, ...] = ()
         if scale is not None:
             # gather() does `scale.to(float32)`; that decodes 2**(code-127) only
             # for a float8 E8M0 dtype. A raw uint8 exponent-code table would be
@@ -181,9 +105,8 @@ class HostEmbeddingTable:
     # ---- UVA path ----------------------------------------------------------
     # The serving default (ATOM_ENGRAM_UVA), with the host gather above kept as
     # the reference implementation. Only THIS RANK'S shard of the table is
-    # page-locked in place -- no copy, no HBM -- and a device kernel reads the
-    # rows it needs across the bus, which also moves the fp8 dequantization off
-    # the host.
+    # page-locked -- no HBM -- and a device kernel reads the rows it needs
+    # across the bus, which also moves the fp8 dequantization off the host.
     #
     # The shard is a whole number of hash heads. Each head owns a disjoint,
     # contiguous, prime-sized row range, so whole heads are a contiguous BYTE
@@ -191,15 +114,12 @@ class HostEmbeddingTable:
     # table. Registering the whole table on every rank is what a TP=4 job cannot
     # afford: 4 x 203 GB of unswappable pages.
 
-    _PAGE = 4096
-
     def enable_uva(self, row_start: int = 0, row_end: int | None = None) -> bool:
-        """Page-lock rows `[row_start, row_end)` so a device kernel can read them.
+        """Page-lock rows `[row_start, row_end)` so a device kernel can read
+        them (`host_memory.pin_rows`); all-or-nothing.
 
-        Registers the existing mapping rather than copying it. Registration
-        faults the pages in, so it is slow (~1 GB/s) and happens once, at load.
-        The range is widened to page boundaries, which registration requires;
-        the extra bytes are neighbouring rows this rank simply never addresses.
+        A table holds one range: enabling a different one while a range is
+        held raises -- `disable_uva()` first.
         """
         row_end = self.num_rows if row_end is None else row_end
         if not 0 <= row_start <= row_end <= self.num_rows:
@@ -207,39 +127,30 @@ class HostEmbeddingTable:
                 f"engram shard rows [{row_start}, {row_end}) outside "
                 f"[0, {self.num_rows})"
             )
-        if self._uva == (row_start, row_end):
-            return True
-        rt = torch.cuda.cudart()
-        regions = [(self._tensor, self.head_dim)]
+        if self._uva is not None:
+            if self._uva == (row_start, row_end):
+                return True
+            raise RuntimeError(
+                f"engram table already page-locks rows {list(self._uva)}; "
+                f"disable_uva() before enabling [{row_start}, {row_end})"
+            )
+        sources = [self._tensor[row_start:row_end]]
         if self._scale is not None:
-            regions.append((self._scale, self._scale.shape[1]))
-        pinned = []
-        for tensor, width in regions:
-            item = tensor.element_size()
-            base = tensor.data_ptr() + row_start * width * item
-            nbytes = (row_end - row_start) * width * item
-            lo = base - (base % self._PAGE)
-            hi = -(-(base + nbytes) // self._PAGE) * self._PAGE
-            runs = _PAGE_RUNS.acquire(rt, lo, hi)
-            if runs is None:
-                # This object is about to report that it holds neither region.
-                _PAGE_RUNS.release(rt, pinned)
-                return False
-            pinned.extend(runs)
-        self._pinned = tuple(pinned)
+            sources.append(self._scale[row_start:row_end])
+        shard = host_memory.pin_rows(sources)
+        if shard is None:
+            return False
+        self._shard = shard
         self._uva = (row_start, row_end)
         return True
 
     def disable_uva(self) -> None:
-        """Release this table's page-locked range, if it holds one.
+        """Drop this table's page-locked range, if it holds one.
 
-        What comes back is what went in, rather than the same offsets derived a
-        second time -- two copies of that arithmetic would have to agree.
+        The memory goes when the last tensor over it does: at once unless a
+        caller still holds one from `registered_shard`, then with that tensor.
         """
-        if self._uva is None:
-            return
-        _PAGE_RUNS.release(torch.cuda.cudart(), self._pinned)
-        self._pinned = ()
+        self._shard = ()
         self._uva = None
 
     def registered_shard(self):
@@ -253,12 +164,8 @@ class HostEmbeddingTable:
         if self._uva is None:
             raise RuntimeError("engram UVA lookup needs enable_uva() first")
         row_start, row_end = self._uva
-        weight = self._tensor[row_start:row_end]
-        scales = (
-            weight
-            if self._scale is None
-            else self._scale[row_start:row_end].view(torch.uint8)
-        )
+        weight = self._shard[0]
+        scales = weight if self._scale is None else self._shard[1].view(torch.uint8)
         return weight, scales, row_start, row_end
 
     @staticmethod
