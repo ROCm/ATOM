@@ -581,6 +581,12 @@ class Context:
     # step whatever shape it was recorded at. A draft re-points it with
     # `scheduled_tokens` (`Drafter._publish_draft_shape`).
     scheduled_tokens_gpu: torch.Tensor | None = None
+    # Mixed prefill+decode (Phase 2). When True, the first num_prefill_tokens
+    # rows of q/k/v are prefill chunks and the rest are decode tokens; the
+    # attention backend splits them via prefill_attn_metadata / decode_attn_metadata.
+    is_mixed: bool = False
+    num_prefill_tokens: int = 0
+    num_prefill_seqs: int = 0
 
     # Optional speculative-decoding inputs staged alongside the target
     # forward's other host-to-device copies. Keeping these on the per-forward
@@ -607,6 +613,9 @@ class Context:
         pcp_split: bool = False,
         target_pcp_split: bool = False,
         scheduled_tokens_gpu: torch.Tensor | None = None,
+        is_mixed: bool = False,
+        num_prefill_tokens: int = 0,
+        num_prefill_seqs: int = 0,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -626,6 +635,9 @@ class Context:
         self.pcp_split = pcp_split
         self.target_pcp_split = target_pcp_split
         self.scheduled_tokens_gpu = scheduled_tokens_gpu
+        self.is_mixed = is_mixed
+        self.num_prefill_tokens = num_prefill_tokens
+        self.num_prefill_seqs = num_prefill_seqs
 
 
 @dataclass
@@ -704,17 +716,14 @@ class AttentionMetaData:
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
-    # A TBO step's micro-batches' metadata, one per `ForwardMode.ubatch_slices`
-    # slice, built with the step's (`finish_ubatch_decode` /
-    # `finish_ubatch_prefill`). None when the step does not split.
-    ubatches: "list[AttentionMetaData] | None" = None
-    # A split decode's packed tokens in its micro-batches' order
-    # (`decode_ubatch_token_order`), which the TBO wrapper gathers its inputs
-    # by and scatters its outputs back through; None otherwise.
-    ubatch_token_order: torch.Tensor | None = None
-    # A decode micro-batch's own scheduled tokens on the device (`[1]`
-    # int32); None on a step's metadata and a prefill micro-batch's.
-    scheduled_tokens_gpu: torch.Tensor | None = None
+    # Mixed prefill+decode (Phase 2) split-dispatch sub-metadata. For a mixed
+    # batch the builder returns ONE AttentionMetaData whose `slot_mapping` covers
+    # all tokens (merged prefill-then-decode), and whose attention dispatch is
+    # driven by these two nested objects: `prefill_attn_metadata` for the first
+    # `context.num_prefill_tokens` rows and `decode_attn_metadata` for the rest.
+    # None for non-mixed batches.
+    prefill_attn_metadata: "AttentionMetaData | None" = None
+    decode_attn_metadata: "AttentionMetaData | None" = None
 
     def __init__(
         self,
@@ -751,7 +760,11 @@ class AttentionMetaData:
         total_kv: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        prefill_attn_metadata: "AttentionMetaData | None" = None,
+        decode_attn_metadata: "AttentionMetaData | None" = None,
     ):
+        self.prefill_attn_metadata = prefill_attn_metadata
+        self.decode_attn_metadata = decode_attn_metadata
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens

@@ -371,16 +371,36 @@ class UBatchWrapper(nn.Module):
         the step's in its micro-batches' order, ``token_order`` that order."""
         ub_attn = ctx.attn_metadata.ubatches[ubatch_idx]
 
-        # Split Context. Its tokens past its own requests' are padding.
-        ts = ub_slice.token_slice
-        ub_scheduled_bs = ub_slice.scheduled_bs(ctx.context.scheduled_bs)
-        ub_token_order = None if token_order is None else token_order[ts]
-        scheduled_tokens_gpu = ub_attn.scheduled_tokens_gpu
-        if scheduled_tokens_gpu is None:
-            scheduled_tokens_gpu = self._ubatch_scheduled_tokens_gpu(
-                ctx.context.scheduled_tokens_gpu,
-                ts.start,
-                ub_slice.scheduled_token_slice.stop,
+        if ctx.context.is_prefill:
+            ub_attn = self.attn_metadata_builder.build_ubatch_prefill_metadata(
+                ctx.attn_metadata,
+                ub_slice,
+                ub_running_bs,
+                ubatch_idx=ubatch_idx,
+            )
+        else:
+            attn_bs = actual_num_reqs if actual_num_reqs is not None else ub_running_bs
+            ub_attn = self.attn_metadata_builder.build_ubatch_metadata(
+                ubatch_idx,
+                attn_bs,
+            )
+
+        # Split Context
+        ub_scheduled_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
+        # Mixed only if this ubatch actually holds rows of both kinds. A slice
+        # from a non-mixed parent carries None; a pure-prefill slice carries a
+        # prefill count equal to its whole length.
+        ub_is_mixed = (
+            ub_slice.num_prefill_tokens is not None
+            and 0 < ub_slice.num_prefill_tokens < ub_scheduled_tokens
+        )
+        if ub_running_tokens is not None:
+            running_tokens = ub_running_tokens
+        elif ctx.context.is_prefill:
+            running_tokens = ub_scheduled_tokens
+        else:
+            running_tokens = ub_running_bs * int(
+                getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
             )
         ub_context = Context(
             positions=positions[..., ts],
@@ -409,6 +429,21 @@ class UBatchWrapper(nn.Module):
             ubatch_token_order=ub_token_order,
             scheduled_tokens_gpu=scheduled_tokens_gpu,
             pcp_split=ctx.context.pcp_split,
+            # Splitting a mixed batch leaves exactly ONE ubatch straddling the
+            # prefill/decode boundary; the others are pure prefill (the split
+            # is gated to guarantee that -- see split_mixed_token_midpoint).
+            # Only the straddling one is mixed, and it has its own boundary,
+            # which `_attn_mixed`'s split dispatch and `embed_head`'s sampling
+            # gather both read off the context and neither can rederive from
+            # the parent's.
+            #
+            # A pure-prefill ubatch reports is_mixed=False and takes the
+            # ordinary prefill path. On a non-mixed parent the slice carries
+            # None and everything below is the Context default, so single-mode
+            # TBO is untouched.
+            is_mixed=ub_is_mixed,
+            num_prefill_tokens=ub_slice.num_prefill_tokens if ub_is_mixed else 0,
+            num_prefill_seqs=ub_slice.num_prefill_seqs if ub_is_mixed else 0,
         )
 
         return ForwardContext(
