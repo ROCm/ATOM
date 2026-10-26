@@ -1626,9 +1626,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.indexer_cp_world,
             max_query_len,
             self.scale,
-            # Built once per decode step in the metadata against this rank's
-            # local block bound, never here -- see `indexer_context_scores`.
-            # None means the scorer builds its own, at ~120us per sparse layer.
+            # Built once per step in the metadata (this rank's local bound).
             work_map=index_score_work_map,
             max_block=index_score_max_block,
         )
@@ -1707,11 +1705,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     emit_sparse_block_table=True,
                     max_query_len=max_query_len,
                     n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
-                    # Built once per decode step in the metadata, never here:
-                    # `make_work_map` is ~15 tiny launches costing ~120 us, so
-                    # per sparse layer it would swamp the kernel it feeds. None
-                    # means the scorer builds its own -- correct, and exactly
-                    # the price this hoist exists to avoid paying 57x a step.
+                    # Built once per step in the metadata: ~120us per layer otherwise.
                     index_score_work_map=sparse_metadata.index_score_work_map,
                     index_score_max_block=sparse_metadata.index_score_max_block,
                 )

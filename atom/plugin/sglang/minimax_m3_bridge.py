@@ -274,14 +274,10 @@ def _minimax_sparse_kv_scale_buffer(self, layer_id: int):
 
 
 def _atom_m3_index_dtype(owner: Any) -> torch.dtype:
-    """ATOM index dtype for MiniMax-M3. fp8, or a refusal naming the flag.
+    """ATOM index dtype for MiniMax-M3: fp8, or a refusal naming the flag.
 
-    The scorers are aiter's FlyDSL kernels and they serve fp8 only
-    (ROCm/aiter#5626). This runs from `configure`, before weights load, which
-    is the SGLang side of the refusal the vLLM pool allocator makes in
-    `aiter_attention._resolve_index_cache_dtype` -- the two share one message
-    rather than each describing the same rule in its own words. Without it the
-    configuration starts and dies at the first decode instead.
+    Runs from `configure`, before weights load; the SGLang side of the refusal
+    in `aiter_attention._resolve_index_cache_dtype`, with the same message.
     """
 
     fallback = getattr(owner, "model_dtype", torch.bfloat16)

@@ -86,24 +86,17 @@ def minimax_m3_sparse_attention(
     layer._sparse_attn_run(qkv, positions, output)
 
 
-def _index_cache_torch_dtype(kv_cache_dtype: str, model_config) -> torch.dtype:
+def _index_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
     """Torch dtype for the MiniMax-M3 index cache: fp8, or a refusal.
 
-    NOT vLLM's ``kv_cache_dtype_str_to_dtype``: its ``fp8 -> torch.uint8`` is
-    right for caches read as byte buffers, but this one is read by a kernel
-    that branches on ``dtype.is_fp8()``, so a uint8 label dots bf16 against
-    uint8. Same ``dtypes.d_dtypes`` handle as the native server, and one byte
-    either way, so page accounting is unchanged.
-
-    Anything else is bf16, which no scorer serves: refused here, at layer
-    construction, rather than by aiter at the first decode.
+    NOT vLLM's ``kv_cache_dtype_str_to_dtype``: its ``fp8 -> torch.uint8`` would
+    make a kernel that branches on ``dtype.is_fp8()`` dot bf16 against uint8.
+    Anything else is bf16, which no scorer serves.
     """
     if str(kv_cache_dtype).startswith("fp8"):
         return dtypes.d_dtypes["fp8"]
     from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
 
-    # The raw string, not what vLLM would map it to: resolving it first would
-    # put a second thing that can fail inside the error path.
     raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {kv_cache_dtype!r}.")
 
 
@@ -120,16 +113,12 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         from vllm.v1.attention.backend import AttentionType
 
         super().__init__()
-        atom_config = get_current_atom_config()
-        vllm_config = atom_config.plugin_config.vllm_config
         self.layer_name = layer_name
         self.prefix = layer_name
         self.attn_type = AttentionType.DECODER
         self.attn_backend = SparseMHAIndexerBackend
         self.kv_cache_dtype = kv_cache_dtype
-        self.kv_cache_torch_dtype = _index_cache_torch_dtype(
-            kv_cache_dtype, vllm_config.model_config
-        )
+        self.kv_cache_torch_dtype = _index_cache_torch_dtype(kv_cache_dtype)
         self.num_kv_heads = 1
         self.head_size = head_dim
         self.head_size_v = head_dim
@@ -652,11 +641,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 num_idx_heads=self.num_idx_heads,
                 decode_max_q=max_query_len,
             ),
-            # The bound is the block table's own width, not
-            # `ceil(max_seq_len/128)`: the map's row count IS the kernel's grid
-            # and must not move between capture and replay, and this step's
-            # longest request does move. vLLM sizes the decode block table from
-            # the model length, so its width is capture-stable.
+            # Bound is the capture-stable block-table width, not this step's longest request.
             index_score_work_map=index_score_work_map_for_forward(
                 main_metadata,
                 "decode",

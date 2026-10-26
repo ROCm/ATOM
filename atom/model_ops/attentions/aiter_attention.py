@@ -70,15 +70,8 @@ def _is_indexed_sparse_attention(module) -> bool:
 
 
 def _resolve_index_cache_dtype(config) -> torch.dtype:
-    """MiniMax-M3's index cache dtype, refused here if the scorers cannot serve it.
-
-    fp8 only. The FlyDSL scorers are the only index scorers and they take an
-    fp8 cache (ROCm/aiter#5626); the Triton decode kernels that used to serve
-    bf16 are gone. Refusing at pool allocation rather than at the first decode
-    is the point: the same configuration otherwise starts, serves a prefill,
-    and dies 57 layers into a step with a dtype error raised inside aiter, which
-    names neither the flag to pass nor where the value came from.
-    """
+    """MiniMax-M3's index cache dtype: fp8 only, refused at allocation rather
+    than 57 layers into the first decode step."""
     from aiter import dtypes
 
     from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
@@ -328,10 +321,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 indexer_cp_enabled,
             )
 
-            # The flydsl index-score kernel's dispatch map, same persistence
-            # argument. Its row count is that kernel's grid, so the bound has to
-            # be one that does not move between capture and replay -- the model
-            # length, never the batch's longest request.
+            # The flydsl index-score kernel's persistent dispatch map; its row
+            # count is the grid, so the bound is the model length.
             from atom.model_ops.minimax_m3.index_topk import (
                 SPARSE_BLOCK_SIZE as _M3_SPARSE_BLOCK_SIZE,
             )
@@ -339,10 +330,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 index_score_work_map_capacity,
             )
 
-            # Indexer CP shards the context round-robin, so a rank scores
-            # ceil(blocks / world) of it and every bound below is that local one.
-            # Resolved here rather than per step for the same reason the sparse
-            # layer resolves it in __init__: no per-forward branch in the model.
+            # Indexer CP shards round-robin: every bound below is the local one.
             self._index_score_cp_world = 1
             self._index_score_cp_rank = 0
             if indexer_cp_enabled():
@@ -352,24 +340,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 triton.cdiv(config.max_model_len, _M3_SPARSE_BLOCK_SIZE),
                 self._index_score_cp_world,
             )
-            # NOT `_num_idx_heads`. Under indexer CP the sparse layer widens
-            # decode `index_q` to one head per CP rank and scores the whole
-            # width (`attention_mha.py`: `num_idx_heads = indexer_cp_world`),
-            # so the map the scorer consumes has that geometry, not the
-            # TP-local KV head count. aiter's row count happens not to depend
-            # on the head count today, so the two agree by coincidence and the
-            # row-count assert in `decode_index_score` -- which compares that
-            # same head-independent number -- would not catch a divergence.
-            # Pass what the scorer actually uses and the question stops being
-            # about aiter's internals.
+            # NOT `_num_idx_heads`: under indexer CP the sparse layer scores one
+            # head per CP rank (`attention_mha.py`), and the row-count assert in
+            # `decode_index_score` would not catch a divergence.
             self._index_score_num_idx_heads = (
                 self._index_score_cp_world if indexer_cp_enabled() else num_head_k
             )
             # CAPACITY, not the exact size at `max_bs`: aiter's grid is
-            # non-monotonic in the batch, so a buffer sized for the largest
-            # batch can be too small for a smaller one -- at max_block 256 a
-            # batch of 8 needs 256 rows and a batch of 7 needs 455. This buffer
-            # is persistent and captured, so it has to serve every batch.
+            # non-monotonic in the batch.
             rows = index_score_work_map_capacity(
                 self.max_bs,
                 self._index_score_max_block,
@@ -512,12 +490,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     index_score_work_map_capacity,
                 )
 
-                # The CP pair has to match the one `_build_ubatch_metadata`
-                # passes to the builder: the shard's dispatch is denser than the
-                # whole context's, so a map sized at cp_world=1 is SHORTER than
-                # the one a CP rank writes -- 64 rows against 128 at bs=8,
-                # max_block=64 -- and the build rejects the buffer outright
-                # ("work_map: expected packed [at least N, 2] int32").
+                # The CP pair must match the one the ubatch builder passes: a map
+                # sized at cp_world=1 is shorter than a CP rank writes.
                 rows = index_score_work_map_capacity(
                     ub_max_bs,
                     self._index_score_max_block,
@@ -855,13 +829,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ]
 
     def _index_score_work_map_buffer(self, prefix: str = "") -> torch.Tensor | None:
-        """The decode work-map buffer, on the same terms as its sibling above.
-
-        None when this model never allocated one -- a non-sparse model, or a
-        prefix whose buffers were not registered. The metadata builder reads
-        the same absence and leaves the map empty, which costs correctness
-        nothing: the scorer then builds its own, at ~120 us per sparse layer.
-        """
+        """The decode work-map buffer; None when this model never allocated one
+        (the scorer then builds its own per layer)."""
         return self.model_runner.forward_vars.get(
             f"{prefix}sparse_attention_index_score_work_map"
         )
@@ -1565,13 +1534,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             if self.block_size in (256, 1024):
                 self._set_ubatch_pa_buffers(running_bs, max_seqlen_q, ub_idx)
             if self._has_sparse_attention:
-                # On the same terms as the PA buffers above: the TBO decode
-                # graph is captured around `build_ubatch_metadata`, so replay
-                # rebuilds no metadata and the scorer reads whatever these
-                # persistent buffers last held. Refilling here -- after this
-                # ubatch's lengths and block table are published -- is what
-                # keeps the dispatch map on this step's geometry, exactly as
-                # `prepare_decode` does for the non-TBO decode graph.
+                # Replay rebuilds no metadata, so refill the persistent map here,
+                # after this ubatch's lengths are published (as `prepare_decode`).
                 self._build_ubatch_sparse_metadata(ub_idx, running_bs, max_seqlen_q)
 
     def _build_ubatch_sparse_metadata(self, ubatch_idx, running_bs, max_q_len):

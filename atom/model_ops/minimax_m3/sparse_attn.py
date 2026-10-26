@@ -101,31 +101,15 @@ class MiniMaxM3SparseMetadata:
     """
     index_score_work_map: torch.Tensor | None = None
     """[grid, 2] int32 GPU -- the decode index-score kernel's packed dispatch
-    order. None on prefill and on an empty batch. None does NOT disable
-    anything: there is one decode scorer and it builds its own map when none
-    arrives -- correctly, and at ~120us a layer.
-
-    Hoisted here for the same reason as `n_valid_column_per_row`, and more
-    urgently: building it is ~15 trivial device ops whose cost is almost all
-    launch floor, ~120us a call against a score kernel of 17-250us. Once per
-    step that disappears; once per sparse layer it would cost more than the
-    kernel it feeds.
+    order, built once per step (~120us a call). None on prefill and on an empty
+    batch; the scorer then builds its own, correctly but per layer.
     """
     index_score_max_block: int = 0
     """The bound `index_score_work_map` was built against, in 128-token blocks.
 
-    NOT `ceil(max_seq_len / 128)`: a map's row count is the score kernel's grid,
-    and under a cudagraph that grid is baked at capture while the map is
-    refilled each step outside it. A bound that tracked the batch's longest
-    request would reshape the map under a fixed grid -- rows that still exist
-    but now mean a different (request, chunk). So the caller passes a bound that
-    does not move, `ceil(max_model_len / 128)`, and the op scores that wide.
-
-    Under indexer CP this is this rank's LOCAL bound,
-    `ceil(ceil(max_model_len / 128) / world)`, because the shard is what the
-    kernel is compiled and dispatched against. Read it as "the width of the
-    score this metadata describes", which is what every consumer wants; the
-    global block count is `block_table.shape[1]` and is read from there.
+    NOT `ceil(max_seq_len / 128)`: the map's row count is the grid baked at
+    capture, so the bound must not move -- `ceil(max_model_len / 128)`, or under
+    indexer CP this rank's LOCAL `ceil(that / world)`.
     """
 
 
@@ -193,17 +177,12 @@ def make_sparse_decode_metadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
     batch = seq_lens.shape[0]
-    # See the field docstring: a caller that captures cudagraphs MUST pass its
-    # own fixed bound, already divided by the CP world it passes here. Falling
-    # back to this step's width is for the eager and test paths, where nothing
-    # is baked and the two always agree.
+    # A caller that captures cudagraphs MUST pass its own fixed bound; this
+    # fallback is for eager and test paths.
     index_score_max_block = index_score_max_block or triton.cdiv(
         triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE), index_score_cp_world
     )
-    # Separate from `num_idx_heads` because under indexer CP they differ: the
-    # column counts are built for the TP-local KV heads, while the score -- and
-    # so its dispatch map -- is built for one head per CP rank. 0 means "no CP
-    # in play", where the two are the same number.
+    # Differs from `num_idx_heads` under indexer CP (one score head per CP rank).
     index_score_num_idx_heads = index_score_num_idx_heads or num_idx_heads
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,

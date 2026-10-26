@@ -32,18 +32,8 @@ import triton
 import triton.language as tl
 
 
-# aiter's MFMA block-score kernel: max-over-128-tokens block scoring on the
-# matrix cores, with a packed work map so a ragged batch does not pay for its
-# holes. This is the ONLY decode scorer -- the Triton one it replaced is gone --
-# so a missing kernel is fatal to M3 decode and this must not degrade silently.
-#
-# Resolved on FIRST USE rather than at import, though, because an ImportError
-# here is not contained to M3: `sparse_attn` imports this module at module
-# scope, `atom/plugin/vllm/attention/backend.py` imports `sparse_attn` for
-# `SPARSE_BLOCK_SIZE`, and that module carries the MLA prefill backends. A hard
-# import would take all of them down on an aiter that merely predates the
-# kernel. Deferring keeps the blast radius at "M3 decode raises, with a message
-# that names what to install".
+# Resolved on first use, not at import: the vLLM backend imports this module via
+# `sparse_attn`, so a hard import would take the MLA prefill backends down too.
 @functools.cache
 def _flydsl(name):
     """One aiter decode-scorer symbol, or a RuntimeError naming the dependency."""
@@ -64,23 +54,9 @@ def _flydsl(name):
 def _topk_small_k():
     """aiter's chunk-narrowing per-row selector: ``(select, supported)``.
 
-    Same forced-block pins and tie direction as the Triton one below, same
-    selection on every shape tried. It narrows in one pass where Triton folds
-    `tl.topk` over ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as
-    the row widens -- 7us against 36us at a 1M context. `_aiter_selector_wins`
-    says where.
-
-    Resolved on use rather than at module scope, for the reason `_flydsl` is:
-    the only CI job that runs `tests/` installs no aiter, so a module-scope
-    import would turn this file's whole test module into a collection error.
-
-    NOT guarded by `try/except ImportError`. It was, and the module moved
-    underneath it (`flydsl/` -> `flydsl/topk/`), which that guard turns into
-    "every row takes the 36us path, forever, silently" instead of an error.
-    There is no aiter that carries the M3 score kernels this file requires but
-    not this selector -- it is older and sits on aiter main -- so an absent
-    module means a moved path, and the right answer to a moved path is to say
-    so.
+    Same pins and tie direction as the Triton selector below; faster as the row
+    widens (`_aiter_selector_wins`). Deliberately not under `except ImportError`:
+    a moved module must raise, not leave every row on the slow path.
     """
     from aiter.ops.flydsl.topk.topk_per_row_small_k import (
         topk_per_row_small_k,
@@ -90,11 +66,8 @@ def _topk_small_k():
     return topk_per_row_small_k, topk_per_row_small_k_supported
 
 
-# aiter's MFMA prefill block-score kernel, by module path because
-# `aiter.ops.flydsl` does not re-export it yet. Guarded for the reason
-# `_flydsl` is deferred, which `test_the_symbols_are_not_imported_at_module_scope`
-# pins: `sparse_attn` imports this module and the vLLM backend imports that, so
-# a hard import here takes the MLA prefill backends down with it.
+# By module path: `aiter.ops.flydsl` does not re-export it yet. Guarded for the
+# reason `_flydsl` is deferred (pinned by `test_the_symbols_are_not_imported_at_module_scope`).
 try:
     from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
         score_prefill_flydsl,
@@ -102,12 +75,9 @@ try:
 except ImportError:  # pragma: no cover - depends on the installed aiter
     score_prefill_flydsl = None
 
-# Shared by all four allocators and by `decode_index_score`, so they cannot
-# drift into naming different flags for the same refusal.
-# Both ROCm flavours: gfx942 is e4m3fnuz, gfx950 is e4m3fn, and the allocator
-# hands back whichever `aiter.dtypes.fp8` is on this part.
+# Both ROCm flavours: gfx942 is e4m3fnuz, gfx950 is e4m3fn.
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-
+# One message for every refusal site, so they cannot name different flags.
 INDEX_CACHE_MUST_BE_FP8 = (
     "MiniMax-M3's index cache must be fp8: the FlyDSL scorers are the only "
     "index scorers and they serve fp8 only (ROCm/aiter#5626). Pass "
@@ -356,24 +326,15 @@ def build_index_score_work_map(
 ):  # fmt: skip
     """``[grid, 2]`` int32: the flydsl score kernel's packed dispatch order.
 
-    None only when the batch is empty, which has no work to dispatch.
+    None only when the batch is empty.
 
-    Build this ONCE PER DECODE STEP. It is ~15 tiny device ops -- almost all
-    launch floor -- and costs ~120us whatever the shape, against a score kernel
-    of 17-250us, so a per-layer rebuild costs far more than the kernel wins.
-    The lengths do not change between layers, so once is right as well as
-    necessary. :func:`decode_index_score` will build one for itself when none
-    arrives, which is correct and slow; every production caller hoists.
+    Build once per decode step: ~120us of launch floor whatever the shape, more
+    than the score kernel it feeds. ``out`` is a persistent buffer to fill
+    (captured decodes replay against its baked pointer).
 
-    ``out`` is a persistent buffer to fill, sliced inside; same reason as
-    :func:`build_n_valid_column_per_row` -- a captured decode replays against
-    the pointer baked in at capture.
-
-    ``cp_world``/``cp_rank`` describe an indexer-CP shard: this rank owns the
-    round-robin blocks ``b % world == rank``, and ``max_block`` is then this
-    rank's LOCAL bound ``ceil(global_blocks / cp_world)``, not the global one.
-    The same pair must reach the map builder and the score call, which
-    re-derive the same per-request local block count from it.
+    ``cp_world``/``cp_rank`` describe an indexer-CP shard (blocks
+    ``b % world == rank``), and ``max_block`` is then this rank's LOCAL bound.
+    The same pair must reach the map builder and the score call.
     """
     if seq_lens.shape[0] <= 0:
         return None
@@ -391,10 +352,7 @@ def build_index_score_work_map(
 def index_score_work_map_size(
     batch, max_block, max_query_len, num_idx_heads, cp_world=1, cp_rank=0,
 ):  # fmt: skip
-    """Rows :func:`build_index_score_work_map` will write, for sizing a buffer.
-
-    0 for an empty batch, so a caller can skip the allocation.
-    """
+    """Rows :func:`build_index_score_work_map` will write; 0 for an empty batch."""
     if batch <= 0:
         return 0
     return _flydsl("minimax_m3_index_score_work_map_size")(
@@ -412,18 +370,9 @@ def index_score_work_map_capacity(
 ):  # fmt: skip
     """Rows a PERSISTENT buffer needs to serve every batch up to ``max_batch``.
 
-    NOT :func:`index_score_work_map_size` at ``max_batch``. aiter documents the
-    exact grid as non-monotonic in the bounds and says a caller sizing a
-    persistent ``[rows, 2]`` buffer for a cudagraph must use this instead --
-    and it really is non-monotonic: at ``max_block=256`` a batch of 8 needs 256
-    rows while a batch of 7 needs 455, so a buffer sized at the larger batch is
-    rejected by the smaller one with "work_map: expected packed [at least 455,
-    2] int32".
-
-    The exact size stays the right thing for VALIDATING a map that was handed
-    in, which is what `decode_index_score` does with it. Only allocation moves.
-
-    0 for an empty batch, so a caller can skip the allocation.
+    NOT :func:`index_score_work_map_size` at ``max_batch``: the grid is
+    non-monotonic in the batch (max_block=256: batch 8 needs 256 rows, batch 7
+    needs 455). 0 for an empty batch.
     """
     if max_batch <= 0:
         return 0
@@ -440,16 +389,9 @@ def index_score_work_map_capacity(
 def index_score_work_map_for_forward(owner, phase, seq_lens, **kw):
     """:func:`build_index_score_work_map`, hoisted to once per forward.
 
-    Same contract and the same reason as
-    :func:`n_valid_column_per_row_for_forward`, for the same callers: the vLLM
-    and SGLang plugins, whose metadata is framework code with no field to
-    publish into. Native ATOM reads
+    Same contract as :func:`n_valid_column_per_row_for_forward`: `owner` MUST
+    live exactly one forward. Native ATOM reads
     `MiniMaxM3SparseMetadata.index_score_work_map` instead.
-
-    `owner` MUST live exactly one forward. The hoist matters more here than it
-    does for the column counts: the map costs ~120us of launch floor, so
-    rebuilding it per sparse layer would cost more than the score kernel it
-    feeds saves.
     """
     cache = getattr(owner, "_index_score_work_map", None)
     if cache is None:
@@ -867,12 +809,8 @@ def _select_with_aiter(
     Declines rather than raises: k past the wave width, or a survivor buffer
     past the LDS budget, are shapes the Triton selector still handles.
 
-    The flattening is a view, which is why `score` has to be contiguous -- the
-    flydsl score kernel writes the feature-contiguous layout `alloc_score`
-    picks, and `.view(rows, max_block)` on that is not a reshape but an error.
-    At the widths where that layout is chosen this selector already declines on
-    its LDS budget, so the guard costs nothing today; it is here so the two
-    changes stay independent.
+    `score` must be contiguous because the flattening is a `.view`, which
+    errors on the permuted layout `alloc_score` can return.
     """
     if not score.is_contiguous():
         return False
@@ -1140,24 +1078,13 @@ def prefill_index_score(
 ):
     """The prefill block scores, ``[num_idx_heads, total_q, max_block]`` fp32.
 
-    The ragged counterpart of :func:`decode_index_score`, and the one place the
-    two prefill scorers are chosen between. Both
-    produce the same layout -- aiter's `alloc_score` is deliberately the one the
-    Triton kernel wrote -- so everything downstream is blind to the choice.
-
-    Neither scorer owes an answer past a query row's causal window, and the two
-    do not even agree about how far past it they write: each fills out to its
-    own query TILE's window, and the tile widths differ. That is safe because
-    `n_valid_column_per_row` bounds the selector at `ceil(causal_len / 128)` per
-    row. It also means the columns beyond it are uninitialised, not merely
-    stale, so the score tensor cannot be read raw.
-
-    Unlike decode there is no indexer-CP variant: prefill stays TP and is handed
-    a single index head (see `_sparse_prefill`), so there is no shard to remap.
+    The ragged counterpart of :func:`decode_index_score`. Both scorers write the
+    same layout, so downstream is blind to the choice. Columns past a row's
+    causal window are uninitialised (`n_valid_column_per_row` bounds the
+    selector), so the score cannot be read raw. No indexer-CP variant: prefill
+    stays TP with a single index head.
     """
-    # flydsl, unless a caller names the Triton scorer. There is no env knob and
-    # no dtype routing: bf16 is refused before it reaches either scorer, so the
-    # choice only exists for the tests that hold the two side by side.
+    # flydsl unless a caller names the Triton scorer, which only the tests do.
     if backend not in (None, "flydsl", "triton"):
         raise ValueError(f"backend must be 'flydsl' or 'triton', got {backend!r}")
     resolved = backend or "flydsl"
@@ -1168,10 +1095,6 @@ def prefill_index_score(
 
     if resolved == "flydsl":
         if score_prefill_flydsl is None:
-            # The import above is guarded so a missing kernel cannot take the
-            # MLA prefill backends down at import; it was never a fallback.
-            # Triton is the tests' reference, not a production route, so say
-            # what to install rather than calling None.
             raise RuntimeError(
                 "MiniMax-M3 prefill needs aiter.ops.flydsl.kernels."
                 "minimax_m3_index_score_prefill, which this aiter does not "
@@ -1180,9 +1103,7 @@ def prefill_index_score(
                 "an aiter that includes the FlyDSL M3 index-score kernels "
                 "(ROCm/aiter#5626)."
             )
-        # sm_scale passes through as-is: the kernel folds `log2(e)` in itself,
-        # exactly as the Triton one does. The fp8 MFMA needs no switch here --
-        # `fp8_mfma` resolves itself from the cache dtype.
+        # sm_scale as-is: the kernel folds log2(e) in itself.
         return score_prefill_flydsl(
             idx_q,
             index_kv_cache,
@@ -1347,49 +1268,23 @@ def decode_index_score(
 ):
     """The decode block scores, `[num_idx_heads, total_q, max_block]` fp32.
 
-    The only decode scorer there is. It raises rather than declining -- the
-    Triton kernel that used to sit behind it is gone -- so a shape outside the
-    envelope (head dim != 128, a cache that is neither bf16 nor fp8-e4m3, a
-    strided last axis) fails loudly in `minimax_m3_index_score_flydsl`'s own
-    asserts instead of quietly running something else.
+    The only decode scorer: shapes outside the kernel's envelope fail in its own
+    asserts rather than running something else.
 
-    ``work_map`` is the packed dispatch order. Pass one. Omitting it is correct
-    and slow: this builds its own, ~120us of launch floor against a score kernel
-    of 17-250us, which is fine once per step and ruinous once per sparse layer.
-    Every production caller hoists it into per-step metadata; the convenience is
-    here for tests and one-off callers, and the docstring is the only thing
-    stopping it becoming the default.
+    ``work_map`` is the packed dispatch order. Pass one: omitting it builds one
+    here, ~120us of launch floor, fine once per step and ruinous per layer.
 
-    `max_block` is the caller's capture-stable bound, NOT
-    `ceil(max_seq_len / 128)` for this step: see the caller for why. That is not
-    free, and not for the reason it looks like. The dead chunks themselves do
-    retire cheaply -- the map packs them to the end of the dispatch order -- but
-    `resolve_config` estimates the machine's CTA supply from `batch * max_block`,
-    so an inflated bound inflates that estimate and it picks the deepest page
-    loop, which its own docstring measures at up to +71% on a short batch.
-    Against a batch-bounded score: b32 q1 s8k fp8 11.9 -> 19.3us, b16 q8 s32k
-    bf16 31.2 -> 42.8us, while b32 q1 s128k -- the one case whose bound does not
-    move -- is unchanged. Over the whole selection op the win survives at 13/14
-    rather than 14/14, the loss being that same short fp8 case at 0.77x.
+    `max_block` is the caller's capture-stable bound, not this step's
+    `ceil(max_seq_len / 128)`: the map's row count is the baked grid. An
+    inflated bound costs speed (`resolve_config` picks a deeper page loop).
 
-    The depth cannot simply be pinned to what the batch wants: it divides the
-    work chunk, so it sets the map's row count, which IS the grid, which is
-    baked at capture. Decoupling the two -- a runtime page-loop count, so the
-    grid stays fixed while the depth tracks the step -- is a kernel change and
-    the real fix.
+    Under indexer CP (``cp_world > 1``) this scores only blocks
+    ``b % cp_world == cp_rank`` into the compacted shard `local_candidate_keys`
+    reads; `max_block` is then the LOCAL bound. Dead slots are left unwritten
+    (`_pack_score_key` sends masked lanes to key 0), so the result cannot be read raw.
 
-    Under indexer CP (``cp_world > 1``) this scores only the blocks
-    ``b % cp_world == cp_rank``, `max_block` is the LOCAL bound, and the result
-    is the compacted shard `local_candidate_keys` reads. One thing matters
-    downstream: it writes only the blocks a request actually has, leaving dead
-    slots untouched. That is safe because `_pack_score_key` sends every masked
-    lane to key 0, below any real candidate -- but it means the score tensor
-    cannot be read raw.
-
-    The score comes back in the transposed layout `alloc_score` picks. Both
-    selectors take the three score strides as arguments, so this is invisible
-    downstream -- except to `_select_with_aiter`, which needs a view and checks
-    contiguity for exactly this reason.
+    The score comes back in the layout `alloc_score` picks, possibly permuted
+    and non-contiguous; pass ``out`` when the consumer needs contiguous.
     """
     if index_kv_cache.dtype not in _FP8_DTYPES:
         raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_kv_cache.dtype}.")
@@ -1400,15 +1295,8 @@ def decode_index_score(
             num_idx_heads=num_idx_heads, cp_world=cp_world, cp_rank=cp_rank,
         )  # fmt: skip
     else:
-        # The map's row count IS the grid, so a map built against a different
-        # max_block is not a shorter map -- it is the kernel walking the
-        # right-sized grid through rows that mean something else. Silent wrong
-        # scores, so this has to refuse.
-        #
-        # ValueError and not an assert, for the reason `_require_packable`
-        # gives: the bound traces back to launch flags and a captured buffer,
-        # and `python -O` must not be able to turn a stale map into wrong
-        # scores that nothing reports.
+        # A map built against another max_block silently mis-scores; a
+        # ValueError rather than an assert so `python -O` cannot drop it.
         rows = index_score_work_map_size(
             batch, max_block, max_query_len, num_idx_heads, cp_world, cp_rank,
         )  # fmt: skip
@@ -1419,23 +1307,12 @@ def decode_index_score(
                 f"against different bounds"
             )
 
-    # `out` is for a consumer that needs a LAYOUT, not one that wants to reuse
-    # a buffer. Past `total_q * num_idx_heads >= 16` the allocator hands back
-    # `[max_block, total_q, H]` permuted into `[H, total_q, max_block]` --
-    # feature-contiguous, which coalesces the scorer's store but leaves the
-    # result non-contiguous, and aiter says so: "it loses eligibility for the
-    # aiter selector ... a caller with a small max_block should check rather
-    # than assume". `indexer_context_scores` is such a caller. Both layouts
-    # produce bit-identical scores, so this costs the store's coalescing and
-    # nothing else.
     score = out
     if score is None:
         score = _flydsl("minimax_m3_index_score_alloc")(
             batch, max_query_len, num_idx_heads, max_block, idx_q.device
         )
-    # sm_scale passes through as-is: the kernel applies `sm_scale * log2(e)`
-    # itself, validated against an independent torch oracle in aiter's
-    # op_tests/test_flydsl_minimax_m3_index_score.py.
+    # sm_scale as-is: the kernel applies log2(e) itself.
     _flydsl("minimax_m3_index_score_flydsl")(
         idx_q,
         index_kv_cache,
@@ -1498,21 +1375,13 @@ def minimax_m3_index_topk_decode(
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
 
-    ``index_score_work_map`` is its scoring-side counterpart --
-    ``MiniMaxM3SparseMetadata.index_score_work_map``, also built once per
-    forward. Omitted, :func:`decode_index_score` builds its own, which is
-    correct but costs ~120us of launch floor; see there.
+    ``index_score_work_map`` is ``MiniMaxM3SparseMetadata.index_score_work_map``,
+    also built once per forward; omitted, :func:`decode_index_score` builds its own.
 
-    ``index_score_max_block`` is the bound that map was built against, and when
-    it is larger than this step's ``ceil(max_seq_len / 128)`` the score is
-    computed and stored that wide. It has to be, because a map's row count IS
-    the grid: under a cudagraph the grid is baked at capture while the map is
-    refilled each step outside it, so both have to follow a bound that does not
-    move -- ``ceil(max_model_len / 128)``, not the batch's longest request. The
-    extra columns cost almost nothing (the packed map retires dead chunks at
-    ~0.2us per thousand) and neither selector reads past its own row bound.
+    ``index_score_max_block`` is the bound that map was built against. When it
+    exceeds this step's ``ceil(max_seq_len / 128)`` the score is stored that wide,
+    since the map's row count is the grid baked at capture.
     """
-    # The head dim is the kernel's business now -- it asserts 128 itself.
     total_q, num_idx_heads, _ = idx_q.shape
     assert (
         num_idx_heads == num_kv_heads

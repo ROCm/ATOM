@@ -781,10 +781,7 @@ def _ensure_side_caches(
     )
     index_shape = (num_blocks, page_size, layer.idx_head_dim)
 
-    # The fourth place an index cache's dtype gets decided, and the only one
-    # that takes it straight from the producer rather than from the config.
-    # No scorer serves bf16, so it is refused here too -- the pool shim is a
-    # path a plugin launch can reach without going through either resolver.
+    # No scorer serves bf16; the pool shim can be reached without either resolver.
     from atom.model_ops.minimax_m3.index_topk import (
         _FP8_DTYPES,
         INDEX_CACHE_MUST_BE_FP8,
@@ -915,12 +912,7 @@ def minimax_m3_sparse_attention_for_sglang(
                 num_idx_heads=layer.num_idx_heads,
                 decode_max_q=1,
             ),
-            # The bound is `block_table.shape[1]`, not `ceil(max_seq_len/128)`:
-            # the map's row count IS the kernel's grid and so has to be stable
-            # across a cudagraph replay, which this step's longest request is
-            # not. `build_minimax_m3_block_table` already slices to the static
-            # token-table width while capturing, so this width is
-            # capture-stable for free.
+            # Bound is the capture-stable block-table width, not this step's longest request.
             index_score_work_map=index_score_work_map_for_forward(
                 forward_batch,
                 "decode",

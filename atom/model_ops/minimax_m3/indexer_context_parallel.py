@@ -35,24 +35,12 @@ def indexer_context_scores(
     than max_seq_len and in-bounds physical pages; no host reads of live metadata.
 
     ``work_map`` is the scorer's packed dispatch order, built once per decode
-    step in the metadata against this rank's LOCAL block bound, and
-    ``max_block`` is that bound. Omitting them is correct and costs ~120us of
-    launch floor per call -- see :func:`decode_index_score`, which builds its
-    own when none arrives. Every production caller hoists.
+    step against this rank's LOCAL block bound ``max_block`` (omitted: see
+    :func:`decode_index_score`). Under a cudagraph that bound is the model
+    length, not ``max_seq_len``, so the shard may carry dead trailing blocks.
 
-    ``max_block`` has to come from the caller rather than from ``max_seq_len``
-    here, and the two are NOT the same number under a cudagraph: the map's row
-    count is the grid, baked at capture, so its bound is the model length, while
-    ``max_seq_len`` is this step's longest request. The shard is therefore the
-    wider of the two and carries dead trailing blocks. Either width is a correct
-    input to `local_candidate_keys`, which reads the width off the tensor and
-    masks what is not this rank's to answer for.
-
-    Dead slots -- past a request's own blocks, or past this rank's share of the
-    global ones -- are left UNWRITTEN, so the result is not safe to read raw.
-    `local_candidate_keys` is what makes that sound: it masks both kinds, the
-    second from the (rank, world, global block count) it is given rather than
-    from the length. See the comment on the allocation below.
+    Dead slots are left UNWRITTEN; `local_candidate_keys` masks them from
+    (rank, world, global block count), so the result cannot be read raw.
     """
     if (
         world_size < 1
@@ -103,28 +91,12 @@ def indexer_context_scores(
     local = triton.cdiv(blocks, world_size)
     if not tokens:
         return torch.empty((heads, 0, local), dtype=torch.float32, device=idx_q.device)
-    # A LOCAL bound, never the global `blocks`: under CP the kernel is given
-    # this rank's own block count and stores at the compacted local index. It
-    # must be the bound the map was built against -- a disagreement is caught
-    # there by a row-count assert rather than showing up as a silently
-    # misnumbered shard.
+    # A LOCAL bound, never the global `blocks`; must match the map's bound.
     width = max_block or local
-    # Contiguous ON PURPOSE. The scorer's own allocator hands back a permuted,
-    # feature-contiguous view once `tokens * heads >= 16` -- which is every
-    # qlen>1 decode at world_size 4 -- and `local_candidate_keys` rejects a
-    # non-contiguous score outright. Both layouts carry bit-identical values,
-    # so asking for this one here costs the store's coalescing and nothing
-    # else, and it beats a copy after the fact.
-    #
-    # Uninitialised is correct here, though it is not obvious. Round-robin
-    # sharding does not divide evenly -- at 257 global blocks over 4 ranks,
-    # rank 0 owns 65 and ranks 1-3 own 64 while every shard is `ceil(257/4)`
-    # wide -- so three of the four carry a trailing slot the scorer never
-    # writes. `local_candidate_keys` masks those out from `(rank, world_size,
-    # global_blocks)` rather than from the length alone, so their content
-    # cannot reach the selection; `test_a_shard_that_runs_past_the_global_end
-    # _is_not_selectable` pins exactly that, and the Triton kernel this
-    # replaced paid for a full -inf store to get the same property.
+    # Contiguous on purpose: the scorer's own allocator can return a permuted
+    # view, which `local_candidate_keys` rejects. Uninitialised is fine: the
+    # trailing slot of an uneven shard is masked there (pinned by
+    # `test_a_shard_that_runs_past_the_global_end_is_not_selectable`).
     out = torch.empty((heads, tokens, width), dtype=torch.float32, device=idx_q.device)
     return decode_index_score(
         idx_q, index_cache, block_table, seq_lens, width,
