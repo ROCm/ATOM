@@ -1433,10 +1433,12 @@ def sparse_pa_per_row(
         ctx_host = sparse_ctx.detach().cpu()
         page_min, page_max = int(bt_host.min()), int(bt_host.max())
         ctx_min, ctx_max = int(ctx_host.min()), int(ctx_host.max())
+        # Graph warmup pads inactive MTP rows with context lengths down to -3;
+        # PA explicitly skips those rows. Only the upper length bound applies.
         valid = (sparse_bt.shape[0] == q_view.shape[0]
                  and sparse_ctx.numel() == q_view.shape[0]
                  and 0 <= page_min <= page_max < k_cache_view.shape[0]
-                 and 0 <= ctx_min <= ctx_max <= sparse_bt.shape[1] * 16)
+                 and ctx_max <= sparse_bt.shape[1] * 16)
         print(f"[m3-pa-input] rank={torch.cuda.current_device()} rows={q_view.shape[0]} "
               f"q={tuple(q_view.shape)} kv={tuple(k_cache_view.shape)} "
               f"bt={tuple(sparse_bt.shape)} page_range=({page_min},{page_max}) "
