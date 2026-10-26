@@ -3452,6 +3452,23 @@ class ModelRunner:
     @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor
+    def _settle_pcp_split_rows(self) -> None:
+        """Cache whether the forward just run row-split for PCP.
+
+        Call right after `run_model`: the drafters rewrite the state the gate
+        reads (is_prefill, max_seqlen_k), so it has only one truthful moment.
+        Plain Python on the caller side -- a hook or a model-side assignment
+        would be skipped on a cudagraph replay while its device work still ran,
+        leaving per-rank answers that deadlock anything gated on them. A model
+        without `pcp_split_active` never row-splits.
+        """
+        if getattr(self, "drafter", None) is not None:
+            get_forward_context().context.pcp_split_rows = (
+                self.model.pcp_split_active()
+                if hasattr(self.model, "pcp_split_active")
+                else False
+            )
+
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
@@ -3472,20 +3489,8 @@ class ModelRunner:
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
-
-        # Whether that forward row-split for PCP, settled HERE and cached: the
-        # drafters below rewrite the very state the gate reads (is_prefill,
-        # max_seqlen_k), so it has only one truthful moment. This also has to be
-        # plain Python on the caller side -- a hook or a model-side assignment
-        # would be skipped on a cudagraph replay while its device work still ran,
-        # leaving per-rank answers that deadlock anything gated on them.
+        self._settle_pcp_split_rows()
         drafter = getattr(self, "drafter", None)
-        if drafter is not None:
-            get_forward_context().context.pcp_split_rows = (
-                self.model.pcp_split_active()
-                if hasattr(self.model, "pcp_split_active")
-                else False
-            )
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -4553,6 +4558,7 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, hidden_states = self.run_model(input_ids, batch)
+            self._settle_pcp_split_rows()
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 
