@@ -535,7 +535,7 @@ PR 内容，aiter 专门把 token 挡在那一步之外。
 | box308 的 GPU 占用 | **已升级为必答项**：box308 既是最终目标机、其 8 卡又被 GLM-5.3 占死，故最终形态下 validate 无卡。P3 前必须在 §5.3 三个候选里选定 |
 | 开发期网关配额 | AMD 网关 2M uncached input token/60s。仅影响开发迭代速度，不影响最终形态（box308 用本地 GLM）。P0 首次真实 review 时记录 token 量 |
 | validate 两轮总时长 | **未实测**，决定 §6 能否进 review job。P2 的第一个动作就是实测（§6.5） |
-| ROCm/ATOM maintainer 是否接受自建机 workflow | 未确认。最便宜的信息源是问 aiter 当初怎么过的 |
+| ~~maintainer 是否接受自建机 workflow~~ | 已消解：本项目作者即 ATOM team 成员。注意这与下一行的 repo admin 是两回事 |
 | refuter 跨家族 | aiter 自己承认 worker/refuter 同为 GLM 时对抗性偏弱；ATOM 新建时应一开始就把 refuter 指向 Opus（`ATOM_BOT_REFUTER_AGENT`） |
 | `authorized.txt` roster | 待定，P3 |
 | ROCm/ATOM repo admin 权限 | 待确认，P3 阻塞项 |
