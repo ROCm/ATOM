@@ -448,6 +448,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # interior states instead of cutting prefill chunks onto them. PAGE path
     # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
+    # Set to 0 to keep Qwen3.5's GDN input projection as two layers
+    # (`in_proj_qkvz` + `in_proj_ba`) when the checkpoint quantizes them with
+    # per-token FP8. The default merges them into one `in_proj_qkvzba`, which
+    # saves one GEMM and one activation quant per GDN layer. Block-scale
+    # checkpoints never merge: `in_proj_ba` is 32 columns per rank and
+    # concatenating it onto `in_proj_qkvz` would break the 128-column scale
+    # blocks. BF16 checkpoints always merge and ignore this.
+    "ATOM_QWEN35_GDN_MERGE_QKVZBA": lambda: (
+        os.getenv("ATOM_QWEN35_GDN_MERGE_QKVZBA", "1") == "1"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
