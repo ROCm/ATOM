@@ -341,6 +341,45 @@ def _replay_tiles_kmajor(
 
 
 @triton.jit
+def _record_owner(rec_ctr, i_nh, i_v, NV: tl.constexpr, do_flush):
+    """Whether this V slice stores the shared k/g records of its head this step.
+
+    The k and g records do not depend on the V split, so one slice stores them.
+    Off a fold step they land past every record being read, and slice 0 does it.
+    On a fold step they land at 0.., over committed records that the head's other
+    slices read to rebuild the state, possibly later than slice 0 runs. There the
+    store goes to the last slice to finish reading: each slice counts itself in
+    after its record loads, and the last one resets the counter for the next launch.
+    """
+    owner = i_v == 0
+    if NV > 1:
+        if do_flush:
+            tl.debug_barrier()
+            arrived = tl.atomic_add(rec_ctr + i_nh, 1, sem="acq_rel")
+            owner = arrived == NV - 1
+            if owner:
+                tl.store(rec_ctr + i_nh, 0)
+    return owner
+
+
+_ARRIVAL_CTRS: dict[tuple[torch.device, str], torch.Tensor] = {}
+
+
+def _arrival_counters(device: torch.device, name: str, entries: int) -> torch.Tensor:
+    """Zeroed int32 arrival counters for one kind of cross-program handoff.
+
+    Each launch leaves them zero (the last arrival resets its own), so one buffer
+    serves every layer: they run one after another on one stream.
+    """
+    key = (device, name)
+    buf = _ARRIVAL_CTRS.get(key)
+    if buf is None or buf.numel() < entries:
+        buf = torch.zeros(max(entries, 1 << 16), dtype=torch.int32, device=device)
+        _ARRIVAL_CTRS[key] = buf
+    return buf
+
+
+@triton.jit
 def _replay_dot(
     lhs,
     rhs,
@@ -483,6 +522,7 @@ def _replayssm_fwd_kernel(
     write_pos,
     slot_idx,
     cu_seqlens,
+    rec_ctr,
     scale,
     N,
     T_TOT,
@@ -649,6 +689,7 @@ def _replayssm_fwd_kernel(
         )
         b_ck += tl.sum(b_kwt * b_xk[:, None], 0)
         b_cq += tl.sum(b_kwt * b_xq[:, None], 0)
+        owns_rec = _record_owner(rec_ctr, i_nh, i_v, tl.cdiv(V, BV), do_flush)
 
         if do_flush:
             tl.store(
@@ -658,7 +699,7 @@ def _replayssm_fwd_kernel(
                 ),
                 mask=mask_k[:, None] & mask_v[None, :],
             )
-        if i_v == 0:
+        if owns_rec:
             p_bkt = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -694,7 +735,7 @@ def _replayssm_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_u.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if owns_rec:
             p_bg2 = buf_g + slot * stride_bufg_slot + base * stride_bufg_pos
             tl.store(p_bg2 + i_hv * stride_bufg_hv, b_gt.to(p_bg2.dtype.element_ty))
         return
@@ -730,6 +771,7 @@ def _replayssm_fwd_kernel(
         BH,
         IS_KDA,
     )
+    owns_rec = _record_owner(rec_ctr, i_nh, i_v, tl.cdiv(V, BV), do_flush)
     if T1_FAST:
         # T == 1: nothing chains from token to token, so S_h is never needed as
         # a value -- only its two contractions, S_h^T k and S_h^T q, and both
@@ -799,7 +841,7 @@ def _replayssm_fwd_kernel(
             + o_v
         )
         tl.store(p_bu, b_u.to(p_bu.dtype.element_ty), mask=mask_v)
-        if i_v == 0:
+        if owns_rec:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -887,7 +929,7 @@ def _replayssm_fwd_kernel(
         tl.store(p_bu, b_v.to(p_bu.dtype.element_ty), mask=mask_v)
         # k and g do not depend on the V split; let one program own the store
         # instead of having every V-block redundantly write the same bytes.
-        if i_v == 0:
+        if owns_rec:
             p_bk = (
                 buf_k
                 + slot * stride_bufk_slot
@@ -1323,6 +1365,7 @@ def replayssm_gated_delta_rule(
         write_pos=write_pos,
         slot_idx=slot_idx,
         cu_seqlens=cu_seqlens,
+        rec_ctr=_arrival_counters(q.device, "rec", N * HV),
         scale=scale,
         N=N,
         T_TOT=T_tot,
