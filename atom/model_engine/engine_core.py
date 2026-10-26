@@ -149,7 +149,12 @@ class EngineCore:
         self._ipc_registry_limit = (
             config.ipc_max_pending_jobs * config.ipc_max_batch_size
         )
-        self.input_queue = queue.Queue(maxsize=config.ipc_max_pending_jobs)
+        # One entry per ADD frame, drained once per engine step: under a burst
+        # many single-request frames land within one forward, so bound it by
+        # the request registry, not by `ipc_max_pending_jobs` frames (that
+        # rejected ordinary 64-way concurrency as "overloaded"). Bytes stay
+        # bounded by `ipc_max_pending_bytes` at admission.
+        self.input_queue = queue.Queue(maxsize=self._ipc_registry_limit)
         self.output_queue = _BoundedOutputQueue(config, self._fail_ipc)
         self.stream_output_queue = (
             queue.Queue()

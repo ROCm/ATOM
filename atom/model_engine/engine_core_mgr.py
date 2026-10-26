@@ -627,16 +627,14 @@ class CoreManager:
             self.max_pool_tokens = min(self.max_pool_tokens, reported)
 
     def _wait_for_all_ready_signals(self):
+        """Wait for READY from every rank, with no deadline: READY follows model
+        load, warmup, compile and graph capture, which can run far longer than
+        `ipc_startup_timeout` on a cold cache. A dead engine still fails fast."""
         pending = set(range(len(self.output_sockets)))
         poller = zmq.Poller()
         for socket in self.output_sockets:
             poller.register(socket, zmq.POLLIN)
-        deadline = self._startup_deadline
         while pending:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Engine IPC handshake timed out: ranks {sorted(pending)}"
-                )
             if self.finished_procs():
                 raise RuntimeError("Engine process exited during IPC handshake")
             for socket, _ in poller.poll(100):
@@ -2363,10 +2361,11 @@ class DisaggCoreManager(CoreManager):
         self._asyncio_mode = config.asyncio_mode
 
     def _wait_for_single_ready(self, idx):
+        # No deadline: READY follows model load and graph capture (see
+        # `_wait_for_all_ready_signals`).
         socket = self.output_sockets[idx]
-        deadline = self._startup_deadline
         while not self._ipc.peers.get(idx, {}).get("ready"):
-            if time.monotonic() >= deadline or self.finished_procs():
+            if self.finished_procs():
                 raise RuntimeError(f"engine {idx} failed its IPC handshake")
             if socket.poll(100):
                 self._handle_handshake(
