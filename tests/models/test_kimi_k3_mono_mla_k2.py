@@ -106,9 +106,44 @@ def test_the_flag_gives_them_k2_alone(stub_binds):
     assert (plans[0].kda, plans[0].moe) == (None, None)
 
 
-def test_a_full_attention_layer_that_closes_a_block_is_refused(stub_binds):
-    with pytest.raises(MonoUnsupported, match="closes a block"):
-        stub_binds.bind_model(_model(13, full=(3, 12)), None, 0, mla_k2=True)
+def test_a_full_attention_layer_that_closes_a_block_keeps_production_k2(
+    stub_binds, caplog
+):
+    """One layer's refusal must not take the KDA layers' mono down with it."""
+    with caplog.at_level("WARNING", logger="atom"):
+        plans = stub_binds.bind_model(_model(13, full=(3, 12)), None, 0, mla_k2=True)
+    assert (plans[12].kda, plans[12].moe) == (None, None)
+    assert plans[3].ffn_only and plans[1].mono
+    assert "layer 12 keeps its production K2" in caplog.text
+    assert "closes a block" in caplog.text
+
+
+def test_the_block_check_runs_before_bind_moe_allocates(stub_binds, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        stub_binds,
+        "bind_moe",
+        lambda layer, lid, dims, rank: seen.append(lid)
+        or SimpleNamespace(layer_id=lid, write_idx=layer_block(lid)[1]),
+    )
+    stub_binds.bind_model(_model(13, full=(3, 12)), None, 0, mla_k2=True)
+    assert 12 not in seen and 3 in seen
+
+
+def test_a_failing_bind_moe_on_a_full_attention_layer_falls_back_alone(
+    stub_binds, monkeypatch
+):
+    real = stub_binds.bind_moe
+
+    def flaky(layer, lid, dims, rank):
+        if lid == 3:
+            raise MonoUnsupported("o_proj is quantized")
+        return real(layer, lid, dims, rank)
+
+    monkeypatch.setattr(stub_binds, "bind_moe", flaky)
+    plans = stub_binds.bind_model(_model(8, full=(3, 7)), None, 0, mla_k2=True)
+    assert (plans[3].kda, plans[3].moe) == (None, None)
+    assert plans[7].ffn_only and plans[1].mono and plans[4].mono
 
 
 def test_no_kda_layer_still_refuses_even_with_the_flag(stub_binds):

@@ -30,6 +30,7 @@ the same layout the MoE kernel's scale readers were written for. That holds only
 for the non-interleaved gate/up layout, so ``is_guinterleave`` is checked.
 """
 
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -51,6 +52,8 @@ from atom.models.kimi_k3.mono.layouts import (
     unshuffle_weight,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
+
+logger = logging.getLogger("atom")
 
 BF16 = torch.bfloat16
 F32 = torch.float32
@@ -428,12 +431,20 @@ def bind_model(model, dims: Dims, rank: int, mla_k2: bool = False) -> list[Layer
         has_ffn = hasattr(layer, "block_sparse_moe") and blocks >= 1
         takes = bool(getattr(layer, "is_linear_attn", False)) and has_ffn
         if not takes and mla_k2 and has_ffn:
-            moe = bind_moe(layer, layer_id, dims, rank)
-            _need(
-                moe.write_idx < 0,
-                f"layer {layer_id}: a full-attention layer that closes a block",
-            )
-            plans.append(LayerPlan(layer_id, None, moe))
+            # One layer's refusal leaves that layer on the production path; it
+            # must not take the KDA layers' mono down with it.
+            try:
+                _need(
+                    layer_block(layer_id)[1] < 0,
+                    "a full-attention layer that closes a block",
+                )
+                moe = bind_moe(layer, layer_id, dims, rank)
+                plans.append(LayerPlan(layer_id, None, moe))
+            except MonoUnsupported as e:
+                logger.warning(
+                    "Kimi-K3 mono: layer %d keeps its production K2 (%s)", layer_id, e
+                )
+                plans.append(LayerPlan(layer_id, None, None))
             continue
         if not takes:
             plans.append(LayerPlan(layer_id, None, None))
