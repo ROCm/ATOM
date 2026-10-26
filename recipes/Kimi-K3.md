@@ -127,29 +127,32 @@ Two more switches cover the rest of the decode steps:
 - `ATOM_MONO_K3_MLA_K2=1` (off by default) also runs K2 on the 24 full-attention
   (MLA) layers. At bs=1 it cut the step ITL 16.5 to 14.8 ms; GSM8K paired against
   the 8-row control was +0.0038 (z = +0.6).
-- `ATOM_PREFILL_DECODE_INTERVAL=1000000` holds new-prefill admission until the
-  running-decode count hits zero, using the existing `PrefillDelayer`
-  (`atom/model_engine/prefill_delayer.py`) in its local, decode-gated
-  (`nodecode`-trigger) mode rather than a new scheduler mechanism. With
-  `--max-num-seqs 2 --cudagraph-capture-sizes "[1,2]"` this gives the same
-  effective bs=1 concurrency bound that an earlier revision of this PR got from
-  a hand-rolled `ATOM_SCHEDULER_MAX_RUNNING_SEQS` admission cap (since reverted);
-  `--max-num-seqs 1` still fails at startup on a DSpark deployment (the block
-  drafter's warmup needs two sequences). Other requests queue, so their TTFT
-  rises (mean 0.9 s to 1.7-1.9 s on the agentic trace). Known gap: a request
-  arriving mid chunked-prefill of another request can in principle be admitted
-  (decode count reads 0 at that instant), letting two requests decode at once
-  afterward; not rigorously isolated, but the aggregate result below suggests it
-  did not materially hurt this benchmark.
+- `ATOM_PREFILL_DECODE_INTERVAL=1000000` delays admitting a new prefill while
+  any request is decoding, using the existing `PrefillDelayer`
+  (`atom/model_engine/prefill_delayer.py`) in its local mode (DP=1, PP=1). After
+  a prefill runs, the interval holds further prefill until the running-decode
+  count reaches zero, so for the agentic trace requests mostly decode one at a
+  time. It is not a hard bs=1 guarantee: while another request is in chunked
+  prefill the running-decode count is zero, so a second request can be admitted
+  then and two can decode together afterward. Launch with
+  `--max-num-seqs 2 --cudagraph-capture-sizes "[1,2]"`; `--max-num-seqs 1`
+  fails at startup on a DSpark deployment (the block drafter's warmup needs two
+  sequences). Queued requests wait, so TTFT rises (mean 0.9 s to about 1.8 s on
+  the agentic trace). An earlier revision of this PR used a hand-rolled
+  `ATOM_SCHEDULER_MAX_RUNNING_SEQS` cap for this; it was removed in favor of the
+  delayer.
 
-Agentic trace, TP8, DSpark k=7, acceptance length pinned 3.84, official client
-3600 s each, p90 interactivity (tok/s/user): native vLLM (no mono, one request at
-a time) 177.4; ATOM default concurrency with `ATOM_MONO_K3_MAX_ROWS=16` 165.5 (+
-`ATOM_MONO_K3_MLA_K2=1`: 177.1); with the one-request admission cap, B+C+A was
-216.6 (39) / 217.5 (43, replicate), within the ~0.5-1 % replicate noise band.
-Swapping the cap for `ATOM_PREFILL_DECODE_INTERVAL=1000000` alone (B+C+A, no
-cap) gives 215.6 — matching the cap's result within that same noise band, so
-the delayer is a valid drop-in replacement for the cap.
+Agentic trace, TP8, DSpark k=7, mono `ATOM_MONO_K3_MAX_ROWS=16` +
+`ATOM_MONO_K3_MLA_K2=1`, official client 3600 s each, p90 interactivity
+(tok/s/user). This is a synthetic benchmark: the acceptance length is forced to
+3.84, so throughput is meaningful but the generated text is not, and it says
+nothing about accuracy. Native vLLM (one request at a time) 177.4; ATOM with
+neither cap nor delayer 177.1 (`ATOM_MONO_K3_MAX_ROWS=16` alone: 165.5); with
+the removed cap 216.6 and 217.5 on two machines; with
+`ATOM_PREFILL_DECODE_INTERVAL=1000000` instead 215.6 (0 errors; delayer held
+about 8 % of scheduler ticks). The delayer run is 0.5 to 0.9 % below the cap
+runs; this is one run per arm, not a statistical equivalence test, and these
+runs were measured on the code before the cap was removed.
 At two-request concurrency (C2) `ATOM_MONO_K3_MAX_ROWS=16` gives 137.4 against
 vLLM's 130.1.
 
