@@ -462,33 +462,56 @@ def test_a_mid_prompt_request_entering_another_requests_slot_is_restored():
     assert cache.cursor[0, 0].item() == -1
 
 
-def test_decode_keeps_are_stored_at_the_committed_position(monkeypatch):
+def test_decode_keeps_are_stored_after_prepare_attn_returns(monkeypatch):
+    """The V2 runner commits from `sample_tokens`, after `prepare_attn` has
+    returned and the batch getters with it. The keep is still stored, at the
+    committed end, from the rows its build recorded."""
     import numpy as np
 
-    from atom.plugin.vllm import (
-        paged_state_checkpoint,
-        req_id_passthrough_patch,
-        v41_speculative,
+    from atom.plugin.vllm import paged_state_checkpoint as psc
+    from atom.plugin.vllm import req_id_passthrough_patch as passthrough
+
+    worker = SimpleNamespace(
+        group_ids=[0], copier=None, decode_candidates={}, decode_rows=None
     )
 
-    batch = SimpleNamespace(num_computed_tokens_cpu=np.array([250, 1020]))
+    class _ModelState:
+        def prepare_attn(self, input_batch, cudagraph_mode, block_tables):
+            psc.record_decode_candidates(
+                worker,
+                passthrough.get_current_req_ids(),
+                [3, 4],
+                input_batch.num_computed_tokens_cpu,
+                np.array([6, 6]),
+                256,
+                "V4.1",
+            )
+
+    passthrough._wrap_with_req_id_snapshot(
+        _ModelState, "prepare_attn", batch_from_arg=True
+    )
+    monkeypatch.setattr(psc, "_decode_plan", {"a": 0, "b": 0})
     monkeypatch.setattr(
-        req_id_passthrough_patch, "get_current_input_batch", lambda: batch
+        psc,
+        "state_checkpoint_unit_ids",
+        lambda _groups, _rows, cols, _name: [(col,) for col in cols],
     )
+    stored = []
     monkeypatch.setattr(
-        req_id_passthrough_patch, "get_current_req_ids", lambda: ["a", "b"]
+        psc,
+        "execute_state_checkpoint_stores",
+        lambda _copier, slots, units: stored.append((slots, units)),
     )
-    stored = {}
-    monkeypatch.setattr(
-        paged_state_checkpoint,
-        "store_decode_keeps",
-        lambda worker, ids, ends, fresh_rows: stored.update(zip(ids, ends.tolist())),
+    batch = SimpleNamespace(
+        req_ids=["a", "b"], num_computed_tokens_cpu=np.array([250, 1020])
     )
-    # Six rows each (one token plus five drafts); "a" keeps 6, "b" keeps 4.
-    v41_speculative._store_committed_decode_keeps(
-        object(), np.array([0, 2]), np.array([0, 6, 12]), 2
-    )
-    assert stored == {"a": 256, "b": 1024}
+    _ModelState().prepare_attn(batch, None, None)
+    assert passthrough.get_current_req_ids() is None
+    # Six rows each (one token plus five drafts); "a" keeps 6, "b" keeps 4,
+    # so "a" commits to 256 and "b" to 1024, block columns 0 and 3.
+    psc.store_committed_decode_keeps(worker, np.array([0, 2]))
+    assert stored == [([3, 4], [(0,), (3,)])]
+    assert worker.decode_candidates == {} and worker.decode_rows is None
 
 
 def test_checkpoints_refuse_async_speculative_scheduling(monkeypatch):

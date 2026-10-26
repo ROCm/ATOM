@@ -281,39 +281,6 @@ def _anchors(num_rejected, query_start_loc, count):
     return ends - 1 - num_rejected[:count].to(ends.dtype)
 
 
-def _store_committed_decode_keeps(worker, num_rejected, query_start_loc, count):
-    """Store this step's decode keeps at the position it actually committed.
-
-    Right after the commit the slots hold exactly the committed state. The next
-    build is too late: if that step is not speculative, its staging advances
-    the cursor before any store runs, and the checkpoint would pair this step's
-    window with the next step's cursor and history.
-    """
-    import numpy as np
-
-    from atom.plugin.vllm.paged_state_checkpoint import store_decode_keeps
-    from atom.plugin.vllm.req_id_passthrough_patch import (
-        get_current_input_batch,
-        get_current_req_ids,
-    )
-
-    batch = get_current_input_batch()
-    req_ids = list(get_current_req_ids() or [])[:count]
-    if batch is None or len(req_ids) < count:
-        return
-    loc = np.asarray(
-        query_start_loc.cpu() if hasattr(query_start_loc, "cpu") else query_start_loc,
-        dtype=np.int64,
-    )
-    rejected = np.asarray(
-        num_rejected.cpu() if hasattr(num_rejected, "cpu") else num_rejected,
-        dtype=np.int64,
-    )
-    starts = np.asarray(batch.num_computed_tokens_cpu[:count], dtype=np.int64)
-    committed = starts + (loc[1 : count + 1] - loc[:count]) - rejected[:count]
-    store_decode_keeps(worker, req_ids, committed, fresh_rows=())
-
-
 def patch_v41_speculative_commit() -> int:
     """Wrap `postprocess_sampled` on every runner class. Returns the count."""
     from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
@@ -381,14 +348,12 @@ def patch_v41_speculative_commit() -> int:
                 from atom.plugin.vllm.paged_state_checkpoint import (
                     _workers,
                     flush_worker,
+                    store_committed_decode_keeps,
                 )
 
                 for _worker in list(_workers.values()):
                     flush_worker(_worker)
-                    if _worker.decode_candidates:
-                        _store_committed_decode_keeps(
-                            _worker, num_rejected, starts, count
-                        )
+                    store_committed_decode_keeps(_worker, num_rejected)
             # Forwarded by keyword, so a caller that omitted the optional
             # argument reaches the original having omitted it too rather than
             # being given a None this wrapper invented.

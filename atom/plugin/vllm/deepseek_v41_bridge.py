@@ -2005,19 +2005,18 @@ def atom_deepseek_v41_forward_context(
 def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, prepared):
     """This step's checkpoint work, through `paged_state_checkpoint`.
 
-    Everything about placement, ordering and the store/restore contract lives
-    in the mechanism (`run_state_checkpoint_step`): the stores the previous build left,
-    this step's plan, resets for recycled slots, restores for prefix hits,
-    and the stores registered for after the forward. This function only hands
-    it the row data the V4.1 bridge owns.
+    Everything about placement, ordering and the store contract lives in the
+    mechanism (`run_state_checkpoint_step`): the stores the previous build
+    left, this step's plan and the stores registered for after the forward.
+    Restores for prefix hits are not among them: `prepare_state` ran them
+    through the cache's hook, before the staging above. This function only
+    hands the mechanism the row data the V4.1 bridge owns.
 
     Speculation needs no special case here. A speculative step's own ends are
     the drafted ends, and the mechanism already defers on that through
-    `StateCheckpointWorker.decode_candidates` -- every boundary the step could commit
-    to is recorded, and the next build stores the one it did. An earlier
-    version of this file deferred by hand against `cache.cursor`; carrying
-    that across would have been a second answer to a question the mechanism
-    already answers.
+    `StateCheckpointWorker.decode_candidates` -- every boundary the step could
+    commit to is recorded, and `store_committed_decode_keeps` stores the one
+    it did once the step commits.
     """
     from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
         current_state_checkpoint_worker,
@@ -2077,7 +2076,10 @@ def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, pre
                 # worker, so the wrong type sat here unexercised.
                 chunk_start=np.asarray(snapshot.num_computed[:rows], dtype=np.int64),
                 lens=np.asarray(snapshot.query_lens[:rows], dtype=np.int64),
-                fresh_rows=getattr(prepared, "reset_rows", ()) or (),
+                # None: a prefix hit was restored in `prepare_state`, through
+                # the cache's hook, before the staging above advanced the
+                # cursor. Restoring here again would overwrite that.
+                fresh_rows=(),
                 block=int(adapter.block_size),
                 is_target=True,
                 name=adapter.name,

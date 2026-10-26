@@ -734,9 +734,13 @@ class StateCheckpointWorker:
         # ``pending_stores`` ran (they are issued at the next build).
         self.forward_ran = False
         # Speculative decode: req_id -> (slot, {boundary: state checkpoint unit ids})
-        # for every boundary the last step could commit to; the next build stores
-        # the one it did commit to, if any.
+        # for every boundary the last step could commit to; the one it did commit
+        # to, if any, is stored at the commit (`store_committed_decode_keeps`) or
+        # else by the next build.
         self.decode_candidates: dict[str, tuple[int, dict]] = {}
+        # That step's batch-ordered request ids and scheduled ends, kept for
+        # the commit: by then the runner's batch getters return None.
+        self.decode_rows: tuple[list, np.ndarray] | None = None
 
 
 def state_checkpoint_unit_ids(
@@ -973,6 +977,31 @@ def record_decode_candidates(worker, req_ids, slots, starts, lens, block, name):
             )
             out[rid] = (int(slots[i]), dict(zip(ends, unit_ids)))
     worker.decode_candidates = out
+    rows = len(req_ids)
+    worker.decode_rows = (
+        list(req_ids),
+        np.asarray(starts[:rows], dtype=np.int64)
+        + np.asarray(lens[:rows], dtype=np.int64),
+    )
+
+
+def store_committed_decode_keeps(worker, num_rejected=None) -> None:
+    """The decode keeps of the step just run, at the end it committed.
+
+    Right after the commit the slots hold exactly the committed state. The
+    next build is too late: a step that is not speculative advances the cursor
+    while it stages, before any store runs, and the keep would pair this
+    step's window with the next step's cursor. ``num_rejected``: per batch row,
+    the drafted tokens the sampler rejected; None for a step with no drafts.
+    """
+    rows, worker.decode_rows = worker.decode_rows, None
+    if rows is None or not worker.decode_candidates:
+        return
+    req_ids, ends = rows
+    if num_rejected is not None:
+        rejected = num_rejected.cpu() if hasattr(num_rejected, "cpu") else num_rejected
+        ends = ends - np.asarray(rejected, dtype=np.int64)[: len(ends)]
+    store_decode_keeps(worker, req_ids, ends, fresh_rows=())
 
 
 def run_state_checkpoint_step(
