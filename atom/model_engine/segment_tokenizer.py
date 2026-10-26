@@ -169,6 +169,10 @@ class SegmentTokenizer:
         Unsupported/short/disabled paths return no hint; ordinary hashing
         remains available to the caller.
         """
+        if not self._prefix_ok:
+            # No stored prefix is ever found or kept, so a projection would be
+            # rebuilt in full every request: let the caller hash as before.
+            return PrefixEncoding(self._checked_encode(prompt), None)
         return self._checked_encode(prompt, (block_size, seed))
 
     def _checked_encode(self, prompt, projection_spec=None):

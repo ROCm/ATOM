@@ -135,6 +135,20 @@ def test_concurrent_forks_do_not_share_mutable_hash_or_token_arrays(tokenizer):
     assert cache._lru.bytes <= cache._lru.budget
 
 
+def test_no_projection_when_prefix_reuse_is_off(tokenizer):
+    """Overlapping added tokens turn prefix reuse off (`_prefix_ok`): nothing
+    would ever be reused, so no projection is built or shipped."""
+    cache = st.SegmentTokenizer(tokenizer, 8 << 20)
+    cache._prefix_ok = False
+    text = prompt() + "hello<END><U>world<A>"
+    with patch.object(st, "project_prefix", wraps=st.project_prefix) as proj:
+        for _ in range(2):
+            encoded = cache.encode_with_prefix(text, 16)
+            assert encoded.token_ids == tokenizer.encode(text)
+            assert encoded.projection is None
+    assert proj.call_count == 0
+
+
 def test_disable_during_encode_drops_the_hint_and_cached_hashes(tokenizer, monkeypatch):
     cache = st.SegmentTokenizer(tokenizer, 8 << 20)
     cache.encode_with_prefix(prompt(), 16)
