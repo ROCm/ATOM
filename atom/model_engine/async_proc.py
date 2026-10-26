@@ -50,6 +50,7 @@ from atom.utils import (
     init_exit_handler,
     make_zmq_socket,
     resolve_obj_by_qualname,
+    run_exiting_on_crash,
     set_process_title,
     shutdown_all_processes,
     worker_process_name,
@@ -511,10 +512,14 @@ class AsyncIOProcManager:
             # Only rank 0 gets the primary output address
             addrs = [None, io_addrs[1]] if i == 0 else [None, None]
 
+            # Through `run_exiting_on_crash`: a runner that raises must end
+            # its process, or this manager's sentinel never fires and the
+            # group waits out a peer's gloo timeout instead of shutting down.
             process = ctx.Process(
-                target=AsyncIOProc,
+                target=run_exiting_on_crash,
                 name=label,
                 args=(
+                    AsyncIOProc,
                     label,
                     addrs,
                     scheduler_output_handle,

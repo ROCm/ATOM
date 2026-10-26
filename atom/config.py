@@ -2092,6 +2092,10 @@ class Config:
     # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
     # rebuild, so the floor is what bounds that amplification.
     dynamic_chunking_min_chunk_size: int = 4096
+    # Mix prefill chunks and decode seqs into the same forward pass. DeepSeek-V4
+    # only (`_validate_mixed_prefill_decode` refuses the rest at launch). Off:
+    # the scheduler emits prefill-only or decode-only batches as before.
+    enable_mixed_prefill_decode: bool = False
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2730,6 +2734,8 @@ class Config:
 
             self.state_replay_tokens = state_replay_tokens(self)
 
+        self._validate_mixed_prefill_decode()
+
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
 
@@ -2771,6 +2777,157 @@ class Config:
             "Dynamic chunking disabled because %s; chunking stays fixed", reason
         )
         self.enable_dynamic_chunking = False
+
+    def _validate_mixed_prefill_decode(self) -> None:
+        """Refuse `--enable-mixed-prefill-decode` on configs that cannot run it.
+
+        One table, checked at launch. The alternative -- and what this replaces
+        -- was a refusal scattered across five files, fired only once a mixed
+        batch had actually been built, so a user learned the combination was
+        unsupported some way into serving rather than at startup. Most of those
+        were `assert`s, which `python -O` strips: the combinations then did not
+        refuse at all, they ran with whichever wrong numerics the assert stood
+        in front of.
+
+        Each entry is a condition this config declares, not one a batch
+        discovers. That is the whole reason they can be checked here: they come
+        off the HF config and the CLI, both settled before a model loads.
+
+        Mixed batching is implemented for DeepSeek-V4 only. Every other
+        attention family is refused here; the base builder's `prepare_mixed`
+        and the MHA forward keep a runtime refusal as a backstop, which firing
+        means this table has a gap.
+        """
+        if not self.enable_mixed_prefill_decode:
+            return
+
+        from atom.utils import get_hf_text_config
+        from atom.utils.selector import Family, attn_family
+
+        # `hf_config` is set earlier in `__post_init__`; the text sub-config is
+        # derived, not stored (multimodal configs nest it). ModelRunner keeps
+        # its own `hf_text_config` attribute -- that one is NOT on Config, and
+        # reading it here is what made this validator raise AttributeError on
+        # every launch that enabled the flag.
+        hf = get_hf_text_config(self.hf_config)
+        family = attn_family(hf)
+        spec = self.speculative_config
+        spec_method = None if spec is None else spec.method
+        cg_mode = self.compilation_config.cudagraph_mode
+        rope_parameters = getattr(hf, "rope_parameters", None) or {}
+        # (is this config affected, what it is, why it cannot run mixed)
+        refusals = [
+            # Only the V4 builder implements `prepare_mixed`. Compared by
+            # family, not `is_mla`: V4 is its own family despite its latent
+            # rank, and dense MLA (DeepSeek-V2/V3/R1, Kimi) is not supported.
+            (
+                family != Family.V4,
+                f"the {family} attention family",
+                (
+                    "mixed prefill+decode batching is implemented for "
+                    "DeepSeek-V4 only"
+                ),
+            ),
+            # The same predicate `DeepseekV4Attention.forward` routes on: a
+            # TR_HYBRID V4 layer takes its narrow split order on EVERY forward,
+            # captured or not, and that order has no mixed form -- it hands the
+            # merged carrier to the paged prefill kernel whole, which then fails
+            # on the segment index arrays only the per-segment metadata
+            # carries. Only the FULL path (`forward_impl`) splits a mixed batch.
+            (
+                family == Family.V4
+                and cg_mode is not None
+                and cg_mode.uses_tr_hybrid(),
+                f"--cudagraph-mode {getattr(cg_mode, 'name', cg_mode)} on DeepSeek-V4",
+                (
+                    "a TR_HYBRID V4 layer runs its narrow split order on every "
+                    "forward, which has no mixed form; use FULL (the default), "
+                    "FULL_DECODE_ONLY or NONE"
+                ),
+            ),
+            # Speculative decoding runs mixed only as V4 + DSpark: a prefill row
+            # verifies as a 0-draft spec row and the V4 decode half is the
+            # unmodified, spec-shaped `prepare_decode`. See
+            # docs/mixed_dspark_design.md.
+            (
+                spec is not None and spec_method != "dspark",
+                f"speculative decoding via {spec_method!r}",
+                (
+                    "only DSpark is wired through the mixed split so far; MTP "
+                    "and EAGLE share its data flow but are unvalidated there"
+                ),
+            ),
+            (
+                spec is not None and self.pipeline_parallel_size > 1,
+                "speculative decoding with pipeline parallel",
+                (
+                    "under PP the decode loop spends no draft rows "
+                    "(spec_width 0), so the spec-shaped mixed split never forms"
+                ),
+            ),
+            # The decode-first `prefill_budget` holds only while prefill is
+            # chunked: unchunked admission takes the first prompt whole even
+            # past the budget, so it can starve the decode rows it reserved.
+            (
+                not self.enable_chunked_prefill,
+                "chunked prefill off",
+                (
+                    "an unchunked prompt is admitted whole even past the "
+                    "decode-first prefill budget, which then cannot hold"
+                ),
+            ),
+            # Keyed off the same predicate as the runner's `use_mrope`, not off
+            # the family: no V4 checkpoint carries `mrope_section` today, but
+            # the family check alone would admit one. `prepare_prefill` lays
+            # M-RoPE positions over every request in the batch, so a mixed
+            # batch's decode rows would write past the prefill positions.
+            (
+                "mrope_section" in rope_parameters,
+                "M-RoPE",
+                (
+                    "the prefill builder lays M-RoPE positions over the whole "
+                    "mixed batch, decode rows included"
+                ),
+            ),
+            (
+                self.prefill_context_parallel_size > 1,
+                "prefill context parallel",
+                (
+                    "the PCP round-robin query split and its attention reindex "
+                    "run over the whole batch, decode rows included"
+                ),
+            ),
+        ]
+        blocked = [(what, why) for cond, what, why in refusals if cond]
+        if blocked:
+            raise ValueError(
+                "--enable-mixed-prefill-decode is not supported with "
+                + "; ".join(f"{what} ({why})" for what, why in blocked)
+                + ". Drop the flag, or the feature it conflicts with."
+            )
+
+        # Decode-first reserves `spec_width + 1` tokens per in-flight decode
+        # before prefill spends anything. A full decode set can then reserve
+        # the whole step and leave prefill nothing -- mixed batches stop
+        # forming and new requests wait on decodes finishing. Not refused: a
+        # decode set rarely sits at `max_num_seqs`, and the operator may want
+        # decode-first at that extreme. Skipped when the width is left to the
+        # checkpoint (`num_speculative_tokens` unset): it is not known yet.
+        if spec is not None and spec.num_speculative_tokens:
+            full_reserve = self.max_num_seqs * (spec.num_speculative_tokens + 1)
+            if full_reserve >= self.max_num_batched_tokens:
+                logger.warning(
+                    "--enable-mixed-prefill-decode with %d speculative tokens: a "
+                    "full decode set (max_num_seqs=%d) reserves %d tokens, which "
+                    "is all of --max-num-batched-tokens=%d, leaving prefill no "
+                    "budget at that load. Raise --max-num-batched-tokens above "
+                    "%d to keep prefill admitting.",
+                    spec.num_speculative_tokens,
+                    self.max_num_seqs,
+                    full_reserve,
+                    self.max_num_batched_tokens,
+                    full_reserve,
+                )
 
     def compute_hash(self) -> str:
         """
