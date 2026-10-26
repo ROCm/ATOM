@@ -806,10 +806,10 @@ def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
 # OVERLAY it across shapes. That op is absent in some ROCm builds (no vLLM _C),
 # and a pure-Python weak ref is impossible: dlpack / set_(untyped_storage) both
 # share the Storage object and thus KEEP it alive -> the pool cannot reuse the
-# memory -> every captured piece's output accumulates (35GB+ on DSV4 TP8
-# PIECEWISE). We therefore JIT-compile a tiny `at::from_blob(..., no-op deleter)`
-# equivalent once (cached under ~/.cache/torch_extensions) so PIECEWISE cudagraph
-# pools overlay exactly like upstream vLLM.
+# memory -> every recorded region's output accumulates across buckets. We
+# therefore JIT-compile a tiny `at::from_blob(..., no-op deleter)` equivalent
+# once (cached under ~/.cache/torch_extensions) so token-graph pools overlay
+# exactly like upstream vLLM.
 _ATOM_WEAKREF_OP = None  # None = not attempted, False = unavailable, else callable
 
 
@@ -868,8 +868,8 @@ at::Tensor atom_weak_ref_tensor(at::Tensor input) {
             from aiter import logger as _logger
 
             _logger.warning(
-                "atom weak_ref_tensor JIT compile failed (%s); PIECEWISE "
-                "cudagraph pools will NOT overlay -> higher memory. Set "
+                "atom weak_ref_tensor JIT compile failed (%s); token "
+                "graph pools will NOT overlay -> higher memory. Set "
                 "ATOM_DISABLE_JIT_WEAKREF=1 to silence.",
                 _e,
             )
@@ -920,27 +920,18 @@ def weak_ref_tensors(
 
 @dataclasses.dataclass
 class CompilationCounter:
-    num_models_seen: int = 0
     num_graphs_seen: int = 0
     # including the splitting ops
     num_piecewise_graphs_seen: int = 0
     # not including the splitting ops
     num_piecewise_capturable_graphs_seen: int = 0
     num_backend_compilations: int = 0
-    # Number of gpu_model_runner attempts to trigger CUDAGraphs capture
-    num_gpu_runner_capture_triggers: int = 0
-    # Number of CUDAGraphs captured
-    num_cudagraph_captured: int = 0
     # InductorAdapter.compile calls
     num_inductor_compiles: int = 0
-    # EagerAdapter.compile calls
-    num_eager_compiles: int = 0
     # The number of time vLLM's compiler cache entry was updated
     num_cache_entries_updated: int = 0
     # The number of standalone_compile compiled artifacts saved
     num_compiled_artifacts_saved: int = 0
-    # Number of times a model was loaded with CompilationLevel.DYNAMO_AS_IS
-    dynamo_as_is_count: int = 0
 
     def clone(self) -> "CompilationCounter":
         return copy.deepcopy(self)

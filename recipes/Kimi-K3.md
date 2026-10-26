@@ -51,12 +51,12 @@ without being asked. It needs TP8, DSpark, FP8 KV, DCP1, a FULL cudagraph and
 DCP1 and the FULL cudagraph by default; **DSpark and `ATOM_ENABLE_REPLAYSSM`
 it does not**, and without both mono stays off:
 
-- FULL cudagraph **is** the CLI default (`cudagraph_mode: str = "FULL"`,
-  `atom/model_engine/arg_utils.py:145`, passed through at :768), so a launch
-  from the CLI arms mono without passing `--cudagraph-mode` at all. The
-  `None -> PIECEWISE` default at `atom/config.py:2393` applies only to a
+- FULL cudagraph **is** the CLI default (`EngineArgs.cudagraph_mode: str =
+  "FULL"` in `atom/model_engine/arg_utils.py`), so a launch from the CLI arms
+  mono without passing `--cudagraph-mode` at all. The `None -> TR_HYBRID`
+  default in `Config.__post_init__` (`atom/config.py`) applies only to a
   config that never went through `arg_utils` -- i.e. plugin mode -- and K3
-  mono refuses PIECEWISE, logging `Kimi-K3 mono decode off: piecewise
+  mono refuses TR_HYBRID, logging `Kimi-K3 mono decode off: TR_HYBRID
   cudagraph`. The examples below still pass the flag explicitly, because it
   costs nothing and makes the requirement visible in the command.
 - **DSpark is not in the launch above.** Mono replaces the KDA layers of a

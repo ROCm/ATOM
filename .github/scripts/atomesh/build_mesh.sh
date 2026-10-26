@@ -51,13 +51,29 @@ lock_args=()
 if [[ -f "${build_dir}/source/Cargo.lock" ]]; then
   lock_args+=(--locked)
 fi
+run_cargo_build() {
+  cargo build --profile "${profile}" --bin atomesh \
+    "${lock_args[@]}" \
+    --manifest-path "${build_dir}/source/Cargo.toml" \
+    --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1
+}
 echo "[build] Mesh commit=${source_commit} profile=${profile}" >&2
-if ! cargo build --profile "${profile}" --bin atomesh \
-  "${lock_args[@]}" \
-  --manifest-path "${build_dir}/source/Cargo.toml" \
-  --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1; then
-  cat "${log_dir}/mesh-build.log" >&2
-  exit 1
+if ! run_cargo_build; then
+  # Shared host mesh caches go stale in two ways:
+  # 1) Cargo leaves .cargo-ok after a cut-short crate extract, so registry/src
+  #    stays broken forever (e.g. foreign-types with only Cargo.toml).
+  # 2) Incremental target/${profile}/build keeps build-script outputs that
+  #    no longer match the sources, so a second pass fails with missing
+  #    generated files (target-lexicon host.rs, serde_core private.rs).
+  # Wipe both and retry once from registry/cache + a clean target profile.
+  registry_src="${CARGO_HOME:-${HOME}/.cargo}/registry/src"
+  echo "[build] First cargo build failed; clearing ${registry_src} and ${target_dir}/${profile}, then retrying" >&2
+  cp "${log_dir}/mesh-build.log" "${log_dir}/mesh-build.attempt1.log"
+  rm -rf "${registry_src}" "${target_dir}/${profile}"
+  if ! run_cargo_build; then
+    cat "${log_dir}/mesh-build.log" >&2
+    exit 1
+  fi
 fi
 cp "${build_dir}/source/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
 cp "${target_dir}/${profile}/atomesh" "${log_dir}/atomesh"

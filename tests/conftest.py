@@ -32,6 +32,7 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils.region_graph import ReqGraph
 
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
 
@@ -255,3 +256,38 @@ def seq_factory():
         return Sequence(token_ids, block_size, sampling_params=sp, **kwargs)
 
     return make_sequence
+
+
+class ReqGraphRecordings:
+    """What a warmup's capture leaves in request graphs, held on the CPU: a
+    bucket of ``running_bs`` requests replays to ``out``."""
+
+    def __init__(self):
+        self.by_requests = {}
+
+    def add(self, running_bs, out, on_replay=None):
+        def replay():
+            if on_replay is not None:
+                on_replay()
+            return out
+
+        self.by_requests[running_bs] = replay
+
+
+@pytest.fixture
+def req_graph_recordings(monkeypatch):
+    """`ReqGraph`'s interface served from `ReqGraphRecordings`, for a draft
+    pass (`DraftGraph`, keyed by its request count) and a test without a GPU
+    to record it on."""
+    recordings = ReqGraphRecordings()
+    held = recordings.by_requests
+
+    def release_graphs(self):
+        dropped = len(held)
+        held.clear()
+        return dropped
+
+    monkeypatch.setattr(ReqGraph, "has", lambda self, key, phase=None: key in held)
+    monkeypatch.setattr(ReqGraph, "replay", lambda self, key=None, **_: held[key]())
+    monkeypatch.setattr(ReqGraph, "release_graphs", release_graphs)
+    return recordings
