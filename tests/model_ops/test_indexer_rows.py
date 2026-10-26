@@ -116,10 +116,12 @@ def test_dcp_split_bands_only_this_rank_s_rows(world, count):
 
 def test_pcp_owned_rows_group_by_request_and_pad():
     """A PCP rank owns rows `first, first + stride, ...`; grouped by request
-    from the host's `cu_seqlens_q`, the padding rows past the last request one
-    group more."""
+    from the host's `cu_seqlens_q`, the padding rows past the last request in
+    its group. One group per request: the FP4 scorer reads group b's keys off
+    `block_tables[b]`, a table with a row per request."""
     cu = np.array([0, 3, 3, 8], dtype=np.int32)
     # Rank 1 of 2 owns rows 1, 3, 5, 7 of 8, then one padding row.
     starts = pcp_owned_rows_by_request(cu, 1, 2, 5)
-    assert starts.tolist() == [0, 1, 1, 4, 5]
+    assert starts.tolist() == [0, 1, 1, 5]
+    assert len(starts) - 1 == len(cu) - 1
     assert pcp_owned_rows_by_request(cu, 0, 2, 4).tolist() == [0, 2, 2, 4]
