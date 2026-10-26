@@ -55,6 +55,9 @@ def test_eplb_promotes_shared_to_routed_layout():
     assert layout.num_logical == 257
     assert layout.num_physical == 296
     assert layout.physical_per_rank == 37
+    # Once appended as a logical ID, the shared expert uses the ordinary EPLB
+    # placement table. The pinned-shared dispatch rewrite is EPLB-off only.
+    assert not layout.uses_dispatch_remap
 
 
 def test_remap_preserves_routed_owner_and_local_slot():

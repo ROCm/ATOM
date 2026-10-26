@@ -126,7 +126,12 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
         return torch.tensor([[1.5, 0.5]]), torch.tensor([[0, 4]])
 
     monkeypatch.setattr(FusedMoE, "select_experts", fake_select_experts)
-    monkeypatch.setattr(eplb_module, "eplb_map_and_record_fused", lambda _, ids: ids)
+
+    def fake_append_and_map(received_layer, weights, ids):
+        assert received_layer is layer
+        return FusedMoE.append_shared_logical_column(layer, weights, ids)
+
+    monkeypatch.setattr(moe_module, "eplb_append_shared_and_map", fake_append_and_map)
     monkeypatch.setattr(
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
     )
@@ -143,6 +148,125 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
     assert weights.tolist() == [[1.5, 0.5, 1.0]]
     assert ids.tolist() == [[0, 4, 8]]
     assert captured["scale"] == 2.0
+
+
+def test_eplb_append_shared_fallback_matches_reference(monkeypatch):
+    layer = _dispatch_layer()
+    layer.expert_layout = MoEExpertLayout.make(
+        num_routed=8,
+        num_fused_shared_experts=1,
+        num_configured_redundant=0,
+        ep_size=2,
+        use_all2all=True,
+        eplb_enabled=True,
+    )
+    layer.append_shared_logical_column = lambda weights, ids: (
+        FusedMoE.append_shared_logical_column(layer, weights, ids)
+    )
+    monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
+    monkeypatch.setattr(
+        eplb_module, "eplb_map_and_record_fused", lambda _, ids: ids + 10
+    )
+    monkeypatch.setattr(
+        moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: False
+    )
+    weights = torch.tensor([[0.75, 0.25], [0.6, 0.4]], dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 4], [3, -1]], dtype=torch.int32)
+
+    out_weights, out_ids = eplb_module.eplb_append_shared_and_map(layer, weights, ids)
+
+    assert out_weights.dtype == weights.dtype
+    assert out_ids.dtype == ids.dtype
+    assert torch.equal(out_weights[:, :2], weights)
+    assert out_weights[:, 2].float().tolist() == [0.5, 0.5]
+    assert out_ids.tolist() == [[10, 14, 18], [13, 9, 18]]
+
+
+@pytest.mark.parametrize(
+    ("ep_rank", "expected_shared_slots"),
+    [
+        (0, {0}),
+        (1, {0, 6}),
+        (2, {0, 6}),
+        (3, {6}),
+    ],
+)
+def test_eplb_append_shared_tracks_live_replica_count_and_slots(
+    monkeypatch, ep_rank, expected_shared_slots
+):
+    """Shared stays logical while its replica count and slots change at runtime."""
+    layout = MoEExpertLayout.make(
+        num_routed=4,
+        num_fused_shared_experts=1,
+        num_configured_redundant=0,
+        ep_size=4,
+        use_all2all=True,
+        eplb_enabled=True,
+    )
+    layer = _FakeMoELayer(
+        expert_layout=layout,
+        num_fused_shared_experts=1,
+        routed_scaling_factor=1.0,
+        layer_id=0,
+    )
+    layer.append_shared_logical_column = lambda weights, ids: (
+        FusedMoE.append_shared_logical_column(layer, weights, ids)
+    )
+    monkeypatch.setattr(
+        moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
+    )
+
+    # Cold start: logical shared expert 4 occupies one slot on every rank.
+    live = eplb_module.ExpertLocationMetadata.from_trivial(
+        num_layers=1,
+        num_logical_experts=5,
+        num_physical_experts=8,
+        ep_size=4,
+        ep_rank=ep_rank,
+        shared_logical_expert=4,
+    )
+    ptrs = {
+        name: getattr(live, name).data_ptr()
+        for name in (
+            "logical_to_physical_map",
+            "logical_replica_count",
+            "logical_to_rank_dispatch_physical_map",
+        )
+    }
+
+    # Runtime rebalance: shared now has two replicas in arbitrary slots 0 and 6.
+    p2l = torch.tensor([[4, 0, 1, 2, 3, 0, 4, 1]], dtype=torch.int32)
+    l2p = torch.tensor([[[1, 5], [2, 7], [3, -1], [4, -1], [0, 6]]], dtype=torch.int32)
+    cnt = torch.tensor([[2, 2, 1, 1, 2]], dtype=torch.int32)
+    new = eplb_module.ExpertLocationMetadata.from_rebalance_result(
+        physical_to_logical_map=p2l,
+        logical_to_physical_map=l2p,
+        logical_replica_count=cnt,
+        ep_size=4,
+        ep_rank=ep_rank,
+        max_num_replicas=live.max_num_replicas,
+    )
+    live.update(new, [0])
+
+    assert int(live.logical_replica_count[0, 4]) == 2
+    assert live.logical_to_physical_map[0, 4, :2].tolist() == [0, 6]
+    for name, ptr in ptrs.items():
+        assert getattr(live, name).data_ptr() == ptr
+
+    monkeypatch.setattr(eplb_module, "_MANAGER", SimpleNamespace(live_metadata=live))
+    monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
+    record_token = eplb_module._EPLB_RECORD_LOAD.set(False)
+    try:
+        weights = torch.ones((8, 1), dtype=torch.float32)
+        ids = torch.zeros((8, 1), dtype=torch.int32)
+        out_weights, out_ids = eplb_module.eplb_append_shared_and_map(
+            layer, weights, ids
+        )
+    finally:
+        eplb_module._EPLB_RECORD_LOAD.reset(record_token)
+
+    assert set(out_ids[:, -1].tolist()) == expected_shared_slots
+    assert out_weights[:, -1].tolist() == [1.0] * 8
 
 
 def _parallel_config(
