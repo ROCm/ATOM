@@ -1,16 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Step-triggered engine-status windows.
 
-The option exists so offline / MLPerf runs can line one DP rank's status
-lines up against another's. Wall-clock sampling cannot do that: the ranks
-read the clock at the same moment but are at different step numbers. A
-forward count can, because DP attention is lockstep -- every rank runs
-exactly one forward per pass, a dummy when it has nothing of its own.
-
-That makes `bump_step` counting the DUMMY the load-bearing detail, and it is
-what the last test here pins. A counter that only advanced on real work would
-look correct under even load and drift apart under uneven load, which is the
-case the option is for.
+Exists so offline / MLPerf runs can line one DP rank's lines up against
+another's, which the clock cannot do. The load-bearing detail is that
+`bump_step` counts the idle rank's DUMMY -- a counter that advanced only on
+real work would look right under even load and drift under uneven load,
+which is the case the option is for. Pinned by the last test here.
 """
 
 from __future__ import annotations
@@ -86,11 +81,8 @@ def test_disabled_stats_never_count_or_open():
 def test_ranks_stay_aligned_when_only_one_of_them_has_work():
     """The reason the counter sits after the dummy, not inside the step.
 
-    Two ranks, one idle. Both reach `bump_step` every pass -- the busy one
-    through `_process_engine_step`, the idle one through
-    `_execute_dummy_batch` -- so both windows close on the same pass. A
-    counter that advanced only on real work would leave the idle rank behind
-    and the two lines would no longer describe the same moment.
+    Both ranks reach `bump_step` every pass -- one via `_process_engine_step`,
+    the idle one via `_execute_dummy_batch` -- so both windows close together.
     """
     busy = _stats(throughput_log_interval_s=10.0, throughput_log_interval_steps=8)
     idle = _stats(throughput_log_interval_s=10.0, throughput_log_interval_steps=8)

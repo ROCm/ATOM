@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: MIT
 """`--throughput-log-interval-steps` is refused where nothing feeds it.
 
-Only `EngineCore.busy_loop` and its DP override call `bump_step`. The P/D
-engines and PP replace those loops entirely, so the counter there would stay
-0 and `window_expired` would never open the window again -- the engine would
-announce a logging mode and then print nothing, which is strictly worse than
-either supporting it or refusing it. `Config.__post_init__` falls back to the
-clock and warns instead.
+Only `EngineCore.busy_loop` and its DP override call `bump_step`; P/D and PP
+replace those loops, so the counter would stay 0 and the line would never be
+emitted -- announcing a logging mode and then printing nothing.
+`Config.__post_init__` falls back to the clock and warns instead.
 """
 
 from __future__ import annotations
@@ -17,11 +15,7 @@ from atom.config import Config
 
 
 def _resolve(**kw) -> Config:
-    """Drive only the step-interval clause, not the whole __post_init__.
-
-    `Config.__post_init__` reaches the model loader and the GPU; this test is
-    about one guard, so it is called directly on a bare instance.
-    """
+    """Drive the one clause: `__post_init__` reaches the loader and the GPU."""
     cfg = Config.__new__(Config)
     cfg.throughput_log_interval = kw.pop("throughput_log_interval", 10.0)
     cfg.throughput_log_interval_steps = kw.pop("throughput_log_interval_steps", 0)
@@ -69,12 +63,10 @@ def test_unsupported_topologies_fall_back_to_the_clock(topology, caplog):
 
 
 def test_a_still_unparsed_kv_transfer_config_does_not_crash():
-    """The guard runs after the JSON string is parsed -- pin that it must.
+    """The guard must run after the CLI's JSON string becomes a dict.
 
-    `kv_transfer_config` reaches `__post_init__` as a string from the CLI and
-    is turned into a dict partway through. A guard placed before that point
-    calls `.get` on a `str` and takes the whole server down at construction,
-    which is how this clause was first written.
+    Placed before that, it calls `.get` on a `str` and takes the server down
+    at construction -- which is how this clause was first written.
     """
     cfg = _resolve(
         throughput_log_interval_steps=40,

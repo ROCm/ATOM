@@ -1992,11 +1992,8 @@ class Config:
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
     # Forwards between engine-status lines, replacing the clock above when
-    # positive. For offline / MLPerf runs that compare one DP rank's lines
-    # against another's: wall-clock sampling lands on a different step number
-    # on each rank, a forward count lands on the same one (DP attention is
-    # lockstep, so every rank runs one forward per pass -- a dummy when it has
-    # nothing of its own).
+    # positive. For offline / MLPerf runs comparing one DP rank's lines against
+    # another's; the clock lands on a different step number on each rank.
     throughput_log_interval_steps: int = 0
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
@@ -2137,17 +2134,13 @@ class Config:
         return list(sizes)
 
     def _resolve_throughput_step_interval(self) -> None:
-        """Keep the step trigger to the loops that actually feed its counter.
+        """Keep the step trigger to the loops that feed its counter.
 
-        `EngineCore.busy_loop` and the DP one call `bump_step`; the P/D and PP
-        engines override or replace those loops and never reach it. Left armed
-        there, `window_expired` would consult a counter that stays 0 and the
-        status line would never be emitted again -- the engine would announce
-        a logging mode and then go silent, which is worse than either working
-        or refusing. Fall back to the clock and say so.
-
-        Degrade rather than raise: this is an observability knob, and a stale
-        flag in a shared launch script must not stop a server from starting.
+        Only `EngineCore.busy_loop` and the DP one call `bump_step`; P/D and
+        PP replace those loops, so the counter would stay 0 and the status
+        line would never be emitted again -- announcing a logging mode and
+        then going silent. Degrade rather than raise: a stale flag in a shared
+        launch script must not stop a server from starting.
         """
         if self.throughput_log_interval_steps <= 0:
             self.throughput_log_interval_steps = 0
@@ -2450,9 +2443,8 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
-        # After the block above: `kv_transfer_config` arrives as a JSON string
-        # from the CLI and only becomes a dict there, and the P/D clause below
-        # reads `kv_role` off it.
+        # After the parse above: the P/D clause reads `kv_role` off
+        # `kv_transfer_config`, which arrives from the CLI as a string.
         self._resolve_throughput_step_interval()
         if self.kv_transfer_config:
             # The offload namespace hashes the model's cache geometry. A worker
