@@ -1302,6 +1302,9 @@ models:
               # Stream the prefill's first token when the request's KV lands,
               # not with the first local decode's deferred output.
               ATOM_PD_EARLY_T0: "1"
+              # The DCP8 decode's 96-head MLA as three 32-head pseudo-requests
+              # per request: 1.9x aiter's native 96-head plan on the C88 shape.
+              ATOM_MLA_DCP_HEAD_FOLD: "1"
 
         - <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c2
