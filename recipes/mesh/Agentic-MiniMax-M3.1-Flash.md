@@ -11,7 +11,7 @@ formal Profiling phase. Warmup does not count toward that delay.
 | Hardware | One TW MI355X node, eight GPUs |
 | Prefill / decode | TP4 GPUs 0–3 / TP4 GPUs 4–7 |
 | Transport | Mooncake Transfer, RDMA, `MC_DISABLE_HIP=1`, one QP per endpoint |
-| Prefix offload | Native Mooncake Store on prefill; two 768 GiB owners |
+| Prefix offload | Native Mooncake Store on prefill; 1 TiB total, two 512 GiB owners |
 | Store owner placement | NUMA0 on rdma4/5; NUMA1 on rdma6/7 |
 | Target / index / draft KV | FP8; block size 128 |
 | DSpark | Checkpoint `dspark/`, 3 draft tokens, synthetic mean acceptance length 2.88 |
@@ -40,7 +40,7 @@ only to eligible dense gather implementations; this target has all sparse
 layers, and the DSpark block reads paged KV directly. A configured bound is not
 proof that an 8 GiB reservation or grouped gather ran; inspect the memory logs.
 
-Dispatch `atomesh-benchmark.yaml` twice from the test branch, with
+Dispatch `atomesh-benchmark.yaml` from the test branch for the selected suite, with
 `atom_source=mounted`, `atomesh_slurm_submit_runner=atomesh-cicd`, automatic node
 selection, and `publish_dashboard=false`:
 
@@ -49,7 +49,11 @@ selection, and `publish_dashboard=false`:
   `minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c48`, and
   `minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c64`.
 
-Use the validated image for both actions:
+For a trace-only run, dispatch only `suite=profile`. After all eight TP rank
+traces have finished exporting, the job stops the load generator and exits
+successfully without waiting for the full benchmark duration.
+
+Use the validated image:
 `rocm/atom-dev:nightly_202610251529@sha256:9194234e34b71463d80c23c81d3f98d46ac3a60b9e0b621101262b7f8b71e774`.
 The Store requires the image's `mooncake_master`, `mooncake_client`, and
 `mooncake.store`; the launcher checks these before allocating Store owners.
