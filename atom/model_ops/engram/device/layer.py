@@ -6,12 +6,66 @@ modules.
 """
 
 import torch
+from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.model_ops.engram.device.gate import engram_post_wkv
+from atom.model_ops.engram.device.gate import engram_post_wkv, engram_post_wkv_tp
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.utils import atom_parameter
+
+
+class _EngramWKV(ReplicatedLinear):
+    """Keep complete local key branches and the shared value in checkpoint order."""
+
+    def __init__(self, input_size, hidden_size, hc_mult, quant_config=None):
+        super().__init__(
+            input_size, (hc_mult + 1) * hidden_size, quant_config=quant_config
+        )
+        self.hc_mult = self.local_hc = hc_mult
+        self.hidden_size = hidden_size
+        if (
+            self.native_a8_group_rows == 32
+            and self.weight.dtype == torch.float8_e4m3fn
+            and self.tp_size in (2, 4)
+            and hc_mult % self.tp_size == 0
+            and hidden_size % 32 == 0
+        ):
+            self.local_hc = hc_mult // self.tp_size
+            self.output_size = (self.local_hc + 1) * hidden_size
+            self.output_partition_sizes = [self.output_size]
+            # Preserve Parameter identities and their loader callbacks. Fresh
+            # storage releases the full allocation, including on meta devices.
+            self.weight.data = self.weight.new_empty((self.output_size, input_size))
+            self.weight_scale.data = self.weight_scale.new_empty(
+                (self.output_size // 32, input_size // 32)
+            )
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self.local_hc != self.hc_mult:
+            group = 32 if param is self.weight_scale else 1
+            branch_rows = self.hidden_size // group
+            expected = (
+                (self.hc_mult + 1) * branch_rows,
+                self.input_size // (32 if group == 32 else 1),
+            )
+            if tuple(loaded_weight.shape) != expected:
+                name = "weight_scale" if param is self.weight_scale else "weight"
+                raise ValueError(
+                    f"Engram {name} is {tuple(loaded_weight.shape)}, expected "
+                    f"full checkpoint shape {expected}"
+                )
+            rows = self.local_hc * branch_rows
+            start = self.tp_rank * rows
+            # Select before Linear's dtype/shape processing and before its
+            # normal child post-load hook shuffles this compact local weight.
+            loaded_weight = torch.cat(
+                (
+                    loaded_weight[start : start + rows],
+                    loaded_weight[self.hc_mult * branch_rows :],
+                )
+            )
+        super().weight_loader(param, loaded_weight)
 
 
 class EngramOp(nn.Module):
@@ -42,10 +96,10 @@ class EngramOp(nn.Module):
         # hc_mult key projections first, the single shared value projection
         # last. Built here, not taken as a module, so the shape is derived
         # once from the arguments that already fix it.
-        self.wkv = ReplicatedLinear(
+        self.wkv = _EngramWKV(
             engram_hidden_size,
-            (hc_mult + 1) * hidden_size,
-            bias=False,
+            hidden_size,
+            hc_mult,
             quant_config=quant_config,
         )
         self.register_buffer("gate_weight", None, persistent=False)
@@ -88,6 +142,15 @@ class EngramOp(nn.Module):
                 f"but embeddings cover {tuple(embeddings.shape[:-1])}"
             )
         kv = self.wkv(embeddings)
+        if self.wkv.local_hc != self.hc_mult:
+            return engram_post_wkv_tp(
+                hidden_states,
+                kv,
+                self.gate_weight,
+                get_tp_group(),
+                token_mask,
+                self.norm_eps,
+            )
         return engram_post_wkv(
             hidden_states, kv, self.gate_weight, token_mask, self.norm_eps
         )
@@ -121,20 +184,29 @@ class EngramOp(nn.Module):
                 )
         native_scale = getattr(self.wkv, "weight_scale", None)
         if native_scale is not None:
+            group_rows = self.wkv.native_a8_group_rows
+            expected_scale = (
+                (expected[0] // group_rows, expected[1] // 32)
+                if group_rows is not None
+                else tuple(native_scale.shape)
+            )
             if (
                 wkv_scale is None
                 or wkv.dtype != self.wkv.weight.dtype
                 or wkv_scale.dtype != native_scale.dtype
-                or wkv_scale.shape != native_scale.shape
+                or tuple(wkv_scale.shape) != expected_scale
             ):
                 raise ValueError(
                     "Native Engram projection requires matching weight and scale layout"
                 )
-            self.wkv.weight.copy_(wkv)
-            native_scale.copy_(wkv_scale)
+            self.wkv.weight_loader(self.wkv.weight, wkv)
+            self.wkv.weight_loader(native_scale, wkv_scale)
             self.k_weight.copy_(k_weight)
             self.q_weight.copy_(q_weight)
             self.process_weights_after_loading()
+            # The production loader visits the linear child independently.
+            # This direct helper owns that visit when loading without it.
+            self.wkv.process_weights_after_loading()
             return
         if wkv_scale is not None:
             # `.float()` decodes 2**(code-127) only for a float8 E8M0 dtype; a

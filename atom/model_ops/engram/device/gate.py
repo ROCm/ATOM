@@ -26,15 +26,21 @@ def _engram_post_wkv_kernel(
     HC: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_MASK: tl.constexpr,
+    LOCAL_HC: tl.constexpr,
+    BRANCH_START: tl.constexpr,
+    GATE_ONLY: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    token, branch = row // HC, row % HC
+    token, local_branch = row // LOCAL_HC, row % LOCAL_HC
+    branch = BRANCH_START + local_branch
     col = tl.arange(0, BLOCK)
     live = col < DIM
-    residual = tl.load(hidden + row * DIM + col, live, 0).to(tl.float32)
-    key = tl.load(kv + token * (HC + 1) * DIM + branch * DIM + col, live, 0).to(
+    residual = tl.load(hidden + (token * HC + branch) * DIM + col, live, 0).to(
         tl.float32
     )
+    key = tl.load(
+        kv + token * (LOCAL_HC + 1) * DIM + local_branch * DIM + col, live, 0
+    ).to(tl.float32)
     w = tl.load(weight + branch * DIM + col, live, 0).to(tl.float32)
     rstd = tl.rsqrt(tl.sum(residual * residual, 0) / DIM + eps)
     rstd *= tl.rsqrt(tl.sum(key * key, 0) / DIM + eps)
@@ -47,40 +53,39 @@ def _engram_post_wkv_kernel(
     gate = tl.sigmoid(signed.to(tl.float32, bitcast=True))
     if HAS_MASK:
         gate = tl.where(tl.load(token_mask + token), gate, 0.0)
-    value = tl.load(kv + token * (HC + 1) * DIM + HC * DIM + col, live, 0).to(
-        tl.float32
+    if GATE_ONLY:
+        tl.store(output + row, gate)
+    else:
+        value = tl.load(kv + token * (HC + 1) * DIM + HC * DIM + col, live, 0).to(
+            tl.float32
+        )
+        tl.store(output + row * DIM + col, residual + gate * value, live)
+
+
+def _gate_reference(hidden, key, weight, token_mask, eps):
+    residual, key = hidden.float(), key.float()
+    rstd = torch.rsqrt(residual.square().mean(-1) + eps) * torch.rsqrt(
+        key.square().mean(-1) + eps
     )
-    tl.store(output + row * DIM + col, residual + gate * value, live)
+    dot = (residual * weight * key).sum(-1) * rstd * hidden.shape[-1] ** -0.5
+    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+    if token_mask is not None:
+        gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
+    return gate
 
 
 def engram_post_wkv_reference(hidden, kv, weight, token_mask=None, eps=1e-20):
     """Original torch operation sequence, also used for CPU/strided inputs."""
     hc, dim = hidden.shape[-2:]
-    key = kv[..., : hc * dim].reshape(*hidden.shape).float()
-    value = kv[..., hc * dim :]
-    residual = hidden.float()
-    rstd = torch.rsqrt(residual.square().mean(-1) + eps) * torch.rsqrt(
-        key.square().mean(-1) + eps
-    )
-    dot = (residual * weight * key).sum(-1) * rstd * dim**-0.5
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
-    if token_mask is not None:
-        gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
-    return (residual + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
-        hidden.dtype
-    )
+    key = kv[..., : hc * dim].reshape(*hidden.shape)
+    gate = _gate_reference(hidden, key, weight, token_mask, eps)
+    return (
+        hidden.float() + gate.unsqueeze(-1) * kv[..., hc * dim :].float().unsqueeze(-2)
+    ).to(hidden.dtype)
 
 
-def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20):
-    """Fused inference path for contiguous [..., HC, DIM] residuals."""
-    hc, dim = hidden.shape[-2:]
-    if kv.shape != (*hidden.shape[:-2], (hc + 1) * dim):
-        raise ValueError("Engram KV projection does not match residual shape")
-    if weight.shape != (hc, dim):
-        raise ValueError("Engram gate weight does not match residual branches")
-    if token_mask is not None and token_mask.shape != hidden.shape[:-2]:
-        raise ValueError("Engram token mask must match residual tokens")
-    supported = (
+def _can_fuse(hidden, kv, weight, token_mask):
+    return (
         envs.ATOM_ENGRAM_FUSED_GATE
         and hidden.is_cuda
         and hidden.dtype in (torch.bfloat16, torch.float16, torch.float32)
@@ -94,6 +99,18 @@ def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20):
             and any(t.requires_grad for t in (hidden, kv, weight))
         )
     )
+
+
+def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20):
+    """Fused inference path for contiguous [..., HC, DIM] residuals."""
+    hc, dim = hidden.shape[-2:]
+    if kv.shape != (*hidden.shape[:-2], (hc + 1) * dim):
+        raise ValueError("Engram KV projection does not match residual shape")
+    if weight.shape != (hc, dim):
+        raise ValueError("Engram gate weight does not match residual branches")
+    if token_mask is not None and token_mask.shape != hidden.shape[:-2]:
+        raise ValueError("Engram token mask must match residual tokens")
+    supported = _can_fuse(hidden, kv, weight, token_mask)
     if not supported:
         return engram_post_wkv_reference(hidden, kv, weight, token_mask, eps)
     output = torch.empty_like(hidden)
@@ -110,7 +127,126 @@ def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20):
             HC=hc,
             BLOCK=block,
             HAS_MASK=token_mask is not None,
+            LOCAL_HC=hc,
+            BRANCH_START=0,
+            GATE_ONLY=False,
             num_warps=8 if block >= 2048 else 4,
             enable_fp_fusion=False,
         )
+    return output
+
+
+@triton.jit
+def _engram_apply_gates_kernel(
+    hidden,
+    kv,
+    gates,
+    output,
+    M: tl.constexpr,
+    HC: tl.constexpr,
+    DIM: tl.constexpr,
+    LOCAL_HC: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    off = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    live = off < M * HC * DIM
+    token = off // (HC * DIM)
+    branch = (off // DIM) % HC
+    col = off % DIM
+    # dim=0 all-gather retains [TP, M, LOCAL_HC], without a gate transpose.
+    gate_idx = (
+        (branch // LOCAL_HC) * M * LOCAL_HC + token * LOCAL_HC + branch % LOCAL_HC
+    )
+    gate = tl.load(gates + gate_idx, live, 0)
+    h = tl.load(hidden + off, live, 0).to(tl.float32)
+    # V stays at the end of each GEMM row; no packing or V all-gather.
+    v = tl.load(kv + token * (LOCAL_HC + 1) * DIM + LOCAL_HC * DIM + col, live, 0).to(
+        tl.float32
+    )
+    tl.store(output + off, h + gate * v, live)
+
+
+def engram_post_wkv_tp(hidden, kv, weight, group, token_mask=None, eps=1e-20):
+    """Local complete Key branches + replicated V; gather FP32 gates only."""
+    hc, dim = hidden.shape[-2:]
+    tp, rank = group.world_size, group.rank_in_group
+    if hc % tp:
+        raise ValueError("Engram branches must divide evenly across TP ranks")
+    local_hc = hc // tp
+    if kv.shape != (*hidden.shape[:-2], (local_hc + 1) * dim):
+        raise ValueError("Engram local KV projection does not match residual shape")
+    if weight.shape != (hc, dim):
+        raise ValueError("Engram gate weight does not match residual branches")
+    if token_mask is not None and token_mask.shape != hidden.shape[:-2]:
+        raise ValueError("Engram token mask must match residual tokens")
+    if not hidden.numel():
+        return hidden.clone()
+    m = hidden.numel() // (hc * dim)
+    start = rank * local_hc
+    fused = _can_fuse(hidden, kv, weight, token_mask)
+    if fused:
+        local_gates = torch.empty(
+            (m, local_hc), device=hidden.device, dtype=torch.float32
+        )
+        block = triton.next_power_of_2(dim)
+        _engram_post_wkv_kernel[(m * local_hc,)](
+            hidden,
+            kv,
+            weight,
+            token_mask,
+            local_gates,
+            eps,
+            DIM=dim,
+            HC=hc,
+            BLOCK=block,
+            HAS_MASK=token_mask is not None,
+            LOCAL_HC=local_hc,
+            BRANCH_START=start,
+            GATE_ONLY=True,
+            num_warps=8 if block >= 2048 else 4,
+            enable_fp_fusion=False,
+        )
+    else:
+        key = kv[..., : local_hc * dim].unflatten(-1, (local_hc, dim))
+        local_gates = (
+            _gate_reference(
+                hidden[..., start : start + local_hc, :],
+                key,
+                weight[start : start + local_hc],
+                token_mask,
+                eps,
+            )
+            .reshape(m, local_hc)
+            .contiguous()
+        )
+    comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
+    gates = group.all_gather(
+        local_gates,
+        dim=0,
+        use_custom=local_gates.is_cuda and comm is not None and not comm.disabled,
+    )
+    if not fused:
+        gates = (
+            gates.reshape(tp, m, local_hc)
+            .permute(1, 0, 2)
+            .reshape(*hidden.shape[:-2], hc)
+        )
+        value = kv[..., local_hc * dim :]
+        return (hidden.float() + gates.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
+            hidden.dtype
+        )
+    output = torch.empty_like(hidden)
+    _engram_apply_gates_kernel[(triton.cdiv(hidden.numel(), 1024),)](
+        hidden,
+        kv,
+        gates,
+        output,
+        M=m,
+        HC=hc,
+        DIM=dim,
+        LOCAL_HC=local_hc,
+        BLOCK=1024,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
     return output
