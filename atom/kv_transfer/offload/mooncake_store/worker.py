@@ -5,7 +5,7 @@
 
 Everything but the transport is the dense offload's: the executors and the
 per-step producer fence (``start_load_kv``), the completion reports, the block
-GPU connector and the dense codec. What changes is where a packed chunk goes:
+GPU connector and a dense or M3 PAGE codec. A packed chunk moves through:
 
 * save: KV blocks --pack, copy--> a slot of the registered transfer pool
   --``batch_put_from``--> the Store owners;
@@ -159,7 +159,7 @@ def _head_first_windows(start: int, end: int, size: int) -> list[range]:
 
 
 class MooncakeStoreOffloadConnector(DenseOffloadConnector):
-    """Dense offload worker whose tier is a Mooncake Store, reached directly."""
+    """Dense or M3 PAGE offload worker backed directly by a Mooncake Store."""
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
@@ -232,6 +232,39 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 "the Store client stays open"
             )
 
+    def _make_codec(self, kv_caches, transfer_tensors, num_blocks):
+        """Include M3 index and draft regions that are absent from kv_caches."""
+        from atom.kv_transfer.offload import config as offcfg
+
+        if offcfg.select_offload_layout(self._config) == "m3":
+            from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+
+            pages = getattr(transfer_tensors, "block_regions", ())
+            if not pages or getattr(transfer_tensors, "slot_regions", ()):
+                raise ValueError(
+                    "M3 Store requires complete PAGE regions and no SLOT state"
+                )
+            blocks = (
+                num_blocks if num_blocks is not None else transfer_tensors.num_blocks
+            )
+            views = transfer_tensors.block_tensor_views
+            if len(views) != len(pages):
+                raise ValueError(
+                    "M3 Store requires a tensor view for every PAGE region"
+                )
+            return DSV4PageSlotCodec(
+                page_regions=pages,
+                slot_regions=(),
+                num_blocks=blocks,
+                num_slots=0,
+                device=views[0].device,
+            )
+        return DenseKVByteCodec(
+            kv_caches,
+            num_blocks=num_blocks,
+            permit_per_request_state=self._permit_per_request_state,
+        )
+
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
@@ -241,11 +274,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._world = world
         # Scheduler blocks, threaded from the model runner. MLA stores its KV
         # token-major, so the codec cannot infer the count from shape[0].
-        self._codec = DenseKVByteCodec(
-            kv_caches,
-            num_blocks=num_blocks,
-            permit_per_request_state=self._permit_per_request_state,
-        )
+        self._codec = self._make_codec(kv_caches, transfer_tensors, num_blocks)
         cfg = self._store_cfg
         namespace = store_namespace(self._config, self.chunk_size)
         device = self._codec.device
