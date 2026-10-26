@@ -1038,6 +1038,15 @@ def _patch_torch_dynamo_metrics_config_logging() -> None:
 _CONSOLE_HANDLER_NAME = "atom.console"
 
 
+def _root_has_no_handler(record: logging.LogRecord) -> bool:
+    """Let atom's console handler print only while nothing on the root logger
+    would; a NullHandler there prints nothing, so it does not count."""
+    return not any(
+        not isinstance(handler, logging.NullHandler)
+        for handler in logging.getLogger().handlers
+    )
+
+
 def set_atom_log_level(level_name: str) -> str:
     """Set the atom logger and its console handler to the same level.
 
@@ -1045,8 +1054,8 @@ def set_atom_log_level(level_name: str) -> str:
     a LogRecord per logger.debug() call and then discards it -- 10.4% of the
     API server's CPU at c=2048. Any name logging knows is accepted, in any case
     and with its aliases (WARN, FATAL). NOTSET and unknown names fall back to
-    INFO instead of preventing process startup; NOTSET would hand the level
-    back to the root logger, which is what the atom logger is isolated from.
+    INFO instead of preventing process startup; NOTSET would make the atom
+    logger take the root logger's level instead of its own.
     Other handlers attached to the atom logger keep their own levels.
 
     Returns the canonical name of the level applied.
@@ -1065,17 +1074,17 @@ def set_atom_log_level(level_name: str) -> str:
 
 def getLogger():
     if not logger.handlers:
-        # Never propagate to the root logger. atom attaches its own handler
-        # below, so propagation re-emitted every record through whatever root
-        # handler the embedding app installed (a logging.basicConfig(), for
-        # example), printing each line twice. Apps that collect logs through
-        # the root logger must attach their handler to the "atom" logger.
-        # This runs on import in EVERY process (front + spawned EngineCore /
-        # ModelRunner), unlike a setLevel() applied only in the parent.
-        logger.propagate = False
-
+        # atom records propagate to the root logger. When the application has
+        # a handler there (logging.basicConfig(), a file or JSON handler,
+        # pytest's capture), that handler prints each record once, in the
+        # application's format and to its destinations, and atom's console
+        # handler stays quiet. With nothing on the root logger -- standalone
+        # ATOM and the EngineCore / ModelRunner processes it spawns -- atom's
+        # console handler prints. The check runs per record, so a root handler
+        # installed after this import (basicConfig() in a main()) takes over.
         console_handler = logging.StreamHandler()
         console_handler.set_name(_CONSOLE_HANDLER_NAME)
+        console_handler.addFilter(_root_has_no_handler)
         from atom.utils import envs as _envs
 
         if _envs.ATOM_LOG_MORE:

@@ -137,13 +137,14 @@ def build_app(engine: DiffusionEngine):
 def apply_atom_log_level(log_level: str | None) -> str:
     """Give the atom loggers of this process and of its workers one level.
 
-    atom.* records stop at ATOM's own console handler and never reach the
-    root handler main() installs, so the level basicConfig() sets does not
-    apply to them. The workers configure their atom logger from ATOM_LOG_LEVEL
-    when they import atom.utils after spawn, so an explicit --log-level is
-    exported there; this process imported atom.utils before parsing argv, so
-    its atom logger is set directly. Without --log-level, ATOM_LOG_LEVEL (or
-    INFO) stays in charge. Returns the canonical name of the level applied.
+    basicConfig() only sets the root logger's level, and atom.* records never
+    consult it: they are filtered by the atom logger's own level, then printed
+    by the root handler main() installs. The workers configure their atom
+    logger from ATOM_LOG_LEVEL when they import atom.utils after spawn, so an
+    explicit --log-level is exported there; this process imported atom.utils
+    before parsing argv, so its atom logger is set directly. Without
+    --log-level, ATOM_LOG_LEVEL (or INFO) stays in charge. Returns the
+    canonical name of the level applied.
     """
     if log_level is not None:
         os.environ["ATOM_LOG_LEVEL"] = log_level
