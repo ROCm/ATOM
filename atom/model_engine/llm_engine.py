@@ -719,6 +719,7 @@ class InputOutputProcessor:
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
+        self._reuse_block_hashes = envs.ATOM_TOKENIZE_CACHE_BLOCK_HASHES
         if getattr(config, "enable_prefix_caching", False):
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
@@ -823,11 +824,23 @@ class InputOutputProcessor:
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
+        prefix_encoding = None
         segment_tokenizer = getattr(self, "segment_tokenizer", None)
         if not isinstance(prompt_or_tokens, str):
             tokens = prompt_or_tokens
         elif segment_tokenizer is not None:
-            tokens = segment_tokenizer.encode(prompt_or_tokens)
+            if (
+                getattr(self, "_reuse_block_hashes", False)
+                and self.prefix_hash_block_size
+                and envs.ATOM_FRONTEND_PREFIX_HASH
+                and multimodal_data is None
+            ):
+                prefix_encoding = segment_tokenizer.encode_with_prefix(
+                    prompt_or_tokens, self.prefix_hash_block_size
+                )
+                tokens = prefix_encoding.token_ids
+            else:
+                tokens = segment_tokenizer.encode(prompt_or_tokens)
         else:
             tokens = self.tokenizer.encode(prompt_or_tokens)
         mrope_positions = None
@@ -891,7 +904,13 @@ class InputOutputProcessor:
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.
         if self.prefix_hash_block_size:
-            ship_prompt_hash_chain(seqs[0], self.prefix_hash_block_size)
+            ship_prompt_hash_chain(
+                seqs[0],
+                self.prefix_hash_block_size,
+                block_hashes=(
+                    None if prefix_encoding is None else prefix_encoding.block_hashes
+                ),
+            )
             for seq in seqs[1:]:
                 seq.prompt_hash_chain = seqs[0].prompt_hash_chain
 
