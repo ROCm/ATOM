@@ -20,9 +20,9 @@ from atom.models.minimax_m3.mono.check import (
     trace_logits,
 )
 from atom.models.minimax_m3.mono.config import (
+    M31_MAX_TOKENS,
     MAX_CONTEXT,
     MAX_TOKENS,
-    M31_MAX_TOKENS,
     SUPPORTED_TP,
     TOKEN_TILE,
     Dims,

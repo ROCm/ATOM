@@ -41,8 +41,7 @@ def traces():
         return {
             "layer": trace(contract.build_layer(TOKENS, INDEX_HEADS), K4_ABI),
             "m31": {
-                tokens: trace(launcher, K4_ABI)
-                for tokens, launcher in m31.items()
+                tokens: trace(launcher, K4_ABI) for tokens, launcher in m31.items()
             },
             "m31_single_s32": trace(m31_single_s32, K4_ABI),
             "m31_resources": {

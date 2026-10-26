@@ -9,8 +9,8 @@ from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
     LOCAL_Q_HEADS,
-    MAX_TOKENS,
     M31_MAX_TOKENS,
+    MAX_TOKENS,
     MOE_SLOTS,
     N_ROUTED,
     TOKEN_TILE,
@@ -81,9 +81,7 @@ def test_s32_uses_sixteen_row_tiles_and_signed_i32_mask():
 def test_s32_pool_holds_one_activation_tile():
     metadata_words = 2 * (TOP_K * M31_MAX_TOKENS + 1) * TOKEN_TILE
     assert layout.pool_words(M31_MAX_TOKENS) == (
-        TOKEN_TILE * (layout.XN8_ROW + layout.XSC_ROW)
-        + WAVES * 64 * 4
-        + metadata_words
+        TOKEN_TILE * (layout.XN8_ROW + layout.XSC_ROW) + WAVES * 64 * 4 + metadata_words
     )
 
 
@@ -92,8 +90,7 @@ def test_legacy_wide_pool_layout_is_unchanged(tokens):
     rows = MOE_SLOTS * tokens + 1
     assert layout.pool_words(tokens) == max(
         WAVES * layout.O_K,
-        tokens * (layout.XN8_ROW + layout.XSC_ROW + N_ROUTED)
-        + WAVES * 64 * 4,
+        tokens * (layout.XN8_ROW + layout.XSC_ROW + N_ROUTED) + WAVES * 64 * 4,
         rows * (layout.MID_ROW + layout.MIDSC_ROW),
     )
 

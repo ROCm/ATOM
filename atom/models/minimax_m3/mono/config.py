@@ -109,6 +109,8 @@ def token_mask_i32(tokens: int) -> int:
     """Low ``tokens`` bits without shifting a signed i32 by its width."""
     assert 1 <= tokens <= 32
     return -1 if tokens == 32 else (1 << tokens) - 1
+
+
 # indexer context parallelism: a rank computes every index q head
 MAX_QKV_ROWS = qkv_rows(TP)
 # a request past this many index blocks is selected by the split stage's long

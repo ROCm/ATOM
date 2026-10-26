@@ -58,7 +58,8 @@ def ffn_reduce_defs(k4ctx):
                     return sum_partials(
                         mb_poll,
                         own,
-                        lambda src: ((src * token_stride + row_tok) * HIDDEN + row) // 2,
+                        lambda src: ((src * token_stride + row_tok) * HIDDEN + row)
+                        // 2,
                         W,
                     )
 
@@ -88,7 +89,8 @@ def ffn_reduce_defs(k4ctx):
                     t0, t1 = rank_sum()
             bo.buffer_store(
                 fx.Vector.from_elements([t0, t1], fx.Float32).to(fx.BFloat16),
-                rsrc(ar_out), row_tok * HIDDEN + row,
+                rsrc(ar_out),
+                row_tok * HIDDEN + row,
             )
 
     return {"ffn_finish": ffn_finish}

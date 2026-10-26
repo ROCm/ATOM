@@ -48,8 +48,7 @@ def test_exact_quark_mxfp8_linear_layout(rows, cols):
     assert scale.numel() == rows * cols // 32
     assert weight.untyped_storage()._cdata == linear.weight.untyped_storage()._cdata
     assert (
-        scale.untyped_storage()._cdata
-        == linear.weight_scale.untyped_storage()._cdata
+        scale.untyped_storage()._cdata == linear.weight_scale.untyped_storage()._cdata
     )
 
 
@@ -62,9 +61,7 @@ def test_shuffled_shared_weight_is_rejected():
 
 def test_noncontiguous_mxfp8_weight_is_rejected():
     linear = _linear(2 * INTER, HIDDEN)
-    linear.weight = torch.empty(
-        HIDDEN, 2 * INTER, dtype=dtypes.fp8, device="meta"
-    ).t()
+    linear.weight = torch.empty(HIDDEN, 2 * INTER, dtype=dtypes.fp8, device="meta").t()
     with pytest.raises(MonoUnsupported, match="weight"):
         _mxfp8(linear, 2 * INTER, HIDDEN, "shared")
 

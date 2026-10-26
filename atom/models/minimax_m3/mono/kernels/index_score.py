@@ -150,7 +150,7 @@ def emit_index_scores(
     g4 = lane // 16
     r_ic = rsrc(index_cache)
     rows = step_rows(seq_lens, tokens, q_len, heads)
-    new_key_window = tokens if tokens > MAX_TOKENS else MAX_TOKENS
+    new_key_window = max(MAX_TOKENS, tokens)
     seq = rows.seq
     # every request's scored blocks in one list, a task per wave across the grid;
     # context-parallel requests' (this rank's blocks) in a second

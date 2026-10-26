@@ -207,9 +207,7 @@ def build_dense_post_kernel(
         def start(name):
             return first_task(bid, BASE[name])
 
-        def push_rows(
-            region, row0, n_rows, only=None, token0=0, token_count=tokens
-        ):
+        def push_rows(region, row0, n_rows, only=None, token0=0, token_count=tokens):
             """This task's bf16 partial rows (misc: token k's n_rows from k n_rows) to
             the peers' ``region``, a pair a lane, wave w -> peer w (itself too);
             ``only``: to that peer alone."""

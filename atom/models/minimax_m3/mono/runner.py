@@ -43,8 +43,8 @@ from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
     LOCAL_Q_HEADS,
-    MAX_TOKENS,
     M31_MAX_TOKENS,
+    MAX_TOKENS,
     N_ROUTED,
     ONE_INDEX_HEAD,
     TOP_K,
@@ -59,8 +59,8 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
 from atom.models.minimax_m3.mono.kernels.post_attn import (
     K4_ABI,
     TL_POINTS,
-    build_post_attn_m31_kernel,
     build_post_attn_kernel,
+    build_post_attn_m31_kernel,
     build_post_attn_shared_fp8_kernel,
 )
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
@@ -69,10 +69,10 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
     build_pre_attn_kernel,
 )
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
-    SCRATCH_BYTES as K1_SCRATCH_BYTES,
+    LEGACY_SCRATCH_BYTES as K1_LEGACY_SCRATCH_BYTES,
 )
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
-    LEGACY_SCRATCH_BYTES as K1_LEGACY_SCRATCH_BYTES,
+    SCRATCH_BYTES as K1_SCRATCH_BYTES,
 )
 from atom.models.minimax_m3.mono.layout import (
     SCRATCH,
@@ -188,8 +188,7 @@ class MonoDecodeRunner:
     def _layer_kernels(self, kernels: dict) -> list:
         """A width's layer kernels, each with its ABI."""
         return [
-            (launch, _KERNEL_ABI.get(kind, K4_ABI))
-            for kind, launch in kernels.items()
+            (launch, _KERNEL_ABI.get(kind, K4_ABI)) for kind, launch in kernels.items()
         ]
 
     def _bind(self, causal_lm, drafter, require_aux: bool) -> None:

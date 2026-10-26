@@ -19,8 +19,8 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
 )
 from atom.models.minimax_m3.mono.kernels.post_attn import (
     K4_ABI,
-    build_post_attn_m31_kernel,
     build_post_attn_kernel,
+    build_post_attn_m31_kernel,
 )
 from atom.models.minimax_m3.mono.layout import dense_mailbox_regions, mailbox_regions
 from atom.mono.runtime.compile import check_traced
@@ -59,9 +59,7 @@ def build_m31_layer(tokens: int, index_heads: int, index_topk: bool = True):
     )
 
 
-def check_m31_build(
-    tokens: int, index_heads: int, index_topk: bool = True
-) -> None:
+def check_m31_build(tokens: int, index_heads: int, index_topk: bool = True) -> None:
     check_traced(
         build_m31_layer(tokens, index_heads, index_topk),
         K4_ABI,

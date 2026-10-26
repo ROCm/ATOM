@@ -191,9 +191,7 @@ class SparseMoeLayer:
         w_qkv, s_qkv = bind_attn(
             attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
         )
-        w_o, s_o = bind_attn(
-            attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj"
-        )
+        w_o, s_o = bind_attn(attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj")
 
         moe = layer.block_sparse_moe
         experts = moe.experts

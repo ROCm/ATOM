@@ -33,14 +33,14 @@ from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
     LOCAL_Q_HEADS,
+    M31_MAX_TOKENS,
     MAX_QKV_ROWS,
     MAX_TOKENS,
-    M31_MAX_TOKENS,
     ONE_INDEX_HEAD,
     PAGE16,
     ROTARY_DIM,
-    TP,
     TOKEN_TILE,
+    TP,
     IndexHeads,
     qkv_rows,
     token_tiles,
@@ -427,7 +427,7 @@ def emit_pre_attn(
                         tk * (HIDDEN // 4) + lts[i] * 2,
                         cache_modifier=CM_DEV,
                     )
-            if const_expr(attn_mxfp8):
+            if const_expr(attn_mxfp8):  # noqa: SIM102
                 # the E8M0 words too; x8s then carries a plain flag, not a scale
                 if tid < XSC_WORDS:
                     bo.buffer_store(
@@ -571,12 +571,7 @@ def emit_pre_attn(
                     kc = wave * CHUNKS_PER_WAVE + cc
                     xb = fx.Vector(
                         fx.ptr_load(
-                            x8
-                            + (
-                                col_tok * (HIDDEN // 4)
-                                + kc * 16
-                                + (lane // 16) * 4
-                            ),
+                            x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
                             result_type=fx.Vector.make_type(4, fx.Float32),
                         )
                     ).bitcast(fx.Int64)
@@ -592,8 +587,7 @@ def emit_pre_attn(
                 tot_r = fx.Float32(0.0)
                 for w in range_constexpr(WAVES):
                     tot_r = tot_r + fx.ptr_load(
-                        red
-                        + ((w * 64 + 16 * (r // 4) + local_tk) * 4 + r % 4)
+                        red + ((w * 64 + 16 * (r // 4) + local_tk) * 4 + r % 4)
                     )
                 if const_expr(attn_mxfp8):
                     row = tot_r
@@ -769,9 +763,7 @@ def emit_k1(
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
     mbox = Mailbox(layer, diag, region_ids)
-    qkv_off, x8_off, x8s_off, hdone_off, rdone_off, x8sc_off = scratch_regions(
-        tokens
-    )
+    qkv_off, x8_off, x8s_off, hdone_off, rdone_off, x8sc_off = scratch_regions(tokens)
     qkv_mb = sreg(scratch, qkv_off, "k1.qkv")
     x8_mb = scratch + fx.Int64(x8_off)  # plain words, behind x8s's tags
     x8s_mb = sreg(scratch, x8s_off, "k1.x8s")

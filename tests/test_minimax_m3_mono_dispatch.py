@@ -10,7 +10,7 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.models.minimax_m3.mono import dispatch, runner
-from atom.models.minimax_m3.mono.config import HIDDEN, MAX_TOKENS, M31_MAX_TOKENS
+from atom.models.minimax_m3.mono.config import HIDDEN, M31_MAX_TOKENS, MAX_TOKENS
 from atom.mono.runtime import deployment
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner

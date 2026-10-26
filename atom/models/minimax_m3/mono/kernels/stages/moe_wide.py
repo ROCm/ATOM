@@ -14,8 +14,8 @@ from atom.models.minimax_m3.mono.config import (
     MOE_SLOTS,
     N_ROUTED,
     SHARED_EXPERT,
-    TOP_K,
     TOKEN_TILE,
+    TOP_K,
     token_mask_i32,
     token_tiles,
 )
@@ -69,8 +69,7 @@ def _down_expert_batches(n_exp, depth, load, with_rows, consume, acc):
     for rnd in range(0, (n_exp + per_batch - 1) // per_batch, 1):
         first = rnd * per_batch
         inflight = [
-            with_rows(load(first + i // 2, i % 2))
-            for i in range_constexpr(depth)
+            with_rows(load(first + i // 2, i % 2)) for i in range_constexpr(depth)
         ]
         for i in range_constexpr(depth):
             acc = consume(acc, inflight[i])
@@ -434,6 +433,7 @@ def moe_wide_defs(k4ctx):
                 if const_expr(it + 1 < UGW_ITERS):
                     cur = nxt
         else:
+
             def load_x_tile(t0, n):
                 rows_to_lds(
                     tid,
@@ -520,9 +520,7 @@ def moe_wide_defs(k4ctx):
         def with_rows(u):
             dwv, dsc, du, dkc, ok = u
             drow = fx.Int32(fx.ptr_load(urow + (du * TOKEN_TILE + l16)))
-            dw = ok.select(
-                fx.ptr_load(uwt + (du * TOKEN_TILE + l16)), fx.Float32(0.0)
-            )
+            dw = ok.select(fx.ptr_load(uwt + (du * TOKEN_TILE + l16)), fx.Float32(0.0))
             return dwv, dsc, drow, dkc, dw, ok
 
         acc = [fx.Float32(0.0) for _ in range(4)]
@@ -560,13 +558,9 @@ def moe_wide_defs(k4ctx):
                     qv = [mx8_q(v, inv) for v in f]
                     row = k * MOE_SLOTS + TOP_K
                     fx.ptr_store(fp8_pack4(*qv[:4]), xs + (row * MID_ROW + tid * 2))
-                    fx.ptr_store(
-                        fp8_pack4(*qv[4:]), xs + (row * MID_ROW + tid * 2 + 1)
-                    )
+                    fx.ptr_store(fp8_pack4(*qv[4:]), xs + (row * MID_ROW + tid * 2 + 1))
                     if tid % 4 == 0:
-                        fx.ptr_store(
-                            sc, xs + (W_MIDSC + row * MIDSC_ROW + tid // 4)
-                        )
+                        fx.ptr_store(sc, xs + (W_MIDSC + row * MIDSC_ROW + tid // 4))
         if tid < MID_ROW_WORDS:
             fx.ptr_store(fx.Int32(0), xs + (MID_ROWS * MID_ROW + tid))
         if tid < MIDSC_ROW_WORDS:
@@ -589,10 +583,7 @@ def moe_wide_defs(k4ctx):
                 c=fx.Vector.filled(4, 0.0, fx.Float32),
                 a_fmt=FP4,
             )
-            acc = [
-                acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0))
-                for e in range(4)
-            ]
+            acc = [acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0)) for e in range(4)]
         if const_expr(shared_fp8):
             col_tok = fx.min(l16, tokens - 1)
             for wv, sc, kc, wgt in sh_units:
@@ -685,10 +676,7 @@ def moe_wide_defs(k4ctx):
                 c=fx.Vector.filled(4, 0.0, fx.Float32),
                 a_fmt=FP4,
             )
-            return [
-                acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0))
-                for e in range(4)
-            ]
+            return [acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0)) for e in range(4)]
 
         # Every up / gate task pair is complete before token tiles reuse the pool.
         n_ug = n_exp * UG_PAIRS
@@ -739,9 +727,7 @@ def moe_wide_defs(k4ctx):
                         sc, inv = mx8_scale(f, (1, 2))
                         qv = [mx8_q(v, inv) for v in f]
                         row = local_k * MOE_SLOTS + TOP_K
-                        fx.ptr_store(
-                            fp8_pack4(*qv[:4]), xs + (row * MID_ROW + tid * 2)
-                        )
+                        fx.ptr_store(fp8_pack4(*qv[:4]), xs + (row * MID_ROW + tid * 2))
                         fx.ptr_store(
                             fp8_pack4(*qv[4:]),
                             xs + (row * MID_ROW + tid * 2 + 1),
@@ -770,9 +756,7 @@ def moe_wide_defs(k4ctx):
                     cu = mfma_scaled(
                         a=wv,
                         sa=sc,
-                        b=lds_b8(
-                            (col_tok * MOE_SLOTS + TOP_K) * MID_ROW + kc * 32
-                        ),
+                        b=lds_b8((col_tok * MOE_SLOTS + TOP_K) * MID_ROW + kc * 32),
                         sb=lds_i32(
                             W_MIDSC
                             + (col_tok * MOE_SLOTS + TOP_K) * MIDSC_ROW

@@ -526,8 +526,7 @@ def o_defs(k4ctx):
                         fx.Vector(
                             bo.buffer_load(
                                 r_wo,
-                                ((rg * (O_K // 32) + kc * 2) * 512 + lane * 16)
-                                // 4,
+                                ((rg * (O_K // 32) + kc * 2) * 512 + lane * 16) // 4,
                                 vec_width=4,
                                 dtype=T.i32,
                                 cache_modifier=CM_NT,
@@ -649,9 +648,7 @@ def o_defs(k4ctx):
             gpu.barrier()
             # push bf16 partial rows, wave w -> peer w (to itself too); with AG_RS
             # to the row group's owner rank only
-            push_rows(
-                "attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None, 0, tokens
-            )
+            push_rows("attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None, 0, tokens)
             gpu.barrier()
             if const_expr(AG_RS):  # noqa: SIM102
                 # the owner sums every peer's partials in rank order and gathers
@@ -730,9 +727,7 @@ def o_defs(k4ctx):
                 wsc.append(
                     e8m0_load(
                         rsrc(s_o),
-                        row_major_scale_index(
-                            rg * 16 + l16, kc * 4 + g4, O_K // 32
-                        ),
+                        row_major_scale_index(rg * 16 + l16, kc * 4 + g4, O_K // 32),
                     )
                 )
             mb_poll([(mr("attnq_s"), k, 1) for k in range(tokens)])
@@ -764,9 +759,9 @@ def o_defs(k4ctx):
                         mx8_b_tiles(xs + col * O_ROW, kc * 32, g4),
                         c,
                         wsc[p],
-                        fx.ptr_load(
-                            xs + OSC_LDS + col * OSC_ROW + kc * 4 + g4
-                        ).bitcast(fx.Int32),
+                        fx.ptr_load(xs + OSC_LDS + col * OSC_ROW + kc * 4 + g4).bitcast(
+                            fx.Int32
+                        ),
                     )
                 fx.ptr_store(c, red + (wave * 64 + lane) * 4)
                 gpu.barrier()
@@ -775,7 +770,9 @@ def o_defs(k4ctx):
                     grp = (tid % O_ROWS) // 16
                     rr = tid % 16
                     fx.ptr_store(
-                        bf16_round(row_sum(red, rr, local, [grp * 4 + w for w in range(4)])),
+                        bf16_round(
+                            row_sum(red, rr, local, [grp * 4 + w for w in range(4)])
+                        ),
                         misc + tid,
                     )
                 gpu.barrier()

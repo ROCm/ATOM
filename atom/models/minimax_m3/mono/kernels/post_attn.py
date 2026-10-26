@@ -57,14 +57,14 @@ from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
     INTER,
-    MAX_TOKENS,
     M31_MAX_TOKENS,
+    MAX_TOKENS,
     MOE_SLOTS,
     N_ROUTED,
     ONE_INDEX_HEAD,
+    TOKEN_TILE,
     TOP_K,
     TOPK_BLOCKS,
-    TOKEN_TILE,
     IndexHeads,
     tile_rows,
 )
@@ -296,17 +296,17 @@ def build_post_attn_kernel(
     # fuse_k1 with every index head: K1's index q of every head (qs) after its x8
     # rows in the pool (K1 is done with the pool before K4's stages use it)
     QS_CP = TILE_ROWS * HIDDEN // 4
-    assert MULTI_TILE or not (fuse_k1 and heads.count > 1) or (
-        QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL
+    assert (
+        MULTI_TILE
+        or not (fuse_k1 and heads.count > 1)
+        or (QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL)
     )
     # attn_mxfp8: K1's E8M0 input codes past its x8 rows and any index q, then the
     # o stage's past its attention rows (the pool's stages take turns)
     X8SC_LDS = QS_CP + (
         0
         if MULTI_TILE
-        else HEAD_DIM // 2 * tokens * heads.count
-        if heads.count > 1
-        else 0
+        else HEAD_DIM // 2 * tokens * heads.count if heads.count > 1 else 0
     )
     OSC_LDS = TILE_ROWS * O_ROW
     assert not attn_mxfp8 or (

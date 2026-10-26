@@ -345,9 +345,7 @@ def moe_common_defs(k4ctx):
                 wv = mxfp8_a_tiles(rsrc(shared_w2, dn_bytes), rg_d, INTER, kc, lane)
                 sc = e8m0_load(
                     rsrc(shared_s2, dn_scale_bytes),
-                    row_major_scale_index(
-                        rg_d * 16 + l16, kc * 4 + g4, W2_SCALE_COLS
-                    ),
+                    row_major_scale_index(rg_d * 16 + l16, kc * 4 + g4, W2_SCALE_COLS),
                 )
                 wgt = (j < DN_KC).select(fx.Float32(1.0), fx.Float32(0.0))
             else:
