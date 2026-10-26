@@ -1387,6 +1387,23 @@ class TestFlyDSLCapabilityGate:
     two of aiter's rejects were in fact missing from it.
     """
 
+    @pytest.fixture(autouse=True)
+    def _compatible_flydsl_api(self, monkeypatch):
+        # Geometry tests must not depend on which optional FlyDSL version the
+        # host has installed. API rejection is checked explicitly below.
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_explicit_plan_api", lambda: True
+        )
+
+    def test_unavailable_plan_api_falls_back(self, monkeypatch):
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        )
+        monkeypatch.setattr(
+            "atom.model_ops.base_attention._flydsl_explicit_plan_api", lambda: False
+        )
+        assert self._call() is None
+
     @staticmethod
     def _call(**over):
         """A call that passes every clause, with one field overridable."""

@@ -541,7 +541,7 @@ class tokenIDProcessor:
             # is still set there (the runner keeps the drafter loaded to write
             # the draft's context KV at prefill) even though the scheduler
             # turned speculation off for it.
-            if self.use_spec and self.is_pipeline_parallel:
+            if self.use_spec and self.is_pipeline_parallel and not self.is_pd_producer:
                 raise NotImplementedError("pipeline parallel + speculative decode")
             # PP verifies nothing locally and a P/D producer never speculates
             # (its DP dummy included), so no row here carries drafts. One that

@@ -219,6 +219,8 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
+    # Physical [groups, local KV heads, bytes per head] within each PAGE.
+    tp_head_groups: tuple[int, int] | None = None
 
 
 @dataclass

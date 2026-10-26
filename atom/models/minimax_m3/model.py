@@ -723,6 +723,17 @@ class MiniMaxM3Model(nn.Module):
         # Eagle3 aux hidden-state capture layer ids. Empty unless an Eagle3 drafter
         # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        spec = atom_config.speculative_config
+        if (
+            get_pp_group().world_size > 1
+            and spec is not None
+            and spec.method == "eagle3"
+            and spec.use_aux_hidden_state
+        ):
+            self.aux_hidden_state_layers = tuple(
+                spec.eagle3_aux_layer_ids
+                or (2, config.num_hidden_layers // 2, config.num_hidden_layers - 3)
+            )
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -750,13 +761,21 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        aux_hidden_states: list[torch.Tensor] = []
+        # Carry earlier stages' captures alongside their residual stream. The
+        # last stage's normal drafter hook consumes the complete ordered list.
+        aux_by_layer = {}
+        if intermediate_tensors is not None:
+            aux_by_layer = {
+                layer: intermediate_tensors.tensors[f"eagle_aux_{layer}"]
+                for layer in self.aux_hidden_state_layers
+                if f"eagle_aux_{layer}" in intermediate_tensors.tensors
+            }
         for idx in range(self.start_layer, self.end_layer):
             if idx in self.aux_hidden_state_layers:
                 hidden_states, residual, aux_hidden_state = self.layers[idx](
                     positions, hidden_states, residual, capture_aux=True
                 )
-                aux_hidden_states.append(aux_hidden_state)
+                aux_by_layer[idx] = aux_hidden_state
             else:
                 hidden_states, residual = self.layers[idx](
                     positions, hidden_states, residual
@@ -764,14 +783,23 @@ class MiniMaxM3Model(nn.Module):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    **{
+                        f"eagle_aux_{layer}": value
+                        for layer, value in aux_by_layer.items()
+                    },
+                }
             )
 
         hidden_states, _ = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.norm
         )
-        if aux_hidden_states:
-            return hidden_states, aux_hidden_states
+        if self.aux_hidden_state_layers:
+            return hidden_states, [
+                aux_by_layer[layer] for layer in self.aux_hidden_state_layers
+            ]
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

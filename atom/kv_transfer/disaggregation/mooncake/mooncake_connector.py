@@ -857,6 +857,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr: list[int] = []
         self._per_block_bytes_list: list[int] = []
         self._block_region_roles: list[str | None] = []
+        self._block_head_groups: list[tuple[int, int] | None] = []
         self._fp4_index_layout: bool = False
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
@@ -1144,6 +1145,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
+        self._block_head_groups = [page.tp_head_groups for page in tt.pages]
         self._fp4_index_layout = any(
             role is not None and role.startswith(INDEX_CACHE_FP4_PREFIX)
             for role in self._block_region_roles
@@ -1576,6 +1578,8 @@ class MooncakeConnector(KVConnectorBase):
                 # Role of each of this side's block regions, so the producer can
                 # check its per-region plan lands on the same kind of region.
                 "consumer_region_roles": self._block_region_roles,
+                "consumer_head_groups": self._block_head_groups,
+                "consumer_tp_rank": self.tp_rank,
                 "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
@@ -2405,11 +2409,25 @@ class MooncakeConnector(KVConnectorBase):
             return True
 
         num_regions = len(self.kv_caches_base_addr)
+        consumer_roles = request_data.get("consumer_region_roles")
+        m3_pages = bool(self._block_region_roles) and all(
+            role and role.startswith("m3.") for role in self._block_region_roles
+        )
+        if m3_pages:
+            if not consumer_roles or len(set(consumer_roles)) != len(consumer_roles):
+                raise RuntimeError("M3 requires unique consumer PAGE roles")
+            by_role = {role: i for i, role in enumerate(consumer_roles)}
+            try:
+                explicit_map = [by_role[role] for role in self._block_region_roles]
+            except KeyError as exc:
+                raise RuntimeError("M3 consumer is missing a producer PAGE") from exc
+        else:
+            explicit_map = self._block_region_consumer_indices
         cmap = self._consumer_region_map(
             num_regions,
             len(consumer_base_addrs),
             request_data.get("consumer_num_layers"),
-            self._block_region_consumer_indices,
+            explicit_map,
         )
         # Under DCP the consumer rank owns only part of each block, so
         # whole-block descriptors no longer line up and the push becomes the
@@ -2480,6 +2498,46 @@ class MooncakeConnector(KVConnectorBase):
                     f"{region_idx} is {role!r}, but consumer region "
                     f"{cmap[region_idx]} is {consumer_roles[cmap[region_idx]]!r}"
                 )
+            if (
+                m3_pages
+                and int(request_data.get("consumer_tp_size", self.tp_size))
+                != self.tp_size
+            ):
+                consumer_tp = int(request_data["consumer_tp_size"])
+                if self.tp_size != 1 or dcp_size != 1:
+                    raise RuntimeError(
+                        "M3 asymmetric TP currently requires a TP1, DCP1 producer and DCP1 consumer"
+                    )
+                from atom.kv_transfer.disaggregation.mha_head_transfer import (
+                    head_slices,
+                )
+
+                dst_shapes = request_data.get("consumer_head_groups")
+                if dst_shapes is None or consumer_bpb is None:
+                    raise RuntimeError(
+                        "M3 asymmetric TP requires consumer PAGE head geometry"
+                    )
+                dst_bpb = consumer_bpb[cmap[region_idx]]
+                slices = head_slices(
+                    bpb,
+                    dst_bpb,
+                    self._block_head_groups[region_idx],
+                    dst_shapes[cmap[region_idx]],
+                    request_data["consumer_tp_rank"],
+                    consumer_tp,
+                )
+                for sb, db in zip(src_block_ids, dst_block_ids, strict=True):
+                    for src_offset, dst_offset, size in slices:
+                        src_addrs.append(src_base + sb * bpb + src_offset)
+                        dst_addrs.append(dst_base + db * dst_bpb + dst_offset)
+                        sizes.append(size)
+                        block_descriptor_count += 1
+                        if debug_block_transfer:
+                            total_block_bytes += size
+                        if len(src_addrs) == self._MAX_RDMA_ENTRIES_PER_BATCH:
+                            if not flush_block_descriptors():
+                                return False
+                continue
             if consumer_bpb is not None and consumer_bpb[cmap[region_idx]] != bpb:
                 raise RuntimeError(
                     f"Region byte-size mismatch for req {req_id}: producer "
