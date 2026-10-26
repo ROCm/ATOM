@@ -1146,12 +1146,21 @@ def _serial_launch_config(
     bs32 33.3->28.7, bs48 38.5->36.4, bs64 even. T=1 takes the T1_* paths,
     where BV=64 stays best; num_stages is flat either way.
 
-    The small-batch rule is gated to gfx950, the only architecture it was
-    measured on. Other targets (gfx942, gfx1250) keep the large-batch config
-    until tests/bench_replayssm_decode.py shows BV=16 winning there too.
+    gfx1250 crosses over far earlier (HV=32 and HV=8, K=V=128, T=4, a graph
+    of 30 layers' calls, us per call at BV=64/32/16, no-fold step / fold step):
+    N*HV=32 8.6/6.8/5.8, 9.2/7.8/6.7; N*HV=64 8.7/6.9/6.5, 9.3/8.1/7.0;
+    N*HV=128 9.1/7.3/8.0, 10.1/10.5/10.3; N*HV=256 10.3/10.5/10.8,
+    13.3/14.6/15.7. Weighting one fold step in three (cache_len 16, ~3.4
+    accepted per step): BV=16 up to N*HV = 64, BV=32 up to 128, BV=64 above.
+
+    gfx942 keeps the large-batch config; it has not been measured.
     """
-    if not is_kda and max_query_len > 1 and N * HV <= 768 and get_gfx() == "gfx950":
-        return min(triton.next_power_of_2(V), 16), 1, 3
+    if not is_kda and max_query_len > 1:
+        gfx = get_gfx()
+        if gfx == "gfx950" and N * HV <= 768:
+            return min(triton.next_power_of_2(V), 16), 1, 3
+        if gfx == "gfx1250" and N * HV <= 128:
+            return min(triton.next_power_of_2(V), 16 if N * HV <= 64 else 32), 1, 3
     return min(triton.next_power_of_2(V), 64), 1, 3
 
 
