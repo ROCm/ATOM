@@ -458,6 +458,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QWEN35_GDN_MERGE_QKVZBA": lambda: (
         os.getenv("ATOM_QWEN35_GDN_MERGE_QKVZBA", "1") == "1"
     ),
+    # Set to 1 to let `GemmaRMSNorm` fold a per-token FP8 activation quant into
+    # the norm, the way it already does for per_1x128 block scales. On the
+    # fused all-reduce path this makes the all-reduce, the Gemma RMSNorm and
+    # the quant one kernel instead of two; off that path the norm and the quant
+    # stay two kernels, as today. Default 0 until measured on GPU: this changes
+    # the norm's return arity for every per-token model that reads
+    # `use_fused_quant`, Qwen3-Next as well as Qwen3.5.
+    "ATOM_FUSED_NORM_PER_TOKEN_QUANT": lambda: (
+        os.getenv("ATOM_FUSED_NORM_PER_TOKEN_QUANT", "0") == "1"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
