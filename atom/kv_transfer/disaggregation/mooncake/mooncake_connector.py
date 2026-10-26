@@ -539,6 +539,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         for req_id, (req, block_ids, slot_idx) in self._reqs_need_save.items():
             assert req.kv_transfer_params is not None
             req.kv_transfer_params["local_slot_index"] = slot_idx
+            if req.kv_transfer_params.get("chunked_transfer"):
+                # MTP owns lookahead pages beyond the prompt on P. D reserves
+                # only prompt pages; keep the extra pages pinned on the sequence
+                # but leave them out of both initial and final transfer metadata.
+                page_tokens = self.block_size * self.dcp_size
+                prompt_blocks = (req.num_prompt_tokens + page_tokens - 1) // page_tokens
+                block_ids = block_ids[:prompt_blocks]
             meta.add_new_req_to_save(
                 request_id=req_id,
                 local_block_ids=block_ids,

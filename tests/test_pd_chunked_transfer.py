@@ -263,6 +263,17 @@ def test_bad_prompt_or_block_geometry_fails_before_writing():
 
 def consumer(expected=2):
     c = mc.MooncakeConnector.__new__(mc.MooncakeConnector)
+    c.is_producer = False
+    c._cuda_device = 0
+    # Drive the real receive queue by hand; CPU tests have no GPU worker.
+    c._write_queue = []
+    c._write_cv = threading.Condition()
+    c._write_closed = False
+    c._write_thread = object()
+    c._write_request_error = None
+    c._verified_producers = set()
+    c._has_slot_regions = False
+    c._staging_slots = mc.SlotPool()
     c.pp_size = 1
     c._completion_lock = threading.Lock()
     c._pending_recv_acks = {}
@@ -285,6 +296,16 @@ def consumer(expected=2):
     c._received_handoffs = {}
     c._scatter_slot = None
     return c
+
+
+def post_write_requests(connector, monkeypatch):
+    """Run one real write-queue round with only the GPU wait replaced."""
+    synchronize = MagicMock()
+    with monkeypatch.context() as patch:
+        patch.setattr(mc.torch.cuda, "synchronize", synchronize)
+        assert connector._post_queued_write_requests()
+    synchronize.assert_called_once_with(connector._cuda_device)
+    assert connector._write_request_error is None
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -439,27 +460,42 @@ def scheduler_connector(monkeypatch, is_producer, pp_size=1, dcp_size=1):
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
+@pytest.mark.parametrize("prompt_tokens", [10, 11, 12])
+@pytest.mark.parametrize("draft_tokens", [0, 3])
 def test_real_scheduler_pins_from_first_chunk_through_final_handoff(
-    monkeypatch, seq_factory, pp_size
+    monkeypatch, seq_factory, pp_size, prompt_tokens, draft_tokens
 ):
+    import numpy as np
     from conftest import MockConfig
 
     from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
     from atom.sampling_params import SamplingParams
 
     sched = Scheduler(
-        MockConfig(max_num_batched_tokens=4, pipeline_parallel_size=pp_size)
+        MockConfig(
+            max_num_batched_tokens=4,
+            pipeline_parallel_size=pp_size,
+            speculative_config=(
+                SimpleNamespace(
+                    num_speculative_tokens=draft_tokens, use_dspark=lambda: False
+                )
+                if draft_tokens
+                else None
+            ),
+        )
     )
     connector = sched.kv_connector = scheduler_connector(monkeypatch, True, pp_size)
     seq = seq_factory(
-        list(range(10)),
+        list(range(prompt_tokens)),
         sampling_params=SamplingParams(max_tokens=1),
+        num_draft_tokens=draft_tokens,
         kv_transfer_params={
             "chunked_transfer": True,
             "do_remote_decode": True,
             "transfer_id": "xfer-a",
         },
     )
+    workers = [idle_producer(stage, pp_size) for stage in range(pp_size)]
     sched.add(seq)
     assert not connector.admission_ready(seq)
     connector.process_pd_completions(
@@ -470,28 +506,62 @@ def test_real_scheduler_pins_from_first_chunk_through_final_handoff(
         )
     )
     batches = []
+    allocated_blocks = (prompt_tokens + max(0, draft_tokens - 1) + 3) // 4
     for _ in range(3):
         batch, seqs = sched.schedule()
         batches.append(batch)
         assert not sched._is_preemptable(seq)
-        result = ScheduledBatchOutput([seq.id], [(42,)], None, None, None)
+        # The draft round still owns its lookahead, even though D reserves
+        # only the prompt and must never receive the extra draft-only page.
+        assert len(seq.block_table) == allocated_blocks
+        for worker, _, _, _ in workers:
+            worker.start_load_kv(batch.connector_meta_output)
+            state = worker._chunked_prefills["xfer-a"]
+            assert list(state.block_ids) == list(seq.block_table[:3])
+            publish(state, int(batch.context_lens[0]))
+        result = ScheduledBatchOutput(
+            [seq.id],
+            [(42, 43, 44, 45) if sched.spec_decode_local else (42,)],
+            np.array([0]),
+            np.array([0]),
+            np.array([[43, 44, 45]]) if draft_tokens else None,
+        )
         sched.postprocess(list(seqs.values()), result, batch=batch)
-    assert [b.context_lens.tolist() for b in batches] == [[4], [8], [10]]
+    assert [b.context_lens.tolist() for b in batches] == [[4], [8], [prompt_tokens]]
     # Earlier snapshots must not follow the live seq past the next PP forward.
     assert batches[0].context_lens.tolist() == [4]
     initial = batches[0].connector_meta_output.reqs_to_save[seq.id]
-    assert initial.chunked_transfer and initial.num_prompt_tokens == 10
+    assert initial.chunked_transfer and initial.num_prompt_tokens == prompt_tokens
     assert initial.prefill_handoff is None
     assert initial.transfer_id == "xfer-a"
-    final = connector.build_connector_meta().reqs_to_save[seq.id]
+    final_meta = connector.build_connector_meta()
+    final = final_meta.reqs_to_save[seq.id]
     assert final.prefill_handoff["first_token_id"] == 42
-    assert connector.should_defer_free(seq)
-    assert seq.block_table
-    sched._update_from_kv_xfer_finished(
-        KVConnectorOutput(
-            connector_completions={ConnectorCompletion("pd_source_safe", seq.id, True)}
-        )
+    assert final.prefill_handoff["draft_token_ids"] == (
+        [43, 44, 45] if draft_tokens else []
     )
+    assert final.local_block_ids == initial.local_block_ids == list(seq.block_table[:3])
+    assert connector.should_defer_free(seq)
+    assert len(seq.block_table) == allocated_blocks
+    pp = PPKVAggregator(pp_size)
+    for worker, request, src, destinations in workers:
+        worker.start_load_kv(final_meta)
+        request["prompt_digest"] = seq.kv_transfer_params["prompt_digest"]
+        dispatch(worker, request)
+        worker._notify_transfer_result.assert_called_once_with(request, success=True)
+        sources, _, sizes = worker.transfer_engine.writes.get_nowait()
+        assert sources == [
+            ctypes.addressof(src) + block * 4 for block in seq.block_table[:3]
+        ]
+        assert sum(sizes) == 12
+        assert worker.transfer_engine.writes.empty()
+        assert bytes(destinations[worker.pp_rank][8:12]) == bytes(src[:4])
+        sched._update_from_kv_xfer_finished(
+            pp.ingest(worker.pp_rank, worker.get_finished())
+        )
+        if worker.pp_rank < pp_size - 1:
+            assert connector.should_defer_free(seq)
+            assert len(seq.block_table) == allocated_blocks
     assert not connector.should_defer_free(seq)
     assert not seq.block_table
 
@@ -554,7 +624,7 @@ def test_mutable_slot_is_sent_once_after_final_metadata():
 
 
 @pytest.mark.parametrize("reverse_indexed", [False, True])
-def test_swa_only_pool_transfers_final_relocated_slot(reverse_indexed):
+def test_swa_only_pool_transfers_final_relocated_slot(monkeypatch, reverse_indexed):
     import msgpack
 
     p, state, _, page_src, page_destinations = producer()
@@ -618,6 +688,8 @@ def test_swa_only_pool_transfers_final_relocated_slot(reverse_indexed):
     )
     d._mla_landing = MagicMock()
     d.start_load_kv(meta)
+    d._send_on_socket.assert_not_called()
+    post_write_requests(d, monkeypatch)
     d._mla_landing.advertise.assert_not_called()
     d._mla_landing.begin.assert_not_called()
     assert meta.reqs_to_recv.keys() <= d._pending_handoffs.keys()
@@ -747,6 +819,8 @@ def test_consumer_dispatches_all_pp_stages_without_source_block_ids(
     c.kv_caches_base_addr = [100, 200, 300]
     c._send_on_socket = MagicMock()
     c.start_load_kv(sched.build_connector_meta())
+    c._send_on_socket.assert_not_called()
+    post_write_requests(c, monkeypatch)
     assert c._send_on_socket.call_count == 3
     for stage, call in enumerate(c._send_on_socket.call_args_list):
         address, (_, payload) = call.args
@@ -1348,6 +1422,12 @@ def test_opposite_admission_order_progresses_without_recompute(
         # A 4-token batch budget still reserves all 10 prompt tokens on D.
         assert len(ds.block_table) == 3 and d.block_manager.kv.num_free == 0
         dw.start_load_kv(batch.connector_meta_output)
+        # Reserving D's pages alone cannot admit P: the write request still
+        # waits in D's queue until prior GPU writes to those pages finish.
+        assert dw._write_queue
+        assert pw.get_finished().is_empty()
+        assert not ps.block_table
+        post_write_requests(dw, monkeypatch)
         p._update_from_kv_xfer_finished(pw.get_finished())
         batch, seqs = p.schedule()
         assert list(seqs) == [ps.id]
@@ -1454,6 +1534,7 @@ def test_capacity_wait_does_not_expire_ready_or_queued_requests(
     assert p.block_manager.allocate(occupied)
     seqs = [pd_sequence(seq_factory, f"wait-{i}") for i in range(3)]
     p.extend(seqs)
+    assert p._arrived_requests == len(seqs)
     worker, request, _src, _dst = idle_producer()
     worker._ack_write_request = MagicMock()
     # Registration includes requests behind a blocked, ready head.
@@ -1578,6 +1659,7 @@ def test_d_transfer_failure_waits_for_write_hold_before_local_recovery(
     dst = (ctypes.c_ubyte * 48)()
     worker = decode_worker(dst)
     worker.start_load_kv(batch.connector_meta_output)
+    post_write_requests(worker, monkeypatch)
     deallocate = MagicMock(wraps=d.block_manager.deallocate)
     monkeypatch.setattr(d.block_manager, "deallocate", deallocate)
     if cancelled:
