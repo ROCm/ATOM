@@ -302,6 +302,15 @@ def install_minimax_mono_plugin_refusal() -> None:
     ``uses_tr_hybrid`` crashes before the ``plugin mode``
     clause can refuse. Mono is unsupported here; return that reason without
     reading ``cudagraph_mode``.
+
+    The stand-in must take exactly what ``MonoDecode.__init__`` passes.
+    ``#2479`` folded the ``use_index_cache`` clause into ``common_refusals``
+    and dropped ``text_config`` from the native signature and its one call
+    site, but left this stand-in demanding it -- so every SGLang MiniMax-M3
+    launch raised ``TypeError`` at model construction instead of refusing.
+    Nothing static catches a signature drift across a rebind like this, and
+    only an SGLang MiniMax-M3 launch executes it, which is why the pairing is
+    pinned by ``tests/plugin/test_minimax_m3_mono_refusal.py``.
     """
     from atom.models.minimax_m3.mono import dispatch
 
@@ -309,8 +318,8 @@ def install_minimax_mono_plugin_refusal() -> None:
         return
     dispatch._config_refusal_native = dispatch._config_refusal
 
-    def _config_refusal(atom_config, text_config):
-        del atom_config, text_config
+    def _config_refusal(atom_config):
+        del atom_config
         return "plugin mode"
 
     dispatch._config_refusal = _config_refusal
