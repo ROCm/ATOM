@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -58,15 +59,42 @@ from atom.kv_transfer.offload.mp.transfer import (
 
 logger = logging.getLogger("atom")
 
-# Finished transfers the step thread may hold while its stream is busy; see
-# `LMCacheMPConnector._release_retired`.
-_RETIRED_CAP = 256
+# IPC resources the step thread may hold while its stream is busy; see
+# `LMCacheMPConnector._release_ipc_resources`. Well past LMCache's ring of
+# recently exported events (2048), which holds step events after their
+# transfers finish.
+_OWNED_IPC_CAP = 8192
 
 
 def _stream_idle() -> bool:
     if not torch.cuda.is_available():
         return True
     return bool(torch.cuda.current_stream().query())
+
+
+def _sole_owner_refcount() -> int:
+    """`sys.getrefcount` of an object only a local variable holds."""
+    entry = object()
+    return sys.getrefcount(entry)
+
+
+_SOLE_OWNER_REFCOUNT = _sole_owner_refcount()
+
+
+def _take_unshared(owned: deque[Any]) -> list[Any]:
+    """Remove and return the entries of `owned` nothing else holds any more.
+
+    Every entry is checked: one held for good elsewhere (a logged exception's
+    traceback, say) must not keep the ones behind it alive.
+    """
+    unshared = []
+    for _ in range(len(owned)):
+        entry = owned.popleft()
+        if sys.getrefcount(entry) <= _SOLE_OWNER_REFCOUNT:
+            unshared.append(entry)
+        else:
+            owned.append(entry)
+    return unshared
 
 
 class LMCacheMPConnector(KVConnectorBase):
@@ -141,12 +169,14 @@ class LMCacheMPConnector(KVConnectorBase):
         # blocks of. A preemption fence has to cover these too: they reach the
         # server after the step that queued them.
         self._submitting_owner: dict[str, str] = {}
-        # Finished transfers, kept until the step thread can drop them. A
-        # future holds its step event, and on ROCm 7.2.x destroying an
-        # interprocess event synchronises every stream of the device and
-        # blocks event creation on every other thread meanwhile. So the drain
-        # thread never drops the last reference; see `_release_retired`.
-        self._retired: list[Any] = []
+        # IPC resources only the step thread destroys: on ROCm 7.2.x
+        # destroying an interprocess event synchronises every stream of the
+        # device and blocks event creation on every other thread meanwhile.
+        # The step events are the step thread's alone; finished futures, whose
+        # response carries the server's imported event, come from the drain
+        # thread under `_lock`. See `_release_ipc_resources`.
+        self._owned_events: deque[Any] = deque()
+        self._owned_futures: deque[Any] = deque()
         # Keep in-flight IDs in the unbounded pending/submitting collections.
         # Only completed IDs enter these bounded replay tombstones.
         self._completed_save_operations: set[str] = set()
@@ -345,7 +375,7 @@ class LMCacheMPConnector(KVConnectorBase):
         return self._start_load_kv_inner(metadata)
 
     def _start_load_kv_inner(self, metadata: Any) -> None:
-        self._release_retired()
+        self._release_ipc_resources()
         # Raised before anything else in the step: the drain thread's useful
         # window is the model forward that follows, where the step thread is in
         # C with the GIL released. By `get_finished` the results are settled.
@@ -364,6 +394,7 @@ class LMCacheMPConnector(KVConnectorBase):
         if not requests:
             return
         event = self._record_step_event()
+        self._owned_events.append(event)
         for req in requests:
             if req.load_spec is not None and self._do_load:
                 self._submit_load(req, event)
@@ -381,21 +412,29 @@ class LMCacheMPConnector(KVConnectorBase):
         event.record(torch.cuda.current_stream())
         return event
 
-    def _release_retired(self) -> None:
-        """Drop finished transfers' references here, on the step thread.
+    def _release_ipc_resources(self) -> None:
+        """Destroy step events and finished futures here, on the step thread.
 
         Only while this thread's stream is idle -- under synchronous
-        scheduling, the start of a step -- so destroying their events waits on
-        nothing. Past `_RETIRED_CAP` they are dropped regardless, so a stream
-        that is never idle cannot grow the list without bound.
+        scheduling, the start of a step -- so a destroy waits on nothing, and
+        only once nothing else holds them. LMCache keeps each future until
+        its next submission and each exported event in a ring, and the drain
+        thread's locals hold some between rounds; letting go first would
+        leave the destroy to whichever of them lets go last, on the drain
+        thread. Past `_OWNED_IPC_CAP` the idle check is skipped, so a stream
+        that is never idle cannot grow the backlog without bound.
         """
         with self._lock:
-            if not self._retired:
-                return
-            if len(self._retired) < _RETIRED_CAP and not _stream_idle():
-                return
-            retired, self._retired = self._retired, []
-        del retired
+            owned = len(self._owned_events) + len(self._owned_futures)
+        if not owned or (owned < _OWNED_IPC_CAP and not _stream_idle()):
+            return
+        # Futures first: each retains its step event, which is unshared only
+        # once they are gone.
+        for resources in (self._owned_futures, self._owned_events):
+            with self._lock:
+                unshared = _take_unshared(resources)
+            # The destroys run here, outside the lock.
+            del unshared
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
@@ -665,9 +704,6 @@ class LMCacheMPConnector(KVConnectorBase):
                         self._perform_load_submit(*rest[:5], rest[7])
                     else:
                         self._perform_save_submit(*rest)
-                    # The future now holds the step event; a stale local here
-                    # must not outlive it and become the last reference.
-                    item = rest = None
                 self._poll_pending_loads()
                 self._poll_pending_saves()
                 with self._drain_round_cv:
@@ -738,9 +774,6 @@ class LMCacheMPConnector(KVConnectorBase):
             # transfer deadline turns into a fail-stop if it never comes.
             logger.exception("LMCache MP load submission unprovable for %s", request_id)
             transfer = _UnprovableSubmission()
-            # No future holds the event, so these locals are its last owners.
-            with self._lock:
-                self._retired.append(event)
         with self._lock:
             self._submitting_loads.discard(operation_id)
             self._submitting_owner.pop(operation_id, None)
@@ -776,7 +809,8 @@ class LMCacheMPConnector(KVConnectorBase):
         with self._lock:
             for operation_id, entry, result in terminal_ops:
                 self._pending_loads.pop(operation_id, None)
-                self._retired.append(entry.future)
+                if entry.future is not None:
+                    self._owned_futures.append(entry.future)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_load_operations,
@@ -815,9 +849,6 @@ class LMCacheMPConnector(KVConnectorBase):
             # the transfer deadline turns into a fail-stop if it never comes.
             logger.exception("LMCache MP save submission unprovable for %s", request_id)
             transfer = _UnprovableSubmission()
-            # No future holds the event, so these locals are its last owners.
-            with self._lock:
-                self._retired.append(event)
         with self._lock:
             self._submitting_saves.discard(operation_id)
             self._submitting_owner.pop(operation_id, None)
@@ -867,7 +898,8 @@ class LMCacheMPConnector(KVConnectorBase):
         with self._lock:
             for operation_id, entry, result in terminal_ops:
                 self._pending_saves.pop(operation_id, None)
-                self._retired.append(entry.future)
+                if entry.future is not None:
+                    self._owned_futures.append(entry.future)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_save_operations,

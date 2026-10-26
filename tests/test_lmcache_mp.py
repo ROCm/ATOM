@@ -2367,6 +2367,7 @@ def test_every_step_records_a_fresh_event(fake_lmcache_modules, monkeypatch):
 
     monkeypatch.setattr(mp_worker.torch.cuda, "Event", _FakeEvent)
     monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(mp_worker, "_stream_idle", lambda: True)
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
 
@@ -2438,50 +2439,84 @@ def test_a_recurrent_load_keeps_the_logical_transfer_end(monkeypatch):
     assert spec.transfer_end_tokens is None
 
 
-def test_finished_transfers_are_released_on_the_step_thread(
+def test_ipc_resources_are_destroyed_on_the_step_thread(
     fake_lmcache_modules, monkeypatch
 ):
-    """The drain thread never drops a finished transfer's last reference.
+    """No step event or finished future is destroyed on the drain thread.
 
-    The future holds the step event, and on ROCm 7.2.x destroying an
-    interprocess event synchronises the device and blocks creating one on any
-    other thread. The step thread drops it at its next start_load_kv, and only
-    while its stream is idle (or the backlog passes the cap).
+    On ROCm 7.2.x destroying an interprocess event synchronises the device and
+    blocks creating one on any other thread. Like LMCache, this adapter lets
+    go of a future at its next submission and of an exported event when its
+    ring overflows, both on the drain thread, so the step thread must still be
+    holding them then; it destroys them only while its stream is idle. A
+    submit that returns None or raises leaves the event to the step thread too.
     """
+    import itertools
     import threading
 
-    released = []
+    destroyed = {}  # name -> destroyed on the step thread
+    names = itertools.count(1)
 
-    class _Future(_WorkerFuture):
+    class _Destroyed:
         def __del__(self):
-            released.append(threading.current_thread() is threading.main_thread())
+            destroyed[self.name] = threading.current_thread() is threading.main_thread()
+
+    class _Event(_Destroyed):
+        def __init__(self, interprocess=False):
+            self.name = f"event{next(names)}"
+
+        def record(self, stream=None):
+            pass
+
+    class _Future(_WorkerFuture, _Destroyed):
+        pass
 
     class _Adapter(_WorkerAdapter):
+        def __init__(self):
+            super().__init__()
+            self.tracked = []
+            self.exported = deque(maxlen=2)
+
         def submit_retrieve_request(self, request_id, op, event):
+            self.tracked = [f for f in self.tracked if not f.query()]
+            self.exported.append(event)
+            if request_id.endswith(":2"):
+                return None
+            if request_id.endswith(":3"):
+                raise ConnectionError("server went away mid-submit")
             future = _Future()
+            future.name = f"future{request_id[-1]}"
             future.ready = True
+            future.retained = [event]
+            self.tracked.append(future)
             return future
 
-    monkeypatch.setattr(
-        mp_worker.torch.cuda,
-        "Event",
-        lambda **_: SimpleNamespace(record=lambda *_: None),
-    )
+    monkeypatch.setattr(mp_worker.torch.cuda, "Event", _Event)
     monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
     idle = [False]
     monkeypatch.setattr(mp_worker, "_stream_idle", lambda: idle[0])
+    monkeypatch.setattr(mp_worker, "_mp_session_id", lambda _c, rid: f"s:{rid}")
     worker = mp_worker.LMCacheMPConnector(_config())
     worker._adapter = _Adapter()
     worker.chunk_size = 8
 
-    worker.start_load_kv(_load_step(20))
-    worker._settle_transfers()
-    assert worker.get_finished().finished_loading
-    assert released == [] and len(worker._retired) == 1  # parked, not dropped
+    def step(metadata):
+        worker.start_load_kv(metadata)
+        worker._settle_transfers()
+        worker.get_finished()
 
-    worker.start_load_kv(LMCacheOffloadMetadata())  # stream busy: kept
-    assert released == [] and len(worker._retired) == 1
+    for req_id in range(1, 4):
+        step(_load_step(req_id))
+    assert destroyed == {}  # stream busy: everything still held
+
+    # Idle from here: the step thread could let go first, the adapter after.
     idle[0] = True
-    worker.start_load_kv(LMCacheOffloadMetadata())
-    assert released == [True] and worker._retired == []
+    for req_id in range(4, 9):
+        step(_load_step(req_id))
+    step(LMCacheOffloadMetadata())
+    assert all(destroyed.values())
+    # The adapter still holds the last future and the two newest exports.
+    assert {f"future{i}" for i in (1, 4, 5, 6, 7)} <= destroyed.keys()
+    assert {f"event{i}" for i in (1, 2, 4, 5, 6)} <= destroyed.keys()
+    assert not {"future8", "event7", "event8"} & destroyed.keys()
     worker.close()
