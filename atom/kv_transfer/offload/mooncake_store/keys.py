@@ -153,7 +153,11 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
             getattr(config, "hf_overrides", None), sort_keys=True, default=str
         ),
         "revision": str(getattr(hf, "_commit_hash", None)),
-        "codec": CODEC_ID,
+        "codec": (
+            "m3-complete-page-v1"
+            if offcfg.select_offload_layout(config) == "m3"
+            else CODEC_ID
+        ),
     }
     canonical = json.dumps(
         document, sort_keys=True, separators=(",", ":"), ensure_ascii=True

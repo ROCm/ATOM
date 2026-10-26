@@ -109,7 +109,7 @@ Four rules carry the module:
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | PAGE-backed native-state registration, scheduler leases, and worker transfer/restore lifecycle. |
-| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included), and the dense/DCP=1 startup refusals. |
+| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included), and the dense-or-M3/DCP=1 startup checks. |
 | `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
@@ -323,11 +323,18 @@ comparison, per-rank retrieve counts, one-writer storage, and promoted ranges.
 `ChunkedOffloadSchedulerBase` (save cadence, load decisions, early block
 release, exact operation completions), the `DenseOffloadConnector` worker
 plumbing (executors, per-step producer fence, completion reports),
-`BlockGPUConnector` and `DenseKVByteCodec`. What replaces LMCache is a Mooncake
+`BlockGPUConnector` and a dense or M3 PAGE codec. What replaces LMCache is a Mooncake
 Store whose memory belongs to separate owner processes -- on the prefill node's
 NUMA nodes and, across two nodes, on the decode node -- reached directly by
 every prefill worker. There is no CPU L1, no LMCache engine or lookup server,
 and no `import lmcache`.
+
+Dense layouts use `DenseKVByteCodec`. MiniMax-M3 and M3.1 use
+`DSV4PageSlotCodec` with complete PAGE regions and no SLOT state: the ordered
+target K/V, scale, index-cache and draft regions from
+`KVTransferTensors.block_regions`. A tensor view must exist for every region.
+The `m3-complete-page-v1` codec namespace keeps these objects separate from
+dense KV objects. Stateful layouts and DCP greater than 1 remain unsupported.
 
 ### Data path
 
