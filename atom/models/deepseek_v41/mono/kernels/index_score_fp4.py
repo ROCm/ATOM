@@ -465,20 +465,20 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
 
 
 @traced
-def run_scores4(c, s, bid, max_chunks):
-    """The FP4 score stage: this CTA's task, if any. A FULL layer's comes from
-    the step's plan (``iplan``: (lead, span, ch0, ch1) a CTA, span 0 for
-    none); a REINDEX layer's from the CTA index alone
-    (``index_plan.reindex_split``): the walk stops at a token's bound, read
-    with the first keys."""
+def run_scores4(c, t0, n, bid, max_chunks):
+    """The FP4 score stage over rows t0 .. t0 + n: this CTA's task, if any. A
+    FULL layer's comes from the step's plan (``iplan``: (lead, span, ch0, ch1)
+    a CTA, span 0 for none; laid out over the same rows); a REINDEX layer's
+    from the CTA index alone (``index_plan.reindex_split``): the walk stops at
+    a token's bound, read with the first keys."""
     a = _stage_args(c)
     _read_all(a.values())
     enter_stage("k2a.iscore")
     if a["ilift"] != 0:
-        per = ip.reindex_split(s, BLOCKS, REINDEX_TASK_CHUNKS)
-        if bid < s * per:
+        per = ip.reindex_split(n, BLOCKS, REINDEX_TASK_CHUNKS)
+        if bid < n * per:
             ch0, ch1 = ip.reindex_chunks(bid % per, per)
-            stage_iscore4(c, bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1)
+            stage_iscore4(c, t0 + bid // per, fx.Int32(1), ch0, ch1, max_chunks, 1)
     else:
         task = _sload4(a["iplan"] + fx.Int64(bid) * 16)
         if task[1] > 0:

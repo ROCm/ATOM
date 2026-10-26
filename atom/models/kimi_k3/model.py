@@ -46,6 +46,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
+    uses_mxfp4_n32k4_scale,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -860,7 +861,7 @@ class KimiFullAttention(nn.Module):
             from atom.model_ops.linear import use_triton_gemm
             from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
 
-            if not use_triton_gemm():
+            if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
                 q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
                     q_c.shape[0]
                 )

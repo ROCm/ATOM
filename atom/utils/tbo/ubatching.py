@@ -9,6 +9,10 @@ import numpy as np
 import torch
 
 from atom.config import get_current_atom_config
+from atom.utils.tbo.ubatch_splitting import (
+    decode_bucket_splits,
+    decode_ubatch_request_ranges,
+)
 
 
 def tbo_overlap_enabled() -> bool:
@@ -100,21 +104,22 @@ def _precompute_prefill_req_split(
 def _precompute_decode(batch) -> tuple[bool, bool, int, int]:
     """Decode, split by request count (uniform tokens per request).
 
-    can_split gate is bs > 2: it must be at least as strict as the strictest
-    backend's per-ubatch metadata / CUDAGraph-capture threshold, or a rank can
-    report "can_split" for a batch size that has no captured graph / no prepared
-    ubatch meta, tripping build_ubatch_metadata's assert. Decode ubatch graphs
-    are captured only for bs > 2 (model_runner) and V4 prepares meta only for
-    scheduled_bs > 2. Decode has no min-token bar, so meets_min_tokens is always
-    True here — if it can split, it's worth splitting.
+    can_split gate is `decode_bucket_splits`: it must be at least as strict as
+    the strictest backend's per-ubatch metadata / CUDAGraph-capture threshold,
+    or a rank can report "can_split" for a batch size that has no captured
+    graph / no prepared ubatch meta, tripping build_ubatch_metadata's assert.
+    Decode buckets record as TBO graphs on the same gate (model_runner) and V4
+    prepares meta only past it. Decode has no min-token bar, so
+    meets_min_tokens is always True here — if it can split, it's worth
+    splitting.
     """
     scheduled_bs = batch.total_seqs_num_decode
-    if scheduled_bs <= 2:
+    if not decode_bucket_splits(scheduled_bs):
         return False, False, 0, 0
     scheduled_tokens = batch.total_tokens_num
     tokens_per_req = scheduled_tokens // scheduled_bs if scheduled_bs else 1
-    reqs_per_ub = scheduled_bs // 2
-    ub0 = reqs_per_ub * tokens_per_req
+    (ub0_start, ub0_end), _ = decode_ubatch_request_ranges(scheduled_bs, 2)
+    ub0 = (ub0_end - ub0_start) * tokens_per_req
     ub1 = scheduled_tokens - ub0
     return True, True, ub0, ub1
 

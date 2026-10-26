@@ -626,6 +626,9 @@ class MLAAttention(nn.Module):
         self.q_proj = mla_modules.q_proj
         self.o_proj = mla_modules.o_proj
         self.kv_b_proj = mla_modules.kv_b_proj
+        # The cached-prefix gather and the Triton split-cat read kv_b_proj's scale
+        # directly, so the loader keeps it e8m0-shuffled.
+        self.kv_b_proj.needs_e8m0_shuffled_scale = True
         self.kv_cache = torch.tensor([])
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale

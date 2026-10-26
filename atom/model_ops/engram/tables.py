@@ -9,6 +9,8 @@ this module on a machine with no Triton.
 import numpy as np
 import torch
 
+from atom.model_ops.engram import host_memory
+
 
 class HostEmbeddingTable:
     """One engram layer's table, memory-mapped and gathered row-wise.
@@ -37,10 +39,10 @@ class HostEmbeddingTable:
         self.head_dim = head_dim
         self._scale = scale
         self.block_size = 0
-        # The registered row range, and the page-aligned base of each
-        # registration made for it.
+        # The page-locked row range and its rows (values, then scales), as
+        # `host_memory.pin_rows` returned them; the tensors own the memory.
         self._uva: tuple[int, int] | None = None
-        self._pinned: tuple[int, ...] = ()
+        self._shard: tuple[torch.Tensor, ...] = ()
         if scale is not None:
             # gather() does `scale.to(float32)`; that decodes 2**(code-127) only
             # for a float8 E8M0 dtype. A raw uint8 exponent-code table would be
@@ -103,9 +105,8 @@ class HostEmbeddingTable:
     # ---- UVA path ----------------------------------------------------------
     # The serving default (ATOM_ENGRAM_UVA), with the host gather above kept as
     # the reference implementation. Only THIS RANK'S shard of the table is
-    # page-locked in place -- no copy, no HBM -- and a device kernel reads the
-    # rows it needs across the bus, which also moves the fp8 dequantization off
-    # the host.
+    # page-locked -- no HBM -- and a device kernel reads the rows it needs
+    # across the bus, which also moves the fp8 dequantization off the host.
     #
     # The shard is a whole number of hash heads. Each head owns a disjoint,
     # contiguous, prime-sized row range, so whole heads are a contiguous BYTE
@@ -113,15 +114,12 @@ class HostEmbeddingTable:
     # table. Registering the whole table on every rank is what a TP=4 job cannot
     # afford: 4 x 203 GB of unswappable pages.
 
-    _PAGE = 4096
-
     def enable_uva(self, row_start: int = 0, row_end: int | None = None) -> bool:
-        """Page-lock rows `[row_start, row_end)` so a device kernel can read them.
+        """Page-lock rows `[row_start, row_end)` so a device kernel can read
+        them (`host_memory.pin_rows`); all-or-nothing.
 
-        Registers the existing mapping rather than copying it. Registration
-        faults the pages in, so it is slow (~1 GB/s) and happens once, at load.
-        The range is widened to page boundaries, which registration requires;
-        the extra bytes are neighbouring rows this rank simply never addresses.
+        A table holds one range: enabling a different one while a range is
+        held raises -- `disable_uva()` first.
         """
         row_end = self.num_rows if row_end is None else row_end
         if not 0 <= row_start <= row_end <= self.num_rows:
@@ -129,41 +127,30 @@ class HostEmbeddingTable:
                 f"engram shard rows [{row_start}, {row_end}) outside "
                 f"[0, {self.num_rows})"
             )
-        if self._uva == (row_start, row_end):
-            return True
-        rt = torch.cuda.cudart()
-        regions = [(self._tensor, self.head_dim)]
+        if self._uva is not None:
+            if self._uva == (row_start, row_end):
+                return True
+            raise RuntimeError(
+                f"engram table already page-locks rows {list(self._uva)}; "
+                f"disable_uva() before enabling [{row_start}, {row_end})"
+            )
+        sources = [self._tensor[row_start:row_end]]
         if self._scale is not None:
-            regions.append((self._scale, self._scale.shape[1]))
-        pinned = []
-        for tensor, width in regions:
-            item = tensor.element_size()
-            base = tensor.data_ptr() + row_start * width * item
-            nbytes = (row_end - row_start) * width * item
-            lo = base - (base % self._PAGE)
-            size = -(-(base + nbytes - lo) // self._PAGE) * self._PAGE
-            if int(rt.cudaHostRegister(lo, size, 0)) != 0:
-                # This object is about to report that it holds neither region.
-                for done in pinned:
-                    rt.cudaHostUnregister(done)
-                return False
-            pinned.append(lo)
-        self._pinned = tuple(pinned)
+            sources.append(self._scale[row_start:row_end])
+        shard = host_memory.pin_rows(sources)
+        if shard is None:
+            return False
+        self._shard = shard
         self._uva = (row_start, row_end)
         return True
 
     def disable_uva(self) -> None:
-        """Release this table's page-locked range, if it holds one.
+        """Drop this table's page-locked range, if it holds one.
 
-        What comes back is what went in, rather than the same offsets derived a
-        second time -- two copies of that arithmetic would have to agree.
+        The memory goes when the last tensor over it does: at once unless a
+        caller still holds one from `registered_shard`, then with that tensor.
         """
-        if self._uva is None:
-            return
-        rt = torch.cuda.cudart()
-        for base in self._pinned:
-            rt.cudaHostUnregister(base)
-        self._pinned = ()
+        self._shard = ()
         self._uva = None
 
     def registered_shard(self):
@@ -177,12 +164,8 @@ class HostEmbeddingTable:
         if self._uva is None:
             raise RuntimeError("engram UVA lookup needs enable_uva() first")
         row_start, row_end = self._uva
-        weight = self._tensor[row_start:row_end]
-        scales = (
-            weight
-            if self._scale is None
-            else self._scale[row_start:row_end].view(torch.uint8)
-        )
+        weight = self._shard[0]
+        scales = weight if self._scale is None else self._shard[1].view(torch.uint8)
         return weight, scales, row_start, row_end
 
     @staticmethod

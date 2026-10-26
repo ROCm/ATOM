@@ -48,6 +48,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_post import (
 )
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
+from atom.models.deepseek_v41.mono.kernels.index_score import await_candidates
 from atom.models.deepseek_v41.mono.kernels.moe import (
     moe_args,
     moe_context,
@@ -354,6 +355,8 @@ def build_layer_post(key: LayerPostBuild):
             cb, key_b, bid, tls, len(k2a.TL_STAGES) - 1,
             before_ug=lambda: run_gates(ca, key_a, bid),
         )  # fmt: skip
+        if const_expr(key.tok_par and key.index_bound_max > 0):
+            await_candidates(ca, s, bid)
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 

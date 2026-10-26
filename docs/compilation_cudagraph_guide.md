@@ -164,8 +164,15 @@ request_bucket(running_bs, max_seqlen_q) == (running_bs, draft_num)
   the one it decodes: `0` for standard decode, `mtp_k` for MTP speculative
   decoding.
 
-A decode step the DP group splits into TBO microbatches has no graph yet and
-runs eagerly (`ForwardMode.decide`).
+Under TBO decode (`--enable-tbo all`), a bucket that splits
+(`decode_bucket_splits`: `running_bs > 2`) is recorded as a TBO graph: its two
+microbatches cut at the bucket (`decode_ubatch_request_ranges(running_bs)`),
+every DP rank recording the same split. A decode step that replays it lays
+each microbatch's attention metadata out for that split
+(`ForwardMode.ubatch_split_bs`), whatever each rank scheduled into the bucket.
+A split decode no recording serves -- off the ladder, under `--enforce-eager`,
+or under TR_HYBRID, whose token graphs have no split recording -- runs eagerly,
+its microbatches cut from the scheduled requests.
 
 ### Graph pool sharing
 
@@ -313,7 +320,7 @@ A recording serves prefill and decode steps of its token count alike, so a decod
 
 Every recording (`TokenGraph.record`, and through it `ReqGraph` and `DraftGraph`) first waits out the NCCL watchdog (`atom/distributed/nccl_watchdog.py:drain_nccl_works`). A collective recorded into the graph joins its NCCL stream into the capture, and a watchdog poll of an eager collective still pending on that stream fails with `hipErrorCapturedEvent` and invalidates the capture; `torch.cuda.synchronize()` alone does not prevent it.
 
-aiter's custom collectives keep their registered (direct-read) capture path inside token graphs, as under FULL: each recorded collective reads its peers' inputs at the addresses the recording gave them, which a segment's pool holds fixed, and the kernels' closing barrier keeps a rank from overwriting an input before every peer has read it. The copy-in path the removed PIECEWISE mode forced cost one device-to-device copy per collective (about 0.9 ms per DeepSeek-V4-Flash DP decode step).
+aiter's custom collectives keep their registered (direct-read) capture path inside token graphs, as under FULL: each recorded collective reads its peers' inputs at the addresses the recording gave them, which a segment's pool holds fixed, and the kernels' closing barrier keeps a rank from overwriting an input before every peer has read it. A recording's collectives are thus sized by its bucket, so under DP attention every prefilling rank, an idle rank's dummy prefill included, replays the bucket holding the group's largest token count (`ForwardMode._pad_to_token_graph`); ranks on different buckets would hang. The copy-in path the removed PIECEWISE mode forced cost one device-to-device copy per collective (about 0.9 ms per DeepSeek-V4-Flash DP decode step).
 
 ## Compiler backend
 

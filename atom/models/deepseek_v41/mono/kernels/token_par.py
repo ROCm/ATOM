@@ -35,11 +35,16 @@ def own_count(s, tp):
     return s // tp
 
 
+def own_rows(s, tp, rank):
+    """(first row, rows) ``rank`` owns of a token-parallel s-row step."""
+    n = own_count(s, tp)
+    return rank * n, n
+
+
 def own_view(c, names):
     """``c`` seen from this rank's tokens: S their count, ``t0`` the first one's
     row of the step, and each per-token argument in ``names`` moved to it."""
-    n = own_count(c["S"], c["d"].ranks)
-    t0 = c["rank"] * n
+    t0, n = own_rows(c["S"], c["d"].ranks, c["rank"])
     lo = fx.Int64(t0)
     args = dict(c["args"])
     for name in names:

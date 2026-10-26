@@ -28,7 +28,8 @@ def _walk_plan(
     plan,
     batch_ids,
     positions,
-    n,
+    lo,
+    hi,
     RATIO: tl.constexpr,
     CTAS: tl.constexpr,
     WALK_ROWS: tl.constexpr,
@@ -36,19 +37,20 @@ def _walk_plan(
     CHUNK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """``index_plan.fill_walk_plan`` over ``index_plan.walk_pieces``, each row's
-    bound its visible columns at ``RATIO``: ``plan`` [CTAS, 4] gets a (lead,
-    span, ch0, ch1) a task, piece after piece, and zeros past the last."""
-    t = tl.arange(0, BLOCK)
-    m = t < n
+    """``index_plan.fill_walk_plan`` over ``index_plan.walk_pieces`` of rows lo
+    .. hi, each row's bound its visible columns at ``RATIO``: ``plan`` [CTAS, 4]
+    gets a (lead, span, ch0, ch1) a task, piece after piece, and zeros past the
+    last."""
+    t = lo + tl.arange(0, BLOCK)
+    m = t < hi
     owner = tl.load(batch_ids + t, mask=m, other=0)
-    prev = tl.load(batch_ids + t - 1, mask=m & (t > 0), other=0)
-    run_start = m & ((t == 0) | (owner != prev))
+    prev = tl.load(batch_ids + t - 1, mask=m & (t > lo), other=0)
+    run_start = m & ((t == lo) | (owner != prev))
     run_first = tl.associative_scan(tl.where(run_start, t, 0), 0, _running_max)
     lead = m & (run_start | ((t - run_first) % WALK_ROWS == 0))
     # a lead's piece runs to the next lead
     after = t[None, :] > t[:, None]
-    end = tl.min(tl.where(lead[None, :] & after, t[None, :], n), 1)
+    end = tl.min(tl.where(lead[None, :] & after, t[None, :], hi), 1)
     pos = tl.load(positions + t, mask=m, other=0)
     bound = ((pos + 1) // RATIO).to(tl.int32)
     inside = (t[None, :] >= t[:, None]) & (t[None, :] < end[:, None])
@@ -84,6 +86,8 @@ def _step_meta_kernel(
     ring_rel,
     key_meta,
     walk_plans,
+    walk_lo,
+    walk_hi,
     table_stride,
     slot_rows,
     ring_slots,
@@ -104,7 +108,8 @@ def _step_meta_kernel(
                 walk_plans[r],
                 batch_ids,
                 positions,
-                n,
+                walk_lo,
+                walk_hi,
                 RATIOS[r],
                 CTAS,
                 WALK_ROWS,
@@ -133,14 +138,17 @@ def _step_meta_kernel(
     tl.store(key_meta + i * WORDS + 3, (slot * slot_rows).to(tl.int32), mask=m)
 
 
-def write_step_meta(step, geometry, window, ring_rel, key_meta, walk_plans) -> None:
+def write_step_meta(
+    step, geometry, window, ring_rel, key_meta, walk_plans, walk_rows
+) -> None:
     """``ring_rel`` [S] int32: each token's window row before the layer's ring
     start, -1 for a pad row. ``key_meta`` [S, KMETA] int32: its first window
     position, window count (0 for a pad), block table offset and slot row base.
     ``walk_plans``: ratio -> [BLOCKS, 4] int32, the FP4 score stage's FULL-layer
     tasks over this step's rows (``index_plan.fill_walk_plan``); none on the
-    FP8 plane."""
+    FP8 plane. ``walk_rows``: (first row, rows) the plans cover."""
     n = ring_rel.shape[0]
+    walk_lo, walk_n = walk_rows
     assert key_meta.shape == (n, KMETA) and key_meta.is_contiguous()
     # a piece a row at most, and each needs a task of its own: else the width
     # search never ends
@@ -153,6 +161,8 @@ def write_step_meta(step, geometry, window, ring_rel, key_meta, walk_plans) -> N
         ring_rel,
         key_meta,
         tuple(walk_plans.values()),
+        walk_lo,
+        walk_lo + walk_n,
         step.block_tables.stride(0),
         window.slot_rows,
         window.ring_slots,

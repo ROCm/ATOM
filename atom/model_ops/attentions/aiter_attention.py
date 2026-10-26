@@ -21,7 +21,7 @@ from atom.utils.block_convert import (
 )
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
-from atom.utils.tbo import TokenSplitPrefillState
+from atom.utils.tbo import TokenSplitPrefillState, decode_ubatch_request_ranges
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 from .mha_kv_pool import MhaKvPool
@@ -1331,6 +1331,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 running_bs,
                 max_seqlen_q,
                 context_lens,
+                split_bs=self._ubatch_split_bs,
             )
 
         return attn_metadata, positions
@@ -1341,19 +1342,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         bs: int,
         max_seqlen_q: int,
         context_lens: np.ndarray,
+        *,
+        split_bs: int | None = None,
     ):
-        """Compute per-ubatch forward_vars for CUDAGraph TBO.
+        """Compute per-ubatch forward_vars for TBO decode.
 
-        Splits the full-batch data into per-ubatch CpuGpuBuffers.
-        The split point is bs // 2 to match CUDAGraph's baked-in token slices.
+        Splits the full-batch data into per-ubatch CpuGpuBuffers, one per
+        micro-batch the step runs (`decode_ubatch_request_ranges` of
+        ``split_bs``, the step's `_ubatch_split_bs`; None: the scheduled
+        requests): a replayed TBO graph's halves of the bucket, or an eager
+        split's halves of the scheduled requests. Each is padded to its half
+        of the padded batch, which covers either.
         """
         self._check_metadata_writable("ub0_mha_metadata", "ub1_mha_metadata")
         var = self.model_runner.forward_vars
         N = self._NUM_TBO_UBATCHES
-        half = bs // N
 
-        ub_ranges = [(0, half), (half, bs)]
-        running_bs_list = [half, bs - half]
+        ub_ranges = decode_ubatch_request_ranges(split_bs or scheduled_bs, N)
+        running_bs_list = [
+            end - start for start, end in decode_ubatch_request_ranges(bs, N)
+        ]
 
         for ub_idx, ((req_start, req_end), running_bs) in enumerate(
             zip(ub_ranges, running_bs_list)

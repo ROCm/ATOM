@@ -128,6 +128,10 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Optional standalone OpenTelemetry tracing (read once per process).
+    "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
+    in {"1", "true"},
+    "ATOM_TRACE_VERSION": lambda: os.getenv("ATOM_TRACE_VERSION", "unknown"),
     # Forward metadata transport: direct or packed. Both keep source checks.
     # Single-member groups and strided bindings retain direct copies.
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
@@ -934,6 +938,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM": lambda: (
         os.getenv("ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM", "0") == "1"
     ),
+    # gfx1250 MXFP4 (per_1x32) linears through aiter's gemm_a4w4
+    "ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE": lambda: (
+        os.getenv("ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE", "0") == "1"
+    ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with
@@ -1132,14 +1140,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
-    # gathering them on the host. The tables stay in host memory (page-locked in
-    # place, not copied to HBM); the GPU pulls only the rows a step names and
-    # dequantizes them there. On by default: the host gather gives the same rows
+    # gathering them on the host. Each rank's shard stays in host memory,
+    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
+    # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
+    # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
+    # into page-locked memory of exactly its size (hipHostMalloc on base pages,
+    # so a fragmented page cache costs no compaction), one copy_ below 512 MiB, else one thread per 128 MiB (at least 8) up to
+    # 16 and the CPUs this process may use, dropping the copied checkpoint
+    # pages from the process as it goes; 0 registers the checkpoint mapping in
+    # place (one thread, under the HIP runtime lock). Either way the shard is
+    # resident once. Copying needs the HIP runtime; elsewhere it registers in
+    # place regardless. `tools/engram/bench_uva_shard.py` measures both.
+    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

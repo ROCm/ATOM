@@ -22,8 +22,10 @@ def peer_layout(tokens: int, d: Dims) -> dict[str, tuple[int, int]]:
     token-parallel step's gathers, [token][..] each: XG the normed rows (K2's
     MoE input); QG / QGS the q latent's MXFP8 words / codes and KG the window
     row (K1); NBG the normed rows (the compressor's) and IWG the head weights
-    (an indexer layer's K1). RT: under DP attention every rank's routes
-    (``moe.stage_route``'s copies, each rank its own step's tokens)."""
+    (an indexer layer's K1); IRDY / ICRDY: a row's selection / candidate
+    blocks are in every rank's ``plain_layout`` (put by its owner's K2a). RT:
+    under DP attention every rank's routes (``moe.stage_route``'s copies, each
+    rank its own step's tokens)."""
     row = tokens * HIDDEN // 2
     return pair_layout(
         [
@@ -35,6 +37,8 @@ def peer_layout(tokens: int, d: Dims) -> dict[str, tuple[int, int]]:
             ("kg", tokens * KV_DIM // 2),
             ("nbg", row),
             ("iwg", tokens * ip.HEADS),
+            ("irdy", tokens),
+            ("icrdy", tokens),
             ("rt", ROUTE_COPIES * tokens * 2 * TOPK),
         ]
     )
@@ -49,3 +53,19 @@ def peer_offsets(tokens: int, d: Dims) -> dict[str, int]:
 
 def peer_bytes(tokens: int, d: Dims) -> int:
     return max(off + n for off, n in peer_layout(tokens, d).values())
+
+
+def plain_layout(tokens: int, selecting: int) -> dict[str, tuple[int, int]]:
+    """Region -> (byte offset, bytes) in the peer buffer's never-zeroed part
+    (``PeerBuffer.plain``), int32 words: IROW the ``selecting`` layers' pool
+    rows, [layer][token][TOPK], and ICAND the candidate blocks, [token]
+    [TOPK_BLOCKS]. Each row's are written whole by the K2a that selects it
+    (``index_score._st_out``), before the step reads them."""
+    out, off = {}, 0
+    for name, words in (
+        ("irow", selecting * tokens * ip.TOPK),
+        ("icand", tokens * ip.TOPK_BLOCKS),
+    ):
+        out[name] = (off, words * 4)
+        off += words * 4
+    return out
