@@ -144,8 +144,16 @@ on:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
             kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4
 
-          MiniMax-M3.1-Flash (accuracy, GSM8K 20-shot, 8 GiB workspace/rank):
+          MiniMax-M3.1-Flash (accuracy, GSM8K 20-shot):
             minimax-m31-flash-mxfp4-1p1d-tp4-gsm8k-20shot-c32
+
+          MiniMax-M3.1-Flash (mooncake_store, TP4 P/D, DSpark3, AgentX):
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c32,
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c48,
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c64
+
+          MiniMax-M3.1-Flash (profile, same C32, P/D traces at Profiling +30 to +33 min):
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c32-profile
 
           MiniMax:
             minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
