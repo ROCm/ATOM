@@ -147,13 +147,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the decode side scatters them into the paged KV and returns the slot.
     # 0 = staged per-page writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
-    # Mooncake P/D: how long a write Mooncake gave up on may still land. A
+    # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
-    # failure; a prefill keeps a landing slot whose write failed out of use
-    # this long. 0 = release at once.
+    # failure; a Mooncake prefill keeps a landing slot whose write failed out
+    # of use this long. 0 = release at once.
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
+    # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
+    "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
+    # MoRIIO P/D: how long a request waits for the handshake with its peer.
+    "ATOM_MORIIO_HANDSHAKE_TIMEOUT_S": lambda: float(
+        os.getenv("ATOM_MORIIO_HANDSHAKE_TIMEOUT_S", "300")
+    ),
+    # MoRIIO P/D write mode: a prefill starts no push this long after the
+    # decode asked for it.
+    "ATOM_MORIIO_WRITE_TIMEOUT_S": lambda: float(
+        os.getenv("ATOM_MORIIO_WRITE_TIMEOUT_S", "600")
+    ),
+    # MoRIIO P/D: log the layers a receive left unchanged (debugging).
+    "ATOM_MORIIO_VERIFY": lambda: _flag_env("ATOM_MORIIO_VERIFY", "0"),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
