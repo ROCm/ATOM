@@ -1559,6 +1559,76 @@ models:
           accuracy:
             threshold: 0.8
       nightly:
+        # Reuse the verified 32K-warmup service and pinned scatter-bounds aiter.
+        # Keep server capacity fixed at 80; each AgentX concurrency starts fresh.
+        - &minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c16
+          topology: 1p1d_eagle3
+          display_topology: 1P1D-TP4-EAGLE3
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [16]
+          server: *minimax_m3_scatter_bounds_server
+          prefill: *minimax_m3_scatter_bounds_prefill
+          decode: *minimax_m3_scatter_bounds_decode
+          env: *minimax_m3_scatter_bounds_env
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
+          run_eval: false
+
+        # Successful gather baseline: run 38841844766 / f217aa3e3.
+        # Sweep cases inherit host-memory preparation, allocator settings,
+        # native grouped gather, image Mesh, and node exclusions together.
+        - &minimax_m3_agentic_gather_baseline
+          <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32
+          concurrency: [32]
+          env:
+            <<: *minimax_m3_scatter_bounds_env
+            prefill:
+              <<: *minimax_m3_scatter_bounds_prefill_env
+              # Avoid repeated large hipMalloc/hipFree during dynamic draft KV
+              # gather. Pinned aiter supports VMM via custom-allreduce copy-in.
+              PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+              PYTORCH_HIP_ALLOC_CONF: expandable_segments:True
+          runner:
+            # These nodes reserve idle HugeTLB that the CI UID cannot release:
+            # 38741996691 (g34), 38793498618 (g12, 720 GiB on prefill NUMA0).
+            # g53 also retains ~300 GiB anon outside job8641; three THP
+            # attempts stopped at912 GiB (38827608848), before model startup.
+            exclude_nodes: [pit2-p03-g34, pit2-p03-g12, pit2-p03-g53]
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
+            prepare_lmcache_host_memory: true
+            # The pinned image has the same Mesh source as this branch.
+            mesh_source: image
+
+        - <<: *minimax_m3_agentic_gather_baseline
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c48
+          concurrency: [48]
+
+        - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c40
+          concurrency: [40]
+
+        - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c56
+          concurrency: [56]
+
+        - <<: *minimax_m3_agentic_gather_baseline
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c72
+          concurrency: [72]
+
+        # Keep the baseline's 80-sequence server capacity: C88 measures client
+        # concurrency above that capacity, including scheduler queuing.
+        - <<: *minimax_m3_agentic_gather_baseline
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c88
+          concurrency: [88]
+
         - name: minimax-m3-fp4-1p1d-tp4
           topology: 1p1d
           pd_worker_layout: single_node
