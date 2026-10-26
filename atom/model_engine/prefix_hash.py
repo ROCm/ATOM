@@ -77,35 +77,36 @@ class ShippedChain(NamedTuple):
     hashes: array.array  # "Q"
 
 
-def ship_prompt_hash_chain(seq, hash_block_size: int, *, projection=None) -> None:
+def ship_prompt_hash_chain(seq, hash_block_size: int, *, block_hashes=None) -> None:
     """Attach `seq`'s chain for `BlockManager._adopt_shipped_chain`.
 
-    `projection` (a `PrefixProjection` from the tokenizer cache) supplies the
-    chain when it was minted for this prompt, block size and seed; otherwise
-    the chain is hashed here. It stays on the frontend: only the chain rides
-    the ADD frame.
+    `block_hashes` (a `PrefixBlockHashes` the tokenizer cache built from these
+    very tokens) supplies the chain when its block size, seed and length fit;
+    otherwise the chain is hashed here. The engine checks the shipped chain
+    against the prompt either way (fingerprint and sampled links).
     """
     if not envs.ATOM_FRONTEND_PREFIX_HASH or hash_block_size <= 0:
         return
     n = full_prompt_blocks(seq, hash_block_size)
-    fingerprint = prompt_fingerprint(seq)
     if (
-        projection is not None
-        and projection.version == 1
-        and (projection.block_size, projection.seed)
+        block_hashes is not None
+        and (block_hashes.block_size, block_hashes.seed)
         == (hash_block_size, seq.cache_seed)
-        and projection.num_tokens == seq.num_prompt_tokens
-        and projection.fingerprint == fingerprint
-        and len(projection.kv_hashes) == n * 8
+        and block_hashes.num_tokens == seq.num_prompt_tokens
+        and block_hashes.num_blocks == n
     ):
-        hashes = projection.kv_array()
+        hashes = block_hashes.as_array()
     else:
         hashes = array.array(
             "Q",
             chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed),
         )
     seq.prompt_hash_chain = ShippedChain(
-        hash_block_size, seq.cache_seed, seq.num_prompt_tokens, fingerprint, hashes
+        hash_block_size,
+        seq.cache_seed,
+        seq.num_prompt_tokens,
+        prompt_fingerprint(seq),
+        hashes,
     )
 
 

@@ -719,7 +719,7 @@ class InputOutputProcessor:
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
-        self._unified_prefix = envs.ATOM_UNIFIED_PREFIX_CACHE
+        self._reuse_block_hashes = envs.ATOM_TOKENIZE_CACHE_BLOCK_HASHES
         if getattr(config, "enable_prefix_caching", False):
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
@@ -830,7 +830,7 @@ class InputOutputProcessor:
             tokens = prompt_or_tokens
         elif segment_tokenizer is not None:
             if (
-                getattr(self, "_unified_prefix", False)
+                getattr(self, "_reuse_block_hashes", False)
                 and self.prefix_hash_block_size
                 and envs.ATOM_FRONTEND_PREFIX_HASH
                 and multimodal_data is None
@@ -907,8 +907,8 @@ class InputOutputProcessor:
             ship_prompt_hash_chain(
                 seqs[0],
                 self.prefix_hash_block_size,
-                projection=(
-                    None if prefix_encoding is None else prefix_encoding.projection
+                block_hashes=(
+                    None if prefix_encoding is None else prefix_encoding.block_hashes
                 ),
             )
             for seq in seqs[1:]:
