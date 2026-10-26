@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Small CPU-only payload for the disposable CI orchestration test PR."""
 
 from __future__ import annotations
