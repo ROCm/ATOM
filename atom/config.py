@@ -1967,6 +1967,11 @@ class Config:
     # The tokens before a replaying forward a backend reads (`Replay.history_ids`).
     # Set by the model: V4.1's Engram n-gram lookback.
     replay_history_tokens: int = 0
+    # How far below a prefix hit with no state checkpoint behind it a prefill
+    # starts to rebuild that state exactly (`BlockManager.replay_start`), 0 =
+    # such a hit is not taken. Set by the model, not a flag: DeepSeek-V4's
+    # window receptive field under ATOM_DSV4_STATE_REPLAY (`deepseek_v4_replay`).
+    state_replay_tokens: int = 0
     # DeepSeek-V4.1 encoder SWA bounded replay: a prefix hit keeps no state
     # checkpoint and rebuilds it by recomputing the window rows below the hit
     # (`--encoder-swa-bounded-replay`). On by default;
@@ -2019,6 +2024,13 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    # None reads ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR once the feature is on; see
+    # `_resolve_dynamic_chunking`.
+    dynamic_chunking_smooth_factor: float | None = None
+    # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
+    # rebuild, so the floor is what bounds that amplification.
+    dynamic_chunking_min_chunk_size: int = 4096
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2445,6 +2457,7 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_dynamic_chunking()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2649,6 +2662,55 @@ class Config:
 
             validate_runtime_config(self)
 
+        if is_deepseek_v4:
+            from atom.model_ops.attentions.deepseek_v4_replay import (
+                state_replay_tokens,
+            )
+
+            self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_dynamic_chunking(self) -> None:
+        """Validate dynamic chunking, or turn it off where it cannot size a chunk.
+
+        Everything here, the env read included, runs only when the feature is
+        on: a stale ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
+        must not stop a server that never asked for dynamic chunking.
+        """
+        if not self.enable_dynamic_chunking:
+            return
+        if self.dynamic_chunking_smooth_factor is None:
+            try:
+                self.dynamic_chunking_smooth_factor = (
+                    envs.ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR must be a number: {exc}"
+                ) from None
+        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+            raise ValueError(
+                "dynamic_chunking_smooth_factor must be in [0, 1], got "
+                f"{self.dynamic_chunking_smooth_factor}"
+            )
+        if self.dynamic_chunking_min_chunk_size <= 0:
+            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+        if self.pipeline_parallel_size <= 1:
+            reason = "pipeline_parallel_size is 1"
+        elif not self.enable_chunked_prefill:
+            reason = "chunked prefill is off"
+        elif self.enable_rapidserve:
+            reason = "the RapidServe prefill scheduler never chunks"
+        elif (self.kv_transfer_config or {}).get("kv_role") == "kv_consumer":
+            reason = "a P/D decode instance does not run the prefills it would size"
+        else:
+            return
+        # Same degrade-to-fixed path as a failed profile or a rejected fit.
+        # Raising would make the flag a hard failure in a shared launch script.
+        logger.warning(
+            "Dynamic chunking disabled because %s; chunking stays fixed", reason
+        )
+        self.enable_dynamic_chunking = False
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -2736,6 +2798,15 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # The drafter graph bakes its draft width in as a constant (DSpark traces
+        # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
+        # would otherwise load the other width's artifact: draft 6 over a draft 3
+        # cache hands MoE half the rows it expects. Acceptance-length knobs only
+        # steer sampling and stay out.
+        spec = self.speculative_config
+        factors.append(
+            None if spec is None else (spec.method, spec.num_speculative_tokens)
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

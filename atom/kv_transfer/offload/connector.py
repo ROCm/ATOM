@@ -207,6 +207,14 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "lookup_pending", None)
         return bool(callback(seq)) if callable(callback) else False
 
+    def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
+        callback = getattr(self._impl, "can_detach_lookup", None)
+        return bool(callback(seq, num_hbm_tokens)) if callable(callback) else False
+
+    def detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
+        callback = getattr(self._impl, "detach_lookup", None)
+        return bool(callback(seq, num_hbm_tokens)) if callable(callback) else False
+
     @property
     def has_state_tier(self) -> bool:
         """True when the selected impl actually hosts the KDA state tier.

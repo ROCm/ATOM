@@ -47,7 +47,9 @@ from atom.kv_transfer.disaggregation import (
     kv_config_has_producer,
 )
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -79,6 +81,7 @@ from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
+from atom.spec_decode.status import SpecStatusQueue
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -151,6 +154,9 @@ support_model_arch_dict = {
 mono_decode_installers = {
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
+    ),
+    "KimiK3ForConditionalGeneration": (
+        "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
     ),
 }
 
@@ -245,10 +251,13 @@ class tokenIDProcessor:
         )
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
+        # Block-drafter warmup fabricates at least two requests, even when
+        # the service admits only one. Real batches/graphs obey max_num_seqs.
+        self._output_request_capacity = max(runner.config.max_num_seqs, 2)
 
         self.async_copy_stream = torch.cuda.Stream(runner.device)
-        self.default_num_rejected_tokens = torch.zeros(
-            max_num_batched_tokens, dtype=torch.int32, device=device
+        self.zero_spec_counts = torch.zeros(
+            2 * self._output_request_capacity, dtype=torch.int32, device=device
         )
         self.clean()
 
@@ -291,64 +300,17 @@ class tokenIDProcessor:
             return logprob_tensor.tolist()
         return None
 
-    def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
-        default_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(self.async_copy_stream):
-            self.async_copy_stream.wait_stream(default_stream)
-            cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self.async_copy_stream)
-        # No reverse wait here. `gpu_tensor` is a draft pass's captured output,
-        # so its address is fixed and the NEXT replay rewrites it -- but that
-        # replay sits behind a whole target forward on the default stream, while
-        # this copy is a few KB. Ordering the default stream against it would
-        # stall it for the copy every step, which is the overlap the side stream
-        # exists to buy. If a future change ever puts a replay closer than one
-        # forward away, the wait belongs immediately before THAT replay, not
-        # here.
-        self.draft_token_ids_cpu.append((cpu_tensor, event))
+    def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
+        # The next replay of this draft output follows a whole target forward.
+        # Preserve side-stream overlap; no reverse wait on the forward stream.
+        self._draft_token_ids_queue.send(gpu_tensor)
 
-    def recv_async_output_draft(self) -> np.ndarray:
-        if not self.draft_token_ids_cpu:
-            return np.array([], dtype=np.int32)
-        token_ids, event = self.draft_token_ids_cpu.pop(0)
-        event.synchronize()
-        return token_ids.numpy()
+    def recv_draft_token_ids(self) -> np.ndarray:
+        output = self._draft_token_ids_queue.receive()
+        return np.array([], dtype=np.int32) if output is None else output
 
-    def send_mtp_status_to_cpu_async(
-        self,
-        num_rejected: torch.Tensor,
-        num_bonus: torch.Tensor,
-        data_ready: torch.cuda.Event,
-    ):
-        # rejected num and bonus num are slightly different info for mtp
-        # take mtp=1 for example:
-        #   first decode after prefill have 0 rej, 0 bonus
-        #   prev acc decode have 0 rej, 1 bonus
-        #   prev rej decode have 1 rej, 0 bonus
-        # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
-        # Single Event for both copies (vs. per-tensor send_to_cpu_async) so the
-        # consumer pops one queue entry and synchronizes once instead of twice.
-        copy_done = torch.cuda.Event()
-        with torch.cuda.stream(self.async_copy_stream):
-            data_ready.wait(stream=self.async_copy_stream)
-            cpu_num_rejected = num_rejected.to("cpu", non_blocking=True)
-            cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
-            copy_done.record(self.async_copy_stream)
-        self.pending_mtp_status_copies.append(
-            (cpu_num_rejected, cpu_num_bonus, copy_done)
-        )
-
-    def recv_mtp_status_async(
-        self,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        if not self.pending_mtp_status_copies:
-            return None, None
-        cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
-            0
-        )
-        copy_done.synchronize()
-        return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
+    def recv_spec_status(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        return self.spec_status_queue.receive() or (None, None)
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -359,13 +321,13 @@ class tokenIDProcessor:
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
-        self.draft_token_ids_cpu: list[torch.Tensor] = []
-        # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
-        # D2H copies fired by send_mtp_status_to_cpu_async, drained by
-        # recv_mtp_status_async after the event syncs.
-        self.pending_mtp_status_copies: list[
-            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
-        ] = []
+        self._draft_token_ids_queue = D2HQueue(
+            self._output_request_capacity * max(self.num_spec_tokens, 1),
+            self.async_copy_stream,
+        )
+        self.spec_status_queue = SpecStatusQueue(
+            self._output_request_capacity, self.async_copy_stream
+        )
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
 
@@ -521,14 +483,14 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
-        # The MTP status queue is filled in postprocess but drained here, so a
+        # The speculative status queue is filled in postprocess but drained here, so a
         # step whose postprocess is skipped must not drain it: `forward()` bails
         # before postprocess when the batch produces no output (every prefill in
         # it is a middle chunk), and the status it popped belongs to the batch
         # whose deferred tokens the NEXT output-producing step will surface.
         # Draining it here would hand that step `num_rejected=None`.
         if batch.produces_output():
-            self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+            self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
@@ -678,8 +640,8 @@ class tokenIDProcessor:
         else:
             self.draft_token_ids = draft_token_ids
             self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
-            token_ids = self.recv_async_output_draft()
-            self.send_to_cpu_async_draft(draft_token_ids)
+            token_ids = self.recv_draft_token_ids()
+            self.send_draft_token_ids_to_cpu(draft_token_ids)
             ret = (
                 token_ids
                 if self.prev_req_ids is not None
@@ -735,6 +697,7 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -1312,23 +1275,23 @@ class ModelRunner:
         )
         return True
 
+    def warmup_max_tokens(self) -> int:
+        """Tokens one warmup forward carries: the activation peak KV sizing allows."""
+        max_tokens = self.config.max_num_batched_tokens
+        if not self.config.enable_dp_attention:
+            max_tokens //= get_dp_group().world_size
+        pcp_size = self.config.prefill_context_parallel_size
+        if pcp_size > 1:
+            max_tokens = max(1, max_tokens // pcp_size)
+        return max_tokens
+
     def warmup_model(self):
         start_time = time.time()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
+        max_model_len = self.config.max_model_len
         dp_size = get_dp_group().world_size
-        if self.config.enable_dp_attention:
-            warmup_max_tokens = max_num_batched_tokens
-        else:
-            warmup_max_tokens = max_num_batched_tokens // dp_size
-
-        pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1:
-            warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
+        warmup_max_tokens = self.warmup_max_tokens()
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1378,6 +1341,14 @@ class ModelRunner:
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
+
+    def profile_dynamic_chunking(self):
+        """Fit chunk overhead from startup dummy forwards (engine RPC)."""
+        return self._dynamic_chunking.profile()
+
+    def take_dynamic_chunking_fit(self):
+        """Return newly calibrated chunk latency coefficients (engine RPC)."""
+        return self._dynamic_chunking.take_fit()
 
     def allocate_forward_vars(self):
         config = self.config
@@ -2716,6 +2687,11 @@ class ModelRunner:
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
             graph_shapes=self._producer_graph_shapes(),
+            dp_stage_report=(
+                self.attn_metadata_builder.dp_stage_report(batch)
+                if dp_size > 1
+                else None
+            ),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -3146,6 +3122,8 @@ class ModelRunner:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
+                # Time only the chunk computation between PP receive and send.
+                chunk_sample = self._dynamic_chunking.start_sample(batch)
                 if pp_enabled:
                     model_output = self.model(
                         input_ids,
@@ -3159,6 +3137,7 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
+                self._dynamic_chunking.finish_sample(chunk_sample)
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:
@@ -3284,7 +3263,10 @@ class ModelRunner:
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
             )
-            num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
+            # Prefill has zero bonus/rejection counts, in the same contiguous
+            # layout as verification. Slice before reshaping to avoid row gaps.
+            spec_counts = self.tokenID_processor.zero_spec_counts[: 2 * bs].view(2, bs)
+            num_reject_tokens = spec_counts[1]
             next_token_locs = num_reject_tokens
             # No drafts scored -> no verdict; the drafter anchors on each
             # segment's last row.
@@ -3332,6 +3314,7 @@ class ModelRunner:
                 verdict = _g.broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
+            spec_counts = verdict[:2]
 
         # Drafter input must agree across TP ranks.
         if get_tp_group().world_size > 1 and (
@@ -3366,9 +3349,9 @@ class ModelRunner:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
-                self.tokenID_processor.send_mtp_status_to_cpu_async(
-                    num_reject_tokens, next_token_locs, self.forward_done_event
-                )  # Async copy to CPU
+                self.tokenID_processor.spec_status_queue.send(
+                    spec_counts, ready=self.forward_done_event
+                )
                 next_token_ids = torch.gather(
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
@@ -4345,6 +4328,13 @@ class ModelRunner:
             # signature -- which of them takes a `max_q_len` is the runner's to
             # know, and it is the same probe the loop above ran.
             if hasattr(self, "drafter"):
+
+                def end_draft_trace(tag):
+                    torch.cuda.synchronize()
+                    self._capture_trace_tag = tag
+                    prof.step()
+                    self._capture_trace_tag = None
+
                 self.drafter.warmup_draft_graphs(
                     (
                         partial(build_capture, max_q_len=full_q_len)
@@ -4352,6 +4342,7 @@ class ModelRunner:
                         else build_capture
                     ),
                     capture_ctx.stream,
+                    end_draft_trace if prof is not None else None,
                 )
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)

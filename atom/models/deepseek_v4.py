@@ -39,6 +39,7 @@ from aiter import (
 from aiter import silu_and_mul as aiter_silu_and_mul
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.batched_gemm_op_a8w8 import (
@@ -102,7 +103,7 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import chunked_row_topk, qsplit_gather_rows
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
@@ -206,19 +207,33 @@ def v4_attention_with_output(
 v4_attn_runner = CudagraphCaptureRunner()
 
 
-def _v4_attn_compress_fake(x: torch.Tensor, layer_name: str) -> None:
+def _v4_attn_compress_fake(
+    x: torch.Tensor,
+    idx_q_quant: torch.Tensor | None,
+    idx_weights: torch.Tensor | None,
+    idx_q_scale: torch.Tensor | None,
+    layer_name: str,
+) -> None:
     return None
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attn_compress_fake, mutates_args=[])
-def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
+def v4_attn_compress(
+    x: torch.Tensor,
+    idx_q_quant: torch.Tensor | None,
+    idx_weights: torch.Tensor | None,
+    idx_q_scale: torch.Tensor | None,
+    layer_name: str,
+) -> None:
     """The split point, and the ONE batch-shaped kernel: the compressor.
 
     Its grid is `plan_gpu.shape[0] = graph_bs * per_seq_bound`, which is why
     this graph keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense
-    piece keys on num_tokens alone. The indexer top-k is token-shaped on both
-    the FP8 and FP4 paths, so it sits in `_sparse_attention` with the rest of
-    that granularity.
+    piece keys on num_tokens alone. The gfx950 FP4 decode scorer is batch-shaped
+    too -- its row-group launch is planned from the sequence count and the
+    query span -- so it runs here as well, after the compressor has written the
+    index rows it reads (`_attn_compress`). Every other indexer top-k is
+    token-shaped and stays in `_sparse_attention`.
 
     It returns NOTHING, and does not need to: a split op's submodule is the one
     piece the backend leaves uncompiled (`backends.py`, `submod_names_to_compile`
@@ -249,6 +264,9 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
         capture=self.attn_ffn_piecewise,
         forward_context=fc,
         x=x,
+        idx_q_quant=idx_q_quant,
+        idx_weights=idx_weights,
+        idx_q_scale=idx_q_scale,
     )
 
 
@@ -1462,7 +1480,8 @@ class Indexer(nn.Module):
         # needs all 64 heads at every rank to compute the per-token
         # compressed-position topk locally without cross-rank all_reduce.
         # Sharding wq_b would force an extra all_reduce on `index_score`
-        # after the per-head sum.
+        # after the per-head sum. Prefill splits the query ROWS across TP
+        # instead (`qsplit`, see `_prefill_chunked_topk`).
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1735,6 +1754,29 @@ class Indexer(nn.Module):
             q_quant, weights, q_scale, self.prefix, self.index_topk
         )  # [total_tokens, index_topk] int32
 
+    def score_decode_topk_into(
+        self,
+        q_fp4: torch.Tensor,
+        weights: torch.Tensor,
+        q_scale: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """The gfx950 FP4 decode top-k, written straight into `out`.
+
+        For `DeepseekV4Attention._attn_compress`, which runs in a split op --
+        already eager or its own graph -- so it calls the scorer directly
+        rather than through the opaque `indexer_score_topk` op, and hands it
+        the fixed buffer the dense piece downstream reads, instead of copying
+        a fresh result into it."""
+        self._score_topk_decode_fp4_flydsl(
+            q_fp4,
+            q_scale,
+            get_forward_context().attn_metadata.block_tables,
+            weights,
+            self.index_topk,
+            out=out,
+        )
+
     def indexer_score_topk(
         self,
         q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8, or packed FP4 (uint8) when the FP4 indexer is on
@@ -1798,6 +1840,7 @@ class Indexer(nn.Module):
         topk: int,
         device: torch.device,
         score_chunk,
+        qsplit: tuple | None = None,
     ) -> torch.Tensor:
         """Chunk query rows so each per-chunk ``[chunk_rows, row_width]`` fp32
         logits buffer stays within ``ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB``, then
@@ -1811,37 +1854,52 @@ class Indexer(nn.Module):
         the returned top-k.
 
         The dense logits column dim (``row_width`` = ``total_committed`` for FP8,
-        ``_max_model_len_idx`` for FP4) is unbounded by ``max_num_batched_tokens``,
-        so a burst of long-context requests can push a single un-chunked
-        allocation to tens of GiB (#1376). ``chunk_tokens`` shrinks as
-        ``row_width`` grows. When a single chunk already fits, the loop runs
-        once (``chunk_start==0`` and ``chunk_end==total_tokens``) and matches the
-        single-shot path — callers can detect that to reuse a schedule
-        precomputed outside the fwd.
+        the batch's max committed length for FP4) is unbounded by
+        ``max_num_batched_tokens``, so a burst of long-context requests can push
+        a single un-chunked allocation to tens of GiB (#1376). ``chunk_tokens``
+        shrinks as ``row_width`` grows.
+
+        ``qsplit`` (set by the metadata builder under plain TP) scores only this
+        rank's rows and all-gathers the rest over the TP group: the indexer is
+        replicated across TP, so every rank would otherwise repeat the same work.
 
         Returns ``[total_tokens, topk]`` int32 (raw kernel output; caller remaps).
         """
-        topk_out = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
-        chunk_tokens = sparse_indexer_row_chunk(
-            total_tokens, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        # The row windows and ``qsplit`` come from the builder's token count; a
+        # query batch of any other height would be split for the wrong rows.
+        assert row_ends.shape[0] == total_tokens, (
+            f"indexer got {total_tokens} query rows, metadata built for "
+            f"{row_ends.shape[0]}"
         )
-        for chunk_start in range(0, total_tokens, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, total_tokens)
-            rs = row_starts[chunk_start:chunk_end]
-            re = row_ends[chunk_start:chunk_end]
-            logits = score_chunk(chunk_start, chunk_end, rs, re)
+
+        def select(logits, lo, hi, out_rows):
             top_k_per_row_prefill(
                 logits,
-                rs,
-                re,
-                topk_out[chunk_start:chunk_end],
+                row_starts[lo:hi],
+                row_ends[lo:hi],
+                out_rows,
                 None,  # values not needed, only indices
-                chunk_end - chunk_start,
+                hi - lo,
                 logits.stride(0),
                 logits.stride(1),
                 k=topk,
             )
-        return topk_out
+
+        return chunked_row_topk(
+            total_rows=total_tokens,
+            row_width=row_width,
+            budget_mb=SPARSE_INDEXER_LOGITS_BUDGET_MB,
+            topk=topk,
+            device=device,
+            qsplit=qsplit,
+            score_chunk=lambda lo, hi: score_chunk(
+                lo, hi, row_starts[lo:hi], row_ends[lo:hi]
+            ),
+            select=select,
+            gather=lambda out, rows_per_rank, slot_lo: qsplit_gather_rows(
+                out, rows_per_rank, slot_lo, get_tp_group().device_group
+            ),
+        )
 
     def _score_topk_prefill(
         self,
@@ -1918,6 +1976,7 @@ class Indexer(nn.Module):
             topk=topk,
             device=device,
             score_chunk=_score,
+            qsplit=indexer_meta.get("qsplit"),
         )
         seq_base = indexer_meta["seq_base_per_token_gpu"].unsqueeze(
             1
@@ -2192,8 +2251,8 @@ class Indexer(nn.Module):
         The dense `[chunk_rows, max_model_len_idx]` fp32 logits is chunked on the
         Q dim via `_prefill_chunked_topk` (same OOM guard as FP8). In the common
         SINGLE-chunk case the schedule (cta_info/n_ctas) precomputed ONCE outside
-        the fwd by the metadata builder is reused as-is (no schedule work in the
-        fwd). Only when the buffer would exceed budget and the loop actually
+        the fwd by the metadata builder -- over this rank's rows under `qsplit` --
+        is reused as-is (no schedule work in the fwd). Only when the buffer would exceed budget and the loop actually
         splits does each chunk rebuild the schedule for its rows (cta_info
         encodes absolute row ids, so a slice of the full schedule won't do)."""
         from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
@@ -2236,11 +2295,15 @@ class Indexer(nn.Module):
             f"block_size=256 (CSA rows per block = block_size // 4)."
         )
 
+        qsplit = indexer_meta.get("qsplit")
+        whole = (0, total_tokens) if qsplit is None else qsplit[3:]
+
         def _score(chunk_start, chunk_end, rs, re):
-            if chunk_start == 0 and chunk_end == total_tokens:
+            if (chunk_start, chunk_end) == whole:
                 # Single chunk (common case): reuse the schedule precomputed once
-                # outside the fwd (metadata builder, sized to the full
-                # prefill_rows) — no compute_prefill_schedule here.
+                # outside the fwd (metadata builder, sized to this rank's rows
+                # under qsplit, else the whole prefill) — no
+                # compute_prefill_schedule here.
                 cta_info, n_ctas = full_cta_info, full_n_ctas
             else:
                 # Multi-chunk (logits would exceed budget): rebuild the schedule
@@ -2292,6 +2355,7 @@ class Indexer(nn.Module):
             topk=topk,
             device=device,
             score_chunk=_score,
+            qsplit=qsplit,
         )  # [total_tokens, topk] int32, raw seq-local
 
     def _score_topk_decode_fp4_flydsl(
@@ -2301,6 +2365,7 @@ class Indexer(nn.Module):
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
         weights: torch.Tensor,  # [padded_tokens, n_heads] fp32
         topk: int,
+        out: torch.Tensor | None = None,  # [>= padded_tokens, topk] int32
     ) -> torch.Tensor:
         """RAGGED decode FP4 via `flydsl_pa_mqa_logits_fp4` with
         `query_start_loc`, which at 64-row pages runs the row-group kernel: a
@@ -2315,23 +2380,21 @@ class Indexer(nn.Module):
         out by), zero on the pad tail, so pad rows get top-k -1 (ignored
         downstream).
 
-        Native decode keeps the sequence capacity and query-span bound fixed
-        for each token bucket. The builder refreshes its complete boundary
-        buffer every forward, including empty slots, so a token-count graph
-        can replay another sequence layout with the same launch and addresses.
+        The launch is planned from the sequence count and `max_seqlen_q`, so it
+        must run where both are part of the graph key (see below).
         """
         device = q_fp4.device
         padded_tokens = q_fp4.size(0)
         attn_metadata = get_forward_context().attn_metadata
         local_ends = attn_metadata.csa_n_committed_per_token[:padded_tokens]
-        # Native decode publishes a token-bucket-sized view and a fixed query
-        # span, so the launch captured inside a dense piece remains valid when
-        # the sequence layout changes. Other callers keep their own metadata.
-        ragged = (attn_metadata.indexer_meta or {}).get("fp4_decode")
-        if ragged is None:
-            ragged = Fp4MqaRaggedMetadata(
-                attn_metadata.cu_seqlens_q, attn_metadata.max_seqlen_q, block_tables
-            )
+        # The step's own sequences. The row-group launch is planned from their
+        # count and `max_seqlen_q`, so a captured one is only valid for steps
+        # with the same two: FULL keys its graph on `(running_bs, max_q_len)`
+        # and narrow PIECEWISE scores inside `_attn_compress`, whose graph keys
+        # on the same bucket. Never from a num_tokens-keyed dense piece.
+        ragged = Fp4MqaRaggedMetadata(
+            attn_metadata.cu_seqlens_q, attn_metadata.max_seqlen_q, block_tables
+        )
         # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
         # the rectangular decode path.
         max_seq_len = self._max_model_len_idx
@@ -2369,7 +2432,11 @@ class Indexer(nn.Module):
         )  # [padded_tokens, max_seq_len] fp32, seq-local
         # Seq-local output → indices returned directly. top_k writes every row
         # (real + empty pad rows → -1), so a bare torch.empty output is fine.
-        topk_out = torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
+        topk_out = (
+            torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
+            if out is None
+            else out[:padded_tokens]
+        )
         # DECODE top-k: every row's window starts at 0, the `rowStart == 0`
         # this entry assumes. The prefill entry dispatches on
         # `topk_use_mulblocks(rows, stride0)` with `stride0 =
@@ -2826,7 +2893,9 @@ class DeepseekV4Attention(nn.Module):
 
         # Batch-shaped side effect. AF_PIECEWISE captures this op; plain
         # PIECEWISE runs it eager. The dense pieces around it are token-shaped.
-        torch.ops.aiter.v4_attn_compress(hidden, self.layer_name)
+        torch.ops.aiter.v4_attn_compress(
+            hidden, idx_q_quant, idx_weights, idx_q_scale, self.layer_name
+        )
 
         o = torch.ops.aiter.v4_sparse_attention(
             q_sa,
@@ -3090,6 +3159,9 @@ class DeepseekV4Attention(nn.Module):
         self,
         *,
         x: torch.Tensor | None = None,  # [num_tokens, dim] hidden state
+        idx_q_quant: torch.Tensor | None = None,  # narrow path: `forward_pre`'s
+        idx_weights: torch.Tensor | None = None,
+        idx_q_scale: torch.Tensor | None = None,
         compressor_already_launched: bool = False,
     ) -> None:
         """Batch-shaped compressor launch plus side-stream join.
@@ -3136,6 +3208,17 @@ class DeepseekV4Attention(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             if self.indexer is not None:
                 current_stream.wait_stream(self.indexer_stream)
+
+        # The gfx950 FP4 decode scorer, after the join: it reads the index rows
+        # the indexer's compressor just wrote. Its launch follows the sequence
+        # count and query span, which this core's graph key fixes and a dense
+        # piece's (token count alone) does not. `_sparse_attention` reads the
+        # result off the fixed buffer.
+        out = attn_md.fp4_decode_topk
+        if out is not None and idx_q_quant is not None and not self.skip_topk:
+            self.indexer.score_decode_topk_into(
+                idx_q_quant, idx_weights, idx_q_scale, out
+            )
 
     def _qk_norm_rope(
         self,
@@ -3245,7 +3328,8 @@ class DeepseekV4Attention(nn.Module):
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP4
-        row-group scorer uses fixed-capacity metadata per token bucket --
+        the FP8 / gfx1250 scorers are token-shaped (the gfx950 FP4 decode
+        scorer is not, and runs in `_attn_compress`) --
         and everything it reads is token-shaped or a whole persistent buffer. So it
         belongs in a dense piece, keyed on num_tokens, not in the core.
         """
@@ -3282,15 +3366,19 @@ class DeepseekV4Attention(nn.Module):
         # paged offsets in the active CSA buffer. Both are token-shaped and run
         # after the compressor split op in the narrow PIECEWISE order.
         if self.indexer is not None and not self.skip_topk:
-            topk_local = self.indexer.topk(
-                x,
-                qr,
-                positions,
-                qr_scale,
-                pre_q_quant=idx_q_quant,
-                pre_weights=idx_weights,
-                pre_q_scale=idx_q_scale,
-            )
+            if idx_q_quant is not None and attn_md.fp4_decode_topk is not None:
+                # Scored in `_attn_compress` (see there).
+                topk_local = attn_md.fp4_decode_topk[:num_tokens]
+            else:
+                topk_local = self.indexer.topk(
+                    x,
+                    qr,
+                    positions,
+                    qr_scale,
+                    pre_q_quant=idx_q_quant,
+                    pre_weights=idx_weights,
+                    pre_q_scale=idx_q_scale,
+                )
             self._fill_csa_paged_compress(attn_md, topk_local, positions, num_tokens)
 
         # ===== Sparse attention dispatch =====
@@ -3847,7 +3935,8 @@ class MoE(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         shared_partial: torch.Tensor | None = None,
-        before_stage2=None,
+        before_stage2_for_rows=None,
+        before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Gate + FusedMoE routed-expert pass.
@@ -3862,7 +3951,8 @@ class MoE(nn.Module):
             x,
             router_logits,
             shared_partial,
-            before_stage2=before_stage2,
+            before_stage2_for_rows=before_stage2_for_rows,
+            before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
         )
 
@@ -3941,20 +4031,43 @@ class MoE(nn.Module):
         """
         routed_stream = torch.cuda.current_stream(x.device)
         self.alt_stream.wait_stream(routed_stream)
+        shared_produced = False
+        shared_waited = False
 
-        def produce_shared():
+        def produce_shared(output_rows):
+            nonlocal shared_produced
             with torch.cuda.stream(self.alt_stream):
                 shared = self.shared_experts.forward(x)
-            routed_stream.wait_stream(self.alt_stream)
+                if shared.shape[0] != output_rows:
+                    padded = shared.new_zeros((output_rows, *shared.shape[1:]))
+                    padded[: shared.shape[0]].copy_(shared)
+                    shared = padded
             shared.record_stream(routed_stream)
+            shared_produced = True
             return shared
+
+        def wait_for_shared():
+            nonlocal shared_waited
+            if not shared_produced:
+                raise RuntimeError(
+                    "comm-fused shared output was joined before it was produced"
+                )
+            if not shared_waited:
+                routed_stream.wait_stream(self.alt_stream)
+                shared_waited = True
 
         routed, is_complete = self.routed_expert_forward(
             x,
-            before_stage2=produce_shared,
+            before_stage2_for_rows=produce_shared,
+            before_shared_add=wait_for_shared,
             stage2_stream=routed_stream,
         )
         if is_complete:
+            if not shared_produced or not shared_waited:
+                raise RuntimeError(
+                    "comm-fused Stage2 completed without joining the shared-output "
+                    "producer"
+                )
             return routed
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts.forward(x)

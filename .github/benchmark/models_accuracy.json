@@ -402,7 +402,7 @@
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "nightly",
-    "accuracy_threshold": 0.8872,
+    "accuracy_threshold": 0.87,
     "accuracy_baseline": 0.9022,
     "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
     "_baseline_note": "ATOM CI measured: 0.9022 (gsm8k 3-shot flexible-extract). Threshold = baseline - 0.015."

@@ -3,6 +3,8 @@
 
 """Worker contracts for reusable native-state LMCache MP transfers."""
 
+import copy
+import json
 import sys
 import types
 from dataclasses import dataclass, replace
@@ -38,8 +40,14 @@ from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     NativeStateLMCacheMPConnector,
     require_native_state_server,
+    stores_state_images,
+)
+from atom.model_engine.arg_utils import (
+    compose_kv_offload_config,
+    kv_offload_connector_config,
 )
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
 
 
 @dataclass
@@ -48,6 +56,7 @@ class _TransferSpec:
     block_ids: list[list[int]]
     start: int = 0
     end: int = 0
+    request_configs: dict | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -93,8 +102,7 @@ def config(**extra):
     )
 
 
-@pytest.fixture
-def worker():
+def _make_worker(*, images=True):
     instance = NativeStateLMCacheMPConnector(config())
     page = torch.zeros((32, 1, 32), dtype=torch.uint8)
     spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
@@ -112,7 +120,7 @@ def worker():
     )
     tensors.set_block_count(32)
     instance._native_layout = build_native_state_mp_layout(
-        tensors, block_size=4, chunk_size=8
+        tensors, block_size=4, chunk_size=8, images=images
     )
     instance.chunk_size = 8
     instance.submitted = []
@@ -128,6 +136,17 @@ def worker():
         submit_store_request=submit, submit_retrieve_request=submit
     )
     return instance
+
+
+@pytest.fixture
+def worker():
+    return _make_worker()
+
+
+@pytest.fixture
+def page_worker():
+    """A worker whose layout registered PAGE alone (`stores_state_images` False)."""
+    return _make_worker(images=False)
 
 
 def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
@@ -251,6 +270,133 @@ def test_failed_retrieve_does_not_restore_or_report_success(worker, monkeypatch)
     finished = worker.get_finished()
     assert finished.failed_loading == {req.load_operation}
     assert not finished.finished_loading
+
+
+def _kv_only_load(hbm=8):
+    return replace(
+        request(loading=True, hbm=hbm),
+        native_state=NativeStateTransfer((), 16, 998, None, kv_only=True),
+    )
+
+
+def test_kv_only_load_reads_page_alone_under_the_request_session(page_worker):
+    req = _kv_only_load()
+    page_worker._submit_load(req, object())
+    # The lookup that reported the reach also locked it, under this session.
+    assert page_worker.submitted_request_ids == ["atom-offload-dp0:7"]
+    [spec] = page_worker.submitted
+    # PAGE for [8, 16) and nothing else: the layout has no image group.
+    assert spec.block_ids == [[3, 4]]
+    assert spec.request_configs is None
+
+
+def test_page_only_save_stores_page_alone(page_worker):
+    req = replace(
+        request(), native_state=NativeStateTransfer((), 16, 998, None, kv_only=True)
+    )
+    page_worker._submit_save(req, object())
+    [spec] = page_worker.submitted
+    assert spec.block_ids == [[1, 2, 3, 4]]
+    assert spec.request_configs is None
+    page_worker.future.ready = True
+    terminals = [
+        completion
+        for completion in page_worker.get_finished().connector_completions
+        if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
+    ]
+    assert terminals == [
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+    ]
+
+
+def test_kv_only_load_restores_nothing(page_worker, monkeypatch):
+    monkeypatch.setattr(
+        page_worker, "_begin_restore", lambda _: pytest.fail("no image to restore")
+    )
+    req = _kv_only_load()
+    page_worker._submit_load(req, object())
+    page_worker.future.ready = True
+    finished = page_worker.get_finished()
+    assert finished.finished_loading == {req.load_operation}
+
+
+def test_a_page_only_layout_registers_no_image_group(page_worker, worker):
+    assert not page_worker._native_layout.images
+    assert {g.engine_group_id for g in page_worker._native_layout.kernel_groups} == {0}
+    assert not any(g.recurrent_state for g in page_worker._native_layout.kernel_groups)
+    assert any(g.recurrent_state for g in worker._native_layout.kernel_groups)
+
+
+def test_page_alone_on_an_images_layout_fails_before_transport(worker):
+    # The scheduler and this worker disagree about images: nothing is sent.
+    worker._submit_load(_kv_only_load(), object())
+    assert worker.submitted == []
+
+
+def test_an_image_on_a_page_only_layout_fails_before_transport(page_worker):
+    page_worker._submit_save(request(), object())
+    assert page_worker.submitted == []
+
+
+@pytest.mark.parametrize("replay, images", [(7875, False), (0, True)])
+def test_images_follow_the_replay(replay, images):
+    assert stores_state_images(replay) is images
+
+
+def _engine_config(kv_transfer_config, architectures=("DeepseekV4ForCausalLM",)):
+    hf = SimpleNamespace(
+        architectures=list(architectures),
+        sliding_window=128,
+        num_hidden_layers=61,
+        compress_ratios=[4, 128, 0],
+        num_nextn_predict_layers=1,
+    )
+    config = SimpleNamespace(
+        hf_config=hf,
+        speculative_config=None,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        enable_prefix_caching=True,
+        kv_transfer_config=kv_transfer_config,
+    )
+    config.state_replay_tokens = state_replay_tokens(config)  # Config.__post_init__
+    return config
+
+
+def test_the_scheduler_and_its_workers_read_one_replay_length(monkeypatch):
+    """Both decide images from `Config.state_replay_tokens`, set once on the
+    engine's config. A `multi` connector hands its offload leg a copy, so P/D
+    plus LMCache MP offload (whose P/D loads know nothing of a replay) runs no
+    replay and keeps images on both sides."""
+    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
+    pd = json.dumps({"kv_role": "kv_producer", "kv_connector": "mooncake"})
+    composed = json.loads(
+        compose_kv_offload_config(pd, kv_offload_connector_config("lmcache_mp", ""))
+    )
+    assert composed["kv_connector"] == "multi"
+    engine = _engine_config(composed)
+    assert engine.state_replay_tokens == 0
+    leg = copy.copy(engine)  # as `MultiConnector` builds its offload leg
+    leg.kv_transfer_config = composed["connectors"][1]
+    assert stores_state_images(leg.state_replay_tokens)
+    assert stores_state_images(engine.state_replay_tokens)
+    # LMCache MP offload alone replays, and neither side stores images.
+    alone = _engine_config({"kv_connector": "lmcache_mp", "kv_role": "offload"})
+    assert alone.state_replay_tokens == 128 + 60 * 127
+    assert not stores_state_images(alone.state_replay_tokens)
+
+
+def test_a_model_the_replay_does_not_cover_keeps_its_images(monkeypatch):
+    """Kimi-K3's KDA state has no bounded receptive field: only an image
+    restores it. The replay switch is DeepSeek-V4's, so it changes nothing
+    there, even turned on."""
+    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
+    k3 = _engine_config(
+        {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+        architectures=("KimiK3ForConditionalGeneration",),
+    )
+    assert k3.state_replay_tokens == 0
+    assert stores_state_images(k3.state_replay_tokens)
 
 
 def test_load_completion_waits_for_native_restore(worker, monkeypatch):
@@ -595,3 +741,21 @@ def test_native_namespace_changes_with_image_codec(monkeypatch):
     assert _model_namespace(config(), checkpoint_spec=first) != _model_namespace(
         config(), checkpoint_spec=second
     )
+
+
+def test_a_layout_without_images_has_a_namespace_of_its_own(monkeypatch):
+    # Scheduler and workers that disagree about images find nothing, never
+    # each other's objects.
+    from atom.kv_transfer.offload.mp import deployment
+
+    monkeypatch.setattr(deployment.offcfg, "build_lmcache_config", lambda _: object())
+    monkeypatch.setattr(deployment.offcfg, "lmcache_replica_world_size", lambda _: 2)
+    monkeypatch.setattr(
+        deployment.offcfg, "build_page_namespace", lambda *_: "page-config"
+    )
+    spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
+    with_images = _model_namespace(config(), checkpoint_spec=spec)
+    page_alone = _model_namespace(config(), checkpoint_spec=spec, images=False)
+    assert with_images != page_alone
+    assert "::native-state-v1-" in with_images
+    assert "::native-page-v1-" in page_alone

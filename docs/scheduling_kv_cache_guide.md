@@ -184,21 +184,60 @@ class ScheduledBatch:
 
 Returned by the model runner after a forward pass:
 
-```python
-class ScheduledBatchOutput:
-    def __init__(
-        self,
-        token_ids: dict[int, tuple[int, ...]],
-        draft_token_ids,
-    ):
-        self.req_ids = list(token_ids.keys())
-        self.token_ids = token_ids        # {seq_id: (accepted_token_ids...)}
-        self.draft_token_ids = draft_token_ids  # {seq_id: [draft_ids]} or None
-```
+| Field | Contents |
+| --- | --- |
+| `req_ids` | Request IDs corresponding to the rows of accepted output |
+| `token_ids` | Accepted token tuples, aligned with `req_ids`; `get_idx(req_id)` finds a request's row |
+| `draft_token_ids` | Optional NumPy array of speculative draft tokens |
+| `num_rejected`, `num_bonus` | Optional NumPy arrays of per-request speculative rejection and bonus counts |
+| `is_deferred_out`, `is_prev_prefill` | Deferred-output and previous-prefill state |
+| `logprobs` | Optional sampled-token log probabilities |
+| `dspark_ell` | Optional request-ID-to-verification-length map from the DSpark scheduler |
 
-- `token_ids` maps sequence ID to a tuple of accepted token IDs.
-- `draft_token_ids` maps sequence ID to a list of speculative draft token IDs for the next step (when MTP is active).
-- A special key `-1` in `token_ids` signals deferred output mode.
+The output owns the storage of `draft_token_ids`, `num_rejected`, and
+`num_bonus`. The constructor copies non-owning NumPy views and retains
+already-owned arrays and `None`. This prevents the transport thread from
+holding the last reference to pinned PyTorch storage and paying its allocator
+release cost while replacing a previous result.
+
+#### Deferred output transfers
+
+| Module | Responsibility |
+| --- | --- |
+| `model_engine/output_transfer.py` | FIFO transfers, reusable pinned slots and completion events, and independent NumPy snapshots |
+| `spec_decode/status.py` | Copy the two packed speculative status rows into independently owned arrays in scheduler order |
+| `model_engine/model_runner.py` | Provide contiguous status counts and consume outputs at the existing scheduling boundaries |
+| `model_engine/scheduler.py` | Enforce the output object's storage-ownership contract |
+
+Each D2H slot has fixed capacity based on the server's `max_num_seqs`, with a
+floor of two requests for the existing block-drafter warmup. Draft capacity is
+that request limit times `num_speculative_tokens`; status capacity is twice
+the request limit. Slots are allocated on first use, and their number is bounded
+by peak outstanding outputs. Only the active batch region is copied. Changing
+batch size reuses the same allocation; exceeding capacity is an error. A dtype
+change replaces a free slot. No additional GPU staging buffer is allocated.
+
+The queue keeps each pending slot until receiving it has waited for D2H and
+copied its active NumPy output. The slot and its completed event can then be
+reused; no per-transfer handle is allocated. Already received arrays remain
+valid after later copies or processor cleanup. Each slot caches only its current
+shape's views, so changing batch sizes does not retain a growing view cache.
+
+Both prefill and verification submit contiguous `[bonus, rejected]` rows with
+one D2H operation and one completion event. Verification uses the final
+post-broadcast verdict, excluding its GPU-only anchor. Prefill views a persistent
+flat zero buffer, slicing before reshaping to keep the active rows contiguous.
+Neither path launches a packing kernel. `SpecStatusQueue` specializes only the
+snapshot: it copies each row once and returns `(rejected, bonus)` in scheduler
+order. Each returned row owns its storage, so `ScheduledBatchOutput` does not
+copy it a second time.
+
+Draft IDs use a separate queue. Their transfer waits on the producer stream;
+the next draft graph replay still follows a target forward, preserving the
+existing overlap. Ordinary sampled-token and logprob transfers are unchanged.
+
+`token_ids` contains accepted-token rows, not the runner's intermediate mapping:
+the runner extracts the deferred-output sentinel before constructing this object.
 
 ## Block manager
 
@@ -341,7 +380,9 @@ After pool sizing, the runner combines that capability with the optional `PagedS
 
 *Replay* (`StateTransfer.replay()`, DeepSeek-V4.1 under `--encoder-swa-bounded-replay`, its default). Nothing is kept: `successor_room` is `inf`, so no rung, anchor or demand checkpoint is placed and no prefill chunk is cut for one. A hit resumes at any hash-block boundary; `BlockManager.replay_start` moves the forward's start one hash block back, and the backend recomputes those tokens into a fresh slot without writing what the prefix cache holds. The scheduler budgets the chunk from the same start, records where the request resumed (`Sequence.replay`, carried on `ScheduledBatch.replaying`), and the reported hit stays there; prefix-hit metrics and block publication count from there too.
 
-Independently of the transfer, a model may ask that the forward finishing a prompt run at least `Config.min_final_prefill_rows` rows (DeepSeek-V4.1's decoder bounded replay); `replay_start` moves a resume closer to the prompt's end back onto the hash-block grid to give it them, on a resume that keeps its state too (a later chunk, a checkpoint hit). A forward that backs off counts its long-prefill cap from where it resumed, and waits rather than end at or below that point.
+Independently of the transfer, a model may ask that the forward finishing a prompt run at least `Config.min_final_prefill_rows` rows (DeepSeek-V4.1's decoder bounded replay); `replay_start` moves a resume closer to the prompt's end back onto the hash-block grid to give it them, on a resume that keeps its state too (a later chunk, a checkpoint hit). A forward that backs off counts its long-prefill cap from where it resumed, and waits rather than end at or below that point (`Scheduler._waits_below_resume`; a DeepSeek-V4 bounded replay excepted, below).
+
+*Bounded replay* (DeepSeek-V4 under `ATOM_DSV4_STATE_REPLAY=1`, with its copy transfer). A V4 window is local: layer l's window at H depends only on layer l-1 over the last W positions, so recomputing `Config.state_replay_tokens` = `W + (L-1)(W-1)` tokens below a hit, with the compressed history read from the cache, rebuilds every layer's window exactly. `can_allocate` keeps a hit that reaches past the nearest checkpoint by more than that (`_replay_hit`, `Sequence.replays_hit`) and restores nothing; `replay_start` starts the forward that far below it, and the forward is a `Replay` as above, so nothing below `until` is written, published or checkpointed. Unlike V4.1's, it may span forwards: a forward picking up where one inside it ended continues it (`_resume_prefill`, keeping `until` and `Replay.start`, below which no window row is read), and admission does not hold it back for a step that can pass the hit, which a budget narrower than the replay never gives. By the hit the replay has rebuilt the state whole, so the prompt-end anchor or a rung may land right on it (`scheduler._cut_floor`): a prompt sent again, whose anchor is its hit, restores instead of replaying again. A replayed hit records no demand, which would cost every replay admission a forward and a checkpoint write for a branch at that exact hit; such a branch replays again. The rows a replay recomputes are reported as reuse lost for want of a checkpoint, not as a hit (`prefix_cache_hit_tokens`, the cache stats). Under LMCache MP offload (the one KV connector a replay runs beside) a replay may end past the HBM prefix, at the PAGE KV LMCache holds: the request parks while that KV alone is loaded (`Sequence.replay_kv_load`), then resumes as a replayed hit below it, or below the HBM hit if the load did not run.
 
 An image holds part of a slot, not all of it (`PagedStateCheckpointSpec.image_bytes`, sized from `AttentionMetadataBuilder.checkpoint_image_bytes`). A resumer starts at the boundary the checkpoint was taken on, and a compressor that pools `ratio` tokens with no overlap begins its first pool exactly there — so every row it reads is one it writes, and the checkpoint owes it nothing. DeepSeek-V4's HCA state is 52% of a slot and entirely dead on that argument, which is what `EntryField.in_checkpoint=False` declares; the sliding windows next to it are a sliding window, so every row a window position reaches is carried. The rows *between* them are not: a class interleaves its layers' windows so one index formula can serve every layer of it, and the rows that construction skips are reachable by no `(layer, position)` pair at all, so nothing writes or reads them (`UnifiedPoolGeometry.entry_row_runs`). Leaving them out costs 17.3% of the entry on the DSpark configuration and makes the image no longer a subsequence of the slot's rows — which is why a reader at the wrong version would gather every window row shifted. Both rules are named in `layout_id` (`nocopy=`, `entry=packed`) and fenced by its version, because two workers disagreeing about either would read one image at two layouts. It holds only while every ratio the model declares divides the quantity a checkpoint is aligned to -- `kv_cache_block_size * decode_context_parallel_size`, not `block_size` -- which `_assert_ratios_divide_the_alignment` enforces at startup against `hf_config.compress_ratios`. Nothing downstream has to cooperate, which is what makes a decode boundary checkpointable at all — see below. The bytes still need a forward to move them, so `checkpoint` records the intent and keeps the record invisible in `COPYING` state. When the next real batch is built, `BlockManager.take_state_maintenance_ops` is the only drain: it returns one typed `StateMaintenanceOps` containing Active Slot relocations, checkpoint stores and checkpoint restores. `ScheduledBatch.state_maintenance_ops` carries that bundle, and `AttentionMetadataBuilder.build` issues every operation on the compute stream before the forward — one place every execution path passes through exactly once per batch. An empty batch does not drain the bundle. Publishing the checkpoint only after its store has ridden a real batch stops a resumer claiming bytes that do not exist yet.
 
@@ -366,12 +407,11 @@ def allocate(self, seq: Sequence):
 
 **KV Cache allocation:**
 
-1. Iterates over `seq.num_blocks` blocks.
-2. For each block, computes hash if the block is full (`len(token_ids) == block_size`). Partial (last) blocks get `hash = -1`.
-3. If prefix caching is enabled, looks up `kv.lookup(h)`:
-   - **Cache hit:** Verifies `token_ids` match, then `kv.claim(block_id)` — `ref_count += 1` if live, otherwise take it off the free list with its contents intact. Deliberately not `kv.allocate`, whose reset would drop the hash and destroy the entry for everyone else. Increments `seq.num_cached_tokens` by `block_size`.
-   - **Cache miss:** `kv.pop()` then `kv.allocate()`.
-4. Full blocks are registered by `kv.publish(block_id, h, token_ids)`.
+1. Claims the hit blocks `can_allocate` found. On the fast walk (`ATOM_PREFIX_FAST_WALK`) it takes the ids of the seq's last walk as one run (`kv.claim_many`), after checking only that their hashes still resolve to them (no check while `kv.index_version` is unchanged). Otherwise, and for a joint tail past that run, it names each block from the prompt chain (`_prompt_hashes`) and claims `kv.lookup(h)`. It compares no tokens: the walk did (the last hit block on the fast walk, every hit block on the per-block walk).
+   - `kv.claim(block_id)`: `ref_count += 1` if live, otherwise take it off the free list with its contents intact. Deliberately not `kv.allocate`, whose reset would drop the hash and destroy the entry for everyone else.
+   - A hash evicted since the probe stops the claim there and lowers the cached count to what was claimed.
+2. The rest of the block table is fresh blocks (`_fresh_block`: `kv.pop()` then `kv.allocate()`), and `seq.num_cached_tokens` is the cached blocks times the hash block size.
+3. Full blocks are registered after their forward by `hash_blocks` (`kv.publish(block_id, h, token_ids)`), which also revokes another hash the block was still indexed under: indexed content never changes.
 
 **Per-request cache allocation (if `seq.has_per_req_cache`):**
 
@@ -413,9 +453,11 @@ A checkpoint the seq resumed from is not released here — it went back to the f
 
 ```python
 def can_allocate(self, seq: Sequence, record: bool = True, *,
-                 block_hashes: list[int] | None = None,
-                 reuse_hashes: bool = False) -> int:
+                 block_hashes: list[int] | None = None) -> int:
     """Return cache-hit hash blocks (>=0) if seq fits, else -1."""
+
+def can_allocate_memoized(self, seq: Sequence) -> int:
+    """can_allocate(seq, record=False) over a walk memoised per seq."""
 
 def record_allocation(self, seq: Sequence, num_cached_blocks: int,
                       block_hashes: list[int]) -> None:
@@ -429,9 +471,29 @@ def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
 capacity. Its cache hit incorporates KV, SWA and state-checkpoint availability.
 With `record=False`, it leaves joint-load fields and joint-boundary counters
 uncommitted; checkpoint demand/end and hit instrumentation still refresh.
-Checkpoint demand counters deduplicate per request. With `reuse_hashes=True`,
-immutable prompt hashes are memoized, but pool lookup, token equality and fit
-are checked on every call. Mutable completion tokens are never memoized.
+Checkpoint demand counters deduplicate per request.
+
+A probe is a walk followed by an evaluation. The walk (`_walk_prefix`) finds
+the contiguous run of prompt blocks in the KV index. It reads the seq's prompt
+chain (`_prompt_hashes`): the chain the frontend shipped, adopted once its block
+size, seed, length and prompt-token fingerprint match and three of its links
+rehash equal here, or else hashes the engine computed, up to a little past the
+first miss. `hash_blocks` publishes prompt blocks under the chain's hashes and
+hashes only the blocks it does not cover (the rest of a cold prompt with no
+shipped chain, and completion tokens, which never enter the chain). So a
+prefill hashes each prompt block at most once on the scheduler thread, and none
+when the shipped chain is adopted (`publish_loaded_prefix`,
+`register_received_prefix` and `acquire_offload_prefix` still hash the blocks
+they handle). The evaluation applies the SWA and state
+gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
+already in use, and the fit. `allocate` claims the block ids the seq's last
+walk found, unless the index changed under them.
+
+The probes that run every tick (the delayer's head check and probe, the DP
+chunk-cost estimate) call `can_allocate_memoized`. It reuses a seq's walk until
+a hash the walk read leaves the index or is remapped, or the hash at its first
+miss is published (`ATOM_PREFIX_WALK_MEMO` lists every trigger), and runs the
+same evaluation on every call, so it returns what `can_allocate` would. `allocate` revalidates only the ids it claims.
 
 `can_append` checks whether the next decode extension needs additional blocks,
 including speculative tokens and the active cache layout.
@@ -478,13 +540,12 @@ Blocks form a hash chain: each block's hash incorporates the previous block's ha
 
 ### Cache lookup during allocation
 
-During `allocate()`, for each full block:
+`can_allocate` walks the prompt's hash chain against the KV index once; `allocate()` then:
 
-1. Compute the block hash via the chain.
-2. Look up `kv.lookup(h)` (-1 on a miss).
-3. If found, verify `kv.block(block_id).token_ids == token_ids` (guard against hash collisions).
-4. **Hit:** `kv.claim(block_id)`. Add `block_size` to `seq.num_cached_tokens`.
-5. **Miss (or first miss in chain):** Once a cache miss occurs, all subsequent blocks in the sequence are also misses (`cache_miss = True` is sticky). Allocate fresh blocks from the free list.
+1. **Hit:** claims the block ids that walk found (`kv.claim_many`), unless the index changed since. Otherwise it looks each block's hash up again (`kv.lookup(h)`, -1 on a miss).
+2. **Miss (or first miss in chain):** once a block misses, all later blocks miss too (the hash is chained). Fresh blocks come from the free list.
+
+Hash collisions: by default (`ATOM_PREFIX_FAST_WALK=1`) the walk compares tokens only on the last hit block (`kv.block(block_id).token_ids == token_ids`), and every block if that one differs. A collision on an interior block alone is not caught, and the request reuses another prompt's KV. `ATOM_PREFIX_FAST_WALK=0` compares every hit block's tokens.
 
 ### Reference counting
 
