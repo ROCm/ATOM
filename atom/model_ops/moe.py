@@ -6,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -15,12 +15,12 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
 from aiter.ops.shuffle import (
     interleave_gate_up_rows,
     moe_shuffle_scale,
     moe_shuffle_weight,
 )
+from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1216,7 +1216,7 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
         )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _log_flydsl_herd_batch(num_tokens: int, top_k: int) -> None:
     logger.info(
         "FlyDSL HERD decode routing: %d tokens, Top-%d candidates, fused drop to %d",
