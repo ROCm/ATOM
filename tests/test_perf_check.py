@@ -1226,7 +1226,7 @@ def _run_matrix(**overrides):
 
 
 def test_matrix_is_the_agreed_set():
-    """Five entries across four levels, and the EAGLE3 pair alongside its base."""
+    """Five entries across four levels, and the MTP3 pair alongside its base."""
     proc = _run_matrix()
     assert proc.returncode == 0, proc.stderr
     cells = json.loads(proc.stdout)
@@ -1238,8 +1238,8 @@ def test_matrix_is_the_agreed_set():
         "deepseek-v4-pro",
         "kimi-k3",
         "m3-mxfp8",
-        "m3-mxfp8-eagle3",
         "qwen35-397b-fp8",
+        "qwen35-397b-fp8-mtp3",
     }
     for entry, concs in by_entry.items():
         assert sorted(concs) == [4, 64, 128, 256], entry
@@ -1260,13 +1260,13 @@ def test_matrix_names_the_level_a_variant_cannot_reach():
     reference level below that is configured builds a short matrix. The message
     has to point at the band rather than at the entry, which is present.
     """
-    proc = _run_matrix(PERF_MODELS="m3-mxfp8", PERF_REFERENCE_CONCS="4")
-    assert proc.returncode == 0, proc.stderr  # base and EAGLE3 both reach c=4
+    proc = _run_matrix(PERF_MODELS="qwen35-397b-fp8", PERF_REFERENCE_CONCS="4")
+    assert proc.returncode == 0, proc.stderr  # base and MTP3 both reach c=4
 
     import build_perf_check_matrix as bpm
 
-    keep = bpm.selected_variants({"m3-mxfp8"})
-    assert keep == {("m3-mxfp8", ""), ("m3-mxfp8", "-eagle3")}
+    keep = bpm.selected_variants({"qwen35-397b-fp8"})
+    assert keep == {("qwen35-397b-fp8", ""), ("qwen35-397b-fp8", "-mtp3")}
     assert bpm.selected_variants({"kimi-k3"}) == {("kimi-k3", "")}
 
 

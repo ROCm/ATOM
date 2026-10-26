@@ -33,21 +33,30 @@ from catalog import build_cells, load_variants
 
 CATALOG = ".github/benchmark/models.json"
 
-# The check measures one PRIMARY variant of each selected model, plus one
-# paired variant: MiniMax-M3-MXFP8 EAGLE3 alongside its base. The pair is what
+# The check measures the BASE variant of each selected model, plus one paired
+# variant: Qwen3.5-397B-A17B-FP8 MTP3 alongside its base. The pair is what
 # separates a regression in the speculative-decode path from one in the model's
 # general path -- only the speculative entry moves, or both do.
 #
-# The pair was DeepSeek-V4-Pro MTP3 until #2696 pruned that variant from the
-# catalog along with every GLM. V4-Pro's remaining speculative variant,
-# DPA DSpark, starts at conc_min=64 and so cannot reach the c=32 level this
-# line judges at; M3-MXFP8 EAGLE3 spans 1..256 and its base is already here.
+# The pair was DeepSeek-V4-Pro MTP3 until #2696 pruned that variant along with
+# every GLM before 5.3. V4-Pro's remaining speculative variant, DPA DSpark,
+# starts at conc_min=64 and so cannot reach the c=32 level this line judges at.
+#
+# **The pair has to be an MTP variant**, which is a constraint from shared code
+# rather than a preference. summarize.py's load_results tags a result with its
+# variant by matching `-(mtp\d*)-` against the filename and nothing else, so a
+# base and an EAGLE3/DSpark/TBO/DPA variant of one model -- same model_id, same
+# path -- come back to _display_model as the same name and the judge merges
+# them into one family. Measured, by trying it: run 40307628240 reported
+# MiniMax-M3-MXFP8 with four levels (c=32 and c=128 twice each) and family
+# deltas of +34.3% / -26.3%, which is base paired against EAGLE3. Generalising
+# that detection means editing summarize.py, which the nightly also reads.
 #
 # Every other catalog variant is deliberately absent: DPA, TBO, DPA TBO,
-# DPA DSpark, DSpark, MegaMoE. They are separate code paths and this line does
-# not watch them; the nightly does. Adding one is a line here plus the GPU jobs
-# it costs, not a change to the criterion.
-PAIRED_VARIANTS = {"m3-mxfp8": "-eagle3"}
+# DPA DSpark, DSpark, EAGLE3, MegaMoE. They are separate code paths and this
+# line does not watch them; the nightly does. Adding one is a line here plus
+# the GPU jobs it costs, not a change to the criterion.
+PAIRED_VARIANTS = {"qwen35-397b-fp8": "-mtp3"}
 
 # How many prompts a measured phase runs, as a multiple of its concurrency
 # level, for levels that should not run the default. The default is what the
