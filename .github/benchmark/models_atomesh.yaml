@@ -1908,12 +1908,15 @@ models:
               max_num_seqs: 32
               decode_max_num_seqs: 32
               spec_decode_acceptance_length: ""
+              enable_prefix_caching: false
+              # Match the PR 2425 V4 accuracy control without prefix caching.
+              extra_args: "--index-cache-dtype fp4 --attn-prefill-chunk-size 16384"
           prefill:
             workers: 1
             tp: 8
             cudagraph_mode: FULL
             compilation_level: 3
-            extra_args: "--enable-tbo"
+            extra_args: "--enable-tbo --max-num-batched-tokens 512"
           decode:
             workers: 1
             tp: 8
