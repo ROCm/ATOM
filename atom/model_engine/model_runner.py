@@ -256,6 +256,11 @@ class tokenIDProcessor:
         # the service admits only one. Real batches/graphs obey max_num_seqs.
         self._output_request_capacity = max(runner.config.max_num_seqs, 2)
 
+        # Every D2H queued on this stream must keep its GPU source referenced
+        # until the copy is known to have completed (its event waited on). The
+        # sources are fresh default-stream tensors and the caching allocator
+        # does not see the side-stream read: a dropped source goes to the next
+        # allocation, and a late copy then reads the next step's data.
         self.async_copy_stream = torch.cuda.Stream(runner.device)
         self.zero_spec_counts = torch.zeros(
             2 * self._output_request_capacity, dtype=torch.int32, device=device
@@ -280,19 +285,25 @@ class tokenIDProcessor:
                 else None
             )
             copy_done.record(self.async_copy_stream)
-        cpu_tensor_handle.append((cpu_tensor, copy_done))
+        # The sampled ids and logprobs are fresh every step; the entry holds
+        # them until recv_async_output has waited on copy_done.
+        cpu_tensor_handle.append((cpu_tensor, copy_done, (gpu_tensor, gpu_logprobs)))
         self.logprobs_cpu.append(cpu_logprobs)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
             return torch.empty(0, dtype=torch.int32, device="cpu")
-        cpu_tensor, event = cpu_tensor_handle.pop(0)
-        event.synchronize()
+        cpu_tensor, copy_done, _ = cpu_tensor_handle[0]
+        copy_done.synchronize()
+        # Pop only after the wait: the pop drops the GPU sources, and the
+        # allocator may reuse them once the copy has completed.
+        cpu_tensor_handle.pop(0)
         return cpu_tensor
 
     def recv_logprobs(self) -> list[float] | None:
         """Pop and return the earliest logprobs from the async copy queue.
-        Must be called after recv_async_output (which synchronizes the event).
+        Must be called after recv_async_output, which waits for the copy that
+        fills this tensor (the same copy_done covers both).
         """
         if not self.logprobs_cpu:
             return None
@@ -313,8 +324,18 @@ class tokenIDProcessor:
     def recv_spec_status(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         return self.spec_status_queue.receive() or (None, None)
 
+    def _wait_for_pending_copies(self) -> None:
+        """Wait for every queued D2H before its entry (and source) is dropped."""
+        for _, copy_done, _ in getattr(self, "token_ids_cpu", ()):
+            copy_done.synchronize()
+        for name in ("_draft_token_ids_queue", "spec_status_queue"):
+            queue = getattr(self, name, None)
+            if queue is not None:
+                queue.drain()
+
     def clean(self):
-        self.token_ids_cpu: list[torch.Tensor] = []
+        self._wait_for_pending_copies()
+        self.token_ids_cpu: list[tuple] = []
         self.logprobs_cpu: list[torch.Tensor | None] = []
 
         self.prev_batch: ScheduledBatch | None = None
