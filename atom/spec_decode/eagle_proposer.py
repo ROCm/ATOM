@@ -240,7 +240,11 @@ class EagleProposer(Drafter):
         fc = get_forward_context()
         q = self.mtp_k + 1
         self._publish_draft_shape(
-            fc, running_bs * q, running_bs * q, running_tokens_are_unified=True
+            fc,
+            running_bs * q,
+            running_bs * q,
+            running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[1:2],
         )
         context_lens = fc.attn_metadata.context_lens[:running_bs].to(torch.int64)
         offsets = torch.arange(q, device=positions.device) - (q - 1)
@@ -584,6 +588,10 @@ class EagleProposer(Drafter):
         if self._share_mtp_indices:
             self.model.model.set_skip_topk(True)
         fc = get_forward_context()
+        # Capture the same live sequence-count slot that propose publishes.
+        fc.context.scheduled_tokens_gpu = self.runner.forward_vars["batch_info"].gpu[
+            0:1
+        ]
         # Where each synthetic sequence actually is. Warming at position 0 would
         # compile a masked, near-empty window -- a shape steady-state decode
         # never draws.

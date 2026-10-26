@@ -70,7 +70,12 @@ def _fake_proposer(num_attention_heads, *, fused, returns_slots=False):
     proposer = types.SimpleNamespace(
         _share_mtp_indices=False,
         device=torch.device("cpu"),
-        runner=types.SimpleNamespace(attn_metadata_builder=builder),
+        runner=types.SimpleNamespace(
+            attn_metadata_builder=builder,
+            forward_vars={
+                "batch_info": types.SimpleNamespace(gpu=torch.tensor([3, 15, 0]))
+            },
+        ),
         # The real rewrite drops the metadata to one row per sequence and
         # hands back the target's verify width.
         _enter_decode_metadata=lambda *a: (TARGET_QUERY_WIDTH, None),
@@ -89,10 +94,16 @@ def _warm_one_size(proposer, running_bs=3):
         work_indptr="target-plan",
         work_info_set="target-info",
     )
-    fc = types.SimpleNamespace(attn_metadata=attn_metadata)
+    fc = types.SimpleNamespace(
+        attn_metadata=attn_metadata, context=types.SimpleNamespace()
+    )
     positions = torch.zeros(running_bs, dtype=torch.int64)
     with patch("atom.spec_decode.eagle_proposer.get_forward_context", return_value=fc):
         EagleProposer._step_warmup_inputs(proposer, running_bs, positions=positions)
+    assert (
+        fc.context.scheduled_tokens_gpu.data_ptr()
+        == proposer.runner.forward_vars["batch_info"].gpu.data_ptr()
+    )
     return attn_metadata, positions
 
 
@@ -236,3 +247,36 @@ def test_every_size_warms_from_the_capture_state():
     # And the buffers are left the way the capture left them.
     assert not var["kv_indptr"].gpu.any()
     assert var["context_lens"].gpu.tolist() == [7] * 8
+
+
+def test_step0_warmup_publishes_live_target_token_count():
+    batch_info = torch.tensor([3, 15, 0], dtype=torch.int32)
+    fc = types.SimpleNamespace(
+        attn_metadata=types.SimpleNamespace(context_lens=torch.tensor([7, 8, 9])),
+        context=types.SimpleNamespace(),
+    )
+    proposer = types.SimpleNamespace(
+        mtp_k=4,
+        runner=types.SimpleNamespace(
+            forward_vars={"batch_info": types.SimpleNamespace(gpu=batch_info)}
+        ),
+        config=types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(data_parallel_size=1)
+        ),
+    )
+    proposer._publish_draft_shape = types.MethodType(
+        Drafter._publish_draft_shape, proposer
+    )
+    with patch("atom.spec_decode.eagle_proposer.get_forward_context", return_value=fc):
+        EagleProposer._step0_warmup_inputs(
+            proposer,
+            3,
+            input_ids=torch.empty(3, 5, dtype=torch.int32),
+            positions=torch.empty(3, 5, dtype=torch.int64),
+            hidden_states=torch.empty(3, 5, 2),
+            last_token_indices=torch.empty(3, dtype=torch.int64),
+        )
+    assert fc.context.running_tokens == 15
+    assert fc.context.scheduled_tokens_gpu.data_ptr() == batch_info[1:2].data_ptr()
+    batch_info[1] = 10
+    assert fc.context.scheduled_tokens_gpu.item() == 10
