@@ -3883,3 +3883,46 @@ def test_store_reads_the_region_map_only_on_a_page_layout():
     v41 = _config(kv_transfer_config=store)
     v41.hf_config.model_type = "deepseek_v41"
     assert KVConnectorFactory.topology_reads_block_regions(v41)
+
+
+@pytest.mark.parametrize("model_type", ["minimax_m3", "minimax_m3_vl"])
+def test_m3_store_codec_includes_all_page_planes(model_type):
+    from atom.kv_transfer.disaggregation.page_region import page_region
+    from atom.kv_transfer.disaggregation.types import KVTransferTensors
+
+    config = _config()
+    config.hf_config.model_type = model_type
+    check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+    connector = object.__new__(MooncakeStoreOffloadConnector)
+    connector._config = config
+    fields = {
+        name: torch.zeros((4, width), dtype=torch.uint8)
+        for name, width in [
+            ("k", 2048),
+            ("v", 2048),
+            ("k_scale", 64),
+            ("v_scale", 64),
+            ("index", 144),
+            ("draft", 2048),
+        ]
+    }
+    transfer = KVTransferTensors(
+        pages=[page_region(t, semantic_role=f"m3.{name}") for name, t in fields.items()]
+    )
+    transfer.set_block_count(4)
+    codec = connector._make_codec({}, transfer, 4)
+    assert codec.bytes_per_block == sum(t.shape[1] for t in fields.values())
+    for bad in (None, KVTransferTensors()):
+        with pytest.raises(ValueError, match="complete PAGE"):
+            connector._make_codec({}, bad, 4)
+
+
+def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatch):
+    config = _config()
+    config.hf_config.model_type = "minimax_m3_vl"
+    # Even with an identical page namespace, a legacy dense object must not
+    # be interpreted as complete M3 PAGE bytes containing the index cache.
+    monkeypatch.setattr(offcfg, "build_page_namespace", lambda *args: "same-page")
+    m3_namespace = keys.store_namespace(config, CHUNK)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: "dense")
+    assert keys.store_namespace(config, CHUNK) != m3_namespace

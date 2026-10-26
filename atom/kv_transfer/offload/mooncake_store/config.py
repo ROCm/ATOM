@@ -186,24 +186,24 @@ def parse_mooncake_store_config(
 
 
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
-    """Require dense KV or V4.1's PAGEs, no DCP, and whole chunks.
+    """Accept dense, M3 PAGE, and V4.1 replay PAGEs; refuse other layouts and DCP.
 
-    The Store holds one object per (rank, chunk) of the dense codec's opaque
-    block bytes, or of V4.1's PAGE regions, whose request state is rebuilt by
-    replay. That V4.1 on the Store needs bounded replay is the model's own
-    runtime gate (`deepseek_v41.config.validate_runtime_config`). Other hybrid
-    layouts need a state tier this connector does not carry. A DCP rank's
-    pages cover a virtual block that the chunk keys do not name.
+    M3 uses complete PAGE regions, including its NSA index cache. V4.1's PAGE
+    regions are stored the same way and its request state is rebuilt by replay.
+    That V4.1 on the Store needs bounded replay is the model's own runtime gate
+    (`deepseek_v41.config.validate_runtime_config`). Other hybrid layouts need a
+    state tier this connector does not carry. A DCP rank's pages cover a
+    virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is neither dense nor V4.1, DCP > 1, or the chunk
-            is not a whole number of KV blocks.
+        ValueError: The model is neither dense, M3, nor V4.1, DCP > 1, or the
+            chunk is not a whole number of KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
-    if layout not in ("dense", _REPLAY_PAGE_LAYOUT):
+    if layout not in ("dense", "m3", _REPLAY_PAGE_LAYOUT):
         raise ValueError(
-            "the Mooncake Store offload moves the dense KV layout and V4.1's "
-            f"replay PAGEs; this model resolves to {layout!r}"
+            "the Mooncake Store offload moves the dense KV layout, M3 PAGE "
+            f"layout, and V4.1's replay PAGEs; this model resolves to {layout!r}"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:
@@ -253,8 +253,7 @@ def _pools(value: Any) -> dict[str, StorePool]:
         return {}
     if not isinstance(value, Mapping) or not value:
         raise ValueError(
-            "mooncake_store.pools must be a non-empty JSON object keyed by RDMA "
-            "device"
+            "mooncake_store.pools must be a non-empty JSON object keyed by RDMA device"
         )
     pools = {}
     for device, pool in value.items():

@@ -4,7 +4,8 @@
 """Store keys for KV chunks: a layout namespace, a rank, and a prefix hash.
 
 One Store object holds one PP/TP rank's bytes of one ``chunk_tokens`` chunk of
-a prompt, as packed by its dense or replay PAGE codec. Its key is
+a prompt, packed by the dense codec, the M3 complete-PAGE codec, or the V4.1
+replay PAGE codec. Its key is
 
     ``{namespace}/w{rank}of{world}/{digest}``
 
@@ -119,6 +120,16 @@ def kv_storage_formats(config: Any) -> dict[str, str]:
     }
 
 
+def _codec_id(config: Any) -> str:
+    """The codec version folded into this server's Store namespace."""
+    layout = offcfg.select_offload_layout(config)
+    if layout == "m3":
+        return "m3-complete-page-v1"
+    if uses_replay_pages(config):
+        return REPLAY_PAGE_CODEC_ID
+    return CODEC_ID
+
+
 def store_namespace(config: Any, chunk_tokens: int) -> str:
     """The key prefix every chunk of this server's KV layout is stored under.
 
@@ -155,7 +166,7 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
             getattr(config, "hf_overrides", None), sort_keys=True, default=str
         ),
         "revision": str(getattr(hf, "_commit_hash", None)),
-        "codec": REPLAY_PAGE_CODEC_ID if uses_replay_pages(config) else CODEC_ID,
+        "codec": _codec_id(config),
     }
     canonical = json.dumps(
         document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
