@@ -338,23 +338,33 @@ def _normalized_radixark():
     return hf
 
 
-def test_dflash_needs_non_causal_kv():
-    """Only a non-MLA BLOCK drafter reads its own pool bidirectionally."""
+def test_dflash_uses_dflash_pool():
+    """Only the SpecForge DFlash draft owns the DCP1 FLASH-layout pool."""
     dk = pytest.importorskip(
         "atom.spec_decode.draft_kv",
         reason="draft_kv imports aiter lazily but config does not",
         exc_type=(ImportError, RuntimeError),
     )
-    assert dk.needs_non_causal_kv(_normalized_radixark()) is True
+    assert dk.uses_dflash_pool(_normalized_radixark()) is True
 
-    # The MLA DSpark draft is also a block drafter, but it binds into the
-    # target's latent rows and gets non-causal from the MLA path instead.
-    mla = types.SimpleNamespace(dspark_with_draft=True, kv_lora_rank=512)
-    assert dk.needs_non_causal_kv(mla) is False
+    # MiniMax-M3.1's DSpark draft is ALSO a non-MLA block drafter with a pool of
+    # its own, but it binds a SHUFFLE pool with per-token scales; keying on
+    # "non-MLA block drafter" handed it this one.
+    minimax = types.SimpleNamespace(
+        architectures=["DSparkMiniMaxDraftModel"], dspark_with_draft=True
+    )
+    assert dk.uses_dflash_pool(minimax) is False
 
-    # A serial MTP/EAGLE draft emits one token per pass: plainly causal.
-    serial = types.SimpleNamespace(num_hidden_layers=1)
-    assert dk.needs_non_causal_kv(serial) is False
+    # The MLA DSpark draft binds into the target's latent rows: no pool.
+    mla = types.SimpleNamespace(
+        architectures=["K3DSparkModel"], dspark_with_draft=True, kv_lora_rank=512
+    )
+    assert dk.uses_dflash_pool(mla) is False
+
+    # A serial MTP/EAGLE draft, and a config with no architectures at all.
+    eagle = types.SimpleNamespace(architectures=["Eagle3LlamaModel"])
+    assert dk.uses_dflash_pool(eagle) is False
+    assert dk.uses_dflash_pool(types.SimpleNamespace(num_hidden_layers=1)) is False
 
 
 def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
@@ -875,13 +885,13 @@ def _guard_refuses(draft_hf):
     # load. Skip per test, not per module, so the source-only guard test below
     # still runs on the CPU-only CI runner.
     pytest.importorskip("aiter")
-    from atom.spec_decode.draft_kv import needs_non_causal_kv
+    from atom.spec_decode.draft_kv import uses_dflash_pool
     from atom.utils.selector import attn_family, get_attn_backend
 
     owns_sibling_pool = draft_hf is not None and bool(
         get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL
     )
-    return owns_sibling_pool and not needs_non_causal_kv(draft_hf)
+    return owns_sibling_pool and not uses_dflash_pool(draft_hf)
 
 
 def test_dcp_guard_admits_the_dflash_draft():
@@ -975,7 +985,7 @@ def _entry_tokens(block_size, dcp, non_causal_gqa):
     stub = types.SimpleNamespace(
         runner=types.SimpleNamespace(block_size=block_size),
         dcp_world_size=dcp,
-        _draft_reads_non_causal_gqa=non_causal_gqa,
+        _draft_uses_dflash_pool=non_causal_gqa,
     )
     return DSparkProposer._draft_entry_tokens.fget(stub)
 

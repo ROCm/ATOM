@@ -12,24 +12,27 @@ logger = logging.getLogger("atom")
 DRAFT_KV_ROWS = "draft_kv"
 
 
-def needs_non_causal_kv(draft_hf) -> bool:
-    """Whether this draft reads its own KV pool bidirectionally.
+#: Drafts whose pool `draft_kv_builder` builds outside the target's DCP group,
+#: entry-granular in FLASH layout, with one per-tensor scale. Keyed on the
+#: architecture `SpeculativeConfig.hf_config_override` renames the SpecForge
+#: DFlash checkpoint to.
+_DFLASH_POOL_ARCHS = frozenset({"K3DFlashModel"})
 
-    A BLOCK drafter proposes all its tokens in one pass and lets every position
-    in the block attend every other, so its read is non-causal -- unlike a
-    serial MTP/EAGLE draft, which emits one token per pass and is plainly causal.
+
+def uses_dflash_pool(draft_hf) -> bool:
+    """Whether this draft owns the DFlash pool rather than the generic one.
 
     Asked of the config rather than the model because this runs from the
-    proposer's `__init__`, before the draft model exists. `dspark_with_draft` is
-    the marker `_normalize_draft_dspark_config` synthesizes for exactly the
-    standalone block drafters; `kv_lora_rank` then separates the two backbones,
-    and only the non-MLA one reads through a pool of its own (an MLA draft binds
-    into the target's latent rows and gets its non-causal read from the MLA
-    path, which already takes `attn_metadata.causal`).
+    proposer's `__init__`, before the draft model exists.
+
+    Keyed on the architecture, NOT on "a non-MLA block drafter": MiniMax-M3.1's
+    DSpark draft is one of those too, and it binds a 5-D SHUFFLE pool with
+    per-token fp8 scales that its per-row decode reads. Handing it this pool's
+    FLASH layout and 1.0 scales would be wrong bytes with no error. An MLA draft
+    owns no pool at all -- it binds into the target's latent rows.
     """
-    return bool(getattr(draft_hf, "dspark_with_draft", False)) and not getattr(
-        draft_hf, "kv_lora_rank", None
-    )
+    arch = (getattr(draft_hf, "architectures", None) or [""])[0]
+    return arch in _DFLASH_POOL_ARCHS
 
 
 def uses_sglang_block_attn() -> bool:
@@ -85,7 +88,7 @@ def draft_kv_builder(model_runner, draft_hf):
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
 
-    non_causal = needs_non_causal_kv(draft_hf)
+    non_causal = uses_dflash_pool(draft_hf)
     kv_cache_dtype = model_runner.config.kv_cache_dtype
 
     if not non_causal:
@@ -183,7 +186,7 @@ class DraftKvBuilder(PoolRowsMixin):
         self.model_runner = model_runner
         self._make_pool = make_pool
         # Decides the LAYOUT this pool is bound in, not its size. See
-        # `needs_non_causal_kv` and `MhaKvPool.fa_views`.
+        # `uses_dflash_pool` and `MhaKvPool.fa_views`.
         self._non_causal = non_causal
         self._kv_pool = None
         self.num_blocks = 0  # set in allocate_kv_cache_tensors

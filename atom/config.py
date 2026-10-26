@@ -1247,8 +1247,6 @@ def _normalize_draft_dspark_config(
 
     mask_token_id = _standalone_dspark_field(hf_config, "dspark_noise_token_id")
     if mask_token_id is None:
-        mask_token_id = dflash_config.get("mask_token_id")
-    if mask_token_id is None:
         raise ValueError(
             "Standalone DSpark draft config is missing `mask_token_id` (the "
             "noise token the draft block is seeded with)."
@@ -2356,7 +2354,7 @@ class Config:
                 # OUT of the dcp group and runs at DCP1, so the head axis is
                 # never sharded at all -- which exactly one draft family in
                 # this tree does (the DFlash non-causal GQA block drafter,
-                # `needs_non_causal_kv`; the target stays at DCP8 while the
+                # `uses_dflash_pool`; the target stays at DCP8 while the
                 # draft reads a pool whose entry is `block_size * dcp_size`
                 # tokens wide, `spec_decode/draft_kv.py:46-57`). Note
                 # `verify_shared_kv_fwd` returns only `o` and never an LSE, so
@@ -2384,14 +2382,14 @@ class Config:
                 # sharded on the head axis. Latent-KV drafts share the target's
                 # cache, own no pool, and are immune. Same helper
                 # `kv_transfer/offload/mp/deployment.py:182` already uses.
-                from atom.spec_decode.draft_kv import needs_non_causal_kv
+                from atom.spec_decode.draft_kv import uses_dflash_pool
                 from atom.utils.selector import attn_family, get_attn_backend
 
                 draft_hf = self.speculative_config.draft_model_hf_config
                 owns_sibling_pool = draft_hf is not None and bool(
                     get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL
                 )
-                if owns_sibling_pool and not needs_non_causal_kv(draft_hf):
+                if owns_sibling_pool and not uses_dflash_pool(draft_hf):
                     # `raise`, not `assert`: `python -O` strips asserts, and a
                     # stripped guard restores exactly the silent mis-shard this
                     # exists to prevent.

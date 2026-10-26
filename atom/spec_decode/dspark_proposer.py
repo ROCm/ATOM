@@ -89,7 +89,7 @@ class DSparkProposer(Drafter):
         from atom.spec_decode.draft_kv import uses_sglang_block_attn
 
         self._sglang_block_attn = (
-            self._draft_reads_non_causal_gqa and uses_sglang_block_attn()
+            self._draft_uses_dflash_pool and uses_sglang_block_attn()
         )
         if self._with_draft:
             self._init_draft_block_buffers()
@@ -282,7 +282,7 @@ class DSparkProposer(Drafter):
             self._blk_prefix_lens = None
             self._blk_req_rows = None
 
-        if self._draft_reads_non_causal_gqa:
+        if self._draft_uses_dflash_pool:
             # The DRAFT's own context slot mapping, one slot per token of the
             # TARGET forward -- see `_publish_draft_ctx_slots`. Sized at the
             # widest token axis the scheduler can hand over, because a prefill
@@ -501,23 +501,24 @@ class DSparkProposer(Drafter):
         return num_spec or self.dspark_block_size
 
     @property
-    def _draft_reads_non_causal_gqa(self) -> bool:
-        """Whether the draft block reads through mha_v3 rather than aiter MLA.
+    def _draft_uses_dflash_pool(self) -> bool:
+        """Whether the draft owns the DFlash pool (`uses_dflash_pool`).
 
         The flavor is the draft CONFIG's, resolved the same way
         `draft_kv_builder` resolves it, so the proposer and the pool cannot
-        disagree about which kernel the block is planned for. A GQA draft plans
-        nothing: mha_v3 takes the page table and `cache_seqlens` and derives its
-        own tiling, so the whole persistent MLA work plan is skipped.
+        disagree about the pool's geometry or about which read the block is
+        planned for. That read plans nothing: it takes the page table and the
+        context lengths and derives its own tiling, so the whole persistent MLA
+        work plan is skipped.
         """
         spec = getattr(self, "speculative_config", None)
         if spec is None or not self._with_draft:
             # Inline V4 DSpark, or a double that never set one up: neither owns
             # a pool of its own, so neither takes the non-causal GQA path.
             return False
-        from atom.spec_decode.draft_kv import needs_non_causal_kv
+        from atom.spec_decode.draft_kv import uses_dflash_pool
 
-        return needs_non_causal_kv(spec.draft_model_hf_config)
+        return uses_dflash_pool(spec.draft_model_hf_config)
 
     @property
     def _draft_is_dcp_sharded(self) -> bool:
@@ -534,7 +535,7 @@ class DSparkProposer(Drafter):
         whole token axis. The target is still at DCP8 -- see
         `_draft_entry_tokens` for what that costs.
         """
-        return self.dcp_world_size > 1 and not self._draft_reads_non_causal_gqa
+        return self.dcp_world_size > 1 and not self._draft_uses_dflash_pool
 
     @property
     def _draft_entry_tokens(self) -> int:
@@ -552,7 +553,7 @@ class DSparkProposer(Drafter):
         For the DCP-sharded (MLA) draft this is the plain block: it addresses
         in local terms, where one id really is `block_size` of its own tokens.
         """
-        if self._draft_reads_non_causal_gqa:
+        if self._draft_uses_dflash_pool:
             return self.runner.block_size * self.dcp_world_size
         return self.runner.block_size
 
@@ -1031,7 +1032,7 @@ class DSparkProposer(Drafter):
         # never reads it, and `_resolve_dtype_q` reaches through
         # `layers[0].self_attn.mla_attn`, which a GQA draft does not have.
         dtype_q = None
-        if not self._draft_reads_non_causal_gqa:
+        if not self._draft_uses_dflash_pool:
             dtype_q = self._blk_dtype_q
             if dtype_q is None:
                 dtype_q, final = self._resolve_dtype_q(forward_context)
@@ -1292,7 +1293,7 @@ class DSparkProposer(Drafter):
             )
             return
 
-        if self._draft_reads_non_causal_gqa:
+        if self._draft_uses_dflash_pool:
             # A GQA draft reads through mha_v3, which plans nothing: it takes
             # the page table and `cache_seqlens` directly and derives its own
             # tiling. Everything below this point is the aiter MLA persistent
