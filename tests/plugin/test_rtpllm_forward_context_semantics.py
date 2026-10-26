@@ -1,10 +1,15 @@
 """Semantic checks for rtpllm forward-context bridge."""
 
+import importlib.util
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+import atom.config
 
 
 class _KwargsObject:
@@ -30,9 +35,9 @@ def _install_forward_context_stubs():
         sys.modules[name] = module
         return module
 
-    config = sys.modules["atom.config"]
+    config = atom.config
     config_attr = getattr(config, "get_current_atom_config", None)
-    config.get_current_atom_config = lambda: config.Config()
+    config.get_current_atom_config = lambda: SimpleNamespace(kv_cache_block_size=16)
 
     attention_gdn = stub(
         "atom.model_ops.attention_gdn",
@@ -76,8 +81,8 @@ def _install_forward_context_stubs():
     utils_forward_context._forward_kv_cache_context = SimpleNamespace(kv_cache_data={})
     utils_forward_context.reset_forward_context = lambda *args, **kwargs: None
     utils_forward_context.set_forward_context = lambda *args, **kwargs: None
-    utils_forward_context.get_forward_context = (
-        lambda *args, **kwargs: SimpleNamespace()
+    utils_forward_context.get_forward_context = lambda *args, **kwargs: (
+        SimpleNamespace()
     )
 
     def _set_kv_cache_data(value):
@@ -99,19 +104,26 @@ def _install_forward_context_stubs():
     return restore
 
 
-# The module under test binds these names at import time, so the stubs only
-# have to be in place across the import below -- and are put back immediately
-# after, because `sys.modules` is process-wide and the rest of the suite wants
-# the real ones.
-_restore_forward_context_stubs = _install_forward_context_stubs()
-
-from atom.plugin.rtpllm.utils.forward_context import (
-    RTPForwardContext,
-    RTPForwardMLAContext,
-    RTPForwardQwen35HybridContext,
+# Import a private copy so this test also works when another test has already
+# imported the production module. Its dependencies are stubbed only while the
+# private copy is loaded; the public module remains untouched.
+_MODULE_NAME = "atom.plugin.rtpllm.utils._forward_context_semantics_test"
+_MODULE_PATH = (
+    Path(__file__).resolve().parents[2] / "atom/plugin/rtpllm/utils/forward_context.py"
 )
+_restore_forward_context_stubs = _install_forward_context_stubs()
+try:
+    _spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
+    assert _spec is not None and _spec.loader is not None
+    _module = importlib.util.module_from_spec(_spec)
+    sys.modules[_MODULE_NAME] = _module
+    _spec.loader.exec_module(_module)
+finally:
+    _restore_forward_context_stubs()
 
-_restore_forward_context_stubs()
+RTPForwardContext = _module.RTPForwardContext
+RTPForwardMLAContext = _module.RTPForwardMLAContext
+RTPForwardQwen35HybridContext = _module.RTPForwardQwen35HybridContext
 
 
 def _make_attn_inputs(
@@ -120,6 +132,7 @@ def _make_attn_inputs(
     prefix_lengths=None,
     sequence_lengths=None,
     sequence_lengths_plus_1_d=None,
+    sequence_lengths_plus_1_device=None,
     cu_seqlens=None,
     kv_cache_block_id_device=None,
     kv_cache_kernel_block_id_device=None,
@@ -131,6 +144,7 @@ def _make_attn_inputs(
         prefix_lengths=prefix_lengths,
         sequence_lengths=sequence_lengths,
         sequence_lengths_plus_1_d=sequence_lengths_plus_1_d,
+        sequence_lengths_plus_1_device=sequence_lengths_plus_1_device,
         cu_seqlens=cu_seqlens,
         kv_cache_block_id_device=kv_cache_block_id_device,
         kv_cache_kernel_block_id_device=kv_cache_kernel_block_id_device,
@@ -194,6 +208,121 @@ def test_rtpllm_forward_context_decode_metadata_state_indices_shape():
     assert int(md.non_spec_state_indices_tensor.min().item()) >= 0
     # last token idx = 35 -> block col 2 under seq_size_per_block=16.
     assert md.non_spec_state_indices_tensor.cpu().tolist() == [125]
+
+
+def test_qwen35_prefill_reads_prefix_state_and_writes_last_chunk_block():
+    attn_inputs = _make_attn_inputs(
+        input_lengths=torch.tensor([5, 3], dtype=torch.int32),
+        prefix_lengths=torch.tensor([4, 0], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[10, 11, 12], [20, 21, 22]], dtype=torch.int32
+        ),
+        is_prefill=True,
+    )
+    md = RTPForwardQwen35HybridContext._build_gdn_metadata(
+        attn_inputs, seq_size_per_block=4, num_tokens=8
+    )
+    assert md.non_spec_state_indices_in_tensor.tolist() == [10, 20]
+    assert md.non_spec_state_indices_tensor.tolist() == [12, 20]
+    assert md.has_initial_state.tolist() == [True, False]
+
+
+def test_qwen35_decode_mixed_boundary_reads_previous_and_writes_current_block():
+    attn_inputs = _make_attn_inputs(
+        input_lengths=torch.tensor([1, 1], dtype=torch.int32),
+        sequence_lengths=torch.tensor([0, 0], dtype=torch.int32),
+        sequence_lengths_plus_1_device=torch.tensor([5, 7], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[10, 11, 12], [20, 21, 22]], dtype=torch.int32
+        ),
+        is_prefill=False,
+    )
+    md = RTPForwardQwen35HybridContext._build_gdn_metadata(
+        attn_inputs, seq_size_per_block=4, num_tokens=2
+    )
+    # The device lengths, not the deliberately stale host lengths, drive replay.
+    assert md.non_spec_state_indices_in_tensor.tolist() == [10, 21]
+    assert md.non_spec_state_indices_tensor.tolist() == [11, 21]
+
+
+def test_qwen35_decode_context_length_is_not_query_length():
+    # RTP input_lengths is the accumulated context, not the number of tokens
+    # scheduled in this decode step. Only the last table column is populated.
+    attn_inputs = _make_attn_inputs(
+        input_lengths=torch.tensor([1274], dtype=torch.int32),
+        sequence_lengths=torch.tensor([1274], dtype=torch.int32),
+        sequence_lengths_plus_1_device=torch.tensor([1275], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[-1] * 19 + [7]], dtype=torch.int32
+        ),
+        is_prefill=False,
+    )
+    md = RTPForwardQwen35HybridContext._build_gdn_metadata(
+        attn_inputs, seq_size_per_block=64, num_tokens=1
+    )
+    assert md.non_spec_state_indices_in_tensor.tolist() == [7]
+    assert md.non_spec_state_indices_tensor.tolist() == [7]
+
+
+def test_qwen35_decode_context_length_crosses_block_boundary():
+    attn_inputs = _make_attn_inputs(
+        input_lengths=torch.tensor([1280], dtype=torch.int32),
+        sequence_lengths=torch.tensor([1280], dtype=torch.int32),
+        sequence_lengths_plus_1_device=torch.tensor([1281], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[-1] * 19 + [7, 8]], dtype=torch.int32
+        ),
+        is_prefill=False,
+    )
+    md = RTPForwardQwen35HybridContext._build_gdn_metadata(
+        attn_inputs, seq_size_per_block=64, num_tokens=1
+    )
+    assert md.non_spec_state_indices_in_tensor.tolist() == [7]
+    assert md.non_spec_state_indices_tensor.tolist() == [8]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm/CUDA")
+def test_qwen35_graph_replay_updates_previous_state_at_block_boundary():
+    device = torch.device("cuda")
+    # Graph block-table views can have a wider backing row stride.
+    table = torch.tensor(
+        [[10, 11, -1], [20, 21, -1]], dtype=torch.int32, device=device
+    )[:, :2]
+    next_lengths = torch.tensor([5, 7], dtype=torch.int32, device=device)
+    query_lengths = torch.ones(2, dtype=torch.int32, device=device)
+    outputs = torch.tensor([11, 21], dtype=torch.int32, device=device)
+    previous = torch.empty_like(outputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        RTPForwardQwen35HybridContext._previous_state_slots(
+            table, next_lengths, outputs, 4, previous, query_lengths
+        )
+    graph.replay()
+    assert previous.cpu().tolist() == [10, 21]
+    next_lengths.copy_(torch.tensor([6, 5], dtype=torch.int32, device=device))
+    graph.replay()
+    assert previous.cpu().tolist() == [11, 20]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm/CUDA")
+def test_qwen35_graph_replay_uses_one_query_token_per_request():
+    device = torch.device("cuda")
+    table = torch.tensor([[-1, -1, 7, 8]], dtype=torch.int32, device=device)
+    next_lengths = torch.tensor([12], dtype=torch.int32, device=device)
+    outputs = torch.tensor([7], dtype=torch.int32, device=device)
+    previous = torch.empty_like(outputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        RTPForwardQwen35HybridContext._previous_state_slots(
+            table, next_lengths, outputs, 4, previous, unit_query_length=True
+        )
+    graph.replay()
+    assert previous.cpu().tolist() == [7]
+    next_lengths.copy_(torch.tensor([13], dtype=torch.int32, device=device))
+    outputs.copy_(torch.tensor([8], dtype=torch.int32, device=device))
+    graph.replay()
+    assert previous.cpu().tolist() == [7]
 
 
 def test_plugin_attention_metadata_slot_mapping_uses_physical_block_table():
@@ -407,7 +536,7 @@ def test_rtpllm_decode_seq_lens_uses_rtp_plus_one_in_graph_and_eager_modes():
     eager_inputs = _make_attn_inputs(
         input_lengths=input_lengths,
         sequence_lengths=sequence_lengths,
-        sequence_lengths_plus_1_d=sequence_lengths_plus_1,
+        sequence_lengths_plus_1_device=sequence_lengths_plus_1,
         is_prefill=False,
     )
     eager_seq_lens = RTPForwardContext._build_seq_lens(
@@ -418,7 +547,7 @@ def test_rtpllm_decode_seq_lens_uses_rtp_plus_one_in_graph_and_eager_modes():
     graph_inputs = _make_attn_inputs(
         input_lengths=input_lengths,
         sequence_lengths=sequence_lengths,
-        sequence_lengths_plus_1_d=sequence_lengths_plus_1,
+        sequence_lengths_plus_1_device=sequence_lengths_plus_1,
         is_prefill=False,
         is_cuda_graph=True,
     )
@@ -632,7 +761,8 @@ def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
     ):
         assert mla_layer.kv_cache is layer_cache
         assert indexer.k_cache.kv_cache[0] is not old_index_cache
-        assert indexer.k_cache.kv_cache[0].shape == (32, 1, 144)
+        # The mocked KV base has 2 x 3 physical token slots.
+        assert indexer.k_cache.kv_cache[0].shape == (6, 1, 144)
 
     assert mla_layer.kv_cache is old_cache
     assert indexer.k_cache.kv_cache[0] is old_index_cache

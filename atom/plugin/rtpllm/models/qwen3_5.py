@@ -116,7 +116,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         self._model_dtype = first_param.dtype
         from atom.plugin.rtpllm.utils import RTPForwardQwen35HybridContext
 
-        self._rtp_forward_context_cls = RTPForwardQwen35HybridContext
+        self._rtp_forward_context_cls = getattr(
+            self, "_rtp_forward_context_cls", RTPForwardQwen35HybridContext
+        )
         # Cache module layer maps once to avoid per-forward model.modules() traversal.
         self._rtp_layer_maps = self._rtp_forward_context_cls.collect_layer_maps(
             model=self.model
@@ -345,11 +347,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         # writing to the kv cache, so the fused-QKV buffer must be sized for
         # the larger (post-alignment) count.
         kv_cache = getattr(self, "kv_cache", None)
-        rtp_kv_heads: int | None = (
-            int(kv_cache.num_kv_heads)
-            if kv_cache is not None and int(kv_cache.num_kv_heads) > 0
-            else None
-        )
+        cache_kv_heads = int(getattr(kv_cache, "num_kv_heads", 0))
+        rtp_kv_heads: int | None = cache_kv_heads if cache_kv_heads > 0 else None
 
         for layer in self._atom_attn_pyobj._rtp_full_attn_layers:
             layer.prewarm_for_cuda_graph(
@@ -398,6 +397,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             "slot_base": torch.empty(max_bs, device=device, dtype=torch.int32),
             "token_offset": torch.empty(max_bs, device=device, dtype=torch.int32),
             "slot_mapping": torch.empty(max_bs, device=device, dtype=torch.int64),
+            "previous_state_slots_i32": torch.empty(
+                max_bs, device=device, dtype=torch.int32
+            ),
             "seq_lens_i32": torch.empty(max_bs, device=device, dtype=torch.int32),
             "block_table_i32": torch.empty(
                 max_bs, max_blocks, device=device, dtype=torch.int32

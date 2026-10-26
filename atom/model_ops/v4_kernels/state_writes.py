@@ -79,7 +79,9 @@ def _swa_write_kernel(
     pool_rows,  # rows in that view; nothing may be written past it
     head_dim: tl.constexpr,
     ring_start,
+    cached_until_ptr,  # [bs] int: positions below it stay as they are
     BLOCK_D: tl.constexpr,
+    CACHED_UNTIL: tl.constexpr,
     RING_SLOTS: tl.constexpr,
     SLOT_ROWS: tl.constexpr,
     RING_STRIDE: tl.constexpr,
@@ -123,6 +125,9 @@ def _swa_write_kernel(
     dst_row = window_row(
         slot, pos, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
     )
+    if CACHED_UNTIL:
+        # a row its ring already holds stays as it is
+        dst_row = tl.where(pos < tl.load(cached_until_ptr + batch_idx), -1, dst_row)
 
     # `cu_seqlens_q` and `write_n` bound the reads; nothing bounded the write.
     # `slot` and `pos` are the row's only inputs and both come from per-forward
@@ -156,6 +161,7 @@ def swa_write(
     k_packed: torch.Tensor | None = None,
     k_rope: torch.Tensor | None = None,
     pool_rope: torch.Tensor | None = None,
+    cached_until: torch.Tensor | None = None,
     prefix: str = "",
 ) -> None:
     """SWA ring in-place write, dispatching on the kv-cache layout.
@@ -202,8 +208,13 @@ def swa_write(
             2buff path only.
         pool_rope: [rows, rope_head_dim] bf16 RoPE plane view — presence selects
             the fp8 2buff path.
+        cached_until: [bs] int — bf16 path: per seq, the position below which
+            its ring already holds the rows and keeps them (a forward that
+            recomputes rows it has, V4.1 decoder bounded replay). None writes
+            every row.
     """
     if pool_rope is not None:
+        assert cached_until is None, "the fp8 2buff path writes every row"
         # fp8 2buff: scatter the op-quantized extend K (k_packed/k_rope) into both
         # planes. Flatten the [T, 1, *] quant-kernel views to [T, *]; the bf16
         # `kv` source is unused here.
@@ -256,7 +267,9 @@ def swa_write(
         pool.shape[0],
         head_dim,
         window.ring_start,
+        positions if cached_until is None else cached_until,
         BLOCK_D=BLOCK_D,
+        CACHED_UNTIL=cached_until is not None,
         **window_constexprs(window),
     )
 

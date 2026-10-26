@@ -9,6 +9,31 @@ pytest.importorskip("aiter", reason="the sampler and rejection sampler are AITER
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import Sampler
 
+ANCHOR = 7  # never a target below: a draft read from an anchor's slot is rejected
+
+
+def verify_stream(draft_ids, widths):
+    """The step's input ids for requests of ``widths`` drafts each -- an anchor,
+    then the request's drafts -- and the logits row verifying each draft (the
+    row before it)."""
+    ids, rows, d = [], [], 0
+    for width in widths:
+        start = len(ids)
+        ids.append(ANCHOR)
+        ids.extend(draft_ids[d : d + width])
+        rows.extend(range(start, start + width))
+        d += width
+    return (
+        torch.tensor(ids, device="cuda", dtype=torch.int32),
+        torch.tensor(rows, device="cuda", dtype=torch.int64),
+    )
+
+
+def bonus_rows(widths):
+    """Each request's last row in `verify_stream`'s layout: anchor + drafts."""
+    ends = torch.tensor(widths, device="cuda", dtype=torch.int64).add(1).cumsum(0)
+    return ends - 1
+
 
 def test_verification_parameters_follow_ragged_request_rows(monkeypatch):
     observed = {}
@@ -79,13 +104,14 @@ def test_stochastic_verification_preserves_conditional_target_distribution():
         temperatures,
         needs_independent_noise=True,
     )
-    output, accepted = rejection_sample(
-        torch.zeros(n * 2, device="cuda", dtype=torch.int32),
+    output, (accepted, _, _) = rejection_sample(
+        *verify_stream([0] * (n * 2), [2] * n),
         2,
         cu,
         None,
         target_logits,
         bonus,
+        bonus_rows([2] * n),
         target_token_ids=targets,
     )
     # A draft of [0, 0] exposes position j only when the preceding target draws
@@ -146,13 +172,14 @@ def test_target_prefixes_cover_every_ragged_acceptance_length(stochastic):
     bonus = torch.full((len(widths),), 3, device="cuda", dtype=torch.int32)
     if not stochastic:
         logits.scatter_(1, targets.long().unsqueeze(-1), 2)
-    output, counts = rejection_sample(
-        torch.zeros_like(targets),
+    output, (counts, rejected, anchors) = rejection_sample(
+        *verify_stream([0] * len(target_ids), widths),
         5,
         cu,
         None,
         logits,
         bonus,
+        bonus_rows(widths),
         target_token_ids=targets if stochastic else None,
     )
     for i, (width, accepted) in enumerate(zip(widths, accepts)):
@@ -160,3 +187,7 @@ def test_target_prefixes_cover_every_ragged_acceptance_length(stochastic):
         expected += [-1] * (6 - len(expected))
         assert output[i].tolist() == expected
     assert counts.tolist() == accepts
+    assert rejected.tolist() == [5 - a for a in accepts]
+    # The anchor is the row the last emitted token was sampled at.
+    starts = [sum(w + 1 for w in widths[:i]) for i in range(len(widths))]
+    assert anchors.tolist() == [s + a for s, a in zip(starts, accepts)]

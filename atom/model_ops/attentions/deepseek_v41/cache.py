@@ -16,9 +16,14 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
 )
 from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
+from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
-from atom.model_ops.deepseek_v41.index_write import write_index_rows
+from atom.model_ops.deepseek_v41.index_plane import IndexUnits
+from atom.model_ops.deepseek_v41.index_write import (
+    write_index_rows,
+    write_index_rows_fp4,
+)
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
@@ -27,23 +32,58 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_scatter_rows_reference,
     swa_write,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, upload_numpy
 
-from .indices import build_indices, fill_step_indptrs
+from .indices import (
+    build_indices,
+    build_window_rows,
+    fill_step_indptrs,
+    splits_window,
+)
 from .metadata import prepare_batch_step
 from .speculative import TentativeState
 
 
 class PagedAttentionCache:
-    def __init__(self, geometry, pages, slots, device, max_tokens=0):
+    def _allocate_backing(self, size, device):
+        """This cache's whole pool, as one flat uint8 arena.
+
+        The one seam a caller that already owns the bytes overrides. PAGE and
+        STATE share a single address space here because
+        :meth:`V41PoolGeometry.window` states a slot's ring as an offset past
+        the absolute end of the paged region, and the ``_indices`` kernels
+        dereference page rows and window rows against one base -- so the pool
+        is handed over whole or not at all, and an override returns the whole
+        arena rather than the paged part of it.
+
+        What an override has to return is what this returns: zeroed, flat
+        uint8, contiguous, on ``device``, and exactly ``size`` elements. Every
+        region below is a `view` of it with its own strides, which neither a
+        short arena nor a longer tail would divide, and the cursor reset plus
+        every cold read assume the zeros.
+        """
+        return torch.zeros(size, dtype=torch.uint8, device=device)
+
+    def __init__(
+        self,
+        geometry,
+        pages,
+        slots,
+        device,
+        max_tokens=0,
+        workspace=None,
+    ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
+        # The scorer's `ScoreWorkspace`, owned by the builder so the startup
+        # profile's throwaway cache and the serving one share it.
+        self.workspace = workspace
         self.packed = geometry.packed
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         index_offsets, boundary = geometry.paged_extents(pages)
         size = boundary + slots * geometry.state_bytes
-        self.backing = torch.zeros(size, dtype=torch.uint8, device=device)
+        self.backing = self._allocate_backing(size, device)
         main_bytes = self.num_pages * geometry.page_bytes
         self.pages = EntryMajorArena(
             geometry.page_fields,
@@ -52,20 +92,29 @@ class PagedAttentionCache:
             buf=self.backing[:main_bytes],
             slot_stride=geometry.page_bytes,
         )
-        # One plane per owner, `[pages, rows, width]`, dense in its own rows:
-        # the stride a paged reader is handed is the rows' and not the PAGE's.
-        # Both sides of the index plane take the view from here.
+        # Each owner's `geometry.index_planes`, each `[pages, rows, width]` and
+        # dense in its own rows: the stride a paged reader is handed is the
+        # rows' and not the PAGE's. Both sides of the index plane take the
+        # views from here.
         self.index_planes = {
-            owner: self._index_plane(
-                index_offsets[owner], geometry.rows_per_page(ratio)
+            owner: tuple(
+                self._index_plane(offset, geometry.rows_per_page(ratio), width)
+                for offset, (_, width) in zip(
+                    index_offsets[owner], geometry.index_planes
+                )
             )
             for owner, ratio in geometry.owners
         }
         # The same bytes as `[tiles, tile rows, width]`, which is what a block
         # id addresses and what the scorer is handed.
         self.index_units = {
-            owner: plane.view(-1, geometry.index_block_rows, plane.shape[-1])
-            for owner, plane in self.index_planes.items()
+            owner: IndexUnits(
+                *(
+                    plane.view(-1, geometry.index_block_rows, plane.shape[-1])
+                    for plane in planes
+                )
+            )
+            for owner, planes in self.index_planes.items()
         }
         self.state = EntryMajorArena(
             geometry.state_fields,
@@ -107,6 +156,14 @@ class PagedAttentionCache:
         self._reset_slots = CpuGpuBuffer(
             slots, dtype=torch.int64, device=device, pin_memory=pinned
         )
+        # The Engram history each of those starts at (`BatchStep.start_histories`).
+        self._reset_histories = CpuGpuBuffer(
+            slots,
+            self.cursor.shape[1] - 1,
+            dtype=self.cursor.dtype,
+            device=device,
+            pin_memory=pinned,
+        )
         # Where a caller that wants no history lands its cursor rows: the copy
         # is issued and judged a step later, so nothing waits for it. See
         # `prepare_state`.
@@ -147,7 +204,8 @@ class PagedAttentionCache:
         regions = [(self.page_bytes.data_ptr(), self.geometry.page_bytes)]
         regions += [
             (plane.data_ptr(), plane.stride(0) * plane.element_size())
-            for plane in self.index_planes.values()
+            for planes in self.index_planes.values()
+            for plane in planes
         ]
         return regions
 
@@ -155,22 +213,23 @@ class PagedAttentionCache:
         """The same regions for one unit, named as `uint8` views."""
         return [self.page_bytes[unit]] + [
             plane[unit].flatten().view(torch.uint8)
-            for plane in self.index_planes.values()
+            for planes in self.index_planes.values()
+            for plane in planes
         ]
 
-    def _index_plane(self, offset, rows):
-        """`[pages, rows, bytes]` at `offset`, untyped.
+    def _index_plane(self, offset, rows, width):
+        """`[pages, rows, width]` bytes at `offset`, untyped.
 
-        A preshuffled FP8 row interleaves its bytes across the tile and carries
-        its scale past the block's data, so a row has no element type to take a
-        view in -- the writer and the scorer both address it as bytes.
+        A preshuffled row interleaves its bytes across the tile (and an FP8
+        one carries its scale past the block's data), so a row has no element
+        type to take a view in -- the writer and the scorer both address it as
+        bytes.
 
         `as_strided`'s storage offset is absolute, so the retyped view's own has
         to be added -- omit it and every plane addresses from the front of the
         pool, over the main pages.
         """
         typed = self.backing.view(torch.uint8)
-        width = self.geometry.index_row_bytes
         return typed.as_strided(
             (self.num_pages, rows, width),
             (rows * width, width, 1),
@@ -213,6 +272,7 @@ class PagedAttentionCache:
         *,
         block_tables,
         tentative=False,
+        is_prefill=False,
         buffers=None,
         running_bs=None,
         running_tokens=None,
@@ -222,7 +282,15 @@ class PagedAttentionCache:
         publication_group=None,
         query_prefix_ready=False,
         query_prefix_republish_reason=None,
+        planners=(),
+        floors=None,
+        cached_until=None,
+        finals=None,
+        start_histories=None,
     ):
+        """`floors`, `cached_until`, `finals`, `start_histories`: per request,
+        on the host, `BatchStep`'s `request_*` and `start_histories`; None for
+        a forward recomputing nothing, ending every prompt."""
         self.require_committed()
         requests = tuple(requests)
         if tentative and (
@@ -258,6 +326,7 @@ class PagedAttentionCache:
             block_tables=block_tables,
             page_limit=self.num_pages,
             tentative=tentative,
+            is_prefill=is_prefill,
             buffers=buffers,
             running_bs=running_bs,
             running_tokens=running_tokens,
@@ -267,18 +336,66 @@ class PagedAttentionCache:
             publication_group=publication_group,
             query_prefix_ready=query_prefix_ready,
             query_prefix_republish_reason=query_prefix_republish_reason,
+            planners=planners,
         )
         step.plans = (
             self._private_plans(requests, tentative) if plans is None else plans
         )
+        count = len(requests)
+        zeros = np.zeros(count, np.int32)
+        step.request_floors = zeros if floors is None else floors
+        step.request_cached_until = zeros if cached_until is None else cached_until
+        step.request_finals = (
+            np.ones(count, np.bool_) if finals is None else np.asarray(finals)
+        )
+        step.start_histories = start_histories
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.
+
+        # Held so a reader that cannot be handed this object still finds it.
+        # Under vLLM's breakable capture an eager break is replayed with the
+        # arguments it was captured with, so attention cannot take `step` as a
+        # parameter and see this step -- it would see the one recorded with the
+        # graph. The cache outlives every step, so reading it from here is live.
+        self.current_step = step
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)
-        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
+        # Before the indptrs, which count each row's window from its floor.
+        self.publish_replay_layout(step, count if running_bs is None else running_bs)
         return step
+
+    def publish_replay_layout(self, step, running_bs, floors=None):
+        """`step.swa_replay_start` and `swa_cached_until` from its host
+        `request_floors` and `request_cached_until`, indexed by the step's own
+        batch rows: the fixed zeros unless a request recomputes rows below
+        where it resumed. ``floors``: the floors already published at fixed
+        addresses, a bounded-replay tail's, whose rows no ring holds."""
+        zeros = self._replay_start_zeros(running_bs)
+        step.swa_replay_start = step.swa_cached_until = zeros
+        if floors is not None:
+            step.swa_replay_start = floors
+        elif step.request_floors.any() and not step.decode:
+            step.swa_replay_start, step.swa_cached_until = upload_numpy(
+                np.stack((step.request_floors, step.request_cached_until)),
+                step.positions.device,
+            )
+
+    def _replay_start_zeros(self, running_bs):
+        """Every request's window from position 0: what a step that is not a
+        bounded-replay tail reads as `swa_replay_start`, indexed by batch id up
+        to `running_bs - 1`. One fixed buffer, sized for every slot up front,
+        so the index kernels a capture records keep reading it on replay."""
+        rows = max(running_bs, self.num_slots, 1)
+        zeros = getattr(self, "_replay_zeros", None)
+        if zeros is None or zeros.numel() < rows:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("The replay-start buffer cannot grow under capture")
+            zeros = self._replay_zeros = torch.zeros(
+                rows, dtype=torch.int32, device=self.indptr_device
+            )
+        return zeros
 
     def _private_plans(self, requests, tentative):
         """Plans into freshly allocated buffers, for a caller without any.
@@ -314,17 +431,18 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
-    def _report_stale_state(self, cursors, starts, requests):
+    def _report_stale_state(self, cursors, starts, requests, fresh):
         """Raise on the first request whose state is not where it is wanted.
 
-        Fresh requests are excluded by their own position: the slot they are
-        about to reuse holds whatever the last tenant left, and the reset below
-        is what makes it theirs.
+        Fresh requests are excluded: the slot they are about to reuse holds
+        whatever the last tenant left, and the reset below is what makes it
+        theirs.
         """
-        wrong = np.flatnonzero((starts != 0) & (cursors[:, 0] != starts))
+        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
         if not wrong.size:
             return
         first = int(wrong[0])
+
         raise ValueError(
             f"Request {requests[first]} needs state at {starts[first]}, "
             f"found {int(cursors[first, 0])}; replay from a recoverable boundary"
@@ -340,9 +458,11 @@ class PagedAttentionCache:
             return
         if self._probe_done is not None and not self._probe_done.query():
             return
-        starts, requests = self._probe_claim
+        starts, requests, fresh = self._probe_claim
         self._probe_claim = None
-        self._report_stale_state(self._probe[: starts.size].numpy(), starts, requests)
+        self._report_stale_state(
+            self._probe[: starts.size].numpy(), starts, requests, fresh
+        )
 
     def prepare_state(self, step, *, histories=True):
         """Read restored cursors; reset recycled slots before any layer writes.
@@ -366,37 +486,54 @@ class PagedAttentionCache:
         count = step.scheduled_bs
         starts = step.request_positions[:count]
         ids = [span.request_id for span in step.requests]
+        # A slot starts over at its floor: 0, or where a request rebuilds its
+        # state below a prefix hit (`BatchStep.request_floors`). One
+        # recomputing rows below where its state is keeps the state, and its
+        # cursor steps back to the forward's start.
+        resumes = step.request_cached_until[:count]
+        fresh = (starts == step.request_floors[:count]) & (resumes == 0)
+        restarted = np.concatenate((np.flatnonzero(fresh), np.flatnonzero(resumes)))
+        # where each state has to be
+        wanted = np.where(resumes > 0, resumes, starts)
         if histories:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
             )
+            self._report_stale_state(cursors, wanted, ids, fresh)
         else:
             # Issued before the reset below, so a recycled slot is captured as
-            # its old tenant left it -- which is why the judge skips position 0.
+            # its old tenant left it -- which is why the judge skips fresh ones.
             self._probe[:count].copy_(
                 torch.index_select(self.cursor, 0, step.slots[:count]),
                 non_blocking=True,
             )
             if self._probe_done is not None:
                 self._probe_done.record()
-            self._probe_claim = (starts.copy(), ids)
+            self._probe_claim = (wanted, ids, fresh.copy())
             cursors = None
-        fresh = starts == 0
-        if fresh.any():
-            # Both resets take the same index, so the slots cross once.
-            slots = self._reset_slots.np[: int(fresh.sum())]
-            slots[:] = [span.slot for span, new in zip(step.requests, fresh) if new]
+        if restarted.size:
+            # The resets take one index, fresh slots first, so the slots cross
+            # once.
+            slots = self._reset_slots.np[: restarted.size]
+            slots[:] = [step.requests[i].slot for i in restarted]
             index = self._reset_slots.copy_to_gpu(slots.size)
-            self.state_bytes.index_fill_(0, index, 0)
-            self.cursor[:, 1:].index_fill_(0, index, -1)
+            self.state_bytes.index_fill_(0, index[: int(fresh.sum())], 0)
+            if step.start_histories is None:
+                self.cursor[:, 1:].index_fill_(0, index, -1)
+                started = -1
+            else:
+                started = step.start_histories[:count][restarted]
+                self._reset_histories.np[: restarted.size] = started
+                self.cursor[:, 1:].index_copy_(
+                    0, index, self._reset_histories.copy_to_gpu(restarted.size)
+                )
             if cursors is not None:
-                cursors[fresh, 0] = 0
-                cursors[fresh, 1:] = -1
+                cursors[restarted, 0] = starts[restarted]
+                cursors[restarted, 1:] = started
         if cursors is None:
             if step.tentative:
                 self.pending = TentativeState(self, step)
             return None
-        self._report_stale_state(cursors, starts, ids)
         if step.tentative:
             self.pending = TentativeState(self, step, cursors[:, 1:])
         return cursors[:, 1:]
@@ -424,10 +561,10 @@ class PagedAttentionCache:
         rows[:, 1:] = histories
         self.cursor[step.slots[:count].long()] = self._cursor_staging.copy_to_gpu(count)
 
-    def commit_tentative(self, step, accepted_lengths):
+    def commit_tentative(self, step, anchors):
         if self.pending is None or self.pending.step is not step:
             raise RuntimeError("Tentative state was not prepared for this step")
-        self.pending.commit(accepted_lengths)
+        self.pending.commit(anchors)
         self.pending = None
 
     def compress(self, owner, compressor, values, scores, step, rope):
@@ -458,9 +595,10 @@ class PagedAttentionCache:
         itself, so nothing here computes one -- `ratio` is all it needs to
         turn the plan's position into a compressed row.
         """
+        (plane,) = self.index_planes[owner]
         write_index_rows(
             index[0],
-            self.index_planes[owner],
+            plane,
             step.plans[ratio].compress_plan_gpu,
             step.block_tables,
             self.geometry.rows_per_page(ratio),
@@ -469,22 +607,77 @@ class PagedAttentionCache:
             scale_fmt=INDEX_FP8_SCALE_FMT,
         )
 
+    def write_index_fp4(self, owner, step, keys, ratio, norm, rope):
+        """`write_index` on the FP4 plane, from the keys before their norm:
+        the same pass norms and rotates them as `Indexer.project_keys` does."""
+        write_index_rows_fp4(
+            keys,
+            self.index_units[owner],
+            step.plans[ratio].compress_plan_gpu,
+            step.block_tables,
+            self.geometry.rows_per_page(ratio),
+            ratio=ratio,
+            norm=norm,
+            rope=rope,
+        )
+
+    def indptrs(self, step):
+        """`step`'s `{ratio: (prefix indptr, extend indptr, reserved top-k)}`
+        (`fill_step_indptrs`), into its fixed buffers: a TBO microbatch's own,
+        else the cache's. Memoized as `unit_tiles` is, so a forward that builds
+        no index (mono's) fills none."""
+        if not step.indptrs:
+            step.indptrs = fill_step_indptrs(
+                step, self.geometry, step.indptr_buffers or self.indptr_buffers
+            )
+        return step.indptrs
+
     def unit_tiles(self, step, ratio):
         """Tile ids per query token: one table per ratio, shared by its owners.
 
         Memoized on the step and dropped by `begin_forward` rather than built
-        with it, unlike the indptrs: these rows are a fresh allocation, so a
-        table built outside the graph is one a replay reads at the capture's
-        address.
+        with it: a table built outside the graph is one a replay reads without
+        rebuilding. With a `workspace` the table is its
+        ratio's fixed rows, rewritten each step; without one, a fresh
+        allocation.
         """
         table = step.tiles.get(ratio)
         if table is None:
+            block_tables = step.block_tables
+            if not step.decode and step.requests:
+                # Expand only pages visible to a nonempty prefill step,
+                # including the cached prefix of a chunk/TBO microbatch. The
+                # persistent table can hold a 1M context even for an 8k prompt.
+                # Decode/verify and empty steps retain the full table width.
+                end = max(request.end for request in step.requests)
+                columns = (
+                    end + self.geometry.block_size - 1
+                ) // self.geometry.block_size
+                block_tables = block_tables[:, :columns]
             table = step.tiles[ratio] = unit_table(
-                step.block_tables,
+                block_tables,
                 step.batch_ids,
-                self.geometry.rows_per_page(ratio) // self.geometry.index_block_rows,
+                self.geometry.index_blocks_per_page(ratio),
+                workspace=step.tile_workspace or self.workspace,
+                ratio=ratio,
             )
         return table
+
+    def candidate_blocks(self, step, source, ratio):
+        """Layer `source`'s candidates bound to their requests' PAGEs at this
+        ratio: one per forward, shared by every REINDEX layer they bound.
+        Memoized on the step for the reason `unit_tiles` is."""
+        bound = step.candidate_blocks.get(source)
+        if bound is None:
+            bound = step.candidate_blocks[source] = bind_candidates(
+                step.candidates[source],
+                step.block_tables,
+                step.batch_ids,
+                self.geometry.index_blocks_per_page(ratio),
+                step.visible[ratio],
+                rows_per_block=self.geometry.index_block_rows,
+            )
+        return bound
 
     def _scatter_rows(self, pages, step, value, ratio):
         """Scatter plan rows with V4's dtype-agnostic, sentinel-aware writer.
@@ -577,13 +770,20 @@ class PagedAttentionCache:
         payload, so both halves of that read the same either way.
 
         Returns the BF16 row an extend pass attends to and whatever the window
-        still owes, `None` for each the caller has no use for.
+        still owes, `None` for each the caller has no use for. `query` None:
+        the KV row alone, for a prefill whose queries are not its rows
+        (`rotate_query`).
         """
         dim, packed = self.geometry.head_dim, self.packed
+
         if not step.width:
             return (None, None) if step.decode else (torch.empty_like(kv), None)
         seam = (
-            query.view(step.width, -1, dim),
+            (
+                kv.new_empty(step.width, 0, dim)
+                if query is None
+                else query.view(step.width, -1, dim)
+            ),
             kv.view(step.width, dim),
             rope.cos_cache,
             rope.sin_cache,
@@ -619,15 +819,29 @@ class PagedAttentionCache:
         )
         return qat, (values, scales) if packed else qat
 
+    def rotate_query(self, query, rope, positions):
+        """`rope_quant_window`'s query half alone, at `positions`."""
+        if positions.numel():
+            rope_quant_window(
+                query.view(positions.numel(), -1, self.geometry.head_dim),
+                None,
+                rope.cos_cache,
+                rope.sin_cache,
+                positions,
+                rope_dim=rope.rope_dim,
+            )
+
     def write_window(self, layer, kv, step):
         # `None` is `rope_quant_window` reporting that it already stored the
         # row, not an empty batch: those two differ in whether `step.width` is
         # zero, and only this one can reach here after a real forward.
         if kv is not None and step.width:
             window = self.geometry.window(layer, self.num_pages)
+            # rows below where a request's ring already holds them stay
+            cached = step.swa_cached_until if step.request_cached_until.any() else None
             if self.packed:
                 write_packed_window(
-                    *kv, self.backing, step, window, self.geometry.head_dim
+                    *kv, self.backing, step, window, self.geometry.head_dim, cached
                 )
                 return
             swa_write(
@@ -642,29 +856,44 @@ class PagedAttentionCache:
                 # zero-length in `cu_seqlens_q`, which is what keeps it from
                 # writing anything at all.
                 min(step.max_q_len, window.ring_slots),
+                cached_until=cached,
             )
 
     def attention_indices(self, spec, step):
-        """This layer's prefix rows, built with its whole group's on a decode.
+        """This layer's `(prefix, pptr, second, sptr)`: rows into the pool, and
+        rows into the attention's second source.
+
+        Prefill and decode alike build their index group's in one launch:
+        every layer's prefix, window included, or on a split decode
+        (`splits_window`) the selection alone, one plane the group shares. A
+        prefill's second source is its own KV (`extend`, one list for the
+        group); a decode's is the layer's ring (`ring_view`), and a split
+        decode's window rows one list for every layer.
 
         The group's first layer is also the layer that owns its selection, so
         by the time anyone asks, every input the run shares already exists.
         Later layers find theirs written and launch nothing.
         """
-        first = spec.index_group_start
-        if not step.decode or spec.index_group_size == 1:
-            # A run of one, anchored on this layer's own ring, so a spec that
-            # declares no group never has to name a start. A prefill takes this
-            # too: it pays work rather than dispatch, and its `extend` plane is
-            # this layer's alone.
-            prefix, pptr, extend, eptr = self._index_group(spec, step, spec.layer_id, 1)
-            return prefix[0], pptr, extend, eptr
+        # a spec that declares no group never names a start: its own
+        first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
+        split = splits_window(step, self.geometry)
         built = step.group_indices.get(first)
         if built is None:
-            built = self._index_group(spec, step, first, spec.index_group_size)
+            layers = 1 if split else spec.index_group_size
+            built = self._index_group(spec, step, first, layers)
             step.group_indices[first] = built
         prefix, pptr, extend, eptr = built
-        return prefix[spec.layer_id - first], pptr, extend, eptr
+        if not split:
+            return prefix[spec.layer_id - first], pptr, extend, eptr
+        if step.window_rows is None:
+            window = self.geometry.window(first, self.num_pages)
+            step.window_rows = build_window_rows(step, self.geometry, window, eptr)
+        return prefix[0], pptr, step.window_rows, eptr
+
+    def ring_view(self, layer):
+        """The BF16 pool from `layer`'s ring start: a split decode's second
+        source, which its window rows index."""
+        return self.pool[self.geometry.window(layer, self.num_pages).ring_start :]
 
     def _index_group(self, spec, step, first, layers):
         """One build covering `layers` consecutive layers from `first`.
@@ -681,6 +910,7 @@ class PagedAttentionCache:
         )
         return build_indices(
             step.selected[spec.topk_owner] if spec.ratio else None,
+            self.indptrs(step)[spec.ratio],
             step,
             self.geometry,
             window,

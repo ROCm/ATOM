@@ -12,7 +12,6 @@ from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
@@ -90,20 +89,13 @@ class KVCacheConfig:
 
 
 class CUDAGraphMode(enum.Enum):
-    """Constants for the cudagraph mode in CompilationConfig.
-    Meanwhile, the subset enum `NONE`, `PIECEWISE` and `FULL` are also
-    treated as concrete runtime mode for cudagraph runtime dispatching.
-    """
+    """Constants for the cudagraph mode in CompilationConfig."""
 
     NONE = 0
-    PIECEWISE = 1
+    TR_HYBRID = 1
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
-    FULL_AND_PIECEWISE = (FULL, PIECEWISE)
-    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
-    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
-    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
-    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
+    FULL_AND_TR_HYBRID = (FULL, TR_HYBRID)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
@@ -111,15 +103,10 @@ class CUDAGraphMode(enum.Enum):
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
 
-    def is_attn_ffn_piecewise(self) -> bool:
-        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
-        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
-        return self is CUDAGraphMode.AF_PIECEWISE
-
-    def requires_piecewise_compilation(self) -> bool:
+    def uses_tr_hybrid(self) -> bool:
         return (
-            self.decode_mode() == CUDAGraphMode.PIECEWISE
-            or self.mixed_mode() == CUDAGraphMode.PIECEWISE
+            self.decode_mode() == CUDAGraphMode.TR_HYBRID
+            or self.mixed_mode() == CUDAGraphMode.TR_HYBRID
         )
 
     def max_cudagraph_mode(self) -> "CUDAGraphMode":
@@ -154,7 +141,6 @@ class CompilationConfig:
     use_cudagraph: bool = True
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
-    # cudagraph_capture_sizes: Optional[list[int]] = [1,2,4,8]
     cudagraph_capture_sizes: list[int] | None = None
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
@@ -180,41 +166,32 @@ class CompilationConfig:
     The mode of the cudagraph:
 
     - NONE, no cudagraph capture.
-    - PIECEWISE. (v1 default)
+    - TR_HYBRID. (default at level 3)
     - FULL.
     - FULL_DECODE_ONLY.
-    - FULL_AND_PIECEWISE.
-    - AF_PIECEWISE.
+    - FULL_AND_TR_HYBRID.
 
-    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
-    core is ALSO captured into its own cudagraph with zero-copy public buffers
-    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
-    attention gap between the dense pieces. Falls back to plain PIECEWISE
-    behavior for models that don't implement the attention-core capture.
-
-    PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
-    incompatiable ops (i.e. some attention ops) outside the cudagraph
-    for general flexibility.
-    This is the default mode.
+    TR_HYBRID mode mixes token graphs and request graphs: the compiled forward
+    is recorded as a `TokenGraph` per token bucket, breaking only at the split
+    ops whose launches depend on host data (`eager_region`), which run between
+    its segments -- eagerly, or as a `ReqGraph` where the request bucket fixes
+    their launches.
 
     FULL mode: Capture full cudagraph for all batches. Can be good for small
     models or workloads with small prompts; not supported by many backends.
-    Generally for performance FULL_AND_PIECEWISE is better.
 
     FULL_DECODE_ONLY mode: Capture full cudagraph for decode batches only.
     Mixed prefill-decode batches are run without cudagraphs. Can be good for
     decode instances in a P/D setup where prefill is not as important so we
     can save some memory.
 
-    FULL_AND_PIECEWISE mode: Capture full cudagraph for decode batches and
-    piecewise cudagraph for prefill and mixed prefill-decode batches.
-    This is like the most performant mode for most models.
+    FULL_AND_TR_HYBRID mode: the native runner records it as TR_HYBRID --
+    decode replays token graphs too, not a full graph (`_tr_hybrid_active`).
 
-    Currently, the cudagraph mode is only used for the v1 engine.
     Note that the cudagraph logic is generally orthogonal to the
-    compilation logic. While piecewise cudagraphs require piecewise
-    compilation (level=PIECEWISE and non-empty splitting_ops), full
-    cudagraphs are supported with and without compilation.
+    compilation logic: full cudagraphs and token graphs are recorded with and
+    without compilation; piecewise compilation (level=PIECEWISE and non-empty
+    splitting_ops) only decides where the compiled pieces split.
 
     Warning: This flag is new and subject to change in addition
     more modes may be added.
@@ -234,7 +211,8 @@ class CompilationConfig:
     are always used, it can set this to False. Otherwise, it should
     set this to True, and the compiler will copy the input to an
     internally managed buffer. Default is False.
-    Note that this flag is only effective when cudagraph_mode is PIECEWISE.
+    Note that this flag is only effective at level 3, whenever cudagraph_mode
+    is not NONE (`VllmBackend`).
     """
 
     inductor_compile_config: dict = field(default_factory=dict)
@@ -352,7 +330,8 @@ class QuantizationConfig:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time.
+        # models at load time. For IQ2R only the non-IQ2R layers qualify;
+        # should_skip_online_quant keeps the IQ2R experts as they are.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
@@ -366,6 +345,7 @@ class QuantizationConfig:
             "quark",
             "modelopt",
             "compressed-tensors",
+            "iq2r",
         ]:
             self.online_quant = True
             if self.quant_method == "compressed-tensors":
@@ -769,7 +749,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
 # Loaded as a bare PretrainedConfig; the ATOM model normalizes the aliases it
 # needs at construction time.
 _PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
-    {"kimi_linear", "glm5_next_text"}
+    {"kimi_linear", "glm5_next_text", "qwen4_exp_text"}
 )
 
 # multimodal models fully supported by plugin mode
@@ -970,6 +950,13 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    if text_config is not None and text_config is not hf_config:
+        # Some exports (Quark NVFP4) carry the layer layout on the VL root; it
+        # replaces the text config's own, then is checked like any other.
+        for attr_name in ("mlp_layer_types", "moe_layer_freq"):
+            attr_value = getattr(hf_config, attr_name, None)
+            if attr_value is not None:
+                setattr(text_config, attr_name, attr_value)
     _normalize_minimax_m3_mlp_layer_types(
         text_config if text_config is not None else hf_config
     )
@@ -1089,17 +1076,6 @@ class ParallelConfig:
             backend="gloo",
         )
         return dp_group
-
-    @staticmethod
-    def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
-        tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
-        # dp rank 0: has_unfinished_seqs=True
-        # dp rank 1: has_unfinished_seqs=False
-        # aggregated: has_unfinished_seqs=True
-        # so this is an OR operation, i.e. MAX in integers
-        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
-        aggregated_has_unfinished = bool(tensor.item())
-        return aggregated_has_unfinished
 
     def compute_hash(self):
         """
@@ -1837,6 +1813,22 @@ def qrep_enabled_for_layer(
     )
 
 
+def qrep_for_step(
+    qrep_enabled: bool, use_seg_mla: bool, is_prefill: bool, prefill_qrep: bool
+) -> bool:
+    """Whether this forward produces the DCP group's query heads locally (QREP)
+    instead of gathering them.
+
+    Decode always does when the layer has QREP. Prefill reaches the QREP-aware
+    branch only as sparse (DSA) prefill -- dense prefill takes the MHA path and
+    never gathers q -- and joins only under ``ATOM_DCP_PREFILL_QREP``
+    (``prefill_qrep``). The seg path is excluded because its q_out is allocated
+    at the per-rank head count. Pure so the prefill clause can be pinned by a
+    test instead of living only as an inline expression.
+    """
+    return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -1933,6 +1925,28 @@ class Config:
     # `StateSlotPool.mark_speculative` for the measurement and
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
+    # DeepSeek-V4.1 decoder SWA bounded replay
+    # (models/deepseek_v41/bounded_replay.py). On by default;
+    # --no-decoder-swa-bounded-replay turns it off. No effect on other models.
+    enable_decoder_swa_bounded_replay: bool = True
+    # The fewest rows the forward that finishes a prompt runs: one that resumes
+    # closer to the prompt's end starts that much earlier, recomputing rows
+    # the cache already holds (`BlockManager.replay_start`). Set by the model,
+    # not a flag: V4.1's decoder bounded replay reads the last `window` rows.
+    min_final_prefill_rows: int = 0
+    # The tokens before a replaying forward a backend reads (`Replay.history_ids`).
+    # Set by the model: V4.1's Engram n-gram lookback.
+    replay_history_tokens: int = 0
+    # How far below a prefix hit with no state checkpoint behind it a prefill
+    # starts to rebuild that state exactly (`BlockManager.replay_start`), 0 =
+    # such a hit is not taken. Set by the model, not a flag: DeepSeek-V4's
+    # window receptive field under ATOM_DSV4_STATE_REPLAY (`deepseek_v4_replay`).
+    state_replay_tokens: int = 0
+    # DeepSeek-V4.1 encoder SWA bounded replay: a prefix hit keeps no state
+    # checkpoint and rebuilds it by recomputing the window rows below the hit
+    # (`--encoder-swa-bounded-replay`). On by default;
+    # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
+    enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -1980,6 +1994,13 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    # None reads ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR once the feature is on; see
+    # `_resolve_dynamic_chunking`.
+    dynamic_chunking_smooth_factor: float | None = None
+    # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
+    # rebuild, so the floor is what bounds that amplification.
+    dynamic_chunking_min_chunk_size: int = 4096
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2105,7 +2126,7 @@ class Config:
             return list(declared)
         sizes = self.compilation_config.cuda_graph_sizes
         if len(sizes) == 1:
-            return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
+            return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
     def __post_init__(self):
@@ -2262,8 +2283,7 @@ class Config:
             )
             if qrep_off is not None:
                 logger.warning(
-                    "dcp_config.enable_query_replication disabled: %s not "
-                    "supported.",
+                    "dcp_config.enable_query_replication disabled: %s not supported.",
                     qrep_off,
                 )
                 self.dcp_config.enable_query_replication = False
@@ -2361,14 +2381,14 @@ class Config:
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
         ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
             self.compilation_config.set_splitting_ops_for_v1()
-            # Default to PIECEWISE, except V4.1 whose Engram stream fork/join
+            # Default to TR_HYBRID, except V4.1 whose Engram stream fork/join
             # currently requires a FULL graph. Explicit choices are preserved.
             # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
                 self.compilation_config.cudagraph_mode = (
                     CUDAGraphMode.FULL
                     if self.hf_config.model_type == "deepseek_v41_text"
-                    else CUDAGraphMode.PIECEWISE
+                    else CUDAGraphMode.TR_HYBRID
                 )
             self.compilation_config.init_with_cudagraph_sizes()
 
@@ -2396,9 +2416,17 @@ class Config:
             # the scheduler never does, so hashing the live config gives each a
             # different namespace and every scheduler lookup misses. Snapshot it
             # here, before the config is shipped to either process.
-            from atom.kv_transfer.offload.config import snapshot_page_hf_geometry
+            from atom.kv_transfer.offload.config import (
+                snapshot_kv_encoding,
+                snapshot_page_hf_geometry,
+            )
 
             self.offload_page_hf_geometry = snapshot_page_hf_geometry(self.hf_config)
+            # Likewise how K and V are encoded (the RoPE settings above all):
+            # llama.py adds a key to the live `rope_parameters` while a worker
+            # builds the model.
+            self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_dynamic_chunking()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2586,17 +2614,71 @@ class Config:
             # CSA2's index plane is paged by the same scorer GLM's is, so a
             # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
             # tiles -- and its ratio-2 owners halve the PAGE before that count
-            # is taken, which makes the floor twice the tile. 256 rather than
-            # that floor, and for the reason DeepSeek-V4 takes it: the block
-            # table is `[max_num_seqs, max_model_len / block_size]` int32 held
-            # twice and copied to the device every forward, 8 MB here against
-            # 134 MB at the 16 this field defaults to. What it costs is prefix
-            # reuse shorter than a PAGE, which stops matching at all.
-            self.kv_cache_block_size = 256
+            # is taken, which makes the floor twice the tile. 128 rather than
+            # that floor: the block table is `[max_num_seqs, max_model_len /
+            # block_size]` int32 held twice and copied to the device every
+            # forward, 17 MB here against 134 MB at the 16 this field defaults
+            # to. Not the 256 DeepSeek-V4 takes: a PAGE is also the prefix
+            # cache's hash block, so it is the granularity of prefix reuse and
+            # of the rows encoder bounded replay recomputes below a hit: one
+            # PAGE, which must cover the window - 1 rows a row at the hit reads.
+            self.kv_cache_block_size = 128
+            if self.enable_decoder_swa_bounded_replay:
+                self.min_final_prefill_rows = self.hf_config.sliding_window
+            self.replay_history_tokens = self.hf_config.engram_max_ngram_size - 1
 
             from atom.models.deepseek_v41.config import validate_runtime_config
 
             validate_runtime_config(self)
+
+        if is_deepseek_v4:
+            from atom.model_ops.attentions.deepseek_v4_replay import (
+                state_replay_tokens,
+            )
+
+            self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_dynamic_chunking(self) -> None:
+        """Validate dynamic chunking, or turn it off where it cannot size a chunk.
+
+        Everything here, the env read included, runs only when the feature is
+        on: a stale ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
+        must not stop a server that never asked for dynamic chunking.
+        """
+        if not self.enable_dynamic_chunking:
+            return
+        if self.dynamic_chunking_smooth_factor is None:
+            try:
+                self.dynamic_chunking_smooth_factor = (
+                    envs.ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR must be a number: {exc}"
+                ) from None
+        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+            raise ValueError(
+                "dynamic_chunking_smooth_factor must be in [0, 1], got "
+                f"{self.dynamic_chunking_smooth_factor}"
+            )
+        if self.dynamic_chunking_min_chunk_size <= 0:
+            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+        if self.pipeline_parallel_size <= 1:
+            reason = "pipeline_parallel_size is 1"
+        elif not self.enable_chunked_prefill:
+            reason = "chunked prefill is off"
+        elif self.enable_rapidserve:
+            reason = "the RapidServe prefill scheduler never chunks"
+        elif (self.kv_transfer_config or {}).get("kv_role") == "kv_consumer":
+            reason = "a P/D decode instance does not run the prefills it would size"
+        else:
+            return
+        # Same degrade-to-fixed path as a failed profile or a rejected fit.
+        # Raising would make the flag a hard failure in a shared launch script.
+        logger.warning(
+            "Dynamic chunking disabled because %s; chunking stays fixed", reason
+        )
+        self.enable_dynamic_chunking = False
 
     def compute_hash(self) -> str:
         """
@@ -2626,9 +2708,8 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         # PCP changes the compiled graph: when pcp>1 the indexer runs through the
-        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
-        # query) and the indexer takes the round-robin all-gather / separate-rope
-        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # opaque `sparse_attn_indexer_pcp` op and takes the round-robin all-gather
+        # / separate-rope path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
         # identically, so without this factor pcp2 loads pcp1's cached artifact
         # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
         # runtime — the same stale-artifact hazard documented for the vocab-embed
@@ -2650,6 +2731,10 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
+        # graphs (early + late layers) instead of one; both compile under the
+        # `backbone` tag, so the flag must key the artifacts.
+        factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
@@ -2682,6 +2767,20 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # The sparse-attention indexer bakes max_model_len and max_num_seqs into
+        # the graph as constants, so a cache built for a smaller max_model_len
+        # faults on the first decode past the old width.
+        factors.append(self.max_model_len)
+        factors.append(self.max_num_seqs)
+        # The drafter graph bakes its draft width in as a constant (DSpark traces
+        # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
+        # would otherwise load the other width's artifact: draft 6 over a draft 3
+        # cache hands MoE half the rows it expects. Acceptance-length knobs only
+        # steer sampling and stay out.
+        spec = self.speculative_config
+        factors.append(
+            None if spec is None else (spec.method, spec.num_speculative_tokens)
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

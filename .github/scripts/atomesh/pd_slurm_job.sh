@@ -135,21 +135,137 @@ for key, value in sorted(os.environ.items()):
 PY
 }
 
-pre_cleanup_local() {
-  echo "=== pre-cleanup: stop running containers on $(hostname) ==="
-  set +e
-  running=()
-  while read -r id; do
-    [[ -n "${id}" ]] && running+=("${id}")
-  done < <(docker ps -q 2>/dev/null)
-
-  if [[ "${#running[@]}" -gt 0 ]]; then
-    docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-    docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
+# Succeeds only when the scheduler answers and no longer lists the job; an
+# unreachable controller counts as "still active".
+scheduler_job_inactive() {
+  local job_id="$1"
+  local active
+  command -v squeue >/dev/null 2>&1 || return 1
+  if command -v timeout >/dev/null 2>&1; then
+    active="$(timeout 10 squeue -h -j "${job_id}" -o %i 2>/dev/null)" || return 1
   else
+    active="$(squeue -h -j "${job_id}" -o %i 2>/dev/null)" || return 1
+  fi
+  [[ -z "${active//[[:space:]]/}" ]]
+}
+
+# Spur can place several jobs on one node despite --exclusive, and every worker
+# runs this on start. Stopping all containers would kill co-scheduled jobs, so
+# only stop this job's leftovers and atomesh containers of finished jobs.
+pre_cleanup_local() {
+  echo "=== pre-cleanup: stop stale atomesh containers on $(hostname) ==="
+  set +e
+  local id name status owner_job
+  local stale=()
+  local kept_active=0
+  while IFS=$'\t' read -r id name status; do
+    [[ -n "${id}" ]] || continue
+    owner_job=""
+    if [[ "${name}" =~ ^atomesh-.+-([0-9]+)-[0-9]+(-benchmark|-eval)?$ ]]; then
+      owner_job="${BASH_REMATCH[1]}"
+    fi
+    if [[ "${owner_job}" == "${JOB_ID}" ]]; then
+      echo "  stop ${id} ${name} (${status}): leftover of this job"
+      stale+=("${id}")
+    elif [[ -n "${owner_job}" ]] && scheduler_job_inactive "${owner_job}"; then
+      echo "  stop ${id} ${name} (${status}): job ${owner_job} is no longer active"
+      stale+=("${id}")
+    else
+      echo "  keep ${id} ${name} (${status})"
+      kept_active=1
+    fi
+  done < <(docker ps --format '{{.ID}}\t{{.Names}}\t{{.Status}}' 2>/dev/null)
+
+  if [[ "${#stale[@]}" -gt 0 ]]; then
+    docker stop -t 0 "${stale[@]}" >/dev/null 2>&1 || true
+  elif [[ "${kept_active}" -eq 0 ]]; then
     echo "no running containers"
   fi
+  if [[ "${kept_active}" -eq 1 ]]; then
+    echo "WARNING: $(hostname) still runs containers of other jobs; GPUs may be shared with them" >&2
+  fi
   set -e
+}
+
+# Prints "<gpu> <used MB>" for the first GPU above ATOMESH_GPU_BUSY_MB.
+busiest_gpu_over_limit() {
+  local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
+  local used line gpu_idx
+  command -v amd-smi >/dev/null 2>&1 || return 1
+  while read -r line; do
+    [[ "${line}" =~ ^[[:space:]]*[0-9]+ ]] || continue
+    gpu_idx="$(awk '{print $1}' <<<"${line}")"
+    used="$(awk '{print $3}' <<<"${line}")"
+    used="${used%MB}"
+    [[ "${used}" =~ ^[0-9]+$ ]] || continue
+    if (( used > max_used_mb )); then
+      echo "${gpu_idx} ${used}"
+      return 0
+    fi
+  done < <(amd-smi monitor -v 2>/dev/null | tail -n +2)
+  return 1
+}
+
+# Spur often ignores --exclusive. If another job already holds VRAM, model
+# load fails with opaque HIP OOM ("0 bytes free"). Fail fast with a clear
+# message so the cell is not attributed to the model or LMCache sizing.
+# Containers pre_cleanup_local just stopped, or the previous job's exited
+# ones, release VRAM only after a while (over 90 s after a DeepSeek-V4 TP8
+# job), so poll for ATOMESH_GPU_IDLE_WAIT_SECONDS first. A busy host is
+# recorded in RUN_DIR/gpu-busy/ for pd_submit.sh to resubmit without it.
+assert_gpus_idle() {
+  local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
+  local wait_s="${ATOMESH_GPU_IDLE_WAIT_SECONDS:-300}"
+  local deadline=$((SECONDS + wait_s))
+  local busy
+  if ! command -v amd-smi >/dev/null 2>&1; then
+    command -v rocm-smi >/dev/null 2>&1 && { rocm-smi --showmemuse 2>/dev/null | head -40 || true; }
+    return 0
+  fi
+  while busy="$(busiest_gpu_over_limit)"; do
+    if (( SECONDS >= deadline )); then
+      echo "ERROR: $(hostname) GPU ${busy%% *} already uses ${busy##* } MB VRAM (limit ${max_used_mb} MB). Spur co-scheduled another job on this node; refusing to start." >&2
+      amd-smi monitor -v 2>/dev/null | head -20 >&2 || true
+      docker ps --format '  {{.Names}}\t{{.Status}}' 2>/dev/null | head -20 >&2 || true
+      mkdir -p "${RUN_DIR}/gpu-busy" 2>/dev/null && touch "${RUN_DIR}/gpu-busy/$(hostname)" 2>/dev/null
+      return 1
+    fi
+    sleep 10
+  done
+  return 0
+}
+
+# The image ships every tuned FlyDSL kernel AOT-compiled under
+# /app/aiter-test/aiter/jit/flydsl_cache, but as root-only (0600) files the
+# --user container cannot read. Without them each new prefill M bucket compiles
+# at runtime and stalls the engine for 8-60 s. Extract them once per node, uid
+# and image (~90 MB, ~2 s); FlyDSL's per-key file locks make the directory safe
+# to share between workers and jobs. Prints the directory, or nothing on failure.
+prepare_flydsl_aot_cache() {
+  [[ "${ATOMESH_FLYDSL_AOT:-1}" == "1" ]] || return 0
+  local image_id root dir
+  image_id="$(docker image inspect --format '{{.Id}}' "${DOCKER_IMAGE}" 2>/dev/null)" || return 0
+  image_id="${image_id#sha256:}"
+  [[ -n "${image_id}" ]] || return 0
+  root="${ATOMESH_FLYDSL_AOT_ROOT:-${TMPDIR:-/tmp}/atomesh-flydsl-aot-$(id -u)}"
+  dir="${root}/${image_id:0:16}"
+  mkdir -p "${root}" 2>/dev/null || return 0
+  (
+    flock -w 600 9 || exit 1
+    [[ -f "${dir}/.complete" ]] && exit 0
+    tmp="$(mktemp -d "${root}/.extract.XXXXXX")" || exit 1
+    # shellcheck disable=SC2016
+    if docker run --rm --user 0 --entrypoint /bin/bash "${DOCKER_IMAGE}" -c '
+        d="$(python3 -c "import importlib.util as u, os; s = u.find_spec(\"aiter\"); print(os.path.join(os.path.dirname(s.origin), \"jit\", \"flydsl_cache\"))")" \
+          && [ -d "$d" ] && tar -C "$d" -cf - .' | tar -xf - -C "${tmp}"; then
+      rm -rf "${dir}"
+      mv "${tmp}" "${dir}" && touch "${dir}/.complete"
+    else
+      rm -rf "${tmp}"
+      exit 1
+    fi
+  ) 9>"${root}/.lock" >&2 || return 0
+  echo "${dir}"
 }
 
 run_container_rank() {
@@ -216,6 +332,14 @@ EOF
     docker pull "${DOCKER_IMAGE}"
   fi
 
+  local flydsl_aot_dir
+  flydsl_aot_dir="$(prepare_flydsl_aot_cache)"
+  if [[ -n "${flydsl_aot_dir}" ]]; then
+    echo "[flydsl-aot] rank=${rank} shared cache ${flydsl_aot_dir}"
+  else
+    echo "[flydsl-aot] rank=${rank} no shared cache; workers fall back to copying or runtime JIT"
+  fi
+
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
   if [[ "${rank}" -eq 0 ]]; then
     mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
@@ -257,6 +381,9 @@ EOF
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
     -e NCCL_NET_PLUGIN=none
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+    # MoRI ignores NCCL_IB_*; give it the same ionic HCAs and RoCE GID index.
+    -e MORI_RDMA_DEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+    -e MORI_IB_GID_INDEX="${NCCL_IB_GID_INDEX}"
     -e NCCL_CROSS_NIC=0
     -e NCCL_PXN_DISABLE=0
     -e NCCL_NET_DISABLE_INTRA=1
@@ -321,6 +448,12 @@ EOF
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)
   [[ -d /it-share ]] && docker_args+=(-v /it-share:/it-share)
   [[ -d /shared_nfs ]] && docker_args+=(-v /shared_nfs:/shared_nfs)
+  if [[ -n "${flydsl_aot_dir}" ]]; then
+    docker_args+=(
+      -v "${flydsl_aot_dir}:/opt/atomesh/flydsl-aot"
+      -e ATOMESH_FLYDSL_AOT_DIR=/opt/atomesh/flydsl-aot
+    )
+  fi
 
   docker_args+=(
     "${DOCKER_IMAGE}"
@@ -332,8 +465,12 @@ EOF
   # unbounded container output on shared NFS, not in the scheduler response.
   echo "[logs] rank=${rank} phase=${execution_phase} full log: ${rank_dir}/${container_log}"
   set +e
-  docker "${docker_args[@]}" > "${rank_dir}/${container_log}" 2>&1
-  docker_rc=$?
+  docker "${docker_args[@]}" 2>&1 \
+    | python3 "${REPO_ROOT}/.github/scripts/atomesh/cap_log.py" \
+      "${rank_dir}/${container_log}" \
+      "${ATOMESH_CONTAINER_LOG_MAX_BYTES:-8589934592}" \
+      "${container}"
+  docker_rc="${PIPESTATUS[0]}"
   set -e
   echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
   if [[ "${docker_rc}" -ne 0 ]]; then
@@ -392,6 +529,7 @@ run_spur_job() {
   echo "run_dir=${RUN_DIR}"
 
   pre_cleanup_local
+  assert_gpus_idle || return 1
   write_env_file "${env_file}"
   if [[ "${node_rank}" -eq 0 ]]; then
     cat > "${RUN_DIR}/cell-metadata.json" <<EOF
@@ -462,18 +600,125 @@ if [[ "${1:-}" == "--spur-worker" ]]; then
   exit $?
 fi
 
+if [[ "${1:-}" == "--spur-preflight" ]]; then
+  pre_cleanup_local
+  assert_gpus_idle
+  exit $?
+fi
+
+spur_controller_job_state() {
+  local -a cmd=(scontrol)
+  if [[ -n "${SPUR_CONTROLLER_ADDR:-}" ]]; then
+    cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+  timeout "${ATOMESH_SPUR_QUERY_TIMEOUT:-20}" "${cmd[@]}" show job "${JOB_ID}" 2>/dev/null \
+    | awk -v id="${JOB_ID}" '
+        /JobId=/ { selected = 0 }
+        { for (i = 1; i <= NF; i++) {
+            if ($i == "JobId=" id) selected = 1
+            if (selected && $i ~ /^JobState=/) { sub(/^JobState=/, "", $i); print $i; exit }
+        } }'
+}
+
+# Spur can start the batch script while its controller still reports the job
+# as PENDING, and srun then refuses to create the worker step. Wait only on an
+# explicit pending state; an unavailable controller keeps the old behaviour.
+wait_for_spur_job_running() {
+  local timeout="${ATOMESH_SPUR_RUNNING_TIMEOUT:-300}"
+  local interval="${ATOMESH_SPUR_RUNNING_POLL_INTERVAL:-5}"
+  local deadline state waited=0
+  command -v scontrol >/dev/null 2>&1 || return 0
+  deadline=$(( $(date +%s) + timeout ))
+  while true; do
+    state="$(spur_controller_job_state || true)"
+    case "${state%%+*}" in
+      PENDING|CONFIGURING) ;;
+      *) break ;;
+    esac
+    if (( $(date +%s) >= deadline )); then
+      echo "WARNING: Spur job ${JOB_ID} still ${state} after ${timeout}s; dispatching workers anyway" >&2
+      return 0
+    fi
+    waited=1
+    sleep "${interval}"
+  done
+  if [[ "${waited}" -eq 1 ]]; then
+    echo "[spur] job ${JOB_ID} controller state is now ${state:-unknown}"
+  fi
+}
+
 if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
   # Spur sbatch runs the batch script only on the first allocated node; the
   # other nodes run placeholders until an srun step dispatches their workers.
   # Use an explicit worker argument because the batch shell also has rank 0
   # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
   # environment, including SPUR_PEER_NODES in allocation order.
-  echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
-  exec srun \
-    --nodes="${NUM_NODES}" \
-    --ntasks="${NUM_NODES}" \
-    --ntasks-per-node=1 \
-    bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker
+  #
+  # Spur sometimes runs the batch script on every allocated node anyway. Each
+  # copy then dispatches its own srun, two workers per rank race on the same
+  # container name, and the loser's cleanup kills the winner. Let one batch
+  # copy dispatch via an atomic mkdir on the shared RUN_DIR. The others must
+  # stay alive (workers on their node run inside their namespaces) and exit
+  # with the dispatcher's rc.
+  DISPATCH_DIR="${RUN_DIR}/.spur-dispatch-${ATOMESH_RUN_TOKEN:-0}"
+  if mkdir "${DISPATCH_DIR}" 2>/dev/null; then
+    hostname > "${DISPATCH_DIR}/owner" 2>/dev/null || true
+    wait_for_spur_job_running
+    # Check every node before any worker starts, so a busy node fails the job
+    # in seconds instead of leaving its peers waiting for a service that never
+    # comes up.
+    echo "=== Spur job ${JOB_ID}: GPU preflight on ${NUM_NODES} node(s) ==="
+    preflight_rc=0
+    srun \
+      --nodes="${NUM_NODES}" \
+      --ntasks="${NUM_NODES}" \
+      --ntasks-per-node=1 \
+      bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-preflight \
+      || preflight_rc=$?
+    if [[ "${preflight_rc}" -ne 0 ]]; then
+      echo "=== Spur job ${JOB_ID}: GPU preflight failed rc=${preflight_rc}; busy: $(ls "${RUN_DIR}/gpu-busy" 2>/dev/null | paste -sd, -) ===" >&2
+      printf '%s\n' "${preflight_rc}" > "${DISPATCH_DIR}/rc.tmp"
+      mv "${DISPATCH_DIR}/rc.tmp" "${DISPATCH_DIR}/rc"
+      exit "${preflight_rc}"
+    fi
+    echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers from $(hostname) ==="
+    dispatch_rc=0
+    srun \
+      --nodes="${NUM_NODES}" \
+      --ntasks="${NUM_NODES}" \
+      --ntasks-per-node=1 \
+      bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker \
+      || dispatch_rc=$?
+    printf '%s\n' "${dispatch_rc}" > "${DISPATCH_DIR}/rc.tmp"
+    mv "${DISPATCH_DIR}/rc.tmp" "${DISPATCH_DIR}/rc"
+    exit "${dispatch_rc}"
+  fi
+
+  echo "=== Spur job ${JOB_ID}: $(hostname) skips duplicate dispatch; workers come from $(cat "${DISPATCH_DIR}/owner" 2>/dev/null || echo unknown) ==="
+  all_ranks_done_since=""
+  while [[ ! -f "${DISPATCH_DIR}/rc" ]]; do
+    # Fallback if the dispatcher dies without writing rc: every worker
+    # publishes rank-rc-* on exit, so stop once all of them did.
+    rank_rcs=()
+    for f in "${RUN_DIR}"/rank-rc-*; do
+      [[ -f "${f}" && "${f}" != *.tmp ]] && rank_rcs+=("${f}")
+    done
+    if [[ "${#rank_rcs[@]}" -ge "${NUM_NODES}" ]]; then
+      all_ranks_done_since="${all_ranks_done_since:-${SECONDS}}"
+      if (( SECONDS - all_ranks_done_since >= 60 )); then
+        max_rc=0
+        for f in "${rank_rcs[@]}"; do
+          rc="$(cat "${f}" 2>/dev/null || echo 1)"
+          [[ "${rc}" =~ ^[0-9]+$ ]] || rc=1
+          (( rc > max_rc )) && max_rc="${rc}"
+        done
+        echo "WARNING: dispatcher wrote no rc; all ranks exited, using max rank rc=${max_rc}" >&2
+        exit "${max_rc}"
+      fi
+    fi
+    sleep 5
+  done
+  exit "$(cat "${DISPATCH_DIR}/rc")"
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")

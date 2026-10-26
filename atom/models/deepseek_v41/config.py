@@ -30,17 +30,6 @@ class LayerAttentionSpec:
     index_group_size: int = 1
 
     @property
-    def shares_attention_input(self):
-        """Whether anything but `wqkv_a` reads this layer's normed input.
-
-        A compressor and an indexer both project the same tensor in BF16, and
-        only a FULL layer builds the first or a FULL/REINDEX layer the second
-        -- so everywhere else the norm has exactly one reader and can hand it
-        the quantized pair instead of a tensor to quantize again.
-        """
-        return self.mode in (AttentionMode.FULL, AttentionMode.REINDEX)
-
-    @property
     def produces_candidates(self):
         return self.candidate_owner == self.layer_id
 
@@ -215,7 +204,11 @@ class DeepseekV41TextConfig(PretrainedConfig):
                 "moe_intermediate_size must be divisible by tensor parallel size"
             )
 
-    def validate_request(self, *, num_draft_tokens, multimodal_data):
+    def validate_request(
+        self, *, num_draft_tokens, multimodal_data, enable_dp_attention=False
+    ):
+        if enable_dp_attention and multimodal_data:
+            raise ValueError("DeepSeek-V4.1 DP attention supports text requests only")
         if num_draft_tokens and multimodal_data:
             raise ValueError(
                 "DeepSeek-V4.1 DSpark currently supports text requests only"
@@ -351,9 +344,9 @@ def validate_runtime_config(config):
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
         (
-            "CUDAGraph mode (use FULL, PIECEWISE or enforce_eager=True)",
+            "CUDAGraph mode (use FULL, TR_HYBRID or enforce_eager=True)",
             not config.enforce_eager
-            and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
+            and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.TR_HYBRID),
         ),
         (
             "torch.compile level (use 0 or 3)",
@@ -374,31 +367,53 @@ def validate_runtime_config(config):
         (
             "data parallel",
             config.parallel_config.data_parallel_size != 1
-            or config.enable_dp_attention,
+            and not config.enable_dp_attention,
         ),
-        ("TBO", config.enable_tbo or config.enable_tbo_decode),
+        ("decode TBO", config.enable_tbo_decode),
         (
-            # `lmcache_mp` is the one transport admitted: it checkpoints STATE
-            # through the backend's PAGE-backed copies. P/D and in-process
-            # offload read SLOT regions and codecs this runtime does not publish.
-            "KV transfer other than lmcache_mp",
+            "prefill TBO without DP attention",
+            config.enable_tbo and not config.enable_dp_attention,
+        ),
+        (
+            # `lmcache_mp` checkpoints STATE through the backend's PAGE-backed
+            # copies; Mooncake P/D moves whole PAGE units plus the request's one
+            # STATE slot (`get_kv_transfer_tensors`). MoRI-IO and in-process
+            # offload read SLOT codecs this runtime does not publish.
+            "KV transfer other than lmcache_mp or mooncake",
             KVConnectorFactory.connector_name(config.kv_transfer_config)
-            not in (None, "lmcache_mp"),
+            not in (None, "lmcache_mp", "mooncake"),
+        ),
+        (
+            # Mooncake defaults a missing role to producer, but producer
+            # detection (`kv_config_has_producer`) reads only an explicit one:
+            # an implicit producer would keep deferred output and decode T0
+            # into the slot before handing it over.
+            "Mooncake P/D without an explicit kv_role",
+            KVConnectorFactory.connector_name(config.kv_transfer_config) == "mooncake"
+            and isinstance(config.kv_transfer_config, dict)
+            and config.kv_transfer_config.get("kv_role")
+            not in ("kv_producer", "kv_consumer"),
         ),
         ("RapidServe", config.enable_rapidserve),
-        ("plugin mode", config.plugin_config is not None),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (
-            # The plane a paged scorer reads. Only that scorer is left, so the
-            # format is the runtime's rather than a choice; the main pool stays
+            # The plane the paged scorer reads: FP8, or FP4 in the row-group
+            # scorer's page-8 layout (`index_plane`). The main pool stays
             # independent of it and takes bf16 or fp4 either way.
-            "an index plane other than fp8",
-            config.index_cache_dtype != "fp8",
+            "an index plane other than fp8 or fp4",
+            config.index_cache_dtype not in ("fp8", "fp4"),
         ),
         (
             "a KV cache other than bf16 or fp4",
             config.kv_cache_dtype not in ("bf16", "fp4"),
+        ),
+        (
+            # A hit rebuilds the window a row at it reads from the one PAGE
+            # below it (`BlockManager.replay_start`).
+            "encoder SWA bounded replay with a PAGE shorter than the window - 1",
+            config.enable_encoder_swa_bounded_replay
+            and config.kv_cache_block_size < config.hf_config.sliding_window - 1,
         ),
     ):
         if enabled:
@@ -410,3 +425,15 @@ def validate_runtime_config(config):
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")
     validate_speculative_config(config)
+
+
+def validate_tbo_parallelism(config):
+    """Check the final topology after the engine applies legacy DP settings."""
+    if config.enable_tbo and (
+        not config.enable_dp_attention
+        or config.tensor_parallel_size * config.parallel_config.data_parallel_size <= 1
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 runtime does not support prefill TBO without "
+            "multi-rank DP attention"
+        )

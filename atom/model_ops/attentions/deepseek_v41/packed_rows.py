@@ -71,6 +71,8 @@ def _write_window(
     cu,
     slots,
     ring_start,
+    cached_until,
+    CACHED_UNTIL: tl.constexpr,
     SLOT_BYTES: tl.constexpr,
     WINDOW: tl.constexpr,
     D: tl.constexpr,
@@ -86,17 +88,23 @@ def _write_window(
     end = tl.load(cu + batch + 1)
     if t < end - WINDOW:
         return
-    slot = tl.load(slots + batch).to(tl.int64)
     pos = tl.load(positions + t)
+    keep = True
+    if CACHED_UNTIL:
+        # a row its ring already holds stays as it is (`swa_write`'s)
+        keep = pos >= tl.load(cached_until + batch)
+    slot = tl.load(slots + batch).to(tl.int64)
     row = ring_start + slot * SLOT_BYTES + (pos % WINDOW) * (D + D // 32)
     d = tl.arange(0, BLOCK)
     v = tl.load(values + t * D + d, d < D, other=0)
     s = tl.load(scales + t * (D // 32) + d, d < D // 32, other=127)
-    tl.store(pool + row + d, v, d < D)
-    tl.store(pool + row + D + d, s, d < D // 32)
+    tl.store(pool + row + d, v, (d < D) & keep)
+    tl.store(pool + row + D + d, s, (d < D // 32) & keep)
 
 
-def write_packed_window(values, scales, pool, step, window, dim):
+def write_packed_window(values, scales, pool, step, window, dim, cached_until=None):
+    """`cached_until`: as `swa_write`'s, per request the position below which
+    its ring keeps the rows it holds; None writes every row."""
     if step.width:
         _write_window[(step.width,)](
             values.view(torch.uint8),
@@ -107,6 +115,8 @@ def write_packed_window(values, scales, pool, step, window, dim):
             step.cu_seqlens_q,
             step.slots,
             window.ring_start,
+            step.positions if cached_until is None else cached_until,
+            cached_until is not None,
             window.slot_rows,
             window.ring_slots,
             dim,

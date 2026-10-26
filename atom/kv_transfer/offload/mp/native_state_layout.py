@@ -38,6 +38,8 @@ class NativeStateMPLayout:
     tensors: tuple[torch.Tensor, ...]
     kernel_groups: tuple[NativeStateMPKernelGroup, ...]
     checkpoint_spec: Any
+    # False: PAGE alone, no image group (`stores_state_images`).
+    images: bool = True
 
     def engine_group_infos(self) -> list[Any]:
         """Convert the neutral plan at the actual LMCache registration boundary."""
@@ -84,6 +86,7 @@ def build_native_state_mp_layout(
     block_size: int,
     chunk_size: int,
     num_blocks: int | None = None,
+    images: bool = True,
 ) -> NativeStateMPLayout:
     """Validate and alias PAGE plus compact native STATE for LMCache MP.
 
@@ -91,7 +94,8 @@ def build_native_state_mp_layout(
     logical chunk per block. The MP server's global null block ID must be
     configured as ``-1``. The final ordinal's final region ends exactly at
     ``image_bytes``; its dim-0 stride continues to address the original full
-    PAGE region.
+    PAGE region. ``images=False`` registers PAGE alone: with no image group,
+    LMCache's hit is the PAGE KV's own extent.
     """
     block_size = _positive_int("native PAGE block size", block_size)
     chunk_size = _positive_int("native checkpoint chunk size", chunk_size)
@@ -146,7 +150,7 @@ def build_native_state_mp_layout(
     tensors = [view.view(torch.uint8) for view in page_views]
     engine_ids = [0] * len(tensors)
     image_offset = 0
-    for ordinal in range(units):
+    for ordinal in range(units if images else 0):
         for page_view, region in zip(
             page_views[:state_count], regions[:state_count], strict=True
         ):
@@ -167,7 +171,7 @@ def build_native_state_mp_layout(
             tensors.append(alias)
             engine_ids.append(1 + ordinal)
             image_offset += nbytes
-    if image_offset != image_bytes:
+    if images and image_offset != image_bytes:
         raise ValueError("PAGE aliases do not cover the native image")
 
     by_identity: dict[tuple, list[int]] = {}
@@ -198,6 +202,7 @@ def build_native_state_mp_layout(
         tensors=tuple(tensors),
         kernel_groups=groups,
         checkpoint_spec=spec,
+        images=images,
     )
 
 

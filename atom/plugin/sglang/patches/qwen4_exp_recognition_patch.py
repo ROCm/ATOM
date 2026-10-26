@@ -19,6 +19,10 @@ QWEN4_EXP_NEXTN_ARCH = "Qwen4ExpForCausalLMNextN"
 _QWEN4_EXP_DRAFT_SOURCE_ARCHS = {
     "Qwen4ExpForConditionalGeneration",
     "Qwen4ExpForCausalLM",
+    # 0.5.20 ``_config_draft_model`` rewrites the checkpoint arch to this
+    # before ATOM's hook. #2385 only listed the checkpoint name, which
+    # 0.5.17 left unchanged, so the Native NextN wrapper never loaded.
+    "Qwen4ExpForCausalLMMTP",
     QWEN4_EXP_NEXTN_ARCH,
 }
 
@@ -74,6 +78,29 @@ def rewrite_qwen4_exp_draft_hf_config(
     return True
 
 
+def promote_flash_draft_text_config(model_config: Any) -> bool:
+    """Point the draft ``ModelConfig`` at the text config.
+
+    0.5.20 keeps the VL ``Qwen4ExpConfig`` as ``hf_config`` and only shrinks
+    ``text_config``. That object has no ``vocab_size`` / ``hidden_size`` /
+    ``mtp``. The Native NextN wrapper and ``Qwen4ExpMTP`` read those fields
+    on the config they are given.
+    """
+    hf = getattr(model_config, "hf_config", None)
+    if not is_qwen4_exp_nextn_arch(hf):
+        return False
+    text = getattr(model_config, "hf_text_config", None) or getattr(
+        hf, "text_config", None
+    )
+    if text is None or text is hf:
+        return False
+    if getattr(hf, "vocab_size", None) is not None:
+        return False
+    model_config.hf_config = text
+    model_config.hf_text_config = text
+    return True
+
+
 def apply_qwen4_exp_hc_hidden_size(model_config: Any) -> bool:
     """Treat Flash ``hc_count`` like DSV4 ``hc_mult`` for EAGLE hidden width."""
     text = getattr(model_config, "hf_text_config", None) or getattr(
@@ -108,6 +135,7 @@ def _patch_qwen4_exp_draft_model() -> None:
         rewrite_qwen4_exp_draft_hf_config(
             self.hf_config, getattr(self, "hf_text_config", None)
         )
+        promote_flash_draft_text_config(self)
 
     _config_draft_model._atom_qwen4_exp_nextn = True  # type: ignore[attr-defined]
     ModelConfig._config_draft_model = _config_draft_model

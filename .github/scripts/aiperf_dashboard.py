@@ -5,7 +5,22 @@ import argparse
 import json
 import os
 import shlex
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "atomesh"))
+from interactivity import RECORDS_FILENAME, agentic_throughput
+
+
+def records_throughput(src):
+    """InferenceX's records-over-span throughput, or None without usable records."""
+    records = src.parent / RECORDS_FILENAME
+    if not records.is_file():
+        return None
+    try:
+        return agentic_throughput(records)
+    except (OSError, ValueError):
+        return None
 
 
 def dashboard_summary(data, src, conc, env, *, single_node=False):
@@ -30,6 +45,9 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
     # its internal warmup and requests cancelled during grace-period draining.
     cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
     cache_total_tokens = total_tokens("total_usage_prompt_tokens")
+    # Prefer the per-request records so the throughput matches InferenceX;
+    # AIPerf's time-sliced aggregates remain the fallback.
+    throughput = records_throughput(src) or {}
 
     payload = {
         "benchmark_backend": "atom",
@@ -46,6 +64,14 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
         "public_dataset": env.get("AIPERF_PUBLIC_DATASET"),
         "topology": env.get("TOPOLOGY") or data.get("topology"),
         "display_topology": env.get("DISPLAY_TOPOLOGY") or data.get("display_topology"),
+        # Whether a prefill/decode split produced these numbers. The launcher knows
+        # it for certain, and the dashboard needs it to size the cell: an
+        # aggregated run puts both phases on one server's GPUs, so its GPU count is
+        # that server's, not a prefill plus decode sum. Callers that are not the
+        # P/D launcher leave AGGREGATED unset, and the field stays absent.
+        "disaggregated": (
+            env.get("AGGREGATED") != "1" if "AGGREGATED" in env else None
+        ),
         "precision": env.get("PRECISION") or data.get("precision"),
         "random_input_len": int(
             data.get("max_context_length") or env.get("AIPERF_MAX_CONTEXT_LENGTH") or 0
@@ -66,9 +92,13 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
         "median_e2el_ms": pct("request_latency", "p50"),
         "p90_e2el_ms": pct("request_latency", "p90"),
         "p99_e2el_ms": pct("request_latency", "p99"),
-        "input_throughput": avg("input_token_throughput"),
-        "output_throughput": avg("output_token_throughput"),
-        "total_token_throughput": avg("total_token_throughput"),
+        "input_throughput": throughput.get("input_tput_tps")
+        or avg("input_token_throughput"),
+        "output_throughput": throughput.get("output_tput_tps")
+        or avg("output_token_throughput"),
+        "total_token_throughput": throughput.get("total_tput_tps")
+        or avg("total_token_throughput"),
+        "throughput_window_s": throughput.get("duration_s"),
         "successful_requests": avg("request_count"),
         "completed": avg("request_count"),
         "benchmark_duration_s": avg("benchmark_duration")

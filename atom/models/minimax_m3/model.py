@@ -48,6 +48,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -675,6 +676,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@token_graph
 @support_torch_compile
 class MiniMaxM3Model(nn.Module):
     def __init__(
@@ -821,7 +823,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-        self._mono = MonoDecode(self, atom_config, config)
+        self._mono = MonoDecode(self, atom_config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

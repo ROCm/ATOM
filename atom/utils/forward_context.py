@@ -3,15 +3,22 @@
 
 import logging
 import threading
+from collections.abc import Container
 from contextlib import contextmanager
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import numpy as np
 import torch
 
-from atom.config import Config, CUDAGraphMode, KVCacheTensor, ParallelConfig
+from atom.config import Config, KVCacheTensor, ParallelConfig
+
+# A module, not its names: `region_graph` reads this one back at call time.
+from atom.utils import region_graph
+
+if TYPE_CHECKING:
+    from atom.model_ops.indexer import IndexRows
 
 
 class AttnState(Enum):
@@ -37,143 +44,65 @@ class AttnState(Enum):
     PREFILL_PREFIX = "prefill_prefix"
 
 
-def _compute_chunked_local_num_tokens(
-    num_tokens_across_dp_cpu: list[int], max_num_tokens: int, chunk_idx: int
-) -> list[int]:
-    dp_size = len(num_tokens_across_dp_cpu)
-
-    local_size = [-1] * dp_size
-    for i in range(dp_size):
-        dp_tokens = num_tokens_across_dp_cpu[i]
-        local_size[i] = min(max_num_tokens, dp_tokens - (max_num_tokens * chunk_idx))
-        if local_size[i] <= 0:
-            local_size[i] = 1  # ensure lockstep even if done
-    return local_size
-
-
-@dataclass
+@dataclass(frozen=True)
 class DPMetadata:
-    max_tokens_across_dp_cpu: torch.Tensor
-    cu_tokens_across_dp_cpu: torch.Tensor
-    max_tokens_across_dp: int  # Pre-computed int value for cudagraph compatibility
-    local_sizes: list[int] | None = None
+    """The sizes the MoE DP collectives read off every rank's running tokens
+    -- the rows each rank's forward runs."""
+
+    running_tokens_per_dp_rank: np.ndarray
+
+    @property
+    def max_tokens_across_dp(self) -> int:
+        return int(self.running_tokens_per_dp_rank.max())
 
     @staticmethod
-    def num_tokens_across_dp(
-        num_tokens: int, dp_size: int, dp_rank: int
-    ) -> torch.Tensor:
-        """
-        Gather the num_tokens across all DP ranks and return results in a
-        CPU tensor of size dp_size.
-        """
-        num_tokens_across_dp = [0] * dp_size
-        num_tokens_across_dp[dp_rank] = num_tokens
-        num_tokens_tensor = torch.tensor(
-            num_tokens_across_dp, device="cpu", dtype=torch.int32
-        )
-        import torch.distributed as dist
-        from aiter.dist.parallel_state import get_dp_group
+    def gather_running_tokens(
+        parallel_config: ParallelConfig, running_tokens: int
+    ) -> np.ndarray:
+        """Every DP rank's running tokens, from each rank's own, by one CPU
+        all_reduce that a group of one skips. For a caller that knows only its
+        own count; one that knows every rank's builds the table itself."""
+        table = np.zeros(parallel_config.data_parallel_size, dtype=np.int32)
+        table[parallel_config.data_parallel_rank] = running_tokens
+        if parallel_config.data_parallel_size > 1:
+            import torch.distributed as dist
+            from aiter.dist.parallel_state import get_dp_group
 
-        dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
-        return num_tokens_tensor
-
-    @staticmethod
-    def make(
-        parallel_config: ParallelConfig,
-        # attn_metadata: Any,
-        num_tokens: int,
-        num_tokens_across_dp: torch.Tensor | None = None,
-        *,
-        unified: bool = False,
-    ) -> "DPMetadata":
-        """Per-rank token counts for this pass, and the sizes derived from them.
-
-        Three ways to a table, and the caller picks by what it knows. Hand one
-        over and it is taken as given. Say `unified` and every rank runs
-        `num_tokens`, so it is that number repeated. Say neither and it is
-        discovered, at the cost of one CPU all_reduce.
-
-        `unified` cannot be checked here -- the assert below reads this rank's
-        own entry, which a repeated fill satisfies by construction. A wrong
-        claim surfaces later, as a fixed-size collective posted at mismatched
-        heights.
-        """
-        assert parallel_config.data_parallel_size > 1
-        dp_size = parallel_config.data_parallel_size
-        dp_rank = parallel_config.data_parallel_rank
-        batchsize = num_tokens
-
-        # A supplied table already says what every rank runs: its own entry is
-        # this pass's height, and saying it again can only disagree.
-        assert num_tokens_across_dp is None or (
-            not unified and num_tokens_across_dp[dp_rank] == batchsize
-        )
-        if num_tokens_across_dp is None:
-            num_tokens_across_dp = (
-                torch.full((dp_size,), batchsize, dtype=torch.int32, device="cpu")
-                if unified
-                else DPMetadata.num_tokens_across_dp(batchsize, dp_size, dp_rank)
-            )
-        max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp)
-        cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_across_dp, dim=0)
-        max_tokens_across_dp = (
-            max_tokens_across_dp_cpu.item()
-        )  # Pre-compute int for cudagraph
-        return DPMetadata(
-            max_tokens_across_dp_cpu, cu_tokens_across_dp_cpu, max_tokens_across_dp
-        )
-
-    @contextmanager
-    def chunked_sizes(self, max_chunk_size_per_rank: int, chunk_idx: int):
-        """
-        Context manager to compute and temporarily set the per-rank local token
-        sizes for a specific chunk during chunked forward execution.
-        This is necessary to ensure each DP (data parallel) rank processes its
-        designated portion of tokens in lockstep with others, even when the
-        token counts are uneven or some ranks have completed their input early.
-        For chunked execution, we break up the total tokens on each rank into
-        multiple chunks (of at most `max_chunk_size_per_rank`), and for a given
-        `chunk_idx`, this context manager sets `self.local_sizes` to the number
-        of tokens to process in that chunk on each rank.
-        It uses cumulative sizes (`cu_tokens_across_dp_cpu`) to derive the
-        number of tokens per rank, and calls `_compute_chunked_local_num_tokens`
-        to determine the chunk-wise split.
-        `self.local_sizes` is only valid inside the context.
-        Args:
-            max_chunk_size_per_rank: The max number of tokens each rank is
-                                     allowed to process in this chunk.
-            chunk_idx: The index of the chunk to compute sizes for.
-        """
-        cu_sizes = self.cu_tokens_across_dp_cpu
-        num_tokens_across_dp_cpu = [
-            (cu_sizes[i] - cu_sizes[i - 1]).item() if i > 0 else cu_sizes[0].item()
-            for i in range(len(cu_sizes))
-        ]
-        self.local_sizes = _compute_chunked_local_num_tokens(
-            num_tokens_across_dp_cpu, max_chunk_size_per_rank, chunk_idx
-        )
-        try:
-            yield self.local_sizes
-        finally:
-            self.local_sizes = None
-
-    def get_chunk_sizes_across_dp_rank(self) -> list[int] | None:
-        return self.local_sizes
+            dist.all_reduce(torch.from_numpy(table), group=get_dp_group().cpu_group)
+        return table
 
     def get_sizes_across_dp(self) -> list[int]:
-        """Per-rank token counts derived from cumulative tensor."""
-        cu = self.cu_tokens_across_dp_cpu
-        return [(cu[i] - (cu[i - 1] if i > 0 else 0)).item() for i in range(len(cu))]
+        return self.running_tokens_per_dp_rank.tolist()
 
 
 @dataclass
 class SpecDecodeMetadata:
-    draft_token_ids: torch.Tensor
+    # The step's input ids. Draft r is input_ids[target_logits_indices[r] + 1]:
+    # logits row t verifies the token that follows it. Read in place by the
+    # rejection sampler, on the forward stream the next step publishes its
+    # input ids on, so they cannot be overwritten under it.
+    input_ids: torch.Tensor
     num_spec_steps: int
     num_draft_tokens_np: np.ndarray
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
+
+
+_uncaptured_decode_shape_warned = False
+
+
+def _warn_uncaptured_decode_shape(running_bs: int, max_seqlen_q: int) -> None:
+    global _uncaptured_decode_shape_warned
+    if _uncaptured_decode_shape_warned:
+        return
+    _uncaptured_decode_shape_warned = True
+    _logger.warning(
+        "No CUDA graph recorded at (bs=%d, q=%d): decode steps at an uncaptured "
+        "shape run eagerly. Expected only on a P/D producer that keeps a drafter.",
+        running_bs,
+        max_seqlen_q,
+    )
 
 
 @dataclass(frozen=True)
@@ -214,14 +143,24 @@ class ForwardMode:
     # Query rows per sequence this step. `num_spec_step + 1` unless a DSpark
     # shrink cut it, then DP-MAX'd -- so it is the group's, like the widths.
     max_seqlen_q: int
-    # A PIECEWISE recording exists at `running_tokens`, so this step may replay.
-    piecewise_captured: bool
-    # TBO's cross-DP AND, or the local answer on one rank -- there being no peer
-    # to veto it. Settled here so the gate has one source at every dp_size.
+    # TBO's cross-DP AND -- on one rank its own answer, no peer vetoing it.
     tbo_collective_active: bool
-    # What else the one per-step collective returned: per-rank token counts, the
-    # DSpark shape max. Not shape. None on a single rank.
-    sync: Any | None = None
+    # What else the one per-step exchange returned (`DPSyncResult`): every
+    # rank's row, a group of one's included -- per-rank token counts, the
+    # DSpark shape max. Not shape.
+    sync: Any
+    # The step runs a recorded token-graph bucket (`running_tokens`), so its
+    # model's `TokenGraph` replays (`atom/utils/region_graph.py`).
+    token_graph: bool = False
+    # The DP group replays request graphs as one this step: a decode's whole
+    # forward (`use_cudagraph`), a prefill's decoder (`DecoderGraph`).
+    req_graphs: bool = False
+    # The decode batch this step's TBO micro-batches are cut from
+    # (`decode_ubatch_request_ranges`), and so the one every backend lays its
+    # per-ubatch metadata out for: the padded bucket when the step replays a
+    # TBO graph, which recorded that split; the scheduled requests on an eager
+    # TBO split. None when the step does not split a decode.
+    ubatch_split_bs: int | None = None
 
     @classmethod
     def decide(
@@ -231,18 +170,32 @@ class ForwardMode:
         dp_size: int,
         dp_group,
         enforce_eager: bool,
+        step_needs_eager: bool,
         capture_sizes: list[int],
-        captured_tokens: list[int] | None,
         is_block_drafter: bool,
         tbo_on: bool,
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
+        running_tokens_per_dp_rank: np.ndarray,
+        graph_shapes: Container[tuple[int, int]] | None = None,
+        tbo_decode_graphs: bool = False,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
+        ``tbo_decode_graphs``: every decode bucket that splits
+        (`decode_bucket_splits`) was recorded as a TBO graph, so a decode the
+        group splits replays like any other.
+
+        ``running_tokens_per_dp_rank`` is the caller's [dp_size] buffer, which
+        every step settles in place from the group's scheduled tokens.
+
         Any new force-eager condition belongs here, not in a caller-side check.
+        `step_needs_eager` is this rank's attention backend refusing a graph for
+        the step (`AttentionMetadataBuilder.step_needs_eager`); the DP group
+        agrees on it.
         """
         # Lazy: `atom.utils.tbo`'s package init reaches back into this module.
+        from atom.utils.tbo.ubatch_splitting import decode_bucket_splits
         from atom.utils.tbo.ubatching import sync_dp_metadata
 
         is_prefill = batch.total_tokens_num_prefill > 0
@@ -252,42 +205,40 @@ class ForwardMode:
         # today, and this is the one that survives a mixed batch.
         scheduled_bs = batch.total_seqs_num
         meets_min, can_split, ub0, ub1 = local_tbo
-
-        sync = None
-        if dp_size > 1:
-            sync = sync_dp_metadata(
-                dp_group=dp_group,
-                dp_size=dp_size,
-                scheduled_tokens=scheduled_tokens,
-                scheduled_bs=scheduled_bs,
-                is_prefill=is_prefill,
-                tbo_on=tbo_on,
-                local_meets_min_tokens=meets_min,
-                local_can_split=can_split,
-                local_ub_tokens=(ub0, ub1),
-                # Only a block drafter needs the group to agree on it; every
-                # other flavor keeps its own and the two extra wire rows are
-                # not sent.
-                max_seqlen_q=max_seqlen_q if is_block_drafter else None,
-            )
-            # The group's query length, taken BEFORE the rows are read off it:
-            # a rank still on its local q settles on a different `running_tokens`
-            # than its peers.
-            if sync.max_seqlen_q_across_dp is not None:
-                max_seqlen_q = sync.max_seqlen_q_across_dp
-            unified_bs = sync.max_bs_across_dp
-            tbo_collective_active = sync.tbo_collective_active
-            # One meaning and only one: every rank is decoding, so the group max
-            # pads them level and `scheduled_tokens` reduces to a decode count on
-            # every rank. A prefilling peer makes the step ragged across the
-            # group, and then each rank runs its own count through the
-            # variable-length gather.
-            unified = not sync.any_rank_has_prefill
-        else:
-            # One rank pads to nobody, so it has one height by construction, and
-            # its TBO answer stands unvetoed.
-            unified_bs, unified = scheduled_bs, True
-            tbo_collective_active = tbo_on and meets_min and can_split
+        # Every rank's row of the step, a group of one's included (its own
+        # row, with nothing exchanged).
+        sync = sync_dp_metadata(
+            dp_group=dp_group,
+            dp_size=dp_size,
+            scheduled_tokens=scheduled_tokens,
+            scheduled_bs=scheduled_bs,
+            is_prefill=is_prefill,
+            tbo_on=tbo_on,
+            needs_eager=step_needs_eager,
+            final_requests=batch.final_prefill_requests(),
+            local_meets_min_tokens=meets_min,
+            local_can_split=can_split,
+            local_ub_tokens=(ub0, ub1),
+            # Only a block drafter needs the group to agree on it; every other
+            # flavor keeps its own and the extra wire row is not sent.
+            max_seqlen_q=max_seqlen_q if is_block_drafter else None,
+        )
+        # The group's query length, taken BEFORE the rows are read off it: a
+        # rank still on its local q settles on a different `running_tokens`
+        # than its peers.
+        if sync.max_seqlen_q_across_dp is not None:
+            max_seqlen_q = sync.max_seqlen_q_across_dp
+        unified_bs = sync.max_bs_across_dp
+        tbo_collective_active = sync.tbo_collective_active
+        # One meaning and only one: every rank runs one height. Every rank
+        # decoding, the group max pads them level and `scheduled_tokens`
+        # reduces to a decode count on every rank; a prefilling peer makes the
+        # step ragged, and each rank runs its own count through the
+        # variable-length gather. A group of one has one height whatever it runs.
+        unified = dp_size == 1 or not sync.any_rank_has_prefill
+        # A graph replays its collectives: the group replays or runs eagerly as
+        # one.
+        step_needs_eager = sync.any_rank_needs_eager
 
         # ---- the batch: one rule, every step ---------------------------
         # `unified_bs` is the reduction's own answer and the ladder is a rule
@@ -308,18 +259,59 @@ class ForwardMode:
         # Whether the TARGET replays. It no longer decides how wide anything
         # is; when the batch answered four ways depending on this, `running_bs`
         # was per-rank on two of them and every consumer had to know which.
-        use_cudagraph = not is_prefill and unified and not enforce_eager and on_ladder
+        #
+        # The ladder answers the batch question alone, but a recording is keyed
+        # by its request bucket (`request_bucket`). Only a P/D producer passes
+        # `graph_shapes`: it keeps its drafter, so capture holds the
+        # draft_num=mtp_k buckets, while the scheduler never speculates for it
+        # and every decode it runs has no draft. That holds on every rank, its DP dummy included, and
+        # `running_bs` is the group's, so the lookup is DP-agreed: the group
+        # replays or runs eagerly as one.
+        # A step the group splits into TBO microbatches has no recording of its
+        # own, and `tbo_collective_active` is the group's: it runs eagerly as
+        # one -- unless it is a decode and the buckets were recorded split
+        # (`tbo_decode_graphs`), where the bucket's recording is the split.
+        tbo_eager = tbo_collective_active and (is_prefill or not tbo_decode_graphs)
+        graphable = not (enforce_eager or step_needs_eager or tbo_eager)
+        # A recording holds every rank's rows in its collectives, so the group
+        # replays request graphs as one, on a step every rank runs alike: all
+        # decoding (`unified`) or all prefilling.
+        req_graphs = graphable and (unified or all(sync.prefill_across_dp))
+        replayable = req_graphs and not is_prefill and on_ladder
+        shape_captured = (
+            graph_shapes is None
+            or request_bucket(running_bs, max_seqlen_q) in graph_shapes
+        )
+        if replayable and not shape_captured:
+            _warn_uncaptured_decode_shape(running_bs, max_seqlen_q)
+        use_cudagraph = replayable and shape_captured
+        # A replayed bucket that splits was recorded split at the bucket, on
+        # every rank alike, whatever each rank scheduled into it; an eager
+        # split cuts this rank's scheduled requests.
+        if use_cudagraph and tbo_decode_graphs and decode_bucket_splits(running_bs):
+            ubatch_split_bs = running_bs
+        elif tbo_collective_active and not is_prefill:
+            ubatch_split_bs = scheduled_bs
+        else:
+            ubatch_split_bs = None
 
-        running_tokens, piecewise_captured = cls._running_tokens(
+        running_tokens, decode_recorded = cls._running_tokens(
             is_prefill=is_prefill,
             unified=unified,
             running_bs=running_bs,
             scheduled_tokens=scheduled_tokens,
-            num_tokens_across_dp=None if sync is None else sync.num_tokens_across_dp,
-            captured_tokens=captured_tokens,
+            scheduled_tokens_per_dp_rank=sync.scheduled_tokens_per_dp_rank,
             is_block_drafter=is_block_drafter,
             max_seqlen_q=max_seqlen_q,
         )
+        token_graph = cls._pad_to_token_graph(
+            is_prefill, graphable, sync, running_tokens_per_dp_rank
+        )
+        if token_graph:
+            running_tokens = token_graph
+        if unified:
+            # Every rank runs the group's height.
+            running_tokens_per_dp_rank.fill(running_tokens)
         return cls(
             use_cudagraph=use_cudagraph,
             is_prefill=is_prefill,
@@ -329,10 +321,38 @@ class ForwardMode:
             running_tokens=running_tokens,
             running_tokens_are_unified=unified,
             max_seqlen_q=max_seqlen_q,
-            piecewise_captured=piecewise_captured,
             tbo_collective_active=tbo_collective_active,
             sync=sync,
+            token_graph=bool(token_graph) or (decode_recorded and graphable),
+            req_graphs=req_graphs,
+            ubatch_split_bs=ubatch_split_bs,
         )
+
+    @staticmethod
+    def _pad_to_token_graph(
+        is_prefill, graphable, sync, running_tokens_per_dp_rank
+    ) -> int:
+        """Settle every rank's running tokens into ``running_tokens_per_dp_rank``
+        -- its scheduled ones, every prefilling rank's raised to the bucket
+        holding the group's largest (`TokenGraph.bucket`) -- and return that
+        bucket on a prefilling rank, else 0.
+
+        One bucket for every prefilling rank, an idle rank's dummy prefill
+        included: a recording's collectives are sized by its bucket, so ranks
+        replaying different ones hang the group.
+        """
+        bucket = region_graph.TokenGraph.bucket
+        running = running_tokens_per_dp_rank
+        np.copyto(running, sync.scheduled_tokens_per_dp_rank)
+        group = bucket(running.max(), "prefill") if graphable else None
+        if group is None:
+            return 0
+        # Every rank's, whether or not it pads itself: a peer's replay
+        # dispatches its padded rows to this rank too.
+        for rank, prefill in enumerate(sync.prefill_across_dp):
+            if prefill:
+                running[rank] = group
+        return group if is_prefill else 0
 
     @staticmethod
     def _running_tokens(
@@ -341,27 +361,21 @@ class ForwardMode:
         unified: bool,
         running_bs: int,
         scheduled_tokens: int,
-        num_tokens_across_dp,
-        captured_tokens,
+        scheduled_tokens_per_dp_rank,
         is_block_drafter: bool,
         max_seqlen_q: int,
     ) -> tuple[int, bool]:
-        """``(running_tokens, piecewise_captured)``.
+        """``(running_tokens, recorded)``: the decode's width, and whether a
+        decode token graph is recorded at it (`TokenGraph.captured_sizes`).
 
         `pad_for_all_gather` asserts the first equals the rows the tensor really
         has, so it is not "the biggest count anyone reported": it is what THIS
         forward will produce.
         """
-        if not unified:
+        if not unified or is_prefill:
             # Nothing padded the tensor -- the varlen gather sends each rank its
-            # own count -- so a height from the group would claim rows nobody
-            # allocated.
-            return scheduled_tokens, False
-        if is_prefill:
-            # Reachable on one rank only: a group of one is unified whatever it
-            # runs, while under DP any prefill clears `unified` above. Prompts
-            # are ragged, so no product recovers a height and this rank's own
-            # count is the whole answer.
+            # own count, and a prompt is ragged, so no product recovers a
+            # height -- and this rank's own count is the whole answer.
             return scheduled_tokens, False
 
         # The batch was rounded onto the ladder AFTER the sync, so this runs rows
@@ -369,25 +383,22 @@ class ForwardMode:
         # out of the reduction.
         q = max_seqlen_q
         running_tokens = running_bs * q
-        if not captured_tokens:
+        captured = region_graph.TokenGraph.captured_sizes("decode")
+        if not captured:
             return running_tokens, False
         if not is_block_drafter:
             # Rectangular layout: one row per (seq, query), which every per-token
             # buffer spans and `slot_mapping[i * q + j]` addresses through. Anything
             # under the product would leave the tail of that rectangle unwritten.
-            return running_tokens, running_tokens in captured_tokens
+            return running_tokens, running_tokens in captured
 
         # Marker-driven layout: the rows are one flat run, so the width is the
         # smallest recorded one that holds it, not a product -- q-divisible
         # because the per-seq structures tile the run at that stride. Every rank
         # is decoding here, so `scheduled_tokens` IS a decode count on each of
-        # them and row 0's reduction is the group's run. `None` is one rank.
-        run = (
-            scheduled_tokens
-            if num_tokens_across_dp is None
-            else int(num_tokens_across_dp.max())
-        )
-        recorded = next((n for n in captured_tokens if n >= run and n % q == 0), None)
+        # them and row 0's reduction is the group's run.
+        run = int(scheduled_tokens_per_dp_rank.max())
+        recorded = region_graph.TokenGraph.bucket(run, "decode", multiple_of=q)
         if recorded is None:
             # Nothing recorded holds the run, so forward it eagerly rather than
             # claim a graph nobody made at this width.
@@ -498,11 +509,12 @@ class Context:
     # stood for "dp-attention is off", and readers needing the strong claim --
     # `_can_use_dp_sharded_head` above all -- silently got the weak one.
     running_tokens_are_unified: bool = True
-    # `running_tokens` for every rank, unreduced; this rank's entry IS
-    # `running_tokens`. Consumers reduce it, because they want different
-    # reductions: padding each rank up to the group is a MAX, an all2all's
-    # receive width holds what every rank sent and is a SUM. None where no DP
-    # reduction produced one, which is where the two coincide.
+    # `running_tokens` for every rank, unreduced, as Python ints
+    # (`set_forward_context`'s table); this rank's entry IS `running_tokens`.
+    # Consumers reduce it, because they want different reductions: padding
+    # each rank up to the group is a MAX, an all2all's receive width holds what
+    # every rank sent and is a SUM. None on a TBO ubatch whose counts were not
+    # exchanged.
     running_tokens_across_dp: tuple[int, ...] | None = None
     # The step's whole shape decision. Set by `prepare_model` via
     # `ForwardMode.decide`; None only on a capture context, which declares its
@@ -596,11 +608,18 @@ class AttentionMetaData:
     # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
-    # Block-table row per query token, for the same indexer -- both aiter ops
-    # address the table by row. Aliases block_tables at one query per sequence.
+    # The step's index query rows as `score_topk` scores them, published once
+    # a step by the attention builder for every indexer layer.
+    index_rows: "IndexRows | None" = None
+    # The same rows for a pooled indexer's MTP layer, whose positions run one
+    # behind the step's, so its rows close their pools a token later.
+    mtp_index_rows: "IndexRows | None" = None
+    # Block-table row per query token, for an indexer that reads its keys a
+    # query row at a time (DCP decode, a pooled indexer's verify). Aliases
+    # block_tables at one query per sequence.
     # Every producer that rewrites block_tables must rewrite this too: a stale
     # one has the right length and the wrong rows.
-    dcp_token_block_tables: torch.Tensor | None = None
+    token_block_tables: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None
@@ -612,7 +631,6 @@ class AttentionMetaData:
     # for prefix cache
     has_cached: bool = False
     total_kv: int | None = None
-    kpool_total_pools: int | None = None
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
@@ -649,13 +667,11 @@ class AttentionMetaData:
         batch_id_per_k_token: torch.Tensor | None = None,
         has_cached: bool = False,
         total_kv: int | None = None,
-        kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
-        self.kpool_total_pools = kpool_total_pools
         self.num_cached_tokens = num_cached_tokens
         self.seq_starts = seq_starts
         self.cu_seqlens_q = cu_seqlens_q
@@ -690,25 +706,13 @@ class AttentionMetaData:
         # Layer-invariant, so the prefill builder makes it once per fwd.
         self.batch_id_per_k_token = batch_id_per_k_token
 
-    def asdict_zerocopy(self, skip_fields: set[str] | None = None) -> dict[str, Any]:
-        """Similar to dataclasses.asdict, but avoids deepcopying."""
-        if skip_fields is None:
-            skip_fields = set()
-        # Note that if we add dataclasses as fields, they will need
-        # similar handling.
-        return {
-            field.name: getattr(self, field.name)
-            for field in fields(self)
-            if field.name not in skip_fields
-        }
-
 
 def get_published_dcp_local_context_lens(
     attn_metadata: AttentionMetaData, num_rows: int
 ) -> torch.Tensor | None:
     """Return the valid prefix of a published sparse-DCP local-length buffer.
 
-    Metadata is allocated at the engine's padded running width while PIECEWISE
+    Metadata is allocated at the engine's padded running width while TR_HYBRID
     eager execution may score only the scheduled rows. The real requests are
     always the prefix and the producer zero-fills the padded tail.
     """
@@ -753,6 +757,32 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class DPStage:
+    """MoE layers a forward runs on other rows than its step: every DP rank's
+    token count for them and the `DPMetadata` the variable-length gather
+    reads while they run (`ForwardContext.use_dp_stage`)."""
+
+    tokens_across_dp: tuple[int, ...]
+    local_tokens: int
+    dp_metadata: DPMetadata
+
+    @classmethod
+    def make(cls, parallel_config, tokens_across_dp) -> "DPStage":
+        tokens = tuple(int(n) for n in tokens_across_dp)
+        return cls(
+            tokens,
+            tokens[parallel_config.data_parallel_rank],
+            DPMetadata(np.array(tokens, dtype=np.int32)),
+        )
+
+
+def request_bucket(running_bs: int, max_seqlen_q: int) -> tuple[int, int]:
+    """A request bucket (`ReqGraph`): the requests a step runs, and the draft
+    tokens each verifies -- its query rows less the one it decodes."""
+    return running_bs, max_seqlen_q - 1
+
+
 @dataclass
 class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
@@ -776,7 +806,7 @@ class ForwardContext:
     # all_gather (``ForwardMode.decide``) and propagated here so
     # ``UBatchWrapper._compute_ub_graph_bs`` no longer needs its own
     # per-ubatch all_reduce. Shape: tuple of length N == len(ubatch_slices).
-    # None when DP is off or when TBO is not active this step.
+    # None when TBO is not active this step.
     ub_max_tokens_across_dp: tuple | None = None
     # The same counts UNREDUCED: per ubatch, every rank's. The MAX above is one
     # reduction of it and an all2all's receive width wants the SUM, so consumers
@@ -805,18 +835,51 @@ class ForwardContext:
     # forward, so it ignores the flag entirely.
     in_hipgraph: bool = False
 
-    # Piecewise-cudagraph dispatch, read per forward by CUDAGraphWrapper:
-    # cudagraph_runtime_mode picks the capture/replay mode, batch_descriptor is
-    # the key (num_tokens). None defaults keep wrappers inert until model_runner
-    # sets them. Typed Any to dodge a CUDAGraphMode circular import.
-    cudagraph_runtime_mode: Any = None
-    batch_descriptor: Any | None = None
+    # TR graphs (`atom/utils/region_graph.py`): "record" while the runner
+    # records a token bucket, "record_req" while it records a prefill's request
+    # bucket (`ModelRunner._record_prefill_req_graphs`), "replay" while a step
+    # replays a token bucket, None everywhere else -- a module with no
+    # recording for its rows then runs as it always did.
+    tr_graph: str | None = None
+
+    # The DP pad-row work this forward already did (see `step_pad_rows`).
+    pad_rows_done: set = field(default_factory=set)
 
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
         if self.attn_metadata is None:
             self.attn_metadata = {}
+
+    @contextmanager
+    def use_dp_stage(self, stage: DPStage | None):
+        """Size the DP MoE collectives for ``stage`` while this block runs.
+
+        The variable-length gather reads every rank's count from
+        ``dp_metadata`` and this rank's own from ``context.scheduled_tokens``;
+        both are switched to the stage's and restored on exit. A no-op for
+        None, so a caller outside DP runs unchanged.
+        """
+        if stage is None:
+            yield
+            return
+        context = self.context
+        outer = (
+            self.dp_metadata,
+            context.scheduled_tokens,
+            context.running_tokens_across_dp,
+        )
+        self.dp_metadata = stage.dp_metadata
+        context.scheduled_tokens = stage.local_tokens
+        context.running_tokens_across_dp = stage.tokens_across_dp
+        try:
+            yield
+        finally:
+            (
+                self.dp_metadata,
+                context.scheduled_tokens,
+                context.running_tokens_across_dp,
+            ) = outer
 
 
 _forward_context: ForwardContext | None = ForwardContext()
@@ -825,6 +888,88 @@ _forward_kv_cache_context: ForwardContext | None = ForwardContext()
 # Cached once at module import — CUDA availability does not change at
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
 _CUDA_AVAILABLE: bool = torch.cuda.is_available()
+
+# DP pad-row mask for consumers recorded into CUDA graphs (MegaMoE). A replay
+# runs no Python, so each pass derives its mask on the device, on its first call,
+# from buffers every step already refreshes -- never from a host count:
+#   target pass: rows at or past `cu_seqlens_q[running_bs]` (padded requests
+#     have length 0, so that entry is this rank's real token count);
+#   draft pass (`[running_bs, q]` rows): rows at or past q times the real request
+#     count the step's target pass recorded.
+# A target pass records that count first thing, whatever else it decides, so a
+# draft never reads an older step's; one that cannot tell (no cu_seqlens_q, a TBO
+# micro-batch) records "no padding". The buffers are persistent because graphs,
+# and the segments of a token graph, record their addresses.
+_NO_PADDING = 1 << 30
+_row_index_device: torch.Tensor | None = None
+_pad_rows_device: torch.Tensor | None = None
+_real_requests_device: torch.Tensor | None = None
+
+
+def enable_pad_rows_device(num_rows: int, device: torch.device) -> None:
+    """Allocate (or grow) the mask buffers. Call before any capture."""
+    global _row_index_device, _pad_rows_device, _real_requests_device
+    if _pad_rows_device is None or _pad_rows_device.shape[0] < num_rows:
+        # int64: the draft threshold (requests x q, or _NO_PADDING x q) is a 0-d
+        # int64 tensor, which would be cast to the row index's dtype.
+        _row_index_device = torch.arange(
+            num_rows, dtype=torch.int64, device=device
+        ).unsqueeze(1)
+        _pad_rows_device = torch.zeros((num_rows, 1), dtype=torch.bool, device=device)
+        _logger.info("DP pad-row mask enabled for %d rows", num_rows)
+    if _real_requests_device is None:
+        _real_requests_device = torch.full(
+            (), _NO_PADDING, dtype=torch.int64, device=device
+        )
+
+
+def step_pad_rows(num_rows: int) -> torch.Tensor | None:
+    """The `[num_rows, 1]` DP pad-row mask for this pass, or None when no row can
+    be padding: masking is off, a TBO micro-batch, the rows are not the pass's
+    `running_tokens` (a PCP shard, a sub-slice), or an eager pass has no padding.
+    While capturing it always returns the mask, so each replay follows its step."""
+    from atom.utils.tbo.ubatching import tbo_active
+
+    forward_context = get_forward_context()
+    context = forward_context.context
+    if context is None or _pad_rows_device is None:
+        return None
+    capturing = torch.cuda.is_current_stream_capturing()
+    done = forward_context.pad_rows_done
+    cu = getattr(forward_context.attn_metadata, "cu_seqlens_q", None)
+    running_bs = context.running_bs
+    tbo = tbo_active()
+    if not context.is_draft and ("requests", capturing) not in done:
+        done.add(("requests", capturing))
+        if tbo or cu is None or not 0 < running_bs < cu.shape[0]:
+            _real_requests_device.fill_(_NO_PADDING)
+        else:
+            _real_requests_device.copy_(
+                (cu[1 : running_bs + 1] > cu[:running_bs]).sum()
+            )
+    if tbo or num_rows != context.running_tokens:
+        return None
+    if not capturing and context.scheduled_tokens >= num_rows:
+        return None
+    if _pad_rows_device.shape[0] < num_rows:
+        return None
+    pad_rows = _pad_rows_device[:num_rows]
+    key = ("mask", context.is_draft, num_rows, capturing)
+    if key not in done:
+        rows = _row_index_device[:num_rows]
+        if context.is_draft:
+            if running_bs <= 0 or num_rows % running_bs:
+                return None
+            torch.ge(
+                rows, _real_requests_device * (num_rows // running_bs), out=pad_rows
+            )
+        else:
+            if cu is None or not 0 < running_bs < cu.shape[0]:
+                return None
+            torch.ge(rows, cu[running_bs], out=pad_rows)
+        done.add(key)
+    return pad_rows
+
 
 # Thread-local storage for TBO dual-thread execution
 
@@ -873,87 +1018,60 @@ def side_stream(stream: torch.cuda.Stream | None):
         yield stream, context.main_stream
 
 
-def _normalize_cudagraph_runtime_mode(mode: Any) -> CUDAGraphMode | None:
-    """Normalize a frontend runtime mode to ATOM's concrete enum.
-
-    Frontends own their graph dispatch and therefore use distinct enum
-    classes.  Match by name rather than value so their enum layouts can evolve
-    independently.  Composite configuration modes are deliberately rejected:
-    a forward context must describe the concrete NONE/PIECEWISE/FULL decision
-    for the current batch.
-    """
-    name = mode if isinstance(mode, str) else getattr(mode, "name", None)
-    if name not in {"NONE", "PIECEWISE", "FULL"}:
-        return None
-    return CUDAGraphMode[name]
-
-
-def get_current_cudagraph_runtime_mode() -> CUDAGraphMode:
-    """Return the concrete graph mode for the active model forward.
-
-    In vLLM plugin mode graph capture/replay is owned by vLLM, so its forward
-    context is authoritative.  Native ATOM records the same decision on its
-    own ForwardContext.  An unavailable/unknown context is treated as NONE:
-    eager dual-stream execution is valid, and some vLLM runners expose NONE
-    while a whole-model FULL graph is being captured.  Replay does not execute
-    this Python dispatcher.
-    """
+def plugin_graph_is_piecewise() -> bool:
+    """Whether the plugin frontend is running the active forward under its
+    own PIECEWISE graph. In plugin mode graph capture/replay is owned by the
+    frontend, so its forward context is authoritative; native ATOM has no
+    such graph. An unavailable context is not one. Replay does not execute
+    this Python dispatcher."""
     from atom.plugin import is_vllm
 
-    if is_vllm():
-        try:
-            from vllm.forward_context import (
-                get_forward_context as get_vllm_forward_context,
-            )
-            from vllm.forward_context import (
-                is_forward_context_available,
-            )
+    if not is_vllm():
+        return False
+    try:
+        from vllm.forward_context import (
+            get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
+            is_forward_context_available,
+        )
 
-            if is_forward_context_available():
-                mode = _normalize_cudagraph_runtime_mode(
-                    get_vllm_forward_context().cudagraph_runtime_mode
-                )
-                if mode is not None:
-                    return mode
-        except (ImportError, AttributeError, AssertionError):
-            pass
-
-    mode = _normalize_cudagraph_runtime_mode(
-        getattr(get_forward_context(), "cudagraph_runtime_mode", None)
+        if not is_forward_context_available():
+            return False
+        mode = get_vllm_forward_context().cudagraph_runtime_mode
+    except (ImportError, AttributeError, AssertionError):
+        return False
+    return (mode if isinstance(mode, str) else getattr(mode, "name", None)) == (
+        "PIECEWISE"
     )
-    return mode if mode is not None else CUDAGraphMode.NONE
 
 
 def set_forward_context(
     attn_metadata: AttentionMetaData,
     atom_config: Config,
     context: Context,
-    num_tokens: int | None = None,
-    num_tokens_across_dp: torch.Tensor | None = None,
+    running_tokens_per_dp_rank: np.ndarray,
     spec_decode_metadata: SpecDecodeMetadata | None = None,
     ubatch_slices: list[Any] | None = None,
     in_hipgraph: bool = False,
     ub_max_tokens_across_dp: tuple | None = None,
     ub_tokens_across_dp: tuple | None = None,
 ) -> None:
+    """``running_tokens_per_dp_rank``: the rows every DP rank's forward runs,
+    this rank's included (`DPMetadata.gather_running_tokens` when only that
+    one is known)."""
     global _forward_context
-    dp_metadata: DPMetadata | None = None
-    if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
-        dp_metadata = DPMetadata.make(
-            atom_config.parallel_config,
-            # attn_metadata,
-            num_tokens or 0,
-            num_tokens_across_dp,
-        )
-
-    # Mirrored here rather than at each caller: the two going out of step is how
-    # an all2all comes to bound its receive buffer by one rank's count. Assigned
-    # unconditionally, because the capture loop reuses one Context across
-    # buckets and a set-only write would leave the last table behind.
-    context.running_tokens_across_dp = (
-        None if num_tokens_across_dp is None else tuple(num_tokens_across_dp.tolist())
+    dp_metadata = (
+        DPMetadata(running_tokens_per_dp_rank)
+        if atom_config.parallel_config.data_parallel_size > 1
+        else None
     )
 
+    # Mirrored here rather than at each caller: the two going out of step is how
+    # an all2all comes to bound its receive buffer by one rank's count.
+    context.running_tokens_across_dp = tuple(running_tokens_per_dp_rank.tolist())
+
+    forward_mode = context.forward_mode
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,
         no_compile_layers=atom_config.compilation_config.static_forward_context,
@@ -966,6 +1084,9 @@ def set_forward_context(
         ub_tokens_across_dp=ub_tokens_across_dp,
         main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
         in_hipgraph=in_hipgraph,
+        tr_graph=(
+            "replay" if forward_mode is not None and forward_mode.token_graph else None
+        ),
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)

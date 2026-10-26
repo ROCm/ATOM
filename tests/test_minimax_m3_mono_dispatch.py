@@ -10,13 +10,15 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.models.minimax_m3.mono import dispatch, runner
+from atom.mono.runtime import deployment
+from atom.mono.runtime.route import LazyRunner
 
 
 class _Mode:
     def __init__(self, piecewise):
         self.piecewise = piecewise
 
-    def requires_piecewise_compilation(self):
+    def uses_tr_hybrid(self):
         return self.piecewise
 
 
@@ -25,6 +27,10 @@ def _atom_config(**overrides):
         "tensor_parallel_size": 4,
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
+        "enable_dp_attention": False,
+        "decode_context_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
         "kv_cache_dtype": "fp8",
         "index_cache_dtype": "fp8",
         "kv_cache_block_size": 128,
@@ -40,20 +46,34 @@ def _atom_config(**overrides):
 
 @pytest.fixture
 def native(monkeypatch):
-    monkeypatch.setattr(dispatch, "is_vllm", lambda: False)
-    monkeypatch.setattr(dispatch, "is_sglang", lambda: False)
+    monkeypatch.setattr(deployment, "is_vllm", lambda: False)
+    monkeypatch.setattr(deployment, "is_sglang", lambda: False)
 
 
 def test_supported_deployment_has_no_refusal(native):
-    assert dispatch._config_refusal(_atom_config(), SimpleNamespace()) is None
+    assert dispatch._config_refusal(_atom_config()) is None
 
 
 @pytest.mark.parametrize(
     "overrides, reason",
     [
-        ({"tensor_parallel_size": 8}, "TP 8"),
+        ({"tensor_parallel_size": 8}, "kv heads 4 is not divisible by TP 8"),
+        ({"tensor_parallel_size": 2}, "2 kv heads a rank at TP 2"),
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP"),
         ({"pipeline_parallel_size": 2}, "PP"),
+        ({"enable_expert_parallel": True}, "expert parallel"),
+        # M3's `Dims` has no DP-attention form: refused, never built.
+        (
+            {
+                "tensor_parallel_size": 1,
+                "parallel_config": SimpleNamespace(data_parallel_size=4),
+                "enable_dp_attention": True,
+                "enable_expert_parallel": True,
+            },
+            "DP attention 4",
+        ),
+        ({"decode_context_parallel_size": 2}, "decode CP"),
+        ({"prefill_context_parallel_size": 2}, "prefill CP"),
         ({"kv_cache_dtype": "bf16"}, "kv cache"),
         ({"index_cache_dtype": "bf16"}, "index cache"),
         ({"kv_cache_block_size": 16}, "block size"),
@@ -61,42 +81,63 @@ def test_supported_deployment_has_no_refusal(native):
         ({"enable_tbo_decode": True}, "TBO"),
         (
             {"compilation_config": SimpleNamespace(cudagraph_mode=_Mode(True))},
-            "piecewise",
+            "TR_HYBRID",
+        ),
+        # `model_runner` wraps the model and the drafter in
+        # `torch.compile(fullgraph=True)` at this level only, and mono calls
+        # `Tensor.data_ptr()`, which graph-breaks -- a break under `fullgraph`
+        # raises instead of falling back, so this has to refuse rather than
+        # crash a qualified deployment mid-request.
+        (
+            {
+                "compilation_config": SimpleNamespace(
+                    level=1, cudagraph_mode=_Mode(False)
+                )
+            },
+            "DYNAMO_AS_IS",
         ),
     ],
 )
 def test_each_unsupported_setting_is_refused(native, overrides, reason):
-    assert reason in dispatch._config_refusal(
-        _atom_config(**overrides), SimpleNamespace()
+    assert reason in dispatch._config_refusal(_atom_config(**overrides))
+
+
+@pytest.mark.parametrize("level", [0, 2, 3])
+def test_other_compilation_levels_are_not_refused(native, level):
+    """Only level 1 wraps in `fullgraph`; 2 and 3 go through the decorator.
+
+    Pinning the complement matters more than the refusal: copying copilot's
+    boundary without checking it would have refused every non-zero level and
+    turned mono off for the served `--level 3` launch.
+    """
+    cfg = _atom_config(
+        compilation_config=SimpleNamespace(level=level, cudagraph_mode=_Mode(False))
     )
+    assert dispatch._config_refusal(cfg) is None
 
 
 def test_the_model_s_full_context_is_served(native):
     cfg = _atom_config(max_model_len=1 << 20)
-    assert dispatch._config_refusal(cfg, SimpleNamespace()) is None
+    assert dispatch._config_refusal(cfg) is None
 
 
 def test_index_cache_dtype_falls_back_to_kv_cache_dtype(native):
     cfg = _atom_config(index_cache_dtype=None)
-    assert dispatch._config_refusal(cfg, SimpleNamespace()) is None
-
-
-def test_use_index_cache_is_refused(native):
-    why = dispatch._config_refusal(
-        _atom_config(), SimpleNamespace(use_index_cache=True)
-    )
-    assert why == "use_index_cache"
+    assert dispatch._config_refusal(cfg) is None
 
 
 def test_plugin_mode_is_refused(native, monkeypatch):
-    monkeypatch.setattr(dispatch, "is_sglang", lambda: True)
-    assert dispatch._config_refusal(_atom_config(), SimpleNamespace()) == "plugin mode"
+    monkeypatch.setattr(deployment, "is_sglang", lambda: True)
+    assert dispatch._config_refusal(_atom_config()) == "plugin mode"
 
 
 # ---------------------------------------------------------------- per-step predicate
 
 
-def _decode_md(rows=4, slots=None, **overrides):
+_PER_SLOT = object()  # a batch id a slot row, the step's own
+
+
+def _decode_md(rows=4, slots=None, batch_ids=_PER_SLOT, **overrides):
     """Sparse decode metadata with ``rows`` table rows (a size-``rows`` graph)."""
     decode = {
         "max_query_len": 1,
@@ -104,14 +145,16 @@ def _decode_md(rows=4, slots=None, **overrides):
         "seq_lens": torch.ones(rows, dtype=torch.int32),
     }
     decode.update(overrides)
+    slots = slots if slots is not None else torch.zeros(rows, dtype=torch.int64)
     return SimpleNamespace(
         sparse_attention_metadata=SimpleNamespace(
-            decode=SimpleNamespace(**decode),
-            num_prefills=0,
-            slot_mapping=(
-                slots if slots is not None else torch.zeros(rows, dtype=torch.int64)
-            ),
-        )
+            decode=SimpleNamespace(**decode), num_prefills=0, slot_mapping=slots
+        ),
+        batch_id_per_q_token=(
+            torch.zeros(slots.numel(), dtype=torch.int32)
+            if batch_ids is _PER_SLOT
+            else batch_ids
+        ),
     )
 
 
@@ -123,12 +166,13 @@ def _forward_context(md=None, is_prefill=False, ubatch_slices=None):
     )
 
 
-def _mono(monkeypatch, fwd):
-    """An enabled MonoDecode whose runner already exists (no GPU work)."""
+def _mono(monkeypatch, fwd, builds=True):
+    """An enabled MonoDecode whose runner already exists (no GPU work); its kernels
+    build on every rank when ``builds``."""
     mono = dispatch.MonoDecode.__new__(dispatch.MonoDecode)
     mono._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=()))
-    mono._runner = object()
-    mono._enabled = True
+    mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
+    mono._mono.runner = SimpleNamespace(prepare=lambda n: builds)
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
     return mono
 
@@ -142,6 +186,23 @@ def _step(n, pos_dtype=torch.int64):
 def test_decode_steps_of_up_to_max_tokens_are_taken(monkeypatch, n):
     md = _forward_context(_decode_md(rows=16))
     assert _mono(monkeypatch, md).supports(*_step(n), None, None)
+
+
+def test_a_kernel_no_rank_could_build_is_declined_at_every_width(monkeypatch):
+    """``prepare`` is the TP-wide verdict: false on every rank, so every rank
+    falls back.
+
+    Asserted as behaviour rather than on ``_mono.enabled``. A width refusal
+    stopped latching the flag in `3b50fa529` -- it is memoized per width
+    instead -- and the flag is still the right assertion for a *create*
+    refusal, which is why the sibling check in `test_native_monokernel`
+    keeps it. What a caller can observe here is that no width is served,
+    this step and the ones after, because this runner builds nothing.
+    """
+    mono = _mono(monkeypatch, _forward_context(_decode_md(rows=16)), builds=False)
+    assert not mono.supports(*_step(4), None, None)
+    assert not mono.supports(*_step(4), None, None)  # the memoized refusal
+    assert not mono.supports(*_step(8), None, None)  # and any other width
 
 
 def test_more_than_max_tokens_take_the_original_path(monkeypatch):
@@ -171,6 +232,9 @@ def test_check_mode_takes_the_same_steps(monkeypatch):
         ),
         _forward_context(_decode_md(slots=torch.zeros(4, dtype=torch.int32))),
         _forward_context(_decode_md(slots=torch.zeros(2, dtype=torch.int64))),
+        _forward_context(_decode_md(batch_ids=None)),
+        _forward_context(_decode_md(batch_ids=torch.zeros(4, dtype=torch.int64))),
+        _forward_context(_decode_md(batch_ids=torch.zeros(2, dtype=torch.int32))),
     ],
     ids=[
         "prefill",
@@ -184,6 +248,9 @@ def test_check_mode_takes_the_same_steps(monkeypatch):
         "strided_table_rows",
         "slots_int32",
         "fewer_slots",
+        "no_batch_ids",
+        "batch_ids_int64",
+        "fewer_batch_ids",
     ],
 )
 def test_other_steps_take_the_original_path(monkeypatch, fwd):
@@ -199,7 +266,7 @@ def test_batches_and_foreign_inputs_take_the_original_path(monkeypatch):
 
 def test_speculative_decoding_is_not_refused(native):
     cfg = _atom_config(speculative_config=object())
-    assert dispatch._config_refusal(cfg, SimpleNamespace()) is None
+    assert dispatch._config_refusal(cfg) is None
 
 
 @pytest.mark.parametrize("q, reqs", [(2, 1), (2, 2), (3, 1), (4, 1)])
@@ -243,5 +310,49 @@ def test_token_rows_pass_plain_decode_tables_through():
 
 def test_disabled_mono_never_takes_a_step(monkeypatch):
     mono = _mono(monkeypatch, _forward_context())
-    mono._enabled = False
+    mono._mono.enabled = False
     assert not mono.supports(*_step(1), None, None)
+
+
+# --- rollout weight sync -----------------------------------------------------
+# A weight sync rewrites parameter buffers in place, so nothing moves address
+# and no shape or dtype check fires; the mono binds that cache a requantized or
+# dequantized copy go on serving the pre-sync weights. Until `weight_updater`
+# invalidates those copies, a runner that can take a sync must not get mono.
+
+
+class _UpdatingRunner:
+    def update_weights(self, named_tensors, clear_kv_cache=True):
+        raise NotImplementedError
+
+
+class _PlainRunner:
+    pass
+
+
+@pytest.mark.parametrize(
+    ("resolved", "refused"),
+    [(_PlainRunner, False), (_UpdatingRunner, True)],
+)
+def test_a_runner_that_takes_weight_updates_is_refused(
+    native, monkeypatch, resolved, refused
+):
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", lambda _: resolved)
+    why = dispatch._config_refusal(_atom_config(runner_qualname="a.runner.Class"))
+    assert (why is not None and "rollout weight updates" in why) is refused
+
+
+def test_an_unresolvable_runner_is_refused(native, monkeypatch):
+    """Guessing wrong costs correctness; refusing only costs speed."""
+
+    def _boom(_):
+        raise ImportError("no such module")
+
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", _boom)
+    why = dispatch._config_refusal(_atom_config(runner_qualname="gone.Runner"))
+    assert "rollout weight updates" in why
+
+
+def test_a_config_without_a_runner_qualname_is_unaffected(native):
+    """SGLang builds its own `atom_config` and sets no runner."""
+    assert dispatch._config_refusal(_atom_config()) is None

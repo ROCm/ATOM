@@ -19,6 +19,7 @@ class _FakeBatch:
     total_seqs_num_decode: int = 0
     num_spec_step: int = 0
     context_lens: object = None
+    num_scheduled_tokens: object = None
 
 
 def prefill_batch(tok, ctx):
@@ -277,3 +278,37 @@ class TestGraphBs:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestPrefillAttentionSpan:
+    def test_nctx_is_new_tokens_times_mean_attended_context(self):
+        # seq A: 1000 cached + 3000 new (ctx 4000); seq B: 0 cached + 2000 new (ctx 2000)
+        batch = _FakeBatch(
+            total_tokens_num=5000,
+            total_seqs_num_prefill=2,
+            context_lens=np.asarray([4000, 2000], dtype=np.int64),
+            num_scheduled_tokens=np.asarray([3000, 2000], dtype=np.int32),
+        )
+        lbl = build_run_label(
+            is_prefill=True,
+            use_cudagraph=False,
+            is_dummy=False,
+            tbo_on=False,
+            scheduled_bs=2,
+            batch=batch,
+            running_bs=2,
+        )
+        # 3000 * (4000 - 1500) + 2000 * (2000 - 1000) = 9.5M
+        assert "nctx=9.5M" in lbl
+
+    def test_no_nctx_without_scheduled_tokens(self):
+        lbl = build_run_label(
+            is_prefill=True,
+            use_cudagraph=False,
+            is_dummy=False,
+            tbo_on=False,
+            scheduled_bs=1,
+            batch=prefill_batch(100, [100]),
+            running_bs=1,
+        )
+        assert "nctx=" not in lbl

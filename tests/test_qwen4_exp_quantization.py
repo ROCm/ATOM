@@ -19,6 +19,29 @@ from atom.models import qwen4_exp
 from atom.quant_spec import LayerQuantConfig
 
 
+def test_stacked_expert_loader_ignores_fused_shared_expert_map_tail():
+    routed = 6
+    w13 = torch.nn.Parameter(torch.zeros(3, 4, 2))
+    w2 = torch.nn.Parameter(torch.zeros(3, 2, 2))
+    w13.weight_loader = lambda *args, **kwargs: None
+    w2.weight_loader = lambda *args, **kwargs: None
+    experts = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(tp_rank=0),
+        expert_layout=SimpleNamespace(num_routed=routed),
+        expert_map=torch.tensor([0, 1, 2, -1, -1, -1, 3, -1]),
+        w13_weight=w13,
+        w2_weight=w2,
+    )
+    qwen4_exp.install_stacked_expert_loaders(experts)
+
+    source_w13 = torch.arange(routed * 4 * 2).reshape(routed, 4, 2)
+    source_w2 = torch.arange(routed * 2 * 2).reshape(routed, 2, 2)
+    w13.weight_loader(w13, source_w13)
+    w2.weight_loader(w2, source_w2)
+    torch.testing.assert_close(w13, source_w13[:3].float())
+    torch.testing.assert_close(w2, source_w2[:3].float())
+
+
 def ptpc_config():
     config = QuantizationConfig()
     config.quant_method = "compressed-tensors"
@@ -232,6 +255,7 @@ def make_embedding(monkeypatch):
         (None, None, False, torch.bfloat16),
         (None, "fp8", True, torch.float8_e4m3fn),
         (None, "fp8", False, torch.bfloat16),
+        (None, "quark", True, torch.bfloat16),
         ("float8_e4m3fn", "compressed-tensors", True, torch.float8_e4m3fn),
         ("float8_e4m3fn", "compressed-tensors", False, torch.float8_e4m3fn),
         ("float8_e4m3fn", None, False, torch.float8_e4m3fn),
@@ -245,8 +269,15 @@ def test_ple_checkpoint_storage(make_embedding, dtype, method, quantized, expect
 
 
 def test_ple_does_not_infer_fp8_from_arbitrary_quantization(make_embedding):
-    with pytest.raises(ValueError, match="supports BF16 or FP8"):
-        make_embedding(method="compressed-tensors")
+    # An undeclared table is BF16; the shard loader refuses any other dtype.
+    layer = make_embedding(method="compressed-tensors")
+    embedding = layer.ngram_embedding
+    assert embedding.weight.dtype == torch.bfloat16
+    shard = torch.zeros(
+        layer.checkpoint_shard_rows, layer.head_dim, dtype=torch.float8_e4m3fn
+    )
+    with pytest.raises(ValueError, match="expected torch.bfloat16 PLE weights"):
+        embedding.weight.weight_loader(embedding.weight, shard, 0)
     with pytest.raises(ValueError, match="unsupported ple_embedding_dtype"):
         make_embedding("float8_e5m2", "compressed-tensors")
 

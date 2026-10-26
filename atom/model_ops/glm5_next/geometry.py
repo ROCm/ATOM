@@ -73,18 +73,22 @@ def speculative_kpool_history_size(
         return pool_size
     if num_speculative_tokens < 0:
         raise ValueError(
-            "num_speculative_tokens must be non-negative, got "
-            f"{num_speculative_tokens}"
+            f"num_speculative_tokens must be non-negative, got {num_speculative_tokens}"
         )
     verification_width = num_speculative_tokens + 1
     required_rows = pool_size + 2 * verification_width
     return 1 << (required_rows - 1).bit_length()
 
 
-def speculative_pool_scratch_width(max_seqlen_k: int, pool_size: int) -> int:
-    """Upper-bound pooled scoring columns by this batch's live KV length."""
-    if max_seqlen_k < 0:
-        raise ValueError(f"max_seqlen_k must be non-negative, got {max_seqlen_k}")
+def pool_plane_width(max_model_len: int, pool_size: int) -> int:
+    """Pooled scoring columns for any decode or verification batch up to the
+    model limit: every pool a request of the model length closes.
+
+    Not the batch's live KV length: a CUDAGraph replays the plane shape it
+    was captured with, and capture metadata carries no real length.
+    """
+    if max_model_len < 0:
+        raise ValueError(f"max_model_len must be non-negative, got {max_model_len}")
     if pool_size <= 0:
         raise ValueError(f"pool_size must be positive, got {pool_size}")
-    return (max_seqlen_k + pool_size - 1) // pool_size
+    return (max_model_len + pool_size - 1) // pool_size

@@ -1186,7 +1186,7 @@ def dcp_decode_candidate_exchange_fused(
     from aiter.ops.topk import flydsl_dcp_topk_merge, top_k_per_row_decode
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
-    from atom.model_ops.sparse_indexer_fp4 import FP4_MQA_BLOCK_K
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 
     dcp_world_size = get_dcp_world_size()
     # Size everything off num_decode_tokens, the rows this rank actually
@@ -1203,7 +1203,7 @@ def dcp_decode_candidate_exchange_fused(
         num_decode_tokens, 1, *padded_q_fp8_decode_tokens.shape[2:]
     )
     # One block-table row per query token; both aiter ops address it by row.
-    block_tables = attn_metadata.dcp_token_block_tables[:num_decode_tokens]
+    block_tables = attn_metadata.token_block_tables[:num_decode_tokens]
 
     local_ctx = dcp_local_context_lens(
         attn_metadata,
@@ -1231,25 +1231,26 @@ def dcp_decode_candidate_exchange_fused(
     else:
         from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 
-        # The schedule the metadata builder published is the one this kernel was
-        # captured with, and it is built off `local_ctx` at `l_max` -- the same
-        # two the call below scores in. Neither may be re-derived here.
         flydsl_pa_mqa_logits_fp4(
             q_rows,
             q_scale[:num_decode_tokens].unsqueeze(1),
             kv_cache,
             kv_scale,
-            block_tables,
-            weights[:num_decode_tokens],
-            local_ctx,
-            l_max,
+            weights=weights[:num_decode_tokens],
+            max_seq_len=l_max,
             weight_scale=weights_scale,
-            next_n=1,
-            block_k=FP4_MQA_BLOCK_K,
             kv_block_size=runner_block_size,
             out=local_logits,
-            cta_info=attn_metadata.indexer_fp4_cta_info,
-            total_ctas=attn_metadata.indexer_fp4_n_ctas,
+            **Fp4MqaRaggedMetadata(
+                attn_metadata.sparse_cu_seqlens_q[: num_decode_tokens + 1],
+                1,
+                block_tables,
+            ).kernel_args(
+                local_ctx,
+                heads=q_rows.shape[-2],
+                page_size=runner_block_size,
+                max_seq_len=l_max,
+            ),
         )
 
     # k_loc is the constant `topk_tokens`, never the live local length: the
@@ -1320,8 +1321,7 @@ def dcp_decode_candidate_exchange_fused(
 def _count_owned_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
     batch_id_per_q_token,  # int32 [num_tokens]
-    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
-    cu_seqlens_k,  # int32 [num_req + 1] -- per-seq base of the flat KV axis
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- positions in the request
     out_counts,  # int32 [num_tokens]
     out_metadata_counts,  # int32 [num_tokens], max(out_counts, 1)
     DCP_RANK: tl.constexpr,
@@ -1337,9 +1337,8 @@ def _count_owned_dcp_prefill_kernel(
 
     Differs from the decode twin (`_count_owned_dcp_kernel`) in two ways:
     the row unit is a query token rather than a request (prefill has many query
-    tokens per request), and `topk_indices` holds a FLAT index into the
-    concatenated KV of all sequences, so the within-sequence position -- which
-    is what the round-robin owner is derived from -- is `indice - cu_seqlens_k[req]`.
+    tokens per request), and the round-robin owner is derived from each
+    candidate's position in its request, which `topk_indices` holds.
     """
     token_id = tl.program_id(0)
     # `-1` marks a CUDAGraph pad token (see token_layout/batch_ids.py): its row
@@ -1347,7 +1346,6 @@ def _count_owned_dcp_prefill_kernel(
     # counts this pass writes stop describing what that pass writes.
     req_id = tl.load(batch_id_per_q_token + token_id)
     valid_req = req_id >= 0
-    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
 
     count = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
@@ -1358,12 +1356,11 @@ def _count_owned_dcp_prefill_kernel(
             mask=col_valid,
             other=-1,
         )
-        pos = indice - base  # position within the sequence
         owned = (
             col_valid
             & valid_req
             & (indice >= 0)
-            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            & (((indice // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         )
         count += tl.sum(owned.to(tl.int32))
 
@@ -1376,8 +1373,7 @@ def _compact_filter_dcp_prefill_kernel(
     dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
     out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets (cumsum of pass 1)
     batch_id_per_q_token,  # int32 [num_tokens]
-    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
-    cu_seqlens_k,  # int32 [num_req + 1]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- positions in the request
     block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
     out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
     DCP_RANK: tl.constexpr,
@@ -1408,7 +1404,6 @@ def _compact_filter_dcp_prefill_kernel(
     # Pad-token guard, in lockstep with pass 1 (see the note there).
     req_id = tl.load(batch_id_per_q_token + token_id)
     valid_req = req_id >= 0
-    base = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
     out_kv_start = tl.load(out_kv_indptr + token_id)
 
     vbs = PAGE_SIZE * DCP_WORLD
@@ -1425,16 +1420,15 @@ def _compact_filter_dcp_prefill_kernel(
             mask=col_valid,
             other=-1,
         )
-        pos = indice - base
         idx_valid = (
             col_valid
             & valid_req
             & (indice >= 0)
-            & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            & (((indice // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         )
 
-        block_id = pos // vbs
-        vb = pos % vbs
+        block_id = indice // vbs
+        vb = indice % vbs
         inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (
             vb % INTERLEAVE
         )
@@ -1462,8 +1456,7 @@ def _compact_filter_dcp_prefill_kernel(
 def triton_filter_and_convert_dcp_index_prefill(
     dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
     batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
-    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] FLAT indices
-    cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
+    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] in-request
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
     dcp_rank: int,
     dcp_world_size: int,
@@ -1477,8 +1470,8 @@ def triton_filter_and_convert_dcp_index_prefill(
 ):
     """Filter a sparse-PREFILL top-k down to this rank's owned KV slots.
 
-    Prefill has one row per query token and its ``topk_indices`` are flat KV
-    indices rather than within-sequence positions. (The decode path no longer
+    Prefill has one row per query token, its ``topk_indices`` positions in
+    the token's request, as the shared scorer emits them. (The decode path no longer
     needs this at all -- the fused merge emits owned slots directly.) Two passes,
     in-place int32 cumsum, order-preserving compaction, and the same
     layer-scoped buffers are reused (they are sized ``max_num_batched_tokens``,
@@ -1486,10 +1479,9 @@ def triton_filter_and_convert_dcp_index_prefill(
     """
     assert topk_indices.dtype == torch.int32
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
-        f"BLOCK_N ({BLOCK_N})"
-    )
+    assert (
+        NUM_TOPK_TOKENS % BLOCK_N == 0
+    ), f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
     assert 0 <= dcp_rank < dcp_world_size
     assert out is not None, "sparse_kv_indices_buffer (out) is required"
 
@@ -1498,7 +1490,6 @@ def triton_filter_and_convert_dcp_index_prefill(
     dsa_kv_indptr_c = dsa_kv_indptr.contiguous()
     batch_id_per_q_token_c = batch_id_per_q_token.contiguous()
     topk_indices_c = topk_indices.contiguous()
-    cu_seqlens_k_c = cu_seqlens_k.contiguous()
     block_table_c = block_table.contiguous()
 
     ti_stride0, ti_stride1 = topk_indices_c.stride()
@@ -1511,7 +1502,6 @@ def triton_filter_and_convert_dcp_index_prefill(
         dsa_kv_indptr_c,
         batch_id_per_q_token_c,
         topk_indices_c,
-        cu_seqlens_k_c,
         counts,
         metadata_counts,
         dcp_rank,
@@ -1539,7 +1529,6 @@ def triton_filter_and_convert_dcp_index_prefill(
         out_kv_indptr,
         batch_id_per_q_token_c,
         topk_indices_c,
-        cu_seqlens_k_c,
         block_table_c,
         out,
         dcp_rank,

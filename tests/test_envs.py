@@ -7,6 +7,8 @@ import pytest
 
 # All ATOM_* env vars that could affect default-value tests
 _ATOM_ENV_VARS = [
+    "ATOM_ENABLE_OTEL_TRACE",
+    "ATOM_TRACE_VERSION",
     "ATOM_DP_RANK",
     "ATOM_DP_RANK_LOCAL",
     "ATOM_DP_SIZE",
@@ -28,6 +30,7 @@ _ATOM_ENV_VARS = [
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_ENABLE_METRICS_DEVICE_TIMER",
     "ATOM_METRICS_UPDATE_INTERVAL_S",
+    "ATOM_SHUTDOWN_TIMEOUT_S",
     "ATOM_PROFILER_MORE",
     "ATOM_PROFILER_RECORD_SHAPES",
     "ATOM_PROFILER_WITH_STACK",
@@ -41,6 +44,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_MEGA_MASK_PAD_ROWS",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -120,6 +124,10 @@ class TestEnvsDefaults:
     def test_profiler_timeout_default(self):
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
 
+    def test_shutdown_timeout_default(self, caplog):
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == 5.0
+        assert not caplog.records
+
     def test_log_more_default(self):
         assert _get_envs().ATOM_LOG_MORE is False
 
@@ -143,6 +151,9 @@ class TestEnvsDefaults:
 
     def test_use_flydsl_fp8_prefill_attn_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
+
+    def test_mega_mask_pad_rows_default_enabled(self):
+        assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is True
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
@@ -228,6 +239,19 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 900.0
 
+    @pytest.mark.parametrize("value", ["0.5", "1800"])
+    def test_shutdown_timeout_override(self, monkeypatch, caplog, value):
+        monkeypatch.setenv("ATOM_SHUTDOWN_TIMEOUT_S", value)
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == float(value)
+        assert not caplog.records
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "", "bad"])
+    def test_shutdown_timeout_warns_and_defaults(self, monkeypatch, caplog, value):
+        monkeypatch.setenv("ATOM_SHUTDOWN_TIMEOUT_S", value)
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == 5.0
+        assert len(caplog.records) == 1
+        assert f"ATOM_SHUTDOWN_TIMEOUT_S={value!r}" in caplog.records[0].getMessage()
+
     def test_model_sensitive_rmsnorm_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "1")
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is True
@@ -273,6 +297,10 @@ class TestEnvsOverrides:
     def test_use_flydsl_gather_kv_b_proj_only_one_enables(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
+
+    def test_mega_mask_pad_rows_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "0")
+        assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is False
 
 
 class TestIsSet:
@@ -357,3 +385,19 @@ def test_malformed_offload_timeout_names_the_variable(monkeypatch):
     monkeypatch.setenv("OFFLOAD_PUBLICATION_TIMEOUT_S", "soon")
     with pytest.raises(ValueError, match="OFFLOAD_PUBLICATION_TIMEOUT_S must be"):
         _ = _get_envs().OFFLOAD_PUBLICATION_TIMEOUT_S
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, False), ("0", False), ("1", True), ("TRUE", True), ("false", False)],
+)
+def test_otel_enable_environment(value, expected, monkeypatch):
+    if value is not None:
+        monkeypatch.setenv("ATOM_ENABLE_OTEL_TRACE", value)
+    assert _get_envs().ATOM_ENABLE_OTEL_TRACE is expected
+
+
+def test_otel_version_environment(monkeypatch):
+    assert _get_envs().ATOM_TRACE_VERSION == "unknown"
+    monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
+    assert _get_envs().ATOM_TRACE_VERSION == "build-test"

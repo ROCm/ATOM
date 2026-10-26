@@ -19,6 +19,11 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
 
+_RMSNORM_MULTIROW_MIN_ROWS = 43_008
+_RMSNORM_MULTIROW_BLOCK_M = 8
+_RMSNORM_MULTIROW_LONG_ROWS = 900_000
+_RMSNORM_MULTIROW_LONG_BLOCK_M = 32
+
 
 if _HAS_TRITON:
 
@@ -68,21 +73,74 @@ if _HAS_TRITON:
         BLOCK: tl.constexpr,
     ):
         row = tl.program_id(0)
+        row_i64 = row.to(tl.int64)
         cols = tl.arange(0, BLOCK)
         mask = cols < H
         # x / y are row-contiguous [M, H]; gate may be strided. Its logical row
         # `row` decomposes into (outer, head) so the token-boundary jump
         # (stride_g_outer) and per-head step (stride_g_head) are read directly,
         # avoiding a contiguous copy of the strided gate slice.
-        g_off = (row // HEADS) * stride_g_outer + (row % HEADS) * stride_g_head + cols
-        x = tl.load(x_ptr + row * stride_xm + cols, mask=mask, other=0.0).to(tl.float32)
+        outer_i64 = (row // HEADS).to(tl.int64)
+        head_i64 = (row % HEADS).to(tl.int64)
+        g_off = outer_i64 * stride_g_outer + head_i64 * stride_g_head + cols
+        x = tl.load(x_ptr + row_i64 * stride_xm + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
         var = tl.sum(x * x, axis=0) / H
         rstd = 1.0 / tl.sqrt(var + eps)
         w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         gate = tl.load(g_ptr + g_off, mask=mask, other=0.0).to(tl.float32)
         y = (x * rstd * w) * tl.sigmoid(gate)
         tl.store(
-            y_ptr + row * stride_ym + cols, y.to(y_ptr.dtype.element_ty), mask=mask
+            y_ptr + row_i64 * stride_ym + cols,
+            y.to(y_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+    @triton.jit
+    def _rmsnorm_gated_multirow_kernel(
+        x_ptr,
+        w_ptr,
+        g_ptr,
+        y_ptr,
+        M,
+        H,
+        eps,
+        stride_xm,
+        stride_ym,
+        stride_g_outer,
+        stride_g_head,
+        HEADS: tl.constexpr,
+        BLOCK: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK)
+        row_mask = rows < M
+        mask = row_mask[:, None] & (cols[None, :] < H)
+        # A masked load/store may still form its pointer on ROCm. Clamp padded
+        # rows before any address arithmetic; `mask` remains based on the real
+        # row ids, so those lanes still perform no memory access.
+        safe_rows = tl.where(row_mask, rows, 0)
+        safe_rows_i64 = safe_rows.to(tl.int64)
+        x_off = safe_rows_i64[:, None] * stride_xm + cols[None, :]
+        outer_i64 = (safe_rows // HEADS).to(tl.int64)
+        head_i64 = (safe_rows % HEADS).to(tl.int64)
+        g_off = (
+            outer_i64[:, None] * stride_g_outer
+            + head_i64[:, None] * stride_g_head
+            + cols[None, :]
+        )
+        x = tl.load(x_ptr + x_off, mask=mask, other=0.0).to(tl.float32)
+        var = tl.sum(x * x, axis=1) / H
+        rstd = tl.rsqrt(var + eps)
+        w = tl.load(w_ptr + cols, mask=cols < H, other=0.0).to(tl.float32)
+        gate = tl.load(g_ptr + g_off, mask=mask, other=0.0).to(tl.float32)
+        y = (x * rstd[:, None] * w[None, :]) * tl.sigmoid(gate)
+        tl.store(
+            y_ptr + safe_rows_i64[:, None] * stride_ym + cols[None, :],
+            y.to(y_ptr.dtype.element_ty),
+            mask=mask,
         )
 
     @triton.jit
@@ -105,6 +163,7 @@ if _HAS_TRITON:
         BLOCK: tl.constexpr,
     ):
         tok = tl.program_id(0)
+        tok_i64 = tok.to(tl.int64)
         head_ids = tl.arange(0, HEADS_POW2)
         cols = tl.arange(0, BLOCK)
         mask = (head_ids[:, None] < HEADS) & (cols[None, :] < H)  # [HEADS_POW2, BLOCK]
@@ -115,12 +174,17 @@ if _HAS_TRITON:
         # index used for addressing to a valid row; the mask (other=0.0) still
         # discards the value, so numerics are unchanged.
         h_safe = tl.where(head_ids < HEADS, head_ids, 0)
-        x_off = tok * stride_xm + h_safe[:, None] * stride_xh + cols[None, :]
+        h_safe_i64 = h_safe.to(tl.int64)
+        x_off = tok_i64 * stride_xm + h_safe_i64[:, None] * stride_xh + cols[None, :]
         x = tl.load(x_ptr + x_off, mask=mask, other=0.0).to(tl.float32)
         var = tl.sum(x * x, axis=1) / H  # [HEADS]
         rstd = 1.0 / tl.sqrt(var + eps)  # [HEADS]
         w = tl.load(w_ptr + cols, mask=cols < H, other=0.0).to(tl.float32)  # [BLOCK]
-        g_off = tok * stride_g_outer + h_safe[:, None] * stride_g_head + cols[None, :]
+        g_off = (
+            tok_i64 * stride_g_outer
+            + h_safe_i64[:, None] * stride_g_head
+            + cols[None, :]
+        )
         gate = tl.load(g_ptr + g_off, mask=mask, other=0.0).to(tl.float32)
         normed = (x * rstd[:, None] * w[None, :]) * tl.sigmoid(gate)  # [HEADS, BLOCK]
         amax = tl.max(tl.abs(normed))  # scalar per token
@@ -128,7 +192,7 @@ if _HAS_TRITON:
         inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
         q = normed * inv
         q = tl.minimum(tl.maximum(q, -fp8_max), fp8_max)
-        y_off = tok * stride_ym + h_safe[:, None] * H + cols[None, :]
+        y_off = tok_i64 * stride_ym + h_safe_i64[:, None] * H + cols[None, :]
         tl.store(y_ptr + y_off, q.to(y_ptr.dtype.element_ty), mask=mask)
         tl.store(s_ptr + tok, scale)
 
@@ -245,6 +309,7 @@ def rmsnorm_gated(
     eps: float,
     quant_type: QuantType | None = None,
     quant_dtype: torch.dtype | None = None,
+    is_prefill: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """rmsnorm(x) over last dim * weight * sigmoid(gate).
 
@@ -284,6 +349,34 @@ def rmsnorm_gated(
     x2 = x2.contiguous()
     y = torch.empty_like(x2)
     BLOCK = triton.next_power_of_2(h)
+    # K3 prefill has many 128-wide rows; grouping them amortizes the otherwise
+    # oversized grid. These thresholds count flattened rows (tokens * heads),
+    # and were measured independently on gfx1250 and gfx950. Keep decode and
+    # the region below the crossover on the original one-row kernel.
+    if is_prefill and h == 128 and m >= _RMSNORM_MULTIROW_MIN_ROWS:
+        is_long = m >= _RMSNORM_MULTIROW_LONG_ROWS
+        block_m = (
+            _RMSNORM_MULTIROW_LONG_BLOCK_M if is_long else _RMSNORM_MULTIROW_BLOCK_M
+        )
+        _rmsnorm_gated_multirow_kernel[(triton.cdiv(m, block_m),)](
+            x2,
+            weight,
+            gate,
+            y,
+            m,
+            h,
+            float(eps),
+            x2.stride(0),
+            y.stride(0),
+            stride_g_outer,
+            stride_g_head,
+            HEADS=heads,
+            BLOCK=BLOCK,
+            BLOCK_M=block_m,
+            num_warps=2 if is_long else 1,
+            waves_per_eu=4,
+        )
+        return y.reshape_as(x)
     _rmsnorm_gated_kernel[(m,)](
         x2,
         weight,

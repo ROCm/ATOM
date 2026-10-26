@@ -14,8 +14,6 @@ import re
 import sys
 import time
 
-import requests
-
 BASE_URL = "http://localhost:8000"
 
 # Long shared prefix: 5-shot math examples (~2000 tokens)
@@ -93,6 +91,8 @@ def extract_answer(text: str):
 
 def get_model_name(base_url: str) -> str:
     """Get the model name from the server."""
+    import requests
+
     resp = requests.get(f"{base_url}/v1/models", timeout=5)
     resp.raise_for_status()
     return resp.json()["data"][0]["id"]
@@ -102,6 +102,8 @@ def send_completion(
     prompt: str, max_tokens: int = 256, base_url: str = BASE_URL, model: str = ""
 ) -> str:
     """Send a completion request to the server."""
+    import requests
+
     resp = requests.post(
         f"{base_url}/v1/completions",
         json={
@@ -146,6 +148,8 @@ def main():
     parser.add_argument("--base-url", type=str, default=BASE_URL)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    import requests
 
     base_url = args.base_url
 

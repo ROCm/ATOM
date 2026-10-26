@@ -10,33 +10,20 @@ those touch just ``self.tokenizer.encode``, ``self.block_size``, and a
 handful of instance attributes, which we wire up by hand.
 """
 
-import sys
-import types
 from itertools import count
 from unittest.mock import MagicMock
 
 import pytest
+from aiter_stub import stubbed_aiter
 
-# ``atom.model_engine.llm_engine`` transitively imports aiter via CoreManager
-# on real installs; here we stub CoreManager so the module is importable
-# without AMD/ROCm-only dependencies.
-if "atom.model_engine.engine_core_mgr" not in sys.modules:
-    _stub = types.ModuleType("atom.model_engine.engine_core_mgr")
-
-    class _StubCoreManager:
-        def __init__(self, *a, **kw):
-            self.added = []
-
-        def add_request(self, reqs):
-            self.added.extend(reqs)
-
-    _stub.CoreManager = _StubCoreManager
-    _stub.DisaggCoreManager = _StubCoreManager
-    sys.modules["atom.model_engine.engine_core_mgr"] = _stub
-
-from atom.model_engine.llm_engine import InputOutputProcessor
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+
+# ``atom.model_engine.llm_engine`` imports aiter through CoreManager on real
+# installs. Stub aiter for the import only: a module left stubbed in
+# ``sys.modules`` would be the one every later test file imports.
+with stubbed_aiter():
+    from atom.model_engine.llm_engine import InputOutputProcessor
 
 
 @pytest.fixture(autouse=True)

@@ -201,6 +201,7 @@ class BlockGPUConnector:
         chunk_size: int | None = None,
         virtual_block_size: int | None = None,
         source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
+        max_staging_bytes: int | None = None,
     ) -> None:
         self.codec = codec
         self.physical_block_size = int(block_size)
@@ -262,12 +263,16 @@ class BlockGPUConnector:
         requested_buffer_chunks = envs.OFFLOAD_GPU_STAGING_CHUNKS
         if requested_buffer_chunks is None:
             requested_buffer_chunks = self._default_staging_buffer_chunks()
-        max_staging_bytes = envs.OFFLOAD_GPU_STAGING_MAX_BYTES
+        # A caller that must know the bound before the KV geometry is known
+        # (the Mooncake Store worker holds it back from the KV budget) passes
+        # it in place of OFFLOAD_GPU_STAGING_MAX_BYTES.
+        if max_staging_bytes is None:
+            max_staging_bytes = envs.OFFLOAD_GPU_STAGING_MAX_BYTES
         if max_staging_bytes is not None:
             if max_staging_bytes < self._gpu_staging_chunk_bytes:
                 raise ValueError(
-                    "OFFLOAD_GPU_STAGING_MAX_BYTES must be at least one "
-                    "LMCache chunk: "
+                    "A GPU staging buffer must hold at least one LMCache chunk; "
+                    "raise OFFLOAD_GPU_STAGING_MAX_BYTES: "
                     f"max_bytes={max_staging_bytes}, "
                     f"chunk_bytes={self._gpu_staging_chunk_bytes}"
                 )

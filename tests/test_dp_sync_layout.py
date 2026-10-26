@@ -89,7 +89,7 @@ def test_the_batch_and_the_token_count_do_not_read_each_other(monkeypatch):
         peers=[_with(0, 99)],
         **_base(scheduled_tokens=10, scheduled_bs=3),
     )
-    assert int(r.num_tokens_across_dp.max()) == 99
+    assert int(r.scheduled_tokens_per_dp_rank.max()) == 99
     assert r.max_bs_across_dp == 3
 
 
@@ -109,6 +109,18 @@ def test_the_prefill_flag_still_reads_as_a_flag_after_the_batch_row(monkeypatch)
         monkeypatch, peers=[_with(2, 1)], **_base(is_prefill=False, scheduled_bs=5)
     )
     assert r.any_rank_has_prefill and r.max_bs_across_dp == 5
+
+
+def test_the_eager_flag_is_its_own_row_after_the_prefill_flag(monkeypatch):
+    """Both OR-reduce and sit side by side, so a one-row shift would read one
+    as the other: a peer needing eager would turn on prefill for everyone, or
+    a peer prefilling would stop every rank replaying. Pinned with each set
+    alone."""
+    eager = _sync(monkeypatch, peers=[_with(3, 1)], **_base())
+    assert eager.any_rank_needs_eager and not eager.any_rank_has_prefill
+    prefill = _sync(monkeypatch, peers=[_with(2, 1)], **_base())
+    assert prefill.any_rank_has_prefill and not prefill.any_rank_needs_eager
+    assert _sync(monkeypatch, peers=[], **_base(needs_eager=True)).any_rank_needs_eager
 
 
 def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
@@ -133,7 +145,7 @@ def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
     # One rank that cannot split vetoes the whole group.
     vetoed = _sync(
         monkeypatch,
-        peers=[_with(4, 0)],
+        peers=[_with(6, 0)],
         **_base(
             tbo_on=True,
             local_meets_min_tokens=True,
@@ -153,7 +165,7 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
     shifted offset reads one of the head's fields and reports it.
     """
     for tbo_on in (False, True):
-        head = 7 if tbo_on else 3
+        head = 9 if tbo_on else 5
         r = _sync(
             monkeypatch,
             peers=[_with(head, 9)],
@@ -162,3 +174,32 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
         assert r.max_seqlen_q_across_dp == 9, f"tbo_on={tbo_on}"
         alone = _sync(monkeypatch, peers=[], **_base(tbo_on=tbo_on, max_seqlen_q=3))
         assert alone.max_seqlen_q_across_dp == 3, f"tbo_on={tbo_on}"
+
+
+def test_the_prefill_flags_come_back_per_rank_in_dp_order(monkeypatch):
+    """Not only OR-reduced: a model whose prefill runs some layers on other
+    rows sizes a decoding peer's collectives by that peer's own rows."""
+    sync = _sync(monkeypatch, peers=[_with(2, 0)], **_base(is_prefill=True))
+    assert sync.prefill_across_dp == (True, False)
+
+
+def test_final_requests_are_max_reduced_from_their_own_row(monkeypatch):
+    """Between the eager flag and the TBO block, with a value no neighbor
+    holds: a shifted row reads a flag or a TBO field instead."""
+    r = _sync(
+        monkeypatch,
+        peers=[_with(4, 6)],
+        **_base(
+            is_prefill=True,
+            final_requests=3,
+            tbo_on=True,
+            local_meets_min_tokens=True,
+            local_can_split=True,
+            local_ub_tokens=(4, 7),
+        ),
+    )
+    assert r.max_final_requests_across_dp == 6
+    assert not r.any_rank_needs_eager
+    assert r.ub_max_tokens_across_dp == (4, 7)
+    alone = _sync(monkeypatch, peers=[], **_base(final_requests=3))
+    assert alone.max_final_requests_across_dp == 3

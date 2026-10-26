@@ -141,24 +141,6 @@ class EngramUva:
 
 
 @dataclass(frozen=True)
-class EngramBatch:
-    """One forward as the kernels see it: every field already on device.
-
-    `compressed` is derived from the very tensor the model embeds, so the rows
-    Engram looks up and the tokens the model runs cannot disagree. `history` is
-    any `[n, max_ngram_size - 1]` int64 plane with `history_index` naming a row
-    per request, which is how the committed cursor is read where it lies rather
-    than gathered out first.
-    """
-
-    compressed: torch.Tensor
-    batch_ids: torch.Tensor
-    cu_seqlens: torch.Tensor
-    history: torch.Tensor
-    history_index: torch.Tensor
-
-
-@dataclass(frozen=True)
 class EngramInputs:
     embeddings: dict[int, torch.Tensor]
     histories: np.ndarray
@@ -221,8 +203,7 @@ class EngramInputPreparer:
         token_mask=None,
         padded_rows=None,
         batch=None,
-        cursor_positions=None,
-        cursor_out=None,
+        staged=None,
     ):
         """Stage one embedding row per row the forward will run.
 
@@ -237,20 +218,13 @@ class EngramInputPreparer:
         still worked out here, and both want the ids on the host. What goes is
         the per-layer, per-request hashing -- measured at 4.4 ms of every 48 ms
         decode step, with the device idle for all of it.
+
+        `staged` (`EngramStep`): the forward launches everything; nothing here.
         """
         compressed_rows = []
         rows = token_ids.numel() if padded_rows is None else padded_rows
-        if self.host.overlap is not None and (batch is not None or dummy):
-            return EngramInputs(
-                self.host.overlap.prepare(
-                    batch,
-                    rows,
-                    cursor_positions=cursor_positions,
-                    cursor_out=cursor_out,
-                ),
-                histories,
-                (),
-            )
+        if staged is not None:
+            return EngramInputs(self.host.overlap.prepare(staged, rows), histories, ())
         if dummy:
             self.host.stage_dummy(rows)
             next_histories = histories

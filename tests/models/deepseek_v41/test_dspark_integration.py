@@ -13,6 +13,7 @@ pytest.importorskip("aiter", reason="the draft stack builds AITER-backed layers"
 
 from torch import nn
 
+from atom.model_ops.attentions.deepseek_v41.backend import ENGRAM_ROWS
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.spec_decode.drafter import AuxCaptureSpec
@@ -74,6 +75,8 @@ def test_capture_builder_uses_full_query_width_and_serving_storage(width):
         == builder.model_runner.forward_vars["v4_meta_state_slot_out"].gpu.data_ptr()
     )
     assert torch.equal(builder.cache.backing, before)
+    # The capture records Engram on no live token: it writes nothing on replay.
+    assert builder.model_runner.forward_vars[ENGRAM_ROWS].np[0] == 0
     # One page, repeated, exactly as V4's capture builds its block table. A
     # capture runs a real forward, so every distinct page it names is a page
     # it writes; naming a run of them hands the block pool's first pages rows
@@ -138,6 +141,52 @@ def test_draft_context_write_spans_the_forwards_width_not_its_tokens(monkeypatch
     assert not written and layer == 0 and taken is step
     torch.testing.assert_close(hidden, aux[: step.width].unsqueeze(0))
     torch.testing.assert_close(positions, torch.arange(step.width)[None])
+
+
+def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
+    """A replayed forward ran the decoder on its tail alone, and the draft's
+    window comes from the decoder's rows: it is written on the tail, through
+    the tail's step, and not at all by a forward that ran no decoder."""
+    written = []
+    outer = SimpleNamespace(replay=None, width=6)
+    cache = SimpleNamespace(
+        packed=False,
+        write_window=lambda layer, keys, taken: written.append((keys, taken)),
+    )
+    monkeypatch.setattr(
+        "atom.utils.forward_context.get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False),
+            attn_metadata=SimpleNamespace(cache=cache, step=outer),
+        ),
+    )
+    draft = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    nn.Module.__init__(draft)
+    draft.rope = object()
+    draft.project_context = lambda rows: rows
+    draft.mtp = [
+        SimpleNamespace(
+            attn=SimpleNamespace(
+                spec=SimpleNamespace(layer_id=0),
+                project_context=lambda hidden, positions, rope, packed: (
+                    hidden,
+                    positions,
+                ),
+            )
+        )
+    ]
+    aux = torch.arange(6 * 2, dtype=torch.float32).view(6, 2)
+    # a middle chunk: its tail holds no request, the decoder ran on none
+    outer.replay = SimpleNamespace(tail=SimpleNamespace(requests=()))
+    draft.write_context_kv(aux, torch.arange(6))
+    assert not written
+    tail = SimpleNamespace(width=2, requests=(object(),))
+    outer.replay = SimpleNamespace(tail=tail, tail_rows=torch.tensor([3, 5]))
+    draft.write_context_kv(aux, torch.arange(10, 16))
+    (hidden, positions), taken = written.pop()
+    assert taken is tail
+    torch.testing.assert_close(hidden, aux[[3, 5]].unsqueeze(0))
+    assert positions.tolist() == [[13, 15]]
 
 
 class ShiftBlock(nn.Module):
@@ -225,6 +274,8 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
     )
     batch = SimpleNamespace(
         is_dummy_run=False,
+        is_final_chunk=None,
+        replaying={},
         req_ids=(11, 22),
         total_seqs_num=2,
         total_tokens_num=4,
@@ -297,7 +348,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        graph.warmup(4, stream=stream)
+        graph.warmup(4)
     torch.cuda.current_stream().wait_stream(stream)
     for slots, anchors in (
         ([3, 1, 0], [17, 12, 3]),
@@ -323,3 +374,42 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
         torch.testing.assert_close(actual_ids[: len(slots)], ids + 1, rtol=0, atol=0)
         assert torch.equal(builder.cache.backing, before)
     assert graph.is_captured(4)
+
+
+def test_engram_rows_carry_live_tokens_and_dead_flags():
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry = V41PoolGeometry(1, ((0, 2),), 32, 128, 128, 32)
+    builder.cache = PagedAttentionCache(builder.geometry, 16, 2, "cpu")
+    builder.block_size, builder.device = 16, "cpu"
+    builder.max_num_batched_tokens = 12
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(2, 12, 9, geometry=builder.geometry)
+    )
+    rows = builder.model_runner.forward_vars[ENGRAM_ROWS]
+    # request 1's tokens 1..2 are an image (no ids of their own)
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        is_final_chunk=None,
+        replaying={},
+        req_ids=(0, 1),
+        num_scheduled_tokens=(2, 3),
+        context_lens=(2, 3),
+        state_slots_committed=(0, 1),
+        block_tables=((0,), (1,)),
+        total_seqs_num=2,
+        total_tokens_num=5,
+        multimodal_data={1: {"embedding_spans": [(1, 2)]}},
+    )
+    builder._prepare(batch, 2, 8)
+    assert rows.np[0] == 5
+    assert rows.np[1:6].tolist() == [0, 0, 0, 1, 1]
+    assert rows.gpu[:6].tolist() == rows.np[:6].tolist()
+    # a capture's synthetic batch: no live token
+    builder._prepare(batch, 2, 8, engram_live=False)
+    assert rows.np[0] == 0

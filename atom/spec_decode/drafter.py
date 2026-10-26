@@ -194,13 +194,6 @@ class Drafter(abc.ABC):
                 max_bs * mtp_k, dtype=torch.int64, **kwargs
             ),
             "bonus_logits_indices": CpuGpuBuffer(max_bs, dtype=torch.int64, **kwargs),
-            # Device-only scratch, shared by PP slots just like other device
-            # tensors in forward_vars. The rejection sampler consumes it on
-            # the forward stream before the next prepare can overwrite it;
-            # draft proposal uses separate token storage. No host publication.
-            "verification_draft_token_ids": torch.empty(
-                max_bs * mtp_k, dtype=torch.int32, device=device
-            ),
         }
 
     # ---- draft passes ----
@@ -220,7 +213,7 @@ class Drafter(abc.ABC):
         )
 
     @torch.inference_mode()
-    def warmup_draft_graphs(self, build_context, stream) -> None:
+    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Run every declared pass once per captured size, paying its JIT here.
 
         aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
@@ -252,7 +245,6 @@ class Drafter(abc.ABC):
             return
         runner = self.runner
         capture_sizes = sorted(runner.capture_sizes)  # capture leaves it descending
-        pool = runner.graph_pool
         start = time.time()
         for pass_ in self.draft_graphs:
             for bs in capture_sizes:
@@ -265,17 +257,24 @@ class Drafter(abc.ABC):
                 context.running_tokens_are_unified = True
                 # The synthetic batch is full, so the pass's scheduled and
                 # running counts are the same number.
-                local_tokens = bs * self.draft_tokens_per_seq
-                context.scheduled_tokens = local_tokens
-                context.running_tokens = local_tokens
+                running_tokens = bs * self.draft_tokens_per_seq
+                runner.running_tokens_per_dp_rank.fill(running_tokens)
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
-                    num_tokens=local_tokens,
+                    running_tokens_per_dp_rank=runner.running_tokens_per_dp_rank,
                 )
-                pool = pass_.warmup(bs, pool=pool, stream=stream)
-        runner.graph_pool = pool
+                self._publish_draft_shape(
+                    get_forward_context(),
+                    running_tokens,
+                    running_tokens,
+                    running_tokens_are_unified=True,
+                )
+                pass_.warmup(bs)
+                if end_trace is not None:
+                    step = pass_.name.rsplit(".", 1)[-1].lstrip("_")
+                    end_trace(f"draft_{step}_bs_{bs}")
         torch.cuda.synchronize()
         if runner.rank == 0:
             logger.info(
@@ -389,8 +388,7 @@ class Drafter(abc.ABC):
         for buf_idx, lid in enumerate(spec.layer_ids):
             if not (lid == -1 or 0 <= lid < n_layers):
                 raise ValueError(
-                    f"aux capture layer id {lid} out of range "
-                    f"{{-1}} U [0,{n_layers})."
+                    f"aux capture layer id {lid} out of range {{-1}} U [0,{n_layers})."
                 )
             if prev is not None and lid <= prev:
                 raise ValueError(
@@ -413,6 +411,15 @@ class Drafter(abc.ABC):
             else:
                 module.register_forward_hook(hook)
         self._captures_aux = True
+        # A target that runs some layers on a subset of rows (V4.1 bounded
+        # replay) moves those layers' captures to their forward rows itself.
+        # The hooks above bind these buffers now, so the target gets the same
+        # tensors.
+        rows_hook = _descend_wrappers(
+            target_model, lambda m: getattr(m, "set_aux_hidden_state_rows", None)
+        )
+        if rows_hook is not None:
+            rows_hook(tuple(spec.layer_ids), tuple(self._aux_buffers))
         logger.info(
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
         )
@@ -629,49 +636,25 @@ class Drafter(abc.ABC):
         if parallel_config.data_parallel_size <= 1:
             return
         context.running_tokens_are_unified = running_tokens_are_unified
-        # The answer travels, not the table it implies -- `make` owns both ways
-        # of reaching one, and skipping its all_reduce is why this is worth
-        # stating at all.
-        forward_context.dp_metadata = DPMetadata.make(
-            parallel_config,
-            running_tokens,
-            unified=running_tokens_are_unified,
-        )
+        # Stating it is what spares the all_reduce: a unified height is every
+        # rank's entry.
+        if running_tokens_are_unified:
+            running_tokens_per_dp_rank = self.runner.running_tokens_per_dp_rank
+            running_tokens_per_dp_rank.fill(running_tokens)
+        else:
+            running_tokens_per_dp_rank = DPMetadata.gather_running_tokens(
+                parallel_config, running_tokens
+            )
+        forward_context.dp_metadata = DPMetadata(running_tokens_per_dp_rank)
+        context.running_tokens_across_dp = tuple(running_tokens_per_dp_rank.tolist())
 
-    def prepare_inputs(
-        self,
-        scheduled_bs: int,
-        # [scheduled_bs] each request's anchor offset WITHIN its own segment;
-        # for a verified request that is its accepted-draft count. None ->
-        # every segment's last row, what a step that verified nothing wants.
-        anchor_in_seq: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Anchor row per request = its segment start + `anchor_in_seq`.
+    def prepare_inputs(self, scheduled_bs: int) -> torch.Tensor:
+        """Anchor row per request when nothing was verified: its segment's last.
 
-        Reading forward from the start is what keeps this length-free; counting
-        back from the segment end needs the segment length, which DSpark's
-        ragged verify makes a per-request number.
+        A verified step takes its anchors from the rejection verdict instead.
         """
         cu_seqlens_q = get_forward_context().attn_metadata.cu_seqlens_q
-        cu_seqlens_q = cu_seqlens_q[: scheduled_bs + 1]
-
-        if anchor_in_seq is None:
-            anchor_in_seq = cu_seqlens_q[1:] - cu_seqlens_q[:-1] - 1
-        token_indices = cu_seqlens_q[:-1] + anchor_in_seq
-
-        # Defensive clamp to the valid flat-token range [0, total_tokens-1].
-        # Under DSpark flat-ragged CUDA graph, the drain-phase corner (tiny /
-        # mixed batches) can drive an anchor index just out of range; the anchor
-        # only seeds the DRAFT (a wrong anchor lowers acceptance but never
-        # corrupts the verified/target output — losslessness is preserved), so
-        # clamping is safe and avoids an index_select GPU fault. No-op on the
-        # normal path where indices are already in range.
-        if self.is_block_drafter:
-            upper = (cu_seqlens_q[-1] - 1).clamp_(min=0)
-            token_indices = token_indices.clamp_(min=0)
-            torch.minimum(token_indices, upper, out=token_indices)
-
-        return token_indices
+        return cu_seqlens_q[1 : scheduled_bs + 1] - 1
 
     @h2d_producer("spec_decode", runner="runner")
     def prepare_spec_decode_indices(
@@ -683,7 +666,8 @@ class Drafter(abc.ABC):
         """Fill host indices/counts before their group's first GPU consumer.
 
         This uses only the settled query lengths, so it can share token input
-        publication. The caller must publish the group before gathering IDs.
+        publication. The caller must publish the group before verification
+        reads them.
         """
         scheduled_bs = len(num_sampled_tokens)
 
@@ -745,13 +729,8 @@ class Drafter(abc.ABC):
         cu_num_draft_tokens = var["cu_num_draft_tokens"].gpu[:scheduled_bs]
         bonus_logits_indices = var["bonus_logits_indices"].gpu[:scheduled_bs]
 
-        # Compute the draft token ids.
-        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = var["verification_draft_token_ids"][:sum_drafted_tokens]
-        torch.index_select(input_ids[1:], 0, target_logits_indices, out=draft_token_ids)
-
         metadata = SpecDecodeMetadata(
-            draft_token_ids=draft_token_ids,
+            input_ids=input_ids,
             num_spec_steps=self.mtp_k,
             num_draft_tokens_np=num_draft_tokens,
             cu_num_draft_tokens=cu_num_draft_tokens,

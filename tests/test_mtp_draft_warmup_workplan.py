@@ -15,6 +15,7 @@ target's capture left -- or a later size's `kv_indptr` runs backwards.
 import types
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 # Named on the module, not on "aiter", for the reason tests/test_dspark.py gives:
@@ -61,15 +62,10 @@ def _fake_proposer(num_attention_heads, *, fused, returns_slots=False):
             out["slot_mapping"] = torch.tensor([11, 12, 13], dtype=torch.int32)
         return out
 
-    def publish_schedule(attn_metadata, running_bs, qlen):
-        # Must see the plan `prepare_mtp_decode` just installed.
-        calls.append({"publish": attn_metadata.work_indptr, "qlen": qlen})
-
     builder = types.SimpleNamespace(
         num_attention_heads=num_attention_heads,
         fuse_mtp_decode_position_update=fused,
         prepare_mtp_decode=prepare_mtp_decode,
-        _publish_indexer_fp4_decode_schedule=publish_schedule,
     )
     proposer = types.SimpleNamespace(
         _share_mtp_indices=False,
@@ -111,17 +107,15 @@ def test_step_warmup_installs_draft_work_plan(
     attn_metadata, _ = _warm_one_size(proposer)
 
     # Same call `propose` makes at step 0, mirroring its only_update rule.
-    prepare, publish = calls
+    (prepare,) = calls
     assert prepare["bs"] == 3
     assert prepare["only_update"] is expect_update
     assert prepare["max_seqlen_q"] == expect_q
     assert prepare["num_reject_tokens"].shape == (3,)
     assert not prepare["num_reject_tokens"].any()
-    # The target's plan is replaced by the draft's, before the schedule
-    # publish that follows it in `propose`.
+    # The target's plan is replaced by the draft's.
     assert attn_metadata.work_indptr == "draft-plan"
     assert attn_metadata.work_info_set == "draft-info"
-    assert publish == {"publish": "draft-plan", "qlen": 1}
 
 
 def test_step_warmup_advances_like_propose_fused():
@@ -178,7 +172,7 @@ class _AdvancingPass:
         self.var = var
         self.seen = {}
 
-    def warmup(self, bs, *, pool=None, stream=None):
+    def warmup(self, bs):
         kv_indptr = self.var["kv_indptr"].gpu
         kv_indptr[: bs + 1] += torch.arange(bs + 1, dtype=kv_indptr.dtype)
         self.var["context_lens"].gpu[:bs] += 1
@@ -186,7 +180,6 @@ class _AdvancingPass:
             kv_indptr[: bs + 1].clone(),
             self.var["context_lens"].gpu[:bs].clone(),
         )
-        return pool
 
 
 def _warmup_all_sizes(warmup_draft_graphs, capture_sizes=(4, 2, 1)):
@@ -199,20 +192,27 @@ def _warmup_all_sizes(warmup_draft_graphs, capture_sizes=(4, 2, 1)):
     proposer.runner = types.SimpleNamespace(
         forward_vars=var,
         capture_sizes=list(capture_sizes),
-        graph_pool=None,
         rank=0,
+        running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
     )
     proposer.draft_graphs = (pass_,)
-    proposer.config = None
+    proposer.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(data_parallel_size=1)
+    )
 
     def build_context(bs):
         return types.SimpleNamespace(), types.SimpleNamespace()
 
+    forward_context = types.SimpleNamespace(context=types.SimpleNamespace())
     with (
         patch("atom.spec_decode.drafter.set_forward_context"),
+        patch(
+            "atom.spec_decode.drafter.get_forward_context",
+            return_value=forward_context,
+        ),
         patch("torch.cuda.synchronize"),
     ):
-        warmup_draft_graphs(proposer, build_context, stream=None)
+        warmup_draft_graphs(proposer, build_context)
     return var, pass_.seen
 
 
