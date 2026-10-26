@@ -2436,3 +2436,52 @@ def test_a_recurrent_load_keeps_the_logical_transfer_end(monkeypatch):
     seq = SimpleNamespace(id="r", num_prompt_tokens=1024)
     assert sched.get_num_new_matched_tokens(seq) == (768, True)
     assert spec.transfer_end_tokens is None
+
+
+def test_finished_transfers_are_released_on_the_step_thread(
+    fake_lmcache_modules, monkeypatch
+):
+    """The drain thread never drops a finished transfer's last reference.
+
+    The future holds the step event, and on ROCm 7.2.x destroying an
+    interprocess event synchronises the device and blocks creating one on any
+    other thread. The step thread drops it at its next start_load_kv, and only
+    while its stream is idle (or the backlog passes the cap).
+    """
+    import threading
+
+    released = []
+
+    class _Future(_WorkerFuture):
+        def __del__(self):
+            released.append(threading.current_thread() is threading.main_thread())
+
+    class _Adapter(_WorkerAdapter):
+        def submit_retrieve_request(self, request_id, op, event):
+            future = _Future()
+            future.ready = True
+            return future
+
+    monkeypatch.setattr(
+        mp_worker.torch.cuda,
+        "Event",
+        lambda **_: SimpleNamespace(record=lambda *_: None),
+    )
+    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
+    idle = [False]
+    monkeypatch.setattr(mp_worker, "_stream_idle", lambda: idle[0])
+    worker = mp_worker.LMCacheMPConnector(_config())
+    worker._adapter = _Adapter()
+    worker.chunk_size = 8
+
+    worker.start_load_kv(_load_step(20))
+    worker._settle_transfers()
+    assert worker.get_finished().finished_loading
+    assert released == [] and len(worker._retired) == 1  # parked, not dropped
+
+    worker.start_load_kv(LMCacheOffloadMetadata())  # stream busy: kept
+    assert released == [] and len(worker._retired) == 1
+    idle[0] = True
+    worker.start_load_kv(LMCacheOffloadMetadata())
+    assert released == [True] and worker._retired == []
+    worker.close()

@@ -58,6 +58,16 @@ from atom.kv_transfer.offload.mp.transfer import (
 
 logger = logging.getLogger("atom")
 
+# Finished transfers the step thread may hold while its stream is busy; see
+# `LMCacheMPConnector._release_retired`.
+_RETIRED_CAP = 256
+
+
+def _stream_idle() -> bool:
+    if not torch.cuda.is_available():
+        return True
+    return bool(torch.cuda.current_stream().query())
+
 
 class LMCacheMPConnector(KVConnectorBase):
     """Worker-side LMCache MP connector for backend-published PAGE views."""
@@ -131,6 +141,12 @@ class LMCacheMPConnector(KVConnectorBase):
         # blocks of. A preemption fence has to cover these too: they reach the
         # server after the step that queued them.
         self._submitting_owner: dict[str, str] = {}
+        # Finished transfers, kept until the step thread can drop them. A
+        # future holds its step event, and on ROCm 7.2.x destroying an
+        # interprocess event synchronises every stream of the device and
+        # blocks event creation on every other thread meanwhile. So the drain
+        # thread never drops the last reference; see `_release_retired`.
+        self._retired: list[Any] = []
         # Keep in-flight IDs in the unbounded pending/submitting collections.
         # Only completed IDs enter these bounded replay tombstones.
         self._completed_save_operations: set[str] = set()
@@ -329,6 +345,7 @@ class LMCacheMPConnector(KVConnectorBase):
         return self._start_load_kv_inner(metadata)
 
     def _start_load_kv_inner(self, metadata: Any) -> None:
+        self._release_retired()
         # Raised before anything else in the step: the drain thread's useful
         # window is the model forward that follows, where the step thread is in
         # C with the GIL released. By `get_finished` the results are settled.
@@ -363,6 +380,22 @@ class LMCacheMPConnector(KVConnectorBase):
         event = torch.cuda.Event(interprocess=self._share_step_event)
         event.record(torch.cuda.current_stream())
         return event
+
+    def _release_retired(self) -> None:
+        """Drop finished transfers' references here, on the step thread.
+
+        Only while this thread's stream is idle -- under synchronous
+        scheduling, the start of a step -- so destroying their events waits on
+        nothing. Past `_RETIRED_CAP` they are dropped regardless, so a stream
+        that is never idle cannot grow the list without bound.
+        """
+        with self._lock:
+            if not self._retired:
+                return
+            if len(self._retired) < _RETIRED_CAP and not _stream_idle():
+                return
+            retired, self._retired = self._retired, []
+        del retired
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
@@ -632,6 +665,9 @@ class LMCacheMPConnector(KVConnectorBase):
                         self._perform_load_submit(*rest[:5], rest[7])
                     else:
                         self._perform_save_submit(*rest)
+                    # The future now holds the step event; a stale local here
+                    # must not outlive it and become the last reference.
+                    item = rest = None
                 self._poll_pending_loads()
                 self._poll_pending_saves()
                 with self._drain_round_cv:
@@ -702,6 +738,9 @@ class LMCacheMPConnector(KVConnectorBase):
             # transfer deadline turns into a fail-stop if it never comes.
             logger.exception("LMCache MP load submission unprovable for %s", request_id)
             transfer = _UnprovableSubmission()
+            # No future holds the event, so these locals are its last owners.
+            with self._lock:
+                self._retired.append(event)
         with self._lock:
             self._submitting_loads.discard(operation_id)
             self._submitting_owner.pop(operation_id, None)
@@ -737,6 +776,7 @@ class LMCacheMPConnector(KVConnectorBase):
         with self._lock:
             for operation_id, entry, result in terminal_ops:
                 self._pending_loads.pop(operation_id, None)
+                self._retired.append(entry.future)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_load_operations,
@@ -775,6 +815,9 @@ class LMCacheMPConnector(KVConnectorBase):
             # the transfer deadline turns into a fail-stop if it never comes.
             logger.exception("LMCache MP save submission unprovable for %s", request_id)
             transfer = _UnprovableSubmission()
+            # No future holds the event, so these locals are its last owners.
+            with self._lock:
+                self._retired.append(event)
         with self._lock:
             self._submitting_saves.discard(operation_id)
             self._submitting_owner.pop(operation_id, None)
@@ -824,6 +867,7 @@ class LMCacheMPConnector(KVConnectorBase):
         with self._lock:
             for operation_id, entry, result in terminal_ops:
                 self._pending_saves.pop(operation_id, None)
+                self._retired.append(entry.future)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_save_operations,
