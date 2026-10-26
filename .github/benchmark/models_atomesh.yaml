@@ -1473,7 +1473,7 @@ models:
         max_model_len: 32768
         max_num_seqs: 64
         max_num_batched_tokens: 32768
-        # Reserve and bound dense cached-prefill K+V to 8 GiB per rank on P/D.
+        # Bounds eligible dense gather only; the target has 60 sparse layers.
         extra_args: "--gqa-prefill-kv-workspace-mb 8192"
     service:
       decode:
@@ -1509,6 +1509,92 @@ models:
           run_eval: true
           eval_only: true
           eval_concurrency: [32]
+      mooncake_store:
+        - &m31_flash_mcstore_dspark3
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c32
+          topology: 1p1d
+          display_topology: 1P1D-TP4-DSPARK3-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [32]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,8,12,16,24,32,40,48,56,64,80,96,112,128,160,192,224,256,320,384,448,512]"
+          server:
+            common_args:
+              gpu_memory_utilization: 0.9
+              max_model_len: 1048576
+              max_num_seqs: 128
+              max_num_batched_tokens: 32768
+              enable_prefix_caching: true
+              # SA MI355X C16-C64: DSpark3, SPEED-Bench golden AL 2.88.
+              # https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39929767608
+              method: dspark
+              draft_model: amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 2.88
+              # Keep native checkpoint weights and the validated ATOM FP8 KV path.
+              extra_args: "--index-cache-dtype fp8 --gqa-prefill-kv-workspace-mb 8192"
+          env:
+            common: &m31_flash_mcstore_common_env
+              MC_DISABLE_HIP: "1"
+              MC_NUM_QP_PER_EP: "1"
+              AITER_QUICK_REDUCE_QUANTIZATION: "INT4"
+              ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "0"
+              ATOM_ENABLE_REPLAYSSM: "0"
+              PYTHONNOUSERSITE: "1"
+              PYTHONHASHSEED: "0"
+              ATOMESH_TORCH_PROFILE_DURATION: "0"
+            prefill: &m31_flash_mcstore_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              MOONCAKE_STORE: "1"
+              # TW MI355X: 1.5 TiB Store, two owners; reserve host RAM for traces.
+              MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            decode: &m31_flash_mcstore_decode_env
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 7200
+          run_eval: false
+
+        - <<: *m31_flash_mcstore_dspark3
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c48
+          concurrency: [48]
+
+        - <<: *m31_flash_mcstore_dspark3
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c64
+          concurrency: [64]
+
+      profile:
+        - <<: *m31_flash_mcstore_dspark3
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c32-profile
+          env:
+            common:
+              <<: *m31_flash_mcstore_common_env
+              # Relative to AIPerf's formal Profiling phase, after warmup.
+              ATOMESH_TORCH_PROFILE_START: "1800"
+              ATOMESH_TORCH_PROFILE_DURATION: "180"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_RECORD_SHAPES: "0"
+              ATOM_PROFILER_WITH_STACK: "0"
+              ATOM_PROFILER_PROFILE_MEMORY: "0"
+              ATOM_PROFILER_TIMEOUT: "3600"
+            prefill: *m31_flash_mcstore_prefill_env
+            decode: *m31_flash_mcstore_decode_env
     accuracy:
       task: gsm8k
       fewshot: 20
