@@ -2494,8 +2494,25 @@ run_aiperf_agentic_benchmark() {
       > >(tee "${out_dir}/aiperf.log") 2>&1 &
     local aiperf_pid=$!
     echo "${aiperf_pid}" > "${aiperf_pid_file}"
+    # Diagnostic-only guard: workers can die while /health still returns 200.
+    # Allow faulthandler to flush, then stop AIPerf instead of waiting 9000s.
+    (
+      while kill -0 "${aiperf_pid}" 2>/dev/null; do
+        if grep -lE 'Memory access fault by GPU|proc died unexpectedly \(exitcode=' \
+          "${RUN_DIR}"/logs/*-rank-*.log > "${out_dir}/gpu-fault-logs.txt" 2>/dev/null; then
+          echo "[gpu-fault] server worker crashed; stopping diagnostic load generator" >&2
+          sleep 5
+          kill -TERM "${aiperf_pid}" 2>/dev/null || true
+          break
+        fi
+        sleep 5
+      done
+    ) &
+    local fault_guard_pid=$!
     local aiperf_rc=0
     wait "${aiperf_pid}" || aiperf_rc=$?
+    kill "${fault_guard_pid}" 2>/dev/null || true
+    wait "${fault_guard_pid}" 2>/dev/null || true
 
     if [[ -n "${profile_pid}" ]]; then
       touch "${profile_done}"
