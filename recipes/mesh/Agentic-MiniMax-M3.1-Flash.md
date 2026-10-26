@@ -35,6 +35,11 @@ aggregated TP4 without Store. These P/D measurements are not an exact replay of
 that serving configuration. Checkpoint-native MXFP8 attention/shared-expert
 weights are retained; online quantization and shared-expert fusion are off.
 
+Native Mooncake Store uses the M3 PAGE codec to save and restore the complete
+ordered target K/V, scale and index-cache regions together with the DSpark
+draft regions. Its codec namespace is separate from dense KV objects. The
+TP4 P/D path uses the target and draft region exports already in this branch.
+
 The existing `--gqa-prefill-kv-workspace-mb 8192` bound is retained. It applies
 only to eligible dense gather implementations; this target has all sparse
 layers, and the DSpark block reads paged KV directly. A configured bound is not
