@@ -1107,7 +1107,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
     # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
     # into page-locked memory of exactly its size (hipHostMalloc on base pages,
-    # so a fragmented page cache costs no compaction), one thread per 128 MiB up to
+    # so a fragmented page cache costs no compaction), one copy_ below 512 MiB, else one thread per 128 MiB (at least 8) up to
     # 16 and the CPUs this process may use, dropping the copied checkpoint
     # pages from the process as it goes; 0 registers the checkpoint mapping in
     # place (one thread, under the HIP runtime lock). Either way the shard is

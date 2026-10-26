@@ -3,7 +3,7 @@
 
 Host-side throughout. Page-locking a shard and voting on the outcome live here
 because they are `cudart` and Gloo calls that a CPU-only machine can run and
-test; hashing on the device and the gather that reads a registered shard are
+test; hashing on the device and the gather that reads a page-locked shard are
 `device.runtime.EngramUva`, which this module never imports -- the caller
 supplies it, and a caller that supplies nothing gets the host path.
 """
@@ -380,10 +380,12 @@ class EngramHost:
 
         Sharding is by hash HEAD. Each head owns a disjoint, contiguous row range
         (the mapping's head offsets are their running sum), so a whole number of
-        heads is a contiguous row -- and byte -- range. A rank registers only that
-        range: the full table on every rank is what a TP job cannot afford.
+        heads is a contiguous row -- and byte -- range. A rank page-locks only
+        that range (`host_memory.pin_rows`: copied into page-locked memory by
+        default, registered in place with ATOM_ENGRAM_UVA_COPY=0): the full
+        table on every rank is what a TP job cannot afford.
 
-        The answer is the GROUP's. An empty shard and a refused registration are
+        The answer is the GROUP's. An empty shard and a refused page-lock are
         both per-rank outcomes, and the device lookup ends in an all-gather: a
         rank that fell back alone would strand every other rank in it.
         """
@@ -428,7 +430,8 @@ class EngramHost:
         return True
 
     def _register_shard(self, prefetcher):
-        """Bytes page-locked for this rank's head range, or 0 if any table said no.
+        """Bytes page-locked for this rank's head range, or 0 if any table said
+        no (or raised).
 
         A partial set is left for `_enable_uva` to release: it releases on every
         other falsy outcome too, so there is one site that gives pages back.
@@ -443,15 +446,35 @@ class EngramHost:
             offsets = mapping.head_offsets[layer_id]
             row_start = int(offsets[self.head_start])
             row_end = int(offsets[last]) + int(mapping.head_vocab_sizes[layer_id][last])
-            if not table.enable_uva(row_start, row_end):
-                logger.info("engram: UVA registration refused on layer %d", layer_id)
+            try:
+                ok = table.enable_uva(row_start, row_end)
+            except Exception:
+                # Answered as a refusal, not raised: the TP group votes next,
+                # and a rank that left before the vote would leave its peers
+                # in the all-reduce. Logged with its traceback, since it is a
+                # bug (a range out of bounds, or a table already holding
+                # another) rather than a lack of memory.
+                logger.warning(
+                    "engram: page-locking layer %d raised; voting no",
+                    layer_id,
+                    exc_info=True,
+                )
+                return 0
+            if not ok:
+                logger.info("engram: UVA page-locking refused on layer %d", layer_id)
                 return 0
             self._pinned_tables.append(table)
             pinned += (row_end - row_start) * table.head_dim
         return pinned
 
     def _release_shard(self):
-        """Unregister every table this rank pinned; these pages are unswappable."""
+        """Drop every shard this rank page-locked; those pages are unswappable.
+
+        Each table gives up its shard tensors (`disable_uva`). The memory -- a
+        `hipHostMalloc` copy by default, or the registration of the checkpoint
+        mapping in place -- goes with the last tensor over it, after the device
+        has finished with it (`host_memory`), so a lookup still holding one
+        keeps it until then."""
         for table in self._pinned_tables:
             table.disable_uva()
         self._pinned_tables = []

@@ -1164,8 +1164,13 @@ def test_copy_threads_scale_with_size_and_respect_cpu_affinity(monkeypatch):
     from atom.model_ops.engram import host_memory as hm
 
     monkeypatch.setattr(hm.os, "sched_getaffinity", lambda pid: set(range(64)))
-    assert hm.copy_threads(hm._BYTES_PER_THREAD - 1) == 1
-    assert hm.copy_threads(4 * hm._BYTES_PER_THREAD) == 4
+    # The documented policy: one copy_ below 512 MiB, then 8..16 threads.
+    assert hm.copy_threads((128 << 20) - 1) == 1
+    assert hm.copy_threads(256 << 20) == 1  # two threads lose to one copy_
+    assert hm.copy_threads((512 << 20) - 1) == 1
+    assert hm.copy_threads(512 << 20) == 8
+    assert hm.copy_threads(1 << 30) == 8
+    assert hm.copy_threads(3 << 30) == 16
     assert hm.copy_threads(1 << 40) == hm._MAX_COPY_THREADS
     monkeypatch.setattr(hm.os, "sched_getaffinity", lambda pid: {0, 1, 2})
     assert hm.copy_threads(1 << 40) == 3
@@ -1279,6 +1284,33 @@ def test_uva_is_the_groups_decision_not_this_ranks(monkeypatch):
     )
     assert cudart.registered == []
     assert rt._pinned_tables == []
+    rt.shutdown()
+
+
+def test_a_table_that_raises_votes_no_instead_of_leaving_the_vote(monkeypatch):
+    """An exception from one table's `enable_uva` (a table already holding
+    another range, a bad range) must reach the group vote as a refusal: a
+    rank that raised before the all-reduce would leave its peers in it."""
+    from atom.model_ops.engram import host as engram_host
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    patch_tp_group(monkeypatch, FakeGroup(world_size=2))
+    votes = []
+
+    def vote(tensor, op=None, group=None):
+        votes.append(int(tensor))
+
+    monkeypatch.setattr(engram_host.dist, "all_reduce", vote)
+    rt = make_runtime()
+    tables = list(rt.prefetcher._tables.values())
+    tables[-1].enable_uva(0, 1)  # holds another range: its enable_uva raises
+    heads = rt.prefetcher._hash_mapping.config.num_hash_heads
+    assert rt._enable_uva(rt.prefetcher, heads) is False
+    assert votes == [0]
+    assert rt._pinned_tables == []
+    tables[-1].disable_uva()
+    assert cudart.registered == []
     rt.shutdown()
 
 

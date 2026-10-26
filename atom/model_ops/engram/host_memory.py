@@ -39,13 +39,19 @@ _PAGE = 4096
 _MADV_DONTNEED = 4
 _PR_SET_THP_DISABLE = 41
 _PR_GET_THP_DISABLE = 42
-# Copy policy, from `tools/engram/bench_host_copy.py` on MI355X
-# (warm source, OMP_NUM_THREADS=4): one `copy_` wins below a few hundred MiB
-# (128 MiB: 1.8 ms vs 2.6 ms on 4 threads), threads win above (1 GiB: 8.8 ms
-# on 8 vs 14.7 ms; 16 GiB: 106 ms on 16 vs 226 ms), and past 16 threads the
-# gain is small. So: one copy thread per `_BYTES_PER_THREAD`, at most
+# Copy policy, from `tools/engram/bench_host_copy.py` on MI355X (warm source,
+# OMP_NUM_THREADS=4; one copy_ against N memmove threads):
+#   256 MiB  copy_ 3.8 ms   2 thr 8.0   4 thr 4.4   8 thr 4.1
+#   512 MiB  copy_ 7.5 ms   4 thr 7.0   8 thr 5.9
+#     1 GiB  copy_ 15.3 ms  8 thr 8.8   16 thr 10.4
+#    16 GiB  copy_ 215 ms   8 thr 120   16 thr 107
+# Two or three threads always lose to one copy_. So: one `copy_` below
+# `_THREADS_FROM` x `_BYTES_PER_THREAD` (512 MiB), otherwise one thread per
+# `_BYTES_PER_THREAD` (128 MiB) but at least `_MIN_COPY_THREADS` (8), at most
 # `_MAX_COPY_THREADS` and the CPUs this process may run on.
 _BYTES_PER_THREAD = 128 << 20
+_THREADS_FROM = 4
+_MIN_COPY_THREADS = 8
 # Largest chunk one copy thread takes at a time; bounds how much copied
 # source is still mapped before it is dropped (`_source_dropper`).
 _CHUNK_BYTES = 256 << 20
@@ -172,8 +178,11 @@ def _owning_bytes(lease: _Lease, offset: int, nbytes: int) -> torch.Tensor:
 
 def copy_threads(nbytes: int) -> int:
     """Threads to copy `nbytes` on (1: a single `copy_`)."""
+    per = nbytes // _BYTES_PER_THREAD
+    if per < _THREADS_FROM:
+        return 1
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 1
-    return max(1, min(_MAX_COPY_THREADS, cpus, nbytes // _BYTES_PER_THREAD))
+    return max(1, min(_MAX_COPY_THREADS, cpus, max(_MIN_COPY_THREADS, per)))
 
 
 def _copy_into(dst: torch.Tensor, src: torch.Tensor, pool, drop=None) -> None:
