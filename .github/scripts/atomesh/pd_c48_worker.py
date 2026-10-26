@@ -173,14 +173,17 @@ def prepare_store_memory(worker):
                     if len(f) == 5}
             # A process bound to a node is killed out of memory past what the node can free; the workers hold theirs.
             gib = min(segments / len(nodes), info["MemFree"] + info["Active(file)"] + info["Inactive(file)"] - (64 << 30)) / 2**30
-            print(f"[C48] Store memory: compacting {node.name} for {gib:.0f} of {segments / len(nodes) / 2**30:.0f} GiB", flush=True)
+            print(f"[C48] Store memory: compacting {node.name} for {gib:.0f} of {segments / len(nodes) / 2**30:.0f} GiB"
+                  f" (MemFree {info['MemFree'] >> 30} GiB, file {(info['Active(file)'] + info['Inactive(file)']) >> 30} GiB)",
+                  flush=True)
             if gib < 1:
                 continue
+            # 1211 GiB on node1 reached ~830 GiB of THP in 600 s (job 10183) and enough in 1800 s (job 10122).
             try:
                 subprocess.run([sys.executable, str(here / "numa_exec.py"), node.name.removeprefix("node"), sys.executable,
-                                str(here / "compact_huge_pages.py"), f"{gib:.0f}"], check=False, timeout=600)
+                                str(here / "compact_huge_pages.py"), f"{gib:.0f}"], check=False, timeout=1800)
             except subprocess.TimeoutExpired:
-                print(f"[C48][WARN] Store memory: compacting {node.name} did not finish in 600 s", flush=True)
+                print(f"[C48][WARN] Store memory: compacting {node.name} did not finish in 1800 s", flush=True)
         done.touch()
 
 
