@@ -2093,8 +2093,8 @@ def test_paged_mla_drafts_keep_the_historical_layer_num_lookup():
     That lookup is the base default, so an MLA draft that does not override
     it still resolves its paged KV. Only a different module layout overrides.
     """
-    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
     from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
     from atom.models.dspark_draft import DSparkDraftModel
     from atom.models.kimi_k3_dspark import KimiK3DSpark
     from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
