@@ -1346,6 +1346,157 @@ def _ensure_ple_states(
     return conv_state, ngram_state
 
 
+class _PLESlotState:
+    """Flash PLE history as an SGLang slot-lifecycle sibling.
+
+    SGLang owns the mamba slot: it copies a slot when a prefix hit or a fork
+    hands one request's state to another, and clears it when a slot is reused.
+    Its own Qwen4-Exp PLE pools ride along through this protocol, but they stay
+    disabled under the plugin (the pool kwargs are keyed on SGLang's config
+    class), so Flash's history lives in these model buffers instead. Without
+    this registration a resumed request keeps whatever PLE window the slot's
+    previous tenant left behind.
+
+    The buffers are read back from the model on every call because they are
+    allocated lazily and may be replaced before capture.
+    """
+
+    def __init__(self, model: Any, ngram_fill: int):
+        self._model = model
+        self._ngram_fill = ngram_fill
+
+    def _states(self):
+        for attr in ("_atom_ple_conv_state", "_atom_ple_ngram_state"):
+            tensor = getattr(self._model, attr, None)
+            if torch.is_tensor(tensor) and tensor.numel():
+                yield attr, tensor
+
+    def reset_slots(self, indices: torch.Tensor) -> None:
+        if indices.numel() == 0:
+            return
+        for attr, tensor in self._states():
+            tensor[indices] = 0 if attr.endswith("conv_state") else self._ngram_fill
+
+    def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
+        if src_index.numel() == 0:
+            return
+        for _, tensor in self._states():
+            tensor[dst_index] = tensor[src_index]
+
+    def get_cpu_slots(self, indices: torch.Tensor) -> Any:
+        return [t[indices].to("cpu", non_blocking=True) for _, t in self._states()]
+
+    def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None:
+        if not data:
+            return
+        for (_, tensor), rows in zip(self._states(), data):
+            tensor[indices] = rows.to(tensor.device, non_blocking=True)
+
+    def iter_transfer_state_entries(self):
+        # P/D disaggregation registers per-layer buffers; PLE is a single
+        # layer's side state and is not part of that transfer contract yet.
+        return iter(())
+
+
+def _register_ple_slot_state(forward_batch: Any, model: Any, ngram_fill: int) -> None:
+    """Attach the PLE buffers to the mamba pool's slot lifecycle, once."""
+    backend = resolve_attn_backend(forward_batch)
+    linear = getattr(backend, "linear_attn_backend", None) or backend
+    pool = resolve_mamba_req_pool(forward_batch, linear)
+    if pool is None:
+        pool = getattr(linear, "req_to_token_pool", None)
+    mamba_pool = getattr(pool, "mamba_pool", None) if pool is not None else None
+    if mamba_pool is None or getattr(mamba_pool, "_atom_ple_sibling", False):
+        return
+    register = getattr(mamba_pool, "register_slot_state", None)
+    if not callable(register):
+        return
+    register(_PLESlotState(model, ngram_fill))
+    mamba_pool._atom_ple_sibling = True
+    logger.info("Registered Flash PLE history as a mamba slot-state sibling")
+
+
+def _ple_track_indices(
+    forward_batch: Any,
+    query_start_loc: torch.Tensor,
+    conv_state_len: int,
+    ngram_width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Destination slots and boundary token positions for the PLE snapshot.
+
+    The window ends at the same aligned boundary SGLang snapshots GDN at, so
+    the two halves of a cached node can never describe different positions.
+    """
+    mask = getattr(forward_batch, "mamba_track_mask", None)
+    track_indices = getattr(forward_batch, "mamba_track_indices", None)
+    if mask is None or track_indices is None:
+        return None
+    aligned = forward_batch.mamba_track_aligned_lens()
+    if aligned is None:
+        return None
+    rows = mask.nonzero(as_tuple=True)[0]
+    if rows.numel() == 0:
+        return None
+    device = query_start_loc.device
+    starts = query_start_loc[:-1].to(device=device, dtype=torch.long)[rows]
+    starts = starts + aligned.to(device=device, dtype=torch.long)[rows]
+    last = (query_start_loc[-1] - 1).to(device=device, dtype=torch.long)
+
+    def window(width: int) -> torch.Tensor:
+        offsets = torch.arange(width, device=device, dtype=torch.long) - width
+        return (starts.unsqueeze(1) + offsets).clamp_(min=0).minimum(last)
+
+    return track_indices[rows], window(conv_state_len), window(ngram_width)
+
+
+def _ple_decode_track_slots(
+    forward_batch: Any, state_indices_out: torch.Tensor
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Destination and source slots for a decode-step PLE snapshot.
+
+    A decode step advances one token, so the working slot already holds the
+    state at the track boundary and a row copy is exact.
+    """
+    mask = getattr(forward_batch, "mamba_track_mask", None)
+    track_indices = getattr(forward_batch, "mamba_track_indices", None)
+    if mask is None or track_indices is None:
+        return None, None
+    rows = mask[: state_indices_out.shape[0]].nonzero(as_tuple=True)[0]
+    if rows.numel() == 0:
+        return None, None
+    src = state_indices_out[rows].to(torch.long)
+    dst = track_indices[rows].to(device=src.device, dtype=torch.long)
+    # Graph pads park dead rows on PAD_SLOT_ID; they own no history to track.
+    live = (src >= 0) & (dst >= 0)
+    if not bool(live.all()):
+        src, dst = src[live], dst[live]
+        if src.numel() == 0:
+            return None, None
+    return dst, src
+
+
+def track_ple_radix_slots(forward_batch: Any) -> None:
+    """Post-replay PLE snapshot for a decode graph.
+
+    Eager decode does this inside the PLE forward. A replayed graph cannot:
+    the slots would be baked at capture, the same reason the GDN track skips
+    capture, so the epilogue re-runs it against the live metadata.
+    """
+    ple = _DECODE_GRAPH.last_ple
+    if ple is None or forward_batch is None:
+        return
+    mode = getattr(forward_batch, "forward_mode", None)
+    if mode is None or not mode.is_decode_or_idle():
+        return
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    dst, src = _ple_decode_track_slots(forward_batch, ple.state_indices_out)
+    if dst is None:
+        return
+    ple.conv_state[dst] = ple.conv_state[src]
+    ple.ngram_state[dst] = ple.ngram_state[src]
+
+
 def _build_decode_graph_ple_metadata(
     atom_config: Any,
     forward_batch: Any,
@@ -1460,7 +1611,27 @@ def build_ple_metadata(
         has_initial = has_initial.clone()
         has_initial[live_bs:] = False
 
-    return Qwen4ExpPLEMetadata(
+    eos = getattr(hf, "eos_token_id", 0)
+    _register_ple_slot_state(
+        forward_batch, model, int(eos[0] if isinstance(eos, (list, tuple)) else eos)
+    )
+    track_dst = track_src = track_conv = track_ngram = None
+    if is_prefill:
+        track = _ple_track_indices(
+            forward_batch,
+            query_start_loc,
+            int(conv_state.shape[-1]),
+            int(ngram_state.shape[-1]),
+        )
+        if track is not None:
+            track_dst, track_conv, track_ngram = track
+    elif forward_batch.forward_mode.is_decode_or_idle() and not _is_capturing():
+        # Eager decode snapshots itself here, once per forward. A replayed
+        # decode graph cannot: the slots would be baked, so the post-replay
+        # epilogue calls ``track_ple_radix_slots`` with the live metadata.
+        track_dst, track_src = _ple_decode_track_slots(forward_batch, idx)
+
+    _DECODE_GRAPH.last_ple = Qwen4ExpPLEMetadata(
         query_start_loc=query_start_loc,
         ngram_state=ngram_state,
         state_indices_in=idx_in,
@@ -1468,7 +1639,12 @@ def build_ple_metadata(
         has_initial_state=has_initial,
         conv_state=conv_state,
         num_accepted_tokens=accepted,
+        track_dst=track_dst,
+        track_src=track_src,
+        track_conv_indices=track_conv,
+        track_ngram_indices=track_ngram,
     )
+    return _DECODE_GRAPH.last_ple
 
 
 def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:

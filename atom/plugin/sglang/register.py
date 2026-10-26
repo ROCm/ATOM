@@ -159,11 +159,15 @@ def _install_decode_graph_forward_context_patch() -> None:
             from atom.plugin.sglang.attention_backend.attention_gdn import (
                 track_mamba_radix_after_decode_graph,
             )
+            from atom.plugin.sglang.qwen4_exp_bridge import track_ple_radix_slots
 
             track_mamba_radix_after_decode_graph(
                 forward_batch,
                 attn_backend=self.model_runner.attn_backend,
             )
+            # Flash keeps its PLE history beside the GDN state; a track slot
+            # with only half of it resumes from a mismatched window.
+            track_ple_radix_slots(forward_batch)
             return output
 
         DecodeCudaGraphRunner.execute = execute_with_mamba_track_epilogue
