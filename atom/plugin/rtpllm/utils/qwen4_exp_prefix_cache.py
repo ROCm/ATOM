@@ -1,8 +1,60 @@
 """RTP-only Qwen3.8 PLE snapshots at cacheable prefix boundaries."""
 
+from types import MethodType
+
 import torch
 import triton
 import triton.language as tl
+
+from atom.model_ops.qwen4_exp.ops.ple import advance_ngram_state
+from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
+
+
+def _rtp_ple_forward_with_state(
+    self: Qwen4ExpPLELayer,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    metadata,
+) -> torch.Tensor:
+    """Write RTP's prefix snapshots without changing shared PLE forward."""
+    if getattr(metadata, "rtp_checkpoint_targets", None) is None:
+        return Qwen4ExpPLELayer.forward_with_state(
+            self, hidden_states, input_ids, metadata
+        )
+    input_ids = input_ids.reshape(-1)
+    ngram_context = advance_ngram_state(
+        input_ids,
+        metadata.query_start_loc,
+        metadata.ngram_state,
+        metadata.state_indices_in,
+        metadata.state_indices_out,
+        metadata.has_initial_state,
+        self.ple_embedding.eos_token_id,
+        history_width=self.ple_embedding.ngram_size - 1,
+        num_accepted_tokens=metadata.num_accepted_tokens,
+    )
+    gated_value = self.gated_memory(
+        hidden_states, input_ids, metadata.query_start_loc, ngram_context
+    )
+    normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
+    conv_output = self._short_conv(
+        normalized,
+        metadata.query_start_loc,
+        metadata.conv_state,
+        metadata.state_indices_in,
+        metadata.state_indices_out,
+        metadata.has_initial_state,
+        metadata.num_accepted_tokens,
+    )
+    write_ple_checkpoints(input_ids, normalized, metadata)
+    return gated_value.flatten(-2) + conv_output
+
+
+def bind_ple_checkpoint_hooks(model: torch.nn.Module) -> None:
+    """Patch only the RTP model instance; standalone and other plugins stay intact."""
+    for module in model.modules():
+        if isinstance(module, Qwen4ExpPLELayer):
+            module.forward_with_state = MethodType(_rtp_ple_forward_with_state, module)
 
 
 @triton.jit

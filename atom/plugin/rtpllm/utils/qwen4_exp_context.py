@@ -774,10 +774,4 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 metadata.ple_metadata.rtp_checkpoint_targets = (
                     gdn_metadata.ssm_checkpoints
                 )
-                if gdn_metadata.ssm_checkpoints is not None:
-                    from atom.plugin.rtpllm.utils.qwen4_exp_prefix_cache import (
-                        write_ple_checkpoints,
-                    )
-
-                    metadata.ple_metadata.checkpoint_writer = write_ple_checkpoints
             yield

@@ -756,6 +756,12 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
 
                 bind_qwen4_exp_mtp_hooks(atom_model)
                 atom_model.model.return_hc_state = True
+            if getattr(self.model_config, "atom_qwen4_exp_prefix_cache_enabled", False):
+                from atom.plugin.rtpllm.utils.qwen4_exp_prefix_cache import (
+                    bind_ple_checkpoint_hooks,
+                )
+
+                bind_ple_checkpoint_hooks(atom_model)
             load_model_in_plugin_mode(
                 model=atom_model,
                 config=atom_model.atom_config,

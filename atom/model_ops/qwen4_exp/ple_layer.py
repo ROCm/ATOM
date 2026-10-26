@@ -530,7 +530,4 @@ class Qwen4ExpPLELayer(nn.Module):
             metadata.has_initial_state,
             metadata.num_accepted_tokens,
         )
-        checkpoint_writer = getattr(metadata, "checkpoint_writer", None)
-        if checkpoint_writer is not None:
-            checkpoint_writer(input_ids, normalized, metadata)
         return gated_value.flatten(-2) + conv_output

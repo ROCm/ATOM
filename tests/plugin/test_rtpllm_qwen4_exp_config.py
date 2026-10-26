@@ -26,7 +26,7 @@ from atom.plugin.rtpllm.models.qwen4_exp_mtp_hooks import (
     _rtp_apply_ple,
     _rtp_spec_conv1d_update,
 )
-from atom.plugin.rtpllm.utils import qwen4_exp_context
+from atom.plugin.rtpllm.utils import qwen4_exp_context, qwen4_exp_prefix_cache
 from atom.plugin.rtpllm.utils.forward_context import (
     RTPForwardContext,
     _target_verify_state_slots_graph_kernel,
@@ -35,6 +35,66 @@ from atom.plugin.rtpllm.utils.qwen4_exp_context import (
     RTPQwen4ExpContext,
     _qsa_graph_slots_kernel,
 )
+
+
+def test_qwen4_exp_prefix_ple_hook_is_instance_local(monkeypatch):
+    class FakePLE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ple_embedding = SimpleNamespace(eos_token_id=0, ngram_size=3)
+            self.norm_conv = None
+
+        def forward_with_state(self, hidden, ids, metadata):
+            return hidden + 1
+
+        def gated_memory(self, hidden, ids, starts, context):
+            return hidden.unsqueeze(1)
+
+        def _apply_norm(self, norm, value):
+            return value
+
+        def _short_conv(self, normalized, *args):
+            return torch.zeros_like(normalized)
+
+    monkeypatch.setattr(qwen4_exp_prefix_cache, "Qwen4ExpPLELayer", FakePLE)
+    monkeypatch.setattr(
+        qwen4_exp_prefix_cache,
+        "advance_ngram_state",
+        lambda *args, **kwargs: None,
+    )
+    writes = []
+    monkeypatch.setattr(
+        qwen4_exp_prefix_cache,
+        "write_ple_checkpoints",
+        lambda ids, normalized, metadata: writes.append(normalized.clone()),
+    )
+    plugin_ple = FakePLE()
+    standalone_ple = FakePLE()
+    qwen4_exp_prefix_cache.bind_ple_checkpoint_hooks(torch.nn.Sequential(plugin_ple))
+    hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    ids = torch.arange(3)
+    metadata = SimpleNamespace(
+        rtp_checkpoint_targets=None,
+        query_start_loc=torch.tensor([0, 3]),
+        ngram_state=None,
+        state_indices_in=None,
+        state_indices_out=None,
+        has_initial_state=None,
+        num_accepted_tokens=None,
+        conv_state=None,
+    )
+    torch.testing.assert_close(
+        plugin_ple.forward_with_state(hidden, ids, metadata), hidden + 1
+    )
+    metadata.rtp_checkpoint_targets = {"rows": torch.tensor([0])}
+    torch.testing.assert_close(
+        plugin_ple.forward_with_state(hidden, ids, metadata), hidden
+    )
+    torch.testing.assert_close(writes[0], hidden)
+    assert len(writes) == 1
+    torch.testing.assert_close(
+        standalone_ple.forward_with_state(hidden, ids, metadata), hidden + 1
+    )
 
 
 @pytest.mark.parametrize("prefill_enabled", [True, False])
