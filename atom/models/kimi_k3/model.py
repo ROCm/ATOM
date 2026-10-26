@@ -39,12 +39,12 @@ from atom.model_ops.fla_ops.replayssm import (
 )
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
-    MXFP4_PRESHUFFLE_K_ALIGN,
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
     uses_mxfp4_n32k4_scale,
@@ -57,7 +57,6 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.triton_fused_sigmoid_mul_quant import fused_sigmoid_mul_maybe_quant
 from atom.model_ops.utils import atom_parameter
-from atom.models.kimi_k3.padding import pad_param_loads, padded_local_size
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -261,40 +260,28 @@ class KimiMLP(nn.Module):
         down_type, down_dtype = _effective_layer_quant(
             quant_config, f"{prefix}.down_proj"
         )
-        # MXFP4 GEMMs cannot handle a K tail (linear.MXFP4_PRESHUFFLE_K_ALIGN), and
-        # down_proj's K is the per-rank intermediate: 33792 / TP8 = 4224 on the
-        # dense layer. Pad it to the next multiple of 256 the way MoE pads its
-        # intermediate: gate_up_proj gains zero rows (situ(0) * 0 == 0, so the
-        # activation tail is exactly zero) and down_proj zero columns.
-        tp_size = get_tensor_model_parallel_world_size()
-        real_local = intermediate_size // tp_size
-        padded_local = real_local
-        if down_type == QuantType.per_1x32 and down_dtype == dtypes.fp4x2:
-            padded_local = padded_local_size(real_local, MXFP4_PRESHUFFLE_K_ALIGN)
-        self.intermediate_pad = padded_local - real_local
-        padded_size = padded_local * tp_size
+        # An MXFP4 down_proj's K is the per-rank intermediate (33792 / TP8 = 4224
+        # on the dense layer), which the MXFP4 GEMMs cannot take unaligned. The
+        # pair pads it together (gate_up zero rows, down zero columns); situ(0) *
+        # 0 == 0, so the activation's padded tail is exactly zero.
+        pad_align = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
-            [padded_size, padded_size],
+            [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=pad_align,
         )
         self.down_proj = RowParallelLinear(
-            padded_size,
+            intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=pad_align,
         )
-        if self.intermediate_pad:
-            assert self.gate_up_proj.tp_size == self.down_proj.tp_size == tp_size, (
-                f"{prefix}: padded against tp={tp_size} but the linears shard "
-                f"over {self.gate_up_proj.tp_size}/{self.down_proj.tp_size}"
-            )
-            pad_param_loads(self.gate_up_proj, 0, tp_size, real_local, padded_local)
-            pad_param_loads(self.down_proj, 1, tp_size, real_local, padded_local)
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
         # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8

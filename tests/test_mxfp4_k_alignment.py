@@ -9,11 +9,13 @@ row, so the result depends on uninitialized memory and fails at an M that varies
 from run to run. Kimi-K3's dense MLP down_proj at TP8 (K = 33792 / 8 = 4224) hit
 this and every generation was garbage.
 
-Two halves, both pinned here:
-  * a preshuffled MXFP4 weight with such a K is refused at load, loudly;
-  * zero-padding K to 256 -- what KimiMLP now does -- is exact on the fast path.
-The GPU-free padding layout is covered by
-tests/models/test_kimi_k3_dense_mlp_padding.py.
+Pinned here, at the kernel and load-check level:
+  * the bug, made deterministic (a positive control that goes red if the
+    kernel ever masks the tail);
+  * zero-padding K to 256 -- what an MLP pair now does inside the parallel
+    linears -- is exact on the fast path;
+  * a preshuffled MXFP4 weight still left unaligned is refused at load, loudly.
+How the pair pads and loads is covered by tests/test_mxfp4_k_pad_pair.py.
 """
 
 from types import SimpleNamespace
@@ -171,3 +173,41 @@ def test_zero_padded_k_matches_the_unpadded_reference(m):
 
 def test_align_constant_matches_the_kernel_step():
     assert MXFP4_PRESHUFFLE_K_ALIGN == 256
+
+
+def test_unpadded_k_reads_the_scale_tail_positive_control():
+    """The bug itself, made deterministic: without padding the fix is needed.
+
+    At K=4224 the ASM kernel's last 256-wide step reads 4 scale groups past the
+    real 132 (e8m0_shuffle pads to 136). Normally those hold whatever memory
+    did; here they are NaN (e8m0 0xFF), so the unpadded GEMM must come out
+    non-finite, while the zero-padded weight of the same data stays correct. If
+    the kernel ever learns to mask the tail, this goes red and the padding can
+    be revisited.
+    """
+    torch.manual_seed(0)
+    n, k, m = 7168, KIMI_K3_DENSE_DOWN_K, 64
+    quant = linear_mod.get_hip_quant(QuantType.per_1x32)
+    w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.02
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    wq, ws = quant(w, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+    tail = (PADDED_K - k) // 32
+    poisoned = torch.cat(
+        [
+            ws.view(torch.uint8),
+            torch.full((n, tail), 0xFF, dtype=torch.uint8, device="cuda"),
+        ],
+        dim=1,
+    )
+    weight = nn.Parameter(wq.clone(), requires_grad=False)
+    linear_mod.shuffle_weights(weight)
+    ws_sh = linear_mod.fp4_utils.e8m0_shuffle(poisoned.view(ws.dtype))
+    y = gemm_a4w4_quant(
+        x, None, weight.data, torch.bfloat16, ws_sh, dtypes.fp4x2, None, n
+    ).float()
+
+    assert not torch.isfinite(y).all(), (
+        "the unpadded K=4224 GEMM no longer reads the scale tail -- the kernel "
+        "may now mask it"
+    )

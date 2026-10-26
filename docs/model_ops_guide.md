@@ -106,7 +106,7 @@ After loading, `process_weights_after_loading()` handles:
 - **e4m3fn to e4m3fnuz normalization** (AMD FP8 format conversion).
 - **Weight reshuffling** via `shuffle_weights()` for pre-shuffled GEMM kernels.
 - **Scale reshuffling** via `fp4_utils.e8m0_shuffle()` for MXFP4 block scales.
-- **MXFP4 K alignment check**: a preshuffled MXFP4 weight must have K a multiple of 256 (`MXFP4_PRESHUFFLE_K_ALIGN`); the preshuffled GEMMs walk K in 256-wide steps and do not mask a tail, so any other K is refused here at load rather than read past the row. A model with such a layer zero-pads K first, as `KimiMLP` does for Kimi-K3's dense MLP at TP8 (4224 -> 4352).
+- **MXFP4 K alignment**: a preshuffled MXFP4 weight must have K a multiple of 256 (`MXFP4_PRESHUFFLE_K_ALIGN`); the preshuffled GEMMs walk K in 256-wide steps and do not mask a tail. A `gate_up -> act -> down` MLP whose per-rank intermediate is unaligned pads it as a pair, like MoE's `intermediate_pad`: pass `mxfp4_k_pad_align(quant_config, down_prefix)` as `output_pad_align` to `MergedColumnParallelLinear` and `input_pad_align` to `RowParallelLinear`. The checkpoint keeps the real sizes; every load path writes the real shard at the front of its padded slot, and the padding is zero weights with unit scales (requires `act(0, 0) == 0`). Any MXFP4 weight still unaligned is refused here at load.
 - **Per-tensor requantization** via `requantize_with_max_scale()` when multiple output partitions have separate scales.
 
 ## Attention operations
