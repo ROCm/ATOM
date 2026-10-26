@@ -6,15 +6,19 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
 from atom.model_ops.gluon_prefill import _scale_cache_view, run_gluon_prefill
 
 
+@pytest.mark.parametrize("scalar_type", [int, np.int32, np.int64])
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("scale_mode", ["token", "scalar0", "scalar1", "mixed"])
-def test_native_pages_and_padded_metadata_are_passed_without_gather(draft, scale_mode):
+def test_native_pages_and_padded_metadata_are_passed_without_gather(
+    draft, scale_mode, scalar_type
+):
     heads = 16 if draft else 1
     q = torch.randn(5, 16, 128, dtype=torch.bfloat16)
     k = torch.empty(8, heads, 8, 128, 16, dtype=torch.float8_e4m3fn)
@@ -31,8 +35,8 @@ def test_native_pages_and_padded_metadata_are_passed_without_gather(draft, scale
         block_tables=torch.tensor([[4, 1], [6, 2], [-1, -1]], dtype=torch.int32),
         cu_seqlens_q=torch.tensor([0, 1, 5, 999], dtype=torch.int32),
         context_lens=torch.tensor([129, 255, 999], dtype=torch.int32),
-        max_seqlen_q=4,
-        max_seqlen_k=255,
+        max_seqlen_q=scalar_type(4),
+        max_seqlen_k=scalar_type(255),
     )
     ctx = SimpleNamespace(
         context=SimpleNamespace(is_prefill=True, is_draft=draft, scheduled_bs=2),
@@ -43,6 +47,8 @@ def test_native_pages_and_padded_metadata_are_passed_without_gather(draft, scale
     def attention(query, kc, vc, out, **kw):
         assert query is q and kc is k and vc is v
         assert kw["backend"] == "gluon"
+        assert type(kw["max_seqlen_q"]) is int and kw["max_seqlen_q"] == 4
+        assert type(kw["max_seqlen_k"]) is int and kw["max_seqlen_k"] == 255
         assert kw["k_descale"] is None and kw["v_descale"] is None
         for name, source in (("k_scale_cache", ks), ("v_scale_cache", vs)):
             view = kw[name]
@@ -198,9 +204,12 @@ def test_real_draft_rope_cache_selects_scalar_instead_of_unused_pool_scales():
     assert calls == ["writer", "attention"]
 
 
+@pytest.mark.parametrize("scalar_type", [int, np.int32, np.int64])
 @pytest.mark.parametrize("qlen", [1, 4])
 @pytest.mark.parametrize("draft", [False, True])
-def test_decode_padding_uses_device_slots_and_preserves_native_pool(qlen, draft):
+def test_decode_padding_uses_device_slots_and_preserves_native_pool(
+    qlen, draft, scalar_type
+):
     from atom.model_ops.gluon_prefill import run_gluon_decode
 
     heads = 16 if draft else 1
@@ -214,8 +223,8 @@ def test_decode_padding_uses_device_slots_and_preserves_native_pool(qlen, draft)
         cu_seqlens_q=torch.tensor([0, qlen, 2 * qlen, 2 * qlen], dtype=torch.int32),
         context_lens=torch.tensor([129, 255, 0], dtype=torch.int32),
         slot_mapping=torch.tensor([128] * (2 * qlen) + [-1] * qlen),
-        max_seqlen_q=qlen,
-        max_seqlen_k=255,
+        max_seqlen_q=scalar_type(qlen),
+        max_seqlen_k=scalar_type(255),
     )
     # Deliberately wrong host count: the live mask must come from device data.
     ctx = SimpleNamespace(
@@ -227,6 +236,8 @@ def test_decode_padding_uses_device_slots_and_preserves_native_pool(qlen, draft)
     def attention(query, kc, vc, output, **kw):
         assert kc is k and vc is v
         assert kw["backend"] == "gluon" and kw["shuffled_kv_cache"]
+        assert type(kw["max_seqlen_q"]) is int and kw["max_seqlen_q"] == qlen
+        assert type(kw["max_seqlen_k"]) is int and kw["max_seqlen_k"] == 255
         assert kw["block_table"].data_ptr() == meta.block_tables.data_ptr()
         assert kw["k_scale_cache"].data_ptr() == scales.data_ptr()
         assert kw["cu_seqlens_q"].tolist() == [0, qlen, 2 * qlen, 3 * qlen]

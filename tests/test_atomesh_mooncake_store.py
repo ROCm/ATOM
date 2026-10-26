@@ -50,6 +50,9 @@ PYTHON_STUB = textwrap.dedent("""\
         if [[ "${port}" == "${STUB_DIE_OWNER_PORT:-}" ]]; then
           exit 5
         fi
+        if [[ "${port}" == "${STUB_STALL_OWNER_PORT:-}" ]]; then
+          exec sleep 60
+        fi
         bytes="$(sed -n 's/.* --global_segment_size=\\([0-9]*\\) .*/\\1/p' <<< " $* ")"
         master="$(sed -n 's/.* --master_server_address=[^ ]*:\\([0-9]*\\) .*/\\1/p' <<< " $* ")"
         echo "${master} ${bytes}" >> "${STUB_DIR}/segments"
@@ -773,6 +776,22 @@ stop_mooncake_store
             MOONCAKE_STORE_WAIT_TIMEOUT="10",
         )
         self.assertEqual(len(self.store_calls("mooncake_client")), 2)
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_owner_timeout_records_live_allocation_before_cleanup(self):
+        result = self.run_shell(
+            "start_mooncake_store\n",
+            expect_rc=1,
+            MOONCAKE_STORE_OWNERS="0:8;1:8",
+            MOONCAKE_STORE_WAIT_TIMEOUT="1",
+            STUB_STALL_OWNER_PORT="50153",
+        )
+        self.assertIn("owners not ready after 1s", result.stderr)
+        diagnostics = (self.root / "logs/mooncake-startup-rank-0.log").read_text()
+        self.assertIn("owner1 pid=", diagnostics)
+        self.assertIn("VmRSS:", diagnostics)
+        self.assertIn("wchan:", diagnostics)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 

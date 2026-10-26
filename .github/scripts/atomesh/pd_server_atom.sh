@@ -1486,13 +1486,37 @@ stop_mooncake_store() {
   [[ -z "${mooncake_store_failed_rc}" ]]
 }
 
+# Record live Store processes before cleanup destroys allocation evidence.
+# Read-only and bounded: a slow /proc read must not extend the startup deadline
+# indefinitely. Never read another workload's process or its environment.
+report_mooncake_store_startup() {
+  local i pid node_file
+  {
+    echo "[mooncake-store][startup] $(date -Is) rank=${NODE_RANK}"
+    for i in "${!mooncake_store_pids[@]}"; do
+      pid="${mooncake_store_pids[i]}"
+      [[ -n "${pid}" ]] || continue
+      echo "[mooncake-store][startup] ${mooncake_store_names[i]} pid=${pid}"
+      timeout 3 awk '/^(State|VmSize|VmRSS|RssAnon|VmSwap|Mems_allowed_list):/' \
+        "/proc/${pid}/status" 2>/dev/null || true
+      printf 'wchan: '
+      timeout 3 cat "/proc/${pid}/wchan" 2>/dev/null || true
+      echo
+    done
+    for node_file in /sys/devices/system/node/node*/meminfo; do
+      timeout 3 awk '/MemFree:|AnonPages:|AnonHugePages:|FilePages:/' \
+        "${node_file}" 2>/dev/null || true
+    done
+  } | tee -a "${RUNTIME_LOG_DIR}/mooncake-startup-rank-${NODE_RANK}.log" || true
+}
+
 # Fails startup (stopping what it started) unless <condition> holds within
 # <timeout> seconds; a dying Store process fails it at once.
 wait_for_mooncake_store() {
   local what="$1" timeout="$2"
   shift 2
   local deadline=$(( $(date +%s) + timeout ))
-  local log
+  local log now next_report=0
   until "$@"; do
     if ! reap_dead_mooncake_store; then
       echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
@@ -1507,7 +1531,12 @@ wait_for_mooncake_store() {
         exit 1
       fi
     done
-    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+    now="$(date +%s)"
+    if [[ "${what}" == "owners" ]] && (( now >= next_report || now >= deadline )); then
+      report_mooncake_store_startup
+      next_report=$(( now + 60 ))
+    fi
+    if [[ "${now}" -ge "${deadline}" ]]; then
       for log in "${mooncake_store_logs[@]}"; do
         tail -n 20 "${log}" >&2 || true
       done

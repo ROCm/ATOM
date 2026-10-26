@@ -125,6 +125,12 @@ def _run_gluon_paged(
     expected_scales = (blocks, heads, page_size)
     k_scale = _scale_cache_view(k_scale, expected_scales, q.device)
     v_scale = _scale_cache_view(v_scale, expected_scales, q.device)
+    # prepare_decode uses NumPy reductions for these host scalars. Passing
+    # np.int32/64 through the split heuristic produces np.bool_ constexprs,
+    # which Gluon rejects at "if NUM_SPLITS > 1". Normalize only host metadata;
+    # no device readback or change to the official split calculation is needed.
+    max_seqlen_q = int(meta.max_seqlen_q)
+    max_seqlen_k = int(meta.max_seqlen_k)
     output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     attention(
         q,
@@ -133,8 +139,8 @@ def _run_gluon_paged(
         output,
         cu_seqlens_q=cu_q,
         seqused_k=context_lens,
-        max_seqlen_q=meta.max_seqlen_q,
-        max_seqlen_k=meta.max_seqlen_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=True,
         alibi_slopes=None,

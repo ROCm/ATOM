@@ -1450,6 +1450,8 @@ models:
               OFFLOAD_LOAD_WORKERS: '1'
               MOONCAKE_STORE: '1'
               ATOMESH_M3_STORE_FUNCTIONAL_CHECK: '1'
+              # Owners initialize their actual allocation before RDMA pinning.
+              MOONCAKE_STORE_WAIT_TIMEOUT: '3600'
               MOONCAKE_STORE_OWNERS: '0:768:rdma4,rdma5;1:768:rdma6,rdma7'
               PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}'
             decode:
@@ -1458,7 +1460,9 @@ models:
             time_limit: '08:00:00'
             # g41: host THP preparation and Store RDMA registration failed
             # in runs 39440228358, 39440253451 and 39440277315.
-            exclude_nodes: [pit2-p03-g34, pit2-p03-g12, pit2-p03-g53, pit2-p03-g41]
+            # g27: NUMA1 owner failed registration, then allocation timed out
+            # in runs 39525950902 and 39529059652; retain the full Store budget.
+            exclude_nodes: [pit2-p03-g34, pit2-p03-g12, pit2-p03-g53, pit2-p03-g41, pit2-p03-g27]
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 7200
