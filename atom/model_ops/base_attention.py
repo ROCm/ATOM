@@ -14,6 +14,7 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
+from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
@@ -582,15 +583,15 @@ def run_pa_decode(
         if context_bound < max_seqlen_q:
             flydsl_seqs = None
     # Inside the guard, not before it: this runs 63 times per decode step and
-    # attention is a piecewise split op, so graph replay does not elide it. A
-    # deployment that never enables FlyDSL should pay nothing here.
+    # attention is an eager region of the token graphs, so replay does not
+    # elide it. A deployment that never enables FlyDSL should pay nothing here.
     #
     # Bounded on purpose: the row counts vary per step -- the sparse sites see a
     # new one on every prefill tail -- so keying on them leaks one entry and one
     # log line per distinct length for the life of the process.
     # `is not False` distinguishes the two falsy cases the `and` above produces:
     # False means FlyDSL is off (log nothing -- such a deployment must not pay
-    # for it, and this runs 63x per step on a piecewise split op that graph
+    # for it, and this runs 63x per step in an eager region that token-graph
     # replay does not elide), None means it is on and the capability check
     # rejected, which is exactly what the log exists to show.
     # The residual cost when off is one envs read; hoisting that to a module
@@ -602,8 +603,7 @@ def run_pa_decode(
     ):
         _flydsl_pa_routed.add(route_sig)
         logger.info(
-            "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d "
-            "head_dim=%d %s)",
+            "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d head_dim=%d %s)",
             f"flydsl[{flydsl_seqs} seqs]" if flydsl_seqs else "gluon",
             q.shape[0],
             max_seqlen_q,
@@ -932,6 +932,7 @@ def fake_(
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
+@eager_region()
 def unified_attention_with_output_base(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,
@@ -978,6 +979,7 @@ def linear_attention_with_output_base_fake(
     gen_fake=linear_attention_with_output_base_fake,
     mutates_args=[],
 )
+@eager_region()
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,

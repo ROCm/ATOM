@@ -7,6 +7,7 @@ numerics, and SpeculativeConfig DSpark detection/routing.
 
 import types
 
+import numpy as np
 import pytest
 
 # Named on the module, not on "aiter": a test collected after one that stubs
@@ -374,221 +375,9 @@ def test_scheduler_multi_request_global_topk():
     assert ell[0] >= ell[1]
 
 
-# ---------------------------------------------------------------------------
-# AF_PIECEWISE generic contract (atom/utils/attn_ffn_piecewise.py)
-# ---------------------------------------------------------------------------
-
-
-def _core_probe(
-    *, piecewise, capturing, graph_ready, dummy=False, capture=True, decode=True
-):
-    """Drive a decorated core once against fake collaborators and report which
-    of capture / replay / deliver / bare-core it chose.
-
-    `capture` is the mode gate (AF_PIECEWISE on). Off, the core never records a
-    graph of its own -- plain PIECEWISE, eager core plus a stabilised output.
-    `decode` is the eligibility gate: prefill is never captured, whatever the
-    mode, because its shapes are one-off."""
-    import types
-
-    from atom.utils.attn_ffn_piecewise import piecewise_core
-
-    log = []
-
-    class FakeRunner:
-        def has_graph(self, key):
-            return graph_ready
-
-        def input_buffers(self, inputs, input_names, upstream):
-            # (what the graph reads, what replay has to refresh)
-            return dict(inputs), {}
-
-        def capture(self, key, read_from, refresh, core, out_buf):
-            log.append("capture")
-
-        def replay(self, key, inputs):
-            log.append("replay")
-            return "replayed"
-
-    class FakeOutputs:
-        def slot(self, key, sample):
-            return sample
-
-        def deliver(self, key, out):
-            log.append("deliver")
-            return out
-
-    @piecewise_core()
-    def core(layer, *, x):
-        log.append("core")
-        return x
-
-    fc = types.SimpleNamespace(
-        context=types.SimpleNamespace(is_dummy_run=dummy),
-        # `_is_decode` reads `attn_metadata.state` by NAME, so a stub enum-alike
-        # is enough and this file needs no AttnState import.
-        attn_metadata=types.SimpleNamespace(
-            state=types.SimpleNamespace(name="DECODE" if decode else "PREFILL_NATIVE"),
-            max_seqlen_q=1,
-        ),
-        in_hipgraph=capturing,
-    )
-    core(
-        types.SimpleNamespace(layer_name="l0"),
-        runner=FakeRunner(),
-        outputs=FakeOutputs(),
-        piecewise=piecewise,
-        capture=capture,
-        forward_context=fc,
-        x=torch.ones(4),
-    )
-    return log
-
-
-def test_decorated_core_picks_capture_replay_or_eager():
-    # The decision table, pinned. Every row that is not a replay must end in a
-    # deliver: whatever computed the output still owes it to the fixed address
-    # the downstream dense piece reads.
-    P = _core_probe
-
-    # Not piecewise: no graph cache, and no slot to deliver to either.
-    assert P(piecewise=False, capturing=False, graph_ready=False) == ["core"]
-    assert P(piecewise=False, capturing=True, graph_ready=True) == ["core"]
-
-    # PREFILL is never captured, whatever the mode: its shapes are one-off and
-    # the compressor's prefill plan is sliced to an actual count, not a
-    # graph-fixed capacity. It still owes the downstream piece a deliver.
-    #
-    # This replaced a `num_tokens <= 512` bound, which was trying to say the
-    # same thing in the wrong units -- at DSpark q=6 it also cut every decode
-    # above bs~85, silently disabling AF for the three largest buckets.
-    assert P(piecewise=True, capturing=False, graph_ready=True, decode=False) == [
-        "core",
-        "deliver",
-    ]
-    assert P(piecewise=True, capturing=True, graph_ready=False, decode=False) == [
-        "core",
-        "deliver",
-    ]
-
-    # Capture pass, first time this key appears: warm up, record, then compute
-    # the real answer (the recording fed on clones).
-    assert P(piecewise=True, capturing=True, graph_ready=False) == [
-        "core",
-        "capture",
-        "core",
-        "deliver",
-    ]
-    # Real step with a graph ready: replay only.
-    assert P(piecewise=True, capturing=False, graph_ready=True) == ["replay"]
-    # Capture pass revisiting a key, and a real step never captured: eager.
-    assert P(piecewise=True, capturing=True, graph_ready=True) == ["core", "deliver"]
-    assert P(piecewise=True, capturing=False, graph_ready=False) == ["core", "deliver"]
-
-    # A dummy run never touches the cache, but still owes the slot.
-    assert P(piecewise=True, capturing=True, graph_ready=False, dummy=True) == [
-        "core",
-        "deliver",
-    ]
-
-    # Plain PIECEWISE (capture gate off): the core never records or replays a
-    # graph of its own, whatever the capture pass / cache says -- it runs eager
-    # and only stabilises its output. This is the path the three-way branch in
-    # v4_attn_compress used to hand-code outside the decorator.
-    assert P(piecewise=True, capturing=True, graph_ready=True, capture=False) == [
-        "core",
-        "deliver",
-    ]
-    assert P(piecewise=True, capturing=False, graph_ready=True, capture=False) == [
-        "core",
-        "deliver",
-    ]
-
-
-def test_non_tensor_params_are_passthrough_not_graph_inputs():
-    # A bool/int/enum config arg on a core is forwarded to the body untouched
-    # (and baked at capture), NOT treated as a graph input to clone or capture
-    # on. This is what lets a model keep its own config flags in its signature --
-    # e.g. V4's `compressor_already_launched` -- without the decorator choking on
-    # a non-tensor. The split comes off the annotations.
-    import torch as _t
-
-    from atom.utils.attn_ffn_piecewise import piecewise_core
-
-    seen = {}
-
-    @piecewise_core()
-    def core(layer, *, x: _t.Tensor, flag: bool = False, n: int = 0):
-        seen["flag"] = flag
-        seen["n"] = n
-        return x
-
-    # Only the tensor is a graph input; the annotated non-tensors are config.
-    assert core.input_names == ("x",)
-    assert core.passthrough_names == ("flag", "n")
-    # piecewise=False just runs the body, and the config args reach it as passed.
-    out = core(object(), piecewise=False, x=_t.ones(3), flag=True, n=7)
-    assert out.shape == (3,)
-    assert seen == {"flag": True, "n": 7}
-
-
-def test_runner_copies_only_what_is_not_zero_copy():
-    import torch as _t
-
-    from atom.utils.cuda_graph import CudagraphCaptureRunner
-
-    r = CudagraphCaptureRunner()
-    inputs = {"x": _t.ones(4, 8), "positions": _t.arange(4)}
-    read_from, refresh = r.input_buffers(inputs, ("x", "positions"), frozenset({"x"}))
-    # A zero-copy input is captured on the caller's own tensor and never
-    # refreshed -- that is what makes its producer responsible for the address.
-    assert read_from["x"] is inputs["x"]
-    assert "x" not in refresh
-    # Everything else is cloned, and the clone is what replay copies into.
-    assert read_from["positions"] is not inputs["positions"]
-    assert refresh["positions"] is read_from["positions"]
-
-
-def test_v4_core_copies_nothing_per_step():
-    # Nothing is copied, and structurally so: the core is the batch-shaped half
-    # alone, and its inputs all come from the dense piece immediately upstream,
-    # whose graph writes them to the same address every replay. `positions` cost
-    # ~5pts when captured on (8f86bbaf) and is not an input here at all any
-    # more -- both its readers (`_qk_norm_rope`, `_fill_csa_paged_compress`) are
-    # token-shaped and stayed in the dense pieces. If a future change moves a
-    # token-shaped reader back INTO the core, this is what should stop it.
-    import pytest
-
-    try:
-        from atom.models.deepseek_v4 import DeepseekV4Attention
-
-        core = DeepseekV4Attention._attn_compress
-    except ImportError as e:
-        if "aiter" not in str(e):
-            raise
-        pytest.skip(f"requires aiter to import deepseek_v4: {e}")
-
-    assert set(core.zero_copy_names) == set(core.input_names)
-
-
-def test_copy_per_step_rejects_a_bare_string():
-    # `("positions")` is a string, not a 1-tuple; `frozenset` of it is a set of
-    # characters, which subtracts nothing from the input names -- so the entry
-    # silently means "copy nothing" while reading as its opposite. That shipped.
-    import pytest
-
-    from atom.utils.attn_ffn_piecewise import piecewise_core
-
-    with pytest.raises(TypeError, match="trailing comma"):
-
-        @piecewise_core(copy_per_step="positions")
-        def core(layer, *, x):
-            return x
-
-
 def test_topk_cannot_reach_qr_when_the_projection_was_handed_in():
-    # `_attn_pre` passes None for `qr`/`qr_scale` on the AF path, which is only
-    # safe because the core's single use of them -- `Indexer.topk` -- never
+    # `_attn_pre` passes None for `qr`/`qr_scale` on the narrow path, which is
+    # only safe because the attention's single use of them -- `Indexer.topk` -- never
     # reaches them once `pre_q_quant` is given. That short-circuit is the whole
     # justification, so assert it directly rather than trusting the read.
     import types
@@ -621,45 +410,6 @@ def test_topk_cannot_reach_qr_when_the_projection_was_handed_in():
         pre_q_scale="s",
     )
     assert out == (sentinel, "w", "s")
-
-
-def test_v4_core_inputs_come_from_the_signature():
-    # There is no second declaration to drift from: the inputs and their order
-    # ARE the core's parameter list, minus the leading layer. The runner clones
-    # and refreshes them by it.
-    import pytest
-
-    try:
-        from atom.models.deepseek_v4 import DeepseekV4Attention
-
-        core = DeepseekV4Attention._attn_compress
-    except ImportError as e:
-        if "aiter" not in str(e):
-            raise
-        pytest.skip(f"requires aiter to import deepseek_v4: {e}")
-
-    # The core holds the batch-shaped kernels: the compressor, whose grid is
-    # `graph_bs * per_seq_bound`, and the gfx950 FP4 decode scorer, whose
-    # row-group launch is planned from the sequence count -- it takes the
-    # indexer projections the dense piece upstream made. Everything
-    # token-shaped stays in the dense pieces.
-    assert core.input_names == ("x", "idx_q_quant", "idx_weights", "idx_q_scale")
-
-
-def test_core_with_var_kwargs_is_rejected():
-    # **kwargs carries no order, and the runner expands by order. Better to fail
-    # at decoration than to mis-assign inputs at replay.
-    from atom.utils.attn_ffn_piecewise import piecewise_core
-
-    try:
-
-        @piecewise_core()
-        def _bad(layer, **named):
-            return None
-
-        assert False, "expected TypeError for a **kwargs core"
-    except TypeError as e:
-        assert "explicitly" in str(e)
 
 
 # ----------------------------------------------------------------------------
@@ -849,7 +599,8 @@ def test_attention_is_reached_only_through_the_opaque_op():
     # Dynamo graphs -- the second trips "VllmBackend can only be called once".
     #
     # The V4 target calls the identical kernel safely because its call site is
-    # behind torch.ops.aiter.v4_attn_compress. Mirror that, and keep it mirrored.
+    # behind torch.ops.aiter.v4_attn_compress_launch. Mirror that, and keep it
+    # mirrored.
     import ast
     import inspect
     import textwrap
@@ -1024,6 +775,7 @@ def _stub_forward_context(*, scheduled_bs, target_bs):
         is_draft=False,
         is_prefill=False,
         positions=None,
+        forward_mode=None,
     )
     # `prepare_decode` publishes the ring slots at the PADDED batch, so the stub
     # does too -- the block slices to that length and nothing stages it.
@@ -1041,8 +793,8 @@ def _proposer_with_graph_bs(
 
     ``captured`` is the fixture keeping its own name's promise: the startup
     sweep records every capture size, and `propose` widens only for a batch
-    that has a recording. Answered through `is_captured` rather than by filling
-    `_cuda_graphs`, so `run` still reaches the backbone -- the only place these
+    that has a recording. Answered through `is_captured` rather than by
+    recording into its request buckets, so `run` still reaches the backbone -- the only place these
     tests can watch the width. `captured=False` is the no-recording case, where
     widening would hand the variable-length MoE gather rows nothing replays.
     """
@@ -1079,9 +831,17 @@ def _proposer_with_graph_bs(
         attn_metadata_builder=types.SimpleNamespace(
             row_ids=torch.arange(p.config.max_num_seqs + 1, dtype=torch.int32)
         ),
+        running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
     )
     p._build_draft_graphs()
     return p
+
+
+def _on_two_dp_ranks(p):
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+    p.runner.running_tokens_per_dp_rank = np.zeros(2, dtype=np.int32)
 
 
 def _install_block_halves(p, inner):
@@ -1206,24 +966,22 @@ def test_propose_sizes_the_draft_gather_without_asking_the_group(monkeypatch):
 
     Every rank's draft height is the same number by construction --
     `running_bs` came out of that reduction and the draft width is config -- so
-    each can write the whole table itself. `DPMetadata.make` all_reduces it
-    when the table is not supplied, which cost one CPU collective per draft
-    pass: `mtp_k` of them per step for the serial drafters.
+    each can write the whole table itself. `DPMetadata.gather_running_tokens`
+    all_reduces it, which would cost one CPU collective per draft pass:
+    `mtp_k` of them per step for the serial drafters.
 
     Watched by making the ask itself fail, not by counting calls: a version
     that asks would otherwise pass here on a stub that answers.
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)
-    p.config.parallel_config = types.SimpleNamespace(
-        data_parallel_size=2, data_parallel_rank=0
-    )
+    _on_two_dp_ranks(p)
 
     def _must_not_ask(*a, **k):
         raise AssertionError("draft asked the group for a height it already knows")
 
     monkeypatch.setattr(
-        mod_drafter.DPMetadata, "num_tokens_across_dp", staticmethod(_must_not_ask)
+        mod_drafter.DPMetadata, "gather_running_tokens", staticmethod(_must_not_ask)
     )
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     fc.dp_metadata = None
@@ -1250,9 +1008,7 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)
-    p.config.parallel_config = types.SimpleNamespace(
-        data_parallel_size=2, data_parallel_rank=0
-    )
+    _on_two_dp_ranks(p)
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     fc.context.is_prefill = True
     fc.dp_metadata = None
@@ -1281,6 +1037,9 @@ def _bare_drafter(dp_size):
             data_parallel_size=dp_size, data_parallel_rank=0
         )
     )
+    drafter.runner = types.SimpleNamespace(
+        running_tokens_per_dp_rank=np.zeros(dp_size, dtype=np.int32)
+    )
     return drafter
 
 
@@ -1291,21 +1050,18 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
     rank's own token stream is not, and declaring it uniform states an equality
     no reduction ever checked.
 
-    What travels is the answer, not the table it implies -- how `make` then
-    builds one is tested against the real thing in tests/test_dp_metadata.py.
-    The two counts are pinned apart so forwarding the wrong one fails here.
+    How the ask reaches the group is tested in tests/test_dp_metadata.py. The
+    two counts are pinned apart so forwarding the wrong one fails here.
     """
-    seen = {}
+    asked = []
 
-    def _make(cfg, batchsize, num_tokens_across_dp=None, *, unified=False):
-        seen["batchsize"] = batchsize
-        seen["table"] = num_tokens_across_dp
-        seen["unified"] = unified
-        return types.SimpleNamespace(
-            get_sizes_across_dp=lambda: [batchsize] * cfg.data_parallel_size
-        )
+    def _gather(cfg, running_tokens):
+        asked.append(running_tokens)
+        return np.array([running_tokens, 5], dtype=np.int32)
 
-    monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_make))
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "gather_running_tokens", staticmethod(_gather)
+    )
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
 
     _bare_drafter(2)._publish_draft_shape(
@@ -1315,7 +1071,8 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
         running_tokens_are_unified=False,
     )
     assert fc.context.running_tokens_are_unified is False
-    assert seen["unified"] is False, "a ragged height has to be discovered"
+    assert asked == [336], "a ragged height is discovered, and it is what RUNS"
+    assert fc.context.running_tokens_across_dp == (336, 5)
 
     _bare_drafter(2)._publish_draft_shape(
         fc,
@@ -1324,9 +1081,8 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
         running_tokens_are_unified=True,
     )
     assert fc.context.running_tokens_are_unified is True
-    assert seen["batchsize"] == 336, "the group is told what the pass RUNS"
-    assert seen["unified"] is True, "an agreed height is worth no ask"
-    assert seen["table"] is None, "the answer travels, not a table built here"
+    assert asked == [336], "an agreed height is worth no ask"
+    assert fc.dp_metadata.get_sizes_across_dp() == [336, 336]
 
 
 def test_publishing_a_shape_does_not_decide_whether_it_is_a_prefill():
@@ -1381,7 +1137,9 @@ def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):
     assert seen_on["B"] == seen_off["B"] == 48
 
 
-def test_propose_replays_at_the_agreed_batch_even_when_it_had_to_pad(monkeypatch):
+def test_propose_replays_at_the_agreed_batch_even_when_it_had_to_pad(
+    monkeypatch, req_graph_recordings
+):
     """The seam, end to end through `propose`.
 
     A step whose real batch is 44 runs the block at the agreed 48 and stands in
@@ -1397,10 +1155,7 @@ def test_propose_replays_at_the_agreed_batch_even_when_it_had_to_pad(monkeypatch
         torch.zeros(48, p.mtp_k),
     )
     replays = []
-    p.block._cuda_graphs[48] = (
-        types.SimpleNamespace(replay=lambda: replays.append(1)),
-        recorded,
-    )
+    req_graph_recordings.add(48, recorded, on_replay=lambda: replays.append(1))
     fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     out = _run_propose(p, fc, 44, monkeypatch, seen)
     assert replays == [1], "must replay the recording at the agreed batch"
@@ -1465,9 +1220,8 @@ def test_the_warm_marks_its_context_as_a_draft(monkeypatch):
     import atom.spec_decode.dspark_proposer as mod
 
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
-    p.runner.graph_pool = None
     p.runner.rank = 0
-    p.warmup_draft_graphs(lambda bs: (fc.attn_metadata, fc.context), None)
+    p.warmup_draft_graphs(lambda bs: (fc.attn_metadata, fc.context))
     assert seen["is_draft"] is True
 
 
@@ -1684,7 +1438,7 @@ def test_qk_norm_rope_short_circuits_dummy_run():
     except ImportError as e:
         # `forward_context`: conftest stubs `atom.config` for the rest of the
         # suite and `module_dispatch_ops` then cannot resolve
-        # `get_current_cudagraph_runtime_mode`, which is why the sibling V4
+        # `plugin_graph_is_piecewise`, which is why the sibling V4
         # tests here only pass when this file runs alone. Anything else is a
         # real import break and must not be skipped past.
         if "aiter" not in str(e) and "forward_context" not in str(e):
@@ -1718,77 +1472,6 @@ def test_qk_norm_rope_short_circuits_dummy_run():
     assert torch.all(qkn.q_sa == 0) and torch.all(qkn.kv == 0)
 
 
-def test_core_still_binds_the_inputs_that_arrive_none():
-    # A core whose signature spans more than one call shape gets None for the
-    # inputs of the shape it is not in -- under the narrow split `_attn_compress` is
-    # handed the paged Q and not `q`/`kv_pre`. Those parameters still have to be
-    # BOUND: dropping them from the call instead was a missing-argument
-    # TypeError that only showed up at cudagraph capture on real hardware.
-    import types
-
-    from atom.utils.attn_ffn_piecewise import piecewise_core
-
-    seen = {}
-
-    @piecewise_core()
-    def core(layer, *, x: torch.Tensor | None, y: torch.Tensor | None):
-        seen["x"], seen["y"] = x, y
-        return y if x is None else x
-
-    class _Outputs:
-        def deliver(self, key, out):
-            return out
-
-    fc = types.SimpleNamespace(
-        context=types.SimpleNamespace(is_dummy_run=False),
-        attn_metadata=object(),
-        in_hipgraph=False,
-    )
-    y = torch.ones(4)
-    out = core(
-        types.SimpleNamespace(layer_name="l0"),
-        runner=None,
-        outputs=_Outputs(),
-        piecewise=True,
-        capture=False,
-        forward_context=fc,
-        x=None,
-        y=y,
-    )
-    assert seen == {"x": None, "y": y}
-    assert out is y
-
-
-def test_core_rejects_an_all_none_call():
-    # The row count comes off an input, so there has to be one. Saying so beats
-    # an AttributeError on None deep in the runner.
-    import types
-
-    import pytest
-
-    from atom.utils.attn_ffn_piecewise import piecewise_core
-
-    @piecewise_core()
-    def core(layer, *, x: torch.Tensor | None):
-        return x
-
-    fc = types.SimpleNamespace(
-        context=types.SimpleNamespace(is_dummy_run=False),
-        attn_metadata=object(),
-        in_hipgraph=False,
-    )
-    with pytest.raises(ValueError, match="every tensor input None"):
-        core(
-            types.SimpleNamespace(layer_name="l0"),
-            runner=None,
-            outputs=None,
-            piecewise=True,
-            capture=False,
-            forward_context=fc,
-            x=None,
-        )
-
-
 def test_every_half_of_the_core_short_circuits_dummy_run():
     # warmup_model runs BEFORE allocate_kv_cache: the SWA plane and the
     # Compressor/Indexer caches are all unbound. The attention has always guarded
@@ -1798,7 +1481,8 @@ def test_every_half_of_the_core_short_circuits_dummy_run():
     # died in `flydsl_hca_compress_attn` on a None kv_cache.
     #
     # So this asserts the property over EVERY entry point `_attn_pre` can reach
-    # under AF, rather than over whichever one was most recently added.
+    # under the narrow split, rather than over whichever one was most recently
+    # added.
     import types
 
     import pytest
@@ -1828,8 +1512,8 @@ def test_every_half_of_the_core_short_circuits_dummy_run():
         kv_fp8=False,
         compress_ratio=4,
         skip_topk=False,
-        indexer=types.SimpleNamespace(topk=_explode),
-        maybe_compressors_async=_explode,
+        indexer=types.SimpleNamespace(topk=_explode, compressor=_explode),
+        compressor=_explode,
         _fill_csa_paged_compress=_explode,
     )
     fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
@@ -1838,9 +1522,7 @@ def test_every_half_of_the_core_short_circuits_dummy_run():
     try:
         qkn = DeepseekV4Attention._qk_norm_rope(layer, q, kv_pre, positions)
         x = torch.zeros(T, D)
-        # `piecewise=False` is the decorator's eager route -- it just runs the
-        # body, which is what has the guard.
-        assert DeepseekV4Attention._attn_compress(layer, piecewise=False, x=x) is None
+        assert DeepseekV4Attention._launch_compressors(layer, x) is None
         o = DeepseekV4Attention._sparse_attention(layer, qkn, positions)
         assert o.shape == (T, H * D) and torch.all(o == 0)
     finally:
@@ -1978,9 +1660,9 @@ def test_every_op_fake_agrees_with_its_body():
                 ],
             ),
             (
-                "v4_attn_compress",
-                [v4._v4_attn_compress_fake(x, None, None, None, "L")],
-                [A._attn_compress(layer, piecewise=False, x=x)],
+                "v4_attn_compress_launch",
+                [v4._v4_attn_compress_launch_fake(x, "L")],
+                [A._launch_compressors(layer, x)],
             ),
             (
                 "v4_sparse_attention",
@@ -2022,10 +1704,10 @@ def test_every_op_fake_agrees_with_its_body():
 
 def test_paged_post_refuses_a_missing_q():
     # `forward()`'s narrow branch always calls `v4_sparse_attention`, so whatever
-    # fills its Q must run on EVERY narrow path. Gating `v4_qk_norm_rope` on
-    # AF_PIECEWISE alone left plain PIECEWISE with no QK-norm at all and a None
-    # Q going into an aiter kernel -- a GPU-side failure, and invisible to every
-    # test here because none of them reach `_attn_pre`.
+    # fills its Q must run on EVERY narrow path: one that skips
+    # `v4_qk_norm_rope` sends a None Q into an aiter kernel -- a GPU-side
+    # failure, and invisible to every test here because none of them reach
+    # `_attn_pre`.
     #
     # So the shape of that mistake is asserted on the CPU side instead.
     import types
@@ -2271,7 +1953,7 @@ def test_reader_ignores_the_indices_length():
 
 
 def test_a_void_op_survives_only_because_split_ops_are_not_compiled():
-    # `v4_attn_compress` returns nothing. That is only safe because a split op's
+    # `v4_attn_compress_launch` returns nothing. That is only safe because a split op's
     # submodule is the one piece the backend leaves uncompiled --
     # `submod_names_to_compile` excludes `is_splitting_graph` -- so it never
     # reaches AOT autograd, which is the layer that drops an effect-free call.
@@ -2314,7 +1996,7 @@ def test_a_void_op_survives_only_because_split_ops_are_not_compiled():
     assert seen["eager"] == 1, "Dynamo alone keeps it; if not, the premise moved"
     assert seen["aot_eager"] == 0, (
         "AOT no longer drops an effect-free op -- then a void op would be safe "
-        "anywhere and `v4_attn_compress` need not stay a split op"
+        "anywhere and `v4_attn_compress_launch` need not stay a split op"
     )
 
     import inspect
@@ -2324,7 +2006,7 @@ def test_a_void_op_survives_only_because_split_ops_are_not_compiled():
     src = inspect.getsource(backends)
     assert "if not item.is_splitting_graph" in src, (
         "the backend no longer excludes split-op submodules from compilation, "
-        "so `v4_attn_compress` would go through AOT and be DCE'd"
+        "so `v4_attn_compress_launch` would go through AOT and be DCE'd"
     )
 
 

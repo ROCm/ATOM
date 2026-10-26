@@ -395,7 +395,7 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
+    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm every size from the state the target's capture left behind.
 
         `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
@@ -422,7 +422,7 @@ class EagleProposer(Drafter):
             return build_context(**kwargs)
 
         try:
-            super().warmup_draft_graphs(build_pristine_context, stream, end_trace)
+            super().warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
             restore()
 
@@ -528,7 +528,7 @@ class EagleProposer(Drafter):
         # the verify step's has the right row count, wrong rows. Published
         # unconditionally: a prefill target (every step on a PD prefill node)
         # never built one, yet steps 1+ still reach the DCP sparse indexer.
-        builder._publish_dcp_token_block_tables(attn_metadata, running_bs, 1)
+        builder._publish_token_block_tables(attn_metadata, running_bs, 1)
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[

@@ -10,11 +10,11 @@ import weakref
 from atom.mono.runtime.peer_memory import PeerBuffer
 
 
-def owned_peer_buffer(owner, nbytes, group, rank, npes, device):
+def owned_peer_buffer(owner, nbytes, group, rank, npes, device, plain_bytes=0):
     """``(PeerBuffer, finalizer)``: the buffer is freed when ``owner`` is dropped
     (a model reload), not at interpreter exit, where the HIP runtime may already
     be gone; calling the finalizer frees it now. Collective (``PeerBuffer``)."""
-    peers = PeerBuffer(nbytes, group, rank, npes, device)
+    peers = PeerBuffer(nbytes, group, rank, npes, device, plain_bytes)
     finalizer = weakref.finalize(owner, peers.close)
     finalizer.atexit = False
     return peers, finalizer

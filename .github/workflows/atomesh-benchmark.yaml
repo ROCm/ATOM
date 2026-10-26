@@ -171,23 +171,6 @@ on:
           - atomesh-cicd
           - atomesh-cicd-mi350
           - atomesh-cicd-mi355-crusoe
-      atomesh_slurm_account:
-        description: 'Slurm account: amd-atom uses amd-atom-qos, amd-frameworks uses amd-frameworks-qos; Crusoe v2 uses amd-aifw-dev'
-        required: false
-        default: auto
-        type: choice
-        options:
-          - auto
-          - amd-atom
-          - amd-frameworks
-      atomesh_slurm_partition:
-        description: 'TW Slurm partition: amd-spur; Crusoe v2 uses the default partition'
-        required: false
-        default: auto
-        type: choice
-        options:
-          - auto
-          - amd-spur
       atomesh_single_node:
         description: 'Single-node P/D placement; auto lets Slurm select an idle node, an explicit node pins the job'
         required: false
@@ -245,8 +228,10 @@ on:
 
 env:
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
-  ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != 'auto' && inputs.atomesh_slurm_account || '' }}
-  ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != 'auto' && inputs.atomesh_slurm_partition || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && 'amd-spur' || '') }}
+  # TW submits only as amd-atom on amd-spur; Crusoe v2 forces amd-aifw-dev on its
+  # default partition and MI350 sends neither.
+  ATOMESH_SLURM_ACCOUNT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd' && 'amd-atom' || '' }}
+  ATOMESH_SLURM_PARTITION: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd' && 'amd-spur' || '' }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
   ATOMESH_DASHBOARD_HARDWARE: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'MI350X' || 'MI355X' }}
   ATOMESH_PD_RANK_MAPPING_POLICY: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'idx2idx' || 'none' }}
@@ -422,8 +407,6 @@ jobs:
           fi
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 16 * * 5" ]]; then
-            ATOMESH_SLURM_ACCOUNT=amd-frameworks \
-            ATOMESH_SLURM_PARTITION=amd-frameworks \
             ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
               python3 .github/scripts/atomesh/pd_matrix.py \
               --suite nightly \
@@ -431,8 +414,6 @@ jobs:
               ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
               --output atomesh-matrix-deepseek.json
 
-            ATOMESH_SLURM_ACCOUNT=amd-frameworks \
-            ATOMESH_SLURM_PARTITION=amd-frameworks \
             ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
               python3 .github/scripts/atomesh/pd_matrix.py \
               --suite weekly \
@@ -440,8 +421,6 @@ jobs:
               ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
               --output atomesh-matrix-v4-weekly.json
 
-            ATOMESH_SLURM_ACCOUNT=amd-tw \
-            ATOMESH_SLURM_PARTITION=amd-tw \
             ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
               python3 .github/scripts/atomesh/pd_matrix.py \
               --suite nightly \
@@ -637,8 +616,8 @@ jobs:
             SLURM_QOS="amd-aifw-dev-qos"
           fi
           if [[ "$(hostname -s)" == "pit2-vm-amd-xl-02" ]]; then
+            SLURM_ACCOUNT="amd-atom"
             SLURM_PARTITION="amd-spur"
-            SLURM_QOS="amd-frameworks-qos"
           fi
           if [[ "${SLURM_ACCOUNT}" == "amd-atom" ]]; then
             SLURM_QOS="amd-atom-qos"

@@ -213,7 +213,7 @@ class Drafter(abc.ABC):
         )
 
     @torch.inference_mode()
-    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
+    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Run every declared pass once per captured size, paying its JIT here.
 
         aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
@@ -245,7 +245,6 @@ class Drafter(abc.ABC):
             return
         runner = self.runner
         capture_sizes = sorted(runner.capture_sizes)  # capture leaves it descending
-        pool = runner.graph_pool
         start = time.time()
         for pass_ in self.draft_graphs:
             for bs in capture_sizes:
@@ -258,20 +257,24 @@ class Drafter(abc.ABC):
                 context.running_tokens_are_unified = True
                 # The synthetic batch is full, so the pass's scheduled and
                 # running counts are the same number.
-                local_tokens = bs * self.draft_tokens_per_seq
-                context.scheduled_tokens = local_tokens
-                context.running_tokens = local_tokens
+                running_tokens = bs * self.draft_tokens_per_seq
+                runner.running_tokens_per_dp_rank.fill(running_tokens)
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
-                    num_tokens=local_tokens,
+                    running_tokens_per_dp_rank=runner.running_tokens_per_dp_rank,
                 )
-                pool = pass_.warmup(bs, pool=pool, stream=stream)
+                self._publish_draft_shape(
+                    get_forward_context(),
+                    running_tokens,
+                    running_tokens,
+                    running_tokens_are_unified=True,
+                )
+                pass_.warmup(bs)
                 if end_trace is not None:
                     step = pass_.name.rsplit(".", 1)[-1].lstrip("_")
                     end_trace(f"draft_{step}_bs_{bs}")
-        runner.graph_pool = pool
         torch.cuda.synchronize()
         if runner.rank == 0:
             logger.info(
@@ -385,8 +388,7 @@ class Drafter(abc.ABC):
         for buf_idx, lid in enumerate(spec.layer_ids):
             if not (lid == -1 or 0 <= lid < n_layers):
                 raise ValueError(
-                    f"aux capture layer id {lid} out of range "
-                    f"{{-1}} U [0,{n_layers})."
+                    f"aux capture layer id {lid} out of range {{-1}} U [0,{n_layers})."
                 )
             if prev is not None and lid <= prev:
                 raise ValueError(
@@ -634,17 +636,17 @@ class Drafter(abc.ABC):
         if parallel_config.data_parallel_size <= 1:
             return
         context.running_tokens_are_unified = running_tokens_are_unified
-        # The answer travels, not the table it implies -- `make` owns both ways
-        # of reaching one, and skipping its all_reduce is why this is worth
-        # stating at all.
-        forward_context.dp_metadata = DPMetadata.make(
-            parallel_config,
-            running_tokens,
-            unified=running_tokens_are_unified,
-        )
-        context.running_tokens_across_dp = tuple(
-            forward_context.dp_metadata.get_sizes_across_dp()
-        )
+        # Stating it is what spares the all_reduce: a unified height is every
+        # rank's entry.
+        if running_tokens_are_unified:
+            running_tokens_per_dp_rank = self.runner.running_tokens_per_dp_rank
+            running_tokens_per_dp_rank.fill(running_tokens)
+        else:
+            running_tokens_per_dp_rank = DPMetadata.gather_running_tokens(
+                parallel_config, running_tokens
+            )
+        forward_context.dp_metadata = DPMetadata(running_tokens_per_dp_rank)
+        context.running_tokens_across_dp = tuple(running_tokens_per_dp_rank.tolist())
 
     def prepare_inputs(self, scheduled_bs: int) -> torch.Tensor:
         """Anchor row per request when nothing was verified: its segment's last.

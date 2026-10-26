@@ -47,7 +47,10 @@ try:
     from aiter.ops.topk import flydsl_dcp_topk_merge, top_k_per_row_decode
 
     from atom.model_ops import dcp_ops
-    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.aiter_mla import (
+        AiterMLAMetadataBuilder,
+        indexes_by_token_table,
+    )
     from atom.model_ops.dcp_ops import (
         dcp_decode_candidate_exchange_fused,
         dcp_local_context_lens,
@@ -396,15 +399,16 @@ def test_filter_partitions_topk_disjointly(name, rows, ctx, world):
                 ), f"[{name}] row {r}: rank {w} emitted a token it does not own"
 
 
-def _build_prefill_topk(kv_lens, bases, layout, k=TOPK, seed=7):
-    """Emulate a `top_k_per_row_prefill` output plane: FLAT KV indices, -1 pad.
+def _build_prefill_topk(kv_lens, layout, k=TOPK, seed=7):
+    """Emulate the shared scorer's prefill selection: positions in the row's
+    request, -1 pad.
 
     kv_len <= k mirrors the short-circuit (every candidate kept, ascending);
     kv_len > k picks a k-subset, which is what the real radix top-k returns.
     """
     gen = torch.Generator().manual_seed(seed)
     ti = torch.full((len(kv_lens), k), -1, dtype=torch.int32)
-    for row, (kv_len, base) in enumerate(zip(kv_lens, bases)):
+    for row, kv_len in enumerate(kv_lens):
         n = min(kv_len, k)
         if kv_len <= k:
             sel = torch.arange(n, dtype=torch.int32)
@@ -417,12 +421,12 @@ def _build_prefill_topk(kv_lens, bases, layout, k=TOPK, seed=7):
             if layout == "compact"
             else torch.randperm(k, generator=gen)[:n].sort().values
         )
-        ti[row, cols] = sel + base
+        ti[row, cols] = sel
     return ti.to(DEV)
 
 
 def _filter_owned_prefill(
-    ti, kv_lens, token_req, cu_seqlens_k, ctx_max, rank, world, block_size=16
+    ti, kv_lens, token_req, num_req, ctx_max, rank, world, block_size=16
 ):
     """Run the production prefill filter for one rank; return owned positions."""
     from atom.model_ops.dcp_ops import triton_filter_and_convert_dcp_index_prefill
@@ -430,7 +434,6 @@ def _filter_owned_prefill(
     rows = ti.shape[0]
     vbs = block_size * world
     n_blocks = (ctx_max + vbs - 1) // vbs
-    num_req = cu_seqlens_k.numel() - 1
     block_table = torch.arange(
         num_req * n_blocks, dtype=torch.int32, device=DEV
     ).reshape(num_req, n_blocks)
@@ -444,7 +447,6 @@ def _filter_owned_prefill(
         dsa_kv_indptr,
         token_req,
         ti,
-        cu_seqlens_k,
         block_table,
         rank,
         world,
@@ -473,8 +475,8 @@ def _filter_owned_prefill(
 @pytest.mark.parametrize(
     "name, ctxs, token_req, kv_lens, world",
     [
-        # Two requests so the flat->position mapping (`indice - cu_seqlens_k[req]`)
-        # is exercised with a non-zero base, and short rows so kv_len << topk.
+        # Two requests so each row has to map through its own request's block
+        # table, and short rows so kv_len << topk.
         ("short rows, 2 reqs", [1000, 300], [0, 0, 0, 1, 1], [1, 17, 1000, 1, 300], 8),
         ("rows longer than topk", [5000], [0, 0], [3000, 5000], 8),
         ("W=2", [1000], [0], [999], 2),
@@ -483,23 +485,16 @@ def _filter_owned_prefill(
 def test_prefill_filter_is_layout_independent(
     name, ctxs, token_req, kv_lens, world, layout
 ):
-    cu = [0]
-    for c in ctxs:
-        cu.append(cu[-1] + c)
-    cu_seqlens_k = torch.tensor(cu, dtype=torch.int32, device=DEV)
-    bases = [int(cu_seqlens_k[r]) for r in token_req]
     treq = torch.tensor(token_req, dtype=torch.int32, device=DEV)
-    ti = _build_prefill_topk(kv_lens, bases, layout)
+    ti = _build_prefill_topk(kv_lens, layout)
 
     # Ground truth straight off the input plane, so it holds for either layout.
-    expected = [
-        set((ti[t][ti[t] >= 0] - bases[t]).cpu().tolist()) for t in range(len(kv_lens))
-    ]
+    expected = [set(ti[t][ti[t] >= 0].cpu().tolist()) for t in range(len(kv_lens))]
 
     union = [set() for _ in kv_lens]
     for rank in range(world):
         owned = _filter_owned_prefill(
-            ti, kv_lens, treq, cu_seqlens_k, max(ctxs), rank, world
+            ti, kv_lens, treq, len(ctxs), max(ctxs), rank, world
         )
         for t, pos in enumerate(owned):
             ids = set(pos.cpu().tolist())
@@ -578,26 +573,25 @@ def test_window_lens_advance_only_on_the_rank_that_owns_the_new_token():
     assert set(advances.ravel().tolist()) <= {0, 1}
 
 
-def _publish(bs, q, world, cols=6, is_sparse=True):
+def _publish(bs, q, world, cols=6, is_sparse=True, kpool=1):
     block_tables = torch.arange(bs * cols, dtype=torch.int32, device=DEV).reshape(
         bs, cols
     )
     stub = SimpleNamespace(
-        is_sparse=is_sparse,
-        dcp_world_size=world,
-        _dcp_token_block_tables_gpu=torch.zeros(
+        indexes_by_token_table=indexes_by_token_table(is_sparse, world, kpool),
+        _token_block_tables_gpu=torch.zeros(
             bs * q, cols, dtype=torch.int32, device=DEV
         ),
     )
-    meta = SimpleNamespace(block_tables=block_tables, dcp_token_block_tables=None)
-    AiterMLAMetadataBuilder._publish_dcp_token_block_tables(stub, meta, bs, q)
+    meta = SimpleNamespace(block_tables=block_tables, token_block_tables=None)
+    AiterMLAMetadataBuilder._publish_token_block_tables(stub, meta, bs, q)
     return meta
 
 
 @pytest.mark.parametrize("bs, q", [(1, 4), (3, 2), (8, 3), (5, 4)])
 def test_token_block_table_row_belongs_to_the_draft_position_s_request(bs, q):
     meta = _publish(bs, q, world=4)
-    rows = meta.dcp_token_block_tables
+    rows = meta.token_block_tables
     assert rows.shape == (bs * q, meta.block_tables.shape[1])
     assert rows.dtype == torch.int32
     for b in range(bs):
@@ -608,13 +602,19 @@ def test_token_block_table_row_belongs_to_the_draft_position_s_request(bs, q):
 def test_one_query_per_sequence_aliases_the_request_table():
     """No copy when there is nothing to expand -- and no chance of drift."""
     meta = _publish(bs=8, q=1, world=4)
-    assert meta.dcp_token_block_tables is meta.block_tables
+    assert meta.token_block_tables is meta.block_tables
 
 
-def test_nothing_published_off_the_dcp_sparse_path():
-    """A leftover table is worse than none: same row count, wrong rows."""
-    assert _publish(bs=4, q=2, world=1).dcp_token_block_tables is None
-    assert _publish(bs=4, q=2, world=4, is_sparse=False).dcp_token_block_tables is None
+def test_nothing_published_where_no_indexer_reads_it():
+    """A leftover table is worse than none: same row count, wrong rows. Only
+    the DCP decode exchange and a pooled indexer read a row per query token."""
+    assert _publish(bs=4, q=2, world=1).token_block_tables is None
+    assert _publish(bs=4, q=2, world=4, is_sparse=False).token_block_tables is None
+    pooled = _publish(bs=4, q=2, world=1, kpool=4)
+    assert torch.equal(
+        pooled.token_block_tables,
+        pooled.block_tables.repeat_interleave(2, dim=0),
+    )
 
 
 def test_every_backend_answers_the_draft_s_dcp_table_publish():
@@ -625,8 +625,8 @@ def test_every_backend_answers_the_draft_s_dcp_table_publish():
     here would reach the verify step."""
     from atom.model_ops.attentions import backends
 
-    base = backends.CommonAttentionBuilder._publish_dcp_token_block_tables
-    assert AiterMLAMetadataBuilder._publish_dcp_token_block_tables is not base
+    base = backends.CommonAttentionBuilder._publish_token_block_tables
+    assert AiterMLAMetadataBuilder._publish_token_block_tables is not base
     metadata = SimpleNamespace()
     base(object(), metadata, 4, 1)
     assert not vars(metadata)
@@ -677,7 +677,7 @@ def test_fused_exchange_passes_the_kernels_one_row_per_query_token(monkeypatch):
     )
     meta = SimpleNamespace(
         dcp_local_context_lens=windows,
-        dcp_token_block_tables=token_bt,
+        token_block_tables=token_bt,
         context_lens=torch.full((bs,), 64, dtype=torch.int32, device=DEV),
     )
     query = torch.randn(bs, q, 8, 16, device=DEV)

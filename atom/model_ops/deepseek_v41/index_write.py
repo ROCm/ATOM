@@ -22,6 +22,8 @@ import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
+from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
+
 MFMA_N = 16
 """Columns one shuffled group interleaves: the MFMA B operand's width.
 
@@ -80,7 +82,7 @@ def _write_index_kernel(
     key = tl.load(keys + token.to(tl.int64) * HEAD_DIM + d).to(tl.float32)
     # One scale per row, so the row is the quantization block and `amax` is a
     # scalar; the floor keeps a row of zeros from dividing by nothing.
-    scale = tl.maximum(tl.max(tl.abs(key)), 1e-4) / FP8_MAX
+    scale = tl.maximum(tl.max(tl.abs(key)), AMAX_FLOOR) / FP8_MAX
     if UE8M0:
         scale = tl.exp2(tl.ceil(tl.log2(scale)))
     # The reciprocal, not a division: aiter's writer and V4's `fused_compress`
