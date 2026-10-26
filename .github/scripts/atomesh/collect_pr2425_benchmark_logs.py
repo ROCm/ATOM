@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import time
@@ -33,6 +34,51 @@ PATTERNS = (
     'slurm_job-{job}/benchmark_results/**/profile_export.jsonl',
     'slurm_job-{job}/rank-*/*.log',
 )
+
+
+def collect_runner_diagnostics(output):
+    records = {}
+    for label, runner, target in (
+        ('c32', 'atomesh-runner-03', '40264271709'),
+        ('c48', 'atomesh-runner-02', '40264276316'),
+    ):
+        root = Path('/share_nfs/ATOMESH_RUNNER') / runner / '_diag'
+        record = {'root': str(root), 'files': []}
+        records[label] = record
+        # These two jobs started at 03:30 UTC. Inspect only their worker files,
+        # then require the expected GitHub run ID before exporting any lines.
+        for path in sorted(root.glob('Worker_20261026-0330*.log')):
+            if not path.resolve().is_relative_to(root.resolve()):
+                continue
+            selected, identified, last_timestamp = [], False, None
+            scanned = 0
+            with path.open('rb') as stream:
+                for raw in stream:
+                    scanned += len(raw)
+                    if scanned > 64 << 20:
+                        break
+                    line = raw.decode(errors='replace').rstrip()
+                    identified |= target in line
+                    match = re.search(r'2026-10-26 (\d{2}:\d{2}:\d{2})', line)
+                    if not match:
+                        continue
+                    last_timestamp = match[1]
+                    if not '05:04:00' <= match[1] <= '05:19:00':
+                        continue
+                    if re.search(r'token|authorization|secret|password|sig=|x-amz', line, re.I):
+                        continue
+                    if re.search(r'error|exception|fail|exit|kill|cancel|finished|completed|disconnect|connection|shutdown|retry|lost', line, re.I):
+                        selected.append(line[:2000])
+            info = {'source': str(path), 'identified_expected_run': identified,
+                    'scanned_bytes': scanned, 'last_timestamp': last_timestamp,
+                    'scan_limited': scanned > 64 << 20}
+            record['files'].append(info)
+            if identified:
+                destination = output / label / ('runner-' + path.name)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text('\n'.join(selected[-250:]) + '\n')
+                info.update(artifact=str(destination.relative_to(output)), selected_lines=len(selected))
+    return records
 
 
 def collect(output):
@@ -70,6 +116,7 @@ def collect(output):
                     record['files'].append({'source': str(path), 'artifact': str(destination.relative_to(output)), 'original_bytes': size, 'copied_bytes': len(data), 'tail_only': size > len(data)})
                 except OSError as exc:
                     record['errors'].append({'path': str(path), 'error': str(exc)})
+    manifest["runner_diagnostics"] = collect_runner_diagnostics(output)
     (output / 'snapshot.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps(manifest, indent=2), flush=True)
     return manifest
