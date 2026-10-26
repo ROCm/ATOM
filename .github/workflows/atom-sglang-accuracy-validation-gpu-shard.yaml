@@ -196,6 +196,7 @@ jobs:
             /mnt/raid0/pretrained_model
             /data/pretrained_model
             /data/models
+            /models
           )
 
           first_existing_root=""
