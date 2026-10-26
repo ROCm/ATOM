@@ -127,17 +127,29 @@ Two more switches cover the rest of the decode steps:
 - `ATOM_MONO_K3_MLA_K2=1` (off by default) also runs K2 on the 24 full-attention
   (MLA) layers. At bs=1 it cut the step ITL 16.5 to 14.8 ms; GSM8K paired against
   the 8-row control was +0.0038 (z = +0.6).
-- `ATOM_SCHEDULER_MAX_RUNNING_SEQS=N` caps how many sequences the scheduler runs
-  at once without touching the engine's buffers. `--max-num-seqs 1` fails at
-  startup on a DSpark deployment (the block drafter's warmup needs two
-  sequences), so launch `--max-num-seqs 2 --cudagraph-capture-sizes "[1,2]"` with
-  `ATOM_SCHEDULER_MAX_RUNNING_SEQS=1`. Other requests queue, so their TTFT rises
-  (mean 0.9 s to 1.7 s on the agentic trace).
+- `ATOM_PREFILL_DECODE_INTERVAL=1000000` holds new-prefill admission until the
+  running-decode count hits zero, using the existing `PrefillDelayer`
+  (`atom/model_engine/prefill_delayer.py`) in its local, decode-gated
+  (`nodecode`-trigger) mode rather than a new scheduler mechanism. With
+  `--max-num-seqs 2 --cudagraph-capture-sizes "[1,2]"` this gives the same
+  effective bs=1 concurrency bound that an earlier revision of this PR got from
+  a hand-rolled `ATOM_SCHEDULER_MAX_RUNNING_SEQS` admission cap (since reverted);
+  `--max-num-seqs 1` still fails at startup on a DSpark deployment (the block
+  drafter's warmup needs two sequences). Other requests queue, so their TTFT
+  rises (mean 0.9 s to 1.7-1.9 s on the agentic trace). Known gap: a request
+  arriving mid chunked-prefill of another request can in principle be admitted
+  (decode count reads 0 at that instant), letting two requests decode at once
+  afterward; not rigorously isolated, but the aggregate result below suggests it
+  did not materially hurt this benchmark.
 
 Agentic trace, TP8, DSpark k=7, acceptance length pinned 3.84, official client
 3600 s each, p90 interactivity (tok/s/user): native vLLM (no mono, one request at
 a time) 177.4; ATOM default concurrency with `ATOM_MONO_K3_MAX_ROWS=16` 165.5 (+
-`ATOM_MONO_K3_MLA_K2=1`: 177.1); with the one-request cap 204.9 (+ MLA K2: 216.6).
+`ATOM_MONO_K3_MLA_K2=1`: 177.1); with the one-request admission cap, B+C+A was
+216.6 (39) / 217.5 (43, replicate), within the ~0.5-1 % replicate noise band.
+Swapping the cap for `ATOM_PREFILL_DECODE_INTERVAL=1000000` alone (B+C+A, no
+cap) gives 215.6 — matching the cap's result within that same noise band, so
+the delayer is a valid drop-in replacement for the cap.
 At two-request concurrency (C2) `ATOM_MONO_K3_MAX_ROWS=16` gives 137.4 against
 vLLM's 130.1.
 
