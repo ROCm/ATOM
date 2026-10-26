@@ -108,6 +108,15 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def free_master_port():
+    """A free port whose pools (100 apart, eight at most) stay clear of the
+    fixed owner, metadata and metrics ports the tests set from 50152 up."""
+    while True:
+        port = free_port()
+        if not 49000 <= port < 52000:
+            return port
+
+
 def prefixed_lines(stdout, prefix):
     """``<prefix>NAME=value`` lines as a dict, values kept verbatim."""
     return dict(
@@ -143,7 +152,7 @@ class MooncakeStoreTest(unittest.TestCase):
         self.numa = self.root / "node"
         for node in (0, 1):
             (self.numa / f"node{node}").mkdir(parents=True)
-        self.master_port = free_port()
+        self.master_port = free_master_port()
         self.calls = self.root / "calls"
         self.calls.touch()
         self.path = f"{self.bin_dir}:{os.environ['PATH']}"
