@@ -152,6 +152,10 @@ class ForwardMode:
     # The step runs a recorded token-graph bucket (`running_tokens`), so its
     # model's `TokenGraph` replays (`atom/utils/region_graph.py`).
     token_graph: bool = False
+    # The bucket it replays is a prefill one, on every rank of the group: a
+    # rank decoding beside a prefilling peer replays the prefill recording too
+    # (`_pad_to_token_graph`, `region_graph._phase`).
+    prefill_token_graph: bool = False
     # The DP group replays request graphs as one this step: a decode's whole
     # forward (`use_cudagraph`), a prefill's decoder (`DecoderGraph`).
     req_graphs: bool = False
@@ -305,7 +309,7 @@ class ForwardMode:
             max_seqlen_q=max_seqlen_q,
         )
         token_graph = cls._pad_to_token_graph(
-            is_prefill, graphable, sync, running_tokens_per_dp_rank
+            graphable, sync, running_tokens_per_dp_rank
         )
         if token_graph:
             running_tokens = token_graph
@@ -324,35 +328,35 @@ class ForwardMode:
             tbo_collective_active=tbo_collective_active,
             sync=sync,
             token_graph=bool(token_graph) or (decode_recorded and graphable),
+            prefill_token_graph=bool(token_graph),
             req_graphs=req_graphs,
             ubatch_split_bs=ubatch_split_bs,
         )
 
     @staticmethod
-    def _pad_to_token_graph(
-        is_prefill, graphable, sync, running_tokens_per_dp_rank
-    ) -> int:
+    def _pad_to_token_graph(graphable, sync, running_tokens_per_dp_rank) -> int:
         """Settle every rank's running tokens into ``running_tokens_per_dp_rank``
-        -- its scheduled ones, every prefilling rank's raised to the bucket
-        holding the group's largest (`TokenGraph.bucket`) -- and return that
-        bucket on a prefilling rank, else 0.
+        -- its scheduled ones, or on a step some rank prefills every rank's
+        raised to the prefill bucket holding the group's largest
+        (`TokenGraph.bucket`) -- and return that bucket, 0 for none.
 
-        One bucket for every prefilling rank, an idle rank's dummy prefill
-        included: a recording's collectives are sized by its bucket, so ranks
-        replaying different ones hang the group.
+        One bucket for every rank, a decoding one and an idle rank's dummy step
+        included: a recording's collectives are sized by its bucket and hold
+        the peer buffers the group recorded it with, so a rank replaying
+        another bucket, or running eagerly beside a replay, hangs the group. A
+        decoding rank replays the prefill recording on its decode rows
+        (`ForwardMode.prefill_token_graph`); its attention, an eager region,
+        still runs the decode it scheduled.
         """
-        bucket = region_graph.TokenGraph.bucket
         running = running_tokens_per_dp_rank
         np.copyto(running, sync.scheduled_tokens_per_dp_rank)
-        group = bucket(running.max(), "prefill") if graphable else None
+        if not graphable or not any(sync.prefill_across_dp):
+            return 0
+        group = region_graph.TokenGraph.bucket(int(running.max()), "prefill")
         if group is None:
             return 0
-        # Every rank's, whether or not it pads itself: a peer's replay
-        # dispatches its padded rows to this rank too.
-        for rank, prefill in enumerate(sync.prefill_across_dp):
-            if prefill:
-                running[rank] = group
-        return group if is_prefill else 0
+        running.fill(group)
+        return group
 
     @staticmethod
     def _running_tokens(

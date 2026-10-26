@@ -1250,7 +1250,7 @@ class ModelRunner:
         collectives: a decode, or with ``prefill`` -- the group's prefill step
         (`Scheduler.dummy_prefill`) -- a request-less prefill of the smallest
         token-graph bucket's tokens, which `ForwardMode._pad_to_token_graph`
-        raises to the bucket every prefilling rank of the group replays.
+        raises to the bucket every rank of the group replays.
 
         Two mechanisms lean on the fabricated id being -1: this pass flushes
         the previous real step's tokens (`prepare_sampled_ids` reports the
@@ -4216,15 +4216,12 @@ class ModelRunner:
         sizes = sorted(
             {n for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < n <= limit}, reverse=True
         )
-        dp_rank = self.config.parallel_config.data_parallel_rank
         for running_tokens in sizes:
-            # The recorded MoE bounds its dispatch by this table: its own
-            # bucket plus the largest on every peer, which covers any step
-            # whose prefilling ranks all replay one bucket
-            # (`ForwardMode._pad_to_token_graph`). Too wide a bound only sorts
-            # more rows; too narrow would drop received ones.
-            self.running_tokens_per_dp_rank.fill(sizes[0])
-            self.running_tokens_per_dp_rank[dp_rank] = running_tokens
+            # Every rank records this bucket at once and replays it only
+            # together, a decoding rank included (`ForwardMode.
+            # _pad_to_token_graph`), so the recording's collectives -- the
+            # MoE's DP exchange among them -- are sized for every rank at it.
+            self.running_tokens_per_dp_rank.fill(running_tokens)
             # A fresh step for each pass: a replaying forward spends its
             # step's indptrs on the tail (`rows_of`).
             for mode in (None, "record"):
