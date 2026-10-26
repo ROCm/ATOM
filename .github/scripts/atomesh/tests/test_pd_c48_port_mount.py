@@ -35,7 +35,7 @@ CPUREF = {
        for c in (1, 4, 16, 32, 48, 56, 72, 88)},
     **{f"V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-{t}": "cpu-lru-refresh-v3"
        for t in ("C4D8", "C16", "C32", "C56", "C72", "C88", "C56-CPU26", "C72-CPU26", "C88-CPU26",
-                 "C72-MLA96", "C72-MLA96-DPROF")},
+                 "C72-MLA96", "C72-MLA96-DPROF", "C72-MLA96-DLDFP4", "C72-DLDFP4")},
     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS": "cpu-lru-refresh-v3",
     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-MLA96-GSM8K": "cpu-lru-refresh-v3",
 }
