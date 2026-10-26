@@ -2065,10 +2065,16 @@ def fused_verify_variant(N: int, HV: int) -> str | None:
     few dozen programs (N*HV <= 32: 12.8 vs 16.2 at HV=32 N=1, 10.9 vs 15.1 at
     HV=8 N=1); past that its per-slice conv and gating rework loses to B, one
     program per head, which wins from N*HV = 64 on (14.4 vs 17.5 at HV=32 N=2,
-    31.0 vs 45.1 at N=32, 399 vs 420 at N=512). Both beat the separate kernels
-    at every size measured, so this never returns None on gfx1250.
+    31.0 vs 45.1 at N=32, 399 vs 420 at N=512).
+
+    Served, B holds up to N*HV = 256 but not past it. Kernel time per decode
+    step, separate kernels -> fused, from torch-profiler traces of the same
+    server with ATOM_GDN_FUSED_VERIFY=0 and auto: TP4 at 16 requests (N*HV =
+    128) 703 -> 648 us; DP4+EP4 at 128 requests (32 per rank, N*HV = 1024)
+    1484 -> 1860 us, B running at twice its isolated time, and TPOT 3.88 ->
+    4.12 ms in two runs each. So N*HV > 256 keeps the separate kernels.
     """
-    if get_gfx() != "gfx1250":
+    if get_gfx() != "gfx1250" or N * HV > 256:
         return None
     return "A" if N * HV <= 32 else "B"
 
