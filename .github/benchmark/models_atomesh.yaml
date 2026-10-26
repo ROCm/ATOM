@@ -1662,7 +1662,7 @@ models:
               <<: *m31_flash_mcstore_common_env
               # Relative to AIPerf's formal Profiling phase, after warmup.
               ATOMESH_TORCH_PROFILE_START: "1800"
-              ATOMESH_TORCH_PROFILE_DURATION: "180"
+              ATOMESH_TORCH_PROFILE_DURATION: "30"
               ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
               ATOM_PROFILER_MORE: "0"
               ATOM_PROFILER_RECORD_SHAPES: "0"

@@ -2,7 +2,7 @@
 
 The dispatch-only `mooncake_store` suite runs AgentX at C32, C48 and C64. The
 `profile` suite runs the same C32 configuration and captures all prefill and
-decode TP ranks for 180 seconds, starting 1800 seconds after AIPerf enters its
+decode TP ranks for 30 seconds, starting 1800 seconds after AIPerf enters its
 formal Profiling phase. Warmup does not count toward that delay.
 
 | Setting | Value |
@@ -77,5 +77,5 @@ On the current TW submit host, `log_root` is under
 `/it-share/ATOMESH_LOG/`; use the job's printed path. Trace export has a 3600-second
 rank timeout. Once all traces are complete, the profiling cell stops its load
 generator; its throughput is not a benchmark result. Missing traces or an
-incomplete 180-second window fail the cell. The unprofiled cells have
+incomplete 30-second window fail the cell. The unprofiled cells have
 `ATOMESH_TORCH_PROFILE_DURATION=0` and run the full measurement.
