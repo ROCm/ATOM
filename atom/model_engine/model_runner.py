@@ -1732,6 +1732,16 @@ class ModelRunner:
         """
         return [s.name for s in self._sub_pool_specs() if s.pool is Pool.STATE]
 
+    def _gqa_prefill_workspace_reserve(self) -> int:
+        from atom.model_ops.prefill_workspace import prefill_workspace_reserve_bytes
+
+        models = [self.model]
+        if hasattr(self, "drafter"):
+            models.append(self.drafter.model)
+        return prefill_workspace_reserve_bytes(
+            models, overlapping_batches=2 if self.config.enable_tbo else 1
+        )
+
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
 
@@ -1854,9 +1864,21 @@ class ModelRunner:
 
         cudagraph_overhead = self._estimate_cudagraph_overhead()
         safety_margin = int(total * 0.02)
+        prefill_workspace = self._gqa_prefill_workspace_reserve()
+        if prefill_workspace:
+            logger.info(
+                "Reserving %.2fGB for local GQA cached-prefill K/V workspace",
+                prefill_workspace / (1 << 30),
+            )
 
         budget = int(total * config.gpu_memory_utilization)
-        non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
+        non_kv_overhead = (
+            peak_torch
+            + non_torch
+            + cudagraph_overhead
+            + safety_margin
+            + prefill_workspace
+        )
         available_for_kv_budget = budget - non_kv_overhead
 
         # Physical clamp: never exceed what's actually free on the GPU.
@@ -1871,17 +1893,17 @@ class ModelRunner:
             )
             available_for_kv_budget -= connector_bytes
         # This prevents OOM when other processes share the GPU. Free HBM must
-        # cover the connector buffers too.
-        free_for_kv = free - connector_bytes
-        if connector_bytes and free_for_kv <= 0:
+        # cover later connector allocations and cached-prefill workspace too.
+        free_for_kv = free - connector_bytes - prefill_workspace
+        if (connector_bytes or prefill_workspace) and free_for_kv <= 0:
             # Otherwise the KV cache gets nothing and the connector allocates
             # from memory that is not there.
             raise RuntimeError(
                 f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
-                f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
-                "buffers need after the KV cache is sized; free GPU memory or "
-                "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
-                "ATOM_PD_MLA_LANDING=0)."
+                f"{connector_bytes / (1 << 30):.2f}GB of KV connector buffers "
+                f"plus {prefill_workspace / (1 << 30):.2f}GB of cached-prefill "
+                "workspace reserved after KV sizing; free GPU memory or reduce "
+                "the connector/workspace requirements."
             )
         available_for_kv = min(available_for_kv_budget, free_for_kv)
 
@@ -1921,9 +1943,9 @@ class ModelRunner:
                 # The physical free-memory clamp is the binding limit, now or
                 # once the budget grows — raising --gpu-memory-utilization won't help.
                 connector_note = (
-                    f"{connector_bytes / (1 << 30):.2f}GB of it reserved for KV "
-                    f"connector buffers; "
-                    if connector_bytes
+                    f"{(connector_bytes + prefill_workspace) / (1 << 30):.2f}GB "
+                    f"of it reserved for KV connector buffers and prefill workspace; "
+                    if connector_bytes or prefill_workspace
                     else ""
                 )
                 fix_msg = (
@@ -2047,6 +2069,8 @@ class ModelRunner:
             f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"prefill_workspace={prefill_workspace / (1 << 30):.2f}GB, "
+            f"connector_reserve={connector_bytes / (1 << 30):.2f}GB, "
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
@@ -2093,6 +2117,8 @@ class ModelRunner:
             f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"prefill_workspace={prefill_workspace / (1 << 30):.2f}GB, "
+            f"connector_reserve={connector_bytes / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
         )
         # get_num_blocks runs in the RUNNER subprocess, so nothing it writes
