@@ -1487,6 +1487,28 @@ models:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
 
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-torch-profile
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 176
+          env:
+            common:
+              <<: *kimi_k3_pp8_reuse_env
+              ATOMESH_TORCH_PROFILE_START: "900"
+              ATOMESH_TORCH_PROFILE_DURATION: "30"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_TIMEOUT: "1800"
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
+              ATOM_PP_MAX_INFLIGHT: "16"
+              OFFLOAD_COPY_WORKERS: "2"
+              OFFLOAD_LOAD_WORKERS: "2"
+            decode: *kimi_k3_pd_decode_env
+
     accuracy:
       task: gsm8k
       fewshot: 5
