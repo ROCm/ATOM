@@ -2729,11 +2729,8 @@ class Expert(nn.Module):
         tp_grid: tuple[int, int] | None = None,
     ):
         super().__init__()
-        # `tp_grid` overrides the (size, rank) both projections shard on. The
-        # shared expert passes whatever `pcp_merged_tp_grid` picked, so it is
-        # cut across pcp instead of replicated on every pcp rank; None keeps the
-        # TP group. A grid coarser than pcp*tp is answered by the caller's
-        # pre-scale, not here -- this only sizes the weights.
+        # `tp_grid`: (size, rank) to shard on instead of the TP group; the
+        # caller's pre-scale accounts for it.
         grid = (
             {"override_tp_size": tp_grid[0], "override_tp_rank": tp_grid[1]}
             if tp_grid is not None
@@ -2897,15 +2894,9 @@ class MoE(nn.Module):
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
-            # Cut on the pcp-folded grid when moe_pcp_merge is on, so the shared
-            # expert stops being a full replica on every pcp rank. Its partials
-            # are then summed by the same tp all_reduce + pcp
-            # reduce_scatter/all_reduce the routed experts already ride.
-            # `align=128` is the same block-scale granularity the FusedMoE above
-            # pads to; the grid steps down to a coarser divisor rather than hand
-            # the weight loader a shard that splits a scale block. Online
-            # re-quantization gathers on the real TP group, which cannot rebuild
-            # a weight cut on the wider grid, so such a shared expert stays on TP.
+            # Shard on the pcp-folded grid like routed (align=128: block-scale
+            # granularity). Online re-quantization gathers on the real TP group
+            # and cannot rebuild a folded weight, so that case stays on TP.
             self._shared_pcp_grid = (
                 None
                 if _shared_expert_requantized_online(qc, f"{prefix}.shared_experts")
@@ -2927,9 +2918,8 @@ class MoE(nn.Module):
         else:
             self._shared_pcp_grid = None
             self.shared_experts = None
-        # What `combine_outputs` owes the collectives downstream: `g/(pcp*tp)`
-        # for a grid that cut it g ways, `1/pcp_size` for one left on the TP
-        # group (grid None). Unused when there is no separate shared expert.
+        # Pre-scale before the tp/pcp collectives: g/(pcp*tp) on a g-way grid,
+        # 1/pcp_size when left on TP.
         self._shared_prescale = (
             self._shared_pcp_grid.prescale
             if self._shared_pcp_grid is not None
@@ -3088,13 +3078,8 @@ class MoE(nn.Module):
         all-reduce across TP ranks.
         """
         if shared is not None:
-            # The tp all_reduce below and the pcp reduce_scatter/all_reduce in
-            # Block between them sum all pcp*tp rank contributions. A shared
-            # expert cut g ways is held by pcp*tp/g of those ranks, so its sum
-            # comes back that many times too large -- `_shared_prescale` is the
-            # g/(pcp*tp) that lands it at 1x. Cut on the whole folded grid it is
-            # 1.0 (a genuine partial sum, like routed, nothing to undo); left
-            # replicated on the TP group it is the familiar 1/pcp_size.
+            # The tp and pcp collectives sum all pcp*tp contributions; a g-way
+            # cut is held by pcp*tp/g ranks, which `_shared_prescale` undoes.
             if self._shared_prescale != 1.0 and (
                 _moe_pcp_merge_active() or _moe_pcp_merge_decode_active()
             ):
@@ -3725,9 +3710,7 @@ def _pcp_active() -> bool:
     not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
     warmup dummy run has no valid KV cache so it must skip the split path.
     """
-    # Policy: V4's attention has no length-keyed dense fallback (that branch is
-    # aiter_mla.py's, i.e. the deepseek_v2 family), so every real prefill splits
-    # -- hence None. Mechanism shared with deepseek_v2 via pcp_split_active.
+    # V4 has no dense fallback, so every real prefill splits.
     return pcp_split_active(None)
 
 
@@ -3959,9 +3942,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     }
 
     def pcp_split_active(self) -> bool:
-        """Did this model's last forward PCP row-split? Callers outside the model
-        (the drafter, via ModelRunner) ask here rather than re-deriving the gate,
-        so the family-specific policy stays in one place."""
+        """Did this model's last forward PCP row-split?"""
         return _pcp_active()
 
     def __init__(self, config: Config, prefix: str = "") -> None:

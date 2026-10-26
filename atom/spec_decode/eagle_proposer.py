@@ -26,20 +26,9 @@ logger = logging.getLogger("atom")
 
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
-    """Whether this draft prefill must be split onto 1/pcp query rows.
-
-    Asks the draft model's own gate. The previous version tried v2's gate first
-    and fell back to v4's only for a class literally named `DeepseekV4MTP`,
-    which sent every other V4-backed drafter (DSpark's `DeepseekV4DSpark`) to
-    the wrong family's policy -- v2 additionally requires
-    `max_seqlen_k > index_topk`, a dense-fallback threshold V4's attention does
-    not have.
-
-    Reads the answer ModelRunner settled right after the target forward, so it
-    is also immune to the draft loop bumping `max_seqlen_k` or clearing
-    `is_prefill` underneath it.
-    """
-    del draft_model  # the answer is a property of the batch, not of the flavor
+    """Whether this draft prefill must be split onto 1/pcp query rows: the
+    target forward's answer, cached by ModelRunner before drafting."""
+    del draft_model  # a property of the batch, not of the draft model
     ctx = getattr(get_forward_context(), "context", None)
     return bool(getattr(ctx, "pcp_split_rows", False))
 

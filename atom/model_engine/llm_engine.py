@@ -161,15 +161,9 @@ class LLMEngine:
                     "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
                     "prefill uses request-boundary balanced grouping."
                 )
-            # TBO stripes positions per request group; the draft prefill split
-            # stripes the batch as one flat global sequence. The shards disagree
-            # on length and order, so refuse rather than crash inside the draft.
-            # Last, so the two branches above have already had their say: both
-            # clear enable_tbo, which means this can only fire at -tp 1 with
-            # merge on. Deliberately conservative -- it keys on the config, so a
-            # run whose token counts would never reach TBO's threshold is
-            # refused too; the alternative is a per-step decision that cannot be
-            # made at startup.
+            # TBO stripes positions per request group, the draft prefill split
+            # the batch as one sequence: their shards disagree. Keyed on config,
+            # so runs that would never reach TBO are refused too.
             if config.enable_tbo and config.speculative_config is not None:
                 raise ValueError(
                     "prefill_context_parallel_size > 1 (-pcp) with speculative "

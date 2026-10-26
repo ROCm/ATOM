@@ -47,12 +47,8 @@ class PcpBalGroup(NamedTuple):
 
 
 class PcpSharedGrid(NamedTuple):
-    """How a pcp-redundant per-token module is cut. See `pcp_merged_tp_grid`.
-
-    `size` ways, this rank holding shard `rank`, and `prescale` the factor its
-    output needs before the tp/pcp collectives sum it -- `size / (pcp * tp)`,
-    which is 1.0 exactly when the cut uses the whole folded grid.
-    """
+    """`size`-way cut, this rank's shard `rank`, and the `prescale` its output
+    needs before the tp/pcp collectives sum it. See `pcp_merged_tp_grid`."""
 
     size: int
     rank: int
@@ -64,7 +60,7 @@ logger = logging.getLogger("atom")
 
 @cache
 def _warn_unaligned_fold(shard_dim: int, pcp_size: int, full: int, align: int) -> None:
-    """Once per distinct shape, not once per layer -- every block asks."""
+    """Once per distinct shape, not once per layer."""
     logger.warning(
         "PCP merge: leaving a %d-wide tensor replicated across the %d pcp "
         "ranks -- no divisor of the %d-wide folded grid cuts it into "
@@ -89,26 +85,12 @@ def pcp_is_enabled() -> bool:
 
 
 def pcp_split_active(dsa_fallback_topk: int | None) -> bool:
-    """Did PCP row-split the CURRENT prefill forward?
+    """Did PCP row-split the current prefill forward?
 
-    The mechanism every model shares -- pcp enabled, real prefill, not a
-    dummy/warmup run -- lives here once. The one genuine difference stays a
-    parameter: a backend that falls back to dense MHA on short batches is not
-    PCP-wired there, so it must pass its threshold and gets False below it.
-    `aiter_mla.py` (the V3.2 / deepseek_v2 family) has that fallback keyed on
-    `max_seqlen_k > index_topk`; DeepSeek-V4's attention has no such branch, so
-    it passes None and every prefill counts.
-
-    Merging the two conditions instead of parameterising them would be wrong in
-    both directions: V4 would wrongly report "not split" for prompts under its
-    own index_topk, and the v2 family would wrongly report "split" for batches
-    that never reached the sparse path.
-
-    Reads only batch-global state, so every PCP rank gets the same answer --
-    which is what lets a caller gate a collective on it. It is NOT stable across
-    a step: a drafter that rewrites `is_prefill` or bumps `max_seqlen_k` changes
-    the answer, so evaluate it while the target's own forward context still
-    stands, not partway through drafting.
+    A backend that falls back to dense MHA on short batches passes its threshold
+    (`dsa_fallback_topk`, V3.2's `index_topk`) and reports False below it; V4
+    passes None. Batch-global, so every rank agrees, but drafting changes the
+    inputs: evaluate it right after the target forward.
     """
     from atom.utils.forward_context import get_forward_context
 
@@ -131,34 +113,15 @@ def pcp_split_active(dsa_fallback_topk: int | None) -> bool:
 def pcp_merged_tp_grid(
     shard_dim: int | None = None, align: int = 1
 ) -> PcpSharedGrid | None:
-    """How to cut a pcp-redundant per-token module, or None to leave it on TP.
+    """Cut a pcp-redundant per-token module on the folded `pcp*tp` grid, or
+    return None to leave it on TP.
 
-    Lets a module that is otherwise replicated across PCP shard on (a divisor
-    of) the same `pcp_size * tp_size` grid FusedMoE folds onto, so the existing
-    tp all_reduce + pcp reduce_scatter/all_reduce sum its partials for free.
-
-    The counting argument is the whole correctness story. Those two collectives
-    between them sum all `pcp_size * tp_size` rank contributions. Cut `g` ways
-    with shard index `flat_rank % g`, and `g | pcp*tp` makes every shard land on
-    exactly `pcp*tp/g` ranks, so the sum comes back `pcp*tp/g` too large --
-    hence `prescale`. The two hand-written cases this generalises: `g == pcp*tp`
-    needs no scale, and `g == tp_size` (replicated across PCP, i.e. this
-    returning None) is the familiar `1/pcp_size`.
-
-    `shard_dim` with `align` is what keeps `g` from outrunning the checkpoint:
-    block-quantised scales only slice on `align` boundaries, so a `g` that cuts
-    `shard_dim` into non-`align` pieces would fault in the weight loader. We
-    step down to the largest divisor that stays clean rather than failing, and
-    return None once that is just the TP group -- the path the model has always
-    taken. `flat_rank` stays `pcp_rank * tp_size + tp_rank`, matching
-    `FusedMoEParallelConfig.make`, so a TP group owns a contiguous run and its
-    PCP partner the next one.
-
-    One level of that fold is deliberately NOT mirrored: `make` folds DP into TP
-    first when `flatten_tp_across_dp_for_moe`. A module summed only by the tp
-    all_reduce + the pcp collective never gets a DP reduce, so following it
-    there would shard into pieces nothing adds back up. That combination is
-    refused below instead.
+    The tp all_reduce and pcp collectives sum all `pcp*tp` contributions, so a
+    `g`-way cut (`g | pcp*tp`) is summed `pcp*tp/g` times: `prescale` undoes
+    that. `g` steps down until `shard_dim / g` is `align`-clean (block-quant
+    scales slice only on `align`). `flat_rank = pcp_rank * tp + tp_rank` must
+    match `FusedMoEParallelConfig.make`; its DP fold is not mirrored, so that
+    combination is refused.
     """
     from atom.config import get_current_atom_config
     from atom.utils import envs
@@ -167,10 +130,7 @@ def pcp_merged_tp_grid(
     if pcp_size <= 1 or not bool(envs.ATOM_PCP_MOE_MERGE):
         return None
     cfg = get_current_atom_config()
-    # Same disjunction as moe.py's `flatten_tp_across_dp_for_moe`. The first
-    # half is already refused at startup (llm_engine.py, PCP + DP-attention);
-    # the second defaults off and only the vLLM plugin sets it, so this guards
-    # a door that is shut rather than one anyone walks through today.
+    # Same condition as moe.py's `flatten_tp_across_dp_for_moe`.
     if getattr(cfg, "enable_dp_attention", False) or getattr(
         cfg, "moe_ep_flatten_tp_across_dp", False
     ):
@@ -355,13 +315,9 @@ def pcp_owned_rows_by_request(
     cu_seqlens_q: np.ndarray, first: int, stride: int, owned: int
 ) -> np.ndarray:
     """Starts of the rows a PCP rank owns (`first`, `first + stride`, ...,
-    `owned` of them) grouped by request (`cu_seqlens_q`), the padding rows
-    past the last request folded into its group. Rows below `x` it owns
-    number `ceil((x - first) / stride)`, so this is arithmetic on the host.
-
-    One group per request, never one more: the FP4 scorer reads group b's
-    keys off `block_tables[b]`, which has a row per request. Padding rows sit
-    at position 0, so their bound is 0 and they read no key."""
+    `owned` of them) grouped by request (`cu_seqlens_q`). Padding rows join
+    the last request's group: one group per `block_tables` row, and at
+    position 0 they read no key."""
     cu = np.asarray(cu_seqlens_q, dtype=np.int64)
     below = (np.maximum(cu - first, 0) + stride - 1) // stride
     starts = below - below[0]

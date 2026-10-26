@@ -196,10 +196,8 @@ def _pcp_active() -> bool:
     reindex) keys off the SAME batch-global condition so they agree within a
     forward.
     """
-    # Policy: this family only wires PCP into the sparse-MLA path, so a model
-    # without index_topk never splits, and one with it splits only above the
-    # threshold (`aiter_mla.py:1254` is where the dense fallback actually
-    # branches). The mechanism itself is shared -- see pcp_split_active.
+    # This family wires PCP only into sparse MLA: no index_topk, no split;
+    # otherwise split only above the dense-fallback threshold.
     index_topk = getattr(get_current_atom_config().hf_config, "index_topk", None)
     if index_topk is None:
         return False
@@ -3107,9 +3105,7 @@ class DeepseekV2Model(nn.Module):
 
 class DeepseekV2ForCausalLM(nn.Module):
     def pcp_split_active(self) -> bool:
-        """Did this model's last forward PCP row-split? Callers outside the model
-        (the drafter, via ModelRunner) ask here rather than re-deriving the gate,
-        so the family-specific policy stays in one place."""
+        """Did this model's last forward PCP row-split?"""
         return _pcp_active()
 
     def __init__(

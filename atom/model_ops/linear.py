@@ -1128,13 +1128,9 @@ class LinearBase(nn.Module):
                 # col qkv w13, tp_dim=0, [m, n] -> [m // tp, n] -> [m // tp, n // 32], don't need gather
                 # row o, w2, tp_dim=1, [m, n] -> [m, n //tp] -> [m, n // tp // 32], need gather
                 need_gather = self.tp_dim == 1 and self.input_size % 32 != 0
-        # The gather runs on the REAL tp group while the shard-back below uses
-        # self.tp_size/tp_rank. An override that WIDENS the grid (the pcp fold:
-        # eff_tp = pcp*tp) breaks that pairing -- all_gather over tp ranks each
-        # holding 1/(pcp*tp) reconstructs 1/pcp of the weight, not the whole of
-        # it, and the shard-back then narrows that as if it were full. DCP's
-        # override narrows instead (eff_tp = tp/dcp), where the gather really
-        # does reconstruct the full weight, so it is unaffected.
+        # The gather runs on the real TP group, so it cannot rebuild a weight
+        # cut on a wider override grid (the pcp fold). DCP's override narrows
+        # the grid and is unaffected.
         if need_gather and self.tp_size > get_tp_group().world_size:
             raise NotImplementedError(
                 f"{self.prefix}: online re-quantization wants a full-weight "

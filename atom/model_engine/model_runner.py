@@ -186,17 +186,9 @@ _kv_config_has_producer = kv_config_has_producer
 
 
 def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
-    """Do the sampled ids have to agree across a parallel group this step?
-
-    Only when they feed back as device-side input to the next forward, which is
-    exactly these two: deferred-out hands them on as `prev_token_ids`, and a
-    drafter consumes them as its draft input. Otherwise `prepare_sampled_ids`
-    returns through the host and leaves no GPU state to diverge from.
-
-    One predicate for both the PCP and the TP broadcast, which have to stay the
-    same condition -- they are the same question asked of two groups, and two
-    copies of it would eventually answer differently.
-    """
+    """Whether sampled ids feed the next forward on device (deferred-out or a
+    drafter), so they must agree across a group. Shared by the PCP and TP
+    broadcasts so the two conditions cannot drift."""
     return is_deferred_out or has_drafter
 
 
@@ -3290,26 +3282,17 @@ class ModelRunner:
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
             )
-            # PCP ranks decode redundantly and are consistent only while their
-            # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
-            # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
-            # then differ per rank and the emitted streams fork. Sync the
-            # verdict here; it is spec-only and must land before the three
-            # values unpacked from it. The ids are synced below, outside this
-            # branch, so the non-spec paths get them too.
+            # PCP ranks decode redundantly but not bit-identically, so their
+            # accept counts can differ: take rank 0's verdict. Ids are synced
+            # below, outside this branch.
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
                 verdict = get_pcp_group().broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
-        # PCP ranks run the same forward redundantly and are consistent only
-        # while their kernels agree bit-for-bit -- they don't (~1 bf16 ULP, which
-        # flips near-tie argmaxes). Measured: ~1.8% of sampled ids differ, and
-        # deferred-out feeds them straight back as the next step's input, so the
-        # moe_pcp_merge all_reduce then sums MoE partials from mismatched hidden
-        # states -- the very thing its own comment assumes cannot happen. Pin the
-        # ids to rank 0. Same condition as the TP broadcast below.
+        # Near-tie argmaxes differ across PCP ranks (~1 bf16 ULP) and the ids
+        # feed the next forward, whose MoE all_reduce assumes identical rows.
         if get_pcp_world_size() > 1 and _needs_id_sync(
             self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
@@ -3317,12 +3300,8 @@ class ModelRunner:
                 sampled_tokens.contiguous(), src=0
             )
 
-        # Drafter input must agree across TP ranks.
-        # Only the ids, on purpose: the sampler is stochastic (independent noise
-        # for n>1 fan-out). The verdict is not -- it is a deterministic function
-        # of target_probs and the draft ids, which TP ranks share bit-for-bit,
-        # so broadcasting it here would be a no-op. Only PCP needs it (its
-        # target_probs differ), and syncs it above.
+        # Drafter input must agree across TP ranks. Ids only: the verdict is
+        # deterministic on TP ranks' bit-identical inputs.
         if get_tp_group().world_size > 1 and _needs_id_sync(
             self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
@@ -3337,12 +3316,8 @@ class ModelRunner:
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
             ).squeeze(-1)
-            # TP only, and the asymmetry with the ids above is deliberate rather
-            # than an oversight: logprobs never feed the next forward, they just
-            # leave through the output channel, and only worker 0 has one -- a
-            # non-zero rank's copy is dropped. So PCP, whose ranks genuinely do
-            # differ here, needs no broadcast, while this TP one (a no-op on
-            # bit-identical inputs) is kept as it was.
+            # No PCP broadcast: logprobs never feed the next forward and only
+            # worker 0's leave.
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
@@ -3450,21 +3425,26 @@ class ModelRunner:
             callback(req_ids)
 
     def _settle_pcp_split_rows(self) -> None:
-        """Cache whether the forward just run row-split for PCP.
-
-        Call right after `run_model`: the drafters rewrite the state the gate
-        reads (is_prefill, max_seqlen_k), so it has only one truthful moment.
-        Plain Python on the caller side -- a hook or a model-side assignment
-        would be skipped on a cudagraph replay while its device work still ran,
-        leaving per-rank answers that deadlock anything gated on them. A model
-        without `pcp_split_active` never row-splits.
-        """
-        if getattr(self, "drafter", None) is not None:
-            get_forward_context().context.pcp_split_rows = (
-                self.model.pcp_split_active()
-                if hasattr(self.model, "pcp_split_active")
-                else False
+        """Cache whether the forward just run row-split for PCP. Call right
+        after `run_model`: drafting rewrites the state the gate reads, and a
+        cudagraph replay skips any model-side bookkeeping."""
+        if getattr(self, "drafter", None) is None:
+            return
+        split_active = getattr(self.model, "pcp_split_active", None)
+        if (
+            split_active is None
+            and get_pcp_world_size() > 1
+            and not getattr(self, "_warned_no_pcp_split", False)
+        ):
+            self._warned_no_pcp_split = True
+            logger.warning(
+                "%s has no pcp_split_active(); assuming PCP never row-splits "
+                "it, so drafter aux states are not gathered.",
+                type(self.model).__name__,
             )
+        get_forward_context().context.pcp_split_rows = bool(
+            split_active() if split_active is not None else False
+        )
 
     @_profile_runner_stage
     @torch.inference_mode()

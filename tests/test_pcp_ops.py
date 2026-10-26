@@ -3,16 +3,10 @@
 
 """CPU unit tests for the Prefill Context Parallel (PCP) pure helpers.
 
-PCP's failure mode is not a wrong number, it is two places disagreeing about
-which rows a rank owns. The draft-prefill crash this suite starts from was
-exactly that: `compute_draft_kv` fed full-size q against attn_metadata already
-reindexed to 1/pcp, and aiter aborted on `kv_indptr_prefix length must be N+1`.
-So the tests here pin the *conventions* --- pad first, then round-robin; dense
-pads with zeros while indptr repeats the last prefix-sum --- and, where two
-functions have to agree, assert them against each other rather than separately.
-
-Everything here is pure tensor work plus parallel-state reads that are
-monkeypatched, so it runs on CPU with no process group.
+PCP fails when two places disagree about which rows a rank owns, so these pin
+the conventions (pad first, then round-robin; dense pads with zeros, indptr
+repeats the last prefix-sum) and assert paired helpers against each other.
+CPU-only: parallel-state reads are monkeypatched.
 
 Groups:
   * draft prefill split  --- `_pcp_split_draft_inputs`
@@ -57,13 +51,7 @@ WS = 4
 
 
 def _inputs(n):
-    """Row i carries i+1 everywhere, so a shard's provenance is readable.
-
-    i+1, not i: padding fills with zero, so starting at 1 leaves 0 as a
-    sentinel that cannot be confused with real row 0 -- otherwise the
-    ownership assertions below have to exempt the one value most likely to
-    expose an off-by-one.
-    """
+    """Row i carries i+1, so provenance is readable and 0 means padding."""
     ids = torch.arange(1, n + 1, dtype=torch.int32)
     pos = torch.arange(1, n + 1, dtype=torch.int32)
     hid = torch.arange(1, n + 1, dtype=torch.float32)[:, None].repeat(1, HID)
@@ -71,13 +59,8 @@ def _inputs(n):
 
 
 def _split(monkeypatch, ids, pos, hid, rank, ws=WS):
-    """Run the helper as PCP rank `rank` of `ws`.
-
-    `get_pcp_world_size` is read by the helper itself (eagle_proposer's
-    namespace); `get_pcp_rank` is read by `pcp_round_robin_split` further down
-    (pcp_utils' namespace). The sizes are passed explicitly by the helper, so
-    only the rank lookup needs patching on the callee side.
-    """
+    """Run the helper as PCP rank `rank` of `ws` (world size read in
+    eagle_proposer, rank in pcp_utils)."""
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: ws)
     monkeypatch.setattr(pu, "get_pcp_rank", lambda: rank)
     return ep._pcp_split_draft_inputs(ids, pos, hid)
@@ -135,14 +118,8 @@ def test_pcp1_is_a_no_op(monkeypatch):
 
 
 def test_row_misalignment_is_rejected(monkeypatch):
-    """The assert that turns a silent miscompute into a crash.
-
-    PCP+TBO rewrites `context.positions` into per-request-group local stripes
-    while ids/hidden stay global-length. Without this check the helper derives
-    `n_pad` from the long tensor and pads the short one by it, producing
-    garbage; now it refuses. (That combination is additionally rejected at
-    startup in llm_engine.)
-    """
+    """Positions shorter than ids/hidden (PCP+TBO) must be refused, not
+    padded by the wrong amount."""
     ids, pos, hid = _inputs(10)
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: WS)
     with pytest.raises(AssertionError, match="row-aligned"):
@@ -283,13 +260,8 @@ def _cfg(**over):
 
 
 def _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank, merge="1", cfg=None):
-    """Present one (pcp, tp) rank position to BOTH folds under test.
-
-    Patched in two namespaces on purpose: `pcp_merged_tp_grid` reads the pcp
-    helpers and tp group out of `pcp_utils`, while `FusedMoEParallelConfig.make`
-    reads its tp group out of `moe` and imports the pcp ones from aiter inside
-    the call. Same numbers, so the two can be compared.
-    """
+    """Present one (pcp, tp) rank position to both folds; each reads it from
+    its own namespace."""
     cfg = cfg if cfg is not None else _cfg()
     m.setenv("ATOM_PCP_MOE_MERGE", merge)
     tp = SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank)
@@ -306,14 +278,8 @@ def _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank, merge="1", cfg=None):
 
 @pytest.mark.parametrize("pcp_size, tp_size", [(8, 1), (2, 4), (4, 2)])
 def test_folded_grid_agrees_with_fused_moe(monkeypatch, pcp_size, tp_size):
-    """The two folds must produce the same (size, rank) on every rank.
-
-    This is the invariant, not the formula: routed and shared ride the same tp
-    all_reduce + pcp collective, so if the two disagree about which slice a rank
-    owns, one of them is double-counted on every layer of every token. `pcp8` is
-    tp=1, where both flatten orders coincide and cannot be told apart -- the
-    mixed configs are what actually discriminate.
-    """
+    """Routed and shared ride the same collectives, so both folds must give
+    every rank the same (size, rank). Only mixed tp/pcp configs discriminate."""
     for flat in range(pcp_size * tp_size):
         pcp_rank, tp_rank = divmod(flat, tp_size)
         with monkeypatch.context() as m:
@@ -329,12 +295,8 @@ def test_folded_grid_agrees_with_fused_moe(monkeypatch, pcp_size, tp_size):
 
 
 def test_the_reversed_flatten_would_be_caught(monkeypatch):
-    """The agreement test above has to be able to go red.
-
-    Both orders are permutations of 0..N-1, so "every shard owned once" passes
-    either way -- only agreement with moe.py separates them. Pin that the
-    reversed mapping really does differ, so the test above is not vacuous.
-    """
+    """The reversed flatten must differ from moe.py's, or the test above
+    would be vacuous."""
     pcp_size, tp_size = 2, 4
     differs = 0
     for flat in range(pcp_size * tp_size):
@@ -357,11 +319,8 @@ def test_the_reversed_flatten_would_be_caught(monkeypatch):
     ],
 )
 def test_steps_down_to_a_block_aligned_grid(monkeypatch, pcp_size, tp_size, want):
-    """A shard that would split a 128 scale block faults in the weight loader.
-
-    `tp*pcp = 16` is where DSV4 hits it: 3072/16 = 192, and `narrow` then runs
-    off the end of a 3-row scale. Step down instead of crashing at load.
-    """
+    """A shard splitting a 128 scale block faults at load (DSV4 at tp*pcp=16:
+    3072/16 = 192), so the grid steps down."""
     with monkeypatch.context() as m:
         _as_rank(m, pcp_size, 0, tp_size, 0)
         grid = pu.pcp_merged_tp_grid(shard_dim=INTER, align=128)
@@ -374,12 +333,8 @@ def test_steps_down_to_a_block_aligned_grid(monkeypatch, pcp_size, tp_size, want
 
 
 def test_prescale_matches_how_often_a_shard_is_summed(monkeypatch):
-    """`prescale` is only correct if the shards tile the ranks evenly.
-
-    The collectives downstream sum all pcp*tp contributions blindly. Cut g ways,
-    every shard must land on exactly pcp*tp/g ranks -- then and only then is the
-    sum uniformly g/(pcp*tp) too large and a scalar can undo it.
-    """
+    """A scalar `prescale` is right only if every shard lands on exactly
+    pcp*tp/g ranks."""
     pcp_size, tp_size = 16, 1
     held = {}
     prescale = None
@@ -473,6 +428,14 @@ def test_settle_pcp_split_rows_takes_only_self(monkeypatch):
     )
     mr.ModelRunner._settle_pcp_split_rows(runner)
     assert ctx.pcp_split_rows is True
+
+    # A model without the method never row-splits; under PCP that is worth
+    # one warning, since its drafter's aux would silently go ungathered.
+    warned = []
+    monkeypatch.setattr(mr, "get_pcp_world_size", lambda: 8)
+    monkeypatch.setattr(mr.logger, "warning", lambda *a, **k: warned.append(a))
     runner.model = SimpleNamespace()
-    mr.ModelRunner._settle_pcp_split_rows(runner)
+    for _ in range(3):
+        mr.ModelRunner._settle_pcp_split_rows(runner)
     assert ctx.pcp_split_rows is False
+    assert len(warned) == 1

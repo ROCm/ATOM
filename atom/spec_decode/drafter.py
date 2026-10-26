@@ -458,19 +458,9 @@ class Drafter(abc.ABC):
         sliced to ``target_hidden_states``' row count — the caller never juggles
         token counts.
 
-        A PCP prefill gathers its rows back only at the very end of the target
-        forward, so these hooks -- sitting on intermediate layers -- captured
-        this rank's 1/pcp round-robin stripe. Gather here so the row alignment
-        promised above actually holds; without it most of the rows the caller
-        reads are the previous forward's leftovers, which halves DSpark's
-        acceptance rate.
-
-        Both `pcp_split_rows` and the row arithmetic are batch-global, so every
-        rank takes the same branch -- required, since this is a collective.
-        Deliberately NOT keyed on how many rows the hooks wrote: that bookkeeping
-        is plain Python inside a hook whose device-side copy is captured into the
-        decode cudagraph, so it stops updating on replay while the copy keeps
-        running, and the resulting per-rank disagreement deadlocks here.
+        After a PCP row-split prefill the hooks hold only this rank's 1/pcp
+        stripe, so gather it. Keyed on the batch-global `pcp_split_rows`, never
+        on hook-side bookkeeping, which a cudagraph replay skips.
         """
         if not self._captures_aux:
             return None
