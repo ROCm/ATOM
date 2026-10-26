@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata
@@ -178,17 +177,6 @@ def test_snapshot_is_a_no_op_without_a_destination():
     assert model._atom_ple_conv_state.abs().sum() == 0
 
 
-@pytest.mark.parametrize("pad_slot", [-1])
-def test_decode_track_slots_drop_graph_pad_rows(pad_slot):
-    """Graph pads park dead rows on PAD_SLOT_ID; indexing with it would wrap."""
-    fb = SimpleNamespace(
-        mamba_track_mask=torch.tensor([True, True]),
-        mamba_track_indices=torch.tensor([6, pad_slot], dtype=torch.int32),
-    )
-    dst, src = _ple_decode_track_slots(fb, torch.tensor([2, 3], dtype=torch.int32))
-    assert dst.tolist() == [6] and src.tolist() == [2]
-
-
 def _layer_stub(model, advance_conv_by):
     """Minimal stand-in for the parts of the PLE layer `forward_with_state` uses.
 
@@ -262,12 +250,59 @@ def test_graph_epilogue_uses_live_slots_not_the_last_built_metadata():
     assert model._atom_ple_conv_state[7].abs().sum() == 0
 
 
-def test_decode_track_slots_absent_when_nothing_is_tracked():
+def test_decode_track_slots_route_untracked_and_pad_rows_to_scratch():
+    """No host sync in a decode loop: instead of selecting the tracked rows,
+    every row is copied and the rest are parked on the scratch row."""
     fb = SimpleNamespace(
-        mamba_track_mask=torch.tensor([False, False]),
+        mamba_track_mask=torch.tensor([True, False, True]),
+        mamba_track_indices=torch.tensor([6, 7, -1], dtype=torch.int32),
+    )
+    scratch = 9
+    dst, src = _ple_decode_track_slots(
+        fb, torch.tensor([2, 3, 4], dtype=torch.int32), scratch
+    )
+    # Row 0 is tracked; row 1 is not; row 2 is a graph pad (PAD_SLOT_ID).
+    assert dst.tolist() == [6, scratch, scratch]
+    assert src.tolist() == [2, 3, 4]
+
+
+def test_decode_track_slots_absent_without_track_metadata():
+    fb = SimpleNamespace(mamba_track_mask=None, mamba_track_indices=None)
+    assert _ple_decode_track_slots(fb, torch.tensor([2, 3], dtype=torch.int32), 9) == (
+        None,
+        None,
+    )
+
+
+def test_decode_track_slots_do_not_synchronize(monkeypatch):
+    """`nonzero()` and `.all()` both drain the stream; a decode step cannot."""
+    calls = []
+    for name in ("nonzero", "item", "tolist"):
+        original = getattr(torch.Tensor, name)
+        monkeypatch.setattr(
+            torch.Tensor,
+            name,
+            lambda self, *a, _n=name, _o=original, **k: (
+                calls.append(_n),
+                _o(self, *a, **k),
+            )[1],
+        )
+    fb = SimpleNamespace(
+        mamba_track_mask=torch.tensor([True, False]),
         mamba_track_indices=torch.tensor([6, 7], dtype=torch.int32),
     )
-    assert _ple_decode_track_slots(fb, torch.tensor([2, 3], dtype=torch.int32)) == (
-        None,
-        None,
-    )
+    _ple_decode_track_slots(fb, torch.tensor([2, 3], dtype=torch.int32), 9)
+    assert calls == []
+
+
+def test_history_buffers_unwrap_the_native_model():
+    """The metadata builder is called with the native model, so that is where
+    the buffers live; the SGLang wrapper keeps it out of the module tree."""
+    from atom.plugin.sglang.qwen4_exp_bridge import _ple_history_buffers
+
+    native = _model()
+    wrapper = SimpleNamespace(_atom_lm=native)
+    conv, ngram = _ple_history_buffers(wrapper)
+    assert conv is native._atom_ple_conv_state
+    assert ngram is native._atom_ple_ngram_state
+    assert _ple_history_buffers(SimpleNamespace()) == (None, None)

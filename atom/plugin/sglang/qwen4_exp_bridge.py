@@ -1312,7 +1312,9 @@ def _ensure_ple_states(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     hf = _hf_text_config(atom_config)
     ngram = max(int(getattr(hf, "ngram_size", 3)), 1)
-    rows = max(num_slots, 1)
+    # One row past the pool: the decode snapshot routes untracked rows and
+    # graph pads here so it can copy the whole batch without a host sync.
+    rows = max(num_slots, 1) + 1
     existing = getattr(model, "_atom_ple_conv_state", None)
     conv_state = _grow_once_tensor(
         model,
@@ -1449,30 +1451,53 @@ def _ple_track_indices(
     return track_indices[rows], window(conv_state_len), window(ngram_width)
 
 
+def _ple_history_buffers(
+    model: Any,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """The PLE history buffers, wherever they were allocated.
+
+    ``build_ple_metadata`` is called with the native language model, so that
+    is what owns them. The SGLang wrapper holds it in ``__dict__`` rather than
+    as a child module, so attribute lookup does not reach through: a caller
+    holding the wrapper (the decode-graph epilogue gets it from
+    ``model_runner``) has to unwrap it explicitly.
+    """
+    for candidate in (model, getattr(model, "_atom_lm", None)):
+        conv = getattr(candidate, "_atom_ple_conv_state", None)
+        ngram = getattr(candidate, "_atom_ple_ngram_state", None)
+        if torch.is_tensor(conv) and torch.is_tensor(ngram):
+            return conv, ngram
+    return None, None
+
+
+def _ple_scratch_row(conv_state: torch.Tensor) -> int:
+    """Discard row of the PLE buffers; see ``_ensure_ple_states``."""
+    return int(conv_state.shape[0]) - 1
+
+
 def _ple_decode_track_slots(
-    forward_batch: Any, state_indices_out: torch.Tensor
+    forward_batch: Any, state_indices_out: torch.Tensor, scratch_row: int
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Destination and source slots for a decode-step PLE snapshot.
 
     A decode step advances one token, so the working slot already holds the
     state at the track boundary and a row copy is exact.
+
+    Full-batch and free of host synchronisation, which a decode loop cannot
+    afford: selecting the tracked rows would need ``nonzero()``, and checking
+    for graph pads would need another. Untracked rows and pads (PAD_SLOT_ID)
+    are routed to the scratch row instead, so the copy runs unconditionally
+    and those writes land somewhere nothing reads.
     """
     mask = getattr(forward_batch, "mamba_track_mask", None)
     track_indices = getattr(forward_batch, "mamba_track_indices", None)
     if mask is None or track_indices is None:
         return None, None
-    rows = mask[: state_indices_out.shape[0]].nonzero(as_tuple=True)[0]
-    if rows.numel() == 0:
-        return None, None
-    src = state_indices_out[rows].to(torch.long)
-    dst = track_indices[rows].to(device=src.device, dtype=torch.long)
-    # Graph pads park dead rows on PAD_SLOT_ID; they own no history to track.
-    live = (src >= 0) & (dst >= 0)
-    if not bool(live.all()):
-        src, dst = src[live], dst[live]
-        if src.numel() == 0:
-            return None, None
-    return dst, src
+    bs = int(state_indices_out.shape[0])
+    src = state_indices_out.to(torch.long)
+    dst = track_indices[:bs].to(device=src.device, dtype=torch.long)
+    keep = mask[:bs].to(device=src.device) & (src >= 0) & (dst >= 0)
+    return torch.where(keep, dst, dst.new_full((), scratch_row)), src.clamp(min=0)
 
 
 def track_ple_radix_slots(
@@ -1496,9 +1521,8 @@ def track_ple_radix_slots(
         return
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         return
-    conv_state = getattr(model, "_atom_ple_conv_state", None)
-    ngram_state = getattr(model, "_atom_ple_ngram_state", None)
-    if not torch.is_tensor(conv_state) or not torch.is_tensor(ngram_state):
+    conv_state, ngram_state = _ple_history_buffers(model)
+    if conv_state is None:
         return
     from atom.plugin.sglang.attention_backend.attention_gdn import (
         SGLangGDNForwardContext,
@@ -1512,11 +1536,19 @@ def track_ple_radix_slots(
     if cache_indices is None:
         return
     bs = int(forward_batch.batch_size)
-    dst, src = _ple_decode_track_slots(forward_batch, cache_indices[:bs])
+    dst, src = _ple_decode_track_slots(
+        forward_batch, cache_indices[:bs], _ple_scratch_row(conv_state)
+    )
     if dst is None:
         return
     conv_state[dst] = conv_state[src]
     ngram_state[dst] = ngram_state[src]
+    if not getattr(track_ple_radix_slots, "_logged", False):
+        # Proof the path is reachable at all: it silently did nothing for a
+        # whole round of testing when the buffer lookup landed on the SGLang
+        # wrapper instead of the native model it allocates them on.
+        logger.info("Flash PLE post-replay snapshot active (rows=%s)", int(bs))
+        track_ple_radix_slots._logged = True  # type: ignore[attr-defined]
 
 
 def _build_decode_graph_ple_metadata(
@@ -1551,6 +1583,13 @@ def _build_decode_graph_ple_metadata(
         batch_size=bs,
         num_accepted_tokens=accepted,
     )
+    if not _is_capturing() and forward_batch.forward_mode.is_decode_or_idle():
+        # This metadata is also what an *uncaptured* decode batch gets, which
+        # runs eagerly and so has no replay epilogue behind it. Capture itself
+        # must stay untracked: the slots would be baked into the graph.
+        ple.track_dst, ple.track_src = _ple_decode_track_slots(
+            forward_batch, ple.state_indices_out, _ple_scratch_row(conv_state)
+        )
     if not getattr(_build_decode_graph_ple_metadata, "_logged", False):
         logger.info(
             "Flash decode graph PLE aliases GDN mamba_cache_indices "
@@ -1620,7 +1659,8 @@ def build_ple_metadata(
 
     num_slots = _ple_state_pool_slots(forward_batch, idx)
     conv_state, ngram_state = _ensure_ple_states(model, atom_config, num_slots)
-    last_slot = max(int(conv_state.shape[0]) - 1, 0)
+    # The last row is the snapshot's discard row, not a slot a request may use.
+    last_slot = max(int(conv_state.shape[0]) - 2, 0)
     if last_slot >= 0:
         idx = torch.where(idx < 0, idx, idx.clamp(max=last_slot))
         idx_in = torch.where(idx_in < 0, idx_in, idx_in.clamp(max=last_slot))
@@ -1651,7 +1691,9 @@ def build_ple_metadata(
         # Eager decode snapshots itself here, once per forward. A replayed
         # decode graph cannot: the slots would be baked, so the post-replay
         # epilogue calls ``track_ple_radix_slots`` with the live metadata.
-        track_dst, track_src = _ple_decode_track_slots(forward_batch, idx)
+        track_dst, track_src = _ple_decode_track_slots(
+            forward_batch, idx, _ple_scratch_row(conv_state)
+        )
 
     return Qwen4ExpPLEMetadata(
         query_start_loc=query_start_loc,
