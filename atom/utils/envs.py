@@ -273,7 +273,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM_ROUTER_FLYDSL_GEMM the split-K partials then meet in fp32 atomics
     # (one final rounding, to fp32) rather than bf16 ones.
     "ATOM_ROUTER_LOGITS_FP32": lambda: (
-        os.getenv("ATOM_ROUTER_LOGITS_FP32", "0") == "1"
+        os.getenv("ATOM_ROUTER_LOGITS_FP32", "1") == "1"
     ),
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
