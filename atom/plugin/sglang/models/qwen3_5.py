@@ -110,15 +110,19 @@ def _validate_qwen35_runtime_contract(
         )
 
     algorithm = str(getattr(server_args, "speculative_algorithm", "") or "").upper()
-    backends = {
-        str(getattr(server_args, name, "") or "").lower()
-        for name in (
-            "attention_backend",
-            "decode_attention_backend",
-            "prefill_attention_backend",
-        )
-    }
-    if "DFLASH" not in algorithm or "aiter" not in backends:
+    speculative_attention_mode = str(
+        getattr(server_args, "speculative_attention_mode", "") or "prefill"
+    ).lower()
+    mode_backend_name = (
+        "decode_attention_backend"
+        if speculative_attention_mode == "decode"
+        else "prefill_attention_backend"
+    )
+    default_backend = getattr(server_args, "attention_backend", "") or ""
+    verify_backend = str(
+        getattr(server_args, mode_backend_name, "") or default_backend
+    ).lower()
+    if "DFLASH" not in algorithm or verify_backend != "aiter":
         return
 
     if unified_attn_enabled is None:

@@ -44,6 +44,47 @@ def test_dflash_on_aiter_requires_unified_attention():
     _validate_qwen35_runtime_contract(args, unified_attn_enabled=True)
 
 
+def test_dflash_uses_per_mode_overrides_instead_of_default_backend():
+    args = _args(
+        speculative_algorithm="DFLASH",
+        attention_backend="aiter",
+        prefill_attention_backend="triton",
+        decode_attention_backend="triton",
+    )
+    _validate_qwen35_runtime_contract(args, unified_attn_enabled=False)
+
+
+def test_dflash_on_effective_prefill_aiter_requires_unified_attention():
+    args = _args(
+        speculative_algorithm="DFLASH",
+        attention_backend="triton",
+        prefill_attention_backend="aiter",
+    )
+    with pytest.raises(ValueError, match="SGLANG_USE_AITER_UNIFIED_ATTN=1"):
+        _validate_qwen35_runtime_contract(args, unified_attn_enabled=False)
+
+
+@pytest.mark.parametrize(
+    ("prefill_backend", "decode_backend", "raises"),
+    [("triton", "aiter", True), ("aiter", "triton", False)],
+)
+def test_dflash_decode_mode_uses_decode_backend(
+    prefill_backend, decode_backend, raises
+):
+    args = _args(
+        speculative_algorithm="DFLASH",
+        attention_backend="triton",
+        speculative_attention_mode="decode",
+        prefill_attention_backend=prefill_backend,
+        decode_attention_backend=decode_backend,
+    )
+    if raises:
+        with pytest.raises(ValueError, match="SGLANG_USE_AITER_UNIFIED_ATTN=1"):
+            _validate_qwen35_runtime_contract(args, unified_attn_enabled=False)
+    else:
+        _validate_qwen35_runtime_contract(args, unified_attn_enabled=False)
+
+
 def test_dflash_off_aiter_does_not_need_unified_attention():
     args = _args(speculative_algorithm="DFLASH", attention_backend="triton")
     _validate_qwen35_runtime_contract(args, unified_attn_enabled=False)
