@@ -1263,6 +1263,100 @@ class TestPartialPrefillRemainingTokens:
         assert sched._partial_prefill_remaining_tokens() == 16  # capped
 
 
+class TestLocalPrefillProbeCountsUncachedRows:
+    """The delayer's probe (`_local_prefill_pending_work`) sizes the fill the
+    next prefill would have. A prefix hit's rows are not forwarded, so a long
+    prompt with a long hit must not end the scan: the probe has to keep going,
+    as admission does, until the budget's worth of uncached rows is seen."""
+
+    def _sched(self):
+        return Scheduler(
+            MockConfig(
+                enable_prefix_caching=True,
+                enable_chunked_prefill=True,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=200,
+                max_num_seqs=8,
+                max_num_batched_tokens=32,
+                max_model_len=128,
+            )
+        )
+
+    def _warm(self, sched, seq_factory, prompt):
+        """Prefill `prompt` to completion so its blocks are in the prefix cache."""
+        seed = seq_factory(prompt, sampling_params=SamplingParams(max_tokens=64))
+        sched.add(seed)
+        while True:
+            batch, _ = sched.schedule()
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[seed.id],
+                    token_ids=[(999,)],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                batch=batch,
+            )
+            if not seed.is_partial_prefill:
+                return seed
+
+    def test_long_cached_prompts_do_not_end_the_scan(self, seq_factory):
+        sched = self._sched()
+        prefix = list(range(1, 37))  # 9 whole blocks
+        self._warm(sched, seq_factory, prefix + [500, 501, 502, 503])
+        # Two 40-token prompts (each over the 32-token budget) sharing the
+        # 36-token prefix: 4 uncached rows each.
+        for tail in ([600, 601, 602, 603], [700, 701, 702, 703]):
+            sched.add(seq_factory(prefix + tail))
+
+        # Counting prompt length stopped after the first: (True, 4).
+        assert sched._local_prefill_pending_work() == (True, 8)
+        batch, _ = sched.schedule()
+        assert batch.total_tokens_num_prefill == 8
+
+    def test_the_budget_still_caps_the_fill(self, seq_factory):
+        sched = self._sched()
+        prefix = list(range(1, 37))
+        self._warm(sched, seq_factory, prefix + [500, 501, 502, 503])
+        for i in range(6):
+            sched.add(seq_factory(prefix + [600 + 8 * i + j for j in range(8)]))
+
+        # 6 x 8 uncached rows, cut at the 32-token budget, as admission is.
+        assert sched._local_prefill_pending_work() == (True, 32)
+        batch, _ = sched.schedule()
+        assert batch.total_tokens_num_prefill == 32
+
+    def test_a_checkpoint_cut_leaves_its_room_to_the_next_request(self, seq_factory):
+        # A state-checkpoint cut pulls the first chunk back to a rung; admission
+        # hands the room it leaves to the next waiting request, and the probe
+        # has to count that too, not stop at the first prompt's length.
+        sched = Scheduler(
+            MockConfig(
+                enable_chunked_prefill=True,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=200,
+                max_num_seqs=8,
+                max_num_batched_tokens=64,
+                max_model_len=256,
+            )
+        )
+        long_seq = seq_factory(list(range(1, 101)))
+        short_seq = seq_factory(list(range(200, 230)))
+
+        def cut(seq, start, end, record=True):
+            return start + 24 if seq is long_seq and end - start > 24 else 0
+
+        sched.block_manager.checkpoint_cut = cut
+        sched.add(long_seq)
+        sched.add(short_seq)
+
+        assert sched._local_prefill_pending_work() == (True, 54)
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [24, 30]
+
+
 class TestOldestWaitingPrefillAge:
     """TTFT SLA guard signal: age (ms) of the oldest ADMITTABLE waiting prefill,
     skipping the same non-admittable seqs as _can_admit_head_prefill."""

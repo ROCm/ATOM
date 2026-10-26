@@ -1009,7 +1009,13 @@ class Scheduler:
         prefillable = pending > 0
         if pending >= budget or len(self.running) >= self.max_num_seqs:
             return prefillable, min(pending, budget)
-        probed_tokens = 0
+        # The scan ends where admission's would: the budget filled (`pending`
+        # counts each probed seq's chunk, the rows its forward computes), the
+        # slots used, or the first seq admission stops at. A cache hit's chunk
+        # is its uncached rows, not `seq.num_tokens`: bounding the scan by
+        # prompt length stopped it after one long, mostly cached prompt and
+        # reported a few thousand rows of fill where admission packs the
+        # whole budget. The prefix walk is memoised across ticks.
         slots = self.max_num_seqs - len(self.running)
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
@@ -1020,11 +1026,8 @@ class Scheduler:
                     seq, resume, hit=seq.replays_hit
                 )
             else:
-                if probed_tokens >= budget:
-                    break
                 # The exact probe's answer; the walk is memoised across ticks.
                 cached_blocks = self.block_manager.can_allocate_memoized(seq)
-                probed_tokens += seq.num_tokens
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
                 if slots <= self._num_parked_remote_kv:
