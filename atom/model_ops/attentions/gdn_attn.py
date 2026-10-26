@@ -1895,6 +1895,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             return cache
         return super().build_kv_cache_tensor(module)
 
+    def _prefill_block_table_rows(self, scheduled_bs, running_bs, has_cached):
+        # MTP switches to paged decode after draft step 0 even without a
+        # cached prefix. Publish this request's table before that transition.
+        if getattr(self.model_runner, "num_spec_tokens", 0) > 0:
+            return scheduled_bs
+        return super()._prefill_block_table_rows(scheduled_bs, running_bs, has_cached)
+
     def prepare_prefill(  # type: ignore[override]
         self,
         batch: ScheduledBatch,
@@ -1967,14 +1974,23 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         running_bs = int(positions.shape[-1])  # rows; see the base contract
         var = self.model_runner.forward_vars
 
-        # GDN hybrid models use paged KV cache for full-attention layers.
-        # Regenerate kv_indices for the new max_seqlen_k after adding a
-        # draft token; kv_indptr stays unchanged (block count is stable).
-        # Note: only_update and num_reject_tokens are unused here — GDN's
-        # paged attention does not use persistent worker buffers that need
-        # incremental updates (unlike MLA). The full kv_indices regeneration
-        # is always correct regardless of the update mode.
+        # The proposer advances positions from the accepted target row, but
+        # context_lens still includes the rejected verify suffix on step 1.
+        context_lens = var["context_lens"].gpu[:running_bs]
+        if num_reject_tokens is not None:
+            context_lens[:bs].sub_(num_reject_tokens[:bs])
+
+        # Prefill leaves the persistent CSR indptr stale; a draft can also
+        # cross a page boundary. Rebuild it from this step's actual lengths.
         kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
+        counts = torch.div(
+            context_lens + self.block_size - 1,
+            self.block_size,
+            rounding_mode="floor",
+        )
+        counts[bs:] = 0
+        kv_indptr[:1].zero_()
+        torch.cumsum(counts, dim=0, dtype=kv_indptr.dtype, out=kv_indptr[1:])
         kv_indices_generate_triton(
             var["block_tables"].gpu[:running_bs],
             var["kv_indices"].gpu,
