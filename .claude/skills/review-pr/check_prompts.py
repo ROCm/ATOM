@@ -240,6 +240,43 @@ def check_runner_label_exclusive():
     return 0
 
 
+def check_publish_needs_post_flag():
+    """_publish.py's only closure against posting with excess write access is its missing
+    `--post` flag: on the self-hosted box it falls back to ~/.git-credentials, a human PAT
+    with repo write access, and posts over plain curl -- so GITHUB_TOKEN permission scoping
+    does not stop it from posting at all. Today the workflow grants the review job only
+    `contents: read`, so that fallback never has write access to use. If the workflow is ever
+    changed to grant `issues: write` or `pull-requests: write` anywhere, GITHUB_TOKEN stops
+    being irrelevant to _publish.py's reach, and the invocation MUST pass --post explicitly
+    -- or there is a silent gap between what the token in scope can do and what the one call
+    site that would use it was actually told to do."""
+    miss = _missing(WORKFLOW, HERE / "_publish.py", HERE / "run_one.sh")
+    if miss:
+        print(f"⏭️  check_publish_needs_post_flag: skipped — not yet built: "
+              f"{[p.name for p in miss]}")
+        return 0
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
+    granted = re.search(r"^\s*(issues|pull-requests):\s*write\s*$", wf, re.M)
+    invocations = re.findall(r"[^\n]*_publish\.py[^\n]*", wf) \
+        + re.findall(r"[^\n]*_publish\.py[^\n]*", run_one)
+    has_post = any("--post" in line for line in invocations)
+    if granted and not has_post:
+        print(f"❌ atom-review-bot.yml grants '{granted.group(0).strip()}' somewhere, "
+              f"but _publish.py is never invoked with --post -- GITHUB_TOKEN scoping is no "
+              f"longer the only thing standing between a job and a post, and _publish.py's "
+              f"missing-flag default (dry-run) must now be an explicit match, not an "
+              f"accident")
+        return 1
+    if granted:
+        print(f"✅ atom-review-bot.yml grants write, and _publish.py is invoked with "
+              f"--post to match it")
+        return 0
+    print(f"✅ atom-review-bot.yml grants no issues/pull-requests write anywhere; "
+          f"_publish.py's missing --post is its only closure, as documented")
+    return 0
+
+
 def main():
     skill = _skill_md()
     bad = 0
@@ -260,6 +297,7 @@ def main():
     bad += check_no_self_trigger()
     bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
+    bad += check_publish_needs_post_flag()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
 
