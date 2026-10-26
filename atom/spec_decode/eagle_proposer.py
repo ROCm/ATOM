@@ -121,14 +121,18 @@ class EagleProposer(Drafter):
         per sequence. That rewrite is what ``warmup_inputs`` replays, so the two
         go through the same code rather than a copy that can drift.
 
-        MRoPE declares nothing, by the same rule Kimi-K3 does: its positions are
-        ``[3, N]``, so there is no leading batch axis to stage, hence nothing to
-        pad and nothing a graph could pin. Declaring anyway used to warm and
-        capture a ONE-dimensional-positions shape that serving never runs --
-        graphs nobody replays, paid for at every startup.
+        MRoPE positions are ``[3, N]``: the token axis is LAST, so they stage
+        as ``StagedInput(batch_last=True)``. The three rows are staged as they
+        are rather than collapsed to one: for text-only decode they are equal
+        (``_build_mrope_decode_positions`` broadcasts one ``arange`` plus the
+        request's ``mrope_position_delta`` to all three), but a prefill step's
+        anchor column can sit on a vision token, where they differ. Staging all
+        three keeps one recording valid for both, so whether a step replays
+        stays a function of ``running_bs`` alone -- a per-step "rows equal?"
+        fallback would let DP ranks split between replay and eager.
         """
         self.step = None
-        if self.runner.use_mrope or self.mtp_k < 2:
+        if self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
             self._reuse_step_buffers = False
@@ -148,7 +152,12 @@ class EagleProposer(Drafter):
             # `input_ids` from that buffer to this one, and `stage` asserts the
             # two agree.
             "input_ids": StagedInput(dtype=torch.int32),
-            "positions": StagedInput(dtype=torch.int64),
+            "positions": (
+                # Three rows, as the runner's `mrope_positions` buffer has.
+                StagedInput(shape=(3,), dtype=torch.int64, batch_last=True)
+                if self.runner.use_mrope
+                else StagedInput(dtype=torch.int64)
+            ),
             "hidden_states": StagedInput(
                 shape=hidden_shape,
                 dtype=self.dtype,
@@ -441,7 +450,8 @@ class EagleProposer(Drafter):
         fc = get_forward_context()
         # Where each synthetic sequence actually is. Warming at position 0 would
         # compile a masked, near-empty window -- a shape steady-state decode
-        # never draws.
+        # never draws. MRoPE's `[3, bs]` takes the same row three times, which
+        # is what text-only decode feeds it.
         staged["positions"].copy_(fc.attn_metadata.context_lens[:running_bs])
         zeros = torch.zeros(running_bs, dtype=torch.int32, device=self.device)
         i0_max_seqlen_q, _ = self._enter_decode_metadata(
@@ -810,9 +820,8 @@ class EagleProposer(Drafter):
                         # padding it with the other rows, just before the
                         # forward, is a step too late.
                         #
-                        # No MRoPE case to guard: a model whose positions keep
-                        # the token axis last declares no pass, so `self.step` is
-                        # None and these stay the target's own 2-D positions.
+                        # MRoPE's `[3, scheduled_bs]` stages along its last
+                        # axis; the pass declared it `batch_last`.
                         if self.step is not None:
                             positions = self.step.stage(
                                 running_bs, {"positions": positions}
