@@ -125,18 +125,23 @@ def check_budget_fits():
 
 
 def check_owner_fallbacks():
-    """Every message but two routes through _notify.py's class->owner map. The watchdog and the
-    lost-review report post their own comments and carry their own copy of a handle, so they
-    drift from the map in silence: the next owner updates _notify.py and still never hears that
-    the runner is down, or that a review vanished."""
-    miss = _missing(WORKFLOW, HERE / "_notify.py", HERE / "watchdog.py",
+    """watchdog.py, lost_review.py and queue_gate.py each hardcode their own fallback owner
+    rather than reading owners.txt: they exist to speak precisely when the review job (and
+    _notify.py with it) never ran at all, so they cannot depend on anything that only works
+    inside that job. That duplication is deliberate, but it drifts from owners.txt in silence
+    if nobody checks it: the next owner updates owners.txt and still never hears that the
+    runner is down, or that a review vanished.
+
+    Since Task 5 moved the map into owners.txt, there is no longer a repo-variable override
+    channel for these three scripts' fallback -- Task 7 removed the workflow's OWNER_OVERRIDE
+    injection along with it, so this only compares each hardcoded login against owners.txt."""
+    miss = _missing(HERE / "_notify.py", HERE / "watchdog.py",
                      HERE / "lost_review.py", HERE / "queue_gate.py")
     if miss:
         print(f"\u23ed\ufe0f  check_owner_fallbacks: skipped \u2014 not yet built: "
               f"{[p.name for p in miss]}")
         return 0
-    wf = WORKFLOW.read_text(encoding="utf-8")
-    classes = _notify_mod().CLASSES
+    owners = _notify_mod().OWNERS
     rows = [
         ("watchdog.py", "env",
          r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
@@ -148,22 +153,17 @@ def check_owner_fallbacks():
     bad = 0
     for filename, cls, pattern in rows:
         m = re.search(pattern, (HERE / filename).read_text(encoding="utf-8"))
-        var, default = classes[cls][:2]
+        default = owners[cls][0]
         if not m:
             print(f"\u274c cannot read {filename}'s owner fallback")
             bad += 1
             continue
         if m.group(1) != default:
-            print(f"\u274c {filename} pages '{m.group(1)}', but _notify.py's {cls} class is "
+            print(f"\u274c {filename} pages '{m.group(1)}', but owners.txt's {cls} class is "
                   f"'{default}'")
             bad += 1
             continue
-        if not re.search(r"OWNER_OVERRIDE: \$\{\{ vars\." + var + r" \}\}", wf):
-            print(f"\u274c {filename} defaults to _notify.py's {cls} owner but the workflow does "
-                  f"not pass {var}")
-            bad += 1
-            continue
-        print(f"\u2705 {filename} matches _notify.py's {cls} class: {default} via {var}")
+        print(f"\u2705 {filename} matches owners.txt's {cls} class: {default}")
     return 1 if bad else 0
 
 
