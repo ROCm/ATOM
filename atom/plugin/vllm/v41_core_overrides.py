@@ -312,7 +312,8 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         Explicit metadata publication does not establish the probe's safety;
         keep this workaround until a separate test does.
 
-        `ATOM_V41_BLOCKING_STATE_PROBE=0` opts back out.
+        `ATOM_V41_BLOCKING_STATE_PROBE=0` opts back out, except with state
+        checkpoints on: their restores need the blocking read either way.
         """
         import os
 

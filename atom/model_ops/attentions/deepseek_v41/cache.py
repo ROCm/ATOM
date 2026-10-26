@@ -562,7 +562,10 @@ class PagedAttentionCache:
         restarted = np.concatenate((np.flatnonzero(fresh), np.flatnonzero(resumes)))
         # where each state has to be
         wanted = np.where(resumes > 0, resumes, starts)
-        if histories:
+        # A checkpoint restore has to see this step's cursors before the reset
+        # and the Engram staging do, so with one installed the read blocks
+        # whatever the caller asked for.
+        if histories or _CHECKPOINT_RESTORE_HOOK is not None:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
             )

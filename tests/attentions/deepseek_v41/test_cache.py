@@ -622,6 +622,37 @@ def test_a_deferred_prepare_state_names_the_stale_slot_one_step_later(
         cache.prepare_state(begin_step(cache, [good]), histories=False)
 
 
+def test_an_installed_restore_hook_keeps_the_read_blocking(small_config, monkeypatch):
+    """A restore has to land before the reset and the Engram staging.
+
+    The deferred probe judges a step's cursors only on the next call, after
+    both, so the hook would never be offered the row. With one installed the
+    read blocks even when the caller asks for no history.
+    """
+    from atom.model_ops.attentions.deepseek_v41 import cache as cache_module
+
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    # A slot another request held last: its cursor matches no position.
+    cache.cursor[0] = torch.tensor([-1, 19, -1, 27])
+    offered = []
+
+    def restore(rows):
+        offered.extend(rows)
+        for slot, position, _request in rows:
+            cache.cursor[slot, 0] = position
+        return len(rows)
+
+    monkeypatch.setattr(cache_module, "_CHECKPOINT_RESTORE_HOOK", restore)
+    resumed = PagedRequest(27, 7, 0, 1, 0, (0, 1))
+    assert (
+        cache.prepare_state(begin_step(cache, [resumed]), histories=False) is not None
+    )
+    assert offered == [(0, 7, 27)]
+    cache.advance_cursor(begin_step(cache, [resumed]), np.full((1, 3), -1))
+    cache.prepare_state(begin_step(cache, [replace(resumed, position=8)]))
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, device):
     """A fresh request reuses whatever the last tenant left; that is not stale."""
