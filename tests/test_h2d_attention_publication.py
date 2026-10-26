@@ -645,9 +645,10 @@ def test_shared_maps_skip_h2d_per_slot_and_tbo_buffer(monkeypatch, kind, transpo
 
 
 @pytest.mark.parametrize("q", [1, 3])
-def test_mla_persistent_plan_spans_only_rows_q_has(monkeypatch, q):
+def test_mla_persistent_plan_spans_only_scheduled_requests(monkeypatch, q):
     # running_tokens: this rank's own height while a DP peer prefills (the
     # first two steps), the group's 4 * q on a unified step (the last two).
+    # Either way only the scheduled requests are planned, never the padding.
     runner, builder = make_runner(monkeypatch, "mla", q=q, tbo=False)
     planned = []
     builder.set_mla_persistent_worker_buffers = (
@@ -658,4 +659,4 @@ def test_mla_persistent_plan_spans_only_rows_q_has(monkeypatch, q):
         start_decode(runner, builder, batch, q)
         builder.prepare_decode(batch, 4, running_tokens, q)
         finish(runner)
-    assert planned == [1, 2, 4, 4]
+    assert planned == [1, 2, 2, 4]
