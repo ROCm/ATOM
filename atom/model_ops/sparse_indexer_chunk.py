@@ -157,97 +157,38 @@ def dcp_qsplit_rows(
     return rows_per_rank, slot_lo, row_lo, row_hi
 
 
-# The split itself has nothing DCP-specific in it: plain TP replicates the
-# DeepSeek-V4 indexer the same way, so the V4 path calls it by this name.
-qsplit_rows = dcp_qsplit_rows
+class LogitsWorkspace:
+    """`capacity` fp32 elements every indexer of a model scores its bands
+    into, one layer after another: the logits plane, held for the server's
+    life.
 
+    A plane is as wide as a request may be long (`max_model_len // ratio`),
+    not as its live context. Allocated per forward it is multi-GiB at a height
+    that varies with the batch: the memory profile (a prefill) never sees it,
+    a token graph's pool keeps the largest bucket's, and the caching allocator
+    is left holding segments too small for the next long prefill. Sized from
+    the configuration, before the memory profile, it is counted in it and
+    never reallocated; scoring runs in bands of it."""
 
-def indexer_qsplit_world(
-    tp: int,
-    *,
-    physical_tp: int,
-    enabled: bool,
-    plugin: bool,
-    gfx1250_opus: bool,
-    dp_attention: bool,
-    tbo: bool,
-    pcp: int,
-    dcp: int,
-) -> int:
-    """TP width the DeepSeek-V4 prefill indexer splits its query rows over.
+    def __init__(self, capacity: int, device):
+        self.capacity = capacity
+        self._logits = torch.empty(capacity, dtype=torch.float32, device=device)
 
-    1 means no split. The split needs every TP rank to hold the same rows,
-    which DP attention, PCP and DCP each break; TBO interleaves two ubatches
-    whose collectives are not ordered against this one. Simulated TP
-    (``--fake-eplb`` on fewer devices) reports a logical width the device group
-    does not have. gfx1250 OPUS scores through its own plans and plugin bridges
-    build their own metadata.
-    """
-    if (
-        not enabled
-        or tp <= 1
-        or physical_tp != tp
-        or plugin
-        or gfx1250_opus
-        or dp_attention
-        or tbo
-        or pcp > 1
-        or dcp > 1
-    ):
-        return 1
-    return tp
+    @classmethod
+    def for_rows(cls, rows: int, width: int, device) -> "LogitsWorkspace":
+        """A plane for `rows` query rows of `width` columns, in as many bands
+        as the logits budget asks."""
+        return cls(logits_rows(rows, width) * width, device)
 
+    @property
+    def nbytes(self) -> int:
+        return self._logits.numel() * self._logits.element_size()
 
-def chunked_row_topk(
-    *,
-    total_rows: int,
-    row_width: int,
-    budget_mb: int,
-    topk: int,
-    device,
-    qsplit,
-    score_chunk,
-    select,
-    gather,
-) -> torch.Tensor:
-    """Score and top-k query rows in budget-sized chunks; optionally split by rank.
+    def logits_rows(self, rows: int, width: int, group: int = 1) -> int:
+        """Rows of a `width`-column band: within the byte budget and this
+        allocation, whichever is smaller, in whole groups of `group` rows."""
+        return decode_band_rows(rows, width, group, self._logits.numel() // width)
 
-    ``score_chunk(lo, hi) -> logits[hi - lo, row_width]`` and
-    ``select(logits, lo, hi, out_rows)`` (the per-row top-k into ``out_rows``)
-    run once per chunk. With ``qsplit = (world, rows_per_rank, slot_lo, row_lo,
-    row_hi)`` (see ``dcp_qsplit_rows``) only this rank's rows are scored, into
-    its own slot, and ``gather(out, rows_per_rank, slot_lo)`` fills in the
-    rest. Each row is scored against the full key set either way, so the
-    selection criterion is the one the unsplit call applies; only the top-k
-    kernel's tie handling may differ, since it picks its algorithm by row count.
-
-    Returns ``[total_rows, topk]`` int32.
-    """
-    if qsplit is None:
-        out_rows, row_lo, row_hi = total_rows, 0, total_rows
-    else:
-        world, rows_per_rank, slot_lo, row_lo, row_hi = qsplit
-        out_rows = world * rows_per_rank
-    out = torch.empty((out_rows, topk), dtype=torch.int32, device=device)
-    chunk = sparse_indexer_row_chunk(max(row_hi - row_lo, 1), row_width, budget_mb)
-    for lo in range(row_lo, row_hi, chunk):
-        hi = min(lo + chunk, row_hi)
-        select(score_chunk(lo, hi), lo, hi, out[lo:hi])
-    if qsplit is not None:
-        gather(out, rows_per_rank, slot_lo)
-    return out[:total_rows]
-
-
-def qsplit_gather_rows(out: torch.Tensor, rows_per_rank: int, slot_lo: int, group):
-    """All-gather each rank's ``dcp_qsplit_rows`` slot of ``out`` in place.
-
-    ``out`` holds ``world_size * rows_per_rank`` rows and this rank has written
-    its own rows into ``out[slot_lo:slot_lo + rows_per_rank]``; afterwards every
-    rank holds every row. The input is the output's own slot, which is the one
-    aliasing an in-place all-gather allows (see ``dcp_qsplit_rows``). Uses the
-    raw ``all_gather_into_tensor``: the group wrapper's ``all_gather`` is
-    out-of-place only and would allocate and copy.
-    """
-    torch.distributed.all_gather_into_tensor(
-        out, out[slot_lo : slot_lo + rows_per_rank], group=group
-    )
+    def logits(self, rows: int, width: int) -> torch.Tensor:
+        """`[rows, width]` fp32, one band of the plane; fails past it."""
+        return flat_view(self._logits, rows, width)

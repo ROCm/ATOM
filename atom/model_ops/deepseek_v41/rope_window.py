@@ -20,6 +20,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.blockscale_kernels.quantization import (
+    AMAX_FLOOR,
     FP8_MAX,
     FP8_TL_DTYPE,
     ceil_pow2_code,
@@ -72,7 +73,7 @@ def _quantized_kv_row(kv, token, position, cos, sin, kv_stride, D, ROPE):
         .to(tl.float32)
     )
 
-    amax = tl.maximum(tl.max(tl.abs(groups), 1), 1e-4)
+    amax = tl.maximum(tl.max(tl.abs(groups), 1), AMAX_FLOOR)
     code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
     step = (code << 23).to(tl.float32, bitcast=True)
     quantized = tl.minimum(tl.maximum(groups / step[:, None], -FP8_MAX), FP8_MAX).to(

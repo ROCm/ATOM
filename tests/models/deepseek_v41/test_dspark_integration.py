@@ -176,11 +176,11 @@ def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
         )
     ]
     aux = torch.arange(6 * 2, dtype=torch.float32).view(6, 2)
-    # a middle chunk: the decoder did not run
-    outer.replay = SimpleNamespace(tail=None)
+    # a middle chunk: its tail holds no request, the decoder ran on none
+    outer.replay = SimpleNamespace(tail=SimpleNamespace(requests=()))
     draft.write_context_kv(aux, torch.arange(6))
     assert not written
-    tail = SimpleNamespace(width=2)
+    tail = SimpleNamespace(width=2, requests=(object(),))
     outer.replay = SimpleNamespace(tail=tail, tail_rows=torch.tensor([3, 5]))
     draft.write_context_kv(aux, torch.arange(10, 16))
     (hidden, positions), taken = written.pop()
@@ -348,7 +348,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        graph.warmup(4, stream=stream)
+        graph.warmup(4)
     torch.cuda.current_stream().wait_stream(stream)
     for slots, anchors in (
         ([3, 1, 0], [17, 12, 3]),

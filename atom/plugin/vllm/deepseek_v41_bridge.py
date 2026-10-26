@@ -1874,6 +1874,7 @@ def atom_deepseek_v41_forward_context(
     """
     from atom.utils.forward_context import (
         Context,
+        DPMetadata,
         reset_forward_context,
         set_forward_context,
     )
@@ -1913,7 +1914,9 @@ def atom_deepseek_v41_forward_context(
         attn_metadata=metadata,
         atom_config=atom_config,
         context=context,
-        num_tokens=running_tokens,
+        running_tokens_per_dp_rank=DPMetadata.gather_running_tokens(
+            atom_config.parallel_config, running_tokens
+        ),
         # False on this path, and not because nothing is being captured.
         #
         # `in_hipgraph` reads as "a graph is recording" but its one consumer

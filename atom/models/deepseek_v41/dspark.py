@@ -71,8 +71,10 @@ class DraftAttention(Attention):
         _, kv_pre = self.project_qkv(hidden)
         return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
-    def forward(self, hidden, hidden_scale, context_kv, step, rope):
-        q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
+    def forward(self, hidden, hidden_scale, context_kv, step, rope, *, hidden_fp8=None):
+        q_lora, kv_pre = self.project_qkv(
+            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+        )
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
@@ -263,7 +265,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if plan is not None:
             # A replayed forward ran the decoder, whose rows these come from,
             # on its tail alone: the draft's window takes the same rows.
-            if plan.tail is None:
+            if not plan.tail.requests:
                 return
             rows, step = plan.tail_rows, plan.tail
             aux_concat, positions = aux_concat[rows], positions[rows]

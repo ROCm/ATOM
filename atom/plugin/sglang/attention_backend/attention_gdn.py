@@ -38,6 +38,7 @@ from atom.utils import envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
+    DPMetadata,
     _forward_kv_cache_context,
     get_forward_context,
     reset_forward_context,
@@ -979,7 +980,10 @@ class SGLangGDNForwardContext:
                     attn_metadata=attn_md,
                     atom_config=get_current_atom_config(),
                     context=forward_context.context,
-                    num_tokens=forward_context.num_tokens,
+                    running_tokens_per_dp_rank=DPMetadata.gather_running_tokens(
+                        get_current_atom_config().parallel_config,
+                        forward_context.num_tokens,
+                    ),
                 )
             yield
         finally:

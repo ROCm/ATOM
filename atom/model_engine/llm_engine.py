@@ -14,6 +14,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
+from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
@@ -694,6 +695,9 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        self.segment_tokenizer = SegmentTokenizer.maybe_create(
+            tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
+        )
         # `has_per_req_cache` flags model architectures that need a
         # per-request stateful buffer outside the paged KV pool. Sequences
         # constructed for these models trigger BlockManager to reserve a
@@ -819,11 +823,13 @@ class InputOutputProcessor:
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
-        tokens = (
-            self.tokenizer.encode(prompt_or_tokens)
-            if isinstance(prompt_or_tokens, str)
-            else prompt_or_tokens
-        )
+        segment_tokenizer = getattr(self, "segment_tokenizer", None)
+        if not isinstance(prompt_or_tokens, str):
+            tokens = prompt_or_tokens
+        elif segment_tokenizer is not None:
+            tokens = segment_tokenizer.encode(prompt_or_tokens)
+        else:
+            tokens = self.tokenizer.encode(prompt_or_tokens)
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:

@@ -49,7 +49,8 @@ class PeerBuffer:
     overwrites a peer's unread data, is the model's layout's to say.
 
     ``bytes`` is the data region, the part zeroed between steps; the step
-    fence's slots sit past it (``step_begin``).
+    fence's slots sit past it (``step_begin``), and past them ``plain``, never
+    zeroed: words a step overwrites whole before any read.
 
     The constructor is collective over ``group`` (the handle exchange, then an
     agreement that every rank mapped every peer): every rank must reach it, so a
@@ -64,14 +65,18 @@ class PeerBuffer:
         rank: int,
         npes: int,
         device: torch.device,
+        plain_bytes: int = 0,
     ):
         # imported here, not at module scope: `step_begin` compiles FlyDSL on
         # the way in, and `SymmetricPeerBuffer` below needs neither.
         from atom.mono.runtime.step_begin import FENCE_BYTES
 
-        self.local = _ipc_heap().alloc_uncached(nbytes + FENCE_BYTES)
-        # a view, not an owner: close() frees the memory under it
+        self.local = _ipc_heap().alloc_uncached(nbytes + FENCE_BYTES + plain_bytes)
+        # views, not owners: close() frees the memory under them
         self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
+        self.plain = torch.as_tensor(
+            _DeviceBytes(self.local + nbytes + FENCE_BYTES, plain_bytes), device=device
+        )
         self.rank = rank
         self._opened: list[int] = []
         addresses = [self.local]
@@ -114,7 +119,7 @@ class PeerBuffer:
         for base in opened:
             _ipc_heap().close_mem_handle(base)
         if self.local:
-            self.bytes = None
+            self.bytes = self.plain = None
             _ipc_heap().free_device_mem(self.local)
             self.local = 0
 

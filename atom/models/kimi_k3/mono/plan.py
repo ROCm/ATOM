@@ -12,15 +12,9 @@ CPU-only. DeepSeek-V4.1 splits its per-step decisions out the same way
 test.
 """
 
-import logging
-from dataclasses import replace
-
 import torch
 
 from atom.models.kimi_k3.mono.config import MAX_QLEN, MAX_ROWS
-from atom.mono.runtime.consensus import MonoUnsupported
-
-logger = logging.getLogger("atom")
 
 
 def kda_metadata(forward_context):
@@ -93,41 +87,3 @@ def width_key(rows: int, qlen: int) -> int:
 
 def _width(key: int) -> tuple[int, int]:
     return divmod(key, MAX_QLEN + 1)
-
-
-def _keep_hooked_layers(plans, inner):
-    """Plans with mono turned off for any layer carrying a forward hook.
-
-    A hook on ``layers[lid]`` never fires on a mono step, and handing the layer
-    back does NOT change that: ``_fallback`` reruns the layer's forward from
-    its submodules rather than calling the module. So this buys nothing for the
-    drafter's aux capture, which ``K3MonoDecodeRunner._write_aux`` now fills
-    directly instead.
-
-    It is kept for the hooks mono does not know about -- ``RLHFModelRunner.
-    _register_hidden_state_hooks`` installs one per captured layer -- where
-    running the production module at least keeps the rest of that layer honest
-    and costs only this layer's speed. Refusing the whole model would be the
-    alternative; say which layers instead.
-    """
-    hooked = {
-        i
-        for i, layer in enumerate(inner.layers)
-        if layer._forward_hooks or layer._forward_pre_hooks
-    }
-    if not hooked:
-        return plans
-    kept = [
-        replace(p, kda=None, moe=None) if p.layer_id in hooked and p.mono else p
-        for p in plans
-    ]
-    dropped = sorted(hooked & {p.layer_id for p in plans if p.mono})
-    if dropped:
-        logger.info(
-            "Kimi-K3 mono: layers %s keep the original modules, something hooks"
-            " them (the drafter's aux capture)",
-            dropped,
-        )
-    if not any(p.mono for p in kept):
-        raise MonoUnsupported("every eligible layer is hooked")
-    return kept
