@@ -8,12 +8,28 @@ from pathlib import Path
 from vllm.v1.simple_kv_offload import manager as simple_kv_offload_manager
 
 
+def enable_mooncake_divergent_hits(scheduler, config):
+    """Let a Mooncake decode reuse a local full-attention hit whose Mamba state lags, as MoRIIO READ does.
+
+    The hybrid lookup otherwise needs a cached Mamba boundary, which a decode that only loads never stores,
+    so every request pulled its whole prompt (job 10093: 0 local hits). Mooncake pulls the unhashed blocks
+    of every group, the running Mamba slot included, so the state at the resume point still comes from P.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import MooncakeConnector
+    connector = scheduler.connector
+    if type(connector) is not MooncakeConnector or config.kv_transfer_config.kv_role != "kv_consumer":
+        raise RuntimeError(f"C48_MOONCAKE_DIVERGENT_HITS needs a decode MooncakeConnector, got {type(connector)}")
+    MooncakeConnector.supports_divergent_local_hybrid_hits = property(lambda self: True)
+
+
 def create_scheduler(*args, **kwargs):
     config = kwargs.get("vllm_config") if "vllm_config" in kwargs else args[0]
     defaults = copy.copy(config.scheduler_config)
     defaults.scheduler_cls = None
     base = defaults.get_scheduler_cls()
     scheduler = base(*args, **kwargs)
+    if os.environ.get("C48_MOONCAKE_DIVERGENT_HITS") == "1":
+        enable_mooncake_divergent_hits(scheduler, config)
     manager = scheduler.kv_cache_manager
     coordinator = manager.coordinator
     requested = scheduler.cache_config.enable_mamba_shared_prefix_checkpoint
@@ -37,6 +53,9 @@ def create_scheduler(*args, **kwargs):
         "manager_shared_prefix_checkpoint": manager.mamba_shared_prefix_checkpoint,
         "partial_hash_hits": coordinator.enable_partial_hash_hits,
         "mamba_partial_cache_hit": scheduler.mamba_partial_cache_hit,
+        "divergent_local_hybrid_hits": bool(
+            getattr(scheduler.connector, "supports_divergent_local_hybrid_hits", False)
+        ),
         "scheduler_block_size": scheduler.block_size,
         "max_num_scheduled_tokens": scheduler.max_num_scheduled_tokens,
         "max_num_batched_tokens": config.scheduler_config.max_num_batched_tokens,

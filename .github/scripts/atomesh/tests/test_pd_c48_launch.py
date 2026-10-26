@@ -50,6 +50,8 @@ class LaunchTest(unittest.TestCase):
                 if store and role == "prefill":
                     added.update(GLIBC_TUNABLES="glibc.malloc.hugetlb=1", MC_MAX_MR_SIZE=str(1 << 30),
                                  C48_MOONCAKE_STORE_COMPACT="1")
+                if role == "decode":
+                    added.update(C48_MOONCAKE_DIVERGENT_HITS="1")
                 self.assertEqual({k: v for k, v in mc_env.items() if k not in src_env}, added)
                 self.assertEqual({k: v for k, v in src_env.items()}, {k: mc_env[k] for k in src_env})
                 t = transfer(mc_argv)
@@ -113,6 +115,34 @@ class LaunchTest(unittest.TestCase):
             del sys.modules["drop_page_cache"]
         self.assertEqual(dropped, ["/m"])
         self.assertEqual([(c.args[0][2], c.args[0][-1]) for c in run.call_args_list], [("0", "400"), ("1", "236")])
+
+    def test_mooncake_divergent_hits_only_on_decode(self):
+        from unittest import mock
+
+        class Base:
+            supports_divergent_local_hybrid_hits = property(lambda self: False)
+
+        class MooncakeConnector(Base):
+            pass
+
+        mods = {"vllm.v1.simple_kv_offload": types.ModuleType("m"),
+                "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector":
+                    types.SimpleNamespace(MooncakeConnector=MooncakeConnector)}
+        mods["vllm.v1.simple_kv_offload"].manager = types.SimpleNamespace()
+        with mock.patch.dict(sys.modules, mods):
+            sys.modules.pop("pd_c48_scheduler", None)
+            from pd_c48_scheduler import enable_mooncake_divergent_hits
+            config = lambda role: types.SimpleNamespace(kv_transfer_config=types.SimpleNamespace(kv_role=role))
+            with self.assertRaises(RuntimeError):
+                enable_mooncake_divergent_hits(types.SimpleNamespace(connector=Base()), config("kv_consumer"))
+            with self.assertRaises(RuntimeError):
+                enable_mooncake_divergent_hits(types.SimpleNamespace(connector=MooncakeConnector()),
+                                               config("kv_producer"))
+            self.assertFalse(MooncakeConnector().supports_divergent_local_hybrid_hits)
+            enable_mooncake_divergent_hits(types.SimpleNamespace(connector=MooncakeConnector()), config("kv_consumer"))
+            self.assertTrue(MooncakeConnector().supports_divergent_local_hybrid_hits)
+            self.assertFalse(Base().supports_divergent_local_hybrid_hits)
+        sys.modules.pop("pd_c48_scheduler", None)
 
     def test_simple_cpu_case_ignores_lmcache_port(self):
         config = json.loads((GAP / "V-QD.json").read_text())
