@@ -43,6 +43,12 @@ on:
           - accuracy
           - profile
           - scatter_bounds
+          - minimax_prefill_repro
+      repro_cleanup_run_id:
+        description: 'minimax_prefill_repro only: completed GitHub run whose leftover reproduction Slurm jobs should be removed before submission'
+        required: false
+        default: ''
+        type: string
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
         required: false
@@ -394,7 +400,7 @@ jobs:
             if [[ -n "${CASE_NAMES}" ]]; then
               CASE_NAME="${CASE_NAMES}"
             elif [[ "${RUN_ALL_MODELS}" != "true" ]]; then
-              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" && "${SUITE}" != "scatter_bounds" ]]; then
+              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" && "${SUITE}" != "scatter_bounds" && "${SUITE}" != "minimax_prefill_repro" ]]; then
                 echo "::error::Set run_all_models=true, provide model_names, or provide case_names."
                 exit 1
               fi
@@ -402,7 +408,7 @@ jobs:
             fi
           fi
 
-          if [[ ("${SUITE}" == "smoke" || "${SUITE}" == "scatter_bounds") && -z "${CASE_NAME}" && -z "${MODEL_NAME}" && "${RUN_ALL_MODELS}" != "true" ]]; then
+          if [[ ("${SUITE}" == "smoke" || "${SUITE}" == "scatter_bounds" || "${SUITE}" == "minimax_prefill_repro") && -z "${CASE_NAME}" && -z "${MODEL_NAME}" && "${RUN_ALL_MODELS}" != "true" ]]; then
             python3 - <<'PY'
           import json
           import os
@@ -1768,6 +1774,72 @@ jobs:
           name: scatter-bounds-${{ github.run_id }}
           path: scatter-bounds-out/
           if-no-files-found: warn
+          retention-days: 14
+
+  minimax-prefill-repro:
+    name: MiniMax prefill minimal reproduction candidate (TP4)
+    needs: [load-config]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'minimax_prefill_repro' }}
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    # Queueing may take hours under amd-atom-qos. Slurm independently limits
+    # allocated GPU time to 20 minutes; this is the Actions/queueing ceiling.
+    timeout-minutes: 1440
+    env:
+      REPRO_IMAGE: ${{ needs.load-config.outputs.image }}
+      SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check reproduction script syntax
+        run: |
+          bash -n .github/scripts/atomesh/cleanup_minimax_prefill_repro.sh
+          bash -n .github/scripts/atomesh/submit_minimax_prefill_repro.sh
+          bash -n .github/scripts/atomesh/run_minimax_prefill_repro.sh
+          python3 -m py_compile .github/scripts/atomesh/minimax_prefill_repro.py
+      - name: Clean up previous reproduction before queueing
+        id: preflight
+        env:
+          REPRO_CLEANUP_RUN_ID: ${{ inputs.repro_cleanup_run_id }}
+        run: bash .github/scripts/atomesh/submit_minimax_prefill_repro.sh --preflight
+      - name: Upload scheduler preflight evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minimax-prefill-repro-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: minimax-prefill-repro-out/scheduler-preflight.log
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Submit bounded TP4 reproduction
+        id: repro
+        run: bash .github/scripts/atomesh/submit_minimax_prefill_repro.sh
+      - name: Cancel allocated or queued reproduction on workflow cancellation
+        if: cancelled() || steps.repro.outcome == 'failure'
+        env:
+          RUN_DIR: ${{ steps.repro.outputs.run_dir }}
+        run: |
+          export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+          if [[ -n "${RUN_DIR}" && -f "${RUN_DIR}/slurm-cancel.sh" ]]; then
+            command -v scancel
+            command -v squeue
+            timeout --kill-after=5 90 bash "${RUN_DIR}/slurm-cancel.sh"
+          fi
+      - name: Collect reproduction evidence
+        if: always()
+        env:
+          RUN_DIR: ${{ steps.repro.outputs.run_dir || steps.preflight.outputs.run_dir }}
+        run: |
+          mkdir -p minimax-prefill-repro-out
+          if [[ -n "${RUN_DIR}" && -d "${RUN_DIR}" ]]; then
+            cp -a "${RUN_DIR}/out/." minimax-prefill-repro-out/ 2>/dev/null || true
+            cp -a "${RUN_DIR}/"slurm-* minimax-prefill-repro-out/ 2>/dev/null || true
+          fi
+          echo 'GPU evidence: minimax-prefill-repro artifact. A green job only means the reduced workload completed without reproducing the hang.' >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload reproduction evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minimax-prefill-repro-${{ github.run_id }}-${{ github.run_attempt }}
+          path: minimax-prefill-repro-out/
+          if-no-files-found: error
           retention-days: 14
 
   run-model-benchmark:
