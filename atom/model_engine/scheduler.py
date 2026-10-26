@@ -588,8 +588,6 @@ class Scheduler:
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
         self.max_num_seqs = config.max_num_seqs
-        if 0 < envs.ATOM_SCHEDULER_MAX_RUNNING_SEQS < self.max_num_seqs:
-            self.max_num_seqs = envs.ATOM_SCHEDULER_MAX_RUNNING_SEQS
         self.max_num_batched_tokens = config.max_num_batched_tokens
         # DP prefill cost balancing, on whenever DP attention runs more than
         # one rank: every rank estimates the cost of its chunk at the whole

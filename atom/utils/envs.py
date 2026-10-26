@@ -484,14 +484,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
-    # Scheduler admission cap, below the engine's --max-num-seqs capacity: at most
-    # this many sequences run at once, while the engine's per-seq buffers and
-    # graph sizes still follow --max-num-seqs. 0 (default) leaves the cap at
-    # --max-num-seqs. Lets a DSpark deployment serve one request at a time
-    # (--max-num-seqs 2 is the smallest the block drafter's warmup accepts).
-    "ATOM_SCHEDULER_MAX_RUNNING_SEQS": lambda: int(
-        os.getenv("ATOM_SCHEDULER_MAX_RUNNING_SEQS", "0")
-    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
