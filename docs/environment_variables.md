@@ -129,6 +129,13 @@ cannot affect a server that does not use the feature.
 | **ATOM_V4_HCA_PERSIST_MIN_ROWS** | int | 15 | Smallest decode call (q rows) that uses `ATOM_V4_HCA_PERSIST`; smaller calls stay on the ASM path. |
 | **ATOM_DCP_SPARSE_PREFILL_NONPS** | bool | 1 (true) | DSA models under DCP: run sparse prefill attention on the non-persistent fp8 gqa64 MLA kernel, which needs no work metadata. Applies with fp8 q/KV, 64 gathered heads (tp4/dcp4, tp8/dcp8), gfx950, `ATOM_MLA_PAGE_SIZE=1` and `--max-num-batched-tokens` <= 32768 (each prefill token is one kernel row; a larger step budget logs a warning and keeps the default kernel). Needs an aiter that ships the kernel (ROCm/aiter#6132); with an older aiter set `0`, or the first sparse prefill past `index_topk` raises. |
 
+### Qwen3.8-Flash-Next (QSA)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_QSA_STACKED_DECODE_SCORER** | bool | 1 (true) | Score decode-sized QSA index calls (at most 256 query rows: the target's MTP verify and the draft) with the MFMA kernel that stacks every row's index heads into the M dimension, so each key tile is read once per 4 rows instead of once per row; BF16, FP8 and MXFP4 index keys. Needs power-of-two index heads (at least 4) and head dim; other shapes keep the CUDA-core scorer. Set `0` to force the CUDA-core scorer. |
+| **ATOM_QSA_DRAFT_KV_BF16** | bool | 1 (true) | With `--kv_cache_dtype fp8` or `--index-cache-dtype fp8/fp4`, keep the MTP draft layer's K/V and index caches in BF16, in a row space (`qsa_draft`) of their own, while the target's 12 QSA layers use the quantized caches. On Qwen3.8-Flash-Next an FP8 draft KV lowers the real acceptance length by about 3.5% (3.05 vs 3.17 tokens a forward at MTP 3); a BF16 one keeps it, at about 6% of the KV pool. Set `0` to quantize the draft's caches like the target's. |
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |
