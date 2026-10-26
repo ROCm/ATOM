@@ -414,6 +414,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # DCP decode with draft tokens: run each request's gathered query heads as
+    # 32-head pseudo-requests over the same KV (see _MLA_DCP_HEAD_FOLDS). DSpark
+    # or no drafter only: an MTP draft step updates the target's work plan in
+    # place, which the folded plan does not survive.
+    "ATOM_MLA_DCP_HEAD_FOLD": lambda: os.getenv("ATOM_MLA_DCP_HEAD_FOLD", "0") == "1",
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
     # Set to 0 for the BF16 flash_attn_varlen_func fallback.
