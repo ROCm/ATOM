@@ -15,9 +15,9 @@ from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.sparse_indexer_chunk import (
-    dcp_qsplit_rows,
     decode_band_rows,
     logits_rows,
+    qsplit_rows,
 )
 
 PRESHUFFLE = "preshuffle"
@@ -51,28 +51,29 @@ class ConcatKeys(NamedTuple):
     row_starts: torch.Tensor
 
 
-class DcpSplit(NamedTuple):
+class RowSplit(NamedTuple):
     """Rows split across ranks that each score against the whole key set:
     this rank scores `[first, end)` into its slot of `stride` rows at `slot`,
     and the `world` slots are all-gathered back in place, row i landing at
-    row i (`dcp_qsplit_rows`). The ranks are the DCP group's, or with
-    `over_tp` the TP group's (a replicated indexer under plain TP). Without
-    a split, a world of one: every row, nothing to gather."""
+    row i (`qsplit_rows`). `group` names the ranks: "dcp" (GLM under DCP,
+    which all-gathers the keys) or "tp" (a TP-replicated indexer, V4 under
+    plain TP). Without a split, a world of one: every row, nothing to
+    gather."""
 
     first: int
     end: int
     slot: int
     stride: int
     world: int
-    over_tp: bool = False
+    group: str = "dcp"
 
     @classmethod
     def of(
-        cls, rows: int, rank: int = 0, world: int = 1, *, over_tp: bool = False
-    ) -> "DcpSplit":
+        cls, rows: int, rank: int = 0, world: int = 1, *, group: str = "dcp"
+    ) -> "RowSplit":
         """This rank's split of `rows`."""
-        stride, slot, first, end = dcp_qsplit_rows(rows, rank, world)
-        return cls(first, end, slot, stride, world, over_tp)
+        stride, slot, first, end = qsplit_rows(rows, rank, world)
+        return cls(first, end, slot, stride, world, group)
 
 
 class IndexRows(NamedTuple):
@@ -88,14 +89,14 @@ class IndexRows(NamedTuple):
     into the workspace's flat logits, each at its offset from its band's
     start, a band holding as many as fit. `concat`: FP8 prefill rows against
     their requests' gathered keys (`ConcatKeys`), `width` then their total.
-    `split`: the bands are this DCP rank's rows alone (`DcpSplit`).
+    `split`: the bands are this rank's rows alone (`RowSplit`).
     `workspace`: the plane the bands were cut to (`LogitsWorkspace`, or one
     that also packs); None, a plane allocated as the rows are scored."""
 
     row_ends: torch.Tensor
     width: int
     bands: tuple[tuple[int, int], ...]
-    split: DcpSplit
+    split: RowSplit
     row_tables: torch.Tensor | None = None
     fp4_bands: tuple | None = None
     packed_offsets: torch.Tensor | None = None
@@ -182,18 +183,18 @@ def fp8_rows(row_ends, width, workspace, row_tables, *, next_n=1) -> IndexRows:
         row_ends,
         width,
         _plane_bands(0, rows, width, workspace, next_n),
-        DcpSplit.of(rows),
+        RowSplit.of(rows),
         row_tables=row_tables,
         next_n=next_n,
         workspace=workspace,
     )
 
 
-def concat_rows(row_ends, keys: ConcatKeys, split: DcpSplit | None = None):
+def concat_rows(row_ends, keys: ConcatKeys, split: RowSplit | None = None):
     """FP8 prefill rows against their requests' gathered keys, banded by the
     logits budget alone: a prefill's temporaries are allocated as it runs.
     This DCP rank's rows of them, `split` (every row by default)."""
-    split = split or DcpSplit.of(row_ends.shape[0])
+    split = split or RowSplit.of(row_ends.shape[0])
     band = max(1, logits_rows(split.end - split.first, keys.total))
     return IndexRows(
         row_ends,
@@ -218,7 +219,7 @@ def fp4_rows(
     row_starts: torch.Tensor | None = None,
     bands: tuple[tuple[int, int], ...] | None = None,
     packed_offsets: torch.Tensor | None = None,
-    split: DcpSplit | None = None,
+    split: RowSplit | None = None,
     storage: Fp4LaunchStorage | None = None,
 ) -> IndexRows:
     """FP4 rows, a sequence's together (`sequences`), each band's launch
@@ -233,7 +234,7 @@ def fp4_rows(
     every row by default) unless `bands` are given -- with `packed_offsets`,
     where each band's rows were packed."""
     rows = row_ends.shape[0]
-    split = split or DcpSplit.of(rows)
+    split = split or RowSplit.of(rows)
     if bands is None:
         bands = _plane_bands(split.first, split.end, width, workspace)
     launches = []

@@ -88,7 +88,7 @@ def _gather_split(out, split):
         return
     region = out[: split.stride * split.world]
     mine = region[split.slot : split.slot + split.stride]
-    group = get_tp_group() if split.over_tp else get_dcp_group()
+    group = get_tp_group() if split.group == "tp" else get_dcp_group()
     pynccl = split_gather_comm(group)
     if pynccl is not None:
         pynccl.all_gather(region, mine)

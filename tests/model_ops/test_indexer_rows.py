@@ -101,7 +101,7 @@ def test_dcp_split_bands_only_this_rank_s_rows(world, count):
     keys = rows_module.ConcatKeys(None, None, 1 << 20, None)
     covered = []
     for rank in range(world):
-        split = rows_module.DcpSplit.of(count, rank, world)
+        split = rows_module.RowSplit.of(count, rank, world)
         rows = rows_module.concat_rows(
             torch.zeros(count, dtype=torch.int32), keys, split
         )
@@ -111,7 +111,7 @@ def test_dcp_split_bands_only_this_rank_s_rows(world, count):
         covered += [r for b, e in rows.bands for r in range(b, e)]
     assert covered == list(range(count))
     # Without DCP, one rank's split: every row, nothing to gather.
-    assert rows_module.DcpSplit.of(count) == (0, count, 0, count, 1, False)
+    assert rows_module.RowSplit.of(count) == (0, count, 0, count, 1, "dcp")
 
 
 def test_pcp_owned_rows_group_by_request_and_pad():
@@ -164,10 +164,10 @@ def _groups(monkeypatch, tp_pynccl, dcp_pynccl):
     return torch_calls
 
 
-@pytest.mark.parametrize("over_tp", [False, True])
+@pytest.mark.parametrize("group", ["dcp", "tp"])
 @pytest.mark.parametrize("count, rank, world", [(12, 7, 8), (13, 2, 4), (1, 1, 2)])
 def test_split_gathers_its_own_slot_on_its_group_s_pynccl(
-    monkeypatch, over_tp, count, rank, world
+    monkeypatch, group, count, rank, world
 ):
     """The gather runs on the split's group's pynccl communicator (built with
     the group, so counted in the memory profile; the torch ProcessGroup's is
@@ -175,10 +175,10 @@ def test_split_gathers_its_own_slot_on_its_group_s_pynccl(
     slot of the output, an empty rank's (12 rows over 8, rank 7) included."""
     tp, dcp = _Pynccl(), _Pynccl()
     torch_calls = _groups(monkeypatch, tp, dcp)
-    split = rows_module.DcpSplit.of(count, rank, world, over_tp=over_tp)
+    split = rows_module.RowSplit.of(count, rank, world, group=group)
     out = torch.zeros(split.stride * world + 3, 4, dtype=torch.int32)
     score_module._gather_split(out, split)
-    used, idle = (tp, dcp) if over_tp else (dcp, tp)
+    used, idle = (tp, dcp) if group == "tp" else (dcp, tp)
     assert torch_calls == [] and idle.calls == []
     [(region, mine)] = used.calls
     assert region.data_ptr() == out.data_ptr()
@@ -192,7 +192,7 @@ def test_split_without_pynccl_gathers_on_the_process_group(monkeypatch, pynccl):
     """No usable pynccl on the DCP group: the gather falls back to its torch
     ProcessGroup, as before. (The TP split is not turned on without one.)"""
     torch_calls = _groups(monkeypatch, _Pynccl(), pynccl)
-    split = rows_module.DcpSplit.of(9, 1, 4)
+    split = rows_module.RowSplit.of(9, 1, 4)
     out = torch.zeros(split.stride * 4, 4, dtype=torch.int32)
     score_module._gather_split(out, split)
     [(region, mine, group)] = torch_calls
@@ -203,5 +203,5 @@ def test_split_without_pynccl_gathers_on_the_process_group(monkeypatch, pynccl):
 def test_unsplit_rows_gather_nothing(monkeypatch):
     tp, dcp = _Pynccl(), _Pynccl()
     torch_calls = _groups(monkeypatch, tp, dcp)
-    score_module._gather_split(torch.zeros(5, 4), rows_module.DcpSplit.of(5))
+    score_module._gather_split(torch.zeros(5, 4), rows_module.RowSplit.of(5))
     assert torch_calls == [] and tp.calls == [] and dcp.calls == []

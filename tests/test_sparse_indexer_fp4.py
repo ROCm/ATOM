@@ -20,7 +20,7 @@ import torch
 
 from atom.model_ops import sparse_indexer_fp4
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
-from atom.model_ops.sparse_indexer_chunk import dcp_qsplit_rows
+from atom.model_ops.sparse_indexer_chunk import qsplit_rows
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_KV_BLOCK_SIZE,
     FP4_QUANT_BLOCK_SIZE,
@@ -1007,12 +1007,10 @@ def _qsplit_roundtrip(full_topk, world_size, sentinel=-7):
     result rather than just that something moved.
     """
     num_rows, topk = full_topk.shape
-    stride = dcp_qsplit_rows(num_rows, 0, world_size)[0]
+    stride = qsplit_rows(num_rows, 0, world_size)[0]
     gathered = torch.full((stride * world_size, topk), sentinel, dtype=full_topk.dtype)
     for rank in range(world_size):
-        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
-            num_rows, rank, world_size
-        )
+        rows_per_rank, slot_lo, row_lo, row_hi = qsplit_rows(num_rows, rank, world_size)
         assert rows_per_rank == stride
         gathered[slot_lo : slot_lo + (row_hi - row_lo)] = full_topk[row_lo:row_hi]
     return gathered[:num_rows]
@@ -1065,9 +1063,7 @@ def test_qsplit_rows_partition_covers_every_row_once(num_rows, world_size):
     strides = set()
     slots = []
     for rank in range(world_size):
-        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
-            num_rows, rank, world_size
-        )
+        rows_per_rank, slot_lo, row_lo, row_hi = qsplit_rows(num_rows, rank, world_size)
         strides.add(rows_per_rank)
         assert row_lo <= row_hi <= num_rows
         assert row_hi - row_lo <= rows_per_rank
@@ -1094,4 +1090,4 @@ def test_qsplit_rows_partition_covers_every_row_once(num_rows, world_size):
 
 def test_qsplit_degenerates_to_the_whole_range_without_dcp():
     """At dcp=1 the rank's slice is every row, i.e. the pre-DCP behaviour."""
-    assert dcp_qsplit_rows(4096, 0, 1) == (4096, 0, 0, 4096)
+    assert qsplit_rows(4096, 0, 1) == (4096, 0, 0, 4096)

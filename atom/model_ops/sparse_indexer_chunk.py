@@ -119,15 +119,14 @@ def flat_view(flat, rows, width):
     return flat[: rows * width].view(rows, width)
 
 
-def dcp_qsplit_rows(
-    num_rows: int, rank: int, world_size: int
-) -> tuple[int, int, int, int]:
+def qsplit_rows(num_rows: int, rank: int, world_size: int) -> tuple[int, int, int, int]:
     """This rank's slot in the gathered buffer and the rows it scores into it.
 
-    Under DCP every rank already all-gathers the whole index cache, so having
-    all ``world_size`` of them score every row recomputes the same top-k that
-    many times. Each rank scores ``[row_lo, row_hi)`` instead, against the full
-    key set, and the selections are all-gathered back.
+    When every rank holds the whole key set -- under DCP after all-gathering
+    the index cache, under plain TP because the indexer is replicated -- all
+    ``world_size`` of them scoring every row recompute the same top-k that many
+    times. Each rank scores ``[row_lo, row_hi)`` instead, against the full key
+    set, and the selections are all-gathered back.
 
     The stride is uniform -- ``ceil(num_rows / world_size)`` for every rank --
     so a rank-major concatenation of stride-sized buffers lands row ``i`` back
@@ -171,7 +170,7 @@ def indexer_qsplit_world(
     dcp: int,
 ) -> int:
     """TP width the DeepSeek-V4 prefill indexer splits its query rows over
-    (`DcpSplit` with `over_tp`); 1 means no split.
+    (`RowSplit` with `group="tp"`); 1 means no split.
 
     The V4 indexer is replicated across TP, so every rank would score the
     same rows. The split needs every TP rank to hold the same rows, which DP

@@ -123,9 +123,9 @@ from atom.model_ops.indexer import (
     NATURAL,
     PRESHUFFLE,
     ConcatKeys,
-    DcpSplit,
     Fp4LaunchStorages,
     IndexRows,
+    RowSplit,
     concat_rows,
     fp4_rows,
     fp8_rows,
@@ -2127,11 +2127,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         visible_end = visible_csa(positions_gpu[:total_tokens]).to(torch.int32)
         split = None
         if self._indexer_qsplit_world > 1:
-            split = DcpSplit.of(
+            split = RowSplit.of(
                 total_tokens,
                 get_tp_group().rank_in_group,
                 self._indexer_qsplit_world,
-                over_tp=True,
+                group="tp",
             )
         if self._indexer_fp4:
             return self._index_rows(
@@ -2189,7 +2189,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         row_tables: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         recorded_as: str | None = None,
-        split: DcpSplit | None = None,
+        split: RowSplit | None = None,
     ) -> IndexRows:
         """Paged index rows: FP8 each row against its own `row_tables` row, FP4
         a request's rows together, grouped by `query_start_loc`. Rows a graph
