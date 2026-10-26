@@ -14,6 +14,7 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.config import _is_minimax_m3_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
+from atom.model_ops.prefill_workspace import PrefillRequestLengths
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -1184,6 +1185,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             cached_prefix_lens.astype(np.int32), device
         )
         ub_attn.max_seqlen_k = int(ctx_lens.max())
+        if ub_attn.prefill_request_lengths is not None:
+            # Keep the shared host description aligned with the final visible
+            # context after reattaching the preceding micro-batch's prefix.
+            ub_attn.prefill_request_lengths = PrefillRequestLengths(
+                cu_q_lens=ub_attn.prefill_request_lengths.cu_q_lens,
+                cu_k_lens=tuple(map(int, cu_k)),
+            )
 
     def prepare_decode(
         self,
