@@ -14,7 +14,7 @@ and a running Store is named by
 * ``ATOM_TEST_MOONCAKE_STORE_LOCAL_HOSTNAME`` (optional) -- this host's
   reachable address, when ``ATOM_HOST_IP`` does not give it.
 
-The worker is the real one -- dense codec, block GPU connector, a transfer
+The worker is the real one -- dense or M3 PAGE codec, block GPU connector, a transfer
 pool registered in HBM, the startup probe -- with only the TP group faked.
 """
 
@@ -157,7 +157,8 @@ def _drain(worker, until, *, timeout_s=60.0):
     raise AssertionError(f"worker reports incomplete after {timeout_s}s: {collected}")
 
 
-def test_kv_round_trip_through_the_store(monkeypatch):
+@pytest.mark.parametrize("layout", ["dense", "m3"])
+def test_kv_round_trip_through_the_store(monkeypatch, layout):
     if _RDMA_DEVICE:
         monkeypatch.setenv("MC_NUM_QP_PER_EP", "1")
     monkeypatch.setattr(
@@ -165,14 +166,55 @@ def test_kv_round_trip_through_the_store(monkeypatch):
     )
     device = torch.device("cuda", torch.cuda.current_device())
     kv_caches = _kv_caches(device)
-    worker = MooncakeStoreOffloadConnector(_config())
+    if layout == "m3":
+        # Include target, draft and replicated index bytes. Opaque PAGEs must
+        # preserve every plane, regardless of their different widths.
+        widths = {
+            "k_cache": 2048,
+            "v_cache": 2048,
+            "k_scale": 64,
+            "v_scale": 64,
+            "index_cache": 144 * BLOCK,
+        }
+        kv_caches = {
+            name: SimpleNamespace(
+                **{
+                    field: torch.randint(
+                        0, 256, (NUM_BLOCKS, width), dtype=torch.uint8, device=device
+                    )
+                    for field, width in widths.items()
+                    if name != "draft" or field != "index_cache"
+                }
+            )
+            for name in ("dense", "sparse", "draft")
+        }
+    config = _config()
+    transfer = None
+    if layout == "m3":
+        from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+
+        config.hf_config.model_type = "minimax_m3"
+        transfer = KVTransferTensors(
+            pages=[
+                page_region(
+                    t.reshape(NUM_BLOCKS, -1), semantic_role=f"m3.{layer}.{field}"
+                )
+                for layer, cache in kv_caches.items()
+                for field, t in vars(cache).items()
+            ]
+        )
+        transfer.set_block_count(NUM_BLOCKS)
+    worker = MooncakeStoreOffloadConnector(config)
     stored_keys: list[str] = []
     try:
         # Includes the startup probe: one chunk through the Store into HBM.
-        worker.register_kv_caches(kv_caches, num_blocks=NUM_BLOCKS)
+        worker.register_kv_caches(
+            kv_caches, transfer_tensors=transfer, num_blocks=NUM_BLOCKS
+        )
         for cache in kv_caches.values():
-            cache.k_cache[DESTINATION[0] * BLOCK :].zero_()
-            cache.index_cache[DESTINATION[0] :].zero_()
+            for tensor in vars(cache).values():
+                tensor.reshape(NUM_BLOCKS, -1)[DESTINATION[0] :].zero_()
         torch.cuda.synchronize(device)
 
         tokens = torch.randint(0, 150_000, (PROMPT,)).tolist()
@@ -201,8 +243,9 @@ def test_kv_round_trip_through_the_store(monkeypatch):
             worker,
             lambda got: operation in got["saved"] and source_safe <= got["completions"],
         )
-        assert ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, True) in (
-            saved["completions"]
+        assert (
+            ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, True)
+            in (saved["completions"])
         )
         assert (
             ConnectorCompletion(DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True)
@@ -234,15 +277,12 @@ def test_kv_round_trip_through_the_store(monkeypatch):
         assert loaded["failed"] == set()
 
         torch.cuda.synchronize(device)
-        rows = PROMPT
         for name, cache in kv_caches.items():
-            assert torch.equal(
-                cache.k_cache[rows : 2 * rows], cache.k_cache[:rows]
-            ), f"{name} MLA rows differ after the Store round trip"
-            assert torch.equal(
-                cache.index_cache[DESTINATION[0] :],
-                cache.index_cache[: DESTINATION[0]],
-            ), f"{name} indexer rows differ after the Store round trip"
+            for field, tensor in vars(cache).items():
+                blocks = tensor.reshape(NUM_BLOCKS, -1)
+                assert torch.equal(blocks[DESTINATION], blocks[SOURCE]), (
+                    f"{name}.{field} differs after the Store round trip"
+                )
         assert worker._pool.quarantined("save") == 0
         assert worker._pool.quarantined("load") == 0
     finally:
