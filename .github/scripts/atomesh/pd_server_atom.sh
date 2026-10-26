@@ -2290,6 +2290,9 @@ run_torch_profile_window() {
     sleep 2
   done
 
+  local full_window=0
+  (( $(date +%s) >= deadline )) && full_window=1
+
   # The server waits ATOM_PROFILER_TIMEOUT for its ranks; give curl headroom
   # past that so the client never abandons an export still being written.
   local stop_timeout=$(( ${ATOM_PROFILER_TIMEOUT:-300} + 300 ))
@@ -2314,6 +2317,10 @@ run_torch_profile_window() {
   if ! wait_for_torch_traces "${start_marker}" "${stop_files[@]}"; then
     echo "[profile] traces incomplete; leaving aiperf to finish on its own"
     return 0
+  fi
+  if (( ! full_window )); then
+    echo "[profile][FAIL] aiperf ended before the full ${ATOMESH_TORCH_PROFILE_DURATION}s trace window"
+    return 1
   fi
   touch "${trace_ok_file}"
   local aiperf_pid
@@ -2505,6 +2512,10 @@ run_aiperf_agentic_benchmark() {
         write_aiperf_chrome_trace "${out_dir}"
       fi
       continue
+    fi
+    if (( ATOMESH_TORCH_PROFILE_DURATION > 0 )); then
+      echo "[profile][FAIL] requested P/D torch traces were not completed; see ${out_dir}/torch_profile.log" >&2
+      return 1
     fi
     if (( aiperf_rc != 0 )); then
       echo "[aiperf][FAIL] aiperf exited with code ${aiperf_rc}" >&2
