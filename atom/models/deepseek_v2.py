@@ -58,7 +58,6 @@ from atom.distributed.dcp_utils import (
     get_dcp_world_size,
 )
 from atom.distributed.pcp_utils import (
-    pcp_split_active,
     get_pcp_world_size,
     pcp_all_reduce,
     pcp_allgather_rankmajor,
@@ -68,6 +67,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_reduce_scatter,
     pcp_round_robin_split,
+    pcp_split_active,
 )
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
