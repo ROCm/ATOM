@@ -305,11 +305,7 @@ class ForwardMode:
             max_seqlen_q=max_seqlen_q,
         )
         token_graph = cls._pad_to_token_graph(
-            scheduled_tokens,
-            is_prefill,
-            graphable,
-            sync,
-            running_tokens_per_dp_rank,
+            is_prefill, graphable, sync, running_tokens_per_dp_rank
         )
         if token_graph:
             running_tokens = token_graph
@@ -334,29 +330,29 @@ class ForwardMode:
 
     @staticmethod
     def _pad_to_token_graph(
-        scheduled_tokens, is_prefill, graphable, sync, running_tokens_per_dp_rank
+        is_prefill, graphable, sync, running_tokens_per_dp_rank
     ) -> int:
         """Settle every rank's running tokens into ``running_tokens_per_dp_rank``
-        -- its scheduled ones, a prefilling rank's raised to its token-graph
-        bucket (`TokenGraph.bucket`) -- and return this rank's bucket, 0 for
-        none.
+        -- its scheduled ones, every prefilling rank's raised to the bucket
+        holding the group's largest (`TokenGraph.bucket`) -- and return that
+        bucket on a prefilling rank, else 0.
 
-        A rank pads when it prefills -- an idle rank's dummy prefill too,
-        already on a bucket. A recorded MoE bounds its dispatch by its own
-        bucket plus the largest on every peer (`_record_tr_graphs`), so no rank
-        may run more rows than the largest bucket.
+        One bucket for every prefilling rank, an idle rank's dummy prefill
+        included: a recording's collectives are sized by its bucket, so ranks
+        replaying different ones hang the group.
         """
         bucket = region_graph.TokenGraph.bucket
         running = running_tokens_per_dp_rank
         np.copyto(running, sync.scheduled_tokens_per_dp_rank)
-        if not graphable or bucket(running.max(), "prefill") is None:
+        group = bucket(running.max(), "prefill") if graphable else None
+        if group is None:
             return 0
         # Every rank's, whether or not it pads itself: a peer's replay
         # dispatches its padded rows to this rank too.
         for rank, prefill in enumerate(sync.prefill_across_dp):
             if prefill:
-                running[rank] = bucket(running[rank], "prefill")
-        return bucket(scheduled_tokens, "prefill") if is_prefill else 0
+                running[rank] = group
+        return group if is_prefill else 0
 
     @staticmethod
     def _running_tokens(

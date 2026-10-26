@@ -3,11 +3,14 @@
 """Qwen3.8-Flash-Next's shared-projection, multi-stream MTP drafter."""
 
 import copy
+import json
+import os
 
 import torch
 from torch import nn
 
 from atom.config import Config
+from atom.model_loader.weight_utils import local_model_dir
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.qwen4_exp.hyperconnection import (
@@ -19,6 +22,38 @@ from atom.models.qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
     _Qwen4ExpQuantizationConfig,
 )
+from atom.quant_spec import LayerQuantConfig
+
+
+def _mtp_weights_quantized(model: str) -> bool:
+    """Whether any MTP weight in the checkpoint carries a quantization scale.
+
+    Quark exports list excluded modules one by one and can miss some: the
+    Qwen3.8-Flash-Next Quark MXFP4 checkpoint stores the whole MTP head in BF16
+    but leaves ``mtp.fc_embedding`` and ``mtp.layers.0.mlp.experts`` off its
+    exclude list. Without a readable index the configured policy is kept.
+    """
+    index = os.path.join(local_model_dir(model), "model.safetensors.index.json")
+    try:
+        with open(index) as f:
+            names = json.load(f)["weight_map"]
+    except (OSError, ValueError, KeyError):
+        return True
+    mtp = [n for n in names if n.startswith("mtp.")]
+    return not mtp or any("_scale" in n.rsplit(".", 1)[-1] for n in mtp)
+
+
+class _UnquantizedMTPQuantizationConfig(_Qwen4ExpQuantizationConfig):
+    """Resolves every MTP layer as excluded from quantization."""
+
+    def get_layer_quant_config(
+        self, layer_name, use_online_quant=False, *, check_children=False
+    ):
+        if layer_name.startswith("mtp."):
+            return LayerQuantConfig(quant_dtype=self.torch_dtype)
+        return super().get_layer_quant_config(
+            layer_name, use_online_quant, check_children=check_children
+        )
 
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
@@ -47,7 +82,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
-        quant_config = _Qwen4ExpQuantizationConfig(atom_config.quant_config)
+        quant_cls = (
+            _Qwen4ExpQuantizationConfig
+            if _mtp_weights_quantized(atom_config.model)
+            else _UnquantizedMTPQuantizationConfig
+        )
+        quant_config = quant_cls(atom_config.quant_config)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )

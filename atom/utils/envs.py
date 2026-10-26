@@ -938,6 +938,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM": lambda: (
         os.getenv("ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM", "0") == "1"
     ),
+    # gfx1250 MXFP4 (per_1x32) linears through aiter's gemm_a4w4
+    "ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE": lambda: (
+        os.getenv("ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE", "0") == "1"
+    ),
     # --- V4 Attention Backend Refactor (PR-A: kill .item(), unlock CUDAGraph) ---
     # `legacy` (default) keeps the per-seq Python dispatch loop with .item()
     # syncs in deepseek_v4.py. `new` routes through V4AttentionBackend with
