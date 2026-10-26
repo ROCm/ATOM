@@ -3,7 +3,8 @@
 """Renormalized softmax top-k routing, one Triton program per token.
 
 Bit-identical to AITER's `topk_softmax` with `need_renorm` (ids, tie order,
-weights, and the sigmoid-scored shared-expert slots it appends). On MI355X at
+weights, the sigmoid-scored shared-expert slots it appends, and the pad rows
+of its optional `num_valid_rows` count). On MI355X at
 512 experts it takes about 4 us per call where the HIP kernel takes 9-11 us.
 Each selection is a single int64 max over (value, -index).
 """
@@ -19,6 +20,7 @@ def _topk_softmax_kernel(
     logits_ptr,
     w_ptr,
     ids_ptr,
+    num_valid_rows_ptr,
     stride_l,
     stride_w,
     stride_i,
@@ -26,6 +28,7 @@ def _topk_softmax_kernel(
     K: tl.constexpr,
     KP: tl.constexpr,
     NSH: tl.constexpr,
+    HAS_NUM_VALID_ROWS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, E)
@@ -51,6 +54,10 @@ def _topk_softmax_kernel(
         total += e
         key = tl.where(offs == idx, -9223372036854775807, key)
     wv = wv * (1.0 / total)
+    if HAS_NUM_VALID_ROWS:
+        pad = row >= tl.load(num_valid_rows_ptr)
+        wv = tl.where(pad, 0.0, wv)
+        iv = tl.where(pad, -1, iv)
     tl.store(w_ptr + row * stride_w + kk, wv, mask=kk < K)
     tl.store(ids_ptr + row * stride_i + kk, iv, mask=kk < K)
     if NSH > 0:
@@ -79,19 +86,31 @@ def triton_topk_softmax(
     topk_ids: torch.Tensor,
     gating_output: torch.Tensor,
     num_shared_experts: int = 0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
     """Fill `topk_weights[:, :k]` / `topk_ids[:, :k]` like AITER's
     `topk_softmax(..., need_renorm=True, ...)` (k = `topk_ids.shape[1]`), and
     `topk_weights[:, k + s]` with sigmoid(shared logit s) for each of the
-    `num_shared_experts` trailing logits."""
+    `num_shared_experts` trailing logits.
+
+    `num_valid_rows`, as in AITER (ROCm/aiter#6916): an optional int32 device
+    tensor whose first element is the count of real rows. Rows at or past it
+    are padding: their routed ids are written -1 and their weights 0; shared
+    columns are written as for any row. Read on device, so a replayed CUDA
+    graph follows each step's count."""
     tokens, width = gating_output.shape
     k = topk_ids.shape[1]
+    if num_valid_rows is not None:
+        assert (
+            num_valid_rows.dtype == torch.int32 and num_valid_rows.numel() >= 1
+        ), "num_valid_rows must be an int32 tensor of at least one element"
     if not tokens:
         return
     _topk_softmax_kernel[(tokens,)](
         gating_output,
         topk_weights,
         topk_ids,
+        num_valid_rows,
         gating_output.stride(0),
         topk_weights.stride(0),
         topk_ids.stride(0),
@@ -99,6 +118,7 @@ def triton_topk_softmax(
         K=k,
         KP=triton.next_power_of_2(k),
         NSH=num_shared_experts,
+        HAS_NUM_VALID_ROWS=num_valid_rows is not None,
         num_warps=1,
         # The weights match AITER bit for bit only without FMA contraction.
         enable_fp_fusion=False,

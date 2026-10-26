@@ -163,8 +163,13 @@ def rocm_aiter_topk_softmax_impl(
     renormalize: bool,
     num_fused_shared_experts: int = 0,
     num_routing_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
+    fused_shared_experts_scoring_func: str | None = None,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """`num_valid_rows`: optional int32 device tensor whose first element is
+    the count of real rows; rows at or past it get routed ids -1 and weights 0
+    (AITER's `topk_softmax` semantics, ROCm/aiter#6916). Passing it to the
+    AITER path needs an AITER with that change."""
     from aiter import topk_softmax
 
     token = gating_output.shape[0]
@@ -203,7 +208,11 @@ def rocm_aiter_topk_softmax_impl(
         )
     ):
         triton_topk_softmax(
-            topk_weights, topk_ids, gating_output, fused_shared_experts_for_kernel
+            topk_weights,
+            topk_ids,
+            gating_output,
+            fused_shared_experts_for_kernel,
+            num_valid_rows,
         )
         if num_fused_shared_experts > 0:
             return total_topk_weights, total_topk_ids
@@ -211,6 +220,8 @@ def rocm_aiter_topk_softmax_impl(
     token_expert_indicies = torch.empty(
         gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
     )
+    # Only when set: an AITER without the parameter rejects the keyword.
+    extra = {} if num_valid_rows is None else {"num_valid_rows": num_valid_rows}
     topk_softmax(
         topk_weights,
         topk_ids,
@@ -219,6 +230,7 @@ def rocm_aiter_topk_softmax_impl(
         renormalize,
         fused_shared_experts_for_kernel,
         fused_shared_experts_scoring_func,
+        **extra,
     )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
@@ -230,7 +242,9 @@ def rocm_aiter_topk_softmax_fake(
     topk: int,
     renormalize: bool,
     num_fused_shared_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
+    num_routing_experts: int = 0,
+    fused_shared_experts_scoring_func: str | None = None,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = gating_output.shape[0]
     device = gating_output.device
@@ -447,7 +461,8 @@ def rocm_aiter_topk_softmax(
     renormalize: bool,
     num_fused_shared_experts: int = 0,
     num_routing_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
+    fused_shared_experts_scoring_func: str | None = None,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     return rocm_aiter_topk_softmax_impl(
         gating_output,
@@ -456,6 +471,7 @@ def rocm_aiter_topk_softmax(
         num_fused_shared_experts,
         num_routing_experts,
         fused_shared_experts_scoring_func,
+        num_valid_rows,
     )
 
 
