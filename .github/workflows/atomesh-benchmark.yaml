@@ -137,7 +137,7 @@ on:
 
           Kimi-K3 (InferenceX AgentX P/D, best prefill per concurrency):
             kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c1-mono,
-            kimi-k3-mxfp4-1p1d-pp8-tp8-dspark7-agentic-1m-c2,
+            kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c2,
             kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c4,
             kimi-k3-mxfp4-1p1d-tp8ep8-dcp8-dspark4-agentic-lmcache-1m-c16,
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32,
