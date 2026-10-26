@@ -15,6 +15,7 @@ CPUREF = {
     "V-QD-CPUREF2": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-LPT3072": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-LPT6144": "cpu-lru-refresh-v2",
+    "V-QD-CPUREF-ADMIT": "cpu-lru-refresh-admit",
     "V-QD-CPUREF2-FP8ATTN": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-FP8ATTN-PROFILE": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-FP8ATTN-FQ": "cpu-lru-refresh-v2",

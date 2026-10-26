@@ -41,6 +41,9 @@ c48_append_port_mount() {
     V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-PNT|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-SW-C*|V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C*)
       c48_fix_dir=cpu-lru-refresh-v3
       c48_fix_sha=18da014b1eed073f6b227b92fc0163baa1e7a6a5fbcbcb31364a4696fa1cbd3f ;;
+    V-QD-CPUREF-ADMIT)
+      c48_fix_dir=cpu-lru-refresh-admit
+      c48_fix_sha=84c9974a5fb739582fa59c315ef087547a9873889cd590ddefa5a8eee5447844 ;;
     *) return 0 ;;
   esac
   c48_fix_source="$1/.github/benchmark/c48-model-gap/${c48_fix_dir}/manager.py"

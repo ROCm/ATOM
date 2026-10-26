@@ -1,0 +1,19 @@
+{
+  "name": "simple_cpu_offload_refresh_gpu_hit_prefix_at_admission",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "source": "https://github.com/vllm-project/vllm/pull/62444 @ be4275d2246d2bca62b921a07a636479bc74fa0c, net diff vs 852989f58 applied to the base",
+  "changes": [
+    "Eager mode: get_num_new_matched_tokens records the GPU hit length; update_state_after_alloc moves the CPU copy of that prefix (full-attention blocks, sliding window, Mamba state at the boundary) to the MRU end once per admission"
+  ],
+  "cases": [
+    "V-QD-CPUREF-ADMIT"
+  ],
+  "files": [
+    {
+      "relative_path": "v1/simple_kv_offload/manager.py",
+      "mount_source": "manager.py",
+      "base_sha256": "3d076547bc16729e1c91238315c384fcfddf9cfd1f1e418d430ae542b7b8e1e5",
+      "patched_sha256": "84c9974a5fb739582fa59c315ef087547a9873889cd590ddefa5a8eee5447844"
+    }
+  ]
+}
