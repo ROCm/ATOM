@@ -127,8 +127,12 @@ Expected output: `ROCm/ATOM` (or `zufayu/ATOM` while registered against the fork
 ## 4. Bot identity
 
 P0 needs no token for this (`rocm-atom-bot` doesn't exist yet). When it does: set the repo secret
-`ATOM_BOT_TOKEN` to the bot account's PAT. The workflow uses it only in the claim and publish
-steps — never in the review step — so the review agent cannot read it.
+`ATOM_BOT_TOKEN` to the bot account's PAT. The workflow binds it as a step env var at five
+places (gate's queue step, the watchdog job, review's claim step, review's notify step, and the
+report job) — including steps that run inside the review job. The one step that is never given
+it is `run_one.sh`'s own "Review (headless GLM)" step: that step carries no `ATOM_BOT_TOKEN` env,
+and `run_one.sh` never reads or exports that name itself, so the headless review agent that runs
+over untrusted PR content has no path to the token even though other steps in the same job do.
 
 ## 5. Keep it running across reboots *and* container restarts (host only)
 

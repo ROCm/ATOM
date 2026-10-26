@@ -65,7 +65,9 @@ WORKER_CMD=("$AGENT" -p --dangerously-skip-permissions)
 REFUTER_CMD=("${ATOM_REVIEW_REFUTER_AGENT:-$AGENT}" -p --dangerously-skip-permissions)
 say() { echo "[run_one #$PR] $*"; }
 # Classify a failed review and expose it so the notify step @-mentions the RIGHT owner:
-#   atom -> GLM/backend (honglie) | flow -> this review pipeline (bot owner) | env -> runner box.
+#   atom -> GLM/backend | flow -> this review pipeline | env -> runner box.
+# Who that resolves to is owners.txt's job, not this comment's -- it already drifted once
+# naming a person by hand; see owners.txt for the live class -> owner map.
 # Writes <class>TAB<message> to the status file the workflow reads, plus an ::error annotation.
 fail() {  # <class> <exit-code> <message...>
   local cls="$1" code="$2"; shift 2

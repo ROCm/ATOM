@@ -104,6 +104,17 @@ finding that reached the card without being attacked, etc.).
   model can cheat the review; loosening it to clear a red defeats the one thing gates
   are for.
 
+**A `7 green / 0 findings` card is not proof the gates did work — it may be proof they
+were never asked to.** With zero findings, `run_one.sh` writes the `NONE AVAILABLE`
+refutation line itself and the refuter never runs; a `refutations.txt` holding only a
+comment still clears the refutations gate the same way. An empty card is therefore the
+cheapest path through the whole pipeline for a worker that did not look, and every gate
+can read green without a model ever having been asked to defend a finding. This is
+inherited from aiter, not an ATOM port defect, and the fix is not to tighten the gates
+here — it is to read a `7 green / 0 findings` card the same way you would read a human
+reviewer who approved without comment: plausible on a trivial PR, worth a second look on
+anything else.
+
 ## 5. What's left for you
 
 Two things remain, both requiring a real shell on the host and your own credentials —
