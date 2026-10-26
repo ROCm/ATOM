@@ -35,39 +35,6 @@ def uses_dflash_pool(draft_hf) -> bool:
     return arch in _DFLASH_POOL_ARCHS
 
 
-def uses_sglang_block_attn() -> bool:
-    """Whether the GQA block read goes through SGLang's two-stage verify kernel.
-
-    `verify_shared_kv_fwd` (vendored under `model_ops/attentions/sglang_port/`)
-    splits the block's one attention into a PREFIX pass over the paged pool and
-    an in-register L_EXT x L_EXT pass over the block's own freshly computed K/V,
-    merged by LSE inside the kernel. That is the exact arrangement SGLang's
-    `TritonAttnBackend.forward_extend` validated for this draft checkpoint, and
-    it replaces the aiter `mha_v3.flash_attn_with_kvcache(causal=False)` read
-    that attends prefix and block together out of the pool.
-
-    NO DCP ARGUMENT, because the draft has no DCP. `verify_shared_kv_fwd`
-    returns only `o` and never an LSE, so it cannot serve a rank holding a
-    disjoint token shard -- and SGLang never asks it to: a draft runner there
-    does not join the dcp group at all. A Qwen3.5 draft shards its KV at plain
-    TP (`models/qwen3_5.py:1111-1113`, "Drafts are TP-sharded and do not
-    replicate KV under DCP", `dcp_size = 1 if is_nextn else attn_dcp_size`) and
-    DFlash's own attention never reads `attn_dcp_size` at all -- it shards q,
-    k and v by `tp_size` flat (`models/dflash.py:146-171`). ATOM now mirrors
-    that: the TARGET stays at DCP8, the draft runs at DCP1 over a pool whose
-    entry is `block_size * dcp_size` tokens wide, and every rank holds the
-    whole prefix for its own TP head slice.
-
-    `ATOM_K3_DRAFT_SGLANG_ATTN=0` forces the aiter `mha_v3` read back on, so
-    the two can be A/B'd against each other on one build. It is the SAME pool
-    either way -- `fa_views` is entry-granular, which is the page the aiter
-    read's `page_table` names.
-    """
-    from atom.utils import envs
-
-    return envs.ATOM_K3_DRAFT_SGLANG_ATTN
-
-
 def draft_kv_builder(model_runner, draft_hf):
     """The KV builder a draft needs of its own, or None if it needs none.
 
@@ -150,11 +117,11 @@ def draft_kv_builder(model_runner, draft_hf):
         kv_dtype=dtypes.d_dtypes[kv_cache_dtype],
         blocks_per_entry=dcp_size,
         # PER-TENSOR, which is what makes the fp8 pool possible at all. The
-        # draft's read is SGLang's `verify_shared_kv_fwd`, whose `k_scale` /
-        # `v_scale` are python floats folded into `qk *= sm_scale * k_scale`
-        # once per program; its write is `aiter.reshape_and_cache_flash`, whose
-        # HIP kernel dereferences `*k_scale` once per launch. Neither can read
-        # a per-(kv head, token) plane, and SGLang stores none -- it refuses
+        # draft's read is aiter `unified_attention`, which loads one
+        # `k_descale`/`v_descale` per program; its write is
+        # `aiter.reshape_and_cache_flash`, whose HIP kernel dereferences
+        # `*k_scale` once per launch. Neither can read a per-(kv head, token)
+        # plane, and SGLang stores none -- it refuses
         # outright ("Only support per-tensor scaling factor for fp8 KV cache",
         # `srt/layers/quantization/kv_cache.py:76`). So the planes are not
         # declared rather than declared and ignored: `scale_views` then raises
@@ -310,9 +277,10 @@ class DraftKvBuilder(PoolRowsMixin):
         runner = self.model_runner
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
         # The layout the DRAFT's reader needs, which is not always the target's.
-        # A non-causal block drafter reads through mha_v3, and that kernel hard
-        # unpacks four axes -- SHUFFLE's x-pack splits head_dim across two of
-        # them, so it cannot be offered at all. Same bytes either way.
+        # The DFlash read takes the 4-D FLASH page at the entry's width, which
+        # is `block_size * dcp` tokens; SHUFFLE would need a power-of-two page
+        # and its x-pack splits head_dim across two axes. Same bytes either
+        # way.
         k_cache, v_cache = (
             self.kv_pool.fa_views(idx)
             if self._non_causal
@@ -320,7 +288,7 @@ class DraftKvBuilder(PoolRowsMixin):
         )
         module.max_model_len = runner.config.max_model_len
         if self._non_causal:
-            # PYTHON FLOATS, not views, and never `scale_views`: a non-causal
+            # PYTHON FLOATS, not views, and never `scale_views`: the DFlash
             # draft's pool declares no scale planes (`per_tensor_scales`), so
             # asking for them is the `KeyError` that method promises. 1.0 is
             # SGLang's own default for an fp8 KV cache with nothing in the
@@ -328,7 +296,7 @@ class DraftKvBuilder(PoolRowsMixin):
             # default value of 1.0" (`srt/layers/quantization/kv_cache.py`) --
             # and it is what both ends of this pool consume:
             # `reshape_and_cache_flash` divides by it on the write,
-            # `verify_shared_kv_fwd` multiplies by it on the read. Set for bf16
+            # `unified_attention` multiplies by it on the read. Set for bf16
             # too, so the two ends never have to ask the dtype what kind of
             # scale they hold.
             #

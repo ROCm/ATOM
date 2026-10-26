@@ -250,16 +250,6 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 |----------|------|---------|-------------|
 | **ATOM_DSPARK_FUSED_MARKOV_SAMPLE** | bool | 1 (true) | Sample the DSpark block with a fused Triton kernel that computes the rank-`r` bias GEMV, adds the base logits in the GEMM epilogue and reduces to token ids in registers — so `W2` stays bf16 and is read exactly once per block position, and no `[B, V]` intermediate exists. Covers both native DSpark block samplers, Kimi-K3 (`r=256`) and DeepSeek-V4 (`r=512`); the op is shape-generic and hands anything it cannot index back to the reference, but only K3 has been run on hardware. Tie-breaking matches `torch.argmax` (lowest index). The bias moves from an fp32 matmul to bf16 MFMA with an fp32 accumulator: every product is exact in fp32 either way, so the result is equal to the reference up to accumulation order. Measured on Kimi-K3 (MI355X, TP8, fp8 KV, full GSM8K 5-shot at 64 concurrency): acceptance 87.08% against 87.06% unfused with the accept-length distribution equal to within 0.1pp, and flexible-extract inside the run-to-run band. Saves 145 µs per drafting step at B=1 and ~235 µs at B=64. Set to `0` to force the reference spelling if an acceptance-rate regression is suspected — the two paths are not bit-identical by construction, so this is the fastest way to rule the kernel in or out. Read at Markov-head construction, so set it before the server starts. |
 
-### Kimi-K3 DFlash draft
-
-The Kimi-K3 DFlash draft is a standalone SpecForge-trained block drafter with a
-GQA backbone, so it owns a KV pool of its own and reads it non-causally. See
-`atom/models/kimi_k3_dflash.py` and `atom/spec_decode/draft_kv.py`.
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **ATOM_K3_DRAFT_SGLANG_ATTN** | bool | 1 (true) | Take the DFlash draft's block attention through the SGLang two-stage verify kernel vendored under `atom/model_ops/attentions/sglang_port/`, which splits the block's one attention into a prefix pass over the paged pool and an in-register pass over the block's own freshly computed K/V, merged by LSE inside the kernel. Set to `0` to fall back to the aiter `mha_v3.flash_attn_with_kvcache(causal=False)` read, which attends prefix and block together out of the pool. The fallback requires a bf16 draft KV pool — it cannot read the fp8 one — and the draft pool inherits the target's dtype, so it needs the target run at `--kv_cache_dtype bf16` (ATOM registers that flag in underscore form only). It is the same pool either way (`fa_views` is entry-granular, which is the page the aiter read's `page_table` names); the two differ only in how the block's attention is decomposed, which makes this the fastest way to rule the vendored kernel in or out if the draft is suspected. Affects only a DFlash draft; no other model reads it. Read once when the draft attention and the proposer are built, so set it before the server starts. |
-
 ### Qwen3 style
 
 | Variable | Type | Default | Description |

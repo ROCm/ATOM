@@ -47,14 +47,6 @@ class DSparkProposer(Drafter):
     driven by a confidence schedule (variable-length, Level B) verification.
     """
 
-    #: Which read the paged GQA block takes. A CLASS default because
-    #: `_init_draft_block_buffers` consults it and is reachable from a proposer
-    #: assembled by `__new__` (the metadata-build tests do exactly that), and
-    #: because False -- "not the SGLang verify kernel" -- is the answer for
-    #: every flavor but one. `__init__` overwrites it from
-    #: `uses_sglang_block_attn`, which is the same function the MODEL asks.
-    _sglang_block_attn: bool = False
-
     #: The draft's own context slot mapping and the token ramp that builds it.
     #: CLASS defaults because `_init_draft_block_buffers` is reached only on
     #: the standalone-draft path, while `compute_draft_kv` -- which reads these
@@ -82,15 +74,6 @@ class DSparkProposer(Drafter):
         # address and size itself in LOCAL (per-rank) terms. 1 when -dcp is unset.
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
-        # Which read the GQA draft's block takes, resolved ONCE and from the
-        # same function the model asks (`KimiK3DFlashAttention.__init__`), so
-        # the CSR built below and the kernel that consumes it cannot end up
-        # disagreeing about whether the block's own T tokens belong in it.
-        from atom.spec_decode.draft_kv import uses_sglang_block_attn
-
-        self._sglang_block_attn = (
-            self._draft_uses_dflash_pool and uses_sglang_block_attn()
-        )
         if self._with_draft:
             self._init_draft_block_buffers()
 
@@ -259,28 +242,6 @@ class DSparkProposer(Drafter):
         self._blk_kv_indices = torch.zeros(
             max_bs * (self.config.max_model_len + t), **i32
         )
-
-        # The SGLang read's prefix CSR reuses `_blk_kv_indptr`/`_blk_kv_indices`
-        # above -- it is the same buffer holding a STRICTLY SHORTER stream (the
-        # block's own T tokens are dropped from every row), and on that path
-        # nothing else reads them: `_build_paged_block_metadata` returns before
-        # the aiter-MLA work plan, which is the only other consumer. These two
-        # are what it needs on top, both O(max_bs) and allocated only where the
-        # path is armed so the other configurations' memory image is unchanged.
-        if self._sglang_block_attn:
-            # Per-request PREFIX length = anchor + 1, i.e. `_blk_ctx_lens` minus
-            # the block. Kept separate rather than derived in place because
-            # `_blk_ctx_lens` is still published as `attn_metadata.context_lens`.
-            self._blk_prefix_lens = torch.zeros(max_bs, **i32)
-            # `create_flashinfer_kv_indices_triton` indexes its table through a
-            # req_pool_indices indirection (SGLang's req_to_token is a shared
-            # arena addressed by pool slot). ATOM's block_tables are already
-            # batch-major, so the indirection is the identity -- a constant
-            # ramp, built once.
-            self._blk_req_rows = torch.arange(max_bs, **i32)
-        else:
-            self._blk_prefix_lens = None
-            self._blk_req_rows = None
 
         if self._draft_uses_dflash_pool:
             # The DRAFT's own context slot mapping, one slot per token of the
@@ -1118,7 +1079,9 @@ class DSparkProposer(Drafter):
         # indices than the generator writes: `kv_indices_generate_kernel` masks
         # its store with `block_cols < n_cols` (block_convert.py), so entries
         # past the block table's width are simply skipped and the decode would
-        # read whatever the previous step left in `_blk_kv_indices`. The bound
+        # read whatever the previous step left in `_blk_kv_indices`. The DFlash
+        # read, which builds no CSR, walks `block_tables` up to `ctx_lens`
+        # itself, so the same bound keeps it inside the table. The bound
         # is each branch's own unit: `block_size` of THIS rank's tokens per
         # entry when the draft is DCP-sharded (a rank packs its round-robin
         # share of a virtual block densely into one page), the full
@@ -1141,49 +1104,28 @@ class DSparkProposer(Drafter):
         attn_metadata.context_lens = ctx_lens
         attn_metadata.max_seqlen_q = T
         attn_metadata.max_seqlen_k = max_seqlen_k
+        if self._draft_uses_dflash_pool:
+            # The DFlash read (`dspark_draft_attn`) takes `block_tables` and
+            # `context_lens` above as its own block table and key counts, the
+            # block rows included, and derives its own tiling: it reads no CSR
+            # and plans nothing, so neither is built. The CSR fields stay bound
+            # to their buffers so nothing downstream sees a stale step's.
+            attn_metadata.kv_indptr = self._blk_kv_indptr[: running_bs + 1]
+            attn_metadata.kv_indices = self._blk_kv_indices
+            attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
+            return
         kv_indptr = self._blk_kv_indptr[: running_bs + 1]
-        # WHAT THIS CSR COVERS depends on which kernel reads it.
-        #
-        # The aiter read attends prefix and block TOGETHER out of the pool, so
-        # its stream is `ctx_lens` = anchor + 1 + T. SGLang's two-stage kernel
-        # takes the block's K/V separately as `k_extend`/`v_extend` (the
-        # pre-cache tensors, before `_write_block_kv` even matters), so its
-        # stream must stop at the anchor -- handing it the longer one would put
-        # every block key in the same softmax twice, which is not a no-op.
-        #
-        # `ctx_lens` here is the TRUE GLOBAL length -- `anchor + 1 + T`, not a
-        # per-rank count -- so this subtraction is the true full prefix. There
-        # is no local/global distinction left to get wrong: the draft is not in
-        # the dcp group and holds every token of it.
-        #
-        # Subtracting from the already-CLAMPED `ctx_lens` rather than
-        # recomputing from `anchor_positions`: the clamp is what keeps the
-        # stream inside the block table's width, and a prefix is always at
-        # least that much shorter. The floor at 1 is the KERNEL's and is
-        # provably inert, not a correction: a zero-length prefix makes stage 1
-        # divide 0/0 and add -inf + log(0), i.e. NaN (verify_mla.py:375-376),
-        # and no row can produce one -- the anchor is a POSITION, so
-        # `anchor + 1 >= 1`, and the pad tail's `_paged_pad_ctx_len` is the
-        # anchor-at-0 row's `1 + T`. It is there so that stays true if either
-        # of those ever moves.
-        prefix_lens = None
-        if self._sglang_block_attn:
-            prefix_lens = self._blk_prefix_lens[:running_bs]
-            torch.sub(ctx_lens, T, out=prefix_lens)
-            prefix_lens.clamp_(min=1)
         # kv_indptr[0] stays 0 (zero-init, never written). cumsum promotes
         # integers to int64, so land it through copy_ rather than out=.
-        kv_indptr[1:].copy_(
-            torch.cumsum(ctx_lens if prefix_lens is None else prefix_lens, dim=0)
-        )
-        # The generator walks block_tables up to this bound, and for a
-        # DCP-SHARDED draft those rows are LOCAL while max_seqlen_k stays
-        # global, so handing it over unscaled would run dcp_world_size times
-        # past each row's valid entries and emit slots from unmapped pages.
-        # Overestimating is fine -- kv_indptr caps the real per-seq count.
+        kv_indptr[1:].copy_(torch.cumsum(ctx_lens, dim=0))
+        # The generator walks block_tables up to this bound, and under DCP those
+        # rows are LOCAL while max_seqlen_k stays global, so handing it over
+        # unscaled would run dcp_world_size times past each row's valid entries
+        # and emit slots from unmapped pages. Overestimating is fine --
+        # kv_indptr caps the real per-seq count.
         index_max_k = (
             max_seqlen_k // self.dcp_world_size + 1
-            if self._draft_is_dcp_sharded
+            if self.dcp_world_size > 1
             else max_seqlen_k
         )
         # The pad tail borrows block 0 for this one call, then gives its own
@@ -1205,73 +1147,13 @@ class DSparkProposer(Drafter):
             saved_page0.copy_(borrowed)
             borrowed.zero_()
         try:
-            if prefix_lens is not None:
-                # SGLang's own gatherer, not ATOM's, and called exactly as
-                # SGLang's `KVIndexTranslator.fill_packed_read_stream` calls
-                # it -- `kv_start_idx=None`, so every row starts at 0.
-                #
-                # ENTRY_PAGE_SIZE is the draft pool's ENTRY SPAN, not SGLang's
-                # 1: their `req_to_token` is token-granular, where ATOM only
-                # ever has the page-granular `block_tables`. That is the arm the
-                # kernel was given for exactly this case (kv_indices.py:89-97)
-                # and it rebuilds the identical ids -- `token = entry * ps +
-                # pos % ps` is the same expression `slots` was built with above
-                # and the same flat space `_attend_sglang`'s pool view reads at.
-                # Handing it `block_size` instead would address one eighth of
-                # each entry under DCP8 and alias eight requests onto one page.
-                from atom.model_ops.attentions.sglang_port.kv_indices import (
-                    create_flashinfer_kv_indices_triton,
-                    kv_indices_num_token_blocks,
-                )
-
-                # 2D grid, as SGLang launches the SAME kernel
-                # (`aiter_backend.py:2043-2052`). The 1D form this replaced ran
-                # ONE program per request, crawling the whole context serially
-                # -- the failure mode the kernel's own docstring names
-                # (kv_indices.py:45-50): "one program crawling the whole
-                # context serially (which bottlenecks long-context spec decode,
-                # where this kernel runs every iteration)". ATOM vendored
-                # `kv_indices_num_token_blocks` for this without ever calling
-                # it; the 2D launch below is the first call site.
-                #
-                # It matters HERE and not for the MLA draft because this draft
-                # is not in the dcp group: it crawls the FULL context where a
-                # DCP-sharded draft crawls 1/dcp of it. The serial work per
-                # program is therefore linear in context length, so the draft's
-                # forward rate decays as the context grows while a DCP-sharded
-                # draft's holds. SGLang launches this same kernel 2D at the
-                # identical draft-DCP1 shape.
-                #
-                # `table_width` is STATIC -- the padded table's token span. Do
-                # NOT use `prefix_lens.max()`: it is a device tensor, so that
-                # would sync the host on every draft step and cost more than
-                # this saves. The helper saturates at `512 // bs` anyway, so a
-                # bound is as good as the exact length.
-                num_token_blocks = kv_indices_num_token_blocks(
-                    block_tables.shape[1] * entry_tokens, running_bs
-                )
-
-                create_flashinfer_kv_indices_triton[(running_bs, num_token_blocks)](
-                    block_tables,
-                    self._blk_req_rows[:running_bs],
-                    prefix_lens,
-                    kv_indptr,
-                    None,  # kv_start_idx: python None, so the kernel
-                    # specializes the offset away rather than taking a runtime
-                    # zero it would have to branch on.
-                    self._blk_kv_indices,
-                    block_tables.stride(0),
-                    ENTRY_PAGE_SIZE=entry_tokens,
-                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
-                )
-            else:
-                kv_indices_generate_triton(
-                    block_tables,
-                    self._blk_kv_indices,
-                    kv_indptr,
-                    block_size,
-                    index_max_k,
-                )
+            kv_indices_generate_triton(
+                block_tables,
+                self._blk_kv_indices,
+                kv_indptr,
+                block_size,
+                index_max_k,
+            )
         finally:
             if n_pad:
                 block_tables[scheduled_bs:, 0].copy_(saved_page0)
@@ -1291,14 +1173,6 @@ class DSparkProposer(Drafter):
                 block_table_state(self.runner.forward_vars["block_tables"]).lengths,
                 scheduled_bs,
             )
-            return
-
-        if self._draft_uses_dflash_pool:
-            # A GQA draft reads through mha_v3, which plans nothing: it takes
-            # the page table and `cache_seqlens` directly and derives its own
-            # tiling. Everything below this point is the aiter MLA persistent
-            # work plan -- head padding, split budget, work descriptors -- and
-            # none of it has an MHA counterpart to fill in.
             return
 
         # Build persistent (ps=1) MLA-decode metadata

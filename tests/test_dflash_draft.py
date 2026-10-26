@@ -2,13 +2,16 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Unit tests for the SpecForge DFlash draft (RadixArk/Kimi-K3-DSpark).
 
-GPU-free. Covers the three things that decide whether the draft is even
-reachable, and that no amount of GPU bring-up would localize:
+GPU-free except the block-read check, which skips without one. Covers the
+things that decide whether the draft is even reachable, and that no amount of
+GPU bring-up would localize:
 
 - config normalization: the arch rename and the nested ``dflash_config`` lift
 - attention-flavor resolution: the draft must resolve to MHA and own a KV pool
 - KV-pool geometry: the scheduler block size, and the DCP head-sharding
   invariant that makes a DCP8 step additive rather than a rewrite
+- the block read: the fold that makes aiter's causal `unified_attention` read
+  the block bidirectionally, and that read against an fp32 reference
 
 The checkpoint these mirror is ``RadixArk/Kimi-K3-DSpark``: a 5-layer Qwen3-style
 GQA draft (64 q / 16 kv heads, head_dim 64) for the Kimi-K3 MLA+KDA target.
@@ -373,10 +376,10 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
     SGLang serves this checkpoint with `--speculative-draft-kv-cache-dtype
     fp8_e4m3`, and both ends of ATOM's pool take exactly the scale it stores:
     `aiter.reshape_and_cache_flash` dereferences `*k_scale` once per launch and
-    `verify_shared_kv_fwd` folds `float(k_scale)` into its qk. Neither can read
-    a per-(kv head, token) plane, so the pool must declare none -- `per_tensor_
-    scales=True`. Getting that wrong is not a crash: `verify_shared_kv_fwd`
-    catches the `float()` ValueError and silently substitutes 1.0.
+    `unified_attention` loads one `k_descale` per program. Neither can read a
+    per-(kv head, token) plane, so the pool must declare none -- `per_tensor_
+    scales=True`. Getting that wrong is not a crash: both read the plane's
+    first element and apply it to every token.
 
     `float8_e4m3fn` specifically, never `fnuz`: triton upcasts fnuz to fp16 on
     gfx950, which measures slower than the bf16 it was meant to beat.
@@ -480,7 +483,7 @@ def test_dflash_pool_is_built_at_full_tp(tp, dcp):
     The DCP-invariance test above builds the pool by calling `_pool` directly,
     so it pins the ARITHMETIC but not the PLUMBING -- and that arithmetic is
     satisfied by the OLD geometry too (heads replicated at tp // dcp, tokens
-    sharded), which is the one that cannot be read by `verify_shared_kv_fwd`.
+    sharded), which a read that returns no LSE cannot merge across ranks.
     This is the test that pins which of the two is built.
     """
     dk = pytest.importorskip(
@@ -945,9 +948,9 @@ def test_dcp_guard_admits_an_mtp_draft():
 def test_dcp_guard_message_names_the_real_reason():
     """The refusal text must describe DCP1, not a replicate-and-merge scheme.
 
-    `verify_shared_kv_fwd` returns only `o` and never an LSE, so the draft
-    cannot merge per-rank partial softmaxes -- it is exempt because it never
-    joins the dcp group (`spec_decode/draft_kv.py:46-57`). A message claiming
+    The draft's read returns only `o` and never an LSE, so the draft cannot
+    merge per-rank partial softmaxes -- it is exempt because it never joins the
+    dcp group (`draft_kv_builder`). A message claiming
     otherwise sends a reader looking for machinery that does not exist.
     """
     import os
@@ -1060,20 +1063,150 @@ def test_pages_past_the_table_are_dropped_not_clamped():
     assert out.tolist() == [10 * vblock, 13 * vblock, -1]
 
 
-def test_prefix_len_is_the_context_minus_the_block_floored_at_one():
-    """Mirrors `dspark_proposer.py:1185-1187`.
+# --------------------------------------------------------------------------- #
+# the block read (model_ops/attentions/dspark_draft_attn.py)
+#
+# `unified_attention` asserts causal; the read gets a non-causal block out of it
+# by folding each request's T rows into its head axis and decoding ONE row per
+# request. The fold is pure tensor reshaping and runs anywhere; the kernel check
+# below needs a GPU.
+# --------------------------------------------------------------------------- #
 
-    Stage 1 needs a NON-EMPTY prefix: a zero-length one divides 0/0 and adds
-    log(0) (`verify_mla.py:375-376`), i.e. NaN. The anchor is a position, so
-    `ctx - T >= 1` already holds for every real row; the floor keeps that true
-    if either side ever moves.
+
+def _fold_mod():
+    pytest.importorskip("torch")
+    from atom.model_ops.attentions import dspark_draft_attn
+
+    return dspark_draft_attn
+
+
+@pytest.mark.parametrize("bs,T,hkv,g", [(1, 7, 2, 4), (3, 7, 2, 4), (2, 4, 1, 8)])
+def test_block_fold_puts_every_row_on_its_own_kv_head(bs, T, hkv, g):
+    """`unified_attention` reads head `j` against KV head `j // (T * G)`.
+
+    So in the folded layout, every one of a request's T rows times its G query
+    heads per KV head must sit in that KV head's contiguous run -- and nothing
+    of another request's. Tag each element with (request, row, query head) and
+    read the tags back.
     """
     import torch
 
-    T = 7
-    ctx_lens = torch.tensor([64, 8, 7, 1], dtype=torch.int32)
-    prefix = torch.empty_like(ctx_lens)
-    torch.sub(ctx_lens, T, out=prefix)
-    prefix.clamp_(min=1)
-    assert prefix.tolist() == [57, 1, 1, 1]
-    assert int(prefix.min()) >= 1, "a zero-length prefix NaNs stage 1"
+    dda = _fold_mod()
+    hq = hkv * g
+    b = torch.arange(bs).view(bs, 1, 1).expand(bs, T, hq)
+    t = torch.arange(T).view(1, T, 1).expand(bs, T, hq)
+    h = torch.arange(hq).view(1, 1, hq).expand(bs, T, hq)
+    # One scalar per (b, t, h), carried in the D axis so the fold moves it.
+    tag = torch.stack([b, t, h], dim=-1).reshape(bs * T, hq, 3)
+
+    qf = dda.fold_block_queries(tag, bs, hkv)
+    assert qf.shape == (bs, hkv * T * g, 3)
+    for req in range(bs):
+        for j in range(hkv * T * g):
+            fb, ft, fh = qf[req, j].tolist()
+            assert fb == req
+            # The head the kernel assigns, and the head the row's query head
+            # belongs to in the unfolded GQA layer.
+            assert j // (T * g) == fh // g
+            # Inside that run: row-major over (t, g), i.e. `(kv_head, t, g)`.
+            assert (j % (T * g)) // g == ft
+            assert j % g == fh % g
+
+    out = torch.empty_like(tag)
+    dda.unfold_block_output(qf, out, hkv)
+    assert torch.equal(out, tag)
+
+
+def _reference_block_attn(q, k_pool, v_pool, block_tables, kv_lens, scale, hkv):
+    """Bidirectional GQA attention of each request's T rows over its pool rows,
+    in fp32, gathered slot by slot from the block table."""
+    import torch
+
+    bs = kv_lens.shape[0]
+    rows, hq, d = q.shape
+    T, g, E = rows // bs, hq // hkv, k_pool.shape[1]
+    out = torch.empty(rows, hq, d, dtype=torch.float32, device=q.device)
+    for b in range(bs):
+        n = int(kv_lens[b])
+        pos = torch.arange(n, device=q.device)
+        ent = block_tables[b, pos // E].long()
+        k = k_pool[ent, pos % E].float()  # [n, hkv, d]
+        v = v_pool[ent, pos % E].float()
+        qb = q[b * T : (b + 1) * T].float().view(T, hkv, g, d)
+        s = torch.einsum("thgd,nhd->thgn", qb, k) * scale
+        p = torch.softmax(s, dim=-1)
+        out[b * T : (b + 1) * T] = torch.einsum("thgn,nhd->thgd", p, v).reshape(
+            T, hq, d
+        )
+    return out
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("far_entries", [False, True])
+def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_entries):
+    """The folded `unified_attention` read IS the block's non-causal attention.
+
+    Draft shape at TP8: 8 q / 2 kv heads, head_dim 64, T = 7, an entry of
+    `block_size 128 * dcp 8 = 1024` tokens. Requests of different lengths, one
+    ending mid-entry, so a causal mask -- which a non-folded read would apply
+    -- would change every row but the last.
+
+    `far_entries` puts a request's pages past entry 16384, where
+    `entry * page_stride` (1024 * 2 * 64 per entry) passes 2**31: the boundary
+    a 32-bit address computation wraps at.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    pytest.importorskip("aiter")
+    dda = _fold_mod()
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    bs, T, hkv, g, d, E = 3, 7, 2, 4, 64, 1024
+    hq = hkv * g
+    kv_lens = torch.tensor([3 * E + 5, E - 1, 2 * E], dtype=torch.int32, device=dev)
+    W = 4
+    base = 16383 if far_entries else 0
+    n_entries = base + bs * W + 1
+    # Distinct, shuffled entry ids per request, so a wrong row of the table
+    # reads another request's keys rather than the right ones by accident.
+    ids = (base + torch.randperm(bs * W)).view(bs, W).to(torch.int32)
+    block_tables = ids.to(dev)
+
+    k_pool = torch.randn(n_entries, E, hkv, d, device=dev, dtype=torch.bfloat16)
+    v_pool = torch.randn_like(k_pool)
+    if kv_dtype == "fp8":
+        from aiter import dtypes
+
+        k_pool, v_pool = k_pool.to(dtypes.fp8), v_pool.to(dtypes.fp8)
+    q = torch.randn(bs * T, hq, d, device=dev, dtype=torch.bfloat16)
+    scale = d**-0.5
+
+    read = dda.DSparkDraftUnifiedAttention(dev, max_bs=8)
+    o = torch.empty_like(q)
+    one = torch.ones(1, dtype=torch.float32, device=dev)
+    read(q, k_pool, v_pool, block_tables, kv_lens, o, scale, 1.0, 1.0, one, one)
+
+    ref = _reference_block_attn(q, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
+    torch.testing.assert_close(o.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_the_read_needs_no_csr_from_the_proposer():
+    """The DFlash path returns before the generic CSR build.
+
+    Source-level, like the guard-message test above: the proposer's metadata
+    build is a method on a fully wired runner. What it pins is that the early
+    return for the DFlash pool sits AHEAD of the `kv_indices_generate_triton`
+    call, so the read's block table is the only addressing published for it.
+    """
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "atom", "spec_decode", "dspark_proposer.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    body = src[src.index("    def _build_paged_block_metadata(") :]
+    early = body.index("        if self._draft_uses_dflash_pool:\n")
+    assert early < body.index("kv_indices_generate_triton(")
+    assert "return" in body[early : body.index("kv_indices_generate_triton(")]

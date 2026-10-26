@@ -297,12 +297,11 @@ class MhaKvPool:
     def fa_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k, v)`, aliasing the pool, in FLASH layout.
 
-        `[entries, entry_tokens, kv_heads, head_dim]` -- the axis order aiter's
-        `mha_v3.flash_attn_with_kvcache` requires. It reads every axis through
-        its own stride, so a non-contiguous view would be fine, but it hard
-        unpacks FOUR axes: SHUFFLE cannot be offered to it at all, because the
-        x-pack splits `head_dim` across two non-adjacent axes and no permute of
-        a 5-D tensor can put it back.
+        `[entries, entry_tokens, kv_heads, head_dim]` -- the non-shuffled page
+        aiter's `unified_attention` reads at any page width. SHUFFLE needs a
+        power-of-two page there, and an entry is `block_size * dcp` tokens; its
+        x-pack also splits `head_dim` across two non-adjacent axes, so no
+        permute of the 5-D view gives this one back.
 
         The leading axis is the ENTRY and not the block, which is the one place
         this view differs from `kv_views`. A page table holds ENTRY ids -- that
@@ -316,12 +315,10 @@ class MhaKvPool:
         charges per byte (`mha_kv_fields`), so the element order costs nothing
         and only the reader's requirements decide it.
 
-        This is the layout a NON-CAUSAL reader needs, which is why it exists:
-        every aiter kernel that reads SHUFFLE is causal at `qlen > 1`
-        (`unified_attention` structurally, `pa_decode_gluon` by deriving
-        `is_causal = query_length > 1`, and the persistent ASM path has no
-        `Msk=0` kernel built on gfx950). A block-diffusion draft attends its
-        block bidirectionally, so it reads here instead.
+        This is the layout the DFlash draft's block read takes: it folds the
+        block into one `qlen == 1` row per request, so `unified_attention`'s
+        causal mask admits every key, and reads the entry-granular page
+        straight off the target's block ids.
         """
         nh, hd, et = self.num_kv_heads, self.head_dim, self.entry_tokens
         return (

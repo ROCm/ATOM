@@ -2356,11 +2356,9 @@ class Config:
                 # this tree does (the DFlash non-causal GQA block drafter,
                 # `uses_dflash_pool`; the target stays at DCP8 while the
                 # draft reads a pool whose entry is `block_size * dcp_size`
-                # tokens wide, `spec_decode/draft_kv.py:46-57`). Note
-                # `verify_shared_kv_fwd` returns only `o` and never an LSE, so
-                # it could not merge partial softmaxes even if asked. MLA is
-                # immune by
-                # construction: its cache is one latent row per token,
+                # tokens wide, `draft_kv_builder`). Its read returns no LSE,
+                # so it could not merge partial softmaxes even if asked. MLA is
+                # immune by construction: its cache is one latent row per token,
                 # replicated across TP, so DCP's token shard is the only shard.
                 #
                 # Every OTHER such draft (Eagle3-llama, a plain GQA speculator)

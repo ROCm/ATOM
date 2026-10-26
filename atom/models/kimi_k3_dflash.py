@@ -58,44 +58,31 @@ as bidirectional -- no error, no fault, just lost acceptance length.
 
 So the block pass does its own write and its own read:
 
-  write  `aiter.reshape_and_cache_flash` -- the block WRITES the KV it attends.
-         Kept on BOTH read paths below, because the next step's prefix is this
-         step's block: whatever the block attends, the pool has to end up
-         holding.
-  read   SGLang's `verify_shared_kv_fwd`, or aiter's
-         `mha_v3.flash_attn_with_kvcache(causal=False)` -- see
-         `_attend_non_causal`.
+  write  `aiter.reshape_and_cache_flash` -- the block WRITES the KV it attends,
+         before the read: the next step's prefix is this step's block, and the
+         read below takes the block's own rows out of the pool with the prefix.
+  read   aiter's `unified_attention` on the FOLDED block -- see
+         `_attend_non_causal` and `model_ops/attentions/dspark_draft_attn.py`.
 
-THE TWO READS
--------------
-`verify_shared_kv_fwd` (vendored verbatim under
-`model_ops/attentions/sglang_port/`) is the kernel SGLang's
-`TritonAttnBackend.forward_extend` validated against THIS checkpoint. It splits
-the single attention in two: a split-KV pass over the PREFIX in the paged pool,
-and an L_EXT x L_EXT pass over the block's own K/V held in registers, merged by
-LSE in the same program (`verify_mla.py:363-367`). `is_causal=False` makes that
-second half bidirectional, which is the whole point -- the block attends itself
-in both directions. The block's K/V therefore reach it TWICE over: once written
-to the pool for the next step, and once passed in as `k_extend`/`v_extend`,
-which is why the prefix CSR handed to it must EXCLUDE them (double-counting a
-key is not a no-op under softmax).
+THE READ
+--------
+`unified_attention` is the kernel `PagedAttentionImpl.paged_attention_unified`
+already decodes through, with the same per-tensor fp8 descale. It asserts
+`causal`, and `pa_decode_gluon` derives `is_causal = query_length > 1`, so no
+aiter paged-GQA entry point is non-causal at `qlen > 1`. A `qlen == 1` query is,
+by construction: the causal mask admits every key below `seqused_k`. So the
+block is FOLDED -- each request becomes ONE query row whose heads are its T
+block rows times its G query heads per KV head, `[bs, h_kv * T * G, d]` --
+and read as an all-decode batch over `[0, anchor + 1 + T)`. All `T * G` rows of
+a KV head share one KV tile, and the all-decode launch is the split-KV grid, so
+a long context is spread over segments rather than walked by one program.
 
-aiter's `mha_v3.flash_attn_with_kvcache` is the A/B fallback
-(`ATOM_K3_DRAFT_SGLANG_ATTN=0`), and the only aiter entry point that is
-non-causal at `qlen > 1` over a paged GQA cache (`unified_attention` asserts
-causal; `pa_decode_gluon` derives `is_causal = query_length > 1` and caps qlen
-at 4; gfx950 ships no `Msk=0` persistent ASM kernel). It reads prefix and block
-together out of the pool, so the CSR the proposer publishes differs between the
-two -- which is why both sides ask `uses_sglang_block_attn` rather than each
-deciding for itself. It is also bf16-only: it takes fp8 KV only when q is fp8
-too, and its descales are per-(batch, kv_head).
-
-That kernel hard-unpacks FOUR cache axes, so this draft's pool is bound in FLASH
-layout (`MhaKvPool.fa_views`) -- SHUFFLE's x-pack splits `head_dim` across two
-non-adjacent axes and cannot be offered to it by any permute. That same layout
-is what lets `verify_shared_kv_fwd` be fed at all: it wants a flat
-`[slot, h_kv, d]` buffer, and `[entries, entry_tokens, h_kv, head_dim]`
-collapses to exactly that with `slot = entry * entry_tokens + offset`.
+The kernel reads the 4-D FLASH layout `[entries, entry_tokens, h_kv, head_dim]`
+(`MhaKvPool.fa_views`) through `block_table` at any page size; SHUFFLE's x-pack
+would need `shuffled_kv_cache` and a power-of-two page. It widens block ids to
+int64 before scaling by the page stride, which this pool needs: an entry is
+`block_size * dcp` tokens, so `entry * stride` passes 2**31 well inside the
+pool sizes ATOM builds.
 
 NO DCP, AND WHY THE ENTRY IS WIDER THAN A BLOCK
 ----------------------------------------------
@@ -111,28 +98,27 @@ What that costs is a pool geometry, not an attention: the draft rides the
 TARGET's block ids, and under DCP8 one of those ids addresses `block_size`
 LOCAL tokens, i.e. `block_size * dcp_size` GLOBAL positions. So the draft's
 pool is built with `blocks_per_entry = dcp_size` and everything addressing it
--- the block pass's `slot_mapping`, the context write's, and the prefix CSR --
-is written in that virtual block. Per-rank bytes are unchanged: 8x the tokens
-against 8x fewer KV heads.
+-- the block pass's `slot_mapping`, the context write's, and the read's
+`block_table` -- is in that virtual block. Per-rank bytes are unchanged: 8x the
+tokens against 8x fewer KV heads.
 
 fp8, AND THE ONE SCALE
 ----------------------
-The pool is fp8_e4m3fn when the target's is fp8, which is what SGLang serves
-this checkpoint at (`--speculative-draft-kv-cache-dtype fp8_e4m3`). Both ends
-take ONE PER-TENSOR scale and neither can take anything else:
-`aiter.reshape_and_cache_flash` dereferences `*k_scale` once per launch, and
-`verify_shared_kv_fwd` folds `float(k_scale)` into `qk *= sm_scale * k_scale`.
-SGLang stores nothing else either -- it refuses, "Only support per-tensor
-scaling factor for fp8 KV cache" (`srt/layers/quantization/kv_cache.py:76`) --
-and defaults the value to 1.0 when the checkpoint carries no scale, which this
-one does not (verified, see `_store_cfg`). So the pool declares NO per-token
-scale planes
-(`mha_kv_scale_fields(per_tensor_scales=True)`) and the scale is a python 1.0.
+The pool is fp8_e4m3fn when the target's is fp8 (SGLang serves this checkpoint
+with `--speculative-draft-kv-cache-dtype fp8_e4m3`; ATOM's draft pool follows
+the target's `--kv_cache_dtype`). Both ends take ONE PER-TENSOR scale and
+neither can take anything else: `aiter.reshape_and_cache_flash` dereferences
+`*k_scale` once per launch, and `unified_attention` loads its `k_descale` /
+`v_descale` once per program. SGLang stores nothing else either -- it refuses,
+"Only support per-tensor scaling factor for fp8 KV cache"
+(`srt/layers/quantization/kv_cache.py:76`) -- and defaults the value to 1.0
+when the checkpoint carries no scale, which this one does not (verified, see
+`_store_cfg`). So the pool declares NO per-token scale planes
+(`mha_kv_scale_fields(per_tensor_scales=True)`) and the scale is 1.0.
 
-`float()` on a multi-element tensor raises ValueError, which
-`verify_shared_kv_fwd` CATCHES and answers with 1.0 (verify_mla.py:852-858) --
-a per-token plane reaching it would be silently ignored, not rejected. Hence
-the explicit `numel() == 1` guard in `_store_cfg`, the same shape as
+A per-token plane handed to either end would not raise: both read its first
+element and apply it to every token. Hence the explicit `numel() == 1` guard in
+`_store_cfg`, the same check as
 `AttentionImpl._reject_per_token_scales_on_unified` (attention_mha.py:182).
 
 `float8_e4m3fnuz` is NOT usable here: triton upcasts it to fp16 on gfx950, so
@@ -158,7 +144,6 @@ from atom.model_ops.linear import (
 from atom.model_ops.paged_attention import Attention
 from atom.models.dspark_draft import DSparkDraftModel
 from atom.models.kimi_k3_dspark import DSparkMarkovHead, _linear_out
-from atom.spec_decode.draft_kv import uses_sglang_block_attn
 
 logger = logging.getLogger("atom")
 
@@ -199,7 +184,7 @@ class KimiK3DFlashAttention(nn.Module):
         # across the DCP group at `tp_eff = tp // dcp` so the token round-robin
         # could be the only shard. It is numerically fine and it is not what
         # SGLang runs; it also forces every read through a kernel that returns
-        # an LSE, which rules out `verify_shared_kv_fwd`. The token axis is
+        # an LSE for a cross-rank merge. The token axis is
         # unsharded instead, and the pool pays for it in `blocks_per_entry`
         # rather than in bytes (see the module docstring).
         # NOTHING in this module reads `get_dcp_world_size()` any more, which
@@ -209,21 +194,11 @@ class KimiK3DFlashAttention(nn.Module):
         # it in (`DSparkProposer._draft_entry_tokens`) -- one number, decided
         # where the pool is built, never re-derived here.
         tp_full = get_tensor_model_parallel_world_size()
-        # Which of the two reads in the module docstring this layer takes. Read
-        # once, here, because it consults an env var and a per-forward
-        # `os.getenv` is a host call inside a captured region. The
-        # proposer asks the SAME function (`_build_paged_block_metadata`), so
-        # the CSR it publishes and the kernel that consumes it cannot disagree
-        # about whether the block's own T tokens are in it.
-        self.sglang_block_attn = uses_sglang_block_attn()
-        # `verify_shared_kv_fwd` sizes its stage-1 scratch (`att_out`/`att_lse`)
-        # from the batch it is first called at and only ever GROWS it. Growing
-        # is a `torch.empty` -- a host allocation, which inside a captured
-        # cudagraph binds the recording to a pool it then replays against
-        # forever. Hand it the engine's maximum from the first call so the one
-        # allocation happens before any capture and `grow_buffers` is a no-op.
-        # None is the graceful answer, not a guess: `verify_shared_kv_fwd` then
-        # sizes off the live batch, which is correct but may reallocate once.
+        # The engine's batch ceiling: it sizes the read's constant
+        # `cu_seqlens_q` ramp once, before any capture, so no replay ever
+        # allocates (`DSparkDraftUnifiedAttention`). None is the graceful
+        # answer, not a guess: the read then sizes off the live batch, which is
+        # correct eagerly but may reallocate once.
         self.max_num_seqs = None if max_num_seqs is None else int(max_num_seqs)
         if self.total_num_heads % tp_full != 0:
             raise ValueError(
@@ -241,6 +216,9 @@ class KimiK3DFlashAttention(nn.Module):
             assert tp_full % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_full)
 
+        # The block's read, built on the first forward that has a pool --
+        # see `_attend_non_causal`.
+        self._block_attn = None
         # `(kv_cache_dtype_str, k_scale_dev, v_scale_dev, k_scale, v_scale)` for
         # the pool this layer ends up bound to, resolved once on the first
         # forward that has one -- see `_store_cfg`.
@@ -357,9 +335,8 @@ class KimiK3DFlashAttention(nn.Module):
             o = q.new_zeros((n, self.num_heads * self.head_dim))
             return _linear_out(self.o_proj(o))
 
-        # The write stays FIRST and unconditional on both reads: the next
-        # block's prefix is this block's T rows, so they have to land in the
-        # pool whether or not this step's read gets them from there.
+        # The write goes FIRST: the read takes the block's own T rows out of
+        # the pool with the prefix, and the next block's prefix is these rows.
         self._write_block_kv(k, v, attn_metadata.slot_mapping[:n], k_cache, v_cache)
         o = self._attend_non_causal(q, k, v, attn_metadata, k_cache, v_cache)
         return _linear_out(self.o_proj(o))
@@ -404,10 +381,10 @@ class KimiK3DFlashAttention(nn.Module):
         "auto" stores the source dtype unchanged (and then never dereferences
         the scales), "fp8" divides by `*k_scale` and casts.
 
-        THE GUARD. `verify_shared_kv_fwd` does `float(k_scale)` inside a `try`
-        and answers 1.0 on ValueError (verify_mla.py:852-858) -- so a per-token
-        scale plane reaching it is not an error, it is a silent 1.0 against a
-        cache quantized at something else. Refused here instead, mirroring
+        THE GUARD. `unified_attention` loads its `k_descale` once per program
+        -- the FIRST element of whatever it is handed -- so a per-token scale
+        plane reaching it is not an error, it is that one token's scale applied
+        to every key. Refused here instead, mirroring
         `AttentionImpl._reject_per_token_scales_on_unified`
         (attention_mha.py:182). It is also what SGLang does, one layer up:
         "Only support per-tensor scaling factor for fp8 KV cache"
@@ -432,9 +409,9 @@ class KimiK3DFlashAttention(nn.Module):
                     f"DFlash draft layer {self.attn.layer_num} was bound a "
                     f"{name} with {scale.numel()} elements. Both its write "
                     "(aiter.reshape_and_cache_flash) and its read "
-                    "(SGLang verify_shared_kv_fwd) take ONE per-tensor scale, "
-                    "and the read answers a multi-element one with a silent "
-                    "1.0 rather than raising."
+                    "(aiter unified_attention) take ONE per-tensor scale, "
+                    "and both read the first element of a multi-element one "
+                    "rather than raising."
                 )
         k_f, v_f = float(k_scale), float(v_scale)
         # Not `== torch.bfloat16`: any 1-byte cache element is a quantized one
@@ -453,174 +430,63 @@ class KimiK3DFlashAttention(nn.Module):
         return self._store
 
     def _attend_non_causal(self, q, k, v, attn_metadata, k_cache, v_cache):
-        """The block's one non-causal read, through whichever kernel is armed.
+        """The block's one non-causal read: aiter `unified_attention`, folded.
 
-        `mha_v3.flash_attn_with_kvcache` is the only aiter entry point that is
-        non-causal at `qlen > 1` over a paged GQA cache: `unified_attention`
-        asserts causal, `pa_decode_gluon` derives `is_causal = query_length > 1`
-        and caps qlen at 4, and gfx950 ships no `Msk=0` persistent ASM kernel.
-        """
-        if self.sglang_block_attn:
-            return self._attend_sglang(q, k, v, attn_metadata, k_cache, v_cache)
-
-        from aiter.ops.triton.attention.mha_v3 import flash_attn_with_kvcache
-
-        if k_cache.dtype.itemsize == 1:
-            # The A/B escape hatch does NOT cover an fp8 pool. mha_v3 takes fp8
-            # KV only when q is fp8 too, and its descales are per-(batch,
-            # kv_head). Omitting them under fp8 does not raise -- it warns and
-            # substitutes 1.0 -- so this would A/B two kernels at two different
-            # numerics and read like a kernel regression. Refused instead.
-            raise NotImplementedError(
-                "ATOM_K3_DRAFT_SGLANG_ATTN=0 needs a bf16 draft KV pool; this "
-                f"one is {k_cache.dtype}. Run the target at --kv_cache_dtype "
-                "bf16 to A/B the two reads, or leave the SGLang read armed."
-            )
-
-        bs = attn_metadata.block_tables.shape[0]
-        t = q.shape[0] // bs
-        # NO `return_softmax_lse`, NO `dcp_lse_merge`, no second head count:
-        # the draft is not in the dcp group, so this local read already is the
-        # global softmax over this rank's TP head slice.
-        #
-        # `k_cache` is ENTRY-granular (`MhaKvPool.fa_views`), i.e. its page is
-        # `block_size * target_dcp` tokens wide -- which is exactly the span one
-        # entry of `page_table` names. Handing this kernel a `block_size`-wide
-        # view of the same bytes would make it read one eighth of each page and
-        # then stride into the next entry's.
-        out = flash_attn_with_kvcache(
-            q=q.view(bs, t, self.num_heads, self.head_dim),
-            k_cache=k_cache,
-            v_cache=v_cache,
-            # A Tensor, and mandatory: `page_table` alone does not route to
-            # the decode kernel, and the call falls into the prefill kernel
-            # and asserts on a batch mismatch.
-            cache_seqlens=attn_metadata.context_lens[:bs],
-            softmax_scale=self.scaling,
-            causal=False,
-            page_table=attn_metadata.block_tables,
-        )
-        return out.reshape(-1, self.num_heads * self.head_dim)
-
-    def _attend_sglang(self, q, k, v, attn_metadata, k_cache, v_cache):
-        """The block's read as SGLang's validated two-stage verify kernel.
-
-        Mirrors `TritonAttnBackend.forward_extend`'s `verify_shared_kv_fwd` call
-        (sglang_port/verify_mla.py:727), with the one deliberate difference that
-        `is_causal=False`: SGLang runs this for the TARGET's verify, where the
-        draft tokens form a causal chain, while a DFlash block attends itself
-        bidirectionally. That argument is plumbed all the way to the mask in
-        `_verify_mla_combine_stage2` (verify_mla.py:352-355), and
-        `can_handle` admits `is_causal=False` as long as no `custom_mask` rides
-        with it (verify_mla.py:678) -- we pass None.
-
-        THE SPLIT. Stage 1 reads the PREFIX out of the pool through
-        `(kv_indptr, kv_indices)`; stage 2 reads the block's own K/V out of
-        `k_extend`/`v_extend`. Those are the pre-cache tensors `_write_block_kv`
-        just stored, handed over directly -- so this layer never reads its own
-        T rows back out of the pool, and the CSR the proposer built for it
-        covers `[0, anchor]` ONLY. Feeding it the `anchor + 1 + T` length the
-        aiter path uses would make every block key appear twice in one softmax.
-
-        THE CACHE. `_caches` returns FLASH layout
-        `[entries, entry_tokens, h_kv, head_dim]`, built by
-        `MhaKvPool.field_view` through `.view(shape)` -- which only succeeds on
-        a contiguous tensor, so the result is contiguous in exactly that axis
-        order and `.view(-1, h_kv, head_dim)` is the free reshape to the
-        `[slot, h_kv, d]` buffer the kernel wants, with
-        `slot = entry * entry_tokens + offset`. That is the same id space the
-        vendored `create_flashinfer_kv_indices_triton` emits at
-        `ENTRY_PAGE_SIZE = entry_tokens`, and the same one `slot_mapping` writes
-        through. No copy, and the `.view` would raise rather than silently
-        reinterpret if the pool ever stopped being contiguous there.
+        Keys are `[0, context_lens[b])` of the pool, the T block rows included
+        since `_write_block_kv` already landed them; `block_tables` is
+        entry-granular, which is exactly the page `k_cache` (`fa_views`) is.
+        See `model_ops/attentions/dspark_draft_attn.py` for the fold.
 
         NO LSE AND NO MERGE, by construction -- this draft is not in the dcp
-        group (see `uses_sglang_block_attn`), so there is one head count and
-        the local read already is the global softmax.
+        group, so there is one head count and the local read already is the
+        global softmax over this rank's TP head slice.
         """
-        from atom.model_ops.attentions.sglang_port.verify_mla import (
-            verify_shared_kv_fwd,
-        )
+        if self._block_attn is None:
+            from atom.model_ops.attentions.dspark_draft_attn import (
+                DSparkDraftUnifiedAttention,
+            )
 
-        # `qo_indptr` is ATOM's `cu_seqlens_q` unchanged: the proposer publishes
-        # `arange(0, (bs + 1) * T, T)`, which is the constant-extend ramp
-        # `can_handle` requires (verify_mla.py:707-723) and exactly what
-        # SGLang's verify path builds for topk == 1.
-        qo_indptr = attn_metadata.cu_seqlens_q
-        bs = qo_indptr.shape[0] - 1
-        # A static python int, not a tensor read: both operands are shapes, so
-        # this costs no host sync and `can_handle`'s `int(max_len_extend)` and
-        # `q.shape[0] == bs * mle` checks are satisfied by construction.
-        t = q.shape[0] // bs
-
-        # `q` is a column slice of the fused QKV output, so these are strided
-        # views (row pitch = q_size + 2 * kv_size), not contiguous ones. Splitting
-        # the LAST dim is still a legal `view` because a row's elements are
-        # adjacent, and the kernel reads q through `stride(0)`/`stride(1)` rather
-        # than assuming packing. `k_extend`/`v_extend` are the one place that
-        # does assume it, and `verify_shared_kv_fwd` takes `.contiguous()` of
-        # them itself (verify_mla.py:807-808).
+            # First forward with a pool is an eager one (`_store_cfg`), so the
+            # ramp it sizes is allocated ahead of any capture.
+            self._block_attn = DSparkDraftUnifiedAttention(
+                q.device, max_bs=self.max_num_seqs or 0
+            )
+        # The SAME scales the write just quantized with, as the one-element
+        # device tensors the write takes -- `_store_cfg` built them eagerly.
+        _, k_dev, v_dev, k_f, v_f = self._store_cfg(k_cache)
+        bs = attn_metadata.block_tables.shape[0]
         q3 = q.view(-1, self.num_heads, self.head_dim)
-        # The SAME scales the write just quantized with, read off the one cache
-        # that resolved them -- a per-tensor python float each, guarded at
-        # `numel() == 1` there because this call answers a multi-element tensor
-        # with a silent 1.0 (verify_mla.py:852-858).
-        _, _, _, k_scale, v_scale = self._store_cfg(k_cache)
-        # Explicitly dense, NOT `empty_like`: q3 is strided, and an output that
-        # inherited that pitch would be a buffer with holes the kernel writes
-        # past the end of.
+        # Explicitly dense, NOT `empty_like`: `q` is a column slice of the
+        # fused QKV output, and an output inheriting that pitch would be a
+        # buffer with holes.
         o = torch.empty(
             (q3.shape[0], self.num_heads, self.head_dim),
             dtype=q.dtype,
             device=q.device,
         )
-        ran = verify_shared_kv_fwd(
+        self._block_attn(
             q3,
-            k.view(-1, self.num_kv_heads, self.head_dim),
-            v.view(-1, self.num_kv_heads, self.head_dim),
+            k_cache,
+            v_cache,
+            attn_metadata.block_tables,
+            attn_metadata.context_lens[:bs],
             o,
-            k_cache.view(-1, self.num_kv_heads, self.head_dim),
-            v_cache.view(-1, self.num_kv_heads, self.head_dim),
-            qo_indptr,
-            attn_metadata.kv_indptr,
-            attn_metadata.kv_indices,
-            None,  # custom_mask: none, and `can_handle` requires that at
-            # is_causal=False -- the block's own mask IS "everything".
-            False,  # is_causal: the block attends itself in both directions.
-            None,  # mask_indptr
-            t,  # max_len_extend == T, static
-            # PER-TENSOR python floats, which is the only kind either end of
-            # this pool can carry. Stage 1 folds them into
-            # `qk *= sm_scale * k_scale` and `acc *= v_scale` once per program
-            # (verify_mla.py:215-240), so at the SGLang default of 1.0 they
-            # cost nothing and the fp8 cache dequantizes exactly as it was
-            # quantized by `reshape_and_cache_flash`.
-            k_scale,
-            v_scale,
-            sm_scale=self.scaling,
-            # See `max_num_seqs`: size the stage-1 scratch once, for the widest
-            # batch this engine can schedule, so no replay ever grows it.
-            max_bs=self.max_num_seqs,
+            self.scaling,
+            k_f,
+            v_f,
+            k_dev,
+            v_dev,
+            k_ext=k.view(-1, self.num_kv_heads, self.head_dim),
+            v_ext=v.view(-1, self.num_kv_heads, self.head_dim),
         )
-        if not ran:
-            # `can_handle` reads shapes and python scalars only, so a refusal is
-            # a property of the CONFIGURATION and reproduces on every step --
-            # there is nothing transient to retry and no fallback that would not
-            # silently change the numerics the checkpoint was validated at.
-            raise RuntimeError(
-                "SGLang verify_shared_kv_fwd refused the DFlash block: "
-                f"q={tuple(q3.shape)} h_kv={self.num_kv_heads} T={t} bs={bs}. "
-                "Set ATOM_K3_DRAFT_SGLANG_ATTN=0 to fall back to the aiter "
-                "mha_v3 read."
-            )
         return o.reshape(-1, self.num_heads * self.head_dim)
 
     def _caches(self, fwd_ctx):
         """This layer's pool rows in FLASH layout, or `(None, None)` if unbound.
 
-        `DraftKvBuilder` bound them that way (`MhaKvPool.fa_views`) because
-        mha_v3 hard-unpacks four axes and SHUFFLE's x-pack splits `head_dim`
-        across two of them.
+        `DraftKvBuilder` bound them that way (`MhaKvPool.fa_views`): the read
+        takes the 4-D `[entries, entry_tokens, h_kv, head_dim]` page at any
+        width, where SHUFFLE's x-pack would need a power-of-two page.
 
         Unbound is a real state, not an error: `warmup_model()` runs before
         `allocate_kv_cache()`, so `kv_cache_data` is None on that pass. Keyed on
@@ -804,8 +670,8 @@ class KimiK3DFlash(DSparkDraftModel):
                     quant_config,
                     prefix=f"layers.{i}",
                     # The ENGINE's batch ceiling, off the atom config rather
-                    # than the draft's hf_config: it is what sizes the SGLang
-                    # read's stage-1 scratch once, before any capture.
+                    # than the draft's hf_config: it sizes the read's constant
+                    # buffers once, before any capture.
                     max_num_seqs=getattr(atom_config, "max_num_seqs", None),
                 )
                 for i in range(config.num_hidden_layers)

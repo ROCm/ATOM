@@ -636,22 +636,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
-    # Which read the Kimi-K3 DFlash GQA draft's block takes. Default on: the
-    # SGLang two-stage verify kernel vendored under
-    # `model_ops/attentions/sglang_port/`, which splits the block's attention
-    # into a prefix pass over the paged pool and an in-register pass over the
-    # block's own K/V, merged by LSE. Set to "0" to fall back to the aiter
-    # `mha_v3.flash_attn_with_kvcache(causal=False)` read, which attends prefix
-    # and block together out of the pool. The fallback needs a bf16 draft KV
-    # pool; it cannot read the fp8 one. Same pool either way -- the two differ
-    # only in how the block's attention is decomposed, so this is the fastest
-    # way to rule the vendored kernel in or out if the draft is suspected. Read
-    # once when the draft attention and the proposer are built, so it must be
-    # set before the server starts. Affects ONLY a DFlash draft; no other model
-    # asks. See `atom/spec_decode/draft_kv.py:uses_sglang_block_attn`.
-    "ATOM_K3_DRAFT_SGLANG_ATTN": lambda: (
-        os.getenv("ATOM_K3_DRAFT_SGLANG_ATTN", "1") != "0"
-    ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft
