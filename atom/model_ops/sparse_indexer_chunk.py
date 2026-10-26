@@ -157,6 +157,47 @@ def dcp_qsplit_rows(
     return rows_per_rank, slot_lo, row_lo, row_hi
 
 
+def indexer_qsplit_world(
+    tp: int,
+    *,
+    physical_tp: int,
+    enabled: bool,
+    pynccl: bool,
+    plugin: bool,
+    gfx1250_opus: bool,
+    dp_attention: bool,
+    tbo: bool,
+    pcp: int,
+    dcp: int,
+) -> int:
+    """TP width the DeepSeek-V4 prefill indexer splits its query rows over
+    (`DcpSplit` with `over_tp`); 1 means no split.
+
+    The V4 indexer is replicated across TP, so every rank would score the
+    same rows. The split needs every TP rank to hold the same rows, which DP
+    attention, PCP and DCP each break; TBO interleaves two ubatches whose
+    collectives are not ordered against this one. Simulated TP (`--fake-eplb`
+    on fewer devices) reports a width the device group does not have. The
+    gather runs on the TP group's pynccl communicator (see `_gather_split`).
+    gfx1250 OPUS scores through its own plans and plugin bridges build their
+    own rows.
+    """
+    if (
+        not enabled
+        or tp <= 1
+        or physical_tp != tp
+        or not pynccl
+        or plugin
+        or gfx1250_opus
+        or dp_attention
+        or tbo
+        or pcp > 1
+        or dcp > 1
+    ):
+        return 1
+    return tp
+
+
 class LogitsWorkspace:
     """`capacity` fp32 elements every indexer of a model scores its bands
     into, one layer after another: the logits plane, held for the server's

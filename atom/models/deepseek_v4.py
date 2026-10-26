@@ -1631,6 +1631,8 @@ class Indexer(nn.Module):
         past its visibility -- the layout `csa_translate_pack` consumes. No
         host-side short-circuit for an empty context: a row whose bound is 0
         gets all -1 from the top-k itself, so nothing is baked into a graph.
+        Under the TP row split the selection carries up to tp-1 tail rows past
+        `T` (`IndexRows.out_rows`), dropped here.
         """
         return score_topk(
             q_quant if q_scale is None else (q_quant, q_scale),
@@ -1639,7 +1641,7 @@ class Indexer(nn.Module):
             get_forward_context().attn_metadata.index_rows,
             topk=topk,
             weight_scale=self._weights_scale,
-        )
+        )[: weights.shape[0]]
 
     @property
     def index_cache(self) -> IndexCache:

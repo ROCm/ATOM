@@ -48,7 +48,10 @@ from typing import Any, cast
 import numpy as np
 import torch
 from aiter import dtypes
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from aiter.jit.utils.chip_info import get_gfx
 
 from atom.distributed.pcp_utils import (
@@ -120,13 +123,15 @@ from atom.model_ops.indexer import (
     NATURAL,
     PRESHUFFLE,
     ConcatKeys,
+    DcpSplit,
     Fp4LaunchStorages,
     IndexRows,
     concat_rows,
     fp4_rows,
     fp8_rows,
 )
-from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+from atom.model_ops.indexer.score import split_gather_comm
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace, indexer_qsplit_world
 from atom.model_ops.v4_kernels import (
     build_v4_paged_decode_indptr,
     fp4_indexer_enabled,
@@ -137,6 +142,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
+from atom.plugin.prepare import is_plugin_mode
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import (
@@ -546,6 +552,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         self.indexer_layout = (
             fp4_indexer_layout_for_arch(get_gfx()) if self._indexer_fp4 else "fp8"
+        )
+        self._indexer_qsplit_world = self._indexer_qsplit_world_size(
+            model_runner.config
         )
         if self.indexer_layout == FP4_GFX1250_NATURAL:
             if self.max_bs > 2048:
@@ -2116,12 +2125,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         n_committed = attn_metadata.n_committed_csa_per_seq_cpu[:scheduled_bs]
         visible_end = visible_csa(positions_gpu[:total_tokens]).to(torch.int32)
+        split = None
+        if self._indexer_qsplit_world > 1:
+            split = DcpSplit.of(
+                total_tokens,
+                get_tp_group().rank_in_group,
+                self._indexer_qsplit_world,
+                over_tp=True,
+            )
         if self._indexer_fp4:
             return self._index_rows(
                 attn_metadata,
                 visible_end,
                 max(int(n_committed.max()), 1),
                 query_start_loc=query_start_loc,
+                split=split,
             )
 
         cu_committed_cpu = np.concatenate(
@@ -2142,7 +2160,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             total=int(cu_committed_cpu[-1]),
             row_starts=cu_committed[batch_ids].to(torch.int32),
         )
-        return concat_rows(visible_end, keys)
+        return concat_rows(visible_end, keys, split)
+
+    def _indexer_qsplit_world_size(self, config) -> int:
+        """See `indexer_qsplit_world`; read once, its inputs are fixed per run."""
+        tp = get_tensor_model_parallel_world_size()
+        if tp <= 1:
+            return 1
+        tp_group = get_tp_group()
+        return indexer_qsplit_world(
+            tp,
+            physical_tp=torch.distributed.get_world_size(tp_group.device_group),
+            enabled=envs.ATOM_V4_INDEXER_QSPLIT,
+            pynccl=split_gather_comm(tp_group) is not None,
+            plugin=is_plugin_mode(),
+            gfx1250_opus=self.indexer_layout == FP4_GFX1250_NATURAL,
+            dp_attention=bool(config.enable_dp_attention),
+            tbo=bool(config.enable_tbo or config.enable_tbo_decode),
+            pcp=get_pcp_world_size(),
+            dcp=int(config.decode_context_parallel_size),
+        )
 
     def _index_rows(
         self,
@@ -2152,11 +2189,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         row_tables: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         recorded_as: str | None = None,
+        split: DcpSplit | None = None,
     ) -> IndexRows:
         """Paged index rows: FP8 each row against its own `row_tables` row, FP4
         a request's rows together, grouped by `query_start_loc`. Rows a graph
         records name the ubatch prefix they are `recorded_as`, whose launch
-        arguments then keep fixed homes (`Fp4LaunchStorage`)."""
+        arguments then keep fixed homes (`Fp4LaunchStorage`). `split`: a
+        prefill's rows this TP rank scores (FP4 only; FP8 prefill rows are
+        concatenated, see `_build_v4_prefill_index_rows`)."""
         if not self._indexer_fp4:
             return fp8_rows(row_ends, width, self.index_logits_workspace, row_tables)
         storage = None if recorded_as is None else self._fp4_launches[recorded_as]
@@ -2174,6 +2214,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 NATURAL if self.indexer_layout == FP4_GFX1250_NATURAL else PRESHUFFLE
             ),
             row_to_batch=attn_metadata.batch_id_per_q_token[: row_ends.shape[0]],
+            split=split,
             storage=storage,
         )
 

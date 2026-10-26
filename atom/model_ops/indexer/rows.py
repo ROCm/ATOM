@@ -52,23 +52,27 @@ class ConcatKeys(NamedTuple):
 
 
 class DcpSplit(NamedTuple):
-    """Rows under DCP, where every rank scores against the whole key set: this
-    rank scores `[first, end)` into its slot of `stride` rows at `slot`, and
-    the `world` slots are all-gathered back in place, row i landing at row i
-    (`dcp_qsplit_rows`). Without DCP, a world of one: every row, nothing to
-    gather."""
+    """Rows split across ranks that each score against the whole key set:
+    this rank scores `[first, end)` into its slot of `stride` rows at `slot`,
+    and the `world` slots are all-gathered back in place, row i landing at
+    row i (`dcp_qsplit_rows`). The ranks are the DCP group's, or with
+    `over_tp` the TP group's (a replicated indexer under plain TP). Without
+    a split, a world of one: every row, nothing to gather."""
 
     first: int
     end: int
     slot: int
     stride: int
     world: int
+    over_tp: bool = False
 
     @classmethod
-    def of(cls, rows: int, rank: int = 0, world: int = 1) -> "DcpSplit":
+    def of(
+        cls, rows: int, rank: int = 0, world: int = 1, *, over_tp: bool = False
+    ) -> "DcpSplit":
         """This rank's split of `rows`."""
         stride, slot, first, end = dcp_qsplit_rows(rows, rank, world)
-        return cls(first, end, slot, stride, world)
+        return cls(first, end, slot, stride, world, over_tp)
 
 
 class IndexRows(NamedTuple):

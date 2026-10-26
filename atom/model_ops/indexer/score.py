@@ -22,6 +22,7 @@ FP8 launch, the top-k -- follows the rows alone and is recorded.
 
 import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes
+from aiter.dist.parallel_state import get_tp_group
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
@@ -73,18 +74,34 @@ def score_topk(
 
 
 def _gather_split(out, split):
-    """Every DCP rank's rows into `out`, in place: the input is this rank's
-    own slot inside the output, the form RCCL supports, so nothing is
-    allocated or copied. The last slot's tail past the rows is never read.
-    A world of one already holds them all."""
+    """Every rank's rows into `out`, in place: the input is this rank's own
+    slot inside the output, the form RCCL supports, so nothing is allocated
+    or copied. The last slot's tail past the rows is never read. A world of
+    one already holds them all.
+
+    Through the group's pynccl communicator, built with the group and so
+    counted in the memory profile, on the current stream. The group's torch
+    ProcessGroup would create its communicator and stream at the first
+    prefill instead -- after the KV budget is fixed -- since nothing else in
+    the step uses it."""
     if split.world == 1:
         return
     region = out[: split.stride * split.world]
-    torch.distributed.all_gather_into_tensor(
-        region,
-        region[split.slot : split.slot + split.stride],
-        group=get_dcp_group().device_group,
-    )
+    mine = region[split.slot : split.slot + split.stride]
+    group = get_tp_group() if split.over_tp else get_dcp_group()
+    pynccl = split_gather_comm(group)
+    if pynccl is not None:
+        pynccl.all_gather(region, mine)
+    else:
+        torch.distributed.all_gather_into_tensor(region, mine, group=group.device_group)
+
+
+def split_gather_comm(group):
+    """`group`'s pynccl communicator when it is usable, else None. Decided
+    at the group's construction, so the same on every rank of it."""
+    communicator = getattr(group, "device_communicator", None)
+    pynccl = getattr(communicator, "pynccl_comm", None)
+    return None if pynccl is None or pynccl.disabled else pynccl
 
 
 def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_band, out):

@@ -16,12 +16,10 @@ import torch
 from atom.model_ops.sparse_indexer_chunk import (
     _BUFFER_DESCRIPTOR_LIMIT_BYTES,
     capped_logits_rows,
-    chunked_row_topk,
     decode_band_rows,
     flat_view,
     indexer_qsplit_world,
     plane_rows,
-    qsplit_rows,
     sparse_indexer_row_chunk,
 )
 from atom.utils import envs
@@ -194,88 +192,10 @@ def test_flat_view_shares_the_workspace_and_refuses_to_grow():
 # ---- DeepSeek-V4 prefill indexer split by query row across plain TP ---------
 
 
-def _split_topk(rows, width, qsplit, scored, gathers, topk=4):
-    torch.manual_seed(0)
-    table = torch.randn(rows, width)
-
-    def select(logits, lo, hi, out_rows):
-        out_rows.copy_(torch.topk(logits, topk).indices.to(torch.int32))
-
-    def score_chunk(lo, hi):
-        scored.extend(range(lo, hi))
-        return table[lo:hi]
-
-    return chunked_row_topk(
-        total_rows=rows,
-        row_width=width,
-        budget_mb=_DEFAULT_BUDGET_MB,
-        topk=topk,
-        device="cpu",
-        qsplit=qsplit,
-        score_chunk=score_chunk,
-        select=select,
-        gather=lambda out, stride, slot_lo: gathers.append((out, stride, slot_lo)),
-    )
-
-
-@pytest.mark.parametrize("world", [2, 4, 8])
-@pytest.mark.parametrize("rows", [1, 5, 12, 64, 100])
-def test_split_rows_are_scored_once_into_their_own_slot(world, rows):
-    """Stitching each rank's gather slot back rank-major rebuilds the unsplit
-    table, and no row is scored twice or by the wrong rank."""
-    full = _split_topk(rows, 16, None, [], [])
-    scored, slots = [], []
-    for rank in range(world):
-        split = (world,) + qsplit_rows(rows, rank, world)
-        _, stride, _, row_lo, row_hi = split
-        mine, gathers = [], []
-        _split_topk(rows, 16, split, mine, gathers)
-        assert sorted(mine) == list(range(row_lo, row_hi))
-        [(out, g_stride, g_slot)] = gathers
-        assert (out.shape[0], g_stride, g_slot) == (
-            world * stride,
-            stride,
-            rank * stride,
-        )
-        slots.append(out[g_slot : g_slot + g_stride])
-        scored += mine
-    assert sorted(scored) == list(range(rows))
-    assert torch.equal(torch.cat(slots)[:rows], full)
-
-
-def test_unsplit_does_not_gather():
-    gathers = []
-    out = _split_topk(7, 16, None, [], gathers)
-    assert gathers == [] and out.shape == (7, 4)
-
-
-def test_budget_chunks_stay_inside_the_rank():
-    rows, world, rank = 800, 8, 3
-    split = (world,) + qsplit_rows(rows, rank, world)
-    scored = []
-
-    def score_chunk(lo, hi):
-        scored.append((lo, hi))
-        return torch.zeros(hi - lo, 4096)
-
-    chunked_row_topk(
-        total_rows=rows,
-        row_width=4096,
-        budget_mb=1,  # 1 MiB / (4096 x 4 B) -> 32-row chunks
-        topk=4,
-        device="cpu",
-        qsplit=split,
-        score_chunk=score_chunk,
-        select=lambda *_: None,
-        gather=lambda *_: None,
-    )
-    assert len(scored) > 1
-    assert scored[0][0] == split[3] and scored[-1][1] == split[4]
-
-
 _GATE = {
     "physical_tp": 8,
     "enabled": True,
+    "pynccl": True,
     "plugin": False,
     "gfx1250_opus": False,
     "dp_attention": False,
@@ -295,6 +215,7 @@ def test_qsplit_on_for_plain_tp():
         (1, {"physical_tp": 1}),
         (8, {"physical_tp": 4}),  # simulated TP: the device group is narrower
         (8, {"enabled": False}),
+        (8, {"pynccl": False}),  # no communicator built with the group
         (8, {"plugin": True}),
         (8, {"gfx1250_opus": True}),
         (8, {"dp_attention": True}),
