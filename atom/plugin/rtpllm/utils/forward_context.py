@@ -87,6 +87,7 @@ if triton is not None:
     def _target_verify_state_slots_graph_kernel(
         block_table,
         sequence_lengths,
+        prefix_lengths,
         read_slots,
         write_slots,
         invalid_live_rows,
@@ -103,17 +104,15 @@ if triton is not None:
         length = tl.load(sequence_lengths + row, live, 0)
         read_col = tl.maximum(length - 2, 0) // block_size
         write_col = tl.maximum(length - 1, 0) // block_size
-        # Block 0 is RTP's reserved padding block. A real row with a
-        # too-narrow table must be distinguishable from graph padding even
-        # though both still use block 0 as the safe fallback address.
-        first_page = tl.load(block_table + row * table_stride_row, live, 0)
-        # RTP may pad a Graph row with either block 0 or -1. Only positive
-        # first-page IDs identify live requests in this block-table contract.
-        real = first_page > 0
+        # Speculative candidates have separate state slots even when their
+        # token positions fall in the same ordinary linear-cache block.
+        max_write_col = write_col + query_len - 1
+        # RTP frees old linear-cache pages, including column zero. It sets
+        # prefix length to zero only for Graph padding; a target verify always
+        # follows at least one real prompt token.
+        real = live & (tl.load(prefix_lengths + row, live, 0) > 0)
         invalid = (
-            live
-            & real
-            & ((read_col >= table_cols) | (write_col + query_len - 1 >= table_cols))
+            live & real & ((read_col >= table_cols) | (max_write_col >= table_cols))
         )
         for token in tl.static_range(query_len):
             column = write_col + token
@@ -2312,21 +2311,19 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
                 raise ValueError(
                     "RTP MTP draft prefill requires one input length per request"
                 )
-            # Graph replay refreshes input_lengths_device, so the captured
-            # assertion also checks live requests. A zero-length row is Graph
-            # padding; every non-padding row must fill its fixed window.
+            # RTP captures a fixed-capacity draft window, but live requests
+            # may have fewer valid tokens after acceptance. A zero-length row
+            # is Graph padding; no row may exceed the captured window.
             valid_lengths = torch.all(
-                (input_lengths == draft_width) | (input_lengths == 0)
+                (input_lengths >= 0) & (input_lengths <= draft_width)
             )
             if in_capture:
                 torch._assert_async(
                     valid_lengths,
-                    "RTP MTP draft prefill requires full-width live requests",
+                    "RTP MTP draft prefill length exceeds capture window",
                 )
             elif not bool(valid_lengths):
-                raise ValueError(
-                    "RTP MTP draft prefill requires full-width live requests"
-                )
+                raise ValueError("RTP MTP draft prefill length exceeds capture window")
         if in_capture and cg_bufs is not None:
             return cg_bufs["query_start_loc"][: batch_size + 1]
 

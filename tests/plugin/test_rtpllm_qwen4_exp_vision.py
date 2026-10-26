@@ -13,7 +13,10 @@ from rtp_llm.multimodal.multimodal_mixin_register import (
     get_multimodal_mixin_cls,
 )
 
-from atom.plugin.rtpllm.models.qwen4_exp import _ATOMQwen4ExpRuntime
+from atom.plugin.rtpllm.models.qwen4_exp import (
+    _ATOMQwen4ExpMTPRuntime,
+    _ATOMQwen4ExpRuntime,
+)
 from atom.plugin.rtpllm.models.qwen4_exp_vision import Qwen4ExpVisionMixin
 from atom.plugin.rtpllm.models.qwen4_exp_vision_impl import Qwen4ExpImageEmbedding
 
@@ -84,6 +87,34 @@ def test_vision_embedding_masks_image_placeholders_on_single_rank(monkeypatch, t
     actual = _ATOMQwen4ExpRuntime._embed_vision_input_ids(runtime, input_ids)
     assert actual is expected
     assert calls == (["masked"] if tp_size == 1 else ["partitioned"])
+
+
+@pytest.mark.parametrize(
+    ("is_multimodal", "tp_size", "expect_masked"),
+    [(True, 1, True), (True, 2, False), (False, 1, False)],
+)
+def test_vision_draft_masks_negative_padding_before_embedding(
+    monkeypatch, is_multimodal, tp_size, expect_masked
+):
+    from atom.model_ops import embed_head
+
+    input_ids = torch.tensor([7, -1, 9], dtype=torch.int32)
+    weight = torch.ones(16, 2)
+    expected = torch.zeros(3, 2)
+    calls = []
+
+    def masked(ids, table):
+        calls.append(True)
+        assert ids is input_ids and table is weight
+        return expected
+
+    monkeypatch.setattr(embed_head, "replicated_embedding", masked)
+    embed_tokens = SimpleNamespace(tp_size=tp_size, weight=weight)
+    actual = _ATOMQwen4ExpMTPRuntime._draft_vision_embeddings(
+        input_ids, embed_tokens, is_multimodal
+    )
+    assert actual is (expected if expect_masked else None)
+    assert calls == ([True] if expect_masked else [])
 
 
 def test_vision_placeholder_ids_are_canonicalized_for_ple_history():
@@ -181,6 +212,34 @@ def test_vision_mtp_uses_candidate_cache_positions(monkeypatch, is_draft, is_gra
     )
     actual = runtime._extract_positions(inputs, torch.device("cpu"), 6)
     assert actual.tolist() == [16, 17, 18, 129, 130, 131]
+
+
+@pytest.mark.parametrize("is_graph", [False, True])
+@pytest.mark.parametrize("live_length", [2, 3])
+def test_vision_mtp_draft_padding_keeps_fixed_window_positions(
+    monkeypatch, is_graph, live_length
+):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime._rtp_model_config = SimpleNamespace(
+        mm_model_config=SimpleNamespace(is_multimodal=True),
+        is_mtp=True,
+        gen_num_per_cycle=2,
+    )
+    runtime._cg_mtp_meta_bufs = {
+        "qwen4_positions_i32": torch.empty(6, dtype=torch.int32)
+    }
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = SimpleNamespace(
+        attention_inputs=SimpleNamespace(
+            is_prefill=True,
+            is_target_verify=False,
+            is_cuda_graph=is_graph,
+            prefix_lengths_device=torch.tensor([16, 0], dtype=torch.int32),
+            input_lengths=torch.tensor([live_length, 0], dtype=torch.int32),
+        )
+    )
+    actual = runtime._extract_positions(inputs, torch.device("cpu"), 6)
+    assert actual.tolist() == [16, 17, 18, 0, 1, 2]
 
 
 def test_vision_graph_decode_uses_prewarmed_position_buffer(monkeypatch):

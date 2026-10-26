@@ -429,9 +429,11 @@ def test_qwen4_exp_mtp_draft_marks_forward_context(
 
     class Draft:
         atom_config = SimpleNamespace()
+        model = SimpleNamespace(embed_tokens=SimpleNamespace(tp_size=2))
 
-        def __call__(self, ids, positions, hc_input):
+        def __call__(self, ids, positions, hc_input, inputs_embeds=None):
             assert context.is_draft
+            assert inputs_embeds is None
             assert ids.tolist() == ([42] if multimodal else [1])
             assert positions.tolist() == ([[9], [10], [11]] if multimodal else [4])
             if multimodal:
@@ -628,7 +630,9 @@ def test_qwen4_exp_graph_uses_refreshed_device_sequence_lengths(monkeypatch):
 
 
 @pytest.mark.parametrize("is_draft", [False, True])
-def test_qwen4_exp_mtp_graph_reserves_full_request_capacity(monkeypatch, is_draft):
+def test_qwen4_exp_mtp_graph_keeps_capture_cap_separate_from_request_capacity(
+    monkeypatch, is_draft
+):
     def init_with_narrow_decode_bucket(
         self,
         model_config,
@@ -652,7 +656,8 @@ def test_qwen4_exp_mtp_graph_reserves_full_request_capacity(monkeypatch, is_draf
         ),
         max_generate_batch_size=8,
     )
-    assert runtime._cg_max_num_tokens == 8
+    assert runtime._cg_max_num_tokens == 4
+    assert runtime._rtp_mtp_request_capacity == 8
 
 
 def test_qwen4_exp_mtp_graph_capacity_uses_bound_positional_argument(monkeypatch):
@@ -675,7 +680,8 @@ def test_qwen4_exp_mtp_graph_capacity_uses_bound_positional_argument(monkeypatch
         None,
         8,
     )
-    assert runtime._cg_max_num_tokens == 8
+    assert runtime._cg_max_num_tokens == 4
+    assert runtime._rtp_mtp_request_capacity == 8
 
 
 def test_qwen4_exp_mtp_graph_rejects_undersized_position_buffer(monkeypatch):
@@ -833,6 +839,7 @@ def test_qwen4_exp_mtp_graph_target_slots(draft_steps):
     _target_verify_state_slots_graph_kernel[(1,)](
         table,
         lengths,
+        torch.tensor([16, 31, 0, 0, 0], dtype=torch.int32, device=device),
         reads,
         writes,
         invalid_live_rows,
@@ -851,8 +858,8 @@ def test_qwen4_exp_mtp_graph_target_slots(draft_steps):
         [0] * width,
     ]
     assert writes.cpu().tolist() == [
-        list(range(11, 11 + width)),
-        list(range(21, 21 + width)),
+        [11 + i for i in range(width)],
+        [21 + i for i in range(width)],
         [0] * width,
         [0] * width,
         [0] * width,
@@ -869,17 +876,102 @@ def test_qwen4_exp_mtp_graph_counts_invalid_real_rows_not_padding():
     writes = torch.empty_like(reads)
     counter = torch.zeros((), device=device, dtype=torch.int32)
     _target_verify_state_slots_graph_kernel[(1,)](
-        table, lengths, reads, writes, counter, 2, *table.stride(), 2, 16, 3, 128
+        table,
+        lengths,
+        torch.tensor([31, 0], dtype=torch.int32, device=device),
+        reads,
+        writes,
+        counter,
+        2,
+        *table.stride(),
+        2,
+        16,
+        3,
+        128,
     )
     assert counter.item() == 1
     assert writes.cpu().tolist() == [[6, 0, 0], [0, 0, 0]]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qwen4_exp_mtp_graph_checks_long_live_row_after_first_page_is_freed():
+    device = torch.device("cuda")
+    # RTP releases old linear-cache blocks, including column zero. The first
+    # row is still live; the second row is Graph padding.
+    table = torch.tensor(
+        [[-1, -1, 7, -1], [0, 0, 0, 0]], device=device, dtype=torch.int32
+    )
+    lengths = torch.tensor([49, 3], device=device, dtype=torch.int32)
+    prefix_lengths = torch.tensor([48, 0], device=device, dtype=torch.int32)
+    reads = torch.empty((2, 3), device=device, dtype=torch.int32)
+    writes = torch.empty_like(reads)
+    invalid_live_rows = torch.empty(1, device=device, dtype=torch.int32)
+    _target_verify_state_slots_graph_kernel[(1,)](
+        table,
+        lengths,
+        prefix_lengths,
+        reads,
+        writes,
+        invalid_live_rows,
+        2,
+        *table.stride(),
+        4,
+        16,
+        3,
+        128,
+    )
+    assert invalid_live_rows.item() == 1
+    assert reads.cpu().tolist() == [[7, 7, 7], [0, 0, 0]]
+    assert writes.cpu().tolist() == [[0, 0, 0], [0, 0, 0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qwen4_exp_mtp_graph_replay_refreshes_live_prefix_lengths():
+    device = torch.device("cuda")
+    table = torch.tensor(
+        [[5, 6, 7, 8], [-1, -1, 9, -1]], device=device, dtype=torch.int32
+    )
+    lengths = torch.tensor([17, 49], device=device, dtype=torch.int32)
+    prefix_lengths = torch.tensor([16, 0], device=device, dtype=torch.int32)
+    reads = torch.empty((2, 3), device=device, dtype=torch.int32)
+    writes = torch.empty_like(reads)
+    invalid_live_rows = torch.empty(1, device=device, dtype=torch.int32)
+
+    def launch():
+        _target_verify_state_slots_graph_kernel[(1,)](
+            table,
+            lengths,
+            prefix_lengths,
+            reads,
+            writes,
+            invalid_live_rows,
+            2,
+            *table.stride(),
+            4,
+            16,
+            3,
+            128,
+        )
+
+    launch()  # Compile before capture.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert invalid_live_rows.item() == 0
+
+    prefix_lengths[1] = 48
+    graph.replay()
+    torch.cuda.synchronize()
+    assert invalid_live_rows.item() == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_qwen4_exp_mtp_graph_overwrites_each_tile_error_flag():
     device = torch.device("cuda")
     table = torch.tensor([[5, 6, 7, 8]] * 129, device=device, dtype=torch.int32)
-    table[128, 3] = -1
+    table[128, 1] = -1
     lengths = torch.full((129,), 17, device=device, dtype=torch.int32)
     reads = torch.empty((129, 3), device=device, dtype=torch.int32)
     writes = torch.empty_like(reads)
@@ -887,12 +979,23 @@ def test_qwen4_exp_mtp_graph_overwrites_each_tile_error_flag():
 
     def launch():
         _target_verify_state_slots_graph_kernel[(2,)](
-            table, lengths, reads, writes, flags, 129, *table.stride(), 4, 16, 3, 128
+            table,
+            lengths,
+            torch.full((129,), 16, dtype=torch.int32, device=device),
+            reads,
+            writes,
+            flags,
+            129,
+            *table.stride(),
+            4,
+            16,
+            3,
+            128,
         )
 
     launch()
     assert flags.cpu().tolist() == [0, 1]
-    table[128, 3] = 8
+    table[128, 1] = 8
     launch()
     assert flags.cpu().tolist() == [0, 0]
 
@@ -917,9 +1020,10 @@ def test_qwen4_exp_mtp_graph_metadata_checks_invalid_live_rows(
     inputs = SimpleNamespace(
         is_target_verify=True,
         input_lengths=torch.tensor([3], dtype=torch.int32),
+        prefix_lengths_device=torch.tensor([16], device=device, dtype=torch.int32),
         kv_cache_kernel_block_id_device=table,
         sequence_lengths_plus_1_device=torch.tensor(
-            [17], device=device, dtype=torch.int32
+            [32], device=device, dtype=torch.int32
         ),
     )
     checked = []
@@ -960,12 +1064,14 @@ def test_qwen4_exp_mtp_target_metadata_captures_and_resets_counter(device_length
         input_lengths=torch.tensor(
             [3], device=device if device_lengths else "cpu", dtype=torch.int32
         ),
+        prefix_lengths_device=torch.tensor([16], device=device, dtype=torch.int32),
         kv_cache_kernel_block_id_device=table,
         sequence_lengths_plus_1_device=lengths,
     )
     _target_verify_state_slots_graph_kernel[(1,)](
         table,
         lengths,
+        inputs.prefix_lengths_device,
         buffers["target_read_slots_i32"],
         buffers["target_write_slots_i32"],
         buffers["target_invalid_live_rows"],
@@ -1027,9 +1133,11 @@ def test_qwen4_exp_graph_prewarms_qsa_caches_before_capture(monkeypatch):
     )
     calls = []
     qsa = SimpleNamespace(is_qsa_attention=True)
+    runtime.__dict__["model"] = object()
     runtime._rtp_layer_maps = ({}, {7: qsa}, {})
     runtime._rtp_forward_context_cls = SimpleNamespace(
-        _bind_qsa_caches=lambda *args: calls.append(args)
+        _bind_qsa_caches=lambda *args: calls.append(("qsa", args)),
+        _bind_ple_caches=lambda *args: calls.append(("ple", args)),
     )
     runtime.kv_cache = SimpleNamespace(get_seq_size_per_block=lambda _: 64)
     runtime._cg_max_num_tokens = 2
@@ -1038,7 +1146,10 @@ def test_qwen4_exp_graph_prewarms_qsa_caches_before_capture(monkeypatch):
 
     runtime._ensure_cuda_graph_prewarmed()
 
-    assert calls == [(runtime, [qsa], 64)]
+    assert calls == [
+        ("ple", (runtime, runtime.model, {})),
+        ("qsa", (runtime, [qsa], 64)),
+    ]
     assert runtime._cg_meta_bufs["physical_block_table_i32"].shape == (2, 3)
 
 
@@ -1070,6 +1181,7 @@ def test_qwen4_exp_mtp_graph_prewarms_verify_window(monkeypatch, draft_steps):
     runtime._rtp_layer_maps = ({}, {}, {})
     runtime.kv_cache = SimpleNamespace(get_seq_size_per_block=lambda _: 64)
     runtime._cg_max_num_tokens = 3
+    runtime._rtp_mtp_request_capacity = 8
     runtime._cg_max_seq_len = 128
     runtime._get_model_device = lambda: torch.device("cpu")
 
@@ -1081,6 +1193,7 @@ def test_qwen4_exp_mtp_graph_prewarms_verify_window(monkeypatch, draft_steps):
     assert decode_buffers["seq_id"].tolist() == [0, 1, 2]
     assert decode_buffers["seq_id_i32"].tolist() == [0, 1, 2]
     assert decode_buffers["slot_mapping"].shape == (3,)
+    assert decode_buffers["qwen4_positions_i32"].shape == (8,)
     assert decode_buffers["block_table_i32"].shape == (3, 3 + draft_steps)
     assert (
         decode_buffers["block_table_i32"].data_ptr()
@@ -1102,6 +1215,7 @@ def test_qwen4_exp_mtp_graph_prewarms_verify_window(monkeypatch, draft_steps):
     assert buffers["seq_id"].tolist() == [i for i in range(3) for _ in range(width)]
     assert buffers["seq_id_i32"].tolist() == buffers["seq_id"].tolist()
     assert buffers["slot_mapping"].shape == (3 * width,)
+    assert buffers["qwen4_positions_i32"].shape == (8 * width,)
     assert buffers["target_read_slots_i32"].shape == (3, width)
     assert buffers["target_write_slots_i32"].shape == (3, width)
     assert buffers["block_table_i32"].shape == (3, 3 + draft_steps)
@@ -1173,9 +1287,9 @@ def test_qwen4_exp_mtp_draft_graph_warmup_keeps_padding_rows(monkeypatch, draft_
         is_prefill=True,
         is_target_verify=False,
         prefill_cuda_graph_copy_params=SimpleNamespace(),
-        input_lengths=torch.tensor([width, width, 0], dtype=torch.int32),
+        input_lengths=torch.tensor([width, width - 1, 0], dtype=torch.int32),
         cu_seqlens_device=torch.tensor(
-            [0, width, 2 * width, 2 * width], dtype=torch.int32
+            [0, width, 2 * width - 1, 2 * width - 1], dtype=torch.int32
         ),
     )
     query_start_loc = RTPQwen4ExpContext._build_query_start_loc_for_plugin(
@@ -1199,7 +1313,7 @@ def test_qwen4_exp_mtp_draft_graph_rejects_uneven_live_lengths(monkeypatch, capt
     )
     with pytest.raises(
         (ValueError, RuntimeError),
-        match="full-width live requests",
+        match="length exceeds capture window",
     ):
         RTPQwen4ExpContext._build_query_start_loc_for_plugin(
             attn_inputs=attn_inputs,
@@ -1525,7 +1639,7 @@ def test_qwen4_exp_ple_uses_actual_gdn_cache_layer():
 
 
 def test_qwen4_exp_ple_graph_uses_selected_forward_buffers(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     raw = torch.empty(3, 1, dtype=torch.bfloat16)
     runtime = SimpleNamespace(
         kv_cache=SimpleNamespace(
@@ -1543,6 +1657,8 @@ def test_qwen4_exp_ple_graph_uses_selected_forward_buffers(monkeypatch):
         config=SimpleNamespace(eos_token_id=2),
         atom_config=SimpleNamespace(torch_dtype=torch.bfloat16),
     )
+    RTPQwen4ExpContext._bind_ple_caches(runtime, model, {5: object()})
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     selected = {"qwen4_has_initial": torch.empty(2, dtype=torch.bool)}
     ids = torch.tensor([1, 2], dtype=torch.int32)
     attn_metadata = SimpleNamespace(
@@ -1561,6 +1677,35 @@ def test_qwen4_exp_ple_graph_uses_selected_forward_buffers(monkeypatch):
     md = RTPQwen4ExpContext._ple_metadata(runtime, model, attn_metadata, {5: object()})
     assert md.has_initial_state.data_ptr() == selected["qwen4_has_initial"].data_ptr()
     assert md.has_initial_state.tolist() == [True, False]
+
+
+def test_qwen4_exp_ple_rebind_requires_prewarm_before_graph_capture(monkeypatch):
+    raw = torch.empty(3, 1, dtype=torch.bfloat16)
+    layer_cache = SimpleNamespace(kv_cache_base=raw)
+    runtime = SimpleNamespace(
+        kv_cache=SimpleNamespace(get_layer_cache=lambda _: layer_cache)
+    )
+    ple = SimpleNamespace(
+        hc_hidden_size=4,
+        conv_state_len=3,
+        ple_embedding=SimpleNamespace(ngram_size=2),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(ple=ple)]),
+        config=SimpleNamespace(eos_token_id=2),
+        atom_config=SimpleNamespace(torch_dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    RTPQwen4ExpContext._bind_ple_caches(runtime, model, {5: object()})
+    ngram, conv = runtime._rtp_ple_ngram, runtime._rtp_ple_conv
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    RTPQwen4ExpContext._bind_ple_caches(runtime, model, {5: object()})
+    assert runtime._rtp_ple_ngram is ngram
+    assert runtime._rtp_ple_conv is conv
+
+    layer_cache.kv_cache_base = torch.empty_like(raw)
+    with pytest.raises(RuntimeError, match="bound before Graph capture"):
+        RTPQwen4ExpContext._bind_ple_caches(runtime, model, {5: object()})
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

@@ -37,7 +37,9 @@ def _install_forward_context_stubs():
 
     config = atom.config
     config_attr = getattr(config, "get_current_atom_config", None)
-    config.get_current_atom_config = lambda: SimpleNamespace(kv_cache_block_size=16)
+    config.get_current_atom_config = lambda: SimpleNamespace(
+        kv_cache_block_size=16, parallel_config=None
+    )
 
     attention_gdn = stub(
         "atom.model_ops.attention_gdn",
@@ -76,6 +78,9 @@ def _install_forward_context_stubs():
         types.ModuleType("atom.utils.forward_context"),
     )
     utils_forward_context.running_tokens_from_bs = running_tokens_from_bs
+    utils_forward_context.DPMetadata = SimpleNamespace(
+        gather_running_tokens=lambda *args: None
+    )
     utils_forward_context.AttentionMetaData = _KwargsObject
     utils_forward_context.Context = _KwargsObject
     utils_forward_context._forward_kv_cache_context = SimpleNamespace(kv_cache_data={})
@@ -662,7 +667,7 @@ def test_bind_temporarily_attaches_mla_layer_cache(monkeypatch):
     )
     monkeypatch.setattr(
         "atom.plugin.rtpllm.utils.forward_context.get_current_atom_config",
-        lambda: SimpleNamespace(kv_cache_block_size=99),
+        lambda: SimpleNamespace(kv_cache_block_size=99, parallel_config=None),
     )
 
     with RTPForwardContext.bind(
@@ -763,7 +768,7 @@ def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
     )
     monkeypatch.setattr(
         "atom.plugin.rtpllm.utils.forward_context.get_current_atom_config",
-        lambda: SimpleNamespace(kv_cache_block_size=16),
+        lambda: SimpleNamespace(kv_cache_block_size=16, parallel_config=None),
     )
 
     with RTPForwardContext.bind(

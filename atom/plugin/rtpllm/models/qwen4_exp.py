@@ -57,14 +57,14 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         if getattr(model_config, "atom_qwen4_exp_mtp_target", False) or getattr(
             model_config, "is_mtp", False
         ):
-            # Text and vision MTP both need the full request capacity, which
-            # can exceed the largest decode capture bucket.
+            # Keep the parent's capture-bucket cap for large Graph workspaces.
+            # Only the small position buffers need full request capacity.
             if max_batch is None:
                 raise ValueError("Qwen4Exp MTP request capacity was not provided")
             max_batch = int(max_batch)
             if max_batch <= 0:
                 raise ValueError("Qwen4Exp MTP requires positive request capacity")
-            self._cg_max_num_tokens = max(self._cg_max_num_tokens, max_batch)
+            self._rtp_mtp_request_capacity = max_batch
         self._atom_attn_pyobj = _Qwen4ExpAttnPyObj(self)
 
     def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
@@ -86,7 +86,14 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
     def _ensure_cuda_graph_prewarmed(self) -> None:
         super()._ensure_cuda_graph_prewarmed()
         buffers = getattr(self, "_cg_meta_bufs", None)
-        if buffers is None or "qsa_compressed_slots" in buffers:
+        if buffers is None:
+            return
+        model = getattr(self, "model", None)
+        if model is not None:
+            self._rtp_forward_context_cls._bind_ple_caches(
+                self, model, self._rtp_layer_maps[0]
+            )
+        if "qsa_compressed_slots" in buffers:
             return
         is_target = bool(
             getattr(
@@ -106,6 +113,7 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         if (is_target or is_mtp_draft) and mtp_tokens_per_request not in (2, 3, 4):
             raise ValueError("Qwen4Exp MTP supports 1, 2, or 3 draft steps")
         max_batch = int(self._cg_max_num_tokens)
+        request_capacity = int(getattr(self, "_rtp_mtp_request_capacity", max_batch))
         device = self._get_model_device()
         qsa_layers = [
             module
@@ -119,11 +127,13 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 int(self.kv_cache.get_seq_size_per_block("full")),
             )
 
-        def add_qsa_buffers(graph_buffers, num_tokens):
+        def add_qsa_buffers(graph_buffers, num_tokens, position_capacity):
             graph_buffers["seq_id_i32"] = graph_buffers["seq_id"].to(torch.int32)
+            graph_buffers["qwen4_positions_i32"] = torch.empty(
+                position_capacity, device=device, dtype=torch.int32
+            )
             for name, dtype in (
                 ("qsa_positions_i64", torch.int64),
-                ("qwen4_positions_i32", torch.int32),
                 ("qsa_slots_i64", torch.int64),
                 ("qwen4_has_initial", torch.bool),
                 ("qsa_compressed_slots", torch.int64),
@@ -145,7 +155,7 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         # The same draft runtime is wrapped by both the Q-token draft-prefill
         # graph and the one-token draft-decode graph. Never replace the decode
         # geometry in the parent's buffers with Q-strided request indices.
-        add_qsa_buffers(buffers, max_batch)
+        add_qsa_buffers(buffers, max_batch, request_capacity)
         if mtp_tokens_per_request == 1:
             return
         max_tokens = max_batch * mtp_tokens_per_request
@@ -183,7 +193,9 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             ("slot_mapping", torch.int64),
         ):
             mtp_buffers[name] = torch.empty(max_tokens, device=device, dtype=dtype)
-        add_qsa_buffers(mtp_buffers, max_tokens)
+        add_qsa_buffers(
+            mtp_buffers, max_tokens, request_capacity * mtp_tokens_per_request
+        )
         if is_target:
             # One flag per index-kernel tile; each replay overwrites it.
             # Graph padding (reserved block 0) is not counted.
@@ -423,7 +435,11 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                     and query_lengths is not None
                     and starts.numel() * width == token_num
                     and query_lengths.numel() == starts.numel()
-                    and bool(torch.all(query_lengths == width).item())
+                    and bool(
+                        torch.all(
+                            (query_lengths >= 0) & (query_lengths <= width)
+                        ).item()
+                    )
                 )
                 if fixed_window:
                     logical = (
@@ -720,6 +736,17 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
 class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
     """Bridge RTP's flat HC hand-off to ATOM's reusable QSA draft layer."""
 
+    @staticmethod
+    def _draft_vision_embeddings(input_ids, embed_tokens, is_multimodal):
+        if not is_multimodal or embed_tokens.tp_size != 1:
+            return None
+        # RTP's speculative padding can contain -1. The TP>1 embedding
+        # masks invalid IDs, but TP=1 otherwise uses a raw gather and faults
+        # before the padding row is skipped.
+        from atom.model_ops.embed_head import replicated_embedding
+
+        return replicated_embedding(input_ids, embed_tokens.weight)
+
     def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
         tagged = inputs.attention_inputs
         if isinstance(tagged, dict):
@@ -816,7 +843,12 @@ class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
             if is_multimodal:
                 get_forward_context().context.positions = rope_positions
             with use_custom_atom_config(self.model.atom_config):
-                hc = self.model(input_ids, rope_positions + 1, hc_input)
+                draft_embeds = self._draft_vision_embeddings(
+                    input_ids, self.model.model.embed_tokens, is_multimodal
+                )
+                hc = self.model(
+                    input_ids, rope_positions + 1, hc_input, inputs_embeds=draft_embeds
+                )
         hc = hc.flatten(1)
         mixed = self.model._head_input(hc)
         return PyModelOutputs(mixed, hc)

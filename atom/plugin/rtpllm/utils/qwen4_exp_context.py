@@ -127,9 +127,20 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             invalid_live_rows = cg_bufs["target_invalid_live_rows"][
                 : triton.cdiv(batch_size, 128)
             ]
+            prefix_lengths = getattr(attn_inputs, "prefix_lengths_device", None)
+            if (
+                prefix_lengths is None
+                or prefix_lengths.device != block_table.device
+                or prefix_lengths.dtype != torch.int32
+                or prefix_lengths.numel() != batch_size
+            ):
+                raise RuntimeError(
+                    "Qwen4Exp MTP target Graph requires device prefix lengths"
+                )
             _target_verify_state_slots_graph_kernel[(triton.cdiv(batch_size, 128),)](
                 block_table,
                 seq_lens,
+                prefix_lengths,
                 read_slots,
                 write_slots,
                 invalid_live_rows,
@@ -465,9 +476,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             module._rtp_qsa_cache_signature = signature
 
     @staticmethod
-    def _ple_metadata(
-        runtime: Any, model: Any, attn_metadata: Any, gdn_layers: dict[int, Any]
-    ) -> Qwen4ExpPLEMetadata | None:
+    def _bind_ple_caches(runtime: Any, model: Any, gdn_layers: dict[int, Any]):
         ple_layers = [
             layer.ple for layer in model.model.layers if layer.ple is not None
         ]
@@ -475,12 +484,6 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             return None
         if len(ple_layers) != 1:
             raise ValueError("RTP Qwen4Exp currently supports one PLE layer")
-        gdn = attn_metadata.gdn_metadata
-        if gdn is None or (
-            gdn.non_spec_state_indices_tensor is None
-            and gdn.spec_state_indices_tensor is None
-        ):
-            raise ValueError("PLE requires GDN state-slot metadata")
         ple = ple_layers[0]
         if not gdn_layers:
             raise ValueError("PLE requires a GDN layer cache")
@@ -488,6 +491,10 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         slots = int(raw.shape[0])
         signature = (raw.data_ptr(), slots, ple.hc_hidden_size, ple.conv_state_len)
         if getattr(runtime, "_rtp_ple_cache_signature", None) != signature:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Qwen4Exp PLE caches must be bound before Graph capture"
+                )
             runtime._rtp_ple_ngram = torch.full(
                 (slots, ple.ple_embedding.ngram_size - 1),
                 int(model.config.eos_token_id),
@@ -500,6 +507,21 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 dtype=model.atom_config.torch_dtype,
             )
             runtime._rtp_ple_cache_signature = signature
+        return ple
+
+    @classmethod
+    def _ple_metadata(
+        cls, runtime: Any, model: Any, attn_metadata: Any, gdn_layers: dict[int, Any]
+    ) -> Qwen4ExpPLEMetadata | None:
+        ple = cls._bind_ple_caches(runtime, model, gdn_layers)
+        if ple is None:
+            return None
+        gdn = attn_metadata.gdn_metadata
+        if gdn is None or (
+            gdn.non_spec_state_indices_tensor is None
+            and gdn.spec_state_indices_tensor is None
+        ):
+            raise ValueError("PLE requires GDN state-slot metadata")
         spec_indices = (
             gdn.spec_state_indices_tensor
             if getattr(gdn, "rtp_target_verify_block_map", None) is not None
