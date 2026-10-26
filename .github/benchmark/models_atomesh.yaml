@@ -1499,6 +1499,9 @@ models:
               ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
               ATOM_PROFILER_MORE: "0"
               ATOM_PROFILER_TIMEOUT: "1800"
+              # A prefill stage has segfaulted soon after stop_profile; dump
+              # every thread's Python stack if it happens again.
+              PYTHONFAULTHANDLER: "1"
             prefill:
               <<: *kimi_k3_pp8_state128_prefill_env
               ATOM_PP_MAX_INFLIGHT: "16"
