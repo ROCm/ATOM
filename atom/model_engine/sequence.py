@@ -391,7 +391,6 @@ class Sequence:
         # rides beside the seq in the ADD frame (`take_shipped_chains`), never
         # inside a pickled seq (`__getstate__`).
         self.prompt_hash_chain: tuple | None = None
-        self.prompt_prefix = None  # immutable content hint; never a KV lease
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
         # carries speculation scratch. Filled by `BlockManager.plan_midstep`
@@ -610,7 +609,6 @@ class Sequence:
         # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
         state = self.__dict__.copy()
         state["prompt_hash_chain"] = None
-        state["prompt_prefix"] = None
         return state
 
     # def __getstate__(self):

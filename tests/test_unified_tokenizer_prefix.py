@@ -183,16 +183,39 @@ def test_ipc_hbm_adoption_does_not_turn_content_into_residency():
     tokens = list(range(40)) + [900, 901, 902]
     projection = pp.project_prefix(tokens, 4)
     seq = Sequence(tokens, 4)
-    ph.ship_prompt_hash_chain(seq, 4, projection=projection)
+    with patch.object(ph, "_link", wraps=ph._link) as kv:
+        ph.ship_prompt_hash_chain(seq, 4, projection=projection)
+    assert kv.call_count == 0  # the chain came from the projection
     [seq] = over_ipc([seq])
-    assert seq.prompt_prefix == projection
     bm = published(range(40))
     assert bm.can_allocate_memoized(seq) == 10
     assert bm.shipped_chains_adopted == 1
     bm.clear_cache()
+    # A content hint, not residency: the KV hit goes with the blocks.
     assert bm.can_allocate_memoized(seq) == 0
-    # The immutable prefix hint survives; the KV hit correctly does not.
-    assert seq.prompt_prefix == projection
+
+
+def test_the_projection_stays_on_the_frontend():
+    """Only the chain rides the ADD frame; the engine reads no projection."""
+    import pickle
+
+    tokens = list(range(4000))
+    projection = pp.project_prefix(tokens, 4)
+    seq = Sequence(tokens, 4)
+    ph.ship_prompt_hash_chain(seq, 4, projection=projection)
+    chain = seq.prompt_hash_chain
+    assert not any(isinstance(f, pp.PrefixProjection) for f in chain)
+    assert len(pickle.dumps(chain)) < len(projection.kv_hashes) + 1024
+
+
+def test_a_stale_projection_is_ignored_and_the_chain_rehashed():
+    tokens = list(range(40))
+    stale = pp.project_prefix([t + 1 for t in tokens], 4)
+    seq = Sequence(tokens, 4)
+    ph.ship_prompt_hash_chain(seq, 4, projection=stale)
+    assert list(seq.prompt_hash_chain.hashes) == ph.chained_block_hashes(
+        tokens, 4, 0, 10, -1
+    )
 
 
 def test_real_frontend_fanout_uses_one_prefix_record(tokenizer):
@@ -207,9 +230,8 @@ def test_real_frontend_fanout_uses_one_prefix_record(tokenizer):
     with patch.object(ph, "_link", wraps=ph._link) as kv:
         siblings = proc.preprocess_fanout(text, SamplingParams(n=2))
     assert kv.call_count < len(siblings[0].prompt_hash_chain.hashes)
-    assert siblings[0].prompt_prefix is siblings[1].prompt_prefix
+    assert siblings[0].prompt_hash_chain is siblings[1].prompt_hash_chain
     for seq in over_ipc(siblings):
-        assert seq.prompt_prefix.matches(seq.prompt_token_ids)
         assert list(seq.prompt_hash_chain.hashes) == ph.chained_block_hashes(
             tokenizer.encode(text), 4, 0, len(seq.prompt_token_ids) // 4, -1
         )
@@ -226,5 +248,8 @@ def test_processor_initialization_uses_one_cache_by_default(tokenizer, monkeypat
     proc = InputOutputProcessor(config, tokenizer, 4)
     assert proc.segment_tokenizer is not None
     assert proc.prefix_hash_block_size == 8 and proc._unified_prefix
-    [seq] = proc.preprocess_fanout(prompt(), SamplingParams())
-    assert seq.prompt_prefix.block_size == 8
+    proc.preprocess_fanout(prompt(), SamplingParams())
+    with patch.object(ph, "_link", wraps=ph._link) as kv:
+        [seq] = proc.preprocess_fanout(prompt() + "hello<END><U>x<A>", SamplingParams())
+    assert seq.prompt_hash_chain.hash_block_size == 8
+    assert kv.call_count < len(seq.prompt_hash_chain.hashes)

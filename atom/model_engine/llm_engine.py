@@ -913,7 +913,6 @@ class InputOutputProcessor:
             )
             for seq in seqs[1:]:
                 seq.prompt_hash_chain = seqs[0].prompt_hash_chain
-                seq.prompt_prefix = seqs[0].prompt_prefix
 
         if n == 1:
             logger.info(
