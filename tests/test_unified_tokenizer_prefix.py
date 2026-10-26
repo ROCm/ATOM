@@ -231,7 +231,7 @@ def test_real_frontend_fanout_uses_one_prefix_record(tokenizer):
 def test_processor_initialization_uses_one_cache_and_nested_page_geometry(
     tokenizer, monkeypatch
 ):
-    monkeypatch.setenv("ATOM_UNIFIED_PREFIX_CACHE", "1")
+    monkeypatch.delenv("ATOM_UNIFIED_PREFIX_CACHE", raising=False)
     config = SimpleNamespace(
         speculative_config=None,
         hf_config=SimpleNamespace(model_type="llama"),
