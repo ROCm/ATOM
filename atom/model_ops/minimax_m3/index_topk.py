@@ -1429,6 +1429,7 @@ def minimax_m3_index_topk_decode(
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
     index_score_work_map: torch.Tensor | None = None,
     index_score_max_block: int = 0,
+    index_score_out: torch.Tensor | None = None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -1436,7 +1437,9 @@ def minimax_m3_index_topk_decode(
     ``index_mxfp4`` and ``pages_per_block`` likewise. The MXFP4 scorer takes the
     step's ``index_score_work_map`` (``MiniMaxM3SparseMetadata``) and stores the
     scores ``index_score_max_block`` wide -- the bound the map was built against,
-    which does not move between graph replays; omitted, it builds its own.
+    which does not move between graph replays; omitted, it builds its own. It stores
+    them into the step's ``index_score_out`` (-inf filled once a step); omitted, it
+    allocates and fills its own.
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1505,6 +1508,13 @@ def minimax_m3_index_topk_decode(
             num_idx_heads,
             sm_scale,
             index_score_work_map,
+            # a buffer for another bound is the scorer's to refuse, not ours to feed
+            (
+                index_score_out
+                if index_score_out is not None
+                and index_score_out.shape[-1] == score_max_block
+                else None
+            ),
         )
     else:
         score = _triton_decode_score(

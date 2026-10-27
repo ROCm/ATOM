@@ -13,8 +13,11 @@ The query is bf16, or e4m3 as the fused writer emits it with
 The decode scorer wants a per-step work map. It is built once per step in the
 metadata (outside any graph) into a persistent buffer, ``index_score_work_map``;
 its row count is the grid, so every call of a step -- and every graph replay --
-must pass the same ``max_block`` the map was built against.
+must pass the same ``max_block`` the map was built against. The scores' -inf
+sentinel is refilled the same way, once a step (``fresh_index_score``), not once a layer.
 """
+
+import torch
 
 from atom.model_ops.minimax_m3.kv_mxfp4 import page_views
 
@@ -53,6 +56,34 @@ def build_index_work_map(
     )
 
 
+def index_score_buffer(max_rows, num_idx_heads, max_block, device):
+    """Flat fp32 storage for the decode scorer's scores of up to ``max_rows`` rows,
+    ``max_block`` wide: the persistent ``out`` of every layer of a captured step."""
+    return torch.empty(
+        num_idx_heads * max_rows * max_block, dtype=torch.float32, device=device
+    )
+
+
+def fresh_index_score(buf, rows, num_idx_heads, max_block, max_query_len):
+    """``[H, rows, max_block]`` view of ``buf``, refilled with the scorer's -inf
+    sentinel, for ``decode_score_mxfp4(out=...)``; call it once a step, outside the
+    graph. A page a row never reaches is never stored, so without the refill it
+    would keep an earlier step's score. None when the scorer lays its own scores out
+    transposed (S * H >= its TRANSPOSE_MIN_F, not TP4's S=8, H=1): the caller then
+    lets the scorer allocate."""
+    from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
+        NEG_INF,
+        TRANSPOSE_MIN_F,
+    )
+
+    if max_query_len * num_idx_heads >= TRANSPOSE_MIN_F:
+        return None
+    n = num_idx_heads * rows * max_block
+    if n > buf.numel():
+        raise ValueError(f"{rows} rows x {max_block} blocks outgrow the score buffer")
+    return buf[:n].view(num_idx_heads, rows, max_block).fill_(NEG_INF)
+
+
 def decode_score_mxfp4(
     idx_q,  # [batch * S, H, 128] bf16 or e4m3
     index_cache,  # uint8 [pages, 8704]
@@ -63,10 +94,13 @@ def decode_score_mxfp4(
     num_idx_heads,
     sm_scale,
     work_map=None,
+    out=None,
 ):
     """``[H, batch * S, max_block]`` fp32 block scores of a uniform decode (S query
     rows a request, causal per row). ``work_map`` is the step's; omitted, the
-    scorer builds its own (~120 us -- fine in a test, ruinous per layer)."""
+    scorer builds its own (~120 us -- fine in a test, ruinous per layer). ``out`` is
+    the step's ``fresh_index_score``; omitted, the scorer allocates and fills its
+    own with -inf (a launch a layer)."""
     k_data, k_scale = page_views(index_cache)
     return _flydsl("minimax_m3_index_score_fp4_flydsl")(
         idx_q,
@@ -78,6 +112,7 @@ def decode_score_mxfp4(
         num_idx_heads,
         sm_scale,
         max_block,
+        out=out,
         work_map=work_map,
     )
 

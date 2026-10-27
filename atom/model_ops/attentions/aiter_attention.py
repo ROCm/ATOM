@@ -315,7 +315,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._has_sparse_attention
             and getattr(self.model_runner.config, "index_cache_dtype", None) == "mxfp4"
         ):
-            from atom.model_ops.minimax_m3.index_mxfp4 import index_work_map_capacity
+            from atom.model_ops.minimax_m3.index_mxfp4 import (
+                index_score_buffer,
+                index_work_map_capacity,
+            )
 
             # The MXFP4 decode scorer's persistent dispatch map (index_mxfp4):
             # its row count is the grid, so the bound is the model length, and the
@@ -333,6 +336,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
             self.model_runner.forward_vars["sparse_attention_index_score_work_map"] = (
                 torch.empty((rows, 2), **i32_kwargs)
+            )
+            # ... and its scores' storage: one for every layer of a step, refilled
+            # with -inf once in `make_sparse_decode_metadata` (fp32, rows x
+            # max_block wide: about 1 MB per 32 rows at the model-length bound).
+            self.model_runner.forward_vars["sparse_attention_index_score_buf"] = (
+                index_score_buffer(
+                    self.max_bs * max_qlen,
+                    num_head_k,
+                    self._index_score_max_block,
+                    self.device,
+                )
             )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
@@ -906,8 +920,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ]
 
     def _index_score_work_map_kwargs(self) -> dict:
-        """The MXFP4 decode scorer's persistent map and its bound, for
-        `make_sparse_decode_metadata`; nothing for any other index cache."""
+        """The MXFP4 decode scorer's persistent map, score storage and the map's
+        bound, for `make_sparse_decode_metadata`; nothing for any other index cache."""
         buf = self.model_runner.forward_vars.get(
             "sparse_attention_index_score_work_map"
         )
@@ -916,6 +930,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         return {
             "index_score_work_map_out": buf,
             "index_score_max_block": self._index_score_max_block,
+            "index_score_buf": self.model_runner.forward_vars[
+                "sparse_attention_index_score_buf"
+            ],
         }
 
     def _get_sparse_attention_block_tables(

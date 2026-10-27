@@ -108,6 +108,12 @@ class MiniMaxM3SparseMetadata:
     NOT `ceil(max_seq_len / 128)`: the map's row count is the grid baked at
     capture, so the bound is `ceil(max_model_len / 128)` and must not move.
     """
+    index_score_out: torch.Tensor | None = None
+    """[H, rows, index_score_max_block] fp32 GPU -- the MXFP4 decode scorer's
+    persistent output, refilled with -inf once a step here instead of by a
+    `torch.full` in every layer. None where the scorer lays its scores out
+    transposed, and wherever the index cache is not MXFP4.
+    """
 
 
 def make_sparse_prefill_metadata(
@@ -166,10 +172,13 @@ def make_sparse_decode_metadata(
     n_valid_column_per_row_out: torch.Tensor | None = None,
     index_score_work_map_out: torch.Tensor | None = None,
     index_score_max_block: int = 0,
+    index_score_buf: torch.Tensor | None = None,
 ) -> MiniMaxM3SparseMetadata:
     """``index_score_work_map_out`` is the persistent buffer of an MXFP4 index
     cache (the builder allocates it only then): given, the decode scorer's work
-    map is built into it here, once, with ``index_score_max_block`` as its bound."""
+    map is built into it here, once, with ``index_score_max_block`` as its bound.
+    ``index_score_buf`` is the scorer's persistent score storage: its view for this
+    step's rows is refilled with -inf here, once."""
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
@@ -184,6 +193,17 @@ def make_sparse_decode_metadata(
             max_query_len=max_query_len,
             num_idx_heads=num_idx_heads,
             out=index_score_work_map_out,
+        )
+    score_out = None
+    if work_map is not None and index_score_buf is not None:
+        from atom.model_ops.minimax_m3.index_mxfp4 import fresh_index_score
+
+        score_out = fresh_index_score(
+            index_score_buf,
+            batch * max_query_len,
+            num_idx_heads,
+            index_score_max_block,
+            max_query_len,
         )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
@@ -205,6 +225,7 @@ def make_sparse_decode_metadata(
         ),
         index_score_work_map=work_map,
         index_score_max_block=index_score_max_block if work_map is not None else 0,
+        index_score_out=score_out,
     )
 
 
