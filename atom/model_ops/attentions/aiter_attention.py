@@ -45,6 +45,8 @@ class _IndexCacheSpec(NamedTuple):
     rows: int
     dim: int
     dtype: torch.dtype
+    # `--index-cache-dtype fp4`: two uint8 planes per key (index_fp4), not one.
+    fp4: bool = False
 
     def __str__(self) -> str:
         """How a row space names itself in a log line."""
@@ -77,8 +79,12 @@ def _resolve_index_cache_dtype(config) -> torch.dtype:
         index_cache_dtype = getattr(config, "kv_cache_dtype", "bf16")
     if index_cache_dtype in ("bf16", "fp8"):
         return dtypes.d_dtypes[index_cache_dtype]
+    if index_cache_dtype == "fp4":
+        # NVFP4 payload + E4M3 scale planes, both uint8 (see minimax_m3/index_fp4).
+        return torch.uint8
     raise ValueError(
-        f"index_cache_dtype must be 'bf16' or 'fp8', got {index_cache_dtype!r}"
+        "index_cache_dtype must be 'bf16', 'fp8' or 'fp4', "
+        f"got {index_cache_dtype!r}"
     )
 
 
@@ -604,6 +610,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             rows=self.row_counts().get(INDEX_ROWS, 0),
             dim=sparse_cfg["sparse_index_dim"],
             dtype=_resolve_index_cache_dtype(runner.config),
+            fp4=getattr(runner.config, "index_cache_dtype", None) == "fp4",
         )
 
     def _index_cache_fields(self, entry_tokens: int) -> tuple[EntryField, ...]:
@@ -617,6 +624,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         spec = self._index_cache_spec()
         if spec is None:
             return ()
+        if spec.fp4:
+            from atom.model_ops.minimax_m3.index_fp4 import fp4_index_row_bytes
+
+            payload_bytes, scale_bytes = fp4_index_row_bytes(spec.dim)
+            return (
+                EntryField(
+                    "index", spec.rows, (entry_tokens * payload_bytes,), torch.uint8
+                ),
+                EntryField(
+                    "index_scale",
+                    spec.rows,
+                    (entry_tokens * scale_bytes,),
+                    torch.uint8,
+                ),
+            )
         return (
             EntryField(
                 "index",
@@ -625,6 +647,33 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 torch.uint8,
             ),
         )
+
+    def _index_fp4_stage(self, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The step's BF16 index keys before FP4 quantization, shared by every
+        sparse layer (each quantizes its keys out before the next layer writes).
+
+        Token-major page-128 ``[rows // 128, 128, dim]`` with the identity
+        ``index_slot_mapping`` beside it, sized for the largest step: a prefill
+        chunk or a full decode graph of ``max_num_seqs`` spec rows.
+        """
+        stage = getattr(self, "_index_fp4_stage_buf", None)
+        if stage is None:
+            config = self.model_runner.config
+            tokens = max(
+                int(config.max_num_batched_tokens), int(config.max_num_seqs) * 16
+            )
+            rows = -(-tokens // self.block_size) * self.block_size
+            device = torch.device("cuda", torch.cuda.current_device())
+            stage = (
+                torch.zeros(
+                    (rows // self.block_size, self.block_size, dim),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                torch.arange(rows, dtype=torch.int64, device=device),
+            )
+            self._index_fp4_stage_buf = stage
+        return stage
 
     def release_kv_pools(self) -> None:
         for pool in self.kv_pools.values():
@@ -695,12 +744,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             runner = self.model_runner
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
             spec = self._index_cache_spec()
-            module.impl.index_cache = pool.field_view(
-                "index",
-                self.pool_rows[INDEX_ROWS][module],
-                spec.dtype,
-                (-1, self.block_size, spec.dim),
-            )
+            row = self.pool_rows[INDEX_ROWS][module]
+            if spec.fp4:
+                from atom.model_ops.minimax_m3.index_fp4 import fp4_index_row_bytes
+
+                payload_bytes, scale_bytes = fp4_index_row_bytes(spec.dim)
+                module.impl.index_cache = pool.field_view(
+                    "index", row, torch.uint8, (-1, self.block_size, payload_bytes)
+                )
+                module.impl.index_scale = pool.field_view(
+                    "index_scale", row, torch.uint8, (-1, self.block_size, scale_bytes)
+                )
+                (
+                    module.impl.index_stage,
+                    module.impl.index_stage_slots,
+                ) = self._index_fp4_stage(spec.dim)
+            else:
+                module.impl.index_cache = pool.field_view(
+                    "index", row, spec.dtype, (-1, self.block_size, spec.dim)
+                )
             module.impl.max_model_len = runner.config.max_model_len
             module.impl.index_topk_cache_state = getattr(
                 runner, "_sparse_attention_topk_cache_state", None
