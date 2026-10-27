@@ -15,6 +15,7 @@ from rtp_llm.ops import DataType, HybridAttentionType
 from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
+from atom.plugin.rtpllm.models import qwen4_exp as qwen4_exp_model
 from atom.plugin.rtpllm.models import qwen4_exp_mtp_hooks
 from atom.plugin.rtpllm.models.qwen3_5 import _ATOMQwen35MoeRuntime
 from atom.plugin.rtpllm.models.qwen4_exp import (
@@ -44,6 +45,7 @@ def test_qwen4_exp_prefix_ple_hook_is_instance_local(monkeypatch):
         def __init__(self):
             super().__init__()
             self.ple_embedding = SimpleNamespace(eos_token_id=0, ngram_size=3)
+            self.conv_state_len = 3
             self.norm_conv = None
 
         def forward_with_state(self, hidden, ids, metadata):
@@ -68,7 +70,7 @@ def test_qwen4_exp_prefix_ple_hook_is_instance_local(monkeypatch):
     monkeypatch.setattr(
         qwen4_exp_prefix_cache,
         "write_ple_checkpoints",
-        lambda ids, normalized, metadata: writes.append(normalized.clone()),
+        lambda ids, normalized, metadata, **kwargs: writes.append(normalized.clone()),
     )
     plugin_ple = FakePLE()
     standalone_ple = FakePLE()
@@ -170,7 +172,14 @@ def test_qwen4_exp_prefix_hook_preserves_real_ple_forward_and_final_state():
         plugin_metadata.conv_state[2], plain_metadata.conv_state[2]
     )
     torch.testing.assert_close(plugin_metadata.ngram_state[1], ids[62:64])
-    assert torch.count_nonzero(plugin_metadata.conv_state[1]).item() > 0
+    prefix_metadata = make_metadata(False)
+    prefix_metadata.query_start_loc = torch.tensor(
+        [0, 64], device="cuda", dtype=torch.int32
+    )
+    baseline.forward_with_state(hidden[:64], ids[:64], prefix_metadata)
+    torch.testing.assert_close(
+        plugin_metadata.conv_state[1], prefix_metadata.conv_state[2], rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("prefill_enabled", [True, False])
@@ -764,7 +773,7 @@ def test_lazy_model_registry_mapping_accessors_resolve_classes():
     assert list(registry.items()) == [("thing", Counter)]
 
 
-def test_qwen4_exp_plugin_config_and_registration(tmp_path):
+def test_qwen4_exp_plugin_config_and_registration(tmp_path, monkeypatch):
     text_config = {
         "num_attention_heads": 24,
         "num_key_value_heads": 2,
@@ -815,6 +824,12 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path):
     config.init_precision_config(None, None)
     assert config.compute_dtype == torch.bfloat16
     config.attn_config.tokens_per_block = 64
+    monkeypatch.setattr(
+        qwen4_exp_model._rtp_ops,
+        "supports_plugin_cache_block_copy",
+        True,
+        raising=False,
+    )
     kv_cache_config = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
     ATOMQwen4Exp._apply_kv_cache_config(config, kv_cache_config)
     qsa_bytes = (64 + 16) * 128 * 2
@@ -822,6 +837,17 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path):
     assert config.auxiliary_paged_cache_bytes_per_block == qsa_bytes + ple_bytes
     assert kv_cache_config.reuse_cache is True
     assert config.atom_qwen4_exp_prefix_cache_enabled is True
+
+    monkeypatch.setattr(
+        qwen4_exp_model._rtp_ops, "supports_plugin_cache_block_copy", False
+    )
+    legacy = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
+    ATOMQwen4Exp._apply_kv_cache_config(config, legacy)
+    assert legacy.reuse_cache is False
+    assert config.atom_qwen4_exp_prefix_cache_enabled is False
+    monkeypatch.setattr(
+        qwen4_exp_model._rtp_ops, "supports_plugin_cache_block_copy", True
+    )
 
     disabled = SimpleNamespace(seq_size_per_block=64, reuse_cache=False)
     ATOMQwen4Exp._apply_kv_cache_config(config, disabled)
@@ -1771,6 +1797,14 @@ def test_qwen4_exp_prefix_copy_follows_full_and_linear_tags():
             torch.tensor([[1, 0, 5]], dtype=torch.int32),
             ["linear", "full"],
         )
+    before_invalid = ple_ngram.clone()
+    with pytest.raises(ValueError, match="out-of-range"):
+        _ATOMQwen4ExpRuntime.copy_plugin_cache_blocks(
+            runtime,
+            torch.tensor([[0, 0, 1], [0, 1, 99]], dtype=torch.int32),
+            ["linear", "full"],
+        )
+    torch.testing.assert_close(ple_ngram, before_invalid)
 
 
 def test_qwen4_exp_prefix_prefill_targets_interior_blocks():
@@ -1780,13 +1814,21 @@ def test_qwen4_exp_prefix_prefill_targets_interior_blocks():
         kv_cache_block_id=torch.tensor([[5, 6, 7]], dtype=torch.int32),
     )
     metadata = SimpleNamespace(non_spec_query_start_loc=torch.tensor([0, 130]))
-    targets = RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64)
+    targets = RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64, 64)
     assert targets is not None
     assert targets["rows"].tolist() == [0, 0]
     assert targets["slots"].tolist() == [5, 6]
     assert targets["offs"].tolist() == [64, 128]
     assert targets["is_end"].tolist() == [0, 0]
     assert metadata.ssm_chunk_offsets.tolist() == [0, 3]
+
+    # A block-aligned prefix hit keeps the next interior checkpoint on the
+    # GDN chunk grid, as guaranteed by RTP's chunk scheduler.
+    inputs.prefix_lengths = torch.tensor([64], dtype=torch.int32)
+    inputs.kv_cache_block_id = torch.tensor([[5, 6, 7, 8]], dtype=torch.int32)
+    prefixed = RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64, 64)
+    assert prefixed["slots"].tolist() == [6, 7]
+    assert prefixed["offs"].tolist() == [64, 128]
 
 
 def test_qwen4_exp_prefix_prefill_targets_skip_empty_graph_padding():
@@ -1796,13 +1838,15 @@ def test_qwen4_exp_prefix_prefill_targets_skip_empty_graph_padding():
         prefix_lengths=torch.tensor([0], dtype=torch.int32),
         kv_cache_block_id=torch.empty((1, 0), dtype=torch.int32),
     )
-    assert RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64) is None
+    assert (
+        RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64, 64) is None
+    )
 
     inputs.input_lengths = torch.tensor([130, 0], dtype=torch.int32)
     inputs.prefix_lengths = torch.tensor([0, 0], dtype=torch.int32)
     inputs.kv_cache_block_id = torch.tensor([[5, 6, 7], [-1, -1, -1]])
     metadata.non_spec_query_start_loc = torch.tensor([0, 130, 130])
-    targets = RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64)
+    targets = RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64, 64)
     assert targets is not None
     assert targets["rows"].tolist() == [0, 0]
     assert targets["slots"].tolist() == [5, 6]
@@ -1816,7 +1860,10 @@ def test_qwen4_exp_prefix_prefill_targets_reject_truncated_block_table():
     )
     metadata = SimpleNamespace(non_spec_query_start_loc=torch.tensor([0, 130]))
     with pytest.raises(ValueError, match="exceeds LINEAR block table"):
-        RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64)
+        RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64, 64)
+    inputs.kv_cache_block_id = torch.tensor([[5, 6, 7]], dtype=torch.int32)
+    with pytest.raises(ValueError, match="matching LINEAR kernel blocks"):
+        RTPQwen4ExpContext._prefill_state_checkpoints(inputs, metadata, 64, 128)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm/CUDA")
@@ -1842,12 +1889,20 @@ def test_qwen4_exp_prefix_ple_checkpoints_match_token_windows():
             "offs": torch.tensor([64, 128], device="cuda", dtype=torch.int32),
         },
     )
-    write_ple_checkpoints(ids, normalized, metadata)
+    write_ple_checkpoints(ids, normalized, metadata, history_width=2, conv_state_len=9)
     for slot, end in ((0, 64), (1, 128)):
         torch.testing.assert_close(ngram[slot], ids[end - 2 : end])
         torch.testing.assert_close(
             conv[slot], normalized[end - 9 : end].transpose(0, 1)
         )
+    ngram_wide = torch.full((3, 4), -1, device="cuda", dtype=torch.int64)
+    conv_wide = torch.full((3, 4, 12), -1, device="cuda", dtype=torch.bfloat16)
+    metadata.ngram_state = ngram_wide
+    metadata.conv_state = conv_wide
+    write_ple_checkpoints(ids, normalized, metadata, history_width=2, conv_state_len=9)
+    torch.testing.assert_close(ngram_wide[0, :2], ids[62:64])
+    assert torch.all(ngram_wide[:, 2:] == -1)
+    assert torch.all(conv_wide[:, :, 9:] == -1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm/CUDA")

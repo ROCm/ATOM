@@ -56,6 +56,7 @@ def _copy_checkpoints_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     STATE_VK: tl.constexpr = False,
+    H_VK: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -73,9 +74,10 @@ def _copy_checkpoints_kernel(
         # runtime slot, which the chunk kernel just wrote.
         idx = i_blk * BLOCK + tl.arange(0, BLOCK)
         mask = idx < STATE_ELEMENTS
+        vk_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
         dst_idx = idx
         if STATE_VK:
-            dst_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
+            dst_idx = vk_idx
         # Both branches cast to the pool's dtype: `h` is bf16 (the chunk
         # kernel allocates it with `k.new_empty`) while the pool is fp32, so
         # the two loads have different types and Triton requires them to
@@ -87,7 +89,8 @@ def _copy_checkpoints_kernel(
             ).to(ssm_dst.dtype.element_ty)
         else:
             src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
-            sv = tl.load(h + src * H_CHUNK_STRIDE + idx, mask=mask, other=0.0).to(
+            src_idx = vk_idx if H_VK else idx
+            sv = tl.load(h + src * H_CHUNK_STRIDE + src_idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
         tl.store(ssm_dst + slot * STATE_SLOT_STRIDE + dst_idx, sv, mask=mask)
@@ -123,6 +126,7 @@ def write_state_checkpoints(
     cu_seqlens: torch.Tensor,
     chunk_size: int,
     conv_state_len: int,
+    h_vk: bool = False,
 ) -> None:
     """Write both halves of every checkpoint this step reached, in one launch.
 
@@ -166,11 +170,14 @@ def write_state_checkpoints(
     h_chunk_stride = h.stride(1)
     state_vk = ssm_state.stride(-2) == 1
     assert h.ndim == 5 and h.shape[2] == ssm_state.shape[1]
-    if state_vk:
-        assert h.shape[-2:] == (ssm_state.shape[-1], ssm_state.shape[-2])
-    else:
-        assert h.shape[-2:] == ssm_state.shape[-2:]
+    expected_h_shape = (
+        (ssm_state.shape[-1], ssm_state.shape[-2]) if h_vk else ssm_state.shape[-2:]
+    )
+    assert h.shape[-2:] == expected_h_shape
     assert h.stride(-1) == 1 and h.stride(-2) == h.shape[-1]
+    assert h.stride(2) == h.shape[-2] * h.shape[-1]
+    if state_vk:
+        assert ssm_state.stride(1) == ssm_state.shape[-2] * ssm_state.shape[-1]
     assert state_slot_stride >= state_elements
     d, state_len = conv_state.shape[1], conv_state_len
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
@@ -202,7 +209,8 @@ def write_state_checkpoints(
         CHUNK=chunk_size,
         BLOCK=BLOCK,
         NBLK_SSM=nblk_ssm,
-        K=h.shape[-2],
-        V=h.shape[-1],
+        K=ssm_state.shape[-2],
+        V=ssm_state.shape[-1],
         STATE_VK=state_vk,
+        H_VK=h_vk,
     )

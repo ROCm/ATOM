@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import json
 import logging
@@ -22,6 +23,9 @@ from atom.plugin.rtpllm.models.qwen3_5 import (
 )
 
 logger = logging.getLogger("atom.plugin.rtpllm.models")
+# rtp_llm.ops installs the extension package on sys.path as an import side
+# effect, so resolve this only after the imports above.
+_rtp_ops = importlib.import_module("librtp_compute_ops.rtp_llm_ops")
 
 
 class _Qwen4ExpAttnPyObj(_ATOMAttnPyObj):
@@ -101,13 +105,17 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         )
         if hasattr(self, "_rtp_ple_ngram"):
             side_pools["linear"].extend((self._rtp_ple_ngram, self._rtp_ple_conv))
-        # Preserve RTP's row order: later copies may source an earlier dst.
-        for row, src, dst in mapping.tolist():
+        copies = mapping.tolist()
+        # Validate the entire mapping before touching any side pool. RTP may
+        # chain copies, so the second pass must still preserve row order.
+        for row, src, dst in copies:
             if row < 0 or row >= len(tags):
                 raise ValueError(f"plugin cache copy has invalid tag row {row}")
             for pool in side_pools.get(tags[row], ()):
                 if src < 0 or dst < 0 or src >= pool.shape[0] or dst >= pool.shape[0]:
                     raise ValueError("plugin cache copy has out-of-range block ID")
+        for row, src, dst in copies:
+            for pool in side_pools.get(tags[row], ()):
                 if src != dst:
                     pool[dst].copy_(pool[src])
 
@@ -690,12 +698,20 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             raise ValueError(
                 "Qwen4Exp QSA cache requires positive, ratio-aligned block geometry"
             )
-        # Side pools follow RTP's tagged block relocations through
-        # copy_plugin_cache_blocks; leave the caller's reuse_cache setting intact.
         if getattr(kv_cache_config, "multi_task_prompt", None) or getattr(
             kv_cache_config, "multi_task_prompt_str", None
         ):
             raise ValueError("Qwen4Exp RTP plugin does not support cached task prompts")
+        # Older RTP binaries do not call copy_plugin_cache_blocks during a
+        # tagged block relocation. Reuse would then read stale QSA/PLE state.
+        if kv_cache_config.reuse_cache and not bool(
+            getattr(_rtp_ops, "supports_plugin_cache_block_copy", False)
+        ):
+            logger.warning(
+                "Disabling Qwen4Exp prefix cache: RTP lacks the compiled "
+                "plugin cache block-copy callback"
+            )
+            kv_cache_config.reuse_cache = False
         model_config.atom_qwen4_exp_prefix_cache_enabled = bool(
             kv_cache_config.reuse_cache
         )

@@ -69,7 +69,10 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
 
     @staticmethod
     def _prefill_state_checkpoints(
-        attn_inputs: Any, metadata: GDNAttentionMetadata, block_size: int
+        attn_inputs: Any,
+        metadata: GDNAttentionMetadata,
+        block_size: int,
+        kernel_block_size: int,
     ) -> dict[str, torch.Tensor] | None:
         """Snapshot every cacheable interior block, not just the prefill tail.
 
@@ -83,9 +86,9 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
 
         if block_size <= 0 or block_size % CHUNK_SIZE:
             raise ValueError("prefix cache requires a chunk-aligned LINEAR block")
-        kernel_block_size = int(
-            getattr(attn_inputs, "kernel_seq_size_per_block", block_size)
-        )
+        # RTP's kernel block width lives on the tagged KV cache, not on the
+        # attention input. A missing/zero kernel width means the base width.
+        kernel_block_size = int(kernel_block_size) or block_size
         if kernel_block_size != block_size:
             raise ValueError("prefix cache requires matching LINEAR kernel blocks")
         lengths = attn_inputs.input_lengths
@@ -108,6 +111,9 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 # Graph padding can have no tokens and no block-table columns.
                 continue
             end = start + length
+            # RTP's computeChunkGrant aligns every non-final chunk to the KV
+            # block, and a prefix hit is block-aligned. Hence an interior
+            # publishable boundary is also on this step's 64-token h grid.
             first_boundary = ((start // block_size) + 1) * block_size
             for position in range(first_boundary, end, block_size):
                 offset = position - start
@@ -126,18 +132,22 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             return None
         device = metadata.non_spec_query_start_loc.device
 
-        def gpu(values: list[int]) -> torch.Tensor:
-            return torch.tensor(values, dtype=torch.int32, device=device)
-
         metadata.ssm_chunk_offsets = prepare_chunk_offsets(
             metadata.non_spec_query_start_loc, CHUNK_SIZE
         )
-        gpu_slots = gpu(slots)
+        # Upload all checkpoint indices together; separate pageable H2D copies
+        # here otherwise add four host launches for every chunked prefill.
+        packed = torch.tensor(
+            [rows, slots, offsets],
+            dtype=torch.int32,
+            pin_memory=device.type == "cuda",
+        ).to(device, non_blocking=True)
+        gpu_slots = packed[1]
         return {
-            "rows": gpu(rows),
+            "rows": packed[0],
             "slots": gpu_slots,
-            "offs": gpu(offsets),
-            "is_end": gpu([0] * len(rows)),
+            "offs": packed[2],
+            "is_end": torch.zeros_like(gpu_slots),
             # RTP only snapshots interior boundaries; the kernel never reads
             # runtime slots when is_end=0.
             "runtime": gpu_slots,
@@ -687,6 +697,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                     inputs.attention_inputs,
                     gdn_metadata,
                     int(runtime.kv_cache.get_seq_size_per_block("linear")),
+                    int(runtime.kv_cache.get_kernel_seq_size_per_block("linear")),
                 )
                 gdn_metadata.ssm_conv_state_len = (
                     int(model.config.linear_conv_kernel_dim) - 1

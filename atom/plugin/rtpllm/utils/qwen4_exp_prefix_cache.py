@@ -46,7 +46,13 @@ def _rtp_ple_forward_with_state(
         metadata.has_initial_state,
         metadata.num_accepted_tokens,
     )
-    write_ple_checkpoints(input_ids, normalized, metadata)
+    write_ple_checkpoints(
+        input_ids,
+        normalized,
+        metadata,
+        history_width=self.ple_embedding.ngram_size - 1,
+        conv_state_len=self.conv_state_len,
+    )
     return gated_value.flatten(-2) + conv_output
 
 
@@ -116,7 +122,11 @@ def _write_ple_checkpoints_kernel(
 
 
 def write_ple_checkpoints(
-    input_ids: torch.Tensor, normalized: torch.Tensor, metadata
+    input_ids: torch.Tensor,
+    normalized: torch.Tensor,
+    metadata,
+    history_width: int,
+    conv_state_len: int,
 ) -> None:
     """Persist PLE n-gram and convolution windows for every GDN checkpoint."""
     targets = getattr(metadata, "rtp_checkpoint_targets", None)
@@ -124,8 +134,8 @@ def write_ple_checkpoints(
         return
     ngram = metadata.ngram_state
     conv = metadata.conv_state
-    width = int(ngram.shape[1])
-    history = int(conv.shape[2])
+    width = int(history_width)
+    history = int(conv_state_len)
     # MTP capacity has extra candidate slots; prefix cache is prefill-only.
     if metadata.num_accepted_tokens is not None:
         raise ValueError("PLE prefix checkpoints require non-speculative prefill")
@@ -133,6 +143,8 @@ def write_ple_checkpoints(
         raise ValueError("PLE checkpoint convolution width mismatch")
     if width <= 0 or history <= 0 or max(width, history) > 64:
         raise ValueError("PLE checkpoint history must fit one prefix block")
+    if ngram.shape[1] < width or conv.shape[2] < history:
+        raise ValueError("PLE checkpoint pool is narrower than model history")
     _write_ple_checkpoints_kernel[
         (targets["rows"].numel(), triton.cdiv(normalized.shape[1], 32))
     ](

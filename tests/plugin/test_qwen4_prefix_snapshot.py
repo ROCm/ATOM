@@ -48,7 +48,10 @@ def test_flydsl_snapshot_matches_prefix_final_state():
         False,
     )
     torch.testing.assert_close(
-        snapshots[:, prefix // 64].float(), final.float(), rtol=1e-2, atol=2e-2
+        snapshots[:, prefix // 64].transpose(-1, -2).float(),
+        final.float(),
+        rtol=1e-2,
+        atol=2e-2,
     )
     from atom.model_ops.fla_ops.gdn_flydsl import prepare_prefill_state
     from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
@@ -72,6 +75,7 @@ def test_flydsl_snapshot_matches_prefix_final_state():
         cu_full,
         64,
         3,
+        h_vk=True,
     )
     restored = prepare_prefill_state(
         state, values([1]), torch.ones(1, device=device, dtype=torch.bool)
@@ -80,3 +84,36 @@ def test_flydsl_snapshot_matches_prefix_final_state():
         restored, final.transpose(-1, -2).float(), rtol=1e-2, atol=2e-2
     )
     assert torch.all(padded[:, elements:] == -99.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_checkpoint_writer_accepts_native_vk_snapshot_with_unequal_dims():
+    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+
+    device = "cuda"
+    k, v = 64, 128
+    logical = torch.arange(k * v, device=device, dtype=torch.float32).reshape(k, v)
+    # AITER emits [V, K]; RTP's persistent pool is a logical [K, V] view
+    # backed by VK-contiguous storage. Unequal dimensions catch swapped axes.
+    snapshot = logical.transpose(-1, -2).contiguous().view(1, 1, 1, v, k)
+    snapshot = snapshot.expand(1, 2, 1, v, k).contiguous()
+    state = torch.zeros(2, 1, v, k, device=device).transpose(-1, -2)
+    conv = torch.zeros(2, 4, 3, device=device)
+    values = lambda items: torch.tensor(items, device=device, dtype=torch.int32)
+    write_state_checkpoints(
+        snapshot,
+        state,
+        torch.zeros(128, 4, device=device),
+        conv,
+        values([0]),
+        values([1]),
+        values([64]),
+        values([0]),
+        values([0]),
+        values([0, 2]),
+        values([0, 128]),
+        64,
+        3,
+        h_vk=True,
+    )
+    torch.testing.assert_close(state[1, 0], logical)
