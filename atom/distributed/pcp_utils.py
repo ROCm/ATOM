@@ -14,7 +14,6 @@ Ported from SGLang's DSA round-robin CP path
 """
 
 import logging
-from functools import cache
 from typing import NamedTuple
 
 import numpy as np
@@ -23,7 +22,6 @@ from aiter.dist.parallel_state import (
     get_pcp_group,
     get_prefill_context_model_parallel_rank,
     get_prefill_context_model_parallel_world_size,
-    get_tp_group,
 )
 
 
@@ -46,30 +44,7 @@ class PcpBalGroup(NamedTuple):
     )
 
 
-class PcpSharedGrid(NamedTuple):
-    """`size`-way cut, this rank's shard `rank`, and the `prescale` its output
-    needs before the tp/pcp collectives sum it. See `pcp_merged_tp_grid`."""
-
-    size: int
-    rank: int
-    prescale: float
-
-
 logger = logging.getLogger("atom")
-
-
-@cache
-def _warn_unaligned_fold(shard_dim: int, pcp_size: int, full: int, align: int) -> None:
-    """Once per distinct shape, not once per layer."""
-    logger.warning(
-        "PCP merge: leaving a %d-wide tensor replicated across the %d pcp "
-        "ranks -- no divisor of the %d-wide folded grid cuts it into "
-        "%d-aligned pieces, so it keeps the 1/pcp_size pre-scale instead.",
-        shard_dim,
-        pcp_size,
-        full,
-        align,
-    )
 
 
 def get_pcp_world_size() -> int:
@@ -108,63 +83,6 @@ def pcp_split_active(dsa_fallback_topk: int | None) -> bool:
     if attn_metadata is None:
         return False
     return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(dsa_fallback_topk)
-
-
-def pcp_merged_tp_grid(
-    shard_dim: int | None = None, align: int = 1
-) -> PcpSharedGrid | None:
-    """Cut a pcp-redundant per-token module on the folded `pcp*tp` grid, or
-    return None to leave it on TP.
-
-    The tp all_reduce and pcp collectives sum all `pcp*tp` contributions, so a
-    `g`-way cut (`g | pcp*tp`) is summed `pcp*tp/g` times: `prescale` undoes
-    that. `g` steps down until `shard_dim / g` is `align`-clean (block-quant
-    scales slice only on `align`). `flat_rank = pcp_rank * tp + tp_rank` must
-    match `FusedMoEParallelConfig.make`; its DP fold is not mirrored, so that
-    combination is refused.
-    """
-    from atom.config import get_current_atom_config
-    from atom.utils import envs
-
-    pcp_size = get_pcp_world_size()
-    if pcp_size <= 1 or not bool(envs.ATOM_PCP_MOE_MERGE):
-        return None
-    cfg = get_current_atom_config()
-    # Same condition as moe.py's `flatten_tp_across_dp_for_moe`.
-    if getattr(cfg, "enable_dp_attention", False) or getattr(
-        cfg, "moe_ep_flatten_tp_across_dp", False
-    ):
-        raise ValueError(
-            "ATOM_PCP_MOE_MERGE=1 cannot be combined with MoE's "
-            "flatten-TP-across-DP (enable_dp_attention or "
-            "moe_ep_flatten_tp_across_dp): the routed experts would shard "
-            "across pcp*dp*tp while the pcp-folded modules shard across "
-            "pcp*tp, and no collective sums the dp dimension back for the "
-            "latter. Set ATOM_PCP_MOE_MERGE=0 or drop the flatten."
-        )
-    tp_size = get_tp_group().world_size
-    tp_rank = 0 if tp_size == 1 else get_tp_group().rank_in_group
-    full = pcp_size * tp_size
-
-    size = tp_size
-    for cand in range(full, tp_size - 1, -1):
-        if full % cand:
-            continue
-        if shard_dim is None or (
-            shard_dim % cand == 0 and (shard_dim // cand) % align == 0
-        ):
-            size = cand
-            break
-    if size <= tp_size:
-        # Nothing the TP group does not already cut -- stay on it.
-        if shard_dim is not None and full > tp_size:
-            _warn_unaligned_fold(shard_dim, pcp_size, full, align)
-        return None
-    return PcpSharedGrid(
-        size=size,
-        rank=(get_pcp_rank() * tp_size + tp_rank) % size,
-        prescale=size / full,
-    )
 
 
 def pcp_pad_len(

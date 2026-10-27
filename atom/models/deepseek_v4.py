@@ -62,7 +62,6 @@ from atom.distributed.pcp_utils import (
     pcp_all_reduce,
     pcp_allgather_rankmajor,
     pcp_allgather_rerange,
-    pcp_merged_tp_grid,
     pcp_pad_len,
     pcp_reduce_scatter,
     pcp_round_robin_split,
@@ -123,7 +122,6 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
-from atom.quant_spec import will_online_requant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
@@ -2726,16 +2724,8 @@ class Expert(nn.Module):
         quant_config: Any | None = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_grid: tuple[int, int] | None = None,
     ):
         super().__init__()
-        # `tp_grid`: (size, rank) to shard on instead of the TP group; the
-        # caller's pre-scale accounts for it.
-        grid = (
-            {"override_tp_size": tp_grid[0], "override_tp_rank": tp_grid[1]}
-            if tp_grid is not None
-            else {}
-        )
         # Fused [w1; w3] (gate_up_proj): both share input x, both ColumnParallel
         # — standard llama/dsv2 fusion. Disk still split; routed via
         # packed_modules_mapping in DeepseekV4ForCausalLM.
@@ -2745,7 +2735,6 @@ class Expert(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            **grid,
         )
         self.w2 = RowParallelLinear(
             inter_dim,
@@ -2754,7 +2743,6 @@ class Expert(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.w2",
-            **grid,
         )
         self.swiglu_limit = swiglu_limit
         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
@@ -2894,14 +2882,6 @@ class MoE(nn.Module):
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
-            # Shard on the pcp-folded grid like routed (align=128: block-scale
-            # granularity). Online re-quantization gathers on the real TP group
-            # and cannot rebuild a folded weight, so that case stays on TP.
-            self._shared_pcp_grid = (
-                None
-                if _shared_expert_requantized_online(qc, f"{prefix}.shared_experts")
-                else pcp_merged_tp_grid(shard_dim=args.moe_inter_dim, align=128)
-            )
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
@@ -2909,22 +2889,9 @@ class MoE(nn.Module):
                 quant_config=qc,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
-                tp_grid=(
-                    None
-                    if self._shared_pcp_grid is None
-                    else (self._shared_pcp_grid.size, self._shared_pcp_grid.rank)
-                ),
             )
         else:
-            self._shared_pcp_grid = None
             self.shared_experts = None
-        # Pre-scale before the tp/pcp collectives: g/(pcp*tp) on a g-way grid,
-        # 1/pcp_size when left on TP.
-        self._shared_prescale = (
-            self._shared_pcp_grid.prescale
-            if self._shared_pcp_grid is not None
-            else 1.0 / max(get_pcp_world_size(), 1)
-        )
         if self.is_hash_layer:
             # Inject hash routing into FusedMoE.select_experts via the
             # custom_routing_function hook (added in atom/model_ops/moe.py).
@@ -3078,12 +3045,18 @@ class MoE(nn.Module):
         all-reduce across TP ranks.
         """
         if shared is not None:
-            # The tp and pcp collectives sum all pcp*tp contributions; a g-way
-            # cut is held by pcp*tp/g ranks, which `_shared_prescale` undoes.
-            if self._shared_prescale != 1.0 and (
-                _moe_pcp_merge_active() or _moe_pcp_merge_decode_active()
-            ):
-                shared = shared * self._shared_prescale
+            # PCP with ATOM_PCP_MOE_MERGE=1 (non-fused shared only): the shared expert
+            # is NOT pcp-sharded (its MergedColumn/RowParallelLinear bind to the
+            # 4-card tp group, so every pcp rank holds the same shared weights
+            # and computes the same full shared output — pcp-redundant). After
+            # this combine the result rides through Block.forward's pcp
+            # reduce_scatter, which SUMS the pcp partners. Without correction the
+            # shared part would be summed pcp_size times (doubled for pcp=2). So
+            # pre-scale shared by 1/pcp_size: the reduce_scatter then RESTORES it
+            # to 1x instead of multiplying. routed is genuinely pcp-sharded
+            # (partial sum) so it must NOT be scaled — only shared.
+            if _moe_pcp_merge_active() or _moe_pcp_merge_decode_active():
+                shared = shared * (1.0 / get_pcp_world_size())
             routed = routed + shared
         if self.tp_size > 1:
             # ATOM AR layer decides internally (via _tbo_aware_tp_reduce) whether
@@ -3632,18 +3605,6 @@ def _run_moe(moe: "MoE", x: torch.Tensor) -> torch.Tensor:
     if moe._use_dual_stream and 0 < num_tokens <= threshold:
         return moe.dual_stream_moe_forward(x)
     return moe.single_stream_moe_forward(x)
-
-
-def _shared_expert_requantized_online(qc, prefix: str) -> bool:
-    """Whether online quantization re-quantizes any of the shared expert's linears."""
-    for name in ("gate_up_proj", "w2"):
-        layer = f"{prefix}.{name}"
-        source = qc.get_layer_quant_config(layer) if qc is not None else None
-        if source is not None and will_online_requant(
-            qc, layer, source.quant_type, source.quant_dtype
-        ):
-            return True
-    return False
 
 
 def moe_pcp_merge_forward(

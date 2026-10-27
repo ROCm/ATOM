@@ -875,14 +875,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             self.ffn_norm.weight,
             self.norm_eps,
         )
-        # Same branch as Block.forward: under PCP the MoE weights are folded
-        # into the TP grid for the draft too, so its output needs the PCP sum.
-        if self._moe_merge_enabled:
-            hc_state.x_prev = torch.ops.aiter.moe_pcp_merge_forward(
-                hc_state.x_prev, self.ffn.prefix
-            )
-        else:
-            hc_state.x_prev = self.ffn(hc_state.x_prev)
+        hc_state.x_prev = self.ffn(hc_state.x_prev)
         return hc_state
 
 

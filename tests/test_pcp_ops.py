@@ -13,10 +13,8 @@ Groups:
   * row ownership        --- `pcp_round_robin_split` vs `pcp_round_robin_query_indices`
   * metadata padding     --- `pcp_pad_dense` vs `pcp_pad_indptr`
   * ragged reindex       --- `pcp_reindex_ragged`
-  * folded MoE grid      --- `pcp_merged_tp_grid` vs `FusedMoEParallelConfig.make`
 """
 
-import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -27,19 +25,9 @@ torch = pytest.importorskip("torch")
 # atom.config first, so a circular import on the mainline path cannot be
 # mistaken for an absent dependency below.
 try:
-    import atom.config
+    import atom.config  # noqa: F401  (import order, see above)
     import atom.distributed.pcp_utils as pu
-    from atom.model_ops import moe as moe_mod
     from atom.spec_decode import eagle_proposer as ep
-
-    # NOT `import aiter.dist.parallel_state as aps`: aiter's __init__ rebinds
-    # its `dist` attribute to torch.distributed after the real subpackage is
-    # already in sys.modules, so the `as` form's attribute walk lands on torch
-    # and raises. The repo's own `from aiter.dist.parallel_state import X` is
-    # unaffected (that reads sys.modules). The module object is what is needed
-    # here: moe.py imports those names *inside* the function under test, so
-    # only patching the real module reaches it.
-    aps = importlib.import_module("aiter.dist.parallel_state")
 except ImportError as _e:  # pragma: no cover - env without aiter/triton
     # Not `except Exception`: that is the exact mistake import_guard.py was
     # written about -- it swallows a SyntaxError in the module under test and
@@ -235,141 +223,6 @@ def test_reindex_ragged_handles_an_all_empty_shard():
     assert idx_local.numel() == 0
 
 
-# --------------------------------------------------------------------------
-# folded MoE grid --- `pcp_merged_tp_grid`
-#
-# DSV4's `moe_inter_dim`, the dimension the shared expert is cut along. 3072 /
-# 128 = 24, so the folded grid can only cut it 1/2/4/8 ways before a block-quant
-# scale block would straddle two ranks.
-# --------------------------------------------------------------------------
-
-INTER = 3072
-
-
-def _cfg(**over):
-    base = {
-        "enable_dp_attention": False,
-        "moe_ep_flatten_tp_across_dp": False,
-        "enable_expert_parallel": False,
-        "dp_logical_size": 0,
-        "moe_all2all_backend": "auto",
-        "enable_low_latency": False,
-    }
-    base.update(over)
-    return SimpleNamespace(**base)
-
-
-def _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank, merge="1", cfg=None):
-    """Present one (pcp, tp) rank position to both folds; each reads it from
-    its own namespace."""
-    cfg = cfg if cfg is not None else _cfg()
-    m.setenv("ATOM_PCP_MOE_MERGE", merge)
-    tp = SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank)
-    m.setattr(pu, "get_pcp_world_size", lambda: pcp_size)
-    m.setattr(pu, "get_pcp_rank", lambda: pcp_rank)
-    m.setattr(pu, "get_tp_group", lambda: tp)
-    m.setattr(moe_mod, "get_tp_group", lambda: tp)
-    m.setattr(moe_mod, "get_current_atom_config", lambda: cfg)
-    m.setattr(atom.config, "get_current_atom_config", lambda: cfg)
-    m.setattr(aps, "get_prefill_context_model_parallel_world_size", lambda: pcp_size)
-    m.setattr(aps, "get_prefill_context_model_parallel_rank", lambda: pcp_rank)
-    return cfg
-
-
-@pytest.mark.parametrize("pcp_size, tp_size", [(8, 1), (2, 4), (4, 2)])
-def test_folded_grid_agrees_with_fused_moe(monkeypatch, pcp_size, tp_size):
-    """Routed and shared ride the same collectives, so both folds must give
-    every rank the same (size, rank). Only mixed tp/pcp configs discriminate."""
-    for flat in range(pcp_size * tp_size):
-        pcp_rank, tp_rank = divmod(flat, tp_size)
-        with monkeypatch.context() as m:
-            cfg = _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank)
-            grid = pu.pcp_merged_tp_grid()
-            fused = moe_mod.FusedMoEParallelConfig.make(tp_size, 1, cfg)
-        assert grid is not None
-        assert (grid.size, grid.rank) == (fused.tp_size, fused.tp_rank), (
-            f"pcp{pcp_size}xtp{tp_size} flat={flat}: "
-            f"grid={grid.size, grid.rank} fused={fused.tp_size, fused.tp_rank}"
-        )
-        assert grid.prescale == 1.0  # whole grid -> nothing to undo
-
-
-def test_the_reversed_flatten_would_be_caught(monkeypatch):
-    """The reversed flatten must differ from moe.py's, or the test above
-    would be vacuous."""
-    pcp_size, tp_size = 2, 4
-    differs = 0
-    for flat in range(pcp_size * tp_size):
-        pcp_rank, tp_rank = divmod(flat, tp_size)
-        with monkeypatch.context() as m:
-            _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank)
-            grid = pu.pcp_merged_tp_grid()
-        reversed_rank = tp_rank * pcp_size + pcp_rank  # the mapping to avoid
-        differs += grid.rank != reversed_rank
-    assert differs > 0
-
-
-@pytest.mark.parametrize(
-    "pcp_size, tp_size, want",
-    [
-        (8, 1, (8, 1.0)),  # 3072/8 = 384, a 128 multiple -> the whole grid
-        (16, 1, (8, 0.5)),  # 3072/16 = 192 is not -> step down to 8
-        (8, 2, (8, 0.5)),  # same ceiling reached from the other axis
-        (2, 8, None),  # steps all the way down to tp -> stay on the TP group
-    ],
-)
-def test_steps_down_to_a_block_aligned_grid(monkeypatch, pcp_size, tp_size, want):
-    """A shard splitting a 128 scale block faults at load (DSV4 at tp*pcp=16:
-    3072/16 = 192), so the grid steps down."""
-    with monkeypatch.context() as m:
-        _as_rank(m, pcp_size, 0, tp_size, 0)
-        grid = pu.pcp_merged_tp_grid(shard_dim=INTER, align=128)
-    if want is None:
-        assert grid is None
-        return
-    size, prescale = want
-    assert (grid.size, grid.prescale) == (size, prescale)
-    assert INTER % grid.size == 0 and (INTER // grid.size) % 128 == 0
-
-
-def test_prescale_matches_how_often_a_shard_is_summed(monkeypatch):
-    """A scalar `prescale` is right only if every shard lands on exactly
-    pcp*tp/g ranks."""
-    pcp_size, tp_size = 16, 1
-    held = {}
-    prescale = None
-    for flat in range(pcp_size * tp_size):
-        pcp_rank, tp_rank = divmod(flat, tp_size)
-        with monkeypatch.context() as m:
-            _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank)
-            grid = pu.pcp_merged_tp_grid(shard_dim=INTER, align=128)
-        held[grid.rank] = held.get(grid.rank, 0) + 1
-        prescale = grid.prescale
-    assert sorted(held) == list(range(8)), "shards 0..7 all present"
-    assert set(held.values()) == {2}, f"uneven: {held}"
-    assert prescale == pytest.approx(1 / 2)
-
-
-@pytest.mark.parametrize(
-    "pcp_size, tp_size, merge",
-    [(1, 8, "1"), (8, 1, "0")],  # no pcp to fold / fold switched off
-)
-def test_no_grid_when_the_fold_is_off(monkeypatch, pcp_size, tp_size, merge):
-    with monkeypatch.context() as m:
-        _as_rank(m, pcp_size, 0, tp_size, 0, merge=merge)
-        assert pu.pcp_merged_tp_grid() is None
-
-
-@pytest.mark.parametrize("flag", ["enable_dp_attention", "moe_ep_flatten_tp_across_dp"])
-def test_flatten_tp_across_dp_is_refused(monkeypatch, flag):
-    """moe.py folds DP into TP before pcp; nothing sums that axis back for a
-    module carried only by the tp all_reduce + the pcp collective."""
-    with monkeypatch.context() as m:
-        _as_rank(m, 8, 0, 1, 0, cfg=_cfg(**{flag: True}))
-        with pytest.raises(ValueError, match="flatten-TP-across-DP"):
-            pu.pcp_merged_tp_grid()
-
-
 def test_needs_id_sync_is_one_predicate_for_both_groups():
     """PCP and TP gate their id broadcast on the same question."""
     mr = pytest.importorskip("atom.model_engine.model_runner")
@@ -377,42 +230,6 @@ def test_needs_id_sync_is_one_predicate_for_both_groups():
     assert mr._needs_id_sync(True, False) is True
     assert mr._needs_id_sync(False, True) is True
     assert mr._needs_id_sync(True, True) is True
-
-
-def test_shared_expert_stays_on_tp_when_requantized_online():
-    """Online re-quantization gathers on the real TP group, which cannot rebuild
-    a weight cut on the wider pcp*tp grid, so such a shared expert is not folded."""
-    import ast
-    import inspect
-    import textwrap
-
-    v4 = pytest.importorskip("atom.models.deepseek_v4")
-    from atom.quant_spec import LayerQuantConfig, QuantType
-
-    fp8 = LayerQuantConfig(
-        quant_type=QuantType.per_Token, quant_dtype=torch.float8_e4m3fn
-    )
-
-    class QC:
-        def __init__(self, online_quant, source, target):
-            self.online_quant = online_quant
-            self._source, self._target = source, target
-
-        def get_layer_quant_config(self, name, use_online_quant=False):
-            return self._target if use_online_quant else self._source
-
-    prefix = "layers.3.ffn.shared_experts"
-    bf16 = LayerQuantConfig.no_quant()
-    assert v4._shared_expert_requantized_online(QC(True, bf16, fp8), prefix)
-    assert not v4._shared_expert_requantized_online(QC(False, bf16, fp8), prefix)
-    # A source already in the online target's format keeps its checkpoint weight.
-    assert not v4._shared_expert_requantized_online(QC(True, fp8, fp8), prefix)
-    assert not v4._shared_expert_requantized_online(None, prefix)
-
-    # And MoE consults it before picking the grid.
-    src = textwrap.dedent(inspect.getsource(v4.MoE.__init__))
-    names = {n.id for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Name)}
-    assert "_shared_expert_requantized_online" in names
 
 
 def test_settle_pcp_split_rows_takes_only_self(monkeypatch):

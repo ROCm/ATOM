@@ -659,34 +659,6 @@ def test_attention_is_reached_only_through_the_opaque_op():
     )
 
 
-def test_draft_ffn_takes_the_pcp_merge_branch_like_block_forward():
-    # Under PCP the draft's MoE is folded onto the pcp*tp grid just like the
-    # target's, so each rank's FFN output is a partial. Block.forward (target
-    # and MTP) sums it through moe_pcp_merge_forward; forward_block calling
-    # self.ffn() directly left the draft unsummed and halved acceptance.
-    import ast
-    import inspect
-    import textwrap
-
-    from atom.models import deepseek_v4 as v4
-    from atom.models import deepseek_v4_dspark as m
-
-    def calls_and_attrs(fn):
-        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-        calls = {
-            node.func.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        }
-        attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-        return calls, attrs
-
-    for fn in (v4.Block.forward, m.DSparkLayer.forward_block):
-        calls, attrs = calls_and_attrs(fn)
-        assert "moe_pcp_merge_forward" in calls, fn.__qualname__
-        assert "_moe_merge_enabled" in attrs, fn.__qualname__
-
-
 def test_opaque_attention_fake_impl_matches_real_output_shape():
     # A wrong fake impl mis-sizes every downstream op in the compiled graph.
     # dspark_attention returns [B, T, dim] -- same shape as its input x.

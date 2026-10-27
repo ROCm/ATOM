@@ -1128,17 +1128,6 @@ class LinearBase(nn.Module):
                 # col qkv w13, tp_dim=0, [m, n] -> [m // tp, n] -> [m // tp, n // 32], don't need gather
                 # row o, w2, tp_dim=1, [m, n] -> [m, n //tp] -> [m, n // tp // 32], need gather
                 need_gather = self.tp_dim == 1 and self.input_size % 32 != 0
-        # The gather runs on the real TP group, so it cannot rebuild a weight
-        # cut on a wider override grid (the pcp fold). DCP's override narrows
-        # the grid and is unaffected.
-        if need_gather and self.tp_size > get_tp_group().world_size:
-            raise NotImplementedError(
-                f"{self.prefix}: online re-quantization wants a full-weight "
-                f"gather, which is not implemented for an effective TP grid "
-                f"({self.tp_size}) wider than the real TP group "
-                f"({get_tp_group().world_size}). Use an offline-quantized "
-                f"checkpoint, or set ATOM_PCP_MOE_MERGE=0 to drop the fold."
-            )
         if need_gather:
             weight = self._gather_full_weight(weight)
             # Per-token scales are shaped (N, 1). In row-parallel layers
@@ -1771,8 +1760,6 @@ class MergedColumnParallelLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
-        override_tp_size: int | None = None,
-        override_tp_rank: int | None = None,
         **kwargs,
     ):
         self.output_sizes = output_sizes
@@ -1784,8 +1771,6 @@ class MergedColumnParallelLinear(LinearBase):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
-            override_tp_size=override_tp_size,
-            override_tp_rank=override_tp_rank,
         )
 
     def weight_loader(
@@ -2630,12 +2615,8 @@ class RowParallelLinear(LinearBase):
         reduce_results: bool = True,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
-        override_tp_size: int | None = None,
-        override_tp_rank: int | None = None,
         **kwargs,
     ):
-        # Overwritten by super() when an override is given; both sizing and
-        # weight_loader read self.tp_rank/tp_size, so they stay same-sourced.
         self.tp_rank = get_tp_group().rank_in_group
         super().__init__(
             input_size,
@@ -2646,8 +2627,6 @@ class RowParallelLinear(LinearBase):
             reduce_results=reduce_results,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
-            override_tp_size=override_tp_size,
-            override_tp_rank=override_tp_rank,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
