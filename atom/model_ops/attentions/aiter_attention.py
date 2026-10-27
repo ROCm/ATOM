@@ -543,7 +543,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim))
+            kv_format = ""
+            if _is_indexed_sparse_attention(module):
+                from atom.utils import envs
+
+                if envs.ATOM_M3_SPARSE_KV_NVFP4:
+                    kv_format = "nvfp4"
+            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, kv_format))
         return tuple(kinds)
 
     def _declare_kv_pools(self) -> dict[KvGeometry, MhaKvPool]:
@@ -584,6 +590,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 head_dim=geometry.head_dim,
                 kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
                 extra_fields=extra_fields,
+                kv_format=geometry.kv_format,
             )
             extra_fields = ()
         return pools
@@ -648,6 +655,38 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 torch.uint8,
             ),
         )
+
+    def _kv_nvfp4_stage(
+        self, num_kv_heads: int, head_dim: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The step's BF16 K/V before NVFP4 quantization, shared by every sparse
+        layer: plain page-128 ``[rows // 128, 2, 128, Hkv, D]`` (the layout the
+        fused writer uses with ``asm_layout=False``), token-major with the
+        identity slot mapping beside it, sized like `_index_fp4_stage`."""
+        stage = getattr(self, "_kv_nvfp4_stage_buf", None)
+        if stage is None:
+            config = self.model_runner.config
+            tokens = max(
+                int(config.max_num_batched_tokens), int(config.max_num_seqs) * 16
+            )
+            rows = -(-tokens // self.block_size) * self.block_size
+            device = torch.device("cuda", torch.cuda.current_device())
+            stage = (
+                torch.zeros(
+                    (
+                        rows // self.block_size,
+                        2,
+                        self.block_size,
+                        num_kv_heads,
+                        head_dim,
+                    ),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                torch.arange(rows, dtype=torch.int64, device=device),
+            )
+            self._kv_nvfp4_stage_buf = stage
+        return stage
 
     def _index_fp4_stage(self, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
         """The step's BF16 index keys before FP4 quantization, shared by every
@@ -784,7 +823,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         row = self.pool_rows[geometry][module]
 
         k_cache, v_cache = pool.kv_views(row)
-        if config.kv_cache_dtype == "fp8":
+        if pool.kv_format == "nvfp4":
+            module.k_scale, module.v_scale = pool.scale_views(row)
+            module.impl.kv_nvfp4 = True
+            module.impl.kv_stage, module.impl.kv_stage_slots = self._kv_nvfp4_stage(
+                geometry.num_kv_heads, geometry.head_dim
+            )
+        elif config.kv_cache_dtype == "fp8":
             module.k_scale, module.v_scale = pool.scale_views(row)
 
         module.max_model_len = config.max_model_len
