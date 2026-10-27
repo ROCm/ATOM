@@ -284,8 +284,13 @@ jobs:
             fi
 
             # Shadow reading. Gates nothing; it is here so the comparison
-            # against the shipped criterion happens on live data.
-            LINK_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json')).get('linkage',{}).get('count',0))")
+            # against the shipped criterion happens on live data. `|| echo 0`
+            # so a failure in this shadow read (e.g. an unexpected report
+            # shape) degrades to 0 rather than failing the step under `bash
+            # -e` -- that would skip the report upload below and silently
+            # suppress the shipped regression issue. The shadow must never be
+            # able to break the shipped path.
+            LINK_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json')).get('linkage',{}).get('count',0))" || echo 0)
             echo "linkage_count=$LINK_COUNT" >> $GITHUB_OUTPUT
             echo "Family-linkage (shadow): $LINK_COUNT vs shipped: $REG_COUNT" >> $GITHUB_STEP_SUMMARY
           else
