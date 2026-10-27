@@ -28,6 +28,8 @@ ENGINE_CORE = Path(__file__).resolve().parents[1] / "atom/model_engine/engine_co
 
 INTERVAL_STEPS = 4
 
+WORK, STALLED, IDLE, OFFLOAD = "work", "stalled", "idle", "offload"
+
 
 def _extract(class_name: str, method: str):
     """The real method, compiled with stubs for the module globals it reads."""
@@ -57,9 +59,16 @@ def _extract(class_name: str, method: str):
 class _Engine:
     """Enough of an engine for one busy loop, driven by a pass schedule.
 
-    `schedule` is one `(now, has_work)` per pass; the loop exits when it runs
-    out. `has_work` drives both `is_finished` and the DP all-reduce, i.e. it is
-    engine-wide, which is the input contract `note_idle` documents.
+    `schedule` is one `(now, state)` per pass; the loop exits when it runs out.
+    The three states are separate on purpose -- collapsing them onto one flag
+    is what hides the passes where a forward does not run:
+
+    - `WORK`     requests exist and a batch is scheduled: a forward runs.
+    - `STALLED`  requests exist but none can be scheduled, so `is_finished()`
+                 is False while `_process_engine_step()` returns False. Real:
+                 a deferred offload save, or decode spinning for PrefillDone.
+    - `IDLE`     nothing to run. Engine-wide, which `note_idle` requires.
+    - `OFFLOAD`  RL rollout parked the weights; both loops skip the pass.
     """
 
     def __init__(self, schedule, interval_steps=INTERVAL_STEPS):
@@ -75,7 +84,7 @@ class _Engine:
         self.scheduler = SimpleNamespace(
             engine_stats=self.stats,
             heartbeat_throughput=lambda now: None,
-            is_finished=lambda: not self._has_work,
+            is_finished=lambda: self._state is IDLE,
             prefill_delayer=None,
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
@@ -96,7 +105,7 @@ class _Engine:
         self._pass += 1
         if self._pass >= len(self._schedule):
             raise StopIteration
-        self._now, self._has_work = self._schedule[self._pass]
+        self._now, self._state = self._schedule[self._pass]
 
     # -- collaborators the loop bodies call ---------------------------------
 
@@ -107,13 +116,15 @@ class _Engine:
         return False
 
     def _is_idle_rl_weights_offloaded(self):
-        return False
+        # The real one sleeps 10ms and returns True; the base loop reads it as
+        # "skip this pass", which is all the schedule needs to express.
+        return self._state is OFFLOAD
 
     def _sync_dp_state(self, local_unfinished, shutdown, offloaded):
-        return self._has_work, False, False
+        return self._state is WORK, False, self._state is OFFLOAD
 
     def _process_engine_step(self):
-        if not self._has_work:
+        if self._state is not WORK:
             return False
         self.forwards += 1
         return True
@@ -144,12 +155,12 @@ def _run(class_name, schedule, **kw):
 # it -- it closes on the step count, which the silence does not advance -- so
 # the silence is exactly what must not reach the divisor.
 BURST_IDLE_BURST = [
-    (0.0, True),
-    (1.0, True),
-    (2.0, False),  # work has drained
-    (3.0, False),
-    (603.0, True),
-    (604.0, True),
+    (0.0, WORK),
+    (1.0, WORK),
+    (2.0, IDLE),  # work has drained
+    (3.0, IDLE),
+    (603.0, WORK),
+    (604.0, WORK),
 ]
 
 
@@ -191,10 +202,43 @@ def test_the_dp_loop_reaches_its_idle_branch_with_a_dummy_already_counted():
     by which time the counter is non-zero. Idle accounting must not depend on
     it.
     """
-    engine = _run("DPEngineCoreProc", [(0.0, False), (1.0, False), (601.0, True)])
+    engine = _run("DPEngineCoreProc", [(0.0, IDLE), (1.0, IDLE), (601.0, WORK)])
     assert engine.dummies == 1  # pass one, before the idle branch was reachable
     assert engine.stats._throughput_steps == 2  # that dummy, plus pass three
     assert engine.stats._throughput_last_log_time == pytest.approx(600.0)
+
+
+def test_requests_that_cannot_be_scheduled_are_not_work():
+    """`is_finished()` is False and no forward runs: the base loop's own case.
+
+    A deferred offload save keeps `deferred_free_blocks` non-empty while
+    `_schedule` has nothing to return, and `DecodeEngineCore` spins the same
+    way waiting for PrefillDone. Keying the window on "has requests" charges
+    those seconds to tokens no forward produced.
+    """
+    engine = _run(
+        "EngineCore",
+        [(0.0, WORK), (1.0, STALLED), (301.0, STALLED), (601.0, WORK), (602.0, WORK)],
+    )
+    assert engine.forwards == 3
+    assert engine.stats._throughput_steps == 3  # the stalled passes are not steps
+    assert engine.stats._throughput_last_log_time == pytest.approx(600.0)
+
+
+@pytest.mark.parametrize(
+    "class_name, origin",
+    # Base skips the pass via `_is_idle_rl_weights_offloaded`, DP via the
+    # `global_offloaded` branch; both leave the window open across it.
+    [("EngineCore", 600.0), ("DPEngineCoreProc", 600.0)],
+)
+def test_parked_weights_are_not_charged_to_the_window(class_name, origin):
+    """An RL rollout offloads the weights for minutes between phases."""
+    engine = _run(
+        class_name,
+        [(0.0, WORK), (1.0, OFFLOAD), (301.0, OFFLOAD), (601.0, WORK), (602.0, WORK)],
+    )
+    assert engine.forwards == 3
+    assert engine.stats._throughput_last_log_time == pytest.approx(origin)
 
 
 @pytest.mark.parametrize("class_name", ["EngineCore", "DPEngineCoreProc"])

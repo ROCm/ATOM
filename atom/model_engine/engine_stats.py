@@ -74,6 +74,7 @@ class EngineStats:
         "_throughput_idle_since",
         "_throughput_last_log_time",
         "_throughput_steps",
+        "_throughput_total_steps",
         "block_manager",
         "cache_enabled",
         "distribution",
@@ -209,6 +210,9 @@ class EngineStats:
         self.throughput_log_interval_steps = max(0, int(throughput_log_interval_steps))
         self._throughput_last_log_time = time.monotonic()
         self._throughput_steps = 0
+        # Never reset: this is the number the line reports and the only one
+        # two ranks can be lined up by. `_throughput_steps` is the window's.
+        self._throughput_total_steps = 0
         # Start of the current idle stretch, or None while forwards are
         # running. See `note_idle`.
         self._throughput_idle_since: float | None = None
@@ -747,9 +751,15 @@ class EngineStats:
         the one count every rank agrees on. Skipping the dummy would drift the
         ranks apart exactly when load is unbalanced. Decode steps genuinely
         differ per rank and no counter can align them.
+
+        Two counters, because they answer different questions: the window's
+        decides when to close, the total is what the line prints. Printing the
+        window's would print the interval on every line -- the same number
+        forever, which lines up nothing.
         """
         if self.throughput_enabled:
             self._throughput_steps += 1
+            self._throughput_total_steps += 1
 
     def note_idle(self, now: float) -> None:
         """Open an idle stretch; `note_busy` subtracts it from the window.
@@ -778,6 +788,9 @@ class EngineStats:
         they actually took, and only the dead span is dropped. Resetting would
         divide their tokens by the shorter remainder and report a rate higher
         than any the engine reached.
+
+        No mode check of its own: only `note_idle` opens a stretch, and it
+        already refuses outside step mode, so there is nothing to close.
         """
         if self._throughput_idle_since is None:
             return
@@ -830,11 +843,19 @@ class EngineStats:
         if not self.window_expired(now) or elapsed <= 0:
             return
         if (
-            self.num_prompt_tokens == 0
+            not self.throughput_log_interval_steps
+            and self.num_prompt_tokens == 0
             and self.num_generation_tokens == 0
             and num_running_reqs == 0
             and num_waiting_reqs == 0
         ):
+            # Time mode only. There an empty window means the engine is idle
+            # and the clock would emit one of these every interval forever.
+            # In step mode an empty window means the opposite -- the window
+            # closed, so `interval` forwards ran -- and it is a DP rank that
+            # spent all of them on dummies for its peers. Suppressing it is
+            # suppressing the line for exactly the rank whose absence of work
+            # is what the other rank's line is being compared against.
             self._open_throughput_window(now)
             return
         prompt_throughput = self.num_prompt_tokens / elapsed
@@ -850,7 +871,7 @@ class EngineStats:
         # Leads the line: it is what two ranks are lined up by. Omitted in time
         # mode, where the count agrees across ranks about nothing.
         step_prefix = (
-            f"step {self._throughput_steps}: "
+            f"step {self._throughput_total_steps}: "
             if self.throughput_log_interval_steps
             else ""
         )

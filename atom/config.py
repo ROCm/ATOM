@@ -2134,23 +2134,36 @@ class Config:
         return list(sizes)
 
     def _resolve_throughput_step_interval(self) -> None:
-        """Keep the step trigger to the loops that feed its counter.
+        """Keep the step trigger to the topologies it has been validated on.
 
-        Only `EngineCore.busy_loop` and the DP one call `bump_step`; P/D and
-        PP replace those loops, so the counter would stay 0 and the status
-        line would never be emitted again -- announcing a logging mode and
-        then going silent. Degrade rather than raise: a stale flag in a shared
-        launch script must not stop a server from starting.
+        Two different reasons, and only the first is a hard one. PP replaces
+        `busy_loop` outright (`pp_engine_core.py`), so `bump_step` is never
+        reached and the line would go silent after announcing a logging mode.
+        RapidServe and P/D are a scope choice: `PrefillEngineCore` and
+        `DecodeEngineCore` inherit the base loop and override only
+        `_process_engine_step`, so the counter would in fact advance there --
+        it is simply untested, and a step number nobody has lined up across a
+        disaggregated pair is worth less than the clock. Degrade rather than
+        raise: a stale flag in a shared launch script must not stop a server
+        from starting.
         """
-        if self.throughput_log_interval_steps <= 0:
+        if self.throughput_log_interval_steps <= 0 or not self.enable_log_stats:
+            # Nothing to warn about with the line itself off: the fallback a
+            # warning would name is the clock, which is equally silent.
             self.throughput_log_interval_steps = 0
             return
+        # Only the disaggregated roles. `kv_role: "offload"` is an LMCache
+        # cache tier on an ordinary engine running the loop that counts.
+        kv_role = (self.kv_transfer_config or {}).get("kv_role")
         if self.pipeline_parallel_size > 1:
-            reason = f"pipeline_parallel_size is {self.pipeline_parallel_size}"
+            reason = (
+                f"pipeline_parallel_size is {self.pipeline_parallel_size}, which "
+                "replaces the busy loop that counts the forwards"
+            )
         elif self.enable_rapidserve:
-            reason = "RapidServe runs its own engine step"
-        elif (self.kv_transfer_config or {}).get("kv_role"):
-            reason = "a P/D engine replaces the busy loop that counts the forwards"
+            reason = "RapidServe is not covered by the step counter yet"
+        elif kv_role in ("kv_producer", "kv_consumer"):
+            reason = f"a P/D engine (kv_role={kv_role}) is not covered yet"
         else:
             return
         logger.warning(

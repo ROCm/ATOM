@@ -168,13 +168,63 @@ def test_idle_moves_the_divisor_not_the_trigger():
     assert busy._throughput_last_log_time != idle._throughput_last_log_time
 
 
+def test_the_printed_step_advances_across_lines(caplog):
+    """The prefix is the whole point, and it must not be the interval.
+
+    `_throughput_steps` resets every close and `window_expired` fires exactly
+    at the interval, so printing it prints the same number on every line --
+    which lines up nothing. The cumulative count is what two ranks share.
+    """
+    s = _stats(throughput_log_interval_steps=4)
+    with caplog.at_level("INFO"):
+        for _ in range(12):
+            if s.window_expired(0.0):
+                s.maybe_log_throughput(
+                    num_running_reqs=2, num_waiting_reqs=0, kv_usage=0.5
+                )
+            s.update_throughput(num_generation_tokens=20)
+            s.bump_step()
+    printed = [
+        line.split("step ")[1].split(":")[0] for line in caplog.text.splitlines()
+    ]
+    assert printed == ["4", "8"], printed
+
+
+def test_a_rank_that_only_ran_dummies_still_emits_its_line(caplog):
+    """DP, unbalanced load -- the case the whole option exists for.
+
+    This rank has no tokens and no requests: it spent the window on dummies so
+    its busy peers could run. Time mode suppresses such a window because the
+    clock would repeat it forever while idle. In step mode the window closed,
+    so `interval` forwards did run, and suppressing it removes the line for
+    exactly the rank the other one is being compared against.
+    """
+    s = _stats(throughput_log_interval_steps=4)
+    for _ in range(4):
+        s.bump_step()
+    with caplog.at_level("INFO"):
+        s.maybe_log_throughput(num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0)
+    assert "step 4: " in caplog.text
+    assert "Avg generation throughput: 0.0 tokens/s" in caplog.text
+    assert "Running: 0 reqs" in caplog.text
+    assert s._throughput_steps == 0  # and the window still closed
+
+
+def test_time_mode_still_suppresses_an_empty_window(caplog):
+    """The default path: no line per interval while the engine sits idle."""
+    s = _stats(throughput_log_interval_s=10.0)
+    with caplog.at_level("INFO"):
+        s.maybe_log_throughput(num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0)
+    assert caplog.text == ""
+
+
 def test_step_mode_opens_on_the_count():
     s = _stats(throughput_log_interval_s=10.0, throughput_log_interval_steps=4)
     now = s._throughput_last_log_time
-    for expected in (False, False, False, True):
-        assert s.window_expired(now) is False or expected
+    for bumps, expected in enumerate((False, False, False, True)):
+        assert s.window_expired(now) is False, f"opened after {bumps} forwards"
         s.bump_step()
-    assert s.window_expired(now) is True
+        assert s.window_expired(now) is expected
 
 
 def test_emitting_resets_the_count(caplog):
@@ -185,12 +235,13 @@ def test_emitting_resets_the_count(caplog):
     with caplog.at_level("INFO"):
         s.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.5)
     assert "step 2:" in caplog.text, caplog.text
-    assert s._throughput_steps == 0
+    assert s._throughput_steps == 0  # the window's count, reset
+    assert s._throughput_total_steps == 2  # the printed one, never reset
     assert not s.window_expired(s._throughput_last_log_time + 3600.0)
 
 
-def test_idle_window_resets_the_count_too():
-    """The nothing-happened path returns early; it must still disarm.
+def test_a_window_with_no_tokens_still_disarms():
+    """Whichever way it ends -- emitted in step mode, suppressed in time mode.
 
     Left armed, every later pass would re-enter and the line would fire on
     the first step after an idle stretch rather than `interval` steps later.

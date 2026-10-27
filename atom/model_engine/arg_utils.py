@@ -600,12 +600,13 @@ class EngineArgs:
             "--throughput-log-interval clock when > 0 (default: 0, use the "
             "clock). For offline / MLPerf runs that compare one DP rank's "
             "lines against another's: wall-clock sampling lands on a "
-            "different step number on each rank, a forward count lands on "
-            "the same one. The window can then span any amount of wall "
-            "clock, so time with no forward running is kept out of the "
-            "tokens/s divisor. Base and DP engines only -- pipeline parallel, "
-            "RapidServe and P/D run their own busy loops and fall back to "
-            "the clock with a warning. Ignored when --no-enable-log-stats.",
+            "different step number on each rank, a cumulative forward count "
+            "lands on the same one. The window can then span any amount of "
+            "wall clock, so time with no forward running is kept out of the "
+            "tokens/s divisor. Base and DP engines only -- pipeline parallel "
+            "replaces the busy loop that counts, and RapidServe and P/D are "
+            "not covered yet; all three fall back to the clock with a "
+            "warning. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--cache-hit-rate-window",

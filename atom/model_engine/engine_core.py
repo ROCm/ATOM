@@ -434,13 +434,21 @@ class EngineCore:
                 if shutdown:
                     break
                 if self._is_idle_rl_weights_offloaded():
+                    # An RL rollout parks the weights for minutes. No forward
+                    # can run meanwhile, so the window must not be charged.
+                    self.scheduler.engine_stats.note_idle(now)
                     continue
                 if not self.scheduler.is_finished():
-                    self.scheduler.engine_stats.note_busy(now)
-                    # True only where a forward ran; no dummy here to stand in
-                    # for an empty schedule, unlike the DP loop.
+                    # Keyed on the forward, not on having requests:
+                    # `is_finished()` stays False through a deferred offload
+                    # save and while decode spins for PrefillDone, and no
+                    # forward runs in either. `now` was read before the
+                    # forward, so the forward's own time stays in the window.
                     if self._process_engine_step():
+                        self.scheduler.engine_stats.note_busy(now)
                         self.scheduler.engine_stats.bump_step()
+                    else:
+                        self.scheduler.engine_stats.note_idle(now)
                 else:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
@@ -927,6 +935,8 @@ class DPEngineCoreProc(EngineCore):
                     break
 
                 if global_offloaded:
+                    # Already engine-wide, which is what `note_idle` wants.
+                    self.scheduler.engine_stats.note_idle(now)
                     time.sleep(0.01)
                     continue
 

@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: MIT
-"""`--throughput-log-interval-steps` is refused where nothing feeds it.
+"""`--throughput-log-interval-steps` is refused outside its validated scope.
 
-Only `EngineCore.busy_loop` and its DP override call `bump_step`; P/D and PP
-replace those loops, so the counter would stay 0 and the line would never be
-emitted -- announcing a logging mode and then printing nothing.
-`Config.__post_init__` falls back to the clock and warns instead.
+PP is the hard case: `PPEngineCoreProc` replaces `busy_loop` outright, so
+`bump_step` is never reached and the line would go silent after announcing a
+logging mode. RapidServe and P/D are a scope choice -- `PrefillEngineCore` and
+`DecodeEngineCore` inherit the base loop and override only
+`_process_engine_step`, so the counter would advance there. Either way
+`Config.__post_init__` falls back to the clock and warns.
+
+The predicate has to tell a disaggregated role apart from an LMCache cache
+tier, which also travels in `kv_transfer_config`.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ def _resolve(**kw) -> Config:
     cfg.pipeline_parallel_size = kw.pop("pipeline_parallel_size", 1)
     cfg.enable_rapidserve = kw.pop("enable_rapidserve", False)
     cfg.kv_transfer_config = kw.pop("kv_transfer_config", {})
+    cfg.enable_log_stats = kw.pop("enable_log_stats", True)
     assert not kw, f"unused: {kw}"
     cfg._resolve_throughput_step_interval()
     return cfg
@@ -62,24 +68,72 @@ def test_unsupported_topologies_fall_back_to_the_clock(topology, caplog):
     assert "throughput_log_interval_steps=40 ignored" in caplog.text
 
 
-def test_a_still_unparsed_kv_transfer_config_does_not_crash():
-    """The guard must run after the CLI's JSON string becomes a dict.
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        {"kv_role": "offload", "kv_connector": "lmcache_offload"},
+        {"kv_connector": "lmcache_offload"},
+    ],
+    ids=["offload_role", "no_role"],
+)
+def test_a_cache_tier_is_not_a_disaggregated_engine(kv_transfer_config, caplog):
+    """`kv_transfer_config` carries LMCache offload too, on an ordinary engine.
 
-    Placed before that, it calls `.get` on a `str` and takes the server down
-    at construction -- which is how this clause was first written.
+    That engine runs the loop that counts, so refusing it would turn the option
+    off for a topology it works on -- and name a P/D engine while doing it.
     """
-    cfg = _resolve(
-        throughput_log_interval_steps=40,
-        kv_transfer_config={"kv_role": "kv_producer"},
-    )
-    assert cfg.throughput_log_interval_steps == 0
-    with pytest.raises(AttributeError):
-        # Documents the failure the ordering avoids, so moving the call back
-        # above the parse fails here rather than in production.
-        _resolve(
+    with caplog.at_level("WARNING"):
+        cfg = _resolve(
             throughput_log_interval_steps=40,
-            kv_transfer_config='{"kv_role": "kv_producer"}',
+            kv_transfer_config=kv_transfer_config,
         )
+    assert cfg.throughput_log_interval_steps == 40
+    assert "ignored" not in caplog.text
+
+
+def test_the_line_being_off_is_not_worth_a_warning(caplog):
+    """The fallback a warning would name is the clock, equally silent here."""
+    with caplog.at_level("WARNING"):
+        cfg = _resolve(throughput_log_interval_steps=40, enable_log_stats=False)
+    assert cfg.throughput_log_interval_steps == 0
+    assert caplog.text == ""
+
+
+def test_the_guard_runs_after_kv_transfer_config_is_parsed():
+    """It reads `kv_role` off a dict; the CLI hands `__post_init__` a string.
+
+    Asserted on `__post_init__`'s own source rather than by calling it, which
+    needs the loader and the GPU. An earlier draft asserted the `AttributeError`
+    from passing a string to `_resolve` directly -- but `_resolve` never runs
+    `__post_init__`, so moving the call back above the parse left it green.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Config.__post_init__)))
+    nodes = list(ast.walk(tree))
+
+    guard = next(
+        n.lineno
+        for n in nodes
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_resolve_throughput_step_interval"
+    )
+    # Every rebind of the field, not just one parser: the JSON path has a
+    # `literal_eval` fallback, and either may be the one that is kept.
+    parse = max(
+        n.lineno
+        for n in nodes
+        if isinstance(n, ast.Attribute)
+        and isinstance(n.ctx, ast.Store)
+        and n.attr == "kv_transfer_config"
+    )
+    assert guard > parse, (
+        "_resolve_throughput_step_interval reads kv_transfer_config.kv_role, "
+        "so it must run after the CLI string has been parsed into a dict"
+    )
 
 
 def test_the_warning_names_the_clock_it_fell_back_to():
