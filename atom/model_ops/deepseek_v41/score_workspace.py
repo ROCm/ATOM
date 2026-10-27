@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from atom.model_ops.sparse_indexer_chunk import (
-    capped_logits_rows,
+    LogitsWorkspace,
     logits_rows,
     plane_rows,
 )
@@ -87,9 +87,9 @@ class PackedRows(NamedTuple):
     bands: tuple[tuple[int, int], ...]
 
 
-class ScoreWorkspace:
-    """The scorer's logits band and each ratio's tile table, at their largest,
-    and the row starts of one-row sequences. The FP4 plane has no tile tables:
+class ScoreWorkspace(LogitsWorkspace):
+    """The scorer's logits plane (`LogitsWorkspace`) and each ratio's tile
+    table, at their largest, and the row starts of one-row sequences. The FP4 plane has no tile tables:
     its scorers read the PAGE table itself, and its logits are packed
     (`capacity` elements, `packed_logits`, laid out by `pack`) with the
     candidate pick's block maxima packed beside them.
@@ -129,10 +129,13 @@ class ScoreWorkspace:
         self.packed = geometry.index_fp4
         if self.packed and pages is None:
             raise ValueError("the FP4 plane packs its logits: it needs the PAGEs")
-        self.capacity = (
-            packed_capacity(geometry, pages, max_tokens, plane)
-            if self.packed
-            else plane
+        super().__init__(
+            (
+                packed_capacity(geometry, pages, max_tokens, plane)
+                if self.packed
+                else plane
+            ),
+            device,
         )
         # A step's rows see the most at the widest ratio; what they may fill is
         # what is left by the padding rows a captured graph adds, each at
@@ -141,7 +144,6 @@ class ScoreWorkspace:
         self._rows_capacity = self.capacity - max_tokens * aligned_spans(
             1 // self._ratio
         )
-        self._logits = torch.empty(self.capacity, dtype=torch.float32, device=device)
         self.block_rows = geometry.index_block_rows
         self._maxima = (
             torch.empty(
@@ -175,10 +177,6 @@ class ScoreWorkspace:
                 for ratio, flat in self._tiles.items()
             }
         )
-
-    def logits(self, rows, width):
-        """`[rows, width]` fp32, one band of the scorer's logits plane."""
-        return _view(self._logits, rows, width)
 
     def fits(self, rows, contexts):
         """Whether a step of requests with `rows` query rows each, every row
@@ -214,15 +212,6 @@ class ScoreWorkspace:
         if not self.packed:
             raise ValueError("only the FP4 plane packs its logits")
         return self._maxima
-
-    def logits_rows(self, rows, width):
-        """Rows that fit both the byte budget and this fixed allocation.
-
-        A narrower live/candidate width can round to more total elements than
-        a configured width. Bound by actual storage too, without reallocating
-        buffers captured by graphs or retained by overlapping microbatches.
-        """
-        return capped_logits_rows(rows, width, self._logits.numel() // width)
 
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""

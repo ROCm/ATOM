@@ -84,6 +84,7 @@ def _mm_topk_kernel(
     tid2eid_ptr,  # [vocab, topk] int32 (hash layers only; else aliases bias)
     out_ids_ptr,  # [N, topk] int32
     out_w_ptr,  # [N, topk] fp32
+    num_valid_rows_ptr,  # [1] int32: rows at or past it route to -1
     stride_g_row,
     stride_g_col,
     stride_tid_row,
@@ -97,6 +98,7 @@ def _mm_topk_kernel(
     IS_HASH: tl.constexpr,
     HAS_IMAGE_MASK: tl.constexpr,
     V4_TIES: tl.constexpr,
+    HAS_NUM_VALID_ROWS: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ):
@@ -189,6 +191,10 @@ def _mm_topk_kernel(
             weight_sum = tl.sum(out_w, axis=0)
         scaling = tl.div_rn(scaling, tl.maximum(weight_sum, 1e-20))
     out_w = out_w * scaling
+    if HAS_NUM_VALID_ROWS:
+        pad = t >= tl.load(num_valid_rows_ptr)
+        out_ids = tl.where(pad, -1, out_ids)
+        out_w = tl.where(pad, 0.0, out_w)
 
     tl.store(out_ids_ptr + t * stride_oid_row + offs_k, out_ids, mask=k_mask)
     tl.store(out_w_ptr + t * stride_ow_row + offs_k, out_w, mask=k_mask)
@@ -207,12 +213,14 @@ def mm_topk_triton(
     out_weights: torch.Tensor,  # [N, topk] fp32 destination
     *,
     image_mask: torch.Tensor | None = None,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
     """Fill ``out_ids`` / ``out_weights`` in place with V4 vision routing.
 
     Destinations may be standalone ``[N, topk]`` tensors or ``[:, :topk]`` views
     of a wider preallocated buffer (row stride is read from the tensor; column
-    stride is assumed 1).
+    stride is assumed 1). Rows at or past ``num_valid_rows`` (``[1]`` int32 on
+    device) get ids -1 and weights 0.
     """
     num_tokens, n_routed = gating_output.shape
     topk = out_ids.shape[1]
@@ -250,6 +258,7 @@ def mm_topk_triton(
         tid2eid if is_hash else bias,
         out_ids,
         out_weights,
+        num_valid_rows,
         gating_output.stride(0),
         gating_output.stride(1),
         tid2eid.stride(0) if is_hash else 0,
@@ -263,6 +272,7 @@ def mm_topk_triton(
         IS_HASH=is_hash,
         HAS_IMAGE_MASK=image_mask is not None,
         V4_TIES=n_routed == 384 and gfx.startswith("gfx9"),
+        HAS_NUM_VALID_ROWS=num_valid_rows is not None,
         BLOCK_E=triton.next_power_of_2(n_routed),
         BLOCK_TOPK=triton.next_power_of_2(topk),
         num_warps=warps,

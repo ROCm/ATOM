@@ -10,19 +10,19 @@ from atom.plugin.prepare import is_sglang, is_vllm
 from atom.utils import resolve_obj_by_qualname
 
 
-def _requires_piecewise_compilation(atom_config) -> bool:
+def _uses_tr_hybrid(atom_config) -> bool:
     """``atom_config.compilation_config.cudagraph_mode``'s own answer, or False
     when either is absent. That absence is the real state at ``--level`` 0/1/2
-    (``CompilationConfig`` is still built, but nothing sets a piecewise
+    (``CompilationConfig`` is still built, but nothing sets a TR_HYBRID
     ``cudagraph_mode`` at those levels) and under SGLang, which builds its own
     ``atom_config`` without a ``compilation_config`` at all (see
-    ``atom/plugin/sglang/minimax_m3_bridge.py``) -- neither one requires
-    piecewise compilation, so treating the missing attribute as "not
-    piecewise" is correct, not just a fallback for incomplete test fixtures."""
+    ``atom/plugin/sglang/minimax_m3_bridge.py``) -- neither one records token
+    graphs, so treating the missing attribute as "not TR_HYBRID" is correct,
+    not just a fallback for incomplete test fixtures."""
     cudagraph_mode = getattr(
         getattr(atom_config, "compilation_config", None), "cudagraph_mode", None
     )
-    return bool(cudagraph_mode) and cudagraph_mode.requires_piecewise_compilation()
+    return bool(cudagraph_mode) and cudagraph_mode.uses_tr_hybrid()
 
 
 def _takes_weight_updates(atom_config) -> bool:
@@ -57,30 +57,61 @@ def _takes_weight_updates(atom_config) -> bool:
         return True
 
 
+def dp_attention_ranks(atom_config) -> int:
+    """The DP attention ranks a deployment runs (each its own requests,
+    attention TP 1, the MoE expert parallel or TP over them), or 0 when it is
+    not one: CoreManager has folded TP into DP by the time a worker reads it."""
+    dp = atom_config.parallel_config.data_parallel_size
+    # absent reads as off: not every config object a caller passes carries it
+    dpa = (
+        getattr(atom_config, "enable_dp_attention", False)
+        and atom_config.tensor_parallel_size == 1
+    )
+    return dp if dpa and dp > 1 else 0
+
+
 def common_refusals(
-    atom_config, dims, supported_tp, *, piecewise_cudagraph_required: bool = True
+    atom_config,
+    dims,
+    supported_tp,
+    supported_dpa=(),
+    *,
+    refuse_tr_hybrid: bool = True,
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
-    (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``;
-    no expert, data, pipeline or context parallelism, no TBO, not a plugin.
+    (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``,
+    and no expert or data parallelism -- or DP attention over one of
+    ``supported_dpa`` ranks with the MoE expert parallel (``dims(1, ranks)``)
+    or TP (``dims(ranks)``) over them; no pipeline or context parallelism, no
+    TBO, not a plugin.
 
-    ``piecewise_cudagraph_required`` gates one more check: no piecewise
-    cudagraph. MiniMax-M3 and DeepSeek-V4.1 mono wraps the *compiled* inner
-    model, so a piecewise-compiled graph of that module runs underneath mono
-    and the two conflict -- this refusal is correct for them, and is the
-    default. GLM-5.2 mono instead routes inside the *uncompiled* outer
-    ``GlmMoeDsaForCausalLM`` and bypasses the compiled inner
-    ``DeepseekV2Model`` entirely, so piecewise compilation of that module
-    never runs and cannot conflict with mono; GLM-5.2 passes
-    ``piecewise_cudagraph_required=False`` to opt out of this one check while
+    ``refuse_tr_hybrid`` gates one more check: no TR_HYBRID graph mode.
+    MiniMax-M3 and DeepSeek-V4.1 mono wraps the *compiled* inner model, so a
+    token graph of that module runs underneath mono and the two conflict --
+    this refusal is correct for them, and is the default. GLM-5.2 mono
+    instead routes inside the *uncompiled* outer ``GlmMoeDsaForCausalLM`` and
+    bypasses the compiled inner ``DeepseekV2Model`` entirely, so that
+    module's token graph never runs and cannot conflict with mono; GLM-5.2
+    passes ``refuse_tr_hybrid=False`` to opt out of this one check while
     keeping every other shared refusal."""
     tp = atom_config.tensor_parallel_size
-    shard = shard_refusal(dims, tp)
-    checks = [
-        (shard is None, shard),
-        (tp in supported_tp, f"TP {tp} not in {supported_tp}"),
-        (not atom_config.enable_expert_parallel, "expert parallel"),
-        (atom_config.parallel_config.data_parallel_size == 1, "DP > 1"),
+    dpa = dp_attention_ranks(atom_config)
+    if dpa not in (0, *supported_dpa):
+        # A model whose `Dims` knows no DP attention is never asked to build one.
+        parallel = [(False, f"DP attention {dpa} not in {supported_dpa}")]
+    elif dpa:
+        ep = atom_config.enable_expert_parallel
+        shard = shard_refusal(lambda _: dims(1, dpa) if ep else dims(dpa), 1)
+        parallel = [(shard is None, shard)]
+    else:
+        shard = shard_refusal(dims, tp)
+        parallel = [
+            (shard is None, shard),
+            (tp in supported_tp, f"TP {tp} not in {supported_tp}"),
+            (not atom_config.enable_expert_parallel, "expert parallel"),
+            (atom_config.parallel_config.data_parallel_size == 1, "DP > 1"),
+        ]
+    checks = parallel + [
         (atom_config.pipeline_parallel_size == 1, "PP > 1"),
         (atom_config.decode_context_parallel_size == 1, "decode CP"),
         (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
@@ -96,9 +127,9 @@ def common_refusals(
         # `fullgraph` appears nowhere else). Under `fullgraph` a graph break
         # raises, and every mono path calls `Tensor.data_ptr()` -- GLM's
         # contract checks and buffer aliasing, K3's kernel argument packing.
-        # Unconditional, not folded into the piecewise check below: that one
+        # Unconditional, not folded into the TR_HYBRID check below: that one
         # is opt-out for GLM-5.2, while this applies to every mono model.
-        # Read like `_requires_piecewise_compilation`: an absent
+        # Read like `_uses_tr_hybrid`: an absent
         # `compilation_config` is a real production state (SGLang builds one
         # without it), and it means no `torch.compile` wrapper at all, so
         # absent reads as "not this level" rather than as a refusal.
@@ -108,10 +139,8 @@ def common_refusals(
             "DYNAMO_AS_IS compilation (fullgraph breaks on data_ptr)",
         ),
     ]
-    if piecewise_cudagraph_required:
-        checks.append(
-            (not _requires_piecewise_compilation(atom_config), "piecewise cudagraph")
-        )
+    if refuse_tr_hybrid:
+        checks.append((not _uses_tr_hybrid(atom_config), "TR_HYBRID cudagraph"))
     return checks
 
 

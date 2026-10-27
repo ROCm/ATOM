@@ -27,11 +27,11 @@ def _prepare_finalize(num_ops=2, *, low_latency=False, internode=False):
             mori_ops,
             max_tokens_per_rank=8,
             num_dispatchers=2,
-            dispatch_format=mpf.MoriDispatchFormat(
+            dispatch_format=mpf.RoutedRowsWire(
                 dtype=torch.bfloat16,  # passthrough: no quantizer runs
                 quant_type=None,
                 scale_dim=0,
-                scale_type_size=4,
+                scale_dtype=torch.float32,
             ),
             low_latency=low_latency,
             internode=internode,

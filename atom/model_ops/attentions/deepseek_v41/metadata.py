@@ -62,9 +62,9 @@ class BatchStep:
     # request is shorter still replays the bucket's graph, so every shape
     # derived from it has to be the bucket's.
     max_q_len: int = 0
-    # Everything below is one forward's, not one layer's. `visible` and
-    # `indptrs` are filled into fixed addresses before any layer runs; the
-    # rest are filled by the layer that gets there first and dropped by
+    # Everything below is one forward's, not one layer's. `visible` is
+    # filled into fixed addresses before any layer runs; the rest, `indptrs`
+    # included, are filled by the layer that gets there first and dropped by
     # `begin_forward`.
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
@@ -82,6 +82,10 @@ class BatchStep:
     # decoder's rows after it (the DSpark draft's window). None where the
     # forward did not replay.
     replay: object | None = None
+    # The `ReplayPlan` a replaying prefill's decoder would run, as the backend
+    # published it (`DeepseekV41MetadataBuilder._publish_decoder`): one set of
+    # addresses for every such step. None where no replay can run.
+    decoder: object | None = None
     indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
@@ -127,8 +131,10 @@ class BatchStep:
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
     # name -> what a step planner worked out on the host (`StepPlan.host`)
     planned_host: dict[str, object] = field(default_factory=dict)
-    # TBO keeps memoized tile tables in a disjoint part of the parent budget.
+    # TBO keeps memoized tile tables in a disjoint part of the parent budget,
+    # and its indptrs in buffers of each microbatch's own.
     tile_workspace: TileWorkspace | None = None
+    indptr_buffers: dict[int, tuple] | None = None
     # [requests] int32: the lowest position whose window row a request's
     # queries may read (SGLang's `swa_replay_start`). Zeros (the cache's fixed
     # buffer, so a capture records one address) except on a bounded-replay
@@ -150,6 +156,7 @@ class BatchStep:
         """
         self.selected.clear()
         self.candidates.clear()
+        self.indptrs = {}
         self.tiles.clear()
         self.candidate_blocks.clear()
         self.group_indices.clear()
@@ -310,23 +317,21 @@ def prepare_batch_step(
         )
     if publication_group is not None:
         # A TBO microbatch's group names its members `{buffer_prefix}name`
-        # (`ub{i}_positions`, ...); match them by the parent's names.
-        def base(member):
-            return member.name.removeprefix(buffer_prefix)
-
-        grouped_tables = f"{buffer_prefix}block_tables" in publication_group.indices
-        for i, member in enumerate(publication_group.members):
-            if base(member) == "block_tables":
-                publication_group.counts[i] = running_bs
-            elif base(member) in required:
-                publication_group.counts[i] = required[base(member)]
-            # Builder-staged members (plans, state slots, Engram rows) keep
-            # their counts in this combined publication, before indptrs run.
-        tables.publish(running_bs if grouped_tables else None, group=publication_group)
+        # (`ub{i}_positions`, ...); find them by the parent's names. Members
+        # staged by the builder (plans, state slots, Engram rows) keep their
+        # counts in this combined publication.
+        members = {}
+        for name, count in required.items():
+            i = publication_group.indices.get(f"{buffer_prefix}{name}")
+            if i is not None:
+                publication_group.counts[i] = count
+                members[name] = publication_group.members[i]
+        tables.publish(
+            running_bs if "block_tables" in members else None, group=publication_group
+        )
         published = {
-            base(member): member.destination[: required[base(member)]]
-            for member in publication_group.members
-            if base(member) in required
+            name: member.destination[: required[name]]
+            for name, member in members.items()
         }
     else:
         published = {
