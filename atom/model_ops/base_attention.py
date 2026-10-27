@@ -14,6 +14,7 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
+from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
@@ -955,7 +956,7 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
         )
     else:
-        return self.impl.forward(
+        out = self.impl.forward(
             query=q,
             key=k,
             value=v,
@@ -963,6 +964,17 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+        # A prefill padded to a token-graph bucket: the kernel wrote the
+        # scheduled rows; the pad rows of the fresh output hold whatever the
+        # allocator had. They reach no sampled row, but keep them finite.
+        context = get_forward_context().context
+        if (
+            context is not None
+            and context.is_prefill
+            and 0 < context.scheduled_tokens < out.shape[0]
+        ):
+            out[context.scheduled_tokens :].zero_()
+        return out
 
 
 def linear_attention_with_output_base_fake(

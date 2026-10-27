@@ -1613,6 +1613,16 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # Inherited as True from the MHA builder, which made `EagleProposer` pass
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
+    # A prefill step pads to a token-graph bucket (`ForwardMode._pad_to_token_graph`,
+    # `ModelRunner._record_tr_graphs`): `prepare_prefill` lays the step out at
+    # `running_tokens`, the rows past the scheduled ones with slot -1 (written
+    # nowhere) and position 0, and the model's recording replays over them. The
+    # GDN and attention regions run live and read the scheduled count, so the pad
+    # rows reach no state, no KV and no sampled row.
+    supports_token_graph = True
+    # The bucket a padded prefill is being laid out at, while `prepare_prefill`
+    # runs; None otherwise.
+    _token_graph_tokens: int | None = None
 
     def _uses_paged_checkpoints(self) -> bool:
         """PAGE image for the Qwen GDN/MHA family; fork otherwise.
@@ -1908,9 +1918,16 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         running_bs: int,
         running_tokens: int,
     ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_prefill(
-            batch, running_bs, running_tokens
+        scheduled_tokens = batch.total_tokens_num_prefill
+        self._token_graph_tokens = (
+            running_tokens if running_tokens > scheduled_tokens else None
         )
+        try:
+            attn_metadata, positions = super().prepare_prefill(
+                batch, running_bs, running_tokens
+            )
+        finally:
+            self._token_graph_tokens = None
         if batch.block_tables == []:
             if any(getattr(batch, "state_save_all", None) or ()):
                 raise RuntimeError(
@@ -1939,6 +1956,97 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions
+
+    def _upload_prefill_mirrors(
+        self, scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
+    ):
+        width = self._token_graph_tokens
+        if width is None or width <= scheduled_tokens:
+            return super()._upload_prefill_mirrors(
+                scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
+            )
+        # The per-row mirrors go up at the bucket's width. A pad row's KV slot
+        # is -1, which the cache writers skip; its position is 0 (the runner
+        # zeroes the device tail too, `_padded_inputs`).
+        var = self.model_runner.forward_vars
+        var["slot_mapping"].np[scheduled_tokens:width] = -1
+        var["positions"].np[scheduled_tokens:width] = 0
+        return super()._upload_prefill_mirrors(
+            scheduled_bs, running_bs, width, has_cached, cached_lens
+        )
+
+    def _build_mrope_prefill_positions(self, batch: ScheduledBatch):
+        width = self._token_graph_tokens
+        if width is None or not getattr(self.model_runner, "use_mrope", False):
+            return super()._build_mrope_prefill_positions(batch)
+        # The model reads MRoPE positions as a (3, running_tokens) view over
+        # the flat buffer (`_mrope_positions_view`), so a padded step has to
+        # be laid out at the bucket's width: the rows' stride is the width.
+        scheduled_tokens = batch.total_tokens_num_prefill
+        positions = self._mrope_cpu_view(width)
+        offset = 0
+        for req_id, seqlen, cached_seqlen in zip(
+            batch.req_ids, batch.context_lens, batch.num_cached_tokens
+        ):
+            num_tokens = int(seqlen) - int(cached_seqlen)
+            mrope_positions = batch.mrope_positions_by_req.get(req_id)
+            if mrope_positions is None:
+                positions[:, offset : offset + num_tokens] = np.arange(
+                    cached_seqlen, seqlen, dtype=np.int64
+                )[None, :]
+            else:
+                positions[:, offset : offset + num_tokens] = mrope_positions[
+                    :, cached_seqlen:seqlen
+                ]
+            offset += num_tokens
+        positions[:, scheduled_tokens:width] = 0
+        return self._copy_mrope_to_gpu(width)
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A prefill of ``tokens`` rows for recording that token-graph bucket
+        (`ModelRunner._record_tr_graphs`): one dummy prompt, as the warmup's,
+        with no block table, so its KV is written nowhere and the GDN layers
+        see no state (`gdn_metadata` None). The recording keeps the segments
+        between the regions; the regions themselves run live at every replay,
+        on the step's own metadata, so what they do on this prompt is moot."""
+        from types import SimpleNamespace
+
+        from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+
+        runner = self.model_runner
+        if not 0 < tokens <= runner.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket of {tokens} rows exceeds the "
+                f"{runner.max_num_batched_tokens}-row token buffers"
+            )
+        seq = Sequence([0] * tokens, block_size=runner.block_size)
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.PREFILL
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=np.array([tokens], dtype=np.int32),
+            total_tokens_num=tokens,
+            total_tokens_num_prefill=tokens,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            is_dummy_run=True,
+        )
+        # What `prepare_model` publishes before `build`: the query prefix.
+        self.publish_cu_seqlens_q(batch, SimpleNamespace(running_bs=1))
+        attn_metadata, positions = self.prepare_prefill(batch, 1, tokens)
+        input_ids = runner.forward_vars["input_ids"].gpu[:tokens]
+        input_ids.zero_()
+        self.prepare_model_inputs(input_ids, attn_metadata)
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return attn_metadata, context
 
     def prepare_decode(  # type: ignore[override]
         self,

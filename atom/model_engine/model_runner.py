@@ -3229,6 +3229,13 @@ class ModelRunner:
                     # PP carries the full run between stages. Only the last
                     # stage returns scheduled rows to sampling/draft consumers.
                     hidden_states = model_output[: context.scheduled_tokens]
+                    if forward_mode.running_tokens > context.scheduled_tokens:
+                        # A prefill padded to a token-graph bucket: the model ran
+                        # the bucket's rows; what follows (the draft's prefill,
+                        # its KV) runs the scheduled ones, positions included.
+                        context.positions = context.positions[
+                            ..., : context.scheduled_tokens
+                        ].contiguous()
                     logits = self._compute_logits(hidden_states, greedy_ids)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
