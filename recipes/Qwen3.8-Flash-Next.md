@@ -159,15 +159,18 @@ QSA K1/K2 share composition factories, and GDN K2 shares the TP8 finish
 factory. S1 and batch launchers share static weight bindings, while native
 metadata and state views bind per step. Immutable layer records retain module
 and weight ownership. `MonoState` owns persistent S1 buffers; per-width builds
-own named batch workspaces. The Qwen build factory compiles and validates its kernel resources before
-`WidthBuilds` performs TP agreement and caching, and remembers a refusal for that width only.
+own named batch workspaces. `WidthBuilds` compiles each build once, checks private
+scratch and the Qwen resource contract, then performs TP agreement and caching.
+It remembers a refusal for that width only.
 `PERSISTENT_ROWS=(1,)` and `BATCH_ROWS=(2,4)` distinguish the two schedules;
 both serve ordinary one-token-per-request decode.
 Kernel dimensions live in `shapes.py`/`dims.py`; deployment checks live in
 `config.py`. Zero-copy weight contracts live in `weights.py`, graph-stable
 buffers in `state.py`, and per-step native metadata views in `step_meta.py`.
-`ATOM_MONO_CHECK=1` enables eager comparisons with
-the original layers for diagnosis; use it separately from performance runs.
+`ATOM_MONO_CHECK=1` enables eager comparisons with the original layers for
+FP8/BF16 S1 diagnosis. It does not cover B2/B4 or Quark. QSA checks run the
+reference attention on its own cache values and restore the Mono cache before
+Mono K2; use checks separately from performance runs.
 
 Validate the actual Mono route before reporting a speedup: a build refusal
 falls back to the native model. Task accuracy uses the full GSM8K protocol
@@ -175,6 +178,52 @@ below and the corresponding model's dashboard `exact_match,flexible-extract`
 threshold (currently 0.96 for Flash-Next). Retain sample outputs and truncation
 records; paired lost-question counts are diagnostic and are not a fixed
 acceptance allowance.
+
+## Quark MXFP4 Mono decode
+
+The Quark checkpoint `amd/Qwen3.8-Flash-Next-Quark-MXFP4` supports the
+same ordinary-decode widths at TP1 and TP8+EP8, with FP8 KV and a BF16
+index cache. Expert weights stay packed MXFP4 with E8M0 scales. Other
+weights retain the checkpoint's quantization exclusions, and layer
+activations remain BF16. This is not an all-linear W4A8 conversion.
+
+The Quark MoE path uses AITER's BF16-output G1 and separate native MXFP4
+intermediate quantization. It requires no local AITER source patch. The
+dependency revision used for this integration is `0.1.1.dev1+g508736740`.
+
+```bash
+ATOM_MONO_ENABLE=1 AITER_LOG_LEVEL=WARNING \
+python -m atom.entrypoints.openai_server \
+  --model amd/Qwen3.8-Flash-Next-Quark-MXFP4 --trust-remote-code \
+  -tp 8 --enable-expert-parallel \
+  --kv-cache-dtype fp8 --index-cache-dtype bf16 --block-size 64 \
+  --max-model-len 8192 --max-num-seqs 4 --max-num-batched-tokens 2048 \
+  --no-enable_prefix_caching \
+  --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4]'
+```
+
+For TP1, replace `-tp 8 --enable-expert-parallel` with `-tp 1`.
+Verify that the log reports `Qwen Quark seam kernels built for width`
+for each served width. A missing dependency contract or unsupported
+deployment produces a refusal and runs the native model instead.
+
+The path fuses HC/router, route sorting and MXFP4 input preparation, and
+QSA norm/RoPE/FP8 cache publication. TP8 also combines QSA projections,
+stable sparse selection and index expansion. Native AITER expert GEMMs,
+sparse attention and tensor collectives remain part of the execution.
+MTP, other checkpoints, and other widths are outside this validation.
+
+The CPU unit test checks deployment/step admission, native cache views,
+workspace bounds and build setup without GPU kernel dependencies:
+
+```bash
+python -m pytest tests/test_qwen4_exp_mono.py
+```
+
+Performance comparisons must use the same checkpoint, dependencies and
+service parameters on both paths, using stock AITER. Disable
+Mono with `ATOM_MONO_ENABLE=0` for the native baseline. Repeat both paths
+and retain full GSM8K results and actual per-rank route evidence.
 
 ## GSM8K evaluation
 
