@@ -339,6 +339,76 @@ Source: sglang `.claude/rules/forward-batch-init-new-purity.md`, adapted to ATOM
 
 ---
 
+### T — Triton Kernel Review
+
+Ported from aiter's own `.claude/skills/review-pr/rules.md`, graded individually rather
+than flattened: aiter's own T1-T9 (plus its B2, which duplicates T1 under a second id) are
+not all equally evidenced on ATOM, and this section says so per rule instead of porting
+the whole family at the same confidence. T2 (mask with no `other=`) and T4 (AMD launch
+knobs — `waves_per_eu`/`matrix_instr_nonkdim`/`kpack` — hardcoded ACROSS archs) are **not
+ported**: T2 was never checked against ATOM (absence of a citation here is "not checked",
+not "clean"), and T4 was checked and came back with zero hits for those three names in the
+directories sampled for this assessment — "not found in sampled directories", not "absent
+from ATOM". Neither claim should be read as more than it is.
+
+**T1 — Triton load/store without a bounds mask** ⚠️
+aiter numbers this defect twice (its own T1 and B2 are the same check); ATOM already has
+an unrelated B2 ("decode/prefill phase classified by size proxy"), so only "T1" is added
+here to avoid an id collision. This is a **regression guard on currently-correct code**,
+not a response to a known ATOM defect: `atom/model_ops/fla_ops/chunk_delta_h.py`'s tile
+loads already carry `mask=`/`other=` throughout, and the handful of unmasked `tl.load`/
+`tl.store` calls in that file are safe by construction — scalar, single-index loads with
+no tile dimension to run past. The rule exists so a future edit that turns one of those
+scalar loads into a tiled one doesn't lose the mask silently.
+Trigger: `tl.load(`/`tl.store(` on a `+` line with no `mask=` kwarg, or a `tl.load(` with
+`mask=` but no `other=`.
+→ `⚠️ T1: [call] has no bounds mask ([or: no other= fallback]) — confirm the index range cannot exceed the tensor, or add mask=/other=`
+
+**T3 — Launch config (`num_warps`/`num_stages`) carried over unretuned** ⚠️
+ATOM evidence: `atom/model_ops/v4_kernels/paged_decode.py`'s `_kernel_config()` (lines
+105-133) picks `num_warps`/`num_stages` from an in-source heuristic ("without autotune",
+per its own docstring) based on `block_h`, and every call site that launches off it
+(lines 712, 787-788, 846-847) inherits that heuristic's choice rather than a per-shape
+tuned value. That is exactly T3's shape: a launch knob set once by reasoning about one
+shape family and carried forward, with no autotune sweep re-deriving it as new shapes
+(block sizes, head counts) are added.
+Trigger: `num_warps=`/`num_stages=`/`num_ctas=` set in added lines, inside a file that
+also defines or calls a Triton kernel.
+→ `⚠️ T3: num_warps/num_stages set from [heuristic/literal] — confirm this was re-tuned for the new shape, not carried over from the shape it was picked for`
+
+**T8 — Launch knob hardcoded in kernel source instead of the config system** ⚠️
+ATOM evidence, same file: `paged_decode.py:896` hardcodes `num_warps=4` directly at a
+Triton kernel call site, bypassing `_kernel_config()`'s own heuristic entirely for that
+one launch. A literal at a call site is invisible to whatever tuning process the config
+system represents — it will not be swept, and a later retune of the heuristic silently
+stops applying to this one call.
+Trigger: `hardcoded_launch_knob()` — a `waves_per_eu=`/`matrix_instr_nonkdim=`/`kpack=`/
+`num_stages=`/`num_warps=`/`num_ctas=` literal (not sourced from `config`/`cfg`/`tune`/
+`kwargs`/an uppercase constant) on an added line outside `configs/`, `op_tests/`, `tests/`.
+→ `⚠️ T8: [knob]=[value] hardcoded at [location] instead of read from config — move it to the tuned config, or justify why this call site is exempt`
+
+**T5 — Accumulator precision loses tail-of-sum bits** ⚠️
+Carried from aiter **without an ATOM citation** — labeled as such, same as aiter marks
+its own uncited rules, rather than silently presented as proven. The trigger shape (a
+`tl.dot(`/`allow_tf32`/`input_precision` call, or an `acc += `/`acc = tl.zeros` manual
+accumulator) fires throughout `fla_ops` and `v4_kernels`, but no ATOM defect commit was
+found demonstrating this specific failure (an fp16/bf16 accumulator silently losing the
+tail of a long reduction sum) during this assessment.
+Trigger: `tl.dot(`, `allow_tf32`, `input_precision`, or a manual `acc\w* +=`/`acc\w* =
+tl.zeros` accumulator pattern on an added line.
+→ `⚠️ T5: accumulator [name] — confirm dtype is fp32 (or confirm the tail-of-sum loss at this length/dtype is acceptable) — no ATOM instance found for this specific rule, carried from aiter`
+
+**T6 — Grid / `program_id` axis disagreement** ⚠️
+Carried from aiter **without an ATOM citation**, same caveat as T5: the trigger shape
+(`grid = lambda` or `tl.program_id`) fires throughout `fla_ops`/`v4_kernels`, but no ATOM
+defect commit was found for this specific failure (a launch grid's axis order disagreeing
+with the `tl.program_id(axis)` the kernel reads it back with — including a swizzled grid
+where the swizzle axis and the `program_id` axis it's applied to don't agree).
+Trigger: `grid = lambda` or `tl.program_id` on an added line.
+→ `⚠️ T6: program_id(axis=[n]) — confirm this matches the grid's own axis order (and the swizzle axis, if the grid is swizzled) — no ATOM instance found for this specific rule, carried from aiter`
+
+---
+
 ### Performance Evidence
 
 Not derived by the current pipeline -- P1-P5 are in `UNREACHABLE_BY_DESIGN`

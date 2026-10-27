@@ -102,16 +102,25 @@ def triton_families(add):
     generic one was tuned on the whole corpus and barely discriminates here: over the 195
     Triton PRs among 600 open aiter PRs, `ops-wrapper` fires on 88% and `modified-kernel`
     on 79%, so a Triton PR arrived carrying a rule set that said little about being Triton.
-    Each family below fires on at most 52% of Triton PRs and at most 17% of all of them."""
+    Each family below fires on at most 52% of Triton PRs and at most 17% of all of them.
+
+    ATOM ported T1, T3, T5, T6 (not aiter's T2, T4 -- see rules.md for why each of those
+    was graded out rather than silently dropped) and B2 was not re-added under its own id:
+    aiter's own numbering duplicates T1 on it (same masked-load defect, two ids), and ATOM's
+    B2 already names something else entirely ("decode/prefill phase classified by size
+    proxy"), so porting aiter's B2 here would collide. T1 alone carries the citation."""
     fams = []
     loads, stores = _calls(add, "tl.load"), _calls(add, "tl.store")
     unmasked = [c for c in loads + stores if "mask=" not in c]
     no_other = [c for c in loads if "mask=" in c and "other=" not in c]
     if unmasked or no_other:
-        fams.append(("triton-mask-bounds", "T1 T2"))
-    if re.search(r"\bnum_warps\b|\bnum_stages\b|\bnum_ctas\b|waves_per_eu|"
-                 r"matrix_instr|\bkpack\b", add):
-        fams.append(("triton-launch-cfg", "T3 T4"))
+        fams.append(("triton-mask-bounds", "T1"))
+    # T4 (AMD launch knobs hardcoded ACROSS archs -- waves_per_eu/matrix_instr_nonkdim/kpack)
+    # is deliberately excluded from this family: zero hits for those three names in the
+    # directories sampled for the P1 assessment. That is "not found in sampled directories",
+    # not "absent" -- not ported, and not claimed as coverage either.
+    if re.search(r"\bnum_warps\b|\bnum_stages\b|\bnum_ctas\b", add):
+        fams.append(("triton-launch-cfg", "T3"))
     # `.to(tl.float32)` alone was 20 of the 54 firings and every sample was an upcast on
     # a load, a store or a quantisation max -- the opposite of the accumulator T5 means.
     # The manual reduction it also covers is kept by name instead.
@@ -1194,6 +1203,21 @@ def derive(files, title="", raw_diff=""):
     if any(p.endswith("model_runner.py") for p in paths) and re.search(r"\bbatch\.\w+\s*=(?!=)", add):
         hit("batch-consumer-purity", "H2")
 
+    # Triton family (T1 T3 T5 T6 T8), ported from aiter's own review-pr skill. Gated so it
+    # only looks at Triton PRs: either the diff adds a `@triton.jit`-decorated kernel, or it
+    # touches one of the directories that hold ATOM's Triton kernels today. v4_kernels and
+    # fla_ops are where T1/T3/T8's citations live (paged_decode.py); the rest of the list is
+    # scope, not evidence -- a PR under one of them gets the same family checks run on it.
+    TRITON_DIRS = ("atom/model_ops/fla_ops/", "atom/model_ops/v4_kernels/",
+                   "atom/model_ops/attentions/", "atom/model_ops/deepseek_v41/",
+                   "atom/model_ops/qwen4_exp/", "atom/model_ops/minimax_m3/",
+                   "atom/model_ops/kimi_k3/", "atom/plugin/vllm/")
+    if re.search(r"@triton\.jit", add) or any(p.startswith(TRITON_DIRS) for p in paths):
+        for fam in triton_families(add):
+            hit(*fam)
+        if hardcoded_launch_knob(files):
+            hit("triton-launch-knob-hardcoded", "T8")
+
     if not t:
         hit("generic-code", "A1 B1 D4")   # never empty: the ledger gate fails closed
     return t
@@ -1204,7 +1228,7 @@ def derive(files, title="", raw_diff=""):
 # were derived -- so `triage.py mapping` is what surfaces it.
 #
 # These 19 ids are rules.md bodies with no corresponding family in derive(): the P0 minimal
-# deriver emits only ALL_RULES's 27 ids, and these are the rest. Carried over verbatim from
+# deriver emits only ALL_RULES's 32 ids, and these are the rest. Carried over verbatim from
 # the pre-pipeline SKILL.md prose, same as every rule here -- they are not dead weight, they
 # are P1's raw material for regrowing ATOM's own rule-family axis from real review history.
 # Do not trim rules.md to make this list shrink; the gap is the thing to see, not to hide.
@@ -1216,7 +1240,8 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
     "P1", "P2", "P3", "P4", "P5", "HK3", "HK6", "HK7",
 )}
 
-ALL_RULES = "A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 F2 G1 G1b G2 H1 H2 HK1 HK2 HK4 HK5 STEP4"
+ALL_RULES = ("A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 F2 G1 G1b G2 H1 H2 "
+             "HK1 HK2 HK4 HK5 STEP4 T1 T3 T5 T6 T8")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert
@@ -1678,13 +1703,23 @@ def family_mapping():
     being maintained by hand either -- it is generated now, and tests/ fails if the
     committed copy and this function disagree.
 
-    Scoped to `derive`'s own source, not the whole file: ATOM's port keeps
-    `triton_families` (and other aiter-only helpers) vendored but unreachable --
-    `derive` deliberately never calls them, P1 territory -- and a whole-file scan
-    would list their families as derivable when they are not."""
+    Scoped to `derive`'s own source, not the whole file -- a whole-file scan would list
+    every vendored-but-unreachable helper's families as derivable when they are not. The
+    Triton family is the one exception that needs a second step: `derive` now actually
+    calls `triton_families` and `hardcoded_launch_knob`, so when its body calls one of
+    them by name, that helper's own body is pulled in too -- not the whole file, which
+    would still wrongly resurrect any other vendored-but-unreachable helper that happens
+    to share the `hit`/`fams.append` shape."""
     src = pathlib.Path(__file__).read_text()
     m = re.search(r"\ndef derive\(.*?\n(?=\ndef |\n[A-Z_]+\s*=)", src, re.S)
     body = m.group(0) if m else src
+    extra_bodies = []
+    for helper in ("triton_families", "hardcoded_launch_knob"):
+        if re.search(rf"\b{helper}\(", body):
+            hm = re.search(rf"\ndef {helper}\(.*?\n(?=\ndef |\n[A-Z_]+\s*=)", src, re.S)
+            if hm:
+                extra_bodies.append(hm.group(0))
+    body = body + "\n".join(extra_bodies)
     out, seen = [], set()
     for mm in re.finditer(r'(?:hit|fams\.append)\(\(?"([\w-]+)",\s*"([^"]+)"\)?\)', body):
         fam, rules = mm.group(1), mm.group(2)
