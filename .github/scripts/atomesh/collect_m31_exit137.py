@@ -88,6 +88,11 @@ for job in sorted(jobs):
     script += 'squeue "${args[@]}" --start -h -j ' + job + ' -o "%i|%S|%R|%N"'
     collect_command(f"job-{job}-accounting.txt", ["bash", "-c", script])
 
+# Read scheduler capacity for the previously successful MI355X candidate;
+# no other workload logs or process details are queried.
+candidate_script = 'source .github/scripts/slurm_submit_helpers.sh; detect_slurm_backend; args=(); if [[ "${USES_SPUR_CONTROLLER:-0}" == "1" && -n "${SPUR_CONTROLLER_ADDR:-}" ]]; then args=(--controller "$SPUR_CONTROLLER_ADDR"); fi; scontrol "${args[@]}" show node pit2-p03-g12'
+collect_command("placement-candidate-g12.txt", ["bash", "-c", candidate_script])
+
 # Query exact containers discovered in this run's metadata. No host kernel
 # journal, broad container listing, environment, or other-job events are read.
 for node, containers in sorted(containers_by_node.items()):
