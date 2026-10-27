@@ -2729,14 +2729,14 @@ class MergedReplicatedLinear(ReplicatedLinear):
         param.weight_loader_process(param_data, loaded_weight)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _router_flydsl_params(kernel_name: str) -> dict | None:
     from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
 
     return get_flydsl_hgemm_kernel_params(kernel_name)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _router_kernel_table(padded_rows: int, k: int):
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
