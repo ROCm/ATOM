@@ -776,7 +776,6 @@ class ModelRunner:
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         if envs.ATOM_ENABLE_GLUON_FUSED_AR:
-            # aiter reads it when it makes the TP communicator (ROCm/aiter#6974).
             os.environ["AITER_GLUON_FUSED_AR"] = "1"
         # Which attention this model's config asks for. The runner holds the
         # answer, not the question: what makes a model MLA or a hybrid is the
