@@ -1203,6 +1203,31 @@ def derive(files, title="", raw_diff=""):
     if any(p.endswith("model_runner.py") for p in paths) and re.search(r"\bbatch\.\w+\s*=(?!=)", add):
         hit("batch-consumer-purity", "H2")
 
+    # E4 -- "a production kernel/dispatch belongs in aiter, not ATOM", from the
+    # closed-unmerged-PR channel (ATOM#2465, #1104, #2510, #1593). Scoped to NEW files
+    # only: ATOM has 116 existing Triton kernel files, and firing on every edit to any
+    # of them would fire on nearly every Triton PR for no reason connected to this
+    # defect. A new, self-contained kernel file (has @triton.jit or a __global__
+    # kernel decl, and does not itself call into aiter) is the trigger; a new ATOM_*
+    # env-var that switches between ATOM-side kernel variants (the #2510 shape) is
+    # the second half, and is not new-file-scoped since #2510 itself added its switch
+    # to existing files (atom/models/deepseek_v4.py, atom/utils/envs.py) -- but it is
+    # scoped to atom/model_ops/ or atom/models/ so a routine config env-var elsewhere
+    # does not also claim this family.
+    new_kernel_files = [
+        p for p, f in files.items()
+        if f["new"] and p.endswith((".py", ".cu", ".cuh", ".hip"))
+        and re.search(r"@triton\.jit|__global__\s+\w", "\n".join(f["add"]))
+        and not re.search(r"from aiter import|import aiter\b|aiter\.", "\n".join(f["add"]))
+    ]
+    new_dispatch_envvar = any(
+        ("atom/model_ops/" in p or "atom/models/" in p)
+        and re.search(r'os\.environ\.get\(\s*["\']ATOM_', "\n".join(f["add"]))
+        for p, f in files.items()
+    )
+    if new_kernel_files or new_dispatch_envvar:
+        hit("production-kernel-belongs-in-aiter", "E4")
+
     # Triton family (T1 T3 T5 T6 T8), ported from aiter's own review-pr skill. Gated so it
     # only looks at Triton PRs: either the diff adds a `@triton.jit`-decorated kernel, or it
     # touches one of the directories that hold ATOM's Triton kernels today. v4_kernels and
@@ -1240,7 +1265,7 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
     "P1", "P2", "P3", "P4", "P5", "HK3", "HK6", "HK7",
 )}
 
-ALL_RULES = ("A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 F2 G1 G1b G2 H1 H2 "
+ALL_RULES = ("A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
              "HK1 HK2 HK4 HK5 STEP4 T1 T3 T5 T6 T8")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float

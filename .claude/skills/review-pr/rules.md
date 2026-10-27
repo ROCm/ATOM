@@ -260,6 +260,36 @@ New aiter param added with default that preserves old behavior: fix only activat
 Real example (aiter#3773): `max_seqlen=-1` — fix never activated until ATOM passed actual value.
 → `📝 E3: new API param needs consumer-side update to activate — follow-up tracked?`
 
+**E4 — A production kernel or dispatch belongs in aiter, not ATOM** ⚠️
+Found via the closed-unmerged-PR channel (ROCm/ATOM PRs closed, not merged, with a
+stated technical reason), not the inline-comment corpus the rest of this file draws
+from — the strongest cluster in that channel, well above the 1-citation bar. The
+shape repeats: a contributor lands a self-contained production kernel or an
+`ATOM_*` dispatch switch in ATOM, and the PR is later closed because the same
+specialization already lives, or is decided to belong, in aiter — not because the
+kernel itself was wrong. In every citation below, the kernel had already cleared
+local correctness/perf review; the boundary violation was caught only by a
+maintainer or author noticing the aiter PR existed, never by anything in the diff.
+Real examples: ATOM#2465 (`atom/model_ops/triton_k3_grouped_topk.py` — closed,
+"superseded by the AITER-native implementation... dispatches through the public
+biased_grouped_topk / topk_gating APIs, so ATOM needs no production kernel copy");
+ATOM#1104 (`atom/model_ops/mamba_ops/causal_conv1d.py` — closed, "superseded by
+aiter #3803... future maintenance... will follow the aiter implementation as the
+source of truth"); ATOM#2510 (new `ATOM_MHC_GLUON_POST_PRE` env-var — closed,
+"migrate the switch on AITER side entirely"); ATOM#1593 (author's own close: "real
+fix should be in aiter side"). ATOM#987 is the same boundary one layer up (a CI
+job, not a kernel): closed as "wrong repo... the intent is a downstream CI check
+in ROCm/aiter."
+Scoped to **new files only**: ATOM has 116 existing Triton kernel files, and a
+trigger on every edit to any of them would fire on nearly every Triton PR in the
+repo for no reason connected to this defect — editing an existing, already-ATOM-
+resident kernel is not the thing these closures are about. The trigger is a
+**new** file (not a new function in an existing file) that is both self-contained
+(no call into `aiter.<fn>`/`from aiter import`) and implements a kernel primitive,
+OR a new `ATOM_*` env-var that switches between ATOM-side kernel variants for a
+choice aiter itself could make.
+→ `⚠️ E4: new [file] implements a production kernel/dispatch with no aiter counterpart linked — confirm this doesn't duplicate (or belong in) aiter, per #2465/#1104/#2510/#1593`
+
 ---
 
 ### F — Resource Duplication
