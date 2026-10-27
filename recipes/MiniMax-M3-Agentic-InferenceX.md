@@ -1,5 +1,7 @@
 # MiniMax-M3 — Agentic serving recipe (InferenceX)
 
+MiniMax-M3.1-Flash (TP4 + DSpark) has its own section: [MiniMax-M3.1-Flash — TP4 + DSpark](#minimax-m31-flash--tp4--dspark).
+
 TP4 + EAGLE3, MXFP4 weights, concurrency 1–48. This is the configuration the SemiAnalysis InferenceX reference benchmarks for this model (`configs/amd-master.yaml`: `{tp: 4, spec-decoding: mtp}`); CONC 40/48 add the LMCache CPU tier.
 
 MiniMax-M3's KV is **uncompressed** — 22.9 KB per token per rank — so the GPU pool stops holding reusable prefixes well before it runs out of room. Throughput flattens at CONC=32 while interactivity keeps falling; 40c is the best point on the ladder, and 48c buys 3.9% more throughput for 38.5% less interactivity. See [Measured](#measured).
@@ -194,6 +196,131 @@ Peak throughput is at 48c, but 40c is the point worth quoting: **+18.6% throughp
 > **Read the last column, not `engine hit`.** The engine's `Prefix cache hit rate` counts the GPU tier only, so a chunk served from LMCache scores as a miss — which is why it appears to collapse to 70.2% at 48c. `realised hit` is derived independently, from the prompt tokens the server actually ran prefill on (`Avg prompt throughput` integrated over the profiling window). Without offload the two agree within 0.5–2.2 pp; with offload they diverge by 14–25 pp, and that divergence *is* the CPU tier's contribution.
 
 The 1c–32c ladder this file carried until 2026-09-17 has been removed rather than re-labelled. Those numbers were taken with `--hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}'`, which reuses the previous layer's top-k on 42 of the 57 sparse layers; the flag was dropped from the command on 2026-09-10 (`e885fc6f4`) but the table was never re-measured, so it reported a configuration this recipe no longer runs and read roughly 14% fast. Re-run the low-concurrency points on the current command if you need them.
+
+## MiniMax-M3.1-Flash — TP4 + DSpark
+
+MiniMax-M3.1-Flash runs a different configuration from the M3 recipe above:
+- DSpark K=7 instead of EAGLE3;
+- every one of the 60 layers is sparse attention with its own indexer;
+- the quantized checkpoint is Quark MXFP4.
+
+The reference is the SemiAnalysis InferenceX SGLang recipe `minimaxm31flash-fp4-mi355x-sglang-agentic-dspark` (TP4, K=7, golden accepted length 4.04, CI run 40110172586).
+
+The concurrency range splits in two:
+
+| CONC | KV / index cache | decode | needs |
+|---|---|---|---|
+| 1–16 | FP8 / FP8 | Mono (fused per-layer decode) | #2686 (Mono with fixed DSpark verify) |
+| 32–48 | **NVFP4 / FP4** + fused verify top-k | production path (Mono refuses NVFP4 KV) | #2744, #2745, #2746 |
+
+Both bands also use the per-channel FP8 draft from #2743. All five PRs are open as of 2026-10-27; on `main` without them, the first band runs without Mono and the second band's flags do not exist.
+
+**Why the second band needs NVFP4.** With FP8 KV and FP8 index the cache cannot hold the agentic working set from CONC 48. At c48 with `--gpu-memory-utilization 0.8`:
+- the cache holds 6.06M tokens, against 7.97M tokens in flight at p50;
+- the prefix-cache hit rate collapses to 17% (the traces allow 96.6%);
+- TTFT p50 is 44 s and output is ~94 tok/s/GPU.
+
+KV block bytes for TP4 (from the server log, 128-token blocks) and the capacity at `--gpu-memory-utilization 0.9`:
+
+| KV | index | block_bytes | blocks | tokens |
+|---|---|---:|---:|---:|
+| FP8 | FP8 | 3,179,520 | 57,011 | 7.3M |
+| FP8 | FP4 | 2,749,440 | ~66,000 | 8.4M |
+| NVFP4 | FP8 | 2,257,920 | ~80,400 | 10.3M |
+| NVFP4 | FP4 | 1,827,840 | ~99,200 | **12.7M** |
+
+At c16 the NVFP4 band is the slower one: 156.4 tok/s/GPU and P90 interactivity 137.9 over 1200 s, against 181.6 and 191.2 for the FP8 + Mono band. The NVFP4 figure was measured before #2746's on-device decode-row fix and has not been re-measured. Keep the split.
+
+```bash
+MODEL=/shared/data/amd_int/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4   # draft at $MODEL/dspark
+CONC=1      # then 2, 4, 8, 16 (FP8 band); 32, 48 (NVFP4 band)
+```
+
+Capture every batch size up to 8, then in steps of 2 / 4 / 8 / 16 up to the running-batch ceiling. `--max-num-seqs` is 2 × CONC, as above.
+
+```bash
+CAPTURE=$(python3 -c "m=2*$CONC; print([s for s in [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128] if s<=max(m,2)])")
+BAND_ENV="ATOM_M3_DSPARK_DRAFT_PTPC=1"
+BAND_ARGS="--kv_cache_dtype fp8 --index-cache-dtype fp8"
+if [ "$CONC" -ge 32 ]; then
+  BAND_ENV="$BAND_ENV ATOM_M3_SPARSE_KV_NVFP4=1"          # ATOM_M3_FUSED_VERIFY_TOPK defaults to 1
+  BAND_ARGS="--kv_cache_dtype fp8 --index-cache-dtype fp4"  # sparse layers' KV goes NVFP4 via the env
+fi
+
+env $BAND_ENV \
+  AITER_LOG_LEVEL=WARNING \
+  ATOM_FORCE_ATTN_TRITON=1 \
+  AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
+  ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1 \
+  ATOM_MONO_ENABLE=1 \
+  python3 -u -m atom.entrypoints.openai_server \
+    --model "$MODEL" --served-model-name MiniMaxAI/MiniMax-M3.1-Flash \
+    --tensor-parallel-size 4 --host 0.0.0.0 --port 8006 --server-port 8000 \
+    --trust-remote-code $BAND_ARGS \
+    --block-size 128 --max-model-len 1048576 --max-num-seqs $((2 * CONC > 2 ? 2 * CONC : 2)) \
+    --max-num-batched-tokens 32768 --gpu-memory-utilization 0.9 \
+    --enable-prefix-caching \
+    --cudagraph-capture-sizes "$CAPTURE" \
+    --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","vision_tower","multi_modal_projector","patch_merge_mlp","*block_sparse_moe"]}' \
+    --method dspark --draft-model "$MODEL/dspark" --num-speculative-tokens 7 \
+    --spec-decode-acceptance-length 4.04 \
+  > server_c${CONC}.log 2>&1 &
+```
+
+- `--spec-decode-acceptance-length 4.04` is SGLang CI's golden accepted length, applied the way InferenceX applies it. It is performance-only. Drop it for accuracy runs.
+- Check which band actually came up from the startup lines:
+  - FP8 band: `MiniMax-M3 mono decode on` on all four ranks.
+  - NVFP4 band: `block_bytes=1827840`, `sparse KV is NVFP4`, and `mono decode off: sparse KV is NVFP4`.
+- Leave `ATOM_M3_INDEXER_CP` unset:
+  - At c16 the decode batch × context is ~0.84M tokens, under the ~1M break-even.
+  - The FP4 index refuses CP (its context scorer reads FP8/BF16 keys only).
+
+Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
+
+```bash
+export AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom: AIPERF_HTTP_TCP_USER_TIMEOUT=900000
+agentx profile \
+  --url http://127.0.0.1:8000 --model MiniMaxAI/MiniMax-M3.1-Flash --tokenizer "$MODEL" \
+  --tokenizer-trust-remote-code \
+  --concurrency $CONC --benchmark-duration 3600 \
+  --server-metrics http://127.0.0.1:8000/metrics \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --output-artifact-dir ./results_m31/c${CONC}
+```
+
+### Measured (M3.1)
+
+Setup:
+- one MI355X node, TP4, 3600 s per point, synthetic accepted length 4.04;
+- tree: #2686 + #2743 + the NVFP4 stack;
+- output tok/s/GPU = output token throughput / 4;
+- interactivity = 1000 / ITL at the stated percentile;
+- SGLang is CI run 40110172586 on the same recipe.
+
+| CONC | band | tok/s/GPU | SGLang | P90 intvty | SGLang | p50 ITL ms | SGLang | prefix hit | TTFT p50 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | FP8 + Mono | 43.9 | 41.42 | 542.4 | 420.2 | 1.72 | 2.17 | 0.966 | 638 ms |
+| 2 | FP8 + Mono | 52.5 | 50.11 | 456.4 | 365.0 | 1.71 | 2.14 | 0.957 | 364 ms |
+| 4 | FP8 + Mono | 65.9 | 63.09 | 411.7 | 347.2 | 1.72 | 2.09 | 0.956 | 351 ms |
+| 8 | FP8 + Mono | 113.0 | 110.59 | 301.1 | 314.5 | 2.19 | 2.55 | 0.948 | 285 ms |
+| 16 | FP8 + Mono | 181.6 | 181.86 | 191.2 | 226.2 | 3.15 | 3.08 | 0.930 | 323 ms |
+| 32 | NVFP4 | 324.1 | 335.4 | 106.6 | 141.6 | 5.60 | 4.12 | 0.940 | 431 ms |
+| 48 | NVFP4 | 434.8 | 436.1 | 67.8 | 70.9 | 8.62 | 6.88 | 0.929 | 439 ms |
+
+The SGLang p50 ITL comes from the run's `bmk_agentic_*` artifact (`itl.p50`, stored to 10 µs). The other SGLang columns come from the InferenceX API.
+
+gsm8k (lm-eval, InferenceX CI's method: 5-shot, chat template, temperature 0, all 1319 samples, real acceptance), strict-match:
+
+| band | strict-match |
+|---|---|
+| FP8 band | 0.9621 ± 0.0053 |
+| NVFP4 band | 0.9659 ± 0.0050 |
+| SGLang CI | 0.9598 ± 0.0054 |
+
+On `main` 481c2bfd4 plus the NVFP4 stack and #2743, without #2686:
+- image `rocm/atom-dev:nightly_202610261558` — older images lack the aiter `topk_gating(num_valid_rows=)` that `main` calls;
+- c48, 1200 s: 396.7 tok/s/GPU, P90 interactivity 70.5;
+- gsm8k: 0.9644 (NVFP4 band), 0.9598 (FP8 band without Mono).
 
 ## Notes
 
