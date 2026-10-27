@@ -237,30 +237,20 @@ def test_needs_id_sync_is_one_predicate_for_both_groups():
     assert mr._needs_id_sync(True, True) is True
 
 
-def test_settle_target_pcp_split_takes_only_self(monkeypatch):
-    """Both forwards call it bare right after run_model; it must not have picked
-    up `forward`'s decorators, which expect a batch."""
+def test_settle_target_pcp_split_snapshots_pcp_split(monkeypatch):
+    """Both forwards call it bare right after run_model (so it must not have
+    picked up `forward`'s decorators) to keep the target's `pcp_split`."""
     mr = pytest.importorskip("atom.model_engine.model_runner")
     assert hasattr(mr.ModelRunner.forward, "__wrapped__")
     assert not hasattr(mr.ModelRunner._settle_target_pcp_split, "__wrapped__")
-    ctx = SimpleNamespace(target_pcp_split=None)
+    ctx = SimpleNamespace(pcp_split=True, target_pcp_split=None)
     monkeypatch.setattr(mr, "get_forward_context", lambda: SimpleNamespace(context=ctx))
-    runner = SimpleNamespace(
-        drafter=object(), model=SimpleNamespace(pcp_split_active=lambda: True)
-    )
+    runner = SimpleNamespace(drafter=object())
     mr.ModelRunner._settle_target_pcp_split(runner)
     assert ctx.target_pcp_split is True
-
-    # A model without the method never row-splits; under PCP that is worth
-    # one warning, since its drafter's aux would silently go ungathered.
-    warned = []
-    monkeypatch.setattr(mr, "get_pcp_world_size", lambda: 8)
-    monkeypatch.setattr(mr.logger, "warning", lambda *a, **k: warned.append(a))
-    runner.model = SimpleNamespace()
-    for _ in range(3):
-        mr.ModelRunner._settle_target_pcp_split(runner)
+    ctx.pcp_split = False
+    mr.ModelRunner._settle_target_pcp_split(runner)
     assert ctx.target_pcp_split is False
-    assert len(warned) == 1
 
 
 def test_aux_gathers_exactly_when_the_target_forward_split(monkeypatch):

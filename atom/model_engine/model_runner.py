@@ -3492,26 +3492,11 @@ class ModelRunner:
             callback(req_ids)
 
     def _settle_target_pcp_split(self) -> None:
-        """Cache whether the forward just run row-split for PCP. Call right
-        after `run_model`: drafting rewrites the state the gate reads, and a
-        cudagraph replay skips any model-side bookkeeping."""
-        if getattr(self, "drafter", None) is None:
-            return
-        split_active = getattr(self.model, "pcp_split_active", None)
-        if (
-            split_active is None
-            and get_pcp_world_size() > 1
-            and not getattr(self, "_warned_no_pcp_split", False)
-        ):
-            self._warned_no_pcp_split = True
-            logger.warning(
-                "%s has no pcp_split_active(); assuming PCP never row-splits "
-                "it, so drafter aux states are not gathered.",
-                type(self.model).__name__,
-            )
-        get_forward_context().context.target_pcp_split = bool(
-            split_active() if split_active is not None else False
-        )
+        """Snapshot the target forward's `pcp_split` before drafting clears it.
+        Call right after `run_model`."""
+        if getattr(self, "drafter", None) is not None:
+            ctx = get_forward_context().context
+            ctx.target_pcp_split = bool(ctx.pcp_split)
 
     @_profile_runner_stage
     @torch.inference_mode()

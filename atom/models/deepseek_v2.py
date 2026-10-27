@@ -64,7 +64,6 @@ from atom.distributed.pcp_utils import (
     pcp_pad_dense,
     pcp_pad_len,
     pcp_round_robin_split,
-    pcp_split_active,
 )
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
@@ -193,12 +192,19 @@ def _pcp_active() -> bool:
     reindex) keys off the SAME batch-global condition so they agree within a
     forward.
     """
-    # This family wires PCP only into sparse MLA: no index_topk, no split;
-    # otherwise split only above the dense-fallback threshold.
+    if not pcp_is_enabled():
+        return False
+    ctx = get_forward_context()
+    context = getattr(ctx, "context", None)
+    attn_metadata = getattr(ctx, "attn_metadata", None)
+    if context is None or attn_metadata is None:
+        return False
+    if not bool(context.is_prefill) or bool(getattr(context, "is_dummy_run", False)):
+        return False
     index_topk = getattr(get_current_atom_config().hf_config, "index_topk", None)
     if index_topk is None:
         return False
-    return pcp_split_active(int(index_topk))
+    return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(index_topk)
 
 
 def _install_increment_version_pcp_shim() -> None:
@@ -3003,10 +3009,6 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
-    def pcp_split_active(self) -> bool:
-        """Did this model's last forward PCP row-split?"""
-        return _pcp_active()
-
     def __init__(
         self,
         atom_config: Config,

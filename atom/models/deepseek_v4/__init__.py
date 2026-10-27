@@ -62,7 +62,6 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange,
     pcp_pad_len,
     pcp_round_robin_split,
-    pcp_split_active,
 )
 from atom.model_loader.loader import WeightsMapper
 from atom.model_loader.weight_utils import local_model_dir
@@ -3564,8 +3563,10 @@ def _pcp_active() -> bool:
     not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
     warmup dummy run has no valid KV cache so it must skip the split path.
     """
-    # V4 has no dense fallback, so every real prefill splits.
-    return pcp_split_active(None)
+    if get_pcp_world_size() <= 1:
+        return False
+    fc = get_forward_context()
+    return fc.context.is_prefill and not fc.context.is_dummy_run
 
 
 @support_torch_compile
@@ -3763,10 +3764,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         "shared_experts.w1": ("shared_experts.gate_up_proj", 0),
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
-
-    def pcp_split_active(self) -> bool:
-        """Did this model's last forward PCP row-split?"""
-        return _pcp_active()
 
     def __init__(self, config: Config, prefix: str = "") -> None:
         super().__init__()

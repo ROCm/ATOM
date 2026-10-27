@@ -59,32 +59,6 @@ def pcp_is_enabled() -> bool:
     return get_pcp_world_size() > 1
 
 
-def pcp_split_active(dsa_fallback_topk: int | None) -> bool:
-    """Did PCP row-split the current prefill forward?
-
-    A backend that falls back to dense MHA on short batches passes its threshold
-    (`dsa_fallback_topk`, V3.2's `index_topk`) and reports False below it; V4
-    passes None. Batch-global, so every rank agrees, but drafting changes the
-    inputs: evaluate it right after the target forward.
-    """
-    from atom.utils.forward_context import get_forward_context
-
-    if not pcp_is_enabled():
-        return False
-    ctx = get_forward_context()
-    context = getattr(ctx, "context", None)
-    if context is None:
-        return False
-    if not bool(context.is_prefill) or bool(getattr(context, "is_dummy_run", False)):
-        return False
-    if dsa_fallback_topk is None:
-        return True
-    attn_metadata = getattr(ctx, "attn_metadata", None)
-    if attn_metadata is None:
-        return False
-    return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(dsa_fallback_topk)
-
-
 def pcp_pad_len(
     total_tokens: int,
     pcp_size: int | None = None,
