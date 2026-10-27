@@ -592,7 +592,9 @@ def weight_is_stored_preshuffled(
     ``native_group_rows`` marks a native group32 weight, otherwise read as
     checkpoint bytes. Only an FP8 32x32 one is shuffled: on gfx950 for AITER's
     preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
-    and always under ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``).
+    always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
+    one (it reads the 32x32 scales as stored), and always under
+    ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``).
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -618,7 +620,10 @@ def weight_is_stored_preshuffled(
             return True
         from aiter.jit.utils.chip_info import get_gfx
 
-        return envs.ATOM_GROUP32_WEIGHT_PRESHUFFLE and get_gfx() == "gfx950"
+        gfx = get_gfx()
+        return gfx == "gfx1250" or (
+            envs.ATOM_GROUP32_WEIGHT_PRESHUFFLE and gfx == "gfx950"
+        )
     quant_value = quant_type.value
     if quant_value == QuantType.per_Token.value:
         # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
