@@ -60,8 +60,10 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "indexer_types",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
-# `Family.GDN`, but note the attribute skew: the guard below reads
+# `kimi_linear` family `kimi_k3` owns. The types `attn_family` resolves to
+# `Family.GDN` (Qwen3-Next, Qwen3.5) plus Qwen3.8's, which it resolves to
+# `Family.QSA_GDN` (`qwen4_exp_text`; `qwen4_exp` is the wrapper name a native
+# config flattens to). Note the attribute skew: the guard below reads
 # `hf_config.model_type` while `attn_family` reads the text config. On the
 # native path they agree only because `get_hf_config` flattens the text type
 # up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
