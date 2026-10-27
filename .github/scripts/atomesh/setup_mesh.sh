@@ -2,6 +2,12 @@
 # Explicit CI build stage, run on the router's host before the service container.
 set -euo pipefail
 
+# Native vLLM uses the image connector proxy, without building ATOM mesh.
+if [[ "${BACKEND:-atom}" == "vllm" ]]; then
+  echo /app/ATOM/atom/mesh/target/release/atomesh
+  exit 0
+fi
+
 repo_root="${1:?Repository root is required}"
 run_dir="${2:?Run directory is required}"
 image="${3:?Build image is required}"
