@@ -152,7 +152,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.config.head_dim,
             self.config.index_head_dim,
             self.config.engram_max_ngram_size - 1,
-            packed=model_runner.config.kv_cache_dtype == "fp4",
+            kv_dtype=model_runner.config.kv_cache_dtype,
             speculative_tokens=num_drafts,
             # Only the ratios the built layers run: a configuration with no
             # window-only layer gets no buffer for one.
@@ -845,6 +845,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             name: stage(name, getattr(layout, name))
             for name in ("rows", "query_ids", "last", "query_ptrs", "last_rows")
         }
+        # The decoder passes' real row counts -- the tail's rows, then layer
+        # 39's one per request -- read in place like the step's
+        # `scheduled_tokens_gpu`: a recording replays every step of its bucket.
+        filled_gpu = stage("filled", [layout.filled])
+        finishing_gpu = stage("finishing", [len(picks)])
         tail = prepare_batch_step(
             spans,
             self.device,
@@ -870,6 +875,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             query_ptrs=plan["query_ptrs"],
             last_rows=plan["last_rows"],
             filled=layout.filled,
+            filled_gpu=filled_gpu,
+            finishing_gpu=finishing_gpu,
         )
 
     @staticmethod
@@ -1041,6 +1048,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             "last": bs,
             "query_ptrs": bs + 1,
             "last_rows": bs,
+            "filled": 1,
+            "finishing": 1,
         }
         return {
             f"{DECODER_ROWS}{name}": CpuGpuBuffer(

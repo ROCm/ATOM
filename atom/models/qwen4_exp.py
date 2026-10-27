@@ -267,6 +267,15 @@ class _FusedSharedExpertConfig(_UnfusedSharedExpertConfig):
         return getattr(self._config, name)
 
 
+def moe_pad_align(intermediate_size: int, tp_size: int) -> int | None:
+    """Expert pad alignment for `FusedMoE`: 128 if the shard needs no padding.
+
+    TP1 keeps Qwen3.8-Flash-Next's 640 instead of padding it to 768; other
+    shards keep the MXFP4 default (256).
+    """
+    return 128 if (intermediate_size // tp_size) % 128 == 0 else None
+
+
 class Qwen4ExpSparseMoeBlock(nn.Module):
     """512 routed experts, top-10, plus one sigmoid-gated shared expert.
 
@@ -332,6 +341,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             ),
             shared_expert_scoring_func="sigmoid" if self.fuse_shared else None,
             shared_expert_prefix=f"{prefix}.shared_expert",
+            pad_align=moe_pad_align(config.moe_intermediate_size, self.tp_size),
         )
         install_stacked_expert_loaders(self.experts)
         self._single_token_ok: bool | None = None

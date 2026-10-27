@@ -115,7 +115,9 @@ class MonoDecodeModel(nn.Module):
             return getattr(self.model, name)
 
 
-def install_mono_decode(model: nn.Module, atom_config, drafter) -> nn.Module:
+def install_mono_decode(
+    model: nn.Module, atom_config, drafter, *, metadata_builder=None
+) -> nn.Module:
     """``model`` wrapped for K3 mono decode, or ``model`` itself when this
     deployment is one mono does not serve."""
     why = config_refusal(atom_config)

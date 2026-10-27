@@ -272,6 +272,12 @@ class V41MonoDecodeRunner:
         dp = get_dp_group()
         return dp if tp == 1 and dp.world_size > 1 else get_tp_group()
 
+    @property
+    def kv_fp8(self) -> bool:
+        """The pool's rows are MXFP8 (``V41PoolGeometry.kv_dtype`` fp8): the
+        attention dequantizes them, K1 writes its window row so."""
+        return get_current_atom_config().kv_cache_dtype == "fp8"
+
     def _bind_rank(self) -> None:
         """This rank, the TP size every build is for and DP attention's ranks,
         the MoE expert parallel or TP over them (``config_refusal`` refused the
@@ -345,6 +351,7 @@ class V41MonoDecodeRunner:
                 timeline=self.timeline,
                 diag_off=self.diag_off,
                 tok_par=self._tok_par(s),
+                kv_fp8=self.kv_fp8,
             )
             for spec, block in zip(self.model.topology, self.model.layers)
         ]
@@ -364,6 +371,7 @@ class V41MonoDecodeRunner:
             tok_par=self._tok_par(s),
             ep=self.ep,
             moe_tp=self.moe_tp,
+            kv_fp8=self.kv_fp8,
         )
 
     def _rows_build(self, s: int) -> RowsBuild:

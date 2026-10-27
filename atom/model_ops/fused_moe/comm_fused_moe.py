@@ -17,6 +17,8 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from atom.config import get_current_atom_config
+from atom.model_ops.fused_moe.routed_rows import gather_rows
+from atom.model_ops.topK import reassign_gathered_shared_ids
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -125,10 +127,6 @@ class CommFusedMoeBackend:
         self.host = host
         self.runtime_module = runtime
         self.use_dp_reduce_scatter = use_dp_reduce_scatter
-        # Hash-routed DSV4 layers read separately gathered input_ids from the
-        # forward context. Leave them on the ordinary path until that gather is
-        # wired to the same compact rank order as hidden/router.
-        self.supports_custom_routing = not use_dp_reduce_scatter
         self.runtime = None
         self._logged_buckets: set[int] = set()
 
@@ -250,28 +248,26 @@ class CommFusedMoeBackend:
         return supported
 
     @staticmethod
-    def _pad_rows(tensor: torch.Tensor, rows: int) -> torch.Tensor:
+    def _pad_rows(tensor: torch.Tensor, rows: int, fill: int = 0) -> torch.Tensor:
         if tensor.shape[0] == rows:
             return tensor
-        # Padding participates in expert selection after the rank-major gather.
-        # Leaving it uninitialized can create arbitrary router scores and
-        # non-zero routed contributions that contaminate another rank's RS
-        # shard.  Zero hidden rows are neutral regardless of which expert the
-        # zero router row selects.
-        padded = tensor.new_zeros((rows, *tensor.shape[1:]))
+        # The rows are already routed, so a pad row must say it goes nowhere
+        # (ids -1, weight 0) and add nothing (hidden and shared partial 0).
+        # Left uninitialized, its weight and ids would route garbage into
+        # another rank's RS shard.
+        padded = tensor.new_full((rows, *tensor.shape[1:]), fill)
         padded[: tensor.shape[0]].copy_(tensor)
         return padded
 
     def _gather_dpa_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, list[int] | None]:
-        """Gather DPA inputs in compact rank order when Window supports ragged M."""
+        self, rows: tuple[torch.Tensor, ...]
+    ) -> tuple[tuple[torch.Tensor, ...], int, list[int] | None]:
+        """Gather DPA inputs -- a rank's hidden states with their top-k weights
+        and ids -- in compact rank order when Window supports ragged M."""
         from atom.utils.forward_context import get_forward_context
 
         ctx = get_forward_context()
-        local_tokens = int(hidden_states.shape[0])
+        local_tokens = int(rows[0].shape[0])
         group = get_dp_group()
         world_size = int(group.world_size)
         dp_metadata = ctx.dp_metadata
@@ -305,32 +301,22 @@ class CommFusedMoeBackend:
                     f"DPA rank {rank} has {local_tokens} input rows but "
                     f"metadata reports {sizes[rank]}"
                 )
-            hidden_states, router_logits = group.device_communicator.all_gatherv(
-                [hidden_states, router_logits],
-                dim=0,
-                sizes=sizes,
-            )
-            return hidden_states, router_logits, local_tokens, sizes
-
-        # Window RS assigns output row ``rank * (bucket / world_size) + row``
-        # to each rank.  Padding only the gathered tensor's global tail would
-        # leave the real rank-major boundaries at ``rank * max_tokens`` and
-        # shift every rank after rank 0 whenever the bucket is larger.  Insert
-        # the bucket slack inside every rank's shard before all-gather instead.
-        # Keep the two ordinary gather payloads separate.  Concatenating them
-        # made the large transfer slower and forced both split views through
-        # full-size contiguous materialization on every MoE layer.
-        hidden_states = group.all_gather(
-            self._pad_rows(hidden_states, shard_rows),
-            use_custom=True,
-            dim=0,
+        else:
+            # Window RS assigns output row ``rank * (bucket / world_size) + row``
+            # to each rank.  Padding only the gathered tensor's global tail would
+            # leave the real rank-major boundaries at ``rank * max_tokens`` and
+            # shift every rank after rank 0 whenever the bucket is larger.
+            # Insert the bucket slack inside every rank's shard before the
+            # gather instead.
+            fills = (0, 0, -1)  # hidden, weights, ids
+            rows = tuple(self._pad_rows(t, shard_rows, f) for t, f in zip(rows, fills))
+            sizes = [shard_rows] * world_size
+        # One grouped collective for every payload, each kept separate.
+        rows = gather_rows(
+            lambda ts: group.device_communicator.all_gatherv(ts, dim=0, sizes=sizes),
+            rows,
         )
-        router_logits = group.all_gather(
-            self._pad_rows(router_logits, shard_rows),
-            use_custom=True,
-            dim=0,
-        )
-        return hidden_states, router_logits, local_tokens, None
+        return rows, local_tokens, sizes if use_ragged_m else None
 
     def forward(
         self,
@@ -373,31 +359,25 @@ class CommFusedMoeBackend:
     ) -> torch.Tensor:
         method = layer.quant_method
         reduce_scatter_sizes = None
+        # Routed on the rank that owns the rows, before the gather (as in
+        # FusedMoE.forward_impl_graph).
+        topk_weights, topk_ids = method.select_experts(
+            layer, hidden_states, router_logits
+        )
         if self.use_dp_reduce_scatter:
             (
-                hidden_states,
-                router_logits,
+                (hidden_states, topk_weights, topk_ids),
                 local_tokens,
                 reduce_scatter_sizes,
-            ) = self._gather_dpa_inputs(hidden_states, router_logits)
+            ) = self._gather_dpa_inputs((hidden_states, topk_weights, topk_ids))
+            reassign_gathered_shared_ids(layer, topk_ids)
             if reduce_scatter_sizes is None:
                 shard_rows = hidden_states.shape[0] // int(get_dp_group().world_size)
                 if shared_partial is not None:
                     shared_partial = self._pad_rows(shared_partial, shard_rows)
-        topk_weights, topk_ids = method.select_experts_with_record(
-            layer=layer,
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            use_grouped_topk=layer.use_grouped_topk,
-            top_k=layer.top_k,
-            renormalize=layer.renormalize,
-            topk_group=layer.topk_group,
-            num_expert_group=layer.num_expert_group,
-            global_num_experts=layer.global_num_experts,
-            custom_routing_function=layer.custom_routing_function,
-            scoring_func=layer.scoring_func,
-            e_score_correction_bias=layer.e_score_correction_bias,
-            fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
+        # On the physical experts after the gather, as FusedMoE._run_experts.
+        topk_weights, topk_ids = method.place_experts(
+            layer, topk_weights, topk_ids, self.use_dp_reduce_scatter
         )
         output = self.runtime.run(
             hidden_states=hidden_states,
@@ -428,6 +408,8 @@ class CommFusedMoeBackend:
             before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
             reduce_scatter_sizes=reduce_scatter_sizes,
+            # Routing sends the rows past `scheduled_tokens_gpu` to expert -1.
+            routes_may_be_missing=True,
             # The DPA input-gather phase completes only after every rank has
             # entered this invocation. It therefore also proves that every peer
             # finished reading the previous Direct partial before Stage2 reuses
