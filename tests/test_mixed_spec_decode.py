@@ -358,6 +358,9 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch):
         + [300, 301, 302, 303]  # 30: first decode after its prefill row
         + [500, 501, 502, 503]  # 50: scheduler-staged
     )
+    # The whole batch's counts reach the device: MoE routes rows past
+    # `scheduled_tokens_gpu` (batch_info[1]) to no expert.
+    assert runner.forward_vars["batch_info"].gpu[:2].tolist() == [4, 15]
     # Prefill row: nothing rejected. Carried-over rows: last step's status.
     assert processor.num_rejected.tolist() == [0, 1, 2, 0]
     assert processor.num_bonus.tolist() == [0, 2, 1, 0]
