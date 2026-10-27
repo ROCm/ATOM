@@ -104,7 +104,7 @@ def triton_families(add):
     on 79%, so a Triton PR arrived carrying a rule set that said little about being Triton.
     Each family below fires on at most 52% of Triton PRs and at most 17% of all of them.
 
-    ATOM ported T1, T3, T5, T6 (not aiter's T2, T4 -- see rules.md for why each of those
+    ATOM ported T1, T3, T6 (not aiter's T2, T4, T5 -- see rules.md for why each of those
     was graded out rather than silently dropped) and B2 was not re-added under its own id:
     aiter's own numbering duplicates T1 on it (same masked-load defect, two ids), and ATOM's
     B2 already names something else entirely ("decode/prefill phase classified by size
@@ -121,12 +121,11 @@ def triton_families(add):
     # not "absent" -- not ported, and not claimed as coverage either.
     if re.search(r"\bnum_warps\b|\bnum_stages\b|\bnum_ctas\b", add):
         fams.append(("triton-launch-cfg", "T3"))
-    # `.to(tl.float32)` alone was 20 of the 54 firings and every sample was an upcast on
-    # a load, a store or a quantisation max -- the opposite of the accumulator T5 means.
-    # The manual reduction it also covers is kept by name instead.
-    if re.search(r"tl\.dot\(|allow_tf32|input_precision|"
-                 r"acc\w*\s*\+=|acc\w*\s*=\s*tl\.zeros", add):
-        fams.append(("triton-accum-prec", "T5"))
+    # T5 ("accumulator precision loses tail-of-sum bits") was removed after P1: it had no
+    # ATOM citation to begin with (carried from aiter, labelled uncited in rules.md) and
+    # fired 0/14 times on Triton-gated PRs in the P1 sample -- a rule that cannot answer
+    # "which real ATOM change would have gone unreviewed without it" earns removal, not a
+    # parking spot. See rules.md's removal note and MAPPING.md.
     # `tl.cdiv(` is ceiling division, not a grid: of the 7 firings it alone produced, all
     # 7 were a tile count, a block-pointer `shape=`, a mask bound or a loop bound.
     if re.search(r"grid\s*=\s*lambda|tl\.program_id", add):
@@ -1247,7 +1246,7 @@ def derive(files, title="", raw_diff=""):
     if new_kernel_files or new_dispatch_envvar:
         hit("production-kernel-belongs-in-aiter", "E4")
 
-    # Triton family (T1 T3 T5 T6 T8), ported from aiter's own review-pr skill. Gated so it
+    # Triton family (T1 T3 T6 T8), ported from aiter's own review-pr skill. Gated so it
     # only looks at Triton PRs: either the diff adds a `@triton.jit`-decorated kernel, or it
     # touches one of the directories that hold ATOM's Triton kernels today. v4_kernels and
     # fla_ops are where T1/T3/T8's citations live (paged_decode.py); the rest of the list is
@@ -1285,7 +1284,7 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
 )}
 
 ALL_RULES = ("A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
-             "HK1 HK2 HK4 HK5 STEP4 T1 T3 T5 T6 T8")
+             "HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert

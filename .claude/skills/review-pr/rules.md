@@ -404,6 +404,19 @@ not "clean"), and T4 was checked and came back with zero hits for those three na
 directories sampled for this assessment — "not found in sampled directories", not "absent
 from ATOM". Neither claim should be read as more than it is.
 
+**T5 ("accumulator precision loses tail-of-sum bits") was landed here, then removed.** It
+had no ATOM citation from the start — carried from aiter and labeled uncited, same as T6
+below — and P1's 26-PR distribution measurement (`p1-distribution.md`) found it fired 0/14
+times across every Triton-gated PR in the sample, the same zero-fire result as T8 before
+T8's trigger bug was found and fixed. Re-checked for real ATOM evidence before removal (a
+fix commit for an fp16/bf16 accumulator losing tail-of-sum precision, or a review comment
+naming that failure): none was found. A rule carried on the strength of "it fires in
+aiter" with no ATOM instance to show for it, and that still fires on nothing after a real
+measurement, cannot answer "which real ATOM change would this have caught" — so it was
+dropped rather than kept as a line that reads as coverage but isn't. If an ATOM instance
+of this defect turns up later, it should be re-added with that citation, not restored
+uncited.
+
 **T1 — Triton load/store without a bounds mask** ⚠️
 aiter numbers this defect twice (its own T1 and B2 are the same check); ATOM already has
 an unrelated B2 ("decode/prefill phase classified by size proxy"), so only "T1" is added
@@ -440,19 +453,9 @@ Trigger: `hardcoded_launch_knob()` — a `waves_per_eu=`/`matrix_instr_nonkdim=`
 `kwargs`/an uppercase constant) on an added line outside `configs/`, `op_tests/`, `tests/`.
 → `⚠️ T8: [knob]=[value] hardcoded at [location] instead of read from config — move it to the tuned config, or justify why this call site is exempt`
 
-**T5 — Accumulator precision loses tail-of-sum bits** ⚠️
-Carried from aiter **without an ATOM citation** — labeled as such, same as aiter marks
-its own uncited rules, rather than silently presented as proven. The trigger shape (a
-`tl.dot(`/`allow_tf32`/`input_precision` call, or an `acc += `/`acc = tl.zeros` manual
-accumulator) fires throughout `fla_ops` and `v4_kernels`, but no ATOM defect commit was
-found demonstrating this specific failure (an fp16/bf16 accumulator silently losing the
-tail of a long reduction sum) during this assessment.
-Trigger: `tl.dot(`, `allow_tf32`, `input_precision`, or a manual `acc\w* +=`/`acc\w* =
-tl.zeros` accumulator pattern on an added line.
-→ `⚠️ T5: accumulator [name] — confirm dtype is fp32 (or confirm the tail-of-sum loss at this length/dtype is acceptable) — no ATOM instance found for this specific rule, carried from aiter`
-
 **T6 — Grid / `program_id` axis disagreement** ⚠️
-Carried from aiter **without an ATOM citation**, same caveat as T5: the trigger shape
+Carried from aiter **without an ATOM citation** — labeled as such, same as aiter marks
+its own uncited rules, rather than silently presented as proven. The trigger shape
 (`grid = lambda` or `tl.program_id`) fires throughout `fla_ops`/`v4_kernels`, but no ATOM
 defect commit was found for this specific failure (a launch grid's axis order disagreeing
 with the `tl.program_id(axis)` the kernel reads it back with — including a swizzled grid
