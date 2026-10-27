@@ -15,6 +15,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from perf_criterion import group_families, judge_family
+
 THROUGHPUT_REGRESSION_PCT = -5.0  # throughput drop >5% = regression
 LATENCY_REGRESSION_PCT = 10.0  # latency increase >10% = regression
 
@@ -270,6 +273,88 @@ def print_regression_report(current_results, baseline_results):
     return regression_count, regressions
 
 
+def collect_deltas(current_results, baseline_results):
+    """Per-configuration deltas, shaped for the family-linkage criterion.
+
+    Pairs current against baseline the same way print_regression_report does,
+    through _config_key, but returns the deltas instead of printing a table.
+    Separate rather than folded into that function because
+    plugin_benchmark_regression.py unpacks its two return values, and widening
+    that signature to carry data derivable here would break it.
+    """
+    baseline_map = {_config_key(d): d for d in baseline_results}
+    deltas = []
+    for data in current_results:
+        key = _config_key(data)
+        baseline = baseline_map.get(key)
+        if baseline is None:
+            continue
+        backend, model, isl, osl, conc = key
+        deltas.append(
+            {
+                "backend": backend,
+                "model": model,
+                "isl": isl,
+                "osl": osl,
+                "conc": conc,
+                "tput_pct": round(
+                    _pct_change(
+                        data.get("total_token_throughput", 0),
+                        baseline.get("total_token_throughput", 0),
+                    ),
+                    2,
+                ),
+                "tpot_pct": round(
+                    _pct_change(
+                        data.get("mean_tpot_ms", 0), baseline.get("mean_tpot_ms", 0)
+                    ),
+                    2,
+                ),
+                "ttft_pct": round(
+                    _pct_change(
+                        data.get("mean_ttft_ms", 0), baseline.get("mean_ttft_ms", 0)
+                    ),
+                    2,
+                ),
+            }
+        )
+    return deltas
+
+
+def judge_linkage(deltas):
+    """The family-linkage verdict, reported alongside the shipped one.
+
+    Shadow only: nothing gates on this yet. It is written into the report so a
+    few nights of live data can be compared against the criterion that ships
+    before the gate moves, rather than after.
+    """
+    triggered, insufficient = [], []
+    for (backend, model, isl, osl), levels in group_families(deltas).items():
+        verdict = judge_family(levels)
+        row = {
+            "backend": backend,
+            "model": model,
+            "isl": isl,
+            "osl": osl,
+            "median_tput_pct": verdict["median_tput_pct"],
+            "median_tpot_pct": verdict["median_tpot_pct"],
+            "median_ttft_pct": verdict["median_ttft_pct"],
+            "n_down": verdict["n_down"],
+            "n_judging": verdict["n_judging"],
+            "mirror_via": verdict["mirror_via"],
+            "judging_concs": verdict["judging_concs"],
+        }
+        if verdict["status"] == "triggered":
+            triggered.append(row)
+        elif verdict["status"] == "insufficient":
+            insufficient.append({**row, "reason": verdict["reason"]})
+    return {
+        "count": len(triggered),
+        "triggered": triggered,
+        "insufficient": insufficient,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Summarize ATOM benchmark results with optional regression detection"
@@ -299,12 +384,19 @@ def main():
 
     regression_count = 0
     regressions = []
+    linkage = {"count": 0, "triggered": [], "insufficient": []}
 
     if args.baseline_dir:
         baseline_results = load_results(args.baseline_dir, recursive=True)
         if baseline_results:
             regression_count, regressions = print_regression_report(
                 current_results, baseline_results
+            )
+            linkage = judge_linkage(collect_deltas(current_results, baseline_results))
+            print(
+                f"\n> Family-linkage criterion (shadow, gates nothing): "
+                f"**{linkage['count']}** famil{'y' if linkage['count'] == 1 else 'ies'} "
+                f"would alert, against {regression_count} configuration(s) above.\n"
             )
         else:
             print("\n> No baseline results found for regression comparison\n")
@@ -314,6 +406,7 @@ def main():
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "regression_count": regression_count,
             "regressions": regressions,
+            "linkage": linkage,
             "all_results": [
                 {
                     "backend": _backend_name(d),
