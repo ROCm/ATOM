@@ -16,7 +16,9 @@ The workload is the AIPerf scenario `inferencex-agentx-mvp` on the public datase
 `semianalysis_cc_traces_weka_062126_256k`: long-context, multi-turn coding
 traces with subagent fan-out. Start a **fresh server for each concurrency**.
 
-Related guide: [`Qwen3.5.md`](Qwen3.5.md) (generic serving, MTP, GSM8K).
+Related guide: [`Qwen3.5.md`](Qwen3.5.md) (generic serving, MTP, GSM8K). For the MLPerf
+Endpoints agentic benchmark on gfx1250 (Qwen3.5-35B-A3B), see
+[`MLPerf-Endpoints-Agentic-Qwen3.5-gfx1250.md`](MLPerf-Endpoints-Agentic-Qwen3.5-gfx1250.md).
 
 | Band | CONC | Serving defaults |
 |---|---|---|

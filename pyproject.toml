@@ -65,6 +65,10 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 # vendored the same way and carry the same exemption -- black already excludes
 # this directory below, for the same reason.
 "tests/models/glm52/kernels/*.py" = ["ALL"]
+# Qwen3.5 mono decode: FlyDSL kernel bodies and the primitives they inline.
+"atom/models/qwen3_5_mono/kernels.py" = ["ALL"]
+"atom/models/qwen3_5_mono/kernels_mtp.py" = ["ALL"]
+"atom/models/qwen3_5_mono/prims.py" = ["ALL"]
 
 [tool.black]
 # The same exemption, for the same reason: the ruff ignores above do not bind
@@ -81,4 +85,5 @@ force-exclude = '''
     atom/models/glm52/mono/kernels
   | tests/models/glm52/kernels
 )/
+|atom/models/qwen3_5_mono/(kernels|kernels_mtp|prims)\.py
 '''

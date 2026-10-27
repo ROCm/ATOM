@@ -771,6 +771,10 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     ):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
+        if self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(inputs_embeds, positions)
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -900,6 +904,11 @@ class _Qwen3_5MultimodalBase(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        from atom.models.qwen3_5_mono.dispatch import QwenMonoDecode
+
+        # fused (mono) decode: 1..4 tokens a step, or MTP verify steps of up to 16
+        # requests (ATOM_QWEN35_MONO=1; MTP also needs ATOM_ENABLE_REPLAYSSM=0)
+        self._mono = QwenMonoDecode(self.language_model, atom_config)
 
     def _prepare_text_config(self, atom_config: Config) -> None:
         pass
@@ -937,6 +946,10 @@ class _Qwen3_5MultimodalBase(nn.Module):
         # embeddings are not dropped after text-only warmup.
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
+        if self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(inputs_embeds, positions)
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )

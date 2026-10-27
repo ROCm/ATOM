@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Which Qwen3.5 forwards take the mono path: decode steps of 1..MAX_TOKENS tokens on
+a TP4 deployment that matches the kernels, with ``ATOM_QWEN35_MONO=1``.
+
+Every check is TP-uniform (the kernels all-reduce in-kernel: ranks that disagreed
+would wait on each other forever). ``ATOM_QWEN35_MONO_CHECK=1`` runs every layer both
+ways and logs the differences (eager steps only)."""
+
+import logging
+import os
+
+import torch
+
+from atom.models.qwen3_5_mono.config import MAX_TOKENS, MTP_MAX_REQS, SPEC, TP
+
+logger = logging.getLogger("atom")
+
+
+def _refusal(atom_config):
+    checks = [
+        (
+            atom_config.tensor_parallel_size == TP,
+            f"TP {atom_config.tensor_parallel_size}",
+        ),
+        (not atom_config.enable_expert_parallel, "expert parallel"),
+        (atom_config.parallel_config.data_parallel_size == 1, "DP > 1"),
+        (
+            atom_config.kv_cache_dtype in ("bf16", "auto"),
+            f"kv cache {atom_config.kv_cache_dtype}",
+        ),
+        (
+            atom_config.kv_cache_block_size == 16,
+            f"block size {atom_config.kv_cache_block_size}",
+        ),
+        (
+            atom_config.max_model_len <= 16384,
+            f"max_model_len {atom_config.max_model_len}",
+        ),
+        (
+            _spec_tokens(atom_config) in (0, SPEC - 1),
+            f"{_spec_tokens(atom_config)} draft tokens",
+        ),
+    ]
+    return next((why for ok, why in checks if not ok), None)
+
+
+def _spec_tokens(atom_config):
+    """Draft tokens a step (0: no speculative decoding)."""
+    sc = getattr(atom_config, "speculative_config", None)
+    if sc is None:
+        return 0
+    return int(getattr(sc, "num_speculative_tokens", 0) or 0)
+
+
+class QwenMonoDecode:
+    def __init__(self, language_model, atom_config):
+        self._lm = language_model
+        self._runner = None
+        self.enabled = os.environ.get("ATOM_QWEN35_MONO", "0") == "1"
+        self.check = os.environ.get("ATOM_QWEN35_MONO_CHECK", "0") == "1"
+        # MTP: the verify steps (SPEC tokens a request) take the mono path; the
+        # per-draft state slots it writes need ReplaySSM off (ATOM_ENABLE_REPLAYSSM=0)
+        self.spec = _spec_tokens(atom_config) > 0
+        if self.enabled:
+            why = _refusal(atom_config)
+            if why is not None:
+                logger.info("Qwen3.5 mono decode off: %s", why)
+                self.enabled = False
+
+    def supports(
+        self, input_ids, positions, intermediate_tensors, inputs_embeds
+    ) -> bool:
+        if not self.enabled or intermediate_tensors is not None:
+            return False
+        from atom.utils.forward_context import get_forward_context
+
+        # the runner is built on the first forward (the eager prefill warmup every rank
+        # runs), so every rank has it before any graph capture: a rank that met its
+        # first decode-shaped forward inside a capture would take ATOM's path there
+        # while the others wait on it in-kernel
+        if self._runner is None and not torch.cuda.is_current_stream_capturing():
+            from atom.models.qwen3_5_mono.runner import MonoRunner, MonoUnsupported
+
+            try:
+                self._runner = MonoRunner(self._lm, spec=self.spec)
+            except MonoUnsupported as err:
+                logger.warning("Qwen3.5 mono decode off: %s", err)
+                self.enabled = False
+                return False
+        fwd = get_forward_context()
+        if fwd.context is None or fwd.context.is_prefill:
+            # timing builds: a prefill is the next Python step after a stretch of graph
+            # replays; their last decode step's stamps are still in the buffer
+            r = self._runner
+            if (
+                r is not None
+                and r.timing
+                and r.steps > 0
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                r.log_timeline(-1)
+            return False
+        n = input_ids.numel()
+        md = fwd.attn_metadata
+        gm = getattr(md, "gdn_metadata", None)
+        if gm is None:
+            return False
+        if self.spec:
+            if getattr(gm, "replayssm", False) or gm.spec_state_indices_tensor is None:
+                return False
+            if (
+                gm.num_prefills != 0
+                or gm.num_decodes != 0
+                or getattr(md, "max_seqlen_q", 0) != SPEC
+            ):
+                return False
+            if n % SPEC != 0 or not 1 <= n // SPEC <= MTP_MAX_REQS:
+                return False
+            si = gm.spec_state_indices_tensor
+            if (
+                si.dtype != torch.int32
+                or si.dim() != 2
+                or si.shape[1] != SPEC
+                or si.stride(1) != 1
+                or si.stride(0) != SPEC
+            ):
+                return False
+        else:
+            if not 1 <= n <= MAX_TOKENS or getattr(md, "max_seqlen_q", 1) != 1:
+                return False
+        if (
+            positions.dtype != torch.int64
+            or positions.dim() != 2
+            or positions.shape[0] != 3
+            or positions.stride(1) != 1
+        ):
+            return False
+        return self._runner is not None
+
+    def forward(self, h_embed, positions):
+        if self.check and not torch.cuda.is_current_stream_capturing():
+            return self._runner.forward_checked(h_embed, positions)
+        return self._runner.forward(h_embed, positions)
