@@ -41,6 +41,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
 )
+from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -188,6 +189,7 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
             )
             for name in ("dense", "sparse", "draft")
         }
+    all_caches = kv_caches
     config = _config()
     transfer = None
     if layout == "m3":
@@ -205,6 +207,18 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
             ]
         )
         transfer.set_block_count(NUM_BLOCKS)
+        # Real M3 KVCacheTensor exposes target/draft K/V/scales only; the
+        # index cache is published separately in transfer_tensors.
+        kv_caches = {
+            layer: SimpleNamespace(
+                **{
+                    field: t
+                    for field, t in vars(cache).items()
+                    if field != "index_cache"
+                }
+            )
+            for layer, cache in all_caches.items()
+        }
     worker = MooncakeStoreOffloadConnector(config)
     stored_keys: list[str] = []
     try:
@@ -212,7 +226,9 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
         worker.register_kv_caches(
             kv_caches, transfer_tensors=transfer, num_blocks=NUM_BLOCKS
         )
-        for cache in kv_caches.values():
+        if layout == "m3":
+            assert isinstance(worker._codec, DSV4PageSlotCodec)
+        for cache in all_caches.values():
             for tensor in vars(cache).values():
                 tensor.reshape(NUM_BLOCKS, -1)[DESTINATION[0] :].zero_()
         torch.cuda.synchronize(device)
@@ -276,7 +292,7 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
         assert loaded["failed"] == set()
 
         torch.cuda.synchronize(device)
-        for name, cache in kv_caches.items():
+        for name, cache in all_caches.items():
             for field, tensor in vars(cache).items():
                 blocks = tensor.reshape(NUM_BLOCKS, -1)
                 assert torch.equal(

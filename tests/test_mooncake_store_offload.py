@@ -3886,10 +3886,16 @@ def test_store_reads_the_region_map_only_on_a_page_layout():
 
 
 @pytest.mark.parametrize("model_type", ["minimax_m3", "minimax_m3_vl"])
-def test_m3_store_codec_includes_all_page_planes(model_type):
+def test_m3_store_codec_includes_all_page_planes(model_type, monkeypatch):
     from atom.kv_transfer.disaggregation.page_region import page_region
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
+    from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 
+    # Exercise real PAGE geometry on CPU; GPU capability refusal is tested
+    # separately in test_m3_offload_codec.py.
+    monkeypatch.setattr(
+        DSV4PageSlotCodec, "has_fused_chunk_major_staging", property(lambda _: True)
+    )
     config = _config()
     config.hf_config.model_type = model_type
     check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
@@ -3926,3 +3932,17 @@ def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatc
     m3_namespace = keys.store_namespace(config, CHUNK)
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: "dense")
     assert keys.store_namespace(config, CHUNK) != m3_namespace
+
+
+@pytest.mark.parametrize("layout", ["dense", "m3"])
+def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout):
+    config = _config()
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: layout)
+    namespace = keys.store_namespace(config, CHUNK)
+    own, other = (
+        ("M3_CODEC_ID", "CODEC_ID") if layout == "m3" else ("CODEC_ID", "M3_CODEC_ID")
+    )
+    monkeypatch.setattr(keys, other, "other-codec-next-version")
+    assert keys.store_namespace(config, CHUNK) == namespace
+    monkeypatch.setattr(keys, own, "own-codec-next-version")
+    assert keys.store_namespace(config, CHUNK) != namespace

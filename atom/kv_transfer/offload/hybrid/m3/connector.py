@@ -48,7 +48,7 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
-from atom.kv_transfer.offload.page_codec import pure_page_codec
+from atom.kv_transfer.offload.hybrid.m3.codec import build_m3_page_codec
 
 logger = logging.getLogger("atom")
 
@@ -71,10 +71,8 @@ class M3OffloadConnector(DenseOffloadConnector):
         rank, world = pp_aware_rank_and_world(self._config, tp)
         self._rank = rank
 
-        # Build the codec from the ordered region list (NOT from kv_caches), so
-        # the NSA index_cache regions are included. slot_regions empty ->
-        # DSV4PageSlotCodec runs pure-PAGE (num_slots=0).
-        self._codec = pure_page_codec(transfer_tensors, num_blocks)
+        # Ordered PAGE regions, not kv_caches: the NSA index cache is only there.
+        self._codec = build_m3_page_codec(transfer_tensors, num_blocks)
 
         self._engine, cfg, meta = build_offload_engine(
             self._config,
