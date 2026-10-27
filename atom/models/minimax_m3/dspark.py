@@ -77,6 +77,7 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
@@ -102,8 +103,17 @@ def _draft_quant_config(config) -> QuantizationConfig:
     copies onto the draft, cannot be trusted to describe these weights. The
     checkpoint's own block goes through the registered parser here; a draft
     config without one is BF16.
+
+    ``ATOM_M3_DSPARK_DRAFT_PTPC=1`` re-quantizes the draft linears to
+    per-channel FP8 at load (dequantized from the ``[1, 32]`` blocks first), so
+    the draft runs the per-token FP8 GEMM. At draft batch sizes the MXFP8 path
+    is a triton block-scale GEMM plus a separate activation quant per linear,
+    several times slower than the per-token kernel the target's ptpc_fp8 uses.
     """
-    draft_qc = QuantizationConfig(config)
+    online = (
+        {"global_quant_config": "ptpc_fp8"} if envs.ATOM_M3_DSPARK_DRAFT_PTPC else None
+    )
+    draft_qc = QuantizationConfig(config, online_quant_config=online)
     spec = draft_qc.global_spec
     if draft_qc.quant_method and (spec.quant_type, spec.quant_dtype) != (
         QuantType.per_1x32,
