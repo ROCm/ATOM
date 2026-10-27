@@ -462,6 +462,14 @@ EOF
     bash -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh"
   )
 
+  local docker_event_pid=""
+  if [[ "${BACKEND:-atom}" == "vllm" ]]; then
+    # This container only; publish event time/type/signal, no arbitrary attributes.
+    docker events --filter "container=${container}" \
+      --format '{{.Time}} {{.Action}} signal={{index .Actor.Attributes "signal"}}' \
+      > "${rank_dir}/container-events.log" 2>/dev/null &
+    docker_event_pid=$!
+  fi
   local docker_rc
   # Spur returns worker stdout/stderr in a size-limited RPC response. Keep
   # unbounded container output on shared NFS, not in the scheduler response.
@@ -476,6 +484,7 @@ EOF
   set -e
   if [[ "${BACKEND:-atom}" == "vllm" ]]; then
     docker inspect --format '{{json .State}}' "${container}" > "${rank_dir}/docker-state.json" 2>/dev/null || true
+    [[ -n "${docker_event_pid}" ]] && kill "${docker_event_pid}" 2>/dev/null || true
   fi
   echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
   if [[ "${docker_rc}" -ne 0 ]]; then
