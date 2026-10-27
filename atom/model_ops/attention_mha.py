@@ -1617,7 +1617,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             }
 
     def _sparse_pa_mxfp4(
-        self, q, k_cache, v_cache, sparse_bt, sparse_ctx, sparse_metadata
+        self, q, k_cache, v_cache, sparse_bt, sparse_ctx, plan_owner
     ):
         from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
@@ -1634,7 +1634,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.num_kv_heads,
             self.scale,
             self._out_dtype,
-            sparse_metadata,
+            plan_owner,
         )
 
     def _mxfp4_select_kwargs(self, sparse_metadata, decode: bool) -> dict:
@@ -1715,8 +1715,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             topk_idx, sparse_bt, sparse_ctx = cached_topk
         output = None if self.kv_mxfp4 else torch.empty_like(q)
         if self.kv_mxfp4:
+            # plan-free: a prefill chunk's row count is new almost every forward
             output = self._sparse_pa_mxfp4(
-                q, k_cache, v_cache, sparse_bt, sparse_ctx, sparse_metadata
+                q, k_cache, v_cache, sparse_bt, sparse_ctx, None
             )
         elif self.kv_nvfp4:
             from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (

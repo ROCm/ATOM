@@ -118,3 +118,66 @@ def test_plans_are_refreshed_once_a_step_and_segmented(monkeypatch):
         q, k, v, bt2, ctx2, 1, SCALE, torch.bfloat16, types.SimpleNamespace()
     )
     assert rel(out, reference(k, v, bt2, ctx2, q, 1)) < 3e-3
+
+
+@pytest.mark.parametrize("hkv", [1, 2])
+@pytest.mark.parametrize("rows", [1, 7, 255, 256, 257, 511, 512, 700])
+def test_plan_free_rows_attend_their_selected_pages(rows, hkv):
+    """The prefill form: no plan, one direct task a row, any row count."""
+    from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
+
+    k, v, bt, ctx, q = make(rows, hkv, seed=rows + hkv, pages=64)
+    out = sparse_pa_mxfp4(q, k, v, bt, ctx, hkv, SCALE, torch.bfloat16, None)
+    assert out.shape == q.shape and out.dtype == torch.bfloat16
+    assert rel(out, reference(k, v, bt, ctx, q, hkv)) < 3e-3
+
+
+def test_plan_free_is_the_planned_path_with_one_task_a_row():
+    """Bit for bit the kernel run with a plan of max_partitions=1 (the splits coincide),
+    and the production planned split (default partitions) agrees to rounding."""
+    from aiter.ops.flydsl.pa_decode import plan_pa_decode
+    from aiter.ops.flydsl.pa_decode_mxfp4 import pa_decode_mxfp4
+    from atom.model_ops.minimax_m3.kv_mxfp4 import page_views
+    from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
+
+    k, v, bt, ctx, q = make(37, 1, seed=9)
+    free = sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, None)
+    kd, ks = page_views(k.view(-1, 1, PAGE_BYTES))
+    vd, vs = page_views(v.view(-1, 1, PAGE_BYTES))
+    out = torch.empty(37, GROUP, 128, dtype=torch.bfloat16, device="cuda")
+    plan = plan_pa_decode(ctx, 1, max_partitions=1, query_length=1)
+    pa_decode_mxfp4(
+        out, q.view(37, GROUP, 128), kd, ks, vd, vs, ctx, bt, SCALE,
+        work_plan=plan, max_context_length=TOPK * 128,
+    )  # fmt: skip
+    assert torch.equal(free, out.view(q.shape))
+    planned = sparse_pa_mxfp4(
+        q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, types.SimpleNamespace()
+    )
+    assert rel(free, planned.float()) < 2e-3
+
+
+def test_plan_free_builds_nothing_per_row_count():
+    """A prefill chunk has a new row count nearly every forward; the planner would
+    compile a kernel for each. Plan-free touches neither the planner's compile cache,
+    nor the plan cache, nor the PA kernel's build cache after its first call."""
+    from aiter.ops.flydsl.kernels.pa_decode_mxfp4_kernel import build_pa_decode_mxfp4
+    from aiter.ops.flydsl.kernels.pa_decode_plan import compile_pa_decode_plan
+    from atom.model_ops.minimax_m3 import sparse_attn_mxfp4 as m
+
+    k, v, bt, ctx, q = make(8, 1, seed=3, pages=64)
+    m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, None)  # first build
+    state = (
+        compile_pa_decode_plan.cache_info().currsize,
+        build_pa_decode_mxfp4.cache_info().currsize,
+        len(m._PLANS),
+    )
+    for rows in (1, 9, 31, 100, 255, 256, 257, 300, 511, 513, 1000, 1023):
+        k, v, bt, ctx, q = make(rows, 1, seed=rows, pages=64)
+        out = m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, None)
+        assert out.shape == q.shape
+    assert state == (
+        compile_pa_decode_plan.cache_info().currsize,
+        build_pa_decode_mxfp4.cache_info().currsize,
+        len(m._PLANS),
+    )

@@ -11,11 +11,16 @@ caches, with the (token, kv head) pair collapsed into the row so the kernel runs
 one kv head per call: the emitted page id is ``page * Hkv + head``, which is the
 page index of the collapsed ``[pages * Hkv, 1, 128, .]`` views taken here.
 
-aiter's planner takes at most ``_FLYDSL_PLAN_MAX_BATCH`` sequences, so a prefill
-chunk of more rows is run in segments, each with a plan of its own. A plan is
-refreshed from the rows' context lengths once per step (they do not depend on
-the layer: the tail block is always selected), and the refresh is recorded in a
-graph when a graph is being captured.
+Decode (a captured graph, a fixed set of row counts) runs planned: aiter's planner
+takes at most ``_FLYDSL_PLAN_MAX_BATCH`` sequences, so more rows are run in
+segments, each with a plan of its own, refreshed from the rows' context lengths
+once per step (they do not depend on the layer: the tail block is always
+selected) and recorded in the graph when one is being captured.
+
+Prefill runs plan-free (``plan_owner=None``): a chunk has a new row count nearly
+every forward, and ``plan_pa_decode`` JIT-compiles a kernel per batch size (~300 ms,
+stalling every rank), so one task a row -- a row reads at most ``topk`` pages -- and
+one specialization whatever the rows.
 """
 
 import torch
@@ -71,12 +76,14 @@ def sparse_pa_mxfp4(
     num_kv_heads: int,
     sm_scale: float,
     out_dtype: torch.dtype,
-    plan_owner,
+    plan_owner=None,
 ) -> torch.Tensor:
     """Attention of every row over its selected pages; ``[rows, num_heads, 128]``.
 
     ``plan_owner`` is an object that lives exactly one forward (the sparse
-    metadata): the plans are refreshed once per owner and capture state.
+    metadata): the plans are refreshed once per owner and capture state. None runs
+    plan-free, one task a row, written directly (prefill); every row then needs a
+    context of at most ``sparse_bt.shape[1]`` pages, which index_topk's emit gives.
     """
     from aiter.ops.flydsl.pa_decode_mxfp4 import pa_decode_mxfp4
 
@@ -99,6 +106,22 @@ def sparse_pa_mxfp4(
     q_rows = q.view(n, group, HEAD_DIM)
     out = torch.empty((n, group, HEAD_DIM), dtype=out_dtype, device=q.device)
     bound = sparse_bt.shape[1] * PAGE_TOKENS
+    if plan_owner is None:
+        pa_decode_mxfp4(
+            out,
+            q_rows,
+            k_data,
+            k_scale,
+            v_data,
+            v_scale,
+            sparse_ctx,
+            sparse_bt,
+            sm_scale,
+            work_plan=None,
+            max_partitions=1,
+            max_context_length=bound,
+        )
+        return out.view(rows, num_heads, HEAD_DIM)
     for seg, start in enumerate(range(0, n, _FLYDSL_PLAN_MAX_BATCH)):
         end = min(start + _FLYDSL_PLAN_MAX_BATCH, n)
         ctx = sparse_ctx[start:end]
