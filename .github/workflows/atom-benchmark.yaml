@@ -282,6 +282,12 @@ jobs:
             else
               echo "has_regression=false" >> $GITHUB_OUTPUT
             fi
+
+            # Shadow reading. Gates nothing; it is here so the comparison
+            # against the shipped criterion happens on live data.
+            LINK_COUNT=$(python3 -c "import json; print(json.load(open('regression_report.json')).get('linkage',{}).get('count',0))")
+            echo "linkage_count=$LINK_COUNT" >> $GITHUB_OUTPUT
+            echo "Family-linkage (shadow): $LINK_COUNT vs shipped: $REG_COUNT" >> $GITHUB_STEP_SUMMARY
           else
             echo "has_regression=false" >> $GITHUB_OUTPUT
           fi

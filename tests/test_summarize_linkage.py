@@ -128,3 +128,26 @@ def test_shipped_fields_are_untouched(tmp_path):
     }
     assert report["regression_count"] == len(report["regressions"])
     assert proc.returncode == 2  # regressions found, exit code unchanged
+
+
+def test_workflow_reads_linkage_count_without_gating_on_it():
+    """The shadow number must reach the summary, and must not move the gate."""
+    import yaml
+
+    workflow = yaml.safe_load(
+        (REPO / ".github" / "workflows" / "atom-benchmark.yaml").read_text()
+    )
+    steps = workflow["jobs"]["summarize-benchmark-result"]["steps"]
+    step = next(s for s in steps if s.get("id") == "check-regression")
+    assert "linkage_count" in step["run"]
+    # The gate is still the shipped criterion.
+    assert "has_regression=true" in step["run"]
+    # The issue-creating step lives in a downstream job (profiler-analysis),
+    # not in summarize-benchmark-result itself -- search all jobs for it.
+    issue_step = next(
+        s
+        for job in workflow["jobs"].values()
+        for s in job.get("steps", [])
+        if isinstance(s.get("name"), str) and "ssue" in s["name"]
+    )
+    assert "linkage" not in str(issue_step.get("if", ""))
