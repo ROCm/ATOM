@@ -23,6 +23,12 @@ def calibration_identity(config, device):
         "kv_cache_dtype": config.kv_cache_dtype,
         "index_cache_dtype": config.index_cache_dtype,
         "graph": not config.enforce_eager,
+        "graph_mode": (
+            config.compilation_config.cudagraph_mode.name
+            if config.compilation_config.cudagraph_mode is not None
+            else None
+        ),
+        "compilation_level": config.compilation_config.level,
         "gpu_name": torch.cuda.get_device_name(device),
         "torch_version": torch.__version__,
         "hip_version": torch.version.hip,
@@ -38,8 +44,9 @@ def validate_calibration(profile, identity, *, width, max_batch):
         raise ValueError("DSpark calibration draft width mismatch")
     if max_batch > profile.get("max_num_seqs", 0):
         raise ValueError("DSpark calibration does not cover the configured batch size")
-    temperatures, sps = profile.get("sts_temperatures", []), profile.get(
-        "sps_table", []
+    temperatures, sps = (
+        profile.get("sts_temperatures", []),
+        profile.get("sps_table", []),
     )
     if len(temperatures) != width or len(sps) <= max_batch * (width + 1):
         raise ValueError("DSpark calibration table is incomplete")

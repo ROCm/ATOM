@@ -1629,6 +1629,9 @@ class DSparkConfig:
         graphs at warmup). Without an explicit profile, use the synthetic stub.
       - calibration_profile: JSON file containing model/runtime-bound SPS and
         STS measurements. Takes precedence over automatic calibration.
+      - online_sps: correct measured costs using completed TP decode steps.
+      - online_sps_sample_interval: pure decode steps between timing samples.
+      - online_sps_update_interval: steps between TP-consistent publications.
     """
 
     confidence_schedule: bool = False
@@ -1638,8 +1641,46 @@ class DSparkConfig:
     disable_sps_calib: bool = False
     # Explicit offline measurements; compatibility is checked before use.
     calibration_profile: str | None = None
+    # Update the measured curve from completed serving steps (TP-only for now).
+    online_sps: bool = False
+    online_sps_sample_interval: int = 8
+    online_sps_update_interval: int = 64
+    # Keep decisions static while measuring the online estimator's overhead.
+    online_sps_observe_only: bool = False
+    # Age the forward residuals in eligible decode steps, not sampled records.
+    online_sps_window_steps: int = 5000
+    # Opt-in global search over executable token-graph costs. Decisions still
+    # cross VerifyScheduler's fixed two-generation causal barrier.
+    bucket_global: bool = False
 
     def __post_init__(self):
+        if self.online_sps_observe_only and not self.online_sps:
+            raise ValueError("online_sps_observe_only requires online_sps")
+        if self.bucket_global and not (
+            self.confidence_schedule and self.ragged and self.calibration_profile
+        ):
+            raise ValueError(
+                "bucket_global requires confidence_schedule, ragged and a calibration_profile"
+            )
+        if (
+            type(self.online_sps_window_steps) is not int
+            or self.online_sps_window_steps < 10
+        ):
+            raise ValueError("online_sps_window_steps must be an integer >= 10")
+        if self.online_sps and not (
+            self.confidence_schedule and self.ragged and self.calibration_profile
+        ):
+            raise ValueError(
+                "online_sps requires confidence_schedule, ragged and a calibration_profile"
+            )
+        for name in ("online_sps_sample_interval", "online_sps_update_interval"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.online_sps_update_interval < max(2, self.online_sps_sample_interval):
+            raise ValueError(
+                "online SPS update interval must cover at least one sample and two steps"
+            )
         if self.calibration_profile is not None and (
             not isinstance(self.calibration_profile, str)
             or not self.calibration_profile

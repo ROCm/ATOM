@@ -51,6 +51,17 @@ class VerifyScheduler:
             self.sps_table, self.sts_temperatures = load_calibration(
                 runner.config, runner.device
             )
+        self.runtime = None
+        self._bucket_lookup = None
+        self._bucket_signature = None
+        if getattr(runner.config.dspark, "bucket_global", False):
+            from atom.spec_decode.dspark_runtime import validate_online_runtime
+
+            validate_online_runtime(runner.config)
+        if getattr(runner.config.dspark, "online_sps", False):
+            from atom.spec_decode.dspark_runtime import DSparkRuntime
+
+            self.runtime = DSparkRuntime(runner)
         self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
         # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.
@@ -96,6 +107,11 @@ class VerifyScheduler:
 
         bs, L = confidence.shape
         sps_table = self.sps_table
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None and sps_table is not None:
+            measured_table = runtime.table(sps_table, bs)
+            if not self.runner.config.dspark.online_sps_observe_only:
+                sps_table = measured_table
         if sps_table is None:
             # Synthetic monotone-decreasing SPS stub until real calibration lands.
             # The stub's slope is ~1/steps, and the prefix scheduler indexes it by
@@ -111,6 +127,33 @@ class VerifyScheduler:
             dp = max(1, self.runner.config.parallel_config.data_parallel_size)
             sps_table = torch.linspace(
                 1.0, 0.1, steps=dp * bs * (L + 1) + 1, device=confidence.device
+            )
+        if getattr(self.runner.config.dspark, "bucket_global", False):
+            from atom.spec_decode.dspark_bucket import (
+                graph_row_indices,
+                schedule_bucket_prefix_lengths_tensor,
+            )
+            from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+            from atom.utils.region_graph import TokenGraph
+
+            sizes = TokenGraph.captured_sizes("decode")
+            if not sizes or torch.cuda.is_current_stream_capturing():
+                return torch.full((bs,), L, dtype=torch.long, device=confidence.device)
+            qs = resolve_q_buckets(self.runner.config.dspark.ragged_graph_sizes, L + 1)
+            signature = (sizes, tuple(qs), sps_table.numel())
+            if signature != self._bucket_signature:
+                self._bucket_lookup = torch.tensor(
+                    graph_row_indices(sizes, qs, sps_table.numel() - 1),
+                    dtype=torch.long,
+                    device="cpu",
+                ).to(device=confidence.device)
+                self._bucket_signature = signature
+            return schedule_bucket_prefix_lengths_tensor(
+                confidence.detach(),
+                sps_table,
+                self._bucket_lookup,
+                qs,
+                sts_temperatures=self.sts_temperatures,
             )
         return schedule_prefix_lengths_tensor(
             confidence.detach(),

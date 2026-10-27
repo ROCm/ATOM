@@ -972,6 +972,11 @@ class ModelRunner:
         # Install after initialization warmup, which is not request traffic.
         # Graph capture runs later via RPC and bypasses run_model, so its
         # timing decorator does not run during capture.
+        calibration_dir = os.environ.get("ATOM_DSPARK_CALIBRATION_DIR")
+        if calibration_dir:
+            from atom.benchmarks.dspark_capture import install
+
+            install(self, calibration_dir)
         self.gpu_forward_metrics = None
         if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER:
             self.gpu_forward_metrics = GPUForwardMetrics(
@@ -2525,6 +2530,26 @@ class ModelRunner:
             if not self._tr_hybrid_active():
                 return  # stay rectangular
 
+            if self.config.dspark.bucket_global:
+                from atom.utils.region_graph import TokenGraph
+
+                short_graph = TokenGraph.bucket(
+                    int(new_len.sum()), "decode", multiple_of=q_eff
+                )
+                full_graph = TokenGraph.bucket(
+                    int(old_nst[:scheduled_bs].sum()), "decode", multiple_of=full_q
+                )
+                # N-2 decisions meet today's bonus floors here. If those floors
+                # erase the predicted graph saving, keep the reserved tokens.
+                # This only restores the existing rectangular path; no current
+                # draft confidence or speculative token value is consulted.
+                if (
+                    short_graph is None
+                    or full_graph is None
+                    or short_graph >= full_graph
+                ):
+                    return
+
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
         # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
         # placeholders already populated by the scheduler from seq.token_ids).
@@ -3523,7 +3548,18 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        verify_scheduler = getattr(
+            getattr(self, "drafter", None), "verify_scheduler", None
+        )
+        dspark_runtime = getattr(verify_scheduler, "runtime", None)
+        dspark_timing = (
+            dspark_runtime.begin(batch, get_forward_context().context.forward_mode)
+            if dspark_runtime is not None
+            else None
+        )
         logits, hidden_states = self.run_model(input_ids, batch)
+        if dspark_runtime is not None:
+            dspark_runtime.target_done(dspark_timing)
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 
@@ -3592,6 +3628,11 @@ class ModelRunner:
             hidden_states,
             needs_independent_noise=needs_independent_noise,
         )
+
+        if dspark_runtime is not None:
+            # Target plus state commit, sampling and drafting, excluding the
+            # async output-copy/HTTP path.
+            dspark_runtime.finish(dspark_timing)
 
         reset_forward_context()
         self._record_forward_vars_event()

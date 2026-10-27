@@ -240,7 +240,15 @@ def run_scenarios(
             chinese = tokenizer.encode("请用中文解释为什么天空是蓝色的。")
             ragged = episode(
                 "varying_verify_lengths",
-                [sequence(chinese, limit=96), sequence(prompts[1], limit=96)],
+                # Three requests permit a real 18 -> 12 row graph reduction
+                # even when the repetitive request accepts all five drafts.
+                # With only two requests, its six-row floor keeps a >=7-row
+                # run in graph 12, so the no-saving guard correctly retains it.
+                [
+                    sequence(chinese, limit=96),
+                    sequence(prompts[1], limit=96),
+                    sequence(chinese, limit=96),
+                ],
                 reorder=True,
             )
             assert all(len(tokens) == 96 for tokens in ragged["outputs"])
