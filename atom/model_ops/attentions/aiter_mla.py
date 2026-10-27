@@ -464,6 +464,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     dcp_persistent,
                     sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
                 ),
+                multi_token=getattr(model_runner, "num_spec_tokens", 0) > 0,
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
