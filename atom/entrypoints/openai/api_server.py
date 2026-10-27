@@ -37,6 +37,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 if TYPE_CHECKING:
     from PIL import Image
+    from transformers.video_utils import VideoMetadata
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
@@ -695,10 +696,13 @@ def _load_image_from_url(url: str) -> "Image.Image":
     return Image.open(url).convert("RGB")
 
 
-def _load_video_from_url(url: str) -> list["Image.Image"]:
+def _load_video_from_url(
+    url: str,
+) -> tuple[list["Image.Image"], "VideoMetadata"]:
     """Decode and sample a video without importing video deps for text/image use."""
     from decord import VideoReader, cpu
     from PIL import Image
+    from transformers.video_utils import VideoMetadata
 
     temporary_path = None
     if url.startswith("data:"):
@@ -720,14 +724,21 @@ def _load_video_from_url(url: str) -> list["Image.Image"]:
         path = url.removeprefix("file://")
     try:
         reader = VideoReader(path, ctx=cpu(0))
-        step = max(1, round(float(reader.get_avg_fps()) / 2.0))
+        fps = float(reader.get_avg_fps())
+        step = max(1, round(fps / 2.0))
         indices = list(range(0, len(reader), step))[:256]
         if len(indices) % 2:
             indices.append(indices[-1])
-        return [
+        frames = [
             Image.fromarray(frame).convert("RGB")
             for frame in reader.get_batch(indices).asnumpy()
         ]
+        metadata = VideoMetadata(
+            total_num_frames=len(reader),
+            fps=fps if fps > 0 else None,
+            frames_indices=indices,
+        )
+        return frames, metadata
     finally:
         if temporary_path is not None:
             os.unlink(temporary_path)
@@ -745,15 +756,21 @@ def _get_multimodal_processor():
 
 def _collect_multimodal_parts(
     messages: list[Any],
-) -> tuple[list[dict[str, Any]], list["Image.Image"], list[list["Image.Image"]]]:
-    """Normalize chat messages into processor form, loading every image.
+) -> tuple[
+    list[dict[str, Any]],
+    list["Image.Image"],
+    list[list["Image.Image"]],
+    list["VideoMetadata"],
+]:
+    """Normalize chat messages into processor form, loading images and videos.
 
-    Content parts keep the order the client sent them in; the images are
-    returned separately in that same order.
+    Content parts keep the order the client sent them in; images, videos, and
+    video metadata are returned separately in matching order.
     """
     processor_messages: list[dict[str, Any]] = []
     images: list[Image.Image] = []
     videos: list[list[Image.Image]] = []
+    video_metadata: list[VideoMetadata] = []
 
     for message in messages:
         content = getattr(message, "content", None)
@@ -794,12 +811,13 @@ def _collect_multimodal_parts(
                     raise ValueError(
                         f"{part_type} content part must include a URL/path"
                     )
-                video = _load_video_from_url(url)
+                video, metadata = _load_video_from_url(url)
                 videos.append(video)
+                video_metadata.append(metadata)
                 parts.append({"type": "video", "video": video})
         processor_messages.append({"role": message.role, "content": parts})
 
-    return processor_messages, images, videos
+    return processor_messages, images, videos, video_metadata
 
 
 def _images_before_text(
@@ -830,7 +848,9 @@ def _prepare_multimodal_inputs(
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
     mm_processor = _get_multimodal_processor()
-    processor_messages, images, videos = _collect_multimodal_parts(messages)
+    processor_messages, images, videos, video_metadata = _collect_multimodal_parts(
+        messages
+    )
 
     if not images and not videos:
         raise ValueError("Multimodal request did not contain images or videos")
@@ -865,7 +885,9 @@ def _prepare_multimodal_inputs(
     )
     if images and not any(token in text for token in ("<|image_pad|>", "<|image|>")):
         raise ValueError("Multimodal chat template did not emit image placeholders")
-    processor_kwargs = {"do_sample_frames": False} if videos else {}
+    processor_kwargs = (
+        {"do_sample_frames": False, "video_metadata": video_metadata} if videos else {}
+    )
     inputs = mm_processor(
         text=[text],
         images=images or None,
