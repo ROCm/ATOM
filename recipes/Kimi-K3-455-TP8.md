@@ -14,11 +14,13 @@ of 8**:
   and aiter switched for TP8, aiter's K3 TP8 GEMM and MoE tables, and the launcher in `/opt/k3`. See [Image](#image).
 
 Validated on CT2 (node0) and CT17, 2026-10-22, with `K3_MOE=tp` and full GSM8K. The throughput figures come from the
-same launcher and GEMM tables on the 20261016 image, with `K3_MOE=ep` (CT15 + CT13, 2026-10-21).
+same launcher and GEMM tables on the 20261016 image, with `K3_MOE=ep` (CT15 + CT13, 2026-10-21). The newer
+[20261027 image](#the-20261027-image) does not start without two ATOM overlays; with them it gave GSM8K strict-match
+0.9651 on E15's Helios-R trays 05 and 07 (2026-10-27, `K3_MOE=ep`).
 
 | | |
 |---|---|
-| **GSM8K**, 5-shot, all 1319 | `K3_MOE=tp`: **strict-match 0.9568 ±0.0056** with RCCL all-reduce, and 0.9492 ±0.0060 with the default custom all-reduce. The gap is within run-to-run noise. `K3_MOE=ep` on the 20261016 image, RCCL: 0.9613–0.9629 |
+| **GSM8K**, 5-shot, all 1319 | `K3_MOE=tp`: **strict-match 0.9568 ±0.0056** with RCCL all-reduce, and 0.9492 ±0.0060 with the default custom all-reduce. The gap is within run-to-run noise. `K3_MOE=ep` on the 20261016 image, RCCL: 0.9613–0.9629. `K3_MOE=ep` on the [20261027 image](#the-20261027-image) with its two overlays, custom all-reduce: 0.9651 ±0.0051 |
 | **Throughput**, 14k/1k, concurrency 32 | `K3_MOE=ep`, RCCL: **893.1 output tok/s**, median TPOT 34.5 ms. Without the TP8 GEMM tables: 787.9 tok/s, 38.8 ms. Not run on this image |
 | **Memory** | `peak_torch` 190 GB and `available_for_kv` about 143 GB per GPU at `--gpu-memory-utilization 0.90` |
 | Gate | B0 text; chat `17 * 23` answers `391`; decode matches prefill |
@@ -28,6 +30,7 @@ same launcher and GEMM tables on the 20261016 image, with `K3_MOE=ep` (CT15 + CT
 Contents:
 
 - [Image](#image)
+- [The 20261027 image](#the-20261027-image)
 - [Before you start](#before-you-start)
 - [Launch](#launch)
 - [Accuracy](#accuracy)
@@ -80,6 +83,65 @@ FlyDSL 0.4.0, torch, Triton and ROCm 10.1 (TheRock wheels, Python 3.12) come fro
 
 ---
 
+## The 20261027 image
+
+`rocm/fw-bringup:gfx1250-atom-k3-20261027`, digest
+`sha256:5eefef68bd4d0d95ba73096f5df50a64f569ddefba3a83c76d3c10eb73c938f3`. It is the 20261022 image with ATOM and aiter
+moved on:
+
+| | commit | contents |
+|---|---|---|
+| ATOM, `/app/ATOM` | `d8877f1c` | A newer `main`, with two PRs merged in: [#2647](https://github.com/ROCm/ATOM/pull/2647) (one TP group across nodes) and [#2737](https://github.com/ROCm/ATOM/pull/2737) (prefetch the next MLA layer's cached-prefix KV all-gathers, opt-in). It does **not** carry #2554 and #2557 |
+| aiter, `/app/aiter` | `7061cbd8` | `main`, which holds the K3 TP8 tables. #6763's GEMM rows are there: [#6530](https://github.com/ROCm/aiter/pull/6530) moved its 94 mxscale rows into `kimik3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`, now 214 rows. [#6768](https://github.com/ROCm/aiter/pull/6768)'s grouped-MoE table is there, retuned. In place of `cc8d4ff12`, aiter has the upstream K-tail fix [#6663](https://github.com/ROCm/aiter/pull/6663); the launcher prints `cc8d4ff12 not needed` |
+
+- **Image files.**
+  - `/opt/k3/build_info.json` holds the commits.
+  - `manifest.json` and `verify_inside.sh` moved to `/opt/k3/base-20261022/` and describe the base image, so the
+    `verify_inside.sh` step of [Launch](#launch) does not apply.
+  - `/opt/k3/README.md` is still the 20261022 image's.
+  - The launcher differs from the 20261022 image's only in `ATOM_COMMIT` and in that aiter message.
+- **As shipped, it does not start.** Post-load weight processing fails on every rank with
+  `AssertionError: 6284 % 16 == 12`. The weight is not an expert's, so `K3_MOE` does not matter:
+  - KDA's `in_proj` is fused with `b_proj` and `f_a_proj`: N = 4 × 1536 + 12 + 128 = 6284 per rank.
+  - Online quantization makes it a per_1x128 FP8 weight, and aiter's preshuffle needs N % 16 == 0.
+  - [#2554](https://github.com/ROCm/ATOM/pull/2554) (E8M0 block scales for online per_1x128 FP8 on gfx1250) pads such a
+    weight's N to a multiple of 128 first.
+  - [#2557](https://github.com/ROCm/ATOM/pull/2557) plans the persistent MLA decode over only the rows that q and o have.
+  - Both are still open. The 20261016 and 20261022 images carried both as overlays; this image dropped them.
+
+**Workaround: serve the image's ATOM with both overlays.** In each tray's container, before the first start:
+
+```bash
+P=https://raw.githubusercontent.com/ROCm/ATOM/recipe-k3-455-tp8/recipes/Kimi-K3-455-TP8-patches
+curl -sSfL -o /tmp/atom-2554.diff $P/atom-2554.diff && curl -sSfL -o /tmp/atom-2557.diff $P/atom-2557.diff
+D=/root/.cache/atom-overlay; rm -rf $D && cp -a /app/ATOM $D && cd $D
+git -c safe.directory='*' apply /tmp/atom-2554.diff /tmp/atom-2557.diff
+# fixed metadata, so both trays get the same commit
+export GIT_AUTHOR_NAME=k3 GIT_AUTHOR_EMAIL=k3@localhost GIT_AUTHOR_DATE=2026-10-27T06:00:00Z \
+  GIT_COMMITTER_NAME=k3 GIT_COMMITTER_EMAIL=k3@localhost GIT_COMMITTER_DATE=2026-10-27T06:00:00Z
+git -c safe.directory='*' commit -qam "ATOM #2554 + #2557 on d8877f1c"
+sed "s/^ATOM_COMMIT=.*/ATOM_COMMIT=$(git -c safe.directory='*' rev-parse HEAD)/" \
+  /opt/k3/k3_455_tp8dcp8_server.sh > /root/.cache/k3_server.sh
+# only on a tray whose NIC is not enp1s0f1 (see Before you start), e.g. E15's Helios-R trays:
+#   sed -i 's/enp1s0f1/enp4s0np0/g' /root/.cache/k3_server.sh
+rm -rf /root/.cache/atom/* /tmp/torchinductor_root
+```
+
+- **Starting it.** Start that copy, with `-e K3_ATOM_DIR=/root/.cache/atom-overlay`, as in [Launch](#launch). On node0:
+  `docker exec -d -e K3_ATOM_DIR=/root/.cache/atom-overlay k3tp8 bash -c 'bash /root/.cache/k3_server.sh 0 <node0 IP> > /root/.cache/tp8.log 2>&1'`.
+  On node1, the same with `4`.
+- **The patch files.**
+  - `atom-2554.diff` is #2554 at `e16b3dd4`.
+  - `atom-2557.diff` is the 20261022 image's overlay: #2557 at `8a24a910`. The PR has moved on since.
+  - The block makes commit `6c960542` on every tray, with the same tree (`161af75e`) as the validation run below.
+- **Validated with the workaround** on E15's Helios-R trays, 2026-10-27:
+  - trays 05 (node0) and 07, NIC `enp4s0np0`;
+  - the launcher defaults: `K3_MOE=ep`, custom all-reduce;
+  - 607 layers online-quantized, healthy in 10 min, `GATE PASS`;
+  - GSM8K strict-match 0.9651 ±0.0051, flexible-extract 0.9636 ±0.0052.
+
+---
+
 ## Before you start
 
 On both trays:
@@ -96,6 +158,13 @@ ip -br addr show enp1s0f1                       # node0's address here is <node0
   - Every TP all-reduce crosses the trays.
   - A tray in state `ppod_configured`, or two trays in different vpods, hang in the first RCCL all-reduce.
   - `ualink/vpod_active_accels` lists the vpod's accelerators; `accel_id` is 4 × (tray − 1).
+- **The data-plane NIC.** The launcher sets `MORI_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to
+  `enp1s0f1`, the NIC of the CT trays.
+  - Elsewhere, use the NIC that routes to the other tray (`ip route get <other tray's IP>`), e.g. `enp4s0np0` on
+    E15's Helios-R trays.
+  - Once the container is up (see [Launch](#launch)), make a copy of the launcher with that name, and start
+    `bash /root/.cache/k3_server.sh` in place of `bash /opt/k3/k3_455_tp8dcp8_server.sh`:
+    `docker exec k3tp8 bash -c "sed 's/enp1s0f1/enp4s0np0/g' /opt/k3/k3_455_tp8dcp8_server.sh > /root/.cache/k3_server.sh"`.
 - **2 TB of host RAM per tray is recommended.**
   - A 1 TB tray cannot keep the checkpoint in page cache, so it loads its weights 30–45× slower.
   - The server then takes 22–24 min to come up.
@@ -107,9 +176,13 @@ ip -br addr show enp1s0f1                       # node0's address here is <node0
   [A0 and B0](https://github.com/ROCm/ATOM/blob/recipe-k3-455-wideep/recipes/Kimi-K3-455-wideEP.md#a0-and-b0-silicon).
 - **The checkpoint**, on a data disk of both trays:
   - Download [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) with
-    `hf download moonshotai/Kimi-K3 --local-dir /data/k3/Kimi-K3`.
-  - Check that the copy is complete: `cd /data/k3/Kimi-K3 && find . -maxdepth 1 -type f -printf "%f %s\n" | sort | md5sum`
+    `hf download moonshotai/Kimi-K3 --local-dir /data/k3/Kimi-K3`. These runs used revision `f831ab66`
+    (`--revision f831ab66814297da540d832a5235f8e904f29d06`), 1.561 TB in 113 files.
+  - Check that the copy is complete:
+    `cd /data/k3/Kimi-K3 && find . -maxdepth 1 -type f -printf "%f %s\n" | LC_ALL=en_US.UTF-8 sort | md5sum`
     must print `fa7ad4b64b18668b2bbf0db320232a8d`.
+    - The sort order is the locale's. Under `C` or `C.UTF-8`, the default in most containers, the same files print
+      `2773d6074935cda0399f6cafd717f86c`.
   - DSpark also needs [`Inferact/Kimi-K3-DSpark`](https://huggingface.co/Inferact/Kimi-K3-DSpark), at
     `/data/k3/Kimi-K3-DSpark`.
 
@@ -236,6 +309,7 @@ bash /opt/k3/gsm8k.sh http://127.0.0.1:8000 /root/.cache/results/gsm8k_<label>  
 | this image, `K3_MOE=tp`, custom all-reduce (the default) | CT2 + CT17, 2026-10-22 | 0.9492 ±0.0060 |
 | the launcher on the 20261016 image, `K3_MOE=tp`, RCCL | CT11 + CT10, 2026-10-19 | 0.9621 ±0.0053 |
 | the 20261016 image with this image's GEMM tables, `K3_MOE=ep`, RCCL | CT15 + CT13, 2026-10-21 | 0.9613–0.9629 |
+| the [20261027 image](#the-20261027-image) with ATOM #2554 and #2557 overlaid, `K3_MOE=ep`, custom all-reduce | E15 05 + 07, 2026-10-27 | 0.9651 ±0.0051 |
 
 The first two rows differ by less than run-to-run noise:
 - Paired over the 1319 questions, 31 were wrong only with the custom all-reduce and 21 only with RCCL. The McNemar
@@ -415,10 +489,12 @@ Restart without `ATOM_PROFILER_MORE` before you benchmark again.
 |---|---|
 | At startup, both trays hang in the first RCCL all-reduce (py-spy: `communicator_pynccl` → `stream.synchronize`) | The trays are not in one active UALink vpod. Check before every start; see [Before you start](#before-you-start) |
 | With `K3_MOE=tp`, one tray or both go down at start, during load or under load | Seen eight times between 2026-10-19 and 10-22, with RCCL and with the custom all-reduce, on pairs inside and outside one vpod. The same configuration ran clean on CT2 + CT17 and on CT12 + CT2. Cause unknown. Watch the first minutes of a start |
-| Pure TP8 (`--decode-context-parallel-size 1`) fails at warm-up with `store->get('0') got error: wait timeout after 300000ms` | One tray loaded more than 300 s later than the other, e.g. a 1 TB tray. The faster tray's first LM-head all-gather creates the TP communicator, and waits for its id with torch's default 300 s store timeout. Fixed in ATOM [#2647](https://github.com/ROCm/ATOM/pull/2647) (`c3cc2367`, `ATOM_MULTINODE_TP_TIMEOUT_S`), which this image does not have. The launcher always runs DCP 8: its post-load DCP all-gather creates the communicator while the ranks are still together |
+| Pure TP8 (`--decode-context-parallel-size 1`) fails at warm-up with `store->get('0') got error: wait timeout after 300000ms` | One tray loaded more than 300 s later than the other, e.g. a 1 TB tray. The faster tray's first LM-head all-gather creates the TP communicator, and waits for its id with torch's default 300 s store timeout. Fixed in ATOM [#2647](https://github.com/ROCm/ATOM/pull/2647) (`c3cc2367`, `ATOM_MULTINODE_TP_TIMEOUT_S`), which the 20261022 image does not have and the [20261027 image](#the-20261027-image) does. The launcher always runs DCP 8: its post-load DCP all-gather creates the communicator while the ranks are still together |
 | Custom all-reduce (`AITER_CUSTOM_AR_USE_SYMM_MEM=1`) | Correct (see [Accuracy](#accuracy)), but 2.4–4.5 µs slower per call than RCCL at decode sizes in a micro-benchmark. Twice, before 2026-10-21, both trays took a fatal CPU error at startup with it on. `=0` goes back to RCCL |
 | `mxscale bpreshuffle (2d) M:…, N:1536, K:128 is untuned` | These DCP8 GEMMs, at decode M ≤ 64 and prefill M about 1100–1350, run a heuristic kernel. They are not in the tables yet |
-| `K3_MOE=tp` at 2048–16384 tokens per MoE call | The image's grouped-MoE table has 15 rows. End to end, its 2048–16384 rows run at 0.97–1.03× the speed of the default tile. [#6768](https://github.com/ROCm/aiter/pull/6768) keeps only the 11 rows for 1–1024 tokens, which are 1.10–1.18× faster. The output is the same either way |
+| `K3_MOE=tp` at 2048–16384 tokens per MoE call | The image's grouped-MoE table has 15 rows. End to end, its 2048–16384 rows run at 0.97–1.03× the speed of the default tile. [#6768](https://github.com/ROCm/aiter/pull/6768) retunes all 15 buckets against the default tiles of #6663: 1.03–1.43× in a `fused_moe` timing with cold weights. It was merged into aiter `main` on 2026-10-27 and is in the [20261027 image](#the-20261027-image). The output is the same either way |
 | GSM8K about 0.89 with `K3_MOE=tp` on another aiter | That aiter lacks `cc8d4ff12`: the default tile_k of 256 does not divide inter_dim 384, so the grouped GEMM drops the last 128 of K. This image's aiter has the fix |
+| The [20261027 image](#the-20261027-image) fails in post-load weight processing: `AssertionError: 6284 % 16 == 12` | Its ATOM lacks #2554 and #2557, which the earlier images carried as overlays. Overlay both; see that section |
+| The checkpoint's file-list md5 is `2773d607…`, not `fa7ad4b6…` | `sort` ran in the `C` locale. Use `LC_ALL=en_US.UTF-8 sort`; see [Before you start](#before-you-start) |
 | Every token is `!` | A0 silicon without translation. See the wide-EP recipe's [A0 and B0](https://github.com/ROCm/ATOM/blob/recipe-k3-455-wideep/recipes/Kimi-K3-455-wideEP.md#a0-and-b0-silicon) |
 | The ranks on the two trays cannot connect | The image's ENV sets `NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo`. Set all three `*_SOCKET_IFNAME` to `enp1s0f1`, as the launcher does |

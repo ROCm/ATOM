@@ -1,0 +1,504 @@
+diff --git a/atom/model_ops/linear.py b/atom/model_ops/linear.py
+index 88a1a0d7e0..cc24a71b87 100644
+--- a/atom/model_ops/linear.py
++++ b/atom/model_ops/linear.py
+@@ -756,6 +756,7 @@ def __init__(
+             and quant_config.blockscale_e8m0_scale
+         )
+         self.native_a8_group_rows = None
++        self.online_e8m0_blockscale = False  # set by online_quantize_weight
+         source_block = layer_quant_config.weight_block_size
+         native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
+             (1, 32),
+@@ -1094,6 +1095,11 @@ def online_quantize_weight(self):
+         )
+         weight = self.weight.data
+         weight_scale = getattr(self, "weight_scale", None)
++        # __init__ decided this from the checkpoint scheme; follow the online target.
++        online_e8m0_scale = (
++            online_quant_type.value == QuantType.per_1x128.value
++            and self.quant_config.blockscale_e8m0_scale
++        )
+         if (
+             self.tp_size > 1
+             and self.tp_dim is not None
+@@ -1182,7 +1188,10 @@ def online_quantize_weight(self):
+                 self.output_partition_sizes,
+             )
+             q_weight, weight_scale = quant_weight_online(
+-                weight, online_quant_type, online_quant_dtype
++                weight,
++                online_quant_type,
++                online_quant_dtype,
++                blockscale_e8m0_scale=online_e8m0_scale,
+             )
+         if need_gather:
+             q_weight, weight_scale = self._shard_quantized_weight(
+@@ -1200,6 +1209,8 @@ def online_quantize_weight(self):
+         # Update quant state
+         self.quant_type = online_quant_type
+         self.params_dtype = online_quant_dtype
++        self.blockscale_e8m0_scale = online_e8m0_scale
++        self.online_e8m0_blockscale = online_e8m0_scale
+         self.layer_quant_config = online_layer_quant_config
+         self._stream_online_quant = False
+         self.quant_func = get_hip_quant(online_quant_type)
+@@ -1362,7 +1373,13 @@ def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
+         # The other half of the shuffle decision `process_weights_after_loading`
+         # takes, so it answers on the same terms `weight_is_stored_preshuffled`
+         # does -- by value.
+-        if not (
++        # The gfx1250 E8M0 (mxfp8_128) GEMM needs N % 128 == 0; the block scale
++        # already has ceil(N/128) rows, so only the weight is padded.
++        is_e8m0_blockscale = (
++            self.quant_type.value == QuantType.per_1x128.value
++            and self.online_e8m0_blockscale
++        )
++        if not is_e8m0_blockscale and not (
+             self.quant_type.value == QuantType.per_Token.value
+             and self.params_dtype == dtypes.fp8
+         ):
+@@ -1387,9 +1404,10 @@ def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
+             self.weight.data, (0, 0, 0, padding_size)
+         )
+         ws = self.weight_scale.data
+-        self.weight_scale.data = torch.cat(
+-            [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
+-        )
++        if not is_e8m0_blockscale:
++            self.weight_scale.data = torch.cat(
++                [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
++            )
+         # Bias is also per-output-channel
+         if self.bias is not None:
+             b = self.bias.data
+@@ -1429,8 +1447,10 @@ def supports_out(self) -> bool:
+             return False
+         if self.quant_type.value == QuantType.No.value:
+             return True
+-        return self.quant_type.value == QuantType.per_1x128.value and bool(
+-            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
++        return (
++            self.quant_type.value == QuantType.per_1x128.value
++            and bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
++            and not self.is_output_padded  # a padded N overruns `out`
+         )
+ 
+     @mark_trace
+@@ -1681,8 +1701,8 @@ def make_row_view(self, start: int, length: int) -> "LinearBase":
+         view.output_size = length
+         # `forward` trims padded rows via `_output_size_before_padding`. A row
+         # view lives entirely inside the real rows, so it must not re-trim; the
+-        # caller is expected to slice below the padding (only per_Token fp8 pads
+-        # at all, and it appends at the end).
++        # caller is expected to slice below the padding (per_Token fp8 and E8M0
++        # per_1x128 pad, both by appending at the end).
+         if getattr(self, "is_output_padded", False):
+             assert (
+                 start + length <= self._output_size_before_padding
+diff --git a/atom/models/kimi_k3/model.py b/atom/models/kimi_k3/model.py
+index 9b3f65b4be..d4a405517f 100644
+--- a/atom/models/kimi_k3/model.py
++++ b/atom/models/kimi_k3/model.py
+@@ -179,6 +179,18 @@ def _effective_layer_quant(
+     return cfg.quant_type, cfg.quant_dtype
+ 
+ 
++def _is_e8m0_blockscale(
++    quant_config: QuantizationConfig | None, quant_type: QuantType
++) -> bool:
++    """Whether a per_1x128 consumer runs E8M0 block scales (same test as
++    LinearBase). FP32-scale fused producers stand down for it."""
++    return (
++        quant_config is not None
++        and quant_type.value == QuantType.per_1x128.value
++        and quant_config.blockscale_e8m0_scale
++    )
++
++
+ class SituAndMul(nn.Module):
+     def __init__(
+         self,
+@@ -808,7 +820,10 @@ def __init__(
+         qknorm_type, qknorm_dtype = _effective_layer_quant(
+             quant_config, f"{prefix}.q_b_proj"
+         )
+-        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
++        self.fuse_qknorm_quant = qknorm_dtype in (
++            dtypes.fp8,
++            dtypes.fp4x2,
++        ) and not _is_e8m0_blockscale(quant_config, qknorm_type)
+         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
+         self.qknorm_quant_type_value = (
+             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
+@@ -826,9 +841,10 @@ def __init__(
+         # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
+         # (ptpc_fp8) or per-1x128 block.
+         o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+-        self.fuse_sigmoid_mul_quant = o_dtype == dtypes.fp8 and o_type in (
+-            QuantType.per_Token,
+-            QuantType.per_1x128,
++        self.fuse_sigmoid_mul_quant = (
++            o_dtype == dtypes.fp8
++            and o_type in (QuantType.per_Token, QuantType.per_1x128)
++            and not _is_e8m0_blockscale(quant_config, o_type)
+         )
+         # .value, like qknorm_quant_type_value above: comparing the pybind11
+         # QuantType inside forward() graph-breaks Dynamo.
+@@ -1044,12 +1060,14 @@ def __init__(
+             quant_config=quant_config,
+             prefix=f"{prefix}.f_b_proj",
+         )
++        # rmsnorm_gated fuses only per-token FP8; otherwise o_proj quantizes itself.
+         o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
++        o_norm_fuses_quant = o_type == QuantType.per_Token and o_dtype == dtypes.fp8
+         self.o_norm = KimiRMSNormGated(
+             self.head_dim,
+             eps=config.rms_norm_eps,
+-            quant_type=o_type,
+-            quant_dtype=o_dtype,
++            quant_type=o_type if o_norm_fuses_quant else None,
++            quant_dtype=o_dtype if o_norm_fuses_quant else None,
+         )
+         self.o_proj = RowParallelLinear(
+             self.proj_size,
+diff --git a/atom/quantization/quark/utils.py b/atom/quantization/quark/utils.py
+index 37cf387ef2..21e01dc02e 100644
+--- a/atom/quantization/quark/utils.py
++++ b/atom/quantization/quark/utils.py
+@@ -665,9 +665,12 @@ def quant_mxfp4_online_even(
+     return q_weight.view(dtypes.fp4x2), weight_scale.view(_mx_block_scale_dtype())
+ 
+ 
+-def quantize_weight_to_fp8_128x128_blockscale(weight, quant_dtype):
++def quantize_weight_to_fp8_128x128_blockscale(weight, quant_dtype, e8m0_scale=False):
+     """Quantize a 2D weight to FP8 with 128x128 block scales.
+ 
++    ``e8m0_scale``: round each block scale up to a power of two (no clipping)
++    and return it as E8M0, the format gfx1250's mxfp8_128 GEMM takes.
++
+     Returns:
+         q_weight: quantized weight with the same shape as input ``weight``.
+         scale: per-block scale with shape ``(ceil(N/128), ceil(K/128))``.
+@@ -689,6 +692,12 @@ def quantize_weight_to_fp8_128x128_blockscale(weight, quant_dtype):
+     finfo = torch.finfo(quant_dtype)
+     block_amax = w_blocks.abs().amax(dim=(2, 3))
+     scale = (block_amax / finfo.max).clamp_min(torch.finfo(torch.float32).tiny)
++    if e8m0_scale:
++        # frexp: scale = m * 2**e with m in [0.5, 1); m == 0.5 is already 2**(e-1).
++        mant, exp = torch.frexp(scale)
++        scale = torch.ldexp(
++            torch.ones_like(scale), torch.where(mant == 0.5, exp - 1, exp)
++        )
+ 
+     q_blocks = torch.clamp(
+         w_blocks / scale.unsqueeze(-1).unsqueeze(-1), min=finfo.min, max=finfo.max
+@@ -700,6 +709,10 @@ def quantize_weight_to_fp8_128x128_blockscale(weight, quant_dtype):
+         .view(n_padded, k_padded)[:n, :k]
+         .contiguous()
+     )
++    if e8m0_scale:
++        from aiter import dtypes
++
++        return q_weight, scale.to(dtypes.fp8_e8m0).contiguous()
+     return q_weight, scale.contiguous()
+ 
+ 
+@@ -707,6 +720,7 @@ def quant_weight_online(
+     weight: torch.Tensor,
+     online_quant_type: QuantType,
+     online_quant_dtype: torch.dtype,
++    blockscale_e8m0_scale: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Dispatch online weight quantization by target dtype / scheme.
+ 
+@@ -729,6 +743,7 @@ def quant_weight_online(
+     :param online_quant_type: Online quantization scheme, used to resolve the
+         FP8 quant function via ``get_hip_quant``.
+     :param online_quant_dtype: Target online quantization dtype.
++    :param blockscale_e8m0_scale: per_1x128 only -- emit an E8M0 block scale.
+     :return: ``(q_weight, weight_scale)``.
+     """
+     from aiter import dtypes, get_hip_quant
+@@ -736,7 +751,9 @@ def quant_weight_online(
+     if online_quant_dtype == dtypes.fp4x2:
+         return quant_mxfp4_online_even(weight)
+     if online_quant_type == QuantType.per_1x128:
+-        return quantize_weight_to_fp8_128x128_blockscale(weight, online_quant_dtype)
++        return quantize_weight_to_fp8_128x128_blockscale(
++            weight, online_quant_dtype, e8m0_scale=blockscale_e8m0_scale
++        )
+     quant_func = get_hip_quant(online_quant_type)
+     # A per_1x32 scheme *is* MX (microscaling): its block scale is E8M0 by
+     # definition of the format, independent of the element dtype. So the scale
+diff --git a/atom/rollout/weight_updater.py b/atom/rollout/weight_updater.py
+index a954594b4e..848c3d2e79 100644
+--- a/atom/rollout/weight_updater.py
++++ b/atom/rollout/weight_updater.py
+@@ -768,6 +768,28 @@ def _is_fp8_param(module: torch.nn.Module, param: torch.nn.Parameter) -> bool:
+             and getattr(module, "weight_scale", None) is not None
+         )
+ 
++    @staticmethod
++    def _logical_weight_shape(
++        module: torch.nn.Module, param: torch.nn.Parameter
++    ) -> tuple:
++        """Parameter shape without the online-E8M0 output-row pad.
++
++        Other layouts, including per-token FP8 padding, keep ``param.shape``:
++        their scale rows are padded too, and zero-filling before quantize would
++        not reproduce that scale.
++        """
++        shape = tuple(param.shape)
++        if (
++            not getattr(module, "online_e8m0_blockscale", False)
++            or not getattr(module, "is_output_padded", False)
++            or len(shape) != 2
++        ):
++            return shape
++        logical_n = getattr(module, "_output_size_before_padding", None)
++        if not isinstance(logical_n, int) or not 0 < logical_n < shape[0]:
++            return shape
++        return (logical_n, shape[1])
++
+     def _requantize_fp8_weight(
+         self,
+         module: torch.nn.Module,
+@@ -787,15 +809,23 @@ def _requantize_fp8_weight(
+ 
+         tensor_gpu = tensor.to(device=self.device, dtype=torch.float32)
+ 
++        # Online E8M0 per_1x128 stores N padded up to a multiple of 128. The
++        # training weight is the logical, unpadded shape, so shard and compare
++        # against that and restore the pad rows before the shape check below.
++        logical_shape = self._logical_weight_shape(module, param)
+         tp_size = self.world_size
+         if tp_size > 1 and tensor_gpu.shape != param.shape:
+             for dim in range(len(param.shape)):
+-                if tensor_gpu.shape[dim] == param.shape[dim] * tp_size:
+-                    shard_size = param.shape[dim]
++                if tensor_gpu.shape[dim] == logical_shape[dim] * tp_size:
++                    shard_size = logical_shape[dim]
+                     tensor_gpu = tensor_gpu.narrow(
+                         dim, self.rank * shard_size, shard_size
+                     )
+                     break
++        if tensor_gpu.shape == logical_shape and logical_shape != tuple(param.shape):
++            tensor_gpu = torch.nn.functional.pad(
++                tensor_gpu, (0, 0, 0, param.shape[0] - tensor_gpu.shape[0])
++            )
+ 
+         if tensor_gpu.shape != param.shape:
+             logger.warning(
+@@ -814,12 +844,17 @@ def _requantize_fp8_weight(
+             # produced a 1x128-along-K scale (N, K//128) and sliced it into the
+             # (N//128, K//128) buffer, which is inconsistent with the blockscale
+             # GEMM and collapses generation after the first weight update.
++            # ``e8m0_scale`` has to be decided here too. Casting an FP32 scale
++            # to E8M0 afterwards does not round it up to a power of two, and
++            # the weight would have been quantized against the unrounded scale.
+             from atom.quantization.quark.utils import (
+                 quantize_weight_to_fp8_128x128_blockscale,
+             )
+ 
+             q_weight, scale = quantize_weight_to_fp8_128x128_blockscale(
+-                tensor_gpu, fp8_dtype
++                tensor_gpu,
++                fp8_dtype,
++                e8m0_scale=bool(getattr(module, "online_e8m0_blockscale", False)),
+             )
+             # The scale writes ride on the weight's fence: `_await_readers_of`
+             # synchronizes the device, so the reader that held the weight held
+diff --git a/tests/test_e8m0_online_blockscale.py b/tests/test_e8m0_online_blockscale.py
+new file mode 100644
+index 0000000000..b0ea484861
+--- /dev/null
++++ b/tests/test_e8m0_online_blockscale.py
+@@ -0,0 +1,187 @@
++# SPDX-License-Identifier: MIT
++"""Online per_1x128 FP8 with E8M0 block scales (QuantizationConfig.blockscale_e8m0_scale)."""
++
++import importlib
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch import nn
++
++aiter = pytest.importorskip("aiter")
++QuantType, dtypes = aiter.QuantType, aiter.dtypes
++
++linear_mod = importlib.import_module("atom.model_ops.linear")
++LayerQuantConfig = importlib.import_module("atom.quant_spec").LayerQuantConfig
++quantize = importlib.import_module(
++    "atom.quantization.quark.utils"
++).quantize_weight_to_fp8_128x128_blockscale
++kimi_k3 = importlib.import_module("atom.models.kimi_k3")
++
++
++def test_e8m0_scale_is_the_fp32_scale_rounded_up_to_a_power_of_two():
++    w = torch.randn(300, 520) * 0.02  # neither dim a multiple of 128
++    _, s32 = quantize(w, dtypes.fp8)
++    q, se = quantize(w, dtypes.fp8, e8m0_scale=True)
++
++    assert se.dtype == dtypes.fp8_e8m0 and tuple(se.shape) == (3, 5)
++    ratio = se.float() / s32
++    assert torch.all((ratio >= 1) & (ratio < 2))
++    assert q.float().abs().max() <= torch.finfo(dtypes.fp8).max  # no clipping
++
++    exact = torch.zeros(128, 128)
++    exact[0, 0] = torch.finfo(dtypes.fp8).max * 2.0**-7
++    assert quantize(exact, dtypes.fp8, e8m0_scale=True)[1].float().item() == 2.0**-7
++
++
++def _bf16_layer(monkeypatch, e8m0, output_size=2112, source=None, *, load=False):
++    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "0")
++    monkeypatch.setattr(
++        linear_mod,
++        "get_tp_group",
++        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
++    )
++    monkeypatch.setattr(
++        linear_mod,
++        "get_current_atom_config",
++        lambda: SimpleNamespace(torch_dtype=torch.bfloat16),
++    )
++    target = LayerQuantConfig(
++        quant_type=QuantType.per_1x128, quant_dtype=dtypes.fp8, is_dynamic=True
++    )
++    quant_config = SimpleNamespace(
++        online_quant=True,
++        blockscale_e8m0_scale=e8m0,
++        get_layer_quant_config=lambda *_a, use_online_quant=False, **_k: (
++            target if use_online_quant else LayerQuantConfig()
++        ),
++    )
++    layer = linear_mod.ColumnParallelLinear(
++        256, output_size, quant_config=quant_config, prefix="layers.3.qkv_a"
++    )
++    if source is None:
++        source = torch.randn(output_size, 256, dtype=torch.bfloat16) * 0.02
++    layer.weight.data = source
++    if load:
++        # The load path: online quantize, then pad and preshuffle.
++        layer.process_weights_after_loading()
++    else:
++        layer.online_quantize_weight()
++    return layer
++
++
++def _same_bytes(a, b):
++    return torch.equal(a.detach().view(torch.uint8), b.detach().view(torch.uint8))
++
++
++def _updater(**kwargs):
++    from atom.rollout.weight_updater import WeightUpdaterMixin
++
++    class _Updater(WeightUpdaterMixin):
++        label = "test"
++        device = torch.device("cpu")
++        rank = 0
++        world_size = 1
++
++    updater = _Updater()
++    for name, value in kwargs.items():
++        setattr(updater, name, value)
++    return updater
++
++
++@pytest.mark.parametrize("output_size", [2112, 2048])
++def test_rollout_sync_reproduces_the_loaded_e8m0_weight(monkeypatch, output_size):
++    monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
++    source_a = torch.randn(output_size, 256, dtype=torch.bfloat16) * 0.02
++    source_b = torch.randn(output_size, 256, dtype=torch.bfloat16) * 0.02
++    layer = _bf16_layer(monkeypatch, True, output_size, source_a, load=True)
++    ref = _bf16_layer(monkeypatch, True, output_size, source_b, load=True)
++    before = layer.weight.detach().view(torch.uint8).clone()
++
++    _updater()._requantize_fp8_weight(layer, "weight", layer.weight, source_b)
++
++    assert not torch.equal(layer.weight.detach().view(torch.uint8), before)
++    assert _same_bytes(layer.weight, ref.weight)
++    assert _same_bytes(layer.weight_scale, ref.weight_scale)
++    assert layer.weight_scale.dtype == dtypes.fp8_e8m0
++    if output_size % 128 != 0:
++        assert layer.is_output_padded
++        assert tuple(layer.weight.shape) == (2176, 256)
++
++    if not torch.cuda.is_available():
++        return
++    layer.cuda()
++    ref.cuda()
++    x = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
++    y = layer(x)
++    y_ref = ref(x)
++    assert y.shape == (4, output_size)
++    torch.testing.assert_close(y, y_ref, atol=0, rtol=0)
++
++
++def test_rollout_sync_shards_logical_n_before_padding(monkeypatch):
++    monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
++    stale = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
++    local = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
++    other = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
++    layer = _bf16_layer(monkeypatch, True, 2112, stale, load=True)
++    ref = _bf16_layer(monkeypatch, True, 2112, local, load=True)
++
++    # Rank 0 of a column-parallel pair. The stored N is padded (2176); the
++    # full training weight is 2 * 2112, which is not 2 * 2176.
++    _updater(world_size=2, rank=0)._requantize_fp8_weight(
++        layer, "weight", layer.weight, torch.cat([local, other], dim=0)
++    )
++
++    assert _same_bytes(layer.weight, ref.weight)
++    assert _same_bytes(layer.weight_scale, ref.weight_scale)
++
++
++@pytest.mark.parametrize("e8m0", [True, False])
++def test_online_target_decides_the_scale_format(monkeypatch, e8m0):
++    layer = _bf16_layer(monkeypatch, e8m0)
++
++    assert layer.quant_type == QuantType.per_1x128
++    assert layer.weight_scale.dtype == (dtypes.fp8_e8m0 if e8m0 else torch.float32)
++    assert layer.blockscale_e8m0_scale is e8m0
++
++
++def test_online_e8m0_weight_is_padded_to_128_rows(monkeypatch):
++    monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
++    layer = _bf16_layer(monkeypatch, e8m0=True)
++
++    layer.is_output_padded = layer._maybe_pad_a8w8_preshuffle_output()
++
++    assert tuple(layer.weight.shape) == (2176, 256)
++    assert torch.all(layer.weight.data[2112:].float() == 0)
++    assert tuple(layer.weight_scale.shape) == (17, 2)  # ceil(2112/128) rows already
++    assert layer._output_size_before_padding == 2112
++    assert layer.supports_out() is False
++
++
++def test_checkpoint_native_e8m0_weight_is_not_padded():
++    module = SimpleNamespace(
++        weight=nn.Parameter(
++            torch.zeros(2112, 256, dtype=torch.uint8), requires_grad=False
++        ),
++        weight_scale=None,
++        quant_type=QuantType.per_1x128,
++        params_dtype=dtypes.fp8,
++        online_e8m0_blockscale=False,
++    )
++    assert linear_mod.LinearBase._maybe_pad_a8w8_preshuffle_output(module) is False
++
++
++@pytest.mark.parametrize(
++    "quant_type,switch,expected",
++    [
++        (QuantType.per_1x128, True, True),
++        (QuantType.per_1x128, False, False),
++        (QuantType.per_Token, True, False),
++    ],
++)
++def test_k3_fused_producers_stand_down_for_an_e8m0_consumer(
++    quant_type, switch, expected
++):
++    cfg = SimpleNamespace(blockscale_e8m0_scale=switch)
++    assert kimi_k3._is_e8m0_blockscale(cfg, quant_type) is expected
