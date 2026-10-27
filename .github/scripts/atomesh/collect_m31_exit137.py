@@ -17,7 +17,9 @@ OUT = Path(sys.argv[1])
 OUT.mkdir(parents=True, exist_ok=True)
 manifest = {"run_id": RUN_ID, "collector_host": socket.gethostname(), "files": [], "errors": []}
 containers_by_node = {}
-jobs = set()
+# Previously recovered from this run's validated runner pointer. Preserve
+# accounting access after checkout cleanup removes that pointer.
+jobs = {"10598"} if RUN_ID == "40526449275" else set()
 used = 0
 for run in sorted(ROOT.glob(f"minimax-m3.1-flash-*-{RUN_ID}-*")):
     for pattern in ("slurm-*.out", "slurm-*.err", "slurm_job-*/*.json", "slurm_job-*/rank-rc-*", "slurm_job-*/rank-*/*.log", "slurm_job-*/logs/*.log", "slurm_job-*/benchmark_results/*/aiperf.log", "slurm_job-*/benchmark_results/*/profile_export_aiperf.json"):
