@@ -29,8 +29,11 @@ from atom.utils import envs
 Q_HEADS = 64
 EXPERT_INTER = 2048  # moe_intermediate_size
 
-# the TP sizes the kernels are built for
-SUPPORTED_TP = (4,)
+# the TP sizes the kernels are built for: the kernel's reference shard is TP8
+# (``GLM5_CONFIG``, 8 heads / 256 intermediate) and TP4 is ``glm5_tp_config(4)``
+SUPPORTED_TP = (4, 8)
+# the TP size the fused indexer serves: ``Glm5TP4MonoKernel`` refuses any other
+FUSED_INDEXER_TP = 4
 # the batches a build covers, and the batches a step is routed at: only one and
 # two were measured faster than the production path, so only they are served
 GRAPH_BATCHES = GLM5_GRAPH_BATCHES
@@ -371,8 +374,9 @@ def indexer_cp_refusal(atom_config) -> str | None:
       ``index_cp_world(npes, samples, index_max_seq)``, which is the TP size
       except for TP8's single-query medium contexts. A group of one is not
       context parallelism, so TP1 is refused by name rather than silently
-      building a CP kernel that shards nothing. (``SUPPORTED_TP`` is ``(4,)``
-      today, so this is a guard against a future TP, not a live case.)
+      building a CP kernel that shards nothing. (The runner turns the fused
+      indexer on at ``FUSED_INDEXER_TP`` only, so this is a guard against a
+      future TP, not a live case.)
     - **``index_max_seq`` a positive multiple of 64 that accommodates every
       query.** The multiple-of-64 half is checked here against
       ``FUSED_INDEX_MAX_SEQ``; the "accommodates every query" half is already
