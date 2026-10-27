@@ -340,9 +340,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if self._page_only:
             # No image to wait for: any computed chunk boundary will do.
             return frontier if frontier > floor else 0
-        # Next image above what this request already stored. A load has to
-        # stop on a chunk strictly below the prompt, so skipping to the last
-        # checkpoint leaves that chunk with no image.
         entry = self._save_tracker.get(str(seq.id))
         saved = int(entry[1]) if entry is not None and entry[0] is seq else 0
         start = max(floor, saved)
@@ -363,20 +360,44 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                     memo[4],
                 )
                 return memo[4]
-        found = 0
         boundaries = getattr(seq, "_mp_boundary_by_hash", None)
         if boundaries is None:
             boundaries = seq._mp_boundary_by_hash = {}
-        for boundary in range(
-            self._chunk_floor(start) + self.chunk_size, frontier + 1, self.chunk_size
-        ):
-            prefix_hash = self._boundary_hash(seq, boundary)
-            boundaries[prefix_hash] = boundary
-            if self._checkpoints.contains(prefix_hash):
-                found = boundary
-                break
+        found = self._next_image(seq, start, frontier, boundaries)
         seq._mp_save_frontier_memo = (frontier, floor, saved, store.generation, found)
         return found
+
+    def _next_image(
+        self, seq: Any, start: int, frontier: int, boundaries: dict | None = None
+    ) -> int:
+        """The boundary of the next image to store above `start`, or 0.
+
+        The highest one a resend of this prompt can load comes first: a load
+        stops on a chunk strictly below the prompt, so that is the prompt-end
+        anchor (`align_checkpoint_anchor`), and storing it first pins it
+        before anything else queues. Only then a rung at the prompt's end,
+        which a continuation loads. Lower rungs that became available in the
+        same step stay unsaved, as do any that formed while an earlier save
+        of the request was in flight: one save per request already serialises
+        them, and storing every one would hold `should_defer_free` and the
+        state budget for a whole ladder per prompt.
+        """
+        reach = min(frontier, self._chunk_floor(max(int(seq.num_prompt_tokens) - 1, 0)))
+        return self._highest_image(
+            seq, start, reach, boundaries
+        ) or self._highest_image(seq, max(start, reach), frontier, boundaries)
+
+    def _highest_image(
+        self, seq: Any, low: int, high: int, boundaries: dict | None
+    ) -> int:
+        """Highest chunk boundary in `(low, high]` holding a checkpoint, or 0."""
+        for boundary in range(self._chunk_floor(high), low, -self.chunk_size):
+            prefix_hash = self._boundary_hash(seq, boundary)
+            if boundaries is not None:
+                boundaries[prefix_hash] = boundary
+            if self._checkpoints.contains(prefix_hash):
+                return boundary
+        return 0
 
     def _save_floor(self, lower: int) -> int:
         """Exclusive lower bound for boundaries worth storing (never 0)."""
@@ -386,14 +407,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         available = self._chunk_floor(available)
         if self._page_only:
             return available if available > self._save_floor(saved) else saved
-        # Same stepping as `_save_frontier`: the next image, not the last.
         start = max(self._save_floor(saved), saved)
-        for boundary in range(
-            self._chunk_floor(start) + self.chunk_size, available + 1, self.chunk_size
-        ):
-            if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
-                return boundary
-        return saved
+        return self._next_image(seq, start, available) or saved
 
     def _may_emit_save(self) -> bool:
         return len(self._save_inflight) < self._max_pending_saves

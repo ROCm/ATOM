@@ -301,32 +301,68 @@ def test_save_frontier_rescans_only_when_frontier_or_checkpoints_change(
     assert scheduler._save_frontier(seq) == 8
     assert len(calls) == scanned  # moves the store, but none of our boundaries
 
-    checkpoint(scheduler, checkpoints, seq, 16)  # a later rung does not skip 8
-    assert scheduler._save_frontier(seq) == 8
-    assert len(calls) == scanned
-
-    scheduler._save_tracker[str(seq.id)] = [seq, 8]
+    checkpoint(scheduler, checkpoints, seq, 16)  # a newer checkpoint publishes
     assert scheduler._save_frontier(seq) == 16
     assert len(calls) > scanned
     rescanned = len(calls)
 
     checkpoints.store.unindex(scheduler._boundary_hash(seq, 16))  # ours drops
-    assert scheduler._save_frontier(seq) == 0
+    assert scheduler._save_frontier(seq) == 8
     assert len(calls) > rescanned
 
 
-def test_each_checkpoint_rung_is_stored_before_a_later_one(monkeypatch):
-    """A same-length prompt can only load the chunk below its end."""
+def test_the_prompt_end_anchor_is_stored_first_and_pinned(monkeypatch):
+    """A resend of this prompt can only load the chunk below its end (16), a
+    continuation the rung at its end (24). The anchor goes first, pinned from
+    the moment it is issued; the rung below it is not backfilled."""
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=24)
+    ids = {
+        boundary: checkpoints.store.lookup(
+            checkpoint(scheduler, checkpoints, seq, boundary)[0]
+        )
+        for boundary in (8, 16, 24)
+    }
+    scheduler.update_state_after_alloc(seq)
+
+    [anchor] = scheduler.build_connector_meta().requests
+    assert anchor.native_state.boundary_tokens == 16
+    assert anchor.save_spec.skip_leading_tokens == 0
+    assert checkpoints.store.records[ids[16]].pin_count == 1
+    assert checkpoints.store.records[ids[24]].pin_count == 0
+    terminal(scheduler, anchor.save_operation)
+
+    [end] = scheduler.build_connector_meta().requests
+    assert end.native_state.boundary_tokens == 24
+    assert end.save_spec.skip_leading_tokens == 16
+    terminal(scheduler, end.save_operation)
+
+    assert scheduler.build_connector_meta().requests == []
+    assert scheduler._has_pending_save(seq) is False
+    assert scheduler.should_defer_free(seq) is False
+    assert checkpoints.store.records[ids[8]].pin_count == 0
+
+
+def test_a_rung_at_the_prompt_end_is_stored_when_no_anchor_formed(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
     seq = sequence(computed=24)
     checkpoint(scheduler, checkpoints, seq, 8)
-    checkpoint(scheduler, checkpoints, seq, 16)
+    checkpoint(scheduler, checkpoints, seq, 24)
     scheduler.update_state_after_alloc(seq)
+
     [first] = scheduler.build_connector_meta().requests
     assert first.native_state.boundary_tokens == 8
     terminal(scheduler, first.save_operation)
     [second] = scheduler.build_connector_meta().requests
-    assert second.native_state.boundary_tokens == 16
+    assert second.native_state.boundary_tokens == 24
+
+
+def test_mid_prefill_saves_the_highest_image_it_has_computed(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(count=40, computed=24)
+    for boundary in (8, 16, 24):
+        checkpoint(scheduler, checkpoints, seq, boundary)
+    assert scheduler._save_frontier(seq) == 24
 
 
 def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):
