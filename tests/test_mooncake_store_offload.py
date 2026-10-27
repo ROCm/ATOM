@@ -895,6 +895,8 @@ _KV_LAYOUT_ENV = (
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV",
     "ATOM_USE_UNIFIED_ATTN",
     "ATOM_FORCE_ATTN_TRITON",
+    "ATOM_M3_SPARSE_KV_NVFP4",
+    "ATOM_M3_DSPARK_DRAFT_PTPC",
 )
 
 
@@ -909,6 +911,8 @@ _KV_LAYOUT_ENV = (
         {"ATOM_USE_UNIFIED_ATTN": "1"},
         # fp8 MHA KV under one fixed scale instead of per-token scales.
         {"ATOM_FORCE_ATTN_TRITON": "1"},
+        {"ATOM_M3_SPARSE_KV_NVFP4": "1"},
+        {"ATOM_M3_DSPARK_DRAFT_PTPC": "1"},
     ],
 )
 def test_namespace_fingerprints_the_kv_layout_the_environment_selects(monkeypatch, env):
@@ -3755,6 +3759,7 @@ def test_m3_store_codec_includes_all_page_planes(model_type):
             ("k_scale", 64),
             ("v_scale", 64),
             ("index", 144),
+            ("index_scale", 16),
             ("draft", 2048),
         ]
     }
