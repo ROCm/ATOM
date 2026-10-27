@@ -21,7 +21,11 @@ artifact_dir="${run_dir}/mesh-build"
 container_dir="/run_logs/slurm_job-${job_id}/mesh-build"
 # The same job's benchmark and eval phases consume the same build artifact.
 if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" ]]; then
-  cache_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)}"
+  # Spur's epilog deletes the user's day-old files under /tmp and /var/tmp,
+  # which strips Cargo's 2006-stamped crate sources but keeps the .cargo-ok
+  # markers that stop re-extraction. run_dir is <log root>/<cell>/slurm_job-<id>
+  # on shared storage; one cache per host keeps nodes off each other's lock.
+  cache_dir="${ATOMESH_MESH_TARGET_DIR:-$(dirname "$(dirname "${run_dir}")")/.mesh-cache/$(hostname -s)-$(id -u)}"
   mkdir -p "${artifact_dir}" "${cache_dir}"
   source_commit="$(git -C "${repo_root}" rev-parse HEAD)"
   source_dirty=false

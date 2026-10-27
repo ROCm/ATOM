@@ -135,13 +135,14 @@ def _stub_v4_runtime_imports():
 
     pcp_utils = types.ModuleType("atom.distributed.pcp_utils")
     for name in (
+        "get_pcp_rank",
         "get_pcp_world_size",
         "pcp_is_enabled",
+        "pcp_owned_rows_by_request",
         "pcp_pad_dense",
         "pcp_pad_indptr",
         "pcp_pad_len",
         "pcp_reindex_ragged",
-        "pcp_round_robin_query_indices",
     ):
         setattr(pcp_utils, name, lambda *args, **kwargs: None)
 
@@ -154,8 +155,6 @@ def _stub_v4_runtime_imports():
         setattr(backends, name, type(name, (), {}))
 
     kernels = types.ModuleType("atom.model_ops.v4_kernels")
-    kernels.FP4_MQA_BLOCK_K = 128
-    kernels.FP4_MQA_PARALLEL_UNIT_NUM = 1
     for name in (
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
@@ -173,6 +172,17 @@ def _stub_v4_runtime_imports():
         prepare=lambda *args, **kwargs: None,
     )
 
+    # The indexer's scorer needs aiter's kernels; the builder only names them.
+    indexer = types.ModuleType("atom.model_ops.indexer")
+    indexer.NATURAL, indexer.PRESHUFFLE = "natural", "preshuffle"
+    for name in ("ConcatKeys", "IndexRows"):
+        setattr(indexer, name, type(name, (), {}))
+    for name in ("Fp4LaunchStorages", "concat_rows", "fp4_rows", "fp8_rows"):
+        setattr(indexer, name, lambda *args, **kwargs: None)
+    # Its sequences are aiter's FP4 MQA plan; the builder only names the type.
+    ragged = types.ModuleType("atom.model_ops.fp4_mqa_ragged_metadata")
+    ragged.Fp4MqaRaggedMetadata = type("Fp4MqaRaggedMetadata", (), {})
+
     replacements = {
         "aiter": aiter,
         "aiter.jit": aiter_jit,
@@ -182,6 +192,8 @@ def _stub_v4_runtime_imports():
         "aiter.dist.parallel_state": parallel_state,
         "atom.distributed.pcp_utils": pcp_utils,
         "atom.model_ops.attentions.backends": backends,
+        "atom.model_ops.fp4_mqa_ragged_metadata": ragged,
+        "atom.model_ops.indexer": indexer,
         "atom.model_ops.v4_kernels": kernels,
     }
     previous = {name: sys.modules.get(name, _MISSING) for name in replacements}

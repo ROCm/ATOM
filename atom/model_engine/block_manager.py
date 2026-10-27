@@ -319,6 +319,7 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             state_tier_capability,
             state_tier_chunk_tokens,
+            state_tier_cpu_bytes,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -487,6 +488,16 @@ class BlockManager:
             self.state_offload = StateOffloadIndex(
                 can_store=self.state_tier_capability.can_store_state,
                 can_load=self.state_tier_capability.can_load_state,
+                # The codec stores one `image_bytes` image per entry (the
+                # worker turns the tier off unless its entry is exactly that).
+                # Not `slot_bytes`: under MTP a slot holds more than an image
+                # (DSpark3: 42.45 vs 29.51 MiB), and dividing by it would cap
+                # this index a third below the codec, hiding images it holds.
+                max_cpu_entries=(
+                    state_tier_cpu_bytes() // checkpoint_spec.image_bytes
+                    if checkpoint_spec is not None
+                    else None
+                ),
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -1608,6 +1619,17 @@ class BlockManager:
             seq.offload_joint.boundary_tokens = 0
             seq.offload_joint.boundary_hash = -1
         return True
+
+    def tier_resume_replays(self, seq: Sequence) -> bool:
+        """Whether a prefill resuming after an offload load replays below it.
+
+        A DeepSeek-V4 bounded replay records it per hit (`replays_hit`). Under
+        a `replay` state transfer (DeepSeek-V4.1 encoder bounded replay) no
+        state is ever restored, so every resume rebuilds it, the tier's as
+        well as the HBM's: the load brings PAGE KV alone, and the forward
+        replays the hash block below where it ends.
+        """
+        return bool(seq.replays_hit or self.state.transfer.replays)
 
     def replay_start(self, seq: Sequence, start: int, *, hit: bool) -> int:
         """Where a prefill resuming at `start` begins, early enough to rebuild

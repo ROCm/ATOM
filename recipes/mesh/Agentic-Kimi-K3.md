@@ -1,7 +1,7 @@
 # Kimi-K3 AgentX with PD Disaggregation and On-Demand Checkpoints
 
 Run Kimi-K3 with one TP8/DCP8 prefill server and one TP8/DCP8 decode server
-on two 8×MI355X nodes. This recipe uses DSpark3, ReplaySSM, native prefix
+on two 8×MI355X nodes. This recipe uses DSpark4, ReplaySSM, native prefix
 caching, and LMCache CPU offload on the prefill node for the SemiAnalysis/Weka
 AgentX workload.
 
@@ -24,10 +24,10 @@ The matching cases are in
 
 | CONC | Case suffix | `max-num-seqs` | Decode graph capture sizes | Comm-group reuse |
 |---:|---|---:|---|---:|
-| 48 | `dspark3-agentic-lmcache-1m-c48` | 96 | 1…384 | 0 |
-| 56 | `dspark3-agentic-lmcache-1m-c56` | 112 | 1…448 | 1 |
-| 72 | `dspark3-agentic-lmcache-1m-c72` | 144 | 1…576 | 1 |
-| 88 | `dspark3-agentic-lmcache-1m-c88` | 176 | 1…704 | 1 |
+| 48 | `dspark4-agentic-lmcache-1m-c48` | 96 | 1…480 | 0 |
+| 56 | `dspark4-agentic-lmcache-1m-c56` | 112 | 1…560 | 1 |
+| 72 | `dspark4-agentic-lmcache-1m-c72` | 144 | 1…720 | 1 |
+| 88 | `dspark4-agentic-lmcache-1m-c88` | 176 | 1…880 | 1 |
 
 Every case has the prefix `kimi-k3-mxfp4-1p1d-tp8-dcp8-` and uses the same
 128 GiB state cap, 224 GiB shared CPU pool, and on-demand setting. The
@@ -92,8 +92,8 @@ COMMON_ARGS=(
   --state-checkpoint-interval-tokens -1
   --method dspark
   --draft-model "${DRAFT_MODEL_PATH}"
-  --num-speculative-tokens 3
-  --spec-decode-acceptance-length 3.00
+  --num-speculative-tokens 4
+  --spec-decode-acceptance-length 3.36
   --online_quant_config "${ONLINE_QUANT_CONFIG}"
   --tool-call-parser kimi_k3
 )
@@ -136,10 +136,10 @@ reports its entry size and retention capacity.
 After applying the common block in a separate shell on the decode node,
 start the Mooncake consumer. Decode uses no LMCache CPU offload in this recipe.
 Its dense graph range matches CI's `cudagraph: auto` calculation:
-`2 * CONC * (1 + 3)` query tokens.
+`2 * CONC * (1 + 4)` query tokens.
 
 ```bash
-GRAPH_MAX=$((MAX_NUM_SEQS * 4))
+GRAPH_MAX=$((MAX_NUM_SEQS * 5))
 CUDAGRAPH_CAPTURE_SIZES="[$(seq -s, 1 "${GRAPH_MAX}")]"
 DECODE_KV_TRANSFER_CONFIG="{\"kv_connector\":\"mooncake\",\"kv_role\":\"kv_consumer\",\"proxy_ip\":\"${ATOM_HOST_IP}\",\"handshake_port\":6301}"
 python3 -m atom.entrypoints.openai_server \
@@ -182,4 +182,4 @@ each concurrency for 3,600 seconds with 10 warmup requests per lane.
 
 For CI, select `ATOMesh Benchmark`, suite `nightly`, model `Kimi-K3-MXFP4`,
 and one exact case name, for example
-`kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c72`.
+`kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c72`.

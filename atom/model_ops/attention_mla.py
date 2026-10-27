@@ -36,7 +36,7 @@ except ImportError:
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
-    mla_decode_fwd as triton_shuffle_mla_decode_fwd,
+    mla_decode_fwd as triton_mla_decode_fwd,
 )
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -199,9 +199,9 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
-# Shuffled KV (block_size=64) kernels, gated by ATOM_MLA_KV_SHUFFLED.
-triton_shuffle_mla_decode_fwd = mark_trace(
-    triton_shuffle_mla_decode_fwd, prefix="mla_decode_shuffle", torch_compile=False
+# Paged Triton decode supports both interleaved and shuffled KV caches.
+triton_mla_decode_fwd = mark_trace(
+    triton_mla_decode_fwd, prefix="mla_decode_triton", torch_compile=False
 )
 triton_cat_and_cache_mla = mark_trace(
     triton_cat_and_cache_mla, prefix="kv_cache_shuffle", torch_compile=False
@@ -626,6 +626,9 @@ class MLAAttention(nn.Module):
         self.q_proj = mla_modules.q_proj
         self.o_proj = mla_modules.o_proj
         self.kv_b_proj = mla_modules.kv_b_proj
+        # The cached-prefix gather and the Triton split-cat read kv_b_proj's scale
+        # directly, so the loader keeps it e8m0-shuffled.
+        self.kv_b_proj.needs_e8m0_shuffled_scale = True
         self.kv_cache = torch.tensor([])
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
@@ -675,6 +678,7 @@ class MLAAttention(nn.Module):
         # fused_qk_rope_concat_and_cache_mla) and an unpadded 576-wide q_out;
         # only the gfx1250 asm decode path needs the segmented layout + 768 pad.
         self.use_triton_mla = bool(envs.ATOM_USE_TRITON_MLA)
+        self.kv_cache_block_size = atom_config.kv_cache_block_size
         # On the non-triton (aiter) path, ATOM_MLA_PAGE_SIZE selects the KV cache
         # layout: >1 uses the segmented (paged) seg kernels + padded q_out, while
         # ==1 falls back to the original interleaved per-token (page_size=1)
@@ -2580,73 +2584,52 @@ class MLAAttention(nn.Module):
 
         final_lse = None
 
-        if self.kv_shuffled:
-            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
-            if self.use_triton_mla:
-                triton_shuffle_mla_decode_fwd(
-                    q,  # [num_tokens, num_query_heads, kv_lora_rank + qk_rope_head_dim]
-                    kv_buffer,  # [num_blocks, 1, block_size, kv_lora_rank + qk_rope_head_dim]
-                    o,
-                    attn_metadata.cu_seqlens_q,
-                    attn_metadata.context_lens,  # seqused_k
-                    int(attn_metadata.max_seqlen_k),  # max_seqlen_kv
-                    attn_metadata.block_tables,  # [bs, max_num_blocks_per_seq] (logical)
-                    self.scale,
-                    self.kv_lora_rank,
-                    self.qk_rope_head_dim,
-                    True,  # causal
-                    None,  # q_descale
-                    self._k_scale,  # kv_descale
-                    shuffled_kv_cache=True,
-                )
+        if self.use_triton_mla:
+            if self.kv_shuffled:
+                kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
             else:
-                _, final_lse = mla_decode_fwd(
-                    q,
-                    kv_buffer,
-                    o,
-                    attn_metadata.cu_seqlens_q,
-                    None,  # kv_shuffled takes seq_lens/page_table, not CSR
-                    None,
-                    None,
-                    attn_metadata.max_seqlen_q,
-                    page_size=kv_buffer.shape[2],
-                    kv_layout="kv_shuffled",
-                    seq_lens=attn_metadata.context_lens[:B],
-                    page_table=attn_metadata.block_tables[:B],
-                    sm_scale=self.scale,
-                    causal=causal,
-                    q_scale=self._q_scale if q.element_size() == 1 else None,
-                    kv_scale=self._k_scale,
-                    return_lse=return_lse,
+                # block_tables contains scheduler block IDs, while the plain
+                # cache is stored as token rows. Group rows into those blocks;
+                # the Triton kernel widens block offsets to int64 internally.
+                kv_buffer = kv_c_and_k_pe_cache.view(
+                    -1, self.kv_cache_block_size, 1, q.shape[-1]
                 )
-        elif hasattr(attn_metadata, "triton_block_table"):
-            from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
-
-            k_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
-            v_buffer = k_buffer[..., : self.kv_lora_rank]
-            page_size = k_buffer.shape[1]
-
-            q_for_triton = (
-                q.to(torch.bfloat16)
-                if q.dtype.is_floating_point and q.element_size() == 1
-                else q
-            )
-
-            # Use pre-built dense block_table from prepare_decode()
-            decode_attention_fwd(
-                q_for_triton,
-                k_buffer,
-                v_buffer,
+            triton_mla_decode_fwd(
+                q,
+                kv_buffer,
                 o,
-                attn_metadata.triton_lse,
-                attn_metadata.triton_block_table,
+                attn_metadata.cu_seqlens_q,
                 attn_metadata.context_lens,
-                attn_metadata.triton_attn_logits,
-                4,  # num_kv_splits
+                int(attn_metadata.max_seqlen_k),
+                attn_metadata.block_tables,
                 self.scale,
-                page_size,
-                k_scale=self._k_scale,
-                v_scale=self._k_scale,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                causal,
+                self._q_scale if q.element_size() == 1 else None,
+                self._k_scale,
+                shuffled_kv_cache=self.kv_shuffled,
+            )
+        elif self.kv_shuffled:
+            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+            _, final_lse = mla_decode_fwd(
+                q,
+                kv_buffer,
+                o,
+                attn_metadata.cu_seqlens_q,
+                None,  # kv_shuffled takes seq_lens/page_table, not CSR
+                None,
+                None,
+                attn_metadata.max_seqlen_q,
+                page_size=kv_buffer.shape[2],
+                kv_layout="kv_shuffled",
+                seq_lens=attn_metadata.context_lens[:B],
+                page_table=attn_metadata.block_tables[:B],
+                sm_scale=self.scale,
+                causal=causal,
+                q_scale=self._q_scale if q.element_size() == 1 else None,
+                kv_scale=self._k_scale,
+                return_lse=return_lse,
             )
         else:
             kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -3357,7 +3340,7 @@ def triton_convert_req_index_to_global_index(
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by "
         f"BLOCK_N ({BLOCK_N})"
     )
 
@@ -3421,7 +3404,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table,  # int32 [num_req, max_num_blocks_per_req]
-    cu_seqlens_q,  # int32 [num_tokens + 1]
+    cu_seqlens_k,  # int32 [num_req + 1]
     out_kv_indices,  # int32
     # Fixed top-k/tile geometry; runtime bounds retain all safety masks.
     NUM_TOPK_TOKENS: tl.constexpr,
@@ -3430,9 +3413,6 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
-    # The FP8 indexer scores one concatenated KV plane, so a request's own
-    # position is `indice - cu_seqlens_q[req]`; the paged FP4 scorer emits it.
-    SEQ_LOCAL: tl.constexpr,
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
     ti_stride1: tl.constexpr,  # topk_indices stride 1
@@ -3455,11 +3435,12 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     indice = tl.load(
         topk_indices + token_id * ti_stride0 + col_id * ti_stride1
     )  # int32
-    pre_seqlens_q = tl.load(cu_seqlens_q + req_id, mask=valid_req, other=0)
-    req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
-    req_kv_len = req_kv_end - pre_seqlens_q
+    req_kv_start = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
+    req_kv_end = tl.load(cu_seqlens_k + req_id + 1, mask=valid_req, other=0)
+    req_kv_len = req_kv_end - req_kv_start
 
-    seq_token_idx = indice if SEQ_LOCAL else indice - pre_seqlens_q
+    # The indexer emits each request's own positions.
+    seq_token_idx = indice
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
@@ -3503,18 +3484,17 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
-    cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
+    cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
     # dsa_kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]           -->>>     output for this kernel
     PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
     out: torch.Tensor | None = None,
-    seq_local: bool = False,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by "
         f"BLOCK_N ({BLOCK_N})"
     )
 
@@ -3537,7 +3517,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         device=topk_indices.device,
         name="triton_convert_req_index_to_global_index_dsa_prefill",
     )
-    num_req = min(block_table.shape[0], cu_seqlens_q.shape[0] - 1)
+    num_req = min(block_table.shape[0], cu_seqlens_k.shape[0] - 1)
     max_num_blocks_per_req = block_table.shape[1]
 
     # Strides in elements
@@ -3552,7 +3532,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         batch_id_per_q_token,
         topk_indices,
         block_table,
-        cu_seqlens_q,
+        cu_seqlens_k,
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
@@ -3561,7 +3541,6 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
-        seq_local,
         # strides
         ti_stride0,
         ti_stride1,

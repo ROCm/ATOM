@@ -137,9 +137,8 @@ SUPPORTED_TP = (8,)
 # 8. Both kernels still take one slab -- i.e. the whole row, exactly as before
 # -- at every row count up to 8.
 #
-# **16 rows is correct and faster; the default stays at 8 anyway, pending a
-# task-level accuracy run.** Three classes of 8-row assumption have been found
-# and fixed:
+# **16 rows is correct and faster** (paired GSM8K: recipes/Kimi-K3.md). Three
+# classes of 8-row assumption have been found and fixed:
 #
 #   * ``MAX_U = 8 * TOPK`` sized the expert union while ``load_route`` wrote an
 #     unclamped slot -- an out-of-bounds write past 8 rows.
@@ -164,13 +163,12 @@ SUPPORTED_TP = (8,)
 # issues the same MFMAs at both widths while the staging does not. Nothing above
 # 16 is measured; do not extrapolate the trend.
 #
-# The default stays 8 because **no task-level accuracy run exists at any
-# width**, and K2's latent MoE carries a real, unsettled precision cost
+# Paired GSM8K at 16 rows showed no regression (recipes/Kimi-K3.md), but K2's
+# latent MoE still carries an unsettled MXFP4 activation-quant precision cost
 # (rel_L2 1.7e-1 .. 3.0e-1: the expert intermediate is bf16 in the reference and
-# MXFP4 here). Raising the cap also arms mono for every CUDA-graph capture size
-# inside it, so it is a decision to make on accuracy evidence, not on speed.
-#
-MAX_ROWS = 8
+# MXFP4 here). The cap also arms mono for every CUDA-graph capture size inside
+# it and sizes the peer buffer that every step zeroes. Nothing above 16 is built.
+MAX_ROWS = 16
 # tokens a request contributes at most (the conv rollback window the kernel
 # tiles for)
 MAX_QLEN = 16
@@ -197,22 +195,22 @@ def config_refusal(atom_config) -> str | None:
     linear = getattr(hf, "linear_attn_config", None) or {}
     spec = atom_config.speculative_config
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
-    # `piecewise_cudagraph_required` is left at its default True, which refuses
-    # PIECEWISE. That is NOT what a CLI launch gets: `cudagraph_mode` defaults
-    # to "FULL" (`model_engine/arg_utils.py:145`, converted at :768), so mono
-    # arms from the CLI without `--cudagraph-mode` being passed. The
-    # `None -> PIECEWISE` default at `config.py:2393` is reached only by a
-    # config built without `arg_utils`, i.e. plugin mode, which this refusal
+    # `refuse_tr_hybrid` is left at its default True, which refuses
+    # TR_HYBRID. That is NOT what a CLI launch gets: `EngineArgs.cudagraph_mode`
+    # defaults to "FULL", so mono arms from the CLI without `--cudagraph-mode`
+    # being passed. The `None -> TR_HYBRID` default in `Config.__post_init__`
+    # is reached only by a config built without `arg_utils`, i.e. plugin
+    # mode, which this refusal
     # then turns mono off for. `recipes/Kimi-K3.md` says the same.
     #
     # Structurally K3 could drop this refusal the way GLM-5.2 does: the
     # installer wraps the *uncompiled* `KimiK3ForConditionalGeneration` and the
     # runner drives `inner.layers` one at a time, so the compiled
-    # `KimiLinearModel.forward` never runs underneath mono and no piecewise
-    # graph of it can conflict. It is kept only because K3 mono has never been
-    # run under PIECEWISE -- every measurement to date used FULL -- and arming
+    # `KimiLinearModel.forward` never runs underneath mono and no token graph
+    # of it can conflict. It is kept only because K3 mono has never been
+    # run under TR_HYBRID -- every measurement to date used FULL -- and arming
     # an untested path is worse than requiring one documented flag. Drop it
-    # when there is a PIECEWISE run to point at, not before.
+    # when there is a TR_HYBRID run to point at, not before.
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP) + [
         # the kernels are one CTA a CU with every CTA resident: a spin wait on
         # another CTA only makes progress while that CTA runs

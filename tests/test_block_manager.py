@@ -1038,6 +1038,31 @@ def test_a_consumer_role_votes_but_never_hands_over_a_store(monkeypatch):
     assert bm.take_state_stores(4) == []
 
 
+def test_the_index_cap_counts_images_not_slots(monkeypatch):
+    """The codec keeps OFFLOAD_STATE_CPU_SIZE / image_bytes entries. Under MTP
+    a slot is larger than an image, and dividing by the slot would cap the
+    index a third below the codec (2,243 vs 3,330 at Kimi-K3 DSpark3)."""
+    from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    spec = PagedStateCheckpointSpec(1 << 19, 3 << 19, "cap-test", image_bytes=1 << 20)
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    bm = BlockManager(
+        cfg,
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+        ),
+    )
+    # 1 GiB / 1 MiB = 1024 codec entries, minus the 1024 // 32 margin.
+    assert bm.state_offload._hash_cap == 1024 - 32
+
+
 def test_a_multi_listing_two_offload_connectors_is_refused(monkeypatch):
     """The tier's bytes ride one connector's worker half and its completions
     ride that connector's `get_finished`, so two providers would each hold half

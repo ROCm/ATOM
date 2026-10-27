@@ -93,7 +93,7 @@ def _opt_out_of_breakable_cudagraph(vllm_config) -> None:
         os.environ[BREAKABLE_ENV] = "0"
         logger.info(
             "[atom-v4-cg] %s is served by ATOM: setting %s=0 (pid=%d). ATOM's V4 "
-            "runs prefill / mixed batches on ATOM's PIECEWISE graphs with the V4 "
+            "runs prefill / mixed batches on vLLM's PIECEWISE graphs with the V4 "
             "attention eager; vLLM's breakable cudagraph would capture that "
             "attention with the capture batch's metadata.",
             arch,
