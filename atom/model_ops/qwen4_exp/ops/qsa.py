@@ -23,13 +23,21 @@ Source provenance:
   without changing the other model's implementation.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.topk import top_k_per_row_prefill
 
 from atom.model_ops.qwen4_exp.ops import qsa_flydsl_layout
+from atom.utils import envs
+
+
+@functools.lru_cache(maxsize=1)
+def _is_gfx1250() -> bool:
+    return get_gfx_runtime() == "gfx1250"
 
 
 def _prev_pow2(n: int) -> int:
@@ -1493,6 +1501,32 @@ def qsa_sparse_paged_gqa(
         raise ValueError("token_to_request must be contiguous int32/int64 [tokens]")
 
     scale = q.shape[2] ** -0.5 if softmax_scale is None else softmax_scale
+    if (
+        kv_splits is None
+        and q.shape[0] > 0
+        and logical_indices.shape[1] > 0
+        and logical_indices.stride(1) == 1
+        and block_table.stride(1) == 1
+        and envs.ATOM_QSA_GFX1250
+        and _is_gfx1250()
+    ):
+        from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
+            qsa_gfx1250_supports,
+            qsa_sparse_paged_gqa_gfx1250,
+        )
+
+        if qsa_gfx1250_supports(q, k_cache, v_cache):
+            return qsa_sparse_paged_gqa_gfx1250(
+                q,
+                k_cache,
+                v_cache,
+                logical_indices,
+                block_table,
+                token_to_request,
+                scale,
+                _table_width_bucket(block_table.shape[1]),
+                get_cu_num(),
+            )
     # Split-K reduction requires contiguous output head dimensions.
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if q.shape[0] == 0:
