@@ -27,12 +27,13 @@ The scripts are in [`mlperf_endpoints_qwen35/`](mlperf_endpoints_qwen35/). Relat
 | Dataset | `mlperf_agentic_inference_dataset`, 613 trajectories, 20,297 assistant turns |
 
 Concurrency: **1-2048, a power of two or three times one** (1, 2, 3, 4, 6, 8, 12, 16, 24, ..., 768,
-1024, 1536, 2048). `run_ep.sh` picks the server from it:
+1024, 1536, 2048). Every point runs MTP with 3 draft tokens (`SPEC=0` turns it off); `run_ep.sh`
+picks the server from the concurrency:
 
 | Concurrency | Server |
 |---|---|
-| 1-16 | TP4, MTP with 3 draft tokens, custom all-reduce |
-| 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity), no MTP |
+| 1-16 | TP4, custom all-reduce |
+| 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
 `--level 0`, 16k-token prefill chunks, decode graphs captured at every size up to `max-num-seqs`.
@@ -75,7 +76,7 @@ their trajectories: 22% of turns at c2048), `MODE` / `SPEC`
 | c | Server | Turns (failed) | TPS | Interactivity (tok/s) | TTFT median | TPOT median | Outputs |
 |---|---|---|---|---|---|---|---|
 | 16 | TP4 + MTP3 | 6,390 (0) | 1,457 | 140.2 | 0.45 s | 5.2 ms | clean |
-| 4096 | DP4 + EP4, 512 / engine | 59,302 (1,873) | 6,779 | n/a | 63 s | 289 ms | clean |
+| 4096 | DP4 + EP4, 512 / engine, no MTP | 59,302 (1,873) | 6,779 | n/a | 63 s | 289 ms | clean |
 
 MTP accepted 2.99 tokens a forward at c16 on the real data. The c4096 point is above the range:
 2,048 conversations run and the rest queue (hence the TTFT and the turns that hit the 900 s
