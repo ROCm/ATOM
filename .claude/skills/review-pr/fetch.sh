@@ -114,20 +114,15 @@ for c in d.get('comments',[]):
 # caught 0 of 3 known overflow defects and no run invoked the scanner at all. Put the candidate
 # list in context before the rule pass instead of relying on the reviewer to remember it.
 #
-# SCAN/SCALE/SCHEMA all live under validate-atom-pr/, which does not exist until P2 -- the same
-# gap REVIEW_AUTO_VALIDATE guards further down. Gated as one block: once that directory exists
-# these go back to being hard requirements exactly as upstream, but before P2 its absence must
-# read as an environment gap on the card, never a finding against the PR and never a reason the
-# whole review fails before rules.txt is even derived.
-SCAN="$SKILLS_ROOT/validate-atom-pr/scan_index_width.py"
+# The scanner lives under review-pr/, not validate-atom-pr/ (which still does not exist --
+# the same gap REVIEW_AUTO_VALIDATE guards further down). It feeds Step 1 review evidence
+# directly; it is not a validation-pipeline executor, so it does not wait on that directory.
+# SCALE/SCHEMA are genuinely P2 (validate-atom-pr/'s own artifacts) and stay gated: their
+# absence reads as an environment gap on the card, never a finding against the PR and never
+# a reason the whole review fails before rules.txt is even derived.
+SCAN="$SKILLS_ROOT/review-pr/scan_index_width.py"
 SCALE="$SKILLS_ROOT/validate-atom-pr/production_scale.md"
 SCHEMA="$SKILLS_ROOT/validate-atom-pr/report_schema.json"
-HAVE_SCAN_INFRA=0
-[ -d "$SKILLS_ROOT/validate-atom-pr" ] && HAVE_SCAN_INFRA=1
-if [ "$HAVE_SCAN_INFRA" = 1 ] && [ ! -x "$SCAN" ]; then
-  echo "required scanner is missing or not executable: $SCAN" >&2
-  exit 1
-fi
 # The scan is an AST pass, so it needs each changed file's post image. The diff names the
 # post-image blob of every hunk, and fetching the PR head puts those blobs in the local object
 # store, where `git cat-file` reaches them without a second worktree. Without this the scan
@@ -145,25 +140,30 @@ BASE_SHA=$(cat "$WORK/base_head.txt")
 HEAD_SHA=$(python3 -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' \
   "$WORK/pr_meta.json")
-if [ "$HAVE_SCAN_INFRA" = 1 ]; then
-  if ! "$SCAN" --diff "$WORK/pr.diff"; then
+
+if [ ! -x "$SCAN" ]; then
+  # The scanner is genuinely missing (not just its P2 validate-atom-pr/ harness) -- this is
+  # the degradation path, kept for that case only, not used as a parking spot for "P2 isn't
+  # here yet".
+  echo "NOT RUN -- index-width scan: scanner is missing or not executable: $SCAN" \
+    | tee "$WORK/index_width_scan.txt" >&2
+else
+  if ! "$SCAN" --diff "$WORK/pr.diff" | tee "$WORK/index_width_scan.txt"; then
     echo "required index-width scan failed; do not report an empty candidate list" >&2
     exit 1
   fi
   # The candidates above cannot be judged without deployment scale, and the scale facts are
-  # useless 400 lines away from them -- print both together.
-  if [ ! -r "$SCALE" ]; then
-    echo "required production-scale evidence is missing: $SCALE" >&2
-    exit 1
+  # useless 400 lines away from them -- print both together when they exist. SCALE/SCHEMA
+  # are validate-atom-pr/'s own P2 artifacts, so their absence is a note, not a hard failure:
+  # the reviewer names the triggering scale from PR/commit context instead.
+  if [ -r "$SCALE" ]; then
+    cat "$SCALE"
+  else
+    echo "note: production-scale evidence (validate-atom-pr/production_scale.md) does not exist yet (P2) -- name the triggering scale from PR/commit context instead" >&2
   fi
-  cat "$SCALE"
   if [ ! -r "$SCHEMA" ]; then
-    echo "required validation report schema is missing: $SCHEMA" >&2
-    exit 1
+    echo "note: validation report schema (validate-atom-pr/report_schema.json) does not exist yet (P2)" >&2
   fi
-else
-  echo "NOT RUN -- index-width scan / scale evidence: validate-atom-pr/ does not exist yet (P2)" \
-    | tee "$WORK/index_width_scan.txt" >&2
 fi
 
 # Triage: decide whether this PR needs runtime evidence at all, and if so, what could carry it.

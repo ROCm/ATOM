@@ -195,10 +195,39 @@ Python code calls a C++ / aiter kernel but doesn't assert `.is_contiguous()` or 
 Trigger: new call to an aiter kernel or C-extension; check that non-trivially-shaped inputs are either asserted contiguous or made contiguous before the call.
 → `⚠️ D8: [tensor] passed to [kernel] without contiguous check — add .contiguous() or assert .is_contiguous()`
 
-**D9 — INT32 overflow in GPU pointer arithmetic** 🔴
-Python wrapper or model code computes a buffer offset or index in `int32` (or `torch.int32`) when the product of dimensions can exceed 2^31 (~2 billion) at production scale.
-Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `total_tokens * head_dim` overflows for long-context batches.
-Trigger: arithmetic involving `token_id`, `total_tokens`, `seq_start`, or `batch_offset` that produces a buffer address or index in int32 without an explicit widening cast to int64 before the multiply.
+**D9 — INT32 overflow in GPU pointer arithmetic** 🔴 *(scanner-backed — read the scan output, not this prose)*
+
+ATOM's best-evidenced rule (three independent production fixes below) is live: `fetch.sh`
+runs `review-pr/scan_index_width.py` over the diff and writes its candidate list to
+`$WORK/index_width_scan.txt` as part of Step 1 evidence, before the rule pass even starts.
+The defect this rule names is an *absence* — no int64 widening before a stride multiply
+that reaches pointer arithmetic — and detecting an absence on a diff hunk needs the index
+variable's type traced through the expression, which a regex cannot do (an earlier
+name-list trigger caught 0 of 3 known ATOM overflow fixes in a controlled run). The scanner
+is an AST pass, ported verbatim from aiter's `scan_index_width.py`: a multiplication is a
+candidate when it feeds pointer/index arithmetic, at least one operand derives from a
+non-`constexpr` kernel parameter (runtime-supplied — the only kind that can grow past
+2^31), and no operand is 64-bit widened (counting widening on an earlier line, carried in
+through a local name). Only sites on diff-added lines are reported.
+
+Python wrapper or model code computes a buffer offset or index in `int32` (or
+`torch.int32`) when the product of dimensions can exceed 2^31 (~2 billion) at production
+scale. Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M
+with H=32, D=128; `total_tokens * head_dim` overflows for long-context batches.
+
+**The candidate list is already in context.** Work it: clear each candidate, and fire D9
+only where you can name the production scale at which the product exceeds 2^31. If the
+list is empty, say so rather than skipping the category silently. If the scan printed a
+`NOT SCANNED` section, D9 cannot be cleared for those files — an empty candidate list that
+excluded them is not evidence of absence.
+
+Real example (ATOM#2565, fixed `3795338967f`): packed KV output offsets computed in int32
+could exceed int32 for long cached batches — fixed by widening the stride multiply to
+int64 before it reaches pointer arithmetic. Scanned clean post-fix (see below).
+Real example (ATOM#2211, fixed `1580bf1af6a`): `address` wraps at `vocab*hidden >= 2^31`,
+shipped NaN at gqa=16 before the int64 widening landed. Scanned clean post-fix.
+Real example (ATOM#1460, fixed `7986573b10c`, `v4_kernels/inverse_rope.py`): same shape,
+same fix. Scanned clean post-fix.
 → `🔴 D9: [expr] in int32 — widen [token_id / total_tokens / seq_start] to int64 before multiplying by [stride]`
 
 **D10 — Sentinel value collides with valid data** 🔴
