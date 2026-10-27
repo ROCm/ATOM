@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 """PAGE-backed global keys and complete, relocatable CSA2 request state."""
 
-import logging
-
 import numpy as np
 import torch
 
@@ -35,8 +33,6 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_write,
 )
 from atom.utils import CpuGpuBuffer, upload_numpy
-
-logger = logging.getLogger(__name__)
 
 from .indices import (
     build_indices,
@@ -440,51 +436,13 @@ class PagedAttentionCache:
         )
 
     def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
-        """Give a checkpoint restore a chance before the contract judges.
+        """A frontend's chance to restore checkpoints before the contract judges.
 
-        The only point between a slot being assigned and its cursor being
-        judged. Placed after the reset, a restore cannot be undone by it;
-        placed before `_report_stale_state`, it is checked by it -- a
-        row-order mistake hands over somebody else's state, and the contract
-        catches exactly that, because the restored cursor then does not equal
-        the position wanted. A wrong restore is a loud death, not a wrong
-        answer.
-
-        Only the rows that would otherwise raise are touched: restoring every
-        row every step overwrites live state with a checkpoint nothing has
-        written, measured as a prefill chunk arriving at `computed=4096` with
-        `cursor=0`. The filter is `~fresh`, the same one the contract uses,
-        so the two cannot drift apart.
+        The point between a slot being assigned and its cursor being judged,
+        so `_report_stale_state` checks whatever a restore produced. Native
+        ATOM restores nothing here; the vLLM plugin's cache overrides it.
         """
-        hook = _CHECKPOINT_RESTORE_HOOK
-        if hook is None:
-            return cursors
-        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
-        if not wrong.size:
-            return cursors
-        # The third element is the request id, not the row index: the checkpoint
-        # block table is addressed in the batch's own row space, which is not
-        # this step's. Handing over the step row read another request's block
-        # ids (measured: a store wrote units 14..21 and the restore read
-        # 192..185 for what should have been the same checkpoint).
-        rows = [
-            (
-                int(step.requests[int(i)].slot),
-                int(starts[int(i)]),
-                ids[int(i)],
-            )
-            for i in wrong
-        ]
-        try:
-            restored = int(hook(rows))
-        except Exception:
-            logger.warning("DeepSeek-V4.1 checkpoint restore failed", exc_info=True)
-            return cursors
-        if not restored:
-            return cursors
-        # Re-read, so the contract judges what the restore produced rather
-        # than what it replaced.
-        return torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
+        return cursors
 
     def _report_stale_state(self, cursors, starts, requests, fresh):
         """Raise on the first request whose state is not where it is wanted.
@@ -495,22 +453,6 @@ class PagedAttentionCache:
         """
         wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
         if not wrong.size:
-            return
-        wrong = np.asarray(
-            [i for i in wrong if not _is_vllm_warmup_request(requests[int(i)])],
-            dtype=np.int64,
-        )
-        if not wrong.size:
-            # vLLM's own synthetic warmup only. It runs a decode step at a
-            # position no request ever reached, through slots nothing wrote,
-            # and discards the output -- so the state it reads is not state
-            # anyone will see. This exemption appeared when the state-checkpoint
-            # layers made the model hybrid: vLLM warms SSM groups with
-            # `_warmup_N_` at position 2, and without it the engine dies
-            # before serving its first request.
-            #
-            # Keyed on vLLM's own naming, so a rename does not silence the
-            # contract -- it brings it back.
             return
         first = int(wrong[0])
 
@@ -566,10 +508,7 @@ class PagedAttentionCache:
         restarted = np.concatenate((np.flatnonzero(fresh), np.flatnonzero(resumes)))
         # where each state has to be
         wanted = np.where(resumes > 0, resumes, starts)
-        # A checkpoint restore has to see this step's cursors before the reset
-        # and the Engram staging do, so with one installed the read blocks
-        # whatever the caller asked for.
-        if histories or _CHECKPOINT_RESTORE_HOOK is not None:
+        if histories:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
             )
@@ -1039,20 +978,3 @@ class PagedAttentionCache:
             layers,
             stride,
         )
-
-
-def _is_vllm_warmup_request(req_id) -> bool:
-    """vLLM's synthetic warmup request, by vLLM's own naming."""
-    text = str(req_id)
-    return text.startswith("_warmup_") and text.endswith("_")
-
-
-#: Set by the state-checkpoint runtime. `rows` is `[(slot, start_token, row)]`
-#: for exactly the rows whose cursor is not where the scheduler wants it;
-#: the hook returns how many it restored.
-_CHECKPOINT_RESTORE_HOOK = None
-
-
-def install_state_checkpoint_restore_hook(hook) -> None:
-    global _CHECKPOINT_RESTORE_HOOK
-    _CHECKPOINT_RESTORE_HOOK = hook

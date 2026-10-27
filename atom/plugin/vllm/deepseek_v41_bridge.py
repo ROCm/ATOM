@@ -1411,7 +1411,6 @@ def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
 
 #: Which request last held each STATE slot, for real batches only.
 _V41_SLOT_OWNERS: dict[int, object] = {}
-_V41_RESTORES_INSTALLED = False
 
 
 def _v41_invalidate_reowned_slots(cache, slots, req_ids, num_computed) -> None:
@@ -1424,7 +1423,7 @@ def _v41_invalidate_reowned_slots(cache, slots, req_ids, num_computed) -> None:
     mid-prompt: one starting at 0 is fresh and reset there. Only with
     checkpoint restores wired: without them nothing resumes mid-prompt.
     """
-    if not _V41_RESTORES_INSTALLED or cache is None or req_ids is None:
+    if getattr(cache, "checkpoint_restore", None) is None or req_ids is None:
         return
     changed = []
     for slot, req_id, start in zip(slots, req_ids, num_computed):
@@ -2103,23 +2102,32 @@ def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None
     not happen quietly.
     """
     from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
-        build_v41_state_checkpoint_copier,
         current_state_checkpoint_worker,
         register_v41_state_checkpoint_adapter,
+    )
+    from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
+
+    adapter = register_v41_state_checkpoint_adapter()
+    if not state_checkpoints_on(adapter, vllm_config):
+        return
+    worker = current_state_checkpoint_worker(adapter)
+    if worker is None:
+        worker = _v41_build_state_checkpoint_worker(vllm_config, adapter, num_slots)
+    # On every bind, not only the first: a rebind builds a new cache, and a
+    # cache without a restore refuses every cross-request hit.
+    cache.checkpoint_restore = _v41_checkpoint_restore(adapter, worker)
+
+
+def _v41_build_state_checkpoint_worker(vllm_config, adapter, num_slots):
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        build_v41_state_checkpoint_copier,
     )
     from atom.plugin.vllm.paged_state_checkpoint import (
         PagedStateCheckpointLayer,
         StateCheckpointWorker,
         register_state_checkpoint_worker,
-        state_checkpoints_on,
     )
 
-    adapter = register_v41_state_checkpoint_adapter()
-    if (
-        not state_checkpoints_on(adapter, vllm_config)
-        or current_state_checkpoint_worker(adapter) is not None
-    ):
-        return
     try:
         copier = build_v41_state_checkpoint_copier(vllm_config, max_batch=num_slots)
         # The ids come off the layers, not off `vllm_config`: the mechanism's
@@ -2142,7 +2150,6 @@ def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None
             )
         worker = StateCheckpointWorker(adapter, copier, groups)
         register_state_checkpoint_worker(worker)
-        _v41_install_restore_hook(adapter, worker)
     except Exception as exc:
         raise RuntimeError(
             "DeepSeek-V4.1 checkpoints are on but their worker could "
@@ -2151,27 +2158,19 @@ def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None
             "for them, so starting without it would serve hits from blocks "
             "nothing wrote."
         ) from exc
+    return worker
 
 
-def _v41_install_restore_hook(adapter, worker) -> None:
-    """Let `PagedAttentionCache.prepare_state` restore from a checkpoint.
+def _v41_checkpoint_restore(adapter, worker):
+    """The restore `VllmBackedPagedAttentionCache` runs before its contract.
 
-    `cache.py` has carried the call site all along (`_restore_stale_rows`,
-    between the slot being assigned and its cursor being judged -- the only
-    place a restore is neither undone by the reset nor unchecked by the
-    contract), but nothing ever called `install_state_checkpoint_restore_hook`, so every
-    cross-request hit died in `_report_stale_state` with `needs state at N,
-    found <whatever the slot's last tenant left>`.
-
-    The hook gets `(slot, wanted_position, batch_row)` for exactly the rows
-    the contract is about to reject, and returns how many it restored; the
-    caller re-reads the cursors so the contract judges the restore. A wrong
-    unit therefore still dies loudly rather than answering from someone
-    else's state.
+    Without it every cross-request hit died in `_report_stale_state` with
+    `needs state at N, found <whatever the slot's last tenant left>`. It gets
+    `(slot, wanted_position, request_id)` for exactly the rows the contract is
+    about to reject and returns how many it restored; the cache re-reads the
+    cursors, so a wrong unit still dies loudly rather than answering from
+    someone else's state.
     """
-    from atom.model_ops.attentions.deepseek_v41.cache import (
-        install_state_checkpoint_restore_hook,
-    )
     from atom.plugin.vllm.paged_state_checkpoint import (
         execute_state_checkpoint_restores,
         state_checkpoint_unit_ids,
@@ -2208,9 +2207,7 @@ def _v41_install_restore_hook(adapter, worker) -> None:
         execute_state_checkpoint_restores(worker.copier, slots, units)
         return len(slots)
 
-    install_state_checkpoint_restore_hook(restore)
-    global _V41_RESTORES_INSTALLED
-    _V41_RESTORES_INSTALLED = True
+    return restore
 
 
 def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:

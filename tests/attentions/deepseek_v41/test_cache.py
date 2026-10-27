@@ -626,17 +626,55 @@ def test_a_deferred_prepare_state_names_the_stale_slot_one_step_later(
         cache.prepare_state(begin_step(cache, [good]), histories=False)
 
 
-def test_an_installed_restore_hook_keeps_the_read_blocking(small_config, monkeypatch):
-    """A restore has to land before the reset and the Engram staging.
+def test_a_frontend_restore_runs_before_the_contract(small_config):
+    """The contract judges what the restore left, not what it replaced."""
+    offered = []
 
-    The deferred probe judges a step's cursors only on the next call, after
-    both, so the hook would never be offered the row. With one installed the
-    read blocks even when the caller asks for no history.
-    """
-    from atom.model_ops.attentions.deepseek_v41 import cache as cache_module
+    class Restoring(PagedAttentionCache):
+        def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
+            offered.append((int(starts[0]), ids[0]))
+            self.cursor[0, 0] = int(starts[0])
+            return torch.index_select(self.cursor, 0, step.slots[:count]).numpy()
 
     geo = replace(geometry(small_config), window_size=32)
-    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    cache = Restoring(geo, 8, 4, "cpu")
+    cache.cursor[0] = torch.tensor([-1, 19, -1, 27])
+    resumed = PagedRequest(27, 7, 0, 1, 0, (0, 1))
+    assert cache.prepare_state(begin_step(cache, [resumed])) is not None
+    assert offered == [(7, 27)]
+
+
+def _plugin_cache(geo, pages, slots):
+    overrides = pytest.importorskip("atom.plugin.vllm.v41_core_overrides")
+    sizes = []
+
+    class Sizing(PagedAttentionCache):
+        def _allocate_backing(self, size, device):
+            sizes.append(size)
+            return torch.zeros(size, dtype=torch.uint8, device=device)
+
+    Sizing(geo, pages, slots, "cpu")
+    backing = torch.zeros(sizes[0], dtype=torch.uint8)
+    return overrides.VllmBackedPagedAttentionCache(
+        geo, pages, slots, "cpu", backing=backing
+    )
+
+
+def test_the_plugin_cache_restores_on_a_deferred_read(small_config, monkeypatch):
+    """A restore has to land before the reset and the Engram staging.
+
+    The deferred read judges a step's cursors only on the next call, after
+    both, so with a restore installed the read blocks even when the caller and
+    `ATOM_V41_BLOCKING_STATE_PROBE=0` ask for the deferred one.
+    """
+    monkeypatch.setenv("ATOM_V41_BLOCKING_STATE_PROBE", "0")
+    geo = replace(geometry(small_config), window_size=32)
+    resumed = PagedRequest(27, 7, 0, 1, 0, (0, 1))
+    # Without a restore the opt-out still defers the read.
+    plain = _plugin_cache(geo, 8, 4)
+    assert plain.prepare_state(begin_step(plain, [resumed]), histories=False) is None
+
+    cache = _plugin_cache(geo, 8, 4)
     # A slot another request held last: its cursor matches no position.
     cache.cursor[0] = torch.tensor([-1, 19, -1, 27])
     offered = []
@@ -647,14 +685,23 @@ def test_an_installed_restore_hook_keeps_the_read_blocking(small_config, monkeyp
             cache.cursor[slot, 0] = position
         return len(rows)
 
-    monkeypatch.setattr(cache_module, "_CHECKPOINT_RESTORE_HOOK", restore)
-    resumed = PagedRequest(27, 7, 0, 1, 0, (0, 1))
-    assert (
-        cache.prepare_state(begin_step(cache, [resumed]), histories=False) is not None
-    )
+    cache.checkpoint_restore = restore
+    step = begin_step(cache, [resumed])
+    assert cache.prepare_state(step, histories=False) is not None
     assert offered == [(0, 7, 27)]
-    cache.advance_cursor(begin_step(cache, [resumed]), np.full((1, 3), -1))
+    cache.advance_cursor(step, np.full((1, 3), -1))
     cache.prepare_state(begin_step(cache, [replace(resumed, position=8)]))
+
+
+def test_the_plugin_cache_leaves_vllm_warmup_rows_unjudged(small_config):
+    """vLLM warms SSM groups with `_warmup_N_` through slots nothing wrote."""
+    cache = _plugin_cache(replace(geometry(small_config), window_size=32), 8, 4)
+    cache.cursor[0] = torch.tensor([3, 19, -1, 27])
+    warmup = PagedRequest("_warmup_0_", 2, 0, 1, 0, (0, 1))
+    cache.prepare_state(begin_step(cache, [warmup]))
+    cache.cursor[0] = torch.tensor([3, 19, -1, 27])
+    with pytest.raises(ValueError, match="Request 28 needs state at 2"):
+        cache.prepare_state(begin_step(cache, [replace(warmup, request_id=28)]))
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

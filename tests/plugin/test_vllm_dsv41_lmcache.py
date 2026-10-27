@@ -445,13 +445,17 @@ def test_a_mid_prompt_request_entering_another_requests_slot_is_restored():
     """A previous tenant that stopped on the same boundary is not this state."""
     import torch
 
-    scope = {"torch": torch, "_V41_SLOT_OWNERS": {}, "_V41_RESTORES_INSTALLED": True}
+    scope = {"torch": torch, "_V41_SLOT_OWNERS": {}}
     invalidate = _from_source(
         "atom/plugin/vllm/deepseek_v41_bridge.py",
         "_v41_invalidate_reowned_slots",
         scope,
     )
-    cache = SimpleNamespace(cursor=torch.tensor([[256, 0], [256, 0], [128, 0]]))
+    cursor = torch.tensor([[256, 0], [256, 0], [128, 0]])
+    # Without a restore nothing resumes mid-prompt, so nothing is invalidated.
+    invalidate(SimpleNamespace(cursor=cursor), [0], ["z"], [256])
+    assert cursor[0, 0].item() == 256 and scope["_V41_SLOT_OWNERS"] == {}
+    cache = SimpleNamespace(cursor=cursor, checkpoint_restore=object())
     invalidate(cache, [0, 1, 2], ["a", "b", "c"], [256, 0, 128])
     # New owners mid-prompt lose their cursor; one starting at 0 is fresh.
     assert cache.cursor[:, 0].tolist() == [-1, 256, -1]
