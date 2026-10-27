@@ -261,3 +261,40 @@ def test_settle_pcp_split_rows_takes_only_self(monkeypatch):
         mr.ModelRunner._settle_pcp_split_rows(runner)
     assert ctx.pcp_split_rows is False
     assert len(warned) == 1
+
+
+def test_aux_gathers_exactly_when_the_target_forward_split(monkeypatch):
+    """After a row-split target prefill the aux hooks hold this rank's 1/pcp
+    stripe; reading it as full rows silently halves DSpark's acceptance."""
+    dr = pytest.importorskip("atom.spec_decode.drafter")
+    ws, n = 4, 10  # pads to 12: 3 rows per rank
+    gathers = []
+
+    def fake_gather(x, pcp_size):
+        gathers.append((x.shape[0], pcp_size))
+        return x.repeat(pcp_size, 1)
+
+    ctx = SimpleNamespace(context=SimpleNamespace(pcp_split_rows=True))
+    monkeypatch.setattr(dr, "get_pcp_world_size", lambda: ws)
+    monkeypatch.setattr(dr, "pcp_allgather_rerange", fake_gather)
+    monkeypatch.setattr(dr, "get_forward_context", lambda: ctx)
+    drafter = SimpleNamespace(_captures_aux=True, _aux_buffers=[torch.ones(16, 2)])
+    hidden = torch.zeros(n, 2)
+
+    (aux,) = dr.Drafter.aux_for(drafter, hidden)
+    assert gathers == [(3, ws)] and aux.shape[0] == n
+
+    gathers.clear()
+    ctx.context.pcp_split_rows = False
+    (aux,) = dr.Drafter.aux_for(drafter, hidden)
+    assert gathers == [] and aux.shape[0] == n
+
+
+def test_draft_split_follows_the_target_not_the_current_pass(monkeypatch):
+    """By step 0 the draft pass has cleared `pcp_split`; whether to split the
+    draft prefill is the target forward's answer, `pcp_split_rows`."""
+    ctx = SimpleNamespace(context=SimpleNamespace(pcp_split_rows=True, pcp_split=False))
+    monkeypatch.setattr(ep, "get_forward_context", lambda: ctx)
+    assert ep._pcp_active_for_draft_model(None) is True
+    ctx.context.pcp_split_rows, ctx.context.pcp_split = False, True
+    assert ep._pcp_active_for_draft_model(None) is False
