@@ -341,7 +341,7 @@ def _paged_builder(blocks=3, *, spec=True):
     builder._qsa_fields = _fields
     builder.device = torch.device("cpu")
     builder.kv_pools = {}
-    builder.pool_rows = {}
+    builder._pool_rows = {}
     cls.allocate_kv_cache_tensors(builder, blocks=blocks, buf=None)
     published = qsa_published_page_bytes(_fields())
     builder.model_runner.state_runtime = (
@@ -441,8 +441,9 @@ def test_transfer_contract_catches_published_regions_drifting(monkeypatch):
 
 
 def test_transfer_contract_catches_a_missing_field():
-    """`rope_positions` (or any field) absent from the published set changes
-    the regions but not the arena: the comparison fails closed."""
+    """`rope_positions` (or any field) absent from the published set fails
+    closed. The unit-size check sees it first; a reorder, which keeps the
+    size, is what needs the arena comparison (the test above)."""
     builder, cls = _paged_builder()
     builder.qsa_region_pool._rows = [
         row
@@ -450,7 +451,7 @@ def test_transfer_contract_catches_a_missing_field():
         if ".index_compressed." not in row[0]
     ]
     builder._page_unit_region_cache = None
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="PAGE unit is 592 B"):
         cls.get_kv_transfer_tensors(builder)
 
 
