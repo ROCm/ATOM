@@ -370,7 +370,7 @@ def test_qsa_builder_inherits_the_page_contract_through_hooks():
     ):
         assert name not in vars(cls), name
         assert name in vars(GDNAttentionMetadataBuilder), name
-    for name in ("_page_unit_pools", "_published_page_unit_bytes"):
+    for name in ("_page_unit_pools", "_page_unit_arenas", "_published_page_unit_bytes"):
         assert name in vars(cls), name
 
 
@@ -415,3 +415,51 @@ def test_page_unit_segments_trim_to_the_image():
     image = builder.model_runner.state_runtime.checkpoint_spec.image_bytes
     _, sizes = cls.page_unit_segments(builder, [0, 2])
     assert int(sizes.sum()) == image
+
+
+def test_transfer_contract_matches_the_arena_byte_layout():
+    builder, cls = _paged_builder()
+    transfer = cls.get_kv_transfer_tensors(builder)
+    assert transfer.paged_state_region_count == 8  # 4 fields * 2 layers
+    assert transfer.paged_state_checkpoint_spec is (
+        builder.model_runner.state_runtime.checkpoint_spec
+    )
+    assert [
+        (page.region.base_addr, page.region.unit_bytes) for page in transfer.pages
+    ] == builder.qsa_arena.region_layout()
+
+
+def test_transfer_contract_catches_published_regions_drifting(monkeypatch):
+    """Published views and the copy's regions read the same pool, so the check
+    compares them with the arena's own offsets: a reorder there is caught."""
+    builder, cls = _paged_builder()
+    rows = builder.qsa_region_pool._rows
+    rows[0], rows[2] = rows[2], rows[0]  # k.0 <-> v.0
+    builder._page_unit_region_cache = None
+    with pytest.raises(RuntimeError, match="do not match the checkpoint PAGE unit"):
+        cls.get_kv_transfer_tensors(builder)
+
+
+def test_transfer_contract_catches_a_missing_field():
+    """`rope_positions` (or any field) absent from the published set changes
+    the regions but not the arena: the comparison fails closed."""
+    builder, cls = _paged_builder()
+    builder.qsa_region_pool._rows = [
+        row
+        for row in builder.qsa_region_pool._rows
+        if ".index_compressed." not in row[0]
+    ]
+    builder._page_unit_region_cache = None
+    with pytest.raises(RuntimeError):
+        cls.get_kv_transfer_tensors(builder)
+
+
+def test_arena_region_layout_matches_its_views():
+    arena = LayerMajorArena(_fields(), entries=5, device="cpu")
+    expected = [
+        (view[layer].data_ptr(), view[layer].stride(0) * view.element_size())
+        for field in arena.fields
+        for view in (arena.view(field.name),)
+        for layer in range(field.layers)
+    ]
+    assert arena.region_layout() == expected

@@ -434,7 +434,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     # The PAGE image lives in the QSA arena; the parent's PAGE contract
     # (`_page_unit_regions`, `page_unit_views`, `page_unit_segments`,
     # `checkpoint_page_unit_bytes`, `get_kv_transfer_tensors`' tail) reads it
-    # through these two hooks.
+    # through these three hooks.
 
     def _published_page_unit_bytes(self) -> int:
         from atom.model_ops.attentions.pool_layout.qsa_page_unit_geometry import (
@@ -448,6 +448,12 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         if pool is None:
             raise RuntimeError("Qwen3.8 PAGE checkpoint has no QSA arena")
         return [pool]
+
+    def _page_unit_arenas(self) -> list:
+        arena = getattr(self, "qsa_arena", None)
+        if arena is None:
+            raise RuntimeError("Qwen3.8 PAGE checkpoint has no QSA arena")
+        return [arena]
 
     def clear_page_units(self, unit_ids) -> None:
         """Reset these PAGE units in the QSA arena (`BlockPool.state_images`).

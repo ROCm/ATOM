@@ -1714,9 +1714,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         Everything below reads the PAGE image through this, so a builder that
         keeps its pages elsewhere (Qwen3.8's QSA arena) overrides it and
-        ``_published_page_unit_bytes``, nothing else.
+        ``_page_unit_arenas`` / ``_published_page_unit_bytes``, nothing else.
         """
         return list(self.kv_pools.values())
+
+    def _page_unit_arenas(self) -> list:
+        """The arenas behind ``_page_unit_pools``, in the same region order."""
+        return [
+            arena
+            for pool in self._page_unit_pools()
+            for arena in (pool.cache, pool.scale, pool.extra)
+            if arena is not None
+        ]
 
     def _published_page_unit_bytes(self) -> int:
         """Bytes one block publishes, from the declaration (before allocation)."""
@@ -1824,7 +1833,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return self._with_paged_state_contract(super().get_kv_transfer_tensors())
 
     def _with_paged_state_contract(self, transfer):
-        """Attach the native checkpoint contract to the published PAGE regions."""
+        """Attach the native checkpoint contract to the published PAGE regions.
+
+        The regions a unit spans are checked against the arenas' own byte
+        offsets (``LayerMajorArena.region_layout``), not against
+        ``_page_unit_regions``: both of those read the same pool views and
+        would move together.
+        """
 
         if transfer is None or not self._uses_paged_checkpoints():
             return transfer
@@ -1832,16 +1847,24 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         spec = None if runtime is None else runtime.checkpoint_spec
         if spec is None:
             return transfer
-        bases, sizes = self._page_unit_regions()
+        bases, _ = self._page_unit_regions()
         count = len(bases)
         published = [
             (page.region.base_addr, page.region.unit_bytes)
             for page in transfer.pages[:count]
         ]
-        if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
+        expected = [
+            region
+            for arena in self._page_unit_arenas()
+            for region in arena.region_layout()
+        ]
+        if published != expected or sum(size for _, size in expected) != int(
+            spec.page_unit_bytes
+        ):
             raise RuntimeError(
                 "transfer regions do not match the checkpoint PAGE unit: "
-                f"{len(transfer.pages)} published, {count} in a unit"
+                f"{len(transfer.pages)} published, {count} in a unit, "
+                f"{len(expected)} in the arenas"
             )
         transfer.paged_state_checkpoint_spec = spec
         transfer.execute_paged_state_copies = self.execute_paged_state_copies

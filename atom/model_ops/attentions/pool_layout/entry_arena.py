@@ -583,6 +583,24 @@ class LayerMajorArena:
             + self._offsets[field.name] * self.entries // itemsize,
         )
 
+    def region_layout(self) -> list[tuple[int, int]]:
+        """`(base address, bytes per entry)` of each field's layers, in field order.
+
+        Byte arithmetic on the declared offsets rather than `view`, so a
+        caller comparing it with the views a transfer publishes catches either
+        side drifting from the arena's actual layout.
+        """
+        base = self.buf.data_ptr()
+        regions: list[tuple[int, int]] = []
+        for field in self.fields:
+            unit = field.per_layer_numel * field.dtype.itemsize
+            start = base + self._offsets[field.name] * self.entries
+            regions.extend(
+                (start + layer * unit * self.entries, unit)
+                for layer in range(field.layers)
+            )
+        return regions
+
     def reset_entries(self, entries: torch.Tensor) -> None:
         """Put every field of ``entries`` back to its declared fill, in every layer.
 
