@@ -29,6 +29,7 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
     engine_budget,
 )
+from atom.model_engine.dp_cache_routing import DPCacheRouting
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
@@ -58,7 +59,7 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
-DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
+DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "cache_affinity")
 DP_LB_DEFAULT = "least_requests"
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
@@ -181,7 +182,7 @@ def _add_frame(seqs: list[Sequence]) -> bytes:
     return pickle.dumps(frame)
 
 
-class CoreManager:
+class CoreManager(DPCacheRouting):
     def _init_shared_state(
         self,
         config: Config,
@@ -262,18 +263,15 @@ class CoreManager:
         # A subclass may fan out through its own add_request() and never charge
         # load at all, but the inherited output thread still calls
         # _release_seq_load() on every finished sequence, so these MUST exist.
-        # Strategy: "round_robin" | "least_requests" | "least_tokens" (validated
-        # at the CLI by argparse choices=DP_LB_STRATEGIES).
+        # Validated at the CLI by argparse choices=DP_LB_STRATEGIES.
         self._dp_lb_strategy = config.dp_load_balance
         # Token-equivalent weight of one in-flight request for "least_tokens".
         # Read once here: this is a construction-time config value (CoreManager
         # is built after env/args are finalized), not a runtime-tunable knob.
         self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
         self._dp_session_affinity_enabled = envs.ATOM_DP_SESSION_AFFINITY
-        # Session id -> rank whose local prefix cache owns the session. Owners
-        # are immutable for the lifetime of the process: moving one turn to a
-        # light rank discards the dominant optimization in agentic workloads,
-        # namely reuse of the accumulated conversation prefix.
+        # Legacy strict-affinity owners. The cache_affinity policy keeps its
+        # own owner table and does not populate or consult these legacy maps.
         self._dp_session_owners: dict[str, int] = {}
         # Last prompt length observed for each sticky session.  A later turn on
         # the same owner normally reuses the old prompt, so only its positive
@@ -303,6 +301,7 @@ class CoreManager:
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
         self._lb_lock = Lock()
+        self._init_dp_cache_balance(config)
         # Control traffic (utility commands, abort, shutdown) travels on its own
         # sockets so that input_sockets keeps a single writer -- see
         # _send_request. These have several writer threads and so do need
@@ -721,7 +720,7 @@ class CoreManager:
                                     )
                             if request_output.finished:
                                 self._seq_id_to_callback.pop(seq_id, None)
-                                self._release_seq_load(seq_id)
+                                self._release_seq_load(seq_id, succeeded=True)
                                 if dbg:
                                     logger.debug(
                                         f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
@@ -742,6 +741,8 @@ class CoreManager:
                                 )
                     elif request_type == EngineCoreRequestType.METRICS:
                         self.latest_metrics[dp_rank] = data
+                    elif request_type == EngineCoreRequestType.CACHE_ADMITTED:
+                        self._cache_admitted(dp_rank, data)
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
@@ -761,9 +762,15 @@ class CoreManager:
                         # the finished-seq list and this socket is FIFO), so a
                         # normal completion finds nothing to do below.
                         delivered = False
+                        completed = []
                         for seq in seqs:
+                            if self._retry_cache_migration(dp_rank, seq):
+                                continue
                             delivered |= self._deliver_terminal_output(seq)
-                            self._release_seq_load(seq.id)
+                            self._release_seq_load(
+                                seq.id, succeeded=bool(seq.output_tokens)
+                            )
+                            completed.append(seq)
                         if delivered and self._flush_stream_batch_fn is not None:
                             # The callbacks above only buffer into a thread-local;
                             # without this flush the chunk never reaches the
@@ -775,7 +782,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        if completed:
+                            self.outputs_queue.put_nowait(completed)
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
@@ -1178,17 +1186,20 @@ class CoreManager:
     def _select_dp_rank_for_seq_locked(
         self, seq: Sequence, explicit_rank: int | None
     ) -> int:
-        """Route one sequence using explicit hint, strict owner, then load.
+        """Use cache-aware placement when selected, otherwise legacy routing.
 
-        This intentionally matches SGLang Model Gateway's agentic routing
-        semantics: a stable correlation/session id selects one DP rank, and
-        every later turn stays there. Load cannot move an existing session;
-        doing so turns a cheap cache hit into a potentially huge prefill.
+        Both paths honor an explicit rank. Legacy session affinity pins later
+        turns to the first owner; cache_affinity can prepare a migration and
+        commit a new owner after the target confirms its recoverable prefix.
 
         Parent lineage does not affect placement. Each child correlation id is
-        its own sticky session, preventing sibling subagents from dogpiling the
-        root's rank. Requests without a session retain normal load balancing.
+        its own session, preventing siblings from dogpiling the root's rank.
+        Requests without a session use the selected policy's load estimate.
         """
+        if getattr(self, "_cache_balancer", None) is not None:
+            rank = self._select_cache_rank_locked(seq, explicit_rank)
+            self._dp_route_counters.setdefault("cache_affinity_total", 0)
+            return self._record_dp_route_locked("cache_affinity_total", rank)
         if explicit_rank is not None:
             if self._dp_session_affinity_enabled:
                 # An explicit placement is authoritative and becomes the
@@ -1234,7 +1245,13 @@ class CoreManager:
         """Return a consistent, non-mutating snapshot of DP routing state."""
         with self._lb_lock:
             sessions_per_rank = [0] * self._routable_engine_count
-            for rank in self._dp_session_owners.values():
+            balancer = getattr(self, "_cache_balancer", None)
+            owners = (
+                (s.owner for s in balancer.sessions.values())
+                if balancer
+                else self._dp_session_owners.values()
+            )
+            for rank in owners:
                 if 0 <= rank < self._routable_engine_count:
                     sessions_per_rank[rank] += 1
             return {
@@ -1244,6 +1261,7 @@ class CoreManager:
                 "inflight_requests_per_rank": list(self._rank_reqs),
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
+                "cache_balance": balancer.statistics() if balancer else {},
             }
 
     def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
@@ -1252,7 +1270,10 @@ class CoreManager:
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
-        if self._dp_session_affinity_enabled and session_id:
+        balancer = getattr(self, "_cache_balancer", None)
+        if balancer is not None:
+            tok_cost = max(0, prompt_tokens - balancer.requests[seq.id].estimated_hit)
+        elif self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
             if previous_prompt_tokens is not None:
                 # Agentic turns normally extend their previous prompt.  Charge
@@ -1305,7 +1326,7 @@ class CoreManager:
         )
         return True
 
-    def _release_seq_load(self, seq_id) -> None:
+    def _release_seq_load(self, seq_id, *, succeeded=False) -> None:
         """Undo a seq's in-flight load when it finishes or is aborted.
 
         Idempotent: a seq is only charged once and released once, so a repeated
@@ -1318,6 +1339,7 @@ class CoreManager:
             dp_rank, req_cost, tok_cost = entry
             self._rank_reqs[dp_rank] -= req_cost
             self._rank_tokens[dp_rank] -= tok_cost
+            self._finish_cache_placement_locked(seq_id, succeeded)
 
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
@@ -1369,8 +1391,17 @@ class CoreManager:
             self._seq_load.clear()
             self._dp_session_owners.clear()
             self._dp_session_prompt_tokens.clear()
+            if getattr(self, "_cache_balancer", None) is not None:
+                from atom.model_engine.dp_cache_balance import CacheBalancer
+
+                self._cache_balancer = CacheBalancer(
+                    self._routable_engine_count, self._cache_balancer.config
+                )
+                self._cache_retry_payloads.clear()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
+        if cmd == "clear_kv_cache" or cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+            self._invalidate_cache_predictions()
         self._refuse_unowned_weight_sync_cmd(cmd, None)
         if dp_rank is None:
             # Send to all DP ranks
@@ -1549,6 +1580,8 @@ class CoreManager:
             )
 
     def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+        if cmd == "clear_kv_cache" or cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+            self._invalidate_cache_predictions()
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)

@@ -550,12 +550,39 @@ def test_one_rank_pads_its_prefill_to_the_smallest_bucket_that_holds_it():
     assert bucket(600) == (0, [600])
 
 
-def test_only_prefilling_ranks_pad_in_the_table():
-    # A prefill beside a peer decoding its own 6 rows.
+def test_mixed_prefill_decode_keeps_live_collective_sizes():
+    # A restored prefill can appear after the scheduler voted for dummy
+    # decode. Its token graph recorded all-prefill collectives, so neither
+    # rank may replay or pad to that recording on this mixed step.
     sync = _graph_sync([300, 6], prefill=(1, 0))
-    assert _bucket(True, sync) == (384, [384, 6])
-    # A peer off the token graph still bounds its dispatch by the padded count.
-    assert _bucket(False, sync) == (0, [384, 6])
+    assert _bucket(True, sync) == (0, [300, 6])
+    assert _bucket(False, sync) == (0, [300, 6])
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_restored_prefill_and_dummy_decode_choose_eager_together(rank):
+    # The real-model hang: a 896-token restored suffix beside a six-token
+    # DSpark dummy. The next all-prefill step must still be graphable.
+    running = np.full(2, 5, dtype=np.int32)  # previous draft width
+    mixed = _graph_sync([6, 896], prefill=(0, 1))
+    batch = (
+        _batch(seqs=1, q=6)
+        if rank == 0
+        else _batch(seqs=1, tokens=896, prefill_tokens=896)
+    )
+    with (
+        mock.patch("atom.utils.tbo.ubatching.sync_dp_metadata", return_value=mixed),
+        mock.patch.object(TokenGraph, "bucket", return_value=1024),
+    ):
+        mode = _decide(
+            batch,
+            dp_size=2,
+            is_block_drafter=True,
+            running_tokens_per_dp_rank=running,
+        )
+    assert not mode.use_cudagraph and not mode.token_graph and not mode.req_graphs
+    assert mode.running_tokens == [6, 896][rank]
+    assert running.tolist() == [6, 896]
 
 
 def test_every_prefilling_rank_replays_the_groups_bucket():

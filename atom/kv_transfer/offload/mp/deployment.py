@@ -14,6 +14,7 @@ import json
 import logging
 from dataclasses import replace
 from typing import Any
+from urllib.parse import urlsplit
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.utils import envs
@@ -122,11 +123,11 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     # descriptors per (model_name, world_size) (all replicas publish the same
     # one), and _mp_session_id scopes request sessions and their locks per
     # replica.
-    if dp_size_local != dp_size:
+    if dp_size_local != dp_size and _mapped_server_url(config) is None:
         raise NotImplementedError(
             "lmcache_mp supports DP and DP-attention only within one host; "
-            "multi-node DP requires one LMCache server per host and local "
-            "server routing "
+            "multi-node DP requires one LMCache server per host and explicit "
+            "lmcache.mp.server_urls_by_rank routing "
             f"(data_parallel_size={dp_size}, local={dp_size_local})"
         )
 
@@ -233,7 +234,60 @@ def _published_tp_replication_factor(
     return factor
 
 
+def _mapped_server_url(config: Any) -> str | None:
+    """One GPU-local MP endpoint per global engine rank.
+
+    A shared backing tier moves content between hosts. MP registration and
+    CUDA/HIP IPC always stay with the server on that engine's own host.
+    """
+    mapping = _extra_config(config).get("lmcache.mp.server_urls_by_rank")
+    if mapping is None:
+        return None
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("lmcache.mp.server_urls_by_rank must be a nonempty object")
+    pc = getattr(config, "parallel_config", None)
+    count = int(
+        getattr(pc, "data_parallel_size", getattr(config, "data_parallel_size", 1))
+    )
+    if getattr(config, "enable_dp_attention", False):
+        count *= int(config.tensor_parallel_size)
+    normalized = {}
+    for key, value in mapping.items():
+        if isinstance(key, bool) or not str(key).isdigit():
+            raise ValueError("MP endpoint keys must be global engine rank numbers")
+        rank = int(key)
+        if rank in normalized:
+            raise ValueError("duplicate MP endpoint rank")
+        if not isinstance(value, str) or value != value.strip():
+            raise ValueError("MP endpoints must be TCP URLs")
+        url = value if "://" in value else f"tcp://{value}"
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "tcp"
+            or not parsed.hostname
+            or not parsed.port
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+        ):
+            raise ValueError("MP endpoints must be tcp://host:port")
+        normalized[rank] = url
+    if set(normalized) != set(range(count)):
+        raise ValueError(
+            f"MP endpoint mapping must cover all {count} global engine ranks"
+        )
+    rank = int(getattr(pc, "data_parallel_rank", 0))
+    if rank not in normalized:
+        raise ValueError("current engine rank is absent from MP endpoint mapping")
+    return normalized[rank]
+
+
 def _server_urls(config: Any) -> list[str]:
+    mapped = _mapped_server_url(config)
+    if mapped is not None:
+        return [mapped]
     extra = _extra_config(config)
     configured = extra.get("lmcache.mp.server_urls")
     if configured is not None:

@@ -516,7 +516,12 @@ def test_reset_clears_even_with_charged_in_flight():
 
 
 def test_dp_lb_strategies_constant():
-    assert DP_LB_STRATEGIES == ("round_robin", "least_requests", "least_tokens")
+    assert DP_LB_STRATEGIES == (
+        "round_robin",
+        "least_requests",
+        "least_tokens",
+        "cache_affinity",
+    )
     assert "least_request" not in DP_LB_STRATEGIES  # guards against typos
 
 

@@ -344,6 +344,13 @@ class ForwardMode:
         bucket = region_graph.TokenGraph.bucket
         running = running_tokens_per_dp_rank
         np.copyto(running, sync.scheduled_tokens_per_dp_rank)
+        # Prefill recordings contain the DP collectives of an all-prefill
+        # step. A cache restore can become runnable after the scheduler's
+        # prefill vote, leaving a peer on dummy decode. Keep that mixed step
+        # eager on every rank; padding only its prefill side cannot make the
+        # recorded collective agree with the peer's live variable-length one.
+        if not all(sync.prefill_across_dp):
+            return 0
         group = bucket(running.max(), "prefill") if graphable else None
         if group is None:
             return 0

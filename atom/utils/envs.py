@@ -192,6 +192,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pressure) and a smaller value toward prompt-token balance (prefill
     # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
+    # JSON cost estimates, migration budgets and hysteresis for cache_affinity.
+    "ATOM_DP_CACHE_BALANCE_CONFIG": lambda: os.getenv(
+        "ATOM_DP_CACHE_BALANCE_CONFIG", "{}"
+    ),
     # Place a new agent session on the lightest DP rank, then keep every later
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than

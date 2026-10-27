@@ -36,6 +36,7 @@ from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
+from atom.model_engine.dp_cache_admission import DPCacheAdmission
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     USEFUL_SHRINK_REFERENCE_CHUNKS,
@@ -587,7 +588,7 @@ class ScheduledBatchOutput:
         return self._req_id_to_idx.get(req_id)
 
 
-class Scheduler:
+class Scheduler(DPCacheAdmission):
     """Manages the lifecycle of inference requests through prefill and decode.
 
     The scheduler maintains two primary queues:
@@ -1251,6 +1252,10 @@ class Scheduler:
         remaining = seq.num_tokens - start
         if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
             remaining = self.long_prefill_token_threshold + cap_from - start
+        if not getattr(seq, "dp_cache_admission_sent", False):
+            boundary = getattr(seq, "dp_cache_alignment_boundary", 0)
+            if boundary:
+                remaining = min(remaining, max(0, boundary - start))
         chunk = self._chunked_prefill_size(
             remaining,
             self._prefill_room(batched_tokens, start),
@@ -1501,6 +1506,7 @@ class Scheduler:
     def add(self, seq: Sequence):
         tracing.enqueue(seq)
         self.metrics.enqueue(seq)
+        self._track_cache_migration(seq)
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
         self._arrived_requests += 1
@@ -1509,6 +1515,7 @@ class Scheduler:
         tracing.enqueue_many(seqs)
         for seq in seqs:
             self.metrics.enqueue(seq)
+            self._track_cache_migration(seq)
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
         self._arrived_requests += len(seqs)
@@ -1961,6 +1968,7 @@ class Scheduler:
 
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
+        self._expire_cache_migrations()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._reject_aborted_waiting(self.waiting.popleft())
@@ -2060,7 +2068,7 @@ class Scheduler:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
-                if not seq.is_partial_prefill:
+                if not seq.is_partial_prefill or seq.status == SequenceStatus.ABORTED:
                     continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
@@ -2074,6 +2082,11 @@ class Scheduler:
                 if chunk:
                     self._resume_prefill(seq, start, hit=False)
                     chunk = self._finalize_prefill_chunk(seq, start, chunk)
+                    if not self._cache_alignment_fits(seq, start, chunk):
+                        seq.dp_cache_retry_reason = "alignment_chunk_unavailable"
+                        self.__dict__.get("_dp_cache_preparing", {}).pop(seq.id, None)
+                        self.abort_request(seq.id)
+                        continue
                 if chunk <= 0:
                     break
                 self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
@@ -2181,6 +2194,8 @@ class Scheduler:
                 continue
 
             if offload_resume:
+                if not self._admit_cache_placement(seq):
+                    continue
                 # Blocks already held from the pre-park allocate; only re-check
                 # the batch budget. No re-match / re-allocate / re-park.
                 #
@@ -2466,6 +2481,8 @@ class Scheduler:
             # the request is certain to prefill locally. The only path reaching
             # this with an inherited PD hit is a *failed* remote recv, and there
             # the local hit is the truthful number.
+            if not self._admit_cache_placement(seq):
+                continue
             seq.prefix_cache_hit_tokens = seq.num_cached_tokens
             self._resume_prefill(
                 seq,
@@ -2479,6 +2496,9 @@ class Scheduler:
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
+            if not self._cache_alignment_fits(seq, seq.num_cached_tokens, chunk):
+                self._reject_cache_migration(seq, "alignment_chunk_unavailable")
+                continue
 
             # Re-assert the atomic-prefill invariant against the *final* chunk.
             # The guard above ran on the pre-allocation size, but the two
@@ -2894,6 +2914,7 @@ class Scheduler:
         return True
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
+        self.__dict__.get("_dp_cache_preparing", {}).pop(seq.id, None)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
@@ -4721,6 +4742,9 @@ class Scheduler:
         keep_running: deque[Sequence] = deque()
         while self.running:
             seq = self.running.popleft()
+            if seq.status == SequenceStatus.ABORTED:
+                keep_running.append(seq)
+                continue
             should_park = self.kv_connector.should_park_partial_prefill_for_load(seq)
             if should_park:
                 if seq.is_partial_prefill:
