@@ -285,10 +285,14 @@ class _SubmitOnlyClient:
 
 
 def test_a_client_without_named_calls_is_driven_through_submit_request(monkeypatch):
-    """Calling `client.lookup` there raised AttributeError inside schedule()."""
+    """Calling `client.lookup` there raised AttributeError inside schedule().
+
+    Needs the module the fallback imports, which LMCache 0.5.5 has and 0.5.6
+    (whose client names its calls) does not.
+    """
     import pytest
 
-    pytest.importorskip("lmcache")
+    pytest.importorskip("lmcache.v1.multiprocess.protocol")
     monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
     fake = _SubmitOnlyClient(chunks=2)
     adapter = _Adapter(fake)
