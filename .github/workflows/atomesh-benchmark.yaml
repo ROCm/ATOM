@@ -144,16 +144,16 @@ on:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
             kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4
 
-          MiniMax-M3.1-Flash (accuracy, GSM8K 20-shot):
-            minimax-m31-flash-mxfp4-1p1d-tp4-gsm8k-20shot-c32
+          MiniMax-M3.1-Flash (accuracy, DSpark7/NVFP4, GSM8K 5-shot):
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-gsm8k-5shot-c32
 
-          MiniMax-M3.1-Flash (mooncake_store, TP4 P/D, DSpark3, AgentX):
-            minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c32,
-            minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c48,
-            minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c64
+          MiniMax-M3.1-Flash (mooncake_store, TP4 P/D, DSpark7/NVFP4, AgentX):
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32,
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c48,
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c64
 
-          MiniMax-M3.1-Flash (profile, same C32, P/D traces at Profiling +30 to +33 min):
-            minimax-m31-flash-mxfp4-1p1d-tp4-dspark3-mcstore-agentx-c32-profile
+          MiniMax-M3.1-Flash (profile, C32, 30s P/D traces at Profiling +30 min):
+            minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32-profile
 
           MiniMax:
             minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
@@ -166,9 +166,9 @@ on:
         default: ''
         type: string
       atomesh_image:
-        description: 'Override ATOM docker image'
+        description: 'Override ATOM docker image; blank uses the selected recipe or backend default'
         required: false
-        default: rocm/atom-dev:latest
+        default: ''
         type: string
       atom_source:
         description: 'ATOM python package the servers import: mounted = this checkout (mounted at /workspace/ATOM), image = the copy installed in the docker image (/app/ATOM). Scripts and the mesh router still come from this checkout.'
@@ -292,6 +292,8 @@ jobs:
         id: image
         env:
           INPUT_ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
+          INPUT_MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
+          INPUT_CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -307,6 +309,21 @@ jobs:
 
           cfg = yaml.safe_load(Path(".github/benchmark/models_atomesh.yaml").read_text(encoding="utf-8")) or {}
           default_image = str(cfg.get("backends", {}).get("atom", {}).get("image", "")).strip()
+          # A selected recipe may pin a tested image. Explicit dispatch input
+          # still takes precedence, including for mixed-model runs.
+          selected_models = {name.strip() for name in os.environ.get("INPUT_MODEL_NAMES", "").split(",") if name.strip()}
+          selected_cases = {name.strip() for name in os.environ.get("INPUT_CASE_NAMES", "").split(",") if name.strip()}
+          models = cfg.get("models", {})
+          if selected_cases:
+              selected_models = {
+                  name for name, model in models.items()
+                  if any(case.get("name") in selected_cases
+                         for cases in model.get("suites", {}).values()
+                         for case in (cases if isinstance(cases, list) else [cases]))
+              }
+          selected_images = {models[name].get("image") or default_image for name in selected_models if name in models}
+          if len(selected_images) == 1:
+              default_image = selected_images.pop()
           image = os.environ.get("INPUT_ATOMESH_IMAGE", "").strip() or default_image
 
           def docker_tags(prefix: str) -> list[dict]:
