@@ -475,7 +475,8 @@ the host, give each its own endpoints.
 | **ATOM_PROFILER_WITH_STACK** | bool | `ATOM_PROFILER_MORE` | Set to `1`/`0` to enable/disable `with_stack` (Python stack capture). Takes precedence over `ATOM_PROFILER_MORE`; unset or empty falls back to it. |
 | **ATOM_PROFILER_PROFILE_MEMORY** | bool | `ATOM_PROFILER_MORE` | Set to `1`/`0` to enable/disable `profile_memory`. Takes precedence over `ATOM_PROFILER_MORE`; unset or empty falls back to it. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
-| **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
+| **ATOM_LOG_LEVEL** | str | `INFO` | Standard Python logging level name for ATOM's `atom` logger and its console handler (for example, `DEBUG`, `WARNING`, or `ERROR`). `NOTSET` and invalid names fall back to `INFO`. Each ATOM record is printed once: by the application's handlers on the root logger when it has any (for example after `logging.basicConfig`), in the application's format; otherwise by ATOM's own console handler. The root logger's level does not filter ATOM records; this variable does. The diffusion server's `--log-level` overrides this variable for the server and its workers. This does not control AITER logging; set `AITER_LOG_LEVEL` separately for the AITER library. |
+| **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, ATOM's own console handler uses a verbose format (includes process name, PID, path, line number, function name). Records printed by the application's root-logger handlers keep the application's format. |
 
 ## Garbage collection
 

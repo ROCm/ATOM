@@ -300,8 +300,7 @@ models:
                 HIP_VISIBLE_DEVICES: "4,5,6,7"
             benchmark: &agentic_1m_aiperf
               kind: aiperf_agentic
-              aiperf_commit: b7b16cf851885567988a643282266bce74e34437
-              scenario: inferencex-agentx-mvp
+              scenario: agentx
               public_dataset: semianalysis_cc_traces_weka_062126
               apply_chat_template: true
               max_context_length: 1048576
@@ -316,7 +315,6 @@ models:
               slice_duration: 1.0
               cancel_drain_timeout: 300
               http_tcp_user_timeout: 900000
-              dataset_weka_live_assistant_responses: 0
               dataset_configuration_timeout: 1800
               service_profile_configure_timeout: 1800
               wait_server_timeout: 4500
@@ -943,9 +941,7 @@ models:
               cudagraph: auto
               cudagraph_mode: FULL
               compilation_level: 3
-            benchmark:
-              <<: *agentic_1m_aiperf
-              aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+            benchmark: *agentic_1m_aiperf
             run_eval: false
           name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1
           concurrency: [1]
