@@ -3706,9 +3706,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # from cache. Only referenced by the chunked-prefill debug log, but keep
         # it consistent to avoid a None in "%d" formatting.
         ub_attn.total_kv = int(info.ub_num_tokens + prefix_len)
-        # MLA now uses chunk-specific KV workspaces, not the generic dense
-        # gather view. Do not retain a pre-split descriptor with different KV.
-        ub_attn.prefill_request_lengths = None
         ub_attn.mla_chunk_meta = MLAChunkContextMetadata(
             kv_indptr=kv_indptr_list,
             kv_indices=kv_indices_list,

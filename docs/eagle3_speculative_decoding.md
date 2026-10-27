@@ -136,19 +136,6 @@ The legacy draft's `config.json` has none of the new fields, so all `getattr`
 toggles fall through to their EAGLE 3 defaults. Behavior is byte-equivalent
 to pre-EAGLE-3.1 ATOM.
 
-## Limit cached-prefill K/V workspace
-
-The global [`--gqa-prefill-kv-workspace-mb`](prefill_kv_workspace.md) option bounds
-dense K/V materialization for each eligible target or draft attention layer.
-For an 8 GiB per-rank, per-call budget, add `--gqa-prefill-kv-workspace-mb 8192`.
-The default is `0` (disabled), and this option currently requires PCP=1.
-
-Eagle's first prefill pass and `compute_draft_kv()` reuse the target request
-metadata, but grouping uses the consuming layer's own KV heads, head dimension
-and gathered dtype. An MHA draft can therefore group even when its target uses
-MLA or sparse attention. The budget applies only when that layer dispatches to
-dense gather + attention; later draft decode steps do not group.
-
 ## Runtime acceptance stats
 
 ATOM's scheduler already emits per-window acceptance via the spec section of

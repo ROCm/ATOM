@@ -35,7 +35,6 @@ from atom.model_ops.attentions.token_layout.batch_ids import (
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
-from atom.model_ops.prefill_workspace import PrefillRequestLengths
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, AttnState, ForwardMode
@@ -959,14 +958,6 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
         )
-        if self.model_runner.config.gqa_prefill_kv_workspace_mb and scheduled_bs:
-            # Shared by target and Eagle step 0, even for an MLA target with
-            # an MHA draft. Decide whether/how to group at the consuming layer.
-            # Capture uncached passes too: a TBO straddle can add a prefix.
-            attn_metadata.prefill_request_lengths = PrefillRequestLengths(
-                cu_q_lens=tuple(map(int, cu_seqlens_q)),
-                cu_k_lens=tuple(map(int, var["cu_seqlens_k"].np[: scheduled_bs + 1])),
-            )
         mrope_positions = self._build_mrope_prefill_positions(batch)
         if mrope_positions is not None:
             positions = mrope_positions
