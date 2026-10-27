@@ -46,6 +46,7 @@ support_model_arch_dict = {
 # Model-specific Mono setup runs after the drafter arms the original layers.
 # An installer may wrap the model or finish binding routing already inside it.
 mono_decode_installers = {
+    "Qwen4ExpForConditionalGeneration": "atom.models.qwen4_exp_mono.dispatch.install_mono_decode",
     "DeepseekV4ForCausalLM": (
         "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
     ),

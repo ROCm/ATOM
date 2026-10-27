@@ -144,7 +144,9 @@ class Qwen4ExpBackend(GDNAttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["Qwen4ExpMetadataBuilder"]:
-        return Qwen4ExpMetadataBuilder
+        from atom.models.qwen4_exp_mono.cache import metadata_builder_cls
+
+        return metadata_builder_cls(Qwen4ExpMetadataBuilder)
 
 
 class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):

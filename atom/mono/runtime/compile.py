@@ -49,6 +49,7 @@ def compile_only():
 def compile_kernels(kernels) -> list:
     """Each ``(launcher, abi)`` of ``kernels`` compiled without a launch (its
     arguments ``abi.zeros()``); returns the launchers."""
+    kernels = tuple(kernels)
     with compile_only():
         for launcher, abi in kernels:
             launcher(*abi.zeros())

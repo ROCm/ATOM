@@ -91,6 +91,91 @@ and draft share the embedding and output head.
   it can fail MoE warmup on gfx950 due to an MoE dispatch limitation.
 - Video inference and long-context accuracy have not been validated.
 
+## Mono decode
+
+On MI355X (`gfx950`), the optional Mono path supports the official FP8
+checkpoint with BF16 activations and KV cache, TP1 or TP8 with expert
+parallelism at TP8. Both TP1 and TP8 serve non-speculative decode batches
+of one, two or four independent requests. Mono is enabled by default for
+qualifying deployments through the shared `ATOM_MONO_ENABLE` switch. Set
+`ATOM_MONO_ENABLE=0` to use the original model throughout.
+
+```bash
+ATOM_MONO_ENABLE=1 \
+python -m atom.entrypoints.openai_server \
+  --model Qwen/Qwen3.8-Flash-Next-FP8 --trust-remote-code \
+  -tp 8 --enable-expert-parallel \
+  --max-model-len 8192 --max-num-seqs 4 \
+  --kv-cache-dtype bf16 --no-enable_prefix_caching \
+  --cudagraph-mode FULL --cudagraph-capture-sizes '[1,2,4]'
+```
+
+For TP1, replace `-tp 8 --enable-expert-parallel` with `-tp 1`.
+Prefill and unsupported decode widths use the original model. Ordinary batches
+use weight-reusing GDN projections and FP8 MoE; TP8 owns experts by rank. Each routed
+G1 output tile runs independently. Shared output projection and routed
+intermediate quantization share one launch; routed/shared merging preserves
+the BF16 endpoints and expert order. B4 uses MFMA HC, and TP1 B2 plus both B4
+layouts fuse MLP HC up with the MoE front. TP8 B2 keeps separate HC and front
+launches. Batch GDN combines recurrence and norm without a global core buffer.
+QSA retains native projections, selection/index-cache preparation and sparse
+attention. Batch Q/K norm, mRoPE and K/V publication share one kernel; TP1
+uses the native attention reduction and output gate, while TP8 stages the gate
+into output projection LDS. Collectives retain their native implementation.
+MTP and plugin serving are outside this Mono deployment contract.
+Use prefix caching disabled for the validated configuration. Mono sizes its
+QSA scores and candidate lists from `--max-model-len`, within
+the checkpoint's context capacity. TP1 uses a fixed-LDS exact selection tree
+when that capacity exceeds 8,192 tokens; 8,192 remains a selection segment,
+not a deployment limit. Resource admission still applies to each build.
+TP8 retains native sparse attention when the metadata context bound exceeds
+256 tokens. Native FULL capture sets this bound to the deployment capacity,
+so its captured QSA seam remains safe across short and long request contexts.
+
+For single-request decode, TP1 uses one shared GDN launcher for ordinary and PLE layers and two-launch
+QSA. FULL graphs use the native batch/query-length keys and the deployment
+context capacity; no context-dependent capture policy is added to the engine. TP8 uses rank-local attention, in-kernel reductions and expert-owned
+MoE. For QSA contexts above 256 tokens, TP8 keeps native sparse attention and
+its attention all-reduce between Mono projection and finish kernels.
+
+The integration follows ATOM's architecture-based model registration. A decode
+wrapper installs after the native model is loaded; the GPU runner is imported
+only on the first eligible step. One runner owns model bindings and the layer
+loop; `execution.py` shares the GDN/QSA layer
+lifecycle, PLE handling and diagnostics. `tp1.py` and `tp8.py` own their build
+sets and the TP8 pull endpoint. `stages/` contains reusable GDN, QSA, HC and MoE
+computations; `kernels/` composes those stages into complete launches and owns
+TP-specific mailbox and collective schedules. Both QSA K1 variants share
+QKV writeout, norm/mRoPE and index-cache math. QSA output projections share
+contiguous-K accumulation while keeping their ready-group waits and peer
+publication schedules. Both K2 variants consume the same
+paged selection/attention stages. GDN shares convolution and the AITER-derived
+recurrence views, norm and MFMA projection math while retaining its different
+TP1/TP8 output schedules. TP1 scheduling lives in `kernels/gdn_tp1.py`;
+typed field groups live in `kernels/arguments.py`, and `abi.py` validates
+and flattens complete launch contracts into the original scalar GPU ABI. Raw views and cache loads live in `stages/memory.py`; task
+geometry and scratch regions live in the device-independent `layout.py`.
+QSA K1/K2 share composition factories, and GDN K2 shares the TP8 finish
+factory. S1 and batch launchers share static weight bindings, while native
+metadata and state views bind per step. Immutable layer records retain module
+and weight ownership. `MonoState` owns persistent S1 buffers; per-width builds
+own named batch workspaces. The Qwen build factory compiles and validates its kernel resources before
+`WidthBuilds` performs TP agreement and caching, and remembers a refusal for that width only.
+`PERSISTENT_ROWS=(1,)` and `BATCH_ROWS=(2,4)` distinguish the two schedules;
+both serve ordinary one-token-per-request decode.
+Kernel dimensions live in `shapes.py`/`dims.py`; deployment checks live in
+`config.py`. Zero-copy weight contracts live in `weights.py`, graph-stable
+buffers in `state.py`, and per-step native metadata views in `step_meta.py`.
+`ATOM_MONO_CHECK=1` enables eager comparisons with
+the original layers for diagnosis; use it separately from performance runs.
+
+Validate the actual Mono route before reporting a speedup: a build refusal
+falls back to the native model. Task accuracy uses the full GSM8K protocol
+below and the corresponding model's dashboard `exact_match,flexible-extract`
+threshold (currently 0.96 for Flash-Next). Retain sample outputs and truncation
+records; paired lost-question counts are diagnostic and are not a fixed
+acceptance allowance.
+
 ## GSM8K evaluation
 
 Install the evaluation client:
@@ -116,4 +201,8 @@ tokens to avoid truncation. The explicit stop string replaces GSM8K's default
 The harness scores the final `content`, not `reasoning_content`.
 The timeout accommodates long requests under load; it does not change the
 generation limit or scoring. Set evaluation concurrency to suit the server's
-capacity.
+capacity. For Mono acceptance, match `num_concurrent` and `--max-num-seqs`
+to the intended C1, C2 or C4 configuration, use `temperature=0` and the fixed
+4096-token budget, and record actual Mono routing alongside the score.
+GSM8K tests task accuracy; long-context attention requests require separate
+functional validation.

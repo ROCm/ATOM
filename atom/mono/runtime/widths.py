@@ -23,11 +23,19 @@ class WidthBuilds:
     A kernel with scratch refuses its width, with a warning: a persistent kernel
     needs every CTA resident at once, and one whose waves need scratch can be
     dispatched only in part (the scratch the runtime holds for the grid), its
-    resident CTAs then waiting for ever on the rest."""
+    resident CTAs then waiting for ever on the rest.
 
-    def __init__(self, build, kernels, group, what: str) -> None:
+    Optional ``check_resources(built, width)`` checks model-specific limits on
+    the compiled build. It raises to refuse, before the collective admission.
+    Builders only assemble kernels and buffers; this class owns compilation.
+    """
+
+    def __init__(
+        self, build, kernels, group, what: str, *, check_resources=None
+    ) -> None:
         self._build, self._kernels = build, kernels
         self._group, self._what = group, what
+        self._check_resources = check_resources
         self._built = {}
         self._refused = set()
 
@@ -50,6 +58,8 @@ class WidthBuilds:
             launchers = compile_kernels(self._kernels(built))
             if not self._scratch_free(launchers, width):
                 built = None
+            elif self._check_resources is not None:
+                self._check_resources(built, width)
         except Exception:
             logger.exception(
                 "%s: building the width-%d kernels failed", self._what, width
