@@ -1166,6 +1166,22 @@ def derive(files, title="", raw_diff=""):
         hit("incomplete-code", "HK4")
     if len({p.split("/")[0] for p in paths}) >= 3:
         hit("scattered-diff", "HK2")
+    if re.search(r"\b(stop_at_idx|max_tokens|deadline|timeout\w*|limit|budget|seq_num|tier)\w*\s*(=|==|!=)\s*-?\d+\b", add, re.I):
+        hit("sentinel-value", "D10")
+    if re.search(r"\bself\.\w*(awaiting|pending|in_?flight|finished_\w*|retained|deferred|_cache)\w*\s*(\.add\(|\.append\(|\.setdefault\(|\[[^\]]+\]\s*=)", add, re.I):
+        hit("unbounded-tracking-set", "F2")
+    if (any("kv_transfer" in p or "disaggregation" in p or "mooncake" in p for p in paths)
+            and re.search(r"self\.\w*(size|rank|dtype|layout)\s*=", add)):
+        hit("pd-handshake", "A4")
+    if (re.search(r"\.item\(\)|\.tolist\(\)", add) or re.search(r'\.to\(\s*["\']cpu["\']\s*\)', add)) \
+            and any(p.endswith("model_runner.py") or ("/models/" in p and p.endswith(".py")) for p in paths):
+        hit("cpu-gpu-sync", "G2")
+    if re.search(r"\b(batch|prev_batch)\.\w+\s*(\.append\(|\.extend\(|\.add_\(|\.fill_\()", add) \
+            or re.search(r"\b(batch|prev_batch)\.\w+\s*\[[^\]]*\]\s*=", add) \
+            or re.search(r"\b(batch|prev_batch)\.\w+\s*(\+=|-=)", add):
+        hit("scheduledbatch-mutation", "H1")
+    if any(p.endswith("model_runner.py") for p in paths) and re.search(r"\bbatch\.\w+\s*=(?!=)", add):
+        hit("batch-consumer-purity", "H2")
 
     if not t:
         hit("generic-code", "A1 B1 D4")   # never empty: the ledger gate fails closed
@@ -1189,7 +1205,7 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
     "P1", "P2", "P3", "P4", "P5", "HK3", "HK6", "HK7",
 )}
 
-ALL_RULES = "A1 A2 A3 B1 B2 B5 B6 C1 C2 D1 D4 E1 E2 E3 HK1 HK2 HK4 HK5 STEP4"
+ALL_RULES = "A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 F2 G2 H1 H2 HK1 HK2 HK4 HK5 STEP4"
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert

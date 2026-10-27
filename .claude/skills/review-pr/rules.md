@@ -33,8 +33,10 @@ gate rejects it as UNANCHORED.
 _"Fixed one path; the same bug lives in a sibling."_
 
 **A1 — Sibling function/kernel not fixed** ⚠️ (🔴 if Tier-1/2 backbone)
-Fix changes address calc, bounds check, or data layout: scan same file for variants named `_opt`, `_prefill_opt`, `_decode`, `_v2`.
+Fix changes address calc, bounds check, or data layout: scan same file for variants named `_opt`, `_prefill_opt`, `_decode`, `_v2`. The sibling is not always same-file: also scan plugin backend directories (`atom/plugin/vllm/`, `atom/plugin/sglang/`) for a copy of the same allocation/dispatch pattern.
 Real example (aiter#3841): strided q_nope fix on decode kernel; `_prefill_opt` in same file had same bug.
+Real example (ATOM#1091, `atom/model_ops/moe.py`, fixed `5663a664`): `expert_data` narrowed to actual shard size with remainder zeroed — a trailing partial rank (e.g. `tp=4, D=10`) no longer hits a `copy_()` shape mismatch; the same PR also removed a redundant `all_reduce` in `Mxfp4MoEMethod.apply` ("other `apply()` methods don't reduce internally... reduction now happens once") — a second, distinct defect (duplicate collective → silently wrong numeric result), single occurrence so far, worth checking for alongside the shard-remainder bug.
+Real example (ATOM#2607, valarLip, `COMMENTED`): "Incomplete fix (same allocation pattern remains): `atom/models/glm5_next.py:748` — `Glm5NextIndexer.forward` (non-kpool branch) still calls `sparse_attn_indexer_impl` without `indexer_logits_ws`... `atom/plugin/vllm/attention/layer_sparse_mla.py:466` and the SGLang plugin... still allocate a `[num_decode_tokens, max_model_len]` fp32 plane per layer — the same unbounded pattern this PR chunks natively." Here the "sibling" is a cross-plugin-backend copy, not a same-file variant — confirms the backend-directory scan above.
 → `⚠️ A1: same bug may exist in [variant] — check function family in this file`
 
 **A2 — Change covers one model/GPU, shared path affects others** ⚠️
@@ -48,6 +50,14 @@ Real example (ATOM#1498): "[MI308]" backbone change still affects gfx950 (MI355X
 New dispatch enables kernel for model family X, tested only on subcase Y.
 Real example (vLLM#16435): FusedMoE activated for wrong families → follow-up restrict PR needed.
 → `⚠️ A3: activation condition enables [X] but only [Y] was tested`
+
+**A4 — Distributed handshake or coordination invariant changes on one side only** ⚠️/🔴
+A new per-connection config field (parallelism degree, block size, dtype, layout) is read on one side of a cross-process relationship — a P/D handshake, a KV-connector aggregator, a producer/consumer coordination predicate — without the matching update on the other side: the exchanged metadata, the merge/aggregation logic, or the assumption the other side's predicate relies on. The mismatch is never caught; a downstream index or control-flow decision silently goes wrong.
+Trigger: diff adds/reads a new `self.<field>` on a connector/engine/producer side (`kv_transfer`, `disaggregation`, `mooncake`, or similar cross-process code) that feeds an index computation or a cross-process control predicate, without the corresponding field being added to the handshake message exchanged with the remote side, or to the aggregator that merges per-connector output.
+Real example (ATOM#1994): yitingw1: "The handshake exchanges `tp_size`/`remote_pp_size` but never `hash_block_size`, so nothing catches a P/D pair with mismatched `decode_context_parallel_size`; since `num_computed_blocks` is computed on one side and used as a block-table index on the other, a mismatch here silently misaligns the slice." Author (Phi-C): "we can add this warning and fallback path here as you suggested." — caught in review.
+Real example (ATOM#2000, yhl-amd, `COMMENTED`): "`MultiConnector.get_finished()` drops `connector_completions`. DSV4 reports SLOT/sidecar save success or failure through `KVConnectorOutput.connector_completions`, but the `MultiConnector` merge only collects recv/send/load/save fields. A sidecar completion entering a sub-connector therefore produces an empty `MultiConnector` output." Same shape, at the aggregator layer instead of the wire layer — also caught in review.
+Real example (Revert ATOM#2315, `Revert "feat(kimi-k3): support P/D disaggregation (#2154)"`): "The producer now disables deferred output, but the DPA draft lockstep predicate still uses deferred output to exclude pipeline parallelism. Output-less producer prefill chunks skip draft collectives while idle DP peers enter them, hanging V4 DPA P/D requests." This one was **not** caught in review and needed a full revert — a reminder that this defect class is genuinely hard to catch from a single-file diff.
+→ `⚠️/🔴 A4: [field/invariant] changed on [side] but not matched on [other side] — a mismatch silently [misaligns index / hangs / drops output]`
 
 ---
 
@@ -191,6 +201,15 @@ Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M
 Trigger: arithmetic involving `token_id`, `total_tokens`, `seq_start`, or `batch_offset` that produces a buffer address or index in int32 without an explicit widening cast to int64 before the multiply.
 → `🔴 D9: [expr] in int32 — widen [token_id / total_tokens / seq_start] to int64 before multiplying by [stride]`
 
+**D10 — Sentinel value collides with valid data** 🔴
+A numeric sentinel (`-1`, `0`, `None`-as-0) is reused to mean "no limit / unset / unavailable" in a field that elsewhere holds a real count, offset, or limit. The collision is silent: the receiving code cannot tell "legitimately zero" from "not set."
+Trigger: a new/changed line sets or compares a sentinel constant (`-1`, `0`) against a field whose name suggests a count/limit/offset/index/deadline (`max_tokens`, `limit`, `stop_at_idx`, `deadline`, `timeout`, `seq_num`, `budget`, `tier`), especially where the same field is read elsewhere as real data; or a function's return narrows away an `Optional[int]` in favor of returning `0`/`-1` for "no answer."
+Real example (ATOM#2012): yitingw1 reproduced the hang independently — `max_tokens=0` → `stop_at_idx=-1` → the `if new_tokens` guard drops the terminal chunk → client blocks forever on `token_queue.get()`; the fix needed a second sentinel (`-2`) because `-1` was already load-bearing on the same path for the P/D `injected_t0` case. Fixed `9a70c95`, then `58ed37d3`.
+Real example (ATOM#2046, `atom/model_ops/fused_moe_triton.py`): JiaoliangYu: "`limit=0` means the opposite here than it did on the old path, and it makes the whole MoE layer output exactly zero... `0.0` is taken as a real bound... No error, no assert."
+Real example (ATOM#2305, `atom/kv_transfer/offload/chunked_scheduler.py`): yhl-amd: "`_MPLookupClient.lookup()` returns `0`, not `None`, when its poll deadline expires... this branch memoizes an MP timeout as a real tier miss." Confirmed + fixed `da8c39ea3`.
+Real example (ATOM#1316, `atom/distributed/kv_events.py`): yitingw1: sequence numbers wrap into the reserved `REPLAY_DONE` sentinel value. Fixed `918f7dcf`.
+→ `🔴 D10: [field] reuses [sentinel] to mean "unset" but also holds real data on [path] — disambiguate with Optional or a distinct sentinel`
+
 ---
 
 ### E — Cross-Repo Sync
@@ -224,6 +243,14 @@ Real example (ATOM#1469): valarLip: "this will make us pin double weight."
 Check: is the original freed after the new variant is created?
 → `⚠️ F1: [new_attr] alongside [original] — doubles HBM; is original freed?`
 
+**F2 — Unbounded per-request/per-shape cache never evicted on the no-op path** ⚠️
+A dict/set keyed by request id, sequence id, or tensor shape gets an entry on every call (or every success), but the matching cleanup only fires on a narrower event some calls never reach — short requests, error paths, or shapes that stop recurring leave the entry forever.
+Trigger: a new `+` line adds to a dict/set (`.add(`, `.append(`, `.setdefault(`, `[key] =`) whose name suggests request/shape tracking (`awaiting`, `pending`, `in_flight`/`inflight`, `finished_*`, `*_cache`, `retained`, `deferred`), while the removal (`del`, `.discard(`, `.pop(`) is reachable only from a different, narrower branch than the one that adds the entry.
+Real example (ATOM#2146): yhl-amd: "Do not retain finished IDs for requests that never issued a save — this adds every completed request to `_finished_awaiting_save`, but an ID is removed only if it later appears in `finished_saving`. Short requests with no aligned chunk... remain in this set for the lifetime of the worker."
+Real example (ATOM#1316, `atom/distributed/kv_events.py`): yitingw1: replay ring buffer reuses `buffer_steps`, "adding a long-lived, count-based memory retention... retaining up to 10000 encoded payloads (including potentially large token_ids) for the lifetime of the publisher." Fixed with a dedicated, decoupled knob in `75792547`.
+Real example (ATOM#1881, `atom/plugin/sglang/attention_backend/attention_gdn.py`): zovonoir: per-shape caches "can grow unbounded over time as `bs` varies" — same defect class.
+→ `⚠️ F2: [tracking_structure] grows on every call but is only cleared on [narrower path] — bound it or evict unconditionally`
+
 ---
 
 ### G — Multi-Stream Synchronization
@@ -232,6 +259,9 @@ _"Written on stream A, consumed on stream B — no sync between them."_
 **G1 — Missing HIP/CUDA stream synchronization** 🔴
 HIP/CUDA streams execute concurrently by default. A tensor produced on stream A and consumed by a kernel on stream B without an explicit sync between them causes the consumer to read garbage — no crash, no error, silent wrong output.
 Trigger: diff introduces a non-default `torch.cuda.Stream`, passes an explicit `stream=` argument to a kernel, or prepares weights/KV buffers on a side stream at model-load time that are later consumed during forward pass on the compute stream. Check: is there `stream.synchronize()`, `stream.wait_stream(other)`, `hipEventRecord` + `hipStreamWaitEvent`, or `torch.cuda.current_stream().wait_stream(other)` between the last write on stream A and the first read on stream B?
+Real example (ATOM#1369, `atom/model_ops/moe.py:3515`): jpy794: "This fixes the use-after-free race for the tensor allocated in stream A and used in stream B. Without this fix the intermediate tensor could be reused by pytorch in the allocating stream before its real use by kernels in the other stream." (H2D/compute-side: allocated on one stream, consumed on another.)
+Real example (ATOM#2654, `fix(mtp): keep side-stream D2H sources alive until the copy runs`): the same rule in the opposite direction — a D2H race. Commit body: "tokenIDProcessor copies the sampled ids... to the host on `async_copy_stream`. The sources are fresh default-stream allocations that the caller drops right after queuing the copy, so the caching allocator can hand their block to the next default-stream allocation before the side-stream copy has run... Under MTP the stale `num_bonus` becomes `num_accepted_tokens`, which the GDN conv update kernel adds to the conv-state offset unchecked: an illegal memory access." The same PR fixed the identical pattern a second and third time in the same commit (dspark ell D2H, output D2H) — three instances of the same mechanism before it was generalized.
+A new `.record_stream(...)` call (a non-deterministic cross-stream handoff — correct only while the allocator's own polling is guaranteed to run before the tensor is freed) should be held to the same bar as a missing sync: prefer deterministic `wait_stream`/event-based sync whenever the free point is actually controllable, and expect the diff to say why `record_stream` was chosen instead. `atom/models/kimi_k3/model.py:681,689` already relies on `record_stream` for the TBO shared-expert output handoff between `alt` and `current` streams, and `atom/utils/tbo/ubatch_wrapper.py`'s `comm_stream`/`compute_stream` pair does the same — a new `record_stream` call elsewhere should explain why `wait_stream` could not be used. (pytorch `.agents/skills/cuda-streams/SKILL.md`, borrowed for this sharper criterion — no independent ATOM citation for the `record_stream`-vs-`wait_stream` choice specifically.)
 → `🔴 G1: [tensor] written on [stream A] consumed on [stream B] without sync — add stream.wait_stream() or hipStreamWaitEvent`
 
 **G1b — Blocking queue.get() without timeout in production serving code** ⚠️
@@ -240,6 +270,30 @@ Trigger: `queue.get()` or `asyncio.Queue.get()` inside a `while True:` worker lo
 Exception: test code, CLI tools, or one-shot scripts where a hang is detectable (CI timeout, interactive TTY).
 Real example (ATOM#789): `loop.call_soon_threadsafe` routes incremental detokenizer state mutations to the event-loop thread — this is correct and is NOT a G1b violation.
 → `⚠️ G1b: [worker] blocks on queue.get() without timeout — add timeout= and handle Empty/TimeoutError to survive producer failure`
+
+**G2 — Blocking CPU/GPU synchronization added to the decode loop** ⚠️
+A new `.item()`, `.tolist()`, boolean-tensor indexing, or blocking `.to("cpu")` (no `non_blocking=True`) inside the model runner's forward path or a model's `forward()` forces the CPU to wait for the GPU queue to drain at that point, on every call. ATOM has no `VLLM_GPU_SYNC_CHECK`-equivalent env var (verified: no such flag in `atom/utils/envs.py`), so there is no automated gate for it; the runnable check is `torch.cuda.set_sync_debug_mode('error')` around the suspect region, which raises instead of silently stalling.
+Trigger: a new `.item()`, `.tolist()`, or `.to("cpu")` without `non_blocking=True` added inside `atom/model_engine/model_runner.py` or a model's `forward()`.
+Grounded in: `model_runner.py`'s `tokenIDProcessor` class (`send_to_cpu_async`/`recv_async_output`, ~line 206-298) already hand-manages `non_blocking=True` transfers for logprobs and rejected/bonus-token counts specifically to avoid forcing a sync — the hazard is real and already worked around ad hoc for existing code; a new unguarded `.item()`/`.tolist()` elsewhere in the same hot path defeats that work.
+Source: vLLM `.agents/skills/pr-checklist/SKILL.md` §1.5 (sync-check); detection method from TensorRT-LLM `.claude/skills/perf-torch-sync-free/SKILL.md` (`torch.cuda.set_sync_debug_mode`). Borrowed, not ATOM-native — no ATOM PR citation yet for this specific rule.
+→ `⚠️ G2: [call] forces a CPU/GPU sync in [function] — confirm with torch.cuda.set_sync_debug_mode('error'), or move it off the hot path`
+
+---
+
+### H — Batch Object Invariants
+_"`ScheduledBatch` is a snapshot, not a scratchpad."_
+
+**H1 — ScheduledBatch mutated in place after capture** 🔴
+`atom/model_engine/scheduler.py` docstrings `ScheduledBatch` as an "Immutable snapshot of sequences selected for a single forward pass," and `model_runner.py` holds `self.prev_batch: ScheduledBatch | None` across steps so a later step can inspect what an earlier one actually ran. An in-place mutation after capture (`.append()`/`.extend()`/`+=`/`-=`/`.add_()`/`.fill_()`/slice-assignment on a `batch.*` or `prev_batch.*` field) corrupts what `prev_batch` thinks it holds instead of producing a fresh value — the same failure mode sglang's own `ScheduledBatch` equivalent hit before it adopted an out-of-place-mutation rule.
+Trigger: a diff calls `.append(`, `.extend(`, `.add_(`, `.fill_(`, or slice/index-assigns a field of a `batch` or `prev_batch` object, or does `batch.<field> +=`/`-=`, instead of rebinding to a new value.
+Source: sglang `.claude/rules/schedule-batch-out-of-place-mutation.md`, adapted to ATOM's `ScheduledBatch`. Borrowed, not ATOM-native — no ATOM PR citation yet.
+→ `🔴 H1: [field] mutated in place on [batch/prev_batch] — rebind to a new value instead of mutating the captured snapshot`
+
+**H2 — Batch-consuming entry points must treat ScheduledBatch as read-only** ⚠️
+Pairs with H1: entry points that consume a `ScheduledBatch` (`prepare_model`, `get_token_locations`, and similar methods in `atom/model_engine/model_runner.py`) are expected to read from `batch` and return/thread a new value, not write back into the `batch` object they were handed — the same "init must stay pure" discipline sglang's `forward-batch-init-new-purity` rule encodes for its own forward-batch construction.
+Trigger: a diff inside a batch-consuming method of `atom/model_engine/model_runner.py` (signature takes a `batch: ScheduledBatch` parameter) writes to a `batch.<field> = ...` field instead of returning a new value.
+Source: sglang `.claude/rules/forward-batch-init-new-purity.md`, adapted to ATOM's `prepare_model`/`get_token_locations`. Borrowed, not ATOM-native — no ATOM PR citation yet.
+→ `⚠️ H2: [method] writes back into batch.[field] instead of returning a new value — keep batch-consuming entry points read-only`
 
 ---
 
@@ -269,7 +323,8 @@ Missing: test script/command, ROCm version, GPU model, TP/DP config, model check
 **P4 — TP split shapes not covered** ⚠️
 New attention / norm op tested only at full head count (TP=1 equivalent). At TP=4/8, `num_heads_q` / `num_heads_k` per device is divided by TP. A kernel passing at H=128 may OOB or produce wrong output at H=32 (TP=4) if shape math doesn't account for the split.
 Trigger: new kernel or dispatch path that takes per-device head count; PR shows only one head count without TP=4/8 variant.
-→ `⚠️ P4: test covers only TP=1 head count — verify at num_heads÷TP=4 (e.g., [128→32])`
+Beyond TP: `atom/config.py` also declares `pp_size`, `data_parallel_size`, and `decode_context_parallel_size` (`dcp_size`) alongside `tp_size` and MoE `ep_size`. The same per-device shape-math hazard P4 checks for under a TP split applies equally under a PP stage boundary, a DP batch split, DCP, or an EP expert split — a new shape-dependent kernel/dispatch path tested only at one setting of any of these dimensions (not just TP) should trigger P4, not only the TP=1-vs-TP=N case. (TensorRT-LLM `.claude/skills/trtllm-code-contribution/SKILL.md`'s "Check Parallelism Dimensions" table, borrowed for this broader framing — no new ATOM citation beyond P4's existing evidence.)
+→ `⚠️ P4: test covers only TP=1 head count — verify at num_heads÷TP=4 (e.g., [128→32]); also check PP/DP/DCP/EP splits if the new path is shape-dependent on those`
 
 **P5 — Benchmark hides a cost real users pay on every call or cold start** ⚠️
 The perf claim is measured with the timing window drawn so a *recurring* production cost is excluded: a first-call JIT compile on a path that is NOT cached across calls, or a setup step that runs on the live stream inside the timed region on every cold start. If that cost is real and recurring, omitting it can turn a net regression into an apparent speedup.
