@@ -1,6 +1,8 @@
 """CPU checks for the native-image experiment's isolation and correctness gates."""
 import importlib.util
 import os
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -47,6 +49,42 @@ class NativeExperimentTest(unittest.TestCase):
                              'kv-transfer-config': {'kv_role': 'kv_consumer'}})
         self.assertIn('--enable-prefix-caching', args)
         self.assertIn('--no-enable-dbo', args)
+
+
+class ValidatedSweepTest(unittest.TestCase):
+    def test_failed_smoke_never_starts_measurement(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            'RUN_DIR': tmp, 'CONC_LIST': '32,48,64',
+            'ATOMESH_ENV_ATOMESH_VLLM_MODE': 'smoke_then_sweep'
+        }), patch.object(runner, 'cleanup') as cleanup:
+            seen = []
+            def fail():
+                seen.append(os.environ['ATOMESH_ENV_ATOMESH_VLLM_MODE'])
+                raise RuntimeError('smoke failed')
+            with self.assertRaisesRegex(RuntimeError, 'smoke failed'):
+                runner.smoke_then_sweep(fail)
+            self.assertEqual(seen, ['smoke'])
+            cleanup.assert_called_once()
+            self.assertEqual(os.environ['RUN_DIR'], tmp)
+            states = json.loads((Path(tmp) / 'suite-status.json').read_text())
+            self.assertEqual(states, [{'phase': 'smoke', 'concurrency': 1, 'status': 'failed'}])
+
+    def test_each_measurement_follows_teardown_and_uses_separate_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            'RUN_DIR': tmp, 'CONC_LIST': '32,48,64',
+            'ATOMESH_ENV_ATOMESH_VLLM_MODE': 'smoke_then_sweep'
+        }), patch.object(runner, 'cleanup') as cleanup:
+            seen = []
+            def phase():
+                self.assertEqual(cleanup.call_count, len(seen))
+                seen.append((os.environ['ATOMESH_ENV_ATOMESH_VLLM_MODE'],
+                             os.environ['CONC_LIST'], os.environ['RUN_DIR']))
+            runner.smoke_then_sweep(phase)
+            self.assertEqual([(m, c) for m, c, _ in seen],
+                             [('smoke', '1'), ('benchmark', '32'), ('benchmark', '48'), ('benchmark', '64')])
+            self.assertEqual(len({path for _, _, path in seen}), 4)
+            self.assertEqual(cleanup.call_count, 4)
+            self.assertEqual(os.environ['CONC_LIST'], '32,48,64')
 
 
 if __name__ == '__main__':

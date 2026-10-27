@@ -2153,3 +2153,8 @@ models:
             common:
               ATOMESH_VLLM_MODE: inspect
               ATOMESH_INSPECT_RUN_ID: "40484777206"
+
+        - <<: *m31_vllm_pd
+          name: m31-vllm-1p1d-tp4-mcstore-validated-sweep
+          concurrency: [32, 48, 64]
+          env: {common: {ATOMESH_VLLM_MODE: smoke_then_sweep}}

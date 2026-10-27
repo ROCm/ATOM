@@ -108,6 +108,7 @@ def cleanup():
                 proc.wait(timeout=25)
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=10)
             except ProcessLookupError:
                 pass
 
@@ -230,6 +231,7 @@ def main():
              "master": 26051 + offset, "bootstrap": 8998 + offset}
     for port in ports.values():
         with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("0.0.0.0", port))
     common["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(ports["bootstrap"])
     for key in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
@@ -346,10 +348,11 @@ def main():
     loader = next(venv.glob("lib/python*/site-packages/aiperf/dataset/loader/base_hf_dataset.py"))
     loader_source = loader.read_text()
     needle = "hf_revision: str | None = None"
-    if loader_source.count(needle) != 1:
+    pinned_line = f"hf_revision: str | None = {plan['benchmark']['dataset_revision']!r}"
+    if loader_source.count(needle) == 1:
+        loader.write_text(loader_source.replace(needle, pinned_line))
+    elif loader_source.count(pinned_line) != 1:
         raise RuntimeError("Unexpected AgentX dataset loader source")
-    loader.write_text(loader_source.replace(needle,
-        f"hf_revision: str | None = {plan['benchmark']['dataset_revision']!r}"))
     dump(out / "harness-dataset-pin.json", {"version": "1.0.12", "file": str(loader),
         "change": "Set BaseHFDatasetLoader.hf_revision", "revision": plan['benchmark']['dataset_revision']})
     artifact = results / f'aiperf-m31-1p1d-c{conc}'
@@ -392,10 +395,51 @@ def main():
         (out / f'{role}-final.prom').write_text(request(url+'/metrics'))
 
 
+def smoke_then_sweep(run_phase=None):
+    """Use one allocation; each phase owns fresh engines and a fresh CPU Store."""
+    run_phase = run_phase or main
+    keys = ('RUN_DIR', 'CONC_LIST', 'ATOMESH_ENV_ATOMESH_VLLM_MODE')
+    saved = {key: os.environ.get(key) for key in keys}
+    root = Path(os.environ['RUN_DIR'])
+    root.mkdir(parents=True, exist_ok=True)
+    phases = []
+    try:
+        for name, mode, concurrency in (('smoke', 'smoke', 1),
+                                       ('c32', 'benchmark', 32),
+                                       ('c48', 'benchmark', 48),
+                                       ('c64', 'benchmark', 64)):
+            os.environ.update(RUN_DIR=str(root / name), CONC_LIST=str(concurrency),
+                              ATOMESH_ENV_ATOMESH_VLLM_MODE=mode)
+            phases.append({'phase': name, 'concurrency': concurrency, 'status': 'running'})
+            dump(root / 'suite-status.json', phases)
+            print(f'[suite] starting {name} with fresh engines and Store', flush=True)
+            try:
+                try:
+                    run_phase()
+                finally:
+                    cleanup()
+                    PROCESSES.clear()
+            except BaseException:
+                phases[-1]['status'] = 'failed'
+                dump(root / 'suite-status.json', phases)
+                raise
+            phases[-1]['status'] = 'success'
+            dump(root / 'suite-status.json', phases)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 if __name__ == '__main__':
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, on_signal)
     try:
-        main()
+        if os.environ.get('ATOMESH_ENV_ATOMESH_VLLM_MODE') == 'smoke_then_sweep':
+            smoke_then_sweep()
+        else:
+            main()
     finally:
         cleanup()

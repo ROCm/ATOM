@@ -34,3 +34,14 @@ resolved configuration, per-service logs, Prometheus snapshots, smoke JSON,
 and raw AgentX exports. Existing Slurm allocation, GPU busy checks, cleanup,
 and result collection are reused. Do not publish dashboard results before
 validating smoke and workload metadata.
+
+The `m31-vllm-1p1d-tp4-mcstore-validated-sweep` case runs smoke followed by
+C32/C48/C64 in one eight-GPU allocation. Each phase stops its engines and
+Store before the next starts, and writes a separate artifact directory.
+`suite-status.json` records progress. A failed smoke, benchmark, or teardown
+stops the sequence. Each measurement still runs for 3600 seconds.
+
+Automatic allocation currently excludes `pit2-p03-g09` after two unexplained
+SIGKILL exits there; explicitly pinned nodes bypass the automatic exclusion.
+The read-only inspection case emits schema-filtered status for its configured
+Actions ID, never raw logs or arbitrary file content.
