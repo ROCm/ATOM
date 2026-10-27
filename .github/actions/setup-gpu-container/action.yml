@@ -127,7 +127,7 @@ runs:
         printenv MODEL_ENV_VARS | grep -v '^$' > "$ENV_FILE" || true
         USE_LOOPBACK_SOCKETS=false
         case "${RUNNER_LABEL}" in
-          linux-atom-do-mi350x-8|linux-atom-do-mi350x-8.test|atom-mi355-8gpu.predownload)
+          linux-atom-do-mi350x-8|linux-atom-do-mi350x-8.test|linux-atom-general-mi350x-8|linux-atom-pitt-mi350x-8|atom-mi355-8gpu.predownload)
             USE_LOOPBACK_SOCKETS=true
             ;;
         esac
@@ -150,7 +150,7 @@ runs:
           PULL_FLAG="--pull ${PULL_POLICY}"
         elif [ -n "${RESOLVED_ATOM_BASE_IMAGE:-}" ]; then
           PULL_FLAG=""
-        elif [ "${RUNNER_LABEL}" = "atom-mi355-8gpu.predownload" ] || [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8" ]; then
+        elif [ "${RUNNER_LABEL}" = "atom-mi355-8gpu.predownload" ] || [ "${RUNNER_LABEL}" = "linux-atom-do-mi350x-8" ] || [ "${RUNNER_LABEL}" = "linux-atom-general-mi350x-8" ] || [ "${RUNNER_LABEL}" = "linux-atom-pitt-mi350x-8" ]; then
           PULL_FLAG="--pull always"
         fi
 
