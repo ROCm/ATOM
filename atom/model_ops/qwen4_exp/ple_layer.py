@@ -530,4 +530,43 @@ class Qwen4ExpPLELayer(nn.Module):
             metadata.has_initial_state,
             metadata.num_accepted_tokens,
         )
+        # After both halves advance: the n-gram history moved in
+        # ``advance_ngram_state`` above and the convolution window in
+        # ``_short_conv``, so a decode row copy would otherwise mix a window
+        # from before this token with ids from after it.
+        self._track_radix_state(metadata, input_ids, normalized)
         return gated_value.flatten(-2) + conv_output
+
+    @staticmethod
+    def _track_radix_state(
+        metadata, input_ids: torch.Tensor, conv_input: torch.Tensor
+    ) -> None:
+        """Write this chunk's boundary PLE history into the radix track slots.
+
+        Extend reads the boundary rather than the working slot, which by now
+        holds the state after the whole chunk: the n-gram history is the input
+        ids ending there, and the convolution window is the same rows of the
+        convolution input that the kernel would have carried over. An aligned
+        boundary is no special case, so extend has one path.
+
+        A decode step advances a single token, so there the working slot is
+        already the boundary state and the caller asks for a row copy instead.
+        The caller owns both choices; see ``Qwen4ExpPLEMetadata``.
+        """
+        dst = metadata.track_dst
+        if dst is None or dst.numel() == 0:
+            return
+        src = metadata.track_src
+        if src is not None and src.numel():
+            metadata.conv_state[dst] = metadata.conv_state[src]
+            metadata.ngram_state[dst] = metadata.ngram_state[src]
+            return
+        conv_indices = metadata.track_conv_indices
+        if conv_indices is not None and conv_indices.numel():
+            # [tracked, state_len, channels] -> the pool's [slot, channels, state_len]
+            metadata.conv_state[dst] = conv_input[conv_indices].transpose(1, 2)
+        ngram_indices = metadata.track_ngram_indices
+        if ngram_indices is not None and ngram_indices.numel():
+            metadata.ngram_state[dst] = input_ids[ngram_indices].to(
+                metadata.ngram_state.dtype
+            )

@@ -96,6 +96,16 @@ class Qwen4ExpPLEMetadata:
     has_initial_state: torch.Tensor  # [reqs] bool
     conv_state: torch.Tensor  # [slots, channels, state_len] short-conv pool
     num_accepted_tokens: torch.Tensor | None = None
+    # SGLang mamba radix cache (extra_buffer). The tree caches the ping-pong
+    # track slot, not the working slot, so PLE's own history has to be written
+    # there at the same boundary the GDN snapshot uses. Extend gathers the
+    # boundary window out of this chunk's tokens (the working slot holds the
+    # state after the whole chunk by then); decode is snapshotted by the
+    # caller, whose slot state already is the boundary state.
+    track_dst: torch.Tensor | None = None  # [tracked] int32 destination slots
+    track_src: torch.Tensor | None = None  # [tracked] int32 source slots (decode)
+    track_conv_indices: torch.Tensor | None = None  # [tracked, state_len] token pos
+    track_ngram_indices: torch.Tensor | None = None  # [tracked, ngram - 1] token pos
 
 
 class Qwen4ExpBackend(GDNAttentionBackend):
