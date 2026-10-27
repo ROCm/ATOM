@@ -1,240 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793056425547,
+  "lastUpdate": 1793068021720,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "email": "69022634+ZLkanyo009@users.noreply.github.com",
-            "name": "Ling Zhang",
-            "username": "ZLkanyo009"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "3760854655163f5c7ba1a494cc2ac5ab70c9878d",
-          "message": "[Sgl Atom][fix] bind Qwen4 GDN FlyDSL and use live seq_lens for eager (#2321)\n\n* [Sgl Atom][fix] bind Qwen4 GDN FlyDSL and use live seq_lens for eager QSA\n\n* test(sglang): satisfy Black and Ruff on the Qwen4 FlyDSL plugin tests",
-          "timestamp": "2026-09-21T14:43:35+08:00",
-          "tree_id": "8da43e8675e6e9e616b0371d8bcf6cbb7a0484f3",
-          "url": "https://github.com/ROCm/ATOM/commit/3760854655163f5c7ba1a494cc2ac5ab70c9878d"
-        },
-        "date": 1789977062050,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
-            "value": 0.9538,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP MTP acceptance (%)",
-            "value": 67.13,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.01,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
-            "value": 0.9431,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9401 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
-            "value": 0.9393,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9356 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP MTP acceptance (%)",
-            "value": 64.38,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9356 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 2.93,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro accuracy (GSM8K)",
-            "value": 0.953,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059 | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DEP RCCL accuracy (GSM8K)",
-            "value": 0.95,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: PR #2110 regression coverage for DPA8 + EP8 using the native RCCL transport with EPLB disabled. Reuses the DeepSeek-V4-Pro 3-shot GSM8K baseline. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9484 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark accuracy (GSM8K)",
-            "value": 0.9515,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro-DSpark"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark MTP acceptance (%)",
-            "value": 42.11,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro-DSpark"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark avg toks/fwd (tok/fwd)",
-            "value": 3.95,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
-            "value": 0.956,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9575 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP MTP acceptance (%)",
-            "value": 66.02,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9575 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
-            "value": 2.98,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::GLM-5.2-MXFP4 MTP accuracy (GSM8K)",
-            "value": 0.9242,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9242 | fewshot: 3 | Model: amd/GLM-5.2-MXFP4"
-          },
-          {
-            "name": "ATOM::GLM-5.2-MXFP4 MTP MTP acceptance (%)",
-            "value": 76.33,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9242 | fewshot: 3 | Model: amd/GLM-5.2-MXFP4"
-          },
-          {
-            "name": "ATOM::GLM-5.2-MXFP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.29,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::GLM-5.3-Flash-kpool-16shot accuracy (GSM8K)",
-            "value": 0.9689,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.9613 | BaselineModel: zai-org/GLM-5.3-Flash | BaselineNote: Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The GLM-5.3-Flash entry above does NOT cover this: at or below index_topk the indexer selects every token, attention_mla runs dense, and the pooled selection is computed but never used -- a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9666, matching the 0.9682/0.9689 of the dense 3-shot entry within run-to-run spread (two runs of identical code disagree on ~28 of 1319 questions in each direction). Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random, the longest prompt is 3591 tokens, and 3591 + max_gen_toks 512 overflows a 4096 cap -- 4 requests then 400 and lm_eval aborts the whole eval after its retries. The short-context GLM-5.3-Flash entry (max-model-len 2048, 3-shot) was removed in favour of this one: below index_topk the indexer selects every token and attention_mla runs dense, so that entry exercised a strict subset of this path while costing a second 8-GPU nightly. Threshold stays at 0.94. This entry is test_level pr, so every unrelated PR runs it on 8 GPUs; repeat runs of IDENTICAL code have landed at 0.9613/0.9629/0.9644/0.9659, so a 0.96 threshold is cleared by 0.0013 in the worst case and would fail roughly one PR in four on unchanged code -- a gate that flaky trains people to re-run until green and stops carrying information. Baseline is the 0.9613 measured on this tree; the 0.9659 it replaced came from an earlier branch and is optimistic here. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9689 | fewshot: 16 | Model: /models/zai-org/GLM-5.3-Flash"
-          },
-          {
-            "name": "ATOM::Kimi-K2.7-Code-MXFP4 accuracy (GSM8K)",
-            "value": 0.9469,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.92 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.7-Code | BaselineNote: Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold inherited from Kimi-K2.5-MXFP4 until CI baseline is refreshed. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/amd/Kimi-K2.7-Code-MXFP4"
-          },
-          {
-            "name": "ATOM::Kimi-K3 DSpark accuracy (GSM8K)",
-            "value": 0.9515,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
-          },
-          {
-            "name": "ATOM::Kimi-K3 DSpark MTP acceptance (%)",
-            "value": 51.29,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
-          },
-          {
-            "name": "ATOM::Kimi-K3 DSpark avg toks/fwd (tok/fwd)",
-            "value": 4.59,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
-            "value": 0.9098,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.63 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-          },
-          {
-            "name": "ATOM::MiniMax-M3-MXFP4 accuracy (GSM8K)",
-            "value": 0.9469,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.93 | Baseline: 0.9363 | BaselineModel: amd/MiniMax-M3-MXFP4 | BaselineNote: FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384) | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9477 | fewshot: 5 | Model: amd/MiniMax-M3-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
-            "value": 0.8984,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8779 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
-            "value": 0.6907,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.65 | Baseline: 0.69 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7854 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP accuracy (GSM8K)",
-            "value": 0.865,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8476 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP MTP acceptance (%)",
-            "value": 84.27,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8476 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.53,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 accuracy (GSM8K)",
-            "value": 0.8522,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8393 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP accuracy (GSM8K)",
-            "value": 0.8491,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8309 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP MTP acceptance (%)",
-            "value": 84.21,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8309 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.53,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
-            "value": 0.9007,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1986 | fewshot: 3 | Model: openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
-            "value": 0.8908,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35569710410 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609210314 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1554 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -319790,6 +319558,1422 @@ window.BENCHMARK_DATA = {
           {
             "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 _tp",
             "value": 4,
+            "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Zhiwei",
+            "username": "ZhiweiYan-96",
+            "email": "yanzhw5@mail3.sysu.edu.cn"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "481c2bfd443f128edac1aab3bdbfdf3735dd4d1b",
+          "message": "[ATOM SGL] retarget 0.5.20 accuracy CI and fix SGLang plugin serving (#1872)\n\n* [sgl+atom] fix(sglang): upgrade to v0.5.17\n\nUpdate SGLang Docker builds to v0.5.17 and adapt ATOM plugin imports/config handling for upstream API changes.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): format v0.5.17 compatibility imports\n\nApply Black formatting and Ruff import organization before rerunning precheckin checks.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): drop legacy v0.5.15 compatibility paths\n\nUse SGLang v0.5.17 import paths directly and remove obsolete MiniMax pool shim now covered upstream.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): keep MiniMax bridge shim out of upgrade diff\n\nRestore the existing MiniMax bridge code and leave only the v0.5.17 prepare-path change in this PR.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): update fp8 kernel import for v0.5.17\n\nUse the SGLang v0.5.17 quantization kernel path and guard DSV4 pool patching when the upstream symbol is unavailable.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): stabilize v0.5.17 accuracy CI\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): address v0.5.17 review feedback\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): cover v0.5.17 plugin edge cases\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): recover R1 and M3 accuracy paths\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): restore M3 graph cache binding\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): adapt EAGLE filter signature\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* [sgl+atom] fix(sglang): keep EAGLE state ordered on filter\n\n* [sgl+atom] style: format EAGLE state lifecycle test\n\n* [sgl+atom] refactor(sglang): trim v0.5.17 diff\n\n* [sgl+atom] refactor(sglang): drop optional M3 diagnostic diff\n\n* [sgl+atom] ci(sglang): refresh PR accuracy matrix for v0.5.17\n\nReplace the legacy SGLang PR accuracy cases with the four target\nconfigurations:\n- GLM-5.2-FP8 TP8\n- GLM-5.2-MXFP4 TP4 MTP3\n- MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3\n- DeepSeek-V4-Pro MTP3 TP8\n\nDrop GLM-5.1-FP8 TP8, DeepSeek-R1-FP4-V2 TP8 MTP3, MiniMax-M3-MXFP4 TP4,\nQwen3.5-35B-A3B-FP8 TP2 and DeepSeek-V4-Flash TP8.\n\n* fix glm51 regression\n\n* format\n\n* [sgl+atom] fix(sglang): restore MiniMax-M3 fp8 sparse attention on v0.5.17\n\nSGLang v0.5.17 ships its own MiniMaxSparseKVPool, so ATOM's\ninstall_minimax_m3_pool_patch() wrapper is no longer reachable (it has no\ncall site). Three contracts it used to satisfy were silently lost:\n\n- Decode / target-verify metadata never set AttnState, so it inherited the\n  PREFILL_NATIVE default. The forward context then reported is_prefill=True\n  and full-attention layers dispatched to prefill_attention, which reads\n  attn_metadata.cu_seqlens_k -- unset on those paths. Set state=DECODE (and\n  cu_seqlens_k) to match every other bridge.\n- SGLang's pool carries no fp8 dequant-scale storage, but the fused\n  qk-norm/KV-insert kernel writes per-token scales. Own them per layer, the\n  same fallback the EAGLE3 bridge uses for SGLang's native draft KV pool.\n- SGLang only allocates an fp8 indexer cache when m3_fp8_attn_gemm_enabled()\n  is true, which needs trtllm_mha + SM100 and so is never active on ROCm.\n  The fused kernel is in fp8 sparse insert mode whenever the main KV cache is\n  fp8 and rejects a bf16 indexer, so own fp8 indexer storage instead.\n\nMI355X TP4, MiniMax-M3-MXFP8 EAGLE3 MTP3, gsm8k 5-shot:\nexact_match,flexible-extract = 0.9515 (threshold 0.93).\n\n* Address SGLang CI review on DSA import, verify replay, and unused env.\n\nImport dsa_backend only when a non-GLM model asks for it, and take\ntarget-verify replay positions from the graph buffers when the batch\nomits them. Drop the two GLM MTP env vars nothing in ATOM reads.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Add Kimi-K3 and Qwen3.8-Flash-Next to the SGLang PR accuracy matrix.\n\nThese two targets live in the nightly catalog but were never in the PR\nworkflow. Forward optional lm-eval batch size and gen kwargs so the\nFlash chat recipe keeps its validated settings.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Add Qwen3.8-2.4T MXFP4 to the SGLang PR accuracy matrix.\n\nUse the nightly catalog recipe: TP8, FP8 KV, compile-only prefill, and\nthe chat GSM8K settings already validated for this checkpoint.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Keep huggingface-hub 1.x when the SGLang CI image installs lm-eval.\n\ndatasets upgrades hub to 2.x, and transformers 5.16.1 then refuses to\nimport. Constrain hub to >=1.31,<2 so Qwen3.8-Flash and GSM8K both load.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Accept DCP indexer buffers in the SGLang sparse MLA op.\n\nGLM-5.2 MTP draft capture now passes the two DCP buffers that the model\nindexer already sends. The plugin op still declared the old 23-argument\nschema, so graph capture died before accuracy started.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Fix SGLang CI crashes on MiniMax refusal, GLM MTP bounds, and spur docker.\n\nMiniMax dispatch calls the refusal hook with one argument, and GLM MXFP4 was feeding out-of-range indexer ends plus FP8 K/V into bf16 FMHA. Spur nodes also miss the buildkit tmp dir and reject privileged containers.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Fix Kimi MLA pool check, V4 draft split plans, and missing buildkit tmp.\n\nSGLang 0.5.20 allocates Kimi's cache as MLATokenToKVPool, and V4 draft capture was handing native decode a metadata object without split_plan_swa. Nodes that lack the buildkit tmp mount now fall back to the legacy builder.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Fix SGLang 0.5.20 prefill config lookup and the remaining accuracy crashes.\n\nQwen compile-only now reads the published CUDA graph config, GLM MXFP4 MTP casts FP8 K/V before bf16 FMHA, and Kimi-K3 GSM8K runs with a smaller batch.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Retrigger the SGLang pull_request workflows.\n\nThe previous push updated the branch without starting ATOM SGLang Test.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Fix the two SGLang accuracy crashes on 0.5.20.\n\nKimi-K3 was still launched with mem-fraction 0.93 and 64-way GSM8K, so the AITER restore put the server back at 0.93 and the process was SIGKILLed. GLM-5.2 MXFP4 MTP verify used a stale seq_lens as the KV length and the hd256 varlen kernel read past the packed rows.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Fix the GLM-5.2 MXFP4 MTP accuracy aperture.\n\nThe TP4 prefill hits the gfx950 hd256 group kernel at 16 heads, and the first MTP verify then runs the paged top-k scorer. Chunk that prefill into the 8-head shape that already passes, and keep short verify on the dense KV table.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Keep the GLM-5.2 MTP aperture fix inside the SGLang plugin.\n\nThe native head chunk and indexer bypass did not stop the crash, and the 10240 CUDA-graph fill was still being read as the live KV length.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Drop the native MLA and indexer edits from the SGLang CI fix.\n\nThose files stay at main. The GLM-5.2 length correction remains in the SGLang plugin.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Keep the Kimi decode replay and GLM verify fixes inside the SGLang plugin.\n\nMLA graph replay has no kv_lens, and padded rows were still seq_len=1 on request 0. GLM verify was still allowed to walk the 10240 capture fill past the K/V tensor.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Size GLM target-verify graph kv indices to the context capacity.\n\nCapture warmup stored a draft-width buffer of 4, so a real verify context of 6 could not be copied in. Replay still writes the live length into that wider buffer.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Keep GLM verify lengths short and invalidate Kimi graph padding.\n\nRestore the #1760 verify lens path so 10240 only sizes capture storage. Replay writes the real short context into that storage. Kimi decode padding was still seq_len=1 on slot 0; zero the length and mark out_cache_loc as -1.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Keep Kimi padding off slot 0 and GLM verify off the 10240 fill.\n\nDecode graph replay copies a bucket-sized out_cache_loc, so the padded zeros were overwriting the -1 write sentinel. GLM capture still publishes that fill as max_seqlen_k, which the varlen kernel records as a host int.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Restore GLM-FP8 decode indexer and the padded stride on TP4 FMHA chunks.\n\nSingle-token decode was skipping the sparse indexer, so GSM8K fell to chance. The TP4 head split also packed the rope-padded view, and the hd256 kernel read past that allocation.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Retarget Kimi-K3 decode MLA onto per-token pages.\n\nSGLang's persistent plan is built at page size 128, while the ATOM kernel reads one KV slot per index. Padding no longer clobbers slot 0, but decode still attends the wrong tokens.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Publish SGLang's Kimi MLA work buffer under ATOM's name.\n\nThe per-token retarget looked up work_meta_data, but SGLang stores that plan on work_metadata and builds it at page granularity 128. Decode never rewrote the buffer, so Kimi kept attending the wrong tokens.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Keep GLM MTP off the CUDA-graph length fill.\n\nA 10240 capture fill was winning over the real prompt, so the verify indexer walked unwritten KV pages and faulted. Draft graph capture also allocates sparse MLA workspaces on the per-step backend that owns the KV pool.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Cap the GLM indexer walk to the KV prefix that was actually written.\n\nA CUDA-graph length fill left the first live verify reading past req_to_token and faulting the GPU.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Format the GLM indexer changes so precheckin Black and Ruff pass.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): keep GLM-5.2 FP8 decode scoring and run MXFP4 verify eagerly\n\nGLM target-verify replay bakes max_seqlen_k and faults on MXFP4, so that graph stays off. FP8 has no MTP and still runs the q=1 indexer; capture skips only the host copy. DeepSeek-V4 graph metadata now publishes fp4_decode_topk.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): mark the DSV4 config fallback for Ruff\n\nPrecheckin fails BLE001 on the new FP4 probe. The broad catch stays because the ATOM config is missing outside a loaded model.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): keep Qwen GDN prefill off FlyDSL on gfx950\n\nThe AITER FlyDSL prefill GEMM raises hipBLAS internal error on gfx950 and kills the Flash server. gfx942 still uses FlyDSL; other arches stay on Triton.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): keep Qwen Flash gfx950 BF16 GEMMs off hipBLASLt\n\nThe new AITER table selects hipBLASLt for Flash BF16 prefill on gfx950 and that solution aborts. Those shapes previously missed the table and used the torch GEMM this accuracy job passed with.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): key the Flash hipBLASLt bypass off the live GPU\n\nget_gfx() reports the last GPU_ARCHS entry, so a gfx942;gfx950 image looks like gfx950 on MI308. Use the device arch and leave the gfx942 hipBLASLt path alone.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): publish GLM indexer rows for score_topk\n\nMain's indexer reads attn_metadata.index_rows. SGLang GLM metadata never set it, so decode-graph capture died on a missing out_rows. Publish the FP8 decode and prefill rows, and keep one logits plane so capture does not allocate.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* test(sglang): drop the Kimi-K3 max-running-requests cap\n\nLet the KDA state cache size the TP8 batch so CI can check whether GSM8K still comes up without the hard limit of 8.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: xinyuazh <xinyuazh@hjbog-srdc-15.amd.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>\nCo-authored-by: zhangxinyuanliuhengyu <xinyuazh@amd.com>",
+          "timestamp": "2026-10-27T02:26:57Z",
+          "url": "https://github.com/ROCm/ATOM/commit/481c2bfd443f128edac1aab3bdbfdf3735dd4d1b"
+        },
+        "date": 1793068020870,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=16 throughput (tok/s)",
+            "value": 1375.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2765.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=16 TTFT (ms)",
+            "value": 159.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=16 TPOT (ms)",
+            "value": 11.24,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=32 throughput (tok/s)",
+            "value": 1955.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3905.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=32 TTFT (ms)",
+            "value": 206.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=32 TPOT (ms)",
+            "value": 15.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=4 throughput (tok/s)",
+            "value": 534.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 1074.59,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=4 TTFT (ms)",
+            "value": 118.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=4 TPOT (ms)",
+            "value": 7.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=4 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=64 throughput (tok/s)",
+            "value": 2458.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 4917.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=64 TTFT (ms)",
+            "value": 276.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=64 TPOT (ms)",
+            "value": 25.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=8 throughput (tok/s)",
+            "value": 902.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1797.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=8 TTFT (ms)",
+            "value": 129.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=8 TPOT (ms)",
+            "value": 8.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 1024/1024 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 61440/600 c=64 throughput (tok/s)",
+            "value": 110.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 61440/600 c=64 Total Tput (tok/s)",
+            "value": 11389.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 61440/600 c=64 TTFT (ms)",
+            "value": 186776.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 61440/600 c=64 TPOT (ms)",
+            "value": 258.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 61440/600 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 61440/600 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=16 throughput (tok/s)",
+            "value": 920.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 8305.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=16 TTFT (ms)",
+            "value": 576.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=16 TPOT (ms)",
+            "value": 16.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=32 throughput (tok/s)",
+            "value": 1164.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 10413.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=32 TTFT (ms)",
+            "value": 835.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=32 TPOT (ms)",
+            "value": 26.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=4 throughput (tok/s)",
+            "value": 454.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4089.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=4 TTFT (ms)",
+            "value": 363.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=4 TPOT (ms)",
+            "value": 8.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=4 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=64 throughput (tok/s)",
+            "value": 1326.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 11958.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=64 TTFT (ms)",
+            "value": 1327.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=64 TPOT (ms)",
+            "value": 46.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=8 throughput (tok/s)",
+            "value": 692.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 6157.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=8 TTFT (ms)",
+            "value": 458.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=8 TPOT (ms)",
+            "value": 10.89,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 MI308 8192/1024 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=16 throughput (tok/s)",
+            "value": 829.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1667.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=16 TTFT (ms)",
+            "value": 263.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=16 TPOT (ms)",
+            "value": 18.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=32 throughput (tok/s)",
+            "value": 1178.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2354,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=32 TTFT (ms)",
+            "value": 321.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=32 TPOT (ms)",
+            "value": 26.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=4 throughput (tok/s)",
+            "value": 378.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 760.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=4 TTFT (ms)",
+            "value": 182.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=4 TPOT (ms)",
+            "value": 10.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=64 throughput (tok/s)",
+            "value": 1534.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 3069.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=64 TTFT (ms)",
+            "value": 428.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=64 TPOT (ms)",
+            "value": 40.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=8 throughput (tok/s)",
+            "value": 573.76,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1143.28,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=8 TTFT (ms)",
+            "value": 206.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=8 TPOT (ms)",
+            "value": 13.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 1024/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 61440/600 c=64 throughput (tok/s)",
+            "value": 95.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 61440/600 c=64 Total Tput (tok/s)",
+            "value": 9844.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 61440/600 c=64 TTFT (ms)",
+            "value": 317781.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 61440/600 c=64 TPOT (ms)",
+            "value": 119.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 61440/600 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 61440/600 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=16 throughput (tok/s)",
+            "value": 637.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 5753.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=16 TTFT (ms)",
+            "value": 809.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=16 TPOT (ms)",
+            "value": 23.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=32 throughput (tok/s)",
+            "value": 827.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 7398.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=32 TTFT (ms)",
+            "value": 1170.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=32 TPOT (ms)",
+            "value": 36.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=4 throughput (tok/s)",
+            "value": 335.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3016.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=4 TTFT (ms)",
+            "value": 513.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=4 TPOT (ms)",
+            "value": 11.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=64 throughput (tok/s)",
+            "value": 973.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 8775.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=64 TTFT (ms)",
+            "value": 1850.65,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=64 TPOT (ms)",
+            "value": 62.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=8 throughput (tok/s)",
+            "value": 479.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 4262.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=8 TTFT (ms)",
+            "value": 640.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=8 TPOT (ms)",
+            "value": 15.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8-tp4 MI308 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=16 throughput (tok/s)",
+            "value": 980.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1970.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=16 TTFT (ms)",
+            "value": 235.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=16 TPOT (ms)",
+            "value": 15.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=32 throughput (tok/s)",
+            "value": 1440.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2875.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=32 TTFT (ms)",
+            "value": 297.66,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=32 TPOT (ms)",
+            "value": 21.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=4 throughput (tok/s)",
+            "value": 386.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 776.61,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=4 TTFT (ms)",
+            "value": 188.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=4 TPOT (ms)",
+            "value": 9.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=64 throughput (tok/s)",
+            "value": 1902.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 3806.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=64 TTFT (ms)",
+            "value": 377.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=64 TPOT (ms)",
+            "value": 32.59,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=8 throughput (tok/s)",
+            "value": 646.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1287.89,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=8 TTFT (ms)",
+            "value": 199.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=8 TPOT (ms)",
+            "value": 11.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 1024/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 61440/600 c=64 throughput (tok/s)",
+            "value": 136.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 61440/600 c=64 Total Tput (tok/s)",
+            "value": 14133.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 61440/600 c=64 TTFT (ms)",
+            "value": 158025.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 61440/600 c=64 TPOT (ms)",
+            "value": 194.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 61440/600 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 61440/600 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=16 throughput (tok/s)",
+            "value": 764.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 6900.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=16 TTFT (ms)",
+            "value": 649.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=16 TPOT (ms)",
+            "value": 19.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=32 throughput (tok/s)",
+            "value": 1026.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 9180.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=32 TTFT (ms)",
+            "value": 937.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=32 TPOT (ms)",
+            "value": 29.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=4 throughput (tok/s)",
+            "value": 353.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3173.39,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=4 TTFT (ms)",
+            "value": 418.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=4 TPOT (ms)",
+            "value": 10.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=64 throughput (tok/s)",
+            "value": 1227.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 11064.69,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=64 TTFT (ms)",
+            "value": 1516.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=64 TPOT (ms)",
+            "value": 49.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=8 throughput (tok/s)",
+            "value": 551.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 4905.76,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=8 TTFT (ms)",
+            "value": 519.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=8 TPOT (ms)",
+            "value": 13.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 MI308 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=16 throughput (tok/s)",
+            "value": 883.5,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1776.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=16 TTFT (ms)",
+            "value": 324.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=16 TPOT (ms)",
+            "value": 17.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=16 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=16 _tp",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=32 throughput (tok/s)",
+            "value": 1297.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2591.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=32 TTFT (ms)",
+            "value": 435.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=32 TPOT (ms)",
+            "value": 23.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=32 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=32 _tp",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=4 throughput (tok/s)",
+            "value": 324.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 653.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=4 TTFT (ms)",
+            "value": 264.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=4 TPOT (ms)",
+            "value": 11.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=4 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=4 _tp",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=8 throughput (tok/s)",
+            "value": 559.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1115.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=8 TTFT (ms)",
+            "value": 268.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=8 TPOT (ms)",
+            "value": 13.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=8 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 1024/1024 c=8 _tp",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=16 throughput (tok/s)",
+            "value": 609.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 5500.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=16 TTFT (ms)",
+            "value": 1200.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=16 TPOT (ms)",
+            "value": 24.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=16 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=16 _tp",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=32 throughput (tok/s)",
+            "value": 787.72,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 7044.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=32 TTFT (ms)",
+            "value": 2062.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=32 TPOT (ms)",
+            "value": 37.59,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=32 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=32 _tp",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=4 throughput (tok/s)",
+            "value": 277.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2493.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=4 TTFT (ms)",
+            "value": 904,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=4 TPOT (ms)",
+            "value": 13.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=4 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=4 _tp",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=8 throughput (tok/s)",
+            "value": 436,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 3878.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=8 TTFT (ms)",
+            "value": 973.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=8 TPOT (ms)",
+            "value": 17.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40350493828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261025@sha256:d2e68b0da2c350436acd9a50b298a017f9ca7fc2090c8c496e303c778d48c1b9"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=8 _gpu_count",
+            "value": 2,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.8-Flash-Next-FP8 MI308 8192/1024 c=8 _tp",
+            "value": 2,
             "unit": ""
           }
         ]
