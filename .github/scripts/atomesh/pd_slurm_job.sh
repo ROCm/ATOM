@@ -474,6 +474,9 @@ EOF
       "${container}"
   docker_rc="${PIPESTATUS[0]}"
   set -e
+  if [[ "${BACKEND:-atom}" == "vllm" ]]; then
+    docker inspect --format '{{json .State}}' "${container}" > "${rank_dir}/docker-state.json" 2>/dev/null || true
+  fi
   echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
   if [[ "${docker_rc}" -ne 0 ]]; then
     echo "[logs] last 16384 bytes of ${rank_dir}/${container_log}:" >&2

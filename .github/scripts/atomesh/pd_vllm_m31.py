@@ -253,13 +253,25 @@ def main():
     available = int(mem['MemAvailable'].split()[0]) * 1024
     assert available > (1024 + 32 + 256) * 1024**3, f"Insufficient host memory: {available}"
     # Reuse the cluster cache, while the model revision remains explicit.
+    # Bound download memory; Xet's concurrent shard reconstruction was killed
+    # with rc=137 during the first run, before Store or engines were started.
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    memory = {"proc_meminfo": Path('/proc/meminfo').read_text(),
+              "proc_cgroup": Path('/proc/self/cgroup').read_text()}
+    for name in ('memory.max', 'memory.current', 'memory.events', 'memory.peak'):
+        path = Path('/sys/fs/cgroup') / name
+        if path.exists():
+            memory[name] = path.read_text()
+    dump(out / "memory-before-download.json", memory)
+    print("[model] resolving pinned snapshot, HTTP streaming, max_workers=2", flush=True)
     from huggingface_hub import snapshot_download
     model_root = Path(os.environ["MODEL_PATH"])
     cache_root = model_root.parent / ".hf-vllm-m31"
     if not model_root.is_absolute():
         raise ValueError("Catalog must supply the shared model root")
     cache_root.mkdir(parents=True, exist_ok=True)
-    model_path = snapshot_download(plan['model'], revision=plan['model_revision'], cache_dir=str(cache_root))
+    model_path = snapshot_download(plan['model'], revision=plan['model_revision'], cache_dir=str(cache_root), max_workers=2)
     assert (Path(model_path) / 'dspark/config.json').exists()
     plan["resolved_model_path"] = model_path
     plan["runtime_ports"] = ports
