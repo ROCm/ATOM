@@ -363,6 +363,7 @@ def build_reference_attention_wob_c1(debug=False, reduce=True, seam=False, ffn=F
     from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_down import run_down_c1
     from atom.models.deepseek_v41.mono.kernels.moe import wsl_words, lds_tail
     from atom.models.deepseek_v41.mono.kernels.moe_shape import RouteShape
+    from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_route import C1RouteShape
     from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_indexer import run_indexer_c1, PER_THREAD
     from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_topk import lds_words
     if seam and not reduce:
@@ -383,7 +384,7 @@ def build_reference_attention_wob_c1(debug=False, reduce=True, seam=False, ffn=F
         raise ValueError("positive ring geometry required")
     layout = ffn_input_layout_c1(index_bound_max, tp) if ffn else attention_ffn_front_layout_c1(tp) if seam else attention_wo_layout_c1(tp)
     d, name = Dims(tp), attention_wob_symbol_c1(debug, reduce, seam, ffn, router, route, shared, gate, ug, down, ffn_reduce, index_bound_max, ring_slots, tp)
-    rs = RouteShape(384,6,1,tp,1)
+    rs = (C1RouteShape if tp == 2 else RouteShape)(384,6,1,tp,1)
     index_sizes = lds_words(PER_THREAD)
     ffn_table_args = FFN_DOWN_ARGS if down else FFN_UG_ARGS if ug else FFN_GATE_ARGS if gate else FFN_SHARED_ARGS if shared else FFN_INPUT_ARGS
     @fx.struct
@@ -617,7 +618,7 @@ def build_reference_attention_wob_c1(debug=False, reduce=True, seam=False, ffn=F
             fscratch = scalar_address(scratch)
             cb = dict(S=1, tid=ftid, bid=bid, lane=ftid%32, wave=ftid//32,
                       d=d,
-                      rs=RouteShape(384,6,1,tp,1),
+                      rs=rs,
                       args=dict(x=scalar_address(args["normed"]),
                                 gate_w=scalar_address(args["gate_w"]),
                                 bias=scalar_address(args["bias"])), red=shared_mem.red.ptr,

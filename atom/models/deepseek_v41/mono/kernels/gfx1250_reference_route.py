@@ -11,7 +11,7 @@ from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int64
 
@@ -28,6 +28,26 @@ from atom.mono.device.sync import sreg
 from atom.mono.plan.execution import BLOCKS, first_task
 
 THREADS, WAVES = 256, 8
+
+
+class C1RouteShape(RouteShape):
+    """TP2 c1 table: picks/weights, six sorted slots, inverse order and queue.
+
+    ROUTE's low nine id bits retain the expert; bits 9..11 carry its sorted
+    slot. The original tagged-pair region and eight-copy fanout are unchanged.
+    No per-expert bitmap or expert-to-slot array is needed by these consumers.
+    """
+    @property
+    def order0(self):
+        return 25
+
+    @property
+    def first0(self):
+        return 31
+
+    @property
+    def queue0(self):
+        return 38
 
 
 def dual_ballot(pred0, pred1):
@@ -107,6 +127,11 @@ def stage_route_c1(c, token):
             my_w = (lane==k).select(weight,my_w)
             my_id = (lane==k).select(win_id,my_id)
         scale = fx.Float32(SCALE)/fx.max(total,fx.Float32(1e-20))
+        if const_expr(isinstance(rs, C1RouteShape)):
+            slot = fx.Int32(0)
+            for pick in range_constexpr(6):
+                slot = slot + (readlane(my_id, pick) < my_id).select(1, 0)
+            my_id = my_id | (slot << 9)
         if lane < 6:
             for copy in range_constexpr(ROUTE_COPIES):
                 at = (copy+token)*12+lane
@@ -116,7 +141,7 @@ def stage_route_c1(c, token):
 
 
 @traced
-def load_route_c1(c, tab):
+def load_route_reference_c1(c, tab):
     """Mother bitmap/prefix construction, private to every consuming CTA."""
     tid,lane,wave,rs = c["tid"],c["lane"],c["wave"],c["rs"]
     assert rs.tokens == 1 and rs.experts == 384 and rs.topk == 6
@@ -175,6 +200,30 @@ def load_route_c1(c, tab):
         pos = fx.ptr_load(tab+rs.first0+slot)
         fx.ptr_store(tid,tab+rs.order0+pos)
     gpu.barrier()
+
+
+@traced
+def load_route_c1(c, tab):
+    """Consume producer-ranked top6, one CTA join and no bitmap/prefix work."""
+    if const_expr(isinstance(c["rs"], C1RouteShape)):
+        tid, rs = c["tid"], c["rs"]
+        copy_at = c["bid"] % ROUTE_COPIES * 12
+        got = c["poll"]([(c["route"], copy_at + fx.min(tid, 11), 1)])[0][0]
+        if tid < 6:
+            expert, slot = got & 511, got >> 9
+            fx.ptr_store(expert, tab + tid)
+            fx.ptr_store(expert, tab + 13 + slot)
+            fx.ptr_store(slot, tab + 19 + tid)
+            fx.ptr_store(tid, tab + rs.order0 + slot)
+        if (tid >= 6) & (tid < 12):
+            fx.ptr_store(got, tab + tid)
+        if tid < 7:
+            fx.ptr_store(tid, tab + rs.first0 + tid)
+        if tid == 0:
+            fx.ptr_store(fx.Int32(6), tab + 12)
+        gpu.barrier()
+    else:
+        load_route_reference_c1(c, tab)
 
 
 def ffn_route_symbol_c1(tables=False):
