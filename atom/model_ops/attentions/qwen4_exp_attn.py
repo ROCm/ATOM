@@ -130,6 +130,20 @@ class Qwen4ExpBackend(GDNAttentionBackend):
                 "Qwen3.8 offload needs PAGE checkpoints; pipeline parallelism "
                 "and RapidServe stay on fork slots"
             )
+        from atom.kv_transfer.disaggregation.factory import resolve_pd_backend
+
+        pd_backend = resolve_pd_backend(config.kv_transfer_config)
+        if pd_backend is not None:
+            # GDN and PLE ride the PAGE checkpoint image, which only the
+            # offload tiers read. A P/D connector moves the QSA pages alone,
+            # and decode would continue from a zero recurrent state: fluent,
+            # wrong output and no error.
+            raise ValueError(
+                "Qwen3.8 disaggregated serving is not supported: "
+                f"kv_connector={pd_backend!r} would transfer the QSA pages "
+                "without the GDN and PLE state. Use an offload connector "
+                "(lmcache_offload or lmcache_mp) or run without kv_transfer_config."
+            )
         if len(set(config.hf_config.ple_layer_ids or [])) > 1:
             raise ValueError("Qwen backend currently allocates state for one PLE layer")
         if config.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):

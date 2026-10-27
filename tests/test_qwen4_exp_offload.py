@@ -211,6 +211,54 @@ def test_validate_config_allows_offload_and_rejects_rapidserve():
         Qwen4ExpBackend.validate_config(builder.model_runner.config)
 
 
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+        {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+        {
+            "kv_connector": "multi",
+            "connectors": [{"kv_connector": "lmcache_offload", "kv_role": "offload"}],
+        },
+    ],
+)
+def test_validate_config_allows_offload_connectors(kv_transfer_config):
+    builder, _ = _builder()
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
+
+    builder.model_runner.config.kv_transfer_config = kv_transfer_config
+    Qwen4ExpBackend.validate_config(builder.model_runner.config)
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config, backend",
+    [
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "mooncake"),
+        ({"kv_connector": "moriio", "kv_role": "kv_consumer"}, "moriio"),
+        # No connector named: the factory defaults to moriio.
+        ({"kv_role": "kv_producer"}, "moriio"),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                ],
+            },
+            "mooncake",
+        ),
+    ],
+)
+def test_validate_config_rejects_pd_connectors(kv_transfer_config, backend):
+    """A P/D peer would get the QSA pages and continue from a zero GDN/PLE state."""
+    builder, _ = _builder()
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
+
+    builder.model_runner.config.kv_transfer_config = kv_transfer_config
+    with pytest.raises(ValueError, match=f"kv_connector={backend!r}"):
+        Qwen4ExpBackend.validate_config(builder.model_runner.config)
+
+
 class _HostEvent:
     def record(self):
         pass
