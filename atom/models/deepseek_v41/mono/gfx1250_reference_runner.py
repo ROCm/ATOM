@@ -99,6 +99,14 @@ class Gfx1250ReferenceRunner(V41MonoDecodeRunner):
                 if table.dtype != torch.bfloat16 or table.shape[-1] != 32:
                     raise MonoUnsupported("reference RoPE requires original BF16 tables")
         self._allocate(model.config)
+        from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_ffn import ffn_input_layout_c1
+        reference_layout = ffn_input_layout_c1(self.index_bound_max,self.tp)
+        required_scratch = max(o+n for o,n in reference_layout.values())
+        if self.scratch.numel() < required_scratch:
+            # Allocate before StepMailboxes/graph binding so the additional
+            # TP2 producer payloads and flags have one stable lifetime.
+            self.scratch = torch.zeros((required_scratch+15)//16*16,
+                                       dtype=torch.uint8,device=self.scratch.device)
         # The mother's final XRDY is eight bytes; step_begin clears 16-byte
         # vectors. Preserve every region offset and pad only the allocation.
         if self.scratch.numel() % 16:

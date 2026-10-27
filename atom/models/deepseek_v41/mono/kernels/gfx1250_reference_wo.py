@@ -429,7 +429,7 @@ def build_reference_attention_wob_c1(debug=False, reduce=True, seam=False, ffn=F
         sxsl:fx.Array[fx.Int32, lds_row(d.sh_inter//32), 16]
         contrib:fx.Array[fx.Int32, 2*rs.picks*16, 16]
         sdl:fx.Array[fx.Int32, 32, 16]
-        pair:fx.Array[fx.Float32, 16, 16]
+        pair:fx.Array[fx.Float32, 32 if tp == 2 else 16, 16]
     @fx.struct
     class IndexLds:
         keys:fx.Array[fx.Int32,index_sizes["keys"],16]
@@ -668,6 +668,9 @@ def build_reference_attention_wob_c1(debug=False, reduce=True, seam=False, ffn=F
                           put_bf=fmb.put_bf,tag=fmb.tag,tok_par=False,
                           sym=scalar_address(c["sym"]),peer=c["peer"],peer_addr=c["peer_addr"],rank=c["rank"])
                 cb["dq"] = sreg(fscratch,layout["dq"][0],"dq")
+                if const_expr(tp == 2):
+                    for key in ("dcv","dcf"):
+                        cb[key] = sreg(fscratch,layout[key][0],key)
                 run_down_c1(cb,bid,ffn_reduce)
     @launcher(name)
     def launch(q:Int64, pool:Int64, sel:Int64, sbound:Int64, kmeta:Int64,
