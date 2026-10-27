@@ -1689,6 +1689,23 @@ models:
             tp: 4
             cudagraph: *m31_capture_c64
 
+        # C88 extends the same band, keeping max-num-seqs at twice client concurrency.
+        - <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c88
+          concurrency: [88]
+          server:
+            common_args:
+              max_num_seqs: 176
+              spec_decode_acceptance_length: 4.04
+          prefill:
+            workers: 1
+            tp: 4
+            cudagraph: &m31_capture_c88 "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176]"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: *m31_capture_c88
+
       profile:
         - <<: *m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32-profile

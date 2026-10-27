@@ -24,7 +24,7 @@ The configuration is in `.github/benchmark/models_atomesh.yaml` under
 | Indexer CP | Unset, as required by FP4 index |
 | DSpark | K=7, checkpoint `dspark/` |
 | Performance acceptance | Synthetic golden AL 4.04; omitted for accuracy |
-| C32 / C48 / C64 max-num-seqs | 64 / 96 / 128 on both roles |
+| C32 / C48 / C64 / C88 max-num-seqs | 64 / 96 / 128 / 176 on both roles |
 | Capture sizes | Recipe list, truncated at the respective max-num-seqs |
 | Context / batch tokens | 1,048,576 / 32,768 |
 | Block size / GPU utilization | 128 / 0.9 |
@@ -51,8 +51,9 @@ kernel and cache layout, and needs a new GPU run.
 - The profiling case waits 1800 seconds after formal Profiling begins, records
   30 seconds on both roles/all ranks, and stops the load after trace export.
   Trace files remain under the job's shared `torch_traces` directory.
-- The former 8 GiB dense-gather workspace flag is omitted to match the recipe;
-  it did not reserve 8 GiB for this all-sparse target.
+- The dense cached-prefill workspace feature has been reverted from this
+  integration branch. Target sparse attention and DSpark read paged KV directly;
+  this recipe does not use a dense-gather workspace budget.
 
 Report P/D throughput per GPU against all eight allocated GPUs. The recipe's
 published throughput/GPU divides by four; its results are not measurements of
@@ -86,7 +87,9 @@ The image resolver also selects this model's pin when the model or its cases
 are selected without an explicit image override.
 
 - `suite=profile`: the C32 30-second trace case.
-- `suite=mooncake_store`: C32/C48/C64, without tracing.
+- `suite=mooncake_store`: C32/C48/C64/C88, each with 3600 seconds of formal
+  profiling after warmup and without torch tracing. Each case starts its own
+  P/D service. The workflow runs these cases in order.
 - `suite=accuracy`: the C32 GSM8K 5-shot case, without synthetic acceptance.
 
 Case names now contain `dspark7-nvfp4`; the previous `dspark3` case names no
@@ -108,3 +111,14 @@ accuracy, benchmark and trace results must be verified from their CI jobs.
   checks passed.
 - The AITER-dependent Mono dispatch and index top-k test modules were skipped
   in this CPU environment. No real GPU inference or RDMA transfer was run.
+
+### After removing dense-prefill workspace budgeting
+
+- Reverted `2142d542c` in this integration branch; the standalone workspace PR
+  remains independent of the M3.1 recipe.
+- 338 runtime/metadata/Store tests passed; 59 GPU-stack-dependent tests skipped
+  in the CPU environment. All 148 ATOMesh config/launcher tests passed.
+- C32/C48/C64/C88 each passed expanded-matrix parameter checks and Slurm dry-run:
+  P/D TP4, NVFP4/FP4 index, DSpark K7/AL4.04, 1 TiB Store, no torch trace, and
+  3600-second formal profiling. C88 uses max-num-seqs 176 on both roles.
+- Ruff, Black, Python AST and diff whitespace checks passed for the reverted files.
