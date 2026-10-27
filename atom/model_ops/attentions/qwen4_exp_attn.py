@@ -431,84 +431,23 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         views.append(ngram[slot : slot + 1])
         return views
 
-    def checkpoint_page_unit_bytes(self) -> int | None:
-        if not self._uses_paged_checkpoints():
-            return None
+    # The PAGE image lives in the QSA arena; the parent's PAGE contract
+    # (`_page_unit_regions`, `page_unit_views`, `page_unit_segments`,
+    # `checkpoint_page_unit_bytes`, `get_kv_transfer_tensors`' tail) reads it
+    # through these two hooks.
+
+    def _published_page_unit_bytes(self) -> int:
         from atom.model_ops.attentions.pool_layout.qsa_page_unit_geometry import (
             qsa_published_page_bytes,
         )
 
-        published = qsa_published_page_bytes(self._qsa_fields())
-        if published <= 0:
-            raise RuntimeError("Qwen3.8 PAGE checkpoint has no published QSA bytes")
-        return published
+        return qsa_published_page_bytes(self._qsa_fields())
 
-    def _qsa_pools(self):
-        from atom.model_ops.attentions.pool_layout.qsa_page_unit_geometry import (
-            QsaRegionPool,
-        )
-
-        arena = getattr(self, "qsa_arena", None)
-        if arena is None:
+    def _page_unit_pools(self) -> list:
+        pool = getattr(self, "qsa_region_pool", None)
+        if pool is None:
             raise RuntimeError("Qwen3.8 PAGE checkpoint has no QSA arena")
-        return [QsaRegionPool(arena)]
-
-    def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_regions,
-        )
-
-        pools = self._qsa_pools()
-        key = tuple(
-            (
-                tensor.data_ptr(),
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                tensor.element_size(),
-            )
-            for pool in pools
-            for _, tensor in pool.region_tensors()
-        )
-        cached = getattr(self, "_page_unit_region_cache", None)
-        if cached is not None and cached[0] == key:
-            return cached[1]
-        regions = mha_page_unit_regions(pools)
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
-        owned = int(regions[1].sum())
-        if spec is not None and owned != spec.page_unit_bytes:
-            raise RuntimeError(
-                f"a PAGE unit is {spec.page_unit_bytes} B but the QSA regions "
-                f"cover {owned} B"
-            )
-        self._page_unit_region_cache = (key, regions)
-        return regions
-
-    def page_unit_views(self, unit_ids):
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_views,
-        )
-
-        self._page_unit_regions()
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
-        image_bytes = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
-        return mha_page_unit_views(self._qsa_pools(), unit_ids, image_bytes=image_bytes)
-
-    def page_unit_segments(self, unit_ids):
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_segments,
-        )
-
-        regions = self._page_unit_regions()
-        spec = self.model_runner.state_runtime.checkpoint_spec
-        first = self._qsa_pools()[0].region_tensors()[0][1]
-        return mha_page_unit_segments(
-            regions,
-            unit_ids,
-            entries=int(first.shape[0]),
-            image_bytes=int(spec.image_bytes),
-        )
+        return [pool]
 
     def clear_page_units(self, unit_ids) -> None:
         """Reset these PAGE units in the QSA arena (`BlockPool.state_images`).
@@ -538,16 +477,25 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Back every paged field with the runner's shared allocation."""
+        from atom.model_ops.attentions.pool_layout.qsa_page_unit_geometry import (
+            QsaRegionPool,
+        )
+
         self.num_blocks = blocks
         self.qsa_arena = LayerMajorArena(
             self._qsa_fields(), blocks, self.device, buf=buf
         )
+        # Once per allocation: the PAGE copy and the store thread read the
+        # image through it every step, and building it is fields x layers
+        # `as_strided` views.
+        self.qsa_region_pool = QsaRegionPool(self.qsa_arena)
         return {}
 
     def release_kv_pools(self) -> None:
         for module in self.pool_rows.get(QSA_ROWS, {}):
             module.bind_caches(None, None, None, None, None)
         self.qsa_arena = None
+        self.qsa_region_pool = None
         super().release_kv_pools()
 
     def get_kv_transfer_tensors(self):
@@ -561,38 +509,16 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
-        arena = getattr(self, "qsa_arena", None)
-        if arena is None:
+        if getattr(self, "qsa_arena", None) is None:
             return None
         transfer = KVTransferTensors(
             pages=[
                 page_region(tensor, semantic_role=role)
-                for role, tensor in self._qsa_pools()[0].region_tensors()
+                for role, tensor in self._page_unit_pools()[0].region_tensors()
             ],
             tp_replication_factor=1,
         )
-        if not self._uses_paged_checkpoints():
-            return transfer
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
-        if spec is None:
-            return transfer
-        bases, sizes = self._page_unit_regions()
-        count = len(bases)
-        published = [
-            (page.region.base_addr, page.region.unit_bytes)
-            for page in transfer.pages[:count]
-        ]
-        if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
-            raise RuntimeError(
-                "QSA transfer regions do not match its checkpoint PAGE unit: "
-                f"{len(transfer.pages)} published, {count} in a unit"
-            )
-        transfer.paged_state_checkpoint_spec = spec
-        transfer.execute_paged_state_copies = self.execute_paged_state_copies
-        transfer.paged_state_region_count = count
-        transfer.native_state_tp_replication_factor = 1
-        return transfer
+        return self._with_paged_state_contract(transfer)
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
         caches = super().allocate_per_req_cache(entries)

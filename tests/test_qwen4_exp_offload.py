@@ -333,3 +333,85 @@ def test_clear_page_units_resets_the_qsa_arena_with_no_kv_pools(monkeypatch):
             raw = _block_bytes(builder.qsa_arena, field.name, block)
             want = 0 if block in (1, 2, 4) else 0x7F
             assert raw.eq(want).all(), (field.name, block)
+
+
+def _paged_builder(blocks=3, *, spec=True):
+    """A builder with a CPU QSA arena allocated the way the runner does."""
+    builder, cls = _builder()
+    builder._qsa_fields = _fields
+    builder.device = torch.device("cpu")
+    builder.kv_pools = {}
+    builder.pool_rows = {}
+    cls.allocate_kv_cache_tensors(builder, blocks=blocks, buf=None)
+    published = qsa_published_page_bytes(_fields())
+    builder.model_runner.state_runtime = (
+        SimpleNamespace(
+            checkpoint_spec=SimpleNamespace(
+                page_unit_bytes=published, image_bytes=published + published // 2
+            )
+        )
+        if spec
+        else None
+    )
+    return builder, cls
+
+
+def test_qsa_builder_inherits_the_page_contract_through_hooks():
+    """One PAGE contract: the QSA builder overrides only the pool hooks."""
+    _, cls = _builder()
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+
+    for name in (
+        "_page_unit_regions",
+        "page_unit_views",
+        "page_unit_segments",
+        "checkpoint_page_unit_bytes",
+        "_with_paged_state_contract",
+    ):
+        assert name not in vars(cls), name
+        assert name in vars(GDNAttentionMetadataBuilder), name
+    for name in ("_page_unit_pools", "_published_page_unit_bytes"):
+        assert name in vars(cls), name
+
+
+def test_qsa_region_pool_is_built_once_per_allocation(monkeypatch):
+    builder, cls = _paged_builder()
+    from atom.model_ops.attentions.pool_layout import qsa_page_unit_geometry
+
+    built = []
+    monkeypatch.setattr(
+        qsa_page_unit_geometry.QsaRegionPool,
+        "__init__",
+        lambda self, arena: built.append(arena),
+    )
+    pool = cls._page_unit_pools(builder)[0]
+    for _ in range(3):
+        cls.page_unit_views(builder, [0, 1])
+        cls.page_unit_segments(builder, [0, 1])
+        cls.get_kv_transfer_tensors(builder)
+    assert cls._page_unit_pools(builder)[0] is pool
+    assert built == []
+
+    cls.release_kv_pools(builder)
+    assert builder.qsa_region_pool is None
+    with pytest.raises(RuntimeError, match="no QSA arena"):
+        cls._page_unit_pools(builder)
+
+
+def test_page_unit_segments_take_the_untrimmed_path_before_the_spec():
+    """The store thread can ask before the runtime exists: same safe path as
+    `page_unit_views`, not an AttributeError."""
+    for runtime in (None, SimpleNamespace(checkpoint_spec=None)):
+        builder, cls = _paged_builder(spec=False)
+        builder.model_runner.state_runtime = runtime
+        ptrs, sizes = cls.page_unit_segments(builder, [1, 2])
+        views = cls.page_unit_views(builder, [1, 2])
+        assert ptrs.tolist() == [view.data_ptr() for view in views]
+        assert sizes.tolist() == [view.numel() * view.element_size() for view in views]
+
+
+def test_page_unit_segments_trim_to_the_image():
+    builder, cls = _paged_builder()
+    image = builder.model_runner.state_runtime.checkpoint_spec.image_bytes
+    _, sizes = cls.page_unit_segments(builder, [0, 2])
+    assert int(sizes.sum()) == image

@@ -1702,17 +1702,32 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         if not self._uses_paged_checkpoints():
             return None
+        published = self._published_page_unit_bytes()
+        if published <= 0:
+            raise RuntimeError("GDN PAGE checkpoint has no published page bytes")
+        return published
+
+    # -- PAGE pools: the one thing a subclass with another pool overrides --
+
+    def _page_unit_pools(self) -> list:
+        """Pools whose ``region_tensors()`` hold the image, in published order.
+
+        Everything below reads the PAGE image through this, so a builder that
+        keeps its pages elsewhere (Qwen3.8's QSA arena) overrides it and
+        ``_published_page_unit_bytes``, nothing else.
+        """
+        return list(self.kv_pools.values())
+
+    def _published_page_unit_bytes(self) -> int:
+        """Bytes one block publishes, from the declaration (before allocation)."""
         from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
             mha_published_page_bytes,
         )
 
-        published = mha_published_page_bytes(self._declare_kv_pools().values())
-        if published <= 0:
-            raise RuntimeError("GDN PAGE checkpoint has no published MHA bytes")
-        return published
+        return mha_published_page_bytes(self._declare_kv_pools().values())
 
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
-        """Where a scheduler block sits in the MHA pool.
+        """Where a scheduler block sits in the paged pool.
 
         The mixin raises: it knows the state planes, not this pool. The
         addresses have to match ``get_kv_transfer_tensors`` or the copy and
@@ -1723,7 +1738,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             mha_page_unit_regions,
         )
 
-        pools = list(self.kv_pools.values())
+        pools = self._page_unit_pools()
         key = tuple(
             (
                 tensor.data_ptr(),
@@ -1743,7 +1758,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         owned = int(regions[1].sum())
         if spec is not None and owned != spec.page_unit_bytes:
             raise RuntimeError(
-                f"a PAGE unit is {spec.page_unit_bytes} B but the MHA regions "
+                f"a PAGE unit is {spec.page_unit_bytes} B but the page regions "
                 f"cover {owned} B"
             )
         self._page_unit_region_cache = (key, regions)
@@ -1777,12 +1792,15 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         self._page_unit_regions()
+        return mha_page_unit_views(
+            self._page_unit_pools(), unit_ids, image_bytes=self._image_bytes()
+        )
+
+    def _image_bytes(self) -> int:
+        """The checkpoint image's size, or 0 (no trim) before the spec exists."""
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
-        image_bytes = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
-        return mha_page_unit_views(
-            self.kv_pools.values(), unit_ids, image_bytes=image_bytes
-        )
+        return int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
 
     def page_unit_segments(self, unit_ids):
         """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
@@ -1792,22 +1810,26 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         regions = self._page_unit_regions()
-        spec = self.model_runner.state_runtime.checkpoint_spec
-        first_region = next(iter(self.kv_pools.values())).region_tensors()[0][1]
+        first_region = self._page_unit_pools()[0].region_tensors()[0][1]
         return mha_page_unit_segments(
             regions,
             unit_ids,
             entries=int(first_region.shape[0]),
-            image_bytes=int(spec.image_bytes),
+            image_bytes=self._image_bytes(),
         )
 
     def get_kv_transfer_tensors(self):
         """MHA PAGE regions, plus the native checkpoint contract for lmcache_mp."""
 
-        transfer = super().get_kv_transfer_tensors()
+        return self._with_paged_state_contract(super().get_kv_transfer_tensors())
+
+    def _with_paged_state_contract(self, transfer):
+        """Attach the native checkpoint contract to the published PAGE regions."""
+
         if transfer is None or not self._uses_paged_checkpoints():
             return transfer
-        spec = self.model_runner.state_runtime.checkpoint_spec
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
         if spec is None:
             return transfer
         bases, sizes = self._page_unit_regions()
@@ -1818,7 +1840,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         ]
         if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
             raise RuntimeError(
-                "GDN transfer regions do not match its checkpoint PAGE unit: "
+                "transfer regions do not match the checkpoint PAGE unit: "
                 f"{len(transfer.pages)} published, {count} in a unit"
             )
         transfer.paged_state_checkpoint_spec = spec
