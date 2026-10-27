@@ -76,6 +76,14 @@ def _flydsl_linear_impls() -> list[Any]:
     return impls
 
 
+def _flydsl_prefill_supported(device: torch.device) -> bool:
+    """FlyDSL prefill GEMM is valid on gfx942. gfx950 hits hipBLAS internally."""
+    if torch.version.hip is None or device.type != "cuda":
+        return True
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    return arch == "gfx942"
+
+
 def _ensure_flydsl_policy(state: torch.Tensor):
     """Bind Native `select_policy` once, same as `_build_gdn_cache_tensor`."""
     impls = _flydsl_linear_impls()
@@ -84,7 +92,7 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     policy = impls[0].gdn_flydsl_policy
     if policy is not None:
         return policy
-    from atom.model_ops.fla_ops.gdn_flydsl import select_policy
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
 
     # ReplaySSM addresses the same contiguous checkpoint Triton prefill
     # writes. FlyDSL's VK view is a different layout; Native keeps both
@@ -96,6 +104,8 @@ def _ensure_flydsl_policy(state: torch.Tensor):
         state=state,
         activation_dtype=impls[0].dt_bias.dtype,
     )
+    if policy.prefill and not _flydsl_prefill_supported(state.device):
+        policy = GDNFlyDSLPolicy(prefill=False, decode=policy.decode)
     for impl in impls:
         impl.gdn_flydsl_policy = policy
     return policy

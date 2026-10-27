@@ -11,6 +11,11 @@ from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 
 from atom.config import Config
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+)
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
@@ -271,6 +276,7 @@ class Drafter(abc.ABC):
                     running_tokens,
                     running_tokens,
                     running_tokens_are_unified=True,
+                    scheduled_tokens_gpu=runner.forward_vars["batch_info"].gpu[2:3],
                 )
                 pass_.warmup(bs)
                 if end_trace is not None:
@@ -455,10 +461,23 @@ class Drafter(abc.ABC):
         row-aligned to ``target_hidden_states`` (the tensor they accompany), or
         None if this drafter captures no aux. The fixed capture buffers are
         sliced to ``target_hidden_states``' row count — the caller never juggles
-        token counts."""
+        token counts.
+
+        After a PCP row-split prefill the hooks hold only this rank's 1/pcp
+        stripe, so gather it. Keyed on the batch-global `target_pcp_split`, never
+        on hook-side bookkeeping, which a cudagraph replay skips.
+        """
         if not self._captures_aux:
             return None
         n = target_hidden_states.shape[0]
+        pcp_ws = get_pcp_world_size()
+        ctx = getattr(get_forward_context(), "context", None)
+        if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
+            n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
+            return [
+                pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n]
+                for buf in self._aux_buffers
+            ]
         return [buf[:n] for buf in self._aux_buffers]
 
     def anchors_to_gpu(self, anchors: list[int]) -> torch.Tensor:
@@ -611,6 +630,7 @@ class Drafter(abc.ABC):
         running_tokens: int,
         *,
         running_tokens_are_unified: bool,
+        scheduled_tokens_gpu: torch.Tensor,
     ) -> None:
         """Re-point the forward context at the pass about to run.
 
@@ -622,7 +642,9 @@ class Drafter(abc.ABC):
 
         Both units: `scheduled_tokens` is how many rows carry a real request,
         `running_tokens` how many the pass runs -- they differ exactly when the
-        batch was widened.
+        batch was widened. `scheduled_tokens_gpu` is `scheduled_tokens` on the
+        device, an entry of the step's `forward_vars["batch_info"]`: what a
+        recorded pass reads.
 
         Both flags below are the caller's to answer, because this seam cannot
         see either. `running_tokens_are_unified` claims every OTHER rank runs
@@ -635,6 +657,9 @@ class Drafter(abc.ABC):
         context = forward_context.context
         context.scheduled_tokens = scheduled_tokens
         context.running_tokens = running_tokens
+        context.scheduled_tokens_gpu = scheduled_tokens_gpu
+        # The pass's own rows; a draft that PCP-splits them says so where it does.
+        context.pcp_split = False
         parallel_config = self.config.parallel_config
         # A group of one is uniform whatever it runs; only the table needs peers.
         if parallel_config.data_parallel_size <= 1:

@@ -18,6 +18,7 @@ self-hosted-runner:
     - linux-atom-mi355-1
     - linux-atom-mi355-4
     - linux-atom-mi355-8
+    - linux-atom-pitt-mi350x-8
 
 # Configuration variables in array of strings defined in your repository or
 # organization. `null` means disabling configuration variables check.

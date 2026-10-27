@@ -690,10 +690,9 @@ class DSparkProposer(Drafter):
         attn_metadata = forward_context.attn_metadata
         context.is_draft = True
 
-        # Drafter-owned aux: our own forward-hook capture buffers, row-aligned to
-        # the target hidden states.
-        aux_hidden_states = self.aux_for(target_hidden_states)
-        if aux_hidden_states is None:
+        # Drafter-owned aux: our own forward-hook capture buffers. Checked, not
+        # read: `aux_for` would all_gather them again under a PCP prefill.
+        if not self._captures_aux:
             raise RuntimeError(
                 "DSpark requires target auxiliary hidden states from "
                 "dspark_target_layer_ids; none were captured."
@@ -764,6 +763,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and `num_draft` config, so
             # every rank reaches this height on its own.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
         if self._prob_state is not None:
             self._prob_state.begin_draft(
@@ -1142,6 +1142,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and T is config, so every
             # rank reaches this height on its own, none has to discover it.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
 
         # ---- 3. Block pass + Markov sampling ---------------------------------
