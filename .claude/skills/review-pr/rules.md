@@ -368,6 +368,20 @@ _"`ScheduledBatch` is a snapshot, not a scratchpad."_
 `atom/model_engine/scheduler.py` docstrings `ScheduledBatch` as an "Immutable snapshot of sequences selected for a single forward pass," and `model_runner.py` holds `self.prev_batch: ScheduledBatch | None` across steps so a later step can inspect what an earlier one actually ran. An in-place mutation after capture (`.append()`/`.extend()`/`+=`/`-=`/`.add_()`/`.fill_()`/slice-assignment on a `batch.*` or `prev_batch.*` field) corrupts what `prev_batch` thinks it holds instead of producing a fresh value — the same failure mode sglang's own `ScheduledBatch` equivalent hit before it adopted an out-of-place-mutation rule.
 Trigger: a diff calls `.append(`, `.extend(`, `.add_(`, `.fill_(`, or slice/index-assigns a field of a `batch` or `prev_batch` object, or does `batch.<field> +=`/`-=`, instead of rebinding to a new value.
 Source: sglang `.claude/rules/schedule-batch-out-of-place-mutation.md`, adapted to ATOM's `ScheduledBatch`. Borrowed, not ATOM-native — no ATOM PR citation yet.
+**Trigger never demonstrated firing on a real PR.** This is a stronger statement than "no
+ATOM PR citation yet" above (which is about evidence for the defect, not about whether the
+wiring fires): across two increments, nobody has produced a real ATOM diff, open or closed,
+merged or not, that trips this trigger — only the regex has been checked against synthetic
+cases. Re-searched for this increment: `gh search prs`/`gh search issues` for
+"ScheduledBatch mutate"/"prev_batch mutated"/"immutable snapshot" (no relevant hits), and
+grepped the full tree for `batch.<field>.append(`/`.extend(`/`.add_(`/`.fill_(`/`prev_batch.
+<field> +=`/`-=` outside tests (one hit, `atom/plugin/register.py:1084`'s
+`forward_batch.positions.add_(1)` — a different object, SGLang's own `ForwardBatch`, not
+ATOM's `ScheduledBatch`, and not matched by this trigger's `batch`/`prev_batch` name scope
+anyway). Left wired (body + trigger + `ALL_RULES`) rather than dropped or parked in
+`UNREACHABLE_BY_DESIGN` — the trigger is reachable by design, just unexercised by any real
+diff found so far — but do not read H1 appearing in a `rules=` line as proof the mechanism
+has ever actually caught anything.
 → `🔴 H1: [field] mutated in place on [batch/prev_batch] — rebind to a new value instead of mutating the captured snapshot`
 
 **H2 — Batch-consuming entry points must treat ScheduledBatch as read-only** ⚠️
