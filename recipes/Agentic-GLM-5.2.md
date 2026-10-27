@@ -256,7 +256,7 @@ depth is chosen per concurrency point.
 | Concurrency | Parallelism | `--num-speculative-tokens` | `--spec-decode-acceptance-length` |
 |---|---|---:|---:|
 | C1, C2 | TP4, mono decode | 3 | `2.99` |
-| C1 on 8 GPUs | TP8, mono decode (see [TP8 C1](#tp8-c1-mono-decode)) | 3 | `2.99` |
+| C1, C2 on 8 GPUs | TP8, mono decode (see [TP8 C1/C2](#tp8-c1c2-mono-decode)) | 3 | `2.99` |
 | C4, C8 | TP4 | 5 | `3.61` |
 | C10 | TP4 | 4 | `3.33` |
 | C16, C24, C32, C40 | TP4 + DCP4 | 4 | `3.33` |
@@ -354,17 +354,30 @@ python -m atom.entrypoints.openai_server \
   2>&1 | tee "server-glm52-mtp${MTP_K}-c${CONC}.log"
 ```
 
-##### TP8 C1 (mono decode)
+##### TP8 C1/C2 (mono decode)
 
 Mono decode also serves TP8, on the external-indexer path (the fused indexer is
-TP4-only). To run `C1` on all eight GPUs, set `TP=8 CONC=1` before the block
-above and change nothing else: it is the TP4 `C1` command with `-tp 8` -- mono
-at MTP3, AL `2.99`, `--max-num-seqs 1`, graphs captured at `[1]`. An armed run
-logs `GLM-5.2 MonoKernel on: S=4 chunk=4 indexer=external`.
+TP4-only). To run `C1` or `C2` on all eight GPUs, set `TP=8` and the `CONC`
+before the block above and change nothing else: each point is the TP4 command
+for that `CONC` with `-tp 8`, so both run mono at MTP3 with AL `2.99`, and each
+admits exactly `CONC` sequences.
+
+| Concurrency | `--max-num-seqs` | `--cudagraph-capture-sizes` | Mono width (`S`) |
+|---|---:|---|---:|
+| C1 | 1 | `[1]` | 4 |
+| C2 | 2 | `[1,2]` | 4, 8 |
 
 ```bash
-TP=8 CONC=1   # then run the server block above unchanged
+TP=8 CONC=1   # C1: --max-num-seqs 1
+# or
+TP=8 CONC=2   # C2: --max-num-seqs 2
+# then run the server block above unchanged
 ```
+
+An armed run logs `GLM-5.2 MonoKernel on: S=<width> ... indexer=external` on its
+first served step at each width (`S=4` for one request, `S=8` for two).
+
+The numbers below are C1 only; TP8 C2 has not been measured yet.
 
 AgentX C1, 3,600 s, forced AL `2.99`, `rocm/atom-dev:nightly_202610181506`
 (ATOM `df86c482` plus this TP8 admission). The TP4 column is InferenceX run
