@@ -505,9 +505,6 @@ class Qwen4ExpPLELayer(nn.Module):
         metadata,
     ) -> torch.Tensor:
         """PLE contribution with persistent n-gram and convolution windows."""
-        # Keep the RTP-only checkpoint hook in
-        # atom/plugin/rtpllm/utils/qwen4_exp_prefix_cache.py in sync with
-        # this forward when changing the n-gram or convolution sequence.
         input_ids = input_ids.reshape(-1)
         ngram_context = advance_ngram_state(
             input_ids,

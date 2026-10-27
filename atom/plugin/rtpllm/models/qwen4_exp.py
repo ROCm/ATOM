@@ -754,6 +754,7 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
     def _create_python_model(self):
         from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
         from atom.plugin.prepare import _set_framework_backbone, prepare_model
+        from atom.plugin.rtpllm.utils.topk_compat import install_rtp_topk_compat
 
         target_device = torch.device(self.device)
         target_dtype = self.model_config.compute_dtype
@@ -763,6 +764,7 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             torch.set_default_device(target_device)
             torch.set_default_dtype(target_dtype)
             _set_framework_backbone("rtpllm")
+            install_rtp_topk_compat()
             atom_model = prepare_model(config=self, engine="rtpllm")
             atom_model = atom_model.to(target_device)
             if getattr(self.model_config, "atom_qwen4_exp_mtp_target", False):
@@ -773,10 +775,16 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
                 bind_qwen4_exp_mtp_hooks(atom_model)
                 atom_model.model.return_hc_state = True
             if getattr(self.model_config, "atom_qwen4_exp_prefix_cache_enabled", False):
+                from atom.plugin.rtpllm.utils.gdn_checkpoint import (
+                    install_rtp_gdn_checkpoint_writer,
+                    install_rtp_native_prefill_snapshot,
+                )
                 from atom.plugin.rtpllm.utils.qwen4_exp_prefix_cache import (
                     bind_ple_checkpoint_hooks,
                 )
 
+                install_rtp_gdn_checkpoint_writer()
+                install_rtp_native_prefill_snapshot()
                 bind_ple_checkpoint_hooks(atom_model)
             load_model_in_plugin_mode(
                 model=atom_model,

@@ -253,10 +253,7 @@ def prefill(
     output = chunk_fwd_o(
         q, k, vn, h, gc, cu_seqlens=cu_seqlens, head_major_vk=True, chunk_indices=chunks
     )
-    # The checkpoint writer reads the native contiguous [V, K] snapshot.
-    # Materializing [K, V] here copies the entire per-chunk buffer on every
-    # prefix-cache prefill even though only cacheable boundaries are stored.
-    snapshots = h if keep_intermediate_states else None
+    snapshots = h.transpose(-1, -2).contiguous() if keep_intermediate_states else None
     return output, ht.transpose(-1, -2), snapshots
 
 

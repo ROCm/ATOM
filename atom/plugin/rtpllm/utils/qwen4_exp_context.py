@@ -115,14 +115,20 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             # block, and a prefix hit is block-aligned. Hence an interior
             # publishable boundary is also on this step's 64-token h grid.
             first_boundary = ((start // block_size) + 1) * block_size
-            for position in range(first_boundary, end, block_size):
+            positions = range(first_boundary, end, block_size)
+            if not positions:
+                continue
+            first_column = (first_boundary - 1) // block_size
+            last_column = first_column + len(positions)
+            if last_column > table.shape[1]:
+                raise ValueError("prefix checkpoint exceeds LINEAR block table")
+            # A single host slice avoids a torch scalar extraction for every
+            # published block in a long cold prompt.
+            row_slots = table[row, first_column:last_column].tolist()
+            for position, slot in zip(positions, row_slots):
                 offset = position - start
                 if offset % CHUNK_SIZE:
                     raise ValueError("prefix checkpoint is not on the GDN chunk grid")
-                column = (position - 1) // block_size
-                if column >= table.shape[1]:
-                    raise ValueError("prefix checkpoint exceeds LINEAR block table")
-                slot = int(table[row, column])
                 if slot < 0:
                     continue  # RTP does not publish an unmaterialized LINEAR block.
                 rows.append(row)
@@ -138,7 +144,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         # Upload all checkpoint indices together; separate pageable H2D copies
         # here otherwise add four host launches for every chunked prefill.
         packed = torch.tensor(
-            [rows, slots, offsets],
+            [rows, slots, offsets, [0] * len(rows)],
             dtype=torch.int32,
             pin_memory=device.type == "cuda",
         ).to(device, non_blocking=True)
@@ -147,7 +153,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             "rows": packed[0],
             "slots": gpu_slots,
             "offs": packed[2],
-            "is_end": torch.zeros_like(gpu_slots),
+            "is_end": packed[3],
             # RTP only snapshots interior boundaries; the kernel never reads
             # runtime slots when is_end=0.
             "runtime": gpu_slots,

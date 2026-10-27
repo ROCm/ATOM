@@ -586,7 +586,6 @@ class GatedDeltaNet(nn.Module):
                     non_spec_query_start_loc,
                     CHUNK_SIZE,
                     gdn_metadata.ssm_conv_state_len,
-                    h_vk=use_flydsl_prefill,
                 )
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes

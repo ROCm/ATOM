@@ -8,11 +8,18 @@ import torch
     torch.version.hip is None or not torch.cuda.is_available(),
     reason="ROCm GPU required",
 )
-def test_flydsl_snapshot_matches_prefix_final_state():
-    from atom.model_ops.fla_ops.gdn_flydsl import (
-        build_prefill_metadata,
-        prefill,
+def test_flydsl_snapshot_matches_prefix_final_state(monkeypatch):
+    from atom.model_ops.fla_ops import gdn_flydsl
+    from atom.plugin import prepare
+    from atom.plugin.rtpllm.utils.gdn_checkpoint import (
+        install_rtp_native_prefill_snapshot,
     )
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "rtpllm")
+    monkeypatch.setattr(gdn_flydsl, "prefill", gdn_flydsl.prefill)
+    install_rtp_native_prefill_snapshot()
+    prefill = gdn_flydsl.prefill
+    build_prefill_metadata = gdn_flydsl.build_prefill_metadata
 
     device = torch.device("cuda")
     torch.manual_seed(7)
@@ -54,14 +61,16 @@ def test_flydsl_snapshot_matches_prefix_final_state():
         atol=2e-2,
     )
     from atom.model_ops.fla_ops.gdn_flydsl import prepare_prefill_state
-    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+    from atom.plugin.rtpllm.utils.gdn_checkpoint import (
+        write_rtp_gdn_checkpoints,
+    )
 
     elements = 24 * 128 * 128
     padded = torch.full((4, elements + 64), -99.0, device=device)
     state = padded[:, :elements].view(4, 24, 128, 128).transpose(-1, -2)
     conv = torch.zeros(4, 16, 3, device=device, dtype=torch.bfloat16)
     values = lambda xs: torch.tensor(xs, device=device, dtype=torch.int32)
-    write_state_checkpoints(
+    write_rtp_gdn_checkpoints(
         snapshots,
         state,
         torch.zeros(length, 16, device=device, dtype=torch.bfloat16),
@@ -87,20 +96,29 @@ def test_flydsl_snapshot_matches_prefix_final_state():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_checkpoint_writer_accepts_native_vk_snapshot_with_unequal_dims():
-    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+@pytest.mark.parametrize("h_vk", [False, True])
+@pytest.mark.parametrize("state_vk", [False, True])
+def test_checkpoint_writer_accepts_snapshot_layouts_with_unequal_dims(h_vk, state_vk):
+    from atom.plugin.rtpllm.utils.gdn_checkpoint import (
+        write_rtp_gdn_checkpoints,
+    )
 
     device = "cuda"
     k, v = 64, 128
     logical = torch.arange(k * v, device=device, dtype=torch.float32).reshape(k, v)
-    # AITER emits [V, K]; RTP's persistent pool is a logical [K, V] view
-    # backed by VK-contiguous storage. Unequal dimensions catch swapped axes.
-    snapshot = logical.transpose(-1, -2).contiguous().view(1, 1, 1, v, k)
-    snapshot = snapshot.expand(1, 2, 1, v, k).contiguous()
-    state = torch.zeros(2, 1, v, k, device=device).transpose(-1, -2)
+    # Exercise both direct-copy specializations and the required transpose
+    # cases. Unequal dimensions catch an accidental K/V axis interchange.
+    source = logical.transpose(-1, -2).contiguous() if h_vk else logical
+    snapshot = source.view(1, 1, 1, *source.shape).expand(1, 2, 1, *source.shape)
+    snapshot = snapshot.contiguous()
+    state = (
+        torch.zeros(2, 1, v, k, device=device).transpose(-1, -2)
+        if state_vk
+        else torch.zeros(2, 1, k, v, device=device)
+    )
     conv = torch.zeros(2, 4, 3, device=device)
     values = lambda items: torch.tensor(items, device=device, dtype=torch.int32)
-    write_state_checkpoints(
+    write_rtp_gdn_checkpoints(
         snapshot,
         state,
         torch.zeros(128, 4, device=device),
@@ -114,6 +132,6 @@ def test_checkpoint_writer_accepts_native_vk_snapshot_with_unequal_dims():
         values([0, 128]),
         64,
         3,
-        h_vk=True,
+        h_vk=h_vk,
     )
     torch.testing.assert_close(state[1, 0], logical)

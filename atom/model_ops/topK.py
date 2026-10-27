@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import inspect
 from functools import lru_cache
 
 import torch
-import triton
-import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
@@ -109,30 +106,6 @@ def is_rocm_aiter_fuse_routed_scaling_factor():
 
 
 aiter_topK_meta_data = None
-
-
-@lru_cache(maxsize=2)
-def _topk_accepts_num_valid_rows(topk_softmax) -> bool:
-    """New AITER masks Graph padding in top-k; older wheels lack that argument."""
-    return "num_valid_rows" in inspect.signature(topk_softmax).parameters
-
-
-@triton.jit
-def _mask_old_aiter_topk_padding(
-    weights,
-    ids,
-    valid_rows,
-    stride_weights,
-    stride_ids,
-    TOPK: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    if row >= tl.load(valid_rows):
-        columns = tl.arange(0, BLOCK)
-        mask = columns < TOPK
-        tl.store(weights + row * stride_weights + columns, 0.0, mask=mask)
-        tl.store(ids + row * stride_ids + columns, -1, mask=mask)
 
 
 @lru_cache(maxsize=1)
@@ -257,7 +230,7 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
-    args = (
+    topk_softmax(
         topk_weights,
         topk_ids,
         token_expert_indicies,
@@ -265,24 +238,8 @@ def rocm_aiter_topk_softmax_impl(
         renormalize,
         fused_shared_experts_for_kernel,
         fused_shared_experts_scoring_func,
+        num_valid_rows,
     )
-    if _topk_accepts_num_valid_rows(topk_softmax):
-        topk_softmax(*args, num_valid_rows)
-    else:
-        topk_softmax(*args)
-        if num_valid_rows is not None:
-            # Match the newer AITER contract without a host read or a Graph
-            # replay-dependent Python branch. Shared-expert columns in the
-            # wider metadata buffer retain their prefilled values.
-            _mask_old_aiter_topk_padding[(token,)](
-                topk_weights,
-                topk_ids,
-                num_valid_rows,
-                topk_weights.stride(0),
-                topk_ids.stride(0),
-                TOPK=topk,
-                BLOCK=triton.next_power_of_2(topk),
-            )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids

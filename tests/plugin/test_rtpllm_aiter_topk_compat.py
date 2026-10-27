@@ -10,7 +10,9 @@ if not torch.cuda.is_available():
 
 pytest.importorskip("aiter")
 
-from atom.model_ops.topK import rocm_aiter_topk_softmax_impl
+from atom.plugin.rtpllm.utils.topk_compat import (
+    rtp_topk_softmax as rocm_aiter_topk_softmax_impl,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

@@ -45,9 +45,7 @@ def _copy_checkpoints_kernel(
     stride_cd_s,  # conv_dst slot stride
     stride_cd_d,  # conv_dst channel stride
     stride_cd_l,  # conv_dst window-position stride
-    STATE_ELEMENTS: tl.constexpr,  # H * K * V, without per-slot padding
-    STATE_SLOT_STRIDE: tl.constexpr,
-    H_CHUNK_STRIDE: tl.constexpr,
+    HKV: tl.constexpr,  # H * K * V, one full recurrent state
     D: tl.constexpr,
     STATE_LEN: tl.constexpr,
     CHUNK: tl.constexpr,
@@ -56,7 +54,6 @@ def _copy_checkpoints_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     STATE_VK: tl.constexpr = False,
-    H_VK: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -73,27 +70,25 @@ def _copy_checkpoints_kernel(
         # sequence's first chunk. The final state exists only in the row's
         # runtime slot, which the chunk kernel just wrote.
         idx = i_blk * BLOCK + tl.arange(0, BLOCK)
-        mask = idx < STATE_ELEMENTS
-        vk_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
+        mask = idx < HKV
         dst_idx = idx
         if STATE_VK:
-            dst_idx = vk_idx
+            dst_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
         # Both branches cast to the pool's dtype: `h` is bf16 (the chunk
         # kernel allocates it with `k.new_empty`) while the pool is fp32, so
         # the two loads have different types and Triton requires them to
         # agree before the store.
         if tl.load(is_end + i_t) != 0:
             src_slot = tl.load(runtime_slots + i_t).to(tl.int64)
-            sv = tl.load(
-                ssm_dst + src_slot * STATE_SLOT_STRIDE + dst_idx, mask=mask, other=0.0
-            ).to(ssm_dst.dtype.element_ty)
-        else:
-            src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
-            src_idx = vk_idx if H_VK else idx
-            sv = tl.load(h + src * H_CHUNK_STRIDE + src_idx, mask=mask, other=0.0).to(
+            sv = tl.load(ssm_dst + src_slot * HKV + dst_idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
-        tl.store(ssm_dst + slot * STATE_SLOT_STRIDE + dst_idx, sv, mask=mask)
+        else:
+            src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
+            sv = tl.load(h + src * HKV + idx, mask=mask, other=0.0).to(
+                ssm_dst.dtype.element_ty
+            )
+        tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
     else:
         # ── conv window: the STATE_LEN tokens ending at the target, ────────
         # oldest first into positions [0, STATE_LEN) of the pool's [D, W]
@@ -126,7 +121,6 @@ def write_state_checkpoints(
     cu_seqlens: torch.Tensor,
     chunk_size: int,
     conv_state_len: int,
-    h_vk: bool = False,
 ) -> None:
     """Write both halves of every checkpoint this step reached, in one launch.
 
@@ -149,12 +143,6 @@ def write_state_checkpoints(
     tokens ``num_spec`` older than the checkpoint -- and read that many rows
     before the target, into the previous sequence's tokens.
 
-    The recurrent state can occupy only the first part of a larger cache
-    block. Its slot stride therefore cannot be used as the number of state
-    elements or as the snapshot stride: doing so reads the wrong snapshot and
-    overwrites the adjacent convolution state. These three extents are passed
-    separately to the kernel.
-
     Neither conv tensor may be assumed contiguous, so the conv half indexes by
     real strides. ``conv_state`` reaches us as a ``transpose(-1, -2)`` view of a
     ``[slots, state_len, D]`` allocation, and ``x`` is a column slice of the
@@ -165,25 +153,12 @@ def write_state_checkpoints(
     n = rows.numel()
     if n == 0:
         return
-    state_elements = ssm_state.shape[1] * ssm_state.shape[2] * ssm_state.shape[3]
-    state_slot_stride = ssm_state.stride(0)
-    h_chunk_stride = h.stride(1)
-    state_vk = ssm_state.stride(-2) == 1
-    assert h.ndim == 5 and h.shape[2] == ssm_state.shape[1]
-    expected_h_shape = (
-        (ssm_state.shape[-1], ssm_state.shape[-2]) if h_vk else ssm_state.shape[-2:]
-    )
-    assert h.shape[-2:] == expected_h_shape
-    assert h.stride(-1) == 1 and h.stride(-2) == h.shape[-1]
-    assert h.stride(2) == h.shape[-2] * h.shape[-1]
-    if state_vk:
-        assert ssm_state.stride(1) == ssm_state.shape[-2] * ssm_state.shape[-1]
-    assert state_slot_stride >= state_elements
+    hkv = ssm_state.stride(0)
     d, state_len = conv_state.shape[1], conv_state_len
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
     BLOCK = 1024
-    nblk_ssm = triton.cdiv(state_elements, BLOCK)
+    nblk_ssm = triton.cdiv(hkv, BLOCK)
     grid = (n, nblk_ssm + triton.cdiv(d, BLOCK))
     _copy_checkpoints_kernel[grid](
         h,
@@ -201,9 +176,7 @@ def write_state_checkpoints(
         conv_state.stride(0),
         conv_state.stride(1),
         conv_state.stride(2),
-        STATE_ELEMENTS=state_elements,
-        STATE_SLOT_STRIDE=state_slot_stride,
-        H_CHUNK_STRIDE=h_chunk_stride,
+        HKV=hkv,
         D=d,
         STATE_LEN=state_len,
         CHUNK=chunk_size,
@@ -211,6 +184,5 @@ def write_state_checkpoints(
         NBLK_SSM=nblk_ssm,
         K=ssm_state.shape[-2],
         V=ssm_state.shape[-1],
-        STATE_VK=state_vk,
-        H_VK=h_vk,
+        STATE_VK=ssm_state.stride(-2) == 1,
     )
