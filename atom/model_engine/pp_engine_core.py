@@ -169,6 +169,12 @@ class PPEngineCoreProc(EngineCore):
                 self.scheduler.release_pp_inflight(scheduled_batch)
                 if self._defer_prefix_hash:
                     self._pending_prefix_hash.append((scheduled_batch, seqs))
+                    # A seq waiting on this chunk's state checkpoint is out of
+                    # the prefill scan, so no later step would flush for it.
+                    # Filing a checkpoint copies nothing; it only needs FIFO
+                    # order, so flush now.
+                    if self.scheduler.holds_checkpoint_hostage(scheduled_batch):
+                        self._flush_pending_prefix_hashes()
                 continue
             completion = self.pp_transport.recv_completion(timeout_ms=poll_ms)
             if completion is None:

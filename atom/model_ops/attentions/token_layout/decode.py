@@ -37,3 +37,23 @@ def decode_positions(
         out=out.reshape(bs, max_seqlen_q),
     )
     return out
+
+
+def verify_context_shift(
+    num_rejected: np.ndarray | None, is_deferred_out: bool
+) -> np.ndarray | None:
+    """Per-row offset from `batch.context_lens` back to the verify window.
+
+    Deferred output: `num_rejected`. Undeferred (PP): postprocess already left
+    one run of `mtp_k + 1` placeholders, so the window starts at `L - num - 1`
+    and the shift is 1. None before any sampler output.
+
+    Only a verify step has a window to shift back to: every caller is behind
+    `max_seqlen_q > 1` (V4.1: `geometry.speculative_tokens`), so a one-token
+    decode never reads this.
+    """
+    if num_rejected is None:
+        return None
+    if is_deferred_out:
+        return num_rejected
+    return np.ones_like(num_rejected)
