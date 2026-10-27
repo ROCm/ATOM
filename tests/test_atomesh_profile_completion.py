@@ -32,22 +32,25 @@ class ProfileCompletionTest(unittest.TestCase):
         out_dir = tmp_path / "benchmark_results/aiperf-test-1p1d-c32"
         out_dir.mkdir(parents=True)
         (out_dir / "profile_export_aiperf.json").write_text("{}")
-        shell = (
-            source[start:end]
-            + r"""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        collector = bin_dir / "python3"
+        collector.write_text("#!/bin/sh\nexit 0\n")
+        collector.chmod(0o755)
+        shell = source[start:end] + r"""
     ensure_aiperf() { :; }
     is_agentic_session_affinity() { return 1; }
-    python3() { :; }
+    build_agentic_client_command() { local -n command="$1"; command=(true); }
     write_aiperf_dashboard_json() { :; }
     write_aiperf_chrome_trace() { :; }
     run_torch_profile_window() { [[ "$TRACE_COMPLETE" == 1 ]] && touch "$3"; return 0; }
     prefill_ips=(); decode_ips=()
     run_aiperf_agentic_benchmark
     """
-        )
         env = dict(
             os.environ,
             RUN_DIR=str(tmp_path),
+            PATH=f"{bin_dir}:{os.environ['PATH']}",
             MODEL_NAME="test",
             MODEL_PATH="test",
             TOPOLOGY="1p1d",
