@@ -112,6 +112,8 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.sparse_indexer_chunk import (
     dcp_qsplit_rows,
+    decode_band_rows,
+    flat_view,
     sparse_indexer_row_chunk,
 )
 from atom.model_ops.sparse_indexer_fp4 import (
@@ -1562,6 +1564,26 @@ def _prefill_mqa_logits_fp4(
     return logits
 
 
+_warned_no_logits_ws = False
+
+
+def _decode_logits(ws: torch.Tensor | None, rows: int, width: int) -> torch.Tensor:
+    """`[rows, width]` band of the shared workspace (fails if it is too small),
+    or a per-forward tensor, once warned, when no workspace was bound."""
+    global _warned_no_logits_ws
+    if ws is not None:
+        return flat_view(ws, rows, width)
+    if not _warned_no_logits_ws:
+        _warned_no_logits_ws = True
+        logger.warning(
+            "Sparse indexer: no logits workspace bound; decode logits are "
+            "allocated per forward (%d x %d fp32)",
+            rows,
+            width,
+        )
+    return torch.empty(rows, width, dtype=torch.float32, device="cuda")
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -1588,6 +1610,7 @@ def sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
+    indexer_logits_ws: torch.Tensor | None = None,
 ) -> None:
     # Room for the DCP prefill all-gather to land in place. It produces
     # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
@@ -1993,12 +2016,13 @@ def sparse_attn_indexer(
             return
         # Non-DCP: this rank holds the whole plane, so its top-k is already the
         # global one.
-        logits = torch.empty(
-            [num_rows, max_model_len], dtype=torch.float32, device="cuda"
-        )
+        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         if indexer_fp4:
             from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 
+            logits = torch.empty(
+                [num_rows, max_model_len], dtype=torch.float32, device="cuda"
+            )
             flydsl_pa_mqa_logits_fp4(
                 padded_q_decode_tokens,
                 q_fp4_scale[:num_decode_tokens],
@@ -2020,29 +2044,54 @@ def sparse_attn_indexer(
                     max_seq_len=max_model_len,
                 ),
             )
-        else:
-            deepgemm_fp8_paged_mqa_logits(
-                padded_q_decode_tokens,
-                kv_cache,
-                weights[:num_padded_tokens],
+            top_k_per_row_decode(
                 logits,
+                next_n,
                 decode_metadata.context_lens,
-                attn_metadata.block_tables,
-                max_model_len,
-                KVBlockSize=runner_block_size,
-                Preshuffle=True,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                stable=stable_topk,
             )
-        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.context_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-            stable=stable_topk,
-        )
+        else:
+            # Score in chunks of whole requests (as V4.1).
+            band = decode_band_rows(
+                num_rows,
+                max_model_len,
+                next_n,
+                (
+                    None
+                    if indexer_logits_ws is None
+                    else indexer_logits_ws.numel() // max_model_len
+                ),
+            )
+            logits = _decode_logits(indexer_logits_ws, band, max_model_len)
+            for r0 in range(0, num_rows, band):
+                r1 = min(r0 + band, num_rows)
+                b0, b1 = r0 // next_n, r1 // next_n
+                scores = logits[: r1 - r0]
+                deepgemm_fp8_paged_mqa_logits(
+                    padded_q_decode_tokens[b0:b1],
+                    kv_cache,
+                    weights[r0:r1],
+                    scores,
+                    decode_metadata.context_lens[b0:b1],
+                    attn_metadata.block_tables[b0:b1],
+                    max_model_len,
+                    KVBlockSize=runner_block_size,
+                    Preshuffle=True,
+                )
+                top_k_per_row_decode(
+                    scores,
+                    next_n,
+                    decode_metadata.context_lens[b0:b1],
+                    topk_indices_decode[r0:r1],
+                    r1 - r0,
+                    scores.stride(0),
+                    scores.stride(1),
+                    stable=stable_topk,
+                )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
@@ -2073,6 +2122,7 @@ direct_register_custom_op(
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",
+        "indexer_logits_ws",
     ],
     fake_impl=lambda *_args, **_kwargs: None,
 )
@@ -2372,6 +2422,8 @@ class Indexer(nn.Module):
             0, dtype=torch.int32, device="cuda"
         )
         self.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
+        # Set by the MLA metadata builder (aiter_mla.py).
+        self.indexer_logits_ws: torch.Tensor | None = None
         atom_config.compilation_config.static_forward_context[prefix] = self
 
         # Rope module used by `forward_impl` (and the `sparse_attn_indexer_pcp`
@@ -2381,6 +2433,17 @@ class Indexer(nn.Module):
         self.rotary_emb = None
 
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
+
+    def uses_logits_workspace(self) -> bool:
+        """Whether `forward_impl` hands `indexer_logits_ws` to the native op.
+
+        Plugins swap in their own op, and subclasses may override
+        `forward_impl`; neither takes the workspace.
+        """
+        return (
+            type(self).forward_impl is Indexer.forward_impl
+            and self.sparse_attn_indexer_impl is torch.ops.aiter.sparse_attn_indexer
+        )
 
     def forward(
         self,
@@ -2510,6 +2573,7 @@ class Indexer(nn.Module):
             rotary_emb.is_neox_style,
             not unfused_qk_rope,
             self.stable_topk,
+            *((self.indexer_logits_ws,) if self.uses_logits_workspace() else ()),
         )
 
 

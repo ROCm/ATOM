@@ -213,7 +213,7 @@ class Drafter(abc.ABC):
         )
 
     @torch.inference_mode()
-    def warmup_draft_graphs(self, build_context, stream) -> None:
+    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
         """Run every declared pass once per captured size, paying its JIT here.
 
         aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
@@ -268,6 +268,9 @@ class Drafter(abc.ABC):
                     num_tokens=local_tokens,
                 )
                 pool = pass_.warmup(bs, pool=pool, stream=stream)
+                if end_trace is not None:
+                    step = pass_.name.rsplit(".", 1)[-1].lstrip("_")
+                    end_trace(f"draft_{step}_bs_{bs}")
         runner.graph_pool = pool
         torch.cuda.synchronize()
         if runner.rank == 0:

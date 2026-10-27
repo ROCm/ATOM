@@ -76,6 +76,24 @@ class SpurDispatchTest(unittest.TestCase):
             """,
         )
         self.write_tool(
+            "scontrol",
+            """
+            import os
+            import sys
+            from pathlib import Path
+
+            counter = Path(os.environ["TEST_ROOT"]) / "scontrol.count"
+            index = int(counter.read_text()) if counter.exists() else 0
+            counter.write_text(str(index + 1))
+            states = os.environ.get("SCONTROL_STATES", "RUNNING").split(",")
+            state = states[min(index, len(states) - 1)]
+            if state == "FAIL":
+                sys.exit(1)
+            job = sys.argv[sys.argv.index("job") + 1]
+            print(f"JobId={job} JobName=test\\n   JobState={state} Reason=None")
+            """,
+        )
+        self.write_tool(
             "docker",
             """
             import json
@@ -217,6 +235,35 @@ class SpurDispatchTest(unittest.TestCase):
         result = json.loads((self.run_dir / "rank-workload-1.json").read_text())
         self.assertEqual(result["status"], "running")
         self.assertIn(["rm", "-f", "atomesh-test-cell-42-1"], self.docker_calls(1))
+
+    def scontrol_queries(self):
+        counter = self.root / "scontrol.count"
+        return int(counter.read_text()) if counter.exists() else 0
+
+    def test_dispatch_waits_until_controller_reports_running(self):
+        result = self.run_job(
+            SCONTROL_STATES="PENDING,CONFIGURING,RUNNING",
+            ATOMESH_SPUR_RUNNING_POLL_INTERVAL="0",
+        )
+        self.assertEqual(self.scontrol_queries(), 3)
+        self.assertIn("controller state is now RUNNING", result.stdout)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_dispatch_proceeds_after_pending_timeout(self):
+        result = self.run_job(
+            SCONTROL_STATES="PENDING", ATOMESH_SPUR_RUNNING_TIMEOUT="0"
+        )
+        self.assertIn("still PENDING after 0s", result.stderr)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_unavailable_controller_does_not_delay_dispatch(self):
+        self.run_job(SCONTROL_STATES="FAIL")
+        self.assertEqual(self.scontrol_queries(), 1)
+        self.assertTrue((self.root / "dispatch.json").exists())
+
+    def test_worker_does_not_query_controller(self):
+        self.run_job("--spur-worker", SCONTROL_STATES="PENDING")
+        self.assertEqual(self.scontrol_queries(), 0)
 
     def test_dispatch_failure_is_not_reported_as_success(self):
         self.run_job(expected_rc=9, DISPATCH_RC="9")

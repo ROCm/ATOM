@@ -18,6 +18,7 @@ from atom.model_engine.model_runner import (
     tokenIDProcessor,
 )
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.spec_decode.status import SpecStatusQueue
 from atom.utils.selector import Family
 
 
@@ -107,7 +108,7 @@ def _processor() -> tokenIDProcessor:
         gpu=np.zeros(8, dtype=np.int32),
         copy_to_gpu=mock.Mock(),
     )
-    processor.recv_mtp_status_async = mock.Mock(
+    processor.recv_spec_status = mock.Mock(
         return_value=(
             np.array([2], dtype=np.int32),
             np.array([1], dtype=np.int32),
@@ -142,7 +143,9 @@ def test_detects_remote_prefill_producer(kv_config, expected):
 
 def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
     runner = SimpleNamespace(
-        config=SimpleNamespace(pipeline_parallel_size=1, kv_transfer_config=kv_config),
+        config=SimpleNamespace(
+            pipeline_parallel_size=1, kv_transfer_config=kv_config, max_num_seqs=8
+        ),
         attn_family=family,
         device="cuda",
     )
@@ -323,11 +326,11 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor = _processor()
 
     # Pure middle chunks skip postprocess, so neither the deferred-token queue
-    # nor its matching MTP-status queue may advance.
+    # nor its matching speculative-status queue may advance.
     tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False]), 1)
     tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, False]), 1)
 
-    processor.recv_mtp_status_async.assert_not_called()
+    processor.recv_spec_status.assert_not_called()
     np.testing.assert_array_equal(processor.prev_rejected_num, [7])
     np.testing.assert_array_equal(processor.prev_bonus_num, [8])
 
@@ -336,7 +339,7 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     # request in the same batch is still a middle chunk.
     tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, True]), 1)
 
-    processor.recv_mtp_status_async.assert_called_once_with()
+    processor.recv_spec_status.assert_called_once_with()
     np.testing.assert_array_equal(processor.prev_rejected_num, [2])
     np.testing.assert_array_equal(processor.prev_bonus_num, [1])
 
@@ -367,7 +370,7 @@ def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
     processor.prev_rejected_num = None
     processor.prev_bonus_num = None
     processor.pre_num_decode_token_per_seq = 1
-    processor.pending_mtp_status_copies = []
+    processor.spec_status_queue = SpecStatusQueue(8, mock.Mock())
     processor.prev_token_ids = np.zeros(bs, dtype=np.int32)
     processor.draft_token_ids = None
     forward_vars = {"cu_seqlens_q": SimpleNamespace(np=cu_seqlens_q, gpu=cu_seqlens_q)}

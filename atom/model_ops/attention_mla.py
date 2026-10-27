@@ -36,7 +36,7 @@ except ImportError:
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
-    mla_decode_fwd as triton_shuffle_mla_decode_fwd,
+    mla_decode_fwd as triton_mla_decode_fwd,
 )
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -199,9 +199,9 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
-# Shuffled KV (block_size=64) kernels, gated by ATOM_MLA_KV_SHUFFLED.
-triton_shuffle_mla_decode_fwd = mark_trace(
-    triton_shuffle_mla_decode_fwd, prefix="mla_decode_shuffle", torch_compile=False
+# Paged Triton decode supports both interleaved and shuffled KV caches.
+triton_mla_decode_fwd = mark_trace(
+    triton_mla_decode_fwd, prefix="mla_decode_triton", torch_compile=False
 )
 triton_cat_and_cache_mla = mark_trace(
     triton_cat_and_cache_mla, prefix="kv_cache_shuffle", torch_compile=False
@@ -675,6 +675,7 @@ class MLAAttention(nn.Module):
         # fused_qk_rope_concat_and_cache_mla) and an unpadded 576-wide q_out;
         # only the gfx1250 asm decode path needs the segmented layout + 768 pad.
         self.use_triton_mla = bool(envs.ATOM_USE_TRITON_MLA)
+        self.kv_cache_block_size = atom_config.kv_cache_block_size
         # On the non-triton (aiter) path, ATOM_MLA_PAGE_SIZE selects the KV cache
         # layout: >1 uses the segmented (paged) seg kernels + padded q_out, while
         # ==1 falls back to the original interleaved per-token (page_size=1)
@@ -2580,73 +2581,52 @@ class MLAAttention(nn.Module):
 
         final_lse = None
 
-        if self.kv_shuffled:
-            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
-            if self.use_triton_mla:
-                triton_shuffle_mla_decode_fwd(
-                    q,  # [num_tokens, num_query_heads, kv_lora_rank + qk_rope_head_dim]
-                    kv_buffer,  # [num_blocks, 1, block_size, kv_lora_rank + qk_rope_head_dim]
-                    o,
-                    attn_metadata.cu_seqlens_q,
-                    attn_metadata.context_lens,  # seqused_k
-                    int(attn_metadata.max_seqlen_k),  # max_seqlen_kv
-                    attn_metadata.block_tables,  # [bs, max_num_blocks_per_seq] (logical)
-                    self.scale,
-                    self.kv_lora_rank,
-                    self.qk_rope_head_dim,
-                    True,  # causal
-                    None,  # q_descale
-                    self._k_scale,  # kv_descale
-                    shuffled_kv_cache=True,
-                )
+        if self.use_triton_mla:
+            if self.kv_shuffled:
+                kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
             else:
-                _, final_lse = mla_decode_fwd(
-                    q,
-                    kv_buffer,
-                    o,
-                    attn_metadata.cu_seqlens_q,
-                    None,  # kv_shuffled takes seq_lens/page_table, not CSR
-                    None,
-                    None,
-                    attn_metadata.max_seqlen_q,
-                    page_size=kv_buffer.shape[2],
-                    kv_layout="kv_shuffled",
-                    seq_lens=attn_metadata.context_lens[:B],
-                    page_table=attn_metadata.block_tables[:B],
-                    sm_scale=self.scale,
-                    causal=causal,
-                    q_scale=self._q_scale if q.element_size() == 1 else None,
-                    kv_scale=self._k_scale,
-                    return_lse=return_lse,
+                # block_tables contains scheduler block IDs, while the plain
+                # cache is stored as token rows. Group rows into those blocks;
+                # the Triton kernel widens block offsets to int64 internally.
+                kv_buffer = kv_c_and_k_pe_cache.view(
+                    -1, self.kv_cache_block_size, 1, q.shape[-1]
                 )
-        elif hasattr(attn_metadata, "triton_block_table"):
-            from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
-
-            k_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
-            v_buffer = k_buffer[..., : self.kv_lora_rank]
-            page_size = k_buffer.shape[1]
-
-            q_for_triton = (
-                q.to(torch.bfloat16)
-                if q.dtype.is_floating_point and q.element_size() == 1
-                else q
-            )
-
-            # Use pre-built dense block_table from prepare_decode()
-            decode_attention_fwd(
-                q_for_triton,
-                k_buffer,
-                v_buffer,
+            triton_mla_decode_fwd(
+                q,
+                kv_buffer,
                 o,
-                attn_metadata.triton_lse,
-                attn_metadata.triton_block_table,
+                attn_metadata.cu_seqlens_q,
                 attn_metadata.context_lens,
-                attn_metadata.triton_attn_logits,
-                4,  # num_kv_splits
+                int(attn_metadata.max_seqlen_k),
+                attn_metadata.block_tables,
                 self.scale,
-                page_size,
-                k_scale=self._k_scale,
-                v_scale=self._k_scale,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                causal,
+                self._q_scale if q.element_size() == 1 else None,
+                self._k_scale,
+                shuffled_kv_cache=self.kv_shuffled,
+            )
+        elif self.kv_shuffled:
+            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+            _, final_lse = mla_decode_fwd(
+                q,
+                kv_buffer,
+                o,
+                attn_metadata.cu_seqlens_q,
+                None,  # kv_shuffled takes seq_lens/page_table, not CSR
+                None,
+                None,
+                attn_metadata.max_seqlen_q,
+                page_size=kv_buffer.shape[2],
+                kv_layout="kv_shuffled",
+                seq_lens=attn_metadata.context_lens[:B],
+                page_table=attn_metadata.block_tables[:B],
+                sm_scale=self.scale,
+                causal=causal,
+                q_scale=self._q_scale if q.element_size() == 1 else None,
+                kv_scale=self._k_scale,
+                return_lse=return_lse,
             )
         else:
             kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)

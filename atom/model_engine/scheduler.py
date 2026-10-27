@@ -523,6 +523,11 @@ class ScheduledBatchOutput:
         num_rejected: Per-request count of rejected speculative tokens.
         num_bonus: Per-request count of bonus accepted tokens.
         is_deferred_out: Whether output was deferred from a previous step.
+
+    NumPy views are copied before the result enters the output queue. Views
+    returned by asynchronous D2H copies otherwise keep pinned tensor storage
+    alive until the transport thread replaces its previous result, putting
+    pinned-memory allocator work on the next result's serialization path.
     """
 
     def __init__(
@@ -539,9 +544,9 @@ class ScheduledBatchOutput:
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
-        self.draft_token_ids = draft_token_ids
-        self.num_rejected = num_rejected
-        self.num_bonus = num_bonus
+        self.draft_token_ids = self._copy_array_view(draft_token_ids)
+        self.num_rejected = self._copy_array_view(num_rejected)
+        self.num_bonus = self._copy_array_view(num_bonus)
         self.is_deferred_out = is_deferred_out
         self.is_prev_prefill = is_prev_prefill
         self.logprobs = logprobs  # Optional[dict[int, float]]
@@ -552,6 +557,14 @@ class ScheduledBatchOutput:
         self.dspark_ell = dspark_ell
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
+
+    @staticmethod
+    def _copy_array_view(value):
+        # Keep already-owned arrays and non-array values unchanged. In
+        # particular, this does not allocate anything for output-less batches.
+        if isinstance(value, np.ndarray) and not value.flags.owndata:
+            return value.copy()
+        return value
 
     def get_idx(self, req_id: int) -> int | None:
         """O(1) lookup of request index by id."""
