@@ -230,7 +230,7 @@ class AsyncIOProc:
         """Make a fatal runner error observable by the parent's sentinel monitor."""
         try:
             self.busy_loop()
-        except Exception:
+        except Exception:  # noqa: BLE001 - any fatal runner error must end the worker
             # Multiprocessing's normal exception exit joins non-daemon threads
             # and children. A failed GPU/transfer worker can have one blocked
             # forever, leaving a live process that no longer serves requests.
