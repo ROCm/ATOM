@@ -51,10 +51,10 @@ TOPK = 16
     ],
 )
 def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
-    monkeypatch.setattr(m, "_runtime_gfx", lambda _device_index: arch)
+    monkeypatch.setattr(m, "get_gfx", lambda: arch)
     m._prefill_score_launch_config.cache_clear()
     try:
-        assert m._prefill_score_launch_config(dtype, 0) == want
+        assert m._prefill_score_launch_config(dtype) == want
     finally:
         m._prefill_score_launch_config.cache_clear()
 

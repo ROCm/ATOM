@@ -26,6 +26,7 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx
 
 try:
     # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
@@ -64,20 +65,9 @@ DECODE_SCORE_NUM_STAGES = 3
 
 
 @functools.cache
-def _runtime_gfx(device_index: int) -> str:
-    return (
-        torch.cuda.get_device_properties(device_index)
-        .gcnArchName.split(":", 1)[0]
-        .lower()
-    )
-
-
-@functools.cache
-def _prefill_score_launch_config(
-    dtype: torch.dtype, device_index: int
-) -> tuple[int, int]:
+def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     """Return (warps, stages) without changing the tuned gfx950 path."""
-    if _runtime_gfx(device_index) != "gfx1250":
+    if get_gfx() != "gfx1250":
         return 4, SCORE_NUM_STAGES
 
     # Triton's default four warps mean 256 lanes on gfx950 (wave64), but only
@@ -1183,11 +1173,8 @@ def minimax_m3_index_topk(
         batch * num_idx_heads,
         triton.cdiv(max_block, chunk_blocks),
     )
-    device_index = idx_q.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
     score_num_warps, score_num_stages = _prefill_score_launch_config(
-        index_kv_cache.dtype, device_index
+        index_kv_cache.dtype
     )
     _index_block_score_kernel[grid_score](
         idx_q,
