@@ -214,6 +214,23 @@ def test_the_dp_loop_reaches_its_idle_branch_with_a_dummy_already_counted():
     assert engine.stats._throughput_last_log_time == pytest.approx(600.0)
 
 
+def test_the_dp_loop_has_no_stalled_state_it_pads_with_a_dummy():
+    """Same schedule as below, and the difference is the point.
+
+    DP reports STALLED as unfinished -- requests exist -- so the pass reaches
+    the forward pair, finds nothing scheduled and runs a dummy. There is no
+    "has work but no forward" pass on this loop, which is why `note_busy`
+    sitting before the pair is correct there and wrong on the base loop.
+    """
+    engine = _run(
+        "DPEngineCoreProc",
+        [(0.0, WORK), (1.0, STALLED), (301.0, STALLED), (601.0, WORK), (602.0, WORK)],
+    )
+    assert engine.dummies == 2  # the two stalled passes
+    assert engine.stats._throughput_steps == 5  # every pass ran a forward
+    assert engine.stats._throughput_last_log_time == 0.0  # nothing was idle
+
+
 def test_requests_that_cannot_be_scheduled_are_not_work():
     """`is_finished()` is False and no forward runs: the base loop's own case.
 

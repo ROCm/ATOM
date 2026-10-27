@@ -70,6 +70,26 @@ def _producer_connectors(config, names: frozenset[str]) -> tuple[dict, ...]:
     )
 
 
+def disaggregated_kv_role(config) -> str | None:
+    """The P/D role this config puts the engine in, or ``None`` if it is not one.
+
+    Both directions, unlike :func:`pd_producer_configured`, and keyed on the
+    connector NAME: ``kv_role`` alone does not classify, because an offload
+    tier legally takes ``kv_producer`` (save only) and ``kv_consumer`` (load
+    only) -- see ``_VALID_KV_ROLES`` in ``offload/_offload_common.py`` -- while
+    running the ordinary engine loop. Tolerates any shape, since the blob
+    arrives as user-supplied CLI JSON.
+    """
+    transfer_config = getattr(config, "kv_transfer_config", None)
+    for connector, path in iter_connector_configs(transfer_config):
+        if _canonical(connector, path=path) not in _PD_TRANSFER_CONNECTORS:
+            continue
+        role = connector.get("kv_role", "kv_producer")
+        if role in ("kv_producer", "kv_consumer"):
+            return role
+    return None
+
+
 def pd_producer_configured(config) -> bool:
     return bool(_producer_connectors(config, _PD_TRANSFER_CONNECTORS))
 

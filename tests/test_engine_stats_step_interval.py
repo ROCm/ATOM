@@ -11,6 +11,7 @@ which is the case the option is for. Pinned by the last test here.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,7 +48,9 @@ def test_idle_before_any_work_is_not_charged_to_the_first_window(monkeypatch, ca
     off the emitted line, so the divisor is the one users see.
     """
     clock = [0.0]
-    monkeypatch.setattr(engine_stats.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        engine_stats, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
     s = _stats(throughput_log_interval_steps=2)
     s._throughput_last_log_time = 0.0
     # The loop's first pass is already idle and lands on the origin stamped in
@@ -107,7 +110,9 @@ def test_a_window_closing_while_idle_re_anchors_the_stretch(monkeypatch):
     unconditionally, which is what the span below is sized to show.
     """
     clock = [100.0]
-    monkeypatch.setattr(engine_stats.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        engine_stats, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
     s = _stats(throughput_log_interval_steps=2)
     s._throughput_last_log_time = 0.0
     s.bump_step()
@@ -131,7 +136,9 @@ def test_an_anchor_never_lands_behind_the_window_origin(monkeypatch):
     `elapsed` below zero that skips the line without resetting the window.
     """
     clock = [0.006]  # emitting the line cost 2ms after the loop read 0.004
-    monkeypatch.setattr(engine_stats.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        engine_stats, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
     s = _stats(throughput_log_interval_steps=4)
     s._throughput_last_log_time = 0.0
     for _ in range(4):
@@ -140,10 +147,14 @@ def test_an_anchor_never_lands_behind_the_window_origin(monkeypatch):
     s.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.5)
     assert s._throughput_last_log_time == 0.006
     s.note_idle(0.004)  # the loop's `now`, from before the close
-    s.note_busy(180.005)
-    assert s._throughput_last_log_time <= 180.005, "origin moved past now"
-    # 4 x 1ms of forwards, not the 2ms left after over-subtracting.
-    assert 180.009 - s._throughput_last_log_time == pytest.approx(0.004)
+    resume = 180.005
+    s.note_busy(resume)
+    assert s._throughput_last_log_time <= resume, "origin moved past now"
+    for i in range(4):  # the second burst, same 1ms forwards
+        clock[0] = resume + (i + 1) * 0.001
+        s.update_throughput(num_generation_tokens=10)
+        s.bump_step()
+    assert clock[0] - s._throughput_last_log_time == pytest.approx(0.004)
 
 
 def test_note_idle_keeps_the_first_anchor():

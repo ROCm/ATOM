@@ -56,8 +56,10 @@ def test_a_negative_interval_is_normalised_to_off(steps):
     [
         {"pipeline_parallel_size": 2},
         {"enable_rapidserve": True},
-        {"kv_transfer_config": {"kv_role": "kv_producer"}},
-        {"kv_transfer_config": {"kv_role": "kv_consumer"}},
+        # A real launch always names the connector; the role alone is not a
+        # config the factory could build anything from.
+        {"kv_transfer_config": {"kv_connector": "mooncake", "kv_role": "kv_producer"}},
+        {"kv_transfer_config": {"kv_connector": "mooncake", "kv_role": "kv_consumer"}},
         # A MultiConnector prefill node carries the role one level down, with
         # nothing at the top -- see the multi/ README's launch command.
         {
@@ -69,8 +71,10 @@ def test_a_negative_interval_is_normalised_to_off(steps):
                 ],
             }
         },
+        # No explicit role: a transfer connector defaults to kv_producer.
+        {"kv_transfer_config": {"kv_connector": "mooncake"}},
     ],
-    ids=["pp", "rapidserve", "pd_prefill", "pd_decode", "pd_multi"],
+    ids=["pp", "rapidserve", "pd_prefill", "pd_decode", "pd_multi", "pd_default_role"],
 )
 def test_unsupported_topologies_fall_back_to_the_clock(topology, caplog):
     with caplog.at_level("WARNING"):
@@ -84,8 +88,13 @@ def test_unsupported_topologies_fall_back_to_the_clock(topology, caplog):
     [
         {"kv_role": "offload", "kv_connector": "lmcache_offload"},
         {"kv_connector": "lmcache_offload"},
+        # `kv_producer` / `kv_consumer` are legal offload DIRECTIONS (save
+        # only / load only) -- see `_VALID_KV_ROLES`. The role does not make
+        # the engine disaggregated; the connector name does.
+        {"kv_connector": "lmcache_offload", "kv_role": "kv_producer"},
+        {"kv_connector": "lmcache_offload", "kv_role": "kv_consumer"},
     ],
-    ids=["offload_role", "no_role"],
+    ids=["offload_role", "no_role", "offload_save_only", "offload_load_only"],
 )
 def test_a_cache_tier_is_not_a_disaggregated_engine(kv_transfer_config, caplog):
     """`kv_transfer_config` carries LMCache offload too, on an ordinary engine.
@@ -100,6 +109,35 @@ def test_a_cache_tier_is_not_a_disaggregated_engine(kv_transfer_config, caplog):
         )
     assert cfg.throughput_log_interval_steps == 40
     assert "ignored" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        {"kv_connector": "mooncake", "kv_role": "kv_producer"},  # dict, not list
+        "mooncake",
+        [None],
+        ["mooncake"],
+        [],
+    ],
+    ids=["dict", "string", "null_entry", "string_entry", "empty"],
+)
+def test_a_malformed_connectors_blob_does_not_raise(connectors):
+    """The blob is user-supplied CLI JSON, and this clause degrades, not raises.
+
+    Writing `connectors` as a dict is an easy hand slip. Raising here is an
+    `AttributeError` out of `Config.__post_init__` -- the server refuses to
+    start, blamed on a logging option, and before the KV config's own
+    validation has had a chance to report the real problem.
+    """
+    cfg = _resolve(
+        throughput_log_interval_steps=40,
+        kv_transfer_config={
+            "kv_connector": "multi",
+            "connectors": connectors,
+        },
+    )
+    assert cfg.throughput_log_interval_steps == 40
 
 
 def test_the_line_being_off_is_not_worth_a_warning(caplog):

@@ -44,10 +44,11 @@ class EngineStats:
           throughput: 0.3 tokens/s, Running: 6 reqs, Waiting: 0 reqs, GPU KV
           cache usage: 0.0%, Prefix cache hit rate: 0.0%
 
-      ...or every ``throughput_log_interval_steps`` forwards when that is set
-      (``Engine 000: step 40: Avg prompt ...``). The clock cannot align two DP
-      ranks -- they read it at the same moment but at different step numbers;
-      a forward count can, see ``bump_step``.
+      ...or every ``throughput_log_interval_steps`` forwards when that is set,
+      led by the cumulative forward count -- so consecutive lines read
+      ``step 40:``, ``step 80:``, not the interval repeated. The clock cannot
+      align two DP ranks: they read it at the same moment but at different
+      step numbers. A forward count can, see ``bump_step``.
 
     A disabled section's ``update_*`` / ``maybe_log_*`` entry points are
     no-ops, so callers need not guard on the feature flag.
