@@ -63,7 +63,9 @@ should be 0).
 Knobs: `CAP_MIN` (default 30), `STOP_FIRST` (1: stop issuing at the first trajectory completion
 once all have started), `TRAJ_X` (trajectories = max(613, `TRAJ_X` x c), default 4: the client
 repeats trajectories with a fresh salt, so the 30-minute cap and not an exhausted pool ends every
-point), `TURN_TIMEOUT` (default 900 s on 30-minute points: bounds the drain), `MODE` / `SPEC`
+point), `TURN_TIMEOUT` (default 14400 s, the benchmark's own: the drain after the cap lasts until the
+in-flight turns finish, up to ~50 min at c2048; 900 bounds it but at high concurrency fails long turns and
+their trajectories: 22% of turns at c2048), `MODE` / `SPEC`
 (override the table above), `SEQ_CAP` (512). A full compliant run is `CAP_MIN=600 STOP_FIRST=0`.
 
 ## Results
