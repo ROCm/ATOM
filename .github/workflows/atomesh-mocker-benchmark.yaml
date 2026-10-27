@@ -60,6 +60,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler python3-dev
+          # pyo3 caches the detected Python in the restored target dir and only
+          # re-detects when an env var changes, so a runner-image Python upgrade
+          # would keep linking the old -lpython3.X. Key the detection on it.
+          echo "PYO3_ENVIRONMENT_SIGNATURE=$(python3 -c 'import sys; print(sys.version)')" >> "$GITHUB_ENV"
 
       - name: Cache cargo build output
         uses: actions/cache@v4
@@ -158,6 +162,9 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler python3-dev
+          # See run_atomesh_test_harness: re-detect Python if the image's changed.
+          export PYO3_ENVIRONMENT_SIGNATURE="$(python3 -c 'import sys; print(sys.version)')"
+          echo "PYO3_ENVIRONMENT_SIGNATURE=$PYO3_ENVIRONMENT_SIGNATURE" >> "$GITHUB_ENV"
           cargo build \
             --manifest-path atom/mesh/mocker/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mocker \
