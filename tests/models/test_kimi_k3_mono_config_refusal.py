@@ -103,19 +103,6 @@ def test_the_shipped_k3_router_is_served(servable):
     assert config_refusal(_atom_config()) is None
 
 
-@pytest.mark.parametrize(
-    ("override", "reason"),
-    [
-        ({"moe_router_activation_func": "softmax"}, "router activation"),
-        ({"moe_renormalize": False}, "does not renormalize"),
-    ],
-)
-def test_a_router_the_route_stage_does_not_implement_is_refused(
-    servable, override, reason
-):
-    assert reason in config_refusal(_atom_config(**override))
-
-
 _MOONCAKE_DECODE = {"kv_role": "kv_consumer", "kv_connector": "mooncake"}
 
 
@@ -147,3 +134,16 @@ def test_a_transport_that_may_copy_on_its_own_stream_is_refused(
     servable, kv_transfer_config
 ):
     assert config_refusal(_with_transport(kv_transfer_config)) == "KV connector"
+
+
+@pytest.mark.parametrize(
+    ("override", "reason"),
+    [
+        ({"moe_router_activation_func": "softmax"}, "router activation"),
+        ({"moe_renormalize": False}, "does not renormalize"),
+    ],
+)
+def test_a_router_the_route_stage_does_not_implement_is_refused(
+    servable, override, reason
+):
+    assert reason in config_refusal(_atom_config(**override))

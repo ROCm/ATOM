@@ -137,23 +137,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
-    # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
-    # DCP decode rank owns into a GPU staging slot and send whole destination
-    # pages instead of one RDMA descriptor per token. 0 = per-token path.
-    "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
-    # Decode (`kv_consumer`, DCP > 1) only: give prefill stages partitions of a
-    # GPU landing pool, first come, first served (see mla_landing.py). A stage
-    # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
-    # the decode side scatters them into the paged KV and returns the slot.
-    # 0 = staged per-page writes only.
-    "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
-    # Mooncake P/D: how long a write Mooncake gave up on may still land. A
-    # decode holds a failed receive's KV pages this long before reporting the
-    # failure; a prefill keeps a landing slot whose write failed out of use
-    # this long. 0 = release at once.
-    "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
-        os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
-    ),
     # Non-PP engines: while requests are parked for remote KV, block up to this
     # many ms after each forward for a fresh worker completion poll, so a
     # receive that landed during the forward is scheduled the next step rather
@@ -175,6 +158,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split (Kimi's) with a numpy check that returns the same pieces; see
     # `tokenizer_split.py`. 0 = the tokenizer's own split.
     "ATOM_FAST_TOKENIZER_SPLIT": lambda: _flag_env("ATOM_FAST_TOKENIZER_SPLIT", "0"),
+    # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
+    # DCP decode rank owns into a GPU staging slot and send whole destination
+    # pages instead of one RDMA descriptor per token. 0 = per-token path.
+    "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
     # Prefill only, for models with per-request state (which ATOM_PD_MLA_STAGING
     # does not serve): pages per producer slot that repacks MLA KV for a DCP
     # consumer below a page of interleave; 0 writes each token run in place.
@@ -185,6 +172,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # negative is higher), so a repack need not queue behind the forward.
     "ATOM_PD_MLA_STAGING_STREAM_PRIORITY": lambda: _int_env(
         "ATOM_PD_MLA_STAGING_STREAM_PRIORITY", 0
+    ),
+    # Decode (`kv_consumer`, DCP > 1) only: give prefill stages partitions of a
+    # GPU landing pool, first come, first served (see mla_landing.py). A stage
+    # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
+    # the decode side scatters them into the paged KV and returns the slot.
+    # 0 = staged per-page writes only.
+    "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
+    # Mooncake P/D: how long a write Mooncake gave up on may still land. A
+    # decode holds a failed receive's KV pages this long before reporting the
+    # failure; a prefill keeps a landing slot whose write failed out of use
+    # this long. 0 = release at once.
+    "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
+        os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
