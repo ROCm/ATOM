@@ -1,6 +1,11 @@
-name: M3.1 PD exit137 log recovery
+name: M3.1 PD log and status recovery
 on:
   workflow_dispatch:
+    inputs:
+      target_run:
+        description: Existing M3.1 benchmark run ID
+        type: string
+        required: true
 permissions:
   contents: read
 jobs:
@@ -12,14 +17,16 @@ jobs:
       - uses: actions/checkout@v6
       - name: Collect existing evidence without starting model services
         shell: bash
+        env:
+          TARGET_RUN_ID: ${{ inputs.target_run }}
         run: |
           set -euo pipefail
           export PATH="/usr/local/slurm-24.05.5.1/bin:${PATH}"
-          python3 .github/scripts/atomesh/collect_m31_exit137.py "${RUNNER_TEMP}/m31-exit137"
+          python3 .github/scripts/atomesh/collect_m31_exit137.py "${RUNNER_TEMP}/m31-exit137" "${TARGET_RUN_ID}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: m31-exit137-40486874680
+          name: m31-exit137-${{ inputs.target_run }}
           path: ${{ runner.temp }}/m31-exit137/
           retention-days: 7
           if-no-files-found: error

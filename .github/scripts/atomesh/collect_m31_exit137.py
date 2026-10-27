@@ -9,7 +9,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-RUN_ID = "40486874680"
+RUN_ID = sys.argv[2]
+if not re.fullmatch(r"[0-9]{5,20}", RUN_ID):
+    raise SystemExit("expected a numeric GitHub run ID")
 ROOT = Path("/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG")
 OUT = Path(sys.argv[1])
 OUT.mkdir(parents=True, exist_ok=True)
@@ -18,7 +20,7 @@ containers_by_node = {}
 jobs = set()
 used = 0
 for run in sorted(ROOT.glob(f"minimax-m3.1-flash-*-{RUN_ID}-*")):
-    for pattern in ("slurm-*.out", "slurm-*.err", "slurm_job-*/*.json", "slurm_job-*/rank-rc-*", "slurm_job-*/rank-*/*.log"):
+    for pattern in ("slurm-*.out", "slurm-*.err", "slurm_job-*/*.json", "slurm_job-*/rank-rc-*", "slurm_job-*/rank-*/*.log", "slurm_job-*/logs/*.log", "slurm_job-*/benchmark_results/*/aiperf.log", "slurm_job-*/benchmark_results/*/profile_export_aiperf.json"):
         for src in sorted(run.glob(pattern)):
             if not src.is_file() or not src.resolve().is_relative_to(ROOT.resolve()):
                 continue
@@ -34,6 +36,9 @@ for run in sorted(ROOT.glob(f"minimax-m3.1-flash-*-{RUN_ID}-*")):
                 dst.write_bytes(data)
                 used += len(data)
                 manifest["files"].append({"source": str(src), "bytes": size, "copied": len(data)})
+                match = re.fullmatch(r"slurm-([0-9]+)[.](out|err)", src.name)
+                if match:
+                    jobs.add(match.group(1))
                 if src.name == "cell-metadata.json":
                     meta = json.loads(data)
                     jobs.add(str(meta["slurm_job_id"]))
@@ -51,6 +56,27 @@ def collect_command(name, command, timeout=45):
     except (OSError, subprocess.TimeoutExpired) as e:
         (OUT / name).write_text(str(e))
         return 1
+
+# A queued Slurm job may not have created cell-metadata.json yet. Read only
+# pointer pairs whose recorded log root explicitly belongs to the requested run.
+for runner in Path("/share_nfs/ATOMESH_RUNNER").glob("atomesh-runner-*"):
+    result_dir = runner / "_work/ATOM/ATOM/atomesh-results"
+    for pointer in result_dir.glob("minimax-m3.1-flash-*.log-root"):
+        try:
+            if pointer.stat().st_size > 4096:
+                continue
+            value = pointer.read_text().strip()
+            if f"-{RUN_ID}-" not in value:
+                continue
+            job_pointer = pointer.with_suffix(".slurm-job-id")
+            if job_pointer.stat().st_size > 64:
+                continue
+            job_id = job_pointer.read_text().strip()
+            if re.fullmatch(r"[0-9]+", job_id):
+                jobs.add(job_id)
+                manifest.setdefault("runner_pointers", []).append({"runner": runner.name, "log_root": value, "job_id": job_id})
+        except OSError as exc:
+            manifest["errors"].append({"path": str(pointer), "error": str(exc)})
 
 for job in sorted(jobs):
     if not re.fullmatch(r"[0-9]+", job):
