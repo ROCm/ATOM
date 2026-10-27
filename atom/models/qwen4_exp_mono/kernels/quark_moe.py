@@ -75,6 +75,15 @@ def expert_config(cfg):
 
 
 @triton.jit
+def _router_logit(ptr, row, col, mask, ROWS: tl.constexpr, SPLITS: tl.constexpr):
+    value = tl.load(ptr + row * 513 + col, mask, 0).to(tl.float32)
+    if SPLITS == 2:
+        value += tl.load(ptr + (ROWS + row) * 513 + col, mask, 0)
+        value = value.to(tl.bfloat16).to(tl.float32)
+    return value
+
+
+@triton.jit
 def _prepare(
     logits,
     x,
@@ -91,13 +100,14 @@ def _prepare(
     ROWS: tl.constexpr,
     TP: tl.constexpr,
     RANK: tl.constexpr,
+    ROUTER_SPLITS: tl.constexpr = 1,
 ):
     row = tl.program_id(0)
     slot = tl.arange(0, 16)
     lane = tl.arange(0, 32)
     if tl.program_id(1) == 0:
         e = tl.arange(0, 512)
-        z = tl.load(logits + row * 513 + e).to(tl.float32)
+        z = _router_logit(logits, row, e, True, ROWS, ROUTER_SPLITS)
         # Float-order keys, with lower expert id winning an equal-logit tie.
         bits = z.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
         ordered = bits ^ ((bits >> 31) & 0x7FFF)
@@ -107,12 +117,12 @@ def _prepare(
         ranked = tl.topk(key, 16, descending=True)
         selected = ranked
         eid = 511 - (selected & 511)
-        value = tl.load(logits + row * 513 + eid, slot < 10, 0).to(tl.float32)
+        value = _router_logit(logits, row, eid, slot < 10, ROWS, ROUTER_SPLITS)
         largest = tl.max(tl.where(slot < 10, value, float("-inf")), 0)
         prob = tl.exp(value - largest)
         prob = tl.where(slot < 10, prob, 0.0)
         prob = prob / tl.sum(prob, 0)
-        shared = tl.load(logits + row * 513 + 512).to(tl.float32)
+        shared = _router_logit(logits, row, 512, True, ROWS, ROUTER_SPLITS)
         eid = tl.where(slot == 10, 512, eid)
         prob = tl.where(slot == 10, 1.0 / (1.0 + tl.exp(-shared)), prob)
         tl.store(ids + row * 11 + slot, eid, slot < 11)
@@ -209,7 +219,7 @@ class Workspace:
             buf((rows, 2560), torch.bfloat16),
         )
 
-    def prepare(self, logits, x, expert_map=None, tp=1, rank=0):
+    def prepare(self, logits, x, expert_map=None, tp=1, rank=0, *, router_splits=1):
         _prepare[(x.shape[0], 6)](
             logits,
             x,
@@ -226,6 +236,7 @@ class Workspace:
             x.shape[0],
             tp,
             rank,
+            ROUTER_SPLITS=router_splits,
             num_warps=4,
         )
 

@@ -40,7 +40,13 @@ def stage_activation(x, activation, tid, tokens, load=None):
 
 
 @traced
-def _router_projection(x, weight, out, tile, tokens, sm, load=None, prefetch=False):
+def _router_projection(
+    x, weight, out, task, tokens, sm, load=None, prefetch=False, split_k=1
+):
+    # A split publishes FP32 partials. The MoE preparation consumer combines
+    # them before the router's BF16 rounding and top-k boundary.
+    tile = task if split_k == 1 else task % 33
+    split = 0 if split_k == 1 else task // 33
     tid = fx.thread_idx.x
     lane = tid % 64
     wave = tid // 64
@@ -48,7 +54,7 @@ def _router_projection(x, weight, out, tile, tokens, sm, load=None, prefetch=Fal
         stage_activation(x, sm.activation.ptr, tid, tokens, load)
     token = fx.min(lane % 16, tokens - 1)
     row = fx.min(tile * 16 + lane % 16, 512)
-    first_at = wave * 32 + 8 * (lane // 16)
+    first_at = (wave + 8 * split * (10 // split_k)) * 32 + 8 * (lane // 16)
     first_w = (
         fx.Vector(
             bo.buffer_load(
@@ -61,8 +67,8 @@ def _router_projection(x, weight, out, tile, tokens, sm, load=None, prefetch=Fal
     if prefetch:
         stage_activation(x, sm.activation.ptr, tid, tokens, load)
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
-    for k in range_constexpr(10):
-        at = (wave + 8 * k) * 32 + 8 * (lane // 16)
+    for k in range_constexpr(10 // split_k):
+        at = (wave + 8 * (k + split * (10 // split_k))) * 32 + 8 * (lane // 16)
         w = (
             first_w
             if prefetch and k == 0
@@ -85,11 +91,11 @@ def _router_projection(x, weight, out, tile, tokens, sm, load=None, prefetch=Fal
         t = tid // 16
         n = tile * 16 + tid % 16
         if n <= 512:
-            bo.buffer_store(
-                row_sum(sm.reduction.ptr, tid % 16, t).to(fx.BFloat16),
-                rsrc(out),
-                t * 513 + n,
-            )
+            value = row_sum(sm.reduction.ptr, tid % 16, t)
+            if split_k == 1:
+                bo.buffer_store(value.to(fx.BFloat16), rsrc(out), t * 513 + n)
+            else:
+                bo.buffer_store(value, rsrc(out), (split * tokens + t) * 513 + n)
 
 
 @traced

@@ -82,13 +82,23 @@ def _hc_pre_dot2(
     COMBINE: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    INTERLEAVE_ROWS: tl.constexpr = 1,
 ):
     """Program (N tile, stream, row). The stream's five K chunks are unrolled
     so every weight and activation load is issued before any arithmetic."""
     tl.static_assert(H == 5 * BK)
     pid_n = tl.program_id(0)
     s = tl.program_id(1)
-    row = tl.program_id(2).to(tl.int64)
+    if INTERLEAVE_ROWS == 1:
+        row = tl.program_id(2).to(tl.int64)
+    else:
+        # Keep sixteen adjacent N tiles together, then reuse their weights
+        # across the four rows before advancing to the next group of tiles.
+        # Only task placement changes; each row retains its reduction tree.
+        tl.static_assert(INTERLEAVE_ROWS == 4)
+        ordinal = pid_n
+        pid_n = (ordinal // (16 * INTERLEAVE_ROWS)) * 16 + ordinal % 16
+        row = ((ordinal // 16) % INTERLEAVE_ROWS).to(tl.int64)
     h_ptr += row * stride_h
     h_out_ptr += row * stride_h
     normed_ptr += row * stride_h

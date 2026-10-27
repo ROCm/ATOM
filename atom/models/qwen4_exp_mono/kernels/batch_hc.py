@@ -75,7 +75,13 @@ def prepare(
     part = torch.empty((rows, 4, nout), device=h.device, dtype=torch.float32)
     kernel = pre if pre is not None else _hc_pre_kernel
     bn, warps = (2, 1) if pre is not None and rows == 2 else (8, 4)
-    kernel[(triton.cdiv(nout, bn), 4, rows)](
+    grid = (triton.cdiv(nout, bn), 4, rows)
+    placement = {}
+    if pre is not None and rows == 4:
+        # Quark's dot2 pre supports grouping rows within sixteen N tiles.
+        grid = (triton.cdiv(nout, 16 * bn) * 16 * rows, 4, 1)
+        placement = {"INTERLEAVE_ROWS": rows}
+    kernel[grid](
         h,
         block if combined else h,
         raw if combined else h,
@@ -95,6 +101,7 @@ def prepare(
         BN=bn,
         BK=512,
         num_warps=warps,
+        **placement,
     )
     return streams, normed, part
 

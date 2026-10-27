@@ -39,9 +39,10 @@ _STREAM = fx.Stream(None)
 
 
 @cache
-def build(tokens):
+def build(tokens, split_k=1):
     assert tokens in (1, 2, 4)
-    name = kernel_symbol("qwen_quark_hc_router", b=tokens)
+    assert split_k in (1, 2)
+    name = kernel_symbol("qwen_quark_hc_router", b=tokens, split_k=split_k)
 
     @flyc.kernel(name=name, known_block_size=[512, 1, 1])
     def kernel(
@@ -77,7 +78,7 @@ def build(tokens):
         emit_up(part, normed, weight, raw, stride, sm.hc.peek(), tokens, True, store)
         gpu.barrier()
         front_sm = sm.front.peek()
-        if task < 33:
+        if task < 33 * split_k:
             _router_projection(
                 payload,
                 router,
@@ -87,6 +88,7 @@ def build(tokens):
                 front_sm,
                 load=lambda pair, width: load_payload(payload, pair, epoch, width),
                 prefetch=True,
+                split_k=split_k,
             )
 
     @launcher(name)
