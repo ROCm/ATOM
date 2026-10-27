@@ -26,8 +26,8 @@ Two transports sit behind the same prepare/finalize pair:
     is configured, not bypassed -- the model-wide recipe (activation, gate mode,
     quant type, padding, swiglu limit) is fixed at construction and the
     per-layer weights/biases go to each forward(). ATOM_MEGA_STAGE1_FUSED and
-    ATOM_MEGA_STAGE2_FUSED become its stage1_fused / stage2_fused: stage 1
-    picks the dispatch (flydsl compact plan, or mori), stage 2 the combine
+    ATOM_MEGA_STAGE2_FUSED become its recipe's dispatch and combine (an older
+    aiter's stage1_fused / stage2_fused): stage 1 picks the dispatch (flydsl compact plan, or mori), stage 2 the combine
     (gemm2 epilogue P2P-writing each weighted (token,k) result into the peers'
     staging so combine only barriers + sums, or mori's combine over fused_moe's
     rows).
@@ -41,6 +41,7 @@ import logging
 import os
 import sys
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -87,6 +88,26 @@ def _import_mega():
     )
 
     return MegaMoEGfx1250
+
+
+def _import_mega_recipe() -> SimpleNamespace | None:
+    """aiter's MegaMoERecipe and MegaMoEGeometry, with the kinds a recipe picks;
+    None on an aiter from before them, which takes stage1/stage2 flags instead."""
+    try:
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (  # type: ignore
+            CombineKind,
+            DispatchKind,
+            MegaMoEGeometry,
+            MegaMoERecipe,
+        )
+    except ImportError:
+        return None
+    return SimpleNamespace(
+        Recipe=MegaMoERecipe,
+        Geometry=MegaMoEGeometry,
+        DispatchKind=DispatchKind,
+        CombineKind=CombineKind,
+    )
 
 
 def _import_v2_from_mori():
@@ -205,7 +226,7 @@ _MEGA_TRANSPORTS: dict = {}
 # PREFILL only by default -- the quant/dequant pair is a fixed per-token cost
 # against a saving that scales with the tokens on the wire, so decode asks for
 # bf16 back unless $ATOM_MEGA_DECODE_COMBINE_QUANT is on.
-# See MoriV2PrepareAndFinalize.combine_quant_for_step.
+# See MoriV2PrepareAndFinalize.combine_wire_for_step.
 _COMBINE_WIRES = {"bf16": "none", "fp8": "mxfp8", "fp4": "mxfp4"}
 _MEGA_COMBINE_WIRE = envs.ATOM_MEGA_COMBINE_WIRE
 if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
@@ -213,8 +234,6 @@ if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
         f"ATOM_MEGA_COMBINE_WIRE must be one of {sorted(_COMBINE_WIRES)}, "
         f"got {_MEGA_COMBINE_WIRE!r}"
     )
-# Read once, like the dispatch wire: this is consulted per layer per forward.
-_MEGA_COMBINE_QUANT = _COMBINE_WIRES[_MEGA_COMBINE_WIRE]
 _MEGA_DECODE_COMBINE_QUANT = envs.ATOM_MEGA_DECODE_COMBINE_QUANT
 
 # aiter's stage2_fused: the gemm2-fused combine, or mori's combine over
@@ -248,6 +267,54 @@ _MEGA_STAGE1_FUSED = (
 )
 
 
+# The one VMM granule a DevComm's resource window takes; init_mega_transport
+# creates one on the communicator it sizes.
+_CCO_DEVCOMM_BYTES = 2 << 20
+
+
+def _mega_recipe(
+    api: SimpleNamespace,
+    *,
+    activation: Any,
+    gate_mode: Any,
+    quant_type: Any,
+    hidden_pad: int,
+    intermediate_pad: int,
+    swiglu_limit: float,
+    combine_wire: str,
+) -> Any:
+    """The MegaMoERecipe this launch asks for: ATOM picks the dispatch, the
+    combine and the wires from its environment, the layer supplies the expert
+    GEMM. Whether the pairing can run is aiter's to say."""
+    return api.Recipe(
+        dispatch=(
+            api.DispatchKind.COMPACT if _MEGA_STAGE1_FUSED else api.DispatchKind.MORI
+        ),
+        combine=(
+            api.CombineKind.FUSED_SCATTER
+            if _MEGA_STAGE2_FUSED
+            else api.CombineKind.MORI
+        ),
+        dispatch_wire=_MEGA_DISPATCH_WIRE,
+        # bf16 is always built; a quantized wire is built alongside it.
+        combine_wires=("bf16", combine_wire),
+        activation=activation,
+        gate_mode=gate_mode,
+        quant_type=quant_type,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        swiglu_limit=swiglu_limit,
+    )
+
+
+def _step_combine(mega: Any, wire: str) -> dict:
+    """forward()'s per-step combine choice: by wire name on an aiter that builds
+    from a recipe, by the older combine_quant spelling otherwise."""
+    if hasattr(mega, "recipe"):
+        return {"combine_wire": wire}
+    return {"combine_quant": _COMBINE_WIRES[wire]}
+
+
 def _check_mega_weights(layer: torch.nn.Module, quant_method: Any) -> None:
     """Reject expert weights MegaMoEGfx1250 cannot run: it only takes MXFP4."""
     w13, w2 = layer.w13_weight, layer.w2_weight
@@ -278,7 +345,7 @@ def init_mega_transport(
     swiglu_limit: float,
     situ_beta: torch.Tensor | None = None,
     situ_linear_beta: torch.Tensor | None = None,
-    combine_quant: str = "none",
+    combine_wire: str = "bf16",
 ) -> Any:
     """Create (and share) the MegaMoE that runs every MoE layer of this model.
 
@@ -287,12 +354,42 @@ def init_mega_transport(
     arguments, so one instance covers the whole model. Which dispatch and
     combine it runs is set by _MEGA_STAGE1_FUSED / _MEGA_STAGE2_FUSED.
 
-    ``combine_quant`` names the quantized return-trip format this transport is
-    to BUILD ($ATOM_MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
-    the choice: MegaMoE builds a combine for it and for bf16, and every forward
-    then names the one it wants -- bf16 unless it says otherwise.
-    See combine_quant_for_step.
+    ``combine_wire`` names the quantized return-trip format this transport is
+    to BUILD ($ATOM_MEGA_COMBINE_WIRE). It is a capability, not the choice:
+    MegaMoE builds a combine for it and for bf16, and every forward then names
+    the one it wants -- bf16 unless it says otherwise. See combine_wire_for_step.
     """
+    api = _import_mega_recipe()
+    if api is not None:
+        recipe = _mega_recipe(
+            api,
+            activation=activation,
+            gate_mode=gate_mode,
+            quant_type=quant_type,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            swiglu_limit=swiglu_limit,
+            combine_wire=combine_wire,
+        )
+        geometry = api.Geometry(
+            rank=ep_rank,
+            world_size=ep_size,
+            model_dim=hidden_dim,
+            inter_dim=inter_dim,
+            experts=num_experts,
+            topk=num_experts_per_token,
+            max_tokens_per_rank=max_num_inp_token_per_rank,
+        )
+        return _init_mega_from_recipe(
+            recipe,
+            geometry,
+            ep_src_global_rank=ep_src_global_rank,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+
+    # An aiter from before MegaMoERecipe: the stage1/stage2 flags.
+    combine_quant = _COMBINE_WIRES[combine_wire]
     key = (
         ep_rank,
         ep_size,
@@ -401,6 +498,70 @@ def init_mega_transport(
         os.environ.get("AITER_FORCE_A8W4", "0"),
         mega._config.stage1_fused,
         mega._config.stage2_fused,
+        per_rank_vmm / (1 << 30),
+    )
+    return mega
+
+
+def _init_mega_from_recipe(
+    recipe: Any,
+    geometry: Any,
+    *,
+    ep_src_global_rank: int,
+    situ_beta: torch.Tensor | None,
+    situ_linear_beta: torch.Tensor | None,
+) -> Any:
+    """init_mega_transport on an aiter that builds MegaMoE from a recipe."""
+    key = (recipe, geometry)
+    cached = _MEGA_TRANSPORTS.get(key)
+    if cached is not None:
+        return cached
+
+    MegaMoEGfx1250 = _import_mega()
+    # MegaMoE's arena -- exactly what the constructor allocates -- plus the
+    # DevComm created below. The communicator carries nothing else.
+    per_rank_vmm = (
+        MegaMoEGfx1250.required_vmm_bytes(recipe, geometry) + _CCO_DEVCOMM_BYTES
+    )
+    comm = _init_cco_comm(
+        geometry.world_size, geometry.rank, ep_src_global_rank, per_rank_vmm
+    )
+    mega = MegaMoEGfx1250.from_recipe(
+        recipe,
+        geometry,
+        communicator=comm,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    # Peer-region stride in the flat symmetric VA, for triton_mega_moe; read
+    # here, while every rank constructs, for the reason the flag path gives.
+    mega._atom_per_rank_size = int(comm.create_dev_comm().per_rank_size)
+    comm.barrier()
+    _MEGA_TRANSPORTS[key] = mega
+    logger.info(
+        "[MegaMoEGfx1250] Created: ep_rank=%d ep_size=%d hidden=%d inter=%d "
+        "experts=%d topk=%d M=%d dispatch=%s wire=%s combine=%s "
+        "combine_wires=%s act=%s gate=%s quant=%s pad=(%d,%d) swiglu_limit=%s "
+        "force_a8w4=%s per_rank_vmm=%.2fGiB",
+        geometry.rank,
+        geometry.world_size,
+        geometry.model_dim,
+        geometry.inter_dim,
+        geometry.experts,
+        geometry.topk,
+        geometry.max_tokens_per_rank,
+        mega.recipe.dispatch.value,
+        mega.recipe.dispatch_wire,
+        mega.recipe.combine.value,
+        ",".join(mega.recipe.combine_wires),
+        mega.recipe.activation,
+        mega.recipe.gate_mode,
+        mega.recipe.quant_type,
+        mega.recipe.hidden_pad,
+        mega.recipe.intermediate_pad,
+        mega.recipe.swiglu_limit,
+        # The other half of the wire pair: logged together so a mismatch reads.
+        os.environ.get("AITER_FORCE_A8W4", "0"),
         per_rank_vmm / (1 << 30),
     )
     return mega
@@ -520,11 +681,11 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             swiglu_limit=float(getattr(layer, "swiglu_limit", 0.0)),
             situ_beta=getattr(layer, "activation_situ_beta", None),
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
-            combine_quant=_MEGA_COMBINE_QUANT,
+            combine_wire=_MEGA_COMBINE_WIRE,
         )
 
     @staticmethod
-    def combine_quant_for_step() -> str:
+    def combine_wire_for_step() -> str:
         """This step's combine wire, named outright -- and DP-agreed.
 
         The quantized wire is prefill-only: the quant/dequant pair is a fixed
@@ -550,13 +711,13 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         capture rather than first reaching it mid-serve.
         """
         if _MEGA_DECODE_COMBINE_QUANT:
-            return _MEGA_COMBINE_QUANT
+            return _MEGA_COMBINE_WIRE
         context = get_forward_context().context
         if context is None:
-            return _MEGA_COMBINE_QUANT
+            return _MEGA_COMBINE_WIRE
         if context.is_prefill or not context.running_tokens_are_unified:
-            return _MEGA_COMBINE_QUANT
-        return "none"
+            return _MEGA_COMBINE_WIRE
+        return "bf16"
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -756,13 +917,14 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         # a4w4, mega bf16 + a8w4 all match to the last bit). Off by default
         # until it has run a real serve.
         if mega is not None and triton_experts is not None:
-            if mega._config.stage1_fused:
+            compact_dispatch, fused_combine = _mega_kinds(mega)
+            if compact_dispatch:
                 raise RuntimeError(
                     "triton_mega_moe drives MegaMoE's token-major dispatch and "
                     "cannot run on the compact stage-1 plan; set "
                     "ATOM_MEGA_STAGE1_FUSED=0 to fall back to mori dispatch"
                 )
-            if not mega._config.stage2_fused:
+            if not fused_combine:
                 raise RuntimeError(
                     "triton_mega_moe scatters GEMM2's rows into the fused "
                     "combine's staging and cannot run on mori's combine; set "
@@ -843,7 +1005,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             recv_token_bound=self._recv_bound(
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
-            combine_quant=self.prepare_finalize.combine_quant_for_step(),
+            **_step_combine(mega, self.prepare_finalize.combine_wire_for_step()),
         )
         return out
 
@@ -866,14 +1028,10 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             "hidden_pad": int(kwargs.get("hidden_pad", 0) or 0),
             "intermediate_pad": int(kwargs.get("intermediate_pad", 0) or 0),
         }
-        built = {
-            "activation": mega.activation,
-            "quant_type": mega.quant_type,
-            "gate_mode": mega.gate_mode,
-            "swiglu_limit": mega.swiglu_limit,
-            "hidden_pad": mega.hidden_pad,
-            "intermediate_pad": mega.intermediate_pad,
-        }
+        # The recipe it was built from, or, on an older aiter, the same names
+        # on the instance.
+        source = getattr(mega, "recipe", mega)
+        built = {name: getattr(source, name) for name in actual}
         differing = {
             name: (value, built[name])
             for name, value in actual.items()
@@ -884,6 +1042,18 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 "this layer's expert-GEMM recipe differs from the one MegaMoE was "
                 f"built with (this layer vs built): {differing}"
             )
+
+
+def _mega_kinds(mega: Any) -> tuple[bool, bool]:
+    """(the compact dispatch, the fused combine): read off the recipe, or the
+    flags an older aiter kept on its config."""
+    recipe = getattr(mega, "recipe", None)
+    if recipe is None:
+        return mega._config.stage1_fused, mega._config.stage2_fused
+    return (
+        recipe.dispatch.value == "compact",
+        recipe.combine.value == "fused_scatter",
+    )
 
 
 def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinalize:
