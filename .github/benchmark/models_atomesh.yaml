@@ -1322,15 +1322,6 @@ models:
         # stalls both engines, so its aiperf numbers are not the cell's.
         - <<: *kimi_k3_mcstore_c88
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-mcstore-1m-c88-torch-profile
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_hc_dspark4_args
-              max_num_seqs: 176
-              # Inferact/Kimi-K3-DSpark left the shared model root on 10-27
-              # 07:10; .backup.144 is the same drafter (config identical to
-              # what the 10-26 runs loaded, weights the same inode), and the
-              # forced acceptance makes the drafter's outputs irrelevant here.
-              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark.backup.144"
           env:
             common:
               <<: *kimi_k3_mcstore_common_env
