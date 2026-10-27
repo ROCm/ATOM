@@ -51,3 +51,19 @@ def page_views(pages: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         off + DATA_PAGE_BYTES,
     )
     return data, scale
+
+
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def dequantize_pages(pages: torch.Tensor) -> torch.Tensor:
+    """fp32 ``[..., 128, 128]`` of MXFP4 pages ``[..., 8704]``: the values the
+    kernels read. The oracle for the write path and the fake-quant reference a
+    wrong-output investigation compares the cache against."""
+    data, scale = page_views(pages)
+    d = data.to(torch.int32)
+    codes = torch.stack((d & 0xF, d >> 4), dim=-1).flatten(-2)  # low nibble first
+    table = torch.tensor(_E2M1, dtype=torch.float32, device=pages.device)
+    val = table[codes & 7] * torch.where(codes & 8 != 0, -1.0, 1.0)
+    exp = torch.exp2(scale.to(torch.float32) - 127.0)  # e8m0, one per 32 elements
+    return (val.unflatten(-1, (-1, 32)) * exp.unsqueeze(-1)).flatten(-2)

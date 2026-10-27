@@ -1263,6 +1263,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.kv_nvfp4: bool = False
         self.kv_stage: torch.Tensor | None = None
         self.kv_stage_slots: torch.Tensor | None = None
+        # ATOM_M3_SPARSE_KV_MXFP4: the bound k/v caches are uint8 [pages, Hkv,
+        # 8704] MXFP4 pages (minimax_m3/kv_mxfp4.py), written by the fused kernel
+        # directly (no stage) together with an fp8 main q. `--index-cache-dtype
+        # mxfp4` makes index_cache uint8 [pages, 8704] the same way.
+        self.kv_mxfp4: bool = False
+        self.index_mxfp4: bool = self.index_cache_dtype == "mxfp4"
+        self._out_dtype = torch.bfloat16
         # Optional shared dict bound by the metadata builder. It is scoped to the
         # current sparse metadata object and carries the last full layer top-k.
         self.index_topk_cache_state: dict | None = None
@@ -1304,7 +1311,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
 
         layer = kv_cache_data[f"layer_{self.layer_num}"]
-        if self.kv_nvfp4:
+        if self.kv_mxfp4:
+            k_cache, v_cache, k_scale, v_scale = (
+                layer.k_cache,
+                layer.v_cache,
+                None,
+                None,
+            )
+        elif self.kv_nvfp4:
             k_cache, v_cache, k_scale, v_scale = (
                 layer.k_cache,
                 layer.v_cache,
@@ -1339,10 +1353,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         fused_k_scale = k_scale if is_fp8 else None
         fused_v_scale = v_scale if is_fp8 else None
         fused_index_cache_dtype = (
-            self.index_cache_dtype if self.index_cache_dtype == "fp8" else "auto"
+            self.index_cache_dtype
+            if self.index_cache_dtype in ("fp8", "mxfp4")
+            else "auto"
         )
         index_fp4 = self.index_scale is not None
-        if self.kv_nvfp4:
+        if self.kv_mxfp4:
+            fused_k_cache, fused_v_cache = k_cache, v_cache
+            fused_kv_slot_mapping = slot_mapping
+            fused_kv_block_size = 128
+            kv_cache_dtype = "mxfp4"
+            fused_k_scale = fused_v_scale = None
+        elif self.kv_nvfp4:
             fused_k_cache = self.kv_stage[:, 0]
             fused_v_cache = self.kv_stage[:, 1]
             fused_kv_slot_mapping = self.kv_stage_slots[:num_tokens]
@@ -1361,7 +1383,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             fused_index_cache = self.index_cache
             fused_index_slot_mapping = slot_mapping
 
-        if self.skip_index_topk:
+        if self.skip_index_topk and not self.kv_mxfp4:
             if self.kv_nvfp4:
                 raise NotImplementedError(
                     "ATOM_M3_SPARSE_KV_NVFP4 does not cover top-k-reusing layers"
@@ -1406,14 +1428,27 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
             return q, k, v, k_cache, v_cache, k_scale, v_scale
 
-        q_out = torch.empty(
-            (num_tokens, self.num_heads * self.head_dim),
-            dtype=qkv.dtype,
-            device=qkv.device,
-        )
-        index_q = torch.empty(
-            (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
-        )
+        # MXFP4 KV: the kernel hands back the main q as e4m3 (cast as is, no
+        # per-tensor scale) and writes no bf16 copy of it.
+        q_fp8 = None
+        if self.kv_mxfp4:
+            q_fp8 = torch.empty(
+                (num_tokens, self.num_heads * self.head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=qkv.device,
+            )
+            q_out = None
+        else:
+            q_out = torch.empty(
+                (num_tokens, self.num_heads * self.head_dim),
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+        index_q = None
+        if not self.skip_index_topk:
+            index_q = torch.empty(
+                (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
+            )
         aiter.fused_qknorm_idxrqknorm(
             qkv,
             self.q_norm.weight,
@@ -1430,16 +1465,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             fused_kv_slot_mapping,
             fused_k_cache,
             fused_v_cache,
-            fused_index_cache,
+            None if self.skip_index_topk else fused_index_cache,
             fused_kv_block_size,
             q_out,
             index_q,
-            fused_index_slot_mapping,
+            None if self.skip_index_topk else fused_index_slot_mapping,
             kv_cache_dtype=kv_cache_dtype,
             index_cache_dtype=fused_index_cache_dtype,
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
-            asm_layout=not self.kv_nvfp4,
+            asm_layout=not (self.kv_nvfp4 or self.kv_mxfp4),
+            skip_index_branch=self.skip_index_topk,
+            q_fp8_out=q_fp8,
         )
         if self.kv_nvfp4:
             from atom.model_ops.minimax_m3.index_fp4 import kv_nvfp4_store
@@ -1457,7 +1494,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.index_scale,
             )
 
-        q = q_out.view(-1, self.num_heads, self.head_dim)
+        q = (q_fp8 if self.kv_mxfp4 else q_out).view(-1, self.num_heads, self.head_dim)
+        self._out_dtype = qkv.dtype
+        if index_q is None:
+            # top-k-reusing layer: no indexer query, as the Triton branch above
+            self._index_q = None
+            self._index_q_cache_key_info = (
+                (num_tokens, self.num_idx_heads, self.index_head_dim),
+                qkv.dtype,
+                qkv.device,
+            )
+            return q, k, v, k_cache, v_cache, k_scale, v_scale
         # Stash the rotated indexer query for dispatch_backend (same-forward,
         # single-threaded; cleared after the sparse backend consumes it).
         self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
