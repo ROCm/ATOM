@@ -1139,11 +1139,13 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     `block_size 128 * dcp 8 = 1024` tokens. Requests of different lengths, one
     ending mid-entry.
 
-    Over ~1000 random keys the softmax is nearly flat, so a causal mask -- it
-    hides at most T - 1 keys from a row -- moves the output by about as much as
-    a loose tolerance allows. Hence the second check: the read must sit far
-    closer to the bidirectional reference than to the causal one, which holds
-    whatever the draw.
+    Over ~1000 random keys the block's own T keys would carry under 1% of the
+    softmax mass, and a causal mask -- it hides at most T - 1 of them from a row
+    -- would move the output by less than fp8 noise. So the data gives them
+    weight: q and every key share one direction, pushed apart for the prefix
+    and together for the block, which makes a block key worth ~50 prefix keys.
+    The read must then sit far closer to the bidirectional reference than to
+    the causal one (measured: 38x and up at fp8, 74x at bf16, over 8 seeds).
 
     `far_entries` puts a request's pages past entry 16384, where
     `entry * page_stride` (1024 * 2 * 64 per entry) passes 2**31: the boundary
@@ -1170,11 +1172,19 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
 
     k_pool = torch.randn(n_entries, E, hkv, d, device=dev, dtype=torch.bfloat16)
     v_pool = torch.randn_like(k_pool)
+    q = torch.randn(bs * T, hq, d, device=dev, dtype=torch.bfloat16)
+    # See the docstring: one shared lane, prefix keys pushed off it, block keys
+    # onto it.
+    q[..., 0] += 4
+    k_pool[..., 0] -= 4
+    for b in range(bs):
+        n = int(kv_lens[b])
+        pos = torch.arange(n - T, n, device=dev)
+        k_pool[block_tables[b, pos // E].long(), pos % E, :, 0] += 8
     if kv_dtype == "fp8":
         from aiter import dtypes
 
         k_pool, v_pool = k_pool.to(dtypes.fp8), v_pool.to(dtypes.fp8)
-    q = torch.randn(bs * T, hq, d, device=dev, dtype=torch.bfloat16)
     scale = d**-0.5
 
     read = dda.DSparkDraftUnifiedAttention(dev, max_bs=8)
@@ -1182,14 +1192,20 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     one = torch.ones(1, dtype=torch.float32, device=dev)
     read(q, k_pool, v_pool, block_tables, kv_lens, o, scale, one, one)
 
-    args = (q, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
+    # Over an fp8 pool the read casts q to the pool's dtype (as SGLang's verify
+    # kernel does); the reference takes the same q.
+    q_ref = q.to(k_pool.dtype).to(q.dtype) if kv_dtype == "fp8" else q
+    args = (q_ref, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
     ref = _reference_block_attn(*args)
-    torch.testing.assert_close(o.float(), ref, atol=3e-3, rtol=2e-2)
+    # fp8 runs both dots at fp8 on gfx950 (Gluon); measured max 3.7e-2 there,
+    # 1.3e-2 at bf16, on O(1) outputs.
+    tol = 6e-2 if kv_dtype == "fp8" else 2.5e-2
+    torch.testing.assert_close(o.float(), ref, atol=tol, rtol=5e-2)
 
     causal = _reference_block_attn(*args, causal=True)
     err_bidir = (o.float() - ref).abs().max().item()
     err_causal = (o.float() - causal).abs().max().item()
-    assert err_causal > 4 * err_bidir, (err_bidir, err_causal)
+    assert err_causal > 10 * err_bidir, (err_bidir, err_causal)
 
 
 def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan():

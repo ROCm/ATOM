@@ -21,6 +21,12 @@ head, so one KV tile serves all ``T * G`` of them, and the all-decode launch is
 the split-KV grid, so a long context is spread over segments instead of walked
 by one program. The block rows come back out of the pool with the prefix, so
 over an fp8 pool they are read quantized.
+
+Over an fp8 pool the query is cast to the pool's dtype too. That is the
+precision SGLang's verify kernel runs this checkpoint at (it casts q to the
+pool dtype for the prefix dot), and it is what lets gfx950 take aiter's Gluon
+kernel, which needs q and KV in one dtype: about 1.6x faster than the Triton
+fallback at bs 32 / 128k context.
 """
 
 from __future__ import annotations
@@ -68,6 +74,9 @@ class DSparkDraftUnifiedAttention:
 
         self.device = device
         self._ua = unified_attention
+        # q's descale when it is cast to an fp8 pool's dtype: the cast is a
+        # plain one, so 1.0. Built here so no replay allocates it.
+        self._q_descale = torch.ones(1, dtype=torch.float32, device=device)
         # One query row per sequence: `cu_seqlens_q` is a constant ramp. Built
         # here, ahead of any capture, for the engine's widest batch, so a
         # replay slices storage the recording saw rather than allocating.
@@ -101,6 +110,9 @@ class DSparkDraftUnifiedAttention:
         hkv = k_cache.shape[2]
         qf = fold_block_queries(q, bs, hkv)
         of = torch.empty_like(qf)
+        quantized = k_cache.dtype.itemsize == 1
+        if quantized:
+            qf = qf.to(k_cache.dtype)
         self._ua(
             q=qf,
             k=k_cache,
@@ -116,7 +128,7 @@ class DSparkDraftUnifiedAttention:
             window_size=(-1, -1),
             block_table=block_tables,
             softcap=0,
-            q_descale=None,
+            q_descale=self._q_descale if quantized else None,
             k_descale=k_descale,
             v_descale=v_descale,
         )
