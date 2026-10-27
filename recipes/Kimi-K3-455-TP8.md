@@ -15,8 +15,8 @@ of 8**:
 
 Validated on CT2 (node0) and CT17, 2026-10-22, with `K3_MOE=tp` and full GSM8K. The throughput figures come from the
 same launcher and GEMM tables on the 20261016 image, with `K3_MOE=ep` (CT15 + CT13, 2026-10-21). The newer
-[20261027 image](#the-20261027-image) does not start without two ATOM overlays; with them it gave GSM8K strict-match
-0.9651 on E15's Helios-R trays 05 and 07 (2026-10-27, `K3_MOE=ep`).
+[20261027 image](#the-20261027-image), as pushed again on 2026-10-27, carries two ATOM overlays that its first push
+dropped. Its ATOM gave GSM8K strict-match 0.9651 on E15's Helios-R trays 05 and 07 (2026-10-27, `K3_MOE=ep`).
 
 | | |
 |---|---|
@@ -85,60 +85,52 @@ FlyDSL 0.4.0, torch, Triton and ROCm 10.1 (TheRock wheels, Python 3.12) come fro
 
 ## The 20261027 image
 
-`rocm/fw-bringup:gfx1250-atom-k3-20261027`, digest
-`sha256:5eefef68bd4d0d95ba73096f5df50a64f569ddefba3a83c76d3c10eb73c938f3`. It is the 20261022 image with ATOM and aiter
-moved on:
+`rocm/fw-bringup:gfx1250-atom-k3-20261027` was pushed twice on 2026-10-27. The tag now points to the second push:
+
+| push | digest | ATOM it serves | |
+|---|---|---|---|
+| second, the tag now | `sha256:d4ceaa4a4744565bb8e03b254ad9e7ab4bb6d4316e6003c8618c53d21c63d818` | `2be1506a` | starts |
+| first | `sha256:5eefef68bd4d0d95ba73096f5df50a64f569ddefba3a83c76d3c10eb73c938f3` | `d8877f1c` | fails at startup; see below |
+
+The second push is the first plus one layer. That layer moves `/app/ATOM` and the launcher's `ATOM_COMMIT` to
+`2be1506a` and records it in `/opt/k3/build_info.json`. Both pushes are the 20261022 image with ATOM and aiter moved
+on:
 
 | | commit | contents |
 |---|---|---|
-| ATOM, `/app/ATOM` | `d8877f1c` | A newer `main`, with two PRs merged in: [#2647](https://github.com/ROCm/ATOM/pull/2647) (one TP group across nodes) and [#2737](https://github.com/ROCm/ATOM/pull/2737) (prefetch the next MLA layer's cached-prefix KV all-gathers, opt-in). It does **not** carry #2554 and #2557 |
+| ATOM, `/app/ATOM` | `2be1506a`, branch [`zejun/k3-image-20261027`](https://github.com/ROCm/ATOM/tree/zejun/k3-image-20261027) | `d8877f1c`, a newer `main` with two PRs merged in: [#2647](https://github.com/ROCm/ATOM/pull/2647) (one TP group across nodes) and [#2737](https://github.com/ROCm/ATOM/pull/2737) (prefetch the next MLA layer's cached-prefix KV all-gathers, opt-in). On top, as image overlays, two open PRs that the 20261016 and 20261022 images carried: [#2557](https://github.com/ROCm/ATOM/pull/2557) at `8a24a910`, and [#2554](https://github.com/ROCm/ATOM/pull/2554) at `e16b3dd4` without its tests |
 | aiter, `/app/aiter` | `7061cbd8` | `main`, which holds the K3 TP8 tables. #6763's GEMM rows are there: [#6530](https://github.com/ROCm/aiter/pull/6530) moved its 94 mxscale rows into `kimik3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv`, now 214 rows. [#6768](https://github.com/ROCm/aiter/pull/6768)'s grouped-MoE table is there, retuned. In place of `cc8d4ff12`, aiter has the upstream K-tail fix [#6663](https://github.com/ROCm/aiter/pull/6663); the launcher prints `cc8d4ff12 not needed` |
 
+- **Which push you have.** Check the digest with
+  `docker image inspect --format '{{json .RepoDigests}}' rocm/fw-bringup:gfx1250-atom-k3-20261027`. In the container,
+  only the second push's `/opt/k3/build_info.json` lists `atom_overlays`. To get the second push, `docker pull` the tag
+  again.
 - **Image files.**
   - `/opt/k3/build_info.json` holds the commits.
   - `manifest.json` and `verify_inside.sh` moved to `/opt/k3/base-20261022/` and describe the base image, so the
     `verify_inside.sh` step of [Launch](#launch) does not apply.
   - `/opt/k3/README.md` is still the 20261022 image's.
-  - The launcher differs from the 20261022 image's only in `ATOM_COMMIT` and in that aiter message.
-- **As shipped, it does not start.** Post-load weight processing fails on every rank with
+  - The launcher differs from the 20261022 image's in `ATOM_COMMIT`, the comment above it, and that aiter message.
+- **Why the first push does not start.** Post-load weight processing fails on every rank with
   `AssertionError: 6284 % 16 == 12`. The weight is not an expert's, so `K3_MOE` does not matter:
   - KDA's `in_proj` is fused with `b_proj` and `f_a_proj`: N = 4 × 1536 + 12 + 128 = 6284 per rank.
   - Online quantization makes it a per_1x128 FP8 weight, and aiter's preshuffle needs N % 16 == 0.
   - [#2554](https://github.com/ROCm/ATOM/pull/2554) (E8M0 block scales for online per_1x128 FP8 on gfx1250) pads such a
     weight's N to a multiple of 128 first.
   - [#2557](https://github.com/ROCm/ATOM/pull/2557) plans the persistent MLA decode over only the rows that q and o have.
-  - Both are still open. The 20261016 and 20261022 images carried both as overlays; this image dropped them.
-
-**Workaround: serve the image's ATOM with both overlays.** In each tray's container, before the first start:
-
-```bash
-P=https://raw.githubusercontent.com/ROCm/ATOM/recipe-k3-455-tp8/recipes/Kimi-K3-455-TP8-patches
-curl -sSfL -o /tmp/atom-2554.diff $P/atom-2554.diff && curl -sSfL -o /tmp/atom-2557.diff $P/atom-2557.diff
-D=/root/.cache/atom-overlay; rm -rf $D && cp -a /app/ATOM $D && cd $D
-git -c safe.directory='*' apply /tmp/atom-2554.diff /tmp/atom-2557.diff
-# fixed metadata, so both trays get the same commit
-export GIT_AUTHOR_NAME=k3 GIT_AUTHOR_EMAIL=k3@localhost GIT_AUTHOR_DATE=2026-10-27T06:00:00Z \
-  GIT_COMMITTER_NAME=k3 GIT_COMMITTER_EMAIL=k3@localhost GIT_COMMITTER_DATE=2026-10-27T06:00:00Z
-git -c safe.directory='*' commit -qam "ATOM #2554 + #2557 on d8877f1c"
-sed "s/^ATOM_COMMIT=.*/ATOM_COMMIT=$(git -c safe.directory='*' rev-parse HEAD)/" \
-  /opt/k3/k3_455_tp8dcp8_server.sh > /root/.cache/k3_server.sh
-# only on a tray whose NIC is not enp1s0f1 (see Before you start), e.g. E15's Helios-R trays:
-#   sed -i 's/enp1s0f1/enp4s0np0/g' /root/.cache/k3_server.sh
-rm -rf /root/.cache/atom/* /tmp/torchinductor_root
-```
-
-- **Starting it.** Start that copy, with `-e K3_ATOM_DIR=/root/.cache/atom-overlay`, as in [Launch](#launch). On node0:
-  `docker exec -d -e K3_ATOM_DIR=/root/.cache/atom-overlay k3tp8 bash -c 'bash /root/.cache/k3_server.sh 0 <node0 IP> > /root/.cache/tp8.log 2>&1'`.
-  On node1, the same with `4`.
-- **The patch files.**
-  - `atom-2554.diff` is #2554 at `e16b3dd4`.
-  - `atom-2557.diff` is the 20261022 image's overlay: #2557 at `8a24a910`. The PR has moved on since.
-  - The block makes commit `6c960542` on every tray, with the same tree (`161af75e`) as the validation run below.
-- **Validated with the workaround** on E15's Helios-R trays, 2026-10-27:
-  - trays 05 (node0) and 07, NIC `enp4s0np0`;
-  - the launcher defaults: `K3_MOE=ep`, custom all-reduce;
-  - 607 layers online-quantized, healthy in 10 min, `GATE PASS`;
+- **If you cannot pull again**, serve `2be1506a` with the first push's launcher. The launcher fetches that commit from
+  GitHub:
+  `docker exec k3tp8 bash -c "sed 's/^ATOM_COMMIT=.*/ATOM_COMMIT=2be1506ae67bdfdf3fa04a13f84a8ade6c80747d/' /opt/k3/k3_455_tp8dcp8_server.sh > /root/.cache/k3_server.sh"`.
+  - Start `bash /root/.cache/k3_server.sh` in place of `bash /opt/k3/k3_455_tp8dcp8_server.sh`, as in [Launch](#launch).
+  - On a tray whose NIC is not `enp1s0f1`, add `-e 's/enp1s0f1/<NIC>/g'` to that `sed`
+    (see [Before you start](#before-you-start)).
+- **Validation.** Run on E15's Helios-R trays 05 (node0) and 07, NIC `enp4s0np0`, 2026-10-27, with the launcher's
+  defaults (`K3_MOE=ep`, custom all-reduce):
+  - the first push serving ATOM tree `161af75e`, the tree of `2be1506a`;
+  - 607 layers online-quantized, `GATE PASS`;
   - GSM8K strict-match 0.9651 ±0.0051, flexible-extract 0.9636 ±0.0052.
+
+  The second push was not run itself. Its launcher serves `2be1506a`.
 
 ---
 
@@ -494,7 +486,7 @@ Restart without `ATOM_PROFILER_MORE` before you benchmark again.
 | `mxscale bpreshuffle (2d) M:…, N:1536, K:128 is untuned` | These DCP8 GEMMs, at decode M ≤ 64 and prefill M about 1100–1350, run a heuristic kernel. They are not in the tables yet |
 | `K3_MOE=tp` at 2048–16384 tokens per MoE call | The image's grouped-MoE table has 15 rows. End to end, its 2048–16384 rows run at 0.97–1.03× the speed of the default tile. [#6768](https://github.com/ROCm/aiter/pull/6768) retunes all 15 buckets against the default tiles of #6663: 1.03–1.43× in a `fused_moe` timing with cold weights. It was merged into aiter `main` on 2026-10-27 and is in the [20261027 image](#the-20261027-image). The output is the same either way |
 | GSM8K about 0.89 with `K3_MOE=tp` on another aiter | That aiter lacks `cc8d4ff12`: the default tile_k of 256 does not divide inter_dim 384, so the grouped GEMM drops the last 128 of K. This image's aiter has the fix |
-| The [20261027 image](#the-20261027-image) fails in post-load weight processing: `AssertionError: 6284 % 16 == 12` | Its ATOM lacks #2554 and #2557, which the earlier images carried as overlays. Overlay both; see that section |
+| The [20261027 image](#the-20261027-image)'s first push fails in post-load weight processing: `AssertionError: 6284 % 16 == 12` | Its ATOM lacks #2554 and #2557, which the earlier images carried as overlays. Pull the tag again: the second push has both. See that section |
 | The checkpoint's file-list md5 is `2773d607…`, not `fa7ad4b6…` | `sort` ran in the `C` locale. Use `LC_ALL=en_US.UTF-8 sort`; see [Before you start](#before-you-start) |
 | Every token is `!` | A0 silicon without translation. See the wide-EP recipe's [A0 and B0](https://github.com/ROCm/ATOM/blob/recipe-k3-455-wideep/recipes/Kimi-K3-455-wideEP.md#a0-and-b0-silicon) |
 | The ranks on the two trays cannot connect | The image's ENV sets `NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo`. Set all three `*_SOCKET_IFNAME` to `enp1s0f1`, as the launcher does |
