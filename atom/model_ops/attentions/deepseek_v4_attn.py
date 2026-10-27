@@ -414,6 +414,15 @@ class DeepseekV4Backend(AttentionBackend):
         return DeepseekV4AttentionMetadataBuilder
 
 
+# The prefill indexer's TP row split saves index scoring, which grows with a
+# step's index logits -- each request's new rows times its committed keys --
+# and, on FP4, the launches of logits bands a rank no longer needs. It pays a
+# per-layer top-k gather, which grows with the rows and waits on the slowest
+# rank. A step of few logits stays whole; the bound is a compromise measured on
+# one setup (TP8 MI355X, FP4 index, prefix hits).
+QSPLIT_MIN_LOGITS = 1 << 26
+
+
 class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     """Per-request cache owner for V4's state-cache buffers.
 
@@ -2081,6 +2090,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         positions_gpu,
         query_start_loc: torch.Tensor | None,
         buf_prefix_ubatch: str = "",
+        rows_per_request: np.ndarray | None = None,
     ) -> None:
         """Publish a prefill's CSA index query rows (`attn_metadata.index_rows`),
         once a forward for every CSA layer. A decode's are published with its
@@ -2090,6 +2100,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         grouping), as the caller holds them: the scheduled requests'
         ``cu_seqlens_q``, or a PCP rank's share (`pcp_owned_rows_by_request`).
         ``buf_prefix_ubatch`` selects a TBO ubatch's buffers.
+        ``rows_per_request``, the scheduled requests' new rows on the host,
+        gates the split across TP (`_prefill_row_split`); PCP and TBO, which
+        never split, pass none.
         """
         if not self.csa_layers:
             return
@@ -2100,6 +2113,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             total_tokens,
             query_start_loc,
             buf_prefix_ubatch,
+            rows_per_request,
         )
 
     def _build_v4_prefill_index_rows(
@@ -2110,6 +2124,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         total_tokens: int,
         query_start_loc: torch.Tensor | None,
         buf_prefix_ubatch: str,
+        rows_per_request: np.ndarray | None = None,
     ) -> IndexRows:
         """A prefill's rows, each seeing its request's committed index rows up
         to its own position (`visible_csa`).
@@ -2125,7 +2140,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         n_committed = attn_metadata.n_committed_csa_per_seq_cpu[:scheduled_bs]
         visible_end = visible_csa(positions_gpu[:total_tokens]).to(torch.int32)
-        split = self._prefill_row_split(total_tokens)
+        split = self._prefill_row_split(total_tokens, rows_per_request, n_committed)
         if self._indexer_fp4:
             return self._index_rows(
                 attn_metadata,
@@ -2155,9 +2170,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return concat_rows(visible_end, keys, split)
 
-    def _prefill_row_split(self, total_tokens: int) -> RowSplit | None:
-        """This TP rank's share of a prefill's index rows, or None unsplit."""
-        if self._indexer_qsplit_world <= 1:
+    def _prefill_row_split(
+        self,
+        total_tokens: int,
+        rows_per_request: np.ndarray | None,
+        n_committed: np.ndarray,
+    ) -> RowSplit | None:
+        """This TP rank's share of a prefill's index rows, or None unsplit.
+
+        A step splits from `QSPLIT_MIN_LOGITS` index logits: each request's
+        `rows_per_request` times its `n_committed` keys, both the scheduled
+        batch's host metadata, the same on every rank. PCP and TBO, which
+        `indexer_qsplit_world` already keeps whole, pass no rows."""
+        if self._indexer_qsplit_world <= 1 or rows_per_request is None:
+            return None
+        # int64: a step's logits reach 2^31 (16K rows of a 512K-token request).
+        logits = int(np.dot(rows_per_request.astype(np.int64), n_committed))
+        if logits < QSPLIT_MIN_LOGITS:
             return None
         return RowSplit.of(
             total_tokens,
@@ -2836,6 +2865,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # The scheduled requests only: `cu_seqlens_q` runs on to the
                 # DP-padded batch, past the block tables a prefill publishes.
                 query_start_loc=attn_metadata.cu_seqlens_q[: scheduled_bs + 1],
+                rows_per_request=extend_lens_np,
             )
         # Two-source paged_2src index buffers (extend + per-ratio prefix).
         # Eager-only — direct H2D, no forward_vars staging required. Sets

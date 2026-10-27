@@ -179,7 +179,8 @@ def indexer_qsplit_world(
     on fewer devices) reports a width the device group does not have. The
     gather runs on the TP group's pynccl communicator (see `_gather_split`).
     gfx1250 OPUS scores through its own plans and plugin bridges build their
-    own rows.
+    own rows. Within this width a prefill step still splits only from
+    `QSPLIT_MIN_LOGITS` index logits (the V4 builder's `_prefill_row_split`).
     """
     if (
         not enabled

@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
+import numpy as np
 import pytest
 import torch
 
@@ -999,19 +1000,133 @@ def test_prefill_rows_carry_this_tp_rank_s_split(v4_builder_cls, monkeypatch, fp
     )
     monkeypatch.setitem(module, "ConcatKeys", lambda **kwargs: kwargs)
     builder._stage = lambda name, values: torch.as_tensor(values)
+    # The smallest step that splits: 4 rows of a request of bound / 4 keys.
+    rows, bound = 8, module["QSPLIT_MIN_LOGITS"]
     metadata = SimpleNamespace(
-        n_committed_csa_per_seq_cpu=torch.tensor([5, 9]).numpy(),
-        batch_id_per_q_token=torch.zeros(10, dtype=torch.long),
+        n_committed_csa_per_seq_cpu=np.array([bound // 4, 0], dtype=np.int32),
+        batch_id_per_q_token=torch.zeros(rows, dtype=torch.long),
         block_tables=None,
     )
-    builder._build_v4_prefill_index_rows(metadata, torch.arange(10), 2, 10, None, "")
-    assert _RecordingSplit.calls == [((10, 3, 8), {"group": "tp"})]
+    builder._build_v4_prefill_index_rows(
+        metadata,
+        torch.arange(rows),
+        2,
+        rows,
+        None,
+        "",
+        np.array([4, 4], dtype=np.int32),
+    )
+    assert _RecordingSplit.calls == [((rows, 3, 8), {"group": "tp"})]
     assert handed["split"][0] == "split"
 
 
-def test_unsplit_prefill_rows_carry_no_split(v4_builder_cls, monkeypatch):
-    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=1, fp4=True)
-    assert builder._prefill_row_split(10) is None and _RecordingSplit.calls == []
+class _Metadata(SimpleNamespace):
+    """Stands in for the metadata `prepare_prefill` takes from its base and
+    promotes to V4's: a class of its own, so `__class__` can be reassigned."""
+
+
+def test_prepare_prefill_gates_the_split_by_each_request_s_new_rows(
+    v4_builder_cls, monkeypatch
+):
+    """`prepare_prefill` hands the split each scheduled request's new rows, not
+    its context: lost on the way, no prefill would ever split."""
+    builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
+    starts, rows = [8, 16, 0], [3, 5, 3]
+    cu = np.cumsum([0, *rows], dtype=np.int32)
+    context = np.add(starts, rows, dtype=np.int32)
+    positions = torch.cat([torch.arange(s, s + n) for s, n in zip(starts, rows)])
+    metadata = _Metadata(
+        block_tables=torch.zeros(3, 4, dtype=torch.int32),
+        cu_seqlens_q=torch.from_numpy(cu),
+        replay_start_cpu=None,
+        replay_end_cpu=None,
+        n_committed_csa_per_seq_cpu=context // 4,
+    )
+    monkeypatch.setitem(module, "AttentionMetaData_DSV4", _Metadata)
+    # `_stub_v4_runtime_imports` leaves the base builder an empty class.
+    monkeypatch.setattr(
+        v4_builder_cls.__mro__[1],
+        "prepare_prefill",
+        lambda self, batch, running_bs, running_tokens: (metadata, positions),
+        raising=False,
+    )
+    builder.model_runner = SimpleNamespace(
+        forward_vars={
+            "positions": SimpleNamespace(np=positions.numpy()),
+            "cu_seqlens_q": SimpleNamespace(np=cu),
+            "context_lens": SimpleNamespace(np=context),
+        }
+    )
+    builder.csa_layers = [0]
+    builder._populate_state_slot_mappings = lambda *args, **kwargs: (
+        None,
+        np.arange(3, dtype=np.int32),
+    )
+    for name in (
+        "_populate_state_slot_in",
+        "_build_compress_plans",
+        "_attach_v4_per_fwd_meta",
+        "_build_paged_prefill_meta",
+        "_attach_tbo_prefill_cpu_lens",
+        "_index_rows",
+    ):
+        setattr(builder, name, lambda *args, **kwargs: None)
+    asked = []
+    builder._prefill_row_split = lambda *args: asked.append(args)
+    batch = SimpleNamespace(
+        total_seqs_num_prefill=3, total_tokens_num_prefill=11, is_dummy_run=False
+    )
+
+    builder.prepare_prefill(batch, 3, 11)
+
+    [(tokens, new_rows, n_committed)] = asked
+    assert tokens == 11
+    assert new_rows.tolist() == rows
+    # Handed through only: the metadata above set it; its setter is stubbed.
+    assert n_committed.tolist() == (context // 4).tolist()
+
+
+@pytest.mark.parametrize("world, given", [(1, True), (8, False)])
+def test_unsplit_prefill_rows_carry_no_split(v4_builder_cls, monkeypatch, world, given):
+    """No split without a split world, or for a caller with no per-request rows
+    (PCP, TBO), however big the step."""
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=world, fp4=True)
+    big = np.array([1 << 14], dtype=np.int32)
+    split = builder._prefill_row_split(1 << 14, big if given else None, big)
+    assert split is None and _RecordingSplit.calls == []
+
+
+@pytest.mark.parametrize(
+    "below, splits", [(1, False), (0, True)], ids=["one_under", "at_bound"]
+)
+def test_small_prefill_steps_stay_whole(v4_builder_cls, monkeypatch, below, splits):
+    """A step splits from exactly `QSPLIT_MIN_LOGITS` index logits; one logit
+    fewer, it is scored whole."""
+    builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
+    bound = module["QSPLIT_MIN_LOGITS"]
+    n_committed = np.array([bound - 1 - below, 1], dtype=np.int32)
+    split = builder._prefill_row_split(2, np.ones(2, dtype=np.int32), n_committed)
+    assert (split is not None) == splits
+
+
+def test_split_pairs_each_request_s_rows_with_its_own_keys(v4_builder_cls, monkeypatch):
+    """A step's logits count each request's rows at its own committed keys,
+    the scoring those rows do, not at the plane's width (the longest
+    request's): one row of a long request beside three of a fresh one is one
+    row's scoring."""
+    builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
+    rows = np.array([1, 3], dtype=np.int32)
+    n_committed = np.array([module["QSPLIT_MIN_LOGITS"] - 1, 0], dtype=np.int32)
+    assert builder._prefill_row_split(4, rows, n_committed) is None
+
+
+def test_split_logits_do_not_wrap_in_int32(v4_builder_cls, monkeypatch):
+    """16K rows of a 512K-token request are 2^31 logits, past int32 (the
+    host metadata's dtype): wrapped, the biggest steps would stay whole."""
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
+    rows = np.array([1 << 14], dtype=np.int32)
+    n_committed = np.array([1 << 17], dtype=np.int32)
+    assert builder._prefill_row_split(1 << 14, rows, n_committed) is not None
 
 
 @pytest.mark.parametrize(
