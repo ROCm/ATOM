@@ -14,7 +14,12 @@ from atom.model_ops.fla_ops import (
     gdn_decode_update_lossy_fast,
     gdn_fused_decode,
 )
-from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
+from atom.model_ops.fla_ops.replayssm import (
+    UT_MIN_QUERY_LEN,
+    fused_verify_variant,
+    replayssm_conv_gated_delta_rule,
+    replayssm_gated_delta_rule,
+)
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -283,6 +288,58 @@ class GatedDeltaNet(nn.Module):
                 core_attn_out[:num_actual_tokens],
             )
         ):
+            if num_actual_tokens < core_attn_out.shape[0]:
+                core_attn_out[num_actual_tokens:].zero_()
+            return core_attn_out
+
+        # Pure MTP-verify batch under ReplaySSM: one kernel takes the in_proj
+        # rows to the output (conv1d, gating, the recurrence and, for variant B,
+        # the gated norm), in place of the four kernels below.
+        variant = None
+        if (
+            z is not None
+            and use_replayssm
+            and spec_sequence_masks is not None
+            and gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes == 0
+            and gdn_metadata.replayssm_route in ("auto", "serial")
+            and gdn_metadata.replayssm_max_query_len < UT_MIN_QUERY_LEN
+        ):
+            mode = envs.ATOM_GDN_FUSED_VERIFY
+            nsd = gdn_metadata.num_spec_decodes
+            hv = self.num_v_heads // self.tp_size
+            if mode in ("a", "b"):
+                variant = mode.upper()
+            elif mode == "auto":
+                variant = fused_verify_variant(nsd, hv)
+        if variant is not None:
+            replayssm_conv_gated_delta_rule(
+                mixed_qkv,
+                conv_weights,
+                self.conv1d.bias,
+                conv_state,
+                spec_state_indices_tensor[:, 0][:nsd],
+                num_accepted_tokens,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                core_attn_out,
+                ssm_state,
+                layer_cache.replay_buf_k,
+                layer_cache.replay_buf_u,
+                layer_cache.replay_buf_g,
+                gdn_metadata.write_pos,
+                gdn_metadata.slot_idx[:nsd],
+                spec_query_start_loc[: nsd + 1],
+                gdn_metadata.replayssm_max_query_len,
+                self.num_k_heads // self.tp_size,
+                self.head_k_dim,
+                z=z[:num_actual_tokens],
+                norm_weight=self.gated_norm.weight,
+                norm_eps=self.gated_norm.eps,
+                fuse_norm=variant == "B",
+            )
             if num_actual_tokens < core_attn_out.shape[0]:
                 core_attn_out[num_actual_tokens:].zero_()
             return core_attn_out

@@ -190,6 +190,13 @@ def max_schedulable_decode_bs(
 _kv_config_has_producer = kv_config_has_producer
 
 
+class GreedyTokenIds(NamedTuple):
+    """The LM head's per-row argmax, standing in for its logits on an all-greedy
+    step (see `ModelRunner._greedy_ids_step`). int32 `[rows]`, one per logits row."""
+
+    ids: torch.Tensor
+
+
 class TokenLocations(NamedTuple):
     """How each request in this decode batch gets its anchor token.
 
@@ -3033,11 +3040,14 @@ class ModelRunner:
         self,
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        greedy_ids: bool = False,
+    ) -> tuple[torch.Tensor | GreedyTokenIds, torch.Tensor]:
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.scheduled_bs
         is_prefill = context.is_prefill
+        # Decode only: a prefill head picks each sequence's last row first.
+        greedy_ids = greedy_ids and not is_prefill
         positions = context.positions
 
         # Dispatch is owned by ForwardMode.decide() (called in prepare_model).
@@ -3219,7 +3229,7 @@ class ModelRunner:
                     # PP carries the full run between stages. Only the last
                     # stage returns scheduled rows to sampling/draft consumers.
                     hidden_states = model_output[: context.scheduled_tokens]
-                    logits = self.model.compute_logits(hidden_states)
+                    logits = self._compute_logits(hidden_states, greedy_ids)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
@@ -3246,7 +3256,7 @@ class ModelRunner:
                             else scheduled_tokens
                         )
                     ]
-                    logits = self.model.compute_logits(hidden_states)
+                    logits = self._compute_logits(hidden_states, greedy_ids)
                     return logits, hidden_states
 
                 graph_key = request_bucket(
@@ -3259,9 +3269,55 @@ class ModelRunner:
                 if logits is not None:
                     logits = logits[:scheduled_tokens]
                 else:
-                    logits = self.model.compute_logits(hidden_states)
+                    logits = self._compute_logits(hidden_states, greedy_ids)
 
         return logits, hidden_states
+
+    def _greedy_lm_head(self):
+        """The target's ParallelLMHead if it can answer argmax-only, else None."""
+        if not hasattr(self, "_greedy_head_cache"):
+            base = getattr(self.model, "language_model", self.model)
+            head = getattr(base, "lm_head", None)
+            self._greedy_head_cache = (
+                head if hasattr(head, "compute_argmax_token") else None
+            )
+        return self._greedy_head_cache
+
+    def _greedy_ids_step(self, batch: ScheduledBatch | None, all_greedy: bool) -> bool:
+        """Whether this step's LM head may hand back argmax ids instead of logits.
+
+        At TP > 1 the logits path all-gathers `[rows, vocab]`; an all-greedy step
+        needs only each row's argmax, which `compute_argmax_token` gets from a
+        `[rows, 2]` gather of per-shard maxima -- the same bf16 logits and the
+        same lowest-index tie rule as the sampler's `topk_select`, so the same
+        tokens. Not under DP (each rank's own batch decides `all_greedy`, and the
+        head's collectives would have to agree), with logprobs, with relaxed MTP
+        (it reads the top-N), or at TP1 (no gather to save, and its logits are
+        recorded with the forward).
+        """
+        if not (
+            envs.ATOM_GREEDY_ARGMAX_HEAD
+            and all_greedy
+            and batch is not None
+            and not envs.ATOM_ENABLE_RELAXED_MTP
+            and self.config.parallel_config.data_parallel_size == 1
+            and not any(batch.return_logprobs)
+        ):
+            return False
+        head = self._greedy_lm_head()
+        return head is not None and head.tp_size > 1
+
+    def _compute_logits(
+        self, hidden_states: torch.Tensor, greedy_ids: bool
+    ) -> torch.Tensor | GreedyTokenIds:
+        if not greedy_ids:
+            return self.model.compute_logits(hidden_states)
+        ids = torch.empty(
+            hidden_states.shape[0], dtype=torch.int32, device=hidden_states.device
+        )
+        return GreedyTokenIds(
+            self._greedy_lm_head().compute_argmax_token(hidden_states, out=ids)
+        )
 
     def flush_pp_send(self) -> bool:
         """Flush pending PP isend. Returns True for call_func wait_out."""
@@ -3293,15 +3349,18 @@ class ModelRunner:
             # sampler's per-row parameters and the logprob gather both. Cut
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
-            logits = logits[:bs]
-            sampled_tokens = self.sampler(
-                logits,
-                temperatures,
-                top_ks,
-                top_ps,
-                all_greedy,
-                needs_independent_noise=needs_independent_noise,
-            )
+            if isinstance(logits, GreedyTokenIds):
+                sampled_tokens = logits.ids[:bs]
+            else:
+                logits = logits[:bs]
+                sampled_tokens = self.sampler(
+                    logits,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    all_greedy,
+                    needs_independent_noise=needs_independent_noise,
+                )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
             spec_counts = self.tokenID_processor.zero_spec_counts[: 2 * bs].view(2, bs)
@@ -3315,27 +3374,38 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-            target_logits = torch.index_select(logits, 0, target_logits_indices)
-            target_token_ids = None
-            if not all_greedy:
-                target_token_ids = self.sampler.sample_verification_tokens(
-                    target_logits,
-                    spec_decode_metadata.cu_num_draft_tokens,
-                    temperatures,
-                    top_ks,
-                    top_ps,
+            if isinstance(logits, GreedyTokenIds):
+                # All-greedy: the head already reduced every row to its argmax,
+                # which is what the greedy sampler and verify would take.
+                bonus_token_ids = torch.index_select(logits.ids, 0, bonus_logits_indices)
+                target_token_ids = torch.index_select(
+                    logits.ids, 0, target_logits_indices
                 )
-                if target_token_ids.numel() and get_tp_group().world_size > 1:
-                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise or not all_greedy,
-            )
+                target_logits = None
+            else:
+                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                target_logits = torch.index_select(logits, 0, target_logits_indices)
+                target_token_ids = None
+                if not all_greedy:
+                    target_token_ids = self.sampler.sample_verification_tokens(
+                        target_logits,
+                        spec_decode_metadata.cu_num_draft_tokens,
+                        temperatures,
+                        top_ks,
+                        top_ps,
+                    )
+                    if target_token_ids.numel() and get_tp_group().world_size > 1:
+                        target_token_ids = get_tp_group().broadcast(
+                            target_token_ids, src=0
+                        )
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
@@ -3498,7 +3568,9 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
-        logits, hidden_states = self.run_model(input_ids, batch)
+        logits, hidden_states = self.run_model(
+            input_ids, batch, greedy_ids=self._greedy_ids_step(batch, all_greedy)
+        )
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -4575,7 +4647,9 @@ class RapidServeModelRunner(ModelRunner):
                 needs_independent_noise,
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
-            logits, hidden_states = self.run_model(input_ids, batch)
+            logits, hidden_states = self.run_model(
+                input_ids, batch, greedy_ids=self._greedy_ids_step(batch, all_greedy)
+            )
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 

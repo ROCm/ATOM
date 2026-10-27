@@ -903,6 +903,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
         "ATOM_DP_LM_HEAD_MODE", "all2all"
     ).lower(),
+    # GDN MTP verify in one kernel from the in_proj rows (conv1d + gating +
+    # ReplaySSM, see replayssm_conv_gated_delta_rule): "auto" picks the variant
+    # by batch, "A" keeps the gated norm a separate launch and the V split,
+    # "B" fuses the norm with one program per head, "0" runs the separate kernels.
+    "ATOM_GDN_FUSED_VERIFY": lambda: os.getenv("ATOM_GDN_FUSED_VERIFY", "auto").lower(),
+    # All-greedy TP decode steps take the target's argmax from the LM head
+    # (per-shard maxima, a [rows, 2] gather) instead of all-gathering the
+    # [rows, vocab] logits. Token-identical; 0 restores the logits path.
+    "ATOM_GREEDY_ARGMAX_HEAD": lambda: (
+        os.getenv("ATOM_GREEDY_ARGMAX_HEAD", "1").lower() in ("1", "true")
+    ),
     # Pure-DP draft greedy argmax: shard the draft lm_head vocab across the DP
     # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
     # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
