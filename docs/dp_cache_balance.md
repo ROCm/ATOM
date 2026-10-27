@@ -94,12 +94,41 @@ This alignment work does not acknowledge or commit the migration. A dropped
 handoff or an expired preparation during alignment aborts through normal
 postprocess, retaining any buffers still used by a forward or transfer.
 
-If a target cannot recover at least the promised prefix, or the preparation
-budget expires while queued, it rejects this placement. The original request
-and hash chain are resubmitted to the prior owner. That owner's own scheduler
-rechecks residency and recomputes any missing tokens. Cancellation discards
-the retry payload; late target replies cannot resurrect it. A concurrent turn
-fences an older migration from overwriting a newer owner decision.
+If a target cannot recover the promised prefix, it reports its actual usable
+boundary before normal abort cleanup. The router then probes the source's
+current local HBM prefix, including STATE availability and required replay.
+The source probe does not query LMCache or count a tier hint as resident STATE.
+It runs asynchronously with a 250 ms coordinator budget by default
+(`source_probe_timeout_seconds`), including control-lock acquisition and reply
+waiting. A busy socket or unavailable probe gives the source zero reuse credit;
+it does not reuse the historical hint. A late reply is discarded.
+
+Using current loads with this request's own charge removed, compare:
+
+```text
+continue on B = wait_B + (prompt_tokens - observed_hit_B) / prefill_rate
+return to A   = wait_A + (prompt_tokens - observed_hit_A) / prefill_rate
+```
+
+The preparation time already spent is excluded from both remaining costs.
+Return to A only if its advantage covers the configured absolute and relative
+gain margins; ties stay on B. This is one reconsideration per migration, with
+a bounded number of probe workers. Lower fresh hits also retract overly long
+historical hints. Queue accounting is corrected again on actual admission.
+
+The chosen engine receives the original request and hash chain with no promised
+minimum hit. If B is chosen, a new generation fences replies from its first
+attempt; ownership changes only after B actually admits the request. The
+scheduler revalidates PAGE/STATE and recomputes every missing token. These are
+snapshots, not reservations: cleanup or eviction may shorten a hit before the
+resubmission. A cache clear invalidates both observations and fences the owner
+commit. Cancellation discards the payload and prevents a late probe from
+resurrecting the request.
+
+Preparation timeouts and failed alignment still use the prior-owner retry;
+they do not claim a safely settled partial restore for reconsideration. The
+prior owner's scheduler checks residency and recomputes missing tokens. A
+concurrent turn fences an older migration from overwriting a newer owner.
 
 Timeouts do not free buffers involved in an uncertain DMA. The existing native
 connector holds their leases until terminal completion, including when the
@@ -136,7 +165,7 @@ Cross-host GPU validation is required before relying on this deployment mode.
 Source HBM copies are not forcibly deleted when the owner changes. Existing
 PAGE/checkpoint reference counts and LRU policies own reclamation; LMCache
 owns its L1/L2 eviction. An evicted or stale hint causes failed preparation
-and safe fallback. This version has no global replica-count policy or active
+and recovery reconsideration or safe fallback. This version has no global replica-count policy or active
 duplicate pruning.
 
 ## Measurement
@@ -153,6 +182,16 @@ Fallback counters distinguish `preparation_timeout`,
 `alignment_chunk_unavailable`, and `admission_callback_unavailable`. Unknown
 reasons use `other`. These categories have bounded cardinality. Compare deltas
 within the profiling window, not lifetime totals that include warmup.
+
+`migration_reconsidered` counts short restores reassessed from actual hits;
+`migration_reconsider_target` and `migration_reconsider_source` report the
+choice. `migration_partial_committed` counts reassessed target placements that
+actually commit ownership (their final admitted hit can differ from the probe).
+`migration_source_probe_ok`, `_timeout`, `_unavailable`, and `_busy` distinguish
+probe outcomes; `migration_source_unknown` counts decisions without a confirmed
+source hit. DEBUG logs include source/target hits, remaining cost estimates and
+the chosen rank, without request contents. These counters are separate from
+fallbacks: staying on B is not a fallback to A.
 
 ### Measured scope
 

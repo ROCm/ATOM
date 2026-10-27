@@ -25,6 +25,7 @@ class CacheBalanceConfig:
     min_gain_ratio: float = 0.15
     cooldown_seconds: float = 30.0
     prepare_timeout_seconds: float = 5.0
+    source_probe_timeout_seconds: float = 0.25
     hint_ttl_seconds: float = 600.0
     max_sessions: int = 4096
     max_migrations: int = 8
@@ -54,6 +55,7 @@ class CacheBalanceConfig:
                     "prefill_tokens_per_second",
                     "transfer_tokens_per_second",
                     "prepare_timeout_seconds",
+                    "source_probe_timeout_seconds",
                     "hint_ttl_seconds",
                     "max_sessions",
                     "max_migrations",
@@ -114,6 +116,17 @@ class Placement:
     minimum_hit: int = 0
     session_version: int = 0
     admitted: bool = False
+    reconsidering: bool = False
+    reconsidered: bool = False
+
+
+@dataclass(frozen=True)
+class RecoveryChoice:
+    rank: int
+    source_hit: int
+    target_hit: int
+    source_seconds: float
+    target_seconds: float
 
 
 class CacheBalancer:
@@ -125,6 +138,7 @@ class CacheBalancer:
         self.counters = Counter()
         self._generation = 0
         self._cursor = 0
+        self.cache_epoch = 0
 
     def _snapshot(self, chain, prompt, now):
         if chain is None or chain.num_prompt_tokens != prompt:
@@ -277,7 +291,7 @@ class CacheBalancer:
             or placement.migration != migration
         ):
             return False
-        if placement.admitted or hit < placement.minimum_hit:
+        if placement.admitted or placement.reconsidering or hit < placement.minimum_hit:
             return False
         placement.admitted = True
         self.counters["admitted"] += 1
@@ -290,10 +304,98 @@ class CacheBalancer:
                     session.owner = rank
                     session.version += 1
                     self.counters["migration_committed"] += 1
+                    if placement.reconsidered:
+                        self.counters["migration_partial_committed"] += 1
                 else:
                     self.counters["migration_owner_superseded"] += 1
             placement.migration = 0
         return True
+
+    def begin_reconsider(self, request_id, rank, migration):
+        placement = self.requests.get(request_id)
+        if (
+            placement is None
+            or placement.rank != rank
+            or not migration
+            or placement.migration != migration
+            or placement.admitted
+            or placement.reconsidering
+            or placement.reconsidered
+        ):
+            return False
+        placement.reconsidering = True
+        return True
+
+    def reconsider(
+        self, request_id, rank, migration, source_hit, target_hit, requests, tokens, now
+    ):
+        """Choose remaining work after a short restore; loads exclude this request.
+
+        Hits are fresh snapshots, never authority to skip prefill. An unknown
+        source gets no reuse credit. Preparation already spent is sunk cost;
+        neither candidate is charged for another promised full-prefix copy.
+        """
+        p = self.requests.get(request_id)
+        if (
+            p is None
+            or p.rank != rank
+            or p.migration != migration
+            or not p.reconsidering
+            or p.admitted
+        ):
+            return None
+        cfg = self.config
+        source = p.source
+        source_known = source_hit is not None
+        source_hit = max(0, min(source_hit or 0, p.prompt_tokens))
+        target_hit = max(0, min(target_hit, p.prompt_tokens))
+
+        def remaining(r, hit):
+            return (
+                max(0, tokens[r]) + p.prompt_tokens - hit
+            ) / cfg.prefill_tokens_per_second + max(
+                0, requests[r]
+            ) * cfg.decode_request_seconds
+
+        stay = remaining(rank, target_hit)
+        back = remaining(source, source_hit)
+        # Returning to A is another move. Require the same configured gain
+        # margin; ties/small differences keep the request at B.
+        gain = stay - back
+        go_back = gain > 0 and gain >= max(
+            cfg.min_gain_seconds, stay * cfg.min_gain_ratio
+        )
+        choice = RecoveryChoice(
+            source if go_back else rank, source_hit, target_hit, back, stay
+        )
+        self.counters["migration_reconsidered"] += 1
+        if not source_known:
+            self.counters["migration_source_unknown"] += 1
+        session = self.sessions.get(p.session_id)
+        if session:
+            for r, hit, known in (
+                (source, source_hit, source_known),
+                (rank, target_hit, True),
+            ):
+                hint = session.hints.get(r)
+                if known and hint and hint.tokens > hit:
+                    del session.hints[r]
+        p.reconsidering = False
+        if go_back:
+            self.counters["migration_reconsider_source"] += 1
+            self.retry(
+                request_id, rank, migration, now, reason="recoverable_prefix_too_short"
+            )
+            p.estimated_hit = source_hit
+        else:
+            self.counters["migration_reconsider_target"] += 1
+            # Fence duplicate rejections/admissions from B's original attempt.
+            self._generation += 1
+            p.migration = self._generation
+            p.minimum_hit = 0
+            p.estimated_hit = target_hit
+            p.reconsidered = True
+        return choice
 
     def retry(self, request_id, rank, migration, now, *, reason=None):
         placement = self.requests.get(request_id)
@@ -314,6 +416,7 @@ class CacheBalancer:
         placement.source = None
         placement.migration = 0
         placement.minimum_hit = 0
+        placement.reconsidering = False
         # A failed destination is no proof of residency at the source either.
         placement.estimated_hit = 0
         self.counters["migration_fallback"] += 1
@@ -349,6 +452,7 @@ class CacheBalancer:
 
     def invalidate(self):
         """Cache clear / weight change: discard predictions and fence old commits."""
+        self.cache_epoch += 1
         for session in self.sessions.values():
             session.hints.clear()
             session.version += 1

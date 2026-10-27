@@ -104,6 +104,7 @@ class EngineUtilityHandler:
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
+        "probe_local_prefix": "_handle_probe_local_prefix",
         "abort_request": "_handle_abort_request",
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
     }
@@ -279,6 +280,21 @@ class EngineUtilityHandler:
     @staticmethod
     def _error_reply(cmd: str, exc: Exception) -> dict:
         return {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _handle_probe_local_prefix(self, args: dict):
+        # Metadata only, serialized with scheduling. Never invoke a runner or
+        # consult shared-tier hints, and do not kill the engine on probe failure.
+        hit = None
+        try:
+            if self.scheduler is not None and not self._weight_sync_fenced:
+                seq = args["seq"]
+                seq.prompt_hash_chain = args["chain"]
+                hit = self.scheduler.block_manager.probe_local_prefix(seq)
+        except Exception:
+            logger.debug("Local prefix probe unavailable", exc_info=True)
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "probe_local_prefix", "result": hit})
+        )
 
     def _handle_collective_rpc(self, args: dict):
         """Invoke an arbitrary ModelRunner method on every TP rank.

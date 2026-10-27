@@ -229,12 +229,86 @@ class BalanceTest(unittest.TestCase):
             {"max_sessions": True},
             {"max_sessions": 1.1},
             {"prepare_timeout_seconds": 0},
+            {"source_probe_timeout_seconds": 0},
             {"min_gain_ratio": 1},
             {"prefill_tokens_per_second": float("nan")},
             {"typo": 1},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 CacheBalanceConfig.parse(options)
+
+    def recover(self, source_hit, target_hit=65536, loads=None):
+        self.seed()
+        p = self.migrate()
+        generation = p.migration
+        self.assertTrue(self.b.begin_reconsider("move", 1, generation))
+        result = self.b.reconsider(
+            "move",
+            1,
+            generation,
+            source_hit,
+            target_hit,
+            [0] * 4,
+            loads or [0] * 4,
+            4,
+        )
+        return p, generation, result
+
+    def test_source_evicted_keep_partial_target_and_recompute_remainder(self):
+        p, old, result = self.recover(0)
+        self.assertEqual(result.rank, 1)
+        self.assertEqual(p.estimated_hit, 65536)
+        self.assertEqual(p.minimum_hit, 0)
+        self.assertGreater(p.migration, old)
+        self.assertEqual(self.b.sessions["s"].owner, 0)
+        self.assertNotIn(0, self.b.sessions["s"].hints)
+        self.assertFalse(self.b.admitted("move", 1, old, 102400, 5))
+        # B may evict again before the requeue: actual admission can safely
+        # recompute even the whole prompt, regardless of the routing snapshot.
+        self.assertTrue(self.b.admitted("move", 1, p.migration, 0, 5))
+        self.assertEqual(self.b.sessions["s"].owner, 1)
+        self.assertEqual(self.b.counters["migration_partial_committed"], 1)
+
+    def test_fresh_full_source_can_win_after_its_queue_drains(self):
+        p, _, result = self.recover(102400)
+        self.assertEqual(result.rank, 0)
+        self.assertEqual(p.migration, 0)
+        self.assertEqual(p.estimated_hit, 102400)
+        self.assertEqual(self.b.counters["migration_fallback"], 1)
+
+    def test_fresh_full_source_does_not_override_current_queue(self):
+        p, _, result = self.recover(102400, loads=[1000000, 0, 0, 0])
+        self.assertEqual(result.rank, 1)
+        self.assertGreater(p.migration, 0)
+
+    def test_unknown_source_gets_no_credit_for_old_hint(self):
+        _, _, result = self.recover(None)
+        self.assertEqual((result.rank, result.source_hit), (1, 0))
+        self.assertEqual(self.b.counters["migration_source_unknown"], 1)
+
+    def test_reconsideration_does_not_double_charge_sunk_copy_cost(self):
+        _, _, result = self.recover(0, target_hit=0)
+        self.assertEqual(result.source_seconds, result.target_seconds)
+        self.assertEqual(result.rank, 1)
+        self.assertAlmostEqual(result.target_seconds, 102401 / 32768)
+
+    def test_reconsideration_is_once_and_cancel_fences_result(self):
+        self.seed()
+        p = self.migrate()
+        generation = p.migration
+        self.assertTrue(self.b.begin_reconsider("move", 1, generation))
+        self.assertFalse(self.b.begin_reconsider("move", 1, generation))
+        self.assertFalse(self.b.admitted("move", 1, generation, 102400, 4))
+        self.b.finish("move", 4)
+        self.assertIsNone(
+            self.b.reconsider("move", 1, generation, 0, 65536, [0] * 4, [0] * 4, 5)
+        )
+
+    def test_concurrent_turn_also_fences_partial_owner_commit(self):
+        p, _, _ = self.recover(0)
+        self.place("newer", now=4.5)
+        self.assertTrue(self.b.admitted("move", 1, p.migration, 65536, 5))
+        self.assertEqual(self.b.sessions["s"].owner, 0)
 
 
 class AdmissionHarness(DPCacheAdmission):
@@ -270,6 +344,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertFalse(self.s._admit_cache_placement(self.seq))
         self.assertFalse(self.s.events)
         self.assertEqual(self.seq.dp_cache_retry_reason, "recoverable_prefix_too_short")
+        self.assertEqual(self.seq.dp_cache_recoverable_hit, 65536)
 
     def test_complete_restore_emits_one_confirmation(self):
         self.seq.num_cached_tokens = 102400
@@ -281,6 +356,14 @@ class AdmissionTest(unittest.TestCase):
         self.seq.num_cached_tokens = 102400
         self.s.block_manager.replay_start = lambda *args, **kw: 98304
         self.assertFalse(self.s._admit_cache_placement(self.seq))
+        self.assertEqual(self.seq.dp_cache_recoverable_hit, 98304)
+
+    def test_partial_continuation_uses_actual_hit_without_prepare_timer(self):
+        self.seq.dp_cache_minimum_hit = 0
+        self.s._track_cache_migration(self.seq)
+        self.assertFalse(self.s.__dict__.get("_dp_cache_preparing"))
+        self.assertTrue(self.s._admit_cache_placement(self.seq))
+        self.assertEqual(self.s.events, [(7, 42, 65536)])
 
     def test_timeout_uses_local_clock_and_existing_abort_cleanup(self):
         with patch(

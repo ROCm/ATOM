@@ -896,6 +896,8 @@ class BlockManager:
         compressed_hit: int,
         block_hashes: list[int],
         assume_checkpointed: bool = False,
+        *,
+        local_only: bool = False,
     ) -> int:
         """Rightmost boundary every Pool.STATE class can resume from.
 
@@ -922,12 +924,15 @@ class BlockManager:
         while boundary > 0:
             settled = True
             for cache in self.state_caches:
-                accepted = cache.resumable_hit(
-                    seq,
-                    boundary,
-                    block_hashes,
-                    assume_checkpointed=assume_checkpointed,
-                )
+                if local_only and cache is self.paged_state_checkpoints:
+                    accepted = cache.local_resumable_hit(seq, boundary, block_hashes)
+                else:
+                    accepted = cache.resumable_hit(
+                        seq,
+                        boundary,
+                        block_hashes,
+                        assume_checkpointed=assume_checkpointed,
+                    )
                 if accepted != boundary:
                     boundary = accepted
                     settled = False
@@ -1284,6 +1289,20 @@ class BlockManager:
         return _PrefixWalk(
             seq.num_tokens, seq.cache_seed, self.kv.index_version, hashes, ids
         )
+
+    def probe_local_prefix(self, seq: Sequence) -> int:
+        """Usable HBM tokens, without allocation, offload lookup, or demand records.
+
+        Called on the engine thread with a private request copy. This is a
+        snapshot, not a reservation; actual admission must revalidate it.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+        walk = self._walk_prefix(seq)
+        hit = self._gated_hit(seq, len(walk.hashes), walk.hashes, local_only=True)
+        hit = self._replay_hit(seq, len(walk.hashes), hit)
+        cached = hit * self.hash_block_size
+        return min(cached, self.replay_start(seq, cached, hit=True))
 
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
         """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`
