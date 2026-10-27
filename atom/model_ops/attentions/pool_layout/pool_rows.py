@@ -32,12 +32,15 @@ class KvGeometry(NamedTuple):
 
     num_kv_heads: int
     head_dim: int
+    # "" for the dtype-wide cache; "nvfp4" for MiniMax-M3 sparse layers under
+    # ATOM_M3_SPARSE_KV_NVFP4 -- a separate pool beside the dense layers' fp8 one.
+    kv_format: str = ""
 
     def __str__(self) -> str:
         """What this row space is called, wherever one is named -- the startup
         log, and the `semantic_role` its transfer regions carry. Both are for a
         person: the default repr would print the class and field names."""
-        return f"h{self.num_kv_heads}d{self.head_dim}"
+        return f"h{self.num_kv_heads}d{self.head_dim}{self.kv_format}"
 
 
 class PoolRowsMixin:
