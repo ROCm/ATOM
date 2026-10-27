@@ -29,9 +29,18 @@ THREADS, WAVES = 256, 8
 
 
 def ffn_input_layout_c1(index_bound_max=0, tp=2):
-    """Exact mother K2a/K2b partition and final XRDY, including unused regions."""
-    return scratch_layout(LayerPostBuild(tokens=1, tp=tp, ug_groups=1,
-                                         index_bound_max=index_bound_max))
+    """Mother offsets plus TP2 routed contributions and tagged readiness.
+
+    The extra regions live through the whole K2 launch; StepMailboxes clears
+    their backing at the start of each decode step like every other region.
+    """
+    out = scratch_layout(LayerPostBuild(tokens=1, tp=tp, ug_groups=1,
+                                        index_bound_max=index_bound_max))
+    if tp == 2:
+        end = (max(o+n for o,n in out.values())+15)//16*16
+        out["dcv"] = (end,320*6*16*4)  # plain FP32 [output][top-k pick][row]
+        out["dcf"] = (end+320*6*16*4,256*8)  # producer-group (value, epoch)
+    return out
 
 
 @traced

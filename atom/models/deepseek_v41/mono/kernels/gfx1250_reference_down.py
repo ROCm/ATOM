@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Mother c1 down: arrival queue, paired tasks and tagged second TP.
+"""c1 down with independent routed production and output ownership.
 
-Keep shared-first, all round weights/scales before UGF waits, register MID
-operands, two matrix chains and original private-LDS BF16 composition.
+TP2 assigns eight expert/output units per arrival-ranked CTA, publishes its
+plain contributions before any consumer wait, then combines in original top-k
+order. TP4 keeps the mother paired-task path.
 """
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -17,13 +18,16 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import poll_copy
 from atom.models.deepseek_v41.mono.kernels.moe import (
     HIDDEN, DOWN_TASKS, DOWN_R_MAX, DOWN_CHAINS, RED_TASKS,
     down_scale_words, wsl_words, down_ug_flags,
-    take_down_rank, contrib_store, down_combine, stage_reduce,
+    take_down_rank, contrib_store, contrib_load, down_combine, stage_reduce,
+    region_pair,
 )
 from atom.mono.device.mx import scale_index
 from atom.mono.device.ops import CM_DEV, CM_NT_GFX1250, bf16_round, fresh, lane_gather, row_sum, rsrc, traced
 from atom.mono.plan.execution import BLOCKS, first_task
 from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_route import C1RouteShape
 from atom.mono.device.ops import uniform
+from atom.mono.device.sync import preg
+from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_sync import publish_plain
 
 
 def down_scales_c1(c, e, task):
@@ -184,14 +188,14 @@ def compact_mid_step(c, first, step):
 
 
 @traced
-def compact_routed_down_live(c, tasks):
+def compact_routed_down_live(c, tasks, slot=None, global_output=False):
     """Six useful expert waves, two-step prefetch and original two chains.
 
     No CTA barrier occurs in this wave-uniform branch. The caller executes
     shared down with all eight waves, then joins all eight before combine.
     """
     lane, d, rs = c["lane"], c["d"], c["rs"]
-    slot = uniform(c["wave"])
+    slot = uniform(c["wave"]) if slot is None else uniform(slot)
     first = slot
     expert = rs.union_expert(c["tab"], 1, slot)
     steps = d.inter // 128
@@ -237,8 +241,74 @@ def compact_routed_down_live(c, tasks):
         for chain in range_constexpr(1,DOWN_CHAINS):
             value = value + accs[j][chain].load()
         if lane%16 == 0:
-            for row in range_constexpr(8):
-                contrib_store(c,j,pick*16+lane//16*8+row,value[row])
+            if const_expr(global_output):
+                # This wave owns one expert/output tile. Keep FP32 values;
+                # route weighting and BF16 rounding belong to the consumer.
+                for q in range_constexpr(2):
+                    words = fx.Vector.from_elements(
+                        [value[q*4+i].bitcast(fx.Int32) for i in range(4)], fx.Int32)
+                    bo.buffer_store(words, rsrc(c["dcv"].value),
+                        tasks[j]*96+pick*16+(lane//16)*8+q*4,
+                        cache_modifier=CM_DEV)
+            else:
+                for row in range_constexpr(8):
+                    contrib_store(c,j,pick*16+lane//16*8+row,value[row])
+
+
+@traced
+def combine_outputs_c1(c, tasks):
+    """Combine one/two complete tiles together, preserving each tile's order."""
+    tid, n = c["tid"], len(tasks)
+    if tid < n*16:
+        j, row = tid//16, tid%16
+        shared = fx.ptr_load(c["sdl"]+tid).bitcast(fx.Float32)
+        routed = fx.Float32(0.0)
+        for k in range_constexpr(6):
+            weight = c["rs"].route_w(c["tab"],1,0,k)
+            value = contrib_load(c,j,k*16+row)
+            routed = bf16_round(routed+bf16_round(value*weight))
+        fx.ptr_store(bf16_round(routed+shared),c["pair"]+tid)
+    gpu.barrier()
+    if tid < n*8:
+        task = tasks[0] if n == 1 else (tid < 8).select(tasks[0],tasks[1])
+        col = task*16+2*(tid%8)
+        v0, v1 = fx.ptr_load(c["pair"]+2*tid), fx.ptr_load(c["pair"]+2*tid+1)
+        for p in range_constexpr(c["d"].tp):
+            dst = preg(c["peer_addr"](p),c["peer"]["ffn"],"ffn")
+            c["put_bf"](dst,2*region_pair(c["rank"],0,1,col),[v0,v1])
+    gpu.barrier()
+
+
+@traced
+def stage_down_distributed_c1(c, arrival, tasks):
+    """Publish all local production before waiting for remote CTA results.
+
+    Arrival IDs 0..239 each own eight units, unit=output*6+expert-slot.
+    Every effective wave runs nine K128 steps. IDs 240..255 only consume;
+    their UG work and output ownership remain intact.
+    """
+    down_shared_c1(c,tasks)
+    if uniform(arrival) < DOWN_TASKS*6//8:
+        unit = uniform(arrival)*8+uniform(c["wave"])
+        task, slot = uniform(unit//6), uniform(unit%6)
+        compact_routed_down_live(c,[task],slot=slot,global_output=True)
+    # Every writer wave drains its stores, then all eight join. No CTA can
+    # enter a contribution wait while its own production is unpublished.
+    publish_plain(c["put"],c["dcf"],arrival,1,
+                  (c["tid"] == 0) & (arrival < DOWN_TASKS*6//8))
+    waits = []
+    for task in tasks:
+        # Six contiguous expert slots intersect at most two producer groups.
+        waits += [(c["dcf"],task*6//8,1),(c["dcf"],(task*6+5)//8,1)]
+    c["poll"](waits)
+    tid = c["tid"]
+    if tid < len(tasks)*96:
+        task = tasks[0] if len(tasks) == 1 else (tid < 96).select(tasks[0],tasks[1])
+        word = bo.buffer_load(rsrc(c["dcv"].value),task*96+tid%96,
+                              vec_width=1,dtype=T.i32,cache_modifier=CM_DEV)
+        fx.ptr_store(fx.Int32(word),c["contrib"]+tid)
+    gpu.barrier()
+    combine_outputs_c1(c,tasks)
 
 
 @traced
@@ -266,9 +336,15 @@ def run_down_c1(c,bid,reduce=True):
     arrival=take_down_rank(c)
     task=first_task(bid,0)
     if arrival<DOWN_TASKS-BLOCKS:
-        stage_down_c1(c,[task,BLOCKS+arrival])
+        if const_expr(isinstance(c["rs"],C1RouteShape)):
+            stage_down_distributed_c1(c,arrival,[task,BLOCKS+arrival])
+        else:
+            stage_down_c1(c,[task,BLOCKS+arrival])
     else:
-        stage_down_c1(c,[task])
+        if const_expr(isinstance(c["rs"],C1RouteShape)):
+            stage_down_distributed_c1(c,arrival,[task])
+        else:
+            stage_down_c1(c,[task])
     if const_expr(reduce):
         for task in range(first_task(bid,0),RED_TASKS,BLOCKS):
             stage_reduce(c,task)
