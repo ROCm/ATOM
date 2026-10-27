@@ -505,6 +505,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3: store the sparse (indexed) layers' K/V as NVFP4 (e2m1 + E4M3 per
+    # 16) in their own pool; dense layers, the draft and --kv_cache_dtype are
+    # unchanged.
+    "ATOM_M3_SPARSE_KV_NVFP4": lambda: (
+        os.getenv("ATOM_M3_SPARSE_KV_NVFP4", "0") == "1"
+    ),
+    # With NVFP4 KV + FP4 index: decode index score + top-k through SGLang's fused
+    # gfx950 verify kernel (>= 3 requests). 0 keeps the Triton scorer + top-k.
+    "ATOM_M3_FUSED_VERIFY_TOPK": lambda: (
+        os.getenv("ATOM_M3_FUSED_VERIFY_TOPK", "1") == "1"
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

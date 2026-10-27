@@ -160,6 +160,25 @@ def index_fp4_store(
     )
 
 
+def kv_nvfp4_store(
+    kv_stage: torch.Tensor,  # [stage_pages, 2, PAGE, Hkv, D] bf16, token-major
+    slot_mapping: torch.Tensor,  # [tokens]
+    k_payload: torch.Tensor,  # [blocks, Hkv, PAGE, D // 2] uint8
+    k_scale: torch.Tensor,  # [blocks, Hkv, PAGE, D // 16] uint8
+    v_payload: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    """Quantize this step's staged K and V into the paged NVFP4 cache."""
+    num_heads, head_dim = kv_stage.shape[3], kv_stage.shape[4]
+    strides = (kv_stage.stride(0), kv_stage.stride(2), kv_stage.stride(3))
+    _nvfp4_store(
+        kv_stage[:, 0], strides, num_heads, head_dim, slot_mapping, k_payload, k_scale
+    )
+    _nvfp4_store(
+        kv_stage[:, 1], strides, num_heads, head_dim, slot_mapping, v_payload, v_scale
+    )
+
+
 def index_fp4_dequant_reference(
     payload: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
