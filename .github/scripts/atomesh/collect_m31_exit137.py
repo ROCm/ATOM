@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-RUN_ID = "40483597163"
+RUN_ID = "40486874680"
 ROOT = Path("/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG")
 OUT = Path(sys.argv[1])
 OUT.mkdir(parents=True, exist_ok=True)
@@ -64,16 +64,12 @@ for node, containers in sorted(containers_by_node.items()):
     if not re.fullmatch(r"pit2-p[0-9]+-g[0-9]+", node):
         continue
     commands = []
-    # Only matching container-cleanup schedule entries; no workload logs.
-    if node == "pit2-p03-g09":
-        commands.append("(crontab -l 2>/dev/null; cat /etc/crontab /etc/cron.d/* 2>/dev/null) | grep -Ei '(docker|container|spur)' | grep -Ei '(clean|prune|kill|stop|remove)' | grep -Eiv '(password|token|secret|authorization)' | head -40")
-        commands.append("systemctl list-timers --all --no-pager 2>/dev/null | grep -Ei '(docker|container|spur|clean)' | head -20")
     for name in sorted(containers):
         if not re.fullmatch(r"atomesh-minimax-m3[.1a-zA-Z0-9_-]+", name):
             continue
         q = shlex.quote(name)
         commands.append("docker inspect --format '{{.Name}} {{json .State}}' " + q)
-        commands.append("docker events --since '2026-10-27T09:49:00Z' --until "
+        commands.append("docker events --since '2026-10-27T10:15:00Z' --until "
                         + '\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"'
                         + " --filter type=container --filter container=" + q
                         + " --format '{{.Time}} {{.Action}} {{.Actor.ID}} {{index .Actor.Attributes \"name\"}} exit={{index .Actor.Attributes \"exitCode\"}} signal={{index .Actor.Attributes \"signal\"}}'")
