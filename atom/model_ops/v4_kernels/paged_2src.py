@@ -652,9 +652,9 @@ def sparse_attn_v4_paged_2src(
         #
         # `out` is forwarded here, as the bf16 opus and Triton branches below
         # do, so a caller that passes an output buffer gets the kernel's write
-        # into it rather than a copy afterwards. (The mixed path does not pass
-        # one yet: `_attn_mixed` allocates its output and copies each segment
-        # in, a [T, H, 512] bf16 copy per layer.)
+        # into it rather than a copy afterwards: a mixed batch's prefill
+        # segment lands straight in its rows of the whole batch's output
+        # (`_attn_mixed`).
         from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
 
         # aiter's asm kernel is signature-compatible with the OPUS one, so the
