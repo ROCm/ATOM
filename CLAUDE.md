@@ -72,10 +72,11 @@ Key entry points:
   Kimi-K3, both wrapped after load through
   `model_runner.mono_decode_installers`; V4.1's per-step cell decisions live in
   `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
-  kernel and its CPU I3 test. Kimi-K3 runs only its KDA layers — K1 (the
-  attention seam through the KDA recurrence) and K2 (`o_proj` + the latent MoE)
-  — and only on a uniform speculative verify of at most 8 rows; the MLA layers
-  keep the original paged path. Which steps it serves and how a served step is
+  kernel and its CPU I3 test. Kimi-K3 runs K1 (the attention seam through
+  the KDA recurrence) and K2 (`o_proj` + the latent MoE) on its KDA layers, and
+  only on a uniform speculative verify of at most 16 rows. The MLA layers keep
+  their original paged attention but also run K2; an MLA layer that cannot bind
+  K2 stays on the production path alone. Which steps it serves and how a served step is
   keyed live in `kimi_k3/mono/plan.py`, apart from `runner.py` so the CPU test
   gate can reach them without AITER or FlyDSL. GLM-5.2's single `kernels/kernel.py` covers the
   whole layer, `kernels/op.py` is its host wrapper, and `kernels/geometry.py` /

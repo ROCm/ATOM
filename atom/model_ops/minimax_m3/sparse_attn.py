@@ -35,6 +35,30 @@ ASM_PAGE_SIZE = 16
 PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE  # 8
 
 
+def to_page16_shuffle(k_cache, v_cache, k_scale, v_scale):
+    """Reinterpret the standard page-128 SHUFFLE KV/scale views as page-16
+    SHUFFLE for the MiniMax-M3 ASM/gluon kernels. Zero-copy (128 == 8*16):
+
+        K:     [N, nkv, hd//x, 128, x] -> [N*8, nkv, hd//x, 16, x]
+        V:     [N, nkv, 128//x, hd, x] -> [N*8, nkv, 16//x, hd, x]
+        scale: [N, nkv, 128]           -> [N*8, nkv, 16]   (fp8 only)
+
+    Scales are re-viewed only when present (fp8); bf16 passes them through
+    (None).
+    """
+    n_blocks, nkv = k_cache.shape[0], k_cache.shape[1]
+    x = k_cache.shape[-1]
+    head_dim = k_cache.shape[2] * x
+    num_phys16 = n_blocks * PAGES_PER_SPARSE_BLOCK
+
+    k16 = k_cache.view(num_phys16, nkv, head_dim // x, ASM_PAGE_SIZE, x)
+    v16 = v_cache.view(num_phys16, nkv, ASM_PAGE_SIZE // x, head_dim, x)
+    if k_scale is not None and v_scale is not None:
+        k_scale = k_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
+        v_scale = v_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
+    return k16, v16, k_scale, v_scale
+
+
 @dataclass
 class MiniMaxM3SparsePrefillMetadata:
     qo_indptr: torch.Tensor
@@ -1343,7 +1367,7 @@ def minimax_m3_sparse_attn_decode_asm(
     # sparse layer of a step (sharing one topk/init/local config) has the same
     # per-row lengths and the FlyDSL plan is refreshed once per step. Callers
     # pass no plan_step_owner otherwise.
-    _sparse_pa_per_row(
+    sparse_pa_per_row(
         q,
         k_cache,
         v_cache,
@@ -1359,7 +1383,7 @@ def minimax_m3_sparse_attn_decode_asm(
 
 
 @torch.no_grad()
-def _sparse_pa_per_row(
+def sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1535,7 +1559,7 @@ def minimax_m3_sparse_attn_prefill_asm(
             block_page_stride=block_page_stride,
         )
 
-    _sparse_pa_per_row(
+    sparse_pa_per_row(
         q,
         k_cache,
         v_cache,

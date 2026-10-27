@@ -149,23 +149,12 @@ def pcp_allgather_rerange(
 #     original stripe tokens. No rerange/slice needed.
 
 
-def pcp_allgather_rankmajor(
-    input_: torch.Tensor, pcp_size: int | None = None
-) -> torch.Tensor:
-    """Gather this rank's 1/W stripe shard into the full rank-major sequence
-    via a plain all_gather (dim=0). Inverse of pcp_reduce_scatter."""
-    if pcp_size is None:
-        pcp_size = get_pcp_world_size()
-    if pcp_size <= 1:
-        return input_
-    return get_pcp_group().all_gather(input_.contiguous(), dim=0)
-
-
 def pcp_reduce_scatter(
     input_: torch.Tensor, pcp_size: int | None = None
 ) -> torch.Tensor:
     """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
-    stripe via a plain reduce_scatter (dim=0). Inverse of pcp_allgather_rankmajor."""
+    stripe via a plain reduce_scatter (dim=0). Inverse of the rank-major gather
+    (FusedMoE._run_experts gathers its routed rows that way)."""
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:

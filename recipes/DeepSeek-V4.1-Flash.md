@@ -1,7 +1,9 @@
 # DeepSeek-V4.1-Flash
 
 The native text backbone and the paged ModelRunner/Scheduler lifecycle are
-usable. The original V4 BF16 attention and inverse RoPE kernels are reused.
+usable. The KV cache is FP8 (`--kv_cache_dtype fp8`, MXFP8 rows attended by
+AITER's `mla_sparse_prefill_v41`); on the BF16 or FP4 pool the original V4
+BF16 attention and inverse RoPE kernels are reused.
 Chat, tool and reasoning-effort protocol integration is complete, and native
 image requests support chunked prefill and request-owned embedding lifetime.
 
@@ -23,6 +25,7 @@ fixed acceptance length 3.51.
 | Vision and image requests | Implemented; [visual quality remains unstable](../docs/deepseek_v41_vision.md#current-limitations) in eager and FULL graph modes |
 | Multimodal chunking and embedding lifetime | Supported; output can vary with chunk size |
 | Packed cache, native quantized experts and graph execution | Implemented; see [memory and numerical limits](../docs/deepseek_v41_performance.md#memory-and-numerical-limits) |
+| FP8 (MXFP8) KV cache (`--kv_cache_dtype fp8`; BF16 and FP4 also accepted) | Complete on the original path and in mono; 1.84x the rows of the BF16 pool, GSM8K within the BF16 baseline's spread |
 | FP8 (default) or FP4 (`--index_cache_dtype fp4`) index plane, paged scorer, whole-forward target graph | Complete; a decode step is the draft's replay plus the target's, and prefill scores in the plane too |
 | DSpark speculation and accepted-prefix state commit | Fixed-width lifecycle supported at level 0; [quality and throughput acceptance remain incomplete](../docs/deepseek_v41_dspark.md#current-limitations) |
 | Candidate-only indexing, Engram residency and fusion | Partial: Engram UVA/overlap and fusions exist. Visibility-sized scratch, candidate-only Reindex and HBM residency remain |

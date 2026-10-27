@@ -364,7 +364,7 @@ def test_the_checkpoint_spec_matches_the_pool_geometry():
         head_dim=512,
         index_dim=128,
         history_size=3,
-        packed=False,
+        kv_dtype="bf16",
         speculative_tokens=5,
         layer_ratios=tuple([0, 0] + [2] * 18 + [1] * 20),
         index_topk=512,

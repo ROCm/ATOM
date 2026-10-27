@@ -321,15 +321,15 @@ def validate_speculative_config(config):
 
         if Path(speculative.model).resolve() != Path(config.model).resolve():
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
-    if config.kv_cache_dtype != "bf16":
-        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 KV cache")
+    if config.kv_cache_dtype not in ("bf16", "fp8"):
+        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 or FP8 KV cache")
     # ATOM's *target* pool, and not in conflict with vLLM's V4.1 draft
     # attention requiring a packed `fp8_ds_mla` layout: those are two
     # different caches. On the plugin path the draft names its own dtype
     # through `--speculative-config`, which vLLM applies to the draft's copy
-    # of the config alone, so the target pool stays bf16 while the draft is
-    # packed. Reads like a contradiction otherwise, and has been read that
-    # way.
+    # of the config alone, so the target pool keeps its own format while the
+    # draft is packed. Reads like a contradiction otherwise, and has been read
+    # that way.
     from atom.utils import envs
 
     if envs.ATOM_ENABLE_RELAXED_MTP:
@@ -524,13 +524,13 @@ def validate_runtime_config(config):
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
             # scorer's page-8 layout (`index_plane`). The main pool stays
-            # independent of it and takes bf16 or fp4 either way.
+            # independent of it and takes bf16, fp8 or fp4 either way.
             "an index plane other than fp8 or fp4",
             config.index_cache_dtype not in ("fp8", "fp4"),
         ),
         (
-            "a KV cache other than bf16 or fp4",
-            config.kv_cache_dtype not in ("bf16", "fp4"),
+            "a KV cache other than bf16, fp8 or fp4",
+            config.kv_cache_dtype not in ("bf16", "fp8", "fp4"),
         ),
         (
             # A hit rebuilds the window a row at it reads from the one PAGE

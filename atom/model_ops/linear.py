@@ -1467,13 +1467,12 @@ class LinearBase(nn.Module):
             if self.bias is not None:
                 y += self.bias
         elif self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
-                x,
-                self.weight,
-                self.bias,
-                otype=otype,
-                out=out,
-            )
+            # The AITER wheel used by RTP-LLM rejects an explicit out=None;
+            # omit the keyword when no output buffer was requested.
+            if out is None:
+                y = tgemm.mm(x, self.weight, self.bias, otype=otype)
+            else:
+                y = tgemm.mm(x, self.weight, self.bias, otype=otype, out=out)
         else:
             if x_scale is None:
                 quant_func = self.quant_func

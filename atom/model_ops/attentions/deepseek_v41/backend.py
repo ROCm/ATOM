@@ -80,7 +80,7 @@ def build_v41_pool_geometry(
     hf_config,
     block_size: int,
     *,
-    packed: bool,
+    kv_dtype: str,
     speculative_tokens: int = 0,
     index_fp4: bool = False,
 ) -> V41PoolGeometry:
@@ -93,9 +93,9 @@ def build_v41_pool_geometry(
     native builder below builds its cache from here, so a change to the
     topology reaches both or neither.
 
-    ``packed`` is the main pool's FP4 layout (native's ``kv_cache_dtype ==
-    "fp4"``), and ``speculative_tokens`` the draft width a verify step retains;
-    both move the geometry, so neither has a default that guesses.
+    ``kv_dtype`` is the main pool's format (native's ``kv_cache_dtype``: bf16,
+    fp4 or fp8), and ``speculative_tokens`` the draft width a verify step
+    retains; both move the geometry, so neither has a default that guesses.
     """
     topology = build_attention_topology(hf_config)[: hf_config.num_hidden_layers]
     return V41PoolGeometry(
@@ -111,7 +111,7 @@ def build_v41_pool_geometry(
         hf_config.head_dim,
         hf_config.index_head_dim,
         hf_config.engram_max_ngram_size - 1,
-        packed=packed,
+        kv_dtype=kv_dtype,
         speculative_tokens=speculative_tokens,
         # Only the ratios the built layers run: a configuration with no
         # window-only layer gets no buffer for one.
@@ -202,7 +202,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.geometry = build_v41_pool_geometry(
             self.config,
             self.block_size,
-            packed=model_runner.config.kv_cache_dtype == "fp4",
+            kv_dtype=model_runner.config.kv_cache_dtype,
             speculative_tokens=num_drafts,
             index_fp4=model_runner.config.index_cache_dtype == "fp4",
         )
@@ -560,11 +560,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 if p_d
                 else []
             ),
-            num_slots=int(state.shape[0]),
+            num_slots=int(state.shape[0]) if p_d else 0,
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=spec,
-            execute_paged_state_copies=self.execute_paged_state_copies,
+            # Under encoder SWA bounded replay there is no checkpoint to copy:
+            # `lmcache_mp` moves PAGE alone and every hit replays.
+            execute_paged_state_copies=(
+                None if spec is None else self.execute_paged_state_copies
+            ),
             paged_state_region_count=len(pages),
         )
 
@@ -883,6 +887,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             name: stage(name, getattr(layout, name))
             for name in ("rows", "query_ids", "last", "query_ptrs", "last_rows")
         }
+        # The decoder passes' real row counts -- the tail's rows, then layer
+        # 39's one per request -- read in place like the step's
+        # `scheduled_tokens_gpu`: a recording replays every step of its bucket.
+        filled_gpu = stage("filled", [layout.filled])
+        finishing_gpu = stage("finishing", [len(picks)])
         tail = prepare_batch_step(
             spans,
             self.device,
@@ -908,6 +917,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             query_ptrs=plan["query_ptrs"],
             last_rows=plan["last_rows"],
             filled=layout.filled,
+            filled_gpu=filled_gpu,
+            finishing_gpu=finishing_gpu,
         )
 
     @staticmethod
@@ -1079,6 +1090,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             "last": bs,
             "query_ptrs": bs + 1,
             "last_rows": bs,
+            "filled": 1,
+            "finishing": 1,
         }
         return {
             f"{DECODER_ROWS}{name}": CpuGpuBuffer(

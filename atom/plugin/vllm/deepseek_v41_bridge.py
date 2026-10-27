@@ -140,7 +140,7 @@ def _build_v41_pool_geometry(
     hf_config,
     block_size: int,
     *,
-    packed: bool,
+    kv_dtype: str,
     speculative_tokens: int = 0,
     index_fp4: bool = False,
 ):
@@ -163,7 +163,7 @@ def _build_v41_pool_geometry(
     return build_v41_pool_geometry(
         hf_config,
         block_size,
-        packed=packed,
+        kv_dtype=kv_dtype,
         speculative_tokens=speculative_tokens,
         index_fp4=index_fp4,
     )
@@ -220,7 +220,7 @@ def v41_proxy_geometry(vllm_config):
     geometry = _build_v41_pool_geometry(
         v41_text_config(vllm_config),
         ATOM_DEEPSEEK_V41_BLOCK_SIZE,
-        packed=v41_kv_cache_dtype(vllm_config) == "fp4",
+        kv_dtype=v41_kv_cache_dtype(vllm_config),
         # The draft width a verify step retains. It moves the geometry -- an
         # extra nextn layer, a window widened by it, and ring slack for the
         # writes a rejected prefix leaves behind.
