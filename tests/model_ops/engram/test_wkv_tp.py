@@ -114,7 +114,10 @@ def test_full_checkpoint_loads_complete_keys_and_replicated_value(
             key_rows = 4 // tp * 64 // block
             start = rank * key_rows
             assert_bytes(param[:key_rows], source[start : start + key_rows])
-            assert_bytes(param[key_rows:], source[4 * 64 // block :])
+            value = source[4 * 64 // block :]
+            assert_bytes(
+                param[key_rows:], torch.roll(value, -wkv.value_start // block, 0)
+            )
 
 
 @pytest.mark.parametrize("direct", [False, True], ids=["production", "direct-helper"])
@@ -146,11 +149,63 @@ def test_loading_shuffles_local_weight_once(monkeypatch, tp_group, tp, direct):
     torch.testing.assert_close(op.gate_weight, q * k)
     key_rows = 4 // tp * 64
     start = (tp - 1) * key_rows
-    local = torch.cat((weight[start : start + key_rows], weight[256:]))
+    local = torch.cat(
+        (
+            weight[start : start + key_rows],
+            torch.roll(weight[256:], -op.wkv.value_start, 0),
+        )
+    )
     assert_bytes(op.wkv.weight, shuffle_weight(local, layout=(16, 16)))
     assert getattr(op.wkv.weight, "is_shuffled", False)
     assert_bytes(op.wkv.weight_scale[: key_rows // 32], scales[start // 32 : 8])
-    assert_bytes(op.wkv.weight_scale[key_rows // 32 :], scales[8:])
+    assert_bytes(
+        op.wkv.weight_scale[key_rows // 32 :],
+        torch.roll(scales[8:], -op.wkv.value_start // 32, 0),
+    )
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_small_projection_uses_prefix_of_the_only_weight(monkeypatch, tp_group, tp):
+    from atom.model_ops import blockscale
+
+    tp_group.world_size = tp
+    monkeypatch.setattr(linear, "weight_is_stored_preshuffled", lambda *a, **k: True)
+    for rank in range(tp):
+        tp_group.rank_in_group = rank
+        op = make_op(dim=128)
+        weight, scales = checkpoint(op)
+        op.load_checkpoint_weights(
+            weight, torch.ones(4, 128), torch.ones(4, 128), scales
+        )
+        stored = op.wkv.weight
+        assert stored.untyped_storage().nbytes() == stored.numel()
+        assert set(dict(op.wkv.named_parameters())) == {"weight", "weight_scale"}
+        x = torch.randn(15, 96)
+        projection = Mock(return_value=torch.empty(15, 5 * 128 // tp))
+        monkeypatch.setattr(blockscale, "native_quant_linear", projection)
+        op.wkv(x)
+        _, prefix, scale_prefix = projection.call_args.args
+        assert prefix.shape == (5 * 128 // tp, 96)
+        assert prefix.is_contiguous() and scale_prefix.is_contiguous()
+        assert (
+            prefix.untyped_storage().data_ptr() == stored.untyped_storage().data_ptr()
+        )
+        assert (
+            scale_prefix.untyped_storage().data_ptr()
+            == op.wkv.weight_scale.untyped_storage().data_ptr()
+        )
+        assert projection.call_args.kwargs["weight_preshuffled"]
+        from aiter.ops.shuffle import shuffle_weight
+
+        keys = 4 * 128 // tp
+        value_start = 4 * 128 + rank * (128 // tp)
+        expected = torch.cat(
+            (
+                weight[rank * keys : (rank + 1) * keys],
+                weight[value_start : value_start + 128 // tp],
+            )
+        )
+        assert_bytes(prefix, shuffle_weight(expected, (16, 16)))
 
 
 @pytest.mark.parametrize("name", ["weight", "weight_scale"])
@@ -191,38 +246,61 @@ def test_direct_helper_validates_full_native_layout(monkeypatch, tp_group, bad):
 
 
 @pytest.mark.parametrize("tp", [2, 4])
-@pytest.mark.parametrize(
-    "shape", [(1,), (128,), (2, 3)], ids=["decode", "prefill", "batched"]
-)
+@pytest.mark.parametrize("shape", [(0,), (1,), (15,), (16,), (128,), (2, 3), (2, 8)])
 def test_dispatches_local_projection_without_forward_context(
     monkeypatch, tp_group, tp, shape
 ):
     tp_group.world_size, tp_group.rank_in_group = tp, tp - 1
-    op = make_op()
+    op = make_op(dim=128)
     op.process_weights_after_loading()
-    hidden = torch.randn(*shape, 4, 64)
+    hidden = torch.randn(*shape, 4, 128)
     embeddings = torch.randn(*shape, 96)
     mask = torch.rand(shape) > 0.25
-    kv = torch.randn(*shape, (4 // tp + 1) * 64)
+    small = 0 < embeddings.numel() // 96 < 16
+    kv = torch.randn(*shape, 5 * 128 // tp if small else (4 // tp + 1) * 128)
     projection = Mock(return_value=kv)
     monkeypatch.setattr(op.wkv, "forward", projection)
     output = torch.randn_like(hidden)
     gate = Mock(return_value=output)
-    monkeypatch.setattr(layer, "engram_post_wkv_tp", gate)
-    monkeypatch.setattr(layer, "engram_post_wkv", Mock(side_effect=AssertionError))
-    # Any reintroduced decode/prefill context lookup, weight packing or KV
-    # collective here fails; the gate function owns the only collective.
+    monkeypatch.setattr(
+        layer, "engram_post_wkv" if small else "engram_post_wkv_tp", gate
+    )
+    monkeypatch.setattr(
+        layer,
+        "engram_post_wkv_tp" if small else "engram_post_wkv",
+        Mock(side_effect=AssertionError),
+    )
+    # Dispatch depends on total tensor rows, including graph padding, with no
+    # forward context lookup or runtime weight packing.
     monkeypatch.setattr(
         layer, "get_forward_context", Mock(side_effect=AssertionError), raising=False
     )
     monkeypatch.setattr(torch, "cat", Mock(side_effect=AssertionError))
-    tp_group.all_gather = Mock(side_effect=AssertionError)
+    gathered = torch.randn(embeddings.numel() // 96, 5 * 128)
+    tp_group.all_gather = (
+        Mock(return_value=gathered) if small else Mock(side_effect=AssertionError)
+    )
     assert op(hidden, embeddings, mask) is output
     projection.assert_called_once_with(embeddings)
-    gate.assert_called_once_with(
-        hidden, kv, op.gate_weight, tp_group, mask, op.norm_eps
-    )
-    tp_group.all_gather.assert_not_called()
+    if small:
+        tp_group.all_gather.assert_called_once()
+        assert tp_group.all_gather.call_args.kwargs == {"dim": 1, "use_custom": True}
+        assert torch.equal(
+            tp_group.all_gather.call_args.args[0], kv.reshape(-1, 5 * 128 // tp)
+        )
+        assert torch.equal(gate.call_args.args[1], gathered.reshape(*shape, 5 * 128))
+        assert gate.call_args.kwargs == {"kv_tp_size": tp}
+    else:
+        gate.assert_called_once_with(
+            hidden,
+            kv,
+            op.gate_weight,
+            tp_group,
+            mask,
+            op.norm_eps,
+            value_start=op.wkv.value_start,
+        )
+        tp_group.all_gather.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -281,7 +359,7 @@ def gpu_checkpoint():
     return weight, scales.view(torch.float8_e8m0fnu)
 
 
-@pytest.mark.parametrize("m", [1, 32, 256], ids=["decode", "small-prefill", "prefill"])
+@pytest.mark.parametrize("m", [1, 15, 16, 32, 256])
 @pytest.mark.parametrize("tp", [2, 4])
 def test_loaded_native_projection_matches_gathered_keys_and_value(
     monkeypatch, tp_group, gpu_checkpoint, m, tp
@@ -306,12 +384,28 @@ def test_loaded_native_projection_matches_gathered_keys_and_value(
             assert op.wkv.weight.shape == ((4 // tp + 1) * 5120, 6144)
             actual = op.wkv(x).float()
             keys.append(actual[:, : (4 // tp) * 5120])
-            values.append(actual[:, (4 // tp) * 5120 :])
-        gathered = torch.cat((*keys, values[0]), dim=-1)
+            value = actual[:, (4 // tp) * 5120 :]
+            values.append(
+                value if m < 16 else torch.roll(value, op.wkv.value_start, -1)
+            )
+        gathered = torch.cat(keys + (values if m < 16 else [values[0]]), dim=-1)
         # Independently tuned projection sizes can change accumulation order.
         # Bound aggregate error and the fraction of BF16 rounding outliers.
         for actual, reference in [(gathered, expected)] + [
-            (value, expected[:, 4 * 5120 :]) for value in values
+            (
+                value,
+                (
+                    expected[
+                        :,
+                        4 * 5120
+                        + rank * (5120 // tp) : 4 * 5120
+                        + (rank + 1) * (5120 // tp),
+                    ]
+                    if m < 16
+                    else expected[:, 4 * 5120 :]
+                ),
+            )
+            for rank, value in enumerate(values)
         ]:
             assert torch.isfinite(actual).all()
             nrmse = (

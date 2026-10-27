@@ -10,6 +10,7 @@ if not torch.cuda.is_available():
     pytest.skip("requires GPU", allow_module_level=True)
 
 from atom.model_ops.engram.device.gate import (
+    engram_post_wkv,
     engram_post_wkv_reference,
     engram_post_wkv_tp,
 )
@@ -19,7 +20,10 @@ from atom.model_ops.engram.device.gate import (
 @pytest.mark.parametrize("shape", [(3, 4, 5120), (2, 3, 4, 64)])
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("masked", [False, True])
-def test_tp_gate_and_complete_residual(tp, shape, fused, masked, monkeypatch):
+@pytest.mark.parametrize("rotated_value", [False, True])
+def test_tp_gate_and_complete_residual(
+    tp, shape, fused, masked, rotated_value, monkeypatch
+):
     monkeypatch.setenv("ATOM_ENGRAM_FUSED_GATE", str(int(fused)))
     torch.manual_seed(713)
     hc, dim = shape[-2:]
@@ -44,8 +48,12 @@ def test_tp_gate_and_complete_residual(tp, shape, fused, masked, monkeypatch):
         hidden.float() + gate.unsqueeze(-1) * kv[..., hc * dim :].float().unsqueeze(-2)
     ).to(hidden.dtype)
     for rank in range(tp):
+        value_start = rank * (dim // tp) if rotated_value else 0
         part = torch.cat(
-            (kv[..., rank * c * dim : (rank + 1) * c * dim], kv[..., hc * dim :]),
+            (
+                kv[..., rank * c * dim : (rank + 1) * c * dim],
+                torch.roll(kv[..., hc * dim :], -value_start, -1),
+            ),
             dim=-1,
         )
 
@@ -63,7 +71,9 @@ def test_tp_gate_and_complete_residual(tp, shape, fused, masked, monkeypatch):
         group = SimpleNamespace(
             world_size=tp, rank_in_group=rank, all_gather=all_gather
         )
-        actual = engram_post_wkv_tp(hidden, part, weight, group, mask)
+        actual = engram_post_wkv_tp(
+            hidden, part, weight, group, mask, value_start=value_start
+        )
         assert torch.equal(actual, expected)
         if mask is not None:
             assert torch.equal(actual[~mask], hidden[~mask])
@@ -74,6 +84,41 @@ def test_tp_gate_and_complete_residual(tp, shape, fused, masked, monkeypatch):
         rtol=1e-2,
         atol=1e-2,
     )
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("shape", [(1, 4, 5120), (15, 4, 5120), (2, 3, 4, 128)])
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_gathered_key_value_shards_need_no_reorder(
+    tp, shape, fused, masked, monkeypatch
+):
+    monkeypatch.setenv("ATOM_ENGRAM_FUSED_GATE", str(int(fused)))
+    torch.manual_seed(914)
+    hc, dim = shape[-2:]
+    h = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(*shape[:-2], (hc + 1) * dim, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(hc, dim, device="cuda")
+    mask = torch.rand(shape[:-2], device="cuda") > 0.4 if masked else None
+    c, v = hc // tp * dim, dim // tp
+    gathered = torch.cat(
+        [
+            torch.cat(
+                (
+                    kv[..., r * c : (r + 1) * c],
+                    kv[..., hc * dim + r * v : hc * dim + (r + 1) * v],
+                ),
+                -1,
+            )
+            for r in range(tp)
+        ],
+        -1,
+    )
+    expected = engram_post_wkv(h, kv, w, mask)
+    actual = engram_post_wkv(h, gathered, w, mask, kv_tp_size=tp)
+    assert torch.equal(actual, expected)
+    if mask is not None:
+        assert torch.equal(actual[~mask], h[~mask])
 
 
 def test_empty_and_invalid_local_projection():

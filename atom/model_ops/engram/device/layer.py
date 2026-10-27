@@ -16,7 +16,7 @@ from atom.model_ops.utils import atom_parameter
 
 
 class _EngramWKV(ReplicatedLinear):
-    """Keep complete local key branches and the shared value in checkpoint order."""
+    """One local Key/full-V weight; its prefix also serves small-token KV TP."""
 
     def __init__(self, input_size, hidden_size, hc_mult, quant_config=None):
         super().__init__(
@@ -24,6 +24,8 @@ class _EngramWKV(ReplicatedLinear):
         )
         self.hc_mult = self.local_hc = hc_mult
         self.hidden_size = hidden_size
+        self.kv_gather_rows = 0
+        self.value_start = 0
         if (
             self.native_a8_group_rows == 32
             and self.weight.dtype == torch.float8_e4m3fn
@@ -40,6 +42,28 @@ class _EngramWKV(ReplicatedLinear):
             self.weight_scale.data = self.weight_scale.new_empty(
                 (self.output_size // 32, input_size // 32)
             )
+            if hidden_size % (32 * self.tp_size) == 0:
+                self.kv_gather_rows = (hc_mult + 1) * hidden_size // self.tp_size
+                self.value_start = self.tp_rank * (hidden_size // self.tp_size)
+
+    def use_kv_gather(self, x: torch.Tensor) -> bool:
+        return self.kv_gather_rows > 0 and 0 < x.numel() // self.input_size < 16
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_kv_gather(x):
+            return super().forward(x)
+        from atom.model_ops.blockscale import native_quant_linear
+
+        # Both views share the only stored weight/scale. Row-aligned prefixes
+        # retain the (16, 16) preshuffle layout; no runtime packing is needed.
+        rows = self.kv_gather_rows
+        return native_quant_linear(
+            x,
+            self.weight[:rows],
+            self.weight_scale[: rows // 32],
+            weight_group_rows=32,
+            weight_preshuffled=getattr(self.weight, "is_shuffled", False),
+        )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         if self.local_hc != self.hc_mult:
@@ -57,12 +81,17 @@ class _EngramWKV(ReplicatedLinear):
                 )
             rows = self.local_hc * branch_rows
             start = self.tp_rank * rows
+            value = self.hc_mult * branch_rows
+            value_start = self.value_start // group
             # Select before Linear's dtype/shape processing and before its
             # normal child post-load hook shuffles this compact local weight.
             loaded_weight = torch.cat(
                 (
                     loaded_weight[start : start + rows],
-                    loaded_weight[self.hc_mult * branch_rows :],
+                    # Put this rank's V shard first. The short prefix is
+                    # [local Keys, local V]; the whole weight retains all V.
+                    loaded_weight[value + value_start :],
+                    loaded_weight[value : value + value_start],
                 )
             )
         super().weight_loader(param, loaded_weight)
@@ -92,10 +121,9 @@ class EngramOp(nn.Module):
         self.hc_mult = hc_mult
         self.norm_eps = norm_eps
 
-        # One fused projection, laid out as the checkpoint stores it: the
-        # hc_mult key projections first, the single shared value projection
-        # last. Built here, not taken as a module, so the shape is derived
-        # once from the arguments that already fix it.
+        # The checkpoint stores hc_mult Keys followed by one shared Value.
+        # _EngramWKV selects local Keys and rotates V once at load time, so
+        # both TP paths can use views of one preshuffled weight.
         self.wkv = _EngramWKV(
             engram_hidden_size,
             hidden_size,
@@ -143,13 +171,27 @@ class EngramOp(nn.Module):
             )
         kv = self.wkv(embeddings)
         if self.wkv.local_hc != self.hc_mult:
+            group = get_tp_group()
+            if self.wkv.use_kv_gather(embeddings):
+                kv = group.all_gather(
+                    kv.reshape(-1, self.wkv.kv_gather_rows), dim=1, use_custom=True
+                ).reshape(*embeddings.shape[:-1], (self.hc_mult + 1) * self.hidden_size)
+                return engram_post_wkv(
+                    hidden_states,
+                    kv,
+                    self.gate_weight,
+                    token_mask,
+                    self.norm_eps,
+                    kv_tp_size=self.wkv.tp_size,
+                )
             return engram_post_wkv_tp(
                 hidden_states,
                 kv,
                 self.gate_weight,
-                get_tp_group(),
+                group,
                 token_mask,
                 self.norm_eps,
+                value_start=self.wkv.value_start,
             )
         return engram_post_wkv(
             hidden_states, kv, self.gate_weight, token_mask, self.norm_eps

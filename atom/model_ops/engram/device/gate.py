@@ -29,6 +29,7 @@ def _engram_post_wkv_kernel(
     LOCAL_HC: tl.constexpr,
     BRANCH_START: tl.constexpr,
     GATE_ONLY: tl.constexpr,
+    KV_TP: tl.constexpr = 1,
 ):
     row = tl.program_id(0).to(tl.int64)
     token, local_branch = row // LOCAL_HC, row % LOCAL_HC
@@ -38,9 +39,20 @@ def _engram_post_wkv_kernel(
     residual = tl.load(hidden + (token * HC + branch) * DIM + col, live, 0).to(
         tl.float32
     )
-    key = tl.load(
-        kv + token * (LOCAL_HC + 1) * DIM + local_branch * DIM + col, live, 0
-    ).to(tl.float32)
+    if KV_TP > 1:
+        # Gathered rows contain [K_rank, V_rank] for each rank. Read that
+        # layout directly, fusing reconstruction with the original gate.
+        PART_HC: tl.constexpr = HC // KV_TP
+        PART_N: tl.constexpr = (HC + 1) * DIM // KV_TP
+        key_idx = (
+            token * (HC + 1) * DIM
+            + (branch // PART_HC) * PART_N
+            + (branch % PART_HC) * DIM
+            + col
+        )
+    else:
+        key_idx = token * (LOCAL_HC + 1) * DIM + local_branch * DIM + col
+    key = tl.load(kv + key_idx, live, 0).to(tl.float32)
     w = tl.load(weight + branch * DIM + col, live, 0).to(tl.float32)
     rstd = tl.rsqrt(tl.sum(residual * residual, 0) / DIM + eps)
     rstd *= tl.rsqrt(tl.sum(key * key, 0) / DIM + eps)
@@ -56,9 +68,17 @@ def _engram_post_wkv_kernel(
     if GATE_ONLY:
         tl.store(output + row, gate)
     else:
-        value = tl.load(kv + token * (HC + 1) * DIM + HC * DIM + col, live, 0).to(
-            tl.float32
-        )
+        if KV_TP > 1:
+            PART_V: tl.constexpr = DIM // KV_TP
+            value_idx = (
+                token * (HC + 1) * DIM
+                + (col // PART_V) * PART_N
+                + PART_HC * DIM
+                + col % PART_V
+            )
+        else:
+            value_idx = token * (HC + 1) * DIM + HC * DIM + col
+        value = tl.load(kv + value_idx, live, 0).to(tl.float32)
         tl.store(output + row * DIM + col, residual + gate * value, live)
 
 
@@ -101,7 +121,7 @@ def _can_fuse(hidden, kv, weight, token_mask):
     )
 
 
-def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20):
+def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20, *, kv_tp_size=1):
     """Fused inference path for contiguous [..., HC, DIM] residuals."""
     hc, dim = hidden.shape[-2:]
     if kv.shape != (*hidden.shape[:-2], (hc + 1) * dim):
@@ -110,8 +130,17 @@ def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20):
         raise ValueError("Engram gate weight does not match residual branches")
     if token_mask is not None and token_mask.shape != hidden.shape[:-2]:
         raise ValueError("Engram token mask must match residual tokens")
+    if kv_tp_size < 1 or hc % kv_tp_size or dim % kv_tp_size:
+        raise ValueError("Engram KV TP size must divide branches and value width")
     supported = _can_fuse(hidden, kv, weight, token_mask)
     if not supported:
+        if kv_tp_size > 1:
+            parts = kv.reshape(*kv.shape[:-1], kv_tp_size, -1)
+            key_rows = hc // kv_tp_size * dim
+            kv = torch.cat(
+                (parts[..., :key_rows].flatten(-2), parts[..., key_rows:].flatten(-2)),
+                dim=-1,
+            )
         return engram_post_wkv_reference(hidden, kv, weight, token_mask, eps)
     output = torch.empty_like(hidden)
     if hidden.numel():
@@ -130,6 +159,7 @@ def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20):
             LOCAL_HC=hc,
             BRANCH_START=0,
             GATE_ONLY=False,
+            KV_TP=kv_tp_size,
             num_warps=8 if block >= 2048 else 4,
             enable_fp_fusion=False,
         )
@@ -147,6 +177,7 @@ def _engram_apply_gates_kernel(
     DIM: tl.constexpr,
     LOCAL_HC: tl.constexpr,
     BLOCK: tl.constexpr,
+    VALUE_START: tl.constexpr = 0,
 ):
     off = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = off < M * HC * DIM
@@ -160,13 +191,16 @@ def _engram_apply_gates_kernel(
     gate = tl.load(gates + gate_idx, live, 0)
     h = tl.load(hidden + off, live, 0).to(tl.float32)
     # V stays at the end of each GEMM row; no packing or V all-gather.
-    v = tl.load(kv + token * (LOCAL_HC + 1) * DIM + LOCAL_HC * DIM + col, live, 0).to(
-        tl.float32
-    )
+    value_col = tl.where(col >= VALUE_START, col - VALUE_START, col + DIM - VALUE_START)
+    v = tl.load(
+        kv + token * (LOCAL_HC + 1) * DIM + LOCAL_HC * DIM + value_col, live, 0
+    ).to(tl.float32)
     tl.store(output + off, h + gate * v, live)
 
 
-def engram_post_wkv_tp(hidden, kv, weight, group, token_mask=None, eps=1e-20):
+def engram_post_wkv_tp(
+    hidden, kv, weight, group, token_mask=None, eps=1e-20, *, value_start=0
+):
     """Local complete Key branches + replicated V; gather FP32 gates only."""
     hc, dim = hidden.shape[-2:]
     tp, rank = group.world_size, group.rank_in_group
@@ -179,6 +213,8 @@ def engram_post_wkv_tp(hidden, kv, weight, group, token_mask=None, eps=1e-20):
         raise ValueError("Engram gate weight does not match residual branches")
     if token_mask is not None and token_mask.shape != hidden.shape[:-2]:
         raise ValueError("Engram token mask must match residual tokens")
+    if not 0 <= value_start < dim:
+        raise ValueError("Engram value start must be inside the value width")
     if not hidden.numel():
         return hidden.clone()
     m = hidden.numel() // (hc * dim)
@@ -232,6 +268,8 @@ def engram_post_wkv_tp(hidden, kv, weight, group, token_mask=None, eps=1e-20):
             .reshape(*hidden.shape[:-2], hc)
         )
         value = kv[..., local_hc * dim :]
+        if value_start:
+            value = torch.roll(value, value_start, dims=-1)
         return (hidden.float() + gates.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
             hidden.dtype
         )
@@ -246,6 +284,7 @@ def engram_post_wkv_tp(hidden, kv, weight, group, token_mask=None, eps=1e-20):
         DIM=dim,
         LOCAL_HC=local_hc,
         BLOCK=1024,
+        VALUE_START=value_start,
         num_warps=4,
         enable_fp_fusion=False,
     )
