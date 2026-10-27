@@ -130,7 +130,7 @@ end of LMCache's LRU (`StateByteCodec.touch`) and reports whether it was still
 there on the `k3_state_touch` channel. A prefix that hits every turn keeps its
 image as warm as its KV, and an image LMCache evicted leaves the index when its
 verdict lands. An admission about to load an image not confirmed in the last
-few seconds is held for a pass (at most `OFFLOAD_LOOKUP_DEFER_S`) while that
+minute is held for a pass (at most `OFFLOAD_LOOKUP_DEFER_S`) while that
 verdict comes back, so it plans a lower boundary instead of parking on a miss
 and recomputing the whole prompt. `OFFLOAD_STATE_CPU_SIZE` caps how much of
 the pool images may take; it reserves nothing, and the worker warns at startup

@@ -21,9 +21,12 @@ logger = logging.getLogger("atom")
 
 #: How long a hash counts as known-resident after the last evidence that its
 #: image was in LMCache (stored, loaded, or confirmed by a touch). Every one of
-#: those leaves the image at the young end of LMCache's LRU, and the pool turns
-#: over in minutes, so this is far inside the time an image needs to age out.
-_TIER_VERIFIED_FOR_S = 5.0
+#: those leaves the image at the young end of LMCache's LRU, and LRU can only
+#: evict it after a pool's worth of newer entries (a 208 GiB pool at AgentX
+#: c64 turns over in about 13 minutes), so this stays well inside the time an
+#: image needs to age out. It is also longer than the usual gap between a
+#: prefix being stored and its next turn, so most loads are never held.
+_TIER_VERIFIED_FOR_S = 60.0
 
 #: A hash voted on every scheduling pass is touched at most this often. The
 #: touch only has to keep the image near the young end, not track every pass.
