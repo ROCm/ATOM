@@ -135,6 +135,15 @@ persistence check should now pass instead of showing the current, correct-for-to
 
 ## 6. What's deliberately left undone
 
+- **Largest PRs can't be fetched at all**: `fetch.sh` pulls a PR's diff over GitHub's
+  GraphQL/REST API, which caps a single diff at 20000 lines; past that it fails closed
+  with an explicit error rather than silently truncating. P1's distribution measurement
+  hit this for real on ATOM#2688 (240 files) and had to substitute a smaller PR to keep a
+  large-PR example in the sample. This is a real gap, not a hypothetical one: the PRs most
+  likely to need review (large, multi-area refactors) are exactly the ones this pipeline
+  cannot reach. Not fixed here — fixing it means a local `git diff` against a fetched
+  merge-base instead of the GitHub API diff, which is a different, larger change to
+  `fetch.sh`'s fetch path and is out of scope for this pass.
 - **P0.5 — publishing**: wire up the claim reaction (👀), `_publish.py --post`, and real
   PR comments. Needs the `rocm-atom-bot` account and its PAT in `ATOM_BOT_TOKEN`.
 - **P1 — ATOM family axis and rule rewrite**: replace the P0 placeholder rule deriver
