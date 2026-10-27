@@ -180,6 +180,9 @@ LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM"
 
+# Builds one common_ops.so per AMDGPU arch and loads the matching gfx* path at runtime.
+COPY docker/scripts/build_sgl_kernel_rocm_multi_arch.py /tmp/build_sgl_kernel_rocm_multi_arch.py
+
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
     echo "========== [SGLANG-ATOM 0/6] Back up base image Triton ==========" && \
@@ -203,20 +206,13 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     echo "sglang ref:" && \
     git rev-parse HEAD
 
-RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
+RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel (multi-arch) ==========" && \
     "${VENV_PYTHON}" -m pip uninstall -y sgl-kernel sglang-kernel sglang || true && \
     "${VENV_PYTHON}" -m pip install --upgrade pip setuptools wheel && \
-    DETECTED_AMDGPU_TARGET="$("${VENV_PYTHON}" -c "import torch; print(torch.cuda.get_device_properties(0).gcnArchName.split(':')[0] if torch.cuda.is_available() else '')" 2>/dev/null || true)" && \
-    if [ -n "${DETECTED_AMDGPU_TARGET}" ]; then \
-      FINAL_AMDGPU_TARGET="${DETECTED_AMDGPU_TARGET}"; \
-      echo "Detected AMDGPU_TARGET=${FINAL_AMDGPU_TARGET} from build GPU"; \
-    else \
-      FINAL_AMDGPU_TARGET="$(printf '%s' "${GPU_ARCH}" | awk -F';' '{print $NF}' | xargs)"; \
-      test -n "${FINAL_AMDGPU_TARGET}"; \
-      echo "GPU not detectable during build; fallback AMDGPU_TARGET=${FINAL_AMDGPU_TARGET} from GPU_ARCH=${GPU_ARCH}"; \
-    fi && \
-    cd /app/sglang/python/sglang/kernels/aot && \
-    AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
+    "${VENV_PYTHON}" /tmp/build_sgl_kernel_rocm_multi_arch.py \
+      --aot-dir /app/sglang/python/sglang/kernels/aot \
+      --python "${VENV_PYTHON}" \
+      --gpu-arch "${GPU_ARCH}" && \
     "${VENV_PYTHON}" -m pip show sglang-kernel || true
 
 RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
