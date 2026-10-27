@@ -65,13 +65,10 @@ class StateByteCodec:
         )
         if self._max_entries is not None and self._max_entries < 1:
             raise ValueError("state CPU budget must fit at least one checkpoint")
+        # The cap's LRU, in the same order as LMCache's: refreshed by `get`,
+        # `touch` and a re-store, so the cap retires images nobody resumes
+        # from rather than the oldest stores.
         self._cache_keys: OrderedDict[Any, None] = OrderedDict()
-        # Under a budget, one extra reference per stored image. LMCache's
-        # LocalCPU LRU only evicts objects whose ref count is 1, so the pool
-        # cannot drop an image behind the codec's back while the engine-side
-        # `StateOffloadIndex` still advertises it. The budget is a reservation:
-        # only `put`'s own LRU retires these, KV pressure cannot.
-        self._held: dict[Any, Any] = {}
         self._cache_lock = threading.Lock()
         self._store_lock = threading.Lock()
         # Never hard-code a size: V4 keeps six compressor fields across
@@ -122,43 +119,79 @@ class StateByteCodec:
         )
 
     def put(self, h: int, unit_ids, on_source_released=None) -> bool:
-        # Bound state independently of KV while retaining the shared allocator.
+        # Cap state independently of KV while retaining the shared allocator;
+        # within the cap, images and KV chunks compete in LMCache's one LRU.
         # Only stores serialize; a load holds its MemoryObj reference while
         # unpacking, so removing its cache entry cannot free live bytes.
         if self._storage is None:
             return False
+        key = self.key(h)
+        if self._touch_key(key):
+            # Same prefix hash and layout, same bytes, still resident: storing
+            # again would only cost an image-sized D2H that LocalCPU then
+            # refuses as a duplicate key. The touch counts as the use it is.
+            if on_source_released is not None:
+                on_source_released()
+            return True
         if self._max_entries is None:
             return self._put(h, unit_ids, on_source_released)
-        key = self.key(h)
         with self._store_lock:
             with self._cache_lock:
-                if key in self._held:
-                    # Same prefix hash and layout, same bytes, and the held
-                    # reference keeps the stored copy resident: storing again
-                    # would only cost an image-sized D2H that LocalCPU then
-                    # refuses as a duplicate key.
-                    self._cache_keys.move_to_end(key)
-                    stored = True
-                else:
-                    stored = False
-                    if key not in self._cache_keys:
-                        while len(self._cache_keys) >= self._max_entries:
-                            old = next(iter(self._cache_keys))
-                            self._storage.remove(old)
-                            del self._cache_keys[old]
-                            held = self._held.pop(old, None)
-                            if held is not None:
-                                held.ref_count_down()
-            if stored:
-                if on_source_released is not None:
-                    on_source_released()
-                return True
+                if key not in self._cache_keys:
+                    while len(self._cache_keys) >= self._max_entries:
+                        old = next(iter(self._cache_keys))
+                        self._storage.remove(old)
+                        del self._cache_keys[old]
             ok = self._put(h, unit_ids, on_source_released)
             if ok:
                 with self._cache_lock:
                     self._cache_keys.pop(key, None)
                     self._cache_keys[key] = None
             return ok
+
+    def touch(self, h: int) -> bool:
+        """Refresh `h`'s image in LMCache's LRU; False when it is gone.
+
+        The state-image twin of what a KV lookup does to its chunks
+        (`LocalCPUBackend.batched_async_contains(pin=True)` then
+        `touch_cache()` -> `cache_policy.update_on_hit`). State hits are
+        answered engine-side by `StateOffloadIndex`, so without this LMCache
+        never learns an image was used, and a prefix hit on every turn keeps
+        its KV at the young end and its image at the cold end, where pressure
+        evicts it first.
+
+        `update_on_hit` under the backend's `cpu_lock`, not `contains(pin=True)`
+        + `touch_cache()`: a pin needs a matching unpin, and `keys_in_request`
+        is the list the KV lookup is filling at the same time.
+        """
+        if self._storage is None:
+            return False
+        return self._touch_key(self.key(h))
+
+    def _touch_key(self, key) -> bool:
+        resident = self._refresh(key)
+        with self._cache_lock:
+            if resident:
+                if key in self._cache_keys:
+                    self._cache_keys.move_to_end(key)
+            else:
+                # Evicted by LMCache: it no longer counts against the cap.
+                self._cache_keys.pop(key, None)
+        return resident
+
+    def _refresh(self, key) -> bool:
+        backend = getattr(self._storage, "local_cpu_backend", None)
+        lock = getattr(backend, "cpu_lock", None)
+        hot = getattr(backend, "hot_cache", None)
+        policy = getattr(backend, "cache_policy", None)
+        if lock is not None and hot is not None and policy is not None:
+            with lock:
+                if key in hot:
+                    policy.update_on_hit(key, hot)
+                    return True
+        # Not in the hot cache (or there is none): another backend may still
+        # hold it, and `get` reads every backend. Presence only.
+        return bool(self._storage.contains(key))
 
     def _put(self, h: int, unit_ids, on_source_released=None) -> bool:
         """Store one checkpoint image. False when nothing was stored.
@@ -186,9 +219,6 @@ class StateByteCodec:
         obj = self._allocate(self.entry_bytes)
         if obj is None:
             return False
-        hold = self._max_entries is not None
-        if hold:
-            obj.ref_count_up()
         # `batched_put` discharges the reference it is handed, but only in its
         # terminal tail loop (LMCache `storage_manager.py`, one
         # `ref_count_down()` per object), which runs *after* every step that can
@@ -221,19 +251,7 @@ class StateByteCodec:
             self._storage.batched_put([key], [obj])
         except Exception:
             obj.ref_count_down()
-            if hold:
-                obj.ref_count_down()
             raise
-        if hold:
-            ref_count = getattr(obj, "get_ref_count", None)
-            if not callable(ref_count) or ref_count() > 1:
-                # The hot cache adopted it (its own reference plus ours).
-                with self._cache_lock:
-                    self._held[key] = obj
-            else:
-                # Refused, e.g. the key was already resident: ours is the
-                # last reference, and keeping it would strand the block.
-                obj.ref_count_down()
         return True
 
     def get(self, h: int, slot) -> bool:
@@ -251,8 +269,11 @@ class StateByteCodec:
         """
         if self._storage is None:
             return False
-        obj = self._storage.get(self.key(h))
+        key = self.key(h)
+        obj = self._storage.get(key)
         if obj is None:
+            with self._cache_lock:
+                self._cache_keys.pop(key, None)
             return False
         size = self._object_bytes(obj)
         if size is not None and size != self.entry_bytes:
@@ -276,10 +297,8 @@ class StateByteCodec:
             self._staged.unpack(obj, self._backend.state_entry_views(slot))
         finally:
             obj.ref_count_down()
-        with self._cache_lock:
-            key = self.key(h)
-            if key in self._cache_keys:
-                self._cache_keys.move_to_end(key)
+        # `get_blocking` does not refresh LMCache's LRU; a resume is a use.
+        self._touch_key(key)
         return True
 
     @staticmethod

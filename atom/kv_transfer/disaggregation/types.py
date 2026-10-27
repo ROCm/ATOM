@@ -121,12 +121,32 @@ class StateStoreOperationId:
             raise ValueError("state store generation must be nonnegative")
 
 
+@dataclass(frozen=True)
+class StateTouchId:
+    """One recency refresh of a state image the engine just voted a hit for.
+
+    Every TP worker touches its own shard and reports whether the image was
+    still resident under this id, so the aggregator's failure-dominant quorum
+    says "gone" as soon as any shard is gone -- which is when a joint load
+    would miss. `round` makes repeated touches of one hash distinct identities,
+    because the aggregator tombstones each `(channel, operation_id)`.
+    """
+
+    prefix_hash: int
+    round: int
+
+    def __post_init__(self) -> None:
+        if self.round < 0:
+            raise ValueError("state touch round must be nonnegative")
+
+
 ConnectorCompletionId = (
     ReqId
     | SaveOperationId
     | SaveSourceGroupId
     | LoadOperationId
     | StateStoreOperationId
+    | StateTouchId
 )
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 

@@ -5822,6 +5822,9 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._save_rr_last = None
     s._pending_state_loads = []
     s._pending_state_stores = []
+    s._pending_state_touches = []
+    s._touch_round = 0
+    s._state_touch_verdicts = {}
     s._save_inflight_since = {}
     s._save_stalled = False
     s._warned_save_stalled = False

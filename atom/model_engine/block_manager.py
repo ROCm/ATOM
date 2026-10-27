@@ -498,6 +498,9 @@ class BlockManager:
                     if checkpoint_spec is not None
                     else None
                 ),
+                # Off again (`stop_refreshing`) if the connector turns out not
+                # to carry state touches.
+                refresh_hits=True,
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -1434,12 +1437,68 @@ class BlockManager:
         )
 
     def record_allocation(
-        self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
-    ) -> None:
-        """Commit the fit probe before any allocation changes the pool."""
-        if self.enable_prefix_caching:
-            decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
-            self._commit_joint_boundary(seq, decision)
+        self,
+        seq: Sequence,
+        num_cached_blocks: int,
+        block_hashes: list[int],
+        *,
+        defer_unverified: bool = False,
+    ) -> bool:
+        """Commit the fit probe before any allocation changes the pool.
+
+        With `defer_unverified`, returns False and commits nothing when the
+        state this admission would load from the CPU tier has not been
+        confirmed in LMCache lately (`StateOffloadIndex.needs_verify`). The
+        caller holds the request for a pass while that image's touch comes
+        back, rather than parking a joint load that may miss and recompute the
+        whole prompt.
+        """
+        if not self.enable_prefix_caching:
+            return True
+        decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
+        if defer_unverified and self._tier_state_unverified(
+            seq, num_cached_blocks, block_hashes, decision
+        ):
+            self.state_offload.loads_deferred_for_verify += 1
+            return False
+        self._commit_joint_boundary(seq, decision)
+        return True
+
+    def _tier_state_unverified(
+        self,
+        seq: Sequence,
+        num_cached_blocks: int,
+        block_hashes: list[int],
+        decision: JointBoundaryDecision,
+    ) -> bool:
+        """Whether `allocate` would load this seq's state from the CPU tier
+        under a hash not confirmed resident recently.
+
+        Mirrors which hash `allocate` hands `_attach_state_slots`: the joint
+        boundary when there is one, else the HBM hit's last block; and the
+        tier only serves it when HBM does not hold it.
+        """
+        offload = self.state_offload
+        if offload is None or not offload.refresh_hits or not seq.has_per_req_cache:
+            return False
+        if decision.skip_reason is None:
+            if decision.state_from_hbm:
+                return False
+            h = decision.boundary_hash
+        else:
+            if not 0 < num_cached_blocks <= len(block_hashes):
+                return False
+            if self.state.transfer.replays or (
+                self.state_replay_tokens and seq.replays_hit
+            ):
+                return False  # a replay rebuilds the state; nothing is loaded
+            h = block_hashes[num_cached_blocks - 1]
+            if self.paged_state_checkpoints is not None:
+                if self.paged_state_checkpoints.contains(h):
+                    return False
+            elif self.state.lookup(h) >= 0:
+                return False
+        return offload.needs_verify(h)
 
     def allocate(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
