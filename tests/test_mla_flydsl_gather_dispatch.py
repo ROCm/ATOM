@@ -136,10 +136,14 @@ def _prefill_impl(**over):
         dtype=torch.bfloat16,
         scale=192**-0.5,
         layer_num=0,
+        dcp_group=SimpleNamespace(reuse_from=None),
         o_proj=lambda x: x,
     )
     for name in (
         "_check_flydsl_fp8_mha",
+        "_dcp_start_context_gathers",
+        "_dcp_prefetch_ready",
+        "_dcp_prefetch_next",
         "_prepare_prefill_k",
         "_drop_rope_pad",
         "_flash_attn_prefill",
