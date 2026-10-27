@@ -16,6 +16,7 @@ Weight keys map directly to model attribute paths; no key rewriting needed.
 """
 
 import math
+from typing import ClassVar
 
 import torch
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
@@ -299,7 +300,7 @@ class Eagle3LlamaModel(nn.Module):
         lm_head.weight        [163840, 7168]  independent lm_head
     """
 
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict] = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
@@ -312,7 +313,7 @@ class Eagle3LlamaModel(nn.Module):
     # Inferact/MiniMax-M3-EAGLE3) instead of the kimi-k2.5 `midlayer.*` layout.
     # Translate that prefix on load. No-op for `midlayer.*` checkpoints (the
     # substring is absent), so both naming conventions load correctly.
-    weights_mapping = {"layers.0.": "midlayer."}
+    weights_mapping: ClassVar[dict] = {"layers.0.": "midlayer."}
 
     def __init__(self, atom_config: Config, prefix: str = "", layer_offset: int = 0):
         super().__init__()

@@ -2,10 +2,9 @@ import copy
 import logging
 
 import torch
+from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 from torch.profiler import record_function
-
-from aiter.dist.parallel_state import get_pp_group
 
 from atom.config import CompilationLevel
 from atom.distributed.dcp_utils import get_dcp_world_size
