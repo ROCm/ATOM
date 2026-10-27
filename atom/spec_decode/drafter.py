@@ -464,7 +464,7 @@ class Drafter(abc.ABC):
         token counts.
 
         After a PCP row-split prefill the hooks hold only this rank's 1/pcp
-        stripe, so gather it. Keyed on the batch-global `pcp_split_rows`, never
+        stripe, so gather it. Keyed on the batch-global `target_pcp_split`, never
         on hook-side bookkeeping, which a cudagraph replay skips.
         """
         if not self._captures_aux:
@@ -472,7 +472,7 @@ class Drafter(abc.ABC):
         n = target_hidden_states.shape[0]
         pcp_ws = get_pcp_world_size()
         ctx = getattr(get_forward_context(), "context", None)
-        if pcp_ws > 1 and n > 0 and getattr(ctx, "pcp_split_rows", False):
+        if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
             n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
             return [
                 pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n]

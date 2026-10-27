@@ -30,7 +30,7 @@ def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     target forward's answer, cached by ModelRunner before drafting."""
     del draft_model  # a property of the batch, not of the draft model
     ctx = getattr(get_forward_context(), "context", None)
-    return bool(getattr(ctx, "pcp_split_rows", False))
+    return bool(getattr(ctx, "target_pcp_split", False))
 
 
 def _pcp_split_draft_inputs(

@@ -237,19 +237,19 @@ def test_needs_id_sync_is_one_predicate_for_both_groups():
     assert mr._needs_id_sync(True, True) is True
 
 
-def test_settle_pcp_split_rows_takes_only_self(monkeypatch):
+def test_settle_target_pcp_split_takes_only_self(monkeypatch):
     """Both forwards call it bare right after run_model; it must not have picked
     up `forward`'s decorators, which expect a batch."""
     mr = pytest.importorskip("atom.model_engine.model_runner")
     assert hasattr(mr.ModelRunner.forward, "__wrapped__")
-    assert not hasattr(mr.ModelRunner._settle_pcp_split_rows, "__wrapped__")
-    ctx = SimpleNamespace(pcp_split_rows=None)
+    assert not hasattr(mr.ModelRunner._settle_target_pcp_split, "__wrapped__")
+    ctx = SimpleNamespace(target_pcp_split=None)
     monkeypatch.setattr(mr, "get_forward_context", lambda: SimpleNamespace(context=ctx))
     runner = SimpleNamespace(
         drafter=object(), model=SimpleNamespace(pcp_split_active=lambda: True)
     )
-    mr.ModelRunner._settle_pcp_split_rows(runner)
-    assert ctx.pcp_split_rows is True
+    mr.ModelRunner._settle_target_pcp_split(runner)
+    assert ctx.target_pcp_split is True
 
     # A model without the method never row-splits; under PCP that is worth
     # one warning, since its drafter's aux would silently go ungathered.
@@ -258,8 +258,8 @@ def test_settle_pcp_split_rows_takes_only_self(monkeypatch):
     monkeypatch.setattr(mr.logger, "warning", lambda *a, **k: warned.append(a))
     runner.model = SimpleNamespace()
     for _ in range(3):
-        mr.ModelRunner._settle_pcp_split_rows(runner)
-    assert ctx.pcp_split_rows is False
+        mr.ModelRunner._settle_target_pcp_split(runner)
+    assert ctx.target_pcp_split is False
     assert len(warned) == 1
 
 
@@ -274,7 +274,7 @@ def test_aux_gathers_exactly_when_the_target_forward_split(monkeypatch):
         gathers.append((x.shape[0], pcp_size))
         return x.repeat(pcp_size, 1)
 
-    ctx = SimpleNamespace(context=SimpleNamespace(pcp_split_rows=True))
+    ctx = SimpleNamespace(context=SimpleNamespace(target_pcp_split=True))
     monkeypatch.setattr(dr, "get_pcp_world_size", lambda: ws)
     monkeypatch.setattr(dr, "pcp_allgather_rerange", fake_gather)
     monkeypatch.setattr(dr, "get_forward_context", lambda: ctx)
@@ -285,16 +285,18 @@ def test_aux_gathers_exactly_when_the_target_forward_split(monkeypatch):
     assert gathers == [(3, ws)] and aux.shape[0] == n
 
     gathers.clear()
-    ctx.context.pcp_split_rows = False
+    ctx.context.target_pcp_split = False
     (aux,) = dr.Drafter.aux_for(drafter, hidden)
     assert gathers == [] and aux.shape[0] == n
 
 
 def test_draft_split_follows_the_target_not_the_current_pass(monkeypatch):
     """By step 0 the draft pass has cleared `pcp_split`; whether to split the
-    draft prefill is the target forward's answer, `pcp_split_rows`."""
-    ctx = SimpleNamespace(context=SimpleNamespace(pcp_split_rows=True, pcp_split=False))
+    draft prefill is the target forward's answer, `target_pcp_split`."""
+    ctx = SimpleNamespace(
+        context=SimpleNamespace(target_pcp_split=True, pcp_split=False)
+    )
     monkeypatch.setattr(ep, "get_forward_context", lambda: ctx)
     assert ep._pcp_active_for_draft_model(None) is True
-    ctx.context.pcp_split_rows, ctx.context.pcp_split = False, True
+    ctx.context.target_pcp_split, ctx.context.pcp_split = False, True
     assert ep._pcp_active_for_draft_model(None) is False

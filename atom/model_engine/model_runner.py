@@ -3491,7 +3491,7 @@ class ModelRunner:
         if callable(callback):
             callback(req_ids)
 
-    def _settle_pcp_split_rows(self) -> None:
+    def _settle_target_pcp_split(self) -> None:
         """Cache whether the forward just run row-split for PCP. Call right
         after `run_model`: drafting rewrites the state the gate reads, and a
         cudagraph replay skips any model-side bookkeeping."""
@@ -3509,7 +3509,7 @@ class ModelRunner:
                 "it, so drafter aux states are not gathered.",
                 type(self.model).__name__,
             )
-        get_forward_context().context.pcp_split_rows = bool(
+        get_forward_context().context.target_pcp_split = bool(
             split_active() if split_active is not None else False
         )
 
@@ -3536,7 +3536,7 @@ class ModelRunner:
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
-        self._settle_pcp_split_rows()
+        self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 
         pp_group = get_pp_group()
@@ -4614,7 +4614,7 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, hidden_states = self.run_model(input_ids, batch)
-            self._settle_pcp_split_rows()
+            self._settle_target_pcp_split()
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 
