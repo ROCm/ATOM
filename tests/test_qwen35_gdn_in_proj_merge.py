@@ -12,12 +12,12 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("aiter")
 
-from atom.models.qwen3_5 import (  # noqa: E402
+from atom.models.qwen3_5 import (
     _QWEN3_5_PACKED_MODULES_MAPPING,
     _apply_merged_in_proj_mapping,
     gdn_in_proj_is_merged,
 )
-from atom.quant_spec import LayerQuantConfig, QuantType  # noqa: E402
+from atom.quant_spec import LayerQuantConfig, QuantType
 
 
 class _Cfg:
