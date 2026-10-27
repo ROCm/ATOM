@@ -28,6 +28,8 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx
 
+from atom.model_ops.minimax_m3.sglang_nvfp4.nvfp4 import nvfp4_load_even_odd
+
 try:
     # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
     # direction as the Triton one below, same selection on every shape tried.
@@ -401,7 +403,8 @@ def _emit_sparse_block_table_kernel(
 @triton.jit
 def _index_block_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
-    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
+    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim] (FP4: payload [.., D/2])
+    iks_ptr,  # FP4 only: index-K scales [num_blocks, 128, D/16] (else unused)
     score_ptr,  # [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     cu_seqlens,  # [batch+1] query start offsets
@@ -417,12 +420,15 @@ def _index_block_score_kernel(
     stride_ik_blk,
     stride_ik_pos,
     stride_ik_d,
+    stride_iks_blk,
+    stride_iks_pos,
     stride_s_h,
     stride_s_n,
     stride_s_k,
     stride_bt_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    IS_FP4: tl.constexpr = False,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -449,6 +455,26 @@ def _index_block_score_kernel(
         mask=(_q_ptrs_0[:, None] < (q_len)),
         other=0.0,
     )
+    if IS_FP4:
+        # Even / odd head dims as fp16, matching the FP4 cache's de-interleaved
+        # load: the score is the even-dim dot plus the odd-dim dot.
+        h2 = tl.arange(0, head_dim // 2) * 2
+        q_base = (
+            q_ptr
+            + seq_start * stride_q_n
+            + pid_h * stride_q_h
+            + _q_ptrs_0[:, None] * stride_q_n
+        )
+        q_m = _q_ptrs_0[:, None] < q_len
+        q_e = tl.load(q_base + h2[None, :] * stride_q_d, mask=q_m, other=0.0).to(
+            tl.float16
+        )
+        q_o = tl.load(q_base + (h2 + 1)[None, :] * stride_q_d, mask=q_m, other=0.0).to(
+            tl.float16
+        )
+    else:
+        q_e = q
+        q_o = q
     q_start = prefix_len + pid_q * BLOCK_SIZE_Q
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
@@ -473,16 +499,30 @@ def _index_block_score_kernel(
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[None, :] * stride_ik_pos
-            + off_d[:, None] * stride_ik_d,
-        )
-        if k.dtype.is_fp8():
-            qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale_log2e
+        if IS_FP4:
+            k_e, k_o = nvfp4_load_even_odd(
+                ik_cache_ptr,
+                iks_ptr,
+                page * stride_ik_blk + off_k * stride_ik_pos,
+                page * stride_iks_blk + off_k * stride_iks_pos,
+                off_k >= 0,
+                head_dim,
+            )
+            qk = (
+                tl.dot(q_e, tl.trans(k_e), out_dtype=tl.float32)
+                + tl.dot(q_o, tl.trans(k_o), out_dtype=tl.float32)
+            ) * sm_scale_log2e
         else:
-            qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
+            k = tl.load(
+                ik_cache_ptr
+                + page * stride_ik_blk
+                + off_k[None, :] * stride_ik_pos
+                + off_d[:, None] * stride_ik_d,
+            )
+            if k.dtype.is_fp8():
+                qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale_log2e
+            else:
+                qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
             qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
@@ -1020,7 +1060,8 @@ def _topk_index_packed_kernel(
 @triton.jit
 def _decode_index_score_tiled_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
-    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
+    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim] (FP4: payload [.., D/2])
+    iks_ptr,  # FP4 only: index-K scales [num_blocks, 128, D/16] (else unused)
     score_ptr,  # out: [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [batch]
@@ -1033,6 +1074,8 @@ def _decode_index_score_tiled_kernel(
     stride_ik_blk,
     stride_ik_pos,
     stride_ik_d,
+    stride_iks_blk,
+    stride_iks_pos,
     stride_s_h,
     stride_s_b,
     stride_s_k,
@@ -1042,6 +1085,7 @@ def _decode_index_score_tiled_kernel(
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    IS_FP4: tl.constexpr = False,
 ):
     pid_b = tl.program_id(0)
     pid_chunk = tl.program_id(1)
@@ -1072,6 +1116,19 @@ def _decode_index_score_tiled_kernel(
         mask=d_mask[:, None] & n_valid[None, :],
         other=0.0,
     )
+    if IS_FP4:
+        # [D/2, N] even / odd head dims as fp16 (see the prefill scorer).
+        h2 = tl.arange(0, BLOCK_SIZE_D // 2) * 2
+        q_base = q_ptr + row[None, :] * stride_q_n + head[None, :] * stride_q_h
+        q_e = tl.load(
+            q_base + h2[:, None] * stride_q_d, mask=n_valid[None, :], other=0.0
+        ).to(tl.float16)
+        q_o = tl.load(
+            q_base + (h2 + 1)[:, None] * stride_q_d, mask=n_valid[None, :], other=0.0
+        ).to(tl.float16)
+    else:
+        q_e = q
+        q_o = q
     # Row `tok` sits at absolute position seq_len - MAX_Q + tok, so its causal
     # cutoff is one past that. Every column has its own.
     causal_len = seq_len - MAX_Q + tok + 1
@@ -1080,18 +1137,33 @@ def _decode_index_score_tiled_kernel(
 
     for blk in tl.range(chunk_start, chunk_end):
         page = tl.load(bt_row + blk).to(tl.int64)
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[:, None] * stride_ik_pos
-            + off_d[None, :] * stride_ik_d,
-            mask=d_mask[None, :],
-            other=0.0,
-        )
-        # Keep the query at its own precision and lift the key to meet it, the
-        # way the gemv path did -- prefill instead rounds the query down to the
-        # cache dtype, and the two phases are meant to keep scoring differently.
-        qk = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * sm_scale_log2e
+        if IS_FP4:
+            # FP4 is gated on head_dim == BLOCK_SIZE_D == 128 (no d mask needed).
+            k_e, k_o = nvfp4_load_even_odd(
+                ik_cache_ptr,
+                iks_ptr,
+                page * stride_ik_blk + off_k * stride_ik_pos,
+                page * stride_iks_blk + off_k * stride_iks_pos,
+                off_k >= 0,
+                BLOCK_SIZE_D,
+            )
+            qk = (
+                tl.dot(k_e, q_e, out_dtype=tl.float32)
+                + tl.dot(k_o, q_o, out_dtype=tl.float32)
+            ) * sm_scale_log2e
+        else:
+            k = tl.load(
+                ik_cache_ptr
+                + page * stride_ik_blk
+                + off_k[:, None] * stride_ik_pos
+                + off_d[None, :] * stride_ik_d,
+                mask=d_mask[None, :],
+                other=0.0,
+            )
+            # Keep the query at its own precision and lift the key to meet it,
+            # the way the gemv path did -- prefill instead rounds the query down
+            # to the cache dtype, and the two phases keep scoring differently.
+            qk = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * sm_scale_log2e
         pos = blk * BLOCK_SIZE_K + off_k
         qk = tl.where(pos[:, None] < causal_len[None, :], qk, float("-inf"))
         score = tl.max(qk, axis=0)
@@ -1123,8 +1195,13 @@ def minimax_m3_index_topk(
     emit_sparse_block_table: bool = False,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
+    index_kv_scale: torch.Tensor | None = None,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
+
+    With ``index_kv_scale`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
+    FP4 payload ``[num_blocks, 128, head_dim // 2]`` uint8 and ``index_kv_scale``
+    its E4M3 block scales ``[num_blocks, 128, head_dim // 16]`` (see index_fp4).
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
@@ -1174,9 +1251,12 @@ def minimax_m3_index_topk(
     score_num_warps, score_num_stages = _prefill_score_launch_config(
         index_kv_cache.dtype
     )
+    is_fp4 = index_kv_scale is not None
+    iks = index_kv_scale if is_fp4 else index_kv_cache
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
+        iks,
         score,
         block_table,
         cu_seqlens_q,
@@ -1192,12 +1272,15 @@ def minimax_m3_index_topk(
         index_kv_cache.stride(0),
         index_kv_cache.stride(1),
         index_kv_cache.stride(2),
+        iks.stride(0),
+        iks.stride(1),
         score.stride(0),
         score.stride(1),
         score.stride(2),
         block_table.stride(0),
         BLOCK_SIZE_Q=SCORE_BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        IS_FP4=is_fp4,
         num_warps=score_num_warps,
         num_stages=score_num_stages,
     )
@@ -1247,8 +1330,11 @@ def minimax_m3_index_topk_decode(
     max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
+    index_kv_scale: torch.Tensor | None = None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
+
+    ``index_kv_scale``: FP4 index cache, as in :func:`minimax_m3_index_topk`.
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1302,9 +1388,12 @@ def minimax_m3_index_topk_decode(
         device=idx_q.device,
     )
     num_score_chunks = _decode_score_chunks(batch, max_block)
+    is_fp4 = index_kv_scale is not None
+    iks = index_kv_scale if is_fp4 else index_kv_cache
     _decode_index_score_tiled_kernel[(batch, num_score_chunks)](
         idx_q,
         index_kv_cache,
+        iks,
         score,
         block_table,
         seq_lens,
@@ -1317,6 +1406,8 @@ def minimax_m3_index_topk_decode(
         index_kv_cache.stride(0),
         index_kv_cache.stride(1),
         index_kv_cache.stride(2),
+        iks.stride(0),
+        iks.stride(1),
         score.stride(0),
         score.stride(1),
         score.stride(2),
@@ -1324,6 +1415,7 @@ def minimax_m3_index_topk_decode(
         NUM_IDX_HEADS=num_idx_heads,
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        IS_FP4=is_fp4,
         num_stages=DECODE_SCORE_NUM_STAGES,
     )
 

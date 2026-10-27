@@ -1280,6 +1280,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
+        # `--index-cache-dtype fp4`: index_cache is the FP4 payload plane and
+        # index_scale its E4M3 scales; the fused cache write lands the step's
+        # BF16 keys in index_stage (token-major, index_stage_slots = identity)
+        # and index_fp4_store quantizes them in (minimax_m3/index_fp4.py).
+        self.index_scale: torch.Tensor | None = None
+        self.index_stage: torch.Tensor | None = None
+        self.index_stage_slots: torch.Tensor | None = None
         # Optional shared dict bound by the metadata builder. It is scoped to the
         # current sparse metadata object and carries the last full layer top-k.
         self.index_topk_cache_state: dict | None = None
@@ -1350,6 +1357,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         fused_index_cache_dtype = (
             self.index_cache_dtype if self.index_cache_dtype == "fp8" else "auto"
         )
+        index_fp4 = self.index_scale is not None
+        if index_fp4:
+            fused_index_cache = self.index_stage
+            fused_index_slot_mapping = self.index_stage_slots[:num_tokens]
+        else:
+            fused_index_cache = self.index_cache
+            fused_index_slot_mapping = slot_mapping
 
         if self.skip_index_topk:
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
@@ -1416,17 +1430,26 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             slot_mapping,
             k_cache,
             v_cache,
-            self.index_cache,
+            fused_index_cache,
             k_cache.shape[3],  # SHUFFLE page size (== ASM_PAGE_SIZE == 16)
             q_out,
             index_q,
-            slot_mapping,
+            fused_index_slot_mapping,
             kv_cache_dtype=kv_cache_dtype,
             index_cache_dtype=fused_index_cache_dtype,
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
             asm_layout=True,
         )
+        if index_fp4:
+            from atom.model_ops.minimax_m3.index_fp4 import index_fp4_store
+
+            index_fp4_store(
+                self.index_stage.view(-1, self.index_head_dim),
+                slot_mapping,
+                self.index_cache,
+                self.index_scale,
+            )
 
         q = q_out.view(-1, self.num_heads, self.head_dim)
         # Stash the rotated indexer query for dispatch_backend (same-forward,
@@ -1585,6 +1608,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.scale,
                 emit_sparse_block_table=True,
                 n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
+                index_kv_scale=self.index_scale,
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
@@ -1729,6 +1753,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     emit_sparse_block_table=True,
                     max_query_len=max_query_len,
                     n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
+                    index_kv_scale=self.index_scale,
                 )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)

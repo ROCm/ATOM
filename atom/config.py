@@ -2668,6 +2668,11 @@ class Config:
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
             )
+            if indexer_cp_off is None and self.index_cache_dtype == "fp4":
+                # The CP context scorer reads FP8/BF16 index keys only.
+                indexer_cp_off = (
+                    "--index-cache-dtype fp4 is not supported by the CP scorer"
+                )
             if indexer_cp_off is not None:
                 logger.warning(
                     "dcp_config.indexer_dcp_only disabled: %s.", indexer_cp_off
