@@ -22,6 +22,34 @@ import types
 import pytest
 
 
+def _gpu_stack_import(name):
+    """Import an atom module that may need the aiter/triton GPU stack.
+
+    Tries the import first, so a module that imports fine without the stack
+    still runs on the CPU-only CI runner. A failure is turned into a skip only
+    when the stack is genuinely absent -- no aiter or triton, or no GPU for
+    aiter to probe the arch of at import. On a GPU host any import error FAILS:
+    a broad `importorskip(..., exc_type=ImportError)` once turned a renamed
+    helper, which left the draft model unimportable, into silent skips there.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        try:
+            importlib.import_module("aiter")
+            importlib.import_module("triton")
+            import torch
+
+            gpu = torch.cuda.is_available()
+        except Exception as e:  # noqa: BLE001 - any failure here means no stack
+            pytest.skip(f"{name} needs the aiter/triton stack, absent here: {e}")
+        if not gpu:
+            pytest.skip(f"{name} needs a GPU: aiter probes the arch at import")
+        raise
+
+
 def _real_hf_config_override():
     """Load the real SpeculativeConfig despite conftest's ``atom.config`` stub.
 
@@ -211,11 +239,7 @@ def test_dflash_resolves_to_mha_not_mla():
     Kept off `get_attn_backend`, which reads the GPU arch through rocminfo; the
     DRAFT_OWNS_KV_POOL flag it would return is asserted separately below.
     """
-    selector = pytest.importorskip(
-        "atom.utils.selector",
-        reason="attn backend selection imports aiter at module load",
-        exc_type=ImportError,
-    )
+    selector = _gpu_stack_import("atom.utils.selector")
 
     assert selector.attn_family(_radixark_cfg()) is selector.Family.MHA
     # The MLA draft it sits beside must still resolve the other way.
@@ -237,11 +261,7 @@ def test_dflash_backend_owns_a_kv_pool():
     # RuntimeError as well as ImportError: importing the backend runs aiter's
     # chip detection, which reads the GPU arch out of rocminfo and raises when
     # there is no GPU. The flag itself is a ClassVar and needs neither.
-    mod = pytest.importorskip(
-        "atom.model_ops.attentions.aiter_attention",
-        reason="backend imports aiter, which probes the GPU arch at load",
-        exc_type=(ImportError, RuntimeError),
-    )
+    mod = _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
     assert mod.AiterBackend.DRAFT_OWNS_KV_POOL is True
 
 
@@ -274,11 +294,7 @@ def test_dflash_pool_needs_the_scheduler_block_size():
     per tile and 16 does not divide 1 -- which is why DraftKvBuilder reads
     model_runner.block_size.
     """
-    pytest.importorskip(
-        "atom.model_ops.attentions.mha_kv_pool",
-        reason="pool imports aiter at module load",
-        exc_type=ImportError,
-    )
+    _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
     assert _pool(block_size=128, world_size=8).block_size == 128
     with pytest.raises(ValueError, match="SHUFFLE"):
         _pool(block_size=1, world_size=8)
@@ -301,11 +317,7 @@ def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
     cannot be the only test of the decision; `test_dflash_pool_is_built_at_full_tp`
     pins which of the two we build.
     """
-    pytest.importorskip(
-        "atom.model_ops.attentions.mha_kv_pool",
-        reason="pool imports aiter at module load",
-        exc_type=ImportError,
-    )
+    _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
     pool = _pool(block_size=128, world_size=tp, blocks_per_entry=dcp)
 
     # Full TP, every dcp: 16 KV heads over 8 ranks is 2 each.
@@ -391,11 +403,7 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
         reason="draft_kv imports aiter at call time",
         exc_type=(ImportError, RuntimeError),
     )
-    pytest.importorskip(
-        "atom.model_ops.attentions.aiter_attention",
-        reason="backend probes the GPU arch at import",
-        exc_type=(ImportError, RuntimeError),
-    )
+    _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
 
     seen = {}
 
@@ -491,11 +499,7 @@ def test_dflash_pool_is_built_at_full_tp(tp, dcp):
         reason="draft_kv imports aiter at call time",
         exc_type=(ImportError, RuntimeError),
     )
-    pytest.importorskip(
-        "atom.model_ops.attentions.aiter_attention",
-        reason="backend probes the GPU arch at import",
-        exc_type=(ImportError, RuntimeError),
-    )
+    _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
     from unittest import mock
 
     from atom.utils import selector
@@ -649,20 +653,12 @@ def _dflash_spec(target, layer_ids, hidden=16):
     constructing the real draft would want a loaded checkpoint, a TP group and
     a GPU.
     """
-    dflash = pytest.importorskip(
-        "atom.models.kimi_k3_dflash",
-        reason="the draft model imports aiter at module load",
-        exc_type=(ImportError, RuntimeError),
-    )
+    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
     return dflash.KimiK3DFlash.target_aux_capture_spec(None, layer_ids, hidden, target)
 
 
 def _generic_extract():
-    proposer = pytest.importorskip(
-        "atom.spec_decode.dspark_proposer",
-        reason="the proposer imports aiter/triton at module load",
-        exc_type=(ImportError, RuntimeError),
-    )
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
     return proposer.DSparkProposer._extract_layer_hidden
 
 
@@ -777,16 +773,8 @@ def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
     earlier, globally-defaulted-on version of this feature regressed CI. It
     keeps the prefix by not implementing the hook at all.
     """
-    dspark = pytest.importorskip(
-        "atom.models.kimi_k3_dspark",
-        reason="the draft model imports aiter at module load",
-        exc_type=(ImportError, RuntimeError),
-    )
-    proposer_mod = pytest.importorskip(
-        "atom.spec_decode.dspark_proposer",
-        reason="the proposer imports aiter/triton at module load",
-        exc_type=(ImportError, RuntimeError),
-    )
+    dspark = _gpu_stack_import("atom.models.kimi_k3_dspark")
+    proposer_mod = _gpu_stack_import("atom.spec_decode.dspark_proposer")
     DSparkProposer = proposer_mod.DSparkProposer
 
     assert not hasattr(dspark.KimiK3DSpark, "target_aux_capture_spec")
@@ -814,11 +802,7 @@ def test_dsv41_dspark_still_owns_its_input_tap():
     because the call site passes it POSITIONALLY to every implementor -- there
     is no `inspect.signature` sniffing that could quietly skip it.
     """
-    v41 = pytest.importorskip(
-        "atom.models.deepseek_v41.dspark",
-        reason="the draft model imports aiter at module load",
-        exc_type=(ImportError, RuntimeError),
-    )
+    v41 = _gpu_stack_import("atom.models.deepseek_v41.dspark")
     model = v41.DeepseekV41DSpark.__new__(v41.DeepseekV41DSpark)
     model.config = types.SimpleNamespace(engram_layer_ids=[1, 2, 3])
 
@@ -841,11 +825,7 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
     reach layer `lid + 1`'s scoring weights, and the feature silently degrades
     to the prefix.
     """
-    proposer_mod = pytest.importorskip(
-        "atom.spec_decode.dspark_proposer",
-        reason="the proposer imports aiter/triton at module load",
-        exc_type=(ImportError, RuntimeError),
-    )
+    proposer_mod = _gpu_stack_import("atom.spec_decode.dspark_proposer")
     from atom.spec_decode.drafter import AuxCaptureSpec
 
     seen = {}
@@ -888,11 +868,7 @@ def _guard_refuses(draft_hf):
     # get_attn_backend resolves to aiter_attention, which imports aiter at module
     # load and probes the GPU arch there. Skip per test, not per module, so the
     # source-only guard test below still runs on the CPU-only CI runner.
-    pytest.importorskip(
-        "atom.model_ops.attentions.aiter_attention",
-        reason="backend imports aiter, which probes the GPU arch at load",
-        exc_type=(ImportError, RuntimeError, TypeError),
-    )
+    _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
     from atom.spec_decode.draft_kv import uses_dflash_pool
     from atom.utils.selector import attn_family, get_attn_backend
 
@@ -987,11 +963,7 @@ def _entry_tokens(block_size, dcp, non_causal_gqa):
     """Call the real property against a minimal stub."""
     # dspark_proposer imports triton at module load; the CPU-only CI runner has
     # none. The pure-arithmetic mirrors below do not need it and keep running.
-    proposer = pytest.importorskip(
-        "atom.spec_decode.dspark_proposer",
-        reason="the proposer imports aiter/triton at module load",
-        exc_type=(ImportError, RuntimeError, TypeError),
-    )
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
     DSparkProposer = proposer.DSparkProposer
 
     stub = types.SimpleNamespace(
@@ -1245,9 +1217,5 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan():
 
 def test_dflash_draft_declares_a_non_mla_block():
     """KimiK3DFlash takes the proposer's non-MLA path, not the MLA plan."""
-    dflash = pytest.importorskip(
-        "atom.models.kimi_k3_dflash",
-        reason="the draft model imports aiter at module load",
-        exc_type=(ImportError, RuntimeError, TypeError),
-    )
+    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
     assert dflash.KimiK3DFlash.block_attention_is_mla is False

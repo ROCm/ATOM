@@ -142,8 +142,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.paged_attention import Attention
-from atom.models.dspark_draft import DSparkDraftModel
-from atom.models.kimi_k3_dspark import DSparkMarkovHead, _linear_out
+from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
 
 logger = logging.getLogger("atom")
 
@@ -297,7 +296,7 @@ class KimiK3DFlashAttention(nn.Module):
         )
 
     def _qkv(self, hidden_states: torch.Tensor):
-        qkv = _linear_out(self.qkv_proj(hidden_states))
+        qkv = linear_out(self.qkv_proj(hidden_states))
         return qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
@@ -333,13 +332,13 @@ class KimiK3DFlashAttention(nn.Module):
             # One head count, because the read produces exactly what `o_proj`
             # consumes -- there is no merge between them any more.
             o = q.new_zeros((n, self.num_heads * self.head_dim))
-            return _linear_out(self.o_proj(o))
+            return linear_out(self.o_proj(o))
 
         # The write goes FIRST: the read takes the block's own T rows out of
         # the pool with the prefix, and the next block's prefix is these rows.
         self._write_block_kv(k, v, attn_metadata.slot_mapping[:n], k_cache, v_cache)
         o = self._attend_non_causal(q, k, v, attn_metadata, k_cache, v_cache)
-        return _linear_out(self.o_proj(o))
+        return linear_out(self.o_proj(o))
 
     def _write_block_kv(self, k, v, slot_mapping, k_cache, v_cache) -> None:
         """Scatter the block's own K/V into this layer's rows of the pool.
@@ -543,9 +542,9 @@ class KimiK3DFlashMLP(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = _linear_out(self.gate_up_proj(x))
+        gate_up = linear_out(self.gate_up_proj(x))
         gate, up = gate_up.chunk(2, dim=-1)
-        return _linear_out(self.down_proj(self.act_fn(gate) * up))
+        return linear_out(self.down_proj(self.act_fn(gate) * up))
 
 
 class KimiK3DFlashDecoderLayer(nn.Module):
@@ -812,7 +811,7 @@ class KimiK3DFlash(DSparkDraftModel):
         return self.layers[0].self_attn.attn.layer_num
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        return self.hidden_norm(_linear_out(self.fc(aux_concat)))
+        return self.hidden_norm(linear_out(self.fc(aux_concat)))
 
     @property
     def context_layers(self):
