@@ -193,3 +193,69 @@ def test_impl_passes_num_valid_rows_to_both_paths(shared, monkeypatch):
         assert bool((ids_eager[n:, :TOPK] == -1).all())
         assert torch.equal(ids_graph, ids_eager)
         assert torch.equal(_bits(w_graph), _bits(w_eager))
+
+
+@needs_aiter_num_valid_rows
+@pytest.mark.parametrize("shared,offset", [(0, 0), (1, 0), (1, 32)])
+def test_select_experts_counts_the_pass_rows(shared, offset, monkeypatch):
+    """Through `FusedMoE.select_experts`, which takes the pass's real row count
+    from the forward context (`scheduled_tokens_gpu`): the captured Triton
+    route follows the count on every replay, bit for bit with the eager AITER
+    one, and with a fused shared expert writes the rows `topk_meta_rows` gives
+    this (TBO micro-)batch at its offset."""
+    from atom.model_ops import topK
+    from atom.model_ops.moe import FusedMoE
+    from atom.utils import forward_context as fc
+
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    rows, max_rows = 48, 128
+    torch.manual_seed(31 + shared + offset)
+    logits = _logits(rows, EXPERTS + shared, 2.0, False)
+    count = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    context = fc.Context(
+        positions=torch.zeros(rows, dtype=torch.int64, device="cuda"),
+        running_tokens=rows,
+        ubatch_token_offset=offset,
+        scheduled_tokens_gpu=count,
+    )
+    monkeypatch.setattr(fc, "_forward_context", fc.ForwardContext(context=context))
+    if shared:
+        meta_w, meta_ids = _outputs(max_rows, shared)
+        monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
+
+    def route():
+        return FusedMoE.select_experts(
+            hidden_states=None,
+            router_logits=logits,
+            top_k=TOPK,
+            use_grouped_topk=False,
+            renormalize=True,
+            num_routing_experts=EXPERTS,
+            num_fused_shared_experts=shared,
+            fused_shared_experts_scoring_func="sigmoid" if shared else None,
+        )
+
+    route()  # compile the Triton kernel outside the capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w_graph, ids_graph = route()
+    if shared:
+        assert w_graph.data_ptr() == meta_w[offset].data_ptr()
+        assert ids_graph.data_ptr() == meta_ids[offset].data_ptr()
+
+    for n in (rows, 0, 29, rows):
+        count.fill_(n)
+        w_eager, ids_eager = (t.clone() for t in route())
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool((ids_eager[n:, :TOPK] == -1).all())
+        assert bool((_bits(w_eager[n:, :TOPK]) == 0).all())
+        assert bool((ids_eager[:n, :TOPK] >= 0).all())
+        assert torch.equal(ids_graph, ids_eager)
+        assert torch.equal(_bits(w_graph), _bits(w_eager))
+    if shared:
+        # Rows outside this batch's slice are never written.
+        outside = torch.ones(max_rows, dtype=torch.bool, device="cuda")
+        outside[offset : offset + rows] = False
+        assert bool(meta_w[outside].isnan().all())
+        assert bool((meta_ids[outside] == EXPERTS).all())
