@@ -285,7 +285,7 @@ jobs:
       #   A hang also wedges the next job's preflight on that host.
       - name: GPU host health check
         id: gpu_host_health
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8'
         timeout-minutes: 3
         run: |
           set -uo pipefail
@@ -320,7 +320,7 @@ jobs:
           echo "All $(printf '%s\n' "${rows}" | wc -l) GPUs on ${host} report temperature and power"
 
       - name: Prune stale Docker data on TW runners
-        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8'
         run: |
           set -euo pipefail
 
@@ -357,7 +357,7 @@ jobs:
           df -h / "${docker_root}" || true
 
       - name: Kill all Docker containers and clean up workspace
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8'
         run: |
           echo "=== Cleaning up containers on $(hostname) ==="
           containers=$(docker ps -q)
@@ -367,15 +367,15 @@ jobs:
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/atom-dev:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
 
       - name: Show Docker containers
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8'
         run: docker ps -a
 
       - name: Show ROCm memory usage
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8'
         run: rocm-smi --showmemuse
 
       - name: Show ROCm GPU processes
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8'
         run: rocm-smi --showpidgpus
 
       - name: Checkout ATOM repo
@@ -465,7 +465,7 @@ jobs:
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Set HF token for predownload runner
-        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
       - name: Start CI container
@@ -485,7 +485,7 @@ jobs:
           docker exec "$CONTAINER_NAME" df -h /dev/shm
 
       - name: GPU preflight check
-        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        if: matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8'
         timeout-minutes: 5
         env:
           GPU_PREFLIGHT_ALLOCATION_MB: "8"
@@ -494,7 +494,7 @@ jobs:
       - name: Collect GPU info (inside container)
         id: gpu-info
         env:
-          COLLECT_VERBOSE_GPU_INFO: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
+          COLLECT_VERBOSE_GPU_INFO: ${{ (matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8') && '1' || '0' }}
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
@@ -609,7 +609,7 @@ jobs:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
           ACCURACY_TIMEOUT_MINUTES: ${{ matrix.accuracy_timeout_minutes || 30 }}
-          ATOM_DEBUG_DEVICE_MAPPING: ${{ matrix.runner == 'linux-atom-do-mi350x-8' && '1' || '0' }}
+          ATOM_DEBUG_DEVICE_MAPPING: ${{ (matrix.runner == 'linux-atom-do-mi350x-8' || matrix.runner == 'linux-atom-general-mi350x-8') && '1' || '0' }}
         run: |
           set -euo pipefail
           echo ""
@@ -758,7 +758,7 @@ jobs:
           set -x
           echo "========== Cleaning up workspace =========="
           runner_label="${{ matrix.runner }}"
-          if [[ "${runner_label}" == "linux-atom-do-mi350x-8" ]]; then
+          if [[ "${runner_label}" == "linux-atom-do-mi350x-8" || "${runner_label}" == "linux-atom-general-mi350x-8" ]]; then
             docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace rocm/atom-dev:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
           fi
           docker stop "$CONTAINER_NAME" || true
