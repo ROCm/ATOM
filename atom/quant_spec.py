@@ -105,8 +105,13 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     Shared by ``LinearBase.online_quantize_weight``, ``FusedMoE._online_quant``
     and ``RMSNorm.online_quantize_activation``: re-quantizing is a no-op (and may
     corrupt already-quantized weights) when the online target is ``No`` or the
-    layer already matches the target ``(quant_type, quant_dtype)``.
+    layer already matches the target ``(quant_type, quant_dtype)``. IQ2R weights
+    have no path back to a float weight, so they always keep their checkpoint
+    format.
     """
+    # getattr: AITER builds without IQ2R have no ``iq2r_2bit``.
+    if cur_type == getattr(QuantType, "iq2r_2bit", None):
+        return True
     return online_cfg.quant_type == QuantType.No or (
         cur_type == online_cfg.quant_type and cur_dtype == online_cfg.quant_dtype
     )
@@ -214,6 +219,26 @@ def should_stream_online_quant(
         return False
     return will_online_requant(
         quant_config, prefix, source_quant_type, source_quant_dtype
+    )
+
+
+def fuses_mxfp8_shared_into_mxfp4(
+    shared: LayerQuantConfig, routed: LayerQuantConfig
+) -> bool:
+    """Whether an MXFP8 shared expert is fused into MXFP4 routed experts.
+
+    Opt-in through ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 (the Quark MXFP4 export of
+    MiniMax-M3.1): FusedMoE re-quantizes the shared expert to MXFP4 at load,
+    which costs it accuracy.
+    """
+    from atom.utils import envs
+
+    return (
+        envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4
+        and shared.quant_type == QuantType.per_1x32
+        and shared.quant_dtype == d_dtypes.get("fp8")
+        and routed.quant_type == QuantType.per_1x32
+        and routed.quant_dtype == d_dtypes.get("fp4x2")
     )
 
 
@@ -413,8 +438,20 @@ def _build_quark_layer_spec(layer_dict: dict) -> LayerQuantConfig:
     weight = layer_dict.get("weight", {}) or {}
     input_tensors = layer_dict.get("input_tensors")
     weight, quant_dtype_override = _quark_weight_spec(weight, input_tensors)
+    quant_type = _parse_quant_type(weight.get("qscheme"))
+    # Quark spells MXFP8 (one E8M0 scale per 1x32 block) as per_block with
+    # block_size [1, 32]; a bare per_block is the 128x128 FP8 layout. The
+    # source block is what routes the linear to its native group-32 FP8 GEMM,
+    # as GenericParser's weight_block_size does for the original checkpoint.
+    weight_block_size = None
+    if weight.get("qscheme") == "per_block" and list(
+        weight.get("block_size") or []
+    ) == [1, 32]:
+        quant_type = QuantType.per_1x32
+        weight_block_size = (1, 32)
     return LayerQuantConfig(
-        quant_type=_parse_quant_type(weight.get("qscheme")),
+        quant_type=quant_type,
+        weight_block_size=weight_block_size,
         quant_dtype=(
             quant_dtype_override
             if quant_dtype_override is not None
@@ -544,6 +581,41 @@ class ModelOptParser(QuantConfigParser):
             global_spec=LayerQuantConfig(),
             layer_pattern_specs=pattern_specs,
             exclude_layers=exclude,
+        )
+
+
+@register_quant_parser("iq2r")
+class Iq2rParser(QuantConfigParser):
+    """Parse AITER IQ2R checkpoint configs."""
+
+    def parse(self, hf_quant_config: dict) -> ParsedQuantConfig:
+        base_config = hf_quant_config.get("base_quantization_config") or {}
+        if not isinstance(base_config, dict):
+            raise TypeError("base_quantization_config must be a JSON object")
+        base_method = str(base_config.get("quant_method") or "_generic")
+        if base_method == "iq2r":
+            raise ValueError("an IQ2R overlay cannot use IQ2R as its base format")
+        base = get_quant_parser(base_method).parse(base_config)
+        patterns = hf_quant_config.get("iq2r_modules")
+        if (
+            not isinstance(patterns, list)
+            or not patterns
+            or not all(isinstance(pattern, str) and pattern for pattern in patterns)
+        ):
+            raise TypeError("iq2r_modules must be a non-empty list of patterns")
+        iq2r_spec = LayerQuantConfig(
+            quant_type=QuantType.iq2r_2bit,
+            quant_dtype=torch.uint8,
+            is_dynamic=False,
+            quant_method="iq2r",
+        )
+        return ParsedQuantConfig(
+            global_spec=base.global_spec,
+            layer_pattern_specs=[
+                *((pattern, iq2r_spec) for pattern in patterns),
+                *base.layer_pattern_specs,
+            ],
+            exclude_layers=list(base.exclude_layers),
         )
 
 

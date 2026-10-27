@@ -132,6 +132,7 @@ support_draft_model_arch_dict = {
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
+    "DSparkMiniMaxDraftModel": "atom.models.minimax_m3.dspark.MiniMaxM3DSpark",
 }
 
 
@@ -270,6 +271,7 @@ class Drafter(abc.ABC):
                     running_tokens,
                     running_tokens,
                     running_tokens_are_unified=True,
+                    scheduled_tokens_gpu=runner.forward_vars["batch_info"].gpu[2:3],
                 )
                 pass_.warmup(bs)
                 if end_trace is not None:
@@ -281,7 +283,10 @@ class Drafter(abc.ABC):
                 "Draft passes warmed at %s in %.2fs: %s",
                 capture_sizes,
                 time.time() - start,
-                [g.name for g in self.draft_graphs],
+                [
+                    g.name + (" (captured)" if g.will_capture else " (eager)")
+                    for g in self.draft_graphs
+                ],
             )
 
     # ---- flavor hooks ----
@@ -607,6 +612,7 @@ class Drafter(abc.ABC):
         running_tokens: int,
         *,
         running_tokens_are_unified: bool,
+        scheduled_tokens_gpu: torch.Tensor,
     ) -> None:
         """Re-point the forward context at the pass about to run.
 
@@ -618,7 +624,9 @@ class Drafter(abc.ABC):
 
         Both units: `scheduled_tokens` is how many rows carry a real request,
         `running_tokens` how many the pass runs -- they differ exactly when the
-        batch was widened.
+        batch was widened. `scheduled_tokens_gpu` is `scheduled_tokens` on the
+        device, an entry of the step's `forward_vars["batch_info"]`: what a
+        recorded pass reads.
 
         Both flags below are the caller's to answer, because this seam cannot
         see either. `running_tokens_are_unified` claims every OTHER rank runs
@@ -631,6 +639,9 @@ class Drafter(abc.ABC):
         context = forward_context.context
         context.scheduled_tokens = scheduled_tokens
         context.running_tokens = running_tokens
+        context.scheduled_tokens_gpu = scheduled_tokens_gpu
+        # The pass's own rows; a draft that PCP-splits them says so where it does.
+        context.pcp_split = False
         parallel_config = self.config.parallel_config
         # A group of one is uniform whatever it runs; only the table needs peers.
         if parallel_config.data_parallel_size <= 1:

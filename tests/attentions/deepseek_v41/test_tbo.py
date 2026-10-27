@@ -747,11 +747,11 @@ def test_dp_moe_original_schedule_preserves_outputs(
     monkeypatch.setattr(moe, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(moe, "get_dp_group", lambda: None)
 
-    def gather(hidden, router, eager, ctx, group):
+    def gather(rows, eager, ctx, group):
         assert eager == (not unified)
         calls.append((tbo_current_ubatch_id(), "gather"))
         torch.cuda._sleep(2_000_000)
-        return hidden.clone(), router.clone(), len(hidden), [len(hidden)]
+        return tuple(t.clone() for t in rows), len(rows[0]), [len(rows[0])]
 
     def scatter(hidden, *args):
         calls.append((tbo_current_ubatch_id(), "scatter"))
@@ -764,9 +764,13 @@ def test_dp_moe_original_schedule_preserves_outputs(
 
     def experts(**kwargs):
         calls.append((tbo_current_ubatch_id(), "experts"))
-        return kwargs["x"] * 2 + kwargs["router_logits"]
+        return kwargs["x"] * 2 + kwargs["topk_weights"]
 
-    monkeypatch.setattr(moe, "dp_gather_hidden_and_router", gather)
+    def select_experts(layer, hidden, router):
+        # The router itself stands in for the weights (and the ids).
+        return router, router
+
+    monkeypatch.setattr(moe, "dp_gather_routed_rows", gather)
     monkeypatch.setattr(moe, "reduce_scatterv", scatter)
     monkeypatch.setattr(moe, "reduce_scatter_with_unpadding", scatter)
     layer = SimpleNamespace(
@@ -774,8 +778,15 @@ def test_dp_moe_original_schedule_preserves_outputs(
         moe_parallel_config=SimpleNamespace(
             use_all2all_kernels=False, dp_logical_ratio=1
         ),
-        quant_method=SimpleNamespace(apply=experts),
+        quant_method=SimpleNamespace(
+            select_experts=select_experts, routed_rows_wire=None
+        ),
+        _run_experts=lambda hidden, weights, ids, x_scale, gathered: (
+            experts(x=hidden, topk_weights=weights, topk_ids=ids)
+        ),
         reduce_results=False,
+        # No prefilled shared columns to re-mark after the gather.
+        expert_layout=SimpleNamespace(mode=None),
         top_k=1,
         renormalize=False,
         use_grouped_topk=False,
@@ -1054,13 +1065,11 @@ def test_tbo_preserves_v4_forward_signature(monkeypatch):
     from atom.models import deepseek_v4
 
     monkeypatch.setattr(deepseek_v4, "_pcp_active", lambda: False)
-    monkeypatch.setattr(deepseek_v4, "_moe_pcp_merge_active", lambda: False)
-    context = SimpleNamespace(context=SimpleNamespace(input_ids=None))
+    context = SimpleNamespace(context=SimpleNamespace(input_ids=None, pcp_split=None))
     monkeypatch.setattr(deepseek_v4, "get_forward_context", lambda: context)
 
     class Model(torch.nn.Module):
         forward = deepseek_v4.DeepseekV4ForCausalLM.forward
-        _need_ids_gather = False
 
         def model(self, input_ids, positions):
             return input_ids + positions

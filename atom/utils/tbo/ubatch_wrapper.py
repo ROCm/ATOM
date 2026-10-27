@@ -383,6 +383,20 @@ class UBatchWrapper(nn.Module):
             for i in range(N)
         ]
 
+    @staticmethod
+    def _ubatch_scheduled_tokens_gpu(
+        step_scheduled_tokens_gpu: torch.Tensor | None, row_offset: int, rows: int
+    ) -> torch.Tensor | None:
+        """A micro-batch's real row count on the device: the step's past this
+        micro-batch's first row, within its `rows`. A step's padding is its
+        trailing rows however it splits (a graph splits the recorded bucket, an
+        eager step its scheduled requests), so that is the micro-batch's own.
+        Clamped here, not by the consumer: aiter's sorter reads the count as
+        the row count."""
+        if step_scheduled_tokens_gpu is None:
+            return None
+        return (step_scheduled_tokens_gpu - row_offset).clamp_(0, rows)
+
     def _make_ubatch_context(
         self,
         ctx: ForwardContext,
@@ -432,9 +446,8 @@ class UBatchWrapper(nn.Module):
             running_tokens_across_dp=running_tokens_across_dp,
             is_draft=ctx.context.is_draft,
             # Carry over per-ubatch slice of input_ids for hash MoE (PCP+TBO mode).
-            # run_model stores local (1/pcp) ids; each ubatch takes its token_slice.
-            # ForCausalLM.forward then allgathers the slice to get ids matching the
-            # MoE's per-ubatch allgathered hidden states (padded_total//2 tokens).
+            # run_model stores local (1/pcp) ids; each ubatch takes its token_slice,
+            # and the MoE hash-routes its local rows by them before any gather.
             input_ids=(
                 ctx.context.input_ids[ub_slice.token_slice]
                 if ctx.context.input_ids is not None
@@ -443,6 +456,12 @@ class UBatchWrapper(nn.Module):
             # Where this ubatch's rows start on the full forward's token axis;
             # drafter aux capture writes at this offset.
             ubatch_token_offset=ub_slice.token_slice.start,
+            scheduled_tokens_gpu=self._ubatch_scheduled_tokens_gpu(
+                ctx.context.scheduled_tokens_gpu,
+                ub_slice.token_slice.start,
+                running_tokens,
+            ),
+            pcp_split=ctx.context.pcp_split,
         )
 
         return ForwardContext(

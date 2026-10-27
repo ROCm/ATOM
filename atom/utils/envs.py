@@ -147,13 +147,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the decode side scatters them into the paged KV and returns the slot.
     # 0 = staged per-page writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
-    # Mooncake P/D: how long a write Mooncake gave up on may still land. A
+    # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
-    # failure; a prefill keeps a landing slot whose write failed out of use
-    # this long. 0 = release at once.
+    # failure; a Mooncake prefill keeps a landing slot whose write failed out
+    # of use this long. 0 = release at once.
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
+    # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
+    "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
+    # MoRIIO P/D: how long a request waits for the handshake with its peer.
+    "ATOM_MORIIO_HANDSHAKE_TIMEOUT_S": lambda: float(
+        os.getenv("ATOM_MORIIO_HANDSHAKE_TIMEOUT_S", "300")
+    ),
+    # MoRIIO P/D write mode: a prefill starts no push this long after the
+    # decode asked for it.
+    "ATOM_MORIIO_WRITE_TIMEOUT_S": lambda: float(
+        os.getenv("ATOM_MORIIO_WRITE_TIMEOUT_S", "600")
+    ),
+    # MoRIIO P/D: log the layers a receive left unchanged (debugging).
+    "ATOM_MORIIO_VERIFY": lambda: _flag_env("ATOM_MORIIO_VERIFY", "0"),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
@@ -343,10 +357,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
-    # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
-    # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
-    # Set to 0 to retain the unmasked path.
-    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "1") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
@@ -757,6 +767,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # across requests (`segment_tokenizer.SegmentTokenizer`): segment ids and
     # stored prompts together, counted by the bytes they retain. 0 turns it off.
     "ATOM_TOKENIZE_CACHE_MB": lambda: int(os.getenv("ATOM_TOKENIZE_CACHE_MB", "512")),
+    # Keep the prompt block-hash chain (frontend prefix hashing) with each
+    # tokenizer-cached prefix and extend it on the next turn instead of
+    # rehashing the whole prompt. Content hashes only: KV residency is still
+    # BlockManager's. 0 hashes every prompt in full.
+    "ATOM_TOKENIZE_CACHE_BLOCK_HASHES": lambda: os.getenv(
+        "ATOM_TOKENIZE_CACHE_BLOCK_HASHES", "1"
+    )
+    == "1",
     # Warm the page cache with a background sequential reader instead of
     # leaving it to demand faults through the mmap. Measured on a local NVMe:
     # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
@@ -843,6 +861,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
     # instead of gluon. Needs aiter with #5809.
     "ATOM_PA_FLYDSL": lambda: os.getenv("ATOM_PA_FLYDSL", "0") == "1",
+    # Qwen QSA: score decode-sized index calls (<= 256 rows) with the MFMA
+    # kernel that stacks the index heads into M; 0 keeps the CUDA-core one.
+    "ATOM_QSA_STACKED_DECODE_SCORER": lambda: _flag_env(
+        "ATOM_QSA_STACKED_DECODE_SCORER", "1"
+    ),
+    # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
+    # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
+    "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -901,6 +927,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
+    ),
+    # Fuse an MXFP8 shared expert into MXFP4 routed experts (the Quark MXFP4
+    # export of MiniMax-M3.1) by re-quantizing the shared expert MXFP8 -> MXFP4
+    # at load, so the MoE runs as one 129-expert / top-5 fused MoE. Off by
+    # default: the shared expert, which every token uses, then carries MXFP4
+    # rounding error. Without it the shared expert stays an MXFP8 MLP.
+    "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
+        os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
@@ -1110,9 +1144,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
     # Only meaningful when prefill_context_parallel_size > 1;
-    # Default "1": all-gather hidden 1/W -> full before MoE and slice
-    # full -> 1/W after, so MoE sees the complete token set (MoE itself is
-    # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
+    # Default "1": FusedMoE routes its 1/W rows, gathers them (hidden states in
+    # the experts' format with their top-k weights and ids) to the full token
+    # set, and reduce-scatters the routed experts' output back to 1/W. Costs
+    # one routed-rows all-gather and one reduce-scatter per layer.
     # "0": MoE runs on each rank's 1/W token shard with no extra comm.
     "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
     # Pure-TP TBO all_reduce overlap mode (see module_dispatch_ops.tbo_all_reduce):
