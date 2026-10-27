@@ -187,6 +187,7 @@ def _warmup_all_sizes(warmup_draft_graphs, capture_sizes=(4, 2, 1)):
     var = {
         "kv_indptr": _Buf(torch.zeros(9, dtype=torch.int32)),
         "context_lens": _Buf(torch.full((8,), 7, dtype=torch.int32)),
+        "batch_info": _Buf(torch.zeros(3, dtype=torch.int32)),
     }
     pass_ = _AdvancingPass(var)
     proposer = object.__new__(EagleProposer)

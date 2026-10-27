@@ -34,10 +34,10 @@ Stages, with TP4's task counts:
             flag, UGF; down by unit: the CTA's after its last task, UGC)
     down    (320, 16 rows; a CTA's two run together): per expert of U the MXFP4
             x MXFP8 GEMV of its intermediate (x its routing weight -> bf16),
-            summed in each token's top-k order, rounded to bf16 at every add
-            (aiter's stage 2 adds bf16 atomically, in no fixed order); the
-            shared expert's FP8 down projection (quantize_fp8 of SMID) -> bf16;
-            routed + shared -> bf16 -> pushed to every rank's FFN region (a
+            summed in f32 in each token's top-k order (the reference's sum;
+            aiter's atomic stage 2 rounds to bf16 at every add); the shared
+            expert's FP8 down projection (quantize_fp8 of SMID) -> bf16;
+            routed + shared, one bf16 rounding -> pushed to every rank's FFN region (a
             token-parallel launch: the token's owner's alone)
     reduce  (160, 32 columns): the TP partials in rank order 0 .. TP - 1
             (``sum_partials``), fp32 -> bf16 -> ``out`` (a token-parallel
@@ -1336,8 +1336,8 @@ def down_units_combine(c, tasks):
 @traced
 def dcon_pair(c, tasks, idx):
     """``down_units_combine``'s pair ``idx``: rows 2 rp, 2 rp + 1 of a task's
-    16 for one token, summed as ``down_combine`` (top-k order, a bf16 rounding
-    an add, local picks only, then the shared expert's), every routed
+    16 for one token, summed as ``down_combine`` (f32 in top-k order, local
+    picks only, then the shared expert's, one bf16 rounding), every routed
     contribution's load issued together."""
     s, tab, d = c["S"], c["tab"], c["d"]
     topk = c["rs"].topk
@@ -1367,8 +1367,8 @@ def dcon_pair(c, tasks, idx):
     r0, r1 = fx.Float32(0.0), fx.Float32(0.0)
     for k in range_constexpr(topk):
         local = is_local(c, c["rs"].route_id(tab, s, t, k))
-        r0 = local.select(bf16_round(r0 + bf_lo(words[k])), r0)
-        r1 = local.select(bf16_round(r1 + bf_hi(words[k])), r1)
+        r0 = local.select(r0 + bf_lo(words[k]), r0)
+        r1 = local.select(r1 + bf_hi(words[k]), r1)
     base = (j * s + t) * ROWS + 2 * rp
     sh0 = fx.ptr_load(c["sdl"] + base).bitcast(fx.Float32)
     sh1 = fx.ptr_load(c["sdl"] + (base + 1)).bitcast(fx.Float32)
@@ -1668,9 +1668,10 @@ def shared_down_loads(c, task):
 @traced
 def down_combine(c, task, j, t0, n):
     """Down task ``task`` (the CTA's j-th) for tokens t0 .. t0 + n: the routed
-    contributions summed in bf16 in each token's top-k order (expert parallel:
-    of this rank's experts), plus the shared expert's (``down_shared``), the sum
-    pushed to every rank (token parallel: to the token's owner)."""
+    contributions (each a bf16, as the reference's experts return) summed in
+    f32 in each token's top-k order (expert parallel: of this rank's experts),
+    plus the shared expert's (``down_shared``), rounded to bf16 once and pushed
+    to every rank (token parallel: to the token's owner)."""
     s, tid, d, tab = c["S"], c["tid"], c["d"], c["tab"]
     topk = c["rs"].topk
     if tid < ROWS * n:
@@ -1678,11 +1679,12 @@ def down_combine(c, task, j, t0, n):
         tl = tid >> 4
         t = plus(t0, tl)
         shared = fx.ptr_load(c["sdl"] + ((j * s + t) * ROWS + r)).bitcast(fx.Float32)
-        # aiter's stage 2 adds each bf16(v * w) into a bf16 buffer: a rounding
-        # at every add (its order is the atomics'; here top-k order)
+        # the reference sums its experts' bf16 outputs in f32
+        # (``inference/model.py`` ``MoE.forward``), not aiter's atomic stage 2
+        # (a bf16 rounding an add)
         routed = fx.Float32(0.0)
         for k in range_constexpr(topk):
-            added = bf16_round(routed + contrib_load(c, j, t * topk + k, r))
+            added = routed + contrib_load(c, j, t * topk + k, r)
             if const_expr(c["rs"].ep > 1):
                 # another rank's pick: no contribution here (its LDS word
                 # never written: selected away, not multiplied by zero)

@@ -723,6 +723,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and `num_draft` config, so
             # every rank reaches this height on its own.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
         label = self.block.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
@@ -1097,6 +1098,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and T is config, so every
             # rank reaches this height on its own, none has to discover it.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
 
         # ---- 3. Block pass + Markov sampling ---------------------------------

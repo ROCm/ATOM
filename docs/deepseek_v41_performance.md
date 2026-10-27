@@ -51,14 +51,21 @@ and buffer addresses remain fixed across steps. Padding tokens carry V4's
 
 ## Cache format and attention boundary
 
-The main pool accepts `kv_cache_dtype="bf16"` or `"fp4"`. The index plane is
-independent: `index_cache_dtype="fp8"` (default) or `"fp4"`.
+The main pool accepts `kv_cache_dtype="fp8"` (the deployed configuration),
+`"bf16"` or `"fp4"`. The index plane is independent: `index_cache_dtype="fp8"`
+(default) or `"fp4"`.
 
-| Region | BF16 main-pool configuration | FP4 main-pool configuration |
-|---|---|---|
-| Main KV, 512 dimensions | BF16 | E2M1 FP4 with E4M3 scales, group 16 |
-| SWA, 512 dimensions | BF16 | E4M3 FP8 with E8M0 scales, group 32 |
-| Index keys, 128 dimensions | E4M3 FP8 with a per-key power-of-two scale | Same FP8 index format |
+| Region | FP8 main-pool configuration | BF16 main-pool configuration | FP4 main-pool configuration |
+|---|---|---|---|
+| Main KV, 512 dimensions | MXFP8: E4M3 with E8M0 scales, group 32 (528 B a row) | BF16 | E2M1 FP4 with E4M3 scales, group 16 |
+| SWA, 512 dimensions | Same MXFP8 rows | BF16 | E4M3 FP8 with E8M0 scales, group 32 |
+| Index keys, 128 dimensions | Per `index_cache_dtype` | E4M3 FP8 with a per-key power-of-two scale | Same FP8 index format |
+
+The FP8 pool holds 1.84x the rows of the BF16 one. Its rows are addressed like
+BF16 ones (int32 row indices), and attention reads them as they are stored:
+the query is quantized to the same MXFP8 format, and AITER's
+`mla_sparse_prefill_v41` (`fp8_attention.sparse_attn_v41_paged_2src`) attends
+over the pool and the window, prefill and decode alike.
 
 The index writer stores scales as FP32 in preshuffled tiles. Global owner
 regions share block IDs while keeping separate index planes. FP32 compressor
@@ -72,8 +79,9 @@ passes ordinary int32 row indices to V4 attention. Prefill keeps the current
 chunk in BF16; decode preserves V4's batch size and split-K dispatch. Neither
 path materializes the entire historical main KV pool.
 
-On the BF16 pool, decode attention reads two sources
-(`sparse_attn_v4_paged_2src`): the selection from the pool, and the window
+On the BF16 pool (and on the FP8 pool through its MXFP8 twin above), decode
+attention reads two sources (`sparse_attn_v4_paged_2src`): the selection from
+the pool, and the window
 through the layer's own ring (`ring_view`), whose rows are one list shared by
 every layer. An index group's layers share one selection plane. The OPUS kernel
 splits each token's keys across blocks when the step has too few tokens to

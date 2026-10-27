@@ -125,12 +125,16 @@ class DecoderGraph:
         queries = plan.queries()
 
         def last_layer(state):
-            with rows_of(metadata, plan.tail, queries, queries.rows):
+            with (
+                rows_of(metadata, plan.tail, queries, queries.rows),
+                forward.use_pass_rows(queries.rows.numel(), plan.finishing_gpu),
+            ):
                 return model._layer(model.last_layer, state, queries)
 
         with (
             _token_graphs_off(forward),
             rows_of(metadata, plan.tail, rows=plan.tail_rows),
+            forward.use_pass_rows(plan.tail_rows.numel(), plan.filled_gpu),
         ):
             last = run_decoder_stages(
                 forward,
