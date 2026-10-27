@@ -31,9 +31,10 @@ bounds do not impose a hard end-to-end TTFT limit.
 It is NOT about mixing prefill+decode in one forward. It DOES preserve cross-DP
 phase alignment: it only releases when every rank is prefill-ready (so all ranks
 enter prefill together and the MoE collective stays aligned), except when a
-must-fire bound forces release regardless. The opt-in cost gate can also
-release an unaligned group when the queue stops growing or its measured
-waiting cost no longer pays off.
+must-fire bound forces release regardless, or the cost gate measures that
+waiting longer no longer pays off. A flat queue alone never releases an
+unaligned group: pending-token probes are capped, so a flat sum does not mean
+that decoding peers have stopped receiving work.
 
 Decision (evaluated every tick, on every rank, in lockstep)
 -----------------------------------------------------------
@@ -57,12 +58,10 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   if any_queue_hot:                             FIRE   # queue age bound
   if hold_ticks >= ttft_max_ticks:                FIRE   # TTFT bound
   if any_partial and hold_ticks >= partial_max_ticks: FIRE  # partial holds KV — tight bound
-  if n_prefillable < dp_size and not cost_gate:    HOLD
-  # -- adaptive give-up for aligned groups or the opt-in cost policy --
+  # -- adaptive give-up (aligned groups only, see below) --
   if G_pending <= prev_G_pending:  stall += 1  else  stall = 0
   # -- alignment gate: hold while some rank lacks prefill (anti-skew) --
   if n_prefillable < dp_size:
-      if stall >= stall_ticks:                    FIRE
       stall_us = G_running_dec * max(rank cost) * t_prefill  # unaligned release
       if cost_gate and (arrival rate on ranks without prefill * stall_us
                         < G_waiting or hold_cost >= stall_us):
@@ -561,15 +560,7 @@ class PrefillDelayer:
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
             return self._fire("partial", g_pending)
 
-        # A capped pending-token count can stay flat while decoding peers
-        # finish requests and free client concurrency for their next prefill.
-        # Keep those peers aligned unless a must-fire bound above releases us.
-        # The measured cost policy remains an explicit alternative.
-        if n_prefillable < self.dp_size and not self._cost_gate:
-            return self._hold(g_pending)
-
-        # Once aligned, a flat queue can release an underfilled forward. The
-        # opt-in cost policy also uses this bound before alignment.
+        # Once aligned, a flat queue can release an underfilled forward.
         if g_pending <= self._prev_pending:
             self._stall_count += 1
         else:
@@ -578,11 +569,12 @@ class PrefillDelayer:
         stalled = self._stall_count >= self.stall_ticks
 
         # ---- alignment gate: hold while a rank lacks prefill (anti-skew) for
-        # stragglers to catch up, until the queue stalls or (cost gate) the
-        # wait has cost more than the unaligned prefill it avoids.
+        # stragglers to catch up, until (cost gate) the wait has cost more
+        # than the unaligned prefill it avoids. The stall bound does not apply
+        # here: a capped pending-token count can stay flat while decoding
+        # peers finish requests and free client concurrency for their next
+        # prefill, so a flat queue says nothing about whether they will align.
         if n_prefillable < self.dp_size:
-            if stalled:
-                return self._fire("stall", g_pending)
             if self._cost_gate and self._alignment_wait_paid(
                 _Gate(*reduced[self._gate_at :]), g_running_dec
             ):
@@ -609,7 +601,7 @@ class PrefillDelayer:
         chance of such an arrival in the tick: release once that expectation
         falls below the tick's cost, or once the wait has cost the whole stall
         (rent-or-buy). Untimed (no step measured on some rank yet): never
-        paid, the stall bound alone releases."""
+        paid, only the must-fire bounds release."""
         timed = gate.timed_ranks
         if timed == 0:
             return False

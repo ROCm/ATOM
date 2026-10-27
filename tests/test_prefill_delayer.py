@@ -352,13 +352,15 @@ def lone_request(d, reduce):
 
 def make_gated(**kw):
     return make_delayer(
-        dp_size=2,
-        cpu_group=_Rank0Group(),
-        ttft_max_ticks=1000,
-        stall_ticks=1000,
-        exchange_prefill_costs=True,
-        cost_gate=True,
-        **kw,
+        **{
+            "dp_size": 2,
+            "cpu_group": _Rank0Group(),
+            "ttft_max_ticks": 1000,
+            "stall_ticks": 1000,
+            "exchange_prefill_costs": True,
+            "cost_gate": True,
+            **kw,
+        }
     )
 
 
@@ -384,13 +386,25 @@ class TestCostGate:
         assert lone_request(d, mixed) is True
         assert d._stat_fire_cost == 1
 
-    def test_untimed_holds_for_the_stall_bound(self):
+    def test_untimed_holds_until_a_must_fire_bound(self):
         d = make_gated()
         skip_first(d)
         mixed = _add_rank({2: 1})
         for _ in range(20):
             assert lone_request(d, mixed) is False
         assert d._stat_fire_cost == 0
+
+    def test_flat_queue_does_not_release_an_unaligned_group(self):
+        # The cost gate is on, but nothing is timed yet: a flat capped queue
+        # must still wait for the peer instead of firing on the stall bound.
+        d = make_gated(stall_ticks=2, ttft_max_ticks=6)
+        skip_first(d)
+        mixed = _add_rank({2: 1})
+        for _ in range(6):
+            assert lone_request(d, mixed) is False
+        assert lone_request(d, mixed) is True
+        assert d._stat_fire_ttft == 1
+        assert d._stat_fire_stall == 0
 
     def test_arrival_rate_decays_while_nothing_comes(self):
         clock = _Clock()
