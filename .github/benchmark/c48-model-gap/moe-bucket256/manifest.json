@@ -1,0 +1,19 @@
+{
+  "name": "kimi_k3_aiter_moe_token_bucket_256",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "latent_moe_runner.py: with VLLM_ROCM_AITER_MOE_BUCKET256_MAX=N (> 256), aiter.fused_moe.get_padded_M maps M in (256, N] to 256, so the tuned-config lookup uses the 256-token row (flydsl t32x64x256 kw2 + t32x256x128 sbm32, bm32) instead of the 512-token row (mxmoe_g1 16x128x256 + t16x128x128 sbm16, bm16). In aiter v0.1.24.post1 the padded M is only the lookup key; buffers are sized from the real M",
+    "Evidence (b59 D traces, slurm 10214, rank 0 annotated steps): per-layer stage1+stage2 230.2 us at 255 tokens (256 row) vs 258.2 us at 270, 256.8 at 280, 268.4 at 310, 277.2 at 320 tokens (512 row). vLLM D runs 5 tokens per request (DSpark4), so C72 decode steps are mostly 257-360 tokens"
+  ],
+  "cases": [
+    "*-MB256*"
+  ],
+  "files": [
+    {
+      "relative_path": "models/kimi_k3/amd/latent_moe_runner.py",
+      "mount_source": "latent_moe_runner.py",
+      "base_sha256": "09ceb7e66e20e5597fcd9eb038dd0103780f5c2c5ad3ee689075f0f18d9bfbc9",
+      "patched_sha256": "b3104c5cace1260a20da602ff41cbc01c2547339f6e2aef24c3a47d40a06bcf9"
+    }
+  ]
+}

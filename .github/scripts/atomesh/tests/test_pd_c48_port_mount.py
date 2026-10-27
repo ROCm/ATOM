@@ -36,7 +36,7 @@ CPUREF = {
     **{f"V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-{t}": "cpu-lru-refresh-v3"
        for t in ("C4D8", "C16", "C32", "C56", "C72", "C88", "C56-CPU26", "C72-CPU26", "C88-CPU26",
                  "C72-MLA96", "C72-MLA96-DPROF", "C72-MLA96-DLDFP4", "C72-DLDFP4",
-                 "C72-MLA96-QPBM")},
+                 "C72-MLA96-QPBM", "C72-MLA96-MB256")},
     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS": "cpu-lru-refresh-v3",
     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-MLA96-GSM8K": "cpu-lru-refresh-v3",
 }
@@ -52,11 +52,12 @@ UPS = {
 
 
 QPBM = {"mla-qrep-pbm/mla_attention.py": "model_executor/layers/attention/mla_attention.py"}
+MB256 = {"moe-bucket256/latent_moe_runner.py": "models/kimi_k3/amd/latent_moe_runner.py"}
 
 
 def extra_overlays(case):
     return {**(MLA96 if "-MLA96" in case else {}), **(QPBM if "-QPBM" in case else {}),
-            **(UPS if case.endswith("-UPS") else {})}
+            **(MB256 if "-MB256" in case else {}), **(UPS if case.endswith("-UPS") else {})}
 FP8ATTN = "/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py,readonly"
 LDFP4_CASE = "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4"
 LDFP4 = "/vllm/models/kimi_k3/amd/linear.py,readonly"
@@ -110,7 +111,8 @@ class PortMountTest(unittest.TestCase):
     def test_extra_overlays_reject_changed_file(self):
         for case in ("V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72-MLA96",
                      "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS",
-                     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72-MLA96-QPBM"):
+                     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72-MLA96-QPBM",
+                     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72-MLA96-MB256"):
             sources = list(extra_overlays(case))
             if "-QPBM" in case:
                 sources.append("mla-qrep-pbm/linear.py")

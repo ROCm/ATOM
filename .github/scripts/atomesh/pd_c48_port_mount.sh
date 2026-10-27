@@ -84,6 +84,10 @@ c48_append_port_mount() {
     # Inert unless VLLM_DCP_Q_REPLICATE=1 / VLLM_DCP_PROJECT_BEFORE_MERGE=1 (Decode only).
     c48_extra+=("mla-qrep-pbm/mla_attention.py model_executor/layers/attention/mla_attention.py f393bcb1c4335762cd7e9a67cc282cf05194fb82449a705358b4cccfc8b543de")
   fi
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-MB256 || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-MB256-* ]]; then
+    # Inert unless VLLM_ROCM_AITER_MOE_BUCKET256_MAX > 256 (Decode only).
+    c48_extra+=("moe-bucket256/latent_moe_runner.py models/kimi_k3/amd/latent_moe_runner.py b3104c5cace1260a20da602ff41cbc01c2547339f6e2aef24c3a47d40a06bcf9")
+  fi
   if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-UPS || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-UPS-* ]]; then
     c48_extra+=(
       "ups-pnt-warm/scheduler.py v1/core/sched/scheduler.py d837782f13a817560d9fefc9761782169e368ddf3d0202a019c7f89631f81f65"
