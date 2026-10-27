@@ -285,6 +285,19 @@ Real example (ATOM#1881, `atom/plugin/sglang/attention_backend/attention_gdn.py`
 ### G — Multi-Stream Synchronization
 _"Written on stream A, consumed on stream B — no sync between them."_
 
+**derive() trigger (both G1 and G1b).** Previously neither had one: confirmed by re-running
+`fetch.sh` on ATOM#1369, which derived `rules=5/25` with G1 absent even though it is the
+PR's own citation. The `stream-lifetime` family now fires on added lines that create or
+hand off a stream, or make a cross-stream lifetime promise explicit — `cuda.Stream(`,
+`.record_stream(`, `.wait_stream(`, `.set_stream(`, or `.to(..., non_blocking=True)` — and
+surfaces both rule bodies together, since a diff in this territory is exactly where the
+reviewer needs to check G1's sync-ordering question and G1b's record_stream-vs-wait_stream
+criterion side by side. Demonstrated firing on ATOM#2654 (`f08cd7f70`, the D2H citation
+below): `rules=7/27`, `[stream-lifetime] G1 G1b`. Still does not fire on #1369 itself (that
+PR's own diff does not touch any of the five regex shapes above; its hazard is a bare
+tensor handoff with no stream API call in the diff at all) — reported honestly rather than
+re-tuned to force a match on the PR that motivated the rule.
+
 **G1 — Missing HIP/CUDA stream synchronization** 🔴
 HIP/CUDA streams execute concurrently by default. A tensor produced on stream A and consumed by a kernel on stream B without an explicit sync between them causes the consumer to read garbage — no crash, no error, silent wrong output.
 Trigger: diff introduces a non-default `torch.cuda.Stream`, passes an explicit `stream=` argument to a kernel, or prepares weights/KV buffers on a side stream at model-load time that are later consumed during forward pass on the compute stream. Check: is there `stream.synchronize()`, `stream.wait_stream(other)`, `hipEventRecord` + `hipStreamWaitEvent`, or `torch.cuda.current_stream().wait_stream(other)` between the last write on stream A and the first read on stream B?

@@ -1176,6 +1176,17 @@ def derive(files, title="", raw_diff=""):
     if (re.search(r"\.item\(\)|\.tolist\(\)", add) or re.search(r'\.to\(\s*["\']cpu["\']\s*\)', add)) \
             and any(p.endswith("model_runner.py") or ("/models/" in p and p.endswith(".py")) for p in paths):
         hit("cpu-gpu-sync", "G2")
+    # G1/G1b previously had no derive() trigger at all -- confirmed on ATOM#1369 (fires
+    # neither). G1 now carries two citations pointing in opposite directions (#1369,
+    # H2D/compute-side; f08cd7f70/#2654, D2H-side), which is exactly the pattern this
+    # project keeps flagging: evidence with no way to surface it. Scoped to added lines
+    # that create or hand off a stream, or make a cross-stream lifetime promise explicit --
+    # a non-default stream, a record_stream/wait_stream/set_stream call, or a non_blocking
+    # transfer, any of which puts the reviewer in stream-lifetime territory where both G1
+    # (missing sync) and G1b (the record_stream-vs-wait_stream criterion) apply.
+    if re.search(r"(?:torch\.)?cuda\.Stream\(|\.record_stream\(|\.wait_stream\(|\.set_stream\("
+                 r"|\.to\([^)]*non_blocking\s*=\s*True", add):
+        hit("stream-lifetime", "G1 G1b")
     if re.search(r"\b(batch|prev_batch)\.\w+\s*(\.append\(|\.extend\(|\.add_\(|\.fill_\()", add) \
             or re.search(r"\b(batch|prev_batch)\.\w+\s*\[[^\]]*\]\s*=", add) \
             or re.search(r"\b(batch|prev_batch)\.\w+\s*(\+=|-=)", add):
@@ -1192,8 +1203,8 @@ def derive(files, title="", raw_diff=""):
 # The failure is invisible from inside a review -- the ledger only ever sees rules that
 # were derived -- so `triage.py mapping` is what surfaces it.
 #
-# These 21 ids are rules.md bodies with no corresponding family in derive(): the P0 minimal
-# deriver emits only ALL_RULES's 19 ids, and these are the rest. Carried over verbatim from
+# These 19 ids are rules.md bodies with no corresponding family in derive(): the P0 minimal
+# deriver emits only ALL_RULES's 27 ids, and these are the rest. Carried over verbatim from
 # the pre-pipeline SKILL.md prose, same as every rule here -- they are not dead weight, they
 # are P1's raw material for regrowing ATOM's own rule-family axis from real review history.
 # Do not trim rules.md to make this list shrink; the gap is the thing to see, not to hide.
@@ -1201,11 +1212,11 @@ _P1_FAMILY_AXIS = ("the P0 minimal deriver does not emit this family; P1 owns re
                    "ATOM's full rule-family axis from real ATOM review history, and this "
                    "body is its raw material, not dead text")
 UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
-    "B3", "B4", "C3", "D1b", "D2", "D5", "D6", "D7", "D8", "D9", "F1", "G1", "G1b",
+    "B3", "B4", "C3", "D1b", "D2", "D5", "D6", "D7", "D8", "D9", "F1",
     "P1", "P2", "P3", "P4", "P5", "HK3", "HK6", "HK7",
 )}
 
-ALL_RULES = "A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 F2 G2 H1 H2 HK1 HK2 HK4 HK5 STEP4"
+ALL_RULES = "A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 F2 G1 G1b G2 H1 H2 HK1 HK2 HK4 HK5 STEP4"
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert
