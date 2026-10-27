@@ -84,9 +84,12 @@ arithmetic (E2M1, one E8M0 per 32 dims) in the row-group scorer's page-8
 layout, values and scales in two planes (`index_plane.py`); one aiter kernel
 norms, rotates, quantizes and stores a key, bit for bit the FP8 path's key
 chain before its quantization. The main pool is independent of it and takes
-`kv_cache_dtype="bf16"` or `"fp4"`; under FP4, main rows use their own format
-and SWA uses FP8. Both use the original V4 BF16 attention kernels and inverse
-RoPE; no V4 file is modified to serve V4.1.
+`kv_cache_dtype="fp8"` (the deployed configuration), `"bf16"` or `"fp4"`.
+Under FP8, main and SWA rows are MXFP8 (E4M3, one E8M0 per 32 dims) and
+attention runs on them through AITER's `mla_sparse_prefill_v41`; under FP4,
+main rows use their own format and SWA uses FP8. BF16 and FP4 use the original
+V4 BF16 attention kernels and inverse RoPE; no V4 file is modified to serve
+V4.1.
 
 Each plane format has one scorer, for every shape. It reads the plane in place and
 gives each query row its own bound and its own tile list, so a prefill token, a
@@ -113,8 +116,8 @@ with `enforce_eager=False` and `CompilationConfig(level=0, ...)`:
   it. The scorer reads its bounds off the device, so there is nothing here for
   a capture to freeze. Prefill stays eager -- the runner only ever captures
   decode shapes.
-- `cudagraph_mode=CUDAGraphMode.PIECEWISE` records the compiled dense pieces
-  and leaves attention eager between them.
+- `cudagraph_mode=CUDAGraphMode.TR_HYBRID` records the forward as token
+  graphs, attention running eagerly between their segments.
 
 Under either mode a decode forward runs the width the step declares --
 `running_bs` requests and `running_tokens` rows -- rather than the scheduled
@@ -129,16 +132,28 @@ backend to select and no capture exclusion.
 
 See [cache format and graph execution](deepseek_v41_performance.md) for cache
 formats, graph ownership and memory limits. Native five-token DSpark admits
-TP sizes that satisfy model dimension divisibility, with BF16 caches and
-optional target graphs; its draft
+TP sizes that satisfy model dimension divisibility, with FP8 or BF16 caches
+and optional target graphs; its draft
 windows, accepted-prefix state, calibration profile, supported scope and **quality
 limitations** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
 speculative caches and multimodal speculation are rejected, as are
-PP/CP/DP, TBO, KV transfer other than `lmcache_mp`, RapidServe, plugin
-execution and EPLB — all before loading. `lmcache_mp` offloads PAGE units and
+PP/CP, DP without DP attention, decode TBO, KV transfer other than `lmcache_mp`, RapidServe
+and EPLB — all before loading. Plugin execution is no longer among them: V4.1
+runs on the vLLM plugin backend, described in
+[the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units. With
+encoder SWA bounded replay (the default) it moves PAGE alone, and a tier load
+resumes like an HBM hit: the forward replays the hash block below it
+(`BlockManager.tier_resume_replays`). With `--no-encoder-swa-bounded-replay` it
 restores STATE through the same PAGE-backed checkpoint images the local prefix
 cache uses (`get_kv_transfer_tensors` publishes each plane of a unit, in
 `StateCopies` order).
+
+That admission is native-only. On the plugin backend every KV connector is
+refused, `lmcache_mp` included: vLLM resolves the connector through its own
+registry, so what runs there is vLLM's `LMCacheMPConnector` rather than the
+ATOM transport that publishes those checkpoint images, and a hit would restore
+PAGEs whose STATE nobody wrote.
+DP attention supports text requests and prefill TBO.
 Compilation level 3 is admitted with FULL graphs or eager execution; the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) records TP2/TP4
 no-EP GPU benchmark results with fixed acceptance length 3.51.
@@ -147,6 +162,132 @@ The [chat and tool protocol](deepseek_v41_protocol.md) and
 [vision and multimodal chunking](deepseek_v41_vision.md) are enabled
 independently of speculation. Host Engram lookup still reads final GPU IDs on
 the CPU; moving the lookup to HBM and fusing it further is future work.
+
+## Data-parallel attention
+
+`--tensor-parallel-size 4 --enable-dp-attention` starts four attention ranks,
+each with TP1 attention, embeddings and output head. Tensor-sharded routed
+experts exchange activations through the existing DP gather/scatter transport.
+For five-token DSpark, use the FP8 KV cache (BF16 also works) and the FP4 or
+FP8 index plane:
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 python -m atom.entrypoints.openai_server \
+  --model /mnt/DeepSeek-V4.1-Flash \
+  --tensor-parallel-size 4 --enable-dp-attention \
+  --kv-cache-dtype fp8 --index-cache-dtype fp4 \
+  --method dspark --num-speculative-tokens 5 \
+  --level 3 --cudagraph-mode FULL \
+  --max-num-seqs 64 --max-num-batched-tokens 16384 \
+  --attn-prefill-chunk-size 16384
+```
+
+Idle ranks participate in collectives using empty cache-request metadata in the
+same pool buffers that graph capture used. Padding rows carry batch ID -1 and
+sentinel write plans, so captured attention kernels neither read nor write state.
+The runner's dummy query segment remains nonempty for sampling and DSpark to
+select a valid anchor row. Startup warmup,
+before pool allocation, continues to use its private scratch cache.
+
+Engram follows the attention TP group: under DPA each rank reads all hash
+heads for its own requests. Each Flash rank registers about 183 GiB of mapped
+host table storage, so startup registration takes longer than TP4.
+
+## Prefill two-batch overlap
+
+Add `--enable-tbo prefill` to the DPA command above. Tensor-sharded experts
+use DP gather/scatter. DPA4 with MORI EP4 and the high-throughput backend was
+also validated with BF16 KV, FP8 index and native DSpark5; that configuration
+requires `MORI_SHMEM_HEAP_SIZE=17179869184` (16 GiB). This does not establish
+coverage for every EP backend or deployment shape.
+V4.1 prefill TBO requires DP attention with more than one effective DP rank.
+V4.1 validation uses the TP × DP rank count, which is unchanged by
+CoreManager's existing DP/TP launch normalization:
+TP4 with the default DP size of 1 launches four DP-attention ranks and is accepted.
+Plain TP and effective single-rank DPA are rejected. Microbatches use
+the configured compilation level; decode keeps its CUDA Graph path.
+The existing `ATOM_TBO_PREFILL_MIN_TOKENS` threshold applies.
+`ATOM_TBO_PREFILL_TOKEN_SPLIT=1` is the default and can split within a request;
+set it to `0` to split only at request boundaries. Eligibility
+is agreed across DP ranks; an idle or incompatible peer selects ordinary execution.
+
+Parent preparation and TBO children both preserve the explicit prefill phase.
+A one-token prefill therefore uses prefill indptrs and bounded tile tables even
+when DSpark is enabled; tentative verification retains decode semantics.
+
+Each microbatch preserves absolute token positions, request state slots and
+page tables, with separate compression plans, attention indptrs and cross-layer
+selection state. Ragged prefill uses the existing TBO DP padding contract:
+attention sees each microbatch's local rows, while MoE pads to the per-microbatch
+DP maximum before gathering and trims the padding after reduce-scatter.
+The shared worker scheduling, DP context and collective selection are unchanged.
+
+Engram snapshots the parent's n-gram history before its cursor advances.
+After metadata construction, the parent starts one side-stream lookup around
+both microbatches. Each consumes its token slice and waits at its Engram layer;
+the parent joins the lookup after both workers finish, including model errors.
+Already-staged rows are sliced identically when Engram overlap is disabled.
+
+V4.1 uses communication stream priority -1 as a fixed backend policy;
+other backends keep the default priority 0.
+MoE keeps the existing compute-to-communication yield and event order.
+The V4.1-local `v41_record_tbo_expert_output` runtime marker protects the routed
+output after dispatch and before downstream shared-expert combine or mHC.
+It remains an opaque custom op in compiled execution. Shared `FusedMoE` has no
+new `record_stream` calls in this change. MORI owns persistent per-ubatch
+transport buffers whose reuse is governed by its existing stream dependencies.
+The existing
+`create_comm_fused_moe_backend` factory rejects TBO and DP > 1, so TBO cannot
+enter the communication-fused backend. If comm-fused TBO support is added, its
+internal allocations and consumer boundaries must be audited separately.
+The shared `moe_forward` custom-op boundary does not replace the V4.1 marker
+or protect unsupported communication-fused backend internals.
+Microbatches use the normal `(input_ids, positions)` model call and honor the
+configured compilation level. DPA remains text-only: image requests are
+rejected during request preprocessing, before sequences reach any DP worker,
+including when DSpark is disabled. TP vision runs without TBO.
+
+Parent and child metadata use one assembler and the same buffer capacity
+checks. Compression-plan names come from the
+plan publisher. TBO rejects compacted scheduler rows before applying a request
+slice, so scheduler indices cannot silently address another request.
+
+Each microbatch has one set of `ub{i}_` pinned/device step buffers in the
+runner's `forward_vars`, plus builder-owned attention indptrs. Packed FP4
+score plans use independent child buffers too. The runner's forward-buffer
+event and H2D publication ownership gate reuse; the child buffers keep fixed
+addresses and there is no separate `PrefillStoragePool` or alternating slot.
+
+These buffers are persistent execution memory, allocated in builder
+initialization before warmup and KV sizing. `ModelRunner.get_num_blocks()`
+subtracts peak/current PyTorch allocated bytes from the GPU budget, which
+already includes the device buffers and indptrs; pinned CPU memory is host
+memory. There is no second TBO-specific reservation. `release_kv_pools()`
+releases PAGE/STATE cache views, while these execution buffers remain resident
+across rollout sleep/wake, like the parent forward buffers and score workspace.
+Consequently sleep does not reclaim their VRAM; wake reuses the same buffers
+and allocates the saved KV pool size. Full execution-buffer reclamation would
+also require rebinding the runner's H2D publication and graph references.
+
+When the private Engram TP collective is unavailable, the TBO parent
+materializes one fallback gather per layer before launching workers; child
+views only wait for and slice these rows. Ordinary TP keeps lazy per-layer
+consumption, so later lookups can overlap earlier layer computation. Completion
+events belong to `EngramStaging` and are reused across forwards.
+
+Eager prefill expands index tile tables only through the largest request end,
+including cached prefixes. Paged scoring bounds each logits band by both its
+addressing limit and `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB` (default 2048 MiB).
+Decode retains fixed-width metadata for graph replay. TBO uses the existing
+single warmup and KV sizing calculation, with no additional budget policy.
+
+Correctness and overlap must be checked together: serial execution can hide
+cross-stream reuse errors, while overlapping kernels alone do not demonstrate
+an end-to-end throughput improvement. The GPU regressions exercise fallback
+dispatch and a synthetic `complete=True` return under delayed consumption and
+partner allocation pressure. The latter checks downstream output lifetime and
+completion-flag preservation, not real comm-fused backend internals. The CPU
+comm-fused integration tests verify that its factory rejects TBO and DP > 1.
 
 ## Decoder SWA bounded replay
 
@@ -166,7 +307,9 @@ Every decoder layer's window starts at the tail (`swa_replay_start`): a tail
 row at position `i` reads `[max(s, i - W + 1), i]`, `s` the tail's first
 position. A forward that does not finish its prompt
 (`ScheduledBatch.is_final_chunk`) runs nothing past the encoder but layer 20's
-compression: no kernel of the decoder's attention or FFN. Layer 39's queries
+compression: no kernel of the decoder's attention or FFN -- except under DP
+attention, where, while another rank runs the decoder, it runs the decoder on
+its tail of padding so every MoE collective has all ranks (see below). Layer 39's queries
 are fewer than its KV rows (`QueryRows`): the rows are gathered in one launch
 (`token_layout.gather_rows`), the index lists built over all KV rows with every
 other row's batch id -1, so the queries' lists come out adjacent, and attention
@@ -194,9 +337,34 @@ With `--no-decoder-swa-bounded-replay` the runtime model compiles its forward
 as one graph (`runtime._Backbone`), as before. Otherwise layers 0..19 and
 21..38 are two graphs (`_EarlyLayers`, `_LateLayers`, each with its own
 compile-cache key) and layers 20 and 39 run between and after them, where a
-replay cuts their rows. Decode, warmup, draft, TBO and padded steps run every
-layer on every row. After a replay only each finishing request's last row of
-the model output is defined; the LM head reads only those.
+replay cuts their rows. Decode, warmup, draft and TBO-split steps run every
+layer on every row.
+
+The tail is a request bucket. The backend lays it out for the step's
+`running_bs` requests, `W` rows each (`bounded_replay.tail_width`, within the
+token buffer): the finishing requests' rows first, then zero-length padding
+requests and rows no request owns, which repeat a real row
+(`lay_out_tail`, `DeepseekV41MetadataBuilder._publish_decoder`). Every step of
+a `running_bs` publishes at the same addresses, so the decoder -- layer 20's
+attention and FFN through layer 39 -- records once per bucket as a `ReqGraph`
+(`decoder_graph.DecoderGraph`, at `ATOM_DECODER_GRAPH_SIZES`) and replays
+with no Python; any other `running_bs`, a step with image rows, an FP8 index
+plane, or a decoder reading a selection carried off the encoder runs the same
+layout eagerly. The runner records the buckets after the token graphs
+(`ModelRunner._record_prefill_req_graphs`).
+
+Under DP attention a prefill replays too. The decoder's MoE collectives are
+sized by every rank's rows, which a tail changes. `running_bs` is the group's,
+so every prefilling rank runs the same tail width and request count, and a rank
+still decoding runs its own rows: each derives that table from the step's one
+packed DP sync, which carries every rank's prefill flag and the requests whose
+prompt it finishes (`sync_dp_metadata`), and runs each stage under it
+(`bounded_replay.decoder_stages`, `run_decoder_stages`,
+`ForwardContext.use_dp_stage`). While any rank runs the decoder -- one finishing
+a prompt, or one still decoding -- a rank finishing none runs it on its tail of
+padding (a recording of its own under DP); when none does, every rank skips
+it. After a replay only each finishing request's last row of the model output
+is defined; the LM head reads only those.
 
 Accuracy: this is not a full prefill. In every decoder layer the tail's rows
 see a window truncated at the tail start, so from layer 21 on even the last

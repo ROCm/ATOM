@@ -29,8 +29,9 @@ def kv_config_has_producer(kv_config: object) -> bool:
     """Whether a KV config contains a P/D producer, including ``multi``.
 
     Both the scheduler and the model runner branch on this: a producer
-    prefills and hands the request off after one token, so it neither defers
-    output nor speculates.
+    prefills and hands the request off after one token, so it never
+    speculates. It still defers output (unless its attention keeps recurrent
+    state), so surfacing that token can take one extra q=1 decode.
     """
     if not isinstance(kv_config, dict):
         return False
@@ -533,8 +534,8 @@ class ConnectorMetadata:
             remote_host=kv_transfer_params.get("remote_host"),
             remote_port=kv_transfer_params.get("remote_port"),
             remote_handshake_port=kv_transfer_params.get("remote_handshake_port"),
-            remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
-            remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
+            remote_dp_size=int(kv_transfer_params.get("remote_dp_size") or 1),
+            remote_dp_rank=int(kv_transfer_params.get("remote_dp_rank") or 0),
             remote_pp_size=kv_transfer_params.get("remote_pp_size", 1),
             remote_tp_size=kv_transfer_params.get("remote_tp_size", 0),
             tp_size=(

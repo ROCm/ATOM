@@ -71,8 +71,10 @@ class DraftAttention(Attention):
         _, kv_pre = self.project_qkv(hidden)
         return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
-    def forward(self, hidden, hidden_scale, context_kv, step, rope):
-        q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
+    def forward(self, hidden, hidden_scale, context_kv, step, rope, *, hidden_fp8=None):
+        q_lora, kv_pre = self.project_qkv(
+            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+        )
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
@@ -263,7 +265,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if plan is not None:
             # A replayed forward ran the decoder, whose rows these come from,
             # on its tail alone: the draft's window takes the same rows.
-            if plan.tail is None:
+            if not plan.tail.requests:
                 return
             rows, step = plan.tail_rows, plan.tail
             aux_concat, positions = aux_concat[rows], positions[rows]
@@ -278,7 +280,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if fused is None:
             for attention in layers:
                 keys = attention.project_context(
-                    hidden, positions, self.rope, packed=cache.packed
+                    hidden, positions, self.rope, packed=cache.window_fp8
                 )
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
@@ -307,7 +309,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 ]
             )
             keys = quantize_fp8(
-                self.rope(kv, positions.flatten()), dequantize=not cache.packed
+                self.rope(kv, positions.flatten()), dequantize=not cache.window_fp8
             )
         else:
             # Same stage-major result, one kernel: the cat is not fused but
@@ -320,12 +322,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 self.rope.cos_cache,
                 self.rope.sin_cache,
                 eps,
-                packed=cache.packed,
+                packed=cache.window_fp8,
             )
         for i, attention in enumerate(layers):
             cache.write_window(
                 attention.spec.layer_id,
-                tuple(t[i : i + 1] for t in keys) if cache.packed else keys[i : i + 1],
+                (
+                    tuple(t[i : i + 1] for t in keys)
+                    if cache.window_fp8
+                    else keys[i : i + 1]
+                ),
                 step,
             )
 
@@ -604,20 +610,24 @@ class DeepseekV41DSpark(DSparkDraftModel):
         base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B, T, V/tp]
         tp_group = get_tp_group()
         use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
-        out_ids = anchor_ids.new_empty(B, T + 1)
-        out_ids[:, 0] = anchor_ids
-        markov_embeds = [
+        # Position k's id lands in column k and is position k + 1's previous
+        # id; position 0 reads the anchors where they are, not a copy of them.
+        out_ids = anchor_ids.new_empty(B, T)
+        # Each step writes its W1[x] rows into its column of this block, so
+        # the confidence head reads them without a stack.
+        markov_w1 = last.markov_head.markov_w1.weight
+        markov_embeds = markov_w1.new_empty(B, T, markov_w1.shape[1])
+        for k in range(T):
             dspark_markov_argmax_tp(
                 base_logits[:, k],
-                out_ids[:, k],
+                anchor_ids if k == 0 else out_ids[:, k - 1],
                 last.markov_head.markov_w1.weight,
                 last.markov_head.markov_w2.weight,
-                out_ids[:, k + 1],
+                out_ids[:, k],
                 head.vocab_start_idx,
                 tp_group,
                 use_custom=use_custom,
+                embed_out=markov_embeds[:, k],
             )
-            for k in range(T)
-        ]
-        confidence = last.confidence_head(hc_hidden, torch.stack(markov_embeds, dim=1))
-        return out_ids[:, 1:], confidence
+        confidence = last.confidence_head(hc_hidden, markov_embeds)
+        return out_ids, confidence

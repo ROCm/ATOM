@@ -20,8 +20,10 @@ Design:
   ``get_finished`` (called post-forward by ``async_proc_aggregation``). This is
   the fix for 005's "load blocks/starves prefill" (corr(TTFT, prefill-conc)=0.773).
 * **Producer fence for saves** — the scheduler emits a save only for chunks
-  whose forward has already run, but a non-final prefill chunk yields no token,
-  so nothing host-synchronizes on that forward before the next step dispatches
+  whose forward this worker has already enqueued (under PP, chunks of batches
+  dispatched before the save's metadata, which every stage takes in dispatch
+  order), but a non-final prefill chunk yields no token, so nothing
+  host-synchronizes on that forward before the next step dispatches
   metadata. The event recorded here on the dispatching stream is therefore the
   only ordering between the producing kernels and the save thread's pack
   stream; it travels through ``engine.store(**kwargs)`` to
@@ -214,9 +216,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 if save_ready_event is None:
                     # Metadata is dispatched before this step's forward, but the
                     # scheduler's save frontier (`build_connector_meta`) covers
-                    # only chunks whose forward already ran, so an event
-                    # recorded on the current stream now is ordered after the
-                    # kernels that produced every token in this step's saves.
+                    # only chunks whose forward this worker already enqueued on
+                    # this stream (under PP, chunks of earlier batches, which a
+                    # stage takes in dispatch order), so an event recorded on
+                    # the current stream now is ordered after the kernels that
+                    # produced every token in this step's saves.
                     # Create the shared step fence lazily so a HIP error here
                     # rejects this step's saves; loads must still be submitted
                     # and report a terminal result.

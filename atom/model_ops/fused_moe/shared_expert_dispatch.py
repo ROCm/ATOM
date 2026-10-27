@@ -48,14 +48,15 @@ def _remap_torch(
         dtype=topk_ids.dtype,
         device=topk_ids.device,
     ).expand(num_tokens, num_fused_shared_experts)
-    shared_w = torch.full(
-        (num_tokens, num_fused_shared_experts),
-        shared_weight,
-        dtype=topk_weights.dtype,
-        device=topk_weights.device,
-    )
+    # A pad row (routed to -1 throughout) takes no shared expert either.
+    pad = topk_ids[:, :1] < 0
+    shared_ids = torch.where(pad, -1, shared_ids)
+    shared_w = torch.where(pad, 0.0, shared_weight).to(topk_weights.dtype)
     return (
-        torch.cat((topk_weights, shared_w), dim=1),
+        torch.cat(
+            (topk_weights, shared_w.expand(num_tokens, num_fused_shared_experts)),
+            dim=1,
+        ),
         torch.cat((routed, shared_ids), dim=1),
     )
 
@@ -96,11 +97,14 @@ if _HAS_TRITON:
         shifted = phys + NUM_SHARED * (phys // routed_per_rank)
         disp = tl.where(in_range, shifted, phys)
 
-        sid = shared_base + (col - topk)
+        # A pad row (routed to -1 throughout) takes no shared expert either.
+        pad = tl.load(topk_ids_ptr + row * topk, mask=mask & ~is_routed, other=0) < 0
+        sid = tl.where(pad, -1, shared_base + (col - topk))
         tl.store(out_ids_ptr + offs, tl.where(is_routed, disp, sid), mask=mask)
 
         w = tl.load(topk_w_ptr + in_off, mask=rmask, other=0.0)
-        tl.store(out_w_ptr + offs, tl.where(is_routed, w, shared_weight), mask=mask)
+        sw = tl.where(pad, 0.0, shared_weight)
+        tl.store(out_w_ptr + offs, tl.where(is_routed, w, sw), mask=mask)
 
 
 def remap_topk_to_dispatch(

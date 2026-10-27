@@ -154,32 +154,65 @@ def test_unknown_explicit_offload_layout_is_rejected(override):
     "model_type",
     ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
 )
-def test_gdn_linear_model_offload_is_refused(model_type):
-    # A GDN model must be turned away at config resolution, not fall through to
-    # `dense` and restore a KV prefix over its stale recurrent state. Clear
-    # `compress_ratios` so the hybrid branch does not claim it first.
+def test_gdn_linear_model_offload_uses_the_page_image_tier(model_type):
+    # The PAGE-image tier already packs `page_unit_views`. Falling through to
+    # `dense` would restore KV over a stale slot. Clear `compress_ratios` so
+    # the hybrid branch does not claim the model first.
     config = _config()
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = model_type
 
-    with pytest.raises(ValueError, match="does not support GDN"):
-        offcfg.select_offload_layout(config)
+    assert offcfg.select_offload_layout(config) == "qwen"
+
+
+def test_qwen_offload_classes_inherit_the_k3_tier():
+    from atom.kv_transfer.offload._offload_common import StateOffloadFace
+    from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+        KimiK3OffloadConnector,
+        KimiK3OffloadScheduler,
+    )
+    from atom.kv_transfer.offload.hybrid.qwen.connector import (
+        QwenOffloadConnector,
+        QwenOffloadScheduler,
+    )
+
+    assert issubclass(QwenOffloadConnector, KimiK3OffloadConnector)
+    assert issubclass(QwenOffloadScheduler, KimiK3OffloadScheduler)
+    assert issubclass(QwenOffloadScheduler, StateOffloadFace)
 
 
 @pytest.mark.parametrize(
     "model_type",
     ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
 )
-def test_gdn_refusal_is_not_bypassed_by_offload_layout_override(model_type):
-    # The refusal must run *before* an explicit override is honoured. Otherwise
-    # `offload_layout: dense` on a GDN checkpoint returns `dense` early and
-    # restores a KV prefix over stale recurrent state (silent wrong output).
+def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
+    # lmcache_mp hashes the PAGE bytes through select_offload_layout. The
+    # family name is ``qwen``, which is not a page-mode key, so the pages stay
+    # the dense MHA mode. An illegal offload_layout override fails here too.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = model_type
+
+    namespace = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    assert namespace.startswith("org/model::atom-page-v")
+    config.kv_transfer_config = {"offload_layout": "dense"}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
+)
+def test_gdn_state_tier_is_not_downgraded_to_dense(model_type):
+    # An explicit `dense` override must not strip the state tier. Otherwise a
+    # KV prefix is restored over a stale slot.
     config = _config()
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = model_type
     config.kv_transfer_config = {"offload_layout": "dense"}
 
-    with pytest.raises(ValueError, match="does not support GDN"):
+    with pytest.raises(ValueError, match="owns no tier"):
         offcfg.select_offload_layout(config)
 
 

@@ -27,6 +27,7 @@ no fused variant to inherit.
 """
 
 import torch
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
@@ -37,7 +38,16 @@ from atom.model_ops.topK import mm_topk
 from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
-from atom.utils.forward_context import get_forward_context
+from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
+
+
+@torch_compile_guard(mutates_args=["output"], gen_fake=lambda output: None)
+def v41_record_tbo_expert_output(output: torch.Tensor) -> None:
+    # Keep this runtime stream dependency in compiled execution as well.
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if tbo_active():
+        output.record_stream(torch.cuda.current_stream())
 
 
 class MoE(V4MoE):
@@ -90,6 +100,7 @@ class MoE(V4MoE):
             out_ids=ids,
             out_weights=weights,
             image_mask=image_mask.flatten(),
+            num_valid_rows=pass_scheduled_tokens_gpu(rows),
         )
         return weights, ids
 
@@ -104,16 +115,24 @@ class MoE(V4MoE):
         self,
         x: torch.Tensor,
         shared_partial: torch.Tensor | None = None,
-        before_stage2=None,
+        before_stage2_for_rows=None,
+        before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
-        return self.experts.forward_maybe_comm_fused(
+        routed, is_complete = self.experts.forward_maybe_comm_fused(
             x,
             self.router_logits(x),
             shared_partial,
-            before_stage2=before_stage2,
+            before_stage2_for_rows=before_stage2_for_rows,
+            before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
         )
+        # create_comm_fused_moe_backend excludes TBO (and DP > 1), so TBO
+        # returns the fallback routed output before shared combine/mHC.
+        # This marker protects consumers after dispatch returns; it cannot
+        # fence an internal combine in a backend returning is_complete=True.
+        v41_record_tbo_expert_output(routed)
+        return routed, is_complete
 
     def forward(self, hidden):
         return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)

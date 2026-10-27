@@ -136,6 +136,26 @@ def test_scheduler_shell_forwards_block_lifecycle_hooks():
     assert calls == [("sent", "request-1"), ("released", "request-2")]
 
 
+def test_page_only_refuses_per_request_state(monkeypatch):
+    class PageWorker:
+        def __init__(self, config):
+            self.config = config
+
+        def register_kv_caches(self, caches, tensors, num_blocks):
+            raise AssertionError("PAGE-only must not register recurrent state")
+
+    monkeypatch.setattr(mp_worker, "LMCacheMPConnector", PageWorker)
+    worker = LMCacheMPConnector(_config())
+    caches = {"layer_0": SimpleNamespace(per_request_state=True)}
+
+    try:
+        worker.register_kv_caches(caches, SimpleNamespace(), 7)
+    except ValueError as exc:
+        assert "per-request recurrent state" in str(exc)
+    else:
+        raise AssertionError("expected PAGE-only recurrent state to be refused")
+
+
 def test_plain_page_layout_uses_generic_implementations(monkeypatch):
     selected = []
 
@@ -240,3 +260,26 @@ def test_scheduler_rejects_disabled_paged_state_checkpoints(monkeypatch):
     enabled = SimpleNamespace(paged_state_checkpoints=SimpleNamespace(enabled=True))
     LMCacheMPConnectorScheduler(_config()).bind_block_manager(enabled)
     assert selected == ["native"]
+
+
+def test_worker_takes_page_only_path_for_replayed_state(monkeypatch):
+    """A `replay` state transfer rebuilds the state at every hit, so a PAGE-only
+    load is resumable even with per-request state registered."""
+    selected = []
+
+    class PageWorker:
+        def __init__(self, config):
+            selected.append("page")
+
+        def register_kv_caches(self, *_):
+            pass
+
+    monkeypatch.setattr(mp_worker, "LMCacheMPConnector", PageWorker)
+    builder = SimpleNamespace(
+        state_transfer=lambda: SimpleNamespace(copies=False, replays=True),
+    )
+    state = SimpleNamespace(per_request_state=True)
+    LMCacheMPConnector(_config()).register_kv_caches(
+        {"state": state}, SimpleNamespace(state_backend=builder), 7
+    )
+    assert selected == ["page"]

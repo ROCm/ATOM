@@ -29,14 +29,6 @@
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },
         {
-          "label": "MTP3",
-          "suffix": "-mtp3",
-          "extra_args": "--method mtp --num-speculative-tokens 3",
-          "bench_args": "--use-chat-template",
-          "conc_min": 1,
-          "conc_max": 256
-        },
-        {
           "label": "TBO",
           "suffix": "-tbo",
           "extra_args": "--enable-tbo",
@@ -60,18 +52,10 @@
           "conc_max": 2048
         },
         {
-          "label": "DPA MTP3",
-          "suffix": "-dpa-mtp3",
-          "extra_args": "--method mtp --num-speculative-tokens 3 --enable-dp-attention",
-          "bench_args": "--use-chat-template",
-          "conc_min": 64,
-          "conc_max": 1024
-        },
-        {
           "label": "DPA DSpark",
           "suffix": "-dpa-dspark",
           "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
-          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode AF_PIECEWISE --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode TR_HYBRID --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 512
@@ -123,7 +107,7 @@
       "env_vars": "",
       "config": {
         "tp": 4,
-        "kv_cache_dtype": "bf16",
+        "kv_cache_dtype": "fp8",
         "extra_args": "--index_cache_dtype fp4"
       },
       "variants": [
@@ -157,57 +141,6 @@
       ]
     },
     {
-      "display": "GLM-5.2-FP8",
-      "path": "zai-org/GLM-5.2-FP8",
-      "prefix": "glm-5-2-fp8",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
-      "config": {
-        "tp": 4,
-        "kv_cache_dtype": "fp8",
-        "extra_args": "--no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"mxfp8\"}, \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\"]}'"
-      },
-      "variants": [
-        { "label": "", "suffix": "", "conc_max": 256 },
-        {
-          "label": "MTP3",
-          "suffix": "-mtp3",
-          "extra_args": "--method mtp --num-speculative-tokens 3",
-          "bench_args": "--use-chat-template",
-          "conc_min": 1,
-          "conc_max": 256
-        }
-      ]
-    },
-    {
-      "display": "GLM-5.2-MXFP4",
-      "path": "amd/GLM-5.2-MXFP4",
-      "prefix": "glm-5-2-mxfp4",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
-      "config": {
-        "tp": 4,
-        "kv_cache_dtype": "fp8",
-        "extra_args": "--no-enable_prefix_caching"
-      },
-      "variants": [
-        {
-          "label": "",
-          "suffix": "",
-          "extra_args": "--online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}'",
-          "conc_max": 256
-        },
-        {
-          "label": "MTP3",
-          "suffix": "-mtp3",
-          "extra_args": "--online_quant_config '{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\",\"model.layers.[1-6][0-9].mlp.*expert*\",\"model.layers.7[0-7].mlp.*expert*\"]}' --method mtp --num-speculative-tokens 3",
-          "bench_args": "--use-chat-template",
-          "conc_min": 1,
-          "conc_max": 256
-        }
-      ]
-    },
-    {
       "display": "gpt-oss-120b",
       "path": "openai/gpt-oss-120b",
       "prefix": "gpt-oss-120b",
@@ -216,20 +149,6 @@
       "config": {
         "kv_cache_dtype": "fp8",
         "extra_args": "--gpu-memory-utilization 0.9"
-      },
-      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
-    },
-    {
-      "display": "Kimi-K2.7-Code-MXFP4",
-      "path": "amd/Kimi-K2.7-Code-MXFP4",
-      "prefix": "kimi-k27-code-mxfp4",
-      "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
-      "config": {
-        "tp": 4,
-        "kv_cache_dtype": "fp8",
-        "trust_remote_code": true,
-        "extra_args": "--gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"\", \"layer_quant_config\": {\"model.layers.*.self_attn.fused_qkv_a_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.q_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.kv_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.o_proj\": \"ptpc_fp8\"}}'"
       },
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     },

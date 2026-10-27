@@ -36,8 +36,10 @@ from atom.model_engine.engine_utility import (
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
 )
+from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
+from atom.observability import tracing
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -171,6 +173,14 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
         logical // visible,
     )
     return visible
+
+
+def _add_frame(seqs: list[Sequence]) -> bytes:
+    """An ADD request for an engine that admits `seqs` with a BlockManager:
+    their shipped prompt chains, if any, ride third (`take_shipped_chains`)."""
+    chains = take_shipped_chains(seqs)
+    frame = (EngineCoreRequestType.ADD, seqs) + ((chains,) if chains else ())
+    return pickle.dumps(frame)
 
 
 class CoreManager:
@@ -986,6 +996,7 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
+        tracing.bind_sequences(seqs)
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
@@ -998,11 +1009,11 @@ class CoreManager:
             # Pipeline parallel (dp=1): requests enter only at stage 0, which
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+            self._send_request(0, _add_frame(seqs))
         elif self._routable_engine_count == 1:
             # Single routable engine, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+            self._send_request(0, _add_frame(seqs))
         else:
             self._dispatch_to_dp_ranks(seqs)
 
@@ -1107,9 +1118,7 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                self._send_request(
-                    dp_rank, pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
-                )
+                self._send_request(dp_rank, _add_frame(rank_seqs))
                 dispatched[dp_rank] = True
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
@@ -2351,6 +2360,7 @@ class DisaggCoreManager(CoreManager):
 
     def add_request(self, seqs: list[Sequence]):
         """Fan-out: send every new sequence to BOTH prefill and decode."""
+        tracing.bind_sequences(seqs, unsupported="pd")
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
         # Register stream callbacks before sending (decode will produce output).
         for seq in seqs:
@@ -2358,8 +2368,9 @@ class DisaggCoreManager(CoreManager):
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
 
-        # Send decode payload as-is.
-        decode_payload = pickle.dumps((EngineCoreRequestType.ADD, seqs))
+        # Send decode payload as-is. Decode admits and allocates the blocks
+        # (`DecodeScheduler.allocate_waiting`), so it alone gets the chains.
+        decode_payload = _add_frame(seqs)
         self._send_request(1, decode_payload)
 
         # For prefill: limit each sequence to 1 output token.  Prefill discards

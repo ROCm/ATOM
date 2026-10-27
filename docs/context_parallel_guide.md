@@ -90,7 +90,7 @@ ATOM_PCP_MOE_MERGE=0            # run MoE per-rank on its 1/pcp shard, no extra 
 
 | Value | MoE behaviour | When to use |
 |---|---|---|
-| `1` (default, recommended) | PCP is folded into the MoE tensor/expert sharding, so MoE weights are also sharded across PCP ranks. Lowers per-GPU MoE weight memory, at the cost of one hidden gather/scatter per MoE layer (which TBO overlaps). | Most deployments |
+| `1` (default, recommended) | PCP is folded into the MoE tensor/expert sharding, so MoE weights are also sharded across PCP ranks. Lowers per-GPU MoE weight memory, at the cost of one routed-rows gather (hidden states with their top-k weights and ids) and one reduce-scatter per MoE layer (which TBO overlaps). | Most deployments |
 | `0` | Each GPU runs MoE independently on its `1/pcp` shard with no extra MoE communication; MoE weights are replicated across PCP ranks. | Avoid extra MoE comm and have memory headroom for replicated MoE weights |
 
 ## Launching server
@@ -210,8 +210,12 @@ PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 2. Each rank runs attention / indexer / compressor on its `1/pcp` token shard.
    The full KV is kept on every rank (all-gathered as needed), so the attention
    kernels are unchanged.
-3. MoE either runs on the local `1/pcp` shard (`ATOM_PCP_MOE_MERGE=0`) or gathers
-   to the full sequence and scatters back (`=1`, default).
+3. MoE either runs on the local `1/pcp` shard (`ATOM_PCP_MOE_MERGE=0`) or
+   (`=1`, default) routes the local shard, gathers the routed rows -- hidden
+   states with their top-k weights and ids, in the format the experts take
+   (MXFP8 where they take it) -- to the full sequence inside `FusedMoE`, and
+   reduce-scatters the routed experts' output back. The shared expert runs on
+   the local shard only.
 4. After the final layer, the `1/pcp` hidden states are all-gathered back to the
    full sequence, the original token order is restored, and the LM head runs.
 5. Decode is untouched: every rank keeps the full KV and runs normally, so PCP
