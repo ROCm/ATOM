@@ -1299,11 +1299,12 @@ class KimiKDAAttention(nn.Module):
         # for exactly one forward: the prefix-cache hit that forks off a
         # checkpoint (BlockManager._attach_state_group reads `state_fork_src`
         # and writes a freshly popped group). Reading the write slot there
-        # resumes from whatever the recycled group still held. Only prefill can
-        # carry a fork -- prepare_state_indices asserts it, and min_fork_tokens
-        # keeps the chunk long enough -- so the decode branches below stay on
-        # `state_indices`. Falling back to the write slot leaves every non-fork
-        # forward bit-identical. Mirrors attention_gdn.py.
+        # resumes from whatever the recycled group still held. Under pp=1 only
+        # prefill carries a fork, since the checkpoint is taken between prompt
+        # chunks; under pp>1 it lands after the prompt, so the decode and
+        # spec-decode branches below honour it too, gated on `has_state_fork`.
+        # Falling back to the write slot leaves every non-fork forward
+        # bit-identical. Mirrors attention_gdn.py.
         state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
         if state_indices_in is None:
             state_indices_in = state_indices
@@ -1361,6 +1362,13 @@ class KimiKDAAttention(nn.Module):
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
+            decode_state_indices_in = state_indices_in[:num_actual_tokens]
+            if kda_metadata.has_state_fork:
+                # Under pp>1 the checkpoint can land after the prompt, so a fork
+                # can reach decode. The conv update reads the _in slot itself; the
+                # recurrence kernel updates in place with no _in index, so copy
+                # the source state onto the (zeroed) destination slot first.
+                ssm_state[decode_state_indices] = ssm_state[decode_state_indices_in]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1370,6 +1378,7 @@ class KimiKDAAttention(nn.Module):
                 None,
                 self.activation,
                 conv_state_indices=decode_state_indices,
+                conv_state_indices_in=decode_state_indices_in,
                 validate_data=False,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -1431,6 +1440,23 @@ class KimiKDAAttention(nn.Module):
             spec_state_indices = kda_metadata.spec_state_indices_tensor
             spec_query_start_loc = kda_metadata.spec_query_start_loc
             num_accepted_tokens = kda_metadata.num_accepted_tokens
+            if kda_metadata.has_state_fork:
+                # Same moment as the decode branch above: under pp>1 the
+                # checkpoint can land after the prompt, and with DSpark on the
+                # first decode after it IS a verify step. Neither kernel below
+                # takes a read-side index -- the conv one walks forward from
+                # `spec_state_indices[:, 0]` and the recurrence updates in
+                # place -- so move both halves onto the write slot first and
+                # let them run on it. Only the resume slot (column 0) is
+                # seeded: the rest of the row is this request's own rollback
+                # scratch, which the kernels write as they walk forward. The
+                # builder ships `_in` on this path only when forked, which is
+                # exactly when this gate is open.
+                nsd = kda_metadata.num_spec_decodes
+                fork_dst = spec_state_indices[:nsd, 0]
+                fork_src = state_indices_in[:nsd]
+                ssm_state[fork_dst] = ssm_state[fork_src]
+                conv_state[fork_dst] = conv_state[fork_src]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,

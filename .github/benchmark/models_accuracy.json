@@ -248,6 +248,19 @@
     "_baseline_note": "Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured."
   },
   {
+    "model_name": "Kimi-K3 DSpark PP2",
+    "model_path": "moonshotai/Kimi-K3",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --pipeline-parallel-size 2 --enforce-eager --trust-remote-code --gpu-memory-utilization 0.9 --block-size 128 --enable_prefix_caching --method dspark --draft-model Inferact/Kimi-K3-DSpark --num-speculative-tokens 7 --max-num-seqs 64 --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*self_attn.[qkv]_conv1d*\", \"*block_sparse_moe.experts*\", \"*block_sparse_moe.routed_expert_*\", \"*vision_tower*\", \"*mm_projector*\"]}'",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.94,
+    "accuracy_timeout_minutes": 60,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark",
+    "_baseline_note": "The only pipeline-parallel accuracy case: Kimi-K3 pp2 x tp4 with DSpark (7 tokens) and prefix caching on, which together exercise the PP-only paths -- the undeferred verify window, the cross-stage aux relay, the checkpoint hold and a KDA state fork landing on a verify step. Eager because PP decode has no CUDA graphs yet, hence the longer timeout. ptpc_fp8 online quant as the Kimi-K3 TP8 case runs it. Spec decode is lossless, so baseline and threshold match Kimi-K3."
+  },
+  {
     "model_name": "Qwen3.5-35B-A3B TP2",
     "model_path": "Qwen/Qwen3.5-35B-A3B",
     "extraArgs": "--kv_cache_dtype fp8 -tp 2 --no-enable_prefix_caching",

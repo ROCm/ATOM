@@ -47,6 +47,10 @@ class KimiMLAGDNBackend(AttentionBackend):
 
 
 class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
+    # `KimiKDAAttention` moves a forked state onto the write slot before
+    # the spec kernels run, so a fork may reach a spec-verify decode.
+    spec_honours_state_fork = True
+
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
 
