@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 import triton
@@ -88,6 +88,15 @@ from atom.utils.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+
+if TYPE_CHECKING:
+    from atom.model_ops.dcp_ops import DcpAllGatherHandle
+
+# DCP prefix-gather prefetch only pays for steps with at least this many new
+# tokens in a sequence: below it the step is host-launch bound, there is no long
+# kernel to hide a gather behind, and the side-stream bookkeeping only adds host
+# time (measured on MI355: +5 ms on a 1024-token tail step).
+_DCP_AG_PREFETCH_MIN_NEW_TOKENS = 8192
 
 # Cap on the KV-split budget: aiter cuts the KV walk into
 # `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
@@ -578,6 +587,12 @@ def should_use_persistent_mode(
 
 
 class MLAAttention(nn.Module):
+    # DCP prefix-gather prefetch (ATOM_DCP_PREFILL_KV_AG_OVERLAP): the layer numbers
+    # that gather a cached prefix, and the one in-flight prefetch
+    # (attn_metadata, layer_num, {chunk: DcpAllGatherHandle}) its predecessor started.
+    _dcp_layers: ClassVar[set[int]] = set()
+    _dcp_prefetched: ClassVar[tuple | None] = None
+
     def __init__(
         self,
         num_heads: int,
@@ -752,6 +767,7 @@ class MLAAttention(nn.Module):
             self.dcp_group = get_dcp_group()
             self.dcp_rank = get_dcp_rank()
             self._cp_triton_ctx = CPTritonContext()
+            MLAAttention._dcp_layers.add(layer_num)
         else:
             self.dcp_group = None
             self.dcp_rank = 0
@@ -1784,6 +1800,7 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         chunk_meta,
+        ctx_gathers: "dict[int, DcpAllGatherHandle] | None" = None,
     ) -> torch.Tensor:
         """Chunked prefill for the has_cached branch.
 
@@ -1805,6 +1822,7 @@ class MLAAttention(nn.Module):
         from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
 
         self._check_flydsl_fp8_mha(prefill_q)
+        gather_ready = self._dcp_prefetch_ready(attn_metadata, chunk_meta)
 
         # Trigger counter: log first hit + every 500th to confirm the chunked
         # path is actually exercised (not silently bypassed when
@@ -1861,6 +1879,14 @@ class MLAAttention(nn.Module):
             q_fp8=q_fp8,
             kv_fp8=new_kv_fp8,
         )
+        # Launched behind the new-token attention, so their host launch cost is
+        # paid while that kernel runs. This layer's own gathers only if no
+        # predecessor prefetched them (the first one); then the next layer's.
+        if ctx_gathers is None:
+            ctx_gathers = self._dcp_start_context_gathers(
+                kv_cache, chunk_meta, gather_ready
+            )
+        self._dcp_prefetch_next(attn_metadata, chunk_meta, gather_ready)
 
         # Step 2: chunked cached-prefix attention.
         chunked_out: torch.Tensor | None = None
@@ -1877,6 +1903,7 @@ class MLAAttention(nn.Module):
                 chunk_meta,
                 q_fp8=q_fp8,
                 kv_out_scales=kv_out_scales,
+                ctx_gathers=ctx_gathers,
             )
         else:
             k_workspace = chunk_meta.k_workspace
@@ -1960,6 +1987,89 @@ class MLAAttention(nn.Module):
             )
         return self.o_proj(output.flatten(start_dim=-2))
 
+    def _dcp_prefetch_ready(self, attn_metadata, chunk_meta):
+        """The point from which this step's prefix gathers may start, or None.
+
+        The gathers read only the cache as of the previous step, so they may
+        start as soon as everything queued so far is done, not after the
+        new-token work. None (they run in place) unless overlap is on, the
+        step has a DCP cached prefix, and its sequences have at least
+        ``_DCP_AG_PREFETCH_MIN_NEW_TOKENS`` new tokens (``max_seqlen_q`` is the
+        same on every rank).
+        """
+        from atom.model_ops.dcp_ops import dcp_all_gather_ready
+
+        if (
+            getattr(chunk_meta, "is_dcp", False)
+            and attn_metadata.max_seqlen_q >= _DCP_AG_PREFETCH_MIN_NEW_TOKENS
+        ):
+            return dcp_all_gather_ready(self.dcp_group)
+        return None
+
+    def _dcp_start_context_gathers(
+        self, kv_cache: torch.Tensor, chunk_meta, ready
+    ) -> "dict[int, DcpAllGatherHandle]":
+        """Start every context chunk's KV gather on the side stream, or none.
+
+        The gather reads only the already-cached prefix and the step's
+        metadata, never this layer's q or new-token KV, so it may run under any
+        earlier layer's compute. The new tokens' cache write lands in other
+        slots than the real prefix; the padding rows a chunk's last partial
+        block carries may race it, but the reorg drops them. {} (the gathers
+        then run in place) when ``ready`` is None, i.e. overlap is off; chunks
+        with no local tokens are skipped on every rank.
+        """
+        from atom.model_ops.dcp_ops import (
+            DcpAllGatherHandle,
+            dcp_gather_compressed_kv,
+        )
+
+        if ready is None:
+            return {}
+        return {
+            c: DcpAllGatherHandle(
+                self.dcp_group,
+                functools_partial(
+                    dcp_gather_compressed_kv, kv_cache, chunk_meta.local_slot_ids[c]
+                ),
+                0,
+                ready,
+            )
+            for c in range(chunk_meta.num_chunks)
+            if chunk_meta.seq_tot[c] != 0
+        }
+
+    def _dcp_prefetch_next(self, attn_metadata, chunk_meta, ready) -> None:
+        """Start the next DCP MLA layer's prefix gathers (cross-layer prefetch).
+
+        They read only that layer's already-cached prefix, so they run beside
+        this layer's attention instead of in front of the next layer's.
+        Nothing after the last layer.
+        """
+        nxt = min(
+            (n for n in MLAAttention._dcp_layers if n > self.layer_num), default=None
+        )
+        if ready is None or nxt is None:
+            return
+        entry = get_forward_context().kv_cache_data.get(f"layer_{nxt}")
+        if entry is None:
+            return
+        MLAAttention._dcp_prefetched = (
+            attn_metadata,
+            nxt,
+            self._dcp_start_context_gathers(entry.k_cache, chunk_meta, ready),
+        )
+
+    def _dcp_take_prefetched(
+        self, attn_metadata
+    ) -> "dict[int, DcpAllGatherHandle] | None":
+        """This layer's prefetched gathers, or None (nobody prefetched, or they
+        belong to another step or layer)."""
+        pre, MLAAttention._dcp_prefetched = MLAAttention._dcp_prefetched, None
+        if pre is not None and pre[0] is attn_metadata and pre[1] == self.layer_num:
+            return pre[2]
+        return None
+
     def _dcp_compute_prefill_context(
         self,
         prefill_q: torch.Tensor,
@@ -1968,6 +2078,7 @@ class MLAAttention(nn.Module):
         chunk_meta,
         q_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
         kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ctx_gathers: "dict[int, DcpAllGatherHandle] | None" = None,
     ):
         """DCP chunked cached-prefix context attention.
 
@@ -1983,6 +2094,10 @@ class MLAAttention(nn.Module):
         the fp8 dequant, the reorg copies, the ``kv_b_proj`` decompress and the
         k_pe concat all ride along with it instead of costing a kernel (and, for
         the reorg, a per-layer Python walk over every (seq, rank) segment) each.
+
+        ``ctx_gathers`` holds the chunks whose gather the layer already started
+        (see ``_dcp_start_context_gathers``); any other chunk's gather runs in
+        place, as before.
         """
         from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
         from atom.model_ops.dcp_ops import dcp_all_gather, dcp_gather_compressed_kv
@@ -1994,16 +2109,22 @@ class MLAAttention(nn.Module):
                 # No local tokens on any rank here. Rank-invariant (the padded
                 # local length is), so every rank skips the collective together.
                 continue
-            # 1. gather this rank's local compressed KV for the chunk (keeps the
-            #    cache dtype, so fp8 stays fp8 here).
-            local_kv = dcp_gather_compressed_kv(kv_cache, chunk_meta.local_slot_ids[c])
-            # 2. AllGather across DCP ranks -> [seq_tot * dcp_world_size, d]. It is
-            #    a copy-only collective, so an fp8 payload is safe (no fp8
-            #    arithmetic, unlike an all-reduce) and keeps the wire at half the
-            #    bf16 traffic. fp8 has no entry in the custom collective's dtype
-            #    enum, so dcp_all_gather pairs the bytes into fp16 rather than
-            #    give the gather up to pynccl.
-            ag_kv = dcp_all_gather(self.dcp_group, local_kv, 0)
+            # 1+2. gather this rank's local compressed KV for the chunk (keeps the
+            #    cache dtype, so fp8 stays fp8 here) and AllGather it across DCP
+            #    ranks -> [seq_tot * dcp_world_size, d]. It is a copy-only
+            #    collective, so an fp8 payload is safe (no fp8 arithmetic, unlike
+            #    an all-reduce) and keeps the wire at half the bf16 traffic. fp8
+            #    has no entry in the custom collective's dtype enum, so
+            #    dcp_all_gather pairs the bytes into fp16 rather than give the
+            #    gather up to pynccl. Already in flight if overlap started it.
+            gather = ctx_gathers.pop(c, None) if ctx_gathers else None
+            if gather is not None:
+                ag_kv = gather.wait()
+            else:
+                local_kv = dcp_gather_compressed_kv(
+                    kv_cache, chunk_meta.local_slot_ids[c]
+                )
+                ag_kv = dcp_all_gather(self.dcp_group, local_kv, 0)
 
             sum_seq_len = chunk_meta.total_tokens[c]
             if sum_seq_len == 0:
@@ -2955,6 +3076,7 @@ class MLAAttention(nn.Module):
             # QREP: q_proj emits the whole DCP-group head set, but dense prefill
             # needs only this rank's heads: its MHA path never gathers q, so there
             # is no AllGather Q for QREP to remove here.
+            ctx_gathers = self._dcp_take_prefetched(attn_metadata)
             proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
             prefill_q = proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
@@ -3007,7 +3129,13 @@ class MLAAttention(nn.Module):
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
                 if chunk_meta is not None:
                     output = self._forward_prefill_cached_chunked(
-                        prefill_q, k_nope, k_rope, kv_cache, attn_metadata, chunk_meta
+                        prefill_q,
+                        k_nope,
+                        k_rope,
+                        kv_cache,
+                        attn_metadata,
+                        chunk_meta,
+                        ctx_gathers,
                     )
                 else:
                     output = self._forward_prefill_cached_single_pass(
