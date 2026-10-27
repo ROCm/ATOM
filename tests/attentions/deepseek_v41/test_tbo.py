@@ -73,7 +73,7 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8), replaying=None):
         cu.np[i + 1] = cu.np[i] + length
     cu.copy_to_gpu(len(lengths) + 1)
     builder.engram = None
-    parent, _ = builder.prepare_prefill(batch, len(lengths))
+    parent, _ = builder.prepare_prefill(batch, len(lengths), batch.total_tokens_num)
     parent.engram_embeddings = {
         layer: torch.arange(sum(lengths) * 4, device=device).view(1, -1, 4) + layer
         for layer in (1, 3)
@@ -145,15 +145,13 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
             steps[0].plans[ratio].compress_plan_gpu.data_ptr()
             != steps[1].plans[ratio].compress_plan_gpu.data_ptr()
         )
-    for ratio in steps[0].indptrs:
-        assert (
-            steps[0].indptrs[ratio][0].data_ptr()
-            != steps[1].indptrs[ratio][0].data_ptr()
+    if device == "cuda":
+        first, second, whole = (
+            parent.cache.indptrs(step) for step in (*steps, parent.step)
         )
-        assert (
-            steps[0].indptrs[ratio][0].data_ptr()
-            != parent.step.indptrs[ratio][0].data_ptr()
-        )
+        for ratio in first:
+            assert first[ratio][0].data_ptr() != second[ratio][0].data_ptr()
+            assert first[ratio][0].data_ptr() != whole[ratio][0].data_ptr()
     for field in ("selected", "candidates", "tiles"):
         getattr(steps[0], field)[2] = torch.tensor([17])
         steps[1].begin_forward()
@@ -252,7 +250,7 @@ def test_kv_release_keeps_persistent_ubatch_buffers_for_rebind(device):
         total_tokens_num=14,
         total_seqs_num=2,
     )
-    parent, _ = builder.prepare_prefill(batch, 2)
+    parent, _ = builder.prepare_prefill(batch, 2, batch.total_tokens_num)
     part = UBatchSlice(slice(0, 2), slice(7, 14))
     child = builder.build_ubatch_prefill_metadata(parent, part, 2, 0)
     torch.testing.assert_close(child.step.positions, parent.step.positions[7:14])
@@ -749,11 +747,11 @@ def test_dp_moe_original_schedule_preserves_outputs(
     monkeypatch.setattr(moe, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(moe, "get_dp_group", lambda: None)
 
-    def gather(hidden, router, eager, ctx, group):
+    def gather(rows, eager, ctx, group):
         assert eager == (not unified)
         calls.append((tbo_current_ubatch_id(), "gather"))
         torch.cuda._sleep(2_000_000)
-        return hidden.clone(), router.clone(), len(hidden), [len(hidden)]
+        return tuple(t.clone() for t in rows), len(rows[0]), [len(rows[0])]
 
     def scatter(hidden, *args):
         calls.append((tbo_current_ubatch_id(), "scatter"))
@@ -766,9 +764,13 @@ def test_dp_moe_original_schedule_preserves_outputs(
 
     def experts(**kwargs):
         calls.append((tbo_current_ubatch_id(), "experts"))
-        return kwargs["x"] * 2 + kwargs["router_logits"]
+        return kwargs["x"] * 2 + kwargs["topk_weights"]
 
-    monkeypatch.setattr(moe, "dp_gather_hidden_and_router", gather)
+    def select_experts(layer, hidden, router):
+        # The router itself stands in for the weights (and the ids).
+        return router, router
+
+    monkeypatch.setattr(moe, "dp_gather_routed_rows", gather)
     monkeypatch.setattr(moe, "reduce_scatterv", scatter)
     monkeypatch.setattr(moe, "reduce_scatter_with_unpadding", scatter)
     layer = SimpleNamespace(
@@ -776,8 +778,15 @@ def test_dp_moe_original_schedule_preserves_outputs(
         moe_parallel_config=SimpleNamespace(
             use_all2all_kernels=False, dp_logical_ratio=1
         ),
-        quant_method=SimpleNamespace(apply=experts),
+        quant_method=SimpleNamespace(
+            select_experts=select_experts, routed_rows_wire=None
+        ),
+        _run_experts=lambda hidden, weights, ids, x_scale, gathered: (
+            experts(x=hidden, topk_weights=weights, topk_ids=ids)
+        ),
         reduce_results=False,
+        # No prefilled shared columns to re-mark after the gather.
+        expert_layout=SimpleNamespace(mode=None),
         top_k=1,
         renormalize=False,
         use_grouped_topk=False,
@@ -959,9 +968,13 @@ def test_forward_does_not_repeat_request_admission(monkeypatch, dp_attention):
         image_mask=torch.ones(1, 1, dtype=torch.bool),
         step=SimpleNamespace(begin_forward=lambda: None, requests=()),
     )
+    # `main_stream` / `in_hipgraph`: the op is a TR-graph break, and an
+    # unrecorded break runs on the context's main stream (`eager_region`).
     context = SimpleNamespace(
         attn_metadata=metadata,
         dp_metadata=object() if dp_attention else None,
+        main_stream=None,
+        in_hipgraph=False,
     )
     monkeypatch.setattr(_forward_context_local, "ctx", context, raising=False)
     hidden = torch.empty(1, 1, 1)
@@ -1000,8 +1013,12 @@ def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
         parent, part, part.request_slice.stop, ubatch_idx=ubatch_idx
     )
     assert child.ubatch_slices is None
-    width = child.attn_metadata.step.width
-    # without the worker context the child looks like a replayable prefill
+    step = child.attn_metadata.step
+    # only a whole prefill's step carries a decoder plan, never a child's
+    assert step.decoder is None and replayable(child, step.width) is False
+    # given one, the worker context still keeps the child on every row
+    step.decoder = object()
+    width = step.width
     assert replayable(child, width) is True
     monkeypatch.setitem(
         ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), ubatch_idx
@@ -1048,13 +1065,11 @@ def test_tbo_preserves_v4_forward_signature(monkeypatch):
     from atom.models import deepseek_v4
 
     monkeypatch.setattr(deepseek_v4, "_pcp_active", lambda: False)
-    monkeypatch.setattr(deepseek_v4, "_moe_pcp_merge_active", lambda: False)
-    context = SimpleNamespace(context=SimpleNamespace(input_ids=None))
+    context = SimpleNamespace(context=SimpleNamespace(input_ids=None, pcp_split=None))
     monkeypatch.setattr(deepseek_v4, "get_forward_context", lambda: context)
 
     class Model(torch.nn.Module):
         forward = deepseek_v4.DeepseekV4ForCausalLM.forward
-        _need_ids_gather = False
 
         def model(self, input_ids, positions):
             return input_ids + positions

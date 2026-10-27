@@ -99,13 +99,13 @@ ATOM uses a module-level global `ForwardContext` to pass metadata through CUDA g
 
 - **`Context`** — lightweight struct: `positions`, `is_prefill`, `batch_size`, `running_bs`, `running_tokens`, `is_draft`. The last two are the step's DP-unified padded shape: sequences and hidden_states rows respectively.
 
-- **`DPMetadata`** — data parallel metadata with `num_tokens_across_dp()` (all-reduce), `max_tokens_across_dp`, and `chunked_sizes()` context manager.
+- **`DPMetadata`** — data parallel metadata holding every rank's running tokens (`running_tokens_per_dp_rank`, a numpy array), with `gather_running_tokens()` (all-reduce, for a caller that knows only its own count), `max_tokens_across_dp`, and `get_sizes_across_dp()`.
 
 **Global accessors:**
 
 | Function | Purpose |
 |---|---|
-| `set_forward_context(attn_metadata, atom_config, context, ...)` | Set the global context before a forward pass |
+| `set_forward_context(attn_metadata, atom_config, context, running_tokens_per_dp_rank, ...)` | Set the global context before a forward pass |
 | `get_forward_context()` | Retrieve the current context (used by attention backends) |
 | `reset_forward_context()` | Clear after forward pass completes |
 | `set_kv_cache_data(kv_cache_data)` | Register KV cache tensors at initialization |

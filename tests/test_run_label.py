@@ -276,6 +276,99 @@ class TestGraphBs:
         assert int(re.search(r"bs=(\d+)", lbl).group(1)) == 117
 
 
+def _eager(is_prefill, tok, running_tokens, ctx, **kw):
+    return build_run_label(
+        is_prefill=is_prefill,
+        use_cudagraph=False,
+        is_dummy=False,
+        tbo_on=False,
+        scheduled_bs=len(ctx),
+        running_bs=len(ctx),
+        batch=(prefill_batch if is_prefill else decode_batch_ctx)(tok, ctx),
+        running_tokens=running_tokens,
+        **kw,
+    )
+
+
+def decode_batch_ctx(tok, ctx):
+    return _FakeBatch(
+        total_tokens_num=tok,
+        total_seqs_num_decode=len(ctx),
+        context_lens=np.asarray(ctx, dtype=np.int64),
+    )
+
+
+class TestPaddedTokens:
+    """`tok=<scheduled>/<running>` wherever the forward runs rows past the
+    scheduled ones, as `bs` shows a padded graph batch."""
+
+    def test_a_prefill_padded_to_a_token_graph_bucket(self):
+        assert "tok=155/256 ctx=48283" in _eager(True, 155, 256, [48283])
+
+    def test_a_decode_padded_to_a_peers_prefill_bucket(self):
+        lbl = _eager(False, 12, 3072, [84991, 169353])
+        assert lbl.startswith("eager_decode[bs=2 tok=12/3072 ")
+
+    def test_an_unpadded_step_shows_one_number(self):
+        for running in (7424, None):
+            lbl = _eager(True, 7424, running, [200192])
+            assert "tok=7424 " in lbl and "/" not in lbl
+
+    def test_a_decode_graph_shows_its_rectangle(self):
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=True,
+            is_dummy=False,
+            tbo_on=False,
+            scheduled_bs=2,
+            running_bs=3,
+            batch=decode_batch(12, d=2, spec=5),
+            running_tokens=18,
+        )
+        assert lbl.startswith("decode[bs=2/3 tok=12/18 d=2 spec=5")
+
+    def test_parse_trace_still_reads_the_scheduled_tokens(self):
+        import re
+
+        lbl = _eager(False, 12, 3072, [84991, 169353])
+        assert int(re.search(r"tok=(\d+)", lbl).group(1)) == 12
+
+
+class TestDpRanks:
+    """`dp=[...]`: what every DP rank scheduled and whether it prefills, this
+    rank starred -- what a decode beside a prefilling peer was padded for."""
+
+    def test_a_decode_beside_a_prefilling_peer(self):
+        lbl = _eager(
+            False, 12, 3072, [84991, 169353], dp=((12, False), (2237, True)), dp_rank=0
+        )
+        assert lbl.endswith(" dp=[12d*,2237p]]")
+
+    def test_the_prefilling_rank_stars_itself(self):
+        lbl = _eager(
+            True, 2237, 3072, [200199, 86838], dp=((12, False), (2237, True)), dp_rank=1
+        )
+        assert " dp=[12d,2237p*]" in lbl
+
+    def test_a_decode_graph_step_carries_it_too(self):
+        lbl = build_run_label(
+            is_prefill=False,
+            use_cudagraph=True,
+            is_dummy=False,
+            tbo_on=True,
+            scheduled_bs=2,
+            running_bs=3,
+            batch=decode_batch(12, d=2, spec=5),
+            running_tokens=18,
+            dp=((12, False), (6, False)),
+            dp_rank=0,
+        )
+        assert lbl.endswith(" dp=[12d*,6d] tbo=1]")
+
+    def test_one_rank_has_no_dp_field(self):
+        assert "dp=" not in _eager(True, 155, 256, [48283])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 

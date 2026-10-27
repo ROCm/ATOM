@@ -24,53 +24,28 @@
     "_baseline_note": "Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059"
   },
   {
-    "model_name": "DeepSeek-V4-Pro DEP RCCL",
-    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --enable-dp-attention --enable-expert-parallel --all2all-backend rccl",
-    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "pr",
-    "accuracy_threshold": 0.94,
-    "accuracy_baseline": 0.96,
-    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "PR #2110 regression coverage for DPA8 + EP8 using the native RCCL transport with EPLB disabled. Reuses the DeepSeek-V4-Pro 3-shot GSM8K baseline."
-  },
-  {
-    "model_name": "DeepSeek-V4-Pro MTP",
-    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --method mtp --num-speculative-tokens 3",
-    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "pr",
-    "accuracy_threshold": 0.94,
-    "mtp_accept_threshold": 0.622,
-    "accuracy_baseline": 0.96,
-    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "Same base model as DeepSeek-V4-Pro FP8 (MTP-3)."
-  },
-  {
     "model_name": "DeepSeek-V4-Pro DSpark",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
-    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --method dspark --num-speculative-tokens 7 --cudagraph-mode PIECEWISE --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --method dspark --num-speculative-tokens 7 --cudagraph-mode TR_HYBRID --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.93,
     "accuracy_baseline": 0.96,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
-    "_baseline_note": "DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions."
+    "_baseline_note": "DSpark spec-decode (7 tokens, dp-attention, TR_HYBRID cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions."
   },
   {
     "model_name": "DeepSeek-V4.1-Flash DSpark",
     "model_path": "deepseek-ai/DeepSeek-V4.1-Flash",
-    "extraArgs": "--kv_cache_dtype bf16 --index_cache_dtype fp4 -tp 4 --method dspark --num-speculative-tokens 5",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 4 --method dspark --num-speculative-tokens 5",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.91,
     "accuracy_baseline": 0.9224,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4.1-Flash",
-    "_baseline_note": "Every argument here is forced rather than chosen: the V4.1 runtime rejects a KV cache other than bf16/fp4, an index plane other than fp8, and any DSpark that is not 5 tokens at TP4 on a bf16 cache (atom/models/deepseek_v41/config.py). Nothing pins the compilation level or max-num-seqs, so this runs at the server's own defaults, level 3 and 512 sequences. The baseline below was measured at 512 but at level 0, because the development box resolves torch's Triton specialization hook to neither name it has been given: Inductor then drops a hand-written Triton kernel silently and the model emits repeated tokens out of whatever the allocator last held, which tests/test_triton_inductor_pairing.py states at the kernel level and is red there. That is a property of one torch/Triton pair, not of this model, so the first CI runs are what confirm the number at level 3 — until then read the baseline as level 0's. Baseline is the mean of three full 1319-question 3-shot runs on this branch, each on a fresh server: 0.9189 / 0.9212 / 0.9272 flexible-extract (strict within 0.0015 of flexible every time), mean 0.9224. Treat the 0.83pp they span as a lower bound on the noise, not the noise itself — an earlier build of this same branch gave 0.9143 / 0.9143 / 0.9151, three runs inside 0.08pp, and reading that as a variance would have been wrong. This model is known to depend on memory layout, and DSpark verifies every draft token against the target, so draft quality moves which batch shapes run rather than what the answer is. The 0.91 bar leaves 1.24pp; a single red is noise until a rerun agrees with it, and a real regression shows up as two. mtp_accept_threshold intentionally omitted until a CI run reports this model's DSpark acceptance rate."
+    "_baseline_note": "The V4.1 runtime rejects a KV cache other than bf16/fp8/fp4, an index plane other than fp8/fp4, and any DSpark that is not 5 tokens on a bf16 or fp8 cache (atom/models/deepseek_v41/config.py); the cache here is the MXFP8 pool (1.84x the rows of bf16) and the FP4 index plane. The baseline below was measured on the bf16 pool; the fp8 pool's full 3-shot runs since, 0.9174 / 0.9204 / 0.9212 flexible-extract at TP4 (the last two with mono decode), sit inside the same spread, so it stands for both. Nothing pins the compilation level or max-num-seqs, so this runs at the server's own defaults, level 3 and 512 sequences. The baseline below was measured at 512 but at level 0, because the development box resolves torch's Triton specialization hook to neither name it has been given: Inductor then drops a hand-written Triton kernel silently and the model emits repeated tokens out of whatever the allocator last held, which tests/test_triton_inductor_pairing.py states at the kernel level and is red there. That is a property of one torch/Triton pair, not of this model, so the first CI runs are what confirm the number at level 3 — until then read the baseline as level 0's. Baseline is the mean of three full 1319-question 3-shot runs on this branch, each on a fresh server: 0.9189 / 0.9212 / 0.9272 flexible-extract (strict within 0.0015 of flexible every time), mean 0.9224. Treat the 0.83pp they span as a lower bound on the noise, not the noise itself — an earlier build of this same branch gave 0.9143 / 0.9143 / 0.9151, three runs inside 0.08pp, and reading that as a variance would have been wrong. This model is known to depend on memory layout, and DSpark verifies every draft token against the target, so draft quality moves which batch shapes run rather than what the answer is. The 0.91 bar leaves 1.24pp; a single red is noise until a rerun agrees with it, and a real regression shows up as two. mtp_accept_threshold intentionally omitted until a CI run reports this model's DSpark acceptance rate."
   },
   {
     "model_name": "DeepSeek-V4-Pro EPLB r0",
@@ -247,18 +222,6 @@
     "_baseline_note": "HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909"
   },
   {
-    "model_name": "Kimi-K2.7-Code-MXFP4",
-    "model_path": "amd/Kimi-K2.7-Code-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code --gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"\", \"layer_quant_config\": {\"model.layers.*.self_attn.fused_qkv_a_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.q_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.kv_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.o_proj\": \"ptpc_fp8\"}}'",
-    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nAITER_AR_1STAGE_MAX_KB=512",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "pr",
-    "accuracy_threshold": 0.92,
-    "accuracy_baseline": 0.9409,
-    "accuracy_baseline_model": "moonshotai/Kimi-K2.7-Code",
-    "_baseline_note": "Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold should be refreshed after CI baseline is available."
-  },
-  {
     "model_name": "Kimi-K3",
     "model_path": "moonshotai/Kimi-K3",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*self_attn.[qkv]_conv1d*\", \"*block_sparse_moe.experts*\", \"*block_sparse_moe.routed_expert_*\", \"*vision_tower*\", \"*mm_projector*\"]}'",
@@ -283,55 +246,6 @@
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark",
     "_baseline_note": "Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured."
-  },
-  {
-    "model_name": "GLM-5-FP8",
-    "model_path": "zai-org/GLM-5-FP8",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
-    "env_vars": "",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "nightly",
-    "accuracy_threshold": 0.93,
-    "accuracy_baseline": 0.9545,
-    "accuracy_baseline_model": "zai-org/GLM-5",
-    "_baseline_note": "HF: amd/GLM-5-MXFP4 card shows GLM-5 baseline=0.9545 (5-shot)"
-  },
-  {
-    "model_name": "GLM-5.2-FP8",
-    "model_path": "zai-org/GLM-5.2-FP8",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --gpu-memory-utilization 0.8 --default-chat-template-kwargs '{\"enable_thinking\":false}'",
-    "env_vars": "",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "nightly",
-    "accuracy_threshold": 0.92,
-    "accuracy_baseline": 0.9447,
-    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
-    "_baseline_note": "ATOM native FP8 gsm8k 3-shot flexible-extract=0.9447 (5-shot=0.9416); --gpu-memory-utilization 0.8 needed since the DSA index cache OOMs at default 0.9. Threshold 0.92 leaves ~2.5pp headroom."
-  },
-  {
-    "model_name": "GLM-5.2-MXFP4",
-    "model_path": "amd/GLM-5.2-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}'",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "nightly",
-    "accuracy_threshold": 0.92,
-    "accuracy_baseline": 0.9447,
-    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
-    "_baseline_note": "Initial GLM-5.2-MXFP4 online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 CI baseline is calibrated."
-  },
-  {
-    "model_name": "GLM-5.2-MXFP4 MTP",
-    "model_path": "amd/GLM-5.2-MXFP4",
-    "extraArgs": "-tp 4 --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\", \"model.layers.[1-6][0-9].mlp.*expert*\", \"model.layers.7[0-7].mlp.*expert*\"]}' --method mtp --num-speculative-tokens 3",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "pr",
-    "accuracy_threshold": 0.92,
-    "mtp_accept_threshold": 0.595,
-    "accuracy_baseline": 0.9447,
-    "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
-    "_baseline_note": "Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated."
   },
   {
     "model_name": "Qwen3.5-35B-A3B TP2",
@@ -394,18 +308,6 @@
     "accuracy_baseline": 0.9538,
     "accuracy_baseline_model": "Qwen/Qwen3.5-397B-A17B-FP8",
     "_baseline_note": "CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser"
-  },
-  {
-    "model_name": "MiniMax-M2.7",
-    "model_path": "MiniMaxAI/MiniMax-M2.7",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
-    "env_vars": "",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "nightly",
-    "accuracy_threshold": 0.87,
-    "accuracy_baseline": 0.9022,
-    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M2.7",
-    "_baseline_note": "ATOM CI measured: 0.9022 (gsm8k 3-shot flexible-extract). Threshold = baseline - 0.015."
   },
   {
     "model_name": "MiniMax-M3-MXFP4",

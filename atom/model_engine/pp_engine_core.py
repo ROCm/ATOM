@@ -17,6 +17,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.observability import tracing
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -62,10 +63,13 @@ class PPEngineCoreProc(EngineCore):
         )
 
     def busy_loop(self):
-        if self.is_head:
-            self._head_busy_loop()
-        else:
-            self._downstream_busy_loop()
+        try:
+            if self.is_head:
+                self._head_busy_loop()
+            else:
+                self._downstream_busy_loop()
+        finally:
+            tracing.shutdown()
 
     def _head_busy_loop(self):
         shutdown = False
@@ -141,6 +145,7 @@ class PPEngineCoreProc(EngineCore):
                     scheduled_batch.connector_meta_output,
                 )
             self.pp_transport.send_metadata(scheduled_batch)
+            tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
             self.scheduler.mark_pp_inflight(scheduled_batch)

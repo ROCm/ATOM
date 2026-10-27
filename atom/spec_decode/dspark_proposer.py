@@ -1,5 +1,4 @@
 import logging
-from contextlib import nullcontext
 
 import torch
 import triton
@@ -24,6 +23,7 @@ from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
+from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -370,7 +370,7 @@ class DSparkProposer(Drafter):
             self._verify_scratch,
         )
 
-    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
+    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm (and capture) the block with every row aimed at no q row.
 
         The warmup runs the captured block directly, not through `propose`, so
@@ -379,16 +379,19 @@ class DSparkProposer(Drafter):
         served step's bases there, and the synthetic batch would overwrite the
         q of requests that still own those slots.
         """
-        self._clear_draft_destinations(stream)
-        super().warmup_draft_graphs(build_context, stream, end_trace)
+        self._clear_draft_destinations()
+        super().warmup_draft_graphs(build_context, end_trace)
 
-    def _clear_draft_destinations(self, stream=None) -> None:
-        """Point every draft row at no q row, on the host and the device."""
+    def _clear_draft_destinations(self) -> None:
+        """Point every draft row at no q row, on the host and the device.
+
+        The device fill goes on the current stream, the one the warmup that
+        follows runs on, so it lands before the block reads the bases.
+        """
         if self.draft_sampling is None:
             return
         self._staging.clear_destinations()
-        with torch.cuda.stream(stream) if stream is not None else nullcontext():
-            self._draft_row_base_buf.gpu.fill_(-1)
+        self._draft_row_base_buf.gpu.fill_(-1)
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.
@@ -767,7 +770,7 @@ class DSparkProposer(Drafter):
         fully bound. Gating on the flag would let the second one through
         describing whatever the previous real step left behind.
         """
-        layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
+        layer_num = self.model.first_attention_layer_num
         cache_data = forward_context.kv_cache_data or {}
         entry = cache_data.get(f"layer_{layer_num}")
         bound = getattr(entry, "k_cache", None) if entry is not None else None
@@ -801,7 +804,7 @@ class DSparkProposer(Drafter):
             # for `final` so the caller does not cache a warmup-time guess.
             return from_config, False
         if bound.dtype != from_config:
-            layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
+            layer_num = self.model.first_attention_layer_num
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
@@ -1054,6 +1057,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and `num_draft` config, so
             # every rank reaches this height on its own.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
         label = self.block.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
@@ -1284,6 +1288,20 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
+        if not self.model.block_attention_is_mla:
+            # A draft that attends its block another way (MiniMax-M3.1's per-row
+            # MHA decode) builds what it reads itself; there is no MLA decode
+            # to plan.
+            self.model.prepare_paged_block(
+                attn_metadata,
+                block_tables,
+                block_positions,
+                slots,
+                ctx_lens,
+                block_table_state(self.runner.forward_vars["block_tables"]).lengths,
+                scheduled_bs,
+            )
+            return
 
         # Build persistent (ps=1) MLA-decode metadata
         from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
@@ -1414,6 +1432,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and T is config, so every
             # rank reaches this height on its own, none has to discover it.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
 
         # ---- 3. Block pass + Markov sampling ---------------------------------

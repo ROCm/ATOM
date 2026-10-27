@@ -30,6 +30,7 @@ the same layout the MoE kernel's scale readers were written for. That holds only
 for the non-interleaved gate/up layout, so ``is_guinterleave`` is checked.
 """
 
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -51,6 +52,8 @@ from atom.models.kimi_k3.mono.layouts import (
     unshuffle_weight,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
+
+logger = logging.getLogger("atom")
 
 BF16 = torch.bfloat16
 F32 = torch.float32
@@ -397,26 +400,52 @@ class LayerPlan:
 
     @property
     def mono(self) -> bool:
+        """K1 and K2 both."""
         return self.kda is not None and self.moe is not None
+
+    @property
+    def ffn_only(self) -> bool:
+        """K2 alone: a full-attention layer whose attention stays on the
+        production path (``bind_model``)."""
+        return self.kda is None and self.moe is not None
 
 
 def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
     """Every decoder layer, in order.
 
-    A layer takes the kernels only when it is a KDA layer with a MoE FFN and at
+    A layer takes K1 and K2 only when it is a KDA layer with a MoE FFN and at
     least one AttnRes block behind it: layer 0 has a dense MLP and no block, and
-    the full-attention layers keep the original MLA path (and their paged KV
+    the full-attention layers keep the original MLA attention (and their paged KV
     cache) because the kernels have no attention of their own.
+
+    Those full-attention layers get K2 alone -- ``o_proj`` and the latent MoE
+    are not KDA's, only the core they read is. K2 restarts the prefix only on a
+    layer that closes a block, which this path does not bank (a block closes at
+    ``layer_id % ATTN_RES_BLOCK == 0``; K3's full-attention layers are 3 mod 4),
+    so a layer that would is refused rather than read wrong.
     """
     layers = model.layers
     plans = []
     for layer_id, layer in enumerate(layers):
         blocks, _ = layer_block(layer_id)
-        takes = (
-            bool(getattr(layer, "is_linear_attn", False))
-            and hasattr(layer, "block_sparse_moe")
-            and blocks >= 1
-        )
+        has_ffn = hasattr(layer, "block_sparse_moe") and blocks >= 1
+        takes = bool(getattr(layer, "is_linear_attn", False)) and has_ffn
+        if not takes and has_ffn:
+            # One layer's refusal leaves that layer on the production path; it
+            # must not take the KDA layers' mono down with it.
+            try:
+                _need(
+                    layer_block(layer_id)[1] < 0,
+                    "a full-attention layer that closes a block",
+                )
+                moe = bind_moe(layer, layer_id, dims, rank)
+                plans.append(LayerPlan(layer_id, None, moe))
+            except MonoUnsupported as e:
+                logger.warning(
+                    "Kimi-K3 mono: layer %d keeps its production K2 (%s)", layer_id, e
+                )
+                plans.append(LayerPlan(layer_id, None, None))
+            continue
         if not takes:
             plans.append(LayerPlan(layer_id, None, None))
             continue

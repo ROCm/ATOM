@@ -273,6 +273,52 @@ jobs:
       CONTAINER_NAME: atom_test_${{ strategy.job-index }}
 
     steps:
+      # First, before any cleanup or image pull: fail fast on a host whose GPUs
+      # cannot run the job.
+      # - No rocm-smi on the host: a runner registered under this label without
+      #   ROCm tools fails every later step anyway.
+      # - A GPU reporting no temperature or power. In CI every GPU hang at server
+      #   start showed this before the job (30 of 30, 2026-10-21..23, on five
+      #   hosts) and no successful job did (0 of 80). The GPUs that hung are the
+      #   ones reporting no power (their SMU does not answer); a host whose GPUs
+      #   all lack a junction temperature fell back to edge and hung every job.
+      #   A hang also wedges the next job's preflight on that host.
+      - name: GPU host health check
+        id: gpu_host_health
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        timeout-minutes: 3
+        run: |
+          set -uo pipefail
+          host="${RUNNER_NAME:-$(hostname)}"
+          if ! command -v rocm-smi >/dev/null 2>&1; then
+            echo "::error title=Unhealthy GPU host::rocm-smi not found on ${host}"
+            exit 1
+          fi
+          if ! smi="$(timeout 60 rocm-smi 2>&1)"; then
+            printf '%s\n' "${smi}"
+            echo "::error title=Unhealthy GPU host::rocm-smi failed or timed out on ${host}"
+            exit 1
+          fi
+          printf '%s\n' "${smi}"
+          # Concise rows: Device, Node, DID, GUID, Temp, Power, ...
+          rows="$(printf '%s\n' "${smi}" | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^0x/')"
+          if [ -z "${rows}" ]; then
+            echo "::error title=Unhealthy GPU host::no GPU rows in rocm-smi output on ${host}"
+            exit 1
+          fi
+          bad="$(printf '%s\n' "${rows}" | awk '$5 == "N/A" || $6 == "N/A" {print $1}')"
+          if [ -n "${bad}" ]; then
+            # No power: the GPU's SMU does not answer -- the one a job hangs on.
+            dead="$(printf '%s\n' "${rows}" | awk '$6 == "N/A" {print $1}')"
+            ids="$(timeout 60 rocm-smi --showuniqueid 2>/dev/null || true)"
+            for gpu in ${dead:-${bad}}; do
+              echo "GPU[${gpu}] $(printf '%s\n' "${ids}" | grep -E "^GPU\[${gpu}\][[:space:]]" | sed 's/^[^:]*: *//')"
+            done
+            echo "::error title=Unhealthy GPU host::on ${host}, GPU(s) $(echo ${bad}) report N/A temperature or power; GPU(s) $(echo ${dead:-none}) report no power (SMU not responding). Jobs on this host hang at server start."
+            exit 1
+          fi
+          echo "All $(printf '%s\n' "${rows}" | wc -l) GPUs on ${host} report temperature and power"
+
       - name: Prune stale Docker data on TW runners
         if: matrix.runner == 'linux-atom-do-mi350x-8'
         run: |

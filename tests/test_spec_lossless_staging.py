@@ -283,12 +283,12 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     assert any(base >= 0 for base in dest(prop)[:3])
     seen = {}
 
-    def base_warmup(self, build_context, stream, end_trace=None):
+    def base_warmup(self, build_context, end_trace=None):
         seen["np"] = self._draft_row_base_buf.np.tolist()
         seen["gpu"] = self._draft_row_base_buf.gpu.tolist()
 
     monkeypatch.setattr(dspark_proposer.Drafter, "warmup_draft_graphs", base_warmup)
-    prop.warmup_draft_graphs(None, None)
+    prop.warmup_draft_graphs(None)
     assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
     # The slot map is untouched: those requests still own their q rows.
     assert {"a", "b", "c"} <= set(prop._staging.slots._slot_of)

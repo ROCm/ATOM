@@ -34,6 +34,13 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
+def _uses_dspark(atom_config) -> bool:
+    use_dspark = getattr(
+        getattr(atom_config, "speculative_config", None), "use_dspark", None
+    )
+    return bool(use_dspark is not None and use_dspark())
+
+
 def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
     checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
@@ -50,6 +57,9 @@ def _config_refusal(atom_config) -> str | None:
             atom_config.max_model_len <= MAX_CONTEXT,
             f"max_model_len {atom_config.max_model_len} > {MAX_CONTEXT}",
         ),
+        # DSpark reads the target's aux hidden states through forward hooks on
+        # the decoder layers, which the mono kernels replace.
+        (not _uses_dspark(atom_config), "DSpark speculative decoding"),
     ]
     return first_refusal(checks)
 
