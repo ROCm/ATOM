@@ -196,6 +196,10 @@ def test_layout_id_names_ple_and_forks_under_pipeline_parallel(monkeypatch):
     layout = cls.state_transfer(builder).paged_layout_id
     assert layout.startswith("gdn-paged-state-v1:")
     assert layout.endswith(":ple_order=conv,ngram")
+    # `allocate_per_req_cache` lays a PLE conv slot out (channels, state_len):
+    # hc_count * hidden_size = 16 channels, (4 - 1) * 3 + num_spec = 10 taps.
+    assert ":ple_conv=(16,10),torch.bfloat16:" in layout
+    assert ":ple_ngram=(3,),torch.int64:" in layout
     builder.model_runner.config.pipeline_parallel_size = 2
     assert not cls._uses_paged_checkpoints(builder)
     assert not cls.state_transfer(builder).copies

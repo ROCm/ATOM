@@ -383,8 +383,9 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         state_len, channels = self._ple_state_shape()
         ngram = self.ngram_context_len + self.num_spec
         dtype = self.model_runner.config.torch_dtype
+        # One slot's shape as `allocate_per_req_cache` lays it out.
         return (
-            f":ple_conv=({state_len},{channels}),{dtype}"
+            f":ple_conv=({channels},{state_len}),{dtype}"
             f":ple_ngram=({ngram},),{torch.int64}"
             ":ple_order=conv,ngram"
         )
