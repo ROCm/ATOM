@@ -1096,8 +1096,9 @@ def strip_trailing_comment(line):
 
 
 LAUNCH_KNOB = re.compile(r"\b(waves_per_eu|matrix_instr_nonkdim|kpack|num_stages|"
-                         r"num_warps|num_ctas)\s*=\s*\d+")
+                         r"num_warps|num_ctas)\s*(?::\s*\w+\s*)?=\s*\d+")
 FROM_CONFIG = re.compile(r"=\s*(config|cfg|conf|tune|tuned|kwargs|\*\*|[A-Z_]+\[)")
+TL_RANGE_CALL = re.compile(r"tl\.range\([^)]*\)")
 
 
 def hardcoded_launch_knob(files):
@@ -1111,7 +1112,23 @@ def hardcoded_launch_knob(files):
     it or fight it.
 
     Config files and tests are exempt -- a literal in a JSON/CSV is the config system
-    working, and a test pinning a knob is pinning it on purpose."""
+    working, and a test pinning a knob is pinning it on purpose.
+
+    The trigger was auditted against P1 (33-rule) evidence: 48 ATOM files carry a bare
+    `num_warps=<int>`/`num_stages=<int>` yet T8 fired on 0/14 Triton-gated PRs in the P1
+    sample. The miss wasn't the keyword list -- it was that `LAUNCH_KNOB` required `name
+    = digit` with nothing in between, so a type-annotated default parameter like
+    `num_warps: int = 4,` (very common in ATOM's own wrapper functions, e.g.
+    `fused_sigmoid_mul_fp8_quant_tiled` in triton_fused_sigmoid_mul_quant.py, PR #2534)
+    never matched even though it is exactly the hardcoded-literal-in-source shape T8
+    exists to catch. Fixed by allowing an optional `: type` between the name and `=`.
+
+    `tl.range(..., num_stages=N)` is deliberately exempted even though it matches the
+    same literal shape: it sets software-pipelining depth for a loop inside the kernel
+    body, not a launch configuration handed to the kernel grid. Firing on it would be a
+    real precision regression (over-firing on every pipelined inner loop), not a second
+    instance of the defect T8 is scoped to -- so `num_stages=` is stripped out wherever
+    it occurs inside a `tl.range(...)` call before the keyword search runs."""
     for path, f in files.items():
         if not path.endswith(".py"):
             continue
@@ -1120,8 +1137,10 @@ def hardcoded_launch_knob(files):
         for line in f["add"]:
             if line.strip().startswith("#"):
                 continue
-            m = LAUNCH_KNOB.search(line)
-            if m and not FROM_CONFIG.search(line):
+            scan_line = TL_RANGE_CALL.sub(
+                lambda mo: re.sub(r"\bnum_stages\s*=\s*\d+", "", mo.group(0)), line)
+            m = LAUNCH_KNOB.search(scan_line)
+            if m and not FROM_CONFIG.search(scan_line):
                 return True
     return False
 
