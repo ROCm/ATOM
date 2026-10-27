@@ -141,3 +141,30 @@ def test_mxfp4_pages_match_the_bf16_write(index_q_fp8, monkeypatch):
     written[slots[valid]] = True
     untouched = dequantize_pages(kp)[:, 0].reshape(-1, D)[~written]
     assert (untouched == 0).all()
+
+
+def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index():
+    T = 21
+    g = torch.Generator(device="cuda").manual_seed(2)
+    width = (NQ + 2 * NKV + NIQ + 1) * D
+    qkv = torch.randn(T, width, device="cuda", generator=g, dtype=torch.bfloat16)
+    position = torch.arange(T, device="cuda", dtype=torch.int64)
+    slots = torch.arange(T, device="cuda", dtype=torch.int64) + 128  # page 1
+
+    full = make_impl(True, True)
+    kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
+    vp = torch.zeros_like(kp)
+    ip = torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
+    q_full = run(full, qkv, position, slots, kp, vp, ip)[0]
+
+    skip = make_impl(True, True)
+    skip.skip_index_topk = True
+    kp2 = torch.zeros_like(kp)
+    vp2 = torch.zeros_like(vp)
+    ip2 = torch.zeros_like(ip)
+    q_skip = run(skip, qkv, position, slots, kp2, vp2, ip2)[0]
+
+    assert skip._index_q is None and skip._index_q_cache_key_info is not None
+    assert torch.equal(kp, kp2) and torch.equal(vp, vp2)  # the same K/V pages
+    assert torch.equal(q_full.view(torch.uint8), q_skip.view(torch.uint8))
+    assert (ip2 == 0).all() and (ip != 0).any()  # no index key written

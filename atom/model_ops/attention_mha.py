@@ -1355,6 +1355,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         fused_index_cache_dtype = (
             self.index_cache_dtype
             if self.index_cache_dtype in ("fp8", "mxfp4")
+            and not (self.skip_index_topk and self.kv_mxfp4)  # no index branch
             else "auto"
         )
         index_fp4 = self.index_scale is not None
