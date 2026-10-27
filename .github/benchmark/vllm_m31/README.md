@@ -45,19 +45,3 @@ Automatic allocation currently excludes `pit2-p03-g09` after two unexplained
 SIGKILL exits there; explicitly pinned nodes bypass the automatic exclusion.
 The read-only inspection case emits schema-filtered status for its configured
 Actions ID, never raw logs or arbitrary file content.
-
-Run 40487190671 attempt 2 failed during Store local-buffer registration on g12
-(`EINVAL`, followed by `ENOMEM`), before any CPU pool was mounted. The retry
-keeps the 128 GiB segment and 4 GiB private buffer per rank. Process-local glibc
-THP hints and malloc perturbation fault allocated pages in before registration;
-Mooncake registers NIC MRs sequentially with a 64 GiB MR cap. P becomes ready
-before D starts, limiting concurrent pool registration to four engine ranks.
-These are startup mitigations; CI must establish whether they resolve the fault.
-No host-wide page-cache or hugepage settings are changed.
-
-Before each model load, a disposable native Store client with HIP initialized
-allocates the exact per-rank segment and private buffer and verifies a 1 MiB
-PUT/GET. It closes before engines start. Its result, memory-lock limit and
-allocation settings are saved in `store-preflight.json`; failure stops the
-phase. This single-client check does not certify the full eight-rank pool or
-GPU KV transfers, which still require the existing PD smoke gates.
