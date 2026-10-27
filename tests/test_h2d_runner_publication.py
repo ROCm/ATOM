@@ -173,6 +173,8 @@ def test_input_ids_deferred_and_new_requests_share_one_publication(
     runner._mark_staging_h2d_enqueued()
     runner.h2d_owner.completion.synchronize()
     assert ids.cpu().tolist() == [82, 93, 71]
+    # [requests, tokens, draft tokens], published with the ids.
+    assert processor.batch_info.gpu.cpu().tolist() == [3, 3, 0]
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
@@ -184,10 +186,12 @@ def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_siz
         runner._gate_staging_reuse()
         processor = runner.tokenID_processor
         assert processor.decode_src is runner.forward_vars["decode_src"]
+        assert processor.batch_info is runner.forward_vars["batch_info"]
         prefill = i % 2 == 0
         batch = SimpleNamespace(
             scheduled_tokens=np.array([i + 1, i + 2], dtype=np.int32),
             total_tokens_num=2,
+            total_seqs_num=1 if prefill else 2,
             total_tokens_num_prefill=2 if prefill else 0,
             total_tokens_num_decode=0 if prefill else 2,
             total_seqs_num_prefill=1 if prefill else 0,

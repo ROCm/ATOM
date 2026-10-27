@@ -150,7 +150,7 @@ def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
     written = []
     outer = SimpleNamespace(replay=None, width=6)
     cache = SimpleNamespace(
-        packed=False,
+        window_fp8=False,
         write_window=lambda layer, keys, taken: written.append((keys, taken)),
     )
     monkeypatch.setattr(

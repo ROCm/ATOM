@@ -48,6 +48,7 @@ from atom.models.deepseek_v41.mono.kernels.attention import (
     COLS,
     GROUPS,
     SCORE_LDS_WORDS,
+    SCORE_Q_WORDS,
     only_live,
     pv_groups,
     score_tasks,
@@ -159,6 +160,9 @@ class AttnPostBuild:
     # reduce-scatter), and the slice, gate and norm run on this rank's tokens
     # (``own_view``); the caller gathers the normed rows
     tok_par: bool = False
+    # the pool's rows are MXFP8: QK on FP8 (q quantized by the original path's
+    # rule), PV on the rows dequantized (``attention``)
+    kv_fp8: bool = False
 
 
 # the per-token arguments the token-parallel stages read and write
@@ -521,18 +525,22 @@ def lds_union(name, members):
     )
 
 
-def attn_post_smem(s, timeline, bound_max, d) -> dict:
+def attn_post_smem(s, timeline, bound_max, d, kv_fp8=False) -> dict:
     """K2a's LDS, a struct a stage: the members of a union, so only one stage's
     buffers take space at a time (``run_attn_post`` fences each hand-over).
     Each opens with what every stage shares at the same offsets -- ``red`` and
-    the stamp record (``timeline``)."""
+    the stamp record (``timeline``). ``kv_fp8``: the score's MXFP8 q operands
+    (``attention._q_shared``)."""
     shared = {
         "red": fx.Array[fx.Float32, k1.WAVES * 2 * 64 * 4, 16],
         "tls": fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16],
     }
     stages = {
         # the score's key rows, a wave's split at a time (``attention``)
-        "score": {"sc_kv": fx.Array[fx.Int32, WAVES * SCORE_LDS_WORDS, 16]},
+        "score": {
+            "sc_kv": fx.Array[fx.Int32, WAVES * SCORE_LDS_WORDS, 16],
+            "sc_q": fx.Array[fx.Int32, SCORE_Q_WORDS if kv_fp8 else 1, 16],
+        },
         "sel": {
             "sk": fx.Array[fx.Int32, SEL_KEYS if bound_max else 1, 16],
             "sh": fx.Array[fx.Int32, SEL_HIST, 16],
@@ -579,13 +587,13 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
         "att": {
             "tree": at.at_tree.ptr, "alpha": at.at_alpha.ptr,
             "stat": at.at_stat.ptr, "out": at.at_out.ptr, "kv": at.at_kv.ptr,
-            "score_kv": sc.sc_kv.ptr,
+            "score_kv": sc.sc_kv.ptr, "score_q": sc.sc_q.ptr,
         },
         "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
         "poll": mb.poll, "peer_addr": lambda p: bases[p], "rank": rank, "sym": sym,
         "peer": peer_offsets(s, Dims(key.tp)),
         "fold": True, "index": False, "aux": False, "ffn": True,
-        "index_fp4": key.index_fp4, "tok_par": key.tok_par,
+        "index_fp4": key.index_fp4, "tok_par": key.tok_par, "kv_fp8": key.kv_fp8,
         "args": args, "d": Dims(key.tp),
     }  # fmt: skip
     for region, (off, _) in layout.items():
@@ -762,7 +770,7 @@ def build_attn_post(key: AttnPostBuild):
     bound_max = key.index_bound_max
     layout = scratch_layout(key)
     keyed = key_tuple(key, SOURCES)
-    members = attn_post_smem(s, timeline, bound_max, Dims(key.tp))
+    members = attn_post_smem(s, timeline, bound_max, Dims(key.tp), key.kv_fp8)
     Smem = lds_union("K2aLds", members)
 
     name = kernel_symbol(

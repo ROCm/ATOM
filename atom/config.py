@@ -950,6 +950,13 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    if isinstance(text_config, dict):
+        # The remote MiniMaxM3VLConfig bundled with some exports (MiniMax-M3.1)
+        # coerces text_config in a way transformers 5 undoes, leaving the raw
+        # dict. The text block has no model_type, so keep every field as a
+        # plain PretrainedConfig attr.
+        text_config = PretrainedConfig.from_dict(text_config)
+        hf_config.text_config = text_config
     if text_config is not None and text_config is not hf_config:
         # Some exports (Quark NVFP4) carry the layer layout on the VL root; it
         # replaces the text config's own, then is checked like any other.
@@ -1164,6 +1171,47 @@ def _resolve_sequential_drafter_max_spec(
     return _SERIAL_MTP_DEFAULT_MAX_SPEC
 
 
+# Standalone DSpark draft architectures: their own checkpoint, normalized by
+# `_normalize_draft_dspark_config`. Inline drafts (V4-Pro-DSpark) are not
+# listed; they ship inside the target checkpoint and are told by
+# `dspark_block_size`.
+_STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset(
+    {"K3DSparkModel", "DSparkMiniMaxDraftModel"}
+)
+# Where the standalone drafts name each field ATOM reads, in lookup order:
+# Kimi-K3's top-level names, then MiniMax-M3.1's `dspark_*` names and its DFlash
+# geometry under `dflash_config`. A dotted alias reads into that sub-config.
+_STANDALONE_DSPARK_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "dspark_target_layer_ids": (
+        "target_layer_ids",
+        "dspark_target_layer_ids",
+        "dflash_config.target_layer_ids",
+    ),
+    "dspark_noise_token_id": (
+        "mask_token_id",
+        "dspark_noise_token_id",
+        "dflash_config.mask_token_id",
+    ),
+    "dspark_markov_rank": ("markov_rank", "dspark_markov_rank"),
+}
+
+
+def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
+    """The value of the first alias of `field` the draft config sets, or None."""
+    for alias in _STANDALONE_DSPARK_FIELD_ALIASES[field]:
+        value = hf_config
+        for part in alias.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = getattr(value, part, None)
+            if value is None:
+                break
+        if value is not None:
+            return value
+    return None
+
+
 def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
@@ -1172,32 +1220,34 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
 
     - INLINE (e.g. V4-Pro-DSpark) ships inside the target checkpoint and already
       uses the ``dspark_*`` names the rest of ATOM reads. It never comes here.
-    - STANDALONE drafts are their OWN checkpoint (``architectures:
-      ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
-      their DSpark fields at the config top level: ``target_layer_ids``,
-      ``mask_token_id``, ``markov_rank``, and optionally a training block width.
+    - STANDALONE drafts are their OWN checkpoint (an architecture in
+      ``_STANDALONE_DSPARK_ARCHS``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``)
+      and name their DSpark fields as ``_STANDALONE_DSPARK_FIELD_ALIASES``
+      lists: ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
     """
-    target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+    target_layer_ids = _standalone_dspark_field(hf_config, "dspark_target_layer_ids")
     if not target_layer_ids:
         raise ValueError(
-            "K3DSparkModel config is missing `target_layer_ids` (the target "
-            "decoder layers whose hidden states the draft consumes). Without "
-            "it the draft has no context input."
+            "Standalone DSpark draft config is missing `target_layer_ids` (the "
+            "target decoder layers whose hidden states the draft consumes). "
+            "Without it the draft has no context input."
         )
     # 0-based target decoder-layer indices, matching ATOM's `layers[i]` aux-tap
     # convention: the reference indexes `hidden_states[layer_id + 1]`, i.e. the
     # OUTPUT of layer `layer_id`, which is the layer this convention taps.
     hf_config.dspark_target_layer_ids = [int(i) for i in target_layer_ids]
 
-    mask_token_id = getattr(hf_config, "mask_token_id", None)
+    mask_token_id = _standalone_dspark_field(hf_config, "dspark_noise_token_id")
     if mask_token_id is None:
         raise ValueError(
-            "K3DSparkModel config is missing `mask_token_id` (the noise token "
-            "the draft block is seeded with)."
+            "Standalone DSpark draft config is missing `mask_token_id` (the "
+            "noise token the draft block is seeded with)."
         )
     hf_config.dspark_noise_token_id = int(mask_token_id)
 
-    hf_config.dspark_markov_rank = int(getattr(hf_config, "markov_rank", 0) or 0)
+    hf_config.dspark_markov_rank = int(
+        _standalone_dspark_field(hf_config, "dspark_markov_rank") or 0
+    )
     # Synthesized marker, not a checkpoint field: the flavor discriminator the
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
@@ -1209,7 +1259,7 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # DSparkProposer._resolve_mtp_k falls back to that.
 
     logger.info(
-        "Detected MLA DSpark drafter with a separate draft model "
+        "Detected DSpark drafter with a separate draft model "
         f"(markov_rank={hf_config.dspark_markov_rank}, "
         f"target_layers={hf_config.dspark_target_layer_ids}, "
         f"mask_token_id={hf_config.dspark_noise_token_id})"
@@ -1335,8 +1385,8 @@ class SpeculativeConfig:
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
         :func:`_normalize_draft_dspark_config`, which runs from
-        :meth:`hf_config_override` when the draft's ``architectures`` is
-        ``["K3DSparkModel"]``, so it is set for exactly the configs that went
+        :meth:`hf_config_override` when the draft's architecture is in
+        ``_STANDALONE_DSPARK_ARCHS``, so it is set for exactly the configs that went
         through that normalization.
         """
         cfg = self.draft_model_hf_config
@@ -1405,7 +1455,15 @@ class SpeculativeConfig:
             )
         # For multimodal models, extract text_config
         if hasattr(self.draft_model_hf_config, "text_config"):
-            self.draft_model_hf_config = self.draft_model_hf_config.text_config
+            root = self.draft_model_hf_config
+            self.draft_model_hf_config = root.text_config
+            # A multimodal draft (MiniMax-M3.1 DSpark) records its quantization
+            # on the root only; the text config is what the draft reads.
+            root_qc = getattr(root, "quantization_config", None)
+            if root_qc and not getattr(
+                self.draft_model_hf_config, "quantization_config", None
+            ):
+                self.draft_model_hf_config.quantization_config = root_qc
         self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
@@ -1433,7 +1491,7 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        if arch.endswith("DSparkModel"):
+        if arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)
             return
         if arch == "LlamaForCausalLMEagle3":
@@ -2767,6 +2825,10 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 decides whether the MoE calls
+        # shared_experts() and how many experts it routes over (129 / top-5 vs
+        # 128 / top-4), so it changes the compiled graph the same way.
+        factors.append(bool(envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4))
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into
         # the graph as constants, so a cache built for a smaller max_model_len
         # faults on the first decode past the old width.
