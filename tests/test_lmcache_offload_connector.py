@@ -6019,25 +6019,67 @@ def test_a_joint_load_clamps_the_kv_leg_to_the_covering_chunk():
     assert ls.lmcache_cached_tokens == 1024
 
 
-def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(monkeypatch):
+def _text_wrapped(model_type: str, text_type: str):
+    return SimpleNamespace(
+        model_type=model_type,
+        text_config=SimpleNamespace(model_type=text_type, num_attention_heads=16),
+    )
+
+
+@pytest.mark.parametrize(
+    "hf_config,scheduler_cls",
+    [
+        pytest.param(
+            SimpleNamespace(model_type="kimi_linear"),
+            KimiK3OffloadScheduler,
+            id="kimi-k3",
+        ),
+        pytest.param(
+            SimpleNamespace(model_type="qwen3_next"),
+            QwenOffloadScheduler,
+            id="qwen3-next",
+        ),
+        pytest.param(
+            _text_wrapped("qwen3_5_moe", "qwen3_5_moe_text"),
+            QwenOffloadScheduler,
+            id="qwen3.5",
+        ),
+        pytest.param(
+            _text_wrapped("qwen4_exp", "qwen4_exp_text"),
+            QwenOffloadScheduler,
+            id="qwen3.8",
+        ),
+    ],
+)
+def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(
+    monkeypatch, hf_config, scheduler_cls
+):
     """A chunk-aligned prompt resent whole, with HBM empty and the tier holding
     all of it. Withholding the last token would floor the KV leg's ceiling to
     512, under the 704 rung that prompt kept, and no joint boundary could form.
-    A hybrid claims the joint boundary instead, so the hit stays whole."""
+    A hybrid claims the joint boundary instead, so the hit stays whole.
+
+    Every state-owning family takes this path, so each is built through the
+    layout selection a server runs; what keeps the forward from skipping the
+    whole prompt is `_decide_load_after_alloc` loading only at a boundary."""
+    from atom.kv_transfer.offload.connector import _build_scheduler
+
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
         lambda _config=None: SimpleNamespace(chunk_size=256),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    sched = QwenOffloadScheduler(
+    sched = _build_scheduler(
         SimpleNamespace(
+            hf_config=hf_config,
             kv_transfer_config={"kv_role": "offload"},
             kv_cache_block_size=64,
             decode_context_parallel_size=1,
             tensor_parallel_size=1,
         )
     )
+    assert type(sched) is scheduler_cls
     sched._min_load_tokens = 0
     sched._lookup_client = _LookupClient(hit=768)
     hybrid = SimpleNamespace(
@@ -6052,6 +6094,11 @@ def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(monkeypatch):
     assert sched.get_num_new_matched_tokens(hybrid) == (768, True)
     ls = sched._load_specs["7"]
     assert ls.lmcache_cached_tokens == 768
+
+    # The whole-prompt hit is not a claim: with no boundary formed nothing
+    # loads, so the request recomputes rather than skipping its prompt.
+    refused = sched._decide_load_after_alloc(hybrid, SimpleNamespace(**vars(ls)))
+    assert refused[:2] == (False, "per_req_cache_state_boundary")
 
     # `_joint_kv_boundary` puts the boundary on the 704 rung and aims the KV
     # leg at the chunk covering it; the claim stops at the boundary.
