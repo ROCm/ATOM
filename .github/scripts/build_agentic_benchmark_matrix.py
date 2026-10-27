@@ -135,6 +135,16 @@ def build_configs(path=None, inputs=None):
         raise ValueError(f"Unknown agentic models: {sorted(selected - known)}")
     configs = [c for c in configs if not selected or c["prefix"] in selected]
 
+    variants = {
+        name.strip() for name in inputs.get("variants", "").split(",") if name.strip()
+    }
+    known_variants = {config["suffix"] for config in configs}
+    if variants - known_variants:
+        raise ValueError(
+            f"Unknown agentic variants: {sorted(variants - known_variants)}"
+        )
+    configs = [c for c in configs if not variants or c["suffix"] in variants]
+
     if inputs.get("concurrency", "").strip():
         values = _concurrency(
             [int(value.strip()) for value in inputs["concurrency"].split(",")]

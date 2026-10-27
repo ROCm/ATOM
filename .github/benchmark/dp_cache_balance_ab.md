@@ -4,6 +4,9 @@ Select `dp-cache-ab` in the ATOM Agentic Benchmark workflow. It creates two
 independent cells, each using attention DP2 / MoE TP2 on two MI355X GPUs,
 128 concurrent session slots and 3600 seconds of profiling arrivals by default.
 The workflow's `duration_seconds` input can override the duration for both arms.
+To run only ON, set `variants` to `-agentic-dspark5-dtp2-cache-on`.
+Leaving `variants` empty retains the two-arm comparison. Unknown suffixes fail
+matrix generation instead of silently starting extra jobs.
 
 | Arm | DP policy | Legacy session affinity |
 | --- | --- | --- |

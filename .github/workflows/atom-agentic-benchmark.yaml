@@ -17,6 +17,10 @@ on:
         description: "Models (optional) — empty uses the preset; e.g. deepseek-v41-flash"
         type: string
         default: ""
+      variants:
+        description: "Variant suffixes (optional, comma-separated) — e.g. -agentic-dspark5-dtp2-cache-on; empty runs all"
+        type: string
+        default: ""
       concurrency:
         description: "Concurrency (optional) — empty uses the preset; test defaults to 2,4"
         type: string

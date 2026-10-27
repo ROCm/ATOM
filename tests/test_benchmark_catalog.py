@@ -423,6 +423,27 @@ def test_agentic_gpu_workflow_only_runs_manually_or_on_schedule():
     )
 
 
+def test_agentic_cache_on_selection_produces_one_point():
+    import json
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    inputs = {
+        "profile": "dp-cache-ab",
+        "models": "deepseek-v41-flash",
+        "variants": "-agentic-dspark5-dtp2-cache-on",
+        "concurrency": "128",
+        "duration_seconds": "3600",
+    }
+    (config,) = build_configs(inputs=inputs)
+    assert json.loads(config["concurrency"]) == [128]
+    assert "--dp-load-balance cache_affinity" in config["server_args"]
+    assert "AIPERF_BENCHMARK_DURATION=3600" in config["env_vars"]
+    assert len(build_configs(inputs={**inputs, "variants": ""})) == 2
+    with pytest.raises(ValueError, match="Unknown agentic variants"):
+        build_configs(inputs={**inputs, "variants": "cache-on-typo"})
+
+
 def test_agentic_nightly_grid_and_shared_capture_recipe():
     import json
     import shlex
