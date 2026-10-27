@@ -516,6 +516,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_FUSED_VERIFY_TOPK": lambda: (
         os.getenv("ATOM_M3_FUSED_VERIFY_TOPK", "1") == "1"
     ),
+    # MiniMax-M3 DSpark draft: re-quantize its MXFP8 linears to per-channel FP8
+    # (ptpc) at load so the draft runs the per-token FP8 GEMM. 0 keeps MXFP8.
+    "ATOM_M3_DSPARK_DRAFT_PTPC": lambda: (
+        os.getenv("ATOM_M3_DSPARK_DRAFT_PTPC", "0") == "1"
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
