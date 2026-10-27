@@ -24,7 +24,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
 from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_plan import (
     BLOCKS, THREADS, WAVES, C1ReferencePlan,
 )
-from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_sync import reference_mailbox
+from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_sync import reference_mailbox, scalar_address
 from atom.mono.device.ops import kernel_symbol, launcher, traced
 from atom.mono.device.sync import sreg
 
@@ -32,6 +32,13 @@ from atom.mono.device.sync import sreg
 @traced
 def slice_prefetch_c1(c, task):
     """Mother residual/gate and mix-weight loads before the TP partial wait."""
+    # The immutable bases are wave-uniform even when K2 keeps them in VGPRs.
+    args = dict(c["args"])
+    args["res_in"] = scalar_address(args["res_in"])
+    args["comb_in"] = scalar_address(args["comb_in"])
+    args["post_in"] = scalar_address(args["post_in"])
+    args["hc_fn"] = scalar_address(args["hc_fn"])
+    c = dict(c, args=args)
     threads = c.get("threads", THREADS)
     rows = first_rounds(c["tid"], KT, lambda e: slice_loads(c, task*COLS, e))
     fns = []
