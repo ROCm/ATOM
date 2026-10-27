@@ -166,17 +166,18 @@ def test_prefill_really_does_run_wider_than_it_scheduled():
             total_tokens_num=9,
             total_seqs_num=3,
             is_dummy_run=False,
+            final_prefill_requests=lambda: 0,
         ),
         dp_size=1,
         dp_group=None,
         enforce_eager=False,
         step_needs_eager=False,
         capture_sizes=np.array([1, 2, 4, 8], dtype=np.int32),
-        captured_tokens=None,
         is_block_drafter=False,
         tbo_on=False,
         local_tbo=(False, False, 0, 0),
         max_seqlen_q=1,
+        running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
     )
 
     assert (mode.scheduled_bs, mode.running_bs) == (3, 4)

@@ -1,7 +1,9 @@
 # DeepSeek-V4.1-Flash
 
 The native text backbone and the paged ModelRunner/Scheduler lifecycle are
-usable. The original V4 BF16 attention and inverse RoPE kernels are reused.
+usable. The KV cache is FP8 (`--kv_cache_dtype fp8`, MXFP8 rows attended by
+AITER's `mla_sparse_prefill_v41`); on the BF16 or FP4 pool the original V4
+BF16 attention and inverse RoPE kernels are reused.
 Chat, tool and reasoning-effort protocol integration is complete, and native
 image requests support chunked prefill and request-owned embedding lifetime.
 
@@ -23,12 +25,14 @@ fixed acceptance length 3.51.
 | Vision and image requests | Implemented; [visual quality remains unstable](../docs/deepseek_v41_vision.md#current-limitations) in eager and FULL graph modes |
 | Multimodal chunking and embedding lifetime | Supported; output can vary with chunk size |
 | Packed cache, native quantized experts and graph execution | Implemented; see [memory and numerical limits](../docs/deepseek_v41_performance.md#memory-and-numerical-limits) |
+| FP8 (MXFP8) KV cache (`--kv_cache_dtype fp8`; BF16 and FP4 also accepted) | Complete on the original path and in mono; 1.84x the rows of the BF16 pool, GSM8K within the BF16 baseline's spread |
 | FP8 (default) or FP4 (`--index_cache_dtype fp4`) index plane, paged scorer, whole-forward target graph | Complete; a decode step is the draft's replay plus the target's, and prefill scores in the plane too |
 | DSpark speculation and accepted-prefix state commit | Fixed-width lifecycle supported at level 0; [quality and throughput acceptance remain incomplete](../docs/deepseek_v41_dspark.md#current-limitations) |
 | Candidate-only indexing, Engram residency and fusion | Partial: Engram UVA/overlap and fusions exist. Visibility-sized scratch, candidate-only Reindex and HBM residency remain |
 | Fused decode (mono) for DSpark verify steps of up to 12 rows and their draft backbone | On by default (`ATOM_MONO_ENABLE`) but currently refused: its MoE kernel still runs MXFP4 activations; see [Fused decode](#fused-decode-mono) |
 | Decoder SWA bounded replay (the decoder on each prompt's last window rows) | On by default (`--no-decoder-swa-bounded-replay`); see [the runtime guide](../docs/deepseek_v41_runtime.md#decoder-swa-bounded-replay) |
 | Encoder SWA bounded replay (no state checkpoints; a hit rebuilds one PAGE) | On by default (`--no-encoder-swa-bounded-replay`); see [the runtime guide](../docs/deepseek_v41_runtime.md#encoder-swa-bounded-replay) |
+| P/D disaggregation (Mooncake) | 1P1D TP2+TP2 validated with DSpark (gsm8k and AgentX c32); MoRI-IO not yet admitted. See [the PD guide](pd_disaggregation_guide.md#deepseek-v41-flash) |
 | TP4 with routed experts sharded across TP instead of whole-expert EP | Supported; relative throughput is workload-dependent |
 | TP2 no EP | GPU benchmark completed at level 3 FULL; see the [AgentX recipe](DeepSeek-V4.1-Flash-Agentic.md) for commands and measured points |
 | Other TP sizes | Configuration tests cover TP1/2/4/8 and dimension divisibility; this does not establish GPU or quality validation for TP1/8. TP8 does not start: AITER's FP8 blockscale GEMM runs no K = 288 (the shared expert's down projection) |

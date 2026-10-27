@@ -28,6 +28,11 @@ logger = logging.getLogger("atom")
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
+    # No model needs that gate when PCP is disabled. In particular, avoid
+    # importing DeepSeek-only optional kernels for Qwen MTP in this case.
+    if get_pcp_world_size() == 1:
+        return False
+
     from atom.models.deepseek_v2 import _pcp_active
 
     if _pcp_active():
@@ -60,6 +65,8 @@ def _pcp_split_draft_inputs(
     which the pad-and-split below would corrupt. No MRoPE model can reach the
     PCP draft path today.
     """
+    # FusedMoE gathers its routed rows across the PCP group on this flag.
+    get_forward_context().context.pcp_split = True
     pcp_ws = get_pcp_world_size()
     n_global = input_ids.shape[0]
     assert positions.shape[0] == n_global and hidden_states.shape[0] == n_global, (
@@ -398,7 +405,7 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
+    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm every size from the state the target's capture left behind.
 
         `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
@@ -425,7 +432,7 @@ class EagleProposer(Drafter):
             return build_context(**kwargs)
 
         try:
-            super().warmup_draft_graphs(build_pristine_context, stream, end_trace)
+            super().warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
             restore()
 
@@ -531,7 +538,7 @@ class EagleProposer(Drafter):
         # the verify step's has the right row count, wrong rows. Published
         # unconditionally: a prefill target (every step on a PD prefill node)
         # never built one, yet steps 1+ still reach the DCP sparse indexer.
-        builder._publish_dcp_token_block_tables(attn_metadata, running_bs, 1)
+        builder._publish_token_block_tables(attn_metadata, running_bs, 1)
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
@@ -629,6 +636,7 @@ class EagleProposer(Drafter):
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
         scheduled_bs = context.scheduled_bs
+        batch_info = self.runner.forward_vars["batch_info"].gpu
         # Mid-steps run at the recorded shape the startup sweep warmed -- but
         # only when one exists at this batch. Widening is for reaching a
         # recording; without one it just hands the variable-length MoE gather
@@ -717,6 +725,7 @@ class EagleProposer(Drafter):
                     running_tokens=running_bs if i else input_ids.shape[0],
                     # Only a widened mid-step runs a height the group agreed on.
                     running_tokens_are_unified=i > 0 and self.step is not None,
+                    scheduled_tokens_gpu=batch_info[0:1] if i else batch_info[1:2],
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------
                 # The draft's first pass is a prefill that reuses the target's

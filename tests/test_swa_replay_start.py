@@ -198,3 +198,17 @@ def test_a_batch_carries_only_the_forwards_starting_below_their_resume():
         total_seqs_num=3,
     )
     assert batch.replaying == {0: replay}
+
+
+def test_a_tier_load_under_a_replay_transfer_resumes_as_a_replay():
+    """An offload load brings PAGE alone; under a `replay` transfer the forward
+    rebuilds the state below where it ends, as at an HBM hit."""
+    replay = _manager(StateTransfer.replay())
+    seq = _seq(5000, cached=2048)
+    seq.replays_hit = False
+    assert BlockManager.tier_resume_replays(replay, seq)
+    assert replay.replay_start(seq, 2048, hit=True) == 1920
+    copy = _manager(StateTransfer.copy("layout"))
+    assert not BlockManager.tier_resume_replays(copy, seq)
+    seq.replays_hit = True
+    assert BlockManager.tier_resume_replays(copy, seq)

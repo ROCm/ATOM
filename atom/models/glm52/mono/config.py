@@ -258,7 +258,7 @@ def config_refusal(atom_config) -> str | None:
     )
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     checks += common_refusals(
-        atom_config, Dims, SUPPORTED_TP, piecewise_cudagraph_required=False
+        atom_config, Dims, SUPPORTED_TP, refuse_tr_hybrid=False
     ) + [
         (geometry is not None, "native geometry"),
         (getattr(hf, "model_type", None) == "glm_moe_dsa", "model type"),

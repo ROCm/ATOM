@@ -321,8 +321,8 @@ def validate_speculative_config(config):
 
         if Path(speculative.model).resolve() != Path(config.model).resolve():
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
-    if config.kv_cache_dtype != "bf16":
-        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 KV cache")
+    if config.kv_cache_dtype not in ("bf16", "fp8"):
+        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 or FP8 KV cache")
     from atom.utils import envs
 
     if envs.ATOM_ENABLE_RELAXED_MTP:
@@ -344,9 +344,9 @@ def validate_runtime_config(config):
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
         (
-            "CUDAGraph mode (use FULL, PIECEWISE or enforce_eager=True)",
+            "CUDAGraph mode (use FULL, TR_HYBRID or enforce_eager=True)",
             not config.enforce_eager
-            and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
+            and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.TR_HYBRID),
         ),
         (
             "torch.compile level (use 0 or 3)",
@@ -375,12 +375,24 @@ def validate_runtime_config(config):
             config.enable_tbo and not config.enable_dp_attention,
         ),
         (
-            # `lmcache_mp` is the one transport admitted: it checkpoints STATE
-            # through the backend's PAGE-backed copies. P/D and in-process
-            # offload read SLOT regions and codecs this runtime does not publish.
-            "KV transfer other than lmcache_mp",
+            # `lmcache_mp` checkpoints STATE through the backend's PAGE-backed
+            # copies; Mooncake P/D moves whole PAGE units plus the request's one
+            # STATE slot (`get_kv_transfer_tensors`). MoRI-IO and in-process
+            # offload read SLOT codecs this runtime does not publish.
+            "KV transfer other than lmcache_mp or mooncake",
             KVConnectorFactory.connector_name(config.kv_transfer_config)
-            not in (None, "lmcache_mp"),
+            not in (None, "lmcache_mp", "mooncake"),
+        ),
+        (
+            # Mooncake defaults a missing role to producer, but producer
+            # detection (`kv_config_has_producer`) reads only an explicit one:
+            # an implicit producer would keep deferred output and decode T0
+            # into the slot before handing it over.
+            "Mooncake P/D without an explicit kv_role",
+            KVConnectorFactory.connector_name(config.kv_transfer_config) == "mooncake"
+            and isinstance(config.kv_transfer_config, dict)
+            and config.kv_transfer_config.get("kv_role")
+            not in ("kv_producer", "kv_consumer"),
         ),
         ("RapidServe", config.enable_rapidserve),
         ("online quantization", config.online_quant_config is not None),
@@ -388,13 +400,13 @@ def validate_runtime_config(config):
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
             # scorer's page-8 layout (`index_plane`). The main pool stays
-            # independent of it and takes bf16 or fp4 either way.
+            # independent of it and takes bf16, fp8 or fp4 either way.
             "an index plane other than fp8 or fp4",
             config.index_cache_dtype not in ("fp8", "fp4"),
         ),
         (
-            "a KV cache other than bf16 or fp4",
-            config.kv_cache_dtype not in ("bf16", "fp4"),
+            "a KV cache other than bf16, fp8 or fp4",
+            config.kv_cache_dtype not in ("bf16", "fp8", "fp4"),
         ),
         (
             # A hit rebuilds the window a row at it reads from the one PAGE

@@ -15,14 +15,21 @@ def _pow2_scale(amax, maximum, minimum):
 
 
 def act_quant(
-    x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, inplace=False
+    x,
+    block_size=128,
+    scale_fmt=None,
+    scale_dtype=torch.float32,
+    inplace=False,
+    amax_floor=1e-4,
 ):
+    """The reference's ``act_quant``; ``amax_floor`` its 1e-4 by default (ATOM
+    floors at ``AMAX_FLOOR`` instead)."""
     grouped = x.float().unflatten(-1, (-1, block_size))
     amax = grouped.abs().amax(-1)
     scale = (
-        _pow2_scale(amax, 448.0, 1e-4)
+        _pow2_scale(amax, 448.0, amax_floor)
         if scale_fmt is not None
-        else amax.clamp_min(1e-4) / 448.0
+        else amax.clamp_min(amax_floor) / 448.0
     )
     quant = (grouped / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
     if inplace:
