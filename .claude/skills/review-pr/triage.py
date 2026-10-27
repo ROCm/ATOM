@@ -13,12 +13,52 @@ from collections import OrderedDict
 # `import atom` the way `aiter/jit/core.py` does. Tier 1 here means "runs on every
 # forward pass" or "base class shared by more than one model family"; see TIER1 below,
 # which names the three files that meet that bar.
-TIER = ("atom/model_engine/model_runner.py", "atom/config.py",
-        "atom/models/deepseek_v2.py", "atom/model_ops/moe.py",
-        "atom/model_engine/scheduler.py", "atom/model_ops/attention_mla.py",
-        "atom/model_ops/attentions/aiter_mla.py", "atom/model_ops/linear.py",
-        "atom/model_ops/attention_mha.py", "atom/model_ops/layernorm.py",
-        "atom/models/deepseek_v4.py")
+#
+# Entries ending in "/" are DIRECTORY prefixes, not files -- `atom/models/deepseek_v4.py`
+# became the package `atom/models/deepseek_v4/` on origin/main sometime after this table
+# was written, and `p in TIER`'s exact-equality match can never match a path inside a
+# package, so that entry was a backbone file the corefiles gate would never demand an
+# assessment for (measured: `git log --since=2026-04-27 --name-only ... origin/main --
+# atom/` shows zero commits can touch the literal path `atom/models/deepseek_v4.py` on
+# today's tree). `_tier_hit` below matches a directory entry by prefix; exact-file entries
+# are unaffected. The four directories added here are the hottest paths that same
+# six-month `git log` turned up with NOTHING in TIER: atom/model_ops/attentions (396
+# commits, only the single file aiter_mla.py was covered), atom/model_ops/v4_kernels
+# (138), atom/models/deepseek_v41 (165), and atom/models/deepseek_v4 (115, the package
+# that replaced the dead file). atom/plugin/sglang (328) and atom/plugin/vllm (323) were
+# also hot but are deliberately NOT here -- see the plugin-bridge comment in derive().
+TIER1 = ("atom/model_engine/model_runner.py", "atom/config.py",
+         "atom/models/deepseek_v2.py")
+# Tier 2: ops shared across more than one model family, where a correctness bug silently
+# produces wrong results for every user of that op (SKILL.md Q3). attentions/ and
+# v4_kernels/ are clean fits: both are imported by deepseek_v4, deepseek_v41 and (for
+# attentions/) qwen4_exp -- distinct production model families sharing one dispatch.
+# deepseek_v4/ and deepseek_v41/ are a softer fit -- each is one model's own
+# implementation, not an op several families share -- but deepseek_v4.py was already
+# carried here before it became a package (see table above), on the same reasoning this
+# keeps: a bug in a single model's backbone file is still silent-wrong-answer for every
+# user of THAT model, and these two are among the highest-churn files in the whole tree
+# (115 and 165 commits respectively, more than every current Tier 2 entry except moe.py).
+# Classifying them Tier 3 ("model-specific") would be literally defensible by SKILL.md's
+# Q1-Q3 but would mean the corefiles gate never requires an assessment for either --
+# which is exactly the coverage hole this fix exists to close. Calibrating this line
+# more precisely is P1's job (see spec S7).
+TIER2 = ("atom/model_ops/moe.py", "atom/model_engine/scheduler.py",
+         "atom/model_ops/attention_mla.py", "atom/model_ops/attentions/",
+         "atom/model_ops/linear.py", "atom/model_ops/attention_mha.py",
+         "atom/model_ops/layernorm.py",
+         "atom/models/deepseek_v4/", "atom/models/deepseek_v41/",
+         "atom/model_ops/v4_kernels/")
+TIER = TIER1 + TIER2
+
+
+def _tier_hit(p, entries):
+    """True when path `p` is one of `entries` -- an exact file, or under a directory
+    entry (one ending in "/"). Exact-file entries still require exact equality, so a
+    file that merely starts with another file's name as a prefix does not false-hit."""
+    return any(p == e or (e.endswith("/") and p.startswith(e)) for e in entries)
+
+
 DOWNSTREAM = ("mla", "fused_moe", "attention", "mha", "quant", "gemm_op_a8w8",
               "moe_op", "jit/core")
 
@@ -1095,10 +1135,17 @@ def derive(files, title="", raw_diff=""):
                      or "/docs/" in p for p in paths):
         return [("infra-only", "NONE")]
 
-    if any(p in TIER[:3] for p in paths):
+    if any(_tier_hit(p, TIER1) for p in paths):
         hit("tier1-every-request", "STEP4 A2 D4")
-    elif any(p in TIER for p in paths):
+    elif any(_tier_hit(p, TIER) for p in paths):
         hit("tier2-shared-op", "A1 A2 B6")
+    # atom/plugin/sglang and atom/plugin/vllm are NOT in TIER even though the same
+    # six-month git log shows them hotter than every Tier 2 entry (328 and 323 commits).
+    # SKILL.md's own Q4 classifies a plugin bridge file as Tier 3 ("HIGH VISIBILITY --
+    # only plugin users are affected"), not Tier 1/2, and this family already exists and
+    # fires on exactly these paths. Adding them to TIER would make a plugin PR derive
+    # both tier2-shared-op and plugin-bridge for the same reason, which is double-firing,
+    # not double coverage -- plugin-bridge already carries E2/E3, the rules that cover it.
     if any(p.startswith("atom/plugin/") for p in paths):
         hit("plugin-bridge", "E2 E3")
     if re.search(r"from aiter import|import aiter\b|aiter\.", add):
@@ -2048,9 +2095,11 @@ def pinned_struct_churn(diff_text, root):
 # deliberately not required here -- a Tier-1 rule written to cover every op wrapper fires
 # on most PRs and the assessment it mandates then stops being performed at all, which is
 # the hole this gate exists to close, not to reopen.
-TIER1 = ("atom/model_engine/model_runner.py", "atom/config.py",
-         "atom/models/deepseek_v2.py")
-TIER2 = tuple(p for p in TIER if p not in TIER1)
+#
+# TIER1/TIER2 are defined once, near the top of this file next to TIER and _tier_hit --
+# not redefined here, so this gate and derive()'s family axis cannot drift apart again
+# the way TIER1 (a literal tuple) and `TIER[:3]` (a slice assumed to be the same three
+# files) already had.
 
 # $WORK artifacts are evidence, not citations of tree files. P6 is by construction about
 # the absence of a measurement, so validation_requirement.json IS where its evidence
@@ -2125,9 +2174,9 @@ def core_files_in(diff_text, root=None):
     out = []
     for p in sorted(touched):
         base = p.rsplit("/", 1)[-1]
-        if p in TIER1:
+        if _tier_hit(p, TIER1):
             out.append((p, "1"))
-        elif p in TIER2:
+        elif _tier_hit(p, TIER2):
             out.append((p, "2"))
         elif (base.endswith((".h", ".hpp", ".cuh"))
               and base not in GENERATED_REGISTRIES

@@ -172,7 +172,20 @@ Otherwise → Tier 3 (model-specific or kernel-specific).
 Key difference from aiter: ATOM has no `import atom` — Tier 1 is defined by
 "executes on every request" or "base class for multiple model families", not by import chain.
 
-The table below is the current snapshot; Q1–Q4 classify new files not yet listed.
+The table below is the current snapshot; Q1–Q4 classify new files not yet listed. A row
+whose File column ends in `/` is a directory entry — every file under it counts, not just
+the one it happens to name today. `atom/models/deepseek_v4.py` was a Tier-2 row here until
+it became the package `atom/models/deepseek_v4/` on origin/main; the old exact-file row
+could then never match a diff again, so the corefiles gate silently stopped demanding a
+Step 4 line for it. Measured with `git log --since=2026-04-27 --name-only --pretty=format:
+origin/main -- atom/`, aggregated two levels deep, over the last six months: `atom/model_ops/attentions`
+396 commits (only the single file `aiter_mla.py` was covered), `atom/plugin/sglang` 328,
+`atom/plugin/vllm` 323, `atom/models/deepseek_v41` 165, `atom/model_ops/v4_kernels` 138,
+`atom/models/deepseek_v4` 115 — several hotter than every current Tier-2 entry except
+`moe.py`. The plugin directories are deliberately not rows here: SKILL.md's own Q4 already
+puts a plugin bridge file at Tier 3, and `derive()`'s `plugin-bridge` family already fires
+on exactly `atom/plugin/`; adding them here would make the same PR derive both
+`tier2-shared-op` and `plugin-bridge` for the same reason.
 
 Backbone files ranked by git commit frequency (2025–2026) and blast radius:
 
@@ -184,11 +197,13 @@ Backbone files ranked by git commit frequency (2025–2026) and blast radius:
 | **2** | `atom/model_ops/moe.py` | 69 | All MoE models | Wrong expert routing, double weight pinning |
 | **2** | `atom/model_engine/scheduler.py` | 68 | Request batching for all models | Stall, wrong decode/prefill split |
 | **2** | `atom/model_ops/attention_mla.py` | 54 | All MLA attention paths | Wrong KV, accuracy drop, crash |
-| **2** | `atom/model_ops/attentions/aiter_mla.py` | 52 | aiter MLA dispatch | Wrong kernel, wrong dtype |
+| **2** | `atom/model_ops/attentions/` | 396 | Attention backends shared by deepseek_v4, deepseek_v41, qwen4_exp | Wrong kernel, wrong dtype, wrong KV |
 | **2** | `atom/model_ops/linear.py` | 49 | All linear layers (every model) | Wrong GEMM dispatch, wrong quant |
 | **2** | `atom/model_ops/attention_mha.py` | 46 | All MHA models | Wrong attention output |
 | **2** | `atom/model_ops/layernorm.py` | 32 | Norm + quant fusion path | Wrong scale, wrong dtype |
-| **2** | `atom/models/deepseek_v4.py` | 34 | DSv4 / Kimi-K2.5 specific | Wrong sparse MLA, SWA layout break |
+| **2** | `atom/models/deepseek_v4/` | 115 | DSv4 backbone (package; replaces the dead `deepseek_v4.py` row) | Wrong sparse MLA, SWA layout break |
+| **2** | `atom/models/deepseek_v41/` | 165 | DSv4.1 backbone — single model family, carried at Tier 2 on the same high-churn/high-blast-radius basis as deepseek_v4/ above, not a strict Q3 shared-op fit | Wrong sparse MLA, wrong mono-decode plan |
+| **2** | `atom/model_ops/v4_kernels/` | 138 | Kernels shared by deepseek_v4, deepseek_v41, deepseek_v4_dspark | Wrong paged/indexer math for all v4-lineage models |
 
 
 **Tier-1 special rule**: When `model_runner.py` or `config.py` is touched, ask: does the change
