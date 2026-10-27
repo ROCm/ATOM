@@ -787,101 +787,6 @@ models:
           prefill: *glm52_agentic_cpp8_prefill
           env: *glm52_agentic_cpp8_env
 
-      # PR 2425 validation only: matched GSM8K runs, real acceptance and fresh
-      # 512-token compute chunks. Plain Mooncake avoids offload prefix hits.
-        - &pr2425_glm_accuracy
-          <<: *glm52_agentic_lmcache_cpp4_dcp4
-          name: pr2425-glm-cpp4-dcp4-gsm8k-baseline-c32
-          display_topology: PR2425-CPP4-DCP4-BASELINE
-          isl: [4096]
-          osl: 1024
-          concurrency: [32]
-          server:
-            common_args:
-              <<: *glm52_agentic_lmcache_cpp4_dcp4_args
-              max_model_len: 8192
-              max_num_seqs: 64
-              decode_max_num_seqs: 64
-              enable_prefix_caching: false
-              extra_args: "--level 3 --method mtp --num-speculative-tokens 3"
-          prefill:
-            workers: 1
-            tp: 1
-            cudagraph: none
-            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 512 --timeout-keep-alive 900"
-          env: &pr2425_glm_accuracy_env
-            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
-            prefill: &pr2425_glm_accuracy_prefill_env
-              HIP_VISIBLE_DEVICES: "0,1,2,3"
-              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
-              PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
-            decode: *glm52_cpp4_dcp4_lmcache_decode_env
-          benchmark:
-            kind: random
-            wait_server_timeout: 5400
-            wait_router_timeout: 600
-          run_eval: true
-          eval_only: true
-          accuracy:
-            task: gsm8k
-            fewshot: 20
-            eval_concurrency: [32]
-            model_type: local-completions
-            endpoint: completions
-            max_gen_toks: 1024
-            threshold: 0.92
-
-        - <<: *pr2425_glm_accuracy
-          name: pr2425-glm-cpp4-dcp4-gsm8k-chunked-c32
-          display_topology: PR2425-CPP4-DCP4-CHUNKED
-          env:
-            <<: *pr2425_glm_accuracy_env
-            prefill:
-              <<: *pr2425_glm_accuracy_prefill_env
-              PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
-
-      profile:
-        # Dispatch-only concurrency comparison with server Prometheus snapshots.
-        # This is a 10-minute sampled agentic workload, not a fresh 1M-token test.
-        - &pr2425_glm_stress
-          <<: *glm52_agentic_lmcache_cpp4_dcp4
-          name: pr2425-glm-cpp4-dcp4-agentic-baseline-c64
-          display_topology: PR2425-CPP4-DCP4-STRESS-BASELINE
-          concurrency: [64]
-          benchmark:
-            <<: *agentic_1m_aiperf
-            benchmark_duration: 600
-            warmup_requests_per_lane: 2
-            warmup_grace_period: 900
-          run_eval: false
-
-        - <<: *pr2425_glm_stress
-          name: pr2425-glm-cpp4-dcp4-agentic-chunked-c64
-          display_topology: PR2425-CPP4-DCP4-STRESS-CHUNKED
-          env:
-            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
-            prefill:
-              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
-              PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode: *glm52_cpp4_dcp4_lmcache_decode_env
-
-        # Long cold-cache queues can legitimately exceed the default 300s.
-        # Keep the default case above to exercise expiry and use this pair for
-        # sustained throughput after the cold-cache warmup.
-        - <<: *pr2425_glm_stress
-          name: pr2425-glm-cpp4-dcp4-agentic-chunked-timeout900-c64
-          display_topology: PR2425-CPP4-DCP4-STRESS-CHUNKED-T900
-          env:
-            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
-            prefill:
-              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
-              PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":900},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode: *glm52_cpp4_dcp4_lmcache_decode_env
-
       # The nightly lmcache-1m cells with their prefix tier in a Mooncake Store
       # and no LMCache anywhere: ATOM's mooncake_store offload connector moves
       # each PP stage's 256-token KV chunks between its GPU and the Store, and
@@ -1953,8 +1858,7 @@ models:
 
       # Manual accuracy suite: no performance workload or synthetic acceptance.
       accuracy:
-        - &pr2425_dsv4_accuracy_original
-          name: ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
+        - name: ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
           topology: 1p1d
           display_topology: 1P1D-TP8-DSPARK3
           pd_worker_layout: multi_node
@@ -1995,41 +1899,3 @@ models:
             endpoint: chat/completions
             max_gen_toks: 4096
             apply_chat_template: true
-
-        # PR 2425: SWA and per-request state must survive the final handoff.
-        - &pr2425_dsv4_accuracy
-          <<: *pr2425_dsv4_accuracy_original
-          name: pr2425-dsv4-tp8-dspark3-gsm8k-baseline-c16
-          display_topology: PR2425-TP8-DSPARK3-BASELINE
-          server:
-            common_args:
-              max_model_len: 8192
-              max_num_seqs: 32
-              decode_max_num_seqs: 32
-              spec_decode_acceptance_length: ""
-              enable_prefix_caching: false
-              # Override the model's explicit enable-prefix-caching argument.
-              extra_args: "--index-cache-dtype fp4 --attn-prefill-chunk-size 16384"
-          prefill:
-            workers: 1
-            tp: 8
-            cudagraph_mode: FULL
-            compilation_level: 3
-            extra_args: "--enable-tbo --max-num-batched-tokens 512"
-          accuracy:
-            task: gsm8k
-            fewshot: 5
-            eval_concurrency: [16]
-            model_type: local-chat-completions
-            endpoint: chat/completions
-            max_gen_toks: 4096
-            apply_chat_template: true
-            threshold: 0.90
-
-        - <<: *pr2425_dsv4_accuracy
-          name: pr2425-dsv4-tp8-dspark3-gsm8k-chunked-c16
-          display_topology: PR2425-TP8-DSPARK3-CHUNKED
-          env:
-            prefill:
-              PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}

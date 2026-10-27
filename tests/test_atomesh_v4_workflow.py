@@ -127,23 +127,17 @@ class V4WorkflowTest(unittest.TestCase):
             RUN_ALL_MODELS="false",
             MODEL_NAMES=MODEL,
         )
-        self.assertIn(
-            "ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16",
-            {cell["name"] for cell in cells},
-        )
-        for cell in cells:
-            with self.subTest(case=cell["name"]):
-                self.assertTrue(cell["eval_only"])
-                self.assertTrue(cell["run_eval"])
-                self.assertEqual(cell["concurrency"], [16])
-                self.assertEqual(
-                    cell["server_args"]["spec_decode_acceptance_length"], ""
-                )
-                for role in ("prefill", "decode"):
-                    self.assertEqual(cell["service"][role]["tp"], 8)
-                    self.assertNotIn(
-                        "--enable-dp-attention", cell["service"][role]["extra_args"]
-                    )
+        self.assertEqual(len(cells), 1)
+        cell = cells[0]
+        self.assertTrue(cell["eval_only"])
+        self.assertTrue(cell["run_eval"])
+        self.assertEqual(cell["concurrency"], [16])
+        self.assertEqual(cell["server_args"]["spec_decode_acceptance_length"], "")
+        for role in ("prefill", "decode"):
+            self.assertEqual(cell["service"][role]["tp"], 8)
+            self.assertNotIn(
+                "--enable-dp-attention", cell["service"][role]["extra_args"]
+            )
 
 
 class V4AccuracyPhaseTest(unittest.TestCase):
