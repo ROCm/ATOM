@@ -29,10 +29,14 @@ for run in sorted(ROOT.glob(f"minimax-m3.1-flash-*-{RUN_ID}-*")):
             if used >= 64 << 20:
                 break
             try:
+                # Keep all four cases within the aggregate budget. Preserve
+                # benchmark records while bounding verbose server log tails.
+                limit = (4 if src.name in {"aiperf.log", "profile_export_aiperf.json"} else 1) << 20
+                limit = min(limit, (64 << 20) - used)
                 with src.open("rb") as f:
                     size = os.fstat(f.fileno()).st_size
-                    f.seek(max(0, size - (4 << 20)))
-                    data = f.read(4 << 20)
+                    f.seek(max(0, size - limit))
+                    data = f.read(limit)
                 dst = OUT / src.relative_to(ROOT)
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(data)
