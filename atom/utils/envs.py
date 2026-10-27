@@ -628,7 +628,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
     # aiter's Gluon all-reduce + residual add + RMSNorm (ROCm/aiter#6974) for
-    # decode (fused calls up to 2 MiB) at TP4 on gfx1250. Set 0 on gfx950.
+    # decode (fused calls up to 2 MiB) at TP4; aiter uses it on gfx1250 only.
     "ATOM_ENABLE_GLUON_FUSED_AR": lambda: (
         os.getenv("ATOM_ENABLE_GLUON_FUSED_AR", "1") == "1"
     ),
