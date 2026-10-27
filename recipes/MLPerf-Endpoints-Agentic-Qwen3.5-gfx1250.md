@@ -33,7 +33,7 @@ picks the server from the concurrency:
 | Concurrency | Server |
 |---|---|
 | 1-16 | TP4, custom all-reduce |
-| 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity) |
+| 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
 `--level 0`, 16k-token prefill chunks, decode graphs captured at every size up to `max-num-seqs`.
@@ -80,6 +80,8 @@ point), `TURN_TIMEOUT` (default 14400 s, the benchmark's own: the drain after th
 in-flight turns finish, up to ~50 min at c2048; 900 bounds it but at high concurrency fails long turns and
 their trajectories: 22% of turns at c2048), `MODE` / `SPEC`
 (override the table above), `SEQ_CAP` (512). A full compliant run is `CAP_MIN=600 STOP_FIRST=0`.
+`ATOM_PREFILL_DECODE_INTERVAL` in the environment overrides the DP points' default of 8 (0 is the
+scheduling before it; see [Prefill / decode interval](#prefill--decode-interval)).
 
 ## Results
 
@@ -94,7 +96,46 @@ tips (ATOM b4f41cdd, aiter 0f95c0f4), "image" = the image's own ATOM / aiter:
 
 MTP accepted 2.99 tokens a forward at c16 and 2.58 at c2048 on the real data. The c4096 point is
 above the range: 2,048 conversations run and the rest queue (hence the TTFT and the turns that hit
-the then 900 s turn timeout); it shows the cap, not the hardware.
+the then 900 s turn timeout); it shows the cap, not the hardware. These points predate the
+[prefill / decode interval](#prefill--decode-interval) (they ran with 0). Interactivity is the
+report's "E2E average interactivity": output tokens over turn latency, TTFT included.
+
+## Prefill / decode interval
+
+The four DP engines step in lockstep: every layer's MoE dispatch waits for all of them, so a step
+lasts as long as the busiest engine, and an engine runs either a prefill or a decode in a step. Once
+the KV cache fills (c2048: past 90% by minute 7) the prefill delayer's KV-pressure rule releases
+prefill on every step, so engines prefill and decode in the same step and every decode waits for the
+prefill beside it. In steady state at c2048 (interval 0) 46% of the steps were mixed and none was
+all-decode: an engine decoded on 15% of its steps, each stretched to ~145 ms against ~55 ms for an
+aligned decode step of the same size (~500 sequences an engine, graphed), and run eagerly (a captured
+decode graph replays only when every engine decodes).
+
+`serve_ep.sh` sets `ATOM_PREFILL_DECODE_INTERVAL=8` on DP points: after any engine prefills, every
+engine runs 8 decode-only passes before new prefill is admitted. Steps then alternate between one
+prefill on all engines, with the turns that arrived meanwhile batched into bigger chunks, and decode
+steps that replay graphs. DeepSeek-R1's DP4 + EP4 + MTP endpoints script and MLPerf configs set 32 for
+the same reason. c2048 with issuing capped at 15 minutes (minutes 10-15 are inside the KV-saturated
+regime; these are not 30-minute points), mori's dispatch geometry tuned for this shape (worth ~0.5%
+of the prefill time, not upstream):
+
+| Interval | Mixed steps | Out tok/s, min 10-15 | Turns (failed) | TPS | TPOT median | 1000 / TPOT | E2E interactivity | NATL median | TTFT median |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 (22-minute point, untuned mori) | 46% | 5,622 | 43,009 (0) | 7,339 | 257 ms | 3.9 | 4.02 | 4.7 | 0.91 s |
+| 4 | 0 | 9,273 | 45,975 (0) | 11,330 | 65 ms | 15.3 | 6.60 | 7.6 | 13.5 s |
+| 8 | 0 | 10,217 | 46,237 (0) | 10,824 | 36 ms | 28.1 | 6.70 | 7.6 | 23.0 s |
+
+Mixed steps are counted over a 10-15 s profiler window (minute 20 for interval 0, minute 12 for the
+others); outputs were clean on every run. With the interval, prompt throughput nearly doubles
+(75-91k against 33-47k tok/s at minutes 6-15: aligned, full chunks) and decode is fast enough that
+prefill becomes the bottleneck: ~300 conversations an engine wait for prefill, which is the TTFT.
+The interval trades TTFT against TPOT: against 8, interval 4 cuts the TTFT by ~40% and nearly doubles
+the TPOT. Which
+side to favour depends on the interactivity definition: the report's E2E interactivity and the
+client's experimental per-trajectory NATL include TTFT, 1000 / TPOT does not (the client reports
+1 / mean TPOT as the official per-user TPS on non-agentic benchmarks and computes no official agentic
+steady state yet). TP points do not set the interval: one engine has nothing to skew against, and a
+nonzero interval there also turns on the delayer's prefill coalescing, untested here.
 
 ## Run length
 
