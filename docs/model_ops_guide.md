@@ -265,7 +265,7 @@ FusedMoE(
 | `QuantType.No` | `UnquantizedFusedMoEMethod` | `aiter.fused_moe.fused_moe` |
 | FP8 (`dtypes.fp8`) | `Fp8MoEMethod` | `aiter.fused_moe.fused_moe` with quant_type |
 | FP8 compressed-tensors | `CompressedTensorsFp8MoEMethod` | `aiter.fused_moe.fused_moe` or `asm_moe` |
-| MXFP4 (`dtypes.fp4x2`) | `Mxfp4MoEMethod` | `aiter.fused_moe.fused_moe` or Triton `triton_kernel_moe_forward` |
+| MXFP4 (`dtypes.fp4x2`) | `Mxfp4MoEMethod` | `aiter.fused_moe.fused_moe` or Triton `triton_kernel_fused_experts` |
 
 The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 methods and supports `a16` mode where activations remain in BF16/FP16 while weights are FP8/INT8.
 
@@ -302,10 +302,42 @@ Key properties:
 
 MORI (MoE Router Infrastructure) provides all-to-all communication kernels for expert parallelism. `MoriPrepareAndFinalize` implements:
 
-- `prepare()`: Dispatches tokens to remote experts via `mori_op.dispatch()`. Optionally quantizes activations to FP8 before dispatch.
+- `prepare()`: Dispatches tokens to remote experts via `mori_op.dispatch()`, in the layer's routed-rows wire (MXFP8 with e8m0 scales where the experts take MXFP8, `ATOM_MORI_FP4_DISPATCH` for MXFP4, bf16 otherwise).
 - `finalize()`: Combines expert outputs via `mori_op.combine()` and copies results back.
 
 The `FusedMoEModularKernel` orchestrates the prepare-compute-finalize pipeline.
+
+### Routing before the rows move (`fused_moe/routed_rows.py`)
+
+A MoE method splits into `select_experts(layer, x, router_logits)` (logical
+routes), `place_experts(layer, topk_weights, topk_ids, gathered)` (the EPLB
+remap and load record, the shared column in the layer's expert layout) and
+`apply(layer, x, topk_weights, topk_ids, ..., x_scale=None)`. `FusedMoE` routes
+on the rank that owns the rows, before any of them move: the MORI dispatch, the
+DP gather (DP attention without the all2all kernels), the PCP gather
+(`ATOM_PCP_MOE_MERGE`, inside `FusedMoE._run_experts`) and the comm-fused DPA
+gather all carry top-k weights and ids rather than router logits. Rows are
+placed after every gather, so a gathered row -- held alike by every rank --
+picks the same EPLB replica on each (`gathered`); and where the legacy layout
+widens in the prefilled shared column (`LEGACY_AITER`), whose ids say by row
+position which rank runs a row's shared expert, a gather is followed by
+`reassign_gathered_shared_ids`, which gives the rows this rank's ids for their
+gathered positions. Every routing kernel takes the pass's real row count,
+`Context.scheduled_tokens_gpu` (an entry of the step's
+`forward_vars["batch_info"]`, read on device so a replayed graph follows its
+own step), and routes the rows past it to -1, so they are neither sent nor
+computed. Only a consumer of the pass's whole rows (`running_tokens`) gets the
+count (`pass_scheduled_tokens_gpu`): the MoE sort reads it as its row count, so
+a subset of the rows -- a PCP shard, gathered rows -- gets None and runs every
+row, unless it declares a pass of its own with its own count
+(`ForwardContext.use_pass_rows`, as V4.1's decoder does over a prefill's tails
+with `ReplayPlan.filled_gpu` / `finishing_gpu`). The rows travel in
+`RoutedRowsWire`, the method's `routed_rows_wire` -- the one format both the
+gathers and the MoRI v1 dispatch use: MXFP4 under `ATOM_MORI_FP4_DISPATCH`,
+MXFP8 where the experts take MXFP8 activations (FlyDSL `fused_moe`, the Triton
+a8w4 EP experts), bf16 otherwise (the TP Triton path, MegaMoE, the MoRI v2
+transport). Rows already in the wire carry their e8m0 rows as `x_scale` through
+`apply`, the modular kernel and `prepare`, so nothing is quantized twice.
 
 ### MoE quantization config (`fused_moe/config.py`)
 
@@ -327,7 +359,7 @@ Factory functions:
 
 ### Triton MoE fallback (`fused_moe_triton.py`)
 
-`triton_kernel_moe_forward()` provides a Triton-based MoE path using the `triton_kernels` library. It uses `routing()` for expert assignment and `matmul_ogs()` for the expert GEMM. This path is currently used for MXFP4 MoE on GFX94x hardware.
+`triton_kernel_fused_experts()` provides a Triton-based MoE path. It takes rows routed already (`FusedMoE.select_experts`, before any gather or dispatch): `routing_from_dispatched()` sorts their top-k ids into the Triton routing data, with a `gate_valid` mask for rows another rank owns or rows past the real row count, and the expert GEMMs run on that. This path is used for MXFP4 MoE under `ATOM_USE_TRITON_MOE`.
 
 ## Normalization
 
@@ -501,7 +533,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `attention_mha.py` | MHA implementation: prefill (flash), decode (ASM/Triton paged attention) |
 | `attention_mla.py` | `MLAAttention`, `MLAModules` — DeepSeek MLA with compressed KV |
 | `moe.py` | `FusedMoE`, `FusedMoEParallelConfig`, `UnquantizedFusedMoEMethod`, `Fp8MoEMethod`, `Mxfp4MoEMethod`, `CompressedTensorsFp8MoEMethod` |
-| `fused_moe_triton.py` | `triton_kernel_moe_forward` — Triton MoE via `triton_kernels` library |
+| `fused_moe_triton.py` | `triton_kernel_fused_experts` — Triton MoE experts on rows routed already (`routing_from_dispatched`) |
 | `embed_head.py` | `VocabParallelEmbedding`, `ParallelLMHead` |
 | `rotary_embedding.py` | `RotaryEmbedding`, `get_rope` |
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
@@ -563,6 +595,7 @@ positions are ragged, and the one-token decode slot mapping comes from
 | `config.py` | `FusedMoEConfig`, `FusedMoEQuantConfig`, `FusedMoEQuantDesc`, `GroupShape`, factory functions (`fp8_w8a8_moe_quant_config`, `mxfp4_w4a16_moe_quant_config`) |
 | `modular_kernel.py` | `FusedMoEModularKernel`, `FusedMoEPrepareAndFinalize`, `ExpertTokensMetadata` — modular MoE kernel pipeline |
 | `mori_prepare_finalize.py` | `MoriPrepareAndFinalize` — MORI all-to-all dispatch/combine for expert parallelism |
+| `routed_rows.py` | `RoutedRowsWire`, `resolve_routed_rows_wire` — the format routed rows travel in across a dispatch or a DP / PCP gather |
 | `utils.py` | MoE utility functions |
 
 ### `atom/utils/`

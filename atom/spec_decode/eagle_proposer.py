@@ -64,6 +64,8 @@ def _pcp_split_draft_inputs(
     which the pad-and-split below would corrupt. No MRoPE model can reach the
     PCP draft path today.
     """
+    # FusedMoE gathers its routed rows across the PCP group on this flag.
+    get_forward_context().context.pcp_split = True
     pcp_ws = get_pcp_world_size()
     n_global = input_ids.shape[0]
     assert positions.shape[0] == n_global and hidden_states.shape[0] == n_global, (
@@ -631,6 +633,7 @@ class EagleProposer(Drafter):
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
         scheduled_bs = context.scheduled_bs
+        batch_info = self.runner.forward_vars["batch_info"].gpu
         # Mid-steps run at the recorded shape the startup sweep warmed -- but
         # only when one exists at this batch. Widening is for reaching a
         # recording; without one it just hands the variable-length MoE gather
@@ -719,6 +722,7 @@ class EagleProposer(Drafter):
                     running_tokens=running_bs if i else input_ids.shape[0],
                     # Only a widened mid-step runs a height the group agreed on.
                     running_tokens_are_unified=i > 0 and self.step is not None,
+                    scheduled_tokens_gpu=batch_info[0:1] if i else batch_info[1:2],
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------
                 # The draft's first pass is a prefill that reuses the target's
