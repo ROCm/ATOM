@@ -457,7 +457,7 @@ def build_lmcache_config(
 
 
 def lmcache_engine_id(config) -> str:
-    """Return the LMCache engine id for this process, namespaced by DP rank.
+    """Return the LMCache engine id for this process: one per server and DP rank.
 
     A scheduler's ``LookupClient`` and its workers' ``LookupServer`` derive the
     same ZMQ ipc socket path from this id, so it must be identical inside one
@@ -475,22 +475,29 @@ def lmcache_engine_id(config) -> str:
     servers on one host -- one per GPU is the usual way to serve a TP1 model --
     both bind ``dp0``; each bind takes the path over, and a scheduler connects
     to whichever server bound last. Its loads then follow another server's
-    hits. ``config.port`` is the model runner's rendezvous port (MASTER_PORT),
-    which no two servers on a host can share, and every process of one server
-    carries the same value, so it tells servers apart without splitting a
-    replica.
+    hits.
+
+    ``parallel_config.data_parallel_base_port`` tells servers apart. It is the
+    port of the model runners' TCPStore, which ``CoreManager`` binds before it
+    spawns any engine (port 0 asks the OS for a free one) and holds for the
+    server's lifetime, then writes back into the config every engine and
+    worker is spawned with. So two live servers on one host never share it,
+    and every process of one server -- every DP replica, PP stage and TP rank
+    -- reads the same value. ``config.port`` (``--port``, default 8006) is not
+    a substitute: the usual launch never sets it, and only ``MASTER_PORT``,
+    which nothing reads, is derived from it. An unresolved port (0, as before
+    ``CoreManager`` runs) falls back to the DP rank alone.
+
+    The id names only these sockets and LMCache's in-process engine; it is not
+    part of a stored chunk's key, so a restart on a new port still finds what
+    an earlier server stored.
     """
-    dp_rank = int(
-        getattr(
-            getattr(config, "parallel_config", None),
-            "data_parallel_rank",
-            0,
-        )
-        or 0
-    )
-    port = getattr(config, "port", None)
-    if isinstance(port, int) and port > 0:
-        return f"atom-offload-p{port}-dp{dp_rank}"
+    parallel = getattr(config, "parallel_config", None)
+    dp_rank = int(getattr(parallel, "data_parallel_rank", 0) or 0)
+    port = getattr(parallel, "data_parallel_base_port", None)
+    # `type(...) is int`: a bool is an int, and True would name port 1.
+    if type(port) is int and port > 0:
+        return f"atom-offload-r{port}-dp{dp_rank}"
     return f"atom-offload-dp{dp_rank}"
 
 

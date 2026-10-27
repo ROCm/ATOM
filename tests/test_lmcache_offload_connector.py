@@ -5672,9 +5672,11 @@ def test_engine_id_defaults_to_replica_zero():
     assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
 
 
-def _server_config(port: int, dp_rank: int = 0, **kw):
+def _server_config(base_port, dp_rank: int = 0, **kw):
     cfg = _dp_config(dp_rank, **kw)
-    cfg.port = port
+    cfg.parallel_config.data_parallel_base_port = base_port
+    # `--port`: every default launch leaves it at 8006, so it must not matter.
+    cfg.port = 8006
     return cfg
 
 
@@ -5682,20 +5684,69 @@ def test_engine_id_is_distinct_per_server_on_one_host():
     # One TP1 server per GPU: every one is DP rank 0, and the lookup socket
     # sits under one host directory. Without the port, the eight schedulers
     # would connect to whichever server bound the shared path last.
-    ids = [offcfg.lmcache_engine_id(_server_config(22010 + gpu)) for gpu in range(8)]
+    ids = [offcfg.lmcache_engine_id(_server_config(41000 + gpu)) for gpu in range(8)]
     assert len(set(ids)) == 8
 
 
 def test_engine_id_with_port_still_pairs_one_replica_and_splits_replicas():
     same = {
         offcfg.lmcache_engine_id(
-            _server_config(22010, 3, pp_size=2, tp_size=4, pp_rank=pp)
+            _server_config(41000, 3, pp_size=2, tp_size=4, pp_rank=pp)
         )
         for pp in range(2)
     }
-    assert same == {"atom-offload-p22010-dp3"}
-    ids = [offcfg.lmcache_engine_id(_server_config(22010, rank)) for rank in range(8)]
+    assert same == {"atom-offload-r41000-dp3"}
+    ids = [offcfg.lmcache_engine_id(_server_config(41000, rank)) for rank in range(8)]
     assert len(set(ids)) == 8
+
+
+@pytest.mark.parametrize("base_port", [0, None, True, "41000"])
+def test_engine_id_ignores_an_unresolved_or_non_int_port(base_port):
+    assert offcfg.lmcache_engine_id(_server_config(base_port)) == "atom-offload-dp0"
+
+
+def test_two_default_tp1_servers_on_one_host_get_distinct_engine_ids(monkeypatch):
+    """Two servers launched the usual way: no --port, no --data-parallel-base-port.
+
+    Each `CoreManager` binds its runners' TCPStore on port 0 before spawning
+    and writes the resolved port into the config its engines are deep-copied
+    from, so the scheduler and every worker of one server agree on the id and
+    the two servers differ.
+    """
+    import copy
+
+    from atom.config import ParallelConfig
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    for name in ("ATOM_DP_BASE_PORT", "ATOM_DP_RANK", "ATOM_DP_SIZE"):
+        monkeypatch.delenv(name, raising=False)
+    managers, ids = [], []
+    try:
+        for _ in range(2):
+            manager = CoreManager.__new__(CoreManager)
+            manager._init_shared_state(
+                SimpleNamespace(dp_load_balance="round_robin"),
+                label="test",
+                local_engine_count=0,
+            )
+            managers.append(manager)
+            config = SimpleNamespace(
+                port=8006,
+                pipeline_parallel_size=1,
+                tensor_parallel_size=1,
+                parallel_config=ParallelConfig(),
+            )
+            assert offcfg.lmcache_engine_id(config) == "atom-offload-dp0"
+            manager._start_distributed_store(config)
+            engine = copy.deepcopy(config)
+            assert offcfg.lmcache_engine_id(engine) == offcfg.lmcache_engine_id(config)
+            ids.append(offcfg.lmcache_engine_id(engine))
+    finally:
+        for manager in managers:
+            manager.close()
+            manager.ctx.term()
+    assert ids[0] != ids[1]
+    assert all(i.startswith("atom-offload-r") and i.endswith("-dp0") for i in ids)
 
 
 def test_replica_world_size_counts_pp_and_tp_but_not_dp():
