@@ -72,7 +72,7 @@ for node, containers in sorted(containers_by_node.items()):
         commands.append("docker events --since '2026-10-27T09:49:00Z' --until "
                         + '\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"'
                         + " --filter type=container --filter container=" + q
-                        + " --format '{{.Time}} {{.Action}} {{.ID}} {{index .Actor.Attributes \"name\"}} exit={{index .Actor.Attributes \"exitCode\"}} signal={{index .Actor.Attributes \"signal\"}}'")
+                        + " --format '{{.Time}} {{.Action}} {{.Actor.ID}} {{index .Actor.Attributes \"name\"}} exit={{index .Actor.Attributes \"exitCode\"}} signal={{index .Actor.Attributes \"signal\"}}'")
     collect_command(f"node-{node}-own-containers.txt", ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={OUT / 'known_hosts'}", node, "\n".join(commands)])
 (OUT / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 print(json.dumps({"files": len(manifest["files"]), "jobs": sorted(jobs), "nodes": sorted(containers_by_node), "errors": manifest["errors"]}))
