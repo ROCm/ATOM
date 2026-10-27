@@ -310,6 +310,30 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
+        self._index_score_max_block = 0
+        if (
+            self._has_sparse_attention
+            and getattr(self.model_runner.config, "index_cache_dtype", None) == "mxfp4"
+        ):
+            from atom.model_ops.minimax_m3.index_mxfp4 import index_work_map_capacity
+
+            # The MXFP4 decode scorer's persistent dispatch map (index_mxfp4):
+            # its row count is the grid, so the bound is the model length, and the
+            # buffer is CAPACITY -- the exact grid is not monotonic in the batch.
+            self._index_score_max_block = cdiv(
+                self.model_runner.config.max_model_len, 128
+            )
+            # Any step width up to the verify's: a plain decode step (S=1) builds
+            # its map into the same buffer.
+            rows = max(
+                index_work_map_capacity(
+                    self.max_bs, self._index_score_max_block, q_len, num_head_k
+                )
+                for q_len in range(1, max_qlen + 1)
+            )
+            self.model_runner.forward_vars["sparse_attention_index_score_work_map"] = (
+                torch.empty((rows, 2), **i32_kwargs)
+            )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -881,6 +905,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
 
+    def _index_score_work_map_kwargs(self) -> dict:
+        """The MXFP4 decode scorer's persistent map and its bound, for
+        `make_sparse_decode_metadata`; nothing for any other index cache."""
+        buf = self.model_runner.forward_vars.get(
+            "sparse_attention_index_score_work_map"
+        )
+        if buf is None:
+            return {}
+        return {
+            "index_score_work_map_out": buf,
+            "index_score_max_block": self._index_score_max_block,
+        }
+
     def _get_sparse_attention_block_tables(
         self,
         block_tables: torch.Tensor,
@@ -1451,6 +1488,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                **self._index_score_work_map_kwargs(),
             )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q, running_tokens=running_tokens
@@ -1704,6 +1742,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                **self._index_score_work_map_kwargs(),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
