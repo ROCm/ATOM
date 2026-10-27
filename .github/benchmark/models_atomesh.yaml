@@ -1449,6 +1449,8 @@ models:
             common_args:
               <<: *kimi_k3_pd_dspark4_args
               max_num_seqs: 176
+              num_speculative_tokens: 6
+              spec_decode_acceptance_length: 3.75
           env:
             common: *kimi_k3_pp8_reuse_env
             prefill:
