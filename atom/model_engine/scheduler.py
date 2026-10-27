@@ -4211,13 +4211,18 @@ class Scheduler:
     def register_prefill_hashes(
         self, batch: ScheduledBatch, seqs: Iterable[Sequence] | None = None
     ) -> None:
-        """Hash blocks for middle chunked-prefill chunks that skip postprocess."""
+        """Hash blocks for middle chunked-prefill chunks that skip postprocess.
+
+        Prefill rows only. A batch reaches here only when it produces no
+        output, which a mixed batch never does (its decode rows always do), but
+        a decode row's tokens are not a prompt chunk and must not be hashed
+        whatever the caller."""
         if not self.block_manager.enable_prefix_caching:
             return
         if batch.is_final_chunk is None:
             return
         seq_by_id = self._batch_seq_lookup(seqs)
-        for i, req_id in enumerate(batch.req_ids):
+        for i, req_id in enumerate(batch.req_ids[: batch.total_seqs_num_prefill]):
             seq = seq_by_id.get(req_id)
             if seq is None or not seq.block_table:
                 logger.warning(

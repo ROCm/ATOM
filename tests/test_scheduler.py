@@ -3472,6 +3472,24 @@ class TestMixedBatch:
         assert d.id not in scheduled and d.status == SequenceStatus.WAITING
         assert len(batch.block_tables) == batch.total_seqs_num
 
+    def test_prefill_hash_registration_skips_a_mixed_batchs_decode_rows(
+        self, seq_factory
+    ):
+        """PP hashes a middle chunk's blocks outside postprocess
+        (`register_prefill_hashes`). A decode row is not a prompt chunk, so its
+        tokens never go into the prefix cache, whatever batch reaches here."""
+        sched = self._mixed_scheduler(enable_prefix_caching=True)
+        decode_seq = self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        prefill_seq = seq_factory([5, 6, 7, 8])
+        sched.add(prefill_seq)
+        batch, _ = sched.schedule()
+        assert batch.is_mixed
+        assert batch.req_ids == [prefill_seq.id, decode_seq.id]
+
+        with mock.patch.object(sched.block_manager, "hash_blocks") as hash_blocks:
+            sched.register_prefill_hashes(batch, list(sched.running))
+        assert [c.args[0] for c in hash_blocks.call_args_list] == [prefill_seq]
+
     def test_mixed_final_prefill_chunk_completes_its_trace(self, seq_factory):
         """With progress advanced at schedule time, a mixed step's final
         prefill chunk closes its prefill span even though a decode row shares
