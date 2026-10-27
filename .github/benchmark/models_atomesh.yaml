@@ -1274,7 +1274,8 @@ models:
       # Chunks are 1024 tokens, one virtual block of TP8+DCP8 at block 128, as
       # LMCACHE_CHUNK_SIZE is in the LMCache cell.
       mooncake_store:
-        - <<: *kimi_k3_agentic_hc_dspark4
+        - &kimi_k3_mcstore_c88
+          <<: *kimi_k3_agentic_hc_dspark4
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-mcstore-1m-c88
           display_topology: 1P1D-TP8-DCP8-DSPARK4-MCSTORE
           concurrency: [88]
@@ -1283,7 +1284,7 @@ models:
               <<: *kimi_k3_agentic_hc_dspark4_args
               max_num_seqs: 176
           env:
-            common:
+            common: &kimi_k3_mcstore_common_env
               ATOM_ENABLE_REPLAYSSM: "1"
               ATOM_STATE_CHECKPOINT_DEMAND: "1"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
@@ -1294,7 +1295,7 @@ models:
             # its weights. Bound to their node, the prefill ranks stalled
             # there for 20+ min (run 38873740028); the decode ranks, unbound,
             # loaded beside the same owners in seconds.
-            prefill:
+            prefill: &kimi_k3_mcstore_prefill_env
               OFFLOAD_PROFILE: "1"
               OFFLOAD_GPU_STAGING_CHUNKS: "32"
               # The state images' LRU budget per rank, as in the LMCache cell.
@@ -1313,6 +1314,25 @@ models:
               # P/D only; the launcher adds mooncake_store through ATOM_KV_OFFLOAD.
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301}
+
+        # The Store C88 cell with torch traces of its prefill and decode
+        # servers: 60 s starting 900 s into the aiperf Profiling phase, then
+        # aiperf is stopped. Traces land under
+        # ${RUN_DIR}/torch_traces/<worker>/rank_<tp>/. The stop_profile export
+        # stalls both engines, so its aiperf numbers are not the cell's.
+        - <<: *kimi_k3_mcstore_c88
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-mcstore-1m-c88-torch-profile
+          env:
+            common:
+              <<: *kimi_k3_mcstore_common_env
+              ATOMESH_TORCH_PROFILE_START: "900"
+              ATOMESH_TORCH_PROFILE_DURATION: "60"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
+              # Kernel names and durations only; shapes/stacks on a TP8 window
+              # risk OOMing the ranks during export.
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_TIMEOUT: "1800"
+            prefill: *kimi_k3_mcstore_prefill_env
 
     accuracy:
       task: gsm8k
