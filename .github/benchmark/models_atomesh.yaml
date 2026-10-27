@@ -2143,3 +2143,11 @@ models:
           name: m31-vllm-1p1d-tp4-mcstore-c64
           concurrency: [64]
           env: {common: {ATOMESH_VLLM_MODE: benchmark}}
+
+        - <<: *m31_vllm_pd
+          name: m31-vllm-inspect-smoke
+          concurrency: [1]
+          env:
+            common:
+              ATOMESH_VLLM_MODE: inspect
+              ATOMESH_INSPECT_RUN_ID: "40480405641"

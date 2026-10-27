@@ -291,6 +291,11 @@ export RESULT_DIR
 CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$\{USER\}/${CURRENT_USER}}"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$USER/${CURRENT_USER}}"
+# Read-only native experiment inspection runs on the submit runner, without sbatch.
+if [[ "${BACKEND}" == "vllm" && "${ATOMESH_ENV_ATOMESH_VLLM_MODE:-}" == "inspect" ]]; then
+  export SLURM_LOG_ROOT
+  exec python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_vllm_inspect.py"
+fi
 export LOG_ROOT="${SLURM_LOG_ROOT%/}/${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-$(date +%Y%m%d%H%M%S)"
 export SLURM_JOB_NAME="${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
 export SLURM_CANCEL_HELPER="${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-cancel.sh"
