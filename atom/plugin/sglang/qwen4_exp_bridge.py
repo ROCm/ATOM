@@ -1168,24 +1168,77 @@ def build_qsa_metadata(
     return qsa
 
 
+def _mamba_physical_slots(pool: Any) -> int:
+    """Rows in the physical mamba conv/temporal tensors (0 if unresolved)."""
+    if pool is None:
+        return 0
+    slots = 0
+    mapping = getattr(pool, "req_index_to_mamba_index_mapping", None)
+    if torch.is_tensor(mapping) and mapping.numel():
+        slots = max(slots, int(mapping.numel()))
+    slots = _max_int_attrs(pool, ("size", "max_num_reqs", "mamba_size"), slots)
+    mamba_pool = getattr(pool, "mamba_pool", None) or pool
+    mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+    if mamba_cache is not None:
+        conv = getattr(mamba_cache, "conv", None)
+        if conv is not None and len(conv) > 0 and hasattr(conv[0], "shape"):
+            slots = max(slots, int(conv[0].shape[0]))
+        temporal = getattr(mamba_cache, "temporal", None)
+        if temporal is not None and hasattr(temporal, "shape"):
+            slots = max(slots, int(temporal.shape[0]))
+    return slots
+
+
 def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
     """Native allocates PLE conv state for the whole per-req pool, not max_bs.
 
     Decode CUDA graphs bake ``conv_state``'s address. Growing after capture
     frees that storage; undersizing it makes a recycled mamba slot OOB on the
     next eager prefill (the conc=4 wave-2 HSA).
+
+    Flash + ``extra_buffer`` radix keeps finished track slots in the same
+    physical pool; the capture-time floor must cover the full mamba pool, not
+    ``max_bs`` (otherwise unique-stress dies around the first wave of recycled
+    indices with a GPU fault under full decode graph).
+
+    Capture often builds PLE before ``forward_batch.req_to_token_pool`` is
+    attached; fall back to the Hybrid linear child's pool and a high floor
+    (≥ allocated ``max_mamba_cache_size``, e.g. 323 here).
     """
-    slots = max(int(_DECODE_GRAPH.max_bs), 16)
+    # High floor: capture may run before pool attrs resolve; never bake a
+    # max_bs-sized PLE buffer for radix/extra_buffer.
+    slots = max(int(_DECODE_GRAPH.max_bs), 512)
+    args = _server_args()
+    if args is not None:
+        for key in ("max_mamba_cache_size", "max_total_tokens"):
+            val = getattr(args, key, None)
+            if val:
+                slots = max(slots, int(val))
+        running = int(getattr(args, "max_running_requests", 0) or 0)
+        if running > 0:
+            # extra_buffer ≈ 2x; radix retains finished track slots on top.
+            slots = max(slots, running * 64)
+    # SGLang resolves the real mamba capacity onto the schedule object after
+    # memory-pool init (launch-time server_args.max_mamba_cache_size stays None).
+    try:
+        from sglang.srt.runtime_context import get_schedule
+
+        sched = get_schedule()
+        mamba_cap = getattr(sched, "max_mamba_cache_size", None)
+        if mamba_cap:
+            slots = max(slots, int(mamba_cap))
+    except Exception:
+        logger.debug("Flash PLE: schedule mamba capacity unavailable", exc_info=True)
     backend = resolve_attn_backend(forward_batch)
-    pool = resolve_mamba_req_pool(forward_batch, backend)
-    if pool is not None:
-        mapping = getattr(pool, "req_index_to_mamba_index_mapping", None)
-        if torch.is_tensor(mapping) and mapping.numel():
-            slots = max(slots, int(mapping.numel()))
-        slots = _max_int_attrs(pool, ("size", "max_num_reqs", "mamba_size"), slots)
-    slots = _max_int_attrs(
-        _req_to_token_pool(forward_batch), ("size", "max_num_reqs"), slots
-    )
+    linear = getattr(backend, "linear_attn_backend", None) or backend
+    pool = resolve_mamba_req_pool(forward_batch, linear)
+    if pool is None:
+        pool = getattr(linear, "req_to_token_pool", None)
+    slots = max(slots, _mamba_physical_slots(pool))
+    try:
+        slots = max(slots, _mamba_physical_slots(_req_to_token_pool(forward_batch)))
+    except Exception:
+        logger.debug("Flash PLE: req_to_token_pool not attached yet", exc_info=True)
     # Host indices only. A GPU ``idx.max().item()`` drains verify, which is
     # still queued when eager draft builds PLE state. Pool capacity above
     # already matches Native's whole-pool allocation.
@@ -1249,6 +1302,7 @@ def _ensure_ple_states(
     hf = _hf_text_config(atom_config)
     ngram = max(int(getattr(hf, "ngram_size", 3)), 1)
     rows = max(num_slots, 1)
+    existing = getattr(model, "_atom_ple_conv_state", None)
     conv_state = _grow_once_tensor(
         model,
         "_atom_ple_conv_state",
@@ -1267,6 +1321,17 @@ def _ensure_ple_states(
         dtype=torch.int64,
         fill=int(eos[0] if isinstance(eos, (list, tuple)) else eos),
     )
+    if not getattr(_ensure_ple_states, "_logged", False) or (
+        existing is not None and int(existing.shape[0]) < int(conv_state.shape[0])
+    ):
+        logger.info(
+            "Flash PLE state pool rows=%s (requested=%s active=%s capturing=%s)",
+            int(conv_state.shape[0]),
+            rows,
+            bool(_DECODE_GRAPH.active),
+            bool(_is_capturing()),
+        )
+        _ensure_ple_states._logged = True  # type: ignore[attr-defined]
     return conv_state, ngram_state
 
 
