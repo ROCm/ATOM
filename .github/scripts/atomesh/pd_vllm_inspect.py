@@ -7,6 +7,8 @@ No Slurm submission, SSH, container action, or shared-filesystem write occurs.
 import json
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 run_id = os.environ['ATOMESH_ENV_ATOMESH_INSPECT_RUN_ID']
@@ -71,5 +73,26 @@ for run in runs:
                 row['download_files_done'], row['download_files_total'] = map(int, progress[-1])
         rows.append(row)
 result = {'kind': 'experiment_status_only', 'actions_run_id': int(run_id), 'jobs': rows}
+if shutil.which('squeue'):
+    try:
+        queue = subprocess.run(['squeue', '--name', prefix[:-1] + '-1', '--noheader',
+                                '--format', '%i|%T|%R'], capture_output=True, text=True, timeout=20)
+        result['scheduler_query_rc'] = queue.returncode
+        result['scheduler'] = []
+        for line in queue.stdout.splitlines():
+            fields = line.strip().split('|')
+            if len(fields) != 3 or not fields[0].isdecimal():
+                continue
+            if fields[1] not in {'PENDING', 'RUNNING', 'COMPLETING', 'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT'}:
+                continue
+            status = {'job_id': int(fields[0]), 'state': fields[1]}
+            if re.fullmatch(r'pit2-p03-g[0-9]+', fields[2]):
+                status['node'] = fields[2]
+            elif fields[2].strip('()') in {'Resources', 'Priority', 'ReqNodeNotAvail', 'None'}:
+                status['reason'] = fields[2].strip('()')
+            result['scheduler'].append(status)
+    except subprocess.TimeoutExpired:
+        result['scheduler_query_timed_out'] = True
+
 (out / 'status.json').write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result, indent=2))
