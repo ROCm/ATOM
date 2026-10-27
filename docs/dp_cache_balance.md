@@ -99,41 +99,12 @@ This alignment work does not acknowledge or commit the migration. A dropped
 handoff or an expired preparation during alignment aborts through normal
 postprocess, retaining any buffers still used by a forward or transfer.
 
-If a target cannot recover the promised prefix, it reports its actual usable
-boundary before normal abort cleanup. The router then probes the source's
-current local HBM prefix, including STATE availability and required replay.
-The source probe does not query LMCache or count a tier hint as resident STATE.
-It runs asynchronously with a 250 ms coordinator budget by default
-(`source_probe_timeout_seconds`), including control-lock acquisition and reply
-waiting. A busy socket or unavailable probe gives the source zero reuse credit;
-it does not reuse the historical hint. A late reply is discarded.
-
-Using current loads with this request's own charge removed, compare:
-
-```text
-continue on B = wait_B + (prompt_tokens - observed_hit_B) / prefill_rate
-return to A   = wait_A + (prompt_tokens - observed_hit_A) / prefill_rate
-```
-
-The preparation time already spent is excluded from both remaining costs.
-Return to A only if its advantage covers the configured absolute and relative
-gain margins; ties stay on B. This is one reconsideration per migration, with
-a bounded number of probe workers. Lower fresh hits also retract overly long
-historical hints. Queue accounting is corrected again on actual admission.
-
-The chosen engine receives the original request and hash chain with no promised
-minimum hit. If B is chosen, a new generation fences replies from its first
-attempt; ownership changes only after B actually admits the request. The
-scheduler revalidates PAGE/STATE and recomputes every missing token. These are
-snapshots, not reservations: cleanup or eviction may shorten a hit before the
-resubmission. A cache clear invalidates both observations and fences the owner
-commit. Cancellation discards the payload and prevents a late probe from
-resurrecting the request.
-
-Preparation timeouts and failed alignment still use the prior-owner retry;
-they do not claim a safely settled partial restore for reconsideration. The
-prior owner's scheduler checks residency and recomputes missing tokens. A
-concurrent turn fences an older migration from overwriting a newer owner.
+If a target cannot recover at least the promised prefix, or the preparation
+budget expires while queued, it rejects this placement. The original request
+and hash chain are resubmitted to the prior owner. That owner's own scheduler
+rechecks residency and recomputes any missing tokens. Cancellation discards
+the retry payload; late target replies cannot resurrect it. A concurrent turn
+fences an older migration from overwriting a newer owner decision.
 
 Timeouts do not free buffers involved in an uncertain DMA. The existing native
 connector holds their leases until terminal completion, including when the
@@ -170,7 +141,7 @@ Cross-host GPU validation is required before relying on this deployment mode.
 Source HBM copies are not forcibly deleted when the owner changes. Existing
 PAGE/checkpoint reference counts and LRU policies own reclamation; LMCache
 owns its L1/L2 eviction. An evicted or stale hint causes failed preparation
-and recovery reconsideration or safe fallback. This version has no global replica-count policy or active
+and safe fallback. This version has no global replica-count policy or active
 duplicate pruning.
 
 ## Measurement
@@ -187,16 +158,6 @@ Fallback counters distinguish `preparation_timeout`,
 `alignment_chunk_unavailable`, and `admission_callback_unavailable`. Unknown
 reasons use `other`. These categories have bounded cardinality. Compare deltas
 within the profiling window, not lifetime totals that include warmup.
-
-`migration_reconsidered` counts short restores reassessed from actual hits;
-`migration_reconsider_target` and `migration_reconsider_source` report the
-choice. `migration_partial_committed` counts reassessed target placements that
-actually commit ownership (their final admitted hit can differ from the probe).
-`migration_source_probe_ok`, `_timeout`, `_unavailable`, and `_busy` distinguish
-probe outcomes; `migration_source_unknown` counts decisions without a confirmed
-source hit. DEBUG logs include source/target hits, remaining cost estimates and
-the chosen rank, without request contents. These counters are separate from
-fallbacks: staying on B is not a fallback to A.
 
 ### Measured scope
 
@@ -222,9 +183,28 @@ load prevent treating all of that reduction as an isolated policy effect.
 
 Measured transfers were within one host. Cross-host deployment and global
 replica eviction still need validation. The policy moves later requests in a
-session; it does not live-migrate an active decode. Short-recovery
-reconsideration is implemented and covered by CPU tests, but has no completed
-model benchmark yet. Both the local comparison and CI run 40486458452 on
-`7beba61` failed during startup because their pinned image's AITER
-`topk_gating` did not accept ATOM's `num_valid_rows` argument. They produced
-no valid performance result for this decision.
+session; it does not live-migrate an active decode.
+
+A later short-recovery reconsideration experiment was removed after a parallel
+900 s AgentX comparison on `792d6d6`. Both arms used cache affinity; the control
+disabled only reconsideration. On V4.1-Flash, MI355X, attention DP2 / MoE TP2,
+c128 and separate LMCache MP servers, the experiment reduced migration fallback
+events from 179/578 to 42/554, but output tokens/s/GPU fell from 1089.50 to
+1054.61 (-3.20%), total tokens/s/GPU fell 1.89%, and P90 inter-token latency
+increased from 72.352 to 78.254 ms (+8.16%). The current code retains the
+control's prior-owner fallback behavior.
+
+Throughput uses successful profiling tokens divided by first request start to
+last request end (929.675 / 928.065 s including completed drain requests), then
+by two GPUs; total includes cached input. Counter samples bracket the 900 s
+arrival window within 1.76 s before start and 0.35 s after end. This is one
+run on different GPU pairs sharing a host, with 3/1 error records and 23/34
+cancelled credits at the finite-window end, not a significance claim.
+
+The 2484 shared successful requests had matching output-length distributions,
+but mean input minus reported cached input increased from 5727.17 to 6005.50
+tokens (+4.86%) with reconsideration. It also added a source probe, with 27/165
+timeouts. A cache snapshot taken before rejection cleanup is not a reservation
+for a later resubmission. Future reconsideration must account for actual
+retained PAGE/STATE and demonstrate net throughput and latency benefit before
+replacing fallback.

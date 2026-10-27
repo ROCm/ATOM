@@ -1053,15 +1053,6 @@ class PagedStateCheckpointCoordinator:
                 return i + 1
         return 0
 
-    def local_resumable_hit(self, seq, hit: int, block_hashes: list[int]) -> int:
-        """A routing snapshot must not mistake a tier hint for resident STATE."""
-        if not self.applies(seq):
-            return hit
-        for i in range(hit - 1, -1, -1):
-            if self.store.contains(block_hashes[i]):
-                return i + 1
-        return 0
-
     def _reachable(self, h: int) -> bool:
         """Whether `h`'s image can be *produced*, in HBM or from the CPU tier.
 

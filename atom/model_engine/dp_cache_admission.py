@@ -11,9 +11,7 @@ import time
 
 class DPCacheAdmission:
     def _track_cache_migration(self, seq):
-        if not getattr(seq, "dp_cache_migration", 0) or not getattr(
-            seq, "dp_cache_minimum_hit", 0
-        ):
+        if not getattr(seq, "dp_cache_migration", 0):
             return
         pending = self.__dict__.setdefault("_dp_cache_preparing", {})
         seq.dp_cache_prepare_deadline = time.monotonic() + seq.dp_cache_prepare_timeout
@@ -90,9 +88,6 @@ class DPCacheAdmission:
                 # unchanged until joint PAGE/STATE restore passes this gate.
                 seq.dp_cache_alignment_boundary = handoff[0]
                 return True
-            # Capture the actual PAGE+STATE/replay boundary before abort cleanup
-            # resets allocations. The router may choose to recompute from here.
-            seq.dp_cache_recoverable_hit = cached
             self._reject_cache_migration(seq, "recoverable_prefix_too_short")
             return False
         callback = getattr(self, "dp_cache_admission_callback", None)
