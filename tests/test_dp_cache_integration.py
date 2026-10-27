@@ -12,7 +12,7 @@ from test_lmcache_mp import _config
 from atom.kv_transfer.offload.mp import deployment
 from atom.model_engine.engine_core_mgr import _add_frame
 from atom.model_engine.prefix_hash import attach_shipped_chains, ship_prompt_hash_chain
-from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
 
 BLOCK = 128
@@ -126,12 +126,51 @@ def test_target_ack_corrects_load_then_changes_owner(monkeypatch):
     assert mgr._cache_balancer.sessions["session"].owner == 0
     mgr._cache_admitted(1, event)
     assert mgr._cache_balancer.sessions["session"].owner == 1
-    assert mgr._seq_load[seq.id][2] == seq.num_prompt_tokens - event[2] < before
+    assert mgr._seq_load[seq.id][2] == seq.num_prompt_tokens - event[2] == before
     assert seq.id not in mgr._cache_retry_payloads
     mgr._mark_seq_prefill_complete(seq.id)
     assert mgr._rank_tokens[1] == 0
     mgr._release_seq_load(seq.id, succeeded=True)
     assert mgr._rank_reqs == [0, 0]
+
+
+def test_work_updates_are_absolute_ordered_and_fenced_by_dispatch(monkeypatch):
+    mgr = manager(monkeypatch)
+    seq = request()
+    _route(mgr, [seq])
+    generation = seq.dp_cache_migration
+    mgr._cache_work(1, [(seq.id, generation, 1, 12)])  # not admitted
+    assert mgr._seq_load[seq.id][2] != 12
+    mgr._cache_admitted(1, (seq.id, generation, seq.dp_cache_minimum_hit))
+    mgr._cache_work(1, [(seq.id, generation, 1, 128)])
+    assert mgr._rank_tokens[1] == 128
+    mgr._cache_work(1, [(seq.id, generation, 1, 256)])  # duplicate
+    mgr._cache_work(0, [(seq.id, generation, 2, 256)])  # wrong engine
+    mgr._cache_work(1, [(seq.id, generation + 1, 2, 256)])
+    assert mgr._rank_tokens[1] == 128
+    # Preemption may legitimately increase work, including generated context.
+    mgr._cache_work(1, [(seq.id, generation, 2, seq.num_prompt_tokens + 100)])
+    assert mgr._rank_tokens[1] == seq.num_prompt_tokens + 100
+    mgr._cache_work(1, [(seq.id, generation, 1, 128)])  # stale pre-preemption
+    assert mgr._rank_tokens[1] == seq.num_prompt_tokens + 100
+    mgr._release_seq_load(seq.id)
+    mgr._cache_work(1, [(seq.id, generation, 3, 128)])  # cancelled
+    assert mgr._rank_tokens == [1000000, 0]
+
+
+def test_fallback_rejects_late_target_progress(monkeypatch):
+    mgr = manager(monkeypatch)
+    seq = request()
+    _route(mgr, [seq])
+    target = pickle.loads(_add_frame([seq]))[1][0]
+    target.dp_cache_retry_reason = "recoverable_prefix_too_short"
+    target.dp_cache_recoverable_hit = 65536
+    mgr._send_control = lambda *args: None
+    mgr._retry_cache_migration(1, target)
+    mgr._cache_admitted(0, (seq.id, 0, 65536))
+    before = list(mgr._rank_tokens)
+    mgr._cache_work(1, [(seq.id, target.dp_cache_migration, 1, 0)])
+    assert mgr._rank_tokens == before
 
 
 def test_cancelled_migration_cannot_retry(monkeypatch):
@@ -144,6 +183,41 @@ def test_cancelled_migration_cannot_retry(monkeypatch):
     mgr._send_control = lambda *args: pytest.fail("cancelled request was retried")
     assert mgr._retry_cache_migration(1, target)
     assert not mgr._cache_retry_payloads
+
+
+def test_real_prefill_retires_work_only_after_forward_and_rebases_after_preempt():
+    sched = Scheduler(
+        MockConfig(
+            kv_cache_block_size=4,
+            num_kvcache_blocks=128,
+            max_model_len=256,
+            max_num_batched_tokens=16,
+            enable_chunked_prefill=True,
+        )
+    )
+    seq = Sequence(list(range(65)), 4)
+    seq.dp_cache_balance = True
+    sched.dp_cache_admission_callback = lambda event: None
+    sched.add(seq)
+    batch, active = sched.schedule()
+    assert batch.total_seqs_num_prefill == 1
+    assert sched.take_cache_work() == []
+    empty = ScheduledBatchOutput([], [], None, None, None, is_deferred_out=True)
+    sched.postprocess(list(active.values()), empty, batch=batch)
+    remaining = seq.num_prompt_tokens - int(batch.num_scheduled_tokens[0])
+    assert sched.take_cache_work() == [(seq.id, 0, 1, remaining)]
+    sched.running.remove(seq)
+    assert sched.preempt(seq)
+    assert sched.take_cache_work() == [(seq.id, 0, 2, 65)]
+    sched._complete_cache_work(batch, {seq.id: seq})
+    assert sched.take_cache_work() == []
+    new_batch, active = sched.schedule()
+    sched.take_cache_work()
+    sched.postprocess(list(active.values()), empty, batch=new_batch)
+    work = sched.take_cache_work()
+    assert work[-1][3] == 65 - int(new_batch.num_cached_tokens[0]) - int(
+        new_batch.num_scheduled_tokens[0]
+    )
 
 
 def test_failed_retry_send_uses_normal_terminal_cleanup(monkeypatch):

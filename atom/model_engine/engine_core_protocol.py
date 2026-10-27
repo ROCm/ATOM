@@ -35,3 +35,5 @@ class EngineCoreRequestType(enum.Enum):
     METRICS = b"\x09"
     # Target confirms an actual recoverable prefix before its first prefill.
     CACHE_ADMITTED = b"\x0a"
+    # Coalesced remaining GPU prefill work, after completion or preemption.
+    CACHE_WORK = b"\x0b"

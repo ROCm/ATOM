@@ -26,6 +26,7 @@ class CacheBalanceConfig:
     cooldown_seconds: float = 30.0
     prepare_timeout_seconds: float = 5.0
     hint_ttl_seconds: float = 600.0
+    recovery_miss_ttl_seconds: float = 120.0
     max_sessions: int = 4096
     max_migrations: int = 8
     max_migrations_per_rank: int = 2
@@ -100,6 +101,9 @@ class Session:
     last_migration: float = float("-inf")
     pending: object = None
     version: int = 0
+    # Failed joint PAGE/STATE restoration, scoped to source, target and the
+    # exact promised prefix. A newer completion is not a tier-save ACK.
+    recovery_misses: dict[tuple[int, int], PrefixHint] = field(default_factory=dict)
 
 
 @dataclass
@@ -114,6 +118,10 @@ class Placement:
     minimum_hit: int = 0
     session_version: int = 0
     admitted: bool = False
+    source_hint: PrefixHint | None = None
+    transfer_seconds: float = 0.0
+    work_migration: int = 0
+    work_revision: int = 0
 
 
 class CacheBalancer:
@@ -156,6 +164,25 @@ class CacheBalancer:
         self.sessions[name] = session
         return session
 
+    def _decode_placement_scores(self, prompt, requests):
+        """Increment in normalized request-count/context imbalance, up to a constant.
+
+        Initial prompt lengths proxy each in-flight request's decode context;
+        this needs no decode-step messages. For Phi=sum((n/mean_n)^2 +
+        (context/mean_context)^2), the rank-dependent increment for adding a
+        request of length q is proportional to n + q*context/mean_length^2.
+        These scores describe balance, not calibrated execution seconds.
+        """
+        count = sum(max(0, n) for n in requests)
+        contexts = [0] * self.ranks
+        for placement in self.requests.values():
+            contexts[placement.rank] += placement.prompt_tokens
+        if count <= 0 or not sum(contexts):
+            return None
+        mean_length = sum(contexts) / count
+        weight = prompt / (mean_length * mean_length)
+        return [max(0, n) + weight * c for n, c in zip(requests, contexts)]
+
     def place(
         self,
         request_id,
@@ -171,17 +198,38 @@ class CacheBalancer:
     ):
         if request_id in self.requests:
             raise ValueError("request already has a DP cache placement")
-        cfg = self.config
-        waits = [
-            max(0, t) / cfg.prefill_tokens_per_second
-            + max(0, n) * cfg.decode_request_seconds
-            for n, t in zip(requests, tokens, strict=True)
-        ]
-        if len(waits) != self.ranks:
+        if len(requests) != self.ranks or len(tokens) != self.ranks:
             raise ValueError("DP cache load snapshot has the wrong rank count")
+        cfg = self.config
+        pending = [p for p in self.requests.values() if p.migration]
+        transfers = [0.0] * self.ranks
+        for p in pending:
+            transfers[p.rank] += p.transfer_seconds
+        waits = [
+            max(max(0, t) / cfg.prefill_tokens_per_second, transfers[r])
+            + max(0, n) * cfg.decode_request_seconds
+            for r, (n, t) in enumerate(zip(requests, tokens, strict=True))
+        ]
         lightest = min(
             range(self.ranks), key=lambda r: (waits[r], (r - self._cursor) % self.ranks)
         )
+        decode_scores = self._decode_placement_scores(prompt, requests)
+        if decode_scores is not None:
+            # Inside the existing minimum useful TTFT-gain margin, prefer a
+            # placement that balances both decode batch size and context work.
+            candidates = [
+                r
+                for r in range(self.ranks)
+                if waits[r] - waits[lightest] <= cfg.min_gain_seconds
+            ]
+            lightest = min(
+                candidates,
+                key=lambda r: (
+                    decode_scores[r],
+                    waits[r],
+                    (r - self._cursor) % self.ranks,
+                ),
+            )
         self._cursor = (self._cursor + 1) % self.ranks
         session = self._session(session_id, lightest)
         rank = session.owner if session else lightest
@@ -211,7 +259,6 @@ class CacheBalancer:
             # overwrite the owner's newer routing decision.
             if session.pending is not None:
                 session.version += 1
-            pending = [p for p in self.requests.values() if p.migration]
             eligible = (
                 can_migrate
                 and explicit_rank is None
@@ -233,6 +280,15 @@ class CacheBalancer:
                     ):
                         continue
                     missing = max(0, hits[rank] - hits[target])
+                    miss = session.recovery_misses.get((rank, target))
+                    if (
+                        missing
+                        and miss is not None
+                        and miss.tokens == hits[rank]
+                        and miss.matches(chain, now, cfg.recovery_miss_ttl_seconds)
+                    ):
+                        self.counters["migration_recovery_miss_avoided"] += 1
+                        continue
                     copy_time = (
                         (
                             cfg.transfer_fixed_seconds
@@ -242,7 +298,7 @@ class CacheBalancer:
                         else 0
                     )
                     finish = (
-                        max(waits[target], copy_time)
+                        max(waits[target], transfers[target] + copy_time)
                         + (prompt - max(hits[rank], hits[target]))
                         / cfg.prefill_tokens_per_second
                     )
@@ -253,19 +309,31 @@ class CacheBalancer:
                     if gain > 0 and gain >= max(
                         cfg.min_gain_seconds, stay * cfg.min_gain_ratio
                     ):
-                        candidates.append((finish, target))
+                        # Moving prefill off the owner must not increase joint
+                        # decode imbalance across the ranks sharing MoE work.
+                        if (
+                            decode_scores is not None
+                            and decode_scores[target] > decode_scores[rank]
+                        ):
+                            self.counters["migration_decode_balance_rejected"] += 1
+                            continue
+                        candidates.append((finish, target, copy_time))
                 if candidates:
-                    target = min(candidates)[1]
+                    _, target, copy_time = min(candidates)
                     self._generation += 1
                     placement.source = rank
                     placement.rank = target
                     placement.migration = self._generation
                     placement.minimum_hit = hits[rank]
+                    placement.source_hint = session.hints[rank]
+                    placement.transfer_seconds = copy_time
                     placement.session_version = session.version
                     session.pending = request_id
                     self.counters["migration_started"] += 1
             session.active.add(request_id)
-        placement.estimated_hit = hits[placement.rank]
+        # Charge the same GPU work that won the cost comparison. Outstanding
+        # restore work has its own queue above; it is not free or GPU prefill.
+        placement.estimated_hit = max(hits[placement.rank], placement.minimum_hit)
         self.requests[request_id] = placement
         return placement
 
@@ -280,10 +348,13 @@ class CacheBalancer:
         if placement.admitted or hit < placement.minimum_hit:
             return False
         placement.admitted = True
+        placement.work_migration = migration
+        placement.transfer_seconds = 0.0
         self.counters["admitted"] += 1
         if migration:
             session = self.sessions.get(placement.session_id)
             if session and session.pending == request_id:
+                session.recovery_misses.pop((placement.source, rank), None)
                 session.pending = None
                 session.last_migration = now
                 if session.version == placement.session_version:
@@ -295,7 +366,9 @@ class CacheBalancer:
             placement.migration = 0
         return True
 
-    def retry(self, request_id, rank, migration, now, *, reason=None):
+    def retry(
+        self, request_id, rank, migration, now, *, reason=None, recoverable_hit=None
+    ):
         placement = self.requests.get(request_id)
         if (
             placement is None
@@ -307,6 +380,17 @@ class CacheBalancer:
             return None
         source = placement.source
         session = self.sessions.get(placement.session_id)
+        if (
+            session is not None
+            and reason == "recoverable_prefix_too_short"
+            and type(recoverable_hit) is int
+            and 0 <= recoverable_hit < placement.minimum_hit
+            and (hint := placement.source_hint) is not None
+        ):
+            session.recovery_misses[source, rank] = PrefixHint(
+                hint.tokens, hint.block_size, hint.seed, hint.digest, now
+            )
+            self.counters["migration_recovery_miss_recorded"] += 1
         if session and session.pending == request_id:
             session.pending = None
             session.last_migration = now
@@ -314,6 +398,7 @@ class CacheBalancer:
         placement.source = None
         placement.migration = 0
         placement.minimum_hit = 0
+        placement.transfer_seconds = 0.0
         # A failed destination is no proof of residency at the source either.
         placement.estimated_hit = 0
         self.counters["migration_fallback"] += 1
@@ -351,15 +436,21 @@ class CacheBalancer:
         """Cache clear / weight change: discard predictions and fence old commits."""
         for session in self.sessions.values():
             session.hints.clear()
+            session.recovery_misses.clear()
             session.version += 1
         for placement in self.requests.values():
             placement.hint = None
+            placement.source_hint = None
 
     def statistics(self):
+        transfers = [0.0] * self.ranks
+        for placement in self.requests.values():
+            transfers[placement.rank] += placement.transfer_seconds
         return {
             **self.counters,
             "sessions": len(self.sessions),
             "pending_migrations": sum(
                 bool(p.migration) for p in self.requests.values()
             ),
+            "pending_restore_seconds_per_rank": transfers,
         }

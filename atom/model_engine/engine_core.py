@@ -544,6 +544,10 @@ class EngineCore:
             batch=batch,
         )
 
+        cache_work = self.scheduler.take_cache_work()
+        if cache_work:
+            self.output_queue.put_nowait(("CACHE_WORK", cache_work))
+
         # Send stream outputs to main process via output_queue
         try:
             while not self.stream_output_queue.empty():
@@ -828,6 +832,12 @@ class EngineCore:
                 if isinstance(item, tuple) and item[0] == "CACHE_ADMITTED":
                     socket.send(
                         pickle.dumps((EngineCoreRequestType.CACHE_ADMITTED, item[1]))
+                    )
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "CACHE_WORK":
+                    socket.send(
+                        pickle.dumps((EngineCoreRequestType.CACHE_WORK, item[1]))
                     )
                     continue
 

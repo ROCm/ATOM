@@ -1,0 +1,21 @@
+--- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -648,4 +648,14 @@
+-            producer_event = event_backend.import_event(
+-                event_ipc_handle, cache_context.device
+-            )
+-            event_backend.wait_event(producer_event, cache_context.stream)
++            try:
++                producer_event = event_backend.import_event(
++                    event_ipc_handle, cache_context.device
++                )
++                event_backend.wait_event(producer_event, cache_context.stream)
++            except Exception:
++                # Block-ID staging may be queued, but this operation has not
++                # submitted any PAGE/STATE read or reserved cache objects yet.
++                # Return a failed store only with a completion event: the worker
++                # must prove device completion before releasing its source lease.
++                # If recording/export fails, propagate the unprovable failure.
++                logger.exception("STORE producer event failed before cache transfer")
++                event_backend.record_event(event, cache_context.stream)
++                return event_backend.export_event(event, cache_context.device), False

@@ -7,7 +7,11 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 from atom.model_engine.dp_cache_admission import DPCacheAdmission
-from atom.model_engine.dp_cache_balance import CacheBalanceConfig, CacheBalancer
+from atom.model_engine.dp_cache_balance import (
+    CacheBalanceConfig,
+    CacheBalancer,
+    Placement,
+)
 
 
 def chain(tokens, *, fork=False):
@@ -95,8 +99,82 @@ class BalanceTest(unittest.TestCase):
         self.seed(rank=1, prompt=65537)
         self.seed(rank=0)
         p = self.migrate()
-        self.assertEqual(p.estimated_hit, 65536)
-        self.assertEqual(p.minimum_hit - p.estimated_hit, 36864)
+        self.assertEqual(p.estimated_hit, 102400)
+        self.assertAlmostEqual(p.transfer_seconds, 0.01 + 36864 / 2000000)
+        self.assertEqual(
+            self.b.statistics()["pending_restore_seconds_per_rank"][1],
+            p.transfer_seconds,
+        )
+        self.b.admitted("move", 1, p.migration, 102400, 4)
+        self.assertEqual(
+            self.b.statistics()["pending_restore_seconds_per_rank"], [0] * 4
+        )
+
+    def test_outstanding_restore_is_not_free_target_capacity(self):
+        self.seed(session="first")
+        self.seed(session="second")
+        first = self.place("m1", "first", now=3, loads=[1000000, 0, 1000000, 1000000])
+        # Target 1 has no GPU work but does have an outstanding restore.
+        # Target 2 has 10 ms of GPU work, hidden by its new restore.
+        second = self.place("m2", "second", now=3, loads=[1000000, 0, 328, 1000000])
+        self.assertEqual((first.rank, second.rank), (1, 2))
+
+    def test_short_recovery_blocks_only_same_promise_until_expiry(self):
+        self.seed()
+        p = self.migrate()
+        self.b.retry(
+            "move",
+            1,
+            p.migration,
+            4,
+            reason="recoverable_prefix_too_short",
+            recoverable_hit=65536,
+        )
+        self.b.finish("move", 5)
+        blocked = self.migrate("second", now=40)
+        self.assertEqual(blocked.migration, 0)
+        self.assertEqual(self.b.counters["migration_recovery_miss_avoided"], 1)
+        self.b.finish("second", 41)
+        self.assertGreater(self.migrate("after-expiry", now=125).migration, 0)
+
+    def test_new_checkpoint_can_retry_despite_previous_short_restore(self):
+        self.seed()
+        p = self.migrate()
+        self.b.retry(
+            "move",
+            1,
+            p.migration,
+            4,
+            reason="recoverable_prefix_too_short",
+            recoverable_hit=65536,
+        )
+        self.b.finish("move", 5)
+        self.seed(prompt=102529)
+        p = self.place(
+            "new-prefix", prompt=102529, now=40, loads=[1000000, 0, 1000000, 1000000]
+        )
+        self.assertGreater(p.migration, 0)
+
+    def test_timeout_does_not_claim_absent_state_and_cache_clear_forgets_misses(self):
+        self.seed()
+        p = self.migrate()
+        self.b.retry(
+            "move", 1, p.migration, 4, reason="preparation_timeout", recoverable_hit=0
+        )
+        self.assertFalse(self.b.sessions["s"].recovery_misses)
+        self.b.finish("move", 5)
+        p = self.migrate("short", now=40)
+        self.b.retry(
+            "short",
+            1,
+            p.migration,
+            41,
+            reason="recoverable_prefix_too_short",
+            recoverable_hit=0,
+        )
+        self.assertTrue(self.b.sessions["s"].recovery_misses)
+        self.b.invalidate()
+        self.assertFalse(self.b.sessions["s"].recovery_misses)
 
     def test_tokenizer_same_length_different_content_cannot_seed_transfer(self):
         self.seed()
@@ -237,6 +315,71 @@ class BalanceTest(unittest.TestCase):
                 CacheBalanceConfig.parse(options)
 
 
+class DecodeBalanceTest(unittest.TestCase):
+    def setUp(self):
+        self.b = CacheBalancer(2, CacheBalanceConfig(checkpoint_tokens=128))
+        # One long request versus three short requests: the two dimensions
+        # disagree, so the incoming request's length should matter.
+        for i, (rank, tokens) in enumerate([(0, 900), (1, 33), (1, 33), (1, 34)]):
+            self.b.requests[i] = Placement(rank, tokens, None, None)
+
+    def test_short_request_prefers_fewer_requests_and_long_prefers_less_context(self):
+        short = self.b._decode_placement_scores(10, [1, 3])
+        long = self.b._decode_placement_scores(1000, [1, 3])
+        self.assertLess(short[0], short[1])
+        self.assertGreater(long[0], long[1])
+
+    def test_new_sessions_use_joint_balance_only_inside_existing_time_margin(self):
+        short = self.b.place("short", None, 10, chain(10), [1, 3], [0, 0], 1)
+        self.assertEqual(short.rank, 0)
+        self.b.requests.pop("short")
+        long = self.b.place("long", None, 1000, chain(1000), [1, 3], [0, 0], 1)
+        self.assertEqual(long.rank, 1)
+        self.b.requests.pop("long")
+        # An obvious prefill queue still takes precedence over the tie-break.
+        queued = self.b.place("queued", None, 1000, chain(1000), [1, 3], [0, 100000], 1)
+        self.assertEqual(queued.rank, 0)
+
+    def test_migration_cannot_trade_prefill_relief_for_worse_decode_balance(self):
+        from atom.model_engine.dp_cache_balance import PrefixHint, Session
+
+        self.b.sessions["s"] = Session(
+            owner=1, hints={1: PrefixHint(128, 128, -1, 0, 1)}
+        )
+        # A short request would worsen the already larger batch on rank 1,
+        # so moving from 1 to 0 is allowed when the owner has a long queue.
+        allowed = self.b.place(
+            "short", "s", 129, chain(129), [1, 3], [0, 100000], 2, can_migrate=True
+        )
+        self.assertEqual(allowed.rank, 0)
+        self.b.finish("short", 3)
+        self.b.sessions["s"].owner = 0
+        self.b.sessions["s"].hints = {0: PrefixHint(896, 128, -1, 6, 4)}
+        self.b.sessions["s"].last_migration = float("-inf")
+        # With this long request, rank 0's larger context is the worse choice:
+        # migrating from 0 to 1 is permitted, while the reverse is refused.
+        allowed = self.b.place(
+            "long", "s", 1025, chain(1025), [1, 3], [100000, 0], 5, can_migrate=True
+        )
+        self.assertEqual(allowed.rank, 1)
+        self.b.finish("long", 6)
+        self.b.sessions["s"].owner = 1
+        self.b.sessions["s"].hints = {1: PrefixHint(896, 128, -1, 6, 7)}
+        self.b.sessions["s"].last_migration = float("-inf")
+        refused = self.b.place(
+            "refused", "s", 1025, chain(1025), [1, 3], [0, 100000], 8, can_migrate=True
+        )
+        self.assertEqual(refused.rank, 1)
+        self.assertEqual(refused.migration, 0)
+        self.assertEqual(self.b.counters["migration_decode_balance_rejected"], 1)
+
+    def test_finished_context_is_not_left_in_the_balance_score(self):
+        self.b.finish(0, 1)
+        scores = self.b._decode_placement_scores(1000, [0, 3])
+        self.assertEqual(scores[0], 0)
+        self.assertGreater(scores[1], 0)
+
+
 class AdmissionHarness(DPCacheAdmission):
     def __init__(self):
         self.waiting = deque()
@@ -264,12 +407,36 @@ class AdmissionTest(unittest.TestCase):
             dp_cache_minimum_hit=102400,
             dp_cache_prepare_timeout=5,
             num_cached_tokens=65536,
+            num_tokens=102401,
         )
 
     def test_short_target_prefix_never_reaches_prefill(self):
         self.assertFalse(self.s._admit_cache_placement(self.seq))
         self.assertFalse(self.s.events)
         self.assertEqual(self.seq.dp_cache_retry_reason, "recoverable_prefix_too_short")
+        self.assertEqual(self.seq.dp_cache_recoverable_hit, 65536)
+
+    def test_completed_work_uses_frozen_offsets_and_preemption_fences_old_batch(self):
+        self.seq.num_cached_tokens = 102400
+        self.s._admit_cache_placement(self.seq)
+        batch = NS(
+            req_ids=[7],
+            total_seqs_num_prefill=1,
+            dp_cache_work_epochs={7: 0},
+            num_cached_tokens=[65536],
+            num_scheduled_tokens=[1024],
+            is_final_chunk=[False],
+        )
+        self.s._complete_cache_work(batch, {7: self.seq})
+        self.assertEqual(self.s.take_cache_work(), [(7, 42, 1, 35841)])
+        self.s._preempt_cache_work(self.seq)
+        self.s._complete_cache_work(batch, {7: self.seq})
+        self.assertEqual(self.s.take_cache_work(), [(7, 42, 2, 102401)])
+        batch.dp_cache_work_epochs = {7: 1}
+        batch.is_final_chunk = [True]
+        self.s._complete_cache_work(batch, {7: self.seq})
+        self.assertEqual(self.s.take_cache_work(), [(7, 42, 3, 0)])
+        self.assertFalse(self.s.take_cache_work())
 
     def test_complete_restore_emits_one_confirmation(self):
         self.seq.num_cached_tokens = 102400

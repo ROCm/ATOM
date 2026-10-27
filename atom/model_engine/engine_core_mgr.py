@@ -806,6 +806,8 @@ class CoreManager(DPCacheRouting):
                         self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.CACHE_ADMITTED:
                         self._cache_admitted(dp_rank, data)
+                    elif request_type == EngineCoreRequestType.CACHE_WORK:
+                        self._cache_work(dp_rank, data)
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:

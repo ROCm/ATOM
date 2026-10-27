@@ -311,6 +311,15 @@ class ScheduledBatch:
         )
 
         self.is_final_chunk = is_final_chunk
+        self.dp_cache_work_epochs = (
+            {
+                seq.id: getattr(seq, "dp_cache_work_epoch", 0)
+                for seq in seqs.values()
+                if getattr(seq, "dp_cache_balance", False)
+            }
+            if total_seqs_num_prefill
+            else {}
+        )
         # Per seq, the token following this forward where the scheduler knows it
         # (a middle prefill chunk's successor prompt token), -1 where sampling
         # supplies it. A drafter runs one position ahead of the target, so this
@@ -3887,6 +3896,7 @@ class Scheduler(DPCacheAdmission):
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
+        self._preempt_cache_work(seq)
         return True
 
     def _advance_prefill_on_schedule(
@@ -4080,6 +4090,8 @@ class Scheduler(DPCacheAdmission):
                     seq.is_partial_prefill = now_partial
                 if not now_partial:
                     tracing.prefill_complete(seq)
+
+        self._complete_cache_work(batch, running_by_id)
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids

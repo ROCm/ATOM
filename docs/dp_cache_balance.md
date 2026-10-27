@@ -80,6 +80,24 @@ admission still apply. These margins are safeguards, not a measured confidence
 interval for the cost model. Queue/copy overlap and native STATE restore still
 need calibration.
 
+The destination's initial GPU-work charge uses the same expected recovered prefix
+as the placement comparison. Outstanding restore time is tracked separately and
+combined with queued GPU work using a maximum, so the full transfer estimate is
+not added to unrelated computation. Scheduler admission corrects the prediction
+to actual usable coverage. Completed prefill chunks then reduce the outstanding
+work; preemption reserves the recomputation again. These updates are asynchronous
+and coalesced per engine step, with execution and migration generations fencing
+stale completions. Decode tokens do not produce per-token work updates.
+
+Placement also considers the joint imbalance of in-flight request counts and
+their initial prompt lengths. Prompt length is a proxy for decode context size;
+it does not track generated tokens or claim to measure sparse-attention runtime.
+The normalized squared-imbalance score makes short incoming requests emphasize
+batch size and long requests emphasize context load. New sessions use this score
+among ranks within the existing minimum useful time-gain margin. A migration must
+meet the time-gain requirements and avoid increasing joint decode imbalance
+relative to staying with the owner. Explicit rank selection remains authoritative.
+
 ## Admission, copying, and failure
 
 The router retains bounded, expiring hints from completed requests. A hint
@@ -105,6 +123,14 @@ and hash chain are resubmitted to the prior owner. That owner's own scheduler
 rechecks residency and recomputes any missing tokens. Cancellation discards
 the retry payload; late target replies cannot resurrect it. A concurrent turn
 fences an older migration from overwriting a newer owner decision.
+
+A confirmed short recovery also records bounded negative evidence for that
+session's exact source, target, prefix hash and checkpoint boundary. The router
+avoids promising that same unavailable prefix again for
+`recovery_miss_ttl_seconds` (120 s by default). A different boundary or expiration
+permits another attempt. Preparation timeouts do not establish missing cache
+coverage and do not create this evidence. The record predicts recovery cost;
+it never authorizes cache reuse or replaces prior-owner fallback.
 
 Timeouts do not free buffers involved in an uncertain DMA. The existing native
 connector holds their leases until terminal completion, including when the
@@ -159,7 +185,51 @@ Fallback counters distinguish `preparation_timeout`,
 reasons use `other`. These categories have bounded cardinality. Compare deltas
 within the profiling window, not lifetime totals that include warmup.
 
+`prefill_work_updates` counts accepted completed-work corrections.
+`pending_restore_seconds_per_rank` exposes the estimated restore backlog, not
+measured GPU blocking time. `migration_recovery_miss_recorded` and
+`migration_recovery_miss_avoided` show whether repeated short-recovery predictions
+are being suppressed. These counters need throughput and latency measurements
+alongside them: fewer fallbacks alone are not evidence of a faster workload.
+`migration_decode_balance_rejected` counts otherwise profitable migration
+candidates rejected by the joint request-count/context balance constraint.
+
 ### Measured scope
+
+The latest incremental comparison against `c4de6c6` tested completed-work
+accounting, separate restore backlog, exact-prefix recovery-miss evidence and
+the joint count/context balance constraint described above. Both arms used
+common worker/dependency recovery fixes, V4.1-Flash, MI355X, attention DP2 /
+MoE TP2, DSpark5, memory 0.9, AgentX SA393/seed42 and c128. They ran simultaneously
+on separate GPU pairs with a common warmup barrier and 900 s of arrivals.
+
+| Metric | Control | Work accounting + joint balance | Change |
+| --- | ---: | ---: | ---: |
+| Output tokens/s/GPU | 1091.23 | 1136.58 | +4.16% |
+| Total tokens/s/GPU, including cached input | 135063.23 | 139129.66 | +3.01% |
+| Mean inter-token latency | 49.58 ms | 45.71 ms | -7.81% |
+| P90 inter-token latency | 76.44 ms | 70.54 ms | -7.71% |
+| Mean TTFT | 2.266 s | 2.405 s | +6.12% |
+| P90 TTFT | 4.032 s | 4.618 s | +14.54% |
+| P99 TTFT | 9.492 s | 9.292 s | -2.10% |
+
+This is a throughput/latency tradeoff: the constraint can retain requests at
+their owner to protect decode balance. It is not a TTFT improvement across
+percentiles. Sampled mean in-flight request-count spread fell from 8.90 to
+5.21; actual scheduled prefill tokens were essentially unchanged (14.952M /
+14.943M). A preceding work-accounting revision without the joint constraint
+reduced output throughput by 2.31%; fixing prefill accounting alone did not
+establish a net gain.
+
+Both clients exited 0, with 2569/2600 successful profiling requests and 1/0
+profiling errors; the treatment had one warmup error. Among 2506 matched
+successful requests, output-length distributions were identical and mean
+inter-token latency decreased 7.58%. Completed workload mixes differed, and
+one run does not establish statistical significance or isolate each change.
+See the [benchmark evidence and dependency overlay](../.github/benchmark/dp_cache_balance_ab.md#incremental-routing-comparison-2026-10-27-utc)
+for denominator, failure accounting and reproduction limits.
+
+#### Earlier policy comparisons
 
 A single same-configuration AgentX A/B on V4.1-Flash, two MI355X GPUs,
 attention DP2 / MoE TP2, 128 concurrent session slots and 900 s profiling

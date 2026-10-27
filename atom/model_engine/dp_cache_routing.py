@@ -127,6 +127,7 @@ class DPCacheRouting:
                 returned_seq.dp_cache_migration,
                 time.monotonic(),
                 reason=returned_seq.dp_cache_retry_reason,
+                recoverable_hit=getattr(returned_seq, "dp_cache_recoverable_hit", None),
             )
             if source is None:
                 return True
@@ -152,6 +153,29 @@ class DPCacheRouting:
                 logger.exception("Cache migration fallback could not be sent")
                 return False
         return True
+
+    def _cache_work(self, rank, events):
+        balancer = getattr(self, "_cache_balancer", None)
+        if balancer is None:
+            return
+        with self._lb_lock:
+            for sid, migration, revision, remaining in events:
+                load = self._seq_load.get(sid)
+                placement = balancer.requests.get(sid)
+                if (
+                    load is None
+                    or load[0] != rank
+                    or placement is None
+                    or not placement.admitted
+                    or placement.work_migration != migration
+                    or revision <= placement.work_revision
+                ):
+                    continue
+                placement.work_revision = revision
+                remaining = max(0, int(remaining))
+                self._rank_tokens[rank] += remaining - load[2]
+                self._seq_load[sid] = (rank, load[1], remaining)
+                balancer.counters["prefill_work_updates"] += 1
 
     def _finish_cache_placement_locked(self, sid, succeeded):
         balancer = getattr(self, "_cache_balancer", None)

@@ -10,6 +10,49 @@ import time
 
 
 class DPCacheAdmission:
+    def _queue_cache_work(self, seq, remaining):
+        if not getattr(seq, "dp_cache_admission_sent", False):
+            return
+        remaining = max(0, int(remaining))
+        if getattr(seq, "dp_cache_last_work", None) == remaining:
+            return
+        seq.dp_cache_last_work = remaining
+        seq.dp_cache_work_revision = getattr(seq, "dp_cache_work_revision", 0) + 1
+        # Coalesce once per engine step, including preemption and re-admission
+        # in that step. No synchronous lookup or per-token decode reporting.
+        self.__dict__.setdefault("_dp_cache_work", {})[seq.id] = (
+            seq.id,
+            getattr(seq, "dp_cache_migration", 0),
+            seq.dp_cache_work_revision,
+            remaining,
+        )
+
+    def take_cache_work(self):
+        pending = self.__dict__.pop("_dp_cache_work", None)
+        return list(pending.values()) if pending else []
+
+    def _preempt_cache_work(self, seq):
+        if getattr(seq, "dp_cache_balance", False):
+            seq.dp_cache_work_epoch = getattr(seq, "dp_cache_work_epoch", 0) + 1
+            self._queue_cache_work(seq, seq.num_tokens)
+
+    def _complete_cache_work(self, batch, seq_by_id):
+        if batch is None:
+            return
+        epochs = getattr(batch, "dp_cache_work_epochs", {})
+        for i, req_id in enumerate(batch.req_ids[: batch.total_seqs_num_prefill]):
+            seq = seq_by_id.get(req_id)
+            if seq is None or req_id not in epochs:
+                continue
+            # A forward issued before preemption cannot retire recompute work
+            # reserved by the new execution. Offsets come from the completed
+            # batch, never from speculative schedule-time advancement.
+            if epochs[req_id] != getattr(seq, "dp_cache_work_epoch", 0):
+                continue
+            end = int(batch.num_cached_tokens[i]) + int(batch.num_scheduled_tokens[i])
+            remaining = 0 if batch.is_final_chunk[i] else seq.num_tokens - end
+            self._queue_cache_work(seq, remaining)
+
     def _track_cache_migration(self, seq):
         if not getattr(seq, "dp_cache_migration", 0):
             return
@@ -70,6 +113,11 @@ class DPCacheAdmission:
         if not getattr(seq, "dp_cache_balance", False):
             return True
         if getattr(seq, "dp_cache_admission_sent", False):
+            cached = min(
+                seq.num_cached_tokens,
+                self.block_manager.replay_start(seq, seq.num_cached_tokens, hit=True),
+            )
+            self._queue_cache_work(seq, seq.num_tokens - cached)
             return True
         cached = seq.num_cached_tokens
         # Bound by the actual forward start, including any model-required
@@ -88,6 +136,9 @@ class DPCacheAdmission:
                 # unchanged until joint PAGE/STATE restore passes this gate.
                 seq.dp_cache_alignment_boundary = handoff[0]
                 return True
+            # Preserve numeric coverage before abort cleanup resets the local
+            # buffers. This is negative routing evidence, never a live lease.
+            seq.dp_cache_recoverable_hit = max(0, int(cached))
             self._reject_cache_migration(seq, "recoverable_prefix_too_short")
             return False
         callback = getattr(self, "dp_cache_admission_callback", None)
