@@ -1827,6 +1827,85 @@ models:
       apply_chat_template: true
       fewshot_as_multiturn: true
 
+  MiniMax-M3.1-Flash-MXFP4:
+    backend: atom
+    model_path: "/share_nfs/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4"
+    precision: MXFP4
+    env:
+      common:
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        ATOM_FORCE_ATTN_TRITON: "1"
+        ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
+        # Force RDMA to avoid HIP IPC shared-pool address corruption.
+        MC_DISABLE_HIP: "1"
+        PYTHONHASHSEED: "0"
+        PYTHONNOUSERSITE: "1"
+        ATOM_PREFIX_CACHE_POLICY: slru
+        ATOM_PREFIX_CACHE_PROTECTED_RATIO: "0.5"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 128
+        enable_prefix_caching: true
+        max_model_len: 1048576
+        max_num_seqs: 128
+        max_num_batched_tokens: ""
+        gpu_memory_utilization: 0.9
+        online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}'
+        extra_args: '--default-chat-template-kwargs {"thinking_mode":"enabled"} --index-cache-dtype fp8 --timeout-keep-alive 900'
+    suites:
+      nightly:
+        # CPP4 prefill (PP4 x TP1, LMCache offload) -> TP4 decode on one node,
+        # DSpark4 at the InferenceX golden acceptance length (thinking on, 3.19).
+        # The TP1 prefill step stays <= 16383 tokens (pa_fwd grid-y limit).
+        - &m31_agentic_cpp4_tp4_dspark4
+          name: minimax-m31-flash-mxfp4-1p1d-cpp4-tp4-dspark4-agentic-lmcache-1m-c32
+          topology: 1p1d_cpp4_tp4
+          display_topology: 1P1D-CPP4-TP4-DSPARK4
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [32]
+          server:
+            common_args:
+              method: dspark
+              draft_model: "/share_nfs/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark"
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.19
+          prefill:
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 4
+            extra_args: "--max-num-batched-tokens 32768"
+          env:
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: "auto"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "160"
+              LMCACHE_CHUNK_SIZE: "256"
+              LMCACHE_CACHE_POLICY: ATOM_SLRU
+              LMCACHE_LOOKUP_SERVER_WORKER_IDS: "0,1,2,3"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark: *agentic_1m_aiperf
+          run_eval: false
+
   DeepSeek-V4-Pro-0813:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro-0813/"
