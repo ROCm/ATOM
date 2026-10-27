@@ -182,6 +182,7 @@ ENV PYTHONPATH="/app/sglang/python:/app/ATOM"
 
 # Builds one common_ops.so per AMDGPU arch and loads the matching gfx* path at runtime.
 COPY docker/scripts/build_sgl_kernel_rocm_multi_arch.py /tmp/build_sgl_kernel_rocm_multi_arch.py
+COPY docker/scripts/verify_rocm_image_gpu_arches.py /tmp/verify_rocm_image_gpu_arches.py
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
@@ -293,6 +294,12 @@ RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
+
+RUN echo "========== [SGLANG-ATOM] Verify multi-arch HIP payloads ==========" && \
+    "${VENV_PYTHON}" /tmp/verify_rocm_image_gpu_arches.py \
+      --required-arches "${GPU_ARCH}" \
+      --require-sgl-kernel-subdirs \
+      --strict-coverage
 
 CMD ["/bin/bash"]
 
@@ -421,6 +428,10 @@ FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
+ARG GPU_ARCH
+
+# Gate: every serving-critical HIP payload must cover GPU_ARCH (default gfx942;gfx950).
+COPY docker/scripts/verify_rocm_image_gpu_arches.py /tmp/verify_rocm_image_gpu_arches.py
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
@@ -671,5 +682,10 @@ RUN set -eux; \
     # a successfully published image carrying the stock runtime.
     hsa="$(grep -m1 '^libhsa-runtime64\.so\.' /opt/rocm/.info/atom-rocm-runtime-sonames)"; \
     nm -D "/opt/rocm/lib/$hsa" | grep -q hsa_amd_signal_create_v2
+
+RUN echo "========== [ATOM] Verify multi-arch HIP payloads ==========" && \
+    "${VENV_PYTHON:-/opt/venv/bin/python}" /tmp/verify_rocm_image_gpu_arches.py \
+      --required-arches "${GPU_ARCH:-${GPU_ARCH_LIST}}" \
+      --strict-coverage
 
 CMD ["/bin/bash"]
