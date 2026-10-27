@@ -180,8 +180,8 @@ def test_small_projection_uses_prefix_of_the_only_weight(monkeypatch, tp_group, 
         stored = op.wkv.weight
         assert stored.untyped_storage().nbytes() == stored.numel()
         assert set(dict(op.wkv.named_parameters())) == {"weight", "weight_scale"}
-        x = torch.randn(15, 96)
-        projection = Mock(return_value=torch.empty(15, 5 * 128 // tp))
+        x = torch.randn(12, 96)
+        projection = Mock(return_value=torch.empty(12, 5 * 128 // tp))
         monkeypatch.setattr(blockscale, "native_quant_linear", projection)
         op.wkv(x)
         _, prefix, scale_prefix = projection.call_args.args
@@ -246,7 +246,9 @@ def test_direct_helper_validates_full_native_layout(monkeypatch, tp_group, bad):
 
 
 @pytest.mark.parametrize("tp", [2, 4])
-@pytest.mark.parametrize("shape", [(0,), (1,), (15,), (16,), (128,), (2, 3), (2, 8)])
+@pytest.mark.parametrize(
+    "shape", [(0,), (1,), (11,), (12,), (13,), (16,), (128,), (2, 3), (2, 6), (2, 8)]
+)
 def test_dispatches_local_projection_without_forward_context(
     monkeypatch, tp_group, tp, shape
 ):
@@ -256,7 +258,7 @@ def test_dispatches_local_projection_without_forward_context(
     hidden = torch.randn(*shape, 4, 128)
     embeddings = torch.randn(*shape, 96)
     mask = torch.rand(shape) > 0.25
-    small = 0 < embeddings.numel() // 96 < 16
+    small = 0 < embeddings.numel() // 96 <= 12
     kv = torch.randn(*shape, 5 * 128 // tp if small else (4 // tp + 1) * 128)
     projection = Mock(return_value=kv)
     monkeypatch.setattr(op.wkv, "forward", projection)
@@ -359,7 +361,7 @@ def gpu_checkpoint():
     return weight, scales.view(torch.float8_e8m0fnu)
 
 
-@pytest.mark.parametrize("m", [1, 15, 16, 32, 256])
+@pytest.mark.parametrize("m", [1, 12, 13, 16, 32, 256])
 @pytest.mark.parametrize("tp", [2, 4])
 def test_loaded_native_projection_matches_gathered_keys_and_value(
     monkeypatch, tp_group, gpu_checkpoint, m, tp
@@ -386,9 +388,9 @@ def test_loaded_native_projection_matches_gathered_keys_and_value(
             keys.append(actual[:, : (4 // tp) * 5120])
             value = actual[:, (4 // tp) * 5120 :]
             values.append(
-                value if m < 16 else torch.roll(value, op.wkv.value_start, -1)
+                value if m <= 12 else torch.roll(value, op.wkv.value_start, -1)
             )
-        gathered = torch.cat(keys + (values if m < 16 else [values[0]]), dim=-1)
+        gathered = torch.cat(keys + (values if m <= 12 else [values[0]]), dim=-1)
         # Independently tuned projection sizes can change accumulation order.
         # Bound aggregate error and the fraction of BF16 rounding outliers.
         for actual, reference in [(gathered, expected)] + [
@@ -401,7 +403,7 @@ def test_loaded_native_projection_matches_gathered_keys_and_value(
                         + rank * (5120 // tp) : 4 * 5120
                         + (rank + 1) * (5120 // tp),
                     ]
-                    if m < 16
+                    if m <= 12
                     else expected[:, 4 * 5120 :]
                 ),
             )

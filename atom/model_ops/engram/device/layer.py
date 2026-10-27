@@ -47,7 +47,7 @@ class _EngramWKV(ReplicatedLinear):
                 self.value_start = self.tp_rank * (hidden_size // self.tp_size)
 
     def use_kv_gather(self, x: torch.Tensor) -> bool:
-        return self.kv_gather_rows > 0 and 0 < x.numel() // self.input_size < 16
+        return self.kv_gather_rows > 0 and 0 < x.numel() // self.input_size <= 12
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_kv_gather(x):
