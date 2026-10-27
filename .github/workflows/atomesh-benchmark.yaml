@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       inspect_run_id:
-        description: 'Diagnostic only: snapshot shared logs and Slurm state for this run ID, without submitting a benchmark'
+        description: 'Diagnostic only: report only Slurm job state for this run ID, without submitting a benchmark'
         required: false
         default: ''
         type: string
@@ -279,16 +279,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
-      - name: Snapshot shared logs and Slurm state
+      - name: Read current run Slurm status
         env:
           INSPECT_RUN_ID: ${{ inputs.inspect_run_id }}
         run: python3 .github/scripts/atomesh/inspect_ci_run.py
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: ci-run-inspection-${{ inputs.inspect_run_id }}
-          path: ci-run-inspection/
-          if-no-files-found: error
 
   load-config:
     if: ${{ inputs.inspect_run_id == '' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
