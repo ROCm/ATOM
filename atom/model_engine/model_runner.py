@@ -762,6 +762,7 @@ def _profile_runner_stage(method):
 class ModelRunner:
     # Read on every step; the per-step route hooks run only when it is set.
     _return_routed_experts: bool = False
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         self._return_routed_experts = bool(config.enable_return_routed_experts)
