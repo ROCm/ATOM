@@ -549,7 +549,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         The live checkpoint is the contiguous pool Triton prefill writes.
         The kernel appends records and does not publish a per-step SSM
         snapshot; ``update_mamba_state_after_mtp_verify`` advances the cursor
-        once the accept length is known and scatters only the conv window.
+        once the accept length is known, scatters the conv window, and
+        rebuilds the SSM state of any radix-tracked step into its track slot.
         """
         del ssm_states  # logical view; the ring addresses the raw pool
         # FlyDSL's transpose view is not the ReplaySSM layout. The policy

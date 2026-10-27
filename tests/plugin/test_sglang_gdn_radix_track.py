@@ -4,7 +4,7 @@ The plugin replaces SGLang's GDN kernels, so it has to make the track calls
 SGLang's own backend makes around them. These tests drive
 `SGLangGatedDeltaNet._track_mamba_states` against a stand-in linear backend and
 check which helper receives which buffers, that extend and decode each have a
-single owner, plus the ReplaySSM radix guard.
+single owner, plus ReplaySSM staying on under the radix cache.
 """
 
 from __future__ import annotations
@@ -243,17 +243,22 @@ def test_replayssm_follows_speculation_without_radix(monkeypatch):
     assert gdn_replayssm.replayssm_enabled() is True
 
 
-def test_replayssm_is_off_under_radix_cache(monkeypatch):
+def test_replayssm_follows_speculation_under_radix_cache(monkeypatch):
+    # The commit hook materializes the tracked state, so the radix cache no
+    # longer turns the ring off.
     monkeypatch.delenv("ATOM_ENABLE_REPLAYSSM", raising=False)
-    _server(monkeypatch, disable_radix_cache=False, speculative_algorithm="DFLASH")
+    _server(monkeypatch, disable_radix_cache=False, speculative_algorithm="EAGLE")
+    assert gdn_replayssm.replayssm_enabled() is True
+    _server(monkeypatch, disable_radix_cache=False, speculative_algorithm=None)
     assert gdn_replayssm.replayssm_enabled() is False
 
 
-def test_forcing_replayssm_under_radix_cache_is_rejected(monkeypatch):
+def test_replayssm_env_override_holds_under_radix_cache(monkeypatch):
+    _server(monkeypatch, disable_radix_cache=False, speculative_algorithm="EAGLE")
     monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", "1")
-    _server(monkeypatch, disable_radix_cache=False, speculative_algorithm="DFLASH")
-    with pytest.raises(RuntimeError, match="radix cache"):
-        gdn_replayssm.replayssm_enabled()
+    assert gdn_replayssm.replayssm_enabled() is True
+    monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", "0")
+    assert gdn_replayssm.replayssm_enabled() is False
 
 
 def _patched_decode_runner(monkeypatch):
