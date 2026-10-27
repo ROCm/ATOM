@@ -47,6 +47,11 @@ not run both policies or force the new owner to remain fixed. Setting it to
 need a stable session header to receive affinity across requests; an explicit
 `data_parallel_rank` wins under both policies.
 
+The offline `ATOM_DP_DISPATCH_DEPTH` pending pool is inactive with
+`cache_affinity`. Requests retain cache-aware placement and admission even
+inside an offline batch; a count-only pending drain cannot create or commit
+the cache migration state. Other routing policies retain the offline depth cap.
+
 `ATOM_DP_CACHE_BALANCE_CONFIG` accepts a JSON object with options defined in
 `CacheBalanceConfig`. Defaults estimate prefill at 32,768 tokens/s and transfer
 at 2,000,000 tokens/s plus 10 ms per copy. These are initial heuristics, **not
@@ -217,6 +222,9 @@ load prevent treating all of that reduction as an isolated policy effect.
 
 Measured transfers were within one host. Cross-host deployment and global
 replica eviction still need validation. The policy moves later requests in a
-session; it does not live-migrate an active decode. A target currently needs
-to recover the source hint boundary before ownership commits; accepting a
-shorter recoverable prefix after reevaluating net benefit is future work.
+session; it does not live-migrate an active decode. Short-recovery
+reconsideration is implemented and covered by CPU tests, but has no completed
+model benchmark yet. Both the local comparison and CI run 40486458452 on
+`7beba61` failed during startup because their pinned image's AITER
+`topk_gating` did not accept ATOM's `num_valid_rows` argument. They produced
+no valid performance result for this decision.

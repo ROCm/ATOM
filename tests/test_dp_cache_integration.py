@@ -13,7 +13,6 @@ from test_lmcache_mp import _config
 
 from atom.kv_transfer.offload.mp import deployment
 from atom.model_engine.collective_rpc import RpcResponseRouter
-from atom.model_engine.engine_core import DPEngineCoreProc
 from atom.model_engine.engine_core_mgr import _add_frame
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -66,6 +65,19 @@ def test_v41_requires_native_checkpoints_before_model_startup():
                 enable_encoder_swa_bounded_replay=True,
             )
         )
+
+
+def test_offline_depth_cannot_bypass_cache_placement(monkeypatch):
+    mgr = manager(monkeypatch)
+    mgr._bp_depth = 1
+    mgr._bp_dispatch_or_refill = lambda **kwargs: pytest.fail(
+        "offline request bypassed cache placement"
+    )
+    seq = request()
+    with mgr.offline_backpressure_batch():
+        assert _route(mgr, [seq]) == [1]
+    assert seq.id in mgr._cache_balancer.requests
+    assert seq.dp_cache_migration > 0
 
 
 @pytest.mark.parametrize("legacy_session_affinity", [False, True])
@@ -445,6 +457,9 @@ def test_multinode_mp_requires_explicit_local_endpoints():
 
 
 def test_dp_dummy_forward_reaps_cancelled_alignment_without_more_prefill():
+    pytest.importorskip("aiter", reason="DPEngineCoreProc imports AITER shared memory")
+    from atom.model_engine.engine_core import DPEngineCoreProc
+
     seq = request()
     seq.status = SequenceStatus.ABORTED
     seq.is_partial_prefill = True

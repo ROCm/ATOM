@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Start the opt-in, container-owned LMCache MP service for benchmark cells."""
 
 import os
