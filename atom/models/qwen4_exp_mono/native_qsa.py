@@ -112,11 +112,13 @@ def prepare(
     hidden_states: torch.Tensor,
     *,
     fuse_decode_index: bool = False,
+    projected_qkv: torch.Tensor | None = None,
+    projected_index_qk: torch.Tensor | None = None,
 ) -> PreparedQsa:
     """Prepare QSA projections and fuse norm/RoPE/cache when metadata is present."""
 
     num_tokens = hidden_states.shape[0]
-    qkv = module.qkv_proj(hidden_states)
+    qkv = module.qkv_proj(hidden_states) if projected_qkv is None else projected_qkv
     gate, q, k, v = qkv.split(
         [module.q_size, module.q_size, module.kv_size, module.kv_size], -1
     )
@@ -153,7 +155,9 @@ def prepare(
     if fuse_decode_index:
         from atom.models.qwen4_exp_mono.kernels.quark_qsa_index import prepare
 
-        index_query = prepare(module, hidden_states, positions, qsa)
+        index_query = prepare(
+            module, hidden_states, positions, qsa, projected=projected_index_qk
+        )
     else:
         index_query = _prepare_index(module, hidden_states, positions, qsa)
     return PreparedQsa(gate, query, qsa, index_query)

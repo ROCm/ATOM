@@ -18,7 +18,7 @@ _STREAM = fx.Stream(None)
 
 def build(rows):
     width = 768
-    assert rows in (2, 4)
+    assert rows in (1, 2, 4)
 
     @fx.struct
     class Smem:

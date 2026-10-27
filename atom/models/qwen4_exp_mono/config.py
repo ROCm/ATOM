@@ -41,11 +41,11 @@ def enabled_widths(tp):
 
 
 def uses_native_mxfp4_moe(atom_config) -> bool:
-    """Experimental TP1 Quark seam: Mono GDN/HC, native MXFP4 MoE/QSA."""
+    """Quark A4W4 experts consumed without converting their packed weights."""
     quant = getattr(atom_config, "quant_config", None)
     hf_quant = getattr(quant, "hf_quant_config", None) or {}
     return (
-        atom_config.tensor_parallel_size == 1
+        atom_config.tensor_parallel_size in (1, 8)
         and getattr(quant, "quant_method", None) == "quark"
         and not getattr(quant, "online_quant", False)
         and hf_quant.get("global_quant_config", {}).get("weight", {}).get("dtype")

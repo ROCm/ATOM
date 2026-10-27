@@ -112,8 +112,12 @@ def _index_front(
         tl.store(CC + cs * 128 + d, tl.reshape(ck, (128,)))
 
 
-def prepare(module, hidden, positions, meta):
-    qk = module.indexer.index_qk_proj(hidden, otype=hidden.dtype)
+def prepare(module, hidden, positions, meta, *, projected=None):
+    qk = (
+        module.indexer.index_qk_proj(hidden, otype=hidden.dtype)
+        if projected is None
+        else projected
+    )
     iq = torch.empty(
         (hidden.shape[0], 4, 128), dtype=hidden.dtype, device=hidden.device
     )

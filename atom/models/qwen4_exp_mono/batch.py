@@ -51,6 +51,7 @@ class MoeKernels(NamedTuple):
 class HcKernels(NamedTuple):
     up: object
     final: object
+    pre: object = None
 
 
 class GdnWorkspace(NamedTuple):
@@ -243,7 +244,9 @@ def mix(module, streams, pending, built):
     use_mfma = built.hc is not None
     fn = batch_hc.run if use_mfma else mix_rows
     options = (
-        {"kernel": built.hc.up if injected else built.hc.final} if use_mfma else {}
+        {"kernel": built.hc.up if injected else built.hc.final, "pre": built.hc.pre}
+        if use_mfma
+        else {}
     )
     h, mixed, r = fn(
         streams,

@@ -61,7 +61,9 @@ def build(tokens, has_inject=True):
     return launch
 
 
-def prepare(h, norm_weight, w_cat, w_up, eps, hc, has_inject, block=None, raw=None):
+def prepare(
+    h, norm_weight, w_cat, w_up, eps, hc, has_inject, block=None, raw=None, *, pre=None
+):
     """Prepare native HC streams, normalization and down projection."""
     rows, width = h.shape
     assert rows in (1, 2, 4) and width == 10240 and hc == 4
@@ -71,7 +73,9 @@ def prepare(h, norm_weight, w_cat, w_up, eps, hc, has_inject, block=None, raw=No
     normed = torch.empty_like(h)
     streams = torch.empty_like(h) if combined else h
     part = torch.empty((rows, 4, nout), device=h.device, dtype=torch.float32)
-    _hc_pre_kernel[(triton.cdiv(nout, 8), 4, rows)](
+    kernel = pre if pre is not None else _hc_pre_kernel
+    bn, warps = (2, 1) if pre is not None and rows == 2 else (8, 4)
+    kernel[(triton.cdiv(nout, bn), 4, rows)](
         h,
         block if combined else h,
         raw if combined else h,
@@ -88,19 +92,30 @@ def prepare(h, norm_weight, w_cat, w_up, eps, hc, has_inject, block=None, raw=No
         HC=4,
         NOUT=nout,
         COMBINE=combined,
-        BN=8,
+        BN=bn,
         BK=512,
-        num_warps=4,
+        num_warps=warps,
     )
     return streams, normed, part
 
 
 def run(
-    h, norm_weight, w_cat, w_up, eps, hc, has_inject, block=None, raw=None, *, kernel
+    h,
+    norm_weight,
+    w_cat,
+    w_up,
+    eps,
+    hc,
+    has_inject,
+    block=None,
+    raw=None,
+    *,
+    kernel,
+    pre=None,
 ):
     """Retain native combine/norm/down and replace only batch up/mix."""
     streams, normed, part = prepare(
-        h, norm_weight, w_cat, w_up, eps, hc, has_inject, block, raw
+        h, norm_weight, w_cat, w_up, eps, hc, has_inject, block, raw, pre=pre
     )
     rows = h.shape[0]
     mixed = torch.empty((rows, 2560), device=h.device, dtype=h.dtype)

@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 
 
-def validate_native_config(rows):
+def validate_native_config(rows, intermediate=640, experts=513, intermediate_pad=0):
     """Reject a different consumer ABI before any recurrent state is updated."""
     from aiter import ActivationType, QuantType, dtypes
     from aiter.fused_moe import GateMode, get_2stage_cfgs, get_padded_M
@@ -30,8 +30,8 @@ def validate_native_config(rows):
     cfg = get_2stage_cfgs(
         get_padded_M(rows),
         2560,
-        640,
-        513,
+        intermediate,
+        experts,
         11,
         torch.bfloat16,
         dtypes.fp4x2,
@@ -41,7 +41,7 @@ def validate_native_config(rows):
         ActivationType.Silu,
         False,
         0,
-        0,
+        intermediate_pad,
         True,
         GateMode.SEPARATED,
         opus_weights_shuffled=True,
@@ -87,7 +87,10 @@ def _prepare(
     quant,
     scales,
     out,
+    expert_map,
     ROWS: tl.constexpr,
+    TP: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     row = tl.program_id(0)
     slot = tl.arange(0, 16)
@@ -114,7 +117,13 @@ def _prepare(
         prob = tl.where(slot == 10, 1.0 / (1.0 + tl.exp(-shared)), prob)
         tl.store(ids + row * 11 + slot, eid, slot < 11)
         tl.store(weights + row * 11 + slot, prob, slot < 11)
-        tl.store(experts + row * 11 + slot, eid, slot < 11)
+        if TP == 8:
+            local = tl.load(expert_map + eid, slot < 11, -1)
+            # Native EP assigns the full shared expert to one rank per token.
+            local = tl.where((slot == 10) & (row % TP != RANK), -1, local)
+        else:
+            local = eid
+        tl.store(experts + row * 11 + slot, local, slot < 11)
         offset = (row * 11 + slot[:, None]) * 32 + lane[None, :]
         packed = (slot[:, None] << 24) | row
         tl.store(
@@ -200,7 +209,7 @@ class Workspace:
             buf((rows, 2560), torch.bfloat16),
         )
 
-    def prepare(self, logits, x):
+    def prepare(self, logits, x, expert_map=None, tp=1, rank=0):
         _prepare[(x.shape[0], 6)](
             logits,
             x,
@@ -213,11 +222,14 @@ class Workspace:
             self.quant,
             self.scales,
             self.out,
+            expert_map if expert_map is not None else self.ids,
             x.shape[0],
+            tp,
+            rank,
             num_warps=4,
         )
 
-    def experts_forward(self, x, w1, w2, s1, s2):
+    def experts_forward(self, x, w1, w2, s1, s2, *, intermediate_pad=0):
         from aiter import ActivationType, QuantType, dtypes
         from aiter.fused_moe import fused_moe_2stages
 
@@ -239,6 +251,7 @@ class Workspace:
             q_dtype_w=dtypes.fp4x2,
             w1_scale=s1,
             w2_scale=s2,
+            intermediate_pad=intermediate_pad,
             topk_ids=self.ids,
             topk_weights=self.weights,
             routing_num_experts=513,
