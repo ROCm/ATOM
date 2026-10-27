@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793038119762,
+  "lastUpdate": 1793122295990,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4456,6 +4456,40 @@ window.BENCHMARK_DATA = {
             "value": 0.9052,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40358287266 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610261558 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1751 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "zhangxinyuanliuhengyu",
+            "username": "zhangxinyuanliuhengyu",
+            "email": "xinyuazh@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "fbb82673e666e4d5138c2ab622d2b28b5781224b",
+          "message": "fix(sglang): avoid HIP segfault in xgrammar json_object bitmask (#2676)\n\n* fix(sglang): avoid HIP segfault in xgrammar json_object bitmask\n\nDefault xgrammar on ROCm applies the vocab mask through sgl_kernel's CUDA bitmask kernel, which kills the server for response_format json_object. Route that HIP binding to a Torch GPU masked_fill.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): use modern typing for xgrammar HIP bitmask patch\n\nSatisfy Pre Checkin Ruff (UP035/UP045/UP007/UP006) on the new plugin file.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): address xgrammar HIP bitmask review feedback\n\nMask logits beyond bitmask coverage, rename the disable env to TORCH (keep TRITON alias), and move the unit test under tests/ so Pre Checkin runs it.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* test(sglang): keep xgrammar HIP bitmask tests under tests/plugin\n\nPlugin tests stay in tests/plugin even though Pre Checkin ignores that tree.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): use the xgrammar Torch bitmask only when sgl_kernel lacks the device arch\n\nThe release image's sgl_kernel is gfx950-only, so MI308X SIGSEGVs. Keep the native kernel when common_ops.so already contains this GPU, and register the disable flag in envs.py.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): unblock MiniMax refusal and V4 fp4_decode_topk on the plugin metadata\n\nSGLang calls the one-arg _config_refusal from #2479, and it builds the generic AttentionMetaData, which did not have the FP4 decode top-k buffer #2572 reads.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): set fp4_decode_topk on the V4 plugin metadata\n\nKeep atom/utils/forward_context.py unchanged. The SGLang bridge publishes generic AttentionMetaData, so set the buffer there; None still uses indexer.topk.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): publish V4 decode split plans on plugin metadata\n\nGeneric AttentionMetaData has no split_plan_swa/csa/hca, so fp8 decode\nraises AttributeError. Fill them in the bridge the way the native\nbuilder does.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* revert(sglang): drop the CI accuracy workarounds from the bitmask fix\n\nMiniMax refusal and DeepSeek-V4 metadata patches were only there to\nturn red accuracy jobs green. Keep the xgrammar HIP bitmask stopgap.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-10-27T15:20:58Z",
+          "url": "https://github.com/ROCm/ATOM/commit/fbb82673e666e4d5138c2ab622d2b28b5781224b"
+        },
+        "date": 1793122294815,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.0008,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40539094122 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610271459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.0008 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8984,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40539094122 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610271459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1592 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
