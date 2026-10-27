@@ -64,16 +64,25 @@ c48_append_port_mount() {
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
   [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == V-QD-CPUREF[23]-FP8ATTN-FQ[23]-PQ-LDFP4* ]] || return 0
   # Inert unless the role's online config selects routed_expert_down_proj (Prefill only).
-  c48_fix_source="$1/.github/benchmark/c48-model-gap/latent-down-mxfp4/linear.py"
+  c48_fix_dir=latent-down-mxfp4 c48_fix_sha=aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-QPBM || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-QPBM-* ]]; then
+    # Superset of latent-down-mxfp4/linear.py; inert unless VLLM_DCP_Q_REPLICATE=1 (Decode only).
+    c48_fix_dir=mla-qrep-pbm c48_fix_sha=a7c30263fb098038c28ad7c7e7cfe2efcdb5894148bccef634ac60af7dfafd1b
+  fi
+  c48_fix_source="$1/.github/benchmark/c48-model-gap/${c48_fix_dir}/linear.py"
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/linear.py"
   [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
-  [[ "${c48_fix_digest%% *}" == "aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa" ]] || return 2
+  [[ "${c48_fix_digest%% *}" == "${c48_fix_sha}" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
   # "<overlay file> <vllm-relative target> <sha256>", see each overlay's manifest.json.
   local -a c48_extra=()
   if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-MLA96 || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-MLA96-* ]]; then
     c48_extra+=("mla-dcp96/rocm_aiter_mla.py v1/attention/backends/mla/rocm_aiter_mla.py e680861fe486b9f3adb565720cfd0d7ca1c4be534570e92dedf3ecda326843cf")
+  fi
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-QPBM || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-QPBM-* ]]; then
+    # Inert unless VLLM_DCP_Q_REPLICATE=1 / VLLM_DCP_PROJECT_BEFORE_MERGE=1 (Decode only).
+    c48_extra+=("mla-qrep-pbm/mla_attention.py model_executor/layers/attention/mla_attention.py f393bcb1c4335762cd7e9a67cc282cf05194fb82449a705358b4cccfc8b543de")
   fi
   if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-UPS || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-UPS-* ]]; then
     c48_extra+=(

@@ -1,0 +1,27 @@
+{
+  "name": "kimi_k3_mla_dcp_qrep_project_before_merge",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "linear.py (on top of latent-down-mxfp4/linear.py): KimiMLAAttention builds q_b_proj as DCPGroupColumnParallelLinear when VLLM_DCP_Q_REPLICATE=1 (same switch as deepseek_v2), so each rank computes its DCP group's 96 query heads and MLA decode skips the per-layer query all-gather. ATOM 6611 D runs dcp_config.enable_query_replication=True",
+    "mla_attention.py: the FP4 BMM path supports query replication with a group-wide W_K (bf16 W_UK all-gathered over heads, MXFP4-quantized once; blocks run along the reduction dim, so each head matches its local quantization)",
+    "mla_attention.py: VLLM_DCP_PROJECT_BEFORE_MERGE=1 V-up-projects the whole group's heads with a group-wide W_V before the DCP a2a LSE merge, so the a2a carries v_head_dim (128) instead of kv_lora_rank (512). ATOM 6611 D runs enable_project_before_merge=True. Disabled per layer (warning) unless the FP4 BMM path and the NCCL a2a combine are in use",
+    "Local check (qrep-pbm/check_qrep_pbm.py, simulated DCP8 at Kimi K3 shapes): group weights byte-identical to per-rank quantization; project-before-merge rel. L2 vs fp32 0.1580 vs 0.1585 for merge-then-project; group absorption equals per-rank absorption"
+  ],
+  "cases": [
+    "*-QPBM*"
+  ],
+  "files": [
+    {
+      "relative_path": "models/kimi_k3/amd/linear.py",
+      "mount_source": "linear.py",
+      "base_sha256": "aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa",
+      "patched_sha256": "a7c30263fb098038c28ad7c7e7cfe2efcdb5894148bccef634ac60af7dfafd1b"
+    },
+    {
+      "relative_path": "model_executor/layers/attention/mla_attention.py",
+      "mount_source": "mla_attention.py",
+      "base_sha256": "b8bf34259b6557c901cd1f5ce30c9ac9be37d8bed408b69cc8d470e9b27701ee",
+      "patched_sha256": "f393bcb1c4335762cd7e9a67cc282cf05194fb82449a705358b4cccfc8b543de"
+    }
+  ]
+}

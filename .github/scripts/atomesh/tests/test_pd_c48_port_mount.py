@@ -35,7 +35,8 @@ CPUREF = {
        for c in (1, 4, 16, 32, 48, 56, 72, 88)},
     **{f"V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-{t}": "cpu-lru-refresh-v3"
        for t in ("C4D8", "C16", "C32", "C56", "C72", "C88", "C56-CPU26", "C72-CPU26", "C88-CPU26",
-                 "C72-MLA96", "C72-MLA96-DPROF", "C72-MLA96-DLDFP4", "C72-DLDFP4")},
+                 "C72-MLA96", "C72-MLA96-DPROF", "C72-MLA96-DLDFP4", "C72-DLDFP4",
+                 "C72-MLA96-QPBM")},
     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS": "cpu-lru-refresh-v3",
     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-MLA96-GSM8K": "cpu-lru-refresh-v3",
 }
@@ -50,8 +51,12 @@ UPS = {
 }
 
 
+QPBM = {"mla-qrep-pbm/mla_attention.py": "model_executor/layers/attention/mla_attention.py"}
+
+
 def extra_overlays(case):
-    return {**(MLA96 if "-MLA96" in case else {}), **(UPS if case.endswith("-UPS") else {})}
+    return {**(MLA96 if "-MLA96" in case else {}), **(QPBM if "-QPBM" in case else {}),
+            **(UPS if case.endswith("-UPS") else {})}
 FP8ATTN = "/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py,readonly"
 LDFP4_CASE = "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4"
 LDFP4 = "/vllm/models/kimi_k3/amd/linear.py,readonly"
@@ -96,15 +101,20 @@ class PortMountTest(unittest.TestCase):
                 self.assertIn(f"/c48-model-gap/{fp8_dir}/", cpuref[4])
             if ldfp4:
                 self.assertTrue(cpuref[5].endswith(LDFP4))
-                self.assertIn("/c48-model-gap/latent-down-mxfp4/", cpuref[5])
+                linear_dir = "mla-qrep-pbm" if "-QPBM" in case else "latent-down-mxfp4"
+                self.assertIn(f"/c48-model-gap/{linear_dir}/linear.py,", cpuref[5])
             for arg, (source, target) in zip(cpuref[6:], extra.items()):
                 self.assertIn(f"/c48-model-gap/{source},", arg)
                 self.assertTrue(arg.endswith(f"target={VLLM}{target},readonly"), arg)
 
     def test_extra_overlays_reject_changed_file(self):
         for case in ("V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72-MLA96",
-                     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS"):
-            for source in extra_overlays(case):
+                     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-UPS",
+                     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72-MLA96-QPBM"):
+            sources = list(extra_overlays(case))
+            if "-QPBM" in case:
+                sources.append("mla-qrep-pbm/linear.py")
+            for source in sources:
                 with tempfile.TemporaryDirectory() as temp:
                     gap = Path(temp) / ".github/benchmark/c48-model-gap"
                     shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
