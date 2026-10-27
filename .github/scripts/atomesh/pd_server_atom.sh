@@ -967,6 +967,18 @@ purge_lmcache_disk() {
 #  - MOONCAKE_STORE_COMPACT_TIMEOUT (default 600 s) stops each NUMA node's
 #    compaction; a node that does not compact in time can leave an owner 4 KiB
 #    pages its NICs refuse to register.
+#  - MOONCAKE_STORE_HUGETLB (auto, 1 or 0; default auto): back the owners with
+#    the node's reserved 2 MiB HugeTLB pages (Mooncake's MC_STORE_USE_HUGEPAGE,
+#    which fails an owner rather than give it 4 KiB pages) instead of
+#    transparent huge pages, and skip the page cache drop and the compaction.
+#    pd_submit.sh asks for the owners' pages with sbatch --comment
+#    hugepages_2m=node<N>:<pages>,...; the pit2-p03 Spur prolog reserves them
+#    for an amd-atom or amd-frameworks job alone on its node, and the epilog
+#    frees them.
+#    auto takes the pool when every NUMA node with owners has free pages for
+#    all of them, keeps transparent huge pages on a node without a pool, and
+#    refuses a pool too small for its owners: THP cannot reach the pool's
+#    memory either. 1 requires the pool; 0 never uses it.
 #  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
 #    Store once this node has compacted: for every pool to count its owners,
 #    and on a decode node for the prefill node's masters. A wait on the other
@@ -993,6 +1005,8 @@ mooncake_store_names=()
 # stopped, or owner capacity the master lost during the run.
 mooncake_store_failed_rc=""
 mooncake_page_cache_dropper_pid=""
+# 1 once choose_mooncake_owner_pages gives this node's owners its HugeTLB pool.
+mooncake_owner_hugetlb=0
 mooncake_owner_plan_numa=()
 mooncake_owner_plan_gib=()
 mooncake_owner_plan_devices=()
@@ -1301,6 +1315,13 @@ check_mooncake_store_settings() {
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
+  case "$(mooncake_setting MOONCAKE_STORE_HUGETLB auto)" in
+    auto | 1 | 0) ;;
+    *)
+      echo "[mooncake-store][FAIL] MOONCAKE_STORE_HUGETLB=$(mooncake_setting MOONCAKE_STORE_HUGETLB) is not auto, 1 or 0" >&2
+      exit 2
+      ;;
+  esac
   plan_mooncake_store_owners
   plan_mooncake_store_pools
   check_mooncake_store_ports
@@ -1387,12 +1408,62 @@ check_mooncake_owner_devices() {
   done
 }
 
-# prepare_mooncake_store_memory: drops the clean page cache that the owners'
-# huge-page faults would otherwise reclaim through compaction, then refuses pins
-# that do not fit a NUMA node (numa_memory_budget.py warns when they exceed its
-# free memory), and compacts each node for its pins: owners that fault a
-# fragmented node from many threads get 4 KiB pages, which the NICs refuse.
+# mooncake_free_hugetlb_pages <node>: the free 2 MiB HugeTLB pages of a NUMA
+# node, 0 without a pool.
+mooncake_free_hugetlb_pages() {
+  local free
+  free="$(cat "${ATOMESH_NUMA_SYSFS_ROOT:-/sys/devices/system/node}/node$1/hugepages/hugepages-2048kB/free_hugepages" 2>/dev/null)" || free=0
+  [[ "${free}" =~ ^[0-9]+$ ]] || free=0
+  echo "${free}"
+}
+
+# choose_mooncake_owner_pages: sets mooncake_owner_hugetlb to 1 when this
+# node's owners take its HugeTLB pool (MOONCAKE_STORE_HUGETLB, see above), else
+# 0. Refuses a pool that has fewer free pages than a NUMA node's owners pin:
+# Mooncake maps each owner's whole segment from it, 512 pages per GiB.
+choose_mooncake_owner_pages() {
+  local mode i node free pooled=0 short=""
+  mode="$(mooncake_setting MOONCAKE_STORE_HUGETLB auto)"
+  local -A pages=()
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    node="${mooncake_owner_plan_numa[i]}"
+    pages[${node}]=$(( ${pages[${node}]:-0} + mooncake_owner_plan_gib[i] * 512 ))
+  done
+  for node in "${!pages[@]}"; do
+    free="$(mooncake_free_hugetlb_pages "${node}")"
+    if (( free > 0 )); then
+      pooled=1
+    fi
+    if (( free < pages[${node}] )); then
+      short+="${short:+; }NUMA node ${node} has ${free} free 2 MiB pages for ${pages[${node}]}"
+    fi
+  done
+  mooncake_owner_hugetlb=0
+  if [[ "${mode}" == "0" || ( "${mode}" == "auto" && "${pooled}" == "0" ) ]]; then
+    return 0
+  fi
+  if [[ -n "${short}" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_HUGETLB=${mode}: the owners do not fit this node's HugeTLB pool (${short}); shrink MOONCAKE_STORE_OWNERS to fit it, or set MOONCAKE_STORE_HUGETLB=0 on a node without one" >&2
+    exit 2
+  fi
+  mooncake_owner_hugetlb=1
+  for node in "${!pages[@]}"; do
+    echo "[mooncake-store] NUMA node ${node}: owners take ${pages[${node}]} of $(mooncake_free_hugetlb_pages "${node}") free 2 MiB HugeTLB pages"
+  done
+}
+
+# prepare_mooncake_store_memory: owners that take the node's HugeTLB pool
+# (choose_mooncake_owner_pages) need nothing more. Otherwise drops the clean
+# page cache that the owners' huge-page faults would otherwise reclaim through
+# compaction, then refuses pins that do not fit a NUMA node
+# (numa_memory_budget.py warns when they exceed its free memory), and compacts
+# each node for its pins: owners that fault a fragmented node from many threads
+# get 4 KiB pages, which the NICs refuse.
 prepare_mooncake_store_memory() {
+  choose_mooncake_owner_pages
+  if [[ "${mooncake_owner_hugetlb}" == "1" ]]; then
+    return 0
+  fi
   local -a drop_dirs=()
   IFS=':' read -r -a drop_dirs <<< "$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS "${MODEL_PATH}")"
   echo "[mooncake-store] dropping the page cache of ${drop_dirs[*]}"
@@ -1597,8 +1668,11 @@ mooncake_owner_pool() {
 
 # Drops the model's page cache every 45 s for 30 min while the workers load
 # weights, which would refill it; page cache is per file, so this serves every
-# node.
+# node. Owners on the HugeTLB pool hold their memory already.
 start_mooncake_page_cache_dropper() {
+  if [[ "${mooncake_owner_hugetlb}" == "1" ]]; then
+    return 0
+  fi
   setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
     --every 45 --for 1800 "${MODEL_PATH}" &
   mooncake_page_cache_dropper_pid=$!
@@ -1635,12 +1709,17 @@ mooncake_page_cache_dropper_running() {
 start_mooncake_store_owners() {
   local master_addr="$1"
   # No GPU: a process that sees one makes Mooncake probe every buffer through HIP.
-  # glibc's THP malloc makes the whole segment huge pages, which the NICs
+  # glibc's THP malloc makes the whole segment huge pages, or Mooncake maps it
+  # from the node's HugeTLB pool (MC_STORE_USE_HUGEPAGE), which the NICs
   # register in under a second per 64 GiB MR; eno1 is firewalled, so the
   # transfer engine binds the role IP.
+  local huge_pages=GLIBC_TUNABLES=glibc.malloc.hugetlb=1
+  if [[ "${mooncake_owner_hugetlb}" == "1" ]]; then
+    huge_pages=MC_STORE_USE_HUGEPAGE=1
+  fi
   local -a owner_env=(
     HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 MC_NUM_QP_PER_EP=1
-    GLIBC_TUNABLES=glibc.malloc.hugetlb=1 MC_MAX_MR_SIZE=68719476736
+    "${huge_pages}" MC_MAX_MR_SIZE=68719476736
     "MC_TCP_BIND_ADDRESS=${host_ip}"
   )
   local i pool log
@@ -1667,12 +1746,13 @@ start_mooncake_store_owners() {
 }
 
 # Reports each owner of this node once it mounted: pid, node, NICs and how much
-# of its memory is huge pages.
+# of its memory is huge pages, transparent or from the HugeTLB pool.
 report_mooncake_store_owners() {
-  local i pid
+  local i pid pages
   for i in "${!mooncake_owner_plan_numa[@]}"; do
     pid="${mooncake_store_pids[mooncake_store_master_count + i]}"
-    echo "[mooncake-store] owner${i} pid=${pid} numa=${mooncake_owner_plan_numa[i]} devices=${mooncake_owner_plan_devices[i]} $(grep -h AnonHugePages "/proc/${pid}/smaps_rollup" 2>/dev/null || echo 'AnonHugePages: ?')"
+    pages="$(grep -h -E '^(AnonHugePages|Private_Hugetlb):' "/proc/${pid}/smaps_rollup" 2>/dev/null | tr -s ' ' | paste -sd ' ')" || pages=""
+    echo "[mooncake-store] owner${i} pid=${pid} numa=${mooncake_owner_plan_numa[i]} devices=${mooncake_owner_plan_devices[i]} ${pages:-AnonHugePages: ?}"
   done
 }
 

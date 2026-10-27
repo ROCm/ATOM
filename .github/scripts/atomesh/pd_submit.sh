@@ -315,6 +315,44 @@ fi
 source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
 detect_slurm_backend
 
+# mooncake_hugepage_request: the sbatch --comment that asks the pit2-p03 Spur
+# prolog to reserve the 2 MiB HugeTLB pages a Store cell's owners pin,
+# "hugepages_2m=node<N>:<pages>,...", 512 pages per GiB of
+# MOONCAKE_STORE_OWNERS (the launcher's default when unset) or
+# MOONCAKE_STORE_DECODE_OWNERS, whichever pins more on a NUMA node: the prolog
+# gives every node of the job the same request. Empty for a cell without a
+# Store or whose owners never take the pool (MOONCAKE_STORE_HUGETLB=0).
+mooncake_hugepage_request() {
+  [[ "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE:-0}" == "1" ]] || return 0
+  [[ "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE_HUGETLB:-auto}" != "0" ]] || return 0
+  local -A pages=()
+  local -a entries=()
+  local spec entry numa gib request=""
+  for spec in \
+    "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS:-0:768:rdma4,rdma5;1:768:rdma6,rdma7}" \
+    "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS:-}"; do
+    local -A node_pages=()
+    IFS=';' read -r -a entries <<< "${spec}"
+    for entry in ${entries[@]+"${entries[@]}"}; do
+      IFS=':' read -r numa gib _ <<< "${entry}"
+      [[ "${numa}" =~ ^[0-9]+$ && "${gib}" =~ ^[0-9]+$ ]] || continue
+      node_pages[${numa}]=$(( ${node_pages[${numa}]:-0} + gib * 512 ))
+    done
+    for numa in "${!node_pages[@]}"; do
+      if (( node_pages[${numa}] > ${pages[${numa}]:-0} )); then
+        pages[${numa}]=${node_pages[${numa}]}
+      fi
+    done
+  done
+  for numa in $(printf '%s\n' "${!pages[@]}" | sort -n); do
+    request+="${request:+,}node${numa}:${pages[${numa}]}"
+  done
+  if [[ -n "${request}" ]]; then
+    echo "hugepages_2m=${request}"
+  fi
+}
+SLURM_COMMENT="$(mooncake_hugepage_request)"
+
 echo "=== ATOMesh benchmark cell ==="
 echo "cell=${ATOMESH_CELL_ID}"
 echo "model=${MODEL_NAME}"
@@ -323,6 +361,7 @@ echo "nodes=${NODE_LIST}"
 echo "slurm_account=${SLURM_ACCOUNT:-default}"
 echo "slurm_partition=${SLURM_PARTITION:-default}"
 echo "slurm_qos=${SLURM_QOS:-default}"
+echo "slurm_comment=${SLURM_COMMENT:-none}"
 echo "isl=${ISL_LIST} osl=${OSL} concurrency=${CONC_LIST}"
 echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
@@ -455,6 +494,9 @@ else
   fi
   if [[ -n "${SLURM_QOS}" ]]; then
     SBATCH_CMD+=(--qos "${SLURM_QOS}")
+  fi
+  if [[ -n "${SLURM_COMMENT}" ]]; then
+    SBATCH_CMD+=(--comment "${SLURM_COMMENT}")
   fi
   SBATCH_CMD+=(
     --nodes "${NUM_NODES}"
