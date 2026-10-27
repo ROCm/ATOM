@@ -193,6 +193,7 @@ start_vllm_router() {
   local image="${ATOMESH_VLLM_ROUTER_IMAGE:?vllm.router.image is required}"
   local discovery_port=$((ATOMESH_VLLM_ROUTER_DISCOVERY_PORT + port_offset))
   local port=$((ROUTER_PORT + port_offset))
+  # The metrics listener defaults to 29000 on every job; a router a cancelled job left behind holds it (job 10239).
   # Extra arguments select Mooncake static P/D URLs instead of MoRIIO discovery.
   local -a mode_args=(--kv-connector moriio --vllm-discovery-address "0.0.0.0:${discovery_port}")
   (( $# )) && mode_args=(--kv-connector mooncake "$@")
@@ -213,6 +214,7 @@ start_vllm_router() {
     --policy "${ROUTER_POLICY}" \
     --prefill-policy "${ROUTER_POLICY}" \
     --decode-policy "${ROUTER_POLICY}" \
+    --prometheus-port "$((port + 10000))" \
     --log-level info >/dev/null || return $?
   docker logs -f "${container}" > "${log_file}" 2>&1 &
   # Detached docker run only acknowledges container creation. A different
