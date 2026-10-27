@@ -41,6 +41,9 @@ _KV = None  # bound kv_cache_data
 _PHASE = "pre"  # "pre" | "preparing" | "ready"
 _BROKEN = None  # reason string once recovery failed; fused path must not be used
 _PLANS: dict = {}  # owner -> plan (chosen by consensus => identical on all ranks)
+_TOKEN_IDS: dict = (
+    {}
+)  # (tokens, mode) -> _TokenIds: the call-id verdicts of ONE token count
 # -- device error check (see ``check_step``). All rank-uniform: every rank passes exactly one
 # ``check_step`` per model forward, so the counters below advance identically on every rank.
 _PERIOD = (
@@ -208,7 +211,9 @@ def _prebuild_profile(gf, name, res) -> None:
 
 def profile_tokens(world: int, arch: str | None = None, cu: int | None = None):
     """Padded token counts (m * world) of every exact profile row for this
-    world/arch/cu. These are the only buckets the profile can ever fuse."""
+    world/arch/cu: the buckets that are PREPARED (plan, binding, windows). Any other token count is
+    served, when it can be, by the prepared bucket aiter's ``bucket_for_m`` names for its real rows
+    (R16 pad-M, ``GemmFusionSite.resolve``); it never gets a bucket of its own."""
     from .stages import aiter_gf
 
     gf = aiter_gf()
@@ -280,6 +285,86 @@ def _refuse_colliding_call_ids() -> None:
     )
 
 
+class _TokenIds:
+    """The call-id verdicts of one token count: ``ids`` = the ids aiter assigned to the launches whose
+    tag carries only the low bits of ``call_id`` (large r13), ``refused`` = the keys that must run
+    native (a collision among the launches of this token count, or no id could be assigned).
+    """
+
+    __slots__ = ("ids", "refused")
+
+    def __init__(self, ids, refused):
+        self.ids, self.refused = ids, frozenset(refused)
+
+
+def token_call_ids(tokens, mode) -> _TokenIds:
+    """The call-id verdicts for one token count, built once and cached. Only the launches of ONE
+    token count (= one forward pass) can meet in a handshake, so that is the scope of the check: over
+    every registered site's resolution of ``tokens``. A pure function of (sites, profile, the
+    prepared buckets), no collective: every rank builds the same answer. Used for pad-M (R16), where
+    the key carries the REAL token count and the universe of keys is every m a bucket can serve.
+    """
+    got = _TOKEN_IDS.get((tokens, mode))
+    if got is None:
+        got = _TOKEN_IDS[(tokens, mode)] = _build_token_call_ids(tokens, mode)
+    return got
+
+
+def _build_token_call_ids(tokens, mode) -> _TokenIds:
+    from . import consensus
+
+    keys = {}
+    for s in _SITES.values():
+        r = s.raw_resolution(tokens, mode)
+        if r is not None and getattr(r, "plan", None) is not None:
+            keys[(s.name, tokens, r.vid, r.n_fused)] = r
+    if not keys or _RES is None:
+        return _TokenIds({}, ())
+    bits_of = getattr(_RES, "plan_tag_bits", None)
+    tagged = [k for k, r in keys.items() if bits_of is not None and bits_of(r.plan)]
+    ids, refused = {}, set()
+    if tagged:
+        try:
+            ids = _RES.tag_unique_ids(tagged) or {}
+        except ValueError:  # more (site, vid, n_fused) triples than tag ids
+            ids = {}
+        if not ids:
+            refused.update(tagged)  # no id can be assigned: those launches run native
+    bits = max((bits_of(keys[k].plan) for k in tagged), default=None)
+
+    def key_fn(site, tok, vid, n):
+        got = ids.get((site, tok, vid, n))
+        return consensus.decision_key(site, tok, vid, n) if got is None else got
+
+    report = _RES.check_call_ids(
+        list(keys),
+        key_fn=key_fn,
+        tag_bits=bits if ids else None,
+        tag_vids={k[2] for k in ids} or None,
+        per_tokens=True,
+    )
+    if report is not None:
+        refused.update(report.refused_keys)
+    padded = sorted(
+        {
+            (r.bucket_tokens // _RES.world, r.vid)
+            for r in keys.values()
+            if r.bucket_tokens
+        }
+    )
+    if padded:
+        logger.info(
+            "gemm_fusion pad-M: tokens=%d (m_real=%d) %s -> bucket m / variant %s; %d call_id "
+            "key(s) refused",
+            tokens,
+            tokens // _RES.world,
+            mode,
+            padded,
+            len(refused),
+        )
+    return _TokenIds(ids, refused)
+
+
 def bind_kv_cache(kv_cache_data) -> None:
     """After KV allocation. Resolves/prepares every profile bucket."""
     global _KV
@@ -306,9 +391,11 @@ def bind_kv_cache(kv_cache_data) -> None:
 
 
 def before_graph_capture(buckets) -> None:
-    """Coverage log + clean epoch. Everything the profile can fuse was resolved
-    and prepared in ``bind_kv_cache``; a capture bucket outside it is native
-    (``late_bucket``) on every rank, decided without a collective.
+    """Coverage log + clean epoch. The exact bucket rows were resolved and prepared in
+    ``bind_kv_cache``; a capture size that is not one resolves, without a collective and identically
+    on every rank, to the prepared bucket that serves its real rows (``pad_hit``) or to native. The
+    graph is then captured with the real ``m`` (a by-value kernel argument), which is the m its
+    replays run with.
     ``buckets``: padded token counts or ``(padded, real)`` pairs."""
     if _RES is None:
         return
@@ -317,11 +404,12 @@ def before_graph_capture(buckets) -> None:
         for padded, _real in pairs:
             r = s.resolve(padded, graph_mode="capture")
             logger.debug(
-                "gemm_fusion capture bucket %s %d -> %s/%s",
+                "gemm_fusion capture bucket %s %d -> %s/%s (bucket tokens %d)",
                 s.name,
                 padded,
                 r.vid,
                 r.reason,
+                r.bucket_tokens or padded,
             )
     _raise_on_device_error("before graph capture")
     _clean_epoch("before graph capture")
@@ -589,5 +677,6 @@ def shutdown(timeout_s: float | None = None) -> None:
                 "gemm_fusion shutdown: release() failed: %r (continuing)", err[0]
             )
     _PLANS.clear()
+    _TOKEN_IDS.clear()
     _SITES.clear()
     _PHASE = "pre"

@@ -67,7 +67,8 @@ def declare_m3_qkv_site(attn_module, *, prefix: str, sparse: bool):
     stages = [
         S.sp_exchange(fields, drop=("iq", "ik") if (sparse and skip) else ()),
         S.head_norm_rope_cache_from_attention(
-            attn, index="fp8_unit_page128" if (sparse and not skip) else None
+            attn,
+            index=S.index_cache_signature(attn.impl) if (sparse and not skip) else None,
         ),
     ]
     site = GemmFusionSite(

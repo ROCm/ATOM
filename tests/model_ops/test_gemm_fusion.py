@@ -94,6 +94,7 @@ class FakeResources:
             None  # what check_call_ids returns (None: no call-id module)
         )
         self.call_id_keys = None
+        self.call_id_calls = []  # (keys, kwargs) of every check_call_ids
         self.reductions = []  # values handed to each reduce_max
         self.blocking_waits = 0
         self.ticks = 0
@@ -140,9 +141,24 @@ class FakeResources:
     def error_description(self):
         return "fake error page"
 
-    def check_call_ids(self, keys):
+    tag_ids_fail = False  # tag_unique_ids cannot assign (too many triples)
+
+    def check_call_ids(self, keys, **kw):
         self.call_id_keys = set(keys)
+        self.call_id_calls.append((set(keys), kw))
         return self.call_id_report
+
+    def plan_tag_bits(self, plan):
+        return 19 if getattr(plan, "src", None) == "r13" else None
+
+    def tag_unique_ids(self, keys):
+        """aiter's rule: low 19 bits = 1 + the ordinal of (site, vid, n_fused), high bits arbitrary."""
+        if self.tag_ids_fail:
+            raise ValueError("more triples than tag ids")
+        distinct = sorted(set(keys))
+        triples = sorted({(k[0], k[2], k[3]) for k in distinct})
+        ordinal = {t: i + 1 for i, t in enumerate(triples)}
+        return {k: 0x12300000 | ordinal[(k[0], k[2], k[3])] for k in distinct}
 
     def reduce_max(self, values):
         self.reductions.append(list(values))
@@ -2276,6 +2292,10 @@ def test_per_call_decision_is_identical_on_every_simulated_rank(make_site, monke
                 c["real"],
                 c["padded"],
             )
+            # what production passes: positions and slot_mapping hold exactly the REAL tokens
+            # (a padded step has real < padded; an input of another length is meta_len -> native)
+            ctx.positions = _T((c["real"],), _torch.int64)
+            state["slot_mapping"] = _T((c["real"],), _torch.int64)
             r, reason, _, _ = s._prepare(
                 ctx, _T((16, 3072), c["dtype"]), _T(c["scale"])
             )
@@ -3964,3 +3984,1150 @@ def test_the_adapter_reads_aiters_launch_gate_as_a_plain_bool(monkeypatch):
     assert (
         _adapter(monkeypatch, SimpleNamespace()).launch_gate is False
     )  # an aiter without it
+
+
+# ================= hardening: index-cache signature, bind-time layout refusal, meta_len =================
+class _L:
+    """Torch-free tensor with REAL strides: shape, dtype, stride(i), dim(), is_contiguous()."""
+
+    def __init__(self, shape, dtype, stride=None):
+        self.shape, self.dtype = tuple(shape), dtype
+        if stride is None:
+            acc, out = 1, []
+            for d in reversed(self.shape):
+                out.append(acc)
+                acc *= d
+            stride = tuple(reversed(out))
+        self._stride = tuple(stride)
+
+    def dim(self):
+        return len(self.shape)
+
+    def stride(self, i):
+        return self._stride[i]
+
+    def is_contiguous(self):
+        acc = 1
+        for d, s in zip(reversed(self.shape), reversed(self._stride)):
+            if d != 1 and s != acc:
+                return False
+            acc *= d
+        return True
+
+
+def _layout(kv="fp8", *, nkv=2, hd=128, n=4, page=16, with_index=True):
+    """(impl, state) of a layer whose caches are exactly what the signature describes."""
+    import torch as _torch
+
+    dt = _torch.float8_e4m3fn if kv == "fp8" else _torch.bfloat16
+    x = 16 if kv == "fp8" else 8
+    state = {
+        "k_cache": _L((n, nkv, hd // x, page, x), dt),
+        "v_cache": _L((n, nkv, page // x, hd, x), dt),
+        "k_scale": _L((n, nkv, page), _torch.float32) if kv == "fp8" else None,
+        "v_scale": _L((n, nkv, page), _torch.float32) if kv == "fp8" else None,
+    }
+    impl = SimpleNamespace(
+        kv_cache_dtype=kv,
+        num_kv_heads=nkv,
+        head_dim=hd,
+        index_cache_dtype="fp8",
+        index_head_dim=128,
+        index_cache=_L((n, 128, 128), _torch.float8_e4m3fn) if with_index else None,
+    )
+    return impl, state
+
+
+def _reason(impl, state, *, page=16, with_index=True):
+    return site_mod._cache_layout_reason(impl, state, page=page, with_index=with_index)
+
+
+# ---- (1a) the signature follows the real index cache
+def test_the_signature_is_the_profile_name_only_for_an_fp8_128_index_cache():
+    from atom.model_ops.gemm_fusion import stages as S
+
+    sig = S.index_cache_signature
+    assert (
+        sig(SimpleNamespace(index_cache_dtype="fp8", index_head_dim=128))
+        == "fp8_unit_page128"
+    )
+    others = [
+        SimpleNamespace(index_cache_dtype="bf16", index_head_dim=128),
+        SimpleNamespace(index_cache_dtype="fp8", index_head_dim=64),
+        SimpleNamespace(index_cache_dtype=None, index_head_dim=128),
+        SimpleNamespace(),  # an impl that cannot say what its index cache is
+    ]
+    got = [sig(o) for o in others]
+    assert "fp8_unit_page128" not in got  # no profile row can match any of them
+    assert len(set(got)) == len(got)  # and they do not collide with each other
+
+
+def test_the_declared_stage_carries_the_derived_signature_not_a_constant(monkeypatch):
+    from atom.model_ops.gemm_fusion import stages as S
+
+    TU.reset_for_tests(None)
+    TU.inject_aiter(
+        monkeypatch,
+        SimpleNamespace(HeadNormRopeCache=lambda **kw: SimpleNamespace(**kw)),
+    )
+    impl = SimpleNamespace(
+        head_dim=128,
+        num_heads=64,
+        num_kv_heads=8,
+        rotary_emb=SimpleNamespace(rotary_dim=64),
+        q_norm=SimpleNamespace(variance_epsilon=1e-6),
+        kv_cache_dtype="fp8",
+        index_head_dim=128,
+        index_cache_dtype="bf16",
+    )
+    attn = SimpleNamespace(impl=impl)
+    stage = S.head_norm_rope_cache_from_attention(
+        attn, index=S.index_cache_signature(impl)
+    )
+    assert stage.index == "bf16_d128_unit_page128"  # a bf16 index cache: no profile row
+    impl.index_cache_dtype = "fp8"
+    stage = S.head_norm_rope_cache_from_attention(
+        attn, index=S.index_cache_signature(impl)
+    )
+    assert stage.index == "fp8_unit_page128"  # the layout the profile was built for
+
+
+def test_declare_m3_qkv_site_no_longer_hard_codes_the_index_layout():
+    import inspect
+
+    from atom.model_ops import gemm_fusion
+
+    src = inspect.getsource(gemm_fusion.declare_m3_qkv_site)
+    assert "fp8_unit_page128" not in src and "index_cache_signature(attn.impl)" in src
+
+
+# ---- (1b) the bound caches are checked against the signature
+def test_matching_caches_pass_for_fp8_and_bf16_sparse_and_dense_layers():
+    for kv in ("fp8", "bf16"):
+        impl, state = _layout(kv)
+        assert _reason(impl, state) is None
+    impl, state = _layout("fp8", with_index=False)
+    assert (
+        _reason(impl, state, with_index=False) is None
+    )  # dense / reuse: no index cache
+    assert (
+        _reason(impl, state, page=None, with_index=False) is None
+    )  # no declared page: the cache's own
+    # a dense layer re-views V as 5-D under another key; scales under *_view on the sparse path
+    impl, state = _layout("fp8", with_index=False)
+    state["v_cache_shuffle"], state["v_cache"] = state["v_cache"], _L(
+        (4, 2, 128, 128), "x"
+    )
+    state["k_scale_view"], state["k_scale"] = state["k_scale"], None
+    assert _reason(impl, state, with_index=False) is None
+
+
+def _bad(kv="fp8", **mut):
+    """A layout with ONE thing wrong; ``mut`` replaces state entries / impl attributes."""
+    impl, state = _layout(kv)
+    for key, val in mut.items():
+        if key in state:
+            state[key] = val
+        else:
+            setattr(impl, key, val)
+    return impl, state
+
+
+@pytest.mark.parametrize(
+    "case,mut,kv,expect",
+    [
+        (
+            "k dtype is bf16 under an fp8 signature",
+            {"k_cache": "bf16k"},
+            "fp8",
+            "kv_layout",
+        ),
+        ("kv head count", {"num_kv_heads": 4}, "fp8", "kv_layout"),
+        ("head dim", {"head_dim": 64}, "fp8", "kv_layout"),
+        ("K element pack x", {"k_cache": "xk"}, "fp8", "kv_layout"),
+        ("K page", {"k_cache": "pagek"}, "fp8", "kv_layout"),
+        ("K not SHUFFLE (inner stride)", {"k_cache": "strk"}, "fp8", "kv_layout"),
+        ("V shape", {"v_cache": "shv"}, "fp8", "kv_layout"),
+        ("V not SHUFFLE (inner stride)", {"v_cache": "strv"}, "fp8", "kv_layout"),
+        ("fp8 without scales", {"k_scale": None}, "fp8", "kv_layout"),
+        ("scale dtype", {"v_scale": "sdt"}, "fp8", "kv_layout"),
+        ("scale shape", {"k_scale": "ssh"}, "fp8", "kv_layout"),
+        ("bf16 with scales", {"k_scale": "any"}, "bf16", "kv_layout"),
+        ("unknown kv dtype", {"kv_cache_dtype": "fp4"}, "fp8", "kv_layout"),
+        ("no index cache bound", {"index_cache": None}, "fp8", "index_layout"),
+        (
+            "index cache dtype config",
+            {"index_cache_dtype": "bf16"},
+            "fp8",
+            "index_layout",
+        ),
+        ("index head dim", {"index_head_dim": 64}, "fp8", "index_layout"),
+        ("index page", {"index_cache": "ip"}, "fp8", "index_layout"),
+        ("index dtype", {"index_cache": "idt"}, "fp8", "index_layout"),
+        ("index not flat contiguous", {"index_cache": "inc"}, "fp8", "index_layout"),
+    ],
+)
+def test_a_cache_that_does_not_match_the_signature_is_refused_with_its_reason(
+    case, mut, kv, expect
+):
+    import torch as _torch
+
+    impl, state = _layout(kv)
+    fp8, bf16, f32 = _torch.float8_e4m3fn, _torch.bfloat16, _torch.float32
+    n, nkv, hd, page = 4, 2, 128, 16
+    nkv_now = mut.get("num_kv_heads", nkv)
+    builders = {
+        "bf16k": lambda: _L((n, nkv, hd // 8, page, 8), bf16),
+        "xk": lambda: _L((n, nkv, hd // 8, page, 8), fp8),
+        "pagek": lambda: _L((n, nkv, hd // 16, 32, 16), fp8),
+        "strk": lambda: _L((n, nkv, hd // 16, page, 16), fp8, stride=(9, 9, 9, 9, 2)),
+        "shv": lambda: _L((n, nkv, 2, hd, 16), fp8),
+        "strv": lambda: _L((n, nkv, 1, hd, 16), fp8, stride=(9, 9, 9, 9, 2)),
+        "sdt": lambda: _L((n, nkv, page), "f16"),
+        "ssh": lambda: _L((n, nkv, 8), f32),
+        "any": lambda: _L((n, nkv, page), f32),
+        "ip": lambda: _L((n, 64, 128), fp8),
+        "idt": lambda: _L((n, 128, 128), bf16),
+        "inc": lambda: _L((n, 128, 128), fp8, stride=(16384, 256, 1)),
+    }
+    for key, val in mut.items():
+        v = builders[val]() if isinstance(val, str) and val in builders else val
+        if key in state:
+            state[key] = v
+        else:
+            setattr(impl, key, v)
+    del nkv_now
+    assert _reason(impl, state) == expect, case
+
+
+def test_index_problems_are_ignored_on_layers_that_have_no_indexer():
+    impl, state = _bad("fp8", index_cache=None, index_cache_dtype="bf16")
+    assert _reason(impl, state, with_index=True) == "index_layout"
+    assert _reason(impl, state, with_index=False) is None  # dense / reuse layer
+
+
+def _prep_case(make_site, impl, state, *, sparse=True, skip=False):
+    """The REAL GemmFusionSite.prepare_bucket with only staging and binding replaced."""
+    s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
+    impl.layer_num = 3
+    impl.gemm_fusion_prologue_supported = lambda: True
+    impl.gemm_fusion_prologue_state = lambda fwd: state
+    s.attn = SimpleNamespace(impl=impl)
+    s.sparse, s.skip_index = sparse, skip
+    s.resolve(64, "eager")
+    s.resolve(64, "capture")
+    st = SimpleNamespace(prepared=False, slot="SLOT")
+    s._stage = lambda *a: st
+    bound = []
+    s._bind_plan = lambda *a: bound.append(a) or True
+    return s, bound
+
+
+def test_prepare_bucket_binds_matching_caches(make_site):
+    impl, state = _layout("fp8")
+    s, bound = _prep_case(make_site, impl, state)
+    assert s.prepare_bucket(64, "dev", {}, None) is True and len(bound) == 1
+    assert not s._prepare_refusals
+
+
+@pytest.mark.parametrize(
+    "mut,reason",
+    [({"k_cache": None}, "kv_layout"), ({"index_cache": None}, "index_layout")],
+)
+def test_prepare_bucket_refuses_a_mismatch_and_agree_makes_it_native_with_that_reason(
+    make_site, caplog, mut, reason
+):
+    impl, state = _bad("fp8", **mut)
+    s, bound = _prep_case(make_site, impl, state)
+    with caplog.at_level("WARNING"):
+        assert s.prepare_bucket(64, "dev", {}, None) is False
+    assert bound == []  # nothing was bound on the mismatching caches
+    assert s._prepare_refusals == {64: reason}
+    assert reason in caplog.text and "native on every rank" in caplog.text
+    s.agree_prepared(64, False)  # what prepare_buckets does with that verdict
+    for mode in ("eager", "capture"):
+        r = s._by_tokens[(64, mode)]
+        assert (r.plan, r.n_fused, r.reason) == (None, 0, reason)
+
+
+def test_a_reuse_or_dense_layer_is_not_refused_for_an_index_cache_it_does_not_have(
+    make_site,
+):
+    impl, state = _bad("fp8", index_cache=None)
+    s, bound = _prep_case(make_site, impl, state, sparse=True, skip=True)
+    assert s.prepare_bucket(64, "dev", {}, None) is True and len(bound) == 1
+
+
+def test_an_unrefused_unprepared_bucket_keeps_its_generic_reason(make_site):
+    impl, state = _layout("fp8")
+    s, _bound = _prep_case(make_site, impl, state)
+    s.agree_prepared(64, False)  # never prepared, never refused
+    assert s._by_tokens[(64, "eager")].reason == "unprepared"
+
+
+# ---- (2) meta_len
+def test_meta_len_ok_requires_both_arrays_to_hold_exactly_the_real_tokens():
+    ok = site_mod.GemmFusionSite.meta_len_ok
+    assert ok(_T((61,)), _T((61,)), 61) is True
+    assert (
+        ok(_T((61,)), _T((60,)), 61) is False
+    )  # slot shorter: real rows would turn into pad
+    assert ok(_T((61,)), _T((62,)), 61) is False  # slot longer
+    assert (
+        ok(_T((62,)), _T((61,)), 61) is False
+    )  # positions longer than the real tokens
+    assert ok(_T((61,)), _T((61,)), 60) is False  # real_tokens disagrees with both
+
+
+def test_decide_path_sends_a_length_mismatch_native_as_meta_len_after_the_other_facts():
+    kw = {
+        "resolution": site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"),
+        "is_dummy_run": False,
+        "x_dtype_is_fp8": True,
+        "x_scale_ok": True,
+    }
+    decide = site_mod.GemmFusionSite.decide_path
+    assert decide(**kw, meta_len_ok=False) == ("native", "meta_len")
+    assert decide(**kw) == ("fused", "profile_hit")  # default: nothing to check
+    # it names the FIRST thing wrong, and wins over the per-launch layout reason after it
+    assert decide(**kw, meta_len_ok=False, tokens_ok=False) == ("native", "meta_len")
+    assert decide(**{**kw, "is_dummy_run": True}, meta_len_ok=False) == (
+        "native",
+        "dummy_run",
+    )
+    assert decide(**kw, x_k_ok=False, meta_len_ok=False) == ("native", "x_k_mismatch")
+
+
+@pytest.mark.parametrize("abi", [3, 2], ids=["r19", "r17/r18"])
+@pytest.mark.parametrize(
+    "which",
+    ["slot_short", "slot_long", "positions_long", "real_disagrees"],
+)
+def test_a_call_whose_metadata_lengths_disagree_is_native_not_a_silent_shrink(
+    make_site, abi, which
+):
+    import torch as _torch
+
+    over = {
+        "slot_short": {"slot": _T((60,), _torch.int64)},
+        "slot_long": {"slot": _T((62,), _torch.int64)},
+        "positions_long": {"pos": _T((62,), _torch.int64)},
+        "real_disagrees": {},
+    }[which]
+    s, _plan, _st, _state, ctx, x, xs = _per_launch_case(make_site, abi=abi, **over)
+    if which == "real_disagrees":
+        ctx.real_tokens = 60  # both arrays hold 61
+    r, reason, got_state, got_st = s._prepare(ctx, x, xs)
+    assert (r.plan, r.reason, reason) == (None, "meta_len", "meta_len")
+    assert got_state is None and got_st is None
+
+
+@pytest.mark.parametrize("abi", [3, 2], ids=["r19", "r17/r18"])
+def test_consistent_lengths_with_padded_rows_stay_fused(make_site, abi):
+    s, plan, st, state, ctx, x, xs = _per_launch_case(make_site, abi=abi)
+    assert (ctx.real_tokens, ctx.padded_tokens) == (
+        61,
+        64,
+    )  # real < padded: not a reason
+    r, _reason, got_state, got_st = s._prepare(ctx, x, xs)
+    assert r.plan is plan and got_state is state and got_st is st
+
+
+# ============ R16 pad-M: a token count that was not prepared runs in the bucket that serves it ============
+class _PadPlan(_R19Plan):
+    """A small plan of a pad-M source (r19 / r20 / r22 / r23): it can launch fewer real rows than the
+    bucket it was built for."""
+
+    pad_m = True
+
+
+class _LargePlan:
+    """A large plan: raw per-launch pointers (no positions / slot_mapping), a receive-window view."""
+
+    vid = "fake.large"
+    mode = "dense"
+    src = "r12"
+    abi = 3
+
+    def __init__(self, pad_m=False, src="r12", mode="dense"):
+        self.pad_m, self.src, self.mode = pad_m, src, mode
+        self.runs, self.views = [], []
+
+    def run(self, **kw):
+        self.runs.append(kw)
+
+    def recv_view(self, res, m_real=None):
+        self.views.append(("recv", m_real))
+        return "VIEW"
+
+    def reuse_view(self, res, m_real=None):
+        self.views.append(("reuse", m_real))
+        return "REUSE"
+
+
+class _OldLargePlan(_LargePlan):
+    """r12: no m_real parameter on the views."""
+
+    def recv_view(self, res):
+        self.views.append(("recv", None))
+        return "VIEW"
+
+
+def _pad_torch(monkeypatch):
+    """``_recording_torch`` plus what ``_runtime_mode`` asks of the stream (not capturing)."""
+    monkeypatch.setattr(
+        site_mod,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(
+                current_stream=lambda: "S",
+                is_available=lambda: False,
+                is_current_stream_capturing=lambda: False,
+            ),
+            int64=site_mod.torch.int64,
+        ),
+        raising=False,
+    )
+
+
+def _pad_env(
+    make_site,
+    monkeypatch,
+    *,
+    buckets=(16, 32),
+    plan=None,
+    n_fused=2,
+    sites=1,
+    bucket_fn="default",
+    order=None,
+):
+    """Sites whose BUCKET rows (m in ``buckets``, T = 4 m) are prepared, the phase 'ready', and a fake
+    aiter whose ``bucket_for_m`` picks the smallest prepared bucket >= m (or ``bucket_fn``).
+    """
+    plan = _PadPlan() if plan is None else plan
+    res = FakeResources(plan_n=(plan, n_fused))
+    s = make_site(res)
+    s.attn = SimpleNamespace(
+        impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True)
+    )
+    all_sites = [s]
+    for i in range(1, sites):
+        all_sites.append(
+            site_mod.GemmFusionSite(
+                f"L{i}.qkv",
+                s.linear,
+                s.stages,
+                native_fns=None,
+                attn=s.attn,
+                q_size=8192,
+                kv_size=128,
+            )
+        )
+    for site in all_sites:
+        for m in buckets:
+            for mode in ("eager", "capture"):
+                site.resolve(m * 4, mode)
+    TU.set_phase("ready")
+    calls = []
+
+    def default_fn(spec, ctx, profile):
+        calls.append(ctx.m)
+        return next((b for b in sorted(buckets) if b >= ctx.m), None)
+
+    gf = _fake_gf(res)
+    if bucket_fn == "default":
+        gf.bucket_for_m = default_fn
+    elif bucket_fn is not None:
+        gf.bucket_for_m = lambda spec, ctx, profile: calls.append(ctx.m) or bucket_fn(
+            ctx.m
+        )
+    TU.inject_aiter(monkeypatch, gf)
+    return res, all_sites, plan, calls
+
+
+def test_an_unprepared_token_count_runs_in_the_prepared_bucket_that_serves_it(
+    make_site, monkeypatch
+):
+    res, (s,), plan, calls = _pad_env(make_site, monkeypatch)
+    agrees = res.agree_calls
+    r = s.resolve(40, "eager")  # m_real 10 -> bucket m 16 -> T 64
+    assert (r.plan, r.n_fused, r.vid, r.bucket_tokens, r.reason) == (
+        plan,
+        2,
+        "fake.v1",
+        64,
+        "pad_hit",
+    )
+    assert res.agree_calls == agrees  # decided without a collective
+    assert s.resolve(40, "eager") is r and calls == [
+        10
+    ]  # cached: the pure function ran once
+    assert (
+        s.resolve(40, "capture").bucket_tokens == 64
+    )  # capture keys resolve the same way
+    exact = s.resolve(64, "eager")  # a PREPARED token count is untouched
+    assert (exact.bucket_tokens, exact.reason) == (0, "profile_hit")
+    assert s.resolve(128, "eager").bucket_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "tokens,expect",
+    [
+        (200, "uncovered"),  # m 50: no bucket serves it
+        (41, "late_bucket"),  # not a whole number of local rows
+    ],
+)
+def test_a_token_count_no_bucket_serves_is_native_with_its_reason(
+    make_site, monkeypatch, tokens, expect
+):
+    _res, (s,), _plan, _calls = _pad_env(make_site, monkeypatch)
+    r = s.resolve(tokens, "eager")
+    assert (r.plan, r.n_fused, r.reason) == (None, 0, expect)
+
+
+def test_without_pad_m_in_aiter_or_with_the_bucket_unprepared_it_is_late_bucket(
+    make_site, monkeypatch
+):
+    _res, (s,), _plan, _calls = _pad_env(make_site, monkeypatch, bucket_fn=None)
+    assert (
+        s.resolve(40, "eager").reason == "late_bucket"
+    )  # an aiter with no bucket_for_m
+    _res, (s,), _plan, _calls = _pad_env(make_site, monkeypatch, bucket_fn=lambda m: 24)
+    assert (
+        s.resolve(80, "eager").reason == "late_bucket"
+    )  # bucket 24 was never prepared
+
+
+def test_a_native_bucket_makes_every_token_count_it_serves_native(
+    make_site, monkeypatch
+):
+    _res, (s,), _plan, _calls = _pad_env(make_site, monkeypatch)
+    for mode in ("eager", "capture"):
+        s._by_tokens[(64, mode)] = site_mod.Resolution(None, 0, "native", "unprepared")
+    r = s.resolve(40, "eager")
+    assert (r.plan, r.reason) == (None, "unprepared")
+
+
+@pytest.mark.parametrize(
+    "plan,n_fused",
+    [
+        (_R19Plan(), 2),  # not a pad-M source
+        (
+            type("P", (_PadPlan,), {"abi": 2})(),
+            2,
+        ),  # r17/r18: stages its inputs, needs exact rows
+        (_LargePlan(pad_m=False), 1),  # large r12: m == bucket only
+    ],
+    ids=["no pad_m", "abi 2", "large r12"],
+)
+def test_a_plan_that_cannot_launch_fewer_rows_than_its_bucket_stays_native(
+    make_site, monkeypatch, plan, n_fused
+):
+    _res, (s,), _p, _c = _pad_env(make_site, monkeypatch, plan=plan, n_fused=n_fused)
+    r = s.resolve(40, "eager")
+    assert (r.plan, r.reason) == (None, "pad_unsupported")
+
+
+def test_a_pad_capable_large_plan_pads(make_site, monkeypatch):
+    plan = _LargePlan(pad_m=True, src="r13")
+    _res, (s,), _p, _c = _pad_env(
+        make_site, monkeypatch, plan=plan, n_fused=1, buckets=(1024, 1280)
+    )
+    r = s.resolve(4 * 1100, "eager")
+    assert (r.plan, r.n_fused, r.bucket_tokens, r.reason) == (plan, 1, 5120, "pad_hit")
+
+
+@pytest.mark.parametrize(
+    "bucket_fn",
+    [lambda m: (_ for _ in ()).throw(RuntimeError("profile")), lambda m: m - 1],
+    ids=["raises", "smaller than m"],
+)
+def test_a_failing_or_inconsistent_bucket_function_is_native_not_a_raise(
+    make_site, monkeypatch, bucket_fn
+):
+    _res, (s,), _p, _c = _pad_env(make_site, monkeypatch, bucket_fn=bucket_fn)
+    r = s.resolve(40, "eager")
+    assert (r.plan, r.reason) == (None, "pad_error")
+
+
+def test_the_padded_resolution_is_the_same_on_every_simulated_rank(
+    make_site, monkeypatch
+):
+    outcomes = set()
+    for rank in range(4):
+        _res, (s,), _p, _c = _pad_env(make_site, monkeypatch)
+        hooks.resources().rank = rank  # the decision must not depend on the rank
+        got = tuple(
+            (r.plan is not None, r.bucket_tokens, r.reason)
+            for r in (s.resolve(t, "eager") for t in (40, 41, 52, 100, 64, 128))
+        )
+        outcomes.add(got)
+    assert len(outcomes) == 1
+
+
+# ---- the call, with the real rows only
+def _pad_case(make_site, monkeypatch, *, tokens=40, real=37, **env):
+    import torch as _torch
+
+    res, (s,), plan, _calls = _pad_env(make_site, monkeypatch, **env)
+    st = SimpleNamespace(
+        outs={"q": "Q"},
+        xs=_T((16, 1), _torch.float32),
+        pos=_T((64,), _torch.int64),
+        slot=_T((64,), _torch.int64),
+        prepared=True,
+        plan=plan,
+        kv_ptrs=None,
+        m=16,
+    )
+    s._staging[64] = st  # the BUCKET's staging
+    state = {
+        "slot_mapping": _T((real,), _torch.int64),
+        "k_cache": _T(),
+        "v_cache": _T(),
+        "k_scale": _T(),
+        "v_scale": _T(),
+    }
+    ctx = SimpleNamespace(
+        is_dummy_run=False,
+        real_tokens=real,
+        padded_tokens=tokens,
+        positions=_T((real,), _torch.int64),
+        prologue_state=lambda: state,
+    )
+    x = _T((tokens // 4, 3072), _torch.float8_e4m3fn)  # the REAL local rows: 10, not 16
+    xs = _T((tokens // 4, 1), _torch.float32)
+    return res, s, plan, st, state, ctx, x, xs
+
+
+def test_a_padded_call_uses_the_buckets_plan_and_staging_and_stays_fused(
+    make_site, monkeypatch
+):
+    _res, s, plan, st, state, ctx, x, xs = _pad_case(make_site, monkeypatch)
+    r, _reason, got_state, got_st = s._prepare(ctx, x, xs)
+    assert r.plan is plan and r.bucket_tokens == 64
+    assert got_st is st and got_state is state  # the bucket's staging, the call's state
+
+
+def test_a_padded_call_hands_the_kernel_the_real_rows_and_the_buckets_outputs(
+    make_site, monkeypatch
+):
+    _res, s, plan, st, state, ctx, x, xs = _pad_case(make_site, monkeypatch)
+    monkeypatch.setattr(site_mod, "_rows2d", lambda t: t, raising=False)
+    _stub_meta(s)
+    r, _reason, got_state, got_st = s._prepare(ctx, x, xs)
+    _pad_torch(monkeypatch)  # only the stream the launch asks for
+    s._execute(r, x, xs, ctx, got_state, got_st, None)
+    (kw,) = plan.runs
+    assert kw["x"] is x and kw["x"].shape[0] == 10  # NOT padded to the bucket's 16 rows
+    assert kw["x_scale"] is xs and kw["meta"]["positions"] is ctx.positions
+    assert kw["meta"]["slot_mapping"] is state["slot_mapping"]  # 37 real tokens, not 64
+    assert kw["outs"] is st.outs  # the bucket's outputs (bigger than the call needs)
+    assert kw["call_id"] == consensus.decision_key("L0.qkv", 40, "fake.v1", 2)
+
+
+def test_a_padded_call_with_inconsistent_metadata_lengths_is_still_native(
+    make_site, monkeypatch
+):
+    import torch as _torch
+
+    _res, s, _plan, _st, _state, ctx, x, xs = _pad_case(make_site, monkeypatch)
+    ctx.positions = _T((36,), _torch.int64)  # one entry short of the real tokens
+    r, reason, got_state, got_st = s._prepare(ctx, x, xs)
+    assert (r.plan, reason, got_state, got_st) == (None, "meta_len", None, None)
+
+
+def test_the_decision_record_carries_the_rows_the_kernel_got_and_the_bucket_that_ran(
+    make_site, monkeypatch
+):
+    _res, s, _plan, st, _state, ctx, x, xs = _pad_case(make_site, monkeypatch)
+    r, reason, _gs, got_st = s._prepare(ctx, x, xs)
+    d = s._decision(ctx, r, reason, "fused", got_st)
+    assert (d.tokens, d.m_real, d.bucket_m, d.path) == (40, 10, 16, "fused")
+    exact = s.resolve(64, "eager")
+    ctx64 = SimpleNamespace(padded_tokens=64)
+    d = s._decision(ctx64, exact, "profile_hit", "fused", st)
+    assert (d.m_real, d.bucket_m) == (16, 16)  # an exact bucket: equal
+    native = site_mod.Resolution(None, 0, "native", "uncovered")
+    d = s._decision(SimpleNamespace(padded_tokens=200), native, "uncovered", "native")
+    assert (d.m_real, d.bucket_m) == (50, 0)  # native: no bucket ran
+
+
+# ---- large: the receive view over the real rows
+def _large_exec(make_site, monkeypatch, plan, tokens=4400, bucket=5120):
+    s = make_site(FakeResources())
+    _pad_torch(monkeypatch)
+    TU.set_phase("ready")
+    r = site_mod.Resolution(plan, 1, "fake.large", "pad_hit", bucket)
+    return s._execute(
+        r, "X", "XS", SimpleNamespace(padded_tokens=tokens), None, None, None
+    )
+
+
+def test_a_pad_capable_large_plan_gets_its_view_over_the_real_rows_explicitly(
+    make_site, monkeypatch
+):
+    plan = _LargePlan(pad_m=True, src="r13")
+    assert _large_exec(make_site, monkeypatch, plan) == {"packed": "VIEW"}
+    assert plan.views == [("recv", 1100)]  # T / world = 4400 / 4, not the bucket's 1280
+    (kw,) = plan.runs
+    assert kw["x"] == "X" and kw["x_scale"] == "XS"  # the real rows, as handed over
+
+
+def test_a_reuse_layers_view_is_over_the_real_rows_too(make_site, monkeypatch):
+    plan = _LargePlan(pad_m=True, src="r13", mode="reuse")
+    assert _large_exec(make_site, monkeypatch, plan) == {"packed": "REUSE"}
+    assert plan.views == [("reuse", 1100)]
+
+
+def test_an_older_large_plan_is_called_with_its_old_view_signature(
+    make_site, monkeypatch
+):
+    plan = _OldLargePlan()  # r12: recv_view(res) only; it runs exact buckets
+    assert _large_exec(make_site, monkeypatch, plan, tokens=5120, bucket=0) == {
+        "packed": "VIEW"
+    }
+    assert plan.views == [("recv", None)]
+
+
+# ---- call ids
+def test_a_tagged_plan_gets_ids_with_distinct_low_bits_per_token_count_not_the_hash(
+    make_site, monkeypatch
+):
+    plan = _LargePlan(pad_m=True, src="r13")
+    _res, sites, _p, _c = _pad_env(
+        make_site, monkeypatch, plan=plan, n_fused=1, buckets=(1024, 1280), sites=3
+    )
+    tokens = 4 * 1100
+    rs = [s.resolve(tokens, "eager") for s in sites]
+    assert [r.reason for r in rs] == ["pad_hit"] * 3
+    ids = [s._call_id(r, tokens) for s, r in zip(sites, rs)]
+    low = [i & 0x7FFFF for i in ids]
+    assert len(set(low)) == 3 and 0 not in low  # distinct and non-zero on the tag bits
+    assert ids != [
+        consensus.decision_key(s.name, tokens, r.vid, r.n_fused)
+        for s, r in zip(sites, rs)
+    ]  # the hash is NOT what reaches the tag
+
+
+def test_a_small_plan_keeps_the_decision_key_and_needs_no_registry(
+    make_site, monkeypatch
+):
+    _res, (s,), _p, _c = _pad_env(make_site, monkeypatch)
+    r = s.resolve(64, "eager")
+    assert s._call_id(r, 64) == consensus.decision_key("L0.qkv", 64, "fake.v1", 2)
+    assert (64, "eager") not in hooks._TOKEN_IDS  # no per-token-count check was built
+
+
+def test_the_call_id_check_of_a_padded_key_is_per_token_count_over_every_site(
+    make_site, monkeypatch
+):
+    res, (a, b), _p, _c = _pad_env(make_site, monkeypatch, sites=2)
+    res.call_id_report = SimpleNamespace(
+        ok=False, refused_keys=frozenset({("L0.qkv", 40, "fake.v1", 2)})
+    )
+    ra, rb = a.resolve(40, "eager"), b.resolve(40, "eager")
+    assert (ra.plan, ra.reason) == (
+        None,
+        "call_id_refused",
+    )  # the colliding site is native
+    assert (rb.plan is not None, rb.reason) == (True, "pad_hit")  # its peer is not
+    keys, kw = res.call_id_calls[-1]
+    assert keys == {("L0.qkv", 40, "fake.v1", 2), ("L1.qkv", 40, "fake.v1", 2)}
+    assert kw["per_tokens"] is True  # only launches of ONE token count can meet
+    assert (
+        a.resolve(64, "eager").reason == "profile_hit"
+    )  # a prepared bucket is untouched
+
+
+def test_the_call_id_verdict_does_not_depend_on_the_order_sites_resolve_in(
+    make_site, monkeypatch
+):
+    refused = frozenset({("L1.qkv", 40, "fake.v1", 2)})
+    got = []
+    for order in ((0, 1), (1, 0)):
+        res, sites, _p, _c = _pad_env(make_site, monkeypatch, sites=2)
+        res.call_id_report = SimpleNamespace(ok=False, refused_keys=refused)
+        got.append(
+            (
+                tuple(sites[i].resolve(40, "eager").reason for i in (0, 1)),
+                hooks.token_call_ids(40, "eager").refused,
+            )
+        )
+        for i in order:
+            sites[i].resolve(40, "eager")
+    assert got[0] == got[1] == (("pad_hit", "call_id_refused"), refused)
+
+
+def test_tagged_ids_that_cannot_be_assigned_make_those_launches_native(
+    make_site, monkeypatch
+):
+    plan = _LargePlan(pad_m=True, src="r13")
+    res, (s,), _p, _c = _pad_env(
+        make_site, monkeypatch, plan=plan, n_fused=1, buckets=(1024, 1280)
+    )
+    res.tag_ids_fail = True
+    assert s.resolve(4 * 1100, "eager").reason == "call_id_refused"  # padded
+    ctx = SimpleNamespace(
+        padded_tokens=4 * 1024, is_dummy_run=False
+    )  # a prepared bucket too
+    r, reason, st, state = s._prepare(ctx, _T((1024, 3072)), _T((1024, 1)))
+    assert (r.plan, reason, st, state) == (None, "call_id_refused", None, None)
+
+
+def test_capture_at_a_token_count_that_is_not_a_bucket_resolves_the_padded_bucket(
+    make_site, monkeypatch
+):
+    _res, (s,), plan, _c = _pad_env(make_site, monkeypatch)
+    hooks.before_graph_capture(
+        [(40, 37)]
+    )  # a custom capture list: T=40, not a bucket row
+    r = s._padded[(40, "capture")]
+    assert (r.plan, r.bucket_tokens, r.reason) == (plan, 64, "pad_hit")
+    # the key the capture runs under is the one the replay's graph was captured with: same T, same m
+    assert s.resolve(40, "capture") is r
+
+
+def test_prepare_still_prepares_the_bucket_rows_and_nothing_else():
+    import inspect
+
+    src = inspect.getsource(hooks.profile_tokens)
+    assert "prof.rows()" in src and "rules" not in src  # exact rows only, as before
+
+
+# ---- the adapter
+def test_the_adapter_passes_the_pad_m_arguments_to_aiters_call_id_module(monkeypatch):
+    import types
+
+    w = _adapter(monkeypatch, SimpleNamespace())
+    seen = []
+    fake = types.ModuleType("aiter.gemm_fusion.callid")
+    fake.check_call_ids = lambda keys, **kw: seen.append((set(keys), kw)) or "REPORT"
+    monkeypatch.setitem(sys.modules, "aiter.gemm_fusion.callid", fake)
+    f = lambda *k: 1
+    assert (
+        w.check_call_ids(
+            {("s", 64, "v", 1)},
+            key_fn=f,
+            tag_bits=19,
+            tag_vids={"v"},
+            per_tokens=True,
+        )
+        == "REPORT"
+    )
+    assert seen[-1] == (
+        {("s", 64, "v", 1)},
+        {"key_fn": f, "tag_bits": 19, "tag_vids": {"v"}, "per_tokens": True},
+    )
+    w.check_call_ids({("s", 64, "v", 1)})
+    assert seen[-1][1] == {}  # nothing extra unless asked
+
+
+def test_the_adapter_has_tag_unique_ids_only_when_aiter_does_and_names_the_tagged_source(
+    monkeypatch,
+):
+    import types
+
+    w = _adapter(monkeypatch, SimpleNamespace())
+    fake = types.ModuleType("aiter.gemm_fusion.callid")
+    monkeypatch.setitem(sys.modules, "aiter.gemm_fusion.callid", fake)
+    assert w.tag_unique_ids([("s", 64, "v", 1)]) is None  # an aiter without the helper
+    fake.tag_unique_ids = lambda keys: {k: 7 for k in keys}
+    assert w.tag_unique_ids([("s", 64, "v", 1)]) == {("s", 64, "v", 1): 7}
+    assert w.plan_tag_bits(SimpleNamespace(src="r13")) == 19
+    assert w.plan_tag_bits(SimpleNamespace(src="r12")) is None
+    assert w.plan_tag_bits(SimpleNamespace(src="r19")) is None
+
+
+# ============ the golden adapter serves an unprepared token count through the prepared bucket's site ========
+def _golden_pad_env(monkeypatch, mode="qkv_dense", bucket_tokens=64):
+    """The REAL ``_site_for`` over a fake aiter: ONE bucket case (T = 64, m = 16) prepared the way
+    ``prepare_cases`` does it, then the phase 'ready'. ``bucket_for_m`` maps m <= 16 to that bucket.
+    """
+    from atom.model_ops.gemm_fusion import test_utils as GC
+
+    matcher = _SigMatcher([])
+    gf = _fake_spec_module(matcher)
+    gf.bucket_for_m = lambda spec, ctx, profile: 16 if ctx.m <= 16 else None
+    TU.inject_aiter(monkeypatch, gf)
+    monkeypatch.setattr(stages, "_kv_block_size", lambda: 16)
+    TU.reset_for_tests(FakeResources())
+    TU.set_phase("preparing")
+    GC._SITES.clear()
+    bucket_case = _golden_case(mode, bucket_tokens)
+    site, holder, attn = GC._site_for(bucket_case, None)
+    matcher.sigs.add(site.spec.signature())
+    t = bucket_case.spec.padded_tokens
+    for md in ("eager", "capture"):
+        site.resolve(t, md)
+        # a pad-M source: it can launch fewer real rows than its bucket
+        r = site._by_tokens[(t, md)]
+        site._by_tokens[(t, md)] = site_mod.Resolution(
+            _PadPlan(), r.n_fused, r.vid, r.reason
+        )
+    TU.set_phase("ready")
+    return GC, site, holder, attn, bucket_case
+
+
+@pytest.mark.parametrize("mode", ["qkv_dense", "qkv_indexer", "qkv_indexer_reuse"])
+def test_a_golden_case_at_an_unprepared_token_count_runs_through_the_prepared_buckets_site(
+    monkeypatch, mode
+):
+    GC, site, holder, attn, _bucket = _golden_pad_env(monkeypatch, mode)
+    case = _golden_case(mode, 50)  # T = 52, m_real = 13: no site of its own
+    assert (_mode_key := GC._mode(case)) and (_mode_key, 50) not in GC._SITES
+    assert GC.padded_bucket(case) == (16, site.name)
+    got = GC._site_for(case, None)
+    assert got[0] is site and got[2] is attn  # the bucket's site, not a fresh empty one
+    assert (_mode_key, 50) not in GC._SITES  # and no site was created for the case
+    assert holder.case is case
+    r = site.resolve(case.spec.padded_tokens, "eager")
+    assert (r.reason, r.bucket_tokens) == ("pad_hit", 64)  # what the call will run in
+    GC._SITES.clear()
+
+
+def test_the_bucket_site_runs_on_the_padded_cases_own_layer_tensors(monkeypatch):
+    GC, site, _holder, attn, _bucket = _golden_pad_env(monkeypatch, "qkv_indexer")
+    case = _golden_case("qkv_indexer", 50)
+    GC._site_for(case, None)
+    impl = attn.impl
+    assert (
+        site.linear.weight is case.weight
+        and site.linear.weight_scale is case.weight_scale
+    )
+    assert (impl.rotary_emb, impl.q_norm, impl.k_norm) == (
+        case.rotary,
+        case.q_norm,
+        case.k_norm,
+    )
+    assert (
+        impl.index_q_norm is case.index_q_norm
+        and impl.index_k_norm is case.index_k_norm
+    )
+    assert impl.index_cache is case.caches["index_cache"]
+    assert site.linear.input_size == case.spec.gemm_nk[1]  # shapes are the site's own
+    GC._SITES.clear()
+
+
+def test_a_prepared_case_keeps_its_own_site_and_is_never_padded(monkeypatch):
+    GC, site, _holder, _attn, bucket = _golden_pad_env(monkeypatch)
+    assert GC.padded_bucket(bucket) is None
+    assert GC._site_for(bucket, None)[0] is site
+    GC._SITES.clear()
+
+
+def test_a_case_nothing_prepared_serves_gets_its_own_site_and_is_native(monkeypatch):
+    GC, site, _holder, _attn, _bucket = _golden_pad_env(monkeypatch)
+    case = _golden_case("qkv_dense", 200)  # m = 50: bucket_for_m says None
+    assert GC.padded_bucket(case) is None
+    own = GC._site_for(case, None)[0]
+    assert own is not site and ("dense", 200) in GC._SITES
+    assert own.resolve(200, "eager").plan is None  # native, exactly as before
+    GC._SITES.clear()
+
+
+def test_a_bucket_prepared_for_one_mode_does_not_serve_another(monkeypatch):
+    GC, site, _holder, _attn, _bucket = _golden_pad_env(monkeypatch, "qkv_dense")
+    other = _golden_case("qkv_indexer", 50)
+    assert GC.padded_bucket(other) is None
+    assert GC._site_for(other, None)[0] is not site
+    GC._SITES.clear()
+
+
+def test_nothing_is_padded_before_the_buckets_are_ready(monkeypatch):
+    GC, site, _holder, _attn, _bucket = _golden_pad_env(monkeypatch)
+    TU.set_phase(
+        "preparing"
+    )  # prepare_cases is still running: the engine's rule, not a pad
+    case = _golden_case("qkv_dense", 50)
+    assert GC.padded_bucket(case) is None
+    assert GC._site_for(case, None)[0] is not site
+    GC._SITES.clear()
+
+
+def test_a_case_sharing_a_prepared_buckets_padded_token_count_runs_through_that_site(
+    monkeypatch,
+):
+    """62 real tokens pad to T = 64, the bucket another case (64 real tokens) prepared: no padding
+    needed, but the engine would serve it through the same site, so the adapter does too.
+    """
+    GC, site, _holder, _attn, _bucket = _golden_pad_env(monkeypatch)
+    case = _golden_case("qkv_dense", 62)
+    assert case.spec.padded_tokens == 64
+    assert GC.padded_bucket(case) == (16, site.name)
+    assert GC._site_for(case, None)[0] is site
+    r = site.resolve(64, "eager")
+    assert (r.reason, r.bucket_tokens) == ("profile_hit", 0)  # exact: the bucket itself
+    GC._SITES.clear()
+
+
+# ======= the golden adapter end to end: a padded case through the REAL candidate entry =====================
+class _Rows:
+    """An output buffer: only its row count and row slicing matter."""
+
+    def __init__(self, n):
+        self.shape = (n, 1, 128)
+
+    def __getitem__(self, s):
+        return _Rows(len(range(*s.indices(self.shape[0]))))
+
+
+def _adapter_torch(monkeypatch):
+    real = site_mod.torch
+    monkeypatch.setattr(
+        site_mod,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(
+                current_stream=lambda: "S",
+                is_available=lambda: False,
+                is_current_stream_capturing=lambda: False,
+            ),
+            float8_e4m3fn=real.float8_e4m3fn,
+            float32=real.float32,
+            int64=real.int64,
+            bfloat16=real.bfloat16,
+        ),
+        raising=False,
+    )
+
+
+def _padded_adapter_case(monkeypatch, mode, tokens):
+    """The bucket (T = 64, m = 16) is prepared; returns the case at ``tokens`` with caches of ITS OWN
+    shape (a golden case sizes them from its tokens) and what the call needs besides."""
+    import types
+
+    import torch as _t
+
+    GC, site, holder, attn, bucket = _golden_pad_env(monkeypatch, mode)
+    plan = site._by_tokens[(64, "eager")].plan
+    sparse_idx = mode == "qkv_indexer"
+    outs = (
+        {"q": _Rows(64), "index_q": _Rows(64)}
+        if sparse_idx
+        else {"q": _Rows(64), "k": _Rows(64), "v": _Rows(64)}
+    )
+    site._staging[64] = SimpleNamespace(
+        outs=outs,
+        xs=_T((16, 1), _t.float32),
+        pos=_T((64,), _t.int64),
+        slot=_T((64,), _t.int64),
+        prepared=True,
+        plan=plan,
+        kv_ptrs=None,
+        m=16,
+    )
+    bucket.caches = {
+        n: _T() for n in ("k_cache", "v_cache", "k_scale", "v_scale", "index_cache")
+    }
+    holder.case = bucket
+    attn.impl.index_cache = bucket.caches[
+        "index_cache"
+    ]  # what the bucket's prepare saw
+    # the bucket case's own rope tables, complete enough for build_meta
+    bucket.rotary = attn.impl.rotary_emb = SimpleNamespace(
+        rotary_dim=64, cos_cache=_T(), sin_cache=_T()
+    )
+    case = _golden_case(mode, tokens)
+    case.caches = {
+        n: _T() for n in ("k_cache", "v_cache", "k_scale", "v_scale", "index_cache")
+    }
+    case.rotary = SimpleNamespace(rotary_dim=64, cos_cache=_T(), sin_cache=_T())
+    for n in ("q_norm", "k_norm", "index_q_norm", "index_k_norm"):
+        setattr(case, n, SimpleNamespace(weight=_T(), variance_epsilon=1e-6))
+    local = (tokens + 3) // 4
+    case.positions = _T((tokens,), _t.int64)
+    case.slot_mapping = _T((tokens,), _t.int64)
+    case.x = _T((local, 6144), _t.float8_e4m3fn)
+    case.x_scale = _T((local, 1), _t.float32)
+    monkeypatch.setitem(sys.modules, "operators", types.ModuleType("operators"))
+    monkeypatch.setattr(site_mod, "_rows2d", lambda t_: t_, raising=False)
+    site._f32 = lambda key, t_: t_
+    _adapter_torch(monkeypatch)
+    return GC, site, plan, case, bucket
+
+
+@pytest.mark.parametrize("mode", ["qkv_dense", "qkv_indexer", "qkv_indexer_reuse"])
+@pytest.mark.parametrize(
+    "tokens,rows",
+    [(50, 50), (52, 52), (60, 60)],
+    ids=["SP-padded", "real == padded < bucket", "close to the bucket"],
+)
+def test_a_padded_call_returns_the_real_rows_of_the_buckets_outputs_and_its_own_caches(
+    monkeypatch, mode, tokens, rows
+):
+    GC, _site, plan, case, bucket = _padded_adapter_case(monkeypatch, mode, tokens)
+    out = GC.qkv_proj_all2all_norm_rope_cache(case, SimpleNamespace(rank=0))
+    produced = {"q", "index_q"} if mode == "qkv_indexer" else {"q", "k", "v"}
+    for name in produced:  # NOT the bucket's 64 rows, whatever the call's own padding
+        assert out[name].shape[0] == rows, name
+    for name, tensor in case.caches.items():  # the case's caches, never the bucket's
+        assert out[name] is tensor and tensor is not bucket.caches[name]
+    d = GC.last_decision()
+    assert (d.path, d.m_real, d.bucket_m, d.reason) == (
+        "fused",
+        (tokens + 3) // 4,
+        16,
+        "pad_hit",
+    )
+    assert len(plan.runs) == 1
+    GC._SITES.clear()
+
+
+@pytest.mark.parametrize("mode", ["qkv_dense", "qkv_indexer", "qkv_indexer_reuse"])
+def test_every_tensor_the_plan_writes_is_the_padded_cases_own_in_every_mode(
+    monkeypatch, mode
+):
+    """The plan's binding is keyed on the pointers in ``meta``: KV, scales and (indexer) the index
+    cache must be this case's, not the bucket case's, in dense and in both page-16 sparse modes.
+    """
+    GC, _site, plan, case, bucket = _padded_adapter_case(monkeypatch, mode, 52)
+    GC.qkv_proj_all2all_norm_rope_cache(case, SimpleNamespace(rank=0))
+    (kw,) = plan.runs
+    wanted = ["k_cache", "v_cache", "k_scale", "v_scale"] + (
+        ["index_cache"] if mode == "qkv_indexer" else []
+    )
+    for name in wanted:
+        assert kw["meta"][name] is case.caches[name], name
+        assert kw["meta"][name] is not bucket.caches[name], name
+    assert (
+        "index_cache" not in kw["meta"] or mode == "qkv_indexer"
+    )  # reuse never writes it
+    assert kw["x"] is case.x and kw["x"].shape[0] == 13  # the real rows
+    GC._SITES.clear()
+
+
+@pytest.mark.parametrize("mode", ["qkv_dense", "qkv_indexer", "qkv_indexer_reuse"])
+def test_the_audit_reports_the_padded_cases_own_tensors_and_the_bucket(
+    monkeypatch, mode
+):
+    GC, site, _plan, case, _bucket = _padded_adapter_case(monkeypatch, mode, 52)
+    rep = GC.padded_call_audit(case)
+    assert rep["site"] == site.name and rep["bucket_m"] == 16
+    assert set(rep["tensors"].values()) == {"case"}
+    assert ("index_cache" in rep["tensors"]) == (mode == "qkv_indexer")
+    assert (
+        GC.padded_call_audit(_golden_case(mode, 64)) is None
+    )  # a prepared case: no padding
+    GC._SITES.clear()
+
+
+def test_the_audit_names_a_tensor_that_would_be_written_elsewhere(monkeypatch):
+    """Not adopting the case's tensors is exactly what the audit must expose."""
+    GC, _site, _plan, case, _bucket = _padded_adapter_case(
+        monkeypatch, "qkv_indexer", 52
+    )
+    monkeypatch.setattr(GC, "_adopt_case_tensors", lambda *a, **k: None)
+    rep = GC.padded_call_audit(case)
+    assert rep["tensors"]["index_cache"] == "other"  # the bucket's index cache
+    assert rep["tensors"]["k_cache"] == "case"  # KV comes from the call's own state
+    GC._SITES.clear()
+
+
+def test_an_exact_prepared_case_still_returns_its_rows_untouched(monkeypatch):
+    GC, _site, _plan, case, _bucket = _padded_adapter_case(monkeypatch, "qkv_dense", 64)
+    out = GC.qkv_proj_all2all_norm_rope_cache(case, SimpleNamespace(rank=0))
+    assert out["q"].shape[0] == 64  # real == padded == bucket: nothing to slice
+    d = GC.last_decision()
+    assert (d.m_real, d.bucket_m) == (16, 16)
+    GC._SITES.clear()

@@ -853,3 +853,93 @@ def test_the_real_fusion_resources_carry_the_launch_gate_the_adapter_reads(
     assert w.inner.launch_gate is False and w.launch_gate is False
     w.inner.launch_gate = True
     assert w.launch_gate is True
+
+
+# ---------------------------------------------------------------------- R16 pad-M (aiter da8e786a)
+def _needs_pad_m(real_gf):
+    if not hasattr(real_gf, "bucket_for_m"):
+        pytest.skip("aiter predates R16 pad-M (no bucket_for_m)")
+
+
+def _fn_params(path, name, cls=None):
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    scope = tree
+    if cls is not None:
+        scope = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == cls
+        )
+    fn = next(
+        n for n in ast.walk(scope) if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+    return [a.arg for a in fn.args.args + fn.args.kwonlyargs]
+
+
+def test_the_pad_m_api_atom_calls_exists_with_the_signatures_it_uses(real_gf):
+    _needs_pad_m(real_gf)
+    root = AITER_ROOT / "aiter"
+    assert {"bucket_for_m", "match_padded"} <= set(real_gf.__all__)
+    assert _fn_params(GF / "match.py", "bucket_for_m") == ["spec", "ctx", "profile"]
+    assert _fn_params(GF / "match.py", "match_padded") == ["spec", "ctx", "profile"]
+    ids = _fn_params(GF / "callid.py", "tag_unique_ids")
+    assert ids[:1] == ["keys"] and "tag_bits" in ids
+    chk = _fn_params(GF / "callid.py", "check_call_ids")
+    for kw in ("key_fn", "tag_bits", "tag_vids", "per_tokens"):
+        assert kw in chk, f"check_call_ids lost '{kw}', which the adapter passes"
+    large = root / "ops" / "gemm_fusion" / "sp_qkv" / "variants_large.py"
+    for view in ("recv_view", "reuse_view"):
+        assert _fn_params(large, view, "SpQkvLarge") == ["self", "res", "m_real"]
+    for f in ("variants.py", "variants_large.py"):  # the plan attributes the site reads
+        src = (large.parent / f).read_text(encoding="utf-8")
+        assert "self.pad_m =" in src and "self.src =" in src
+
+
+def test_the_site_resolves_every_m_through_aiters_real_bucket_for_m_on_the_shipped_profile(
+    real_gf, atu, monkeypatch
+):
+    """The pure pad-M decision on the REAL matcher and profile: a token count that was not prepared
+    resolves to the prepared bucket aiter's ``bucket_for_m`` names (rows are prepared, nothing else),
+    and its call_id key is one aiter's own pad-M key universe contains."""
+    _needs_pad_m(real_gf)
+    from atom.model_ops.gemm_fusion import hooks
+
+    spec_mod = importlib.import_module("aiter.ops.gemm_fusion.sp_qkv.specs")
+    spec = spec_mod.sp_qkv_spec("dense")
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    TU.reset_for_tests()
+    TU.init_with_resources(_config(PROFILE_NAME), _wrapper(real_gf, atu))
+    TU.set_phase("preparing")
+    site = _dense_site(spec)
+    prof = real_gf.load_profile(PROFILE_NAME)
+    rows = sorted({r.m for r in prof.rows() if r.m <= 256})
+    assert rows[:3] == [1, 2, 4] and rows[-1] <= 256
+    try:
+        for m in rows:
+            for mode in ("eager", "capture"):
+                assert site.resolve(4 * m, mode).plan is not None, m
+    except ImportError as e:
+        pytest.skip(f"variants need the native stack to import: {e}")
+    TU.set_phase("ready")
+    caps = frozenset({"mori_cco", "gfx950_sc_bypass"})
+    keys, _ = importlib.import_module("aiter.gemm_fusion.callid").profile_call_id_keys(
+        prof, [site.name], world=4, pad_m=True
+    )
+    universe = set(keys)
+    padded = 0
+    for m in range(1, rows[-1] + 1):
+        ctx = real_gf.MatchCtx(
+            arch="gfx950", cu=256, world=4, m=m, available=caps, graph_mode="eager"
+        )
+        bucket = real_gf.bucket_for_m(spec, ctx, PROFILE_NAME)
+        r = site.resolve(4 * m, "eager")
+        if m in rows:
+            assert (r.bucket_tokens, r.reason) == (0, "profile_hit"), m
+            continue
+        assert bucket in rows and bucket > m, (m, bucket)  # rows are what is prepared
+        assert (r.reason, r.bucket_tokens) == ("pad_hit", 4 * bucket), m
+        assert r.plan is site._by_tokens[(4 * bucket, "eager")].plan
+        assert (site.name, 4 * m, r.vid, r.n_fused) in universe, m
+        padded += 1
+    assert padded > 100  # most of m 1..256 is served by padding
+    assert hooks.world_or_1() == 4

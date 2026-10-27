@@ -72,6 +72,24 @@ def _kv_block_size() -> int:
     return int(get_current_atom_config().kv_cache_block_size)
 
 
+def index_cache_signature(impl) -> str:
+    """The ``HeadNormRopeCache.index`` value for THIS layer's real indexer-key cache.
+
+    ``"fp8_unit_page128"`` is the one layout the profile's rows were built and validated for: an FP8
+    cache addressed flat as ``[slot][128]``. The kernels write ``index_cache + slot * 128`` bytes, so
+    a bf16 cache, another index head dim, or any other element size would be written at the wrong
+    addresses with no error. Every other combination therefore gets a name no profile row carries:
+    ``match_prefix`` finds no row and the layer stays native. Decided from the impl's configuration
+    (the same on every rank); the bound tensor is checked again at bind time
+    (``GemmFusionSite.cache_layout_reason``).
+    """
+    dtype = getattr(impl, "index_cache_dtype", None)
+    dim = getattr(impl, "index_head_dim", None)
+    if dtype == "fp8" and dim == 128:
+        return "fp8_unit_page128"
+    return f"{dtype}_d{dim}_unit_page128"
+
+
 def head_norm_rope_cache_from_attention(attn, index: str | None = None):
     """``HeadNormRopeCache`` describing what ``attn.impl.rope_cache`` computes.
 

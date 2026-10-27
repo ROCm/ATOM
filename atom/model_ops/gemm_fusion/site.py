@@ -43,6 +43,10 @@ class Resolution:
     n_fused: int  # stages covered (0 = all native)
     vid: str = "native"
     reason: str = ""
+    # R16 pad-M: the T of the PREPARED bucket this call runs in when it differs from the call's own
+    # (0 = the call's T is itself a prepared bucket). The plan, binding and outputs are the bucket's;
+    # the kernel is only handed the real rows.
+    bucket_tokens: int = 0
 
 
 @dataclass
@@ -54,6 +58,8 @@ class Decision:
     path: str  # "native" | "fused"
     reason: str = ""
     bind_mode: str = ""  # "staged" | "raw" (1-stage plans take raw pointers)
+    m_real: int = 0  # local rows the kernel was handed (T / world)
+    bucket_m: int = 0  # local rows of the prepared bucket whose plan ran (0: native)
 
 
 def _plan_vid(plan) -> str:
@@ -65,6 +71,75 @@ def _plan_vid(plan) -> str:
 def _rows2d(t):
     """[max_pos, 1, 1, rot/2] (ATOM rotary) or [max_pos, rot/2] -> [max_pos, rot/2]."""
     return t if t.dim() == 2 else t.reshape(t.shape[0], -1)
+
+
+_KV_TORCH_DTYPE = {"fp8": "float8_e4m3fn", "bf16": "bfloat16"}
+
+
+def _cache_layout_reason(impl, state, *, page, with_index):
+    """Pure check of the bound caches against what the fused prologue writes (None = they match).
+
+    The signature (``shuffle_page{page}_{kv_dtype}_ptok`` and the index layout) is built from
+    configuration; aiter writes through raw pointers, so a tensor of another dtype or SHUFFLE geometry
+    would be written at the wrong addresses with no error. Checked once at bind time (outside any
+    step) and, through ``agree_prepared``, native on EVERY rank on a mismatch:
+      K       [N, kv_heads, head_dim//x, page, x]   V  [N, kv_heads, page//x, head_dim, x]
+              dtype of the signature, ``x`` = 16 bytes per element (the innermost, contiguous axis; one
+              page row ``x`` elements apart)
+      scales  fp8 only, float32 ``[N, kv_heads, page]``, innermost contiguous; None for bf16
+      index   (indexer layers) FP8, contiguous ``[N, 128, 128]`` = flat ``[slot][128]``
+    """
+    kv_dtype = getattr(impl, "kv_cache_dtype", "bf16")
+    name = _KV_TORCH_DTYPE.get(kv_dtype)
+    if name is None:
+        return "kv_layout"
+    want = getattr(torch, name)
+    x = 16 // (1 if kv_dtype == "fp8" else 2)
+    nkv, hd = impl.num_kv_heads, impl.head_dim
+    k = state.get("k_cache")
+    v = state.get("v_cache_shuffle", state.get("v_cache"))
+    ks = state.get("k_scale_view", state.get("k_scale"))
+    vs = state.get("v_scale_view", state.get("v_scale"))
+    if k is None or v is None or k.dim() != 5 or v.dim() != 5:
+        return "kv_layout"
+    pg = k.shape[3] if page is None else page
+    if (
+        k.dtype != want
+        or v.dtype != want
+        or (k.shape[1], k.shape[2] * x, k.shape[3], k.shape[4]) != (nkv, hd, pg, x)
+        or (v.shape[0], v.shape[1], v.shape[2] * x, v.shape[3], v.shape[4])
+        != (k.shape[0], nkv, pg, hd, x)
+        or k.stride(4) != 1
+        or k.stride(3) != x
+        or v.stride(4) != 1
+        or v.stride(3) != x
+    ):
+        return "kv_layout"
+    if kv_dtype == "fp8":
+        for s in (ks, vs):
+            if (
+                s is None
+                or s.dtype != torch.float32
+                or s.dim() != 3
+                or tuple(s.shape) != (k.shape[0], nkv, pg)
+                or s.stride(2) != 1
+            ):
+                return "kv_layout"
+    elif ks is not None or vs is not None:
+        return "kv_layout"
+    if with_index:
+        ic = getattr(impl, "index_cache", None)
+        if (
+            ic is None
+            or getattr(impl, "index_cache_dtype", None) != "fp8"
+            or getattr(impl, "index_head_dim", None) != 128
+            or ic.dtype != torch.float8_e4m3fn
+            or ic.dim() != 3
+            or tuple(ic.shape[1:]) != (128, 128)
+            or not ic.is_contiguous()
+        ):
+            return "index_layout"
+    return None
 
 
 class GemmFusionSite:
@@ -101,6 +176,13 @@ class GemmFusionSite:
         self._by_tokens: dict = {}
         self._wcache: dict = {}
         self._staging: dict = {}
+        # bucket -> why THIS rank refused to prepare it (bound caches do not match the signature)
+        self._prepare_refusals: dict = {}
+        # R16 pad-M, ready phase: a T that was not prepared resolves, as a PURE function of
+        # (T, profile), to the prepared bucket that serves it (or native). _padded_raw: before the
+        # call-id verdict; _padded: final.
+        self._padded: dict = {}
+        self._padded_raw: dict = {}
         # True only on the first registered site (hooks.register_site): it advances the device STEP
         # counter once per forward. Set before registration; registration decides it.
         self.ticks_step = False
@@ -201,9 +283,11 @@ class GemmFusionSite:
         """Resolve a bucket. Cache key is ``(tokens, graph_mode)``.
 
         Only the collective ``preparing`` phase runs match/consensus/ensure. Before
-        it every call is native (``not_prepared``); after it a bucket that was not
-        resolved is native (``late_bucket``) -- both decided identically on every
-        rank without a collective inside the forward.
+        it every call is native (``not_prepared``); after it a token count that was not
+        prepared is resolved WITHOUT a collective by aiter's pure ``bucket_for_m`` (R16 pad-M):
+        the prepared bucket whose plan serves that many real rows runs with the real rows only
+        (``pad_hit``), else it is native (``late_bucket`` / ``uncovered`` ...). Both are decided
+        identically on every rank: a function of (T, profile) and the buckets agreed at prepare.
         """
         key = (tokens, graph_mode)
         r = self._by_tokens.get(key)
@@ -218,8 +302,16 @@ class GemmFusionSite:
         if phase == "pre":
             return Resolution(None, 0, "native", "not_prepared")  # not cached
         if phase == "ready":
-            r = Resolution(None, 0, "native", "late_bucket")
-            self._by_tokens[key] = r
+            r = self._padded.get(key)
+            if r is None:
+                r = self._padded_raw_resolution(tokens, graph_mode, res)
+                if r.bucket_tokens and r.plan is not None:
+                    # a padded key is a different (token count, variant) than any prepared one: its
+                    # call_id is checked among the launches of THIS token count (pure, no collective)
+                    ids = hooks.token_call_ids(tokens, graph_mode)
+                    if (self.name, tokens, r.vid, r.n_fused) in ids.refused:
+                        r = Resolution(None, 0, r.vid, "call_id_refused")
+                self._padded[key] = r
             return r
         gf = aiter_gf()
         contract_err = getattr(gf, "ContractError", ())
@@ -290,6 +382,69 @@ class GemmFusionSite:
         self._by_tokens[key] = r
         return r
 
+    @classmethod
+    def _pad_capable(cls, plan, n_fused) -> bool:
+        """Whether ``plan`` can launch fewer real rows than the bucket it was built for: aiter marks
+        those plans ``pad_m``; a small plan must also take x_scale / positions / slot_mapping per
+        launch (abi >= 3), the large one takes none of them."""
+        if not getattr(plan, "pad_m", False):
+            return False
+        return cls.per_launch(plan) if n_fused >= 2 else True
+
+    def _padded_raw_resolution(self, tokens, graph_mode, res):
+        key = (tokens, graph_mode)
+        got = self._padded_raw.get(key)
+        if got is None:
+            got = self._padded_raw[key] = self._pad_match(tokens, graph_mode, res)
+        return got
+
+    def _pad_match(self, tokens, graph_mode, res):
+        """The resolution of a token count that was NOT prepared (ready phase), before the call-id
+        verdict. Pure: aiter's ``bucket_for_m`` depends only on (spec, arch, cu, world, m_real) and the
+        immutable profile, and whether that bucket is usable is what every rank agreed at prepare.
+        """
+        late = Resolution(None, 0, "native", "late_bucket")
+        bucket_for_m = getattr(aiter_gf(), "bucket_for_m", None)
+        world = hooks.world_or_1()
+        if bucket_for_m is None or tokens % world:
+            return late  # an aiter without pad-M, or T that is not a whole number of local rows
+        m_real = res.local_m(tokens)
+        try:
+            bucket_m = bucket_for_m(
+                self.spec, res.match_ctx(m_real, graph_mode), hooks.profile()
+            )
+        # deterministic in (spec, m, profile): the same on every rank
+        except Exception:
+            logger.exception("%s: bucket_for_m(m=%d) failed; native", self.name, m_real)
+            return Resolution(None, 0, "native", "pad_error")
+        if bucket_m is None:
+            return Resolution(None, 0, "native", "uncovered")
+        if bucket_m < m_real:
+            return Resolution(None, 0, "native", "pad_error")
+        bucket_t = int(bucket_m) * world
+        rb = self._by_tokens.get((bucket_t, graph_mode))
+        if rb is None or isinstance(rb, Exception):
+            return late  # the bucket itself was never prepared
+        if rb.plan is None:
+            return Resolution(None, 0, "native", rb.reason)  # the bucket is native too
+        if bucket_t == tokens:
+            return rb
+        if not self._pad_capable(rb.plan, rb.n_fused):
+            return Resolution(None, 0, rb.vid, "pad_unsupported")
+        return Resolution(rb.plan, rb.n_fused, rb.vid, "pad_hit", bucket_t)
+
+    def raw_resolution(self, tokens, graph_mode):
+        """The resolution of ``(tokens, mode)`` BEFORE its call-id verdict, or None (not ready, an
+        error entry). Independent of the order sites resolved in: it is what the per-token-count
+        call-id check (``hooks.token_call_ids``) is built from."""
+        r = self._by_tokens.get((tokens, graph_mode))
+        if r is not None:
+            return None if isinstance(r, Exception) else r
+        res = hooks.resources()
+        if res is None or hooks.phase() != "ready":
+            return None
+        return self._padded_raw_resolution(tokens, graph_mode, res)
+
     @staticmethod
     def _runtime_mode() -> str:
         return (
@@ -339,12 +494,11 @@ class GemmFusionSite:
             ok = self._prepared_ok(tokens, r, prepared)
             outcome = res.agree(self.name + "#prepared", tokens, None, int(bool(ok)))
             if outcome != "agree" or not ok:
-                self._by_tokens[(tokens, mode)] = Resolution(
-                    None,
-                    0,
-                    "native",
-                    "prepare_disagree" if outcome != "agree" else "unprepared",
-                )
+                if outcome != "agree":
+                    why = "prepare_disagree"
+                else:
+                    why = self._prepare_refusals.get(tokens, "unprepared")
+                self._by_tokens[(tokens, mode)] = Resolution(None, 0, "native", why)
 
     def refuse_call_ids(self, refused) -> int:
         """Downgrade every bucket whose ``(site, tokens, vid, n_fused)`` key is in ``refused`` (a
@@ -476,6 +630,7 @@ class GemmFusionSite:
         x_dtype_is_fp8,
         x_scale_ok,
         x_k_ok=True,
+        meta_len_ok=True,
         tokens_ok=True,
     ):
         """The per-call fused/native decision as a PURE function of rank-uniform inputs
@@ -489,6 +644,13 @@ class GemmFusionSite:
         r17/r18 plan gets T-length arrays the site stages (pad rows are position 0, slot -1; see
         ``_stage_inputs``); an r19 plan (``plan.abi >= 3``) takes the caller's arrays per launch and
         its kernel pads the rows past ``t_valid`` the same way.
+
+        ``meta_len_ok``: ``positions`` and ``slot_mapping`` hold exactly ``real_tokens`` entries
+        each. The r19 kernel reads ``t_valid = min(numel(positions), numel(slot_mapping), T)`` rows as
+        real ones (frozen into a captured graph), and r17/r18 staging slices both to ``real_tokens``:
+        a ``slot_mapping`` shorter than the real tokens would silently turn real rows into pad rows
+        (position 0, cache write skipped) and a longer one is metadata the site did not stage. Both are
+        native decisions instead of a silent shrink or a rank-local raise.
 
         ``tokens_ok`` (r19 only): the per-launch ``positions`` / ``slot_mapping`` / ``x_scale``
         satisfy the plan's own input contract. The plan RAISES on a violation, and a raise on one
@@ -507,6 +669,8 @@ class GemmFusionSite:
                 "native",
                 "x_k_mismatch",
             )  # the plan's K is the spec's (input_size); never feed it another
+        if not meta_len_ok:
+            return "native", "meta_len"
         if not tokens_ok:
             return "native", "meta_layout"
         return "fused", resolution.reason
@@ -533,6 +697,26 @@ class GemmFusionSite:
         return x_scale.is_contiguous() and all(
             t.dtype == torch.int64 and t.is_contiguous() and t.numel() >= 1
             for t in (positions, slot_mapping)
+        )
+
+    @staticmethod
+    def meta_len_ok(positions, slot_mapping, real_tokens) -> bool:
+        """``numel(positions) == numel(slot_mapping) == real_tokens``: the lengths every consumer of
+        the per-call token arrays (t_valid, ``_stage_inputs``) assumes. Metadata only, rank-uniform.
+        """
+        return int(positions.numel()) == int(slot_mapping.numel()) == int(real_tokens)
+
+    def cache_layout_reason(self, state):
+        """Why the caches in ``state`` are not what this site's signature describes (None = they
+        are): ``"kv_layout"`` (K/V/scales) or ``"index_layout"`` (indexer keys). Checked at bind time
+        on the bound tensors, because the signature is built from configuration before the KV pool
+        exists and a mismatch would be written through with no error. See ``_cache_layout_reason``.
+        """
+        return _cache_layout_reason(
+            self.attn.impl,
+            state,
+            page=self.declared_page(),
+            with_index=bool(self.sparse and not self.skip_index),
         )
 
     @staticmethod
@@ -595,6 +779,18 @@ class GemmFusionSite:
         )
         if state is None:
             return False
+        why = self.cache_layout_reason(state)
+        if why is not None:
+            # False here is AGREED across ranks by agree_prepared: the bucket is native on all of them
+            if not self._prepare_refusals:
+                logger.warning(
+                    "%s: the bound caches do not match the fused signature (%s); native on every "
+                    "rank",
+                    self.name,
+                    why,
+                )
+            self._prepare_refusals[tokens] = why
+            return False
         return self._bind_plan(r, tokens, st, state, device, kv_cache_data)
 
     # -- execution -------------------------------------------------------
@@ -626,16 +822,22 @@ class GemmFusionSite:
         the fused kernels' own tags report a divergence that still completes.
         """
         r = self.resolve(ctx.padded_tokens, self._runtime_mode())
+        if r.plan is not None and self._tag_refused(r, ctx.padded_tokens):
+            r = Resolution(None, 0, r.vid, "call_id_refused")
         reason = r.reason
         if r.plan is None:
             return r, reason, None, None
         fp8, scale_ok = self.input_facts(x, x_scale)
         state = None
         tokens_ok = True
+        meta_len_ok = True
         if r.n_fused >= 2:
             # eligibility was agreed at resolve; never None here
             state = ctx.prologue_state()
-            if self.per_launch(r.plan) and fp8 and scale_ok:
+            meta_len_ok = self.meta_len_ok(
+                ctx.positions, state["slot_mapping"], ctx.real_tokens
+            )
+            if meta_len_ok and self.per_launch(r.plan) and fp8 and scale_ok:
                 tokens_ok = self.per_launch_ok(
                     x_scale, ctx.positions, state["slot_mapping"]
                 )
@@ -645,13 +847,15 @@ class GemmFusionSite:
             x_dtype_is_fp8=fp8,
             x_scale_ok=scale_ok,
             x_k_ok=x.shape[-1] == self.linear.input_size,  # SPMD: same on every rank
+            meta_len_ok=meta_len_ok,
             tokens_ok=tokens_ok,
         )
         if path == "native":
             return Resolution(None, 0, "native", why), why, None, None
         if r.n_fused < 2:
             return r, reason, None, None
-        st = self._staging[ctx.padded_tokens]  # prepared on every rank (agree_prepared)
+        # the PREPARED bucket's staging (agree_prepared): the call's own T unless it was padded
+        st = self._staging[r.bucket_tokens or ctx.padded_tokens]
         return r, reason, state, st
 
     def _stage_inputs(self, x_scale, ctx, state, st):
@@ -701,11 +905,10 @@ class GemmFusionSite:
             res=res.bound,
             stream=torch.cuda.current_stream(),
             # the launch's identity in the kernels' handshake tags (R12 plans require it; older plans
-            # ignore it). Distinct non-zero keys were checked statically in prepare_buckets, and a
-            # refused key never reaches here (its bucket is native).
-            call_id=consensus.decision_key(
-                self.name, ctx.padded_tokens, r.vid, r.n_fused
-            ),
+            # ignore it). Distinct non-zero keys were checked statically (prepare_buckets for the
+            # prepared buckets, per token count for padded ones), and a refused key never reaches
+            # here (its bucket is native).
+            call_id=self._call_id(r, ctx.padded_tokens),
         )
         if r.n_fused < 2:
             # Zero-copy view of the plan's receive window; valid until this rank
@@ -715,12 +918,41 @@ class GemmFusionSite:
             # row and are never read (skip branch), and rope_cache's
             # qkv.contiguous() copies the view with those semantics intact.
             plan = r.plan
+            # R16: the view is over the REAL rows (T = 4 * m_real), passed explicitly because a graph
+            # replay runs no Python and the plan's own "last launch" would be stale
+            rows = (
+                (ctx.padded_tokens // hooks.world_or_1(),)
+                if getattr(plan, "pad_m", False)
+                else ()
+            )
             if getattr(plan, "mode", None) == "reuse" and hasattr(plan, "reuse_view"):
-                view = plan.reuse_view(res.bound)
+                view = plan.reuse_view(res.bound, *rows)
             else:
-                view = plan.recv_view(res.bound)
+                view = plan.recv_view(res.bound, *rows)
             outs = {"packed": view}
         return outs
+
+    def _tag_refused(self, r, tokens) -> bool:
+        """A plan whose tag carries only the low bits of ``call_id`` whose id could not be assigned
+        (rank-uniform, per token count): its call is native."""
+        bits = getattr(hooks.resources(), "plan_tag_bits", None)
+        if bits is None or not bits(r.plan):
+            return False
+        ids = hooks.token_call_ids(tokens, self._runtime_mode())
+        return (self.name, tokens, r.vid, r.n_fused) in ids.refused
+
+    def _call_id(self, r, tokens) -> int:
+        """The launch's identity in the handshake tag. Small plans: the 31-bit ``decision_key``. A plan
+        whose tag carries only the LOW bits of call_id (large r13): the id aiter's ``tag_unique_ids``
+        assigned for this token count, whose low bits are distinct and non-zero by construction (a
+        ``decision_key`` collides on them)."""
+        bits = getattr(hooks.resources(), "plan_tag_bits", None)
+        if bits is not None and bits(r.plan):
+            ids = hooks.token_call_ids(tokens, self._runtime_mode())
+            got = ids.ids.get((self.name, tokens, r.vid, r.n_fused))
+            if got is not None:
+                return got
+        return consensus.decision_key(self.name, tokens, r.vid, r.n_fused)
 
     def _bind_label(self, r, path, st):
         if path == "fused" and r.n_fused < 2:
@@ -730,6 +962,12 @@ class GemmFusionSite:
         return "staged"
 
     def _decision(self, ctx, r, reason, path, st=None):
+        world = hooks.world_or_1()
+        m_real = ctx.padded_tokens // world
+        # the coverage record of pad-M: the rows the kernel got vs the rows of the bucket whose plan ran
+        bucket_m = (
+            0 if r.plan is None else (r.bucket_tokens or ctx.padded_tokens) // world
+        )
         d = Decision(
             self.name,
             ctx.padded_tokens,
@@ -738,6 +976,8 @@ class GemmFusionSite:
             path,
             reason,
             self._bind_label(r, path, st),
+            m_real,
+            bucket_m,
         )
         return d
 

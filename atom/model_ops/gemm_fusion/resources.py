@@ -198,24 +198,60 @@ class FusionResourcesWrapper:
         """
         self.inner.quiesce_and_reset()
 
-    def check_call_ids(self, keys):
-        """aiter's static call-id uniqueness check over ``(site, tokens, vid, n_fused)`` keys.
-        Returns its report (``.ok``, ``.refused_keys``), or None when this aiter has no call-id
-        module (older build: its plans ignore ``call_id``). Rank-uniform: same keys, same install.
-        """
+    @staticmethod
+    def _callid_module():
+        """aiter's call-id module, or None (older build: its plans ignore ``call_id``)."""
         try:
             import importlib
 
-            callid = importlib.import_module(
+            return importlib.import_module(
                 getattr(aiter_gf(), "__name__", "aiter.gemm_fusion") + ".callid"
             )
         except ImportError:
+            return None
+
+    def check_call_ids(
+        self, keys, *, key_fn=None, tag_bits=None, tag_vids=None, per_tokens=False
+    ):
+        """aiter's static call-id uniqueness check over ``(site, tokens, vid, n_fused)`` keys.
+        Returns its report (``.ok``, ``.refused_keys``), or None when this aiter has no call-id
+        module (older build: its plans ignore ``call_id``). Rank-uniform: same keys, same install.
+
+        R16 pad-M: ``per_tokens`` (only launches of ONE token count can meet in a handshake),
+        ``tag_bits`` / ``tag_vids`` (a variant whose tag carries only the low bits of ``call_id``)
+        and ``key_fn`` (the id function the launches really use) are passed through when given.
+        """
+        callid = self._callid_module()
+        if callid is None:
             logger.warning(
                 "gemm_fusion: the installed aiter has no callid module; the call_id uniqueness "
                 "check is skipped"
             )
             return None
-        return callid.check_call_ids(keys)
+        kw = {}
+        if key_fn is not None:
+            kw["key_fn"] = key_fn
+        if tag_bits is not None:
+            kw["tag_bits"] = tag_bits
+            kw["tag_vids"] = tag_vids
+        if per_tokens:
+            kw["per_tokens"] = True
+        return callid.check_call_ids(keys, **kw)
+
+    def tag_unique_ids(self, keys):
+        """``{key: call_id}`` whose LOW tag bits are distinct and non-zero within every token count
+        (aiter's ``tag_unique_ids``, for plans whose tag carries only those bits), or None when this
+        aiter has no such helper. A pure function of the key set."""
+        callid = self._callid_module()
+        fn = None if callid is None else getattr(callid, "tag_unique_ids", None)
+        return None if fn is None else fn(keys)
+
+    @staticmethod
+    def plan_tag_bits(plan):
+        """19 for a plan whose handshake tag carries only the low 19 bits of ``call_id`` (the large
+        r13 source, E = STEP << 32 | (m_real - 1) << 19 | call_id & 0x7FFFF), else None.
+        """
+        return 19 if getattr(plan, "src", None) == "r13" else None
 
     def reduce_max(self, values):
         """Elementwise MAX all-reduce of small ints over the SP group; trivial on one rank.

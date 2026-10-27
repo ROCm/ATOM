@@ -61,6 +61,7 @@ def reset_for_tests(res=None, profile="test-profile"):
     uninstall_faults()
     hooks._SITES.clear()
     hooks._PLANS.clear()
+    hooks._TOKEN_IDS.clear()
     DECISIONS.clear()
     hooks._KV = None
     hooks._RES = res
@@ -707,6 +708,15 @@ def run_prologue(site, x, x_scale, ctx, native_full, native_after_exchange, out_
 # plan on this rank. Compare or clone each large-M result before the next large launch. The model
 # path's aliasing check (C-S4) does not apply here.
 #
+# PAD-M (R16): ``prepare_cases`` prepares the BUCKET cases only (a case passed to it is prepared at its
+# own token count, as an exact bucket, and never pads). A later call for a case whose token count was
+# NOT prepared is served the way the engine serves it: through the site of the prepared bucket that
+# aiter's ``bucket_for_m`` names for its real rows (one layer = one site, every m runs through it),
+# with the kernel handed the case's real rows only. ``padded_bucket(case)`` says which bucket that is;
+# the decision records ``m_real`` and ``bucket_m``. A case's own weights / norms / rope tables / index
+# cache are what run (the bucket's site is re-pointed at them for the call; aiter then makes a second
+# binding for those pointers, which is fine eagerly and refused inside a graph capture).
+#
 # Evidence: ``last_decision()``, ``decisions()`` (selected vid, fused prefix, fallback reason).
 WORLD = 4
 _SITES: dict = {}
@@ -817,10 +827,107 @@ class _GoldenSite(DirectGemmFusionSite):
             self.linear = saved
 
 
+def _pad_entry(case, mode):
+    """The ``_SITES`` entry of the PREPARED bucket whose plan serves this case's rows (its padded
+    token count is that bucket's own, or pad-M maps it there: aiter's pure ``bucket_for_m``, through
+    that site's own prepared buckets), or None: the phase is not ready, nothing prepared serves it, or
+    the plan cannot launch fewer rows.
+    """
+    t = case.spec.padded_tokens
+    for (m, _tokens), ent in list(_SITES.items()):
+        if m != mode:
+            continue
+        r = ent[0].raw_resolution(t, "eager")
+        if r is not None and r.plan is not None:
+            return ent
+    return None
+
+
+def padded_bucket(case):
+    """``(bucket_m, site_name)`` of the prepared bucket this case would run in (pad-M, or the bucket
+    whose padded token count it shares), or None: the case has a site of its own, nothing prepared
+    serves it, or the phase is not ready. Pure: no collective.
+    """
+    mode = _mode(case)
+    if (mode, case.spec.tokens) in _SITES:
+        return None
+    ent = _pad_entry(case, mode) if hooks.phase() == "ready" else None
+    if ent is None:
+        return None
+    t = case.spec.padded_tokens
+    r = ent[0].raw_resolution(t, "eager")
+    return (r.bucket_tokens or t) // WORLD, ent[0].name
+
+
+def padded_call_audit(case):
+    """Host-only (no launch): what a padded call hands aiter's plan for this case, and whose tensors
+    they are. ``None`` when the case is not served by a prepared bucket's site; else
+    ``{"site": name, "bucket_m": m, "tensors": {name: "case" | "other"}}`` over the KV cache, the
+    scales and the index cache the plan WRITES: "case" = that exact tensor is the case's own, "other"
+    = the plan would write somewhere else. Run it on the node to see which tensor is wrong without
+    guessing; it applies the same adoption the call does."""
+    mode = _mode(case)
+    if (mode, case.spec.tokens) in _SITES or hooks.phase() != "ready":
+        return None
+    ent = _pad_entry(case, mode)
+    if ent is None:
+        return None
+    site, _holder, attn = ent
+    _adopt_case_tensors(site, attn, case, mode)
+    ctx = _ctx(case, attn)
+    r, _reason, state, st = site._prepare(ctx, case.x, case.x_scale)
+    if r.plan is None or st is None:
+        return {"site": site.name, "bucket_m": 0, "tensors": {}, "native": r.reason}
+    meta = site.build_meta(st, state, ctx)
+    own = case.caches or {}
+    tensors = {}
+    for name in ("k_cache", "v_cache", "k_scale", "v_scale", "index_cache"):
+        got = meta.get(name)
+        if got is None:
+            continue
+        ref = own.get(name)
+        tensors[name] = (
+            "case" if ref is not None and got.data_ptr() == ref.data_ptr() else "other"
+        )
+    return {
+        "site": site.name,
+        "bucket_m": r.bucket_tokens // WORLD,
+        "tensors": tensors,
+    }
+
+
+def _adopt_case_tensors(site, attn, case, mode):
+    """Point the bucket's site at THIS case's layer tensors (weight, scales, norms, rope tables, index
+    cache): the golden cases are independent tensors, whereas a layer in the engine has one set. The
+    plan's pointer binding is keyed on them, so aiter makes a new binding for tensors it has not seen.
+    """
+    impl = attn.impl
+    impl.rotary_emb, impl.q_norm, impl.k_norm = case.rotary, case.q_norm, case.k_norm
+    if mode != "dense":
+        impl.index_q_norm, impl.index_k_norm = case.index_q_norm, case.index_k_norm
+        impl.index_cache = (case.caches or {}).get("index_cache")
+    lin = site.linear
+    site.linear = SimpleNamespace(
+        output_size=lin.output_size,
+        input_size=lin.input_size,
+        weight=case.weight,
+        weight_scale=case.weight_scale,
+    )
+
+
 def _site_for(case, comm):
     mode = _mode(case)
     key = (mode, case.spec.tokens)
     ent = _SITES.get(key)
+    if ent is None and hooks.phase() == "ready":
+        # a token count nobody prepared: the engine serves it through the site of the prepared bucket
+        # that serves its real rows (pad-M), so does the adapter. Not registered under this key: the
+        # case has no site of its own.
+        ent = _pad_entry(case, mode)
+        if ent is not None:
+            _adopt_case_tensors(ent[0], ent[2], case, mode)
+            ent[1].case = case
+            return ent
     if ent is None:
         holder = SimpleNamespace(case=case)
         sparse = mode != "dense"
@@ -986,10 +1093,20 @@ def qkv_proj_all2all_norm_rope_cache(case, comm):
     if kind == "native":
         return payload
     real = case.spec.tokens
-    if real < case.spec.padded_tokens:
-        # The fused kernel ran the SP-divisibility pad rows too (position 0, slot -1); the baseline
-        # returns only the real rows, so return the same rows (a view, no copy).
-        payload = {k: v[:real] for k, v in payload.items()}
+    # The fused outputs are the BUCKET's staging buffers: ``T_bucket`` rows, whose tail is the SP
+    # divisibility pad (position 0, slot -1) and, under pad-M, the rows between the call's padded T
+    # and the bucket's. The baseline returns only the real rows, so return the same rows (a view,
+    # no copy) whenever there are more: not only when the call itself was SP-padded, because a case
+    # whose tokens are a multiple of 4 (real == padded) still gets a bigger bucket's buffers.
+    payload = {
+        k: (
+            v[:real]
+            if real < case.spec.padded_tokens
+            or (hasattr(v, "shape") and v.shape[0] > real)
+            else v
+        )
+        for k, v in payload.items()
+    }
     return {**payload, **case.caches}
 
 
