@@ -64,6 +64,10 @@ for node, containers in sorted(containers_by_node.items()):
     if not re.fullmatch(r"pit2-p[0-9]+-g[0-9]+", node):
         continue
     commands = []
+    # Only matching container-cleanup schedule entries; no workload logs.
+    if node == "pit2-p03-g09":
+        commands.append("(crontab -l 2>/dev/null; cat /etc/crontab /etc/cron.d/* 2>/dev/null) | grep -Ei '(docker|container|spur)' | grep -Ei '(clean|prune|kill|stop|remove)' | grep -Eiv '(password|token|secret|authorization)' | head -40")
+        commands.append("systemctl list-timers --all --no-pager 2>/dev/null | grep -Ei '(docker|container|spur|clean)' | head -20")
     for name in sorted(containers):
         if not re.fullmatch(r"atomesh-minimax-m3[.1a-zA-Z0-9_-]+", name):
             continue
