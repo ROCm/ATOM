@@ -14,6 +14,8 @@ from atom.models.deepseek_v4.mono.config import SCALE_BM
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.common import sqrt_softplus, swiglu
 from atom.models.deepseek_v4.mono.kernels.helpers import traced
+from atom.models.deepseek_v4.mono.kernels.moe_down import union_down
+from atom.models.deepseek_v4.mono.kernels.moe_ug import publish_routes, routed_union
 from atom.models.deepseek_v4.mono.kernels.plan import (
     ROUTER_TILE,
     UG8,
@@ -116,6 +118,7 @@ def ffn_stages(ctx):
     use_fp8_block128 = ctx["use_fp8_block128"]
     use_mxfp4_weight = ctx["use_mxfp4_weight"]
     use_mxfp8_block32 = ctx["use_mxfp8_block32"]
+    expert_union = ctx["expert_union"]
     w_dn = ctx["w_dn"]
     w_r = ctx["w_r"]
     w_sdn = ctx["w_sdn"]
@@ -494,6 +497,8 @@ def ffn_stages(ctx):
                         m0,
                         m1,
                     )
+            if const_expr(expert_union):
+                return
             if (c == 0) & (tid < count if shared else tid == 0):
                 sn = tid + sample if shared else fx.Int32(sample)
                 sl = fx.Int32(0) if shared else slot
@@ -520,6 +525,23 @@ def ffn_stages(ctx):
             w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
             s_rg = (lane // 32) * (INTER // 16) + c // 2
             return live, uu, c, slot, has_sh, w_rg, w_ln, s_rg
+
+        if const_expr(expert_union):
+            ctx["swiglu"] = swiglu
+            publish_routes(ctx)
+            live, _u, c0, slot0, has_sh, wr0, wl0, sr0 = ug8_tile(u0)
+            if has_sh & live:
+                pre = shared_units(c0, wr0, wl0, sr0, has_sh & live)
+                stage_moe_input(list(range(S)), shared=True)
+                gpu.barrier()
+                reduce_rows(
+                    1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16)
+                )
+                gpu.barrier()
+                ug8_emit(c0, slot0, 0, True, True)
+            gpu.barrier()
+            routed_union(ctx)
+            return
 
         # a shared-expert tile serves every sample at once (B columns); routed work is items
         N_UG_ITEMS = S * N_UG_TASKS
@@ -621,6 +643,9 @@ def ffn_stages(ctx):
             stamp("ug", sample * N_UG_TASKS + uu, 4, pred=live)
 
     up_gate()
+    if const_expr(expert_union):
+        union_down(ctx)
+        return {}
 
     # =============== 10. expert down + route weighting + MoE TP reduce
     DN_NKC = INTER // 64

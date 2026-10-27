@@ -558,8 +558,33 @@ def build_dsv4_kernel(
             KT_OFF + SPLIT_KEYS * KS,
             index_heads * IHD * 3 // 2,
         )
+    # One exact build profile owns UG/Down selection and its LDS geometry.
+    # Other widths, draft blocks and formats keep their existing path.
+    # These are Python build constants. A tuple avoids expanding a long
+    # short-circuit tree in FlyDSL's device-control-flow rewriter.
+    expert_union = all(
+        (
+            S == 7,
+            TOK == 7,
+            phase == "moe",
+            not DRAFT_BLOCK,
+            npes == 8,
+            TOP_K == 6,
+            N_EXPERTS == 384,
+            HC == 4,
+            HIDDEN == 7168,
+            INTER == 384,
+            G == 256,
+            use_mxfp4_weight,
+            use_mxfp8_block32,
+            shared_bf16_block128,
+            routed_down_bf16,
+        )
+    )
+    DN_TILE = 128 if expert_union else dn_tile(S, HIDDEN)
     ON = S * max(ROW_TILE, QKV_A_TILE, UG_TILE * 2)
-    DN_TILE = dn_tile(S, HIDDEN)
+    if expert_union:
+        ON = max(ON, S * DN_TILE)
     N_DN_TILES = HIDDEN // DN_TILE
 
     st_args = {

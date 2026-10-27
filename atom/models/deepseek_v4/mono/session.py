@@ -1670,7 +1670,6 @@ class V4MonoSession:
             )
         if is_live_decode:
             self.full_publications += 1
-        published_rows = len(self.adapter.published_contract)
         continuation_contract = (
             self.adapter.continuation_contract(context)
             if self.profile.continuation and is_live_decode
@@ -1679,7 +1678,6 @@ class V4MonoSession:
         if (
             self.profile.continuation
             and is_live_decode
-            and (published_rows in self.adapter.prepared_widths or graph_key == (3, 1))
             and continuation_contract is not None
             and self.graph_is_current(graph_key)
         ):

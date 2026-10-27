@@ -895,10 +895,15 @@ class V4CacheAdapter:
             and requests == 3
             and context.context.running_bs == 4
         )
-        if not exact_tail and (
-            rows not in self.prepared_widths or context.context.running_bs != requests
-        ):
+        if not rows or (not exact_tail and context.context.running_bs != requests):
             return None
+        if rows not in self.prepared_widths and not exact_tail:
+            # A captured fixed-q batch may span several prepared lanes. Validate
+            # its whole-request partition, not just individual kernel widths.
+            try:
+                self._plan(rows)
+            except MonoUnsupported:
+                return None
         var = self.builder.model_runner.forward_vars
         slots = var["v4_meta_state_slot_out"].np[:requests]
         slots_in = var["v4_meta_state_slot_in"].np[:requests]
