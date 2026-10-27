@@ -544,6 +544,7 @@ run_spur_job() {
 
   pre_cleanup_local
   assert_gpus_idle || return 1
+  export ATOMESH_ALLOCATED_NODE="${SELECTED_NODES[node_rank]}"
   write_env_file "${env_file}"
   if [[ "${node_rank}" -eq 0 ]]; then
     cat > "${RUN_DIR}/cell-metadata.json" <<EOF
@@ -590,11 +591,37 @@ EOF
   for execution_phase in "${EXECUTION_PHASES[@]}"; do
     service_port_offset="$(execution_phase_port_offset "${execution_phase}")"
     echo "=== Spur rank ${node_rank} phase=${execution_phase} service_port_offset=${service_port_offset} ==="
-    run_container_rank \
-      "${node_rank}" \
-      "${env_file}" \
-      "${execution_phase}" \
-      "${service_port_offset}" || rc=$?
+    while true; do
+      rc=0
+      run_container_rank \
+        "${node_rank}" \
+        "${env_file}" \
+        "${execution_phase}" \
+        "${service_port_offset}" || rc=$?
+      [[ "${BACKEND:-atom}" == "vllm" && "${rc}" -eq 86 ]] || break
+      # Native controller has stopped its engines. Remove only this container
+      # before host cache cleanup; recover-host verifies job/token/node and
+      # permits at most one cleanup attempt on this allocation.
+      local memory_container="atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${node_rank}"
+      bounded_docker_rm "${memory_container}"
+      local remaining_container
+      if ! remaining_container="$(docker ps -aq --filter "name=^/${memory_container}$")" \
+          || [[ -n "${remaining_container}" ]]; then
+        echo "[store-memory] container cleanup not confirmed; refusing memory recovery" >&2
+        rc=1
+        break
+      fi
+      local recovery_rc=0
+      python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_vllm_memory.py" recover-host \
+        --root "${RUN_DIR}" --job-id "${JOB_ID}" \
+        --token "${ATOMESH_RUN_TOKEN:-}" --node "${ATOMESH_ALLOCATED_NODE}" || recovery_rc=$?
+      if [[ "${recovery_rc}" -ne 0 ]]; then
+        rc="${recovery_rc}"
+        break
+      fi
+      assert_gpus_idle || return 1
+      echo "[store-memory] host cleaned; retrying native suite on ${ATOMESH_ALLOCATED_NODE}"
+    done
     if [[ "${rc}" -ne 0 ]]; then
       echo "=== Spur rank ${node_rank} phase=${execution_phase} failed rc=${rc} ==="
       return "${rc}"

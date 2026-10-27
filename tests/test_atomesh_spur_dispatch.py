@@ -104,6 +104,14 @@ class SpurDispatchTest(unittest.TestCase):
             rank = os.environ["SPUR_TASK_OFFSET"]
             with (Path(os.environ["TEST_ROOT"]) / ("docker-" + rank + ".jsonl")).open("a") as stream:
                 stream.write(json.dumps(sys.argv[1:]) + "\\n")
+            if os.environ.get("NATIVE_MEMORY_FAILURE"):
+                if sys.argv[1] == "inspect" and "--format" not in sys.argv:
+                    sys.exit(1)  # owned container was removed before recovery
+                if sys.argv[1] == "run":
+                    counter = Path(os.environ["TEST_ROOT"]) / "native-runs"
+                    count = int(counter.read_text()) if counter.exists() else 0
+                    counter.write_text(str(count + 1))
+                    sys.exit(86 if count == 0 else 0)
             if sys.argv[1:3] == ["image", "inspect"] and os.environ.get("FAKE_IMAGE_ID"):
                 print(os.environ["FAKE_IMAGE_ID"])
             if sys.argv[1] == "run" and "--entrypoint" in sys.argv and "test-image" in sys.argv:
@@ -176,6 +184,19 @@ class SpurDispatchTest(unittest.TestCase):
             json.loads(line)
             for line in (self.root / f"docker-{rank}.jsonl").read_text().splitlines()
         ]
+
+    def test_native_memory_failure_cleans_before_local_retry_or_returns_86(self):
+        helper = self.script.with_name("pd_vllm_memory.py")
+        helper.write_text("import os, sys\nraise SystemExit(int(os.environ['TEST_RECOVERY_RC']))\n")
+        for recovery_rc, expected_runs in ((0, 2), (86, 1)):
+            with self.subTest(recovery_rc=recovery_rc):
+                counter = self.root / "native-runs"
+                counter.unlink(missing_ok=True)
+                self.run_job("--spur-worker", BACKEND="vllm", NUM_NODES="1",
+                             DOCKER_IMAGE="native-image", NATIVE_MEMORY_FAILURE="1",
+                             TEST_RECOVERY_RC=str(recovery_rc), expected_rc=recovery_rc)
+                self.assertEqual(int(counter.read_text()), expected_runs)
+                self.assertEqual((self.run_dir / 'rank-rc-0').read_text().strip(), str(recovery_rc))
 
     def test_eval_only_pulls_image_and_runs_only_eval_on_both_workers(self):
         self.run_job(EVAL_ONLY="true", RUN_EVAL="true", EVAL_TASK="gsm8k")

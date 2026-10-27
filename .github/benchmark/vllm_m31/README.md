@@ -45,3 +45,32 @@ Automatic allocation currently excludes `pit2-p03-g09` after two unexplained
 SIGKILL exits there; explicitly pinned nodes bypass the automatic exclusion.
 The read-only inspection case emits schema-filtered status for its configured
 Actions ID, never raw logs or arbitrary file content.
+
+Memory recovery follows PR #2750 (`e73246e80ec`): evict only the pinned model
+snapshot's clean file cache with `drop_page_cache.py`, check NUMA budgets with
+128 GiB reserved per node, then use `numa_exec.py` + `compact_huge_pages.py` to
+fault/free the Store budget as THP. Private buffers are conservatively budgeted
+on each GPU/NIC NUMA node because worker malloc placement is not guaranteed;
+this only affects preparation, not the configured Store or buffer capacity. The native launcher checks the actual
+`AnonHugePages` bytes; insufficient THP or a 600-second per-node preparation
+timeout stops startup. Native Store uses the PR's glibc THP hint and 64 GiB MR
+cap. The earlier malloc perturbation, sequential P/D startup and separate
+native Store PUT/GET preflight in `57888067b` were reverted.
+
+On the `atomesh-cicd` Spur runner, a memory-specific exit (86) first stops and
+removes this allocation's container. A job/token/node-validated recovery helper
+uses existing host write permissions or noninteractive `sudo -n` to sync, drop
+host page cache and compact memory. It never elevates container capabilities.
+Successful cleanup permits one fresh local run; old phase artifacts are archived
+so result collectors cannot reuse previous partial measurements. Missing cleanup
+permission or a second memory failure ends the allocation. Only after Slurm is
+terminal, the submitter excludes that node and submits again (at most three
+resubmissions, configurable with `ATOMESH_VLLM_MEMORY_RETRIES`). Explicitly pinned
+nodes are not silently widened. Generic model and correctness failures do not
+trigger this retry path. A host cleanup timeout is fatal, not resubmitted.
+
+`memory-preparation.json` and `thp-node-*.json` record measured hugepage bytes;
+`vllm-memory-retry.json` binds the reason to the exact allocation;
+`host-memory-recovery.json` records whether cleanup succeeded or lacked permission.
+The model image, revisions, 1 TiB pool, per-rank 4 GiB buffer, prefix caches,
+DSpark3 and benchmark workload remain as specified above.

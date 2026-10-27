@@ -22,6 +22,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE.parents[1] / "benchmark/vllm_m31"
 PROCESSES: list[tuple[str, subprocess.Popen, Path]] = []
+# Explicit script path also supports CPU unit-test imports via importlib.
+sys.path.insert(0, str(HERE))
+from pd_vllm_memory import StoreMemoryUnavailable, memory_failure, prepare as prepare_store_memory
+
 
 
 def dump(path, data):
@@ -253,7 +257,8 @@ def main():
     print(json.dumps(hardware), flush=True)
     mem = dict(line.split(":", 1) for line in Path('/proc/meminfo').read_text().splitlines())
     available = int(mem['MemAvailable'].split()[0]) * 1024
-    assert available > (1024 + 32 + 256) * 1024**3, f"Insufficient host memory: {available}"
+    if available <= (1024 + 32 + 256) * 1024**3:
+        memory_failure('memory_budget', out)
     # Reuse the cluster cache, while the model revision remains explicit.
     # Bound download memory; Xet's concurrent shard reconstruction was killed
     # with rc=137 during the first run, before Store or engines were started.
@@ -275,6 +280,7 @@ def main():
     cache_root.mkdir(parents=True, exist_ok=True)
     model_path = snapshot_download(plan['model'], revision=plan['model_revision'], cache_dir=str(cache_root), max_workers=2)
     assert (Path(model_path) / 'dspark/config.json').exists()
+    prepare_store_memory(json.loads((CONFIG / "mooncake-store.json").read_text()), model_path, out)
     plan["resolved_model_path"] = model_path
     plan["runtime_ports"] = ports
     plan["status"] = "running"
@@ -320,11 +326,21 @@ def main():
                          'dbo-decode-token-threshold': 32768})
         cmd = ['vllm', 'serve', model_path, *flags(args)]
         dump(out / f'{role}-launch.json', {'argv': cmd, 'env': {k: env[k] for k in
-             sorted(env) if k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'HIP_VISIBLE', 'DEBUG_HIP'))}})
+             sorted(env) if k == 'GLIBC_TUNABLES' or k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'HIP_VISIBLE', 'DEBUG_HIP'))}})
         start(role, cmd, env, logs)
     urls = {role: f'http://{ip}:{ports[role]}' for role in ('prefill', 'decode')}
-    for url in urls.values():
-        wait_http(url + '/health', int(os.environ.get('WAIT_SERVER_TIMEOUT', 7200)))
+    try:
+        for url in urls.values():
+            wait_http(url + '/health', int(os.environ.get('WAIT_SERVER_TIMEOUT', 7200)))
+    except RuntimeError:
+        # Only Store registration ENOMEM during startup qualifies for memory
+        # recovery; ordinary model, transport and correctness failures stay fatal.
+        for path in (logs / 'prefill.log', logs / 'decode.log'):
+            text = path.read_text(errors='replace') if path.exists() else ''
+            if ('Failed to register memory' in text and 'Cannot allocate memory [12]' in text
+                    and 'Initialize MooncakeDistributedStore failed' in text):
+                memory_failure('rdma_registration_enomem', out)
+        raise
     proxy_url = f'http://{ip}:{ports["proxy"]}'
     start('proxy', [sys.executable, str(HERE / 'pd_vllm_proxy.py'),
           '--host', '0.0.0.0', '--port', str(ports['proxy']), '--prefill', urls['prefill'],
@@ -434,6 +450,7 @@ def smoke_then_sweep(run_phase=None):
 
 
 if __name__ == '__main__':
+    os.environ['ATOMESH_ALLOCATION_RUN_DIR'] = os.environ['RUN_DIR']
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, on_signal)
     try:
@@ -441,5 +458,8 @@ if __name__ == '__main__':
             smoke_then_sweep()
         else:
             main()
+    except StoreMemoryUnavailable as exc:
+        print(f'[store-memory] {exc}; returning memory retry status 86', flush=True)
+        raise SystemExit(86)
     finally:
         cleanup()

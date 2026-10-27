@@ -53,7 +53,9 @@
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "900",
     "VLLM_MOONCAKE_BOOTSTRAP_PORT": "8998",
     "MOONCAKE_CONFIG_PATH": "/config/mooncake-store.json",
-    "PYTHONHASHSEED": "42"
+    "PYTHONHASHSEED": "42",
+    "GLIBC_TUNABLES": "glibc.malloc.hugetlb=1",
+    "MC_MAX_MR_SIZE": "68719476736"
   },
   "speculative_config": {
     "method": "dspark",

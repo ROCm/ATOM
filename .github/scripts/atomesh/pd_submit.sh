@@ -527,9 +527,37 @@ submit_and_monitor_slurm_job() {
 GPU_BUSY_RETRIES="${ATOMESH_GPU_BUSY_RETRIES:-6}"
 GPU_BUSY_WAIT_SECONDS="${ATOMESH_GPU_BUSY_WAIT_SECONDS:-300}"
 gpu_busy_attempt=0
+memory_attempt=0
+MEMORY_RETRIES="${ATOMESH_VLLM_MEMORY_RETRIES:-3}"
+if [[ ! "${MEMORY_RETRIES}" =~ ^([0-9]|10)$ ]]; then
+  echo "ERROR: ATOMESH_VLLM_MEMORY_RETRIES must be 0..10" >&2
+  exit 2
+fi
+memory_exclusions="${SLURM_EXCLUDE_NODES}"
 declare -A gpu_busy_nodes=()
 while true; do
   submit_and_monitor_slurm_job
+  # The old allocation is terminal before we request another. A token-bound
+  # marker AND rank rc 86 are required; generic failures are never retried here.
+  if [[ "${BACKEND}" == "vllm" && "${NUM_NODES}" -eq 1 \
+      && "${SLURM_STATE}" == "FAILED" ]] && \
+      failed_memory_node="$(python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_vllm_memory.py" retry-node \
+        --root "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" --token "${ATOMESH_RUN_TOKEN}")"; then
+    if (( memory_attempt >= MEMORY_RETRIES )) || [[ -n "${NODE_LIST}" ]]; then
+      echo "[store-memory] cannot resubmit: retry budget exhausted or nodes explicitly pinned" >&2
+      break
+    fi
+    python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_vllm_memory.py" archive-failed \
+      --root "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" --token "${ATOMESH_RUN_TOKEN}"
+    memory_attempt=$((memory_attempt + 1))
+    memory_exclusions="${memory_exclusions:+${memory_exclusions},}${failed_memory_node}"
+    # Insert before the job script; the latest --exclude includes all earlier
+    # exclusions. Never remove the configured g09 exclusion or reuse a bad node.
+    last_arg=$((${#SBATCH_CMD[@]} - 1))
+    SBATCH_CMD=("${SBATCH_CMD[@]:0:last_arg}" --exclude "${memory_exclusions}" "${SBATCH_CMD[last_arg]}")
+    echo "[store-memory] resubmitting ${memory_attempt}/${MEMORY_RETRIES}; excluded=${memory_exclusions}"
+    continue
+  fi
   [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" && -n "${NODE_LIST}" ]] || break
   busy_dir="${LOG_ROOT}/slurm_job-${JOB_ID}/gpu-busy"
   shopt -s nullglob
