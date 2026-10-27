@@ -193,6 +193,15 @@ Trigger: diff adds a new function decorated with `@compile_ops` or `torch.librar
 **D8 — Kernel call missing contiguous check** ⚠️
 Python code calls a C++ / aiter kernel but doesn't assert `.is_contiguous()` or call `.contiguous()` on inputs that may arrive strided (slice of larger tensor, `.T`, output of non-contiguous `view()`). Kernel reads from wrong addresses — completely silent wrong result.
 Trigger: new call to an aiter kernel or C-extension; check that non-trivially-shaped inputs are either asserted contiguous or made contiguous before the call.
+Real example (ATOM#2371, review comment from xytpai, found via the closed-PR channel —
+the PR itself was closed as superseded by #2431, not closed for this reason): *"The
+wrapper validates the index tensors' device, shape, and dtype, but the kernel reads them
+using `ptr + token_id`, which assumes contiguous storage. A non-contiguous view such as
+`buffer[::2]` passes validation but produces incorrect output."* xytpai reproduced it on
+GPU with logically identical index values — making only `src_token` non-contiguous
+produced 1,056 mismatched output bytes, with no exception raised. D8's first ATOM-native
+citation; until this, the rule had evidence from elsewhere (vendored prose) but no ATOM
+instance of its own.
 → `⚠️ D8: [tensor] passed to [kernel] without contiguous check — add .contiguous() or assert .is_contiguous()`
 
 **D9 — INT32 overflow in GPU pointer arithmetic** 🔴 *(scanner-backed — read the scan output, not this prose)*
