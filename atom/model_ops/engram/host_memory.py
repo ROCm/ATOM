@@ -106,9 +106,8 @@ class _HipHostAllocator:
 
 def _host_allocator():
     """The page-locked allocator a shard is copied into, or None to register
-    the checkpoint mapping in place (`ATOM_ENGRAM_UVA_COPY=0`, or no HIP
-    runtime to call)."""
-    if not envs.ATOM_ENGRAM_UVA_COPY or not torch.version.hip:
+    the checkpoint mapping in place (no HIP runtime to call)."""
+    if not torch.version.hip:
         return None
     try:
         return _HipHostAllocator(
@@ -365,15 +364,22 @@ def _as_bytes(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(-1).view(torch.uint8)
 
 
-def pin_rows(sources: list[torch.Tensor]) -> tuple[torch.Tensor, ...] | None:
+def pin_rows(
+    sources: list[torch.Tensor], copy: bool | None = None
+) -> tuple[torch.Tensor, ...] | None:
     """`sources` (contiguous row ranges) as page-locked tensors of the same
     dtype and shape, owning their memory; all-or-nothing.
+
+    `copy` picks copying (True) or in-place registration (False) instead of
+    `ATOM_ENGRAM_UVA_COPY`.
 
     None, with everything taken released, on any failure -- no memory, a
     refused registration, no thread to copy on -- so the TP group can fall
     back as one.
     """
-    allocator = _host_allocator()
+    if copy is None:
+        copy = envs.ATOM_ENGRAM_UVA_COPY
+    allocator = _host_allocator() if copy else None
     leases: list[_Lease] = []
     try:
         if allocator is not None:

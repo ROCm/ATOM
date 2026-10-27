@@ -22,6 +22,7 @@ across chunked prefill and decode. The depthwise convolution uses kernel size
 `(kernel - 1) * dilation` previous tokens per channel.
 """
 
+import logging
 import math
 
 import torch
@@ -37,8 +38,13 @@ from atom.model_ops.qwen4_exp.ops.ple import (
     dilated_causal_conv1d,
     fp8_embedding_lookup,
     ple_gate,
+    sharded_table_lookup,
 )
+from atom.model_ops.qwen4_exp.ple_host_table import PleHostTable
 from atom.model_ops.utils import atom_parameter
+from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -96,6 +102,14 @@ def nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+def _check_global_scale(prefix: str, weight_scale: torch.Tensor) -> None:
+    scale = weight_scale.item()
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(
+            f"{prefix}.weight_scale is missing or is not finite and positive"
+        )
+
+
 class _Qwen4ExpFP8Embedding(nn.Module):
     """Vocab-sharded FP8 table with one checkpoint scale for the whole table.
 
@@ -128,11 +142,7 @@ class _Qwen4ExpFP8Embedding(nn.Module):
         param.data.copy_(loaded_weight.reshape_as(param))
 
     def process_weights_after_loading(self) -> None:
-        scale = self.weight_scale.item()
-        if not math.isfinite(scale) or scale <= 0:
-            raise ValueError(
-                f"{self.prefix}.weight_scale is missing or is not finite and positive"
-            )
+        _check_global_scale(self.prefix, self.weight_scale)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         output = fp8_embedding_lookup(
@@ -141,6 +151,107 @@ class _Qwen4ExpFP8Embedding(nn.Module):
             self.weight_scale,
             self.vocab_start_idx,
             self.vocab_end_idx,
+            self.output_dtype,
+        )
+        if ids.numel() and self.tp_size > 1:
+            output = get_tp_group().all_reduce(output, ca_fp8_quant=False)
+        return output
+
+
+def _host_table_available() -> bool:
+    """Whether the n-gram table goes to page-locked host memory instead of HBM.
+
+    Only where it would otherwise be allocated on a ROCm device: the kernel
+    reads it through HIP's unified addressing. `ATOM_ENGRAM_UVA=0` keeps it in
+    HBM, as it does the Engram tables.
+    """
+    if torch.version.hip is None or torch.empty(0).device.type != "cuda":
+        return False
+    if not envs.ATOM_ENGRAM_UVA:
+        logger.info("PLE n-gram table: in HBM (ATOM_ENGRAM_UVA=0)")
+        return False
+    return True
+
+
+class _Qwen4ExpHostEmbedding(nn.Module):
+    """Vocab-sharded PLE table in page-locked host memory, read over UVA.
+
+    The table is ~100 GB and a token reads `ngram_heads` rows of it, so it
+    does not earn its HBM. `PleHostTable` page-locks each checkpoint shard as
+    it loads, and `sharded_table_lookup` reads the rows a step names across the
+    bus through `shard_bases`. Those addresses are fixed from load to exit, so
+    the lookup can be captured in a CUDA graph. If page-locking fails the
+    table moves to HBM and the same kernel reads it there; either way the rows
+    returned are the checkpoint's, bit for bit.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        shard_rows: int,
+        prefix: str,
+        fp8: bool,
+    ):
+        super().__init__()
+        self.prefix = prefix
+        self.tp_size = get_tp_group().world_size
+        if num_embeddings % self.tp_size:
+            raise ValueError("PLE vocabulary size must be divisible by TP size")
+        rows = num_embeddings // self.tp_size
+        self.vocab_start_idx = rows * get_tp_group().rank_in_group
+        self.vocab_end_idx = self.vocab_start_idx + rows
+        self.embedding_dim = embedding_dim
+        self.shard_rows = shard_rows
+        self.fp8 = fp8
+        self.output_dtype = torch.get_default_dtype()
+        dtype = torch.float8_e4m3fn if fp8 else self.output_dtype
+        # The loader's handle on the table: the dtype the shard loader checks
+        # and the `weight_loader`, holding no rows.
+        self.weight = atom_parameter(
+            torch.empty(0, embedding_dim, dtype=dtype, device="cpu")
+        )
+        if fp8:
+            self.weight_scale = atom_parameter(
+                torch.full((1,), float("nan"), dtype=torch.float32)
+            )
+            self.weight_scale.weight_loader = _Qwen4ExpFP8Embedding._scale_loader
+        self.register_buffer(
+            "shard_bases",
+            torch.zeros(-(-num_embeddings // shard_rows), dtype=torch.int64),
+            persistent=False,
+        )
+        self.table = PleHostTable(
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            embedding_dim,
+            dtype,
+            shard_rows,
+            self.shard_bases.device,
+            prefix,
+        )
+
+    def process_weights_after_loading(self) -> None:
+        if self.fp8:
+            _check_global_scale(self.prefix, self.weight_scale)
+        self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
+        if self.table.on_host:
+            logger.info(
+                "%s: n-gram table in page-locked host memory, %.1f GiB read "
+                "over UVA, none in HBM",
+                self.prefix,
+                self.table.pinned_bytes / 1024**3,
+            )
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        output = sharded_table_lookup(
+            ids,
+            self.shard_bases,
+            self.weight_scale if self.fp8 else None,
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            self.shard_rows,
+            self.embedding_dim,
             self.output_dtype,
         )
         if ids.numel() and self.tp_size > 1:
@@ -241,14 +352,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # the embedding BF16; the shard loader rejects any dtype mismatch.
             # PLE uses a global scalar, independently of the linear block scales.
             embedding_cls = _Qwen4ExpFP8Embedding
-        self.ngram_embedding = embedding_cls(
-            self.table_rows, self.head_dim, prefix=embedding_prefix
-        )
         # The 128 checkpoint shards are slices of the PADDED table, so the
         # shard width divides it exactly.
         self.checkpoint_shard_rows = (
             self.table_rows + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
+        if _host_table_available():
+            self.ngram_embedding = _Qwen4ExpHostEmbedding(
+                self.table_rows,
+                self.head_dim,
+                self.checkpoint_shard_rows,
+                prefix=embedding_prefix,
+                fp8=embedding_cls is _Qwen4ExpFP8Embedding,
+            )
+        else:
+            self.ngram_embedding = embedding_cls(
+                self.table_rows, self.head_dim, prefix=embedding_prefix
+            )
         self.ngram_embedding.weight.weight_loader = self._embedding_shard_loader
 
         self.max_total_tokens = max_total_tokens
@@ -310,6 +430,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return
         rows = overlap_end - overlap_start
         source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
+        if isinstance(embedding, _Qwen4ExpHostEmbedding):
+            embedding.table.load_rows(shard_index, overlap_start, source)
+            return
         target = param.data.narrow(0, overlap_start - tp_start, rows)
         target.copy_(source)
 

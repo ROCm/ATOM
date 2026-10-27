@@ -1182,6 +1182,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
+    # Also governs the Qwen3.8 PLE n-gram table (~100 GB): page-locked on the
+    # host and read over UVA by default, in HBM with 0.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
     # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
     # into page-locked memory of exactly its size (hipHostMalloc on base pages,
