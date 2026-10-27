@@ -10,6 +10,8 @@ which is the case the option is for. Pinned by the last test here.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from atom.model_engine import engine_stats
@@ -119,6 +121,31 @@ def test_a_window_closing_while_idle_re_anchors_the_stretch(monkeypatch):
     assert s._throughput_last_log_time == 605.0
 
 
+def test_an_anchor_never_lands_behind_the_window_origin(monkeypatch):
+    """The loop reads `now` before the heartbeat that may close the window.
+
+    `_open_throughput_window` then stamps a LATER clock read as the origin, so
+    the `now` the loop still carries is already behind it. Subtracting from
+    there removes a span the window never contained: the origin ends up past
+    `now` and the window reports a rate higher than the engine reached, or an
+    `elapsed` below zero that skips the line without resetting the window.
+    """
+    clock = [0.006]  # emitting the line cost 2ms after the loop read 0.004
+    monkeypatch.setattr(engine_stats.time, "monotonic", lambda: clock[0])
+    s = _stats(throughput_log_interval_steps=4)
+    s._throughput_last_log_time = 0.0
+    for _ in range(4):
+        s.update_throughput(num_generation_tokens=10)
+        s.bump_step()
+    s.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.5)
+    assert s._throughput_last_log_time == 0.006
+    s.note_idle(0.004)  # the loop's `now`, from before the close
+    s.note_busy(180.005)
+    assert s._throughput_last_log_time <= 180.005, "origin moved past now"
+    # 4 x 1ms of forwards, not the 2ms left after over-subtracting.
+    assert 180.009 - s._throughput_last_log_time == pytest.approx(0.004)
+
+
 def test_note_idle_keeps_the_first_anchor():
     """Called on every idle pass of the loop, not once per stretch."""
     s = _stats(throughput_log_interval_steps=4)
@@ -185,7 +212,9 @@ def test_the_printed_step_advances_across_lines(caplog):
             s.update_throughput(num_generation_tokens=20)
             s.bump_step()
     printed = [
-        line.split("step ")[1].split(":")[0] for line in caplog.text.splitlines()
+        line.split("step ")[1].split(":")[0]
+        for line in caplog.text.splitlines()
+        if "step " in line  # any other INFO line would IndexError here
     ]
     assert printed == ["4", "8"], printed
 
@@ -213,6 +242,11 @@ def test_a_rank_that_only_ran_dummies_still_emits_its_line(caplog):
 def test_time_mode_still_suppresses_an_empty_window(caplog):
     """The default path: no line per interval while the engine sits idle."""
     s = _stats(throughput_log_interval_s=10.0)
+    # The branch under test sits behind `window_expired`. Without this the
+    # call returns at that guard and the assertion passes for the wrong
+    # reason -- it stays green with the suppression removed entirely.
+    s._throughput_last_log_time -= 20.0
+    assert s.window_expired(time.monotonic())
     with caplog.at_level("INFO"):
         s.maybe_log_throughput(num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0)
     assert caplog.text == ""

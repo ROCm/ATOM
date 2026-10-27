@@ -58,8 +58,19 @@ def test_a_negative_interval_is_normalised_to_off(steps):
         {"enable_rapidserve": True},
         {"kv_transfer_config": {"kv_role": "kv_producer"}},
         {"kv_transfer_config": {"kv_role": "kv_consumer"}},
+        # A MultiConnector prefill node carries the role one level down, with
+        # nothing at the top -- see the multi/ README's launch command.
+        {
+            "kv_transfer_config": {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                ],
+            }
+        },
     ],
-    ids=["pp", "rapidserve", "pd_prefill", "pd_decode"],
+    ids=["pp", "rapidserve", "pd_prefill", "pd_decode", "pd_multi"],
 )
 def test_unsupported_topologies_fall_back_to_the_clock(topology, caplog):
     with caplog.at_level("WARNING"):

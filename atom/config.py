@@ -2152,9 +2152,23 @@ class Config:
             # warning would name is the clock, which is equally silent.
             self.throughput_log_interval_steps = 0
             return
-        # Only the disaggregated roles. `kv_role: "offload"` is an LMCache
-        # cache tier on an ordinary engine running the loop that counts.
-        kv_role = (self.kv_transfer_config or {}).get("kv_role")
+        # Only the disaggregated roles, and they can arrive nested: a
+        # MultiConnector prefill node carries `kv_role` inside `connectors`
+        # with nothing at the top level (see
+        # `atom/kv_transfer/disaggregation/multi/README.md`). Reading the top
+        # level alone lets exactly that node through. `kv_role: "offload"` is
+        # the other direction -- an LMCache cache tier on an ordinary engine
+        # running the loop that counts, which must not be refused.
+        kv_cfg = self.kv_transfer_config or {}
+        kv_role = next(
+            (
+                role
+                for role in [kv_cfg.get("kv_role")]
+                + [c.get("kv_role") for c in kv_cfg.get("connectors") or []]
+                if role in ("kv_producer", "kv_consumer")
+            ),
+            None,
+        )
         if self.pipeline_parallel_size > 1:
             reason = (
                 f"pipeline_parallel_size is {self.pipeline_parallel_size}, which "
@@ -2162,7 +2176,7 @@ class Config:
             )
         elif self.enable_rapidserve:
             reason = "RapidServe is not covered by the step counter yet"
-        elif kv_role in ("kv_producer", "kv_consumer"):
+        elif kv_role is not None:
             reason = f"a P/D engine (kv_role={kv_role}) is not covered yet"
         else:
             return

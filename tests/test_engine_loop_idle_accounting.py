@@ -121,7 +121,13 @@ class _Engine:
         return self._state is OFFLOAD
 
     def _sync_dp_state(self, local_unfinished, shutdown, offloaded):
-        return self._state is WORK, False, self._state is OFFLOAD
+        # Mirrors the real `local_unfinished`: STALLED has requests, so
+        # the rank reports unfinished even though no forward will run.
+        return (
+            self._state in (WORK, STALLED),
+            False,
+            self._state is OFFLOAD,
+        )
 
     def _process_engine_step(self):
         if self._state is not WORK:

@@ -756,6 +756,12 @@ class EngineStats:
         decides when to close, the total is what the line prints. Printing the
         window's would print the interval on every line -- the same number
         forever, which lines up nothing.
+
+        The total matches across ranks only while the DP collective is
+        healthy. `_sync_dp_state` falls back to local state once the all_reduce
+        raises, and from there the ranks can branch differently -- that is a
+        shutdown path, but it means the number is a comparison aid, not an
+        invariant to assert on.
         """
         if self.throughput_enabled:
             self._throughput_steps += 1
@@ -778,7 +784,13 @@ class EngineStats:
             and self.throughput_log_interval_steps
             and self._throughput_idle_since is None
         ):
-            self._throughput_idle_since = now
+            # Never behind the origin. The loop reads `now` before
+            # `heartbeat_throughput`, which may have opened a window at a
+            # later clock read; an anchor behind that origin would be
+            # subtracted from a span the window never contained, leaving the
+            # origin past `now` and the rate overstated. Mirror of the
+            # re-anchor in `_open_throughput_window`, for the other direction.
+            self._throughput_idle_since = max(now, self._throughput_last_log_time)
 
     def note_busy(self, now: float) -> None:
         """Close an idle stretch by moving the window origin past it.

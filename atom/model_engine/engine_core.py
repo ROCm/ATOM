@@ -942,6 +942,9 @@ class DPEngineCoreProc(EngineCore):
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
+                    # Pass one never lands here -- `engines_running` starts
+                    # True so the first all_reduce runs -- so window one also
+                    # carries that rendezvous. The first line is warmup.
                     # Global, not local: a locally idle rank reaching the pair
                     # below is running a dummy for its peers, which is work.
                     self.scheduler.engine_stats.note_idle(now)
