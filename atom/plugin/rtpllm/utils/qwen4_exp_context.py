@@ -100,22 +100,28 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             or prefixes.numel() != lengths.numel()
         ):
             raise ValueError("prefix checkpoints require host LINEAR block metadata")
-        rows, slots, offsets, runtime_slots = [], [], [], []
+        rows, slots, offsets = [], [], []
         for row, (start, length) in enumerate(zip(prefixes.tolist(), lengths.tolist())):
+            if start < 0 or length < 0:
+                raise ValueError("prefix checkpoint lengths must be non-negative")
+            if length == 0:
+                # Graph padding can have no tokens and no block-table columns.
+                continue
             end = start + length
             first_boundary = ((start // block_size) + 1) * block_size
-            last_slot = int(table[row, (end - 1) // block_size])
             for position in range(first_boundary, end, block_size):
                 offset = position - start
                 if offset % CHUNK_SIZE:
                     raise ValueError("prefix checkpoint is not on the GDN chunk grid")
-                slot = int(table[row, (position - 1) // block_size])
+                column = (position - 1) // block_size
+                if column >= table.shape[1]:
+                    raise ValueError("prefix checkpoint exceeds LINEAR block table")
+                slot = int(table[row, column])
                 if slot < 0:
                     continue  # RTP does not publish an unmaterialized LINEAR block.
                 rows.append(row)
                 slots.append(slot)
                 offsets.append(offset)
-                runtime_slots.append(last_slot)
         if not rows:
             return None
         device = metadata.non_spec_query_start_loc.device
@@ -126,12 +132,15 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         metadata.ssm_chunk_offsets = prepare_chunk_offsets(
             metadata.non_spec_query_start_loc, CHUNK_SIZE
         )
+        gpu_slots = gpu(slots)
         return {
             "rows": gpu(rows),
-            "slots": gpu(slots),
+            "slots": gpu_slots,
             "offs": gpu(offsets),
             "is_end": gpu([0] * len(rows)),
-            "runtime": gpu(runtime_slots),
+            # RTP only snapshots interior boundaries; the kernel never reads
+            # runtime slots when is_end=0.
+            "runtime": gpu_slots,
         }
 
     @classmethod
