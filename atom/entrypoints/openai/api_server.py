@@ -411,7 +411,12 @@ def _get_dp_session_affinity_ids(
     conversation. Clients without a session header retain normal DP load
     balancing.
     """
-    if os.environ.get("ATOM_DP_SESSION_AFFINITY", "0").lower() not in {
+    cache_balance = (
+        getattr(getattr(engine, "core_mgr", None), "_cache_balancer", None) is not None
+    )
+    if not cache_balance and os.environ.get(
+        "ATOM_DP_SESSION_AFFINITY", "0"
+    ).lower() not in {
         "1",
         "true",
         "yes",
@@ -2739,6 +2744,14 @@ async def get_mtp_stats():
         raise HTTPException(
             status_code=500, detail=f"Failed to get MTP statistics: {e!s}"
         )
+
+
+@app.get("/debug/dp_router_stats")
+async def get_dp_router_stats():
+    """Frontend-local placement state; does not wait on busy engine ranks."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    return engine.core_mgr.get_dp_router_statistics()
 
 
 @app.get("/debug/cache_stats")

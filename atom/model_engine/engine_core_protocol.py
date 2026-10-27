@@ -33,3 +33,5 @@ class EngineCoreRequestType(enum.Enum):
     UTILITY_RESPONSE = b"\x08"
     # Unsolicited metrics snapshot, pushed by EngineCore on its own clock.
     METRICS = b"\x09"
+    # Target confirms an actual recoverable prefix before its first prefill.
+    CACHE_ADMITTED = b"\x0a"

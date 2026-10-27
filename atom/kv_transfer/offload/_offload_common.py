@@ -943,6 +943,17 @@ class OffloadSchedulerMixin(ABC):
         """
         return max(int(hbm), int(lmc))
 
+    def pending_prefill_handoff(self, seq) -> tuple[int, int] | None:
+        """The live alignment boundary and tier reach, before a load is issued."""
+        sid = str(seq.id)
+        spec = self._load_specs.get(sid)
+        if sid not in self._handoff_loads or spec is None:
+            return None
+        return (
+            int(getattr(seq, "offload_handoff_boundary_tokens", 0) or 0),
+            int(spec.lmcache_cached_tokens),
+        )
+
     def should_park_partial_prefill_for_load(self, seq) -> bool:
         if not self._do_load:
             return False

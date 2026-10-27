@@ -394,6 +394,10 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'cache_affinity': keep sessions local; when the estimated gain "
+            "justifies a move, recover the prefix through lmcache_mp before "
+            "switching owner. This policy supersedes ATOM_DP_SESSION_AFFINITY. "
+            "Tune costs and budgets with ATOM_DP_CACHE_BALANCE_CONFIG (JSON). "
             "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(
