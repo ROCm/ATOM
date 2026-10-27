@@ -12,14 +12,19 @@ network.
 
 import collections
 import sys
+from pathlib import Path
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
+# Add .github/scripts to path to import perf_criterion
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from perf_criterion import group_families, judge_family
 
 THROUGHPUT_REGRESSION_PCT = -5.0  # summarize.py, as shipped
 LATENCY_REGRESSION_PCT = 10.0
 
+# Metrics from the delta shape: tput_pct (total_token_throughput), tpot_pct, ttft_pct.
+# summarize.py's TRACKED_METRICS has four entries (adds output_throughput); see docstring
+# of shipped_alerts() for why only these three are counted here.
 _SHIPPED_METRICS = (
     ("tput_pct", True),
     ("tpot_pct", False),
@@ -28,7 +33,20 @@ _SHIPPED_METRICS = (
 
 
 def shipped_alerts(deltas):
-    """summarize.py's criterion: any one (configuration, metric) over threshold."""
+    """Reproduce summarize.py's criterion over the metrics the delta shape carries.
+
+    This counts any one (configuration, metric) exceeding the regression threshold.
+    Note: summarize.py tracks four metrics (TRACKED_METRICS), including
+    output_throughput, but the delta dict carries only three (_SHIPPED_METRICS):
+    tput_pct (mapped from total_token_throughput), tpot_pct, and ttft_pct. The
+    output_throughput field is omitted because judge_family judges only on the
+    single throughput field. Adding a second throughput metric would require
+    extending the delta contract with a field no criterion reads.
+
+    Consequently, shipped_total is a lower bound on what summarize.py would report
+    from the same underlying data. The error is conservative: undercounting makes
+    the shipped criterion appear safer than it actually is.
+    """
     hits = 0
     for delta in deltas:
         for field, higher_is_better in _SHIPPED_METRICS:
