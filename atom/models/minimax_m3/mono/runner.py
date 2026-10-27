@@ -31,6 +31,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 import atom.model_ops.topK as topk_meta
 from atom.distributed.indexer_cp import indexer_cp_enabled
@@ -359,7 +360,8 @@ class MonoDecodeRunner:
         for d, lw in enumerate(self.dense):
             kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
             pre = kernels["dense_pre0" if d == 0 else "dense_pre"]
-            pre(
+            _run_compiled(
+                pre,
                 *K1_ABI.pack(
                     {
                         "ar": _ptr(ar), "res": _ptr(res), "h_out": _ptr(self.h),
@@ -375,12 +377,13 @@ class MonoDecodeRunner:
                         "layer": lw.layer_id, "tl": 0,
                     }
                 ),
-                stream=stream,
+                stream,
             )  # fmt: skip
             if lw.layer_id in aux_layers:
                 aux.append(self.h[:n].clone())
             attn = self.attend_dense(lw, n, fwd, kv)
-            kernels["dense_post"](
+            _run_compiled(
+                kernels["dense_post"],
                 *DENSE_POST_ABI.pack(
                     {
                         "attn": _ptr(attn), "h_in": _ptr(self.h), "w_o": _ptr(lw.w_o),
@@ -392,7 +395,7 @@ class MonoDecodeRunner:
                         **self.peers.kernel_args(), "layer": lw.layer_id, "tl": 0,
                     }
                 ),
-                stream=stream,
+                stream,
             )  # fmt: skip
             ar, res = self.ars[d % 2][:n], self.h_mids[d % 2][:n]
         return res
@@ -471,7 +474,7 @@ class MonoDecodeRunner:
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
             "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
         }  # fmt: skip
-        self.k4[n][lw.index_topk](*K4_ABI.pack(args), stream=stream)
+        _run_compiled(self.k4[n][lw.index_topk], *K4_ABI.pack(args), stream)
         return self.h_mids[(i + 1) % 2][:n]
 
     def finish_step(self, res: torch.Tensor) -> torch.Tensor:
