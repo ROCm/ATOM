@@ -40,7 +40,9 @@ for run in runs:
                     tail = source.read(131072).decode(errors='replace')
                 for name, marker in {'traceback': 'Traceback (most recent call last)',
                     'engine_failure': 'Engine core initialization failed',
-                    'ready': 'Application startup complete',
+                    'ready': ('service_ready=true' if role == 'mooncake-master' else
+                              'All prefiller instances are ready.' if role == 'proxy' else
+                              'Application startup complete'),
                     'out_of_memory': 'out of memory',
                     'mr_failure': 'ibv_reg_mr failed'}.items():
                     row[f'{role}_{name}'] = marker in tail
@@ -71,6 +73,16 @@ for run in runs:
             progress = re.findall(r'Fetching\s+\d+ files:[^\r\n]*?\|\s*(\d+)/(\d+)', tail)
             if progress:
                 row['download_files_done'], row['download_files_total'] = map(int, progress[-1])
+        events = job / 'rank-0/container-events.log'
+        if events.is_file():
+            row['container_events'] = []
+            for line in events.read_text().splitlines():
+                match = re.fullmatch(r'(\d+) (create|start|kill|die|destroy) signal=(\d*)', line)
+                if match:
+                    event = {'time': int(match[1]), 'action': match[2]}
+                    if match[3]:
+                        event['signal'] = int(match[3])
+                    row['container_events'].append(event)
         rows.append(row)
 result = {'kind': 'experiment_status_only', 'actions_run_id': int(run_id), 'jobs': rows}
 if shutil.which('squeue'):
