@@ -2110,6 +2110,8 @@ models:
       mooncake_store:
         - &m31_vllm_pd
           name: m31-vllm-1p1d-tp4-mcstore-smoke
+          runner:
+            exclude_nodes: pit2-p03-g09
           topology: 1p1d
           pd_worker_layout: single_node
           nodes: "${ATOMESH_1P1D_NODES}"

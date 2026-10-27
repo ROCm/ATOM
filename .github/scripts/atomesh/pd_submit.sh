@@ -256,6 +256,7 @@ exports = {
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
+    "SLURM_EXCLUDE_NODES": csv_value(runner.get("exclude_nodes", "")),
     "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
     "SPUR_CONTROLLER_ADDR": spur_controller_addr,
     "SPUR_ACCOUNTING_ADDR": spur_accounting_addr,
@@ -321,6 +322,7 @@ echo "cell=${ATOMESH_CELL_ID}"
 echo "model=${MODEL_NAME}"
 echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
+echo "automatic_node_exclusions=${SLURM_EXCLUDE_NODES}"
 echo "slurm_account=${SLURM_ACCOUNT:-default}"
 echo "slurm_partition=${SLURM_PARTITION:-default}"
 echo "slurm_qos=${SLURM_QOS:-default}"
@@ -465,6 +467,9 @@ else
     --gres "gpu:${SLURM_GPUS_PER_NODE}"
     --time "${SLURM_TIME_LIMIT}"
   )
+  if [[ -n "${SLURM_EXCLUDE_NODES}" && -z "${NODE_LIST}" ]]; then
+    SBATCH_CMD+=(--exclude "${SLURM_EXCLUDE_NODES}")
+  fi
   if [[ -n "${NODE_LIST}" ]]; then
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
