@@ -202,6 +202,8 @@ pub struct CliArgs {
     #[cfg(feature = "ext-proc")]
     #[command(flatten)]
     pub ext_proc: crate::ext_proc::ExtProcConfig,
+    #[command(flatten)]
+    pub prepare_pool: crate::config::PreparePoolConfig,
     // ==================== Worker Configuration ====================
     /// Host address to bind the router server
     #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
@@ -618,6 +620,7 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .prepare_pool(self.prepare_pool.clone())
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -720,6 +723,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_prepare_options_map_to_router_config() {
+        let args = CliArgs::try_parse_from([
+            "atomesh",
+            "--prepare-workers",
+            "2",
+            "--prepare-queue-capacity",
+            "6",
+            "--prepare-queue-timeout-ms",
+            "100",
+            "--prepare-timeout-ms",
+            "2000",
+            "--prepare-max-tokenize-bytes",
+            "8192",
+        ])
+        .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(
+            config.prepare_pool,
+            crate::config::PreparePoolConfig {
+                workers: Some(2),
+                queue_capacity: Some(6),
+                queue_timeout_ms: 100,
+                prepare_timeout_ms: 2000,
+                max_tokenize_bytes: Some(8192),
+            }
+        );
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 6);
+
+        // Common prepare options and legacy ext-proc options keep separate ids,
+        // and the common options win once both are resolved.
+        #[cfg(feature = "ext-proc")]
+        {
+            let args = CliArgs::try_parse_from([
+                "atomesh",
+                "--ext-proc",
+                "--ext-proc-parser-concurrency",
+                "4",
+                "--prepare-workers",
+                "1",
+                "--ext-proc-max-tokenize-bytes",
+                "4096",
+                "--prepare-max-tokenize-bytes",
+                "8192",
+            ])
+            .unwrap();
+            assert_eq!(args.ext_proc.parser_concurrency, Some(4));
+            assert_eq!(args.ext_proc.max_tokenize_bytes, Some(4096));
+            assert_eq!(args.prepare_pool.workers, Some(1));
+            assert_eq!(args.prepare_pool.max_tokenize_bytes, Some(8192));
+            let config = args.to_router_config(Vec::new()).unwrap();
+            assert_eq!(config.resolved_prepare_workers(), 1);
+            assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
+            assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
+        }
+    }
+
+    #[test]
     fn parse_policy_accepts_dp_sticky() {
         let args = CliArgs::default();
         assert!(matches!(
@@ -781,6 +841,7 @@ impl Default for CliArgs {
         Self {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
+            prepare_pool: Default::default(),
             host: "0.0.0.0".to_string(),
             port: 30000,
             worker_urls: Vec::new(),

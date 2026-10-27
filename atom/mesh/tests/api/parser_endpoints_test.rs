@@ -23,6 +23,7 @@ struct ParserTestContext {
     _client: Client,
     _config: RouterConfig,
     app_context: Arc<AppContext>,
+    _prepare_runtime: mesh::core::prepare_pool::PreparePoolRuntime,
 }
 
 impl ParserTestContext {
@@ -75,7 +76,8 @@ impl ParserTestContext {
             .unwrap();
 
         // Create app context with parser factories initialized
-        let app_context = crate::common::create_test_context_with_parsers(config.clone()).await;
+        let (app_context, prepare_runtime) =
+            crate::common::create_test_context_with_parsers(config.clone()).await;
 
         // Create router
         let router = RouterFactory::create_router(&app_context).await.unwrap();
@@ -87,6 +89,7 @@ impl ParserTestContext {
             _client: client,
             _config: config,
             app_context,
+            _prepare_runtime: prepare_runtime,
         }
     }
 

@@ -827,7 +827,7 @@ mod responses_endpoint_tests {
     }
 
     #[tokio::test]
-    async fn test_v1_responses_delete_not_implemented() {
+    async fn test_v1_responses_delete_preserves_backend_rejection() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18954,
             worker_type: WorkerType::Regular,
@@ -839,7 +839,7 @@ mod responses_endpoint_tests {
 
         let app = ctx.create_app().await;
 
-        // Test DELETE is not implemented
+        // The mock worker only supports GET; preserve its rejection.
         let resp_id = "resp-test-123";
 
         let req = Request::builder()
@@ -848,7 +848,8 @@ mod responses_endpoint_tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.headers()["allow"], "GET,HEAD");
 
         ctx.shutdown().await;
     }
@@ -1323,7 +1324,7 @@ mod pd_mode_tests {
             .build_unchecked();
 
         // Create app context
-        let app_context = crate::common::create_test_context(config).await;
+        let (app_context, _prepare_runtime) = crate::common::create_test_context(config).await;
 
         // Create router - this might fail due to health check issues
         let router_result = RouterFactory::create_router(&app_context).await;

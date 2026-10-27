@@ -9,7 +9,11 @@ use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
-    core::{steps::TokenizerConfigRequest, Job, UNKNOWN_MODEL_ID},
+    core::{
+        prepare_pool::{JobContext, PrepareError},
+        steps::TokenizerConfigRequest,
+        Job, UNKNOWN_MODEL_ID,
+    },
     protocols::tokenize::{
         AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
         DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
@@ -31,10 +35,36 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
         .into_response()
 }
 
-fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn Tokenizer>, String> {
-    if let Some(tokenizer) = registry.get(model) {
+fn prepare_error_response(error: PrepareError) -> Response {
+    let status =
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    error_response(status, &error.to_string(), error.code())
+}
+
+/// Run CPU-bound tokenizer work and response serialization on the preparation
+/// pool, so Tokio workers stay free for I/O.
+async fn run_on_prepare_pool(
+    context: &AppContext,
+    work: impl FnOnce(&JobContext) -> Response + Send + 'static,
+) -> Response {
+    let pool = &context.prepare_pool;
+    let ticket = pool.submit(pool.prepare_deadline(), work).await;
+    match ticket {
+        Ok(ticket) => ticket.wait().await.unwrap_or_else(prepare_error_response),
+        Err(error) => prepare_error_response(error),
+    }
+}
+
+fn get_tokenizer_entry(
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<TokenizerEntry, String> {
+    if let Some(entry) = registry
+        .get_by_name(model)
+        .or_else(|| registry.get_by_id(model))
+    {
         debug!("Found tokenizer for model: {}", model);
-        return Ok(tokenizer);
+        return Ok(entry);
     }
 
     if model == UNKNOWN_MODEL_ID || model.is_empty() {
@@ -44,7 +74,7 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
                 "Using first available tokenizer '{}' as default",
                 first.name
             );
-            return Ok(first.tokenizer.clone());
+            return Ok(first.clone());
         }
     }
 
@@ -61,16 +91,24 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
     }
 }
 
-pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeRequest) -> Response {
+pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Response {
     debug!("Tokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
-        Ok(t) => t,
+    let entry = match get_tokenizer_entry(&context.tokenizer_registry, &request.model) {
+        Ok(entry) => entry,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
         }
     };
 
+    run_on_prepare_pool(context, move |_| {
+        let encoder = crate::routers::prepare::thread_tokenizer::encoder(&entry);
+        encode_prompts(&*encoder, &request)
+    })
+    .await
+}
+
+fn encode_prompts(tokenizer: &dyn Tokenizer, request: &TokenizeRequest) -> Response {
     let texts = request.prompt.as_strings();
     let is_batch = request.prompt.is_batch();
 
@@ -121,16 +159,20 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     .into_response()
 }
 
-pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRequest) -> Response {
+pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -> Response {
     debug!("Detokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
-        Ok(t) => t,
+    let tokenizer = match get_tokenizer_entry(&context.tokenizer_registry, &request.model) {
+        Ok(entry) => entry.tokenizer,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
         }
     };
 
+    run_on_prepare_pool(context, move |_| decode_sequences(&*tokenizer, &request)).await
+}
+
+fn decode_sequences(tokenizer: &dyn Tokenizer, request: &DetokenizeRequest) -> Response {
     let sequences = request.tokens.sequences();
     let is_batch = request.tokens.is_batch();
 

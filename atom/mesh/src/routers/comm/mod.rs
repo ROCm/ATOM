@@ -5,4 +5,5 @@ pub mod metrics_utils;
 pub mod parse;
 pub mod persistence_utils;
 pub mod placement_response;
+pub(crate) mod proxy_body;
 pub mod tokenize;

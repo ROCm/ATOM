@@ -1,6 +1,7 @@
 use clap::Parser;
 use mesh::{
     cliargs::{filter_prefill_args_from, parse_prefill_args, Cli, Commands},
+    core::runtime::build_runtime,
     server, version,
 };
 
@@ -43,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router_config = cli_args.to_router_config(prefill_urls)?;
     router_config.validate()?;
     let server_config = cli_args.to_server_config(router_config);
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = build_runtime()?;
     runtime.block_on(async move { server::startup(server_config).await })?;
     Ok(())
 }
