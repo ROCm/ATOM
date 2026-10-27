@@ -71,6 +71,7 @@ class EngineStats:
         "_spec_interval_distribution",
         "_spec_interval_draft_tokens",
         "_spec_log_interval",
+        "_throughput_idle_since",
         "_throughput_last_log_time",
         "_throughput_steps",
         "block_manager",
@@ -208,6 +209,9 @@ class EngineStats:
         self.throughput_log_interval_steps = max(0, int(throughput_log_interval_steps))
         self._throughput_last_log_time = time.monotonic()
         self._throughput_steps = 0
+        # Start of the current idle stretch, or None while forwards are
+        # running. See `note_idle`.
+        self._throughput_idle_since: float | None = None
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0
 
@@ -747,21 +751,51 @@ class EngineStats:
         if self.throughput_enabled:
             self._throughput_steps += 1
 
-    def refresh_idle_throughput_clock(self, now: float) -> None:
-        """Refresh an empty step window while the whole engine is idle.
+    def note_idle(self, now: float) -> None:
+        """Open an idle stretch; `note_busy` subtracts it from the window.
 
-        DP callers must use global idleness: a locally idle rank can still
-        be executing dummies for its busy peers. Refresh every idle tick so
-        different rank clocks cannot choose different refresh deadlines.
+        Step mode only. There the window closes on a forward count, so it can
+        span any amount of wall clock, while `elapsed` -- the divisor behind
+        both throughputs -- is still measured on the clock. Without this the
+        window's tokens are charged for time no forward ran. Time mode needs
+        none of it: the interval already bounds the window.
+
+        DP callers must pass *engine-wide* idleness. A locally idle rank still
+        runs dummies for its busy peers, and that is time its tokens earned.
         """
         if (
             self.throughput_enabled
             and self.throughput_log_interval_steps
-            and self._throughput_steps == 0
-            and self.num_prompt_tokens == 0
-            and self.num_generation_tokens == 0
+            and self._throughput_idle_since is None
         ):
-            self._throughput_last_log_time = now
+            self._throughput_idle_since = now
+
+    def note_busy(self, now: float) -> None:
+        """Close an idle stretch by moving the window origin past it.
+
+        Moving the origin rather than resetting it to `now` is what keeps a
+        half-filled window honest: the forwards already counted keep the time
+        they actually took, and only the dead span is dropped. Resetting would
+        divide their tokens by the shorter remainder and report a rate higher
+        than any the engine reached.
+        """
+        if self._throughput_idle_since is None:
+            return
+        self._throughput_last_log_time += now - self._throughput_idle_since
+        self._throughput_idle_since = None
+
+    def _open_throughput_window(self, now: float) -> None:
+        """Start a fresh window at `now`, carrying the idle anchor with it.
+
+        A window does close while the engine is idle -- the loop's last
+        forwards fill it, and the close lands on a pass that is already idle.
+        An anchor left behind the new origin would then be subtracted from a
+        window that already skipped that span, putting the origin past `now`.
+        """
+        self._throughput_last_log_time = now
+        self._throughput_steps = 0
+        if self._throughput_idle_since is not None:
+            self._throughput_idle_since = now
 
     def window_expired(self, now: float) -> bool:
         """Whether the throughput window is due to close.
@@ -801,8 +835,7 @@ class EngineStats:
             and num_running_reqs == 0
             and num_waiting_reqs == 0
         ):
-            self._throughput_last_log_time = now
-            self._throughput_steps = 0
+            self._open_throughput_window(now)
             return
         prompt_throughput = self.num_prompt_tokens / elapsed
         generation_throughput = self.num_generation_tokens / elapsed
@@ -840,7 +873,6 @@ class EngineStats:
                 else f"{prefix_cache_hit_rate * 100:.1f}%"
             ),
         )
-        self._throughput_last_log_time = now
-        self._throughput_steps = 0
+        self._open_throughput_window(now)
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0

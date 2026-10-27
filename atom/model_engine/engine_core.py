@@ -436,12 +436,13 @@ class EngineCore:
                 if self._is_idle_rl_weights_offloaded():
                     continue
                 if not self.scheduler.is_finished():
+                    self.scheduler.engine_stats.note_busy(now)
                     # True only where a forward ran; no dummy here to stand in
                     # for an empty schedule, unlike the DP loop.
                     if self._process_engine_step():
                         self.scheduler.engine_stats.bump_step()
                 else:
-                    self.scheduler.engine_stats.refresh_idle_throughput_clock(now)
+                    self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
         finally:
@@ -931,7 +932,9 @@ class DPEngineCoreProc(EngineCore):
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
-                    self.scheduler.engine_stats.refresh_idle_throughput_clock(now)
+                    # Global, not local: a locally idle rank reaching the pair
+                    # below is running a dummy for its peers, which is work.
+                    self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
                     if self.has_pending_kv_work():
@@ -941,6 +944,7 @@ class DPEngineCoreProc(EngineCore):
                         self._advance_idle_kv_transfer()
                     continue
 
+                self.scheduler.engine_stats.note_busy(now)
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()

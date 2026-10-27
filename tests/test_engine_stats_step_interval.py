@@ -38,51 +38,95 @@ def test_step_mode_ignores_the_clock():
     assert not s.window_expired(s._throughput_last_log_time + 3600.0)
 
 
-def test_first_step_window_excludes_idle_heartbeats(monkeypatch, caplog):
-    now = [0.0]
-    monkeypatch.setattr(engine_stats.time, "monotonic", lambda: now[0])
+def test_idle_before_any_work_is_not_charged_to_the_first_window(monkeypatch, caplog):
+    """The startup case: model load and the wait for request one.
+
+    Both land inside window one, whose origin is stamped in `__init__`. Read
+    off the emitted line, so the divisor is the one users see.
+    """
+    clock = [0.0]
+    monkeypatch.setattr(engine_stats.time, "monotonic", lambda: clock[0])
     s = _stats(throughput_log_interval_steps=2)
-    for idle_time in (10.0, 30.0, 60.0):
-        now[0] = idle_time
-        s.refresh_idle_throughput_clock(idle_time)
-        assert not s.window_expired(idle_time)
+    s._throughput_last_log_time = 0.0
+    # The loop's first pass is already idle and lands on the origin stamped in
+    # `__init__`; the rest of the stretch is the same one, re-noted each pass.
+    for tick in (0.0, 30.0, 60.0):
+        clock[0] = tick
+        s.note_idle(tick)
+        assert not s.window_expired(tick)
+    s.note_busy(60.0)
     s.update_throughput(num_generation_tokens=10)
     s.bump_step()
     s.bump_step()
-    now[0] = 61.0
+    clock[0] = 61.0
     with caplog.at_level("INFO"):
         s.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.5)
     assert "step 2: " in caplog.text
+    # 10 tokens over the 1s a forward ran, not over the 61s since startup.
     assert "Avg generation throughput: 10.0 tokens/s" in caplog.text
 
 
-def test_idle_heartbeat_does_not_discard_a_partial_step_window():
+def test_a_half_filled_window_keeps_its_work_time_and_drops_the_idle():
+    """The case a reset-to-now cannot express, and the reason for `+=`.
+
+    Burst A ran 2s, then 600s of nothing, then burst B ran 3s. The window
+    closes on the step count with 5s of forwards in it. Resetting the origin
+    at the end of the idle stretch would divide A's tokens by B's 3s and
+    report a rate the engine never reached.
+    """
     s = _stats(throughput_log_interval_steps=4)
-    start = s._throughput_last_log_time
-    s.update_throughput(num_prompt_tokens=8, num_generation_tokens=2)
+    s._throughput_last_log_time = 0.0
+    s.update_throughput(num_prompt_tokens=400)  # burst A, t=0..2
     s.bump_step()
-    s.refresh_idle_throughput_clock(start + 60.0)
-    assert s._throughput_last_log_time == start
-    assert s._throughput_steps == 1
-    assert (s.num_prompt_tokens, s.num_generation_tokens) == (8, 2)
-
-
-def test_idle_heartbeat_keeps_a_dummy_only_partial_window():
-    s = _stats(throughput_log_interval_steps=4)
-    start = s._throughput_last_log_time
     s.bump_step()
-    s.refresh_idle_throughput_clock(start + 60.0)
-    assert s._throughput_last_log_time == start
-    assert s._throughput_steps == 1
+    s.note_idle(2.0)
+    s.note_busy(602.0)
+    assert s._throughput_last_log_time == 600.0  # origin moved by the idle span
+    assert s._throughput_steps == 2  # A's forwards survive
+    assert s.num_prompt_tokens == 400
+    s.update_throughput(num_generation_tokens=600)  # burst B, t=602..605
+    s.bump_step()
+    s.bump_step()
+    assert s.window_expired(605.0)
+    assert (s.num_prompt_tokens + s.num_generation_tokens) / (
+        605.0 - s._throughput_last_log_time
+    ) == 200.0  # 1000 tokens over the 5s of forwards
 
 
-def test_idle_heartbeat_keeps_tokens_scheduled_before_the_forward():
+def test_a_window_closing_while_idle_re_anchors_the_stretch(monkeypatch):
+    """A window can close after the idle stretch opened, and does.
+
+    `note_idle` takes the loop's `now`; the close a few lines later inside
+    `maybe_log_throughput` reads the clock again and stamps the later value as
+    the new origin. An anchor left at the earlier one is then subtracted from
+    a window that already skipped it, putting the origin past `now` and
+    `elapsed` below zero. The real gap is one clock read, so it costs a
+    skipped line rather than a hang -- the invariant is still worth holding
+    unconditionally, which is what the span below is sized to show.
+    """
+    clock = [100.0]
+    monkeypatch.setattr(engine_stats.time, "monotonic", lambda: clock[0])
+    s = _stats(throughput_log_interval_steps=2)
+    s._throughput_last_log_time = 0.0
+    s.bump_step()
+    s.bump_step()
+    s.note_idle(5.0)
+    # Nothing ran and nothing is queued: the empty-window path, not a line.
+    s.maybe_log_throughput(num_running_reqs=0, num_waiting_reqs=0, kv_usage=None)
+    assert s._throughput_last_log_time == 100.0
+    s.note_busy(605.0)
+    # 605 - 100, not 605 - 5: 0..100 is behind the origin already.
+    assert s._throughput_last_log_time == 605.0
+
+
+def test_note_idle_keeps_the_first_anchor():
+    """Called on every idle pass of the loop, not once per stretch."""
     s = _stats(throughput_log_interval_steps=4)
-    start = s._throughput_last_log_time
-    s.update_throughput(num_prompt_tokens=8)
-    s.refresh_idle_throughput_clock(start + 60.0)
-    assert s._throughput_last_log_time == start
-    assert s.num_prompt_tokens == 8
+    s._throughput_last_log_time = 0.0
+    for tick in (10.0, 20.0, 30.0):
+        s.note_idle(tick)
+    s.note_busy(40.0)
+    assert s._throughput_last_log_time == 30.0  # idle ran 10..40, not 30..40
 
 
 @pytest.mark.parametrize(
@@ -90,26 +134,38 @@ def test_idle_heartbeat_keeps_tokens_scheduled_before_the_forward():
     [{"throughput_log_interval_steps": 0}, {"enable_log_stats": False}],
     ids=["time_mode", "disabled"],
 )
-def test_idle_refresh_keeps_other_logging_modes_unchanged(options):
+def test_idle_accounting_is_inert_outside_step_mode(options):
+    """Time mode's window is already bounded by its interval.
+
+    Shifting its origin would redefine the default status line's throughput
+    from per-interval to per-active-second for every existing deployment.
+    """
     s = _stats(**options)
     start = s._throughput_last_log_time
-    s.refresh_idle_throughput_clock(start + 60.0)
+    s.note_idle(start + 60.0)
+    s.note_busy(start + 120.0)
     assert s._throughput_last_log_time == start
 
 
-def test_ranks_refresh_the_same_idle_tick_despite_different_clock_origins():
+def test_idle_moves_the_divisor_not_the_trigger():
+    """One rank idles mid-window, the other does not; both still close together.
+
+    Idle accounting touches `elapsed` only. Wiring it into `window_expired`
+    would desynchronize the ranks -- the thing the step counter exists for.
+    """
     busy = _stats(throughput_log_interval_steps=4)
     idle = _stats(throughput_log_interval_steps=4)
-    busy._throughput_last_log_time = 0.0
-    idle._throughput_last_log_time = 0.1
-    # A 10s deadline would refresh only the first rank on this DP tick.
-    busy.refresh_idle_throughput_clock(10.05)
-    idle.refresh_idle_throughput_clock(10.05)
-    assert busy._throughput_last_log_time == idle._throughput_last_log_time == 10.05
-    for _ in range(4):
+    for s in (busy, idle):
+        s._throughput_last_log_time = 0.0
+    idle.note_idle(1.0)
+    idle.note_busy(601.0)
+    for pass_no in range(1, 5):
         busy.bump_step()
         idle.bump_step()
-    assert busy.window_expired(11.0) and idle.window_expired(11.0)
+        assert busy.window_expired(601.0) == idle.window_expired(
+            601.0
+        ), f"ranks disagreed on pass {pass_no}"
+    assert busy._throughput_last_log_time != idle._throughput_last_log_time
 
 
 def test_step_mode_opens_on_the_count():
