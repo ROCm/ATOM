@@ -2443,10 +2443,11 @@ class DeepseekV4Attention(nn.Module):
         # `_segment_forward_context`, per segment.
         saved_input_ids = ctx.input_ids
 
-        # One combined output; each half writes its own rows. `_sparse_attention`
-        # has no `out=`, so this is a slice-copy rather than a zero-copy slot.
+        # One combined output; each half's attention lands in its own rows
+        # (`_sparse_attention(out=)`), so nothing is copied for the prefill
+        # segment. Decode has no output argument and copies its few rows in.
         out = torch.empty(
-            (n_p + n_d, self.n_local_heads * self.head_dim),
+            (n_p + n_d, self.n_local_heads, self.head_dim),
             dtype=x.dtype,
             device=x.device,
         )
@@ -2470,18 +2471,19 @@ class DeepseekV4Attention(nn.Module):
                 # always matches what this launch did.
                 self._launch_compressors(x[sl])
                 qkn = self._qk_norm_rope(q[sl], kv_pre[sl], positions[sl])
-                out[sl] = self._sparse_attention(
+                self._sparse_attention(
                     qkn,
                     positions[sl],
                     x=x[sl],
                     qr=qr[sl],
                     qr_scale=None if qr_scale is None else qr_scale[sl],
+                    out=out[sl],
                 )
 
         with _mixed_span(f"mixed[n_p={n_p} n_d={n_d}]"):
             _seg(0, n_p, attn_md.prefill_attn_metadata, True)
             _seg(n_p, n_p + n_d, attn_md.decode_attn_metadata, False)
-        return out
+        return out.view(n_p + n_d, -1)
 
     def _qk_norm_rope(
         self,
@@ -2581,9 +2583,16 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor | None = None,  # FULL only: inline `forward_batched`
         qr: torch.Tensor | None = None,  # FULL only, same
         qr_scale: torch.Tensor | None = None,  # FULL only, same
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The TOKEN-shaped tail: indexer top-k, CSA pack, the paged attention, and
         prefill's SWA write.
+
+        ``out``, when given, is the ``[num_tokens, n_local_heads, head_dim]``
+        buffer the attention lands in -- a mixed batch's segment of the whole
+        batch's output (`_attn_mixed`). The prefill kernels write into it; a
+        path without an output argument (decode, the Triton fallbacks) copies
+        its result in.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8
@@ -2610,6 +2619,8 @@ class DeepseekV4Attention(nn.Module):
             # warmup runs before allocate_kv_cache: `unified_kv` is unbound and
             # the paged kernels would read OOB. Same guard the core has always
             # carried; this half now runs outside it. See `_qk_norm_rope`.
+            if out is not None:
+                return out.zero_().view(num_tokens, -1)
             return q_rows.new_zeros(
                 (num_tokens, self.n_local_heads * self.head_dim),
                 dtype=torch.bfloat16,
@@ -2751,9 +2762,9 @@ class DeepseekV4Attention(nn.Module):
             # quant; bf16 → OPUS / Triton over q_sa and the bf16 extend kv_full.
             # Under PCP the extend K is the PCP all-gathered full sequence
             # (k_*_full for fp8, kv_full for bf16); off PCP it is this fwd's
-            # tensor unchanged. On bf16 the wrapper reuses out=qkn.q_sa as the
-            # attention output buffer (q_sa is not needed after this call →
-            # avoids an extra empty_like); fp8 ignores both q_sa and out.
+            # tensor unchanged. Without a caller's `out`, the output reuses
+            # q_sa (not needed after this call), which the fp8 path, whose
+            # q_sa is None, turns into a fresh allocation.
             o = sparse_attn_v4_paged_2src(
                 qkn.q_sa,
                 self.unified_kv,
@@ -2764,9 +2775,7 @@ class DeepseekV4Attention(nn.Module):
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
-                # Reuse q_sa as the attention output buffer; q_sa is not needed
-                # after this call and this avoids an extra empty_like allocation.
-                out=qkn.q_sa,
+                out=qkn.q_sa if out is None else out,
                 unified_kv_rope=self.unified_kv_rope,
                 q_packed=qkn.q_packed,
                 q_rope=qkn.q_rope,
@@ -2815,6 +2824,9 @@ class DeepseekV4Attention(nn.Module):
                 prefix=f"{self.layer_name}.swa_write",
             )
 
+        if out is not None and o.data_ptr() != out.data_ptr():
+            out.copy_(o)
+            o = out
         # `o` is returned un-inverse-RoPE'd: `_wo_a_grouped_lora` removes the
         # absolute-position contribution the value-side RoPE carried in, on every
         # path, so the positions travel downstream instead.
