@@ -1243,18 +1243,54 @@ def qsa_select_paged_tokens(
         row_starts = torch.empty(
             row_end - row_start, dtype=torch.int32, device=q.device
         )
-        logits, visible_groups = qsa_paged_mqa_logits(
-            q[row_slice],
-            compressed_k_cache,
-            page_table,
-            token_to_request[row_slice],
-            query_positions[row_slice],
-            context_lens,
-            compress_ratio,
-            max_columns=columns,
-            row_starts=row_starts,
-            allow_flydsl=allow_flydsl,
+        q_chunk = q[row_slice]
+        token_to_request_chunk = token_to_request[row_slice]
+        query_positions_chunk = query_positions[row_slice]
+        use_gfx1250_scorer = (
+            envs.ATOM_QSA_GFX1250_SCORER
+            and not allow_flydsl
+            and _is_gfx1250()
+            and q_chunk.shape[0] == 4 * page_table.shape[0]
         )
+        if use_gfx1250_scorer:
+            from atom.model_ops.qwen4_exp.ops.qsa_select_gfx1250 import (
+                qsa_index_scores,
+                qsa_index_scores_supports,
+            )
+
+            use_gfx1250_scorer = qsa_index_scores_supports(
+                q_chunk, compressed_k_cache, page_table
+            )
+        if use_gfx1250_scorer:
+            visible_groups = torch.empty_like(row_starts)
+            logits = qsa_index_scores(
+                q_chunk,
+                compressed_k_cache,
+                page_table,
+                token_to_request_chunk,
+                query_positions_chunk,
+                context_lens,
+                compress_ratio,
+                columns,
+                q.shape[2] ** 0.5,
+                _table_width_bucket(page_table.shape[1]),
+                get_cu_num(),
+                visible_groups=visible_groups,
+                row_starts=row_starts,
+            )
+        else:
+            logits, visible_groups = qsa_paged_mqa_logits(
+                q_chunk,
+                compressed_k_cache,
+                page_table,
+                token_to_request_chunk,
+                query_positions_chunk,
+                context_lens,
+                compress_ratio,
+                max_columns=columns,
+                row_starts=row_starts,
+                allow_flydsl=allow_flydsl,
+            )
         selected_groups = torch.empty(
             (row_end - row_start, block_topk), dtype=torch.int32, device=q.device
         )
@@ -1274,9 +1310,9 @@ def qsa_select_paged_tokens(
         )
         qsa_expand_block_indices(
             selected_groups,
-            query_positions[row_slice],
+            query_positions_chunk,
             context_lens,
-            token_to_request[row_slice],
+            token_to_request_chunk,
             compress_ratio,
             token_topk,
             out[row_slice],
