@@ -469,7 +469,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             config.hidden_size,
             eps=config.rms_norm_eps,
             quant_config=input_norm_quant,
-            write_bf16=self.layer_type == "linear_attention",
+            # A merged in_proj_qkvzba consumes the quantized activation
+            # directly, so the norm no longer has to emit the BF16 copy that
+            # the separate in_proj_ba needed.
+            write_bf16=self.layer_type == "linear_attention" and not gdn_merged,
             # Layer 0's input is the embedding, already complete on every rank.
             fused_allreduce=fuse_allreduce_norm and layer_num > 0,
         )
