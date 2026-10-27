@@ -62,6 +62,13 @@ class VerifyScheduler:
             from atom.spec_decode.dspark_runtime import DSparkRuntime
 
             self.runtime = DSparkRuntime(runner)
+        self.dp = None
+        if runner.config.parallel_config.data_parallel_size > 1 and (
+            runner.config.dspark.online_sps or runner.config.dspark.bucket_global
+        ):
+            from atom.spec_decode.dspark_dp import DPVerifyPlanner
+
+            self.dp = DPVerifyPlanner(self)
         self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
         # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.
@@ -106,6 +113,12 @@ class VerifyScheduler:
         from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths_tensor
 
         bs, L = confidence.shape
+        dp = getattr(self, "dp", None)
+        if dp is not None:
+            dp.capture(confidence)
+            # The DP planner consumes this confidence at N+2, with the current
+            # bonus floors and every peer's frontier. No local budget is final.
+            return torch.full((bs,), L, dtype=torch.long, device=confidence.device)
         sps_table = self.sps_table
         runtime = getattr(self, "runtime", None)
         if runtime is not None and sps_table is not None:
@@ -215,6 +228,10 @@ class VerifyScheduler:
         The copy is queued here; ``_resolve_ell`` adopts it once it is
         ``_ELL_GENERATION`` steps old.
         """
+        dp = getattr(self, "dp", None)
+        if dp is not None:
+            dp.record(req_ids)
+            return
         ell = self._last_ell
         if ell is None:
             self._ell_pending.clear()
@@ -282,7 +299,9 @@ class VerifyScheduler:
         """{req_id: ell} from a fixed generation back, so every TP rank adopts
         the SAME one — see ``_resolve_ell``. Read this at the top of a step; the
         sync it performs is a no-op there and a real stall anywhere later."""
-        self._resolve_ell()
+        dp = getattr(self, "dp", None)
+        if dp is None:
+            self._resolve_ell()
         return self._ell_map
 
     @ell_by_req.setter
@@ -290,6 +309,9 @@ class VerifyScheduler:
         # Direct assignment (e.g. reset to {}) drops the in-flight copies too.
         self._ell_map = value
         self._ell_pending.clear()
+        dp = getattr(self, "dp", None)
+        if dp is not None:
+            dp.invalidate()
 
     def ell_nonblocking(self) -> dict:
         """Non-blocking read for the SAME-step postprocess path (carried back to

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Real decode timing and TP-consistent publication for online DSpark costs."""
+"""Real decode timing and TP/DP-consistent publication for online DSpark costs."""
 
 from __future__ import annotations
 
@@ -21,16 +21,14 @@ def validate_online_runtime(config):
     if not (config.dspark.online_sps or getattr(config.dspark, "bucket_global", False)):
         return
     if (
-        config.parallel_config.data_parallel_size != 1
-        or config.pipeline_parallel_size != 1
+        config.pipeline_parallel_size != 1
         or config.prefill_context_parallel_size != 1
         or config.decode_context_parallel_size != 1
-        or config.enable_expert_parallel
         or config.enable_tbo
         or config.enforce_eager
     ):
         raise ValueError(
-            "Online DSpark SPS currently requires TP-only, DP/PP/PCP/DCP=1, graphs, and TBO disabled"
+            "Online DSpark SPS requires PP/PCP/DCP=1, graphs, and TBO disabled"
         )
     mode = config.compilation_config.cudagraph_mode
     if mode is None or not mode.uses_tr_hybrid():
@@ -53,7 +51,7 @@ class Timing:
 
 
 class DSparkRuntime:
-    def __init__(self, runner, *, group=None, event_factory=None):
+    def __init__(self, runner, *, group=None, event_factory=None, mesh=None):
         validate_online_runtime(runner.config)
         self.runner = runner
         cfg = runner.config.dspark
@@ -66,6 +64,14 @@ class DSparkRuntime:
         )
         self.sample_interval = cfg.online_sps_sample_interval
         self.update_interval = cfg.online_sps_update_interval
+        self.mesh = mesh
+        self.dp_state = None
+        if runner.config.parallel_config.data_parallel_size > 1 and mesh is None:
+            from atom.spec_decode.dspark_dp import SPSMesh
+
+            self.mesh = SPSMesh()
+        if group is None and self.mesh is not None:
+            group = self.mesh.tp_group
         if group is None:
             from aiter.dist.parallel_state import get_tp_group
 
@@ -88,11 +94,22 @@ class DSparkRuntime:
         self._recv = [torch.empty_like(self._send) for _ in range(self.world_size)]
 
     def begin(self, batch, forward_mode):
+        # Under DP the planner publishes a group-wide decode predicate and a
+        # request-set generation before shape agreement. Dummy ranks take part
+        # in both timing and publication; mixed P/D steps take part in neither.
+        dp = self.dp_state
+        if self.mesh is not None and (dp is None or not dp.pure_decode):
+            return None
         if (
             batch is None
-            or batch.is_dummy_run
-            or batch.total_tokens_num_prefill
-            or not batch.total_tokens_num_decode
+            or (
+                dp is None
+                and (
+                    batch.is_dummy_run
+                    or batch.total_tokens_num_prefill
+                    or not batch.total_tokens_num_decode
+                )
+            )
             or not forward_mode.token_graph
             or torch.cuda.is_current_stream_capturing()
         ):
@@ -122,10 +139,14 @@ class DSparkRuntime:
         )
         timing = Timing(
             self.step,
-            batch.total_seqs_num,
+            dp.batch if dp is not None else batch.total_seqs_num,
             forward_mode.running_tokens,
             *events,
-            context=self._context if req_ids is not None else -1,
+            context=(
+                dp.context
+                if dp is not None
+                else (self._context if req_ids is not None else -1)
+            ),
         )
         timing.start.record()
         self.pending.append(timing)
@@ -179,6 +200,11 @@ class DSparkRuntime:
             rows = [r.tolist() for r in self._recv]
         else:
             rows = [self._send.tolist()]
+        if self.mesh is not None:
+            # All local fields above describe the SAME group workload. A DP
+            # rank's local bs/ids must not be used as the matching key here.
+            tp_rows = torch.tensor(rows, dtype=torch.float64, device="cpu")
+            rows = self.mesh.gather_dp(tp_rows).reshape(-1, MAX_PENDING, 6).tolist()
         matched = common_rank_samples(rows)
         contexts = {sample.step: sample.context for sample in available}
         for step, batch, executed_rows, target_ms, post_ms in matched:

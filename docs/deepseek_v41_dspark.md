@@ -203,36 +203,80 @@ or CPU scheduling cost. STS temperatures remain fixed.
 By default, `online_sps_sample_interval=8` and
 `online_sps_update_interval=64`. Events are queried without an added CUDA
 synchronize. A synchronous, small CPU Gloo collective publishes the intersection
-of completed samples on every TP rank, using maximum rank times for each phase.
+of completed samples on every TP/DP worker, using maximum worker times for each phase.
 Samples must be at least two decode steps old. Pending events are bounded and
-never reused before completion. Prefill, dummy runs, capture and eager forwards
-do not update the estimator. `DSpark online SPS` log entries report versions,
+never reused before completion. Prefill, capture and eager forwards do not
+update the estimator. A TP-only dummy is excluded; under DP, an idle worker's
+dummy participates in the group's decode timing and publication. Mixed P/D
+steps are excluded on every worker. `DSpark online SPS` log entries report versions,
 sample counts and the fitted correction.
 
-This implementation currently requires TP-only execution, DP/PP/PCP/DCP=1,
-TR_HYBRID token graphs, no EP and no TBO. Select `--cudagraph-mode TR_HYBRID`
+This implementation supports TP, DP, DP attention and EP, with PP/PCP/DCP=1,
+TR_HYBRID token graphs and TBO disabled. Select `--cudagraph-mode TR_HYBRID`
 explicitly: the V4.1 default remains FULL, which does not apply ragged lengths.
 On this main revision V4.1 admits TR_HYBRID at compilation level 0. Token-graph
 record/replay is independent of torch.compile; level 3 still admits FULL only.
 The online runtime rejects that combination. Profiles bind both the graph mode
-and compilation level; regenerate the SPS measurements when changing them.
-The default confidence policy retains early stopping. Experimental
+and compilation level, as well as DP size, DP attention, EP and its backend;
+regenerate the SPS measurements when changing them. Legacy TP profiles are
+accepted only for the original plain-TP topology.
+The default TP confidence policy retains early stopping. Experimental
 `bucket_global=true` searches all prefix budgets and configured per-request q
 caps using actual captured decode graph sizes, including q divisibility. Costs
 use those graph rows rather than logical token counts. Uncovered candidates are
 excluded. After current bonus floors are applied, a contraction that does not
 reduce the executable graph is discarded. Both policies preserve the fixed
 two-generation delayed per-request adoption and all boundary/state guards.
-This is not DeepInfer's separate N−2 budget / N−1 allocation policy; per-request
-allocations remain two generations old. Nearby, same-request shape contrasts
-reduce context confounding but are observational, not identical-KV replays or
+This is not DeepInfer's separate N−2 budget / N−1 allocation policy. Under TP,
+per-request allocations remain two generations old. Nearby, same-request shape
+contrasts reduce context confounding but are observational, not identical-KV replays or
 a complete model of V4.1 attention cost. Snapshots expose batch-local slopes,
 support counts, fixed offsets and post-target costs. `slope_ms_per_row` is only
 an aggregate diagnostic; the decision table uses batch-local coefficients.
 
-`online_sps_observe_only=true` keeps sampling, TP publication and cost-table
-rebuilding active while using the static cost table for decisions. It is an
-ablation option and requires `online_sps=true`. The post-target nine-observation
+### Joint DP verification budget
+
+With DP enabled, either `online_sps` or `bucket_global` opts into the joint
+planner. Each TP group's leader asynchronously copies cumulative survival
+probabilities; the planner reads exactly forward N−2, never the latest ready
+copy. It rebuilds candidate allocations using the current request set and
+mandatory bonus-token floors. No current draft tokens or confidence are used.
+
+For each captured graph and query cap, each DP rank maximizes expected output
+within that row capacity. The group scores the sum of those expected outputs
+against the time of the common executable graph. DP ranks keep different
+per-request verification lengths, but agree on the query cap and graph cost.
+The chosen query cap is carried into `ForwardMode`, including for non-nested
+divisors. The final token count still comes from ordinary DP shape agreement.
+A contraction is discarded if bonus floors or a busier peer leave the group on
+the same graph. Idle dummies retain their existing reserved shape and contribute
+zero expected output tokens.
+
+The planner's CPU exchange happens on every forward, including idle dummies,
+middle prefill chunks and mixed P/D steps. A missing N−2 record or a request-set
+boundary keeps the full layout for that group step; it does not reuse stale
+confidence. Pending copies retain their source and destination until completion
+and are bounded to four entries. These metadata exchanges and CPU planning add
+overhead; they are outside the target-event timing interval and must be included
+when evaluating end-to-end performance.
+
+The online DP cost curve uses the maximum local real request count as its batch
+key, common executed rows, and phase maxima across all TP/DP workers. A change
+in any rank's request-set generation or real/idle/prefill state changes the
+group generation used for slope fitting. This is an approximate group cost
+model, not a full predictor of the per-rank KV/context distribution.
+
+`atom.benchmarks.profile_dspark_sps` accepts `--dp-size`,
+`--enable-dp-attention`, `--enable-expert-parallel`, and
+`--moe-all2all-backend` for matching deployment measurements. Its torchrun world
+size is TP×DP. Use `--max-num-seqs` to bound the calibration sweep. Fit STS from
+the matching deployment's confidence records before using a profile for
+performance evaluation.
+
+`online_sps_observe_only=true` keeps sampling, TP/DP publication and cost-table
+rebuilding active while using the static cost curve for decisions. Under DP,
+the same joint planner stays active so that only online cost correction is
+ablated. It requires `online_sps=true`. The post-target nine-observation
 window is unchanged; it has not been converted to a nine-step window. Online
 SPS and bucket-global decisions both remain disabled by default pending SA
 latency and throughput validation.
@@ -262,6 +306,41 @@ Restore and accepted-prefix assertions must remain enabled.
 Automated coverage lives in `tests/models/deepseek_v41/` and
 `tests/attentions/deepseek_v41/`. Request-state checks are separate from
 generation-quality and throughput evaluation.
+
+The DP component validator exercises unequal rank loads, idle ranks, mixed
+P/D, arrivals, reorder, bonus floors, bounded copies and online publication:
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m tests.validate_dspark_dp \
+  --tp-size 2 --device cuda --output /tmp/dspark-tp2-dp2.json
+torchrun --standalone --nproc-per-node=4 -m tests.validate_dspark_dp \
+  --tp-size 1 --device cuda --output /tmp/dspark-tp1-dp4.json
+```
+
+For the real-model TP2×DP2 comparison, use a profile matching this topology
+and run each mode in a fresh process:
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m tests.validate_dspark_dp_model \
+  --model /path/to/model --profile /path/to/dp-profile.json \
+  --dp-size 2 --output /tmp/dspark-dp-reference.json
+torchrun --standalone --nproc-per-node=4 -m tests.validate_dspark_dp_model \
+  --model /path/to/model --profile /path/to/dp-profile.json \
+  --dp-size 2 --dynamic --controlled-confidence \
+  --compare-with /tmp/dspark-dp-reference.json \
+  --output /tmp/dspark-dp-dynamic.json
+```
+
+The model validator uses one production scheduler per TP group and broadcasts
+its batches to workers. Controlled confidence stresses graph contraction while
+preserving the draft tokens and target sampling. Compare per-request output
+counts/hashes between modes and check the dynamic report for actual graph
+contractions. This is a correctness probe, not a throughput or confidence-fit
+measurement. An execution-complete report alone does not assert output
+equivalence; `--compare-with` fails on mismatched final output hashes.
+EP/MoRI model execution needs separate validation. The current DP validation
+results and the unresolved full-width repeatability check are recorded in
+[the validation notes](deepseek_v41_dspark_dp_validation.md).
 
 ## Current limitations
 

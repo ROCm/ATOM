@@ -1629,9 +1629,9 @@ class DSparkConfig:
         graphs at warmup). Without an explicit profile, use the synthetic stub.
       - calibration_profile: JSON file containing model/runtime-bound SPS and
         STS measurements. Takes precedence over automatic calibration.
-      - online_sps: correct measured costs using completed TP decode steps.
+      - online_sps: correct measured costs using completed TP/DP decode steps.
       - online_sps_sample_interval: pure decode steps between timing samples.
-      - online_sps_update_interval: steps between TP-consistent publications.
+      - online_sps_update_interval: steps between group-consistent publications.
     """
 
     confidence_schedule: bool = False
@@ -1641,7 +1641,8 @@ class DSparkConfig:
     disable_sps_calib: bool = False
     # Explicit offline measurements; compatibility is checked before use.
     calibration_profile: str | None = None
-    # Update the measured curve from completed serving steps (TP-only for now).
+    # Update the measured curve from completed serving steps. DP uses a joint
+    # graph budget with fixed N-2 confidence and group-consistent timing.
     online_sps: bool = False
     online_sps_sample_interval: int = 8
     online_sps_update_interval: int = 64

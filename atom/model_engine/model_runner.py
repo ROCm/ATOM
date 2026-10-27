@@ -2530,7 +2530,10 @@ class ModelRunner:
             if not self._tr_hybrid_active():
                 return  # stay rectangular
 
-            if self.config.dspark.bucket_global:
+            if (
+                self.config.dspark.bucket_global
+                and self.config.parallel_config.data_parallel_size == 1
+            ):
                 from atom.utils.region_graph import TokenGraph
 
                 short_graph = TokenGraph.bucket(
@@ -2746,12 +2749,19 @@ class ModelRunner:
 
     @_profile_runner_stage
     def prepare_model(self, batch: ScheduledBatch):
+        verify = getattr(getattr(self, "drafter", None), "verify_scheduler", None)
+        dp_planner = getattr(verify, "dp", None)
+        if dp_planner is not None:
+            # Unconditional with respect to local batch type and dummy/output
+            # state, before both the ragged mutation and DP shape agreement.
+            dp_planner.prepare(batch)
         shrunk_q = self._dspark_apply_q_bucket(batch)
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
         # prepare_input_ids sizes the buffer, and because one call site is the
         # only way the step is guaranteed a single cross-DP collective.
         dp_size = self.config.parallel_config.data_parallel_size
+        planned_q = getattr(dp_planner, "selected_q", None)
         forward_mode = ForwardMode.decide(
             batch=batch,
             dp_size=dp_size,
@@ -2764,7 +2774,11 @@ class ModelRunner:
             ),
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
-            max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
+            max_seqlen_q=(
+                planned_q
+                if planned_q is not None
+                else (batch.num_spec_step + 1 if shrunk_q is None else shrunk_q)
+            ),
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             graph_shapes=self._producer_graph_shapes(),
             tbo_decode_graphs=self.tbo_decode_graphs,

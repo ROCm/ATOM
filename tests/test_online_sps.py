@@ -187,7 +187,6 @@ def test_off_by_default_and_explicit_profile_required():
         ("pipeline_parallel_size", 2),
         ("prefill_context_parallel_size", 2),
         ("decode_context_parallel_size", 2),
-        ("enable_expert_parallel", True),
         ("enable_tbo", True),
         ("enforce_eager", True),
     ],
@@ -206,15 +205,6 @@ def test_unvalidated_topologies_fail_closed(field, value):
     )
     validate_online_runtime(config)
     setattr(config, field, value)
-    with pytest.raises(ValueError):
-        validate_online_runtime(config)
-
-
-def test_data_parallel_rejected():
-    config = SimpleNamespace(
-        dspark=SimpleNamespace(online_sps=True),
-        parallel_config=SimpleNamespace(data_parallel_size=2),
-    )
     with pytest.raises(ValueError):
         validate_online_runtime(config)
 

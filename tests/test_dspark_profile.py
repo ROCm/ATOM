@@ -6,6 +6,18 @@ import pytest
 from atom.spec_decode.calibration import calibration_identity, validate_calibration
 
 
+def test_single_node_worker_rank_retains_the_full_node_dp_slice():
+    from atom.spec_decode.calibration import single_node_parallel_config
+
+    for rank in range(4):
+        parallel, tp, local = single_node_parallel_config(4, 2, rank)
+        assert parallel.data_parallel_size_local == 2
+        assert parallel.data_parallel_rank == rank // 2
+        assert parallel.data_parallel_rank_local * tp + local == rank
+    with pytest.raises(ValueError, match="rank layout"):
+        single_node_parallel_config(3, 2, 0)
+
+
 def profile():
     return {
         "version": 1,
@@ -55,6 +67,31 @@ def test_profile_identity_binds_graph_mode_and_compilation_level(tmp_path, monke
         validate_calibration(
             data, calibration_identity(config, "cpu"), width=5, max_batch=4
         )
+
+
+def test_legacy_tp_profile_cannot_be_reused_for_dp_or_ep():
+    data = profile()
+    defaults = {
+        "data_parallel_size": 1,
+        "dp_attention": False,
+        "expert_parallel": False,
+        "moe_all2all_backend": "auto",
+        "moe_ep_flatten_tp_across_dp": False,
+    }
+    identity = {**data["identity"], "parallelism": defaults}
+    validate_calibration(data, identity, width=5, max_batch=4)
+    for field, value in [
+        ("data_parallel_size", 2),
+        ("dp_attention", True),
+        ("expert_parallel", True),
+        ("moe_all2all_backend", "rccl"),
+        ("moe_ep_flatten_tp_across_dp", True),
+    ]:
+        changed = {**identity, "parallelism": {**defaults, field: value}}
+        with pytest.raises(ValueError, match="does not match"):
+            validate_calibration(data, changed, width=5, max_batch=4)
+        measured = {**data, "identity": changed}
+        validate_calibration(measured, changed, width=5, max_batch=4)
 
 
 @pytest.mark.parametrize(
