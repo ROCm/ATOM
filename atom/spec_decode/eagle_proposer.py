@@ -497,8 +497,6 @@ class EagleProposer(Drafter):
         has_flat_kv = "kv_indices" in var
         i0_max_seqlen_q = attn_metadata.max_seqlen_q
         attn_metadata.max_seqlen_q = 1
-        # The shared object now describes decode, not its original prefill.
-        attn_metadata.prefill_request_lengths = None
         slot_mapping = var["slot_mapping"].gpu[:running_bs]  # max_seqlen_q is 1 here
         cu_seqlens_q = var["cu_seqlens_q"].gpu[: running_bs + 1]
         attn_metadata.cu_seqlens_q = cu_seqlens_q

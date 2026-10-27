@@ -138,7 +138,6 @@ class EngineArgs:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
-    gqa_prefill_kv_workspace_mb: int = 0
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
     enable_decoder_swa_bounded_replay: bool = True
@@ -496,15 +495,6 @@ class EngineArgs:
                 "MLA chunked-prefill budget in tokens. Default uses "
                 "max_num_batched_tokens."
             ),
-        )
-        parser.add_argument(
-            "--gqa-prefill-kv-workspace-mb",
-            type=int,
-            default=0,
-            help="Per-rank dense K+V workspace limit in MiB for MHA/GQA cached "
-            "prefill (PCP=1), including target and Eagle layers. Groups whole "
-            "requests only when the current layer uses dense gather + attention. "
-            "0 disables grouping; use 8192 for 8 GiB. A single request must fit.",
         )
         parser.add_argument(
             "--state-checkpoint-interval-tokens",
