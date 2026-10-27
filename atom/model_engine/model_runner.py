@@ -942,6 +942,9 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
+            bind_mono_drafter = getattr(self.model, "bind_mono_drafter", None)
+            if bind_mono_drafter is not None:
+                bind_mono_drafter(self.drafter)
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(

@@ -856,6 +856,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
 
+    def bind_mono_drafter(self, drafter) -> None:
+        self._mono.bind_drafter(drafter)
+
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         """Default Eagle3 aux hidden-state layer ids: early / middle / late of
         the target model (early=2, mid=n//2, late=n-3), matching vLLM's default.
@@ -939,6 +942,9 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.language_model.set_aux_hidden_state_layers(layers)
+
+    def bind_mono_drafter(self, drafter) -> None:
+        self.language_model.bind_mono_drafter(drafter)
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         return self.language_model.get_eagle3_aux_hidden_state_layers()
