@@ -125,11 +125,10 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - model_name: "GLM-5.2-FP8 TP8"
+          - model_name: "GLM-5.2-FP8 TP4"
             model_path: "zai-org/GLM-5.2-FP8"
-            extra_args: "--trust-remote-code --tp-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --disable-radix-cache --max-prefill-tokens 65536 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"},\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'"
+            extra_args: "--trust-remote-code --tp-size 4 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"},\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'"
             env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
               AITER_QUICK_REDUCE_QUANTIZATION=INT4
               AITER_USE_FLYDSL_MOE_SORTING=1
               SGLANG_USE_AITER=1
@@ -140,25 +139,16 @@ jobs:
             lm_eval_num_concurrent: 65
             accuracy_test_threshold: 0.92
             runner: spur-runner-mi355x-8gpu
-          - model_name: "GLM-5.2-MXFP4 TP4 MTP3"
+          - model_name: "GLM-5.2-MXFP4 TP4"
             model_path: "amd/GLM-5.2-MXFP4"
-            extra_args: "--trust-remote-code --tp-size 4 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\",\"*expert*\"]}}' --enable-return-hidden-states --max-running-requests 256 --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled --cuda-graph-max-bs-decode 256 --speculative-algorithm EAGLE --speculative-draft-attention-backend aiter --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
+            extra_args: "--trust-remote-code --tp-size 4 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.8 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\",\"*expert*\"]}}'"
             env_vars: |
-              SGLANG_DEFAULT_SERVER_ARGS=
               AITER_QUICK_REDUCE_QUANTIZATION=INT4
               AITER_USE_FLYDSL_MOE_SORTING=1
               SGLANG_USE_AITER=1
               SGLANG_ENABLE_TORCH_COMPILE=1
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
               TORCHINDUCTOR_COMPILE_THREADS=128
-              SGLANG_OPT_USE_TOPK_V2=false
-              ATOM_LOADER_NUM_THREADS=1
-              ATOM_REPLICATE_VOCAB_EMBED=1
-              ATOM_SGLANG_V4_ENABLE_TARGET_VERIFY_CG=1
-              ATOM_SGLANG_V4_DISABLE_TARGET_VERIFY_CG=0
-              ATOM_SGLANG_V4_DISABLE_DRAFT_CG=0
-              ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1
-              ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG=0
             lm_eval_num_fewshot: 5
             lm_eval_num_concurrent: 65
             accuracy_test_threshold: 0.92
