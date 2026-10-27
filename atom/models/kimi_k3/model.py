@@ -1257,7 +1257,13 @@ class KimiKDAAttention(nn.Module):
             f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
             gate = self.f_b_proj(f_a, x_scale=f_a_scale)
         else:
-            gate = self.f_b_proj(f_a_view.contiguous())
+            # Not .contiguous(): it returns a one-row view as is (size-1 dims
+            # ignore strides), handing the GEMM the fused row stride, which
+            # the gfx950 FlyDSL bf16 path rejects. A fresh buffer is aligned.
+            f_a = torch.empty(
+                f_a_view.shape, dtype=f_a_view.dtype, device=f_a_view.device
+            )
+            gate = self.f_b_proj(f_a.copy_(f_a_view))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         # Prefill returns its own contiguous output. Allocate this buffer only
         # for decode/spec-decode, where the recurrence writes into it directly.

@@ -146,6 +146,7 @@ class DenseKVByteCodec:
                 getattr(kvt, "index_raw", None),
                 getattr(kvt, "index_compressed", None),
                 getattr(kvt, "rope_positions", None),
+                getattr(kvt, "index_compressed_scale", None),
             ):
                 if t is not None and isinstance(t, torch.Tensor) and t.numel() > 0:
                     self._segments.append(t)
