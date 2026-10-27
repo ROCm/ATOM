@@ -201,6 +201,41 @@ def test_layout_id_names_ple_and_forks_under_pipeline_parallel(monkeypatch):
     assert not cls.state_transfer(builder).copies
 
 
+@pytest.mark.parametrize(
+    "kv_transfer_config, paged",
+    [
+        (None, False),
+        ({}, False),
+        ({"kv_connector": "lmcache_offload", "kv_role": "offload"}, True),
+        ({"kv_connector": "lmcache_mp", "kv_role": "offload"}, True),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+                ],
+            },
+            True,
+        ),
+    ],
+)
+def test_page_checkpoints_follow_an_offload_connector(
+    monkeypatch, kv_transfer_config, paged
+):
+    """A server without offload keeps main's fork slots; only a tier that reads
+    the PAGE image moves Qwen3.8 onto it."""
+    builder, cls = _builder()
+    monkeypatch.setattr(
+        "atom.model_ops.attentions.gdn_attn.get_tp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    builder.model_runner.config.kv_transfer_config = kv_transfer_config
+    assert cls._uses_paged_checkpoints(builder) is paged
+    assert bool(cls.state_transfer(builder).copies) is paged
+    if not paged:
+        assert cls.checkpoint_page_unit_bytes(builder) is None
+
+
 def test_validate_config_allows_offload_and_rejects_rapidserve():
     builder, _ = _builder()
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend

@@ -48,11 +48,29 @@ PLE_STATE_SLOT_CLASS = STATE_SLOT_CLASS
 
 
 def _qwen38_offload_ready(config) -> bool:
-    """PAGE checkpoints are on only for a single worker without RapidServe."""
+    """PAGE checkpoints are possible only for a single worker without RapidServe."""
 
     if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
         return False
     return not getattr(config, "enable_rapidserve", False)
+
+
+def _qwen38_offload_configured(config) -> bool:
+    """Whether a configured offload tier reads the PAGE checkpoint image.
+
+    A server without one keeps fork-slot checkpoints, as on main: PAGE images
+    change the KV budget, the hit behaviour and the copy path, and have been
+    validated only as the offload tier's image so far.
+    """
+
+    if not config.kv_transfer_config:
+        return False
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    return any(
+        KVConnectorFactory.is_offload_backend(name)
+        for name, _ in KVConnectorFactory.leaf_connectors(config) or ()
+    )
 
 
 # The QSA layers' row space. Named rather than derived from
@@ -330,9 +348,14 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         return specs
 
     def _uses_paged_checkpoints(self) -> bool:
-        """QSA pages hold the image. The parent builder would aim it at MHA."""
+        """QSA pages hold the image when an offload tier reads it; fork otherwise.
 
-        if not _qwen38_offload_ready(self.model_runner.config):
+        The parent builder would aim the image at MHA regions, so this one
+        answers for itself.
+        """
+
+        config = self.model_runner.config
+        if not _qwen38_offload_ready(config) or not _qwen38_offload_configured(config):
             return False
         from atom.utils import get_hf_text_config
 

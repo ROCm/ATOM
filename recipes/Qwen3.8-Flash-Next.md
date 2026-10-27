@@ -68,8 +68,12 @@ and draft share the embedding and output head.
   parallelism, DP attention, and TBO are not supported.
 - Text LMCache offload is the `qwen` layout: QSA pages (K, V, raw index,
   compressed index) plus a PAGE checkpoint of the GDN state and the PLE
-  conv/n-gram windows. Pipeline parallelism and RapidServe stay on fork
-  slots and still reject offload.
+  conv/n-gram windows. PAGE checkpoints are used only when an offload
+  connector (`lmcache_offload` or `lmcache_mp`) is configured; a server
+  without one keeps fork-slot checkpoints. Pipeline parallelism and
+  RapidServe stay on fork slots and still reject offload. P/D
+  disaggregation connectors (`mooncake`, `moriio`) are rejected: they would
+  move the QSA pages without the GDN/PLE state.
 - This example covers FP8 with TP1. Pure TP2 is not currently validated;
   it can fail MoE warmup on gfx950 due to an MoE dispatch limitation.
 - Video inference and long-context accuracy have not been validated.
