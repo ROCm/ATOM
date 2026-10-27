@@ -27,7 +27,8 @@ Verification (``prob_rejection_sample``)
     Target ``p`` = softmax(logits / T) restricted to the top-p nucleus
     (smallest set of highest-probability tokens with mass >= top_p, ties at
     the boundary kept) and renormalized -- the distribution the runner's
-    sampler draws from.
+    sampler draws from (aiter's top-p sampler; the native fallback's
+    ``cumsum - p <= top_p`` differs only on exact boundary ties).
     * standard (Leviathan et al. 2023): accept x_k iff u < p(x_k)/q(x_k);
       on the first rejection resample from norm(max(p - q, 0)).
     * block (Sun et al. 2024, ``ATOM_DSPARK_BLOCK_VERIFY=1``): the
@@ -45,10 +46,12 @@ Verification (``prob_rejection_sample``)
     all-gathers; every rank then takes identical decisions.
     Output layout / verdict are exactly the existing rejection sampler's
     (``_finish_request``); the bonus token is still the runner's sampler draw.
+
+Noise is keyed by host step counters, not by the request's ``seed``: seeded
+requests are not reproducible on this path.
 """
 
 import logging
-import os
 from dataclasses import dataclass, field
 
 import torch
@@ -65,14 +68,16 @@ from atom.model_ops.dspark_markov_sample import (
 )
 from atom.model_ops.rejection_sampler import _draft_token, _finish_request
 from atom.model_ops.sampler import SAMPLER_EPS
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-PROB_DRAFT = os.environ.get("ATOM_DSPARK_PROB_DRAFT", "0") == "1"
-BLOCK_VERIFY = os.environ.get("ATOM_DSPARK_BLOCK_VERIFY", "0") == "1"
-DRAFT_TSCALE = float(os.environ.get("ATOM_DSPARK_PROB_DRAFT_TSCALE", "1.0"))
-# 0 => let the drafter use the sharded LM head when the greedy path would
-SHARDED_DRAFT = os.environ.get("ATOM_DSPARK_PROB_SHARDED", "1") == "1"
+PROB_DRAFT = envs.ATOM_DSPARK_PROB_DRAFT
+BLOCK_VERIFY = envs.ATOM_DSPARK_BLOCK_VERIFY
+DRAFT_TSCALE = envs.ATOM_DSPARK_PROB_DRAFT_TSCALE
+# 1 (default) => draft off the sharded LM head whenever the greedy path would;
+# 0 => always sample the all-gathered vocab.
+SHARDED_DRAFT = envs.ATOM_DSPARK_PROB_SHARDED
 
 # The runner clamps temperature 0 to SAMPLER_EPS (1e-10) and the sampler treats
 # exactly the rows at or below it as greedy (``_apply_greedy_tokens``); use the
@@ -84,11 +89,11 @@ _GREEDY_T = tl.constexpr(GREEDY_T)
 _RAND_MIN = tl.constexpr(4.6566127342e-10)
 # Top-p search: coarse bisection passes over the row, then the tokens left in
 # the bracket are compacted (<= _CAND_CAP) and the search finishes on them.
-_COARSE_ITERS = int(os.environ.get("ATOM_DSPARK_PROB_COARSE", "12"))
+_COARSE_ITERS = 12
 _FINE_ITERS = tl.constexpr(18)
-_CAND_CAP = int(os.environ.get("ATOM_DSPARK_PROB_CAP", "8192"))
-_VBLOCK = int(os.environ.get("ATOM_DSPARK_PROB_VBLOCK", "8192"))
-_NUM_WARPS = int(os.environ.get("ATOM_DSPARK_PROB_WARPS", "8"))
+_CAND_CAP = 8192
+_VBLOCK = 8192
+_NUM_WARPS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +195,9 @@ def _prob_markov_stage1(
     )
     z = base.to(tl.float32) + acc
     # q's logits, pre-temperature: verification rebuilds q from exactly these.
-    tl.store(q_out_ptr + offs_row[:, None] * stride_q_row + offs_v[None, :], z, mask=mask2)
+    tl.store(
+        q_out_ptr + offs_row[:, None] * stride_q_row + offs_v[None, :], z, mask=mask2
+    )
 
     temp = tl.load(temp_ptr + offs_row, mask=row_mask, other=1.0)
     greedy = temp <= _GREEDY_T
@@ -459,7 +466,10 @@ def _bisect_pass(row, V, inv_t, m, lo, mid, hi, BLOCK: tl.constexpr):
     c_hi = tl.zeros((BLOCK,), tl.int32)
     for start in range(0, V, BLOCK):
         offs = start + tl.arange(0, BLOCK)
-        y = tl.load(row + offs, mask=offs < V, other=float("-inf")).to(tl.float32) * inv_t
+        y = (
+            tl.load(row + offs, mask=offs < V, other=float("-inf")).to(tl.float32)
+            * inv_t
+        )
         ge = y >= mid
         accv += tl.where(ge, tl.exp(y - m), 0.0)
         c_lo += ((y >= lo) & (y < mid)).to(tl.int32)
@@ -469,8 +479,17 @@ def _bisect_pass(row, V, inv_t, m, lo, mid, hi, BLOCK: tl.constexpr):
 
 @triton.jit
 def _topp_threshold(
-    row, cand_ptr, V, inv_t, m, z, top_p, BLOCK: tl.constexpr, CAP: tl.constexpr,
-    MAX_COARSE: tl.constexpr, FBLOCK: tl.constexpr = 2048,
+    row,
+    cand_ptr,
+    V,
+    inv_t,
+    m,
+    z,
+    top_p,
+    BLOCK: tl.constexpr,
+    CAP: tl.constexpr,
+    MAX_COARSE: tl.constexpr,
+    FBLOCK: tl.constexpr = 2048,
 ):
     """(tau, zk): the largest tau with mass(>= tau) >= top_p z, and that mass.
 
@@ -499,7 +518,10 @@ def _topp_threshold(
     mhi_v = tl.zeros((BLOCK,), tl.float32)
     for start in range(0, V, BLOCK):
         offs = start + tl.arange(0, BLOCK)
-        y = tl.load(row + offs, mask=offs < V, other=float("-inf")).to(tl.float32) * inv_t
+        y = (
+            tl.load(row + offs, mask=offs < V, other=float("-inf")).to(tl.float32)
+            * inv_t
+        )
         e = tl.exp(y - m)
         inb = (y >= lo) & (y < hi)
         csum = tl.cumsum(inb.to(tl.int32), axis=0)
@@ -538,7 +560,17 @@ def _topp_threshold(
     return lo, zk
 
 
-@triton.jit(do_not_specialize=["num_spec_steps", "top_p_scalar", "q_width", "q_vs", "q_cols", "q_stride", "rank_id"])
+@triton.jit(
+    do_not_specialize=[
+        "num_spec_steps",
+        "top_p_scalar",
+        "q_width",
+        "q_vs",
+        "q_cols",
+        "q_stride",
+        "rank_id",
+    ]
+)
 def _verify_row_stats_kernel(
     target_ptr,  # [N, V]
     input_ids_ptr,
@@ -588,7 +620,7 @@ def _verify_row_stats_kernel(
     hasq = 0
     if greedy:
         if own_row:
-            lmax, amax = _row_max_argmax(row, V, BLOCK)
+            _, amax = _row_max_argmax(row, V, BLOCK)
             tl.store(out, amax.to(tl.float32))
     else:
         if own_row:
@@ -602,8 +634,16 @@ def _verify_row_stats_kernel(
             zk = z
             if top_p < 1.0:
                 tau, zk = _topp_threshold(
-                    row, cand_ptr + r.to(tl.int64) * (2 * CAP), V, inv_t, m, z, top_p,
-                    BLOCK, CAP, COARSE,
+                    row,
+                    cand_ptr + r.to(tl.int64) * (2 * CAP),
+                    V,
+                    inv_t,
+                    m,
+                    z,
+                    top_p,
+                    BLOCK,
+                    CAP,
+                    COARSE,
                 )
             lx = tl.load(row + xs).to(tl.float32) * inv_t
             px = tl.where(x_ok & (lx >= tau), tl.exp(lx - m) / zk, 0.0)
@@ -614,22 +654,21 @@ def _verify_row_stats_kernel(
             tl.store(out + 4, px)
 
         s_row = tl.load(src_ptr + req_idx)
-        if s_row >= 0:
-            if k < q_width:
-                qid = tl.load(q_ids_ptr + s_row * q_width + k)
-                tq = tl.load(q_temps_ptr + s_row).to(tl.float32)
-                if (qid == x) & x_ok & (tq > _GREEDY_T):
-                    inv_tq = 1.0 / tq
-                    qrow = q_ptr + (s_row.to(tl.int64) * q_width + k) * q_stride
-                    mq, zq, _ = _row_online_stats(qrow, q_cols, inv_tq, BLOCK)
-                    xl = x - q_vs
-                    own = (xl >= 0) & (xl < q_cols)
-                    dx = tl.load(qrow + tl.where(own, xl, 0)) * inv_tq
-                    dx = tl.where(own, dx, float("-inf"))
-                    tl.store(out + 5, mq)
-                    tl.store(out + 6, zq)
-                    tl.store(out + 7, dx)
-                    hasq = 1
+        if (s_row >= 0) & (k < q_width):
+            qid = tl.load(q_ids_ptr + s_row * q_width + k)
+            tq = tl.load(q_temps_ptr + s_row).to(tl.float32)
+            if (qid == x) & x_ok & (tq > _GREEDY_T):
+                inv_tq = 1.0 / tq
+                qrow = q_ptr + (s_row.to(tl.int64) * q_width + k) * q_stride
+                mq, zq, _ = _row_online_stats(qrow, q_cols, inv_tq, BLOCK)
+                xl = x - q_vs
+                own = (xl >= 0) & (xl < q_cols)
+                dx = tl.load(qrow + tl.where(own, xl, 0)) * inv_tq
+                dx = tl.where(own, dx, float("-inf"))
+                tl.store(out + 5, mq)
+                tl.store(out + 6, zq)
+                tl.store(out + 7, dx)
+                hasq = 1
     tl.store(hasq_ptr + r, hasq)
 
 
@@ -714,7 +753,10 @@ def _block_residual_mass_kernel(
             for st in range(0, q_cols, BLOCK):
                 offs = st + tl.arange(0, BLOCK)
                 mask = (offs < q_cols) & (q_vs + offs < V)
-                y = tl.load(row + offs, mask=mask, other=float("-inf")).to(tl.float32) * inv_t
+                y = (
+                    tl.load(row + offs, mask=mask, other=float("-inf")).to(tl.float32)
+                    * inv_t
+                )
                 p = tl.where(mask & (y >= tau), tl.exp(y - m) / zk, 0.0)
                 d = tl.load(qrow + offs, mask=mask, other=float("-inf")) * inv_tq
                 q = tl.where(mask, tl.exp(d - mq) / zq, 0.0)
@@ -842,7 +884,7 @@ def _prob_resample_kernel(
     as the fallback when the residual is all zero."""
     req_idx = tl.program_id(0)
     bs = tl.num_programs(0)
-    start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
+    start, _n = _req_span(cu_num_draft_tokens_ptr, req_idx)
     temp = tl.load(temps_ptr + req_idx).to(tl.float32)
     num_acc = tl.load(dec_ptr + req_idx).to(tl.int32)
     rejected = tl.load(dec_ptr + bs + req_idx) > 0.5
@@ -860,7 +902,9 @@ def _prob_resample_kernel(
         tau = _ts(rs_ptr, r, N, QTP, 2)
         zk = _ts(rs_ptr, r, N, QTP, 3)
         s_row = tl.maximum(tl.load(src_ptr + req_idx), 0)
-        inv_tq = 1.0 / tl.maximum(tl.load(q_temps_ptr + s_row).to(tl.float32), _GREEDY_T)
+        inv_tq = 1.0 / tl.maximum(
+            tl.load(q_temps_ptr + s_row).to(tl.float32), _GREEDY_T
+        )
         mq, zq, _ = _q_comb(rs_ptr, r, N, QTP)
         row = target_ptr + r.to(tl.int64) * V + q_vs
         qrow = q_ptr + (s_row.to(tl.int64) * q_width + num_acc) * q_stride
@@ -868,7 +912,10 @@ def _prob_resample_kernel(
             offs = st + tl.arange(0, BLOCK)
             gid = q_vs + offs
             mask = (offs < q_cols) & (gid < V)
-            y = tl.load(row + offs, mask=mask, other=float("-inf")).to(tl.float32) * inv_t
+            y = (
+                tl.load(row + offs, mask=mask, other=float("-inf")).to(tl.float32)
+                * inv_t
+            )
             p = tl.where(mask & (y >= tau), tl.exp(y - m) / zk, 0.0)
             if hq:
                 d = tl.load(qrow + offs, mask=mask, other=float("-inf")) * inv_tq
@@ -984,12 +1031,11 @@ def prob_rejection_sample(
     verdict = torch.empty((3, bs), dtype=torch.int32, device=device)
     if bs == 0:
         return output, verdict
-    f32 = dict(dtype=torch.float32, device=device)
+    f32 = {"dtype": torch.float32, "device": device}
     nrow = max(num_rows, 1)
     rs = torch.empty((nrow, 8), **f32)
     rm = torch.empty(nrow, **f32)
     hasq = torch.empty(nrow, dtype=torch.int32, device=device)
-    cand = torch.empty((nrow, 2 * _CAND_CAP), **f32)
     dec = torch.empty((3, bs), **f32)
     res = torch.empty((bs, 4), **f32)
     if isinstance(top_ps, torch.Tensor) and top_ps.numel() > 1:
@@ -999,6 +1045,11 @@ def prob_rejection_sample(
             top_ps = float(top_ps.item())
         top_p_ptr, has_ptr = temperatures, False
         top_p_scalar = 1.0 if top_ps is None else float(top_ps)
+    # Top-p candidate scratch (64 KB per row); never touched without top-p.
+    if has_ptr or top_p_scalar < 1.0:
+        cand = torch.empty((nrow, 2 * _CAND_CAP), **f32)
+    else:
+        cand = rs
     temps = temperatures.to(torch.float32)
     gather = (
         (lambda t: tp_group.all_gather(t, dim=0, use_custom=use_custom))
@@ -1127,7 +1178,7 @@ def prob_rejection_sample(
 # diagnostics (ATOM_DSPARK_PROB_DEBUG=N: every N verify steps, sync + torch)
 # ---------------------------------------------------------------------------
 
-PROB_DEBUG = int(os.environ.get("ATOM_DSPARK_PROB_DEBUG", "0") or 0)
+PROB_DEBUG = envs.ATOM_DSPARK_PROB_DEBUG
 _DBG_TDS = (1.0, 0.85, 0.7, 0.5)
 _dbg = {"calls": 0, "rows": 0, "rows0": 0}
 
@@ -1136,18 +1187,28 @@ def _nucleus_probs(logits_f32, temps_col, top_p):
     p = torch.softmax(logits_f32 / temps_col, dim=-1)
     if top_p is None or top_p >= 1.0:
         return p
-    sp, idx = torch.sort(p, dim=-1, descending=True)
+    sp, _ = torch.sort(p, dim=-1, descending=True)
     cs = torch.cumsum(sp, dim=-1)
     keep_sorted = (cs - sp) < top_p
-    thr = torch.where(keep_sorted, sp, torch.full_like(sp, 2.0)).min(dim=-1, keepdim=True).values
+    thr = (
+        torch.where(keep_sorted, sp, torch.full_like(sp, 2.0))
+        .min(dim=-1, keepdim=True)
+        .values
+    )
     p = torch.where(p >= thr, p, torch.zeros_like(p))
     return p / p.sum(dim=-1, keepdim=True)
 
 
 @torch.no_grad()
 def debug_acceptance(
-    target_logits, cu_num_draft_tokens, input_ids, target_logits_indices,
-    temperatures, top_ps, src, state,
+    target_logits,
+    cu_num_draft_tokens,
+    input_ids,
+    target_logits_indices,
+    temperatures,
+    top_ps,
+    src,
+    state,
 ):
     """Expected per-position acceptance of alternative drafting rules on the
     SAME (p, q) rows: greedy draft + sample match = p(argmax z); probabilistic
@@ -1212,10 +1273,11 @@ def debug_acceptance(
     _dbg["calls"] += 1
     if _dbg["calls"] % 20 == 0:
         n, n0 = max(_dbg["rows"], 1), max(_dbg["rows0"], 1)
-        msg = " ".join(
-            f"{k}={_dbg[k] / n:.4f}/{_dbg[k + '@0'] / n0:.4f}" for k in res
-        )
+        msg = " ".join(f"{k}={_dbg[k] / n:.4f}/{_dbg[k + '@0'] / n0:.4f}" for k in res)
         logger.info(
             "[DSpark prob dbg] rows=%d rows@k0=%d top_p=%.3f (all/k0) %s",
-            _dbg["rows"], _dbg["rows0"], top_p, msg,
+            _dbg["rows"],
+            _dbg["rows0"],
+            top_p,
+            msg,
         )

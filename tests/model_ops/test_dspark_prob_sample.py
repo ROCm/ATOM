@@ -8,16 +8,20 @@
    request, completed on the host with fresh target samples, must follow the
    joint target law (chi-square), including top-p and rows without q.
 
-Run: python test_dspark_prob_sample.py   (needs one GPU)
+Needs one GPU; skipped without triton / a device.
 """
 
 import itertools
 import math
-import sys
 import threading
 
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("triton")
+if not torch.cuda.is_available():
+    pytest.skip("needs a GPU", allow_module_level=True)
 
 from atom.model_ops.dspark_prob_sample import (
     ProbDraftState,
@@ -35,7 +39,7 @@ try:
     def chi2_sf(x, dof):
         return float(_chi2.sf(x, dof))
 
-except Exception:  # Wilson-Hilferty
+except ImportError:  # Wilson-Hilferty
 
     def chi2_sf(x, dof):
         z = ((x / dof) ** (1 / 3) - (1 - 2 / (9 * dof))) / math.sqrt(2 / (9 * dof))
@@ -68,7 +72,7 @@ def nucleus(logits, T, top_p):
     p = torch.softmax(logits.double() / T, -1)
     if top_p >= 1.0:
         return p
-    sp, idx = torch.sort(p, descending=True)
+    sp, _ = torch.sort(p, descending=True)
     cs = torch.cumsum(sp, -1)
     # keep tokens whose preceding cumulative mass < top_p
     keep_sorted = (cs - sp) < top_p
@@ -83,7 +87,8 @@ def nucleus(logits, T, top_p):
 # ---------------------------------------------------------------------------
 
 
-def test_draft(V=96, r=64, B=64, iters=1500, T=0.8):
+@pytest.mark.parametrize("T,iters", [(0.8, 1500), (1.0, 800)])
+def test_draft(T, iters, V=96, r=64, B=64):
     base = (torch.randn(B, V, device=DEV) * 1.5).to(torch.bfloat16)
     base[:] = base[0]  # identical rows => B samples per launch
     w1 = (torch.randn(V, r, device=DEV) * 0.15).to(torch.bfloat16)
@@ -106,11 +111,12 @@ def test_draft(V=96, r=64, B=64, iters=1500, T=0.8):
     zerr = (q - z_ref).abs().max().item()
     assert torch.equal(emb, w1[prev]), "markov embed mismatch"
     probs = torch.softmax(q[0].double() / T, -1).cpu().numpy()
-    stat, dof, pv, bad = chisq(counts.cpu().numpy(), probs)
-    print(f"[draft] V={V} T={T} n={int(counts.sum())} |z-zref|max={zerr:.2e} "
-          f"chi2={stat:.1f} dof={dof} p={pv:.3f} greedy_ok={greedy_ok}")
+    stat, dof, pv, _ = chisq(counts.cpu().numpy(), probs)
+    print(
+        f"[draft] V={V} T={T} n={int(counts.sum())} |z-zref|max={zerr:.2e} "
+        f"chi2={stat:.1f} dof={dof} p={pv:.3f} greedy_ok={greedy_ok}"
+    )
     assert zerr < 1e-3 and greedy_ok and pv > 1e-3
-    return pv
 
 
 def test_draft_tp(V=128, r=64, B=48, tp=4, iters=40, T=0.9):
@@ -136,14 +142,26 @@ def test_draft_tp(V=128, r=64, B=48, tp=4, iters=40, T=0.9):
             o = torch.empty(B, dtype=torch.int32, device=DEV)
             q = torch.empty(B, cols, dtype=torch.float32, device=DEV)
             e = torch.empty(B, r, dtype=torch.bfloat16, device=DEV)
-            prob_markov_sample(base[:, rk * cols:(rk + 1) * cols], prev, w1, w2, o, q,
-                               temps, seed, 1, e, vocab_start=rk * cols, tp_group=grp)
+            prob_markov_sample(
+                base[:, rk * cols : (rk + 1) * cols],
+                prev,
+                w1,
+                w2,
+                o,
+                q,
+                temps,
+                seed,
+                1,
+                e,
+                vocab_start=rk * cols,
+                tp_group=grp,
+            )
             return o, q
 
         res = run_ranks(tp, rank_fn)
         for rk, (o, q) in enumerate(res):
             assert torch.equal(o, res[0][0]), "ranks disagree"
-            assert (q - q1[:, rk * cols:(rk + 1) * cols]).abs().max().item() < 1e-4
+            assert (q - q1[:, rk * cols : (rk + 1) * cols]).abs().max().item() < 1e-4
         same += int((res[0][0] == out1).sum())
         tot += B
     print(f"[draft-tp] tp={tp} V={V} sharded==whole ids {same}/{tot}")
@@ -167,7 +185,9 @@ class ARModel:
 
     def _get(self, tab, prefix, scale):
         if prefix not in tab:
-            tab[prefix] = torch.randn(self.V, generator=self.g, dtype=torch.float64) * scale
+            tab[prefix] = (
+                torch.randn(self.V, generator=self.g, dtype=torch.float64) * scale
+            )
         return tab[prefix]
 
     def target_logits(self, prefix):
@@ -236,7 +256,9 @@ def run_ranks(world, fn):
     return outs
 
 
-def run_verify(model, n, R, T, top_p, use_block, hasq_frac=1.0, greedy=False, seed0=0, tp=1):
+def run_verify(
+    model, n, R, T, top_p, use_block, hasq_frac=1.0, greedy=False, seed0=0, tp=1
+):
     """Return list of completed (n+1)-token sequences and acceptance stats."""
     V = model.V
     gen = torch.Generator().manual_seed(1234 + seed0)
@@ -260,8 +282,11 @@ def run_verify(model, n, R, T, top_p, use_block, hasq_frac=1.0, greedy=False, se
         if greedy:
             bonus[i] = int(torch.argmax(model.target_logits(prefix)))
         else:
-            bonus[i] = int(torch.multinomial(
-                nucleus(model.target_logits(prefix), T, top_p), 1, generator=gen))
+            bonus[i] = int(
+                torch.multinomial(
+                    nucleus(model.target_logits(prefix), T, top_p), 1, generator=gen
+                )
+            )
     # input ids layout: per request [anchor, d0..d_{n-1}], target rows at 0..n-1
     tokens_per = n + 1
     input_ids = torch.zeros(R * tokens_per, dtype=torch.int32)
@@ -269,7 +294,9 @@ def run_verify(model, n, R, T, top_p, use_block, hasq_frac=1.0, greedy=False, se
     bli = torch.zeros(R, dtype=torch.int32)
     for i in range(R):
         input_ids[i * tokens_per] = 0
-        input_ids[i * tokens_per + 1: (i + 1) * tokens_per] = torch.from_numpy(drafts[i])
+        input_ids[i * tokens_per + 1 : (i + 1) * tokens_per] = torch.from_numpy(
+            drafts[i]
+        )
         for k in range(n):
             tli[i * n + k] = i * tokens_per + k
         bli[i] = i * tokens_per + n
@@ -279,13 +306,22 @@ def run_verify(model, n, R, T, top_p, use_block, hasq_frac=1.0, greedy=False, se
         drop = torch.rand(R, generator=gen) >= hasq_frac
         src[drop] = -1
     temps = torch.full((R,), 1e-10 if greedy else T, dtype=torch.float32, device=DEV)
-    args = (input_ids.to(DEV), tli.to(DEV), n, cu.to(DEV), tlog.to(DEV),
-            torch.from_numpy(bonus).to(torch.int32).to(DEV), bli.to(DEV), temps,
-            top_p if top_p < 1.0 else None, src.to(DEV))
+    args = (
+        input_ids.to(DEV),
+        tli.to(DEV),
+        n,
+        cu.to(DEV),
+        tlog.to(DEV),
+        torch.from_numpy(bonus).to(torch.int32).to(DEV),
+        bli.to(DEV),
+        temps,
+        top_p if top_p < 1.0 else None,
+        src.to(DEV),
+    )
 
     def make_state(vs, cols, world):
         st = ProbDraftState.allocate(R, n, V, DEV)
-        st.q[:R, :, :cols] = qlog[:, :, vs:vs + cols].to(DEV)
+        st.q[:R, :, :cols] = qlog[:, :, vs : vs + cols].to(DEV)
         st.ids[:R] = torch.from_numpy(drafts).to(torch.int32).to(DEV)
         st.temps[:R] = 1e-10 if greedy else T
         st.set_layout(vs, cols, world)
@@ -293,14 +329,22 @@ def run_verify(model, n, R, T, top_p, use_block, hasq_frac=1.0, greedy=False, se
         return st
 
     if tp == 1:
-        out, verdict = prob_rejection_sample(*args, make_state(0, V, 1), use_block=use_block)
+        out, verdict = prob_rejection_sample(
+            *args, make_state(0, V, 1), use_block=use_block
+        )
     else:
         cols = V // tp
         states = [make_state(rk * cols, cols, tp) for rk in range(tp)]
-        res = run_ranks(tp, lambda rk, grp: prob_rejection_sample(
-            *args, states[rk], use_block=use_block, tp_group=grp))
+        res = run_ranks(
+            tp,
+            lambda rk, grp: prob_rejection_sample(
+                *args, states[rk], use_block=use_block, tp_group=grp
+            ),
+        )
         for o, v in res[1:]:
-            assert torch.equal(o, res[0][0]) and torch.equal(v, res[0][1]), "ranks disagree"
+            assert torch.equal(o, res[0][0]) and torch.equal(
+                v, res[0][1]
+            ), "ranks disagree"
         out, verdict = res[0]
     out = out.cpu().numpy()
     verdict = verdict.cpu().numpy()
@@ -313,7 +357,7 @@ def run_verify(model, n, R, T, top_p, use_block, hasq_frac=1.0, greedy=False, se
         assert verdict[1, i] == n - na
         assert verdict[2, i] == bli[i].item() - n + na, "anchor row"
         if na < n:
-            assert all(t == -1 for t in out[i, na + 1:]), out[i]
+            assert all(t == -1 for t in out[i, na + 1 :]), out[i]
         seqs.append(emitted)
     return seqs, verdict[0]
 
@@ -327,7 +371,9 @@ def complete(model, seqs, L, T, top_p, greedy, gen):
             if greedy:
                 s.append(int(torch.argmax(pl)))
             else:
-                s.append(int(torch.multinomial(nucleus(pl, T, top_p), 1, generator=gen)))
+                s.append(
+                    int(torch.multinomial(nucleus(pl, T, top_p), 1, generator=gen))
+                )
         full.append(tuple(s))
     return full
 
@@ -346,13 +392,29 @@ def joint_probs(model, L, T, top_p):
     return probs
 
 
-def test_verify(use_block, top_p, hasq_frac=1.0, V=6, n=3, R=4096, rounds=12, T=1.0, L=3, tp=1):
+@pytest.mark.parametrize(
+    "use_block,top_p,hasq_frac,V,tp,rounds",
+    [
+        (False, 1.0, 1.0, 6, 1, 12),
+        (False, 0.8, 1.0, 6, 1, 12),
+        (False, 0.9, 0.5, 6, 1, 12),
+        (True, 1.0, 1.0, 6, 1, 12),
+        (True, 0.8, 1.0, 6, 1, 12),
+        (True, 0.9, 0.5, 6, 1, 12),
+        (False, 0.85, 1.0, 8, 4, 8),
+        (True, 0.85, 1.0, 8, 4, 8),
+        (False, 1.0, 0.5, 8, 4, 8),
+    ],
+)
+def test_verify(use_block, top_p, hasq_frac, V, tp, rounds, n=3, R=4096, T=1.0, L=3):
     model = ARModel(V, n, seed=11 if use_block else 7)
     gen = torch.Generator().manual_seed(99)
     allseq = []
     acc = []
     for rd in range(rounds):
-        seqs, na = run_verify(model, n, R, T, top_p, use_block, hasq_frac, seed0=rd + 1, tp=tp)
+        seqs, na = run_verify(
+            model, n, R, T, top_p, use_block, hasq_frac, seed0=rd + 1, tp=tp
+        )
         allseq += complete(model, seqs, L, T, top_p, False, gen)
         acc.append(na.mean())
     probs = joint_probs(model, L, T, top_p)
@@ -363,11 +425,12 @@ def test_verify(use_block, top_p, hasq_frac=1.0, V=6, n=3, R=4096, rounds=12, T=
         counts[idx[s]] += 1
     stat, dof, pv, bad = chisq(counts, [probs[k] for k in keys])
     name = "block" if use_block else "standard"
-    print(f"[verify-{name}] tp={tp} V={V} top_p={top_p} hasq={hasq_frac} n={len(allseq)} "
-          f"mean_accepted={np.mean(acc):.3f} chi2={stat:.1f} dof={dof} p={pv:.3f} "
-          f"zero-prob hits={int(bad)}")
+    print(
+        f"[verify-{name}] tp={tp} V={V} top_p={top_p} hasq={hasq_frac} n={len(allseq)} "
+        f"mean_accepted={np.mean(acc):.3f} chi2={stat:.1f} dof={dof} p={pv:.3f} "
+        f"zero-prob hits={int(bad)}"
+    )
     assert bad == 0 and pv > 1e-3
-    return np.mean(acc)
 
 
 def test_greedy(V=6, n=3, R=512):
@@ -378,8 +441,10 @@ def test_greedy(V=6, n=3, R=512):
         for t in s:
             assert t == int(torch.argmax(model.target_logits(tuple(prefix)))), s
             prefix.append(t)
-    print(f"[verify-greedy] R={R} all emitted tokens == target argmax chain, "
-          f"mean_accepted={na.mean():.3f}")
+    print(
+        f"[verify-greedy] R={R} all emitted tokens == target argmax chain, "
+        f"mean_accepted={na.mean():.3f}"
+    )
 
 
 def test_acceptance_gain(V=50, n=5, R=2048, T=1.0, top_p=0.95):
@@ -396,30 +461,21 @@ def test_acceptance_gain(V=50, n=5, R=2048, T=1.0, top_p=0.95):
         k = 0
         while k < n:
             x = int(torch.argmax(model.draft_logits(prefix)))
-            y = int(torch.multinomial(nucleus(model.target_logits(prefix), T, top_p), 1, generator=gen))
+            y = int(
+                torch.multinomial(
+                    nucleus(model.target_logits(prefix), T, top_p), 1, generator=gen
+                )
+            )
             if x != y:
                 break
             prefix += (x,)
             k += 1
         tot += k
-    print(f"[accept] V={V} n={n}: greedy-draft/match={tot / R:.3f} "
-          f"prob/standard={na_std.mean():.3f} prob/block={na_blk.mean():.3f}")
+    print(
+        f"[accept] V={V} n={n}: greedy-draft/match={tot / R:.3f} "
+        f"prob/standard={na_std.mean():.3f} prob/block={na_blk.mean():.3f}"
+    )
 
 
 if __name__ == "__main__":
-    test_draft()
-    test_draft(T=1.0, iters=800)
-    test_greedy()
-    test_verify(False, 1.0)
-    test_verify(False, 0.8)
-    test_verify(False, 0.9, hasq_frac=0.5)
-    test_verify(True, 1.0)
-    test_verify(True, 0.8)
-    test_verify(True, 0.9, hasq_frac=0.5)
-    test_draft_tp()
-    test_verify(False, 0.85, V=8, tp=4, rounds=8)
-    test_verify(True, 0.85, V=8, tp=4, rounds=8)
-    test_verify(False, 1.0, V=8, hasq_frac=0.5, tp=4, rounds=8)
-    test_acceptance_gain()
-    print("ALL PASSED")
-    sys.exit(0)
+    raise SystemExit(pytest.main([__file__, "-v", "-s"]))

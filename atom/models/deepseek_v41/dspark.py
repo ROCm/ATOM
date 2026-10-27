@@ -614,7 +614,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if sharded:
             base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B,T,V/tp]
             tp_group = get_tp_group()
-            st.set_layout(head.vocab_start_idx, base_logits.shape[-1], tp_group.world_size)
+            st.set_layout(
+                head.vocab_start_idx, base_logits.shape[-1], tp_group.world_size
+            )
         else:
             base_logits = head.get_logits(normed).view(B, T, -1)  # [B, T, V]
             tp_group = None

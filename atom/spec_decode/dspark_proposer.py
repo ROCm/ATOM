@@ -1,5 +1,4 @@
 import logging
-import os
 
 import torch
 import triton
@@ -68,28 +67,46 @@ class DSparkProposer(Drafter):
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
-        # Opt-in probabilistic drafting (ATOM_DSPARK_PROB_DRAFT=1). Allocated
-        # here, before any draft graph is captured, so the graph bakes these
-        # addresses; the model's head reads them through `_prob_draft`.
+        # Opt-in probabilistic drafting (ATOM_DSPARK_PROB_DRAFT=1); allocated in
+        # `load_model`, once the shared LM head is bound.
         self._prob_state = None
+
+    @property
+    def prob_state(self):
+        """The ``ProbDraftState`` shared with the runner's verification, or
+        None when probabilistic drafting is off."""
+        return self._prob_state
+
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
         if (
-            os.environ.get("ATOM_DSPARK_PROB_DRAFT", "0") == "1"
+            envs.ATOM_DSPARK_PROB_DRAFT
             and not self._with_draft
             and hasattr(type(self.model), "_head_and_sample_prob")
         ):
-            from atom.model_ops.dspark_prob_sample import ProbDraftState
+            self._init_prob_state()
 
-            self._prob_state = ProbDraftState.allocate(
-                int(self.config.max_num_seqs),
-                int(self.draft_tokens_per_seq),
-                int(self.model.vocab_size),
-                device,
-            )
-            self.model._prob_draft = self._prob_state
-            logger.info(
-                "DSpark probabilistic drafting ON (q buffer %s)",
-                tuple(self._prob_state.q.shape),
-            )
+    def _init_prob_state(self) -> None:
+        """Allocated before warmup and any draft graph capture: the memory
+        profile counts it and the graphs bake its addresses; the model's head
+        reads it through ``_prob_draft``. With the sharded draft head only this
+        rank's vocab columns are kept."""
+        from atom.model_ops.dspark_prob_sample import SHARDED_DRAFT, ProbDraftState
+
+        cols = int(self.model.vocab_size)
+        if SHARDED_DRAFT and self.model._sharded_markov_sample():
+            cols = int(self.model.head.weight.shape[0])
+        self._prob_state = ProbDraftState.allocate(
+            int(self.config.max_num_seqs),
+            int(self.draft_tokens_per_seq),
+            cols,
+            self.device,
+        )
+        self.model._prob_draft = self._prob_state
+        logger.info(
+            "DSpark probabilistic drafting ON (q buffer %s)",
+            tuple(self._prob_state.q.shape),
+        )
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.

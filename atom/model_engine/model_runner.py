@@ -3243,8 +3243,10 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
-        # ATOM_DSPARK_PROB_DRAFT=1: the drafter samples at these temperatures.
-        self._dspark_draft_temps = temperatures
+        # ATOM_DSPARK_PROB_DRAFT=1: the drafter samples at these temperatures,
+        # or greedily (None) when the next verification would not use its q.
+        prob_state = self._dspark_prob_state(top_ks)
+        self._dspark_draft_temps = temperatures if prob_state is not None else None
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3282,8 +3284,8 @@ class ModelRunner:
             # ATOM_DSPARK_PROB_DRAFT=1: probability-ratio verification against
             # the drafter's stored q (None => the existing path, unchanged).
             prob_src = None
-            if not all_greedy:
-                prob_src = self._dspark_prob_src(batch, top_ks)
+            if not all_greedy and prob_state is not None:
+                prob_src = prob_state.src_for(batch.req_ids, bs)
             if not all_greedy and prob_src is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
@@ -3305,6 +3307,8 @@ class ModelRunner:
             if prob_src is not None:
                 from atom.model_ops.dspark_prob_sample import (
                     BLOCK_VERIFY,
+                    PROB_DEBUG,
+                    debug_acceptance,
                     prob_rejection_sample,
                 )
 
@@ -3319,16 +3323,12 @@ class ModelRunner:
                     temperatures,
                     top_ps,
                     prob_src,
-                    self.drafter._prob_state,
+                    prob_state,
                     use_block=BLOCK_VERIFY,
                     tp_group=get_tp_group(),
                     use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
                 )
-                from atom.model_ops.dspark_prob_sample import PROB_DEBUG
-
-                if PROB_DEBUG and self.drafter._prob_state.verify_step % PROB_DEBUG == 0:
-                    from atom.model_ops.dspark_prob_sample import debug_acceptance
-
+                if PROB_DEBUG and prob_state.verify_step % PROB_DEBUG == 0:
                     debug_acceptance(
                         target_logits,
                         spec_decode_metadata.cu_num_draft_tokens,
@@ -3337,7 +3337,7 @@ class ModelRunner:
                         temperatures,
                         top_ps,
                         prob_src,
-                        self.drafter._prob_state,
+                        prob_state,
                     )
                 # Every rank computes the same verdict from identical inputs;
                 # align it with rank 0 anyway (sampled_tokens is broadcast
@@ -3651,18 +3651,18 @@ class ModelRunner:
             finished_sending=done_sending, finished_recving=done_recving
         )
 
-    def _dspark_prob_src(self, batch, top_ks):
-        """Device [bs] row of each request's stored q, or None when the
-        probabilistic verification does not apply (feature off, top-k set,
-        synthetic acceptance, no DSpark drafter)."""
-        prob_state = getattr(getattr(self, "drafter", None), "_prob_state", None)
+    def _dspark_prob_state(self, top_ks):
+        """The drafter's ``ProbDraftState`` when probability-ratio verification
+        applies to this batch, else None (feature off, top-k set, synthetic
+        acceptance, PCP > 1, no DSpark drafter)."""
+        prob_state = getattr(getattr(self, "drafter", None), "prob_state", None)
         if prob_state is None or top_ks is not None:
             return None
         if self.rejection_sampler.synthetic_acceptance_rates is not None:
             return None
         if get_pcp_world_size() > 1:
             return None
-        return prob_state.src_for(batch.req_ids, batch.total_seqs_num)
+        return prob_state
 
     def propose_draft_token_ids(
         self,
@@ -3728,7 +3728,7 @@ class ModelRunner:
         # same count.
         if draft_token is not None and get_pcp_world_size() > 1:
             draft_token = get_pcp_group().broadcast(draft_token.contiguous(), src=0)
-        prob_state = getattr(self.drafter, "_prob_state", None)
+        prob_state = getattr(self.drafter, "prob_state", None)
         if prob_state is not None:
             # Which request each row of the stored q belongs to; verification
             # of the next step uses it only if no other draft ran in between.
