@@ -664,3 +664,56 @@ def test_reachable_without_a_gpu_build():
             )
             if imported.startswith("atom."):
                 frontier.append(imported)
+
+
+@pytest.mark.parametrize("blocks_per_entry", [1, 8])
+def test_nvfp4_pd_regions_include_payload_and_all_scales(blocks_per_entry):
+    """A byte transfer between P/D reconstructs the NVFP4 + FP4-index views."""
+    block_size = 128
+    blocks = 2 * blocks_per_entry
+    extra = (
+        EntryField("index", 2, (block_size * blocks_per_entry * 64,), torch.uint8),
+        EntryField("index_scale", 2, (block_size * blocks_per_entry * 8,), torch.uint8),
+    )
+    kwargs = {
+        "layers": 2,
+        "num_kv_heads": 1,
+        "head_dim": 128,
+        "block_size": block_size,
+        "blocks_per_entry": blocks_per_entry,
+        "kv_dtype": FP8,
+        "kv_format": "nvfp4",
+        "extra_fields": extra,
+    }
+    producer, consumer = MhaKvPool(**kwargs), MhaKvPool(**kwargs)
+    producer.allocate(2, "cpu")
+    consumer.allocate(2, "cpu")
+    # Per layer/token: K/V 64+64 bytes, scales 8+8, index 64+8.
+    assert producer.pool_bytes(2) == blocks * 2 * block_size * 216
+    regions = producer.region_tensors()
+    assert len(regions) == 12
+    assert [name for name, _ in regions] == [
+        name for name, _ in consumer.region_tensors()
+    ]
+    for index, ((_, src), (_, dst)) in enumerate(
+        zip(regions, consumer.region_tensors())
+    ):
+        src.copy_(
+            torch.arange(src.numel(), dtype=torch.int64)
+            .reshape(src.shape)
+            .add(index)
+            .to(torch.uint8)
+        )
+        dst.copy_(src)
+    for layer in range(2):
+        for a, b in zip(producer.kv_views(layer), consumer.kv_views(layer)):
+            assert a.shape == (blocks, 1, 128, 64)
+            torch.testing.assert_close(a, b)
+        for a, b in zip(producer.scale_views(layer), consumer.scale_views(layer)):
+            assert a.shape == (blocks, 1, 128, 8)
+            torch.testing.assert_close(a, b)
+        for name, width in (("index", 64), ("index_scale", 8)):
+            torch.testing.assert_close(
+                producer.field_view(name, layer, torch.uint8, (blocks, 128, width)),
+                consumer.field_view(name, layer, torch.uint8, (blocks, 128, width)),
+            )
