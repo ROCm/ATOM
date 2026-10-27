@@ -2936,6 +2936,13 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.tensor_parallel_rank > 0:
+        # The node that runs TP rank 0 serves the API; this one only runs the
+        # workers of its own ranks.
+        from atom.model_engine.tp_multinode import serve_remote_tp_ranks
+
+        raise SystemExit(serve_remote_tp_ranks(EngineArgs.from_cli_args(args)))
+
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
         _request_logger.setLevel(logging.INFO)

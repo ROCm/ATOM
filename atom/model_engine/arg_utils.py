@@ -119,6 +119,8 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    tensor_parallel_size_local: int | None = None
+    tensor_parallel_rank: int = 0
     decode_context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
@@ -209,6 +211,28 @@ class EngineArgs:
             type=int,
             default=1,
             help="Tensor parallel size.",
+        )
+        parser.add_argument(
+            "--tensor-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of tensor-parallel ranks to run on THIS node. Defaults "
+                "to --tensor-parallel-size (single-node). Set it lower to "
+                "spread one TP group over several nodes; every node then needs "
+                "--data-parallel-master-ip of the node that runs TP rank 0 and "
+                "the same --data-parallel-base-port."
+            ),
+        )
+        parser.add_argument(
+            "--tensor-parallel-rank",
+            type=int,
+            default=0,
+            help=(
+                "First tensor-parallel rank owned by this node. Node 0 uses 0 "
+                "and serves the API; the second node of a 2x4 run uses 4 and "
+                "runs only its model-runner workers."
+            ),
         )
         parser.add_argument(
             "--pipeline-parallel-size",
@@ -908,6 +932,8 @@ class EngineArgs:
             "data_parallel_rank": kwargs.pop("data_parallel_rank"),
             "data_parallel_master_ip": kwargs.pop("data_parallel_master_ip"),
             "data_parallel_master_port": kwargs.pop("data_parallel_master_port"),
+            "tensor_parallel_size_local": kwargs.pop("tensor_parallel_size_local"),
+            "tensor_parallel_rank": kwargs.pop("tensor_parallel_rank"),
         }
         base_port = kwargs.pop("data_parallel_base_port")
         if base_port is not None:

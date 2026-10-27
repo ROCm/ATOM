@@ -324,8 +324,8 @@ class CoreManager:
         pc = config.parallel_config
         if multinode and pc.data_parallel_base_port == 0:
             raise ValueError(
-                "Multi-node DP requires the same nonzero --data-parallel-base-port "
-                "(or ATOM_DP_BASE_PORT) on every node."
+                "Multi-node DP or TP requires the same nonzero "
+                "--data-parallel-base-port (or ATOM_DP_BASE_PORT) on every node."
             )
         if not multinode or pc.data_parallel_rank == 0:
             store = TCPStore(
@@ -424,7 +424,9 @@ class CoreManager:
         local_dp_ranks = []
 
         try:
-            self._start_distributed_store(config, multinode=multinode)
+            self._start_distributed_store(
+                config, multinode=multinode or config.is_multinode_tp
+            )
             for engine_index in range(self.local_engine_count):
                 assignment_index = engine_index // self.pp_size
                 dp_rank, local_dp_rank = rank_assignments[assignment_index]

@@ -9,6 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
 
@@ -164,6 +165,21 @@ mono_decode_installers = {
         "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
     ),
 }
+
+
+def managed_store_client_kwargs(config) -> dict:
+    """Extra arguments for a rank's client of the CoreManager's TCPStore.
+
+    Every NCCL communicator created on first use takes its unique id from this
+    store. When the TP group spans nodes, its trays reach such a collective
+    apart by as much as their checkpoint loads differ (13 minutes on a tray
+    that cannot page-cache the checkpoint), so torch's default 300 s wait aborts
+    the start. Such a rank waits as long as the rest of the cross-node TP setup
+    does instead.
+    """
+    if config.is_multinode_tp:
+        return {"timeout": timedelta(seconds=envs.ATOM_MULTINODE_TP_TIMEOUT_S)}
+    return {}
 
 
 def max_schedulable_decode_bs(
@@ -1036,7 +1052,8 @@ class ModelRunner:
         # tp_world_size: how many GPUs this stage actually occupies.
         stage_span = config.tp_world_size * config.prefill_context_parallel_size
         engine_index = dp_rank_local * pp_size + pp_rank
-        local_device_rank = engine_index * stage_span + rank
+        # A TP group that spans nodes has its ranks from tp_rank_start on here.
+        local_device_rank = engine_index * stage_span + rank - config.tp_rank_start
         num_gpus = torch.cuda.device_count()
         if local_device_rank >= num_gpus:
             raise ValueError(
@@ -1066,13 +1083,15 @@ class ModelRunner:
             and not torch.distributed.is_initialized()
         ):
             # Preserve AITER's environment setup when preinitializing its group.
+            visible = config.tp_size_local if config.is_multinode_tp else world_size
             os.environ.setdefault(
-                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(world_size)))
+                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(visible)))
             )
             store = torch.distributed.TCPStore(
                 config.parallel_config.data_parallel_master_ip,
                 config.parallel_config.data_parallel_base_port,
                 is_master=False,
+                **managed_store_client_kwargs(config),
             )
             torch.distributed.init_process_group(
                 backend="nccl", store=store, rank=global_rank, world_size=world_size
@@ -1946,7 +1965,11 @@ class ModelRunner:
         # single source for every entry count, so it must never disagree with
         # the number the pool is actually built at.
         num_kvcache_blocks = plan.paged_entries
-        if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+        # Only rank 0's answer reaches the scheduler; ranks on another node can
+        # have less memory free.
+        if (
+            config.pipeline_parallel_size > 1 or config.is_multinode_tp
+        ) and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
             )
