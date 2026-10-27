@@ -61,6 +61,39 @@ SCORE_CHUNK_CTAS_PER_CU = 8
 # short-context rows, which is not where a step spends its time.
 SCORE_NUM_STAGES = 3
 DECODE_SCORE_NUM_STAGES = 3
+
+
+@functools.cache
+def _runtime_gfx(device_index: int) -> str:
+    return (
+        torch.cuda.get_device_properties(device_index)
+        .gcnArchName.split(":", 1)[0]
+        .lower()
+    )
+
+
+@functools.cache
+def _prefill_score_launch_config(
+    dtype: torch.dtype, device_index: int
+) -> tuple[int, int]:
+    """Return (warps, stages) without changing the tuned gfx950 path."""
+    if _runtime_gfx(device_index) != "gfx1250":
+        return 4, SCORE_NUM_STAGES
+
+    # Triton's default four warps mean 256 lanes on gfx950 (wave64), but only
+    # 128 on gfx1250 (wave32).  The 128x128 fp32 accumulator then doubles from
+    # 64 to 128 values per lane and spills heavily.  Eight wave32 warps restore
+    # the original lane count.  FP8 also prefers one pipeline stage on gfx1250;
+    # keep the existing setting for the supported BF16 fallback.
+    fp8_dtypes = (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    return 8, 1 if dtype in fp8_dtypes else SCORE_NUM_STAGES
+
+
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
 # floors the blocks a chunk walks -- the query tile is loaded once outside the
 # block loop, so at one block per chunk that fixed cost is the whole cost.
@@ -1150,6 +1183,12 @@ def minimax_m3_index_topk(
         batch * num_idx_heads,
         triton.cdiv(max_block, chunk_blocks),
     )
+    device_index = idx_q.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    score_num_warps, score_num_stages = _prefill_score_launch_config(
+        index_kv_cache.dtype, device_index
+    )
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1174,7 +1213,8 @@ def minimax_m3_index_topk(
         block_table.stride(0),
         BLOCK_SIZE_Q=SCORE_BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_stages=SCORE_NUM_STAGES,
+        num_warps=score_num_warps,
+        num_stages=score_num_stages,
     )
 
     topk_idx = torch.empty(

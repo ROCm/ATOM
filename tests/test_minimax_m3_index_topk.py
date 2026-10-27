@@ -42,6 +42,23 @@ from atom.model_ops.minimax_m3.index_topk import (
 TOPK = 16
 
 
+@pytest.mark.parametrize(
+    "arch,dtype,want",
+    [
+        ("gfx950", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
+        ("gfx1250", torch.bfloat16, (8, m.SCORE_NUM_STAGES)),
+        ("gfx1250", torch.float8_e4m3fnuz, (8, 1)),
+    ],
+)
+def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
+    monkeypatch.setattr(m, "_runtime_gfx", lambda _device_index: arch)
+    m._prefill_score_launch_config.cache_clear()
+    try:
+        assert m._prefill_score_launch_config(dtype, 0) == want
+    finally:
+        m._prefill_score_launch_config.cache_clear()
+
+
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
