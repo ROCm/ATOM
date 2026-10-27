@@ -217,6 +217,46 @@ def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
         offcfg.build_page_namespace(config, _lmcache_config(), 4)
 
 
+def _qwen38_config(*, image_input: bool):
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "qwen4_exp"
+    config.hf_config.text_config = SimpleNamespace(
+        model_type="qwen4_exp_text", num_attention_heads=32
+    )
+    config.multimodal_config = SimpleNamespace() if image_input else None
+    return config
+
+
+def test_qwen38_page_namespace_separates_image_input():
+    """With image input Qwen3.8 caches `rope_positions` too, so one checkpoint
+    stores two byte layouts; a shared tier must not read one as the other."""
+    text_only = offcfg.build_page_namespace(
+        _qwen38_config(image_input=False), _lmcache_config(), 1
+    )
+    images = offcfg.build_page_namespace(
+        _qwen38_config(image_input=True), _lmcache_config(), 1
+    )
+    assert text_only != images
+    assert text_only == offcfg.build_page_namespace(
+        _qwen38_config(image_input=False), _lmcache_config(), 1
+    )
+
+
+@pytest.mark.parametrize("model_type", [None, "qwen3_5_moe_text"])
+def test_image_input_leaves_other_page_namespaces_unchanged(model_type):
+    # Their segment set does not depend on it: keying it would only split a
+    # tier that text-only and image servers can share, and orphan what is
+    # already stored.
+    config = _config()
+    if model_type is not None:
+        config.hf_config.compress_ratios = None
+        config.hf_config.model_type = model_type
+    before = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    config.multimodal_config = SimpleNamespace()
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == before
+
+
 @pytest.mark.parametrize(
     "model_type",
     ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],

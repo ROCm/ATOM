@@ -140,7 +140,9 @@ class DenseKVByteCodec:
                 getattr(kvt, "index_scale", None),
                 # Qwen3.8 QSA. Same rule: new tails, never a reorder. Absent
                 # tensors stay out, so a model that does not set them keeps
-                # the byte layout it already stored.
+                # the byte layout it already stored. Within Qwen3.8,
+                # `rope_positions` exists only with image input on, so
+                # `build_page_namespace` keys that switch (`image_input`).
                 getattr(kvt, "index_raw", None),
                 getattr(kvt, "index_compressed", None),
                 getattr(kvt, "rope_positions", None),
