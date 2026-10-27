@@ -126,6 +126,7 @@ exports = {
     "BACKEND": cell["backend"],
     "DOCKER_IMAGE": cell["image"],
     "MODEL_PATH": cell["model_path"],
+    "MODEL_SERVED_NAME": server_args.get("served_model_name", ""),
     "PRECISION": cell.get("precision", ""),
     "TOPOLOGY": cell["topology"],
     "DISPLAY_TOPOLOGY": cell.get("display_topology", cell["topology"]),
@@ -143,6 +144,7 @@ exports = {
     "AIPERF_DIR": benchmark.get("aiperf_dir", ""),
     "AIPERF_VENV": benchmark.get("aiperf_venv", ""),
     "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
+    "AIPERF_AGENTX_VERSION": benchmark.get("agentx_version", ""),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
     "AIPERF_APPLY_CHAT_TEMPLATE": str(

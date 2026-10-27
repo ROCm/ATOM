@@ -190,6 +190,7 @@ resolve_model_path() {
   fi
 }
 MODEL_PATH="$(resolve_model_path "${MODEL_PATH}")"
+MODEL_SERVED_NAME="${MODEL_SERVED_NAME:-${MODEL_PATH}}"
 DRAFT_MODEL_PATH="$(resolve_model_path "${DRAFT_MODEL_PATH}")"
 
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
@@ -275,7 +276,12 @@ WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 
 BENCHMARK_KIND="${BENCHMARK_KIND:-random}"
 AIPERF_DIR="${AIPERF_DIR:-/tmp/atomesh-aiperf}"
-AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
+AIPERF_AGENTX_VERSION="${AIPERF_AGENTX_VERSION:-}"
+if [[ -n "${AIPERF_AGENTX_VERSION}" ]]; then
+  AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-agentx-${AIPERF_AGENTX_VERSION}-venv}"
+else
+  AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
+fi
 AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
@@ -748,6 +754,7 @@ fi
 
 server_common=(
   --model "${MODEL_PATH}"
+  --served-model-name "${MODEL_SERVED_NAME}"
   --host 0.0.0.0
   --trust-remote-code
   --kv_cache_dtype "${KV_CACHE_DTYPE}"
@@ -2167,6 +2174,19 @@ run_benchmark() {
 }
 
 ensure_aiperf() {
+  if [[ -n "${AIPERF_AGENTX_VERSION:-}" ]]; then
+    local installed=""
+    if [[ -x "${AIPERF_VENV}/bin/agentx" ]]; then
+      installed="$("${AIPERF_VENV}/bin/python" -c \
+        'from importlib.metadata import version; print(version("agentx-harness"))' 2>/dev/null || true)"
+    fi
+    if [[ "${installed}" != "${AIPERF_AGENTX_VERSION}" ]]; then
+      python3 -m venv "${AIPERF_VENV}"
+      "${AIPERF_VENV}/bin/python" -m pip install "agentx-harness==${AIPERF_AGENTX_VERSION}"
+    fi
+    "${AIPERF_VENV}/bin/agentx" --version
+    return
+  fi
   local current_commit=""
   if [[ -d "${AIPERF_DIR}/.git" ]]; then
     current_commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || true)"
@@ -2385,6 +2405,57 @@ wait_for_torch_traces() {
   done
 }
 
+# AgentX uses its own scenario defaults, matching recipe #2747. Keeping the
+# command in one builder also lets CPU tests inspect the actual launch argv.
+build_agentic_client_command() {
+  local -n out="$1"
+  local conc="$2" out_dir="$3"
+  if [[ -n "${AIPERF_AGENTX_VERSION:-}" ]]; then
+    out=(
+      "${AIPERF_VENV}/bin/agentx" profile
+      --url "http://127.0.0.1:${ROUTER_PORT}"
+      --model "${MODEL_SERVED_NAME}"
+      --tokenizer "${MODEL_PATH}" --tokenizer-trust-remote-code
+      --concurrency "${conc}" --benchmark-duration "${AIPERF_BENCHMARK_DURATION}"
+      "${server_metrics_args[@]}"
+      --public-dataset "${AIPERF_PUBLIC_DATASET}"
+      --output-artifact-dir "${out_dir}"
+    )
+  else
+    out=(
+      "${AIPERF_VENV}/bin/aiperf" profile
+      "${unsafe_args[@]}"
+      --scenario "${AIPERF_SCENARIO}"
+      --url "http://127.0.0.1:${ROUTER_PORT}"
+      --endpoint /v1/chat/completions
+      --endpoint-type chat
+      --streaming
+      --model "${MODEL_SERVED_NAME}"
+      --concurrency "${conc}"
+      --benchmark-duration "${AIPERF_BENCHMARK_DURATION}"
+      --stats-interval 30
+      --random-seed 42
+      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}"
+      --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}"
+      --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}"
+      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}"
+      --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}"
+      --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}"
+      --use-server-token-count
+      --no-gpu-telemetry
+      --tokenizer "${MODEL_PATH}"
+      --tokenizer-trust-remote-code
+      "${chat_template_args[@]}"
+      --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}"
+      --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}"
+      --slice-duration "${AIPERF_SLICE_DURATION}"
+      "${server_metrics_args[@]}"
+      --output-artifact-dir "${out_dir}"
+      --public-dataset "${AIPERF_PUBLIC_DATASET}"
+    )
+  fi
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
 
@@ -2454,43 +2525,24 @@ run_aiperf_agentic_benchmark() {
         > >(tee "${out_dir}/torch_profile.log") 2>&1 &
       profile_pid=$!
     fi
-    AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
-    AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
-    AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
-    AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
-    AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
-    AIPERF_UI_REALTIME_METRICS_ENABLED=true \
+    local -a benchmark_cmd=() client_env=(env)
+    build_agentic_client_command benchmark_cmd "${conc}" "${out_dir}"
+    client_env+=("AIPERF_HTTP_TCP_USER_TIMEOUT=${AIPERF_HTTP_TCP_USER_TIMEOUT}")
+    if [[ -n "${AIPERF_AGENTX_VERSION:-}" ]]; then
+      client_env+=("AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom:")
+    else
+      client_env+=(
+        "AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}"
+        "AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}"
+        "AIPERF_DATASET_CONFIGURATION_TIMEOUT=${AIPERF_DATASET_CONFIGURATION_TIMEOUT}"
+        "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}"
+        "AIPERF_UI_REALTIME_METRICS_ENABLED=true"
+      )
+    fi
+    "${client_env[@]}" \
       python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
       --output "${out_dir}/metrics" "${report_args[@]}" -- \
-      "${AIPERF_VENV}/bin/aiperf" profile \
-      "${unsafe_args[@]}" \
-      --scenario "${AIPERF_SCENARIO}" \
-      --url "http://127.0.0.1:${ROUTER_PORT}" \
-      --endpoint /v1/chat/completions \
-      --endpoint-type chat \
-      --streaming \
-      --model "${MODEL_PATH}" \
-      --concurrency "${conc}" \
-      --benchmark-duration "${AIPERF_BENCHMARK_DURATION}" \
-      --stats-interval 30 \
-      --random-seed 42 \
-      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}" \
-      --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}" \
-      --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}" \
-      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \
-      --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}" \
-      --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}" \
-      --use-server-token-count \
-      --no-gpu-telemetry \
-      --tokenizer "${MODEL_PATH}" \
-      --tokenizer-trust-remote-code \
-      "${chat_template_args[@]}" \
-      --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}" \
-      --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}" \
-      --slice-duration "${AIPERF_SLICE_DURATION}" \
-      "${server_metrics_args[@]}" \
-      --output-artifact-dir "${out_dir}" \
-      --public-dataset "${AIPERF_PUBLIC_DATASET}" \
+      "${benchmark_cmd[@]}" \
       > >(tee "${out_dir}/aiperf.log") 2>&1 &
     local aiperf_pid=$!
     echo "${aiperf_pid}" > "${aiperf_pid_file}"
@@ -2576,7 +2628,7 @@ run_swebench_lite_eval() {
     bash "${runner}" \
       --output-dir "${result_dir}" \
       --model-name "${MODEL_NAME}" \
-      --api-model "${MODEL_PATH}" \
+      --api-model "${MODEL_SERVED_NAME}" \
       --api-base "http://127.0.0.1:${ROUTER_PORT}/v1" \
       --run-id "${tag}" \
       --limit "${EVAL_LIMIT:-full}" \
@@ -2660,9 +2712,9 @@ run_eval() {
   fi
   local eval_model_args_base
   if [[ "${EVAL_MODEL_TYPE}" == "local-chat-completions" ]]; then
-    eval_model_args_base="model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
+    eval_model_args_base="model=${MODEL_SERVED_NAME},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
   else
-    eval_model_args_base="model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
+    eval_model_args_base="model=${MODEL_SERVED_NAME},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
     eval_model_args_extra="${eval_model_args_extra},tokenized_requests=False,trust_remote_code=True"
   fi
 
