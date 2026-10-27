@@ -1,45 +1,75 @@
 #!/usr/bin/env python3
-"""Copy bounded logs of one native M3 vLLM run from shared NFS; no GPU job."""
+"""Publish only whitelisted numeric/boolean status for one known experiment.
+
+Never copies logs, environment, scheduler text, arbitrary JSON, or file contents.
+No Slurm submission, SSH, container action, or shared-filesystem write occurs.
+"""
 import json
 import os
-import shutil
-import subprocess
+import re
 from pathlib import Path
 
 run_id = os.environ['ATOMESH_ENV_ATOMESH_INSPECT_RUN_ID']
-if run_id != 'latest' and not run_id.isdecimal():
-    raise ValueError('Inspection requires a numeric Actions run ID')
-root = Path(os.environ['SLURM_LOG_ROOT'])
+if not run_id.isdecimal():
+    raise ValueError('Status inspection requires a numeric Actions run ID')
+root = Path(os.environ['SLURM_LOG_ROOT']).resolve()
 out = Path(os.environ['RESULT_DIR']) / 'inspection'
 out.mkdir(parents=True, exist_ok=True)
-runs = sorted(root.glob('*m31-vllm-1p1d-tp4-mcstore-*-mooncake_store-*' if run_id == 'latest' else f'*m31-vllm-*-{run_id}-*'))
-if run_id == 'latest' and runs:
-    runs = [max(runs, key=lambda p: p.stat().st_mtime)]
-if not runs:
-    raise RuntimeError(f'No native M3 vLLM run {run_id} in {root}')
-index = []
+# Exact task namespace and Actions ID; only its timestamp suffix is variable.
+prefix = f'minimax-m3.1-flash-vllm-m31-vllm-1p1d-tp4-mcstore-smoke-mooncake_store-{run_id}-'
+runs = [p for p in root.glob(prefix + '*')
+        if p.parent.resolve() == root and p.name[len(prefix):].isdecimal()]
+rows = []
 for run in runs:
-    for p in sorted(run.rglob('*')):
-        if not p.is_file() or p.suffix not in {'.log', '.out', '.err', '.json', '.prom', '.rc'}:
+    for job in run.glob('slurm_job-*'):
+        job_id = job.name.removeprefix('slurm_job-')
+        if not job_id.isdecimal() or job.resolve().parent != run.resolve():
             continue
-        # Never copy environment/credential files or unbounded binary artifacts.
-        if 'env' in p.name or 'token' in p.name or 'secret' in p.name:
-            continue
-        dest = out / run.name / p.relative_to(run)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with p.open('rb') as source:
-            source.seek(max(0, p.stat().st_size - 131072))
-            dest.write_bytes(source.read(131072))
-        index.append({'path': str(p), 'size': p.stat().st_size, 'copied': str(dest)})
-    ids = [p.name.removeprefix('slurm_job-') for p in run.glob('slurm_job-*')
-           if p.name.removeprefix('slurm_job-').isdecimal()]
-    if ids and shutil.which('squeue'):
-        result = subprocess.run(['squeue', '-j', ','.join(ids), '-o', '%i %j %T %R'],
-                                capture_output=True, text=True, timeout=20)
-        (out / 'squeue.txt').write_text(result.stdout + result.stderr)
-(out / 'index.json').write_text(json.dumps(index, indent=2) + '\n')
-print(f'READ-ONLY INSPECTION: Actions {run_id}, {len(runs)} directories, {len(index)} files; no sbatch')
-for row in index:
-    if row['path'].endswith(('prefill.log', 'decode.log', 'container.log', '.err')):
-        print(row['path'])
-        print(Path(row['copied']).read_text(errors='replace')[-6000:])
+        row = {'actions_run_id': int(run_id), 'slurm_job_id': int(job_id),
+               'image_preflight_complete': (job / 'image-hardware.json').is_file(),
+               'model_snapshot_resolved': (job / 'resolved-experiment.json').is_file()}
+        for role in ('prefill', 'decode', 'proxy', 'mooncake-master'):
+            log = job / 'logs' / f'{role}.log'
+            row[role + '_log_exists'] = log.is_file()
+            if log.is_file():
+                row[role + '_log_bytes'] = log.stat().st_size
+                with log.open('rb') as source:
+                    source.seek(max(0, log.stat().st_size - 131072))
+                    tail = source.read(131072).decode(errors='replace')
+                for name, marker in {'traceback': 'Traceback (most recent call last)',
+                    'engine_failure': 'Engine core initialization failed',
+                    'ready': 'Application startup complete',
+                    'out_of_memory': 'out of memory',
+                    'mr_failure': 'ibv_reg_mr failed'}.items():
+                    row[f'{role}_{name}'] = marker in tail
+        memory_file = job / 'memory-before-download.json'
+        if memory_file.is_file():
+            memory = json.loads(memory_file.read_text())
+            for key in ('memory.max', 'memory.current', 'memory.peak'):
+                value = str(memory.get(key, '')).strip()
+                if value.isdecimal():
+                    row[key] = int(value)
+                elif value == 'max':
+                    row[key] = 'max'
+            for line in str(memory.get('memory.events', '')).splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in {'low', 'high', 'max', 'oom', 'oom_kill', 'oom_group_kill'} and parts[1].isdecimal():
+                    row['memory.events.' + parts[0]] = int(parts[1])
+        state_file = job / 'rank-0/docker-state.json'
+        if state_file.is_file():
+            state = json.loads(state_file.read_text())
+            for key in ('OOMKilled', 'Running', 'ExitCode'):
+                if type(state.get(key)) in (int, bool):
+                    row['container_' + key] = state[key]
+        container_log = job / 'rank-0/container.log'
+        if container_log.is_file():
+            with container_log.open('rb') as source:
+                source.seek(max(0, container_log.stat().st_size - 131072))
+                tail = source.read(131072).decode(errors='replace')
+            progress = re.findall(r'Fetching\s+\d+ files:[^\r\n]*?\|\s*(\d+)/(\d+)', tail)
+            if progress:
+                row['download_files_done'], row['download_files_total'] = map(int, progress[-1])
+        rows.append(row)
+result = {'kind': 'experiment_status_only', 'actions_run_id': int(run_id), 'jobs': rows}
+(out / 'status.json').write_text(json.dumps(result, indent=2) + '\n')
+print(json.dumps(result, indent=2))
