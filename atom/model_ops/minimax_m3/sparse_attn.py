@@ -20,6 +20,7 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
+from aiter.ops.attention import pa_fwd_asm_supports_arch
 
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
 
@@ -241,7 +242,6 @@ def _sparse_pa_ran_on_asm(
     """
     from atom.model_ops.base_attention import (
         PA_ASM_MAX_QUERY_GROUP_SIZE,
-        pa_fwd_asm_supports_arch,
         run_pa_fwd_asm,
     )
 

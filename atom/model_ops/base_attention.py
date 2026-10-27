@@ -11,6 +11,9 @@ from abc import ABC, abstractmethod
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.gluon.pa_decode_gluon import (
+    pa_decode_gluon_supports_arch,
+)
 from torch import nn
 
 from atom.config import get_current_atom_config
@@ -128,26 +131,6 @@ def gluon_decode_over_limit(max_qlen: int, num_heads: int, num_kv_heads: int) ->
         16 // qlen_p2, 1 << (num_heads // num_kv_heads - 1).bit_length()
     )
     return max_qlen > PA_GLUON_MAX_QUERY_LEN or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
-
-
-# aiter ships pa_decode_gluon and pa_fwd_asm for these only (not gfx1250).
-_GLUON_ASM_PA_ARCHS = ("gfx942", "gfx950")
-
-
-@functools.cache
-def gluon_decode_supports_arch() -> bool:
-    """Whether aiter's pa_decode_gluon supports the current GPU."""
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return get_gfx_runtime() in _GLUON_ASM_PA_ARCHS
-
-
-@functools.cache
-def pa_fwd_asm_supports_arch() -> bool:
-    """Whether aiter ships pa_fwd_asm kernels for the current GPU."""
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return get_gfx_runtime() in _GLUON_ASM_PA_ARCHS
 
 
 def run_pa_fwd_asm(
@@ -311,7 +294,7 @@ def _flydsl_pa_decode_num_seqs(
     if not (is_fp8_kv or is_bf16_kv):
         return None
     # BF16 KV stays on gluon where gluon exists.
-    if is_bf16_kv and gluon_decode_supports_arch():
+    if is_bf16_kv and pa_decode_gluon_supports_arch():
         return None
     x = 8 if is_bf16_kv else 16
     if k_cache.dim() != 5 or k_cache.shape[-1] != x:
@@ -764,7 +747,7 @@ def run_pa_decode(
             max_context_length=context_bound,
         )
 
-    if not gluon_decode_supports_arch():
+    if not pa_decode_gluon_supports_arch():
         raise RuntimeError(
             "This GPU has no gluon paged decode: set ATOM_PA_FLYDSL=1"
             if not envs.ATOM_PA_FLYDSL

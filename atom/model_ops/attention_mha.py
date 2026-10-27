@@ -9,6 +9,7 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
 from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 
@@ -19,7 +20,6 @@ from atom.model_ops.base_attention import (
     dense_decode_splits,
     flydsl_decode_seqs,
     gluon_decode_over_limit,
-    gluon_decode_supports_arch,
     run_pa_decode,
     run_pa_fwd_asm,
 )
@@ -593,7 +593,7 @@ class PagedAttentionImpl(nn.Module):
     def _shuffle_v_for_flydsl(self, v_cache, k_cache):
         # FlyDSL on gfx1250 reads a 4D V as the plain layout; this cache is
         # SHUFFLE, so pass its 5D view. gluon takes the 4D view as it always has.
-        if gluon_decode_supports_arch() or v_cache.dim() != 4 or k_cache.dim() != 5:
+        if pa_decode_gluon_supports_arch() or v_cache.dim() != 4 or k_cache.dim() != 5:
             return v_cache
         return self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
@@ -604,7 +604,7 @@ class PagedAttentionImpl(nn.Module):
         """
         if (
             envs.ATOM_USE_UNIFIED_ATTN
-            or gluon_decode_supports_arch()
+            or pa_decode_gluon_supports_arch()
             or self.sliding_window > 0
         ):
             return False
@@ -1113,7 +1113,7 @@ class PagedAttentionImpl(nn.Module):
         # clamps internally too, and a sentinel would otherwise split them.
         max_qlen = max(1, int(max_qlen))
         # No gluon decode (gfx1250): unified, which hands FlyDSL what it takes.
-        over_gluon = not gluon_decode_supports_arch() or gluon_decode_over_limit(
+        over_gluon = not pa_decode_gluon_supports_arch() or gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
         over_asm = (

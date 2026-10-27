@@ -47,8 +47,8 @@ def _gluon_decode_present(monkeypatch):
     from atom.model_ops import base_attention as ba
 
     monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(ba, "gluon_decode_supports_arch", lambda: True)
-    monkeypatch.setattr(mha, "gluon_decode_supports_arch", lambda: True)
+    monkeypatch.setattr(ba, "pa_decode_gluon_supports_arch", lambda: True)
+    monkeypatch.setattr(mha, "pa_decode_gluon_supports_arch", lambda: True)
 
 
 def _fake_ctx(n):
@@ -1759,8 +1759,8 @@ class TestNoGluonFlyDSLRouting:
         from atom.model_ops import base_attention as ba
 
         monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx1250")
-        monkeypatch.setattr(ba, "gluon_decode_supports_arch", lambda: False)
-        monkeypatch.setattr(mha, "gluon_decode_supports_arch", lambda: False)
+        monkeypatch.setattr(ba, "pa_decode_gluon_supports_arch", lambda: False)
+        monkeypatch.setattr(mha, "pa_decode_gluon_supports_arch", lambda: False)
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", False)
         return mha, ba
 
@@ -1902,17 +1902,16 @@ class TestNoGluonFlyDSLRouting:
     def test_v_cache_goes_to_flydsl_as_its_5d_shuffle_view(self, monkeypatch, gluon):
         """A 4D V reads as the plain layout on gfx1250, a silent wrong answer."""
         mha, _ba = self._no_gluon(monkeypatch)
-        monkeypatch.setattr(mha, "gluon_decode_supports_arch", lambda: gluon)
+        monkeypatch.setattr(mha, "pa_decode_gluon_supports_arch", lambda: gluon)
         layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
         v = self._meta(8, 1, 128, 128)
         out = layer._shuffle_v_for_flydsl(v, self._meta(8, 1, 8, 128, 16))
         assert out.shape == ((8, 1, 128, 128) if gluon else (8, 1, 8, 128, 16))
 
     def test_sparse_rows_skip_asm_without_its_kernels(self, monkeypatch):
-        from atom.model_ops import base_attention as ba
         from atom.model_ops.minimax_m3 import sparse_attn
 
-        monkeypatch.setattr(ba, "pa_fwd_asm_supports_arch", lambda: False)
+        monkeypatch.setattr(sparse_attn, "pa_fwd_asm_supports_arch", lambda: False)
         m = self._meta
         assert not sparse_attn._sparse_pa_ran_on_asm(
             m(4096, 16, 128),
