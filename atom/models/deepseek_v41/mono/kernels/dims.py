@@ -17,6 +17,8 @@ from atom.mono.plan.shard import Shard, Tiles, cdiv, padded
 HIDDEN = 5120
 HC = 4  # hyper-connection streams
 Q_RANK, KV_DIM = 1280, 512  # the q latent, the window row
+# a KV row in an FP8 pool (``kv_fp8``): E4M3 values, then an E8M0 scale a 32
+KV_FP8_ROW_BYTES = KV_DIM + KV_DIM // 32
 Q_HEADS = 64  # attention query heads
 O_GROUPS = 8  # wo_a groups
 O_RANK = 1024  # wo_a output rows a group

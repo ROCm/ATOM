@@ -51,6 +51,7 @@ from atom.models.deepseek_v41.mono.kernels.dims import (
     HEAD_DIM,
     HIDDEN,
     KV_DIM,
+    KV_FP8_ROW_BYTES,
     Q_RANK,
     Dims,
 )
@@ -97,6 +98,7 @@ from atom.mono.device.ops import (
     row_sum,
     rsrc,
     traced,
+    xshfl,
 )
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
@@ -176,6 +178,9 @@ class AttnPreBuild:
     # tokens' rows), slice .. qkv run on this rank's tokens, and their q latent
     # (QG) and window rows (KG) are gathered from every rank
     tok_par: bool = False
+    # the pool's rows are MXFP8 (FP8 values then E8M0 scales, ``row_bytes``):
+    # the window row is stored so, not as its BF16 QAT
+    kv_fp8: bool = False
 
 
 # ``timeline`` stamps: kernel start, then the end of each stage's task loop
@@ -980,25 +985,59 @@ def stage_qkv(c, t):
     e0 = bf16_round(kn[0] * cs - kn[1] * sn)
     e1 = bf16_round(kn[0] * sn + kn[1] * cs)
     amax = butterfly(fx.max(abs(e0), abs(e1)), (1, 2, 4, 8), fx.max)
-    step = pow2(
-        code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
-    )
-    qat = [fp8_value(clamp_fp8(v / step)) * step for v in (e0, e1)]
-    # the ring row of a [rows, 512] bf16 pool: the step's row of this token (int32,
-    # -1: none) past the layer's ring start
+    code = code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
+    step = pow2(code)
+    scaled = [clamp_fp8(v / step) for v in (e0, e1)]
+    # the step's row of this token (int32, -1: none) past the layer's ring start
     row = rel + a["ring_off"]
+    if const_expr(c["kv_fp8"]):
+        _ring_row_fp8(c, t, tt, mine, rel, row, scaled, code)
+    else:
+        qat = [fp8_value(v) * step for v in scaled]
+        # a [rows, 512] bf16 pool's row: the QAT values
+        if mine & (rel >= 0):
+            dst = rsrc(a["ring"] + fx.Int64(row) * (KV_DIM * 2))
+            for j in range_constexpr(2):
+                bo.buffer_store(qat[j].to(fx.BFloat16), dst, tt * 2 + j)
+        if const_expr(c["tok_par"]):  # noqa: SIM102
+            # token parallel: the row to every other rank (``ring_row_from``)
+            if mine:
+                tg = c["t0"] + t
+                for p in range_constexpr(c["d"].tp):
+                    if c["rank"] != p:
+                        c["put_bf"](c["kv_dsts"][p], tg * KV_DIM + 2 * tt, qat)
+    gpu.barrier()
+
+
+@traced
+def _ring_row_fp8(c, t, tt, mine, rel, row, scaled, code):
+    """``stage_qkv``'s window row in an FP8 pool: thread tt's pair of E4M3
+    values (``scaled``, in range) and its group's E8M0 ``code``. An even thread
+    stores its pair and its neighbour's as one word, a group's first thread
+    its scale; token parallel pushes the same words to every other rank's KG
+    (``ring_row_from``: data words, then a group's code a word)."""
+    a = c["args"]
+    nb = [xshfl(v, 1) for v in scaled]
+    word = fp8_pack4(scaled[0], scaled[1], nb[0], nb[1])
     if mine & (rel >= 0):
-        dst = rsrc(a["ring"] + fx.Int64(row) * (KV_DIM * 2))
-        for j in range_constexpr(2):
-            bo.buffer_store(qat[j].to(fx.BFloat16), dst, tt * 2 + j)
+        dst = rsrc(a["ring"] + fx.Int64(row) * KV_FP8_ROW_BYTES)
+        if tt % 2 == 0:
+            bo.buffer_store(word, dst, tt // 2)
+        if tt % 16 == 0:
+            bo.buffer_store(fx.Int8(code), dst, KV_DIM + tt // 16)
     if const_expr(c["tok_par"]):  # noqa: SIM102
-        # token parallel: the row to every other rank (``ring_row_from``)
         if mine:
             tg = c["t0"] + t
             for p in range_constexpr(c["d"].tp):
                 if c["rank"] != p:
-                    c["put_bf"](c["kv_dsts"][p], tg * KV_DIM + 2 * tt, qat)
-    gpu.barrier()
+                    if tt % 2 == 0:
+                        c["put"](c["kv_dsts"][p], tg * (KV_DIM // 2) + tt // 2, word)
+                    if tt % 16 == 0:
+                        c["put"](
+                            c["kv_dsts"][p],
+                            tg * (KV_DIM // 2) + KV_DIM // 4 + tt // 16,
+                            code,
+                        )
 
 
 @traced
@@ -1022,20 +1061,29 @@ def normed_row_from(c, nbg, t, n):
 @traced
 def ring_row_from(c, kg, t, n):
     """Token t, when another rank owns it: its window row from KG -> the ring
-    row (``stage_qkv``'s store)."""
+    row (``stage_qkv``'s store): a BF16 row's words, or an FP8 row's data
+    words and then its codes, a word each (``_ring_row_fp8``)."""
     tid = c["tid"]
     a = c["args"]
     if t // n != c["rank"]:
         rel = ld_i32(a["ring_rows"], t)
         row = rel + a["ring_off"]
-        if tid < KV_DIM // 2:
+        words = KV_DIM // 4 + KV_DIM // 32 if const_expr(c["kv_fp8"]) else KV_DIM // 2
+        if tid < words:
             (w,) = c["poll"]([(kg, t * (KV_DIM // 2) + tid, 1)])
             if rel >= 0:
-                bo.buffer_store(
-                    w[0],
-                    rsrc(a["ring"] + fx.Int64(row) * (KV_DIM * 2)),
-                    tid,
-                )
+                if const_expr(c["kv_fp8"]):
+                    dst = rsrc(a["ring"] + fx.Int64(row) * KV_FP8_ROW_BYTES)
+                    if tid < KV_DIM // 4:
+                        bo.buffer_store(w[0], dst, tid)
+                    else:
+                        bo.buffer_store(fx.Int8(w[0]), dst, KV_DIM + tid - KV_DIM // 4)
+                else:
+                    bo.buffer_store(
+                        w[0],
+                        rsrc(a["ring"] + fx.Int64(row) * (KV_DIM * 2)),
+                        tid,
+                    )
 
 
 # ---------------------------------------------------------------- wq_b
@@ -1215,7 +1263,7 @@ def build_attn_pre(key: AttnPreBuild):
                 "iq_out": iq_out, "iqs_out": iqs_out, "iw_out": iw_out,
             },
             "fold": key.fold, "index": key.feeds_index, "aux": key.aux, "ffn": False,
-            "d": dims, "tok_par": False,
+            "d": dims, "tok_par": False, "kv_fp8": key.kv_fp8,
         }  # fmt: skip
         for region, (off, _) in layout.items():
             c[region] = sreg(scratch, off, region)

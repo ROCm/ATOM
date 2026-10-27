@@ -329,6 +329,20 @@ class TestDPSessionAffinityHeaders:
             "parent",
         )
 
+    def test_mlperf_session_id_header(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={"x-session-id": "conv", "x-correlation-id": "fallback"}
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == ("conv", None)
+
+    def test_dynamo_session_id_wins_over_session_id(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={"x-dynamo-session-id": "child", "x-session-id": "conv"}
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == ("child", None)
+
     def test_correlation_id_is_session_fallback(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "true")
         request = SimpleNamespace(headers={"x-correlation-id": "session"})

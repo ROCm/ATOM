@@ -89,11 +89,10 @@ class LLMEngine:
             )
             config.enable_tbo = False
             config.enable_tbo_decode = False
-        # PCP and DP-attention are not yet compatible: PCP stripe-splits
-        # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
-        # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
-        # the FULL (un-split) token count, so all_gatherv asserts
-        # `1/pcp_size != full`.
+        # PCP and DP-attention together are unverified. The refusal's original
+        # cause, a DP all-gather of the hash-routing input ids sized for the
+        # un-split token count, is gone: the MoE now routes before its DP
+        # gather, on rank-local ids.
         if config.enable_dp_attention and config.pipeline_parallel_size > 1:
             raise ValueError(
                 "--enable-dp-attention and pipeline-parallel (pp>1) "
@@ -103,11 +102,9 @@ class LLMEngine:
             raise ValueError(
                 "prefill_context_parallel_size > 1 (-pcp) combined with "
                 "--enable-dp-attention is not supported yet (may be supported "
-                "in a future release): PCP splits tokens to 1/pcp_size while "
-                "DP-attention's id-gather expects the full token count, "
-                "causing an all_gatherv size mismatch. For now, disable one of "
-                "them (use -tp N -pcp M without DP-attention, or -dp N "
-                "--enable-dp-attention without -pcp)."
+                "in a future release): the combination is unverified. For "
+                "now, disable one of them (use -tp N -pcp M without "
+                "DP-attention, or -dp N --enable-dp-attention without -pcp)."
             )
         # PCP + TBO prefill: supported via coordinated splitting.
         # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
@@ -719,6 +716,7 @@ class InputOutputProcessor:
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
+        self._reuse_block_hashes = envs.ATOM_TOKENIZE_CACHE_BLOCK_HASHES
         if getattr(config, "enable_prefix_caching", False):
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
@@ -823,11 +821,23 @@ class InputOutputProcessor:
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
+        prefix_encoding = None
         segment_tokenizer = getattr(self, "segment_tokenizer", None)
         if not isinstance(prompt_or_tokens, str):
             tokens = prompt_or_tokens
         elif segment_tokenizer is not None:
-            tokens = segment_tokenizer.encode(prompt_or_tokens)
+            if (
+                getattr(self, "_reuse_block_hashes", False)
+                and self.prefix_hash_block_size
+                and envs.ATOM_FRONTEND_PREFIX_HASH
+                and multimodal_data is None
+            ):
+                prefix_encoding = segment_tokenizer.encode_with_prefix(
+                    prompt_or_tokens, self.prefix_hash_block_size
+                )
+                tokens = prefix_encoding.token_ids
+            else:
+                tokens = segment_tokenizer.encode(prompt_or_tokens)
         else:
             tokens = self.tokenizer.encode(prompt_or_tokens)
         mrope_positions = None
@@ -891,7 +901,13 @@ class InputOutputProcessor:
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.
         if self.prefix_hash_block_size:
-            ship_prompt_hash_chain(seqs[0], self.prefix_hash_block_size)
+            ship_prompt_hash_chain(
+                seqs[0],
+                self.prefix_hash_block_size,
+                block_hashes=(
+                    None if prefix_encoding is None else prefix_encoding.block_hashes
+                ),
+            )
             for seq in seqs[1:]:
                 seq.prompt_hash_chain = seqs[0].prompt_hash_chain
 

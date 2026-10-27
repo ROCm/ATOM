@@ -136,7 +136,7 @@ This ensures:
 When a DP rank has no real work but other ranks do, it executes dummy batches to participate in collective operations:
 
 - **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a one-sequence decode dummy through the model, triggering AllReduce and MORI collectives so other ranks are not blocked.
-- **Dummy prefill** — when prefill token graphs are recorded and a peer prefills, `Scheduler.dummy_prefill` makes the same call a request-less prefill instead. `ForwardMode._pad_to_token_graph` raises it to the bucket every prefilling rank replays, since ranks replaying different buckets hang the group.
+- **Dummy prefill** — when prefill token graphs are recorded and a peer prefills, `Scheduler.dummy_prefill` makes the same call a request-less prefill instead. `ForwardMode._pad_to_token_graph` raises it, and without the prefill delayer a decoding rank's rows too, to the bucket every rank of the step replays, since ranks replaying different buckets hang the group.
 
 ### Device assignment
 
