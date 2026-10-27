@@ -56,10 +56,12 @@ def test_a_negative_interval_is_normalised_to_off(steps):
     [
         {"pipeline_parallel_size": 2},
         {"enable_rapidserve": True},
-        # A real launch always names the connector; the role alone is not a
-        # config the factory could build anything from.
         {"kv_transfer_config": {"kv_connector": "mooncake", "kv_role": "kv_producer"}},
         {"kv_transfer_config": {"kv_connector": "mooncake", "kv_role": "kv_consumer"}},
+        # Omitting the name does not mean "no connector": `create_connector`
+        # builds `_DEFAULT_BACKEND` (moriio), so these are real P/D nodes.
+        {"kv_transfer_config": {"kv_role": "kv_producer", "handshake_port": 6301}},
+        {"kv_transfer_config": {"kv_role": "kv_consumer"}},
         # A MultiConnector prefill node carries the role one level down, with
         # nothing at the top -- see the multi/ README's launch command.
         {
@@ -74,7 +76,16 @@ def test_a_negative_interval_is_normalised_to_off(steps):
         # No explicit role: a transfer connector defaults to kv_producer.
         {"kv_transfer_config": {"kv_connector": "mooncake"}},
     ],
-    ids=["pp", "rapidserve", "pd_prefill", "pd_decode", "pd_multi", "pd_default_role"],
+    ids=[
+        "pp",
+        "rapidserve",
+        "pd_prefill",
+        "pd_decode",
+        "pd_default_connector_prefill",
+        "pd_default_connector_decode",
+        "pd_multi",
+        "pd_default_role",
+    ],
 )
 def test_unsupported_topologies_fall_back_to_the_clock(topology, caplog):
     with caplog.at_level("WARNING"):
@@ -129,6 +140,11 @@ def test_a_malformed_connectors_blob_does_not_raise(connectors):
     `AttributeError` out of `Config.__post_init__` -- the server refuses to
     start, blamed on a logging option, and before the KV config's own
     validation has had a chance to report the real problem.
+
+    The entry a broken shape describes is skipped, so the config reads as not
+    disaggregated and keeps the step interval. That is the degrade: this
+    clause does not decide whether the blob is valid, and the KV layer still
+    reports the real error.
     """
     cfg = _resolve(
         throughput_log_interval_steps=40,

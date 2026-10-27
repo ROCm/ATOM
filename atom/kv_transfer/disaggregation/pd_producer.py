@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Classify P/D producer connectors without importing attention backends."""
+"""Classify P/D connectors without importing attention backends."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any
 
-from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.factory import (
+    _DEFAULT_BACKEND,
+    PD_TRANSFER_BACKENDS,
+    KVConnectorFactory,
+)
 from atom.kv_transfer.disaggregation.types import DEFAULT_SHARDED_STAGING_WORKERS
 from atom.utils import envs
 
@@ -73,18 +77,36 @@ def _producer_connectors(config, names: frozenset[str]) -> tuple[dict, ...]:
 def disaggregated_kv_role(config) -> str | None:
     """The P/D role this config puts the engine in, or ``None`` if it is not one.
 
-    Both directions, unlike :func:`pd_producer_configured`, and keyed on the
-    connector NAME: ``kv_role`` alone does not classify, because an offload
-    tier legally takes ``kv_producer`` (save only) and ``kv_consumer`` (load
-    only) -- see ``_VALID_KV_ROLES`` in ``offload/_offload_common.py`` -- while
-    running the ordinary engine loop. Tolerates any shape, since the blob
-    arrives as user-supplied CLI JSON.
+    Three rules the obvious version gets wrong, each with a witness in
+    ``factory.py``:
+
+    * The connector NAME classifies, not ``kv_role``. An offload tier legally
+      takes ``kv_producer`` (save only) and ``kv_consumer`` (load only) -- see
+      ``_VALID_KV_ROLES`` in ``offload/_offload_common.py`` -- while running
+      the ordinary engine loop.
+    * A missing name is ``_DEFAULT_BACKEND``, not "no connector":
+      ``create_connector`` builds moriio from a config that omits it, so
+      reading the omission as absence classifies a real P/D node as ordinary.
+    * ``multi`` carries its entries one level down.
+
+    Both directions, unlike :func:`pd_producer_configured`. Tolerates any
+    shape: the blob arrives as user-supplied CLI JSON, and a caller running at
+    config time must degrade rather than take the process down.
     """
     transfer_config = getattr(config, "kv_transfer_config", None)
-    for connector, path in iter_connector_configs(transfer_config):
-        if _canonical(connector, path=path) not in _PD_TRANSFER_CONNECTORS:
+    if not isinstance(transfer_config, dict) or not transfer_config:
+        return None
+    entries = [transfer_config]
+    nested = transfer_config.get("connectors")
+    if isinstance(nested, (list, tuple)):
+        entries += [entry for entry in nested if isinstance(entry, dict)]
+    for entry in entries:
+        name = entry.get("kv_connector", _DEFAULT_BACKEND)
+        if not isinstance(name, str):
             continue
-        role = connector.get("kv_role", "kv_producer")
+        if name.strip().casefold() not in PD_TRANSFER_BACKENDS:
+            continue
+        role = entry.get("kv_role", "kv_producer")
         if role in ("kv_producer", "kv_consumer"):
             return role
     return None
