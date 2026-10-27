@@ -70,15 +70,31 @@ def _is_indexed_sparse_attention(module) -> bool:
 
 
 def _resolve_index_cache_dtype(config) -> torch.dtype:
+    """MiniMax-M3's index cache dtype: fp8 only, refused at allocation rather
+    than 57 layers into the first decode step."""
     from aiter import dtypes
 
+    from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
+
     index_cache_dtype = getattr(config, "index_cache_dtype", None)
-    if index_cache_dtype is None:
+    inherited = index_cache_dtype is None
+    if inherited:
         index_cache_dtype = getattr(config, "kv_cache_dtype", "bf16")
-    if index_cache_dtype in ("bf16", "fp8"):
-        return dtypes.d_dtypes[index_cache_dtype]
+    if index_cache_dtype == "fp8":
+        return dtypes.d_dtypes["fp8"]
+    if index_cache_dtype == "bf16":
+        raise ValueError(
+            f"{INDEX_CACHE_MUST_BE_FP8} Got 'bf16'"
+            + (
+                ", inherited from --kv_cache_dtype because --index-cache-dtype "
+                "was not passed."
+                if inherited
+                else "."
+            )
+        )
     raise ValueError(
-        f"index_cache_dtype must be 'bf16' or 'fp8', got {index_cache_dtype!r}"
+        f"index_cache_dtype must be 'fp8', got {index_cache_dtype!r}. "
+        f"{INDEX_CACHE_MUST_BE_FP8}"
     )
 
 
@@ -299,6 +315,54 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 num_head_k * self.max_bs * max_qlen,
                 **i32_kwargs,
             )
+            from atom.distributed.indexer_cp import (
+                get_indexer_cp_rank,
+                get_indexer_cp_world_size,
+                indexer_cp_enabled,
+            )
+
+            # The flydsl index-score kernel's persistent dispatch map; its row
+            # count is the grid, so the bound is the model length.
+            from atom.model_ops.minimax_m3.index_topk import (
+                SPARSE_BLOCK_SIZE as _M3_SPARSE_BLOCK_SIZE,
+            )
+            from atom.model_ops.minimax_m3.index_topk import (
+                index_score_work_map_capacity,
+            )
+
+            # Indexer CP shards round-robin: every bound below is the local one.
+            self._index_score_cp_world = 1
+            self._index_score_cp_rank = 0
+            if indexer_cp_enabled():
+                self._index_score_cp_world = get_indexer_cp_world_size()
+                self._index_score_cp_rank = get_indexer_cp_rank()
+            self._index_score_max_block = triton.cdiv(
+                triton.cdiv(config.max_model_len, _M3_SPARSE_BLOCK_SIZE),
+                self._index_score_cp_world,
+            )
+            # NOT `_num_idx_heads`: under indexer CP the sparse layer scores one
+            # head per CP rank (`attention_mha.py`), and the row-count assert in
+            # `decode_index_score` would not catch a divergence.
+            self._index_score_num_idx_heads = (
+                self._index_score_cp_world if indexer_cp_enabled() else num_head_k
+            )
+            # CAPACITY, not the exact size at `max_bs`: aiter's grid is
+            # non-monotonic in the batch.
+            rows = index_score_work_map_capacity(
+                self.max_bs,
+                self._index_score_max_block,
+                max_qlen,
+                self._index_score_num_idx_heads,
+                self._index_score_cp_world,
+                self._index_score_cp_rank,
+            )
+            self.model_runner.forward_vars["sparse_attention_index_score_work_map"] = (
+                torch.empty((rows, 2), **i32_kwargs) if rows else None
+            )
+        else:
+            self._index_score_max_block = 0
+            self._index_score_cp_world, self._index_score_cp_rank = 1, 0
+            self._index_score_num_idx_heads = 0
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -421,6 +485,23 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 # would have the second overwrite the first.
                 var[f"{p}sparse_attention_n_valid_column_per_row"] = torch.empty(
                     self._num_idx_heads * ub_max_bs * max_seqlen_qo, **i32_kwargs
+                )
+                from atom.model_ops.minimax_m3.index_topk import (
+                    index_score_work_map_capacity,
+                )
+
+                # The CP pair must match the one the ubatch builder passes: a map
+                # sized at cp_world=1 is shorter than a CP rank writes.
+                rows = index_score_work_map_capacity(
+                    ub_max_bs,
+                    self._index_score_max_block,
+                    max_seqlen_qo,
+                    self._index_score_num_idx_heads,
+                    self._index_score_cp_world,
+                    self._index_score_cp_rank,
+                )
+                var[f"{p}sparse_attention_index_score_work_map"] = (
+                    torch.empty((rows, 2), **i32_kwargs) if rows else None
                 )
 
             # PA work buffers per ubatch (GPU only)
@@ -747,6 +828,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
 
+    def _index_score_work_map_buffer(self, prefix: str = "") -> torch.Tensor | None:
+        """The decode work-map buffer; None when this model never allocated one
+        (the scorer then builds its own per layer)."""
+        return self.model_runner.forward_vars.get(
+            f"{prefix}sparse_attention_index_score_work_map"
+        )
+
     def _get_sparse_attention_block_tables(
         self,
         block_tables: torch.Tensor,
@@ -977,6 +1065,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=1,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                index_score_work_map_out=self._index_score_work_map_buffer(),
+                index_score_max_block=self._index_score_max_block,
+                index_score_num_idx_heads=self._index_score_num_idx_heads,
+                index_score_cp_world=self._index_score_cp_world,
+                index_score_cp_rank=self._index_score_cp_rank,
             )
         # Same short-circuit as the metadata launch above. A dummy step would
         # refresh the live work_info from synthetic lengths, but every real
@@ -1317,6 +1410,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                index_score_work_map_out=self._index_score_work_map_buffer(),
+                index_score_max_block=self._index_score_max_block,
+                index_score_num_idx_heads=self._index_score_num_idx_heads,
+                index_score_cp_world=self._index_score_cp_world,
+                index_score_cp_rank=self._index_score_cp_rank,
             )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q, running_tokens=running_tokens
@@ -1435,6 +1533,42 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Set PA persistent worker buffers for this ubatch
             if self.block_size in (256, 1024):
                 self._set_ubatch_pa_buffers(running_bs, max_seqlen_q, ub_idx)
+            if self._has_sparse_attention:
+                # Replay rebuilds no metadata, so refill the persistent map here,
+                # after this ubatch's lengths are published (as `prepare_decode`).
+                self._build_ubatch_sparse_metadata(ub_idx, running_bs, max_seqlen_q)
+
+    def _build_ubatch_sparse_metadata(self, ubatch_idx, running_bs, max_q_len):
+        """Fill one ubatch's persistent sparse decode buffers from its lengths.
+
+        The returned metadata only wraps those buffers, so a caller that wants
+        the refresh alone can discard it.
+        """
+        if max_q_len > 1:
+            raise NotImplementedError(
+                "MiniMax M3 sparse TBO decode with max_q_len > 1 is not implemented."
+            )
+        from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+        var = self.model_runner.forward_vars
+        p = f"ub{ubatch_idx}_"
+        context_lens = var[f"{p}context_lens"].gpu[:running_bs]
+        block_tables = var[f"{p}block_tables"].gpu[:running_bs]
+        return make_sparse_decode_metadata(
+            seq_lens=context_lens,
+            block_table=self._get_sparse_attention_block_tables(
+                block_tables, context_lens, running_bs
+            ),
+            slot_mapping=var[f"{p}slot_mapping"].gpu[: running_bs * max_q_len],
+            max_seq_len=self.model_runner.config.max_model_len,
+            num_idx_heads=self._num_idx_heads,
+            n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
+            index_score_work_map_out=self._index_score_work_map_buffer(p),
+            index_score_max_block=self._index_score_max_block,
+            index_score_num_idx_heads=self._index_score_num_idx_heads,
+            index_score_cp_world=self._index_score_cp_world,
+            index_score_cp_rank=self._index_score_cp_rank,
+        )
 
     def _set_ubatch_pa_buffers(self, running_bs, max_q_len, ubatch_idx):
         """Compute PA work buffers for a per-ubatch forward_vars set."""
@@ -1499,27 +1633,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
         if self._has_sparse_attention:
-            if max_q_len > 1:
-                raise NotImplementedError(
-                    "MiniMax M3 sparse TBO decode with max_q_len > 1 is not "
-                    "implemented."
-                )
-            from atom.model_ops.minimax_m3.sparse_attn import (
-                make_sparse_decode_metadata,
-            )
-
-            sparse_block_tables = self._get_sparse_attention_block_tables(
-                attn.block_tables,
-                attn.context_lens,
-                running_bs,
-            )
-            attn.sparse_attention_metadata = make_sparse_decode_metadata(
-                seq_lens=attn.context_lens,
-                block_table=sparse_block_tables,
-                slot_mapping=attn.slot_mapping,
-                max_seq_len=attn.max_seqlen_k,
-                num_idx_heads=self._num_idx_heads,
-                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
+            attn.sparse_attention_metadata = self._build_ubatch_sparse_metadata(
+                ubatch_idx, running_bs, max_q_len
             )
         return attn
 
@@ -1570,6 +1685,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
+                index_score_work_map_out=self._index_score_work_map_buffer(),
+                index_score_max_block=self._index_score_max_block,
+                index_score_num_idx_heads=self._index_score_num_idx_heads,
+                index_score_cp_world=self._index_score_cp_world,
+                index_score_cp_rank=self._index_score_cp_rank,
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)

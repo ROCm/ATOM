@@ -22,19 +22,25 @@ abort the run for every other test as well.
 
 from __future__ import annotations
 
+import functools
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
+pytest.importorskip("aiter", reason="the scorers and dtypes below are aiter's")
+
+# `aiter.dtypes.fp8` rather than a hardcoded `float8_e4m3fn`: the two ROCm archs
+# disagree on which flavour is native, and these tests must build the container
+# the runtime actually allocates.
+import aiter
 
 from atom.model_ops.minimax_m3 import index_topk as m
 from atom.model_ops.minimax_m3.index_topk import (
-    DECODE_SCORE_MIN_BLOCKS,
-    DECODE_SCORE_TARGET_GRID,
     PREFILL_TOPK_MAX_BLOCK_SIZE_K,
     PREFILL_TOPK_MIN_BLOCK_SIZE_K,
     SPARSE_BLOCK_SIZE,
-    _decode_score_chunks,
     _prefill_topk_block_size_k,
     _require_packable,
 )
@@ -73,70 +79,6 @@ class TestPrefillTileWidth:
             assert _prefill_topk_block_size_k(mb) >= TOPK
 
 
-class TestDecodeScoreChunks:
-    """A grid dim, so: shape-constant, positive, and never past the blocks."""
-
-    @pytest.mark.parametrize("batch", [1, 2, 7, 8, 50, 64, 256, 1024])
-    @pytest.mark.parametrize("max_block", [1, 2, 63, 64, 256, 800, 8192])
-    def test_bounds_and_coverage(self, batch, max_block):
-        # Not a power of two: it is a grid dim, not a tile, so nothing indexes
-        # it with tl.arange. What has to hold is that the chunks cover every
-        # block and that none of them is empty by construction.
-        n = _decode_score_chunks(batch, max_block)
-        assert 1 <= n <= max_block
-        # Two bounds, one per end of the batch range.
-        assert n <= max(1, -(-max_block // DECODE_SCORE_MIN_BLOCKS))
-        assert batch * n <= max(DECODE_SCORE_TARGET_GRID, batch)
-        chunk_blocks = -(-max_block // n)
-        assert chunk_blocks * n >= max_block
-        assert chunk_blocks * (n - 1) < max_block
-
-    def test_the_ceiling_binds_at_high_batch(self):
-        """The floor alone would return the same count at every batch.
-
-        Asserted against a literal rather than DECODE_SCORE_TARGET_GRID: a bound
-        read from the constant moves with it, so raising the constant back out
-        of range would satisfy the assertion instead of failing it.
-        """
-        assert _decode_score_chunks(8, 8192) > _decode_score_chunks(128, 8192)
-        assert _decode_score_chunks(128, 8192) * 128 <= 16384
-
-    @pytest.mark.parametrize("batch", [1, 64])
-    def test_an_empty_bound_still_gives_a_grid(self, batch):
-        """`cdiv(max_block, cdiv(max_block, chunks))` divides by its own inner
-        result, which is zero when there is nothing to score. The exception
-        lands outside any kernel launch, so on tp>1 one rank raises and the
-        rest wait in the next collective -- the shape a hang takes."""
-        assert _decode_score_chunks(batch, 0) == 1
-
-    def test_shrinks_with_batch(self):
-        # A larger batch must not buy more chunks per request: the grid is
-        # (request, chunk), so that would multiply into a pointless grid.
-        prev = _decode_score_chunks(1, 4096)
-        for batch in (2, 4, 16, 64, 256, 4096):
-            cur = _decode_score_chunks(batch, 4096)
-            assert cur <= prev
-            prev = cur
-
-    @pytest.mark.parametrize("max_block", [3, 5, 64, 800, 2464, 8192, 65534])
-    @pytest.mark.parametrize("batch", [1, 8, 64])
-    def test_a_chunk_walks_at_least_min_blocks(self, batch, max_block):
-        """The floor is the whole point of the split rule: a chunk down to one
-        block pays the query-tile load, which sits outside the block loop, for
-        a single block of work. Deleting the clamp must turn this red."""
-        n = _decode_score_chunks(batch, max_block)
-        assert -(-max_block // n) >= DECODE_SCORE_MIN_BLOCKS
-
-    @pytest.mark.parametrize("max_block,want_chunks", [(1, 1), (2, 1), (4, 2)])
-    def test_the_floor_is_a_target_not_a_guarantee(self, max_block, want_chunks):
-        """Right above MIN_BLOCKS the floor cannot hand out a second full
-        chunk: max_block=4 splits into 2 chunks of 2, under the floor. Nothing
-        is wrong with that -- 2 blocks still amortize the query tile -- but the
-        floor is a target, so `test_a_chunk_walks_at_least_min_blocks` skips
-        this range rather than asserting something untrue about it."""
-        assert _decode_score_chunks(1, max_block) == want_chunks
-
-
 class TestPackableBound:
     """The packed key spends its low 16 bits on a 1-based block id."""
 
@@ -155,6 +97,127 @@ class TestPackableBound:
         # not a limit anyone meets. Pin the arithmetic so a block-size change
         # that would bring it into range fails here first.
         assert 0xFFFE * SPARSE_BLOCK_SIZE > 8_000_000
+
+
+class TestTheAiterDependencyIsDeferred:
+    """A missing decode kernel must not break IMPORT, only use.
+
+    The FlyDSL M3 index-score kernels are newer than the aiter ATOM's image
+    builds (`AITER_COMMIT: HEAD` -> aiter main), so on an aiter that predates
+    them these symbols are simply absent. That has to stay contained: this
+    module is imported at module scope by `sparse_attn`, which is imported at
+    module scope by `atom/plugin/vllm/attention/backend.py` for
+    `SPARSE_BLOCK_SIZE` -- and that module carries the MLA prefill backends.
+    A module-scope `from aiter.ops.flydsl import minimax_m3_*` would therefore
+    take down far more than MiniMax-M3.
+
+    Neither phase has a production fallback, so using one without the kernel
+    must fail loudly and name what to install; these tests pin that for the
+    import itself, for decode, and for prefill.
+    """
+
+    def test_the_symbols_are_not_imported_at_module_scope(self):
+        import inspect
+
+        body = inspect.getsource(m)
+        offenders = [
+            line
+            for line in body.splitlines()
+            if line.startswith(("from aiter", "import aiter"))
+            and "minimax_m3_index_score" in line
+        ]
+        assert not offenders, f"module-scope aiter M3 import reintroduced: {offenders}"
+
+    def test_using_it_without_the_kernel_names_the_dependency(self, monkeypatch):
+        import sys
+        import types
+
+        real = sys.modules["aiter.ops.flydsl"]
+        stub = types.ModuleType("aiter.ops.flydsl")
+        # `__getattr__` is excluded deliberately, not incidentally: aiter's
+        # flydsl package resolves its kernels through a module-level lazy
+        # loader, so copying it would hand the stub the very symbols this test
+        # is pretending do not exist.
+        stub.__dict__.update(
+            {
+                k: v
+                for k, v in real.__dict__.items()
+                if "minimax" not in k.lower() and k not in ("__getattr__", "__dir__")
+            }
+        )
+        # Both, and the attribute is the one that matters: the resolver says
+        # `from aiter.ops import flydsl`, which reads the attribute off the
+        # parent package rather than going through sys.modules.
+        monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", stub)
+        monkeypatch.setattr("aiter.ops.flydsl", stub)
+        m._flydsl.cache_clear()
+        try:
+            with pytest.raises(RuntimeError, match="aiter#5626"):
+                m.index_score_work_map_size(1, 1, 1, 1)
+        finally:
+            # The resolver memoizes across tests; a stubbed entry left behind
+            # would fail every later GPU test in this file.
+            m._flydsl.cache_clear()
+
+    def test_prefill_without_the_kernel_names_the_dependency(self, monkeypatch):
+        # The guarded import leaves `score_prefill_flydsl` None on an older
+        # aiter, and the default route is the only production route, so an
+        # unguarded call site would surface this as a bare TypeError.
+        monkeypatch.setattr(m, "score_prefill_flydsl", None)
+        with pytest.raises(RuntimeError, match="aiter#5626"):
+            m.prefill_index_score(
+                torch.empty((1, 1, 1)),
+                torch.empty((1, 128, 1)),
+                torch.empty((1, 1), dtype=torch.int32),
+                torch.zeros(2, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                1,
+                128,
+                1.0,
+            )
+
+
+# The shape the non-monotonicity shows up at: at max_block 256 a batch of 8
+# needs 256 grid rows while a batch of 7 needs 455.
+CAPACITY_SHAPE = {"max_block": 256, "max_query_len": 1, "num_idx_heads": 1}
+
+
+class TestPersistentWorkMapCapacity:
+    """A captured buffer must serve EVERY batch, not just the largest one.
+
+    aiter's grid is non-monotonic in the batch, which is the whole reason it
+    ships a separate capacity API. Sizing the persistent buffer with the exact
+    size at `max_bs` therefore under-allocates for some smaller live batch, and
+    the build rejects it at that step -- after capture, on a real request.
+    """
+
+    def test_the_exact_size_really_is_non_monotonic(self):
+        # Self-validating: if aiter ever makes the grid monotonic, the tests
+        # below stop proving anything and this one says so.
+        sizes = [m.index_score_work_map_size(b, **CAPACITY_SHAPE) for b in range(1, 33)]
+        assert any(
+            sizes[i] > sizes[i + 1] for i in range(len(sizes) - 1)
+        ), "the grid is monotonic now; this whole class can go"
+
+    @pytest.mark.parametrize("max_batch", [8, 17, 32])
+    def test_capacity_covers_every_batch_below_it(self, max_batch):
+        cap = m.index_score_work_map_capacity(max_batch, **CAPACITY_SHAPE)
+        worst = max(
+            m.index_score_work_map_size(b, **CAPACITY_SHAPE)
+            for b in range(1, max_batch + 1)
+        )
+        assert cap >= worst, f"capacity {cap} < worst exact size {worst}"
+
+    def test_the_exact_size_would_not_have(self):
+        # The bug this guards: at max_block 256 a batch of 8 needs 256 rows and
+        # a batch of 7 needs 455, so `size(8)` is not a buffer a batch of 7 fits.
+        assert m.index_score_work_map_size(7, **CAPACITY_SHAPE) > (
+            m.index_score_work_map_size(8, **CAPACITY_SHAPE)
+        )
+
+    def test_empty_batch_asks_for_nothing(self):
+        assert m.index_score_work_map_capacity(0, **CAPACITY_SHAPE) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +245,12 @@ def _inputs(qlens, prefixes, heads, device):
 
     return {
         "idx_q": randn(total_q, heads, HEAD_DIM),
-        "index_kv_cache": randn(batch * nblk, SPARSE_BLOCK_SIZE, HEAD_DIM),
+        # fp8 because that is the only index cache the scorers serve; bf16 is
+        # refused at pool allocation, so no configuration reaches them with it.
+        # `idx_q` stays bf16 -- that is the Q dtype, not the cache's.
+        "index_kv_cache": randn(batch * nblk, SPARSE_BLOCK_SIZE, HEAD_DIM).to(
+            aiter.dtypes.fp8
+        ),
         "block_table": torch.arange(batch * nblk, **i32).view(batch, nblk),
         "cu_seqlens_q": torch.tensor(
             [0, *torch.tensor(qlens).cumsum(0).tolist()], **i32
@@ -197,6 +265,30 @@ def _inputs(qlens, prefixes, heads, device):
         "num_kv_heads": heads,
         "sm_scale": HEAD_DIM**-0.5,
     }
+
+
+@gpu
+def test_a_capacity_buffer_serves_the_batch_the_exact_size_would_not():
+    """End to end: build into one persistent buffer at both batches.
+
+    Also pins the half this relies on but does not control -- aiter accepts an
+    OVERSIZED `out` and hands back a `[rows, 2]` view of it, so the caller does
+    not slice and `decode_index_score`'s exact-row check still sees the right
+    shape.
+    """
+    shape = CAPACITY_SHAPE
+    buf = torch.empty(
+        (m.index_score_work_map_capacity(8, **shape), 2),
+        dtype=torch.int32, device="cuda",
+    )  # fmt: skip
+    for batch in (8, 7):
+        lens = torch.full(
+            (batch,), shape["max_block"] * SPARSE_BLOCK_SIZE,
+            dtype=torch.int32, device="cuda",
+        )  # fmt: skip
+        built = m.build_index_score_work_map(lens, out=buf, **shape)
+        assert built.shape[0] == m.index_score_work_map_size(batch, **shape)
+        assert built.data_ptr() == buf.data_ptr(), "aiter copied instead of slicing"
 
 
 @gpu
@@ -532,8 +624,9 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     from atom.model_ops.minimax_m3 import index_topk as m2
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
-    if m2.topk_per_row_small_k is None:
-        pytest.skip("aiter's small-k selector is not installed")
+    # Resolved on use, and not optional: an aiter without it is an ImportError
+    # here rather than a skip, which is the whole point of dropping the guard.
+    m2._topk_small_k()
     batch, heads, ctx = 2, 1, m2._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE
     kw = _inputs([1] * batch, [ctx - 1] * batch, heads, "cuda")
     md = make_sparse_decode_metadata(
@@ -562,3 +655,432 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     )
     assert torch.equal(ait_ctx, tri_ctx)
     assert torch.equal(ait_bt, tri_bt)
+
+
+# ---------------------------------------------------------------------------
+# The decode score kernel, and the hoist that makes it worth having.
+# ---------------------------------------------------------------------------
+def _score_oracle(idx_q, cache, block_table, seq_lens, max_query_len, heads, sm_scale):
+    """Block scores in fp32 on the device, straight from the definition.
+
+    `[heads, batch*max_query_len, nblk]`, NaN wherever the kernel is not
+    required to write (`blk >= ceil(seq_len/128)`). Deliberately a transcription
+    rather than a second kernel: there is one decode scorer now, so the only
+    honest anchor is the rule it is supposed to implement.
+    """
+    batch = seq_lens.shape[0]
+    dev, p = idx_q.device, SPARSE_BLOCK_SIZE
+    nblk = -(-int(seq_lens.max()) // p)
+    out = torch.full(
+        (heads, batch * max_query_len, nblk), float("nan"), dtype=torch.float32,
+        device=dev,
+    )  # fmt: skip
+    # The kernel folds log2(e) into the scale and works in base 2; the selection
+    # is invariant to that, but a score comparison is not.
+    scale = sm_scale * 1.4426950408889634
+    tok = torch.arange(max_query_len, device=dev).repeat_interleave(heads)
+    within = torch.arange(p, device=dev)
+    for b in range(batch):
+        length = int(seq_lens[b])
+        q = idx_q[b * max_query_len : (b + 1) * max_query_len].reshape(-1, HEAD_DIM)
+        cuts = length - max_query_len + tok + 1  # one causal cutoff per column
+        for blk in range(-(-length // p)):
+            # K is lifted to Q's dtype before fp32, not the other way round, so
+            # an fp8 cache reproduces the kernel's rounding instead of skipping it.
+            k = cache[int(block_table[b, blk])].to(idx_q.dtype).float()
+            z = (k @ q.float().T) * scale
+            z = z.masked_fill((blk * p + within)[:, None] >= cuts[None, :], -torch.inf)
+            out[:, b * max_query_len : (b + 1) * max_query_len, blk] = (
+                z.amax(0).reshape(max_query_len, heads).T
+            )
+    return out
+
+
+@gpu
+class TestDecodeScoreAgainstTheDefinition:
+    """The decode scorer against `_score_oracle`, not against another kernel.
+
+    This used to compare two kernels -- flydsl against the Triton one it beat --
+    and assert on the SELECTION rather than the scores, because two accumulation
+    orders may legally reorder blocks that tie. The Triton kernel is gone, so
+    both halves of that change: the anchor is the definition, and scores are now
+    comparable directly (with a tolerance, not bit-for-bit).
+    """
+
+    @staticmethod
+    def _run(kw, work_map, max_block):
+        return m.minimax_m3_index_topk_decode(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            kw["max_seq_len"], TOPK, INIT, LOCAL, kw["num_kv_heads"],
+            kw["sm_scale"], emit_sparse_block_table=True,
+            max_query_len=kw["max_query_len"],
+            index_score_work_map=work_map, index_score_max_block=max_block,
+        )  # fmt: skip
+
+    @pytest.mark.parametrize("max_query_len", [1, 8])
+    @pytest.mark.parametrize("ragged", [False, True], ids=["uniform", "ragged"])
+    def test_the_scores_are_the_ones_the_definition_asks_for(
+        self, ragged, max_query_len
+    ):
+        batch, heads = 6, 2
+        prefixes = [8192, 1024, 65536, 256, 16384, 512] if ragged else [8192] * batch
+        kw = _inputs([max_query_len] * batch, prefixes, heads, "cuda")
+        max_block = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+        work_map = m.build_index_score_work_map(
+            kw["seq_lens"],
+            max_block=max_block,
+            max_query_len=max_query_len,
+            num_idx_heads=heads,
+        )
+        score = m.decode_index_score(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            max_block, max_query_len, heads, kw["sm_scale"], work_map,
+        )  # fmt: skip
+        want = _score_oracle(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            max_query_len, heads, kw["sm_scale"],
+        )  # fmt: skip
+        assert score.shape == want.shape
+        # Only where the kernel is required to write: the oracle marks the rest
+        # NaN, and the kernel leaves those slots alone by design.
+        live = ~torch.isnan(want)
+        # Both sides carry -inf for a fully-masked block; subtracting them gives
+        # NaN, so compare those positions by equality and the rest by tolerance.
+        neg_inf = want == -torch.inf
+        assert torch.equal(score[live & neg_inf], want[live & neg_inf])
+        finite = live & ~neg_inf
+        assert torch.allclose(score[finite], want[finite], rtol=2e-2, atol=2e-2)
+
+    def test_a_map_built_for_a_wider_bound_still_agrees(self):
+        """What a cudagraph replay does: score to `max_model_len`, not to the
+        batch's longest request. The extra columns must not move the answer."""
+        batch, heads = 4, 2
+        kw = _inputs([1] * batch, [4096, 8192, 1024, 2048], heads, "cuda")
+        narrow = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+        wide = 4 * narrow
+        # The table is widened with the bound, as production has it: the engine
+        # sizes block tables from `max_model_len`, the same quantity
+        # `_index_score_max_block` comes from, so a table narrower than the
+        # bound never reaches the kernel -- and aiter rejects that pair rather
+        # than reading past the row.
+        wide_table = torch.zeros(batch, wide, dtype=torch.int32, device="cuda")
+        wide_table[:, :narrow] = kw["block_table"]
+        wide_kw = {**kw, "block_table": wide_table}
+        work_map = m.build_index_score_work_map(
+            kw["seq_lens"], max_block=wide, max_query_len=1, num_idx_heads=heads
+        )
+        wide_idx, _, _ = self._run(wide_kw, work_map, wide)
+        narrow_idx, _, _ = self._run(kw, None, narrow)
+        rows = heads * batch
+        assert torch.equal(
+            torch.sort(wide_idx.reshape(rows, TOPK), dim=1).values,
+            torch.sort(narrow_idx.reshape(rows, TOPK), dim=1).values,
+        )
+
+    def test_a_map_built_for_another_bound_is_refused(self):
+        """The one failure here that would otherwise be silent: the row count
+        IS the grid, so a mismatched map is not a short map, it is the kernel
+        reading rows that mean a different (request, chunk)."""
+        kw = _inputs([1] * 4, [8192] * 4, 2, "cuda")
+        max_block = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+        work_map = m.build_index_score_work_map(
+            kw["seq_lens"], max_block=2 * max_block, max_query_len=1, num_idx_heads=2
+        )
+        # ValueError and not AssertionError: the bound comes from launch
+        # flags and a captured buffer, so `python -O` must not be able to turn
+        # a stale map into unreported wrong scores. Same rule as
+        # `TestPackableBound`.
+        with pytest.raises(ValueError, match="different bounds"):
+            self._run(kw, work_map, 0)
+
+
+@gpu
+class TestIndexScoreWorkMapHoist:
+    """One build per decode step, not one per sparse layer.
+
+    `make_work_map` is ~15 tiny device ops and costs ~120us whatever the shape
+    -- launch floor, not work -- against a score kernel of 17-250us. Rebuilding
+    it per layer is the failure that makes the whole substitution a net loss
+    while every correctness test still passes.
+
+    Every call path builds it in a metadata builder, one step upstream of this
+    module. What is testable here is the half that lives here: given a map the
+    op uses it as handed over and does not rebuild.
+
+    The op does build one when none arrives -- there is no second scorer to fall
+    back to any more, so declining would mean raising. That is the slow-but-
+    correct path, and the count below is what keeps it from quietly becoming the
+    fast path's behaviour too.
+    """
+
+    @pytest.mark.parametrize("hoisted", [True, False])
+    def test_it_builds_exactly_when_the_caller_did_not(self, monkeypatch, hoisted):
+        kw = _inputs([1] * 4, [8192] * 4, 2, "cuda")
+        max_block = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+        real = m.build_index_score_work_map
+        work_map = real(
+            kw["seq_lens"], max_block=max_block, max_query_len=1, num_idx_heads=2
+        )
+        builds = []
+
+        def counted(*a, **k):
+            builds.append(1)
+            return real(*a, **k)
+
+        monkeypatch.setattr(m, "build_index_score_work_map", counted)
+        idx, _, _ = m.minimax_m3_index_topk_decode(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            kw["max_seq_len"], TOPK, INIT, LOCAL, 2, kw["sm_scale"],
+            emit_sparse_block_table=True, max_query_len=1,
+            index_score_work_map=work_map if hoisted else None,
+            index_score_max_block=max_block if hoisted else 0,
+        )  # fmt: skip
+        assert idx.shape == (2, 4, TOPK)
+        assert len(builds) == (0 if hoisted else 1)
+
+
+def _prefill_score_oracle(kw, heads, cache=None):
+    """Prefill block scores in fp32 on the device, straight from the definition.
+
+    `[heads, total_q, max_block]`, NaN wherever NEITHER scorer owes an answer:
+    past a row's own causal window. The two tile the query axis differently --
+    Triton by `SCORE_BLOCK_SIZE_Q`, flydsl by its own `tile_q` -- and each fills
+    out to its TILE's window, so they legitimately disagree about columns past
+    the row's. `n_valid_column_per_row` bounds the selector at exactly
+    `ceil(causal_len / 128)` per row, so that window is the whole contract.
+
+    A transcription of the rule rather than a third kernel, for the reason the
+    module docstring gives.
+    """
+    idx_q = kw["idx_q"]
+    cache = kw["index_kv_cache"] if cache is None else cache
+    cu = kw["cu_seqlens_q"].tolist()
+    dev, p = idx_q.device, SPARSE_BLOCK_SIZE
+    out = torch.full(
+        (heads, idx_q.shape[0], -(-kw["max_seq_len"] // p)),
+        float("nan"), dtype=torch.float32, device=dev,
+    )  # fmt: skip
+    # The kernels fold log2(e) into the scale and work in base 2; the selection
+    # is invariant to that, but a score comparison is not.
+    scale = kw["sm_scale"] * 1.4426950408889634
+    within = torch.arange(p, device=dev)
+    for b in range(kw["seq_lens"].shape[0]):
+        lo, hi = cu[b], cu[b + 1]
+        prefix, length = int(kw["prefix_lens"][b]), int(kw["seq_lens"][b])
+        # One causal cutoff per (token, head) column, in the order
+        # `reshape(-1, HEAD_DIM)` lays the columns out.
+        cuts = prefix + torch.arange(hi - lo, device=dev).repeat_interleave(heads) + 1
+        q = idx_q[lo:hi].reshape(-1, HEAD_DIM)
+        if cache.dtype != idx_q.dtype:
+            # PREFILL rounds Q DOWN to the cache dtype -- the Triton kernel is
+            # `tl.dot(q.to(k.dtype), k)` under `k.dtype.is_fp8()`, and flydsl's
+            # `fp8_mfma` does the same. That is the opposite of decode, which
+            # lifts K to Q, so this oracle must not borrow the decode rule: at
+            # the 2e-2 tolerance the two roundings are close enough that an
+            # fp8-Q regression shared by both scorers would pass unnoticed.
+            q = q.to(cache.dtype)
+        for blk in range(-(-length // p)):
+            # K goes straight to fp32 -- exact from either dtype. The rounding
+            # that matters here is Q's, applied above.
+            k = cache[int(kw["block_table"][b, blk])].float()
+            z = (k @ q.float().T) * scale
+            z = z.masked_fill((blk * p + within)[:, None] >= cuts[None, :], -torch.inf)
+            col = torch.where(
+                blk < -(-cuts // p), z.amax(0), z.new_full(cuts.shape, float("nan"))
+            )
+            out[:, lo:hi, blk] = col.reshape(hi - lo, heads).T
+    return out
+
+
+def _prefill_score(kw, heads, backend):
+    """`prefill_index_score` on `_inputs` kwargs, plus the oracle's live mask."""
+    cache = kw["index_kv_cache"]
+    score = m.prefill_index_score(
+        kw["idx_q"], cache, kw["block_table"], kw["cu_seqlens_q"], kw["seq_lens"],
+        kw["prefix_lens"], kw["max_query_len"], kw["max_seq_len"], kw["sm_scale"],
+        backend=backend,
+    )  # fmt: skip
+    return score, _prefill_score_oracle(kw, heads, cache)
+
+
+# (qlens, prefixes): fresh prompts, a ragged chunked-prefill batch, and the
+# single-token tiles a chunk boundary leaves behind.
+PREFILL_SHAPES = [
+    ([600] * 4, [0] * 4),
+    ([600, 137, 1024, 41], [547, 8192, 0, 65536]),
+    ([1, 1, 1, 1], [8192, 1024, 256, 512]),
+]
+PREFILL_IDS = ["fresh", "ragged-chunked", "q1-tail"]
+
+
+@gpu
+class TestPrefillScoreAgainstTheDefinition:
+    """Both prefill scorers against `_prefill_score_oracle`, not each other.
+
+    `TestPrefillScorersAgree` below does compare them, which the module
+    docstring's rule allows only because both are live and the dispatch's whole
+    claim IS that they agree. These tests are what stops a defect they share
+    from passing as agreement.
+    """
+
+    @pytest.mark.parametrize("backend", ["flydsl", "triton"])
+    @pytest.mark.parametrize("heads", [1, 2], ids=["cp-slice", "tp"])
+    @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
+    def test_the_scores_are_the_ones_the_definition_asks_for(
+        self, qlens, prefixes, heads, backend
+    ):
+        kw = _inputs(qlens, prefixes, heads, "cuda")
+        score, want = _prefill_score(kw, heads, backend)
+        assert score.shape == want.shape
+        # Only where the scorer is required to write: the oracle marks the rest
+        # NaN, and past its own tile's window a scorer leaves the slot
+        # uninitialised by design.
+        live = ~torch.isnan(want)
+        assert live.any()
+        # atol 1e-3, not 2e-2. Measured worst case over every shape, head count
+        # and backend here is 1.7e-5 on an fp8 cache, so 2e-2
+        # was three orders of magnitude of slack -- enough that the oracle
+        # could model the WRONG rounding (lifting K to Q, which is decode's
+        # rule) and still pass at 1.69e-2, within 18% of the bound. 1e-3 keeps
+        # ~60x headroom over the real error and still fails that mistake.
+        assert torch.allclose(score[live], want[live], rtol=2e-2, atol=1e-3)
+
+    @pytest.mark.parametrize("backend", ["flydsl", "triton"])
+    def test_a_perturbed_cache_moves_the_scores(self, backend):
+        """Negative control: the comparison above can actually fail."""
+        kw = _inputs(*PREFILL_SHAPES[1], 2, "cuda")
+        _, want = _prefill_score(kw, 2, backend)
+        live = ~torch.isnan(want)
+        # fp8 has no add kernel, so the perturbation happens in float.
+        page = kw["block_table"][1, 0]
+        kw["index_kv_cache"][page] = (
+            kw["index_kv_cache"][page].to(torch.float32) + 1.0
+        ).to(kw["index_kv_cache"].dtype)
+        moved, _ = _prefill_score(kw, 2, backend)
+        assert not torch.allclose(moved[live], want[live], rtol=2e-2, atol=2e-2)
+
+
+def test_the_vllm_pool_allocator_refuses_bf16_by_name():
+    """The refusal that matters most: it happens before anything is allocated.
+
+    `_resolve_index_cache_dtype` runs when the KV pool is sized. Without this
+    the same configuration starts, serves a prefill and dies at the first
+    decode inside aiter, which names neither the flag nor ATOM as the refuser.
+
+    Pinned because a refusal nothing watches is one refactor from disappearing,
+    and this one is the whole of the fp8 narrowing on the vLLM/native path.
+    """
+    from atom.model_ops.attentions.aiter_attention import _resolve_index_cache_dtype
+
+    # explicit bf16
+    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+        _resolve_index_cache_dtype(SimpleNamespace(index_cache_dtype="bf16"))
+    # and the case nobody passes a flag for: inherited from --kv_cache_dtype
+    with pytest.raises(ValueError, match="inherited from --kv_cache_dtype"):
+        _resolve_index_cache_dtype(
+            SimpleNamespace(index_cache_dtype=None, kv_cache_dtype="bf16")
+        )
+    # fp8 still resolves, so the guard is not refusing everything
+    assert (
+        _resolve_index_cache_dtype(SimpleNamespace(index_cache_dtype="fp8"))
+        == aiter.dtypes.fp8
+    )
+
+
+def test_the_sglang_pool_refuses_bf16_by_name():
+    """The same refusal, at the same stage, on the other front end.
+
+    SGLang does not go through `_resolve_index_cache_dtype`; it resolves the
+    index dtype itself in `_atom_m3_index_dtype`, called from `configure`
+    before weights load. Left unguarded that path kept the old behaviour --
+    start, then die at the first decode -- which is the one thing the narrowing
+    exists to prevent.
+    """
+    from atom.plugin.sglang.minimax_m3_bridge import _atom_m3_index_dtype
+
+    bf16_owner = SimpleNamespace(
+        model_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype_str="bfloat16",
+    )
+    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+        _atom_m3_index_dtype(bf16_owner)
+    # an fp8 KV cache still resolves, through the fallback this guard sits after
+    fp8_owner = SimpleNamespace(
+        model_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype_str="fp8_e4m3",
+    )
+    assert _atom_m3_index_dtype(fp8_owner) == aiter.dtypes.fp8
+
+
+@gpu
+def test_a_bf16_index_cache_is_refused_by_name():
+    """bf16 was served by the Triton decode scorer, which this change deletes.
+
+    The FlyDSL scorers take fp8 only, so ATOM refuses bf16 itself rather than
+    letting it reach aiter -- aiter's dtype error names neither the flag to pass
+    nor that ATOM is what refuses. `_resolve_index_cache_dtype` refuses the same
+    configuration earlier, when the pool is allocated; this pins the scorer's
+    backstop for any path that did not come through it.
+    """
+    kw = _inputs([1, 1], [511, 511], 1, "cuda")
+    kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.bfloat16)
+    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+        m.decode_index_score(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE), 1, 1, kw["sm_scale"],
+        )  # fmt: skip
+
+
+@gpu
+class TestPrefillScorersAgree:
+    """The dispatch's claim: swapping the scorer does not move the answer.
+
+    Scores with a tolerance -- two accumulation orders over the same 128 values
+    are not bit-identical -- and then the SELECTION exactly, which is what the
+    rest of the model actually consumes.
+    """
+
+    @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
+    def test_the_two_scorers_agree_where_either_owes_an_answer(self, qlens, prefixes):
+        kw = _inputs(qlens, prefixes, 2, "cuda")
+        fly, want = _prefill_score(kw, 2, "flydsl")
+        tri, _ = _prefill_score(kw, 2, "triton")
+        live = ~torch.isnan(want)
+        # Same bound as the oracle comparison above, for the same reason: each
+        # scorer sits within 1.7e-5 of the definition, so they sit within twice
+        # that of each other and 2e-2 would hide a real divergence.
+        assert torch.allclose(fly[live], tri[live], rtol=2e-2, atol=1e-3)
+
+    @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
+    def test_the_selection_is_the_same(self, monkeypatch, qlens, prefixes):
+        # The case `auto` actually dispatches, and now the only one: `k_lds` --
+        # with it any reason to run the flydsl prefill scorer at all -- is legal
+        # only on an fp8 cache, and bf16 is refused before it can reach either
+        # scorer. This is the test that can see a tie resolve to a different
+        # block.
+        kw = _inputs(qlens, prefixes, 2, "cuda")
+        picked = []
+        real = m.prefill_index_score
+        for backend in ("flydsl", "triton"):
+            # Bound here rather than through a production knob: the entry point
+            # takes no backend, and adding one so a test can reach the second
+            # scorer would be a parameter nothing else wants.
+            monkeypatch.setattr(
+                m, "prefill_index_score", functools.partial(real, backend=backend)
+            )
+            idx, _sbt, sctx = m.minimax_m3_index_topk(
+                **kw, emit_sparse_block_table=True
+            )
+            # sbt is dropped: it is score ORDER, which ties may legally
+            # permute; the selected set and the context length are the
+            # properties that must not move.
+            picked.append((idx, sctx))
+        (ia, ca), (ib, cb) = picked
+        assert torch.equal(ca, cb)
+        for h in range(ia.shape[0]):
+            for r in range(0, ia.shape[1], 37):
+                sa = {int(v) for v in ia[h, r] if v >= 0}
+                sb = {int(v) for v in ib[h, r] if v >= 0}
+                assert sa == sb, f"head {h} row {r}"

@@ -781,6 +781,15 @@ def _ensure_side_caches(
     )
     index_shape = (num_blocks, page_size, layer.idx_head_dim)
 
+    # No scorer serves bf16; the pool shim can be reached without either resolver.
+    from atom.model_ops.minimax_m3.index_topk import (
+        _FP8_DTYPES,
+        INDEX_CACHE_MUST_BE_FP8,
+    )
+
+    if index_key.dtype not in _FP8_DTYPES:
+        raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_key.dtype}.")
+
     index_cache = getattr(layer, "_sglang_m3_index_cache", None)
     if (
         index_cache is None
@@ -870,6 +879,7 @@ def minimax_m3_sparse_attention_for_sglang(
     output = torch.empty_like(q)
 
     from atom.model_ops.minimax_m3.index_topk import (
+        index_score_work_map_for_forward,
         minimax_m3_index_topk,
         minimax_m3_index_topk_decode,
         n_valid_column_per_row_for_forward,
@@ -902,6 +912,16 @@ def minimax_m3_sparse_attention_for_sglang(
                 num_idx_heads=layer.num_idx_heads,
                 decode_max_q=1,
             ),
+            # Bound is the capture-stable block-table width, not this step's longest request.
+            index_score_work_map=index_score_work_map_for_forward(
+                forward_batch,
+                "decode",
+                metadata.seq_lens,
+                max_block=metadata.block_table.shape[1],
+                max_query_len=1,
+                num_idx_heads=layer.num_idx_heads,
+            ),
+            index_score_max_block=metadata.block_table.shape[1],
         )
         minimax_m3_sparse_attn_decode_split_kv(
             q[:batch_size],

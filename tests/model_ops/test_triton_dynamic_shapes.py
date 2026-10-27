@@ -253,11 +253,25 @@ def test_qsa_real_requests_change_within_and_between_buckets():
 
 
 def test_m3_context_and_batch_reuse_kernels():
+    # aiter imported here and not at module scope: the only CI job that runs
+    # tests/ has no aiter, and a module-scope import makes this whole file a
+    # collection error there instead of the skip the importorskip above sets up.
+    import aiter
+
     from atom.model_ops.minimax_m3 import indexer_candidate_exchange as ex
     from atom.model_ops.minimax_m3 import indexer_context_parallel as cp
 
-    cache = torch.zeros(64, 128, 128, device="cuda", dtype=torch.bfloat16)
-    with one_variant(cp._context_score, ex._local_topk, ex._merge_topk):
+    # fp8: the index cache the FlyDSL scorers serve, and the only one ATOM
+    # allocates now. bf16 is refused before it can reach them.
+    cache = torch.zeros(64, 128, 128, device="cuda").to(aiter.dtypes.fp8)
+    # The context scorer is no longer in this list because it is no longer a
+    # Triton kernel: `indexer_context_scores` now dispatches to aiter's FlyDSL
+    # scorer, which `one_variant` cannot instrument and which does not
+    # specialize on shape the way a `tl.constexpr` does. The call below still
+    # runs it at every shape -- what is dropped is the single-variant
+    # assertion, not the coverage. The two selector kernels after it are still
+    # Triton and still the ones this test exists to pin.
+    with one_variant(ex._local_topk, ex._merge_topk):
         for n, blocks in ((1, 33), (15, 35), (16, 37), (17, 39), (31, 41)):
             q = torch.ones(n, 4, 128, device="cuda", dtype=torch.bfloat16)
             table = torch.arange(64, device="cuda", dtype=torch.int32).repeat(n, 1)

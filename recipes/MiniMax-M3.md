@@ -16,6 +16,14 @@ docker pull rocm/atom-dev:latest
 
 ### Launching Server
 
+
+> **`--index-cache-dtype fp8` is required, not a tuning choice.** The index
+> scorers are aiter's FlyDSL kernels and they serve an fp8 index cache only; a
+> bf16 one is refused when the KV pool is allocated, with a message naming this
+> flag. Omitting the flag inherits `--kv_cache_dtype`, so a run that passes
+> `--kv_cache_dtype bf16` and nothing else is refused at startup rather than
+> silently served.
+
 ```bash
 model_path=${model_path:-amd/MiniMax-M3-MXFP4}
 run_name=${run_name:-m3-mxfp4}

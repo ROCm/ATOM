@@ -274,7 +274,11 @@ def _minimax_sparse_kv_scale_buffer(self, layer_id: int):
 
 
 def _atom_m3_index_dtype(owner: Any) -> torch.dtype:
-    """ATOM index dtype for MiniMax-M3: fp8 when KV/index config says fp8."""
+    """ATOM index dtype for MiniMax-M3: fp8, or a refusal naming the flag.
+
+    Runs from `configure`, before weights load; the SGLang side of the refusal
+    in `aiter_attention._resolve_index_cache_dtype`, with the same message.
+    """
 
     fallback = getattr(owner, "model_dtype", torch.bfloat16)
     index_dtype = _resolve_m3_index_cache_dtype(fallback)
@@ -286,7 +290,9 @@ def _atom_m3_index_dtype(owner: Any) -> torch.dtype:
         from aiter import dtypes
 
         return dtypes.d_dtypes["fp8"]
-    return index_dtype
+    from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
+
+    raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_dtype}.")
 
 
 def _is_minimax_m3_owner(owner: Any) -> bool:

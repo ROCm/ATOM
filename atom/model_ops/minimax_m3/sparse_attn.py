@@ -21,7 +21,10 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
+from atom.model_ops.minimax_m3.index_topk import (
+    build_index_score_work_map,
+    build_n_valid_column_per_row,
+)
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -96,6 +99,18 @@ class MiniMaxM3SparseMetadata:
     `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
     indexer. `index_topk` consumes it and never derives its own.
     """
+    index_score_work_map: torch.Tensor | None = None
+    """[grid, 2] int32 GPU -- the decode index-score kernel's packed dispatch
+    order, built once per step (~120us a call). None on prefill and on an empty
+    batch; the scorer then builds its own, correctly but per layer.
+    """
+    index_score_max_block: int = 0
+    """The bound `index_score_work_map` was built against, in 128-token blocks.
+
+    NOT `ceil(max_seq_len / 128)`: the map's row count is the grid baked at
+    capture, so the bound must not move -- `ceil(max_model_len / 128)`, or under
+    indexer CP this rank's LOCAL `ceil(that / world)`.
+    """
 
 
 def make_sparse_prefill_metadata(
@@ -152,11 +167,23 @@ def make_sparse_decode_metadata(
     num_idx_heads: int,
     max_query_len: int = 1,
     n_valid_column_per_row_out: torch.Tensor | None = None,
+    index_score_work_map_out: torch.Tensor | None = None,
+    index_score_max_block: int = 0,
+    index_score_cp_world: int = 1,
+    index_score_cp_rank: int = 0,
+    index_score_num_idx_heads: int = 0,
 ) -> MiniMaxM3SparseMetadata:
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
     batch = seq_lens.shape[0]
+    # A caller that captures cudagraphs MUST pass its own fixed bound; this
+    # fallback is for eager and test paths.
+    index_score_max_block = index_score_max_block or triton.cdiv(
+        triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE), index_score_cp_world
+    )
+    # Differs from `num_idx_heads` under indexer CP (one score head per CP rank).
+    index_score_num_idx_heads = index_score_num_idx_heads or num_idx_heads
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
         max_seq_len=max_seq_len,
@@ -175,6 +202,16 @@ def make_sparse_decode_metadata(
             decode_max_q=max_query_len,
             out=n_valid_column_per_row_out,
         ),
+        index_score_work_map=build_index_score_work_map(
+            seq_lens,
+            max_block=index_score_max_block,
+            max_query_len=max_query_len,
+            num_idx_heads=index_score_num_idx_heads,
+            out=index_score_work_map_out,
+            cp_world=index_score_cp_world,
+            cp_rank=index_score_cp_rank,
+        ),
+        index_score_max_block=index_score_max_block,
     )
 
 

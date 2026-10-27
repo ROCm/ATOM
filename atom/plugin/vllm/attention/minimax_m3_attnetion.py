@@ -86,38 +86,18 @@ def minimax_m3_sparse_attention(
     layer._sparse_attn_run(qkv, positions, output)
 
 
-def _index_cache_torch_dtype(kv_cache_dtype: str, model_config) -> torch.dtype:
-    """Torch dtype for the MiniMax-M3 index cache.
+def _index_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
+    """Torch dtype for the MiniMax-M3 index cache: fp8, or a refusal.
 
-    Everything except fp8 is vLLM's own mapping. fp8 is the exception, and it
-    belongs here rather than in ``kv_cache_dtype_str_to_dtype``: that table is
-    vLLM's, it is shared by every layer of every model, and its ``fp8 ->
-    torch.uint8`` entry is deliberate -- vLLM's kernels take an fp8 KV cache as
-    a byte buffer and reinterpret it, and so do the aiter paged kernels behind
-    ATOM's main sparse and dense caches (see
-    ``_page16_shuffle_cache_for_sparse_kernel``, which does the ``.view()``
-    itself). Relabelling fp8 globally would change those caches too.
-
-    The index cache is read by a kernel that dispatches on the tensor instead:
-    ``_index_block_score_kernel`` branches on ``k.dtype.is_fp8()``, so a
-    uint8-labelled cache goes down the bf16 branch and dots bf16 against uint8
-    (a Triton compile error on the first request). The bytes there are already
-    fp8 -- aiter's ``fused_qknorm_idxrqknorm`` writes them under
-    ``kv_cache_dtype="fp8"`` -- so only the label was wrong. ``dtypes.d_dtypes``
-    is the same handle the native server resolves this cache through
-    (``atom.model_ops.attentions.aiter_attention._resolve_index_cache_dtype``),
-    which keeps the two paths on one arch-correct fp8 dtype instead of a
-    hard-coded ``torch.float8_e4m3fn``.
-
-    The element stays one byte either way, so vLLM's page-size accounting is
-    unchanged, and vLLM already allows a real fp8 dtype in this position -- its
-    own ``fp8_inc`` entry maps to ``torch.float8_e4m3fn``.
+    NOT vLLM's ``kv_cache_dtype_str_to_dtype``: its ``fp8 -> torch.uint8`` would
+    make a kernel that branches on ``dtype.is_fp8()`` dot bf16 against uint8.
+    Anything else is bf16, which no scorer serves.
     """
-    from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-
     if str(kv_cache_dtype).startswith("fp8"):
         return dtypes.d_dtypes["fp8"]
-    return kv_cache_dtype_str_to_dtype(kv_cache_dtype, model_config)
+    from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
+
+    raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {kv_cache_dtype!r}.")
 
 
 class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
@@ -133,16 +113,12 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         from vllm.v1.attention.backend import AttentionType
 
         super().__init__()
-        atom_config = get_current_atom_config()
-        vllm_config = atom_config.plugin_config.vllm_config
         self.layer_name = layer_name
         self.prefix = layer_name
         self.attn_type = AttentionType.DECODER
         self.attn_backend = SparseMHAIndexerBackend
         self.kv_cache_dtype = kv_cache_dtype
-        self.kv_cache_torch_dtype = _index_cache_torch_dtype(
-            kv_cache_dtype, vllm_config.model_config
-        )
+        self.kv_cache_torch_dtype = _index_cache_torch_dtype(kv_cache_dtype)
         self.num_kv_heads = 1
         self.head_size = head_dim
         self.head_size_v = head_dim
@@ -618,6 +594,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         index_metadata,
     ):
         from atom.model_ops.minimax_m3.index_topk import (
+            index_score_work_map_for_forward,
             minimax_m3_index_topk_decode,
             n_valid_column_per_row_for_forward,
         )
@@ -664,6 +641,16 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 num_idx_heads=self.num_idx_heads,
                 decode_max_q=max_query_len,
             ),
+            # Bound is the capture-stable block-table width, not this step's longest request.
+            index_score_work_map=index_score_work_map_for_forward(
+                main_metadata,
+                "decode",
+                index_decode_md.seq_lens,
+                max_block=index_decode_md.block_table.shape[1],
+                max_query_len=max_query_len,
+                num_idx_heads=self.num_idx_heads,
+            ),
+            index_score_max_block=index_decode_md.block_table.shape[1],
         )
         self._store_cached_topk(key, topk_idx)
         return topk_idx
