@@ -18,7 +18,10 @@ root = Path(os.environ['SLURM_LOG_ROOT']).resolve()
 out = Path(os.environ['RESULT_DIR']) / 'inspection'
 out.mkdir(parents=True, exist_ok=True)
 # Exact task namespace and Actions ID; only its timestamp suffix is variable.
-prefix = f'minimax-m3.1-flash-vllm-m31-vllm-1p1d-tp4-mcstore-smoke-mooncake_store-{run_id}-'
+case = os.environ.get('ATOMESH_ENV_ATOMESH_INSPECT_CASE', 'smoke')
+if case not in {'smoke', 'validated-sweep'}:
+    raise ValueError('Unknown native experiment case')
+prefix = f'minimax-m3.1-flash-vllm-m31-vllm-1p1d-tp4-mcstore-{case}-mooncake_store-{run_id}-'
 runs = [p for p in root.glob(prefix + '*')
         if p.parent.resolve() == root and p.name[len(prefix):].isdecimal()]
 rows = []
@@ -27,11 +30,28 @@ for run in runs:
         job_id = job.name.removeprefix('slurm_job-')
         if not job_id.isdecimal() or job.resolve().parent != run.resolve():
             continue
+        current = job
+        phases = []
+        suite_file = job / 'suite-status.json'
+        if suite_file.is_file():
+            try:
+                suite = json.loads(suite_file.read_text())
+            except json.JSONDecodeError:
+                suite = []
+            for phase in suite:
+                if (phase.get('phase') in {'smoke', 'c32', 'c48', 'c64'}
+                        and phase.get('status') in {'running', 'success', 'failed'}
+                        and type(phase.get('concurrency')) is int
+                        and phase['concurrency'] in {1, 32, 48, 64}):
+                    phases.append({k: phase[k] for k in ('phase', 'status', 'concurrency')})
+            if phases:
+                current = job / phases[-1]['phase']
         row = {'actions_run_id': int(run_id), 'slurm_job_id': int(job_id),
-               'image_preflight_complete': (job / 'image-hardware.json').is_file(),
-               'model_snapshot_resolved': (job / 'resolved-experiment.json').is_file()}
+               'suite_phases': phases,
+               'image_preflight_complete': (current / 'image-hardware.json').is_file(),
+               'model_snapshot_resolved': (current / 'resolved-experiment.json').is_file()}
         for role in ('prefill', 'decode', 'proxy', 'mooncake-master'):
-            log = job / 'logs' / f'{role}.log'
+            log = current / 'logs' / f'{role}.log'
             row[role + '_log_exists'] = log.is_file()
             if log.is_file():
                 row[role + '_log_bytes'] = log.stat().st_size
@@ -46,7 +66,7 @@ for run in runs:
                     'out_of_memory': 'out of memory',
                     'mr_failure': 'ibv_reg_mr failed'}.items():
                     row[f'{role}_{name}'] = marker in tail
-        memory_file = job / 'memory-before-download.json'
+        memory_file = current / 'memory-before-download.json'
         if memory_file.is_file():
             memory = json.loads(memory_file.read_text())
             for key in ('memory.max', 'memory.current', 'memory.peak'):

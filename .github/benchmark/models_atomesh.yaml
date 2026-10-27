@@ -2152,7 +2152,8 @@ models:
           env:
             common:
               ATOMESH_VLLM_MODE: inspect
-              ATOMESH_INSPECT_RUN_ID: "40484777206"
+              ATOMESH_INSPECT_RUN_ID: "40487190671"
+              ATOMESH_INSPECT_CASE: validated-sweep
 
         - <<: *m31_vllm_pd
           name: m31-vllm-1p1d-tp4-mcstore-validated-sweep
