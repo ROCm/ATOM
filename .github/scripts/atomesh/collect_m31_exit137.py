@@ -82,6 +82,10 @@ for job in sorted(jobs):
     if not re.fullmatch(r"[0-9]+", job):
         continue
     script = "source .github/scripts/slurm_submit_helpers.sh; detect_slurm_backend; query_slurm_controller_job " + job + "; query_slurm_accounting_job " + job
+    script += '; args=(); if [[ "${USES_SPUR_CONTROLLER:-0}" == "1" && -n "${SPUR_CONTROLLER_ADDR:-}" ]]; then args=(--controller "$SPUR_CONTROLLER_ADDR"); fi; '
+    script += 'scontrol "${args[@]}" show job ' + job + '; '
+    script += 'squeue "${args[@]}" -h -j ' + job + ' -o "%i|%T|%M|%R|%N"; '
+    script += 'squeue "${args[@]}" --start -h -j ' + job + ' -o "%i|%S|%R|%N"'
     collect_command(f"job-{job}-accounting.txt", ["bash", "-c", script])
 
 # Query exact containers discovered in this run's metadata. No host kernel
