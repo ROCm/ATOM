@@ -1587,10 +1587,6 @@ models:
               # Relative to AIPerf's formal Profiling phase, after warmup.
               ATOMESH_TORCH_PROFILE_START: "1800"
               ATOMESH_TORCH_PROFILE_DURATION: "30"
-              PYTHONFAULTHANDLER: "1"
-              # Diagnostic run only: attribute GPU faults to the launching call.
-              AMD_SERIALIZE_KERNEL: "3"
-              ATOM_M3_SPARSE_VALIDATE: "1"
               ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
               ATOM_PROFILER_MORE: "0"
               ATOM_PROFILER_RECORD_SHAPES: "0"

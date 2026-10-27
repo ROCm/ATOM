@@ -1425,30 +1425,6 @@ def sparse_pa_per_row(
     k_cache_view = k_cache.view(nph16 * _hkv, 1, *k_cache.shape[2:])
     v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
 
-    # Temporary CI diagnosis: validate PA inputs before an asynchronous fault
-    # can destroy the useful Python stack. Never run host copies in capture.
-    import os
-    if os.environ.get("ATOM_M3_SPARSE_VALIDATE") == "1" and not torch.cuda.is_current_stream_capturing():
-        bt_host = sparse_bt.detach().cpu()
-        ctx_host = sparse_ctx.detach().cpu()
-        page_min, page_max = int(bt_host.min()), int(bt_host.max())
-        ctx_min, ctx_max = int(ctx_host.min()), int(ctx_host.max())
-        # Graph warmup pads inactive MTP rows with context lengths down to -3;
-        # PA explicitly skips those rows. Only the upper length bound applies.
-        valid = (sparse_bt.shape[0] == q_view.shape[0]
-                 and sparse_ctx.numel() == q_view.shape[0]
-                 and 0 <= page_min <= page_max < k_cache_view.shape[0]
-                 and ctx_max <= sparse_bt.shape[1] * 16)
-        print(f"[m3-pa-input] rank={torch.cuda.current_device()} rows={q_view.shape[0]} "
-              f"q={tuple(q_view.shape)} kv={tuple(k_cache_view.shape)} "
-              f"bt={tuple(sparse_bt.shape)} page_range=({page_min},{page_max}) "
-              f"ctx_range=({ctx_min},{ctx_max}) "
-              f"k_ptr={hex(k_cache_view.data_ptr())} v_ptr={hex(v_cache_view.data_ptr())} "
-              f"k_scale_ptr={hex(k_scale.data_ptr()) if k_scale is not None else None} "
-              f"valid={valid}", flush=True)
-        if not valid:
-            raise RuntimeError("M3 sparse PA bounds validation failed")
-
     if _sparse_pa_ran_on_asm(
         q_view,
         k_cache_view,

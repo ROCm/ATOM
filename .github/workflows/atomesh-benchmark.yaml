@@ -29,11 +29,6 @@ on:
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
-      inspect_run_id:
-        description: 'Diagnostic only: report only Slurm job state for this run ID, without submitting a benchmark'
-        required: false
-        default: ''
-        type: string
       suite:
         description: 'Benchmark suite'
         required: false
@@ -270,22 +265,8 @@ permissions:
   contents: write
 
 jobs:
-  inspect-existing-run:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_run_id != '' }}
-    name: Inspect existing ATOMesh run (read only)
-    runs-on: atomesh-cicd
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-      - name: Read current run Slurm status
-        env:
-          INSPECT_RUN_ID: ${{ inputs.inspect_run_id }}
-        run: python3 .github/scripts/atomesh/inspect_ci_run.py
-
   load-config:
-    if: ${{ inputs.inspect_run_id == '' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: Load ATOMesh benchmark config
     runs-on: ubuntu-latest
     outputs:
