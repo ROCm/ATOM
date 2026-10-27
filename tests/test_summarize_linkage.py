@@ -112,6 +112,52 @@ def test_linkage_trips_where_the_family_moves_together(tmp_path):
     assert entry["mirror_via"] == "TPOT"
 
 
+def test_missing_baseline_tpot_does_not_auto_confirm_the_mirror_gate(tmp_path):
+    """A missing/zero baseline mean_tpot_ms must not read as a mirrored move.
+
+    Before the fix, a missing baseline metric became ``tput_pct`` /
+    ``tpot_pct`` of ``inf`` via ``_pct_change``'s zero-baseline branch, and
+    ``_mirrors`` always treats an infinite latency delta as confirming any
+    nonzero throughput drop. A family only mildly (-4%) down, with no real
+    latency evidence, must not trigger.
+    """
+    base = tmp_path / "base"
+    cur = tmp_path / "cur"
+    for conc in (32, 128):
+        # mean_tpot_ms=0.0 on the baseline side -- "missing" per collect_deltas.
+        _baseline_result(base, "base", "M", conc, 1000.0, 0.0, 100.0)
+        _current_result(cur, "M", conc, 960.0, 11.0, 101.0)  # -4% tput, ttft +1%
+    _proc, report = _run(tmp_path, cur, base)
+    assert report["linkage"]["count"] == 0
+    assert all(e["model"] != "M" for e in report["linkage"]["triggered"])
+
+
+def test_missing_baseline_throughput_reports_insufficient_not_clean(tmp_path):
+    """A missing/zero baseline total_token_throughput must not hide a real drop.
+
+    Before the fix, the level with a missing baseline throughput got
+    ``tput_pct = inf``; ``statistics.median([-8.0, inf])`` is itself ``inf``,
+    which is not <= the -3% trigger threshold, so a genuinely -8% family read
+    as ``clean``. After the fix that level's ``tput_pct`` is ``None``, so
+    ``judge_family`` filters it out of the judging set entirely -- leaving
+    only one usable judging level, below ``FAMILY_MIN_CONFIGS`` -- and the
+    family must come back ``insufficient``, never ``clean`` (and, since only
+    one level is genuinely down, never ``triggered`` either).
+    """
+    base = tmp_path / "base"
+    cur = tmp_path / "cur"
+    _baseline_result(base, "base", "M", 32, 1000.0, 10.0, 100.0)
+    _current_result(cur, "M", 32, 920.0, 10.0, 100.0)  # genuine -8% tput
+    # total_token_throughput missing on the baseline side at this level.
+    _baseline_result(base, "base", "M", 128, 0.0, 10.0, 100.0)
+    _current_result(cur, "M", 128, 920.0, 10.0, 100.0)
+    _proc, report = _run(tmp_path, cur, base)
+    assert report["linkage"]["count"] == 0
+    assert all(e["model"] != "M" for e in report["linkage"]["triggered"])
+    entry = next(e for e in report["linkage"]["insufficient"] if e["model"] == "M")
+    assert "judging" in entry["reason"]
+
+
 def test_shipped_fields_are_untouched(tmp_path):
     """Three consumers read these; adding linkage must not disturb them."""
     base = tmp_path / "base"

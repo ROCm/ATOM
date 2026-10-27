@@ -273,6 +273,22 @@ def print_regression_report(current_results, baseline_results):
     return regression_count, regressions
 
 
+def _delta_or_none(current, baseline, key):
+    """Percentage change for one metric, or ``None`` if either side is absent/zero.
+
+    A missing or zero value on either side makes ``_pct_change`` either divide
+    by zero (``inf``) or compare against a value that was never really
+    measured; neither is usable evidence, so this reports "no data" instead of
+    a number a downstream median or comparison could be fooled by. Mirrors
+    perf_judge.py's ``_delta_or_none``, which the PR-side criterion already
+    relies on for the same reason.
+    """
+    current_value, baseline_value = current.get(key), baseline.get(key)
+    if not current_value or not baseline_value:
+        return None
+    return round(_pct_change(current_value, baseline_value), 2)
+
+
 def collect_deltas(current_results, baseline_results):
     """Per-configuration deltas, shaped for the family-linkage criterion.
 
@@ -281,6 +297,11 @@ def collect_deltas(current_results, baseline_results):
     Separate rather than folded into that function because
     plugin_benchmark_regression.py unpacks its two return values, and widening
     that signature to carry data derivable here would break it.
+
+    Each metric is ``None`` rather than a number when either side of the pair
+    is missing or zero (see ``_delta_or_none``) -- ``perf_criterion.judge_family``
+    is built to filter and median over that shape, so a missing baseline
+    metric can never read as an infinite move in either direction.
     """
     baseline_map = {_config_key(d): d for d in baseline_results}
     deltas = []
@@ -297,25 +318,9 @@ def collect_deltas(current_results, baseline_results):
                 "isl": isl,
                 "osl": osl,
                 "conc": conc,
-                "tput_pct": round(
-                    _pct_change(
-                        data.get("total_token_throughput", 0),
-                        baseline.get("total_token_throughput", 0),
-                    ),
-                    2,
-                ),
-                "tpot_pct": round(
-                    _pct_change(
-                        data.get("mean_tpot_ms", 0), baseline.get("mean_tpot_ms", 0)
-                    ),
-                    2,
-                ),
-                "ttft_pct": round(
-                    _pct_change(
-                        data.get("mean_ttft_ms", 0), baseline.get("mean_ttft_ms", 0)
-                    ),
-                    2,
-                ),
+                "tput_pct": _delta_or_none(data, baseline, "total_token_throughput"),
+                "tpot_pct": _delta_or_none(data, baseline, "mean_tpot_ms"),
+                "ttft_pct": _delta_or_none(data, baseline, "mean_ttft_ms"),
             }
         )
     return deltas
