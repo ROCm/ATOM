@@ -137,6 +137,7 @@ def test_plan_free_is_the_planned_path_with_one_task_a_row():
     and the production planned split (default partitions) agrees to rounding."""
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
     from aiter.ops.flydsl.pa_decode_mxfp4 import pa_decode_mxfp4
+
     from atom.model_ops.minimax_m3.kv_mxfp4 import page_views
     from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
@@ -163,6 +164,7 @@ def test_plan_free_builds_nothing_per_row_count():
     nor the plan cache, nor the PA kernel's build cache after its first call."""
     from aiter.ops.flydsl.kernels.pa_decode_mxfp4_kernel import build_pa_decode_mxfp4
     from aiter.ops.flydsl.kernels.pa_decode_plan import compile_pa_decode_plan
+
     from atom.model_ops.minimax_m3 import sparse_attn_mxfp4 as m
 
     k, v, bt, ctx, q = make(8, 1, seed=3, pages=64)

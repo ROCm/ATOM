@@ -1616,9 +1616,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 "sparse_layer_ordinal": self.sparse_layer_ordinal,
             }
 
-    def _sparse_pa_mxfp4(
-        self, q, k_cache, v_cache, sparse_bt, sparse_ctx, plan_owner
-    ):
+    def _sparse_pa_mxfp4(self, q, k_cache, v_cache, sparse_bt, sparse_ctx, plan_owner):
         from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
         if self.local_blocks < 1:
