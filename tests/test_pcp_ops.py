@@ -51,6 +51,9 @@ def _split(monkeypatch, ids, pos, hid, rank, ws=WS):
     eagle_proposer, rank in pcp_utils)."""
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: ws)
     monkeypatch.setattr(pu, "get_pcp_rank", lambda: rank)
+    # The helper flags the pass as split for FusedMoE's PCP gather.
+    ctx = SimpleNamespace(context=SimpleNamespace(pcp_split=False))
+    monkeypatch.setattr(ep, "get_forward_context", lambda: ctx)
     return ep._pcp_split_draft_inputs(ids, pos, hid)
 
 
@@ -110,6 +113,8 @@ def test_row_misalignment_is_rejected(monkeypatch):
     padded by the wrong amount."""
     ids, pos, hid = _inputs(10)
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: WS)
+    ctx = SimpleNamespace(context=SimpleNamespace(pcp_split=False))
+    monkeypatch.setattr(ep, "get_forward_context", lambda: ctx)
     with pytest.raises(AssertionError, match="row-aligned"):
         ep._pcp_split_draft_inputs(ids, pos[:4], hid)
     with pytest.raises(AssertionError, match="row-aligned"):
