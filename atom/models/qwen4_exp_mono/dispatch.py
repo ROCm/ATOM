@@ -7,7 +7,11 @@ import logging
 import torch
 from torch import nn
 
-from atom.models.qwen4_exp_mono.config import config_refusal, enabled_widths
+from atom.models.qwen4_exp_mono.config import (
+    config_refusal,
+    enabled_widths,
+    uses_native_mxfp4_moe,
+)
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
@@ -56,13 +60,19 @@ def step_supported(
 class MonoDecodeModel(nn.Module):
     """Run accepted widths on mono and preserve the original fallback."""
 
-    def __init__(self, model: nn.Module, tp=1, max_model_len=8192) -> None:
+    def __init__(
+        self, model: nn.Module, tp=1, max_model_len=8192, native_mxfp4_moe=False
+    ) -> None:
         super().__init__()
         self.model = model
         self.tp = tp
 
         def create_runner():
             try:
+                if native_mxfp4_moe:
+                    from atom.models.qwen4_exp_mono.quark import QuarkMonoRunner
+
+                    return QuarkMonoRunner(model, max_model_len)
                 from atom.models.qwen4_exp_mono.runner import QwenMonoRunner
             except ImportError as error:
                 raise MonoUnsupported(f"mono kernels unavailable: {error}") from error
@@ -104,5 +114,8 @@ def install_mono_decode(model, atom_config, drafter, *, metadata_builder=None):
         logger.info("Qwen mono off: %s", why)
         return model
     return MonoDecodeModel(
-        model, atom_config.tensor_parallel_size, atom_config.max_model_len
+        model,
+        atom_config.tensor_parallel_size,
+        atom_config.max_model_len,
+        native_mxfp4_moe=uses_native_mxfp4_moe(atom_config),
     )

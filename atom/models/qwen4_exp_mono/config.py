@@ -40,6 +40,19 @@ def enabled_widths(tp):
     return DECODE_ROWS if tp in ENABLED_TP else ()
 
 
+def uses_native_mxfp4_moe(atom_config) -> bool:
+    """Experimental TP1 Quark seam: Mono GDN/HC, native MXFP4 MoE/QSA."""
+    quant = getattr(atom_config, "quant_config", None)
+    hf_quant = getattr(quant, "hf_quant_config", None) or {}
+    return (
+        atom_config.tensor_parallel_size == 1
+        and getattr(quant, "quant_method", None) == "quark"
+        and not getattr(quant, "online_quant", False)
+        and hf_quant.get("global_quant_config", {}).get("weight", {}).get("dtype")
+        == "fp4"
+    )
+
+
 def _shape_checks(hf) -> list[tuple[bool, str]]:
     layer_types = tuple(
         "full_attention" if kind == "qwen_sparse_attention" else kind
@@ -169,7 +182,11 @@ def config_refusal(atom_config) -> str | None:
             "speculative decode",
         ),
         (
-            getattr(atom_config, "kv_cache_dtype", None) == "bf16",
+            getattr(atom_config, "kv_cache_dtype", None) == "bf16"
+            or (
+                uses_native_mxfp4_moe(atom_config)
+                and getattr(atom_config, "kv_cache_dtype", None) == "fp8"
+            ),
             "KV cache is not BF16",
         ),
         (atom_config.torch_dtype == torch.bfloat16, "activation dtype is not BF16"),

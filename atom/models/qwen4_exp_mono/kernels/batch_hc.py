@@ -64,7 +64,7 @@ def build(tokens, has_inject=True):
 def prepare(h, norm_weight, w_cat, w_up, eps, hc, has_inject, block=None, raw=None):
     """Prepare native HC streams, normalization and down projection."""
     rows, width = h.shape
-    assert rows in (2, 4) and width == 10240 and hc == 4
+    assert rows in (1, 2, 4) and width == 10240 and hc == 4
     nout = 324 if has_inject else 320
     assert w_cat.shape == (nout, 10240) and w_up.shape == (10240, 320)
     combined = block is not None

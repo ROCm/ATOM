@@ -16,6 +16,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_compress_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
+    qsa_store_quantized_rows,
     qsa_store_rows,
 )
 from atom.model_ops.qwen4_exp.qsa_attention import canonical_rope_positions
@@ -72,7 +73,17 @@ def _prepare_index(
         rope_position_offset=int(get_forward_context().context.is_draft),
     )
     normalized = module.indexer.normalize_compressed_keys(pooled, first_positions)
-    qsa_store_rows(module.compressed_key_cache, qsa.compressed_slot_mapping, normalized)
+    if module.compressed_key_scale is None:
+        qsa_store_rows(
+            module.compressed_key_cache, qsa.compressed_slot_mapping, normalized
+        )
+    else:
+        qsa_store_quantized_rows(
+            module.compressed_key_cache,
+            module.compressed_key_scale,
+            qsa.compressed_slot_mapping,
+            normalized,
+        )
 
     return index_q
 
@@ -91,6 +102,7 @@ def _select_prepared(module, index_q: torch.Tensor, qsa) -> torch.Tensor:
         module.indexer.compress_ratio,
         max_seq_len=qsa.max_seq_len,
         allow_flydsl=bool(getattr(get_forward_context().context, "is_prefill", False)),
+        compressed_k_scale=module.compressed_key_scale,
     )
 
 
@@ -98,6 +110,8 @@ def prepare(
     module,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
+    *,
+    fuse_decode_index: bool = False,
 ) -> PreparedQsa:
     """Prepare QSA projections and fuse norm/RoPE/cache when metadata is present."""
 
@@ -122,6 +136,8 @@ def prepare(
             module.k_cache,
             module.v_cache,
             qsa.slot_mapping,
+            module.k_scale_cache,
+            module.v_scale_cache,
         )
     else:
         q, k = module.qk_norm(q, k)
@@ -134,7 +150,12 @@ def prepare(
         return PreparedQsa(
             gate, query, None, None, key, value, hidden_states, positions
         )
-    index_query = _prepare_index(module, hidden_states, positions, qsa)
+    if fuse_decode_index:
+        from atom.models.qwen4_exp_mono.kernels.quark_qsa_index import prepare
+
+        index_query = prepare(module, hidden_states, positions, qsa)
+    else:
+        index_query = _prepare_index(module, hidden_states, positions, qsa)
     return PreparedQsa(gate, query, qsa, index_query)
 
 
@@ -182,6 +203,8 @@ def attend(
                 if forward_context.context.is_prefill
                 else prepared.qsa.block_tables.shape[0]
             ),
+            k_scale=module.k_scale_cache,
+            v_scale=module.v_scale_cache,
         )
 
     return attn_out

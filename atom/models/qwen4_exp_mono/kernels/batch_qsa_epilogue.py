@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.qwen4_exp.ops.qsa import FP8_MAX
+
 
 @triton.jit
 def _qsa_norm_rope_cache_kernel(
@@ -17,6 +19,8 @@ def _qsa_norm_rope_cache_kernel(
     OQ,
     KC,
     VC,
+    KSC,
+    VSC,
     SLOT,
     COS,
     SIN,
@@ -28,6 +32,9 @@ def _qsa_norm_rope_cache_kernel(
     PA: tl.constexpr,
     CS: tl.constexpr,
     BS: tl.constexpr,
+    SLOTS: tl.constexpr,
+    FP8_KV: tl.constexpr,
+    FP8_LIMIT: tl.constexpr,
     EPS: tl.constexpr,
     QH: tl.constexpr,
     KH: tl.constexpr,
@@ -74,12 +81,39 @@ def _qsa_norm_rope_cache_kernel(
     else:
         slot = tl.load(SLOT + token).to(tl.int64)
         address = (slot // BS) * CS + (slot % BS) * KH * D + (head - QH) * D + d
-        tl.store(KC + address, out, slot >= 0)
         value = tl.load(V + token * VS + (head - QH) * D + d)
-        tl.store(VC + address, value, slot >= 0)
+        valid = (slot >= 0) & (slot < SLOTS)
+        if FP8_KV:
+            # Quantize the BF16 RoPE endpoint, matching the native row writer.
+            key = out.to(tl.float32)
+            value = value.to(tl.float32)
+            ka = tl.maximum(tl.max(tl.abs(key), 0), 1.0e-12)
+            va = tl.maximum(tl.max(tl.abs(value), 0), 1.0e-12)
+            key = tl.clamp(key * (FP8_LIMIT / ka), -FP8_LIMIT, FP8_LIMIT)
+            value = tl.clamp(value * (FP8_LIMIT / va), -FP8_LIMIT, FP8_LIMIT)
+            tl.store(KC + address, key, valid)
+            tl.store(VC + address, value, valid)
+            scale_address = slot * KH + head - QH
+            tl.store(KSC + scale_address, ka / FP8_LIMIT, valid)
+            tl.store(VSC + scale_address, va / FP8_LIMIT, valid)
+        else:
+            tl.store(KC + address, out, valid)
+            tl.store(VC + address, value, valid)
 
 
-def qsa_norm_rope_cache(q, k, value, norm, rope, positions, k_cache, v_cache, slots):
+def qsa_norm_rope_cache(
+    q,
+    k,
+    value,
+    norm,
+    rope,
+    positions,
+    k_cache,
+    v_cache,
+    slots,
+    k_scale=None,
+    v_scale=None,
+):
     """Ordinary Mono decode: normalize/rotate Q/K and publish K/V once.
 
     The per-head norm and both RoPE products retain their BF16 endpoints.
@@ -87,6 +121,17 @@ def qsa_norm_rope_cache(q, k, value, norm, rope, positions, k_cache, v_cache, sl
     Negative slots preserve padded-request cache rows.
     """
     tokens, q_heads, dim = q.shape
+    if k_scale is not None and (
+        v_scale is None
+        or k_cache.element_size() != 1
+        or k_scale.dtype != torch.float32
+        or v_scale.dtype != torch.float32
+        or k_scale.shape != k_cache.shape[:3]
+        or v_scale.shape != k_scale.shape
+        or not k_scale.is_contiguous()
+        or not v_scale.is_contiguous()
+    ):
+        raise ValueError("Mono FP8 QSA requires contiguous per-head FP32 scales")
     query = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     sections = getattr(rope, "mrope_section", None) or [rope.rotary_dim // 2, 0, 0]
     _qsa_norm_rope_cache_kernel[(tokens * (q_heads + k.shape[1]),)](
@@ -98,6 +143,8 @@ def qsa_norm_rope_cache(q, k, value, norm, rope, positions, k_cache, v_cache, sl
         query,
         k_cache,
         v_cache,
+        k_scale if k_scale is not None else k_cache,
+        v_scale if v_scale is not None else v_cache,
         slots,
         rope.cos_cache,
         rope.sin_cache,
@@ -113,6 +160,9 @@ def qsa_norm_rope_cache(q, k, value, norm, rope, positions, k_cache, v_cache, sl
         ),
         CS=k_cache.stride(0),
         BS=k_cache.shape[1],
+        SLOTS=k_cache.shape[0] * k_cache.shape[1],
+        FP8_KV=k_scale is not None,
+        FP8_LIMIT=FP8_MAX,
         EPS=norm._eps,
         QH=q_heads,
         KH=k.shape[1],
