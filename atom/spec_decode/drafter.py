@@ -11,6 +11,11 @@ from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 
 from atom.config import Config
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+)
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
@@ -456,10 +461,23 @@ class Drafter(abc.ABC):
         row-aligned to ``target_hidden_states`` (the tensor they accompany), or
         None if this drafter captures no aux. The fixed capture buffers are
         sliced to ``target_hidden_states``' row count — the caller never juggles
-        token counts."""
+        token counts.
+
+        After a PCP row-split prefill the hooks hold only this rank's 1/pcp
+        stripe, so gather it. Keyed on the batch-global `target_pcp_split`, never
+        on hook-side bookkeeping, which a cudagraph replay skips.
+        """
         if not self._captures_aux:
             return None
         n = target_hidden_states.shape[0]
+        pcp_ws = get_pcp_world_size()
+        ctx = getattr(get_forward_context(), "context", None)
+        if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
+            n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
+            return [
+                pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n]
+                for buf in self._aux_buffers
+            ]
         return [buf[:n] for buf in self._aux_buffers]
 
     def anchors_to_gpu(self, anchors: list[int]) -> torch.Tensor:
