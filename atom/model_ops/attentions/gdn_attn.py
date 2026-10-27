@@ -1336,9 +1336,10 @@ class GDNStateMixin(PoolRowsMixin):
                 if cached is not None
                 else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
             )
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(non_spec_query_start_loc)
+            nums_dict, batch_ptr, token_chunk_offset_ptr = self._conv1d_metadata(
+                non_spec_query_start_loc, num_prefills
             )
+            self._prime_chunk_indices(non_spec_query_start_loc, num_prefills)
         else:
             has_initial_state = None
 
@@ -1398,6 +1399,14 @@ class GDNStateMixin(PoolRowsMixin):
         md.replayssm_max_query_len = self.replayssm_max_query_len
 
         if is_prefill:
+            # The live slots, from the host mirror `prepare_state_indices`
+            # filled this step: a boolean-mask index on the device tensor
+            # would be a nonzero(), a device sync on every prefill step.
+            slots = self.non_spec_state_indices_tensor.np[:num_reqs]
+            live_np = slots[slots >= 0]
+            if live_np.size:
+                write_pos.index_fill_(0, self._staged_i64("replay_live", live_np), -1)
+            return
             # A prefill (re)initialises the checkpoint wholesale via
             # `chunk_gated_delta_rule` and writes NO records, so the next
             # forward must fold none.  Parking the cursor at -1 rather than 0
@@ -1956,6 +1965,107 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions
+
+    # Small per-step index tables staged through pinned memory and sent up
+    # without a sync. A ring of slots per name: a slot is rewritten only
+    # after `_STAGING_SLOTS - 1` later uploads of that table, by which time
+    # the copy that read it has long run; `query()` guards the rare case.
+    _STAGING_SLOTS = 4
+
+    def _staging(self, name: str, cap: int, dtype):
+        st = self.__dict__.setdefault("_staging_bufs", {})
+        if name not in st:
+            st[name] = {
+                "slots": [
+                    [
+                        torch.empty(cap, dtype=dtype, pin_memory=True),
+                        torch.empty(cap, dtype=dtype, device=self.device),
+                        None,
+                    ]
+                    for _ in range(self._STAGING_SLOTS)
+                ],
+                "next": 0,
+            }
+        return st[name]
+
+    def _stage_upload(self, name: str, values: np.ndarray, cap: int, dtype):
+        ring = self._staging(name, cap, dtype)
+        slot = ring["slots"][ring["next"]]
+        ring["next"] = (ring["next"] + 1) % self._STAGING_SLOTS
+        cpu, gpu, ev = slot
+        n = len(values)
+        if n > cpu.shape[0]:
+            return None
+        if ev is not None and not ev.query():
+            ev.synchronize()
+        cpu.numpy()[:n] = values
+        gpu[:n].copy_(cpu[:n], non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        slot[2] = ev
+        return gpu[:n]
+
+    def _staged_i64(self, name: str, values: np.ndarray):
+        out = self._stage_upload(name, values, self.model_runner.max_bs + 1, torch.int64)
+        if out is None:
+            return torch.as_tensor(values, dtype=torch.int64, device=self.device)
+        return out
+
+    def _conv1d_metadata(self, query_start_loc, num_prefills: int):
+        """`compute_causal_conv1d_metadata` from the host copy of the query
+        prefix: the per-program (sequence, chunk) tables of the conv1d prefill
+        kernel, uploaded without a sync. The device-tensor version did a D2H
+        for the lengths and two pageable H2Ds, on every prefill step."""
+        BLOCK_M = 8
+        cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
+        lens = np.diff(cu).astype(np.int64)
+        nums = -(-lens // BLOCK_M)
+        tot = int(nums.sum())
+        cap = self.model_runner.max_num_batched_tokens // BLOCK_M + self.model_runner.max_bs + 1
+        mlist = np.repeat(np.arange(len(nums), dtype=np.int32), nums)
+        offsets = np.arange(tot, dtype=np.int32) - np.repeat(
+            (np.cumsum(nums) - nums).astype(np.int32), nums
+        )
+        batch_ptr = self._stage_upload("conv1d_batch", mlist, cap, torch.int32)
+        offset_ptr = self._stage_upload("conv1d_offset", offsets, cap, torch.int32)
+        if batch_ptr is None or offset_ptr is None:
+            return compute_causal_conv1d_metadata(query_start_loc)
+        # The launcher's grid reads `tot`; with the pointers set it copies nothing.
+        nums_dict = {
+            BLOCK_M: {
+                "nums": torch.from_numpy(nums),
+                "tot": tot,
+                "mlist": torch.from_numpy(mlist),
+                "mlist_len": tot,
+                "offsetlist": torch.from_numpy(offsets),
+                "batch_ptr": batch_ptr,
+                "token_chunk_offset_ptr": offset_ptr,
+            }
+        }
+        return nums_dict, batch_ptr, offset_ptr
+
+    # Chunk index tables for the GDN prefill kernels (`prepare_chunk_indices`:
+    # [(sequence, chunk-in-sequence)] per chunk, for the 16- and 64-token
+    # chunkings), built here from the host copy of the query prefix and sent
+    # up without a sync. Pinned staging, one GPU table per chunking.
+    _CHUNK_INDEX_SIZES = (16, 64)
+
+    def _prime_chunk_indices(self, query_start_loc, num_prefills: int) -> None:
+        from atom.model_ops.fla_ops.index import prepare_chunk_indices
+
+        cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
+        lens = np.diff(cu)
+        for chunk_size in self._CHUNK_INDEX_SIZES:
+            counts = -(-lens // chunk_size)
+            total = int(counts.sum())
+            flat = np.empty(2 * total, dtype=np.int64)
+            flat[0::2] = np.repeat(np.arange(len(lens)), counts)
+            flat[1::2] = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+            cap = 2 * (self.model_runner.max_num_batched_tokens // chunk_size + self.model_runner.max_bs + 1)
+            gpu = self._stage_upload(f"chunk_idx_{chunk_size}", flat, cap, torch.int64)
+            if gpu is None:
+                return  # the kernels compute their own (with the sync)
+            prepare_chunk_indices.prime(gpu.view(total, 2), query_start_loc, chunk_size)
 
     def _upload_prefill_mirrors(
         self, scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens

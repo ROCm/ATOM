@@ -315,7 +315,9 @@ def chunk_gated_delta_rule(
         q, k, v, beta, g = map(
             lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g)
         )
-    if not head_first and q.shape[1] < q.shape[2]:
+    if not head_first and q.shape[1] < q.shape[2] and cu_seqlens is None:
+        # A format hint for direct callers; a varlen call's T is the batch's
+        # token total and is legitimately small on a short prefill.
         warnings.warn(
             f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
             "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
