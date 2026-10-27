@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       build_rocm7:
-        description: "Build the ROCm 7 line -> rocm/atom-dev:latest + :nightly_<ts> (scheduled nightly runs always build every live line; default enabled)"
+        description: "Build the ROCm 7 line -> rocm/atom-dev:latest + :nightly_<ts>, and the plugin images vllm-latest / sglang-latest (scheduled nightly runs always build every live line; default enabled)"
         type: boolean
         default: true
       build_rocm10:
-        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.0 + :nightly_<ts>-rocm10.0 (scheduled nightly runs always build every live line; default enabled)"
+        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.0 + :nightly_<ts>-rocm10.0, and the plugin images vllm-latest-rocm10.0 / sglang-latest-rocm10.0 (scheduled nightly runs always build every live line; default enabled)"
         type: boolean
         default: true
       base_image_override:
@@ -83,9 +83,10 @@ on:
 
 # The live lines, defined once for the whole workflow. LINE_STABLE owns the
 # unsuffixed tags (latest, nightly_<ts>, vllm-latest, sglang-latest);
-# LINE_NEXT publishes the same set suffixed with the ROCm version read out of
-# its image. Promoting ROCm 10 is these two values and nothing else: `latest`
-# follows, and the line that used to be stable simply stops being built.
+# LINE_NEXT publishes the same set, including the vLLM and SGLang plugin
+# images, suffixed with the ROCm version read out of its image. Promoting
+# ROCm 10 is these two values and nothing else: `latest` follows, and the
+# line that used to be stable simply stops being built.
 env:
   LINE_STABLE: rocm7
   LINE_NEXT: rocm10.0
@@ -115,15 +116,10 @@ jobs:
           lines=""
           add() { lines="${lines:+${lines},}\"$1\""; }
 
-          # only_release_oot / only_release_sglang mean "just rebuild that
-          # layer". Those layers belong to the stable line, so there is
-          # nothing for a second line to do -- without this it would spend
-          # three hours building an image that every later step skips.
-          if [ "${{ inputs.only_release_oot }}" = "true" ] || [ "${{ inputs.only_release_sglang }}" = "true" ]; then
-            printf 'lines=["%s"]\n' "${LINE_STABLE}" >> "${GITHUB_OUTPUT}"
-            echo "Lines: ${LINE_STABLE} (only_release_oot / only_release_sglang)"
-            exit 0
-          fi
+          # only_release_oot / only_release_sglang rebuild the plugin layer on
+          # the native image. They use the same line set as a full release, so
+          # a ROCm 10 run still publishes vllm-latest-rocm10.0 and
+          # sglang-latest-rocm10.0 instead of replacing the unsuffixed tags.
 
           if [ "${{ github.event_name }}" = "schedule" ]; then
             # Like the OOT and SGLang layers, a scheduled run builds every
@@ -165,8 +161,8 @@ jobs:
       RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
       GPU_ARCH: "gfx942;gfx950"
       SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
-      SGLANG_REF: "v0.5.20"
-      SGLANG_VERSION: "0.5.20"
+      SGLANG_REF: "v0.5.22"
+      SGLANG_VERSION: "0.5.22"
 
     steps:
       - name: Set HF_TOKEN
@@ -585,15 +581,9 @@ jobs:
         continue-on-error: true
         timeout-minutes: 180
         run: |
-          # The vLLM and SGLang layers belong to the stable line only. They
-          # are owned and tagged by someone else, so a second line must not
-          # build them, and above all must not publish over their tags -- the
-          # ROCm 10 line would otherwise have replaced vllm-latest and the
-          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
-          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
-            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM layer (owned by the ROCm 7 line)."
-            exit 0
-          fi
+          # Built from this line's native image. The push step appends
+          # TAG_SUFFIX, so the ROCm 10 image is vllm-latest-rocm10.0 and does
+          # not replace vllm-latest.
           OOT_BASE_IMAGE="${CI_IMAGE}"
           echo "Using OOT base image: ${OOT_BASE_IMAGE}"
           docker build --network=host -t "${CI_OOT_IMAGE}" \
@@ -625,15 +615,6 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
-          # The vLLM and SGLang layers belong to the stable line only. They
-          # are owned and tagged by someone else, so a second line must not
-          # build them, and above all must not publish over their tags -- the
-          # ROCm 10 line would otherwise have replaced vllm-latest and the
-          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
-          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
-            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM push layer (owned by the ROCm 7 line)."
-            exit 0
-          fi
           # Record every tag this job creates, so Clean Up can remove exactly
           # those. The old cleanup removed by glob (nightly_*, latest*), which
           # with two lines in one run means one job deleting the other's
@@ -644,8 +625,8 @@ jobs:
           }
           VLLM_VER="${VLLM_VERSION}"
           OOT_TAG_SUFFIX="${{ inputs.oot_tag_suffix || '' }}"
-          OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
-          OOT_LATEST_TAG="vllm-latest"
+          OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)${TAG_SUFFIX}"
+          OOT_LATEST_TAG="vllm-latest${TAG_SUFFIX}"
           if [ -n "${OOT_TAG_SUFFIX}" ]; then
             if [[ ! "${OOT_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
               echo "Invalid oot_tag_suffix '${OOT_TAG_SUFFIX}'. Allowed characters: letters, numbers, '.', '_' and '-'."
@@ -666,15 +647,9 @@ jobs:
         if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
         timeout-minutes: 180
         run: |
-          # The vLLM and SGLang layers belong to the stable line only. They
-          # are owned and tagged by someone else, so a second line must not
-          # build them, and above all must not publish over their tags -- the
-          # ROCm 10 line would otherwise have replaced vllm-latest and the
-          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
-          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
-            echo "${FLAVOR} is not the stable line: skipping the SGLang layer (owned by the ROCm 7 line)."
-            exit 0
-          fi
+          # Built from this line's native image. The push step appends
+          # TAG_SUFFIX, so the ROCm 10 image is sglang-latest-rocm10.0 and
+          # does not replace sglang-latest.
           SGLANG_BASE_IMAGE="${CI_IMAGE}"
           echo "Using SGLang+ATOM base image: ${SGLANG_BASE_IMAGE}"
           docker build --network=host -t "${CI_SGLANG_IMAGE}" \
@@ -701,15 +676,6 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
-          # The vLLM and SGLang layers belong to the stable line only. They
-          # are owned and tagged by someone else, so a second line must not
-          # build them, and above all must not publish over their tags -- the
-          # ROCm 10 line would otherwise have replaced vllm-latest and the
-          # day's vllm-v<ver>-nightly_<date> with a ROCm 10 image.
-          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
-            echo "${FLAVOR} is not the stable line: skipping the SGLang push layer (owned by the ROCm 7 line)."
-            exit 0
-          fi
           # Record every tag this job creates, so Clean Up can remove exactly
           # those. The old cleanup removed by glob (nightly_*, latest*), which
           # with two lines in one run means one job deleting the other's
@@ -720,8 +686,8 @@ jobs:
           }
           SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
           SGLANG_TAG_SUFFIX="${{ inputs.sglang_tag_suffix || '' }}"
-          SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
-          SGLANG_LATEST_TAG="sglang-latest"
+          SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)${TAG_SUFFIX}"
+          SGLANG_LATEST_TAG="sglang-latest${TAG_SUFFIX}"
           if [ -n "${SGLANG_TAG_SUFFIX}" ]; then
             if [[ ! "${SGLANG_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
               echo "Invalid sglang_tag_suffix '${SGLANG_TAG_SUFFIX}'. Allowed characters: letters, numbers, '.', '_' and '-'."
