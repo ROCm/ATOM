@@ -3,7 +3,15 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 used by RTP-LLM
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
+
+
 from functools import cache
 from typing import TYPE_CHECKING
 
@@ -26,7 +34,9 @@ class Family(StrEnum):
     instead of falling through to MHA.
     """
 
+    CSA2 = "csa2"
     V4 = "v4"
+    QSA_GDN = "qsa_gdn"
     KIMI_MLA = "kimi_mla"
     MLA = "mla"
     GDN = "gdn"
@@ -41,12 +51,31 @@ class Family(StrEnum):
         """
         return self in (Family.MLA, Family.KIMI_MLA)
 
+    @property
+    def has_recurrent_state(self) -> bool:
+        """Whether this family keeps a slot-addressed per-request state.
+
+        The hybrids and pure GDN register such a pool, tagged
+        `per_request_state=True`. Applying a token to it advances it, so
+        unlike a paged write -- which lands at the token's own position --
+        doing it twice is not idempotent.
+
+        DeepSeek-V4.1 (CSA2) keeps one too: its STATE slot's cursor, compressor
+        rings and Engram history advance per token, and a consumer resuming it
+        checks the cursor sits exactly at the prompt's end.
+        """
+        return self in (Family.KIMI_MLA, Family.QSA_GDN, Family.GDN, Family.CSA2)
+
 
 # What makes a hybrid one is which of its layers are linear, and no field says
 # that -- so these two are named, and everything else is read off the shape.
 _KIMI_MLA_TYPES = ("kimi_linear", "glm5_next_text")
+# Qwen3.8-Flash-Next is a GDN hybrid too, but its full-attention layers are QSA
+# rather than MHA, so it gets its own backend instead of riding the GDN one.
+_QSA_GDN_TYPES = ("qwen4_exp_text",)
 _GDN_TYPES = ("qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text")
 _V4_TYPES = ("deepseek_v4", "deepseek_v4_mtp")
+_V41_TYPES = ("deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark")
 
 
 def attn_family(hf_text_config) -> Family:
@@ -67,8 +96,14 @@ def attn_family(hf_text_config) -> Family:
     # (`get_hf_config` preserves it) and is what tells them apart; a draft is
     # stamped `deepseek_v4_mtp` instead and has no architecture of its own.
     arches = getattr(hf_text_config, "architectures", None) or []
+    if model_type in _V41_TYPES or any(
+        arch in ("DeepseekV41ForCausalLM", "DeepseekV41DSparkModel") for arch in arches
+    ):
+        return Family.CSA2
     if any("DeepseekV4" in str(arch) for arch in arches) or model_type in _V4_TYPES:
         return Family.V4
+    if model_type in _QSA_GDN_TYPES:
+        return Family.QSA_GDN
     if model_type in _KIMI_MLA_TYPES:
         return Family.KIMI_MLA
     if getattr(hf_text_config, "kv_lora_rank", None) is not None:
@@ -111,8 +146,16 @@ def _cached_get_attn_backend(
 
 
 def get_attn_backend_cls(family: Family, use_sglang: bool, use_vllm: bool) -> str:
+    if family is Family.CSA2:
+        if use_sglang or use_vllm:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 CSA2 currently supports native ATOM only"
+            )
+        return "atom.model_ops.attentions.deepseek_v41.backend.DeepseekV41Backend"
     if family is Family.V4:
         return "atom.model_ops.attentions.deepseek_v4_attn.DeepseekV4Backend"
+    if family is Family.QSA_GDN:
+        return "atom.model_ops.attentions.qwen4_exp_attn.Qwen4ExpBackend"
     if family is Family.KIMI_MLA:
         return "atom.model_ops.attentions.kimi_mla_gdn_attn.KimiMLAGDNBackend"
     if family is Family.MLA:

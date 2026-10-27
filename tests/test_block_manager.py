@@ -3,8 +3,10 @@
 
 import logging
 
+import pytest
 from conftest import MockConfig
 
+from atom.model_engine import block_manager as bm_module
 from atom.model_engine.block_manager import BlockManager
 
 # ── compute_hash ───────────────────────────────────────────────────────────
@@ -264,6 +266,35 @@ class TestDeallocatePartial:
         for block_id in protected:
             assert bm.kv.block(block_id).ref_count >= 1
 
+    def test_per_request_state_requires_explicit_connector_capability(
+        self, seq_factory
+    ):
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        table = list(seq.block_table)
+        seq.has_per_req_cache = True
+
+        with pytest.raises(RuntimeError, match="explicit connector safety capability"):
+            bm.deallocate_partial(seq, frozenset(table[:2]))
+
+        assert list(seq.block_table) == table
+        assert all(bm.kv.block(block_id).ref_count == 1 for block_id in table)
+
+    def test_explicit_connector_capability_allows_per_request_state(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        protected = frozenset(seq.block_table[:2])
+        seq.has_per_req_cache = True
+
+        bm.deallocate_partial(seq, protected, per_request_state_safe=True)
+
+        assert not seq.block_table
+        assert bm.kv.num_used == len(protected)
+
     def test_free_leased_blocks_returns_the_rest_to_the_pool(self, seq_factory):
         cfg = MockConfig(num_kvcache_blocks=32, kv_cache_block_size=4)
         bm = BlockManager(cfg)
@@ -312,6 +343,42 @@ class TestPrefixCaching:
         n = block_manager_prefix.can_allocate(s2)
         block_manager_prefix.allocate(s2, n)
         assert s2.num_cached_tokens == 4
+
+    def test_admission_hashes_each_prompt_block_once(
+        self, block_manager_prefix, seq_factory, monkeypatch
+    ):
+        bm = block_manager_prefix
+        s1 = seq_factory(list(range(1, 17)))
+        bm.allocate(s1)
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        bm.deallocate(s1)
+
+        # Blocks hashed, by the per-block hasher or the fast walk's bulk one.
+        calls = []
+        real = BlockManager.compute_hash
+        monkeypatch.setattr(
+            BlockManager,
+            "compute_hash",
+            classmethod(lambda cls, t, p=-1: calls.append(1) or real(t, p)),
+        )
+        bulk = bm_module.chained_block_hashes
+
+        def bulk_spy(tokens, hbs, start, end, prev):
+            calls.extend([1] * (end - start))
+            return bulk(tokens, hbs, start, end, prev)
+
+        monkeypatch.setattr(bm_module, "chained_block_hashes", bulk_spy)
+        s2 = seq_factory(list(range(1, 17)) + [90, 91, 92, 93])
+        # The delayer's probe, the lookup-detach probe, its re-probe after the
+        # tier answer, and admission's probe, then the claim.
+        for _ in range(3):
+            bm.can_allocate(s2, record=False)
+        n = bm.can_allocate(s2, record=False)
+        bm.allocate(s2, n)
+        # Four probes and a claim over a 5-block prompt: the hit walk reaches
+        # block 4 (the last is never matched), each block hashed once.
+        assert n == 4
+        assert len(calls) == 4
 
     def test_prefix_cache_miss_different_tokens(
         self, block_manager_prefix, seq_factory
@@ -971,6 +1038,31 @@ def test_a_consumer_role_votes_but_never_hands_over_a_store(monkeypatch):
     assert bm.take_state_stores(4) == []
 
 
+def test_the_index_cap_counts_images_not_slots(monkeypatch):
+    """The codec keeps OFFLOAD_STATE_CPU_SIZE / image_bytes entries. Under MTP
+    a slot is larger than an image, and dividing by the slot would cap the
+    index a third below the codec (2,243 vs 3,330 at Kimi-K3 DSpark3)."""
+    from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    spec = PagedStateCheckpointSpec(1 << 19, 3 << 19, "cap-test", image_bytes=1 << 20)
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    bm = BlockManager(
+        cfg,
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+        ),
+    )
+    # 1 GiB / 1 MiB = 1024 codec entries, minus the 1024 // 32 margin.
+    assert bm.state_offload._hash_cap == 1024 - 32
+
+
 def test_a_multi_listing_two_offload_connectors_is_refused(monkeypatch):
     """The tier's bytes ride one connector's worker half and its completions
     ride that connector's `get_finished`, so two providers would each hold half
@@ -1257,9 +1349,14 @@ class TestJointChunkProbeIsGated:
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" not in caplog.text
 
-    def test_a_hosted_tier_still_probes_and_says_so_when_it_cannot_read(self, caplog):
+    def test_a_hosted_tier_still_probes_and_says_so_when_it_cannot_read(
+        self, caplog, monkeypatch
+    ):
         """The warning is worth printing exactly here: the tier is on, so a
         missing chunk size really does disable the joint KV load."""
+        import sys
+
+        monkeypatch.setitem(sys.modules, "lmcache.v1.config", None)
         with caplog.at_level(logging.WARNING, logger="atom"):
             bm = self._bm(
                 {
@@ -1268,7 +1365,6 @@ class TestJointChunkProbeIsGated:
                     "offload_layout": "kimi_k3",
                 }
             )
-        # lmcache is not installed in the unit-test environment, so the probe
-        # runs and fails -- which is the point: it ran.
+        # Exercise the missing dependency even in images with LMCache installed.
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" in caplog.text

@@ -13,15 +13,11 @@ use axum::{
     extract::{Request, State},
     http::{HeaderValue, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
-use bytes::Bytes;
-use http_body::Frame;
-use rand::Rng;
-use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
-use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
+use tracing::{error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
@@ -32,94 +28,6 @@ use crate::{
     routers::comm::error::extract_error_code_from_response,
     server::AppState,
 };
-
-/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
-/// This ensures that for streaming responses, the token is only returned after the entire
-/// stream has been sent to the client.
-pub struct TokenGuardBody {
-    inner: Body,
-    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
-    token_bucket: Option<Arc<TokenBucket>>,
-    /// Number of tokens to return.
-    tokens: f64,
-}
-
-impl TokenGuardBody {
-    /// Create a new TokenGuardBody that will return tokens when dropped.
-    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
-        Self {
-            inner,
-            token_bucket: Some(token_bucket),
-            tokens,
-        }
-    }
-}
-
-impl Drop for TokenGuardBody {
-    fn drop(&mut self) {
-        if let Some(bucket) = self.token_bucket.take() {
-            debug!(
-                "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                self.tokens
-            );
-            // Use lock-free sync return - no runtime needed, guaranteed token return
-            bucket.return_tokens_sync(self.tokens);
-        }
-    }
-}
-
-impl http_body::Body for TokenGuardBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        // SAFETY: We never move the inner body, and Body is Unpin
-        // (it's a type alias for UnsyncBoxBody which is Unpin)
-        let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-/// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
-const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
-/// Generate OpenAI-compatible request ID based on endpoint.
-fn generate_request_id(path: &str) -> String {
-    let prefix = if path.contains("/chat/completions") {
-        "chatcmpl-"
-    } else if path.contains("/completions") {
-        "cmpl-"
-    } else if path.contains("/generate") {
-        "gnt-"
-    } else if path.contains("/responses") {
-        "resp-"
-    } else {
-        "req-"
-    };
-
-    // Generate a random string similar to OpenAI's format
-    // Use byte array indexing (O(1)) instead of chars().nth() (O(n))
-    let mut rng = rand::rng();
-    let random_part: String = (0..24)
-        .map(|_| {
-            let idx = rng.random_range(0..REQUEST_ID_CHARS.len());
-            REQUEST_ID_CHARS[idx] as char
-        })
-        .collect();
-
-    format!("{}{}", prefix, random_part)
-}
 
 /// Extension type for storing request ID
 #[derive(Clone, Debug)]
@@ -172,21 +80,13 @@ where
     }
 
     fn call(&mut self, mut req: Request) -> Self::Future {
-        let headers = self.headers.clone();
-
-        // Extract request ID from headers or generate new one
-        let mut request_id = None;
-
-        for header_name in headers.iter() {
-            if let Some(header_value) = req.headers().get(header_name) {
-                if let Ok(value) = header_value.to_str() {
-                    request_id = Some(value.to_string());
-                    break;
-                }
-            }
-        }
-
-        let request_id = request_id.unwrap_or_else(|| generate_request_id(req.uri().path()));
+        let request_id =
+            crate::observability::request_id::resolve(&self.headers, req.uri().path(), |name| {
+                req.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            });
 
         // Insert request ID into request extensions for other middleware/handlers to use
         req.extensions_mut().insert(RequestId(request_id.clone()));
@@ -311,189 +211,26 @@ pub fn create_logging_layer() -> TraceLayer<
         .on_response(ResponseLogger)
 }
 
-/// Request queue entry
-pub struct QueuedRequest {
-    /// Time when the request was queued
-    queued_at: Instant,
-    /// Channel to send the permit back when acquired
-    permit_tx: oneshot::Sender<Result<(), StatusCode>>,
-}
-
-/// Queue processor that handles queued requests
-pub struct QueueProcessor {
-    token_bucket: Arc<TokenBucket>,
-    queue_rx: mpsc::Receiver<QueuedRequest>,
-    queue_timeout: Duration,
-}
-
-impl QueueProcessor {
-    pub fn new(
-        token_bucket: Arc<TokenBucket>,
-        queue_rx: mpsc::Receiver<QueuedRequest>,
-        queue_timeout: Duration,
-    ) -> Self {
-        Self {
-            token_bucket,
-            queue_rx,
-            queue_timeout,
-        }
-    }
-
-    pub async fn run(mut self) {
-        debug!("Starting concurrency queue processor");
-
-        // Process requests in a single task to reduce overhead
-        while let Some(queued) = self.queue_rx.recv().await {
-            // Check timeout immediately
-            let elapsed = queued.queued_at.elapsed();
-            if elapsed >= self.queue_timeout {
-                warn!("Request already timed out in queue");
-                let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
-                continue;
-            }
-
-            let remaining_timeout = self.queue_timeout - elapsed;
-
-            // Try to acquire token for this request
-            if self.token_bucket.try_acquire(1.0).await.is_ok() {
-                // Got token immediately
-                debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
-            } else {
-                // Need to wait for token
-                let token_bucket = self.token_bucket.clone();
-
-                // Spawn task only when we actually need to wait
-                tokio::spawn(async move {
-                    if token_bucket
-                        .acquire_timeout(1.0, remaining_timeout)
-                        .await
-                        .is_ok()
-                    {
-                        debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
-                    } else {
-                        warn!("Queue: request timed out waiting for token");
-                        let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
-                    }
-                });
-            }
-        }
-
-        warn!("Concurrency queue processor shutting down");
-    }
-}
-
-/// State for the concurrency limiter
-pub struct ConcurrencyLimiter {
-    pub queue_tx: Option<mpsc::Sender<QueuedRequest>>,
-}
-
-impl ConcurrencyLimiter {
-    /// Create new concurrency limiter with optional queue
-    pub fn new(
-        token_bucket: Option<Arc<TokenBucket>>,
-        queue_size: usize,
-        queue_timeout: Duration,
-    ) -> (Self, Option<QueueProcessor>) {
-        match (token_bucket, queue_size) {
-            (None, _) => (Self { queue_tx: None }, None),
-            (Some(bucket), size) if size > 0 => {
-                let (queue_tx, queue_rx) = mpsc::channel(size);
-                let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
-                (
-                    Self {
-                        queue_tx: Some(queue_tx),
-                    },
-                    Some(processor),
-                )
-            }
-            (Some(_), _) => (Self { queue_tx: None }, None),
-        }
-    }
-}
-
-/// Middleware function for concurrency limiting with optional queuing
+/// Admission is acquired before invoking the handler and follows the response body.
+/// Dropping either the handler future or the body returns all reserved resources.
 pub async fn concurrency_limit_middleware(
     State(app_state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let token_bucket = match &app_state.context.rate_limiter {
-        Some(bucket) => bucket.clone(),
-        None => {
-            // Rate limiting disabled, pass through immediately
-            return next.run(request).await;
+    match app_state.context.admission.acquire("http").await {
+        Ok(lease) => {
+            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+            let response = next.run(request).await;
+            crate::core::AttachedBody::wrap_response(response, lease)
         }
-    };
-
-    // Try to acquire token immediately
-    if token_bucket.try_acquire(1.0).await.is_ok() {
-        debug!("Acquired token immediately");
-        MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
-        let response = next.run(request).await;
-
-        // Wrap the response body with TokenGuardBody to return token when stream ends
-        // This ensures that for streaming responses, the token is only returned
-        // after the entire stream has been sent to the client.
-        let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
-        Response::from_parts(parts, Body::new(guarded_body))
-    } else {
-        // No tokens available, try to queue if enabled
-        if let Some(queue_tx) = &app_state.concurrency_queue_tx {
-            debug!("No tokens available, attempting to queue request");
-
-            // Create a channel for the token response
-            let (permit_tx, permit_rx) = oneshot::channel();
-
-            let queued = QueuedRequest {
-                queued_at: Instant::now(),
-                permit_tx,
-            };
-
-            // Try to send to queue
-            match queue_tx.try_send(queued) {
-                Ok(_) => {
-                    // Wait for token from queue processor
-                    match permit_rx.await {
-                        Ok(Ok(())) => {
-                            debug!("Acquired token from queue");
-                            MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
-
-                            let response = next.run(request).await;
-
-                            // Wrap the response body with TokenGuardBody to return token when stream ends
-                            let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
-                            Response::from_parts(parts, Body::new(guarded_body))
-                        }
-                        Ok(Err(status)) => {
-                            warn!("Queue returned error status: {}", status);
-                            MeshMetrics::record_http_rate_limit(
-                                metrics_labels::RATE_LIMIT_REJECTED,
-                            );
-                            status.into_response()
-                        }
-                        Err(_) => {
-                            error!("Queue response channel closed");
-                            MeshMetrics::record_http_rate_limit(
-                                metrics_labels::RATE_LIMIT_REJECTED,
-                            );
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                        }
-                    }
-                }
-                Err(_) => {
-                    warn!("Request queue is full, returning 429");
-                    MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-                    StatusCode::TOO_MANY_REQUESTS.into_response()
-                }
-            }
-        } else {
-            warn!("No tokens available and queuing is disabled, returning 429");
+        Err(error) => {
             MeshMetrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            StatusCode::TOO_MANY_REQUESTS.into_response()
+            crate::routers::comm::error::create_error(
+                StatusCode::from_u16(error.status).unwrap(),
+                error.code,
+                error.message,
+            )
         }
     }
 }
@@ -504,6 +241,21 @@ pub async fn concurrency_limit_middleware(
 
 /// Global counter for active HTTP connections (handlers currently executing)
 static ACTIVE_HTTP_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+struct ActiveHttpGuard;
+impl ActiveHttpGuard {
+    fn new() -> Self {
+        let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        MeshMetrics::set_http_connections_active(active as usize);
+        Self
+    }
+}
+impl Drop for ActiveHttpGuard {
+    fn drop(&mut self) {
+        let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+        MeshMetrics::set_http_connections_active(active as usize);
+    }
+}
 
 /// Tower Layer for HTTP metrics collection (Mesh Layer 1 metrics)
 #[derive(Clone)]
@@ -560,8 +312,7 @@ where
 
         Box::pin(async move {
             // Increment inside async block - ensures no leak if future is dropped before polling
-            let active = ACTIVE_HTTP_CONNECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
-            MeshMetrics::set_http_connections_active(active as usize);
+            let _active = ActiveHttpGuard::new();
 
             let guard = in_flight_request_tracker.track();
 
@@ -569,10 +320,6 @@ where
             let result = inner.call(req).await;
 
             drop(guard);
-
-            // Always decrement, regardless of success or failure
-            let active = ACTIVE_HTTP_CONNECTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
-            MeshMetrics::set_http_connections_active(active as usize);
 
             let response = result?;
 
@@ -630,5 +377,67 @@ mod tests {
             normalize_path_for_metrics("/v1/workers/12345"),
             "/v1/workers/{id}"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use axum::{routing::get, Router};
+    use futures_util::poll;
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn http_cancellation_before_headers_and_while_queued_refunds_shared_admission() {
+        let config = crate::config::RouterConfig {
+            max_concurrent_requests: 1,
+            queue_size: 2,
+            ..Default::default()
+        };
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let context = Arc::new(
+            crate::app_context::AppContextBuilder::from_config(config, 5)
+                .await
+                .unwrap()
+                .rate_limiter(Some(bucket.clone()))
+                .build()
+                .unwrap(),
+        );
+        let router = Arc::new(
+            crate::routers::http_router::Router::new(&context)
+                .await
+                .unwrap(),
+        );
+        let state = Arc::new(AppState {
+            context: context.clone(),
+            router,
+            router_manager: None,
+        });
+        let app = Router::new()
+            .route(
+                "/pending",
+                get(|| async { std::future::pending::<Response>().await }),
+            )
+            .route("/body", get(|| async { "payload" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                concurrency_limit_middleware,
+            ));
+        let request = |path: &str| Request::builder().uri(path).body(Body::empty()).unwrap();
+        let mut running = Box::pin(app.clone().oneshot(request("/pending")));
+        assert!(poll!(&mut running).is_pending());
+        assert_eq!(bucket.available_tokens().await, 0.0);
+        let mut queued = Box::pin(app.clone().oneshot(request("/pending")));
+        assert!(poll!(&mut queued).is_pending());
+        drop(queued);
+        drop(running);
+        assert_eq!(bucket.available_tokens().await, 1.0);
+        // The returned body must hold the same lease until disposal.
+        let response = app.oneshot(request("/body")).await.unwrap();
+        assert_eq!(bucket.available_tokens().await, 0.0);
+        let mut other_ingress = Box::pin(context.admission.acquire("ext_proc"));
+        assert!(poll!(&mut other_ingress).is_pending());
+        drop(response);
+        drop(other_ingress.await.unwrap());
+        assert_eq!(bucket.available_tokens().await, 1.0);
     }
 }

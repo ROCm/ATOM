@@ -19,8 +19,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 from torch import nn
 
+from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
 
 
@@ -160,6 +162,38 @@ def test_releasing_before_the_first_build_builds_nothing():
     builder.release_kv_pools()
 
     assert asked == []
+
+
+def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=4,
+        head_dim=128,
+        kv_dtype=torch.bfloat16,
+    )
+    pool.allocate(2, "cpu")
+    builder = DraftKvBuilder.__new__(DraftKvBuilder)
+    builder._kv_pool = pool
+
+    transfer = builder.get_kv_transfer_tensors()
+    transfer.set_block_count(2)
+
+    assert transfer.tp_replication_factor == 1
+    assert [region.semantic_role for region in transfer.block_regions] == [
+        "draft.k.layer_0",
+        "draft.v.layer_0",
+    ]
+    assert [tuple(view.shape[:2]) for view in transfer.block_tensor_views] == [
+        (2, 1),
+        (2, 1),
+    ]
+    assert all(
+        region.base_addr == view.data_ptr()
+        for region, view in zip(
+            transfer.block_regions, transfer.block_tensor_views, strict=True
+        )
+    )
 
 
 def test_rows_are_the_pool_layers_the_modules_index():

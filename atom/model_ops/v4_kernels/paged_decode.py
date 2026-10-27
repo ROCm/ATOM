@@ -59,7 +59,12 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.model_ops.v4_kernels import hca_persist
+from atom.model_ops.v4_kernels.paged_decode_gluon import (
+    _paged_decode_fused_gluon_kernel,
+)
 from atom.model_ops.v4_kernels.pool_index import row_offset
+from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
@@ -324,10 +329,9 @@ def _paged_decode_fused_kernel(
     alpha_sink = tl.exp2(sink - m_final)
     l_final = l_i * alpha_kv + alpha_sink
 
-    denom = tl.maximum(l_final, 1.0e-30)
-    out = tl.where(
-        l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
-    )
+    # Normalize once per head before broadcasting across the value channels.
+    scale = alpha_kv / tl.maximum(l_final, 1.0e-30)
+    out = tl.where(l_final[:, None] > 0.0, acc * scale[:, None], 0.0)
     tl.store(
         out_ptr
         + t * out_stride_t
@@ -706,12 +710,27 @@ def _sparse_attn_v4_paged_decode_triton(
 
     qk_scale = float(softmax_scale) * LOG2E
     _bk, num_warps, num_stages = _kernel_config(block_h)
+    cdna_version = {"gfx942": 3, "gfx950": 4}.get(get_gfx())
+    use_gluon_fused = (
+        kv_splits == 1
+        and not quant_kv
+        and q.dtype == torch.bfloat16
+        and D == 512
+        and block_h in (16, 32)
+        and block_k is None
+        and cdna_version is not None
+    )
     if block_k is None:
-        # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
-        # the per-tile dequant cost (scale load + cast + multiply) over more
-        # MFMA work. Empirically BLOCK_K=32 wins ~20% over BLOCK_K=16 on fp8
-        # (bs=512 ctx=4096: 3000µs → 2300µs) without hurting bf16.
-        block_k = 32 if quant_kv else _bk
+        if use_gluon_fused:
+            # CDNA3 must fit KV + probabilities within 64 KiB LDS.
+            # CDNA4 can widen H16 to K64 while keeping 1024 score elements.
+            block_k = 1024 // block_h if cdna_version == 4 else 32
+        else:
+            # fp8 dequant inflates per-tile ALU work ~4×; a wider K tile amortizes
+            # the per-tile dequant cost (scale load + cast + multiply) over more
+            # MFMA work. Empirically BLOCK_K=32 wins ~20% over BLOCK_K=16 on fp8
+            # (bs=512 ctx=4096: 3000µs → 2300µs) without hurting bf16.
+            block_k = 32 if quant_kv else _bk
 
     # Kernel reads (kv_scales_ptr, ks_stride_n) only when QUANT_KV — supply a
     # dummy 1-element fp32 tensor on the bf16 path so the launch signature
@@ -732,7 +751,12 @@ def _sparse_attn_v4_paged_decode_triton(
     # skipping the partial-buffer alloc and the second kernel launch.
     if kv_splits == 1:
         grid_fused = (T, n_head_blocks)
-        _paged_decode_fused_kernel[grid_fused](
+        kernel = (
+            _paged_decode_fused_gluon_kernel
+            if use_gluon_fused
+            else _paged_decode_fused_kernel
+        )
+        kernel[grid_fused](
             q,
             unified_kv,
             kv_scales_arg,
@@ -759,8 +783,15 @@ def _sparse_attn_v4_paged_decode_triton(
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
+            **({"CDNA_VERSION": cdna_version} if use_gluon_fused else {}),
             num_warps=num_warps,
             num_stages=num_stages,
+            # Buffer-load lowering for 32-head tiles can cross 256 VGPRs.
+            waves_per_eu=(
+                2
+                if not use_gluon_fused and block_h == 32 and D == 512 and not quant_kv
+                else 0
+            ),
         )
         return out
 
@@ -911,6 +942,90 @@ def sparse_attn_v4_paged_decode_reference(
     return _sparse_attn_ragged_torch(q, unified_kv, attn_sink, topk_idxs, softmax_scale)
 
 
+def _sparse_attn_v4_paged_decode_prefill_asm(
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    empty_kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    unified_kv_rope: torch.Tensor,
+    q_packed_in: torch.Tensor,
+    q_rope_in: torch.Tensor,
+) -> torch.Tensor:
+    """Run H=128 fp8 decode through the sparse-prefill ASM kernel.
+
+    Decode has no flat extend source: its current token has already been
+    written to ``unified_kv`` and included in ``kv_indices``. Feed the decode
+    CSR as the prefill kernel's prefix stream and an empty CSR as its extend
+    stream. The KV tensors for that unused stream alias the unified pools so
+    the launch needs no per-layer dummy allocation.
+    """
+    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
+
+    n = q_packed_in.shape[0]
+    if empty_kv_indptr.numel() < n + 1:
+        raise ValueError(
+            "V4 prefill-ASM decode needs an all-zero empty_kv_indptr with at "
+            f"least N+1={n + 1} entries, got {empty_kv_indptr.numel()}"
+        )
+
+    return mla_sparse_prefill_fp8_asm(
+        q_nope=q_packed_in,
+        q_rope=q_rope_in,
+        unified_kv_nope=unified_kv,
+        unified_kv_rope=unified_kv_rope,
+        kv_indices_prefix=kv_indices,
+        kv_indptr_prefix=kv_indptr[: n + 1],
+        kv_nope=unified_kv,
+        kv_rope=unified_kv_rope,
+        kv_indices_extend=kv_indices[:0],
+        kv_indptr_extend=empty_kv_indptr[: n + 1],
+        attn_sink=attn_sink,
+        softmax_scale=softmax_scale,
+    )
+
+
+# aiter never picks more than 16 KV splits for the v4 nm decode kernel.
+V4_DECODE_MAX_SPLITS = 16
+
+
+def v4_uniform_split_table(rows: int, device) -> torch.Tensor:
+    """``[V4_DECODE_MAX_SPLITS, rows + 1]`` int32; row ``s - 1`` is the uniform
+    ``split_indptr`` ``[0, s, 2s, ...]`` of ``s`` splits per row.
+
+    Built once, outside CUDA-graph capture, and never written again: every
+    split plan is a slice of it, so graphs of any size read constant memory and
+    no forward rewrites a plan before it runs.
+    """
+    splits = torch.arange(1, V4_DECODE_MAX_SPLITS + 1, dtype=torch.int32, device=device)
+    return splits[:, None] * torch.arange(rows + 1, dtype=torch.int32, device=device)
+
+
+def v4_decode_split_plan(
+    rows: int, heads: int, kv_len: int, split_table: torch.Tensor
+) -> tuple[int, torch.Tensor] | None:
+    """aiter's KV split plan for the fp8 decode ASM kernel, or None.
+
+    For a decode call of `rows` query rows (its `qo_indptr` has `rows + 1`
+    entries), `heads` local heads and at most `kv_len` KV per row. Host only:
+    aiter picks the split count ``s`` and the plan's ``split_indptr`` is row
+    ``s - 1`` of `split_table` (:func:`v4_uniform_split_table`), whose prefix
+    the decode call trims to its rows. Pass it on as
+    ``sparse_attn_v4_paged_decode(..., split_plan=plan)``. None on aiter builds
+    before ROCm/aiter#6126, which leaves the split pick to aiter.
+    """
+    import aiter.mla
+
+    num_kv_splits = getattr(aiter.mla, "get_mla_v4_nm_num_kv_splits", None)
+    if num_kv_splits is None:
+        return None
+    s = num_kv_splits(rows, heads, kv_len)
+    if s > split_table.shape[0] or rows >= split_table.shape[1]:
+        return None  # outside the table: let aiter pick
+    return s, split_table[s - 1]
+
+
 def _sparse_attn_v4_paged_decode_asm(
     unified_kv: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -923,6 +1038,7 @@ def _sparse_attn_v4_paged_decode_asm(
     qo_indptr: torch.Tensor,
     kv_last_page_lens: torch.Tensor | None = None,  # unused on v4 nm (page_size=1)
     num_kv_splits: int | None = None,
+    split_indptr: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Native 2buff fp8 V4 decode via the aiter assembly kernel
     ``mla_decode_fwd_v4_nm`` (ROCm/aiter#3112, mi350/gfx950).
@@ -1032,6 +1148,10 @@ def _sparse_attn_v4_paged_decode_asm(
         (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
     )
 
+    # A uniform split plan's prefix is itself a valid plan, so it trims like
+    # qo_indptr.
+    if split_indptr is not None:
+        split_indptr = split_indptr[: N + 1]
     aiter.mla.mla_decode_fwd_v4_nm(
         q_packed,
         q_rope,
@@ -1045,6 +1165,7 @@ def _sparse_attn_v4_paged_decode_asm(
         sink=attn_sink,
         sm_scale=softmax_scale,
         num_kv_splits=num_kv_splits,
+        split_indptr=split_indptr,
     )
     # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
     # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
@@ -1065,13 +1186,27 @@ def sparse_attn_v4_paged_decode(
     q_rope_in: torch.Tensor | None = None,
     qo_indptr: torch.Tensor | None = None,
     kv_last_page_lens: torch.Tensor | None = None,
+    empty_kv_indptr: torch.Tensor | None = None,
     prefix: str = "",
+    split_plan: tuple[int, torch.Tensor] | None = None,
+    compress_ratio: int | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
-    Native 2buff fp8 (``unified_kv_rope`` provided): routes to the aiter asm
-    kernel (op5) with pre-packed fp8 Q (``q_packed_in``/``q_rope_in``); the
-    fp8 NoPE pool + bf16 RoPE pool are read with no requant.
+    Native 2buff fp8 (``unified_kv_rope`` provided): normally routes to the
+    aiter decode ASM kernel (op5). With
+    ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``, gfx1250 H=128 instead reuses the
+    sparse-prefill ASM kernel with an empty extend stream. Both paths consume
+    pre-packed fp8 Q and the fp8 NoPE + bf16 RoPE pools with no requant.
+
+    ``split_plan`` is ``(num_kv_splits, split_indptr)`` (:func:`v4_decode_split_plan`)
+    for the decode ASM kernel, built by whoever built this
+    call's ``qo_indptr``; None leaves the split pick to aiter.
+
+    ``compress_ratio`` is the calling layer's ratio (0 SWA, 4 CSA, 128 HCA).
+    With ``ATOM_V4_HCA_PERSIST`` (default on), fp8 HCA calls with 128 heads on
+    gfx950 and ``ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= 32768`` run aiter's
+    persistent kernel (``hca_persist``) instead; ``split_plan`` is then unused.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1079,6 +1214,45 @@ def sparse_attn_v4_paged_decode(
     unreachable from the model).
     """
     if unified_kv_rope is not None:
+        if (
+            envs.ATOM_USE_V4_PREFILL_ASM_FOR_DECODE
+            and q_packed_in is not None
+            and q_packed_in.shape[1] == 128
+            and empty_kv_indptr is not None
+            and get_gfx() == "gfx1250"
+        ):
+            return _sparse_attn_v4_paged_decode_prefill_asm(
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                empty_kv_indptr,
+                attn_sink,
+                softmax_scale,
+                unified_kv_rope,
+                q_packed_in,
+                q_rope_in,
+            )
+        if (
+            q_packed_in is not None
+            and hca_persist.wanted(
+                compress_ratio=compress_ratio,
+                heads=q_packed_in.shape[1],
+                rows=q_packed_in.shape[0],
+                gfx=get_gfx(),
+            )
+            and hca_persist.layout_ok(unified_kv, unified_kv_rope)
+            and hca_persist.workspace_ready(q_packed_in.device)
+        ):
+            return hca_persist.hca_persist_decode(
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                unified_kv_rope,
+                q_packed_in,
+                q_rope_in,
+            )
+        num_kv_splits, split_indptr = split_plan or (None, None)
         return _sparse_attn_v4_paged_decode_asm(
             unified_kv,
             kv_indices,
@@ -1090,6 +1264,8 @@ def sparse_attn_v4_paged_decode(
             q_rope_in,
             qo_indptr=qo_indptr,
             kv_last_page_lens=kv_last_page_lens,
+            num_kv_splits=num_kv_splits,
+            split_indptr=split_indptr,
         )
     gfx = get_gfx()
     if gfx == "gfx1250" or gfx.startswith("gfx94"):

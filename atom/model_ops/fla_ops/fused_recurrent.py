@@ -61,6 +61,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    INIT_STATE_VK: tl.constexpr = False,
+    FINAL_STATE_VK: tl.constexpr = False,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -118,7 +120,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             )
         else:
             p_h0 = h0 + bos * HV * K * V
-        p_h0 = p_h0 + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+        if INIT_STATE_VK:
+            p_h0 = p_h0 + i_hv * K * V + o_k[:, None] + o_v[None, :] * K
+        else:
+            p_h0 = p_h0 + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for i_t in range(T):
@@ -161,7 +166,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             )
         else:
             p_ht = ht + (bos + i_t) * stride_final_state_token
-        p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+        if FINAL_STATE_VK:
+            p_ht = p_ht + i_hv * K * V + o_k[:, None] + o_v[None, :] * K
+        else:
+            p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
         p_q += H * K
@@ -259,6 +267,8 @@ def fused_recurrent_gated_delta_rule_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=False,
+        INIT_STATE_VK=initial_state.stride(-2) == 1,
+        FINAL_STATE_VK=final_state.stride(-2) == 1,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -442,8 +452,7 @@ def gdn_decode_update_lossy_fast(
         )
     if initial_state.ndim != 4 or initial_state.shape[1:] != (HV, K, V):
         raise ValueError(
-            "decode fast path expects initial_state shaped "
-            f"[num_slots, {HV}, {K}, {V}]"
+            f"decode fast path expects initial_state shaped [num_slots, {HV}, {K}, {V}]"
         )
     if not initial_state.is_contiguous():
         raise ValueError("decode fast path expects contiguous initial_state")

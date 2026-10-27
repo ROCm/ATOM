@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
@@ -28,10 +27,13 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
 DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
+DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL = "dense.page.source_quiescent"
 DENSE_PAGE_STORE_CHANNEL = "dense.page.store"
 
 
@@ -58,8 +60,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         The standalone connector supplies LMCache's legacy lookup client. The
         multiprocess connector supplies a small adapter with the same public
-        ``lookup``/``clear_lookup_status`` contract, so both transports retain
-        one scheduling and exact-completion implementation.
+        ``lookup``/``clear_lookup_status`` methods, so both transports retain one
+        scheduling and exact-completion implementation. The two differ in one
+        documented way: the adapter's ``lookup`` also returns ``None``, meaning
+        "the worker did not answer in time", which is not a hit of zero and must
+        not be remembered as one.
         """
         self._init_offload_statistics()
         self._config = config
@@ -81,6 +86,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             minimum=1,
         )
         self._lookup_client = lookup_client
+
+        # Optional veto on how far a reported hit may reach, installed by a
+        # hybrid connector. A model whose recurrent state must be restored
+        # alongside the KV has a second condition this scheduler knows nothing
+        # about -- the state at the hit boundary has to exist too -- and the
+        # only safe answer to a missing state is a shorter hit. Called with
+        # ``(seq, hit)`` and returns the permitted hit.
+        self._hit_cap_hook = None
 
         # req_id -> LoadSpec (pending load decided at match time)
         self._load_specs: dict[str, LoadSpec] = {}
@@ -120,6 +133,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._save_lease_owner: dict[int, object] = {}
         self._pending_source_safe_releases: list[frozenset] = []
         self._source_safe_waiting_for_store: dict[SaveOperationId, set[int]] = {}
+        # A failed store may retry only after every TP rank has stopped reading
+        # its source. A post-submit failure need not provide that guarantee.
+        self._save_previous_frontier: dict[SaveOperationId, int] = {}
+        self._save_previous_owner: dict[SaveOperationId, object] = {}
+        self._save_quiescent: set[SaveOperationId] = set()
+        self._save_retry_blocked: dict[str, SaveOperationId] = {}
         self._save_nonce = 0
         self._load_nonce = 0
         self._load_lifecycles: dict[str, object] = {}
@@ -127,21 +146,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._lookup_in_step: list[str] = []
         self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
+        self._block_manager = None
+        self._lookup_defer_since: dict[str, float] = {}
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
-        try:
-            self._min_load_tokens = max(
-                0, int(os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192"))
-            )
-        except ValueError:
-            logger.warning(
-                "LMCache offload scheduler: invalid OFFLOAD_MIN_LOAD_TOKENS=%r; "
-                "using 8192",
-                os.environ.get("OFFLOAD_MIN_LOAD_TOKENS"),
-            )
-            self._min_load_tokens = 8192
+        self._min_load_tokens = envs.OFFLOAD_MIN_LOAD_TOKENS
+
+    def bind_block_manager(self, block_manager) -> None:
+        if self._block_manager is not None and self._block_manager is not block_manager:
+            raise RuntimeError("offload scheduler is already bound to a block manager")
+        self._block_manager = block_manager
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def _begin_load_lifecycle(self, seq) -> None:
@@ -150,35 +166,321 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if previous is not None and previous is not seq:
             self._clear_pending_load(sid)
             self._active_load_operations.pop(sid, None)
+            self._load_failed_seqs.pop(sid, None)
+            self._forget_tier_hit(sid)
         self._load_lifecycles[sid] = seq
 
+    def _lookup_token_ids(self, seq) -> list[int]:
+        """The prompt extent this layout can safely ask the tier to resume."""
+        return list(seq.token_ids[: seq.num_prompt_tokens])
+
+    def _lookup_len(self, seq) -> int:
+        """`len(self._lookup_token_ids(seq))` without copying the prompt."""
+        return int(seq.num_prompt_tokens)
+
+    def install_hit_cap_hook(self, hook) -> None:
+        """Let a hybrid connector shorten every hit this scheduler reports.
+
+        One hook, not a list: the cap is a correctness constraint rather than a
+        policy, and two of them would raise the question of which wins for a
+        reader who has to be sure the answer is "the shortest".
+        """
+        self._hit_cap_hook = hook
+
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        t0 = time.perf_counter()
+        try:
+            return self._get_num_new_matched_tokens(seq)
+        finally:
+            self._perf_bump("matched_us", int((time.perf_counter() - t0) * 1e6))
+            self._perf_bump("matched_n")
+
+    def _get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        """How many extra prompt tokens the external tier can supply.
+
+        Called once per step for as long as the request stays unadmitted, so
+        the tier hit is remembered rather than asked for again
+        (`OffloadSchedulerMixin._init_tier_hit_memo`) while the answer below is
+        re-derived every call. A remembered hit carries no worker-side lookup
+        pin; the pin is re-taken where the load is committed
+        (`OffloadSchedulerMixin._ensure_lookup_pin`).
+        """
+
         if not self._do_load or self._lookup_client is None:
             return 0, False
         self._begin_load_lifecycle(seq)
-        num_prompt = seq.num_prompt_tokens
-        token_ids = list(seq.token_ids[:num_prompt])
         sid = str(seq.id)
+        if self._repeat_load_suppressed(seq, sid):
+            return 0, False
+        if self._lookup_len(seq) <= 0:
+            return 0, False
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
             # must be dispatched before the ID can acquire a new lease.
             return 0, False
-        try:
-            if pending is None:
-                if sid not in self._lookup_in_step:
-                    self._lookup_in_step.append(sid)
-                self._lookup_results[sid] = (seq, 0)
-                hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
-                if hit is None:
-                    self._lookup_results.pop(sid, None)
-                else:
-                    self._lookup_results[sid] = (seq, int(hit))
-            else:
-                hit = pending[1]
-        except Exception:
-            logger.exception("LMCache offload lookup failed for seq %s", seq.id)
+        if pending is not None:
+            hit = pending[1]
+        else:
+            remembered, hit = self._remembered_tier_hit(seq, sid)
+            if not remembered:
+                hit = self._fresh_tier_lookup(seq, sid)
+        if hit is None:
             return 0, False
+        return self._answer_from_tier_hit(seq, sid, hit)
+
+    def prefetch_lookups(self, seqs) -> None:
+        """Send lookups for waiting requests before they reach admission.
+
+        Called once per scheduling pass with the head of the waiting queue.
+        The answer is consumed by the ordinary `_fresh_tier_lookup` when the
+        request is admitted, so only the round trip moves off the admission
+        path; the hit, its pin and the memo are exactly what a synchronous
+        lookup would have produced.
+        """
+        client = self._lookup_client
+        submit = getattr(client, "submit", None)
+        if submit is None or not self._do_load:
+            return
+        t0 = time.perf_counter()
+        client.pump()
+        budget = envs.OFFLOAD_ASYNC_LOOKUP_DEPTH
+        memo = self._tier_hit_memo or {}
+        pending = client.pending_ids()
+        for seq in seqs:
+            if budget <= 0:
+                break
+            sid = str(seq.id)
+            if sid in pending or sid in self._lookup_results or sid in self._load_specs:
+                continue
+            entry = memo.get(sid)
+            if entry is not None and entry[0]() is seq:
+                continue
+            if self._load_failed_seqs.get(sid) is seq:
+                continue
+            # Its lookup was consumed when it parked; a finished load moves it
+            # to the head before admission sets `offload_loaded`.
+            if getattr(seq, "status", None) == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if resumes_offload_prefill(seq):
+                continue
+            if self._lookup_len(seq) <= 0:
+                continue
+            budget -= 1
+            if submit(self._lookup_token_ids(seq), sid):
+                self._perf_bump("lookup_prefetched")
+        self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
+
+    def _load_ruled_out(self, seq, num_hbm_tokens: int) -> bool:
+        """Whether no tier answer could make `seq` load anything.
+
+        Every load path compares the tier hit with the post-allocation HBM
+        prefix and refuses a load shorter than `_min_load_tokens`
+        (`_decide_load_after_alloc`; the unaligned handoff only adds
+        refusals). A tier hit never exceeds the prompt, so when the uncached
+        tail is already below the threshold, no answer can produce a load.
+        Using the connector's own threshold keeps this check and the load
+        decision consistent.
+        """
+        if not self._do_load or self._lookup_client is None:
+            return False
+        uncached = int(seq.num_tokens) - max(0, int(num_hbm_tokens))
+        return uncached < int(getattr(self, "_min_load_tokens", 8192))
+
+    def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
+        """Whether admission may proceed without waiting for `seq`'s lookup.
+
+        Side-effect free, so the scheduler can ask before its admission checks
+        and call `detach_lookup` only once the request is admitted. Requires:
+        - `_load_ruled_out`: the answer cannot change what is loaded;
+        - no load or consumed lookup in this lifecycle, which the ordinary
+          path finishes;
+        - an asynchronous lookup that is in flight or can be sent. A detached
+          lookup is still sent, for its side effects (L1 recency and the MP
+          session); a client that only looks up synchronously cannot do that.
+        """
+        if not self._load_ruled_out(seq, num_hbm_tokens):
+            return False
+        sid = str(seq.id)
+        if (
+            sid in self._load_specs
+            or sid in self._lookup_results
+            or sid in self._active_load_operations
+        ):
+            return False
+        client = self._lookup_client
+        pending_ids = getattr(client, "pending_ids", None)
+        if callable(pending_ids) and sid in pending_ids():
+            return True
+        supports_async = getattr(client, "supports_async", None)
+        return (
+            callable(supports_async)
+            and bool(supports_async())
+            and self._lookup_len(seq) > 0
+        )
+
+    def detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
+        """Admit `seq` without its lookup's answer; keep the lookup itself.
+
+        Called after the request is admitted. Sends the lookup unless a
+        prefetch already did: on LMCache MP the lookup refreshes the prefix's
+        L1 recency and opens the session whose end touches every chunk of the
+        request. The client releases the answer's read locks when it arrives
+        and reports the hit to `reconcile_detached_lookups`.
+
+        The save floor starts at the HBM prefix and is corrected by
+        `reconcile_detached_lookups`.
+
+        Returns False, changing nothing, when the lookup cannot be tracked;
+        the request then runs without a tier lookup, which loses only the LRU
+        refresh (`_load_ruled_out` already excludes a load).
+        """
+        if not self.can_detach_lookup(seq, num_hbm_tokens):
+            return False
+        sid = str(seq.id)
+        client = self._lookup_client
+        if sid not in client.pending_ids():
+            if not client.submit(self._lookup_token_ids(seq), sid):
+                return False
+            self._perf_bump("lookup_detached_sent")
+        # Registered before `discard`, which releases an answered lookup at once.
+        self._detached_lookups[sid] = seq
+        client.discard(sid)
+        self._lookup_defer_since.pop(sid, None)
+        self._forget_tier_hit(sid)
+        floor = self._chunk_floor(max(0, int(num_hbm_tokens)))
+        if floor > 0:
+            self._hit_save_floors[sid] = floor
+        self._perf_bump("lookup_detached")
+        return True
+
+    def reconcile_detached_lookups(self) -> None:
+        """Correct detached requests' save floors from their lookups' outcome.
+
+        HBM residency does not prove the tier still holds the prefix: LMCache
+        evicts independently, and because it matches contiguously from
+        position 0, one missing chunk hides every later one. So:
+        - an answered lookup lowers the floor to the tier's contiguous hit,
+          and the chunks above it are saved again;
+        - a lookup that ended without an answer (failed or timed out) gives
+          no information, so the floor drops to 0.
+
+        Best-effort: if the request finishes before its lookup answers, it
+        saves nothing more, and the next request on the prefix repairs the
+        gap with its own lookup.
+        """
+        client = self._lookup_client
+        pop_hits = getattr(client, "pop_discarded_hits", None)
+        if not callable(pop_hits):
+            return
+        try:
+            hits = pop_hits()
+        except Exception:
+            logger.warning(
+                "LMCache: reading discarded lookup hits failed", exc_info=True
+            )
+            hits = {}
+        detached = self._detached_lookups
+        for sid, hit in hits.items():
+            seq = detached.pop(sid, None)
+            if seq is not None and self._lower_save_floor(
+                sid, seq, self._chunk_floor(max(0, int(hit)))
+            ):
+                self._perf_bump("detached_floor_lowered")
+
+        pending_ids = getattr(client, "pending_ids", None)
+        in_flight = pending_ids() if callable(pending_ids) else ()
+        for sid, seq in list(detached.items()):
+            if sid not in in_flight:
+                del detached[sid]
+                if self._lower_save_floor(sid, seq, 0):
+                    self._perf_bump("detached_floor_reset")
+            elif not self._is_tracked(sid, seq):
+                # Finished while its lookup is in flight: nothing left to fix.
+                del detached[sid]
+
+    @property
+    def _detached_lookups(self) -> dict[str, object]:
+        """Admitted requests whose detached lookup has not answered yet.
+
+        Created on first use, like the MP scheduler's `_pending_session_ends`,
+        so schedulers assembled without this base's `__init__` still work.
+        """
+        return self.__dict__.setdefault("_detached_lookups_by_sid", {})
+
+    def _is_tracked(self, sid: str, seq) -> bool:
+        entry = self._save_tracker.get(sid)
+        return entry is not None and entry[0] is seq
+
+    def _lower_save_floor(self, sid: str, seq, tokens: int) -> bool:
+        """Lower `sid`'s save floor to `tokens`; True if its tracker moved."""
+        floor = self._hit_save_floors.get(sid)
+        if floor is not None and tokens < floor:
+            self._hit_save_floors[sid] = tokens
+        if self._is_tracked(sid, seq) and tokens < int(self._save_tracker[sid][1]):
+            self._save_tracker[sid][1] = tokens
+            return True
+        return False
+
+    def lookup_pending(self, seq) -> bool:
+        """True while admission should pass over `seq`: its lookup is in flight.
+
+        Waiting a step or two for an answer that may carry tens of thousands of
+        prompt tokens is cheaper than either blocking the scheduler thread on
+        it (every DP rank waits in lockstep) or admitting the request without
+        it (a recompute). Bounded by `OFFLOAD_LOOKUP_DEFER_S`, after which the
+        ordinary synchronous lookup waits for the answer.
+        """
+        client = self._lookup_client
+        if getattr(client, "is_pending", None) is None:
+            return False
+        sid = str(seq.id)
+        if not client.is_pending(sid) or client.poll(sid):
+            self._lookup_defer_since.pop(sid, None)
+            return False
+        now = time.monotonic()
+        first = self._lookup_defer_since.setdefault(sid, now)
+        if now - first > envs.OFFLOAD_LOOKUP_DEFER_S:
+            self._perf_bump("lookup_defer_expired")
+            return False
+        self._perf_bump("lookup_deferred")
+        return True
+
+    def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
+        """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
+
+        num_prompt = seq.num_prompt_tokens
+        token_ids = self._lookup_token_ids(seq)
+        if sid not in self._lookup_in_step:
+            self._lookup_in_step.append(sid)
+        self._lookup_results[sid] = (seq, 0)
+        _t0 = time.perf_counter()
+        try:
+            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+            _us = int((time.perf_counter() - _t0) * 1e6)
+            self._perf_bump("lookup_n")
+            self._perf_bump("lookup_us", _us)
+            if _us > self.__dict__.get("_perf_lookup_max_us", 0):
+                self._perf_lookup_max_us = _us
+                self._perf_counters["lookup_max_us"] = _us
+            self._perf_bump("lookup_prompt_tokens", num_prompt)
+            self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
+            self._perf_bump("lookup_hit_tokens", int(hit or 0))
+            if hit is None:
+                self._perf_bump("lookup_none")
+        except Exception:
+            # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
+            # a half-run lookup may have taken.
+            logger.exception("LMCache offload lookup failed for seq %s", seq.id)
+            self._lookup_results.pop(sid, None)
+            self._remember_tier_hit(seq, sid, None)
+            return None
+        if hit is None:
+            self._lookup_results.pop(sid, None)
+        else:
+            hit = int(hit)
+            self._lookup_results[sid] = (seq, hit)
+        self._remember_tier_hit(seq, sid, hit)
         if logger.isEnabledFor(logging.DEBUG):
             _lh = None
             try:
@@ -200,27 +502,57 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 hit,
                 _lh,
             )
+        return hit
+
+    def _answer_from_tier_hit(self, seq, sid: str, hit: int) -> tuple[int, bool]:
+        """Turn a tier hit into this step's answer, and arm what it implies."""
+
         if not hit:
             return 0, False
-        hit = int(hit)
-        if hit == num_prompt:  # full-prompt hit → recompute last token
-            hit -= 1
-        self._hit_save_floors[sid] = self._chunk_floor(hit)
-        need = hit - int(seq.num_cached_tokens)
+        num_prompt = seq.num_prompt_tokens
+        frontier = int(seq.num_cached_tokens)
+        hit = self._loadable_hit(hit, num_prompt)
+        if self._hit_cap_hook is not None:
+            # After `_loadable_hit`, so the hook caps the hit that will
+            # actually be requested; before the save floor is recorded, so a
+            # capped hit does not leave a floor claiming the tier already holds
+            # the part that was just refused. The cap names a state boundary,
+            # which need not be a chunk multiple, so it is floored again --
+            # `_loadable_hit`'s own reason applies unchanged to the capped
+            # length.
+            capped = int(self._hit_cap_hook(seq, hit))
+            if capped < hit:
+                logger.debug(
+                    "[OFFLOAD-LOOKUP] seq=%s hit capped %d -> %d",
+                    seq.id,
+                    hit,
+                    capped,
+                )
+                hit = self._chunk_floor(capped)
+            if hit <= 0:
+                self._clear_pending_load(sid)
+                self._hit_save_floors.pop(sid, None)
+                return 0, False
+        self._hit_save_floors[sid] = hit
+        need = hit - frontier
         if need <= 0:
             self._clear_pending_load(sid)
             self._hit_save_floors[sid] = self._chunk_floor(hit)
             return 0, False
         self._load_specs[sid] = LoadSpec(
-            hbm_cached_tokens=int(seq.num_cached_tokens),
+            hbm_cached_tokens=frontier,
             lmcache_cached_tokens=hit,
             can_load=False,
         )
-        return need, True  # True => park in WAITING_FOR_REMOTE_KVS
+        # True => park in WAITING_FOR_REMOTE_KVS
+        return need, True
 
     def update_state_after_alloc(self, seq) -> None:
         self._begin_load_lifecycle(seq)
         sid = str(seq.id)
+        # Admitted: the frontier moves and the load spec is dispatched, so a
+        # remembered hit has been spent. A preempted request asks again.
+        self._forget_tier_hit(sid)
         ls = self._load_specs.get(sid) if self._do_load else None
         logger.debug(
             "[OFFLOAD-ALLOC] seq=%s ls_found=%s num_cached_now=%s",
@@ -256,6 +588,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._handoff_loads.discard(sid)
         self._load_save_floors.pop(sid, None)
         self._hit_save_floors.pop(sid, None)
+        self._release_lookup(sid)
+
+    def _release_lookup(self, sid: str) -> None:
+        """Clear this request's lookup once no load spec needs it."""
         # clear_lookup_status only clears the client's memo; it does not
         # release worker pins. Keep the ID for the next metadata dispatch.
         if self._lookup_client is not None:
@@ -303,7 +639,110 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Return whether another save may be emitted this scheduler step."""
         return True
 
+    def _new_load_operation(self, seq) -> LoadOperationId:
+        operation = LoadOperationId(seq.id, self._load_nonce)
+        self._load_nonce += 1
+        return operation
+
+    def _build_save_request(
+        self,
+        seq,
+        saved: int,
+        aligned: int,
+        operation: SaveOperationId,
+        block_ids: list[int],
+        is_last_prefill: bool,
+    ) -> LMCacheReqMeta | None:
+        """Admit any layout-specific sources before advancing the watermark."""
+        return LMCacheReqMeta(
+            req_id=seq.id,
+            token_ids=list(seq.token_ids[:aligned]),
+            block_ids=block_ids,
+            save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
+            is_last_prefill=is_last_prefill,
+            save_operation=operation,
+        )
+
+    def _build_load_request(
+        self,
+        seq,
+        load_spec: LoadSpec,
+        load_operation: LoadOperationId,
+        transfer_end: int,
+    ) -> LMCacheReqMeta:
+        """Describe one dispatched load of ``[hbm, transfer_end)`` to the worker.
+
+        Ships the prompt prefix the transfer covers, from which the worker
+        derives the chunk keys. A transport keyed differently overrides this.
+        """
+        return LMCacheReqMeta(
+            req_id=seq.id,
+            token_ids=list(seq.token_ids[:transfer_end]),
+            block_ids=list(seq.block_table),
+            load_spec=load_spec,
+            load_operation=load_operation,
+        )
+
+    def _late_save_frontier(self, seq, saved: int, available: int) -> int:
+        """Return the largest layout-valid boundary for a late-acquired source."""
+        del seq, saved
+        return self._chunk_floor(available)
+
+    def _reacquires_late_source(self) -> bool:
+        """Whether a finished request's final save reacquires its prefix by hash.
+
+        Only a bound `BlockManager` with prefix caching has a hash index to
+        reacquire through. Without one (the vLLM plugin, or
+        `--no-enable_prefix_caching`) teardown instead leases the unemitted
+        suffix of the frozen block table, and the final save reads exactly
+        those leased blocks.
+        """
+        manager = self._block_manager
+        return manager is not None and bool(
+            getattr(manager, "enable_prefix_caching", False)
+        )
+
+    def _late_save_source(
+        self, seq, saved: int, aligned: int
+    ) -> tuple[int, list[int], frozenset[int]] | None:
+        """Reacquire a finished request's still-resident prefix at admission."""
+        if not self._reacquires_late_source():
+            raise RuntimeError("late offload save requires a prefix-cache index")
+        block_ids, available, claimed = self._block_manager.acquire_offload_prefix(
+            seq, saved, aligned
+        )
+        target = self._late_save_frontier(seq, saved, available)
+        source_block_size = int(getattr(self, "virtual_block_size", self.block_size))
+        keep_count = max(0, (target - saved) // source_block_size)
+        keep = frozenset(claimed[:keep_count])
+        drop = claimed[keep_count:]
+        if drop:
+            self._block_manager.free_leased_blocks(drop)
+        if available < aligned:
+            # A block of the prefix was evicted (or reused) between teardown
+            # and admission, so the final save stores less than was computed.
+            self.total_truncated_late_saves += 1
+            # Early release trades this: the tail's blocks went back to the pool
+            # at teardown, so eviction before admission shortens the final save.
+            logger.warning(
+                "Late offload save of seq %s found %d of %d computed tokens still "
+                "resident; the evicted tail is not stored "
+                "(total truncated_late_saves=%d)",
+                seq.id,
+                available,
+                aligned,
+                self.total_truncated_late_saves,
+            )
+        if target <= saved:
+            # Nothing savable is still resident (or no boundary qualifies):
+            # retire the request rather than emit an empty save forever.
+            if keep:
+                self._block_manager.free_leased_blocks(keep)
+            return None
+        return target, block_ids, keep
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
+        _perf_t0 = time.perf_counter()
         meta = LMCacheOffloadMetadata()
 
         # Loads
@@ -334,7 +773,17 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
+            # This is the one place a retrieve is handed to the worker, so it
+            # is where the load's lookup pin has to be live -- a spec derived
+            # from a remembered hit has none yet.
+            if not self._ensure_lookup_pin(seq, sid, ls):
+                self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
+                self._clear_pending_load(sid)
+                continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
+            # The scheduler needs the physical load floor to publish the
+            # restored blocks' hashes before resuming suffix prefill.
+            seq.offload_load_start_tokens = hbm
             seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
@@ -352,8 +801,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             loading_sids.add(sid)
             self._load_save_floors[sid] = self._chunk_floor(hbm)
-            load_operation = LoadOperationId(seq.id, self._load_nonce)
-            self._load_nonce += 1
+            load_operation = self._new_load_operation(seq)
             seq._load_operation = load_operation
             self._active_load_operations[sid] = (seq, load_operation)
             self._track_load_statistics(load_operation, lmc - hbm)
@@ -361,23 +809,23 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
             )
             meta.add_request(
-                LMCacheReqMeta(
-                    req_id=seq.id,
-                    token_ids=list(seq.token_ids[:transfer_end]),
-                    block_ids=list(seq.block_table),
-                    load_spec=ls,
-                    load_operation=load_operation,
-                )
+                self._build_load_request(seq, ls, load_operation, transfer_end)
             )
         meta.lookup_requests_in_step = [
             sid
             for sid in self._lookup_in_step
             if sid in loading_sids or sid not in self._load_specs
         ]
-        # Saves: store fully computed prompt chunks. Under scheduler-side
-        # chunked prefill, seq.num_cached_tokens advances after each prefill
-        # chunk's forward has completed; use it as the D2H-safe frontier.
-        chunk = self.chunk_size or 256
+        # Saves: store prompt chunks up to the computed frontier,
+        # seq.num_cached_tokens. Without PP it advances once a chunk's forward
+        # has returned. Under PP, schedule() advances it as it dispatches a
+        # chunk, right after it builds this metadata, so the frontier covers
+        # the chunks of every batch dispatched before this one, some of them
+        # still running on later stages. The producer fence still orders each
+        # save after the forwards it reads: every stage takes metadata and
+        # batches in dispatch order, one RPC at a time, and records its fence
+        # when it takes this metadata (dense `start_load_kv`), after it has
+        # enqueued every earlier forward on the same stream.
         tracker_sids = list(self._save_tracker.keys())
         if tracker_sids and self._save_rr_last in self._save_tracker:
             start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
@@ -387,12 +835,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not self._do_save:
                 continue
             if not self._may_emit_save():
+                self._perf_bump("save_cap_block_steps")
                 break
             seq, saved = entry
             if sid in self._reqs_need_recv or sid in loading_sids:
                 continue  # loading this step; defer its save
             if sid in self._save_inflight:
                 continue  # keep at most one save per request in flight
+            blocked = self._save_retry_blocked.get(sid)
+            if blocked is not None and self._save_previous_owner.get(blocked) is seq:
+                continue  # failed source may still be in use on another rank
             computed = min(
                 int(
                     getattr(
@@ -404,7 +856,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 int(seq.num_prompt_tokens),
             )
             is_last_prefill = computed >= int(seq.num_prompt_tokens)
-            aligned = (computed // chunk) * chunk
+            aligned = self._save_frontier(seq)
             if aligned <= saved:
                 continue
             logger.debug(
@@ -417,22 +869,41 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             save_operation = SaveOperationId(seq.id, self._save_nonce)
             self._save_nonce += 1
-            self._track_save_statistics(save_operation, aligned - saved)
-            block_ids = list(
-                getattr(seq, "_offload_finished_block_ids", seq.block_table)
-            )
-            meta.add_request(
-                LMCacheReqMeta(
-                    req_id=seq.id,
-                    token_ids=list(seq.token_ids[:aligned]),
-                    block_ids=block_ids,
-                    save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
-                    is_last_prefill=is_last_prefill,
-                    save_operation=save_operation,
+            late_acquired = frozenset()
+            if getattr(seq, "_offload_released", False) and (
+                self._reacquires_late_source()
+            ):
+                late_source = self._late_save_source(seq, saved, aligned)
+                if late_source is None:
+                    self._perf_bump("late_save_dropped")
+                    self._perf_bump("late_save_dropped_tokens", aligned - saved)
+                    self._save_tracker.pop(sid, None)
+                    continue
+                self._perf_bump("late_save_emit")
+                aligned, block_ids, late_acquired = late_source
+            else:
+                block_ids = list(
+                    getattr(seq, "_offload_finished_block_ids", seq.block_table)
                 )
-            )
+            try:
+                request = self._build_save_request(
+                    seq, saved, aligned, save_operation, block_ids, is_last_prefill
+                )
+            except Exception:
+                if late_acquired:
+                    self._block_manager.free_leased_blocks(late_acquired)
+                raise
+            if request is None:
+                if late_acquired:
+                    self._block_manager.free_leased_blocks(late_acquired)
+                continue
+            self._track_save_statistics(save_operation, aligned - saved)
+            meta.add_request(request)
             entry[1] = aligned
+            self._save_previous_frontier[save_operation] = saved
+            self._save_previous_owner[save_operation] = seq
             self._save_inflight[sid] = save_operation
+            self._refresh_save_reclaim_clock(seq)
             self._save_rr_last = sid
             if getattr(self, "_early_release", False):
                 # Freeze the exact token-index -> block-id mapping before a
@@ -447,6 +918,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 }
                 self._save_operation_safe[save_operation] = set()
                 self._save_operation_owner[save_operation] = seq
+                if late_acquired:
+                    self.activate_block_leases(seq, late_acquired)
         dispatched = set(meta.lookup_requests_in_step)
         for sid in dispatched:
             self._lookup_results.pop(sid, None)
@@ -454,6 +927,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
+        self._perf_bump("build_meta_us", int((time.perf_counter() - _perf_t0) * 1e6))
+        self._perf_bump("build_meta_n")
+        self._perf_maybe_log()
         return meta
 
     def should_defer_free(self, seq) -> bool:
@@ -485,19 +961,21 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         does not support exact leases, or a load is in flight, since a load also
         touches HBM blocks this connector does not track per-range) -- the
         scheduler falls back to deferring the whole request. This includes a
-        final save that has not been emitted yet: request teardown freezes its
-        full block table and computed frontier so the next metadata build can
-        still dispatch that save after unrelated blocks have been released.
+        final save that has not been emitted yet. When the prefix can be
+        reacquired by hash (`_reacquires_late_source`) teardown freezes its
+        token identity and computed frontier but protects no physical PAGE:
+        admission reacquires the still-canonical prefix through the index.
+        Otherwise there is nothing to reacquire through, so teardown freezes
+        the block table and leases the unemitted suffix, and the final save
+        reads exactly those leased blocks.
         """
         if not self._early_release or self._has_active_load(seq):
             return None
-        sid = str(seq.id)
-        table = list(getattr(seq, "_offload_finished_block_ids", seq.block_table))
-        if not hasattr(seq, "_offload_finished_block_ids"):
-            seq._offload_finished_block_ids = table
-        seq._offload_finished_cached_tokens = min(
-            int(getattr(seq, "num_cached_tokens", 0)), int(seq.num_prompt_tokens)
-        )
+        seq._offload_finished = True
+        if not hasattr(seq, "_offload_finished_cached_tokens"):
+            seq._offload_finished_cached_tokens = min(
+                int(getattr(seq, "num_cached_tokens", 0)), int(seq.num_prompt_tokens)
+            )
 
         protected: set[int] = set()
         for operation, blocks in self._save_operation_blocks.items():
@@ -508,20 +986,29 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 block_id for block_id in blocks.values() if block_id not in safe
             )
 
-        entry = self._save_tracker.get(sid)
-        if entry is not None and entry[0] is seq:
-            saved = int(entry[1])
-            aligned = self._save_frontier(seq)
-            if aligned > saved:
-                start_block = saved // self.virtual_block_size
-                end_block = -(-aligned // self.virtual_block_size)
-                protected.update(table[start_block:end_block])
+        if not self._reacquires_late_source():
+            table = list(getattr(seq, "_offload_finished_block_ids", seq.block_table))
+            seq._offload_finished_block_ids = table
+            entry = self._save_tracker.get(str(seq.id))
+            if entry is not None and entry[0] is seq:
+                saved = int(entry[1])
+                aligned = self._save_frontier(seq)
+                if aligned > saved:
+                    start_block = saved // self.virtual_block_size
+                    end_block = -(-aligned // self.virtual_block_size)
+                    protected.update(table[start_block:end_block])
         return frozenset(protected)
 
     def activate_block_leases(self, seq, block_ids: frozenset[int]) -> None:
         """Record the refcount shares transferred at request deallocation."""
 
-        if not self._early_release or not block_ids:
+        if not self._early_release:
+            return
+        # Only a partial deallocation reaches here. `protected_block_ids` runs
+        # before the scheduler decides, and a request deferred whole still owns
+        # its table, so only from now on must a final save reacquire its source.
+        seq._offload_released = True
+        if not block_ids:
             return
         lease_key = id(seq)
         leased = self._save_lease_blocks.setdefault(lease_key, set())
@@ -555,7 +1042,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             owner = self._save_lease_owner.pop(lease_key, None)
             owned_operations = [
                 op
-                for op, operation_owner in self._save_operation_owner.items()
+                for op, operation_owner in self._save_previous_owner.items()
                 if id(operation_owner) == lease_key
             ]
             sid = str(owner.id) if owner is not None else None
@@ -563,13 +1050,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if operation in owned_operations:
                 self._save_inflight.pop(sid, None)
                 self._cancel_save_statistics(operation)
-            for candidate in [
-                op for op in self._save_operation_blocks if op in owned_operations
-            ]:
+            for candidate in owned_operations:
                 self._save_operation_blocks.pop(candidate, None)
                 self._save_operation_safe.pop(candidate, None)
                 self._save_operation_owner.pop(candidate, None)
                 self._source_safe_waiting_for_store.pop(candidate, None)
+                self._save_previous_frontier.pop(candidate, None)
+                self._save_previous_owner.pop(candidate, None)
+                self._save_quiescent.discard(candidate)
+                if sid is not None and self._save_retry_blocked.get(sid) == candidate:
+                    self._save_retry_blocked.pop(sid, None)
             if sid is not None:
                 entry = self._save_tracker.get(sid)
                 if entry is not None and entry[0] is owner:
@@ -598,7 +1088,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         a load or cleanup dispatchable in ``build_connector_meta``.
         """
         pending_finished_save = getattr(self, "_early_release", False) and any(
-            hasattr(entry[0], "_offload_finished_block_ids")
+            getattr(entry[0], "_offload_finished", False)
             and self._has_pending_save(entry[0])
             for entry in self._save_tracker.values()
         )
@@ -623,13 +1113,59 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return
         self._save_inflight.pop(sid, None)
         if getattr(self, "_early_release", False):
-            # The dedicated connector completion reports store success/failure.
-            # This legacy terminal remains for MultiConnector save pairing.
+            # Store success/failure and lease release travel on the dedicated
+            # connector channel. This terminal only clears the in-flight save.
             self._finish_retired_request(sid)
             return
+        if isinstance(active, SaveOperationId):
+            self._save_previous_frontier.pop(active, None)
+            self._save_previous_owner.pop(active, None)
+            self._save_quiescent.discard(active)
         self._finish_save_statistics(req_id)
         self._release_operation_lease(req_id)
         self._finish_retired_request(sid)
+
+    def save_finished_by_request(self, req_id) -> None:
+        """Complete a save when only the plain request id is available.
+
+        `save_finished` refuses a raw id once the lifecycle has an exact
+        `SaveOperationId`, so a delayed report cannot complete a newer
+        lifecycle. A vLLM-plugin scheduler cannot satisfy that: vLLM's
+        `KVConnectorOutput` carries request ids as plain strings, so the exact
+        identity never survives the trip back from the worker.
+
+        Resolving the parked identity here keeps the guard meaningful instead of
+        weakening `save_finished` -- and without it the entry never clears, so
+        `_save_inflight` grows for the life of the process and
+        `has_pending_work()` never goes quiet.
+        """
+        sid = str(req_id)
+        active = self._save_inflight.get(sid)
+        self.save_finished(active if active is not None else sid)
+
+    def load_finished_by_request(self, req_id) -> bool:
+        """`load_finished` for a caller that has only the plain request id.
+
+        Same reason as `save_finished_by_request`.
+        """
+        sid = str(req_id)
+        entry = self._active_load_operations.get(sid)
+        return self.load_finished(entry[1] if entry is not None else sid)
+
+    def load_failed_by_request(self, req_id) -> bool:
+        """`load_failed` for a caller that has only the plain request id.
+
+        Same reason as `save_finished_by_request`: vLLM's `KVConnectorOutput`
+        carries request ids as plain strings, so the exact `LoadOperationId`
+        never survives the trip back from the worker half. Routing a failure
+        through `load_finished` instead would pop `_load_save_floors`, which is
+        the record that the `[HBM, LMCache)` range is NOT persisted -- the
+        recomputed chunks would then never be saved.
+        """
+
+        sid = str(req_id)
+        entry = self._active_load_operations.get(sid)
+        return self.load_failed(entry[1] if entry is not None else sid)
 
     def connector_completion(self, completion: ConnectorCompletion) -> bool | None:
         """Apply TP/PP-quorumed source-safe and store-terminal reports."""
@@ -639,6 +1175,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not isinstance(identity, SaveSourceGroupId):
                 return False
             self._source_group_finished(identity)
+            return None
+        if completion.channel == DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL:
+            operation = completion.operation_id
+            if not isinstance(operation, SaveOperationId) or not completion.succeeded:
+                return False
+            self._source_quiescent(operation)
             return None
         if completion.channel != DENSE_PAGE_STORE_CHANNEL:
             return False
@@ -680,14 +1222,22 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._save_lease_blocks.pop(lease_key, None)
                 self._save_lease_at.pop(lease_key, None)
                 self._save_lease_owner.pop(lease_key, None)
+        all_safe = set(block_map.values()).issubset(safe)
+        if all_safe:
+            # Every rank has finished reading every source block of this save,
+            # so a store failure that arrives now (or already arrived) may
+            # retry without waiting for a separate quiescent report.
+            self._save_quiescent.add(operation)
         if self._save_inflight.get(sid) == operation:
             self._source_safe_waiting_for_store.setdefault(operation, set()).update(
                 newly_safe
             )
-        elif set(block_map.values()).issubset(safe):
+        elif all_safe:
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._save_operation_owner.pop(operation, None)
+        if all_safe and self._save_retry_blocked.get(sid) == operation:
+            self._retry_or_retire_failed_save(operation)
 
     def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
         sid = str(operation.req_id)
@@ -702,13 +1252,78 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_inflight.pop(sid, None)
         self._source_safe_waiting_for_store.pop(operation, None)
         if succeeded:
+            self._save_previous_frontier.pop(operation, None)
+            self._save_previous_owner.pop(operation, None)
+            self._save_quiescent.discard(operation)
             self._finish_save_statistics(operation)
             # Store completion is also a source-safety fence for cache hits.
             self._release_operation_lease(operation)
         else:
             self._cancel_save_statistics(operation)
-            # Failed stores keep unsafe ranges leased until abandon timeout.
+            if operation in self._save_quiescent:
+                self._retry_or_retire_failed_save(operation)
+            else:
+                # A post-submit failure may still be reading the source. Do
+                # not retry or release its lease without a TP-wide fence.
+                self._save_retry_blocked[sid] = operation
+                return
         self._finish_retired_request(sid)
+
+    def _source_quiescent(self, operation: SaveOperationId) -> None:
+        sid = str(operation.req_id)
+        if (
+            operation not in self._save_previous_frontier
+            and operation not in self._save_operation_blocks
+        ):
+            return
+        self._save_quiescent.add(operation)
+        # Every rank either completed its store or rejected it before any GPU
+        # read. Its source blocks no longer need a save lease.
+        self._release_operation_lease(operation)
+        if self._save_retry_blocked.get(sid) == operation:
+            self._retry_or_retire_failed_save(operation)
+
+    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> bool:
+        """Retry a failed save that every rank stopped reading, or retire it.
+
+        Returns whether a retry was set up: False when its request has
+        finished, its ID was reused, or nothing of it is tracked any more.
+        """
+        sid = str(operation.req_id)
+        if self._save_retry_blocked.get(sid) == operation:
+            self._save_retry_blocked.pop(sid, None)
+        self._save_quiescent.discard(operation)
+        # The failed operation is quiescent on every rank: its exact block map
+        # is no longer needed, and a retry records a fresh one.
+        self._release_operation_lease(operation)
+        previous = self._save_previous_frontier.pop(operation, None)
+        entry = self._save_tracker.get(sid)
+        owner = self._save_previous_owner.pop(operation, None)
+        if entry is None or previous is None:
+            return False
+        if owner is not None and entry[0] is not owner:
+            return False  # request ID was reused
+        if getattr(entry[0], "_offload_finished", False):
+            # Teardown may already have returned the source blocks to the pool.
+            # A missing cache entry is safer than a retry against recycled KV.
+            self._save_tracker.pop(sid, None)
+            lease_key = id(entry[0])
+            remaining = self._save_lease_blocks.pop(lease_key, None)
+            self._save_lease_at.pop(lease_key, None)
+            self._save_lease_owner.pop(lease_key, None)
+            if remaining:
+                # Unbound (plugin) teardown also leased the not-yet-emitted
+                # suffix; no further save reads it once the request retires.
+                self._pending_source_safe_releases.append(frozenset(remaining))
+                self.total_source_safe_released_blocks += len(remaining)
+            return False
+        entry[1] = min(int(entry[1]), previous)
+        logger.warning(
+            "LMCache offload: retrying failed dense save req=%s from token %d",
+            sid,
+            previous,
+        )
+        return True
 
     def _release_operation_lease(self, operation) -> None:
         if not isinstance(operation, SaveOperationId):
@@ -729,13 +1344,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._save_lease_owner.pop(lease_key, None)
 
     def _finish_retired_request(self, sid: str) -> None:
+        if sid in self._save_retry_blocked:
+            return
         entry = self._save_tracker.get(sid)
         if entry is None:
             return
         seq = entry[0]
-        if hasattr(seq, "_offload_finished_block_ids") and not self._has_pending_save(
-            seq
-        ):
+        if getattr(seq, "_offload_finished", False) and not self._has_pending_save(seq):
             self._save_tracker.pop(sid, None)
 
     def blocks_waiting_for_store(self) -> int:
@@ -759,6 +1374,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_operation_blocks.pop(operation, None)
             self._save_operation_safe.pop(operation, None)
             self._source_safe_waiting_for_store.pop(operation, None)
+            self._save_previous_frontier.pop(operation, None)
+            self._save_previous_owner.pop(operation, None)
+            self._save_quiescent.discard(operation)
+            if self._save_retry_blocked.get(sid) == operation:
+                self._save_retry_blocked.pop(sid, None)
         if blocks:
             self._pending_source_safe_releases.append(frozenset(blocks))
             self.total_abnormal_lease_reclaims += len(blocks)
@@ -782,6 +1402,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # [HBM, LMC) chunks be saved again instead of permanently treating
             # them as already persisted.
             entry[1] = self._chunk_floor(floor)
+        self._record_failed_load_attempt(sid)
+        # Drop the hit too. `_repeat_load_suppressed` already answers for this
+        # request, but the memo must not outlive the load spec it would imply
+        # if that guard is ever moved or short-circuited.
+        self._forget_tier_hit(sid)
         self._clear_pending_load(sid)
         return True
 
@@ -802,6 +1427,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(seq.id)
         if self._load_lifecycles.get(sid) is not seq:
             return
+        # The remembered hit is left alone: a cancel says this connector is not
+        # the one loading the request right now, not that the tier stopped
+        # holding the prefix, so re-answering from it is honest. The tier is
+        # asked again before anything is transferred (`_ensure_lookup_pin`).
         self._clear_pending_load(sid)
         active = self._active_load_operations.get(sid)
         if active is not None and active[0] is seq:
@@ -810,6 +1439,36 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._cancel_load_statistics(operation)
             if getattr(seq, "_load_operation", None) == operation:
                 delattr(seq, "_load_operation")
+
+    def _drop_finished_save_state(self, sid: str, seq) -> None:
+        """Forget a finished request's save bookkeeping.
+
+        Keyed on the *blocks*, not the request: the tracker entry holds the
+        `Sequence` and is what `build_connector_meta`'s save loop iterates, so
+        it may only be dropped once nothing can still read that block table.
+        Both terminals route here -- `request_finished` when the free was not
+        deferred at all, `source_blocks_released` when it was.
+        """
+        entry = self._save_tracker.get(sid)
+        if entry is not None and entry[0] is seq:
+            self._save_tracker.pop(sid, None)
+        blocked = self._save_retry_blocked.get(sid)
+        if (
+            blocked is not None
+            and self._save_previous_owner.get(blocked) is seq
+            and sid not in self._save_tracker
+        ):
+            # The request's blocks are gone (never deferred, or released back
+            # to the pool), so a parked failed save has nothing left to retry
+            # or reclaim.
+            self._save_retry_blocked.pop(sid, None)
+            self._save_previous_frontier.pop(blocked, None)
+            self._save_previous_owner.pop(blocked, None)
+            self._save_quiescent.discard(blocked)
+            self._save_operation_blocks.pop(blocked, None)
+            self._save_operation_safe.pop(blocked, None)
+            self._save_operation_owner.pop(blocked, None)
+            self._source_safe_waiting_for_store.pop(blocked, None)
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
@@ -820,27 +1479,53 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._active_load_operations.pop(sid, None)
                 self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
+        self._release_failed_load_attempt(sid, seq)
+        self._forget_tier_hit(sid)
+        self._lookup_defer_since.pop(sid, None)
+        discard = getattr(self._lookup_client, "discard", None)
+        if discard is not None:
+            try:
+                discard(sid)
+            except Exception:
+                # Its read locks are then released only by the server's
+                # session cleanup or read TTL.
+                logger.warning(
+                    "LMCache offload: async lookup discard failed for %s",
+                    sid,
+                    exc_info=True,
+                )
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:
                 # Freeze the final computed frontier before BlockManager
                 # clears it during partial deallocation. Keep the tracker when
                 # a final chunk still needs emission; a later metadata build
-                # uses the frozen block table recorded by
-                # `protected_block_ids`.
+                # reacquires the prefix through the bound BlockManager, or
+                # (unbound) reads the block table `protected_block_ids` froze.
                 seq._offload_finished_cached_tokens = min(
                     int(getattr(seq, "num_cached_tokens", 0)),
                     int(seq.num_prompt_tokens),
                 )
-                if not self.should_defer_free(seq):
-                    self._save_tracker.pop(sid, None)
-            elif not self.should_defer_free(seq):
-                self._save_tracker.pop(sid, None)
+            if not self.should_defer_free(seq):
+                self._drop_finished_save_state(sid, seq)
         if hasattr(seq, "_load_operation"):
             delattr(seq, "_load_operation")
 
+    def source_blocks_released(self, seq) -> None:
+        """Terminal for the deferred path: the blocks are back in the pool.
+
+        `request_finished` ran while `should_defer_free` was still True, so it
+        left the tracker in place. Nothing else pops it on a save that
+        *completes* normally (`save_finished` clears only `_save_inflight`;
+        `abandon_save` and `release_stalled_save` cover the failure exits), so
+        without this the entry -- and the `Sequence` it pins -- lives forever,
+        and the save loop keeps visiting a freed, reusable block table.
+        """
+        self._drop_finished_save_state(str(seq.id), seq)
+
 
 __all__ = [
+    "DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL",
     "DENSE_PAGE_SOURCE_SAFE_CHANNEL",
     "DENSE_PAGE_STORE_CHANNEL",
     "ChunkedOffloadSchedulerBase",

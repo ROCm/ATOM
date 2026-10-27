@@ -31,9 +31,15 @@ from atom.model_ops.v4_kernels.indexer_weights import (
     scale_indexer_weights,
 )
 from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
+from atom.model_ops.v4_kernels.paged_2src import (
+    sparse_attn_v4_paged_2src,
+    sparse_attn_v4_paged_2src_reference,
+)
 from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_decode_reference,
+    v4_decode_split_plan,
+    v4_uniform_split_table,
 )
 from atom.model_ops.v4_kernels.paged_decode_indices import (
     build_v4_paged_decode_indptr,
@@ -41,10 +47,6 @@ from atom.model_ops.v4_kernels.paged_decode_indices import (
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_decode_indices_reference,
-)
-from atom.model_ops.v4_kernels.paged_prefill import (
-    sparse_attn_v4_paged_prefill,
-    sparse_attn_v4_paged_prefill_reference,
 )
 from atom.model_ops.v4_kernels.paged_prefill_indices import (
     write_v4_paged_prefill_indices,
@@ -63,8 +65,6 @@ from atom.model_ops.v4_kernels.state_writes import (
 )
 
 __all__ = [
-    "FP4_MQA_BLOCK_K",
-    "FP4_MQA_PARALLEL_UNIT_NUM",
     "CompressPlan",
     "QKNormRopeOut",
     "build_v4_paged_decode_indptr",
@@ -82,13 +82,15 @@ __all__ = [
     "qk_norm_rope_maybe_quant_fp8_2buff",
     "qk_norm_rope_maybe_quant_reference",
     "scale_indexer_weights",
+    "sparse_attn_v4_paged_2src",
+    "sparse_attn_v4_paged_2src_reference",
     "sparse_attn_v4_paged_decode",
     "sparse_attn_v4_paged_decode_reference",
-    "sparse_attn_v4_paged_prefill",
-    "sparse_attn_v4_paged_prefill_reference",
     "swa_write",
     "swa_write_2buff_prepacked",
     "update_compressor_states",
+    "v4_decode_split_plan",
+    "v4_uniform_split_table",
     "write_v4_paged_decode_indices",
     "write_v4_paged_decode_indices_reference",
     "write_v4_paged_prefill_indices",
@@ -96,25 +98,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger("atom")
-
-# FP4 indexer persistent-grid schedule params for the `pa_mqa_logits_fp4_prefill`
-# kernels, which decode and prefill both score through.
-# The attention metadata builder precomputes each path's cta_info with these
-# and the scorer passes the matching block_k, so layout and grid agree. They
-# live here (rather than in either caller) because both the builder and the
-# model-side scorer must use the SAME values.
-#
-# The grid floor is a CTA-count target, not the kernel default: every consumer
-# takes `max(floor, rows)`, so it only adds split-K to grids too small to fill
-# the GPU and is an identity for the wide ones. Splits are numerically inert --
-# each CTA gets a disjoint KV-column range, no cross-CTA partial sums.
-# 512 idled the machine on long contexts, where rows shrink as the logits buffer
-# widens: decode rows=128 W~32768 54.1us -> 51.2us, prefill rows=1024 224.6us ->
-# 206.2us. 4096 is not any shape's optimum (CTA-count quantization makes the
-# ordering shape-specific) but has the smallest worst-case regret of the values
-# tried; re-tune against a real workload mix.
-FP4_MQA_PARALLEL_UNIT_NUM = 4096
-FP4_MQA_BLOCK_K = 256
 
 
 def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
@@ -135,8 +118,7 @@ def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
 
     Keeping the predicate in one place is what stops the two from drifting —
     a divergence is silent at startup and only surfaces as a graph/eager dtype
-    mismatch. Lives here rather than in either caller for the same reason as
-    `FP4_MQA_*` above.
+    mismatch. Lives here rather than in either caller so both read one copy.
 
     gfx942 keeps the FP8 indexer because its FP4 path is unsupported. Pass
     `warn=True` from the builder only — it runs once, while `Indexer.__init__`

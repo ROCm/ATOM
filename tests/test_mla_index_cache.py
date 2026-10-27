@@ -10,6 +10,7 @@ import torch
 
 from atom.models.utils import get_pp_indices
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+from atom.utils.tbo.ubatch_splitting import decode_ubatch_request_ranges
 
 try:
     import aiter  # noqa: F401
@@ -18,7 +19,9 @@ try:
     from atom.model_ops.attentions.aiter_mla import (
         AiterMLAMetadataBuilder,
         _pad_prefill_mla_draft_tail,
+        indexes_by_token_table,
     )
+    from atom.model_ops.indexer import ConcatKeys, concat_rows
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
 
@@ -408,27 +411,10 @@ class _FakeCacheSlice:
         return self.identity, shape
 
 
-class _FakeTransferTensor:
-    def __init__(self, address):
-        self._address = address
-
-    def stride(self, dim):
-        assert dim == 0
-        return 1
-
-    def element_size(self):
-        return 1
-
-    def numel(self):
-        return 8
-
-    def data_ptr(self):
-        return self._address
-
-
-def _FakeTransferStack(num_layers, address_base):
-    """One fake tensor per layer, at distinguishable addresses."""
-    return [_FakeTransferTensor(address_base + layer) for layer in range(num_layers)]
+def _transfer_stack(num_layers):
+    """One real 8-byte tensor per layer: `page_region` views and checks it, and
+    these tests read only which consumer row each region lands on."""
+    return [torch.zeros(8, dtype=torch.uint8) for _ in range(num_layers)]
 
 
 def _bind_builder(module, index_cache_layer_map, *, rows_before: int):
@@ -462,6 +448,9 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
         layer_num=5,
         indexer=SimpleNamespace(
             k_cache=SimpleNamespace(kv_cache=[None]),
+            # The binder compares its own FP4 verdict against the layer's and
+            # asserts they agree, so the double has to carry one.
+            _indexer_fp4=False,
         ),
     )
     builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2)
@@ -472,6 +461,34 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
     assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
     assert cache_tensor.layer_num == module.layer_num
     assert cache_tensor.index_cache.identity == ("index", 1)
+    # FP8 has one index plane; the second stays unset rather than aliasing it.
+    assert cache_tensor.index_scale is None
+
+
+def test_build_kv_cache_tensor_publishes_both_fp4_index_planes():
+    """Under FP4 the index region is two planes, and both have to leave here.
+
+    The e8m0 plane is bound onto the indexer either way -- what this pins is
+    that it also reaches the `KVCacheTensor`, which is the only thing the dense
+    offload codec reads. Without it a restored prefix carries keys whose
+    exponents are whatever the block held before, every index in bounds.
+    """
+    module = _MlaLayer(
+        layer_num=5,
+        indexer=SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=[None], kv_cache_scale=None),
+            _indexer_fp4=True,
+        ),
+    )
+    builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2)
+    builder._indexer_fp4 = True
+
+    cache_tensor = builder.build_kv_cache_tensor(module)
+
+    assert module.indexer.k_cache.kv_cache[0].identity == ("index", 1)
+    assert module.indexer.k_cache.kv_cache_scale.identity == ("index_scale", 1)
+    assert cache_tensor.index_cache.identity == ("index", 1)
+    assert cache_tensor.index_scale.identity == ("index_scale", 1)
 
 
 def test_build_shared_layer_keeps_main_kv_without_index_slice():
@@ -496,7 +513,7 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
     _mock_pp(monkeypatch, rank=1, world_size=2)
     builder.block_ratio = 1
     builder.kv_pool = _FakePool(
-        layers=4, regions=[*_FakeTransferStack(4, 100), *_FakeTransferStack(3, 200)]
+        layers=4, regions=[*_transfer_stack(4), *_transfer_stack(3)]
     )
     runner.index_cache_layer_ids = (3, 5, 6)
     builder.num_blocks = 8
@@ -530,7 +547,7 @@ def test_hybrid_transfer_regions_compact_both_kv_and_index_rows(monkeypatch):
     _mock_pp(monkeypatch, rank=1, world_size=2)
     builder.block_ratio = 1
     builder.kv_pool = _FakePool(
-        layers=2, regions=[*_FakeTransferStack(2, 100), *_FakeTransferStack(2, 200)]
+        layers=2, regions=[*_transfer_stack(2), *_transfer_stack(2)]
     )
     runner.index_cache_layer_ids = (3, 5)
     builder.num_blocks = 8
@@ -575,12 +592,22 @@ def _capture_metadata_builder(dcp_world_size, *, is_sparse):
         var["dcp_local_context_lens"] = _FakeMetadataBuffer(bs)
 
     builder = object.__new__(AiterMLAMetadataBuilder)
-    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=var,
+        block_size=1,
+        config=SimpleNamespace(max_model_len=1024),
+    )
     builder.block_size = 1
     builder.is_sparse = is_sparse
     builder.dcp_world_size = dcp_world_size
+    builder.index_kpool = 1
+    builder._indexer_fp4 = False
+    builder.index_logits_workspace = None
     builder._publishes_dcp_local_lens = is_sparse and dcp_world_size > 1
-    builder._tbo_full_running_bs = 0
+    builder.indexes_by_token_table = indexes_by_token_table(
+        is_sparse, dcp_world_size, builder.index_kpool
+    )
+    builder._tbo_ubatch_request_ranges = []
     builder.dtype_q = None
     builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
     return builder, var
@@ -618,9 +645,15 @@ def test_cudagraph_capture_keeps_non_sparse_dcp_paths_independent(
     assert metadata.dcp_local_context_lens is None
 
 
-def test_ubatch_metadata_views_full_dcp_local_context_buffer():
+@pytest.mark.parametrize(
+    ("scheduled_bs", "expected"),
+    # ubatch 1 starts where its micro-batch's requests do, not at half the
+    # padded batch: 3 scheduled requests split [0, 1) / [1, 3).
+    [(4, [13, 14]), (3, [12, 13])],
+)
+def test_ubatch_metadata_views_full_dcp_local_context_buffer(scheduled_bs, expected):
     builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
-    builder._tbo_full_running_bs = 4
+    builder._tbo_ubatch_request_ranges = decode_ubatch_request_ranges(scheduled_bs, 2)
     builder._set_ubatch_mla_buffers = lambda *args, **kwargs: None
     var["dcp_local_context_lens"].gpu.copy_(
         torch.tensor([11, 12, 13, 14], dtype=torch.int32)
@@ -652,6 +685,33 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer():
 
     torch.testing.assert_close(
         metadata.dcp_local_context_lens,
-        torch.tensor([13, 14], dtype=torch.int32),
+        torch.tensor(expected, dtype=torch.int32),
     )
     assert "ub1_dcp_local_context_lens" not in var
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_a_tbo_prefill_ubatch_scores_against_the_whole_steps_keys(world):
+    """A token split can cut a request in two: the second ubatch's rows of it
+    see keys the first ubatch's tokens wrote, so an ubatch scores against the
+    step's gathered keys -- row starts unrebased -- and under DCP this rank's
+    share of its own rows."""
+    keys = ConcatKeys(
+        block_tables=torch.zeros(2, 4, dtype=torch.int32),
+        cu_committed=torch.tensor([0, 6, 10], dtype=torch.int32),
+        total=10,
+        row_starts=torch.tensor([0] * 6 + [6] * 4, dtype=torch.int32),
+    )
+    step = concat_rows(torch.arange(1, 11, dtype=torch.int32), keys)
+    builder = SimpleNamespace(dcp_rank=world - 1, dcp_world_size=world)
+    # Tokens 4..10: the last two of request 0, then request 1.
+    ub_slice = SimpleNamespace(token_slice=slice(4, 10), request_slice=slice(0, 2))
+
+    rows = AiterMLAMetadataBuilder._ubatch_prefill_index_rows(
+        builder, step, None, None, ub_slice
+    )
+
+    assert rows.row_ends.tolist() == list(range(5, 11))
+    assert rows.concat.total == 10
+    assert rows.concat.row_starts.tolist() == [0, 0, 6, 6, 6, 6]
+    assert rows.split.world == world

@@ -3,8 +3,10 @@
 
 import logging
 import os
+import subprocess
 import sys
 import threading
+import time
 import types
 from collections import deque
 from types import SimpleNamespace
@@ -13,7 +15,9 @@ from unittest.mock import MagicMock
 import pytest
 
 # Ensure aiter.dist.parallel_state exposes symbols mooncake_connector needs.
+# The top-level name is taken back down below.
 _ps = sys.modules.get("aiter.dist.parallel_state")
+_stubbed: list[str] = []
 if _ps is not None:
     for _fn in ("get_dp_group", "get_tp_group"):
         if not hasattr(_ps, _fn):
@@ -21,20 +25,42 @@ if _ps is not None:
 else:
     _aiter_pkg = types.ModuleType("aiter")
     _aiter_pkg.__path__ = []
-    sys.modules.setdefault("aiter", _aiter_pkg)
     _dist = types.ModuleType("aiter.dist")
     _dist.__path__ = []
-    sys.modules.setdefault("aiter.dist", _dist)
     _ps_stub = types.ModuleType("aiter.dist.parallel_state")
     for _fn in ("get_dp_group", "get_tp_group"):
         setattr(_ps_stub, _fn, MagicMock())
-    sys.modules.setdefault("aiter.dist.parallel_state", _ps_stub)
+    for _name, _mod in (
+        ("aiter", _aiter_pkg),
+        ("aiter.dist", _dist),
+        ("aiter.dist.parallel_state", _ps_stub),
+    ):
+        if _name not in sys.modules:
+            sys.modules[_name] = _mod
+            _stubbed.append(_name)
 
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
     side_channel_port_offset,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+
+# Drop the top-level name now that the imports above are bound. The submodules
+# stay -- the connectors reach for them lazily, at call time -- but `aiter`
+# itself has no reader here, and leaving it is what made
+# `pytest.importorskip("aiter")` succeed in every module collected after this
+# one: the skip did not fire, and the real `from aiter import ...` inside the
+# module under test then raised ImportError during collection, which takes the
+# whole run down instead of skipping one file.
+if "aiter" in _stubbed:
+    del sys.modules["aiter"]
+
+
+@pytest.fixture(autouse=True)
+def _report_failed_receives_at_once(monkeypatch):
+    """Report a failed receive at once; the hold has tests of its own."""
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "0")
+
 
 # ---------------------------------------------------------------------------
 # pp-aware side-channel port offset
@@ -127,6 +153,23 @@ def test_build_req_meta_reads_remote_pp_size():
     assert meta.remote_pp_size == 4
 
 
+def test_build_req_meta_keeps_remote_and_local_state_slots_distinct():
+    meta = ConnectorMetadata._build_req_meta(
+        req_id="r0",
+        local_block_ids=[0],
+        kv_transfer_params={
+            "remote_block_ids": [5],
+            "remote_host": "h",
+            "remote_handshake_port": 6301,
+            "tp_size": 1,
+            "local_slot_index": 11,
+            "remote_slot_index": 7,
+        },
+    )
+    assert meta.local_slot_index == 11
+    assert meta.remote_slot_index == 7
+
+
 def test_build_req_meta_defaults_pp_size_one():
     meta = ConnectorMetadata._build_req_meta(
         req_id="r0",
@@ -163,6 +206,7 @@ def test_producer_advertises_remote_pp_size():
         spec_token_ids=None,
         block_table=[1, 2, 3],
         id=99,
+        state_slot=7,
         state_slots=[],
         kv_transfer_params_output=None,
     )
@@ -172,6 +216,48 @@ def test_producer_advertises_remote_pp_size():
     assert seq.kv_transfer_params_output["block_size"] == 64
     assert seq.kv_transfer_params_output["dcp_size"] == 1
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
+    assert seq.kv_transfer_params_output["remote_slot_index"] == 7
+
+
+@pytest.mark.parametrize(
+    "producer_slots",
+    [
+        # Compatibility form emitted by older producers.
+        {"local_slot_index": 7},
+        # The explicit source slot must win over the legacy field.
+        {"local_slot_index": 3, "remote_slot_index": 7},
+    ],
+)
+def test_consumer_preserves_producer_final_slot_before_setting_destination(
+    producer_slots,
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc)
+
+    # Nothing locally cached, so the incremental-transfer branch resolves to a
+    # full transfer and leaves the slot bookkeeping under test alone.
+    seq = SimpleNamespace(
+        id="decode-1",
+        state_slot=11,
+        block_table=[1, 2],
+        has_per_req_cache=False,
+        num_cached_tokens=0,
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "transfer_id": "prefill-1",
+            "hash_block_size": 64,
+            **producer_slots,
+        },
+    )
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["remote_slot_index"] == 7
+    assert seq.kv_transfer_params["local_slot_index"] == 11
+    meta = sched.build_connector_meta().reqs_to_recv["decode-1"]
+    assert meta.remote_slot_index == 7
+    assert meta.local_slot_index == 11
 
 
 def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
@@ -283,6 +369,387 @@ def test_mismatched_or_missing_block_size_forces_full_transfer(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize(
+    "protocol,configured_device,expected_device",
+    [
+        ("rdma", "", "rdma2"),
+        ("rdma", "ionic_4,ionic_0", "ionic_4,ionic_0"),
+        ("tcp", "rdma2", ""),
+    ],
+)
+def test_mooncake_control_address_is_independent_of_rdma_device(
+    monkeypatch, role, protocol, configured_device, expected_device
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    host_ip = "10.19.0.140"
+    monkeypatch.setenv("ATOM_HOST_IP", host_ip)
+    monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(
+        mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=8)
+    )
+    monkeypatch.setattr(
+        mc, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+
+    # Reproduce a host with a separate RoCE network. The old constructor
+    # replaced ATOM_HOST_IP with this HCA address, breaking TCP handshakes.
+    original_listdir = os.listdir
+    monkeypatch.setattr(
+        os,
+        "listdir",
+        lambda path: (
+            ["tw-eth2"]
+            if str(path).startswith("/sys/class/infiniband/")
+            else original_listdir(path)
+        ),
+    )
+    original_check_output = subprocess.check_output
+    monkeypatch.setattr(
+        subprocess,
+        "check_output",
+        lambda cmd, **kwargs: (
+            "2: tw-eth2 inet 10.103.40.121/31 scope global tw-eth2\n"
+            if cmd[:4] == ["ip", "-o", "-4", "addr"]
+            else original_check_output(cmd, **kwargs)
+        ),
+    )
+
+    engine = MagicMock()
+    engine.initialize.return_value = 0
+    engine.get_rpc_port.return_value = 16578
+    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc, "get_open_port", lambda: 41000)
+    monkeypatch.setattr(mc.zmq, "Context", MagicMock())
+    monkeypatch.setattr(mc, "ThreadPoolExecutor", MagicMock())
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=0),
+        pipeline_parallel_size=1,
+        hf_config=SimpleNamespace(num_hidden_layers=2),
+        kv_cache_block_size=16,
+        decode_context_parallel_size=1,
+        dcp_config=SimpleNamespace(interleave_size=1),
+        kv_transfer_config={
+            "kv_role": role,
+            "protocol": protocol,
+            "ib_device": configured_device,
+        },
+    )
+    conn = mc.MooncakeConnector(config)
+
+    engine.initialize.assert_called_once_with(
+        host_ip, "P2PHANDSHAKE", protocol, expected_device
+    )
+    assert conn.engine_id == f"{host_ip}:16578"
+    assert conn.request_address == f"{host_ip}:8000"
+    assert conn.ib_devices == (expected_device.split(",") if expected_device else [])
+
+    if role == "kv_consumer":
+        # This test exercises the wire payload without registering GPU memory.
+        conn._notification_port = 42000
+        # Check the actual wire payload used for the RDMA target and ZMQ
+        # write-done notification, not only the engine's bootstrap address.
+        conn._send_on_socket = MagicMock()
+        # Drive the write-request worker by hand: no thread, one round per call.
+        conn._write_thread = object()
+        meta = ConnectorMetadata._build_req_meta(
+            req_id="r0",
+            local_block_ids=[0],
+            kv_transfer_params={
+                "remote_block_ids": [1],
+                "remote_host": "10.19.0.113",
+                "remote_handshake_port": 6301,
+                "tp_size": 8,
+                "transfer_id": 9,
+            },
+        )
+        conn.start_load_kv(
+            SimpleNamespace(
+                request_id_to_transfer_id={"r0": 9}, reqs_to_recv={"r0": meta}
+            )
+        )
+        # Nothing goes out on the engine thread: the request is posted by the
+        # write-request worker, and only after the device has drained.
+        conn._send_on_socket.assert_not_called()
+        assert len(conn._write_queue) == 1
+        order = []
+        conn._send_on_socket.side_effect = lambda *a: order.append("send")
+        monkeypatch.setattr(
+            mc.torch.cuda, "synchronize", lambda *a: order.append("synchronize")
+        )
+        assert conn._post_queued_write_requests()
+        assert order == ["synchronize", "send"]
+        assert conn._write_request_error is None
+        addr, (_, payload) = conn._send_on_socket.call_args.args
+        request = mc.msgpack.loads(payload)
+        assert addr == "tcp://10.19.0.113:6301"
+        assert request["consumer_host"] == host_ip
+        assert request["consumer_rpc_port"] == 16578
+        assert request["notify_host"] == host_ip
+        assert request["notify_port"] == 42000
+
+        # A post that fails off-thread surfaces on the engine thread.
+        conn._send_on_socket.side_effect = OSError("unreachable")
+        conn._write_queue.append(("tcp://10.19.0.113:6301", [b"x"]))
+        assert not conn._post_queued_write_requests()
+        with pytest.raises(RuntimeError, match="could not post a write request"):
+            conn.get_finished()
+
+
+def _one_row_staging_consumer(monkeypatch, send):
+    """A real consumer with one staging row whose producer runs `send`."""
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setenv("ATOM_HOST_IP", "10.19.0.140")
+    monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
+    monkeypatch.setattr(mc.torch.cuda, "set_device", lambda *a: None)
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(
+        mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(
+        mc, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    engine = MagicMock()
+    engine.initialize.return_value = 0
+    engine.get_rpc_port.return_value = 16578
+    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc, "get_open_port", lambda: 41000)
+    monkeypatch.setattr(mc.zmq, "Context", MagicMock())
+    conn = mc.MooncakeConnector(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(pipeline_parallel_rank=0),
+            pipeline_parallel_size=1,
+            hf_config=SimpleNamespace(num_hidden_layers=2),
+            kv_cache_block_size=16,
+            decode_context_parallel_size=1,
+            dcp_config=SimpleNamespace(interleave_size=1),
+            kv_transfer_config={"kv_role": "kv_consumer", "protocol": "rdma"},
+        )
+    )
+    conn._notification_port = 42000
+    conn._has_slot_regions = True
+    conn._staging_pool_size = 1
+    conn._staging_slots = mc.SlotPool(1)
+    conn._staging_base_addr = 0
+    conn._staging_slot_bytes = 64
+    conn._send_on_socket = lambda addr, parts, repeat=1: send(conn, addr)
+    conn._verify_producer = lambda addr: None
+    return conn
+
+
+def _receive_two(conn):
+    """Run `start_load_kv` for two receives off-thread; return what it did."""
+
+    def meta(i):
+        return ConnectorMetadata._build_req_meta(
+            req_id=f"r{i}",
+            local_block_ids=[i],
+            kv_transfer_params={
+                "remote_block_ids": [i],
+                "remote_host": "10.19.0.113",
+                "remote_handshake_port": 6301,
+                "tp_size": 1,
+                "transfer_id": i,
+            },
+        )
+
+    outcome = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            conn.start_load_kv(
+                SimpleNamespace(
+                    request_id_to_transfer_id={"r0": 0, "r1": 1},
+                    reqs_to_recv={"r0": meta(0), "r1": meta(1)},
+                )
+            )
+        except RuntimeError as e:
+            outcome["error"] = e
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    outcome["returned"] = done.wait(10)
+    return outcome
+
+
+def test_consumer_posts_each_receive_before_taking_the_next_staging_row(
+    monkeypatch,
+):
+    """With one staging row, the second receive waits in `acquire()` until
+    the first transfer frees the row, which needs its write request posted
+    first. Posting only after the whole loop would deadlock."""
+    posted = []
+    both_posted = threading.Event()
+
+    def send(conn, addr):
+        # The transfer completes as soon as it is posted, returning the row.
+        posted.append(addr)
+        conn._staging_slots.release(0)
+        if len(posted) == 2:
+            both_posted.set()
+
+    conn = _one_row_staging_consumer(monkeypatch, send)
+    try:
+        outcome = _receive_two(conn)
+        assert outcome["returned"], "second receive never got a staging row"
+        assert "error" not in outcome
+        # Returning means the second request was queued, not yet posted.
+        assert both_posted.wait(5), "second write request was never posted"
+        assert len(posted) == 2
+    finally:
+        conn.close()
+        if conn._write_thread is not None:
+            conn._write_thread.join(5)
+
+
+def test_a_failed_post_wakes_a_receive_waiting_for_a_staging_row(monkeypatch):
+    """If the first request is never posted its row never comes back; the
+    second receive must raise instead of blocking the engine thread."""
+
+    def send(conn, addr):
+        raise OSError("producer unreachable")
+
+    conn = _one_row_staging_consumer(monkeypatch, send)
+    outcome = _receive_two(conn)
+    assert outcome["returned"], "engine thread stayed blocked on the staging row"
+    assert isinstance(outcome.get("error"), RuntimeError)
+    # The row stays held: a partly posted transfer may still write it.
+    assert conn._staging_slots.free == []
+    with pytest.raises(RuntimeError, match="could not post a write request"):
+        conn.get_finished()
+    # The worker stopped at the failure; nothing outlives the test.
+    conn._write_thread.join(5)
+    assert not conn._write_thread.is_alive()
+
+
+def _queue_only_consumer():
+    """A consumer whose write-request worker is driven by hand."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+    conn.is_producer = False
+    conn._cuda_device = 0
+    conn._write_queue = []
+    conn._write_cv = threading.Condition()
+    conn._write_closed = False
+    conn._write_thread = object()
+    conn._write_request_error = None
+    conn._verified_producers = set()
+    conn._has_slot_regions = False
+    conn._staging_slots = mc.SlotPool()
+    return mc, conn
+
+
+def test_one_synchronize_posts_every_request_queued_before_it(monkeypatch):
+    """A burst of receives shares one device synchronize instead of paying
+    one each, in order, behind the requests ahead of it."""
+    mc, conn = _queue_only_consumer()
+    events = []
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: events.append("sync"))
+    conn._send_on_socket = lambda addr, parts: events.append(parts[0])
+    for i in range(4):
+        conn._enqueue_write_requests([("tcp://p:1", [f"r{i}".encode()])])
+    assert conn._post_queued_write_requests()
+    assert events == ["sync", b"r0", b"r1", b"r2", b"r3"]
+
+
+def test_close_drops_queued_requests_and_stops_the_worker(monkeypatch):
+    mc, conn = _queue_only_consumer()
+    sent = []
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
+    conn._send_on_socket = lambda addr, parts: sent.append(parts)
+    conn._enqueue_write_requests([("tcp://p:1", [b"r0"])])
+    conn.close()
+    assert not conn._post_queued_write_requests()
+    conn._enqueue_write_requests([("tcp://p:1", [b"r1"])])
+    assert sent == [] and conn._write_queue == []
+
+
+def test_nothing_is_posted_after_close_returns(monkeypatch):
+    """A batch the worker took before `close()` -- here, while it waits for the
+    device -- must not go out afterwards: teardown releases the memory the
+    producer would write into."""
+    mc, conn = _queue_only_consumer()
+    syncing, release = threading.Event(), threading.Event()
+
+    def blocked_sync(*_):
+        syncing.set()
+        release.wait(5)
+
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", blocked_sync)
+    sent = []
+    conn._send_on_socket = lambda addr, parts: sent.append(parts)
+    conn._enqueue_write_requests([("tcp://p:1", [b"r0"]), ("tcp://p:1", [b"r1"])])
+    result = {}
+    worker = threading.Thread(
+        target=lambda: result.update(more=conn._post_queued_write_requests()),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert syncing.wait(5)
+        conn.close()
+    finally:
+        release.set()
+        worker.join(5)
+    assert sent == []
+    assert result == {"more": False}
+
+
+def test_consumer_refuses_a_producer_with_other_slot_sizes(monkeypatch):
+    """Checked once, on first contact, before any write request goes out."""
+    mc, conn = _queue_only_consumer()
+    conn._has_slot_regions = True
+    conn._slot_regions = [(0, 4096)]
+    conn._decoder = mc.msgspec.msgpack.Decoder(mc.MooncakeAgentMetadata)
+    reply = mc.msgspec.msgpack.encode(
+        mc.MooncakeAgentMetadata(
+            engine_id="p", rpc_port=1, has_slot_regions=True, slot_bps=[8192]
+        )
+    )
+    sock = MagicMock()
+    sock.poll.return_value = 1
+    sock.recv_multipart.return_value = [b"", reply]
+    conn.zmq_context = MagicMock()
+    conn.zmq_context.socket.return_value = sock
+    sent = []
+    conn._send_on_socket = lambda addr, parts: sent.append(parts)
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
+    conn._enqueue_write_requests([("tcp://p:1", [b"r0"])])
+    assert not conn._post_queued_write_requests()
+    assert sent == []
+    assert "state slots of [8192] B" in str(conn._write_request_error)
+    sock.send_multipart.assert_called_once_with([mc.MSG_GET_META])
+
+    # Matching sizes pass, and the producer is asked only once.
+    _, conn2 = _queue_only_consumer()
+    conn2.__dict__.update(
+        _has_slot_regions=True,
+        _slot_regions=[(0, 8192)],
+        _decoder=conn._decoder,
+        zmq_context=conn.zmq_context,
+        _send_on_socket=lambda addr, parts: sent.append(parts),
+    )
+    for i in range(2):
+        conn2._enqueue_write_requests([("tcp://p:1", [b"r%d" % i])])
+        assert conn2._post_queued_write_requests()
+    assert sent == [[b"r0"], [b"r1"]]
+    assert sock.send_multipart.call_count == 2
+
+
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
@@ -307,12 +774,100 @@ def test_mooncake_rdma_preserves_explicit_device():
     assert mc._select_ib_device("rdma", "ionic_3", None) == "ionic_3"
 
 
+def test_mooncake_rdma_normalizes_explicit_device_list():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert (
+        mc._select_ib_device("rdma", " ionic_4, ionic_0,ionic_4 ", None)
+        == "ionic_4,ionic_0"
+    )
+
+
 def test_mooncake_rdma_auto_selects_from_physical_gpu(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"auto{idx}")
     assert mc._select_ib_device("rdma", "", 5) == "auto5"
+
+
+def test_mooncake_rdma_registers_all_alternate_hcas_for_upper_rail_gpu(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        4,
+        enable_alternate_hca=True,
+        hca_count=8,
+    ) == [
+        "ionic_4",
+        *(f"ionic_{idx}" for idx in range(4)),
+        *(f"ionic_{idx}" for idx in range(5, 8)),
+    ]
+
+
+def test_mooncake_rdma_registers_all_alternate_hcas_for_lower_rail_gpu(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        3,
+        enable_alternate_hca=True,
+        hca_count=8,
+    ) == [
+        "ionic_3",
+        "ionic_0",
+        "ionic_1",
+        "ionic_2",
+        *(f"ionic_{idx}" for idx in range(4, 8)),
+    ]
+
+
+def test_mooncake_rdma_skips_missing_alternate_hcas(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(
+        mc,
+        "_ib_device_exists",
+        lambda device: device in {"ionic_3", "ionic_0", "ionic_7"},
+    )
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        3,
+        enable_alternate_hca=True,
+        hca_count=8,
+    ) == ["ionic_3", "ionic_0", "ionic_7"]
+
+
+def test_mooncake_rdma_rejects_nonpositive_hca_count(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+
+    with pytest.raises(ValueError, match="ib_hca_count"):
+        mc._select_ib_devices(
+            "rdma",
+            "",
+            4,
+            enable_alternate_hca=True,
+            hca_count=0,
+        )
 
 
 def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
@@ -491,17 +1046,96 @@ def _make_connector(**overrides):
     conn._fence_lock = threading.Lock()
     conn._pending_recv_expected = {}
     conn._pending_recv_stages = {}
+    conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}
+    conn._pending_recv_acks = {}
+    conn._pending_recv_stall_watch = {}
+    conn._held_failures = {}
     conn._pending_recv = set()
     conn._pending_recv_blocks = {}
     conn._pending_recv_slots = {}
     conn._blocks_pending_fence = []
     conn.done_recving = set()
+    conn.failed_recving = set()
     conn._scatter_slot = None
     conn._release_targets = {}
     for k, v in overrides.items():
         setattr(conn, k, v)
     return conn
+
+
+def _make_transfer_connector(prefill_data, captured):
+    conn = _make_connector()
+    conn.pp_size = 1
+    conn.pp_rank = 0
+    conn.tp_size = 1
+    conn.dcp_size = 1
+    conn.transfer_engine = object()
+    conn._transfer_refcount_lock = threading.Lock()
+    conn._transfer_refcount = {}
+    conn._completed_prefills_lock = threading.Lock()
+    conn._completed_prefills = {}
+    conn._kv_cache_ready_events = {}
+    conn.done_sending = set()
+    conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
+    conn._execute_block_slot_transfer = (
+        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
+            (request, target, src, dst, data, req_id, engine)
+        )
+        or True
+    )
+    conn._send_write_done = lambda *_args, **_kwargs: None
+    return conn
+
+
+def _stateful_write_request(**overrides):
+    request = {
+        "request_id": "decode-1",
+        "transfer_id": "prefill-1",
+        "consumer_host": "10.0.0.2",
+        "consumer_rpc_port": 42000,
+        "dst_block_ids": [9],
+        "notify_host": "10.0.0.2",
+        "notify_port": 42001,
+        "consumer_tp_size": 1,
+        "write_nonce": 1,
+        "has_slot_regions": True,
+        "src_slot_index": 7,
+        "src_swa_block_ids": [7],
+        "dst_slot_index": 11,
+    }
+    request.update(overrides)
+    return request
+
+
+def test_tp_transfer_uses_final_source_slot_after_checkpoint_move():
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
+    )
+
+    conn._execute_transfer(_stateful_write_request())
+
+    assert len(captured) == 1
+    transferred = captured[0][4]
+    assert transferred["slot_index"] == 7
+    assert transferred["swa_block_ids"] == [7]
+    # The slot path takes the engine `_execute_transfer` picked, so #2276's
+    # matched-rail routing reaches it too.
+    assert captured[0][6] is conn.transfer_engine
+
+
+@pytest.mark.parametrize("invalid_slot", [-1, None, "invalid"])
+def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invalid_slot):
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
+    )
+
+    conn._execute_transfer(_stateful_write_request(src_slot_index=invalid_slot))
+
+    assert captured == []
+    assert "missing the producer's final source slot" in caplog.text
 
 
 def test_write_done_correct_nonce_accepted():
@@ -545,6 +1179,234 @@ def test_write_done_nonce_cleaned_up_on_completion():
     conn._pending_recv_nonce["r1"] = 777
     conn._record_write_done("r1", 0, 0, 777)
     assert "r1" not in conn._pending_recv_nonce
+
+
+def test_failed_write_done_returns_the_staging_row_to_the_pool():
+    """A rejected transfer must not leak the staging row it reserved.
+
+    The consumer reserves a row before asking the producer to write. When the
+    producer reports failure the bytes never landed, so the scatter is skipped
+    on purpose -- but the row still has to go back, or _staging_slots.acquire()
+    blocks forever once repeated failures drain the pool.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    scattered = []
+    conn = _make_connector(
+        _staging_slots=mc.SlotPool(),
+        _scatter_slot=lambda *args: scattered.append(args),
+    )
+    conn._pending_recv_expected["r1"] = 1
+    conn._pending_recv_slots["r1"] = (7, 3)
+
+    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+
+    assert conn._staging_slots.free == [3], "staging row was not returned to the pool"
+    assert not scattered, "a failed transfer must not scatter its staging row"
+    assert "r1" not in conn._pending_recv_slots
+    assert "r1" in conn.failed_recving
+
+
+def test_failed_write_done_without_a_staging_row_is_a_noop():
+    """Block-only transfers reserve no row; the failure path must not crash."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = _make_connector(_staging_slots=mc.SlotPool())
+    conn._pending_recv_expected["r1"] = 1
+    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+    assert conn._staging_slots.free == []
+    assert "r1" in conn.failed_recving
+
+
+def test_failed_write_done_waits_for_every_producer_rank():
+    """A failure is published, and stage-0 released, only with the last rank.
+
+    Producers are never cancelled: a stage still running may write the
+    request's pages after the scheduler reused them for the recompute.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sent = []
+    conn = _make_connector(
+        _release_targets={"r1": ("stage0", "t1", 1)},
+        _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
+    )
+    conn._pending_recv_expected["r1"] = 2
+    assert not conn._record_write_done("r1", 0, 0, 0, success=False)
+    assert not conn._record_write_done("r1", 0, 0, 0, success=False)  # resend
+    assert conn.failed_recving == set() and sent == []
+    assert conn._record_write_done("r1", 1, 0, 0)
+    assert conn.failed_recving == {"r1"} and conn.done_recving == set()
+    assert sent == [("stage0", mc.MSG_RELEASE)]
+    assert not conn._pending_recv_failed
+
+
+def test_silent_producer_ranks_fail_the_receive_after_their_window():
+    """An acknowledged rank silent past its write window has stopped writing.
+
+    Without a bound, one failed stage plus one dead stage kept the request,
+    its decode blocks and stage-0's page table forever.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sent = []
+    conn = _make_connector(
+        _release_targets={"old": ("stage0", "t1", 1)},
+        _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
+        _mla_landing=None,
+    )
+    for req_id in ("old", "new"):
+        conn._pending_recv_expected[req_id] = 2
+        conn._pending_recv.add(req_id)
+    assert not conn._record_write_done("old", 1, 0, 0, success=False)
+    ack = {"request_id": "old", "pp_rank": 0, "tp_rank": 0, "write_window_s": 60}
+    conn._record_write_ack(ack)
+    conn._record_write_ack({**ack, "request_id": "new"})
+    conn._record_write_ack({**ack, "request_id": "new", "pp_rank": 1})
+    conn._expire_pending_recvs()
+    assert conn.failed_recving == set()  # the windows are still open
+    conn._pending_recv_acks["old"][(0, 0)] = time.monotonic() - 1
+    conn._expire_pending_recvs()
+    assert conn.failed_recving == {"old"} and conn.done_recving == set()
+    assert sent == [("stage0", mc.MSG_RELEASE)]
+    assert list(conn._pending_recv_acks) == ["new"]
+    assert conn._pending_recv == {"new"}
+    assert not conn._pending_recv_failed and "old" not in conn._pending_recv_stages
+    # The dead stage's write-done, should it ever come, changes nothing.
+    assert not conn._record_write_done("old", 0, 0, 0)
+    assert conn.done_recving == set()
+
+
+def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
+    """It may still get the request and write, however long that takes."""
+    pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
+    conn = _make_connector(_mla_landing=None)
+    conn._pending_recv_expected["r1"] = 2
+    conn._pending_recv.add("r1")
+    assert not conn._record_write_done("r1", 1, 0, 0, success=False)
+    conn._record_write_ack(
+        {"request_id": "r1", "pp_rank": 1, "tp_rank": 0, "write_window_s": 1}
+    )
+    conn._pending_recv_acks["r1"][(1, 0)] = time.monotonic() - 1
+    conn._expire_pending_recvs()
+    assert conn.failed_recving == set()
+
+
+@pytest.mark.parametrize("window", [None, -1, 0, float("inf"), True, "60"])
+def test_an_ack_without_a_usable_window_starts_no_deadline(window):
+    pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
+    conn = _make_connector(_mla_landing=None)
+    conn._pending_recv_expected["r1"] = 1
+    conn._record_write_ack(
+        {"request_id": "r1", "pp_rank": 0, "tp_rank": 0, "write_window_s": window}
+    )
+    assert conn._pending_recv_acks == {}
+
+
+@pytest.mark.parametrize(
+    "raw, seconds",
+    [(None, 30.0), ("60", 60.0), ("2", 5.0), ("abc", 5.0), (" 45s", 45.0)],
+)
+def test_the_write_window_follows_mooncakes_transfer_timeout(monkeypatch, raw, seconds):
+    """Read the way Mooncake reads MC_TRANSFER_TIMEOUT (atoi, 5 s floor)."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    if raw is None:
+        monkeypatch.delenv("MC_TRANSFER_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("MC_TRANSFER_TIMEOUT", raw)
+    assert mc._mc_transfer_timeout_s() == seconds
+    assert mc._write_window_s() == (
+        mc.PD_TRANSFER_DEADLINE_S + seconds + mc.PD_WRITE_WINDOW_SLACK_S
+    )
+
+
+def test_no_rdma_attempt_starts_past_the_transfer_deadline():
+    """A stage stops writing at its deadline, inside the window it acknowledged."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+    engine = MagicMock()
+    engine.batch_transfer_sync_write.return_value = 0
+    args = ("consumer:1", [1], [2], [3], "r", "block")
+    assert conn._rdma_write(*args, engine=engine, deadline=time.monotonic() + 60)
+    assert conn._rdma_write(*args, engine=engine, deadline=time.monotonic() - 1) is None
+    assert engine.batch_transfer_sync_write.call_count == 1
+
+
+@pytest.mark.parametrize("timed_out", [True, False])
+def test_a_failed_rdma_write_is_not_retried(monkeypatch, caplog, timed_out):
+    """Mooncake returns from a timed-out sync write without cancelling it."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_mc_transfer_timeout_s", lambda: 0.0 if timed_out else 1e9)
+    conn = object.__new__(mc.MooncakeConnector)
+    engine = MagicMock()
+    engine.batch_transfer_sync_write.side_effect = [-1, 0]
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert (
+            conn._rdma_write("consumer:1", [1], [2], [3], "r", "block", engine=engine)
+            is False
+        )
+    assert engine.batch_transfer_sync_write.call_count == 1
+    (failed,) = [r for r in caplog.records if "[PRODUCER]" in r.getMessage()]
+    assert ("may still land" in failed.getMessage()) == timed_out
+
+
+def test_a_failed_receive_is_reported_only_after_its_hold(monkeypatch):
+    """Its pages and staging row stay held while a failed write may land."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    conn = _make_connector(_staging_slots=mc.SlotPool(), _mla_landing=None)
+    conn._pending_recv_expected["r1"] = 1
+    conn._pending_recv.add("r1")
+    conn._pending_recv_slots["r1"] = (7, 3)
+
+    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+    conn._report_held_failures()
+    assert conn.failed_recving == set() and conn._staging_slots.free == []
+    assert "r1" in conn._pending_recv
+
+    now = time.monotonic()
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now + 61)
+    conn._report_held_failures()
+    assert conn.failed_recving == {"r1"} and conn._staging_slots.free == [3]
+    assert conn._held_failures == {} and "r1" not in conn._pending_recv
+
+
+@pytest.mark.parametrize("acked", [True, False])
+def test_a_stalled_receive_is_logged_once(monkeypatch, caplog, acked):
+    """As an error when a rank never acknowledged it: it waits without a bound."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = _make_connector(_mla_landing=None)
+    conn._pending_recv_expected["r1"] = 2
+    conn._pending_recv_stall_watch["r1"] = time.monotonic()
+    assert not conn._record_write_done("r1", 0, 0, 0, success=False)
+    if acked:
+        conn._pending_recv_acks["r1"] = {(1, 0): time.monotonic() + 600}
+    conn._expire_pending_recvs()  # too early to log
+
+    now = time.monotonic()
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now + 31)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn._expire_pending_recvs()
+        conn._expire_pending_recvs()
+    (record,) = [r for r in caplog.records if "has waited" in r.getMessage()]
+    assert "1 of 2 reported" in record.getMessage()
+    assert ("never acknowledged" in record.getMessage()) == (not acked)
+    assert record.levelno == (logging.WARNING if acked else logging.ERROR)
+    assert conn.failed_recving == set()
 
 
 def test_write_done_pp_only_dedup():
@@ -607,8 +1469,12 @@ class _FakeMeta:
         self.requests = list(requests)
 
 
-def _fake_batch(req_ids, meta):
-    return SimpleNamespace(req_ids=list(req_ids), connector_meta_output=meta)
+def _fake_batch(req_ids, meta, *, pp_completion_ack=False):
+    return SimpleNamespace(
+        req_ids=list(req_ids),
+        connector_meta_output=meta,
+        pp_completion_ack=pp_completion_ack,
+    )
 
 
 def _pp_engine_core_cls():
@@ -641,9 +1507,19 @@ def _fake_head(batch):
         pp_transport=MagicMock(),
         scheduler=MagicMock(),
         _poll_kv_transfer_progress=MagicMock(),
+        _dispatch_idle_offload_work=MagicMock(),
+        _poll_dynamic_chunking_calibration=MagicMock(),
+        # Real throttle, mocked dispatch: `_pp_head_step` runs on a loop that
+        # never sleeps, so it must go through `_advance_idle_kv_transfer`.
+        _next_idle_kv_drain=0.0,
     )
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None
+    head.scheduler.dynamic_chunking_active = False
+    head.pp_transport.recv_completion.return_value = None
+    head._advance_idle_kv_transfer = PPEngineCoreProc._advance_idle_kv_transfer.__get__(
+        head
+    )
     head._dispatch_connector_only_batch = (
         PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
     )
@@ -679,6 +1555,42 @@ def test_pp_head_skips_empty_meta_of_request_less_batch():
         head.pp_transport.send_metadata.assert_not_called()
 
 
+def test_pp_head_dispatches_idle_offload_without_a_batch():
+    """`Scheduler.is_finished()` stays false while blocks are deferred, so the
+    loop re-enters `_pp_head_step` and never reaches its own idle-drain branch.
+    The leftover suffix saves must be dispatched here or never at all."""
+    head = _fake_head(None)
+    head._dispatch_idle_offload_work.assert_called_once()
+
+
+def test_pp_head_idle_dispatch_shares_the_drain_throttle(monkeypatch):
+    """The loop has no sleep; a direct dispatch would rebuild connector
+    metadata on every turn."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+    from atom.model_engine import engine_core
+
+    # CI can spend longer than the 1 ms drain interval between calls. Control
+    # the clock so this tests the throttle rather than the runner's speed.
+    now = 100.0
+    monkeypatch.setattr(engine_core, "time", SimpleNamespace(monotonic=lambda: now))
+    head = _fake_head(None)
+    head._dispatch_idle_offload_work.assert_called_once()
+    assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
+
+    now += engine_core.KV_IDLE_DRAIN_INTERVAL_S / 2
+    head.scheduler.schedule.side_effect = [None]
+    PPEngineCoreProc._pp_head_step(head)
+
+    head._dispatch_idle_offload_work.assert_called_once()  # still once: throttled
+
+    now = head._next_idle_kv_drain
+    head.scheduler.schedule.side_effect = [None]
+    PPEngineCoreProc._pp_head_step(head)
+
+    assert head._dispatch_idle_offload_work.call_count == 2
+    assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
+
+
 def test_pp_head_forwards_normal_batch_with_meta():
     """A batch with requests keeps the original path: dispatch, send, forward."""
     meta = _FakeMeta(["load-r1"])
@@ -689,6 +1601,7 @@ def test_pp_head_forwards_normal_batch_with_meta():
     assert _dispatched_metas(head) == [meta]
     head.pp_transport.send_metadata.assert_called_once_with(batch)
     head.runner_mgr.call_func.assert_any_call("forward", batch, wait_out=True)
+    head._dispatch_idle_offload_work.assert_called_once()  # Next schedule is None.
 
 
 def test_pp_downstream_skips_forward_for_request_less_batch():
@@ -718,7 +1631,146 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
         c for c in stage.runner_mgr.call_func.call_args_list if c.args[0] == "forward"
     ]
     assert forwards == []
-    stage.pp_transport.send_tokens.assert_not_called()
+    stage.pp_transport.send_completion.assert_not_called()
+
+
+def _downstream_stage(**overrides):
+    stage = SimpleNamespace(
+        kv_transfer_enabled=False,
+        is_last=True,
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        utility_handler=MagicMock(),
+        utility_queue=MagicMock(),
+        _is_idle_rl_weights_offloaded=lambda: False,
+        _poll_and_send_kv_status=MagicMock(),
+    )
+    for key, value in overrides.items():
+        setattr(stage, key, value)
+    return stage
+
+
+def _run_last_stage(batch):
+    PPEngineCoreProc = _pp_engine_core_cls()
+    stage = _downstream_stage()
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+    stage.pp_transport.recv_metadata.return_value = batch
+    stage.runner_mgr.call_func.return_value = "fwd-out"
+    PPEngineCoreProc._downstream_busy_loop(stage)
+    return stage
+
+
+def test_pp_downstream_skips_the_middle_chunk_ack_by_default():
+    """A middle chunk retires on the last stage without a completion message."""
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: False
+
+    stage = _run_last_stage(batch)
+
+    stage.pp_transport.send_completion.assert_not_called()
+
+
+def test_pp_downstream_acks_a_middle_chunk_the_head_asked_for():
+    batch = _fake_batch([7], None, pp_completion_ack=True)
+    batch.produces_output = lambda: False
+
+    stage = _run_last_stage(batch)
+
+    stage.pp_transport.send_completion.assert_called_once_with([7])
+
+
+def test_pp_downstream_sends_output_whatever_the_ack_flag():
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: True
+
+    stage = _run_last_stage(batch)
+
+    stage.pp_transport.send_completion.assert_called_once_with([7], "fwd-out")
+
+
+def _head_for_batch(batch, *, dynamic_chunking_active=False):
+    PPEngineCoreProc = _pp_engine_core_cls()
+    head = SimpleNamespace(
+        _in_flight=deque(),
+        _defer_prefix_hash=False,
+        pp_size=2,
+        kv_transfer_enabled=False,
+        output_queue=MagicMock(),
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        _poll_kv_transfer_progress=MagicMock(),
+        _dispatch_idle_offload_work=MagicMock(),
+        _poll_dynamic_chunking_calibration=MagicMock(),
+        _advance_idle_kv_transfer=MagicMock(),
+        _next_idle_kv_drain=0.0,
+    )
+    head.scheduler.schedule.side_effect = [(batch, {7: SimpleNamespace(id=7)}), None]
+    head.scheduler.take_rejected.return_value = None
+    head.scheduler.dynamic_chunking_active = dynamic_chunking_active
+    head._dispatch_connector_only_batch = MagicMock()
+    return PPEngineCoreProc, head
+
+
+def test_pp_head_retires_a_middle_chunk_without_a_completion_ack():
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: False
+    PPEngineCoreProc, head = _head_for_batch(batch)
+
+    PPEngineCoreProc._pp_head_step(head)
+
+    assert batch.pp_completion_ack is False
+    head.pp_transport.recv_completion.assert_not_called()
+    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
+    assert len(head._in_flight) == 0
+
+
+def test_pp_head_waits_for_a_middle_chunk_ack_while_dynamic_chunking_is_active():
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: False
+    PPEngineCoreProc, head = _head_for_batch(batch, dynamic_chunking_active=True)
+    head.pp_transport.recv_completion.return_value = ([7], None)
+
+    PPEngineCoreProc._pp_head_step(head)
+
+    # Set before the metadata goes out, so the last stage reads the same flag.
+    assert head.pp_transport.send_metadata.call_args.args[0].pp_completion_ack is True
+    head.pp_transport.recv_completion.assert_called()
+    head.scheduler.release_pp_inflight.assert_called_once_with(batch)
+
+
+def test_pp_head_stops_asking_for_acks_once_dynamic_chunking_ends():
+    # Calibration gave up, or the fit was rejected: middle chunks go back to
+    # retiring locally rather than paying the ack for the life of the process.
+    first, second = _fake_batch([7], None), _fake_batch([8], None)
+    for batch in (first, second):
+        batch.produces_output = lambda: False
+    PPEngineCoreProc, head = _head_for_batch(first, dynamic_chunking_active=True)
+    head.pp_transport.recv_completion.return_value = ([7], None)
+    PPEngineCoreProc._pp_head_step(head)
+
+    head.scheduler.dynamic_chunking_active = False
+    head.scheduler.schedule.side_effect = [(second, {8: SimpleNamespace(id=8)}), None]
+    head.pp_transport.recv_completion.reset_mock()
+    PPEngineCoreProc._pp_head_step(head)
+
+    assert first.pp_completion_ack is True
+    assert second.pp_completion_ack is False
+    head.pp_transport.recv_completion.assert_not_called()
+
+
+def test_pp_head_rejects_a_final_chunk_whose_tokens_are_out_of_order():
+    batch = _fake_batch([7], None)
+    batch.produces_output = lambda: True
+    PPEngineCoreProc, head = _head_for_batch(batch)
+    head.pp_transport.recv_completion.return_value = (
+        [7],
+        SimpleNamespace(req_ids=[8]),
+    )
+
+    with pytest.raises(AssertionError, match="PP token ordering violated"):
+        PPEngineCoreProc._pp_head_step(head)
 
 
 def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
@@ -740,7 +1792,18 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     batch_sizes = []
     transferred_bytes = 0
 
-    def record_batch(_target, src_addrs, dst_addrs, sizes, _req_id, _label):
+    def record_batch(
+        _target,
+        src_addrs,
+        dst_addrs,
+        sizes,
+        _req_id,
+        _label,
+        *,
+        engine=None,
+        deadline=None,
+    ):
+        assert engine is None
         nonlocal transferred_bytes
         assert len(src_addrs) == len(dst_addrs) == len(sizes)
         assert len(src_addrs) <= connector._MAX_RDMA_ENTRIES_PER_BATCH
@@ -748,7 +1811,7 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
         transferred_bytes += sum(sizes)
         return True
 
-    connector._rdma_write_with_retry = record_batch
+    connector._rdma_write = record_batch
     dst_block_ids = list(range(100, 140))
     src_block_ids = list(range(len(dst_block_ids) * 8))
     request_data = {
@@ -795,9 +1858,10 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     gather_indices = object()
     connector._prepare_sharded_index = MagicMock(return_value=gather_indices)
     connector._gather_sharded_index = MagicMock()
-    connector._index_staging_stream = MagicMock()
+    staging_stream = MagicMock()
+    connector._send_worker_stream = MagicMock(return_value=staging_stream)
     connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
-    connector._rdma_write_with_retry = MagicMock(return_value=True)
+    connector._rdma_write = MagicMock(return_value=True)
     ready_event = object()
     request_data = {
         "consumer_base_addrs": [3_000_000, 4_000_000],
@@ -817,8 +1881,9 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         [10],
         "req-1",
         ready_event,
+        engine=ready_event,
     )
-    connector._index_staging_stream.wait_event.assert_called_once_with(ready_event)
+    staging_stream.wait_event.assert_called_once_with(ready_event)
     connector._execute_staged_index_layer_chunk.assert_called_once_with(
         "consumer:1234",
         1,
@@ -827,6 +1892,12 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         [10],
         "req-1",
         gather_indices,
+        engine=ready_event,
+        deadline=None,
+    )
+    assert all(
+        call.kwargs["engine"] is ready_event
+        for call in connector._rdma_write.call_args_list
     )
 
 
@@ -847,8 +1918,8 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._index_staging_chunk_pages = 256
     connector._prepare_sharded_index = MagicMock(return_value=object())
     connector._gather_sharded_index = MagicMock()
-    connector._index_staging_stream = MagicMock()
-    connector._rdma_write_with_retry = MagicMock(return_value=True)
+    connector._send_worker_stream = MagicMock()
+    connector._rdma_write = MagicMock(return_value=True)
     request_data = {
         "consumer_base_addrs": [3_000_000, 4_000_000],
         "consumer_num_layers": 2,
@@ -876,9 +1947,12 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
     )
     connector = object.__new__(mc.MooncakeConnector)
     connector.is_producer = True
-    connector._index_staging_stream = object()
+    connector._index_staging_pool_size = 1
     connector._cuda_device = 3
     connector._kv_cache_ready_events = {}
+    connector._kv_cache_ready_batches = deque()
+    connector._kv_ready_done_event = None
+    connector._kv_ready_expired = {}
     connector._completed_prefills_lock = threading.Lock()
     ready_event = MagicMock()
     producer_stream = object()
@@ -893,3 +1967,395 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
 
     ready_event.record.assert_called_once_with(producer_stream)
     assert connector._kv_cache_ready_events == {11: ready_event, 12: ready_event}
+
+
+def _ready_event_producer(mc, monkeypatch):
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.is_producer = True
+    connector._index_staging_pool_size = 1
+    connector._cuda_device = 0
+    connector._kv_cache_ready_events = {}
+    connector._kv_cache_ready_batches = deque()
+    connector._kv_ready_done_event = None
+    connector._kv_ready_expired = {}
+    connector._completed_prefills_lock = threading.Lock()
+    monkeypatch.setattr(mc.torch.cuda, "Event", MagicMock)
+    monkeypatch.setattr(mc.torch.cuda, "current_stream", lambda _d: None)
+    clock = [1000.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: clock[0])
+    return connector, clock
+
+
+def test_ready_events_no_transfer_takes_are_freed_after_their_ttl(monkeypatch):
+    """Without the TTL, every final prefill with no finished transfer leaked
+    its event: requests without P/D, aborts, unpulled requests, failures.
+
+    A transfer that still comes later finds a long-complete stand-in, so a
+    DSA index transfer goes ahead instead of failing on a missing event.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector, clock = _ready_event_producer(mc, monkeypatch)
+    connector.record_kv_cache_ready(["a", "b"])
+    first = connector._kv_cache_ready_events["a"]
+    clock[0] += 10
+    connector.record_kv_cache_ready(["b"])  # recorded again, by a later batch
+    clock[0] += mc.KV_CACHE_READY_EVENT_TTL_S - 5
+    connector.record_kv_cache_ready(["c"])
+    # The first batch aged out: "a" holds the shared stand-in (that batch's
+    # own event, complete long ago); "b" keeps its later event.
+    done = connector._kv_ready_done_event
+    assert done is first
+    assert connector._get_kv_cache_ready_event("a") is done
+    assert connector._kv_cache_ready_events["b"] is not first
+    assert list(connector._kv_ready_expired) == ["a"]
+    assert len(connector._kv_cache_ready_batches) == 2
+
+
+def test_ready_events_age_out_while_prefill_is_idle(monkeypatch):
+    """get_finished runs every step, so no new prefill batch is needed."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector, clock = _ready_event_producer(mc, monkeypatch)
+    for name, value in vars(_make_connector()).items():
+        setattr(connector, name, value)
+    connector.done_sending = set()
+    connector.record_kv_cache_ready(["a"])
+    clock[0] += mc.KV_CACHE_READY_EVENT_TTL_S + 1
+    connector.get_finished()
+    assert not connector._kv_cache_ready_batches
+    assert list(connector._kv_ready_expired) == ["a"]
+
+
+def test_requests_whose_event_aged_out_are_remembered_up_to_a_cap(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "KV_CACHE_READY_EXPIRED_MAX", 2)
+    connector, clock = _ready_event_producer(mc, monkeypatch)
+    connector.record_kv_cache_ready(["a", "b", "c"])
+    clock[0] += mc.KV_CACHE_READY_EVENT_TTL_S + 1
+    connector.record_kv_cache_ready(["d"])
+    assert list(connector._kv_ready_expired) == ["b", "c"]
+    assert connector._get_kv_cache_ready_event("a") is None
+    assert connector._get_kv_cache_ready_event("c") is connector._kv_ready_done_event
+
+
+# ---------------------------------------------------------------------------
+# Matched-rail engines for independent P/D GPU ranks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "protocol,devices,rails,message",
+    [
+        ("tcp", [], ["ionic_0"], "protocol=rdma"),
+        ("rdma", ["ionic_0", "ionic_1"], ["ionic_0", "ionic_1"], "single primary"),
+        ("rdma", ["ionic_0"], ["ionic_1"], "including the primary"),
+        ("rdma", ["ionic_0"], ["ionic_0", "missing"], "existing local HCAs"),
+    ],
+)
+def test_matched_rails_reject_invalid_transport_configuration(
+    monkeypatch, protocol, devices, rails, message
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: name.startswith("ionic_"))
+    with pytest.raises(ValueError, match=message):
+        mc._validate_matched_rails(protocol, devices, rails)
+
+
+def test_matched_rails_disabled_preserves_tcp_and_multi_hca(monkeypatch):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    mc._validate_matched_rails("tcp", [], [])
+    mc._validate_matched_rails("rdma", ["ionic_0", "ionic_1"], [])
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _: True)
+    mc._validate_matched_rails("rdma", ["ionic_2"], ["ionic_2", "ionic_6"])
+
+
+@pytest.fixture
+def matched_rail_sysfs(tmp_path, monkeypatch):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setattr(mc, "_IB_SYSFS_ROOT", tmp_path)
+
+    def add(name, *states):
+        device = tmp_path / name
+        device.mkdir(exist_ok=True)
+        for index, state in enumerate(states, 1):
+            port = device / "ports" / str(index)
+            port.mkdir(parents=True)
+            if state is not None:
+                (port / "state").write_text(state)
+        return device
+
+    return mc, add
+
+
+@pytest.mark.parametrize("prefix", ["ionic_", "rdma", "mlx5_"])
+@pytest.mark.parametrize("value", ["auto", " AUTO "])
+def test_matched_rails_auto_discovers_only_active_primary_family(
+    matched_rail_sysfs, prefix, value
+):
+    mc, add = matched_rail_sysfs
+    for suffix in (10, 2, 0):
+        add(f"{prefix}{suffix}", "4: ACTIVE\n")
+    add(f"{prefix}3", "1: DOWN\n")
+    add(f"{prefix}4", None)  # A missing state file is not an active port.
+    add(f"{prefix}5")  # No ports exposed.
+    add(f"{prefix}6", "2: INIT\n", "4: ACTIVE\n")
+    add(f"{prefix}7", "4: ACTIVE\n", "4: ACTIVE\n")  # Include a device once.
+    add(f"{prefix}8_extra", "4: ACTIVE\n")
+    add("other_0", "4: ACTIVE\n")
+
+    assert mc._resolve_matched_rails("rdma", [f"{prefix}2"], value) == [
+        f"{prefix}{i}" for i in (0, 2, 6, 7, 10)
+    ]
+
+
+def test_matched_rails_auto_excludes_unrelated_active_nic(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    for i in range(8):
+        add(f"ionic_{i}", "4: ACTIVE\n")
+    add("mlx5_0", "4: ACTIVE\n")
+    assert mc._resolve_matched_rails("rdma", ["ionic_2"], "auto") == [
+        f"ionic_{i}" for i in range(8)
+    ]
+
+
+@pytest.mark.parametrize("state", [None, "1: DOWN\n", "invalid"])
+def test_matched_rails_auto_rejects_inactive_primary(matched_rail_sysfs, state):
+    mc, add = matched_rail_sysfs
+    add("ionic_2", state)
+    add("ionic_6", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="Primary HCA.*no readable ACTIVE"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_rejects_missing_primary(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("ionic_6", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="Primary HCA.*no readable ACTIVE"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_reports_hidden_sysfs(matched_rail_sysfs, tmp_path):
+    mc, _ = matched_rail_sysfs
+    mc._IB_SYSFS_ROOT = tmp_path / "not-mounted"
+    with pytest.raises(ValueError, match="Cannot discover RDMA HCAs"):
+        mc._resolve_matched_rails("rdma", ["ionic_2"], "auto")
+
+
+def test_matched_rails_auto_requires_numbered_names(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("custom_hca", "4: ACTIVE\n")
+    with pytest.raises(ValueError, match="explicit HCA list"):
+        mc._resolve_matched_rails("rdma", ["custom_hca"], "auto")
+    assert mc._resolve_matched_rails("rdma", ["custom_hca"], "custom_hca") == [
+        "custom_hca"
+    ]
+
+
+@pytest.mark.parametrize(
+    "protocol,devices,message",
+    [
+        ("tcp", [], "protocol=rdma"),
+        ("rdma", [], "single primary"),
+        ("rdma", ["ionic_0", "ionic_1"], "single primary"),
+    ],
+)
+def test_matched_rails_auto_validates_before_discovery(
+    monkeypatch, protocol, devices, message
+):
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    discovery = MagicMock(side_effect=AssertionError("must not discover"))
+    monkeypatch.setattr(mc, "_discover_active_matched_rails", discovery)
+    with pytest.raises(ValueError, match=message):
+        mc._resolve_matched_rails(protocol, devices, "auto")
+    discovery.assert_not_called()
+
+
+def test_matched_rails_explicit_list_and_unset_do_not_discover(matched_rail_sysfs):
+    mc, add = matched_rail_sysfs
+    add("ionic_2", "4: ACTIVE\n")
+    add("ionic_6", "1: DOWN\n")
+    # Preserve explicit-list behavior; only auto filters link state.
+    assert mc._resolve_matched_rails(
+        "rdma", ["ionic_2"], " ionic_6, ionic_2,ionic_6, "
+    ) == ["ionic_6", "ionic_2"]
+    mc._IB_SYSFS_ROOT = mc._IB_SYSFS_ROOT / "not-mounted"
+    assert mc._resolve_matched_rails("tcp", [], " ") == []
+    assert mc._resolve_matched_rails("rdma", ["ionic_2", "ionic_6"], "") == []
+
+
+def _matched_rail_producer():
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = object.__new__(mc.MooncakeConnector)
+    conn.dp_rank = 2
+    conn.pp_rank = 0
+    conn.pp_size = conn.tp_size = 1
+    conn._completed_prefills = {}
+    conn._kv_cache_ready_events = {}
+    conn._completed_prefills_lock = threading.Lock()
+    conn._transfer_refcount_lock = threading.Lock()
+    conn._completion_lock = threading.Lock()
+    conn._transfer_refcount = {}
+    conn.done_sending = set()
+    conn._wait_for_prefill_data = lambda _: {"block_ids": [1], "slot_index": -1}
+    conn._get_kv_cache_ready_event = lambda _: None
+    conn._notify_transfer_result = MagicMock()
+    conn.transfer_engine = MagicMock()
+    conn.transfer_engine.batch_transfer_sync_write.return_value = 0
+    conn.transfer_engine.get_first_buffer_address.return_value = 1
+    conn._rail_pool = None
+    return conn
+
+
+def _matched_rail_request(name, device):
+    return {
+        "request_id": name,
+        "transfer_id": name,
+        "consumer_host": device,
+        "consumer_rpc_port": 1234,
+        "consumer_ib_device": device,
+        "consumer_dp_rank": 6,
+        "dst_block_ids": [2],
+    }
+
+
+@pytest.mark.parametrize("has_slot_data", [False, True])
+@pytest.mark.parametrize("matched", [False, True])
+def test_concurrent_pd_requests_keep_their_selected_engine(has_slot_data, matched):
+    from concurrent.futures import ThreadPoolExecutor
+
+    conn = _matched_rail_producer()
+    extra = MagicMock()
+    extra.batch_transfer_sync_write.return_value = 0
+    extra.get_first_buffer_address.return_value = 1
+    engines = {"ionic_2": conn.transfer_engine, "ionic_6": extra}
+    if matched:
+        conn._rail_pool = SimpleNamespace(get=engines.__getitem__)
+    barrier = threading.Barrier(2)
+
+    def transfer(data, target, *_args, engine=None):
+        # Both selections must finish before either write. Mutating the
+        # connector's shared engine here would send a request on the wrong rail.
+        barrier.wait(timeout=10)
+        return conn._rdma_write(
+            target, [100], [200], [64], data["request_id"], "test", engine=engine
+        )
+
+    conn._execute_block_transfer = transfer
+    conn._execute_block_slot_transfer = transfer
+    requests = [_matched_rail_request(f"req-{device}", device) for device in engines]
+    for request in requests:
+        request["has_slot_regions"] = has_slot_data
+        if has_slot_data:
+            # A stateful transfer must carry the producer's final source slot
+            # (#2154); _execute_transfer rejects the request before it ever
+            # reaches the rail selection this test exercises.
+            request["src_slot_index"] = 5
+            request["dst_slot_index"] = 6
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(conn._execute_transfer, requests))
+
+    assert conn.done_sending == {request["request_id"] for request in requests}
+    assert all(
+        call.kwargs["success"] for call in conn._notify_transfer_result.call_args_list
+    )
+    assert conn.transfer_engine is engines["ionic_2"]
+    for device, engine in engines.items():
+        calls = engine.batch_transfer_sync_write.call_args_list
+        expected = (
+            [f"{device}:1234"]
+            if matched
+            else (["ionic_2:1234", "ionic_6:1234"] if device == "ionic_2" else [])
+        )
+        assert sorted(call.args[0] for call in calls) == expected
+
+
+def test_missing_consumer_rail_notifies_failure_without_writing():
+    from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
+
+    conn = _matched_rail_producer()
+    factory = MagicMock()
+    conn._rail_pool = RailEnginePool(
+        factory,
+        conn.transfer_engine,
+        "ionic_2",
+        ["ionic_2"],
+        lambda device: "127.0.0.1",
+    )
+    conn._rail_pool.set_regions([100], [64])
+    conn._execute_block_transfer = MagicMock()
+    request = _matched_rail_request("old-consumer", None)
+    request.pop("consumer_ib_device")
+    conn._execute_transfer(request)
+    conn._notify_transfer_result.assert_called_once_with(request, success=False)
+    conn._execute_block_transfer.assert_not_called()
+    conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
+    factory.assert_not_called()
+    assert not conn.done_sending
+
+
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_rdma_chunks_use_selected_engine(succeeds):
+    conn = _matched_rail_producer()
+    conn._MAX_RDMA_ENTRIES_PER_BATCH = 2
+    selected = MagicMock()
+    selected.batch_transfer_sync_write.side_effect = [0, 0] if succeeds else [-1]
+    assert (
+        conn._rdma_write(
+            "consumer:1234",
+            [1, 2, 3],
+            [4, 5, 6],
+            [64, 64, 64],
+            "request",
+            "block",
+            engine=selected,
+        )
+        is succeeds
+    )
+    calls = selected.batch_transfer_sync_write.call_args_list
+    assert calls[0].args == ("consumer:1234", [1, 2], [4, 5], [64, 64])
+    # A failed chunk is final: its writes may still land, a retry would hide them.
+    assert [c.args for c in calls[1:]] == (
+        [("consumer:1234", [3], [6], [64])] if succeeds else []
+    )
+    conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
+
+
+def test_staged_index_write_preserves_selected_engine(monkeypatch):
+    from contextlib import nullcontext
+
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    conn = _matched_rail_producer()
+    conn._index_staging_slots = MagicMock()
+    conn._index_staging_slots.acquire.return_value = 3
+    staging_stream = SimpleNamespace(synchronize=MagicMock())
+    conn._send_worker_stream = lambda: staging_stream
+    conn._gather_sharded_index = lambda *_args: (10000, 2)
+    conn._rdma_write = MagicMock(return_value=True)
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
+    selected = object()
+    assert conn._execute_staged_index_layer_chunk(
+        "consumer:1234", 0, 20000, 64, [4, 5], "request", object(), engine=selected
+    )
+    conn._rdma_write.assert_called_once_with(
+        "consumer:1234",
+        [10000],
+        [20256],
+        [128],
+        "request",
+        "staged-index",
+        engine=selected,
+        deadline=None,
+    )
+    staging_stream.synchronize.assert_called_once()
+    conn._index_staging_slots.release.assert_called_once_with(3)

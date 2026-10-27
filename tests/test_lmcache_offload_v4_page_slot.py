@@ -32,8 +32,6 @@ from atom.kv_transfer.offload.hybrid.dsv4.codec import (
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
     DSV4_PAGE_SAVE_CHANNEL,
-    _env_nonnegative_float,
-    _env_positive_float,
     _wait_for_publication,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
@@ -50,6 +48,7 @@ from atom.kv_transfer.offload.metadata import (
     SlotLoadSpec,
     SlotSaveSpec,
 )
+from atom.utils import envs
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 _PAYLOAD = b"\x07\x08\x09\xff"
@@ -1638,11 +1637,10 @@ def test_wait_for_publication_zero_timeout_probes_once_without_sleeping(visible)
 
 
 @pytest.mark.parametrize(
-    ("name", "parser", "value"),
+    ("name", "value"),
     [
         pytest.param(
             "OFFLOAD_PUBLICATION_TIMEOUT_S",
-            _env_nonnegative_float,
             value,
             id=f"timeout-{label}",
         )
@@ -1655,7 +1653,6 @@ def test_wait_for_publication_zero_timeout_probes_once_without_sleeping(visible)
     + [
         pytest.param(
             "OFFLOAD_PUBLICATION_POLL_INTERVAL_S",
-            _env_positive_float,
             value,
             id=f"interval-{label}",
         )
@@ -1669,19 +1666,18 @@ def test_wait_for_publication_zero_timeout_probes_once_without_sleeping(visible)
 def test_publication_env_parsers_reject_nonfinite_values(
     monkeypatch,
     name,
-    parser,
     value,
 ):
     monkeypatch.setenv(name, value)
 
     with pytest.raises(ValueError, match=rf"{name} must be finite"):
-        parser(name, 1.0)
+        getattr(envs, name)
 
 
 def test_publication_timeout_env_parser_accepts_zero(monkeypatch):
     monkeypatch.setenv("OFFLOAD_PUBLICATION_TIMEOUT_S", "0")
 
-    assert _env_nonnegative_float("OFFLOAD_PUBLICATION_TIMEOUT_S", 5.0) == 0.0
+    assert envs.OFFLOAD_PUBLICATION_TIMEOUT_S == 0.0
 
 
 @pytest.mark.parametrize(
@@ -1711,6 +1707,40 @@ def test_connector_init_rejects_nonfinite_config_before_starting_executors(
 
     with pytest.raises(ValueError, match=rf"{name} must be finite"):
         LMCacheOffloadConnector(config)
+
+
+def test_slot_load_executor_stays_serial_regardless_of_env(monkeypatch, caplog):
+    """OFFLOAD_LOAD_WORKERS must not widen the DSV4 load pool.
+
+    `start_load_kv` hands every SLOT load in a worker batch the *same*
+    `_SlotLoadBatchReservation` -- one staging row, shared -- and that is only
+    sound because the load executor runs them in submission order. A second
+    load thread would drive two loads through one staging row at once and
+    corrupt both. The knob is honoured on the dense path, where each load thread
+    owns its own thread-local staging state; here it must be refused, and
+    loudly, since a silently-ignored tuning knob reads as "measured, no effect".
+    """
+
+    config = SimpleNamespace(kv_transfer_config={}, kv_cache_block_size=64)
+
+    connector = LMCacheOffloadConnector(config)
+    try:
+        assert connector.load_workers == 1
+        assert connector._load_executor._max_workers == 1
+    finally:
+        connector.close()
+
+    monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "4")
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        connector = LMCacheOffloadConnector(config)
+    try:
+        assert connector.load_workers == 1
+        assert connector._load_executor._max_workers == 1
+    finally:
+        connector.close()
+    assert any(
+        "OFFLOAD_LOAD_WORKERS=4" in record.getMessage() for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "1.5", "bad"])

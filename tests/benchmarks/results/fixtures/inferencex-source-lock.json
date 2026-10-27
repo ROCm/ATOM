@@ -1,0 +1,25 @@
+{
+  "commit": "8f9a30bf6351f435cecb28d8b2e4a57459bd76e2",
+  "sources_sha256": {
+    "packages/db/src/etl/benchmark-mapper.ts": "4120dbb4c6b9d244786bbf4f0b042470bfe5402ce87a273578dd76a3488e4ef3",
+    "packages/constants/src/index.ts": "a70247bb06d16448b0e28b3fa3eee5e75d3aa80eaa344089ce6fd81e2a24cd8d",
+    "packages/constants/src/benchmark-curve.ts": "7058f7c856df749db5b22f8671dd76b05da55c3c4049e72bb1744fe64779f592",
+    "packages/constants/src/framework-aliases.ts": "bde3ccb1c01c0995a4ee123ee0041a301944e945c3ad7ff61350042df4b80f68",
+    "packages/constants/src/github.ts": "9ae35eb816f179592c5117c7a57032856b6971a26dfa6c7917ffd392860510a8",
+    "packages/constants/src/gpu-keys.ts": "2ec5d101cfa096c39610b36eb5535017777267607080a959015cb48a9ddced66",
+    "packages/constants/src/metric-keys.ts": "75886228e7327fc78b720028055cafbd3a1f3d55ee52778d272d6b349b61e896",
+    "packages/constants/src/precision-keys.ts": "4d3e4e067da46b44dd4faf61a118d7c49a87fdcfd12895d0854f8ebc889dcbf5",
+    "packages/constants/src/models.ts": "bdc8e287f57107cdf0772c50ad4abc0278757b20db78844cc6cf02e88ea66717",
+    "packages/constants/src/seo.ts": "4fefc97996a07bc72e33ffb534d9499731fcbcd3b54b6341a01cfa2f2ce54d6e",
+    "packages/constants/src/tables.ts": "8e7a133efaf90dcf5aefbdf2d2eff5ec2d8c2a82d0401a6d51fc0e71801255f1",
+    "packages/constants/src/tco.ts": "dcfb4c24cc965eb21e405f7a70066f38c815854258ae712e29b597db9a547c25",
+    "packages/constants/src/token-length-sketch.ts": "1b8954d844ab220b13632ce00698ea4e55353b6efe27e011d871b84d8c8b4705",
+    "packages/db/src/etl/agentic-v3-flatten.ts": "cace5a2e3e6ad70273fc2aa2fa722bb0ddd07ea48efe41c55ccfb161c053f753",
+    "packages/db/src/etl/normalizers.ts": "b5b4af6ec5ff3cfb5b845b1b752e6ec266e571334a76e86b9a2fb0b795444e76",
+    "packages/db/src/etl/full-response-interactivity.ts": "035e768d6c2823671115ff16c037959765293f9051c1fc104da42eed12cf845f",
+    "packages/db/src/queries/agentic-shared.ts": "f0f16efb9aa4df38e817f69d4c884935b58487198b41f4961edf10e290096632",
+    "packages/db/src/etl/tpu-normalization.ts": "7ac4be84768dd19ef588620fc837b8c21271f7b1ca9a0e9030dac6985326b3d4",
+    "packages/db/src/etl/runtime-metadata.ts": "0df4d0db0911a1c5dc88cbeced88e5a03e6facb3aeacf4b671cf4226e8fa8a04",
+    "packages/db/src/etl/skip-tracker.ts": "8e424e8be566fa185964edb06f16e1a393099b0c88f8e9c3192155d31bf81fbd"
+  }
+}

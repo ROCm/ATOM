@@ -2,8 +2,6 @@
 
 This directory contains the integration test suite for **atom/mesh**, organized by functional area. All tests run with `cargo test` and do not require a GPU or real inference backend — they use mock workers and in-memory routers.
 
-**Total: ~224 tests across 24 mesh test files.**
-
 ## Directory Structure
 
 ```
@@ -69,7 +67,7 @@ The `common/` directory provides shared test utilities used across all test modu
 
 | File | Tests | Description |
 |------|-------|-------------|
-| `auth_test.rs` | 5 | API key authentication middleware. Tests that requests without a valid API key are rejected, and valid keys are accepted. Covers both missing and invalid key scenarios. |
+| `auth_test.rs` | 2 | Inference and health endpoint access when authentication is not configured. |
 
 ## Protocol Spec Tests (`spec/`)
 

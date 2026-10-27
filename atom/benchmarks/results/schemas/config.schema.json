@@ -1,0 +1,149 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ATOM benchmark v1 config",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": "atom-benchmark/v1"
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "repository",
+        "run_id",
+        "attempt"
+      ]
+    },
+    "software": {
+      "type": "object"
+    },
+    "model": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "hardware": {
+      "type": "object",
+      "properties": {
+        "gpu_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pci_bus_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "pci_bus_id"
+            ]
+          }
+        }
+      },
+      "required": [
+        "gpu_count",
+        "devices"
+      ]
+    },
+    "parallelism": {
+      "type": "object",
+      "properties": {
+        "tp": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pp": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "dp": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "ep": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "tp",
+        "pp",
+        "dp",
+        "ep"
+      ]
+    },
+    "workload": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "random",
+            "agentic"
+          ]
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "kind",
+        "concurrency"
+      ]
+    },
+    "recipe": {
+      "type": "object",
+      "properties": {
+        "server_argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "server_argv"
+      ]
+    },
+    "validity": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "source",
+    "software",
+    "model",
+    "hardware",
+    "parallelism",
+    "workload",
+    "recipe",
+    "validity"
+  ]
+}

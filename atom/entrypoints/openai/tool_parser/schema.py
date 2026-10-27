@@ -13,6 +13,8 @@ import ast
 import json
 from typing import Any
 
+from .tool_parser import qualified_tool_name
+
 
 class ParamTypes(dict):
     """A mapping :func:`build_param_types` has already produced.
@@ -43,8 +45,9 @@ def build_param_types(tools: list | None) -> dict[str, dict[str, Any]]:
         fn = tool.get("function", tool)
         if not isinstance(fn, dict):
             continue
-        name = fn.get("name")
-        if not name:
+        try:
+            name = qualified_tool_name(tool)
+        except ValueError:
             continue
         schema = fn.get("parameters") or fn.get("input_schema") or {}
         props = schema.get("properties") if isinstance(schema, dict) else None

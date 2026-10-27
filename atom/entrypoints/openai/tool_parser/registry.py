@@ -22,6 +22,7 @@ from typing import Any
 
 from ..chat_encoders import render_probe_prompt
 from .deepseekv4_tool_parser import DsmlParser
+from .deepseekv41_tool_parser import DsmlV41Parser
 from .glm_tool_parser import GlmParser
 from .kimi_k3_tool_parser import KimiK3Parser
 from .kimi_tool_parser import KimiParser
@@ -46,6 +47,7 @@ _DETECT_ORDER: tuple[type[ToolCallParser], ...] = (
     KimiK3Parser,
     MiniMaxParser,
     DsmlParser,
+    DsmlV41Parser,
     GlmParser,
     QwenXmlParser,
 )

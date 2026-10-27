@@ -12,11 +12,15 @@ Usage:
     python -m atom.entrypoints.openai_server --model <model> [options]
 """
 
+if __name__ == "__main__":
+    from atom.metrics.prometheus import initialize_metrics
+
+    initialize_metrics()
+
 import asyncio
 import base64
 import binascii
 import contextlib
-import io
 import json
 import logging
 import os
@@ -40,11 +44,16 @@ if TYPE_CHECKING:
     from transformers.video_utils import VideoMetadata
 
 from atom import SamplingParams
+from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
-from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.multimodal.processing import prepare_multimodal_inputs
+from atom.multimodal.registry import get_native_multimodal_processor
+from atom.observability.tracing import TraceMiddleware, set_request_id
+from atom.observability.tracing import initialize as initialize_tracing
+from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -63,7 +72,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
-from .metrics import AtomMetricsExporter
+from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
@@ -82,7 +91,12 @@ from .reasoning import (
     thinking_switched_off,
 )
 from .reasoning_dialects import resolve_dialect
-from .request_timing import RequestTimingMiddleware, record_nonstream_first_token
+from .request_timing import (
+    RequestTimingMiddleware,
+    get_stream_timing,
+    has_generated_output,
+    record_nonstream_first_token,
+)
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
@@ -124,7 +138,7 @@ from .serving_responses import (
     unsupported_responses_parameter,
 )
 from .serving_responses import stream_failure_frames as responses_stream_failure_frames
-from .sse import event_frame
+from .sse import event_frame, iter_sse_data
 from .streaming_dispatch import (
     SYNTHETIC_TOKEN_TEXT,
     FrameWait,
@@ -172,7 +186,6 @@ reasoning_dialect: Any = None
 reasoning_toggle: tuple[str, Any, Any] | None = None
 processor: Any | None = None
 model_name: str = ""
-processor_model_path: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
 _seq_id_to_request_id: dict[int, str] = {}
@@ -377,9 +390,8 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 # 35 discarded bytes. The keepalive only has to beat proxy and SDK idle-read
 # timeouts, which are tens of seconds.
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
-_metrics_exporter = AtomMetricsExporter()
+_metrics_exporter, _request_metrics, _stream_metrics = create_metrics_exporter()
 _background_tasks: list[asyncio.Task] = []
-_METRICS_REFRESH_INTERVAL_SECONDS = 5.0
 # The watch compares two `gc.get_stats()` reads against something that moves on
 # the scale of minutes, so it has no reason to ride the metrics cadence.
 _GC_WATCH_INTERVAL_SECONDS = 60.0
@@ -402,8 +414,10 @@ def _get_dp_session_affinity_ids(
     When its Dynamo-affinity header option is enabled it also sends the parent
     session ID for forked agent trees. CoreManager retains that lineage for
     observability but deliberately assigns each child correlation ID its own
-    strict cache owner, matching SGLang's agentic routing. Clients without a
-    session header retain normal DP load balancing.
+    strict cache owner, matching SGLang's agentic routing. The MLPerf Endpoints
+    agentic client instead sends ``X-Session-ID`` on every turn of a
+    conversation. Clients without a session header retain normal DP load
+    balancing.
     """
     if os.environ.get("ATOM_DP_SESSION_AFFINITY", "0").lower() not in {
         "1",
@@ -415,9 +429,11 @@ def _get_dp_session_affinity_ids(
     if raw_request is None:
         return None, None
 
-    session_id = raw_request.headers.get(
-        "x-dynamo-session-id"
-    ) or raw_request.headers.get("x-correlation-id")
+    session_id = (
+        raw_request.headers.get("x-dynamo-session-id")
+        or raw_request.headers.get("x-session-id")
+        or raw_request.headers.get("x-correlation-id")
+    )
     parent_id = raw_request.headers.get("x-dynamo-parent-session-id")
     return session_id, parent_id
 
@@ -450,50 +466,11 @@ def _log_request_model(event_type: str, request_id: str, model: Any) -> None:
     request logging off. Measured 20-26 us on an agent-shaped request against
     0.07 us for the guard.
 
-    `_log_sse` directly below already asks the question in this order. Two
-    spellings of one rule in one module is what this removes.
+    The client stream wrapper also skips parsing when no observer needs it.
     """
     if _request_logger is None:
         return
     _log_request_event(event_type, request_id, model.model_dump())
-
-
-def _log_sse(chunk: str, request_id: str) -> None:
-    """Log every SSE frame in `chunk`, and never fail the stream doing it.
-
-    One yield can carry several frames: `serving_chat` deliberately coalesces
-    finish + usage + `[DONE]` into one send, because at a wave boundary many
-    requests finalize at once and collapsing three socket writes per request
-    to one relieves the event loop. This used to `json.loads` the whole send
-    as a single payload, which raises `Extra data:` on exactly that frame --
-    out of the generator, so with `--request-log` on, the *last* frame of
-    every OpenAI stream never reached the client and no `[DONE]` was sent.
-
-    And frames are not all `data:`-first. Anthropic writes `event: NAME` on
-    the line above, so a `startswith("data: ")` test skipped every frame that
-    endpoint produces -- silently, which for a log is the worst failure it
-    can have.
-
-    A payload that will not parse is logged as text rather than dropped or
-    raised: this is the diagnostic path, and it must not be the reason a
-    response fails.
-    """
-    if _request_logger is None:
-        return
-    for frame in chunk.split("\n\n"):
-        payload = None
-        for line in frame.splitlines():
-            if line.startswith("data:"):
-                payload = line[5:].strip()
-        if payload is None:
-            continue
-        if payload == "[DONE]":
-            _log_request_event("stream_done", request_id, None)
-            continue
-        try:
-            _log_request_event("stream_chunk", request_id, json.loads(payload))
-        except ValueError:
-            _log_request_event("stream_chunk_unparsed", request_id, payload)
 
 
 async def _client_stream(
@@ -513,6 +490,9 @@ async def _client_stream(
     with an endpoint-shaped hole in it is worse than none, because the zero it
     reports looks like an answer.
     """
+    # StreamingResponse sends its headers before iterating this generator, so
+    # the middleware has already marked whether this response is eligible.
+    timing = get_stream_timing()
     it = gen.__aiter__()
     delivered = False
     while True:
@@ -524,7 +504,31 @@ async def _client_stream(
             except StopAsyncIteration:
                 return
         delivered = True
-        _log_sse(chunk, request_id)
+        # Parse each complete local frame once for both logging and TTFT.
+        # After first output (or a terminal event), logging alone needs parsing.
+        if timing is not None or _request_logger is not None:
+            for data in iter_sse_data(chunk):
+                if data == "[DONE]":
+                    timing = None
+                    _log_request_event("stream_done", request_id, None)
+                else:
+                    try:
+                        payload = json.loads(data)
+                    except ValueError:
+                        # Diagnostics must not swallow malformed output.
+                        _log_request_event("stream_chunk_unparsed", request_id, data)
+                        continue
+                    _log_request_event("stream_chunk", request_id, payload)
+                    if timing is not None:
+                        if isinstance(payload, dict) and (
+                            "error" in payload or payload.get("type") == "error"
+                        ):
+                            timing = None
+                        elif has_generated_output(payload):
+                            timing.first_output(streaming=True)
+                            timing = None
+                if timing is None and _request_logger is None:
+                    break
         yield chunk
 
 
@@ -653,53 +657,15 @@ def _validate_sequence_context_length(seq) -> None:
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
-    for message in messages:
-        content = getattr(message, "content", None)
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and part.get("type") in {
-                "image",
-                "image_url",
-                "video",
-                "video_url",
-            }:
-                return True
-    return False
-
-
-def _load_image_from_url(url: str) -> "Image.Image":
-    # Imported here, not at module scope, and this is the one place in the
-    # file that needs it at runtime. Pillow is not a declared dependency, so a
-    # module-scope `from PIL import Image` made the whole server module
-    # unimportable wherever it is absent -- which is the non-GPU CI runner,
-    # where the only test that reached this module had to wrap its import in a
-    # try/except and degrade to `api_server = None`. Text-only serving does
-    # not need Pillow, so it should not be a condition of importing the
-    # server; a request that actually carries an image raises here, naming it.
-    from PIL import Image
-
-    if url.startswith("data:"):
-        try:
-            _, encoded = url.split(",", 1)
-            image_bytes = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise ValueError("Invalid base64 data URL for image_url") from exc
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    if url.startswith(("http://", "https://")):
-        with urllib.request.urlopen(url, timeout=30) as response:
-            image_bytes = response.read()
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    url = url.removeprefix("file://")
-    return Image.open(url).convert("RGB")
+    return has_multimodal_content(
+        [{"content": message.content} for message in messages]
+    )
 
 
 def _load_video_from_url(
     url: str,
 ) -> tuple[list["Image.Image"], "VideoMetadata"]:
-    """Decode and sample a video without importing video deps for text/image use."""
+    """Sample video frames while retaining their original timing metadata."""
     from decord import VideoReader, cpu
     from PIL import Image
     from transformers.video_utils import VideoMetadata
@@ -725,8 +691,7 @@ def _load_video_from_url(
     try:
         reader = VideoReader(path, ctx=cpu(0))
         fps = float(reader.get_avg_fps())
-        step = max(1, round(fps / 2.0))
-        indices = list(range(0, len(reader), step))[:256]
+        indices = list(range(0, len(reader), max(1, round(fps / 2.0))))[:256]
         if len(indices) % 2:
             indices.append(indices[-1])
         frames = [
@@ -747,99 +712,82 @@ def _load_video_from_url(
 def _get_multimodal_processor():
     global processor
     if processor is None:
-        logger.info(f"Loading multimodal processor from {processor_model_path}...")
-        processor = AutoProcessor.from_pretrained(
-            processor_model_path, trust_remote_code=True
+        logger.info(f"Loading multimodal processor from {model_name}...")
+        processor = get_native_multimodal_processor(
+            _get_engine_config(), tokenizer, custom_message_encoder
         )
+        if processor is None:
+            # The checkpoint path: model_name may be --served-model-name.
+            processor = AutoProcessor.from_pretrained(
+                _get_engine_config().model, trust_remote_code=True
+            )
+            # A checkpoint that ships its template for the tokenizer only
+            # (MiniMax-M3.1) renders with the server's, --chat-template included.
+            if processor.chat_template is None:
+                processor.chat_template = tokenizer.chat_template
     return processor
 
 
-def _collect_multimodal_parts(
-    messages: list[Any],
-) -> tuple[
-    list[dict[str, Any]],
-    list["Image.Image"],
-    list[list["Image.Image"]],
-    list["VideoMetadata"],
-]:
-    """Normalize chat messages into processor form, loading images and videos.
-
-    Content parts keep the order the client sent them in; images, videos, and
-    video metadata are returned separately in matching order.
-    """
-    processor_messages: list[dict[str, Any]] = []
-    images: list[Image.Image] = []
+def _prepare_glm5_video_inputs(
+    conversation: list[dict[str, Any]],
+    sources: list[Any],
+    processor: Any,
+    chat_template_kwargs: dict[str, Any],
+    tools: Any = None,
+) -> tuple[list[int], dict[str, Any]]:
+    """Bind parsed video markers to sampled frames and matching metadata."""
     videos: list[list[Image.Image]] = []
     video_metadata: list[VideoMetadata] = []
-
-    for message in messages:
-        content = getattr(message, "content", None)
-        if isinstance(content, str) or content is None:
-            processor_messages.append({"role": message.role, "content": content or ""})
-            continue
-
-        parts: list[dict[str, Any]] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = part.get("type")
-            if part_type == "text":
-                parts.append({"type": "text", "text": part.get("text", "")})
-            elif part_type == "image_url":
-                image_url = part.get("image_url", {})
-                url = image_url.get("url") if isinstance(image_url, dict) else None
-                if not url:
-                    raise ValueError(
-                        "image_url content part must include image_url.url"
-                    )
-                image = _load_image_from_url(url)
-                images.append(image)
-                parts.append({"type": "image", "image": image})
-            elif part_type == "image":
-                url = part.get("image")
-                if not isinstance(url, str):
-                    raise ValueError(
-                        "image content part must include an image URL/path"
-                    )
-                image = _load_image_from_url(url)
-                images.append(image)
-                parts.append({"type": "image", "image": image})
-            elif part_type in {"video", "video_url"}:
-                value = part.get(part_type)
-                url = value.get("url") if isinstance(value, dict) else value
-                if not isinstance(url, str):
-                    raise ValueError(
-                        f"{part_type} content part must include a URL/path"
-                    )
-                video, metadata = _load_video_from_url(url)
-                videos.append(video)
-                video_metadata.append(metadata)
-                parts.append({"type": "video", "video": video})
-        processor_messages.append({"role": message.role, "content": parts})
-
-    return processor_messages, images, videos, video_metadata
-
-
-def _images_before_text(
-    processor_messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Hoist image parts ahead of the text within each message.
-
-    Qwen3.5's template only reliably emits <|image_pad|> when image entries
-    precede the text, matching the native offline multimodal example.
-    """
-    reordered: list[dict[str, Any]] = []
-    for message in processor_messages:
-        content = message["content"]
+    processor_messages: list[dict[str, Any]] = []
+    for message in conversation:
+        content = message.get("content")
         if not isinstance(content, list):
-            reordered.append(message)
+            processor_messages.append({**message, "content": content or ""})
             continue
-        parts = [part for part in content if part["type"] in {"image", "video"}]
-        texts = [part["text"] for part in content if part["type"] == "text"]
-        if texts:
-            parts.append({"type": "text", "text": "\n".join(texts)})
-        reordered.append({"role": message["role"], "content": parts})
-    return reordered
+        video_parts = []
+        text_parts = []
+        for part in content:
+            if part["type"] == "video":
+                source_index = len(videos)
+                if source_index >= len(sources) or not isinstance(
+                    sources[source_index], str
+                ):
+                    raise ValueError("video content part must include a URL/path")
+                frames, metadata = _load_video_from_url(sources[source_index])
+                videos.append(frames)
+                video_metadata.append(metadata)
+                video_parts.append({**part, "video": frames})
+            elif part["type"] == "text":
+                text_parts.append(part["text"])
+        if text_parts:
+            video_parts.append({"type": "text", "text": "\n".join(text_parts)})
+        processor_messages.append({**message, "content": video_parts})
+
+    template_kwargs = dict(chat_template_kwargs)
+    template_kwargs.pop("tokenize", None)
+    template_kwargs.pop("add_generation_prompt", None)
+    if tools is not None:
+        template_kwargs["tools"] = tools
+    text = processor.apply_chat_template(
+        processor_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+    inputs = processor(
+        text=[text],
+        images=None,
+        videos=videos,
+        video_metadata=video_metadata,
+        do_sample_frames=False,
+        return_tensors="pt",
+    )
+    pixel_values = inputs.get("pixel_values_videos")
+    grid_thw = inputs.get("video_grid_thw")
+    return inputs["input_ids"][0].tolist(), {
+        "pixel_values": pixel_values,
+        "image_grid_thw": grid_thw,
+    }
 
 
 def _prepare_multimodal_inputs(
@@ -847,64 +795,40 @@ def _prepare_multimodal_inputs(
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
-    mm_processor = _get_multimodal_processor()
-    processor_messages, images, videos, video_metadata = _collect_multimodal_parts(
-        messages
+    conversation, media = parse_chat_messages(
+        [
+            {**message.to_template_dict(), "content": message.content}
+            for message in messages
+        ]
     )
-
-    if not images and not videos:
-        raise ValueError("Multimodal request did not contain images or videos")
-
-    # Models whose processor deviates from the Qwen convention register their
-    # own builder (e.g. Kimi-K3's messages+medias API and unexpanded
-    # <|media_pad|> placeholders).
-    if images and videos:
-        raise ValueError("Mixing images and videos in one request is not supported yet")
-
-    built = None
-    if not videos:
-        built = build_multimodal_inputs(
-            _get_engine_config(),
-            mm_processor,
-            processor_messages,
-            images,
+    config = _get_engine_config()
+    architectures = (
+        getattr(getattr(config, "hf_config", None), "architectures", None) or []
+    )
+    if "video" in media and "Glm5NextForConditionalGeneration" in architectures:
+        if "image" in media:
+            raise ValueError(
+                "Mixing images and videos in one request is not supported yet"
+            )
+        if "audio" in media:
+            raise ValueError(
+                "Mixing audio and videos in one request is not supported yet"
+            )
+        return _prepare_glm5_video_inputs(
+            conversation,
+            media["video"],
+            _get_multimodal_processor(),
             chat_template_kwargs,
             tools=tools,
         )
-    if built is not None:
-        return built
-
-    template_kwargs = dict(chat_template_kwargs)
-    template_kwargs.pop("tokenize", None)
-    template_kwargs.pop("add_generation_prompt", None)
-    text = mm_processor.apply_chat_template(
-        _images_before_text(processor_messages),
-        tokenize=False,
-        add_generation_prompt=True,
-        **template_kwargs,
+    return prepare_multimodal_inputs(
+        config,
+        _get_multimodal_processor(),
+        conversation,
+        media,
+        chat_template_kwargs,
+        tools=tools,
     )
-    if images and not any(token in text for token in ("<|image_pad|>", "<|image|>")):
-        raise ValueError("Multimodal chat template did not emit image placeholders")
-    processor_kwargs = (
-        {"do_sample_frames": False, "video_metadata": video_metadata} if videos else {}
-    )
-    inputs = mm_processor(
-        text=[text],
-        images=images or None,
-        videos=videos or None,
-        return_tensors="pt",
-        **processor_kwargs,
-    )
-    pixel_values = inputs.get("pixel_values")
-    grid_thw = inputs.get("image_grid_thw")
-    if inputs.get("pixel_values_videos") is not None:
-        pixel_values = inputs["pixel_values_videos"]
-        grid_thw = inputs["video_grid_thw"]
-    multimodal_data = {
-        "pixel_values": pixel_values,
-        "image_grid_thw": grid_thw,
-    }
-    return inputs["input_ids"][0].tolist(), multimodal_data
 
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
@@ -978,15 +902,16 @@ def _send_stream_chunk_tagged(
 
 
 async def generate_async(
-    prompt: str,
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    return_token_ids: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Generate text asynchronously for non-streaming requests."""
+    """Generate non-streaming output, optionally echoing local prompt token IDs."""
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -1026,7 +951,7 @@ async def generate_async(
 
     def do_preprocess():
         return engine.io_processor.preprocess(
-            prompt,
+            prompt_or_tokens,
             sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=kv_transfer_params,
@@ -1075,7 +1000,13 @@ async def generate_async(
 
     text = delivered_text(all_token_ids)
     num_tokens_input = (
-        seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
+        seq.num_prompt_tokens
+        if seq is not None
+        else len(
+            prompt_or_tokens
+            if isinstance(prompt_or_tokens, list)
+            else tokenizer.encode(prompt_or_tokens)
+        )
     )
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
@@ -1102,6 +1033,9 @@ async def generate_async(
     }
     if kv_transfer_output_meta_info is not None:
         response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info
+    if return_token_ids and seq is not None:
+        # Convert the token array to a JSON-serializable list.
+        response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
 
 
@@ -1214,12 +1148,15 @@ async def generate_async_fanout(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    return_token_ids: bool = False,
 ) -> list[dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
     Returns a list of per-sibling output dicts in the same shape as
     :func:`generate_async` yields for n==1, so response builders can treat
     each entry the same way.
+
+    Shared prompt token IDs are returned only in the first output.
     """
 
     n = int(sampling_params.n)
@@ -1302,7 +1239,7 @@ async def generate_async_fanout(
                 try:
                     engine.core_mgr.abort_request(_seq.id)
                 except Exception:
-                    pass
+                    logger.debug("abort_request failed on teardown", exc_info=True)
             engine.io_processor.requests.pop(_seq.id, None)
 
     finished_at = time.time()
@@ -1333,6 +1270,8 @@ async def generate_async_fanout(
                 "latency": finished_at - started_at,
             }
         )
+    if return_token_ids and seqs:
+        outputs[0]["prompt_token_ids"] = list(seqs[0].prompt_token_ids)
     return outputs
 
 
@@ -1349,6 +1288,51 @@ def validate_model(requested_model: str | None) -> None:
             detail=f"Requested model '{requested_model}' does not match "
             f"server model '{model_name}'",
         )
+
+
+def _validate_return_token_ids(
+    return_token_ids: bool | None, stream: bool | None
+) -> None:
+    """Prompt token IDs can be returned only in non-streaming responses."""
+    if not return_token_ids:
+        return
+    if stream:
+        raise ValueError(
+            "return_token_ids is not supported with stream=true; the ids are "
+            "returned on the response body, which a stream does not have"
+        )
+
+
+def _engine_kv_transfer_params(
+    kv_transfer_params: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Copy KV metadata without IDs already passed as the engine prompt."""
+    if kv_transfer_params is None or "prompt_token_ids" not in kv_transfer_params:
+        return kv_transfer_params
+    return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
+
+
+def _prompt_headroom(
+    max_tokens: int, max_ctx: int, kv_transfer_params: dict[str, Any] | None
+) -> int:
+    """Output tokens to reserve when an over-long prompt is truncated.
+
+    A PD router sends the prefill leg ``max_tokens=1`` and the decode leg the
+    client's value. With a KV handoff the reservation therefore cannot depend
+    on ``max_tokens``, or the two legs truncate to different prompts and the
+    transferred blocks no longer match the decode-side sequence.
+    """
+    headroom = max(1024, max_ctx // 8)
+    if kv_transfer_params is None:
+        headroom = min(max_tokens, headroom)
+    return headroom
+
+
+def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
+    """Return the prefill's KV location to the PD router, as chat does."""
+    if "kv_transfer_output_meta_info" in final_output:
+        response["kv_transfer_params"] = final_output["kv_transfer_output_meta_info"]
+    return response
 
 
 async def setup_streaming_request(
@@ -1441,7 +1425,7 @@ def cleanup_stream(seq_id: int, aborted: bool = False) -> None:
         try:
             engine.core_mgr.abort_request(seq_id)
         except Exception:
-            pass
+            logger.debug("abort_request failed on teardown", exc_info=True)
     engine.io_processor.requests.pop(seq_id, None)
 
 
@@ -1692,6 +1676,8 @@ async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    await asyncio.to_thread(initialize_tracing)
+    metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
     maybe_attach_gc_debug_callback("api_server")
@@ -1704,7 +1690,7 @@ async def lifespan(app: FastAPI):
     _background_tasks[:] = [
         asyncio.create_task(_periodic(interval, step), name=step.__name__)
         for interval, step in (
-            (_METRICS_REFRESH_INTERVAL_SECONDS, _refresh_metrics_once),
+            (metrics_interval, _refresh_metrics_once),
             (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
         )
     ]
@@ -1718,16 +1704,21 @@ async def lifespan(app: FastAPI):
         # shutdown the thing that cannot be stopped.
         await asyncio.gather(*_background_tasks, return_exceptions=True)
         _background_tasks.clear()
+        await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
-        if engine is not None:
-            engine.close()
+        try:
+            if engine is not None:
+                engine.close()
+        finally:
+            await asyncio.to_thread(shutdown_tracing)
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
 app.add_middleware(
     RequestTimingMiddleware,
-    observe_ttft=_metrics_exporter.observe_time_to_first_token,
+    observe_ttft=_request_metrics.observe_time_to_first_token,
 )
+app.add_middleware(TraceMiddleware, model=lambda: model_name)
 
 
 # ---- Error handlers ----
@@ -1749,7 +1740,7 @@ async def value_error_handler(request: Request, exc: ValueError):
 
 @app.exception_handler(Exception)
 async def general_error_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled error: {exc}", exc_info=True)
+    logger.error("Unhandled error: %s", exc, exc_info=exc)
     return JSONResponse(
         status_code=500,
         content={
@@ -1805,6 +1796,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 merged_kwargs["thinking_effort"] = _th_effort
 
         effective_n = _coerce_n(request.n, request.temperature)
+        _validate_return_token_ids(request.return_token_ids, request.stream)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
@@ -1816,6 +1808,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        set_request_id(request_id)
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -1826,45 +1819,51 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         _log_request_model("request", request_id, request)
 
         is_multimodal = _has_multimodal_content(messages)
+        multimodal_data = None
+        kv_transfer_params = request.kv_transfer_params
         if is_multimodal:
-            # Image loading (blocking network I/O, up to a 30s urlopen) plus
+            # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
             # run them in a worker thread. Warm the processor on the loop first
             # so concurrent cold-start requests don't race on its lazy init.
             _get_multimodal_processor()
             loop = asyncio.get_running_loop()
-            token_ids, multimodal_data = await loop.run_in_executor(
+            prompt_or_tokens, multimodal_data = await loop.run_in_executor(
                 None,
                 _prepare_multimodal_inputs,
                 messages,
                 merged_kwargs,
                 request.tools,
             )
+        elif (pretokenized := request.get_prompt_token_ids()) is not None:
+            # Reuse prefill IDs to skip template rendering and tokenization.
+            prompt_or_tokens = pretokenized
+            kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            prompt = apply_chat_template(
+            prompt_or_tokens = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
-                [msg.to_template_dict() for msg in messages],
+                messages,
                 tools=request.tools,
                 **merged_kwargs,
             )
 
-        # The K3 template may inject the opening reasoning marker into the prompt
-        # itself; if so the stream begins mid-thought and the ReasoningFilter must
-        # start in the thinking state. Multimodal inputs arrive pre-tokenized.
+        # The K3 template may open the reasoning channel in text or token IDs.
         _reasoning = reasoning_channel(
             (
-                prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
-                if is_multimodal
-                else prompt_starts_in_reasoning(prompt)
+                prompt_starts_in_reasoning(prompt_or_tokens)
+                if isinstance(prompt_or_tokens, str)
+                else prompt_tokens_start_in_reasoning(
+                    prompt_or_tokens, tokenizer.decode
+                )
             ),
             template_kwargs=merged_kwargs,
         )
 
         # Streaming
         if request.stream:
-            stream_input = token_ids if is_multimodal else prompt
-            stream_multimodal_data = multimodal_data if is_multimodal else None
+            stream_input = prompt_or_tokens
+            stream_multimodal_data = multimodal_data
             if effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
@@ -1872,7 +1871,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         sampling_params,
                         request_id,
                         multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1896,7 +1895,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         sampling_params,
                         request_id,
                         multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -1922,11 +1921,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         if is_multimodal and effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    token_ids,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
                     multimodal_data=multimodal_data,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1946,7 +1946,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async_multimodal(
-                    token_ids,
+                    prompt_or_tokens,
                     multimodal_data,
                     sampling_params,
                     request_id,
@@ -1970,10 +1970,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         elif effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1993,10 +1994,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
-                    prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -2015,7 +2017,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_model("response", request_id, resp)
-        return resp
+        # Bypass FastAPI's recursive conversion of the token ID list.
+        return JSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
@@ -2024,8 +2027,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         logger.error(f"Validation error in chat_completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in chat_completions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error in chat_completions")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/v1/completions")
@@ -2036,6 +2039,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
+        _validate_return_token_ids(request.return_token_ids, request.stream)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
@@ -2045,8 +2049,12 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_p=request.top_p,
             n=effective_n,
         )
+        # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
+        prompt_or_tokens = request.get_prompt_or_tokens()
+        kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
+        set_request_id(request_id)
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -2061,10 +2069,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
             if effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
-                        request.prompt,
+                        prompt_or_tokens,
                         sampling_params,
                         request_id,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -2080,10 +2088,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request(
-                        request.prompt,
+                        prompt_or_tokens,
                         sampling_params,
                         request_id,
-                        kv_transfer_params=request.kv_transfer_params,
+                        kv_transfer_params=kv_transfer_params,
                         **dp_routing,
                     )
                 )
@@ -2105,10 +2113,11 @@ async def completions(request: CompletionRequest, raw_request: Request):
         if effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
-                    request.prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -2120,10 +2129,11 @@ async def completions(request: CompletionRequest, raw_request: Request):
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
-                    request.prompt,
+                    prompt_or_tokens,
                     sampling_params,
                     request_id,
-                    kv_transfer_params=request.kv_transfer_params,
+                    kv_transfer_params=kv_transfer_params,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -2135,7 +2145,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
 
             resp = build_completion_response(request_id, model_name, final_output)
         _log_request_model("response", request_id, resp)
-        return resp
+        return JSONResponse(content=resp.model_dump(mode="json"))
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
@@ -2144,8 +2154,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
         logger.error(f"Validation error in completions: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in completions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error in completions")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/v1/messages")
@@ -2202,7 +2212,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
-            [msg.to_template_dict() for msg in messages],
+            messages,
             tools=anthropic_to_openai_tools(request.tools),
             **merged_kwargs,
         )
@@ -2232,6 +2242,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         request_id = uuid.uuid4().hex[:24]
+        set_request_id(request_id)
+        kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
         input_tokens = len(tokenizer.encode(prompt))
 
         max_ctx = None
@@ -2247,11 +2259,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                     max_ctx = int(_v)
                     break
             except Exception:
+                logger.debug("max_ctx candidate rejected", exc_info=True)
                 continue
         if not max_ctx:
             max_ctx = 30720
         logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
-        headroom = min(request.max_tokens, max(1024, max_ctx // 8))
+        headroom = _prompt_headroom(request.max_tokens, max_ctx, kv_transfer_params)
         max_input = max_ctx - headroom
         if input_tokens > max_input:
             logger.warning(
@@ -2264,7 +2277,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if request.stream:
             # Streaming response
             seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(prompt, sampling_params, request_id)
+                await setup_streaming_request(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=kv_transfer_params,
+                )
             )
 
             async def generate_anthropic_stream():
@@ -2435,7 +2453,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         # Non-streaming response
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(prompt, sampling_params, request_id),
+            generate_async(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
+            ),
             raw_request,
             request_id,
         )
@@ -2466,7 +2489,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         _, tool_calls = flatten_tool_events(events)
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
-        return build_anthropic_response(
+        response = build_anthropic_response(
             request_id=request_id,
             model=model_name,
             events=events,
@@ -2482,10 +2505,19 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 final_output.get("finish_reason"), bool(tool_calls)
             ),
         )
+        return _with_kv_transfer_params(response, final_output)
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
     except Exception as e:
         logger.exception("Error in anthropic_messages")
         return JSONResponse(
@@ -2529,6 +2561,22 @@ async def responses_create(raw_request: Request):
                 }
             },
         )
+
+    # PD handoff metadata rather than a Responses parameter: take it out before
+    # the body is checked against the Responses schema.
+    kv_transfer_params = body.pop("kv_transfer_params", None)
+    if kv_transfer_params is not None and not isinstance(kv_transfer_params, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "kv_transfer_params must be a JSON object",
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            },
+        )
+    kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
     unsupported = unsupported_responses_parameter(body)
     if unsupported:
@@ -2579,7 +2627,7 @@ async def responses_create(raw_request: Request):
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
-            [msg.to_template_dict() for msg in messages],
+            messages,
             tools=openai_tools,
             **merged_kwargs,
         )
@@ -2614,6 +2662,7 @@ async def responses_create(raw_request: Request):
         )
 
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
+        set_request_id(request_id)
         input_tokens = len(tokenizer.encode(prompt))
 
         max_ctx = 30720
@@ -2627,7 +2676,7 @@ async def responses_create(raw_request: Request):
             if value:
                 max_ctx = int(value)
                 break
-        headroom = min(max_tokens, max(1024, max_ctx // 8))
+        headroom = _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
         max_input = max_ctx - headroom
         if input_tokens > max_input:
             logger.warning(
@@ -2640,7 +2689,12 @@ async def responses_create(raw_request: Request):
         created_at = int(time.time())
         if request.stream:
             seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(prompt, sampling_params, request_id)
+                await setup_streaming_request(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=kv_transfer_params,
+                )
             )
 
             async def generate_responses_stream():
@@ -2733,7 +2787,12 @@ async def responses_create(raw_request: Request):
             )
 
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(prompt, sampling_params, request_id),
+            generate_async(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
+            ),
             raw_request,
             request_id,
         )
@@ -2753,7 +2812,7 @@ async def responses_create(raw_request: Request):
         )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
-        return build_responses_response(
+        response = build_responses_response(
             request_id=request_id,
             model=model_name,
             events=events,
@@ -2764,9 +2823,12 @@ async def responses_create(raw_request: Request):
             cache_read_input_tokens=cache_read_input_tokens,
             created_at=created_at,
         )
+        return _with_kv_transfer_params(response, final_output)
 
     except _ClientDisconnected:
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
+    except ValueError as exc:
+        return await value_error_handler(raw_request, exc)
     except Exception as e:
         logger.exception("Error in responses_create")
         return JSONResponse(
@@ -2797,7 +2859,7 @@ async def health():
 async def metrics():
     """Expose cached standalone-engine metrics in Prometheus text format."""
     return Response(
-        content=_metrics_exporter.render(),
+        content=await _metrics_exporter.render_async(),
         headers={"Content-Type": _metrics_exporter.content_type},
     )
 
@@ -2941,8 +3003,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine, tokenizer, model_name, processor_model_path
-    global default_chat_template_kwargs, _request_logger
+    global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher
@@ -3037,11 +3098,27 @@ def main():
             logger.info("Using inline chat template from --chat-template argument")
 
     model_name = args.served_model_name if args.served_model_name else args.model
-    processor_model_path = args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    # Remote DP nodes block inside engine startup and never run the API loop.
+    # Expose their local mmap metrics on the same configured HTTP port.
+    dp_rank = (
+        envs.ATOM_DP_RANK
+        if envs.is_set("ATOM_DP_RANK")
+        else engine_args.data_parallel_rank
+    )
+    if dp_rank > 0:
+        from atom.metrics.prometheus import start_metrics_server
+
+        server, _ = start_metrics_server(args.host, args.server_port)
+        try:
+            engine_args.create_engine(tokenizer=tokenizer)
+        finally:
+            server.shutdown()
+            server.server_close()
+        return
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
     reasoning_dialect, _dialect_stated = resolve_dialect(
         _template_source,
@@ -3103,7 +3180,7 @@ def main():
     _stream_batch_dispatcher = StreamBatchDispatcher(
         tokenizer,
         synthetic_text=synthetic_token_text,
-        observe_inter_token_latency=_metrics_exporter.observe_inter_token_latency,
+        observe_inter_token_latency=_stream_metrics.observe_inter_token_latency,
     )
     # Here and not in the dispatcher's constructor: it replays a few thousand
     # updates, which every test that builds a dispatcher would then pay for.

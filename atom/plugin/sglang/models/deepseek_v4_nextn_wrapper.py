@@ -14,14 +14,16 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 from torch import nn
 
 from atom.config import QuantizationConfig as AtomQuantizationConfig
 from atom.config import SpeculativeConfig
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.models.deepseek_v4 import DeepseekV4Attention, ParallelHead
-from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.plugin.config import (
+    generate_atom_config_for_plugin_mode,
+    get_sglang_server_args,
+)
 from atom.plugin.sglang.runtime import (
     SGLangForwardBatchMetadata,
     SGLangPluginRuntime,
@@ -124,7 +126,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         with plugin_runtime_scope(framework="sglang"):
             self.atom_config = generate_atom_config_for_plugin_mode(config)
 
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
         draft_model_path = (
             server_args.speculative_draft_model_path or server_args.model_path
         )
@@ -172,7 +174,10 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             hc_eps=getattr(config, "hc_eps", 1e-6),
         )
-        self._bind_shared_modules()
+        # Embed/head are shared with the target via set_embed_and_head after
+        # both models load. Binding them onto MTP blocks here registers
+        # model.mtp.0.embed/head as MTP parameters, and spec_decode loading
+        # never writes those names, so they stay at init.
         self.logits_head = _DeepseekV4MTPLogitsHeadAdapter(self.model)
         self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
 
@@ -300,7 +305,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         del weights
         from atom.model_loader.loader import load_model
 
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
         draft_model_path = (
             server_args.speculative_draft_model_path or server_args.model_path
         )

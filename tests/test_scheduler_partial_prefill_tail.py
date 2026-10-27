@@ -30,6 +30,7 @@ from types import SimpleNamespace
 
 from conftest import MockConfig
 
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -45,8 +46,14 @@ class _VetoDelayer:
     """Stub cross-DP delayer that always refuses prefill this tick, forcing the
     decode loop to run while a partial prefill is still sitting in `running`."""
 
-    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+    is_local = False
+    max_queue_ms = None
+
+    def protects_decode(self, running_decode_batch: int) -> bool:
         return False
+
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+        return PrefillDecision(allow=False, prefillable_ranks=int(prefillable))
 
 
 class TestSkippedPartialPrefillGoesToTail:

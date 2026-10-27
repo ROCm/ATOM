@@ -41,10 +41,15 @@ def _cu(lens):
     return torch.tensor(v, dtype=torch.int32)
 
 
-def _run_reference(lens, src, prev, draft):
-    """Stage every slot with the sentinel, then fill the deferred spans."""
+def _run_reference(lens, src, prev, draft, width=0):
+    """Stage every slot with the sentinel, then fill the deferred spans.
+
+    `width` is the forward's, so the buffer is allocated to it rather than to
+    the batch: the sentinel has to be there for the tail to be able to keep it,
+    which is what makes "the tail was zeroed" a claim and not a tautology.
+    """
     cu = _cu(lens)
-    out = torch.full((int(cu[-1]),), STAGED, dtype=torch.int32)
+    out = torch.full((max(int(cu[-1]), width),), STAGED, dtype=torch.int32)
     fill_deferred_decode_ids_reference(
         out,
         cu,
@@ -52,6 +57,7 @@ def _run_reference(lens, src, prev, draft):
         torch.tensor(prev, dtype=torch.int32),
         None if draft is None else torch.tensor(draft, dtype=torch.int32),
         max_tokens_per_seq=int(max(lens)),
+        width=width,
     )
     return out, cu
 
@@ -142,7 +148,33 @@ def test_deferred_rows_need_not_match_current_positions():
     assert _spans(out, cu) == [[30], [10], [20]]
 
 
+def test_the_graphs_padded_tail_is_zeroed_and_stops_at_the_last_request():
+    """The tail is the rows a replayed graph reads and this batch never wrote.
+
+    Left alone they hold the previous forward's ids and the MoE path consumes
+    them; zeroed too eagerly they eat the last request's own tokens. So both
+    edges are the claim, and the batch below is ragged so that "where the last
+    request ends" cannot be confused with `bs * max(lens)`.
+    """
+    lens = [3, 1, 2]
+    out, cu = _run_reference(
+        lens, [0, 1, NEW_SEQUENCE], [100, 200], [[11, 12], [21, 22]], width=11
+    )
+
+    assert _spans(out, cu) == [[100, 11, 12], [200], [STAGED, STAGED]]
+    assert out[int(cu[-1]) :].tolist() == [0] * 5
+
+
+def test_a_width_no_wider_than_the_batch_leaves_no_tail():
+    """An eager step is its own width, and must not have rows zeroed under it."""
+    lens = [2, 2]
+    out, _ = _run_reference(lens, [0, 1], [100, 200], [[11], [21]], width=4)
+
+    assert out.tolist() == [100, 11, 200, 21]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel needs a GPU")
+@pytest.mark.parametrize("width", [0, 37])
 @pytest.mark.parametrize(
     "lens,src",
     [
@@ -152,7 +184,7 @@ def test_deferred_rows_need_not_match_current_positions():
         ([1] * 6, [5, 4, 3, 2, 1, 0]),
     ],
 )
-def test_kernel_matches_reference(lens, src):
+def test_kernel_matches_reference(lens, src, width):
     from atom.model_ops.decode_input_ids import fill_deferred_decode_ids
 
     torch.manual_seed(0)
@@ -163,7 +195,7 @@ def test_kernel_matches_reference(lens, src):
     has_draft = max(lens) > 1
 
     ref, cu = _run_reference(
-        lens, src, prev.tolist(), draft.tolist() if has_draft else None
+        lens, src, prev.tolist(), draft.tolist() if has_draft else None, width=width
     )
 
     out = torch.full_like(ref, STAGED).cuda()
@@ -174,6 +206,7 @@ def test_kernel_matches_reference(lens, src):
         prev.cuda(),
         draft.cuda() if has_draft else None,
         max_tokens_per_seq=int(max(lens)),
+        width=width,
     )
     torch.cuda.synchronize()
     assert (ref != STAGED).any(), "every span was left staged; the case proves nothing"

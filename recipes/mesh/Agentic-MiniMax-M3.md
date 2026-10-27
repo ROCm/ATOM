@@ -58,6 +58,7 @@ export PYTHONUNBUFFERED=1
 export PYTHONHASHSEED=0
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_FORCE_ATTN_TRITON=1
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export ATOM_HOST_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
 
 # Avoid stale compiled kernels from previous experiments.
@@ -138,9 +139,14 @@ python -m atom.entrypoints.openai_server \
   --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","vision_tower","multi_modal_projector","patch_merge_mlp","*block_sparse_moe"]}' \
   --no-enable_prefix_caching \
   --hf-overrides '{"use_index_cache":true,"index_topk_freq":4}' \
-  --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
+  --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}' \
   2>&1 | tee "${LOG_PATH}"
 ```
+
+The command above is configured for the single-node GPU0-3 to GPU4-7
+cross-rail layout. For multi-node deployments where both prefill and decode use
+GPU0-3 with same-index rank mapping, remove `ib_enable_alternate_hca` and
+`ib_hca_count`.
 
 ## Step 3: Verify KV Transfer Info
 

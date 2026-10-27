@@ -14,6 +14,8 @@ MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT:-2h}"
 MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS:-1800}"
 MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL:-30}"
 MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL:-60}"
+MODEL_DOWNLOAD_ATTEMPTS="${MODEL_DOWNLOAD_ATTEMPTS:-3}"
+MODEL_DOWNLOAD_RETRY_DELAY="${MODEL_DOWNLOAD_RETRY_DELAY:-30}"
 MODEL_USE_LOCK="${MODEL_USE_LOCK:-true}"
 MODEL_ENABLE_REMOTE_REVISION_CHECK="${MODEL_ENABLE_REMOTE_REVISION_CHECK:-1}"
 LOCK_ROOT="${MODEL_LOCK_ROOT:-/tmp/atom-model-locks}"
@@ -204,6 +206,99 @@ start_progress_reporter() {
   PROGRESS_PID="$!"
 }
 
+run_download_once() {
+  local status=0
+
+  (
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export MODEL_ID REMOTE_REVISION STAGING_DIR
+    timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" python3 - <<'PY'
+import os
+import sys
+
+from huggingface_hub.errors import (
+    GatedRepoError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
+
+model_id = os.environ["MODEL_ID"]
+revision = os.environ.get("REMOTE_REVISION") or None
+token = os.environ.get("HF_TOKEN") or None
+
+try:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        repo_id=model_id,
+        revision=revision,
+        local_dir=os.environ["STAGING_DIR"],
+        local_dir_use_symlinks=False,
+        token=token,
+    )
+except Exception as exc:
+    print(
+        f"Failed to download model '{model_id}'"
+        f" at revision '{revision or 'default'}': {exc}",
+        file=sys.stderr,
+    )
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    refusal = (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError)
+    if isinstance(exc, refusal) or status in (401, 403, 404):
+        sys.exit(2)  # a refusal: every attempt reaches the same answer
+    transport = (ConnectionError, TimeoutError)
+    try:
+        import httpx
+
+        transport = (httpx.TransportError,) + transport
+    except ImportError:
+        pass
+    if isinstance(exc, transport) or (
+        status is not None and (status in (408, 429) or status >= 500)
+    ):
+        sys.exit(3)  # the wire or the server blinked; another attempt can land
+    sys.exit(1)  # local and permanent: broken image, unwritable staging, full disk
+PY
+  ) &
+  DOWNLOAD_PID="$!"
+  wait "${DOWNLOAD_PID}" || status=$?
+  DOWNLOAD_PID=""
+  return "${status}"
+}
+
+# 3 is transport: the wire or the server blinked, and another attempt can
+# land. Everything else is not retryable -- 2 is a refusal every attempt
+# reaches identically, 124 is a timeout that already spent its whole budget,
+# and 1 is local and permanent (a broken image, an unwritable staging
+# directory, a full filesystem): repeating those spends three attempts and
+# their sleeps on a diagnosis that cannot change.
+download_with_retries() {
+  local attempt status delay
+
+  for attempt in $(seq 1 "${MODEL_DOWNLOAD_ATTEMPTS}"); do
+    status=0
+    run_download_once || status=$?
+
+    if [ "${status}" -eq 0 ]; then
+      return 0
+    fi
+
+    if [ "${status}" -ne 3 ]; then
+      log "Download failed with status ${status}; not retryable."
+      return "${status}"
+    fi
+
+    if [ "${attempt}" -lt "${MODEL_DOWNLOAD_ATTEMPTS}" ]; then
+      delay=$(( MODEL_DOWNLOAD_RETRY_DELAY * attempt ))
+      log "Download attempt ${attempt}/${MODEL_DOWNLOAD_ATTEMPTS} failed; retrying in ${delay}s, resuming from ${STAGING_DIR}"
+      sleep "${delay}"
+    fi
+  done
+
+  log "Download failed after ${MODEL_DOWNLOAD_ATTEMPTS} attempts."
+  return "${status}"
+}
+
 cleanup() {
   local exit_code=$?
 
@@ -288,39 +383,7 @@ log "Download timeout is ${MODEL_DOWNLOAD_TIMEOUT}"
 
 start_progress_reporter
 
-(
-  export HF_HUB_ENABLE_HF_TRANSFER=1
-  export MODEL_ID REMOTE_REVISION STAGING_DIR
-  timeout --signal=TERM --kill-after=5m "${MODEL_DOWNLOAD_TIMEOUT}" python3 - <<'PY'
-import os
-import sys
-
-model_id = os.environ["MODEL_ID"]
-revision = os.environ.get("REMOTE_REVISION") or None
-token = os.environ.get("HF_TOKEN") or None
-
-try:
-    from huggingface_hub import snapshot_download
-
-    snapshot_download(
-        repo_id=model_id,
-        revision=revision,
-        local_dir=os.environ["STAGING_DIR"],
-        local_dir_use_symlinks=False,
-        token=token,
-    )
-except Exception as exc:
-    print(
-        f"Failed to download model '{model_id}'"
-        f" at revision '{revision or 'default'}': {exc}",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-PY
-) &
-DOWNLOAD_PID="$!"
-wait "${DOWNLOAD_PID}"
-DOWNLOAD_PID=""
+download_with_retries
 
 if [ -n "${PROGRESS_PID}" ] && kill -0 "${PROGRESS_PID}" 2>/dev/null; then
   kill "${PROGRESS_PID}" 2>/dev/null || true

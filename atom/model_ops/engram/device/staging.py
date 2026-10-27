@@ -1,0 +1,320 @@
+# SPDX-License-Identifier: MIT
+"""Graph-replayable Engram lookup and TP reassembly beside early layers.
+
+A private collective instance isolates side-stream synchronization/scratch
+from model collectives. Storage and IPC registration precede graph capture.
+Every forward (including warmup) records the same kernels, fork and joins on
+fixed addresses (`EngramStep`): a replay reads its own step.
+"""
+
+import logging
+import os
+from collections.abc import Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from unittest.mock import patch
+
+import torch
+
+from atom.model_ops.engram.device.hashing import (
+    EngramBatch,
+    engram_compress,
+    engram_cursor_rows,
+    engram_snapshot,
+    engram_snapshot_indices,
+)
+from atom.model_ops.engram.device.uva import uva_gather_into
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EngramStep:
+    """One forward's Engram inputs at fixed addresses, its full width.
+
+    `live`: the live leading tokens, on the device (0: nothing is read or
+    written). `dead`: a token's no-own-id flag. `candidates`: a verify step's
+    every accepted prefix (`commit_tentative` picks one); None advances
+    `cursor` in place.
+    """
+
+    input_ids: torch.Tensor
+    live: torch.Tensor
+    dead: torch.Tensor
+    batch_ids: torch.Tensor
+    cu_seqlens: torch.Tensor
+    positions: torch.Tensor
+    cursor: torch.Tensor
+    history_index: torch.Tensor
+    candidates: torch.Tensor | None
+
+
+class EngramStaging:
+    def __init__(self, uva):
+        self.uva = uva
+        self.host = host = uva.host
+        self.stream = torch.cuda.Stream(host.device)
+        self.done = {layer: torch.cuda.Event() for layer in host.layer_ids}
+        self.snapshot = torch.empty(
+            host.max_num_tokens,
+            uva.hash_tables.ngram,
+            dtype=torch.int64,
+            device=host.device,
+        )
+        self.compressed = torch.empty(
+            host.max_num_tokens, dtype=torch.int32, device=host.device
+        )
+        self.step = None
+        self.flat = {
+            layer: torch.empty(
+                host.max_num_tokens,
+                host.local_heads * host.prefetcher._tables[layer].head_dim,
+                dtype=host.buffers[layer].gpu.dtype,
+                device=host.device,
+            )
+            for layer in host.layer_ids
+        }
+
+        self.collective = None
+        self.gathered = {}
+        self._init_collective()
+        self.fallback_done = (
+            {layer: torch.cuda.Event() for layer in host.layer_ids}
+            if host._tp_group is not None and self.collective is None
+            else {}
+        )
+
+    def _init_collective(self):
+        host = self.host
+        group = host._tp_group
+        if group is None:
+            return
+        # The last-dimension kernel supports these TP sizes and 16-byte packs.
+        # Keep the original main-stream path for other configurations.
+        first = host.layer_ids[0]
+        local_width = host.local_heads * host.prefetcher._tables[first].head_dim
+        itemsize = host.buffers[first].gpu.element_size()
+        if group.world_size not in (2, 4, 8) or local_width * itemsize % 16:
+            logger.warning(
+                "engram: side-stream TP gather unsupported; using main stream"
+            )
+            return
+        from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+        # Sharing TP GPU state would race barrier flags and scratch against
+        # main-stream all-reduce. Only reuse the CPU bootstrap group.
+        # AITER exports pool handles with offset zero. Use its raw hipMalloc
+        # pool so even small allocations have an exportable allocation base.
+        # Scope this to initialization; do not change the model communicator.
+        with patch.dict(os.environ, {"AITER_CUSTOM_AR_RAW_INPUT_POOL": "1"}):
+            collective = CustomAllreduce(
+                group.cpu_group,
+                host.device,
+                max_size=max(1024 * 1024, host.max_num_tokens * local_width * itemsize),
+            )
+        if collective.disabled:
+            logger.warning("engram: private TP gather unavailable; using main stream")
+            return
+        self.collective = collective
+        for layer in host.layer_ids:
+            full_width = local_width * group.world_size
+            self.gathered[layer] = (
+                host.buffers[layer].gpu
+                if full_width == host.embed_width
+                else torch.empty(
+                    host.max_num_tokens,
+                    full_width,
+                    dtype=host.buffers[layer].gpu.dtype,
+                    device=host.device,
+                )
+            )
+        logger.info(
+            "engram: hash/UVA/TP gather on one side stream with private IPC state"
+        )
+
+    def prepare(self, step, width):
+        """Name the forward's inputs (`EngramStep`); `start` launches on them."""
+        if not 0 <= width <= self.host.max_num_tokens:
+            raise ValueError("Engram staging exceeds capacity")
+        self.step = step
+        return EngramStagedRows(self, width)
+
+    def _snapshot(self, width):
+        """Compressed ids, then the lookbacks the hashes read (and a verify
+        step's cursor candidates): before the cursor advance, they alias."""
+        step, tables = self.step, self.uva.hash_tables
+        compressed = self.compressed[:width]
+        engram_compress(
+            tables,
+            step.input_ids[:width],
+            dead_mask=step.dead[:width],
+            out=compressed,
+            live=step.live,
+        )
+        batch = EngramBatch(
+            compressed=compressed,
+            batch_ids=step.batch_ids[:width],
+            cu_seqlens=step.cu_seqlens,
+            history=step.cursor[:, 1:],
+            history_index=step.history_index,
+        )
+        engram_snapshot(
+            tables,
+            batch,
+            self.snapshot[:width],
+            cursor_positions=step.positions,
+            cursor_out=step.candidates,
+            live=step.live,
+        )
+
+    def _advance_cursor(self, width):
+        """A non-verify step's cursor, committed in place."""
+        step = self.step
+        if step.candidates is None:
+            engram_cursor_rows(
+                self.uva.hash_tables,
+                self.compressed[:width],
+                step.cu_seqlens,
+                step.positions,
+                step.cursor[:, 1:],
+                step.history_index,
+                step.cursor,
+                live=step.live,
+            )
+
+    def start(self, width):
+        host = self.host
+        self._snapshot(width)
+        compute = torch.cuda.current_stream(host.device)
+        # Get the parent BEFORE entering the guard: waiting on ourselves
+        # would neither order the inputs nor join the graph capture.
+        self.stream.wait_stream(compute)
+        # past the fork: the side stream reads the snapshot, not the cursor
+        self._advance_cursor(width)
+        with torch.cuda.stream(self.stream):
+            for layer in host.layer_ids:
+                ids = engram_snapshot_indices(
+                    self.uva.hash_tables,
+                    layer,
+                    self.snapshot[:width],
+                    self.uva.row_ids[:width],
+                )
+                table = host.prefetcher._tables[layer]
+                uva_gather_into(
+                    table,
+                    ids,
+                    self.flat[layer][:width].view(
+                        width, host.local_heads, table.head_dim
+                    ),
+                    head_start=host.head_start,
+                    local_heads=host.local_heads,
+                    total_heads=host.total_heads,
+                )
+                if self.collective is not None:
+                    out = self.gathered[layer][:width]
+                    # Use the communicator's pre-registered input pool. Direct
+                    # external registration in AITER assumes a zero IPC offset,
+                    # which is invalid for caching-allocator suballocations.
+                    self.collective.all_gather_unreg(
+                        self.flat[layer][:width], out=out, dim=1
+                    )
+                    if self.gathered[layer] is not host.buffers[layer].gpu:
+                        host.buffers[layer].gpu[:width].copy_(
+                            out[:, : host.embed_width]
+                        )
+                elif host._tp_group is None:
+                    host.buffers[layer].gpu[:width].copy_(self.flat[layer][:width])
+                # Ready means the complete embedding, including TP reassembly.
+                self.done[layer].record(self.stream)
+
+    def consume(self, layer, width):
+        host = self.host
+        torch.cuda.current_stream(host.device).wait_event(self.done[layer])
+        if host._tp_group is not None and self.collective is None:
+            out = self.flat[layer][:width]
+            out = host._tp_group.all_gather(out, use_custom=True, dim=1)
+            out = out[:, : host.embed_width]
+            host.buffers[layer].gpu[:width].copy_(out)
+
+    def join(self):
+        # Close the fork even if a partial forward did not consume every layer.
+        torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
+
+
+class EngramStagedRows(dict):
+    """A width-bound view, not a consumable pending queue.
+
+    Capture calls stage/get/join after warmup without another prepare.
+    Replay uses the frozen addresses; the step's own metadata fills them.
+    """
+
+    def __init__(self, staging, width):
+        super().__init__(
+            (layer, buffer.gpu[:width].unsqueeze(0))
+            for layer, buffer in staging.host.buffers.items()
+        )
+        self.staging, self.width = staging, width
+        self._fallback_ready = set()
+
+    def stage(self, *, tbo=False):
+        self._fallback_ready.clear()
+        self.staging.start(self.width)
+        # Only TBO must serialize shared-communicator gathers before workers
+        # start. Ordinary TP consumes each layer just before it is needed.
+        if tbo:
+            for layer in self.staging.fallback_done:
+                self.get(layer)
+
+    def get(self, layer, default=None):
+        if layer in self:
+            done = self.staging.fallback_done.get(layer)
+            if done is None or layer not in self._fallback_ready:
+                self.staging.consume(layer, self.width)
+                if done is not None:
+                    done.record()
+                    self._fallback_ready.add(layer)
+            elif done is not None:
+                torch.cuda.current_stream(self.staging.host.device).wait_event(done)
+        return super().get(layer, default)
+
+    def join(self):
+        self.staging.join()
+
+    def slice(self, token_slice):
+        return EngramRowsView(self, token_slice)
+
+
+class EngramRowsView(Mapping):
+    """Read-only token slices; every value access waits for the parent lookup.
+
+    Mapping routes get/items/values/dict copies through __getitem__, so none
+    can expose a device row without establishing its consumer dependency.
+    """
+
+    def __init__(self, parent, token_slice):
+        self._rows = {layer: rows[:, token_slice] for layer, rows in parent.items()}
+        self.parent = parent
+
+    def __getitem__(self, layer):
+        rows = self._rows[layer]
+        self.parent.get(layer)
+        return rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __len__(self):
+        return len(self._rows)
+
+
+@contextmanager
+def engram_staging(rows: Mapping[int, torch.Tensor], *, tbo=False):
+    """Own the parent fork/join; token views never restart its lookup."""
+    if not isinstance(rows, EngramStagedRows):
+        yield
+        return
+    try:
+        rows.stage(tbo=tbo)
+        yield
+    finally:
+        rows.join()

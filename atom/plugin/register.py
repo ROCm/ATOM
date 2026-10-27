@@ -2,38 +2,58 @@
 
 import logging
 import os
+from importlib import import_module
 
 from atom.config import Config
-from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
-from atom.models.glm4_moe import Glm4MoeForCausalLM
-from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
-from atom.models.minimax_m3 import (
-    MiniMaxM3SparseForCausalLM,
-    MiniMaxM3SparseForConditionalGeneration,
-)
-from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.models.qwen3_5 import (
-    Qwen3_5ForConditionalGenerationTextOnly,
-    Qwen3_5MoeForConditionalGenerationTextOnly,
-)
-from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
 logger = logging.getLogger("atom")
 
-_ATOM_SUPPORTED_MODELS = {
-    "Qwen3ForCausalLM": Qwen3ForCausalLM,
-    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
-    "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
-    "DeepseekV32ForCausalLM": DeepseekV3ForCausalLM,
-    "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
-    "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
-    "MiniMaxM3SparseForCausalLM": MiniMaxM3SparseForCausalLM,
-    "MiniMaxM3SparseForConditionalGeneration": MiniMaxM3SparseForConditionalGeneration,
-    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
-    "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
-}
+
+class _LazyModelRegistry(dict):
+    """Import only the requested architecture and its kernel dependencies."""
+
+    def __getitem__(self, name):
+        model = super().__getitem__(name)
+        if isinstance(model, str):
+            module_name, symbol = model.rsplit(":", 1)
+            model = getattr(import_module(module_name), symbol)
+            self[name] = model
+        return model
+
+    def get(self, name, default=None):
+        try:
+            return self[name]
+        except KeyError:
+            return default
+
+    def values(self):
+        for name in self:
+            self[name]
+        return super().values()
+
+    def items(self):
+        for name in self:
+            self[name]
+        return super().items()
+
+
+_ATOM_SUPPORTED_MODELS = _LazyModelRegistry(
+    {
+        "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
+        "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
+        "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
+        "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
+        "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
+        "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3:MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGenerationTextOnly",
+        "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGenerationTextOnly",
+        "Qwen4ExpForConditionalGeneration": "atom.models.qwen4_exp:Qwen4ExpForConditionalGeneration",
+    }
+)
 
 if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
@@ -45,6 +65,7 @@ if is_sglang():
         Qwen3_5MoeForCausalLM,
     )
     from atom.models.qwen3_next import Qwen3NextForCausalLM
+    from atom.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 
     _ATOM_SUPPORTED_MODELS.update(
         {
@@ -62,6 +83,8 @@ if is_sglang():
             # (BF16) attention projections.
             "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
             "KimiK3ForConditionalGeneration": KimiK3ForCausalLM,
+            # Qwen3.8-Flash-Next / Qwen4Exp — not Qwen3.5.
+            "Qwen4ExpForConditionalGeneration": Qwen4ExpForConditionalGeneration,
         }
     )
     _ATOM_SUPPORTED_DRAFT_MODELS = {
@@ -140,6 +163,15 @@ def _register_custom_attention_to_sglang() -> None:
         )
         return ATOMDeepseekV4BackendForSgl(runner)
 
+    @register_attention_backend("dsa")
+    def create_atom_dsa_backend(runner):
+        hf_config = runner.model_config.hf_config
+        if is_glm52_dsa_config(hf_config):
+            return create_glm52_backend(runner)
+        import sglang.srt.layers.attention.dsa_backend as sglang_dsa_backend
+
+        return sglang_dsa_backend.DeepseekSparseAttnBackend(runner)
+
     @register_attention_backend("nsa")
     def create_atom_nsa_backend(runner):
         hf_config = runner.model_config.hf_config
@@ -152,6 +184,41 @@ def _register_custom_attention_to_sglang() -> None:
     install_upstream_glm52_graph_metadata_adapter()
 
 
+def _keep_atom_backend_for_qwen_qsa() -> None:
+    """Stop SGLang from replacing ATOM's full-attention backend on Qwen QSA models.
+
+    Since v0.5.20 SGLang's hybrid-GDN backend wrapper swaps the full-attention
+    child for its own ``QwenSparseAttnBackend`` whenever ``is_qwen_qsa`` holds.
+    ATOM's Qwen4Exp runs its own QSA kernels and fills their CUDA-graph page
+    tables from ``ATOMAttnBackendForSgl.init_forward_metadata_out_graph``; with
+    the swap that hook never runs and graph capture fails on the unallocated
+    buffers. Report "not QSA" to SGLang only for Qwen4Exp models ATOM serves.
+    """
+    try:
+        import sglang.srt.layers.attention.qsa.config as sglang_qsa_config
+    except ImportError:
+        return
+    if getattr(sglang_qsa_config, "_atom_keep_backend_patched", False):
+        return
+    if "atom.plugin.sglang" not in os.environ.get("SGLANG_EXTERNAL_MODEL_PACKAGE", ""):
+        return
+
+    original_is_qwen_qsa = sglang_qsa_config.is_qwen_qsa
+
+    def is_qwen_qsa(config) -> bool:
+        arches = getattr(config, "architectures", None) or []
+        if any("Qwen4Exp" in str(arch) for arch in arches):
+            return False
+        return original_is_qwen_qsa(config)
+
+    sglang_qsa_config.is_qwen_qsa = is_qwen_qsa
+    sglang_qsa_config._atom_keep_backend_patched = True
+    logger.info(
+        "ATOM plugin: keep ATOMAttnBackendForSgl for Qwen4Exp QSA layers "
+        "(SGLang QwenSparseAttnBackend disabled)"
+    )
+
+
 def _patch_sglang_dsv4_draft_backends() -> None:
     """Route hard-coded speculative factories to ATOM-owned backends.
 
@@ -159,6 +226,10 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     of going through the attention registry.  SGLang's native backend asserts a
     native DeepSeekV4TokenToKVPool, while ATOM plugin mode uses a proxy KV pool,
     so patch the factory methods to return the ATOM shim.
+
+    SGLang 0.5.19 ``DraftBackendFactory._create_backend`` unpacks
+    ``stamp, backend = factory()``.  Both decode and draft-extend factories
+    must return that pair; a bare backend raises TypeError before lm_eval.
 
     GLM-5.2 uses SGLang's AITER multi-step lifecycle with ATOM's general
     attention backend.
@@ -178,16 +249,22 @@ def _patch_sglang_dsv4_draft_backends() -> None:
         return
 
     def _create_atom_dsv4_decode_backend(self):
-        return ATOMDeepseekV4BackendForSgl(
-            self.draft_model_runner,
-            topk=self.topk,
-            speculative_num_steps=self.speculative_num_steps,
+        return (
+            "dsv4",
+            ATOMDeepseekV4BackendForSgl(
+                self.draft_model_runner,
+                topk=self.topk,
+                speculative_num_steps=self.speculative_num_steps,
+            ),
         )
 
     def _create_atom_dsv4_prefill_backend(self):
-        return ATOMDeepseekV4BackendForSgl(
-            self.draft_model_runner,
-            skip_prefill=False,
+        return (
+            "dsv4",
+            ATOMDeepseekV4BackendForSgl(
+                self.draft_model_runner,
+                skip_prefill=False,
+            ),
         )
 
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
@@ -265,6 +342,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             )
         except Exception:
             return False
+
+    def _is_qwen4_exp_nextn_runner(runner) -> bool:
+        model_config = getattr(runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        return "Qwen4ExpForCausalLMNextN" in (
+            getattr(hf_config, "architectures", None) or []
+        )
 
     def _is_dsv4_or_glm52_nextn_runner(runner) -> bool:
         return _is_dsv4_nextn_runner(runner) or _is_glm52_nextn_runner(runner)
@@ -377,6 +461,12 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         include_v2=True
                     )
                 )
+                # GLM verify capture bakes max_seqlen_k. The V4 flag turns
+                # that replay on for every supported model; a 6-token prompt
+                # then faults inside the replayed kernel. Eager verify uses
+                # the live length. DeepSeek-V4 still follows the flag.
+                if _is_glm52_runner(model_runner) and is_target_verify:
+                    return False
                 if (
                     is_supported_model
                     and is_target_verify
@@ -385,14 +475,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     return False
                 if is_supported_model and is_draft_extend:
                     return False
-                if _is_glm52_runner(model_runner) and is_target_verify:
-                    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-                    if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
-                        return False
-                    max_seq_len = int(max(seq_lens_cpu))
-                    max_graph_seq_len = GLM52_GRAPH_SEQ_LEN_CAPACITY
-                    if max_seq_len > max_graph_seq_len:
-                        return False
             except Exception:  # noqa: S110
                 pass
             return original_can_run(self, forward_batch)
@@ -785,15 +867,22 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         backend.get_cuda_graph_seq_len_fill_value = (
                             lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
+            # Flash draft stays eager: mRoPE positions are [3, N], same as
+            # Native EagleProposer skipping mid-step graphs.
             skip_all_draft_graphs = (
                 _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG")
                 and not _draft_extend_graph_enabled(draft_runner)
                 and _is_dsv4_or_glm52_nextn_runner(draft_runner)
-            )
+            ) or _is_qwen4_exp_nextn_runner(draft_runner)
             original_capture_cuda_graphs = None
             if skip_all_draft_graphs:
                 original_capture_cuda_graphs = self._capture_cuda_graphs
-                self._capture_cuda_graphs = lambda: None
+
+                def _skip_draft_cuda_graphs(_self=self):
+                    _self.cuda_graph_runner = None
+                    _self.cuda_graph_runner_for_draft_extend = None
+
+                self._capture_cuda_graphs = _skip_draft_cuda_graphs
             original_draft_extend_backend = None
             hide_draft_extend_backend = (
                 not _draft_extend_graph_enabled(draft_runner)
@@ -1038,6 +1127,7 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     )
 
     _register_custom_attention_to_sglang()
+    _keep_atom_backend_for_qwen_qsa()
     _patch_sglang_dsv4_draft_backends()
     patch_sglang_eagle3_runtime_compat()
     _patch_sglang_dsv4_spec_cuda_graph()

@@ -7,7 +7,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import aiohttp
 import huggingface_hub.constants
@@ -37,12 +37,17 @@ class RequestFuncOutput:
     generated_text: str = ""
     success: bool = False
     latency: float = 0.0
-    output_tokens: int = 0
+    output_tokens: int | None = None
     ttft: float = 0.0  # Time to first token
-    itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    itl: list[float] = field(default_factory=list)  # List of inter-token latencies
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
+    request_start_ns: int = 0
+    request_end_ns: int = 0
+    full_response_duration_s: float | None = None
+    first_content_ns: int | None = None
+    content_ttft_s: float | None = None
 
 
 async def async_request_tgi(
@@ -270,6 +275,7 @@ async def async_request_openai_completions(
 
         generated_text = ""
         st = time.perf_counter()
+        output.request_start_ns = time.time_ns()
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -294,6 +300,9 @@ async def async_request_openai_completions(
                                 # e.g. for special tokens
                                 text = choices[0].get("text")
                                 timestamp = time.perf_counter()
+                                if text and output.first_content_ns is None:
+                                    output.first_content_ns = time.time_ns()
+                                    output.content_ttft_s = timestamp - st
                                 # First token
                                 if not first_chunk_received:
                                     first_chunk_received = True
@@ -306,7 +315,7 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
-                            elif usage := data.get("usage"):
+                            if usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
                     if first_chunk_received:
                         output.success = True
@@ -321,11 +330,14 @@ async def async_request_openai_completions(
                 else:
                     output.error = response.reason or ""
                     output.success = False
-        except Exception:
+            output.request_end_ns = time.time_ns()
+            output.full_response_duration_s = time.perf_counter() - st
+        except Exception:  # noqa: BLE001 - record request failures
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    output.request_end_ns = output.request_end_ns or time.time_ns()
     if pbar:
         pbar.update(1)
     return output
@@ -377,6 +389,7 @@ async def async_request_openai_chat_completions(
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
+        output.request_start_ns = time.time_ns()
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -395,6 +408,9 @@ async def async_request_openai_chat_completions(
 
                             if choices := data.get("choices"):
                                 content = choices[0]["delta"].get("content")
+                                if content and output.first_content_ns is None:
+                                    output.first_content_ns = time.time_ns()
+                                    output.content_ttft_s = timestamp - st
                                 # First token
                                 if ttft == 0.0:
                                     ttft = timestamp - st
@@ -405,7 +421,7 @@ async def async_request_openai_chat_completions(
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 generated_text += content or ""
-                            elif usage := data.get("usage"):
+                            if usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
 
                             most_recent_timestamp = timestamp
@@ -416,11 +432,14 @@ async def async_request_openai_chat_completions(
                 else:
                     output.error = response.reason or ""
                     output.success = False
-        except Exception:
+            output.request_end_ns = time.time_ns()
+            output.full_response_duration_s = time.perf_counter() - st
+        except Exception:  # noqa: BLE001 - record request failures
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    output.request_end_ns = output.request_end_ns or time.time_ns()
     if pbar:
         pbar.update(1)
     return output

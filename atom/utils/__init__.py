@@ -475,9 +475,11 @@ def split_zmq_path(path: str) -> tuple[str, str, str]:
 
     scheme = parsed.scheme
     host = parsed.hostname or ""
-    port = str(parsed.port or "")
+    # Port 0 is a request for the kernel to assign one, not a missing port, so
+    # it has to survive the emptiness check below.
+    port = "" if parsed.port is None else str(parsed.port)
 
-    if scheme == "tcp" and not all((host, port)):
+    if scheme == "tcp" and not (host and port):
         # The host and port fields are required for tcp
         raise ValueError(f"Invalid zmq path: {path}")
 
@@ -697,6 +699,18 @@ def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
+    def __setattr__(self, name, value):
+        if (
+            name in ("cpu", "gpu", "np")
+            and self.__dict__.get("_publication") is not None
+        ):
+            from atom.utils.h2d import PublicationError
+
+            raise PublicationError(
+                "bound metadata storage is fixed; recreate the buffer and owner"
+            )
+        object.__setattr__(self, name, value)
+
     def __init__(
         self,
         *size: int | torch.SymInt,
@@ -704,7 +718,12 @@ class CpuGpuBuffer:
         device: torch.device,
         pin_memory: bool = True,
         with_numpy: bool = True,
+        publication_group: str | None = None,
+        publication_unit: str = "rows",
     ) -> None:
+        self._publication = None
+        self.publication_group = publication_group
+        self.publication_unit = publication_unit
         self.cpu = torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
         self.gpu = torch.zeros_like(self.cpu, device=device)
         self.np: np.ndarray
@@ -719,7 +738,11 @@ class CpuGpuBuffer:
                 )
             self.np = self.cpu.numpy()
 
-    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
+    def copy_to_gpu(
+        self, n: int | None = None, *, republish_reason: str | None = None
+    ) -> torch.Tensor:
+        if self._publication is not None:
+            return self._publication.copy_to_gpu(n, republish_reason=republish_reason)
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
@@ -742,6 +765,8 @@ class CpuGpuBuffer:
             device=self.gpu.device,
             pin_memory=self.cpu.is_pinned(),
             with_numpy=hasattr(self, "np"),
+            publication_group=self.publication_group,
+            publication_unit=self.publication_unit,
         )
         new.cpu.copy_(self.cpu)
         new.gpu.copy_(self.gpu)
@@ -781,10 +806,10 @@ def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
 # OVERLAY it across shapes. That op is absent in some ROCm builds (no vLLM _C),
 # and a pure-Python weak ref is impossible: dlpack / set_(untyped_storage) both
 # share the Storage object and thus KEEP it alive -> the pool cannot reuse the
-# memory -> every captured piece's output accumulates (35GB+ on DSV4 TP8
-# PIECEWISE). We therefore JIT-compile a tiny `at::from_blob(..., no-op deleter)`
-# equivalent once (cached under ~/.cache/torch_extensions) so PIECEWISE cudagraph
-# pools overlay exactly like upstream vLLM.
+# memory -> every recorded region's output accumulates across buckets. We
+# therefore JIT-compile a tiny `at::from_blob(..., no-op deleter)` equivalent
+# once (cached under ~/.cache/torch_extensions) so token-graph pools overlay
+# exactly like upstream vLLM.
 _ATOM_WEAKREF_OP = None  # None = not attempted, False = unavailable, else callable
 
 
@@ -843,8 +868,8 @@ at::Tensor atom_weak_ref_tensor(at::Tensor input) {
             from aiter import logger as _logger
 
             _logger.warning(
-                "atom weak_ref_tensor JIT compile failed (%s); PIECEWISE "
-                "cudagraph pools will NOT overlay -> higher memory. Set "
+                "atom weak_ref_tensor JIT compile failed (%s); token "
+                "graph pools will NOT overlay -> higher memory. Set "
                 "ATOM_DISABLE_JIT_WEAKREF=1 to silence.",
                 _e,
             )
@@ -895,27 +920,18 @@ def weak_ref_tensors(
 
 @dataclasses.dataclass
 class CompilationCounter:
-    num_models_seen: int = 0
     num_graphs_seen: int = 0
     # including the splitting ops
     num_piecewise_graphs_seen: int = 0
     # not including the splitting ops
     num_piecewise_capturable_graphs_seen: int = 0
     num_backend_compilations: int = 0
-    # Number of gpu_model_runner attempts to trigger CUDAGraphs capture
-    num_gpu_runner_capture_triggers: int = 0
-    # Number of CUDAGraphs captured
-    num_cudagraph_captured: int = 0
     # InductorAdapter.compile calls
     num_inductor_compiles: int = 0
-    # EagerAdapter.compile calls
-    num_eager_compiles: int = 0
     # The number of time vLLM's compiler cache entry was updated
     num_cache_entries_updated: int = 0
     # The number of standalone_compile compiled artifacts saved
     num_compiled_artifacts_saved: int = 0
-    # Number of times a model was loaded with CompilationLevel.DYNAMO_AS_IS
-    dynamo_as_is_count: int = 0
 
     def clone(self) -> "CompilationCounter":
         return copy.deepcopy(self)

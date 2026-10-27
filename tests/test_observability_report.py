@@ -1,6 +1,8 @@
 import importlib.util
 import io
 import json
+import os
+import subprocess
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -13,6 +15,18 @@ _path = (
 _spec = importlib.util.spec_from_file_location("export_report", _path)
 report = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(report)
+
+
+@pytest.mark.parametrize(
+    "fraction", ["2", "27", "274", "2741", "27414", "274144", "274144682"]
+)
+@pytest.mark.parametrize("zone", ["Z", "+00:00"])
+def test_prometheus_scrape_timestamps_accept_variable_fractional_precision(
+    fraction, zone
+):
+    timestamp = report.timestamp(f"2026-09-09T09:03:10.{fraction}{zone}")
+    expected = report.timestamp("2026-09-09T09:03:10Z") + float("0." + fraction)
+    assert abs(timestamp - expected) < 0.000002
 
 
 def test_prometheus_export_uses_real_response_values_and_keeps_missing_points(
@@ -35,11 +49,14 @@ def test_prometheus_export_uses_real_response_values_and_keeps_missing_points(
     monkeypatch.setattr(report.urllib.request, "urlopen", response)
     output = tmp_path / "report.html"
     data = report.generate_report("http://prometheus.example", 100, 110, output)
-    assert len(queries) == 20
     assert any('role="prefill",streaming="false"' in q for q in queries)
     assert any("histogram_quantile(0.9," in q for q in queries)
     for panel in data["panels"]:
-        for points in panel["series"].values():
+        for points in [
+            *panel["series"].values(),
+            *panel.get("block_counts", {}).values(),
+            *panel.get("cache_counts", {}).values(),
+        ]:
             assert points == [[100.0, None], [105.0, 6.25], [110.0, None]]
     text = output.read_text()
     embedded = text.split('<script id="report-data" type="application/json">')[1].split(
@@ -82,5 +99,252 @@ def test_failed_source_does_not_overwrite_previous_report(monkeypatch, tmp_path)
 def test_invalid_json_values_are_rejected(value, tmp_path):
     data = report.demo_data()
     data["panels"][0]["series"]["p99"][0][1] = value
-    with pytest.raises(ValueError, match="Latency"):
+    with pytest.raises(ValueError, match="Metric values"):
         report.write_report(data, tmp_path / "report.html")
+
+
+def test_scheduler_queries_keep_units_and_gauge_semantics():
+    panels = {p["id"]: p for p in report.panels_for("pd")}
+    batch = report.query_for(panels["decode_batch_size"], "mean", 60)
+    assert batch.startswith("1 * ") and "rate(atom:decode_batch_size_sum" in batch
+    queue = report.query_for(panels["decode_queues"], "waiting", 60)
+    assert 'state="waiting"' in queue and "rate(" not in queue
+    kv = report.query_for(panels["prefill_kv_blocks"], "used", 60)
+    assert kv.startswith("100 * sum(") and 'state="total"' in kv
+    assert "rate(" not in kv
+    used_count = report.block_count_query_for(panels["prefill_kv_blocks"], "used")
+    total_count = report.block_count_query_for(panels["decode_kv_blocks"], "total")
+    assert (
+        used_count
+        == 'sum(atom:scheduler_kv_cache_blocks{job="atom",role="prefill",state="used"})'
+    )
+    assert (
+        total_count
+        == 'sum(atom:scheduler_kv_cache_blocks{job="atom",role="decode",state="total"})'
+    )
+    transfer = report.query_for(panels["pd_kv_transfer"], "p99", 60)
+    assert 'role="decode"' in transfer and "histogram_quantile(0.99," in transfer
+    assert panels["decode_batch_size"]["unit"] == "requests"
+    assert panels["prefill_kv_blocks"]["unit"] == "%"
+    assert "pd_kv_transfer" not in {p["id"] for p in report.panels_for("standalone")}
+
+
+def test_grouped_queries_preserve_instances_and_weight_ratios():
+    panels = {p["id"]: p for p in report.panels_for("pd")}
+    cache = report.query_for(panels["prefill_cache_hit"], "reuse", 60, by_instance=True)
+    assert cache.count("sum by (instance)") == 3
+    assert "increase(atom:prefix_cache_cached_tokens_total" in cache
+    assert "increase(atom:prefix_cache_offload_tokens_total" in cache
+    assert "increase(atom:prefix_cache_full_tokens_total" in cache
+    assert "avg(" not in cache
+    latency = report.query_for(
+        panels["decode_gpu_forward"], "p99", 60, by_instance=True
+    )
+    assert "histogram_quantile(0.99, sum by (instance, le)" in latency
+    aggregate = report.query_for(panels["decode_gpu_forward"], "p99", 60)
+    assert "sum by (le)" in aggregate and "instance" not in aggregate
+    assert panels["decode_context_tokens"]["unit"] == "tokens"
+    standalone = {p["id"]: p for p in report.panels_for("standalone")}
+    for phase in ("prefill", "decode"):
+        request = panels[f"{phase}_request_context_tokens"]
+        assert f'role="{phase}"' in request["selector"]
+        assert request["kind"] == "requests" and request["phase"] == phase
+        assert report.statistics_for(request) == ()
+        query = report.request_context_query(request, 100, 110)
+        assert f"max_over_time(atom:{phase}_request_context_tokens{{" in query
+        assert "request_id, sequence_id, started_at" in query
+        service = standalone[f"{phase}_request_context_tokens"]
+        assert 'role="standalone"' in service["selector"]
+        assert service["phase"] == phase
+        assert 'role="standalone"' in standalone[f"{phase}_context_tokens"]["selector"]
+    assert (
+        'role="standalone"' in standalone["standalone_request_gpu_forward"]["selector"]
+    )
+
+
+@pytest.mark.parametrize("deployment", ["pd", "standalone"])
+def test_context_and_gpu_queries_preserve_units_and_instance_histograms(deployment):
+    panels = {p["metric"]: p for p in report.panels_for(deployment)}
+    for metric, scale in (
+        ("atom:prefill_context_tokens", 1),
+        ("atom:decode_context_tokens", 1),
+        ("atom:prefill_request_gpu_forward_seconds", 1000),
+    ):
+        panel = panels[metric]
+        mean = report.query_for(panel, "mean", 60, by_instance=True)
+        assert mean.startswith(f"{scale} * ")
+        assert f"{metric}_sum" in mean and f"{metric}_count" in mean
+        percentile = report.query_for(panel, "p99", 60, by_instance=True)
+        assert "histogram_quantile(0.99, sum by (instance, le)" in percentile
+        assert f"{metric}_bucket" in percentile
+
+
+def test_instance_queries_retain_missing_values_and_do_not_average_percentiles(
+    monkeypatch, tmp_path
+):
+    def response(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)["query"][0]
+        values = [{"metric": {}, "values": [[100, "12"], [105, "18"]]}]
+        if "by (instance" in query:
+            values = [
+                {"metric": {"instance": host}, "values": [[100, value], [105, "NaN"]]}
+                for host, value in [("node-a:8010", "10"), ("node-b:8010", "30")]
+            ]
+        return io.BytesIO(
+            json.dumps({"status": "success", "data": {"result": values}}).encode()
+        )
+
+    monkeypatch.setattr(report.urllib.request, "urlopen", response)
+    data = report.generate_report("http://fixture", 100, 110, tmp_path / "report.html")
+    panel = next(p for p in data["panels"] if p["id"] == "prefill_ttft")
+    assert panel["series"]["p99"][0][1] == 12
+    assert panel["instances"]["node-a:8010"]["series"]["p99"] == [
+        [100, 10],
+        [105, None],
+    ]
+    assert panel["instances"]["node-b:8010"]["series"]["p99"][0][1] == 30
+    assert {"role": "prefill", "instance": "node-b:8010"} in data["meta"]["instances"]
+    cache = next(p for p in data["panels"] if p["id"] == "prefill_cache_hit")
+    assert cache["instances"]["node-a:8010"]["cache_counts"]["gpu"][0][1] == 10
+    assert cache["instances"]["node-a:8010"]["cache_counts"]["lmcache"][0][1] == 10
+    data["panels"][0]["instances"]["bad:1"] = {"series": {"p99": [[100, -1]]}}
+    with pytest.raises(ValueError, match="Metric values"):
+        report.write_report(data, tmp_path / "bad.html")
+
+
+def test_archived_gpu_only_cache_report_keeps_its_original_meaning(tmp_path):
+    data = report.demo_data()
+    panel = next(p for p in data["panels"] if p.get("kind") == "cache")
+    panel.pop("cache_breakdown")
+    panel.pop("instances")
+    panel["series"] = {"hit": panel["series"]["gpu"]}
+    panel["cache_counts"] = {
+        "cached": panel["cache_counts"]["gpu"],
+        "prompt": panel["cache_counts"]["prompt"],
+    }
+    report.write_report(data, tmp_path / "legacy.html")
+    assert report.statistics_for(panel) == ("hit",)
+    query = report.query_for(panel, "hit", 60)
+    assert "offload" not in query
+    assert set(panel["series"]) == {"hit"}
+
+
+@pytest.mark.skipif(
+    not os.environ.get("ATOMESH_TEST_PROMTOOL_BIN"),
+    reason="Set ATOMESH_TEST_PROMTOOL_BIN for PromQL tier coverage checks",
+)
+@pytest.mark.parametrize("missing", [True, False])
+def test_cache_reuse_queries_distinguish_missing_tier_from_zero(tmp_path, missing):
+    panel = next(p for p in report.panels_for("pd") if p["id"] == "prefill_cache_hit")
+    series = []
+    for instance, gpu, offload, prompt in (
+        ("a:8010", 8, 1, 10),
+        ("b:8010", 20, 0, 100),
+    ):
+        for suffix, increment in (
+            ("cached", gpu),
+            ("offload", offload),
+            ("full", prompt),
+        ):
+            if missing and instance == "b:8010" and suffix == "offload":
+                continue
+            series.append(
+                {
+                    "series": f'atom:prefix_cache_{suffix}_tokens_total{{job="atom",role="prefill",instance="{instance}"}}',
+                    "values": f"0+{increment}x8",
+                }
+            )
+    checks = []
+    for grouped in (False, True):
+        expected = [{"labels": '{instance="a:8010"}', "value": 90}] if grouped else []
+        if not missing:
+            expected = (
+                [*expected, {"labels": '{instance="b:8010"}', "value": 20}]
+                if grouped
+                else [{"labels": "{}", "value": 100 * 29 / 110}]
+            )
+        checks.append(
+            {
+                "expr": report.query_for(panel, "reuse", 60, by_instance=grouped),
+                "eval_time": "120s",
+                "exp_samples": expected,
+            }
+        )
+    fixture = tmp_path / "cache-coverage.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "tests": [
+                    {
+                        "interval": "15s",
+                        "input_series": series,
+                        "promql_expr_test": checks,
+                    }
+                ]
+            }
+        )
+    )
+    result = subprocess.run(
+        [os.environ["ATOMESH_TEST_PROMTOOL_BIN"], "test", "rules", str(fixture)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_request_context_uses_dispatch_times_and_deduplicates_scrapes(monkeypatch):
+    def vector(request, sequence, started, instance="node:8020"):
+        return {
+            "metric": {
+                "request_id": request,
+                "sequence_id": sequence,
+                "started_at": str(started),
+                "instance": instance,
+            },
+            "values": [[100, "8000"], [105, "8000"], [110, "8000"]],
+        }
+
+    vectors = [
+        vector("reused-id", "1", 101),
+        vector("reused-id", "1", 101),
+        vector("reused-id", "2", 102),
+        vector("other", "1", 101, "other:8020"),
+        vector("old", "3", 99),
+        vector("future", "4", 111),
+    ]
+    monkeypatch.setattr(report, "_fetch_vectors", lambda *args: vectors)
+    records = report.fetch_request_context("http://fixture", "query", 100, 110)
+    assert len(records) == 3
+    assert [r["timestamp"] for r in records] == [101, 101, 102]
+    assert all(r["context_tokens"] == 8000 for r in records)
+    assert len([r for r in records if r["request_id"] == "reused-id"]) == 2
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_request_context_collects_per_instance_and_round_trips(
+    monkeypatch, tmp_path, phase
+):
+    records = [
+        {
+            "timestamp": 105.123,
+            "request_id": "</script><request>",
+            "sequence_id": "7",
+            "instance": "node:8020",
+            "context_tokens": 12345,
+        }
+    ]
+    monkeypatch.setattr(report, "fetch_request_context", lambda *args: records)
+    monkeypatch.setattr(report, "fetch_series", lambda *args: [[100, 1], [110, 1]])
+    monkeypatch.setattr(report, "fetch_instance_series", lambda *args: {})
+    data = report.generate_report("http://fixture", 100, 110, tmp_path / "report.html")
+    panel = next(p for p in data["panels"] if p.get("phase") == phase)
+    assert panel["records"] == records
+    assert panel["instances"]["node:8020"]["records"] == records
+    assert panel["series"] == {}
+    assert {"role": phase, "instance": "node:8020"} in data["meta"]["instances"]
+    assert "</script><request>" not in (tmp_path / "report.html").read_text()
+    panel["records"][0]["context_tokens"] = -1
+    with pytest.raises(ValueError, match="context_tokens"):
+        report.validate_data(data)

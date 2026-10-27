@@ -12,17 +12,20 @@ from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
+)
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
+    NVFP4_DTYPE,
     LayerQuantConfig,
     get_quant_parser,
 )
-from atom.utils import envs, get_open_port
+from atom.utils import envs
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 
 if TYPE_CHECKING:
@@ -44,9 +47,20 @@ class KVCacheTensor:
     v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
-    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
-    # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
+    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major.
+    # Its per-block shape follows ``--index_cache_dtype``: the FP8 row is
+    # ``(num_blocks, block_size, aligned_index_dim)``, while FP4 is the packed
+    # E2M1 plane ``(num_blocks, k_tiles, 4, block_size, 16)`` that
+    # ``fp4_index_block_shapes`` fixes, paired with ``index_scale`` below.
+    # Omitted for non-DSA layers.
     index_cache: torch.Tensor | None = None
+    # The e8m0 scale plane paired with ``index_cache`` under
+    # ``--index_cache_dtype fp4``, block-major over the same block axis. None on
+    # every other layer, FP8 indexers included. The FP4 index region is two
+    # planes, not one: a mover that takes ``index_cache`` alone restores keys
+    # without their exponents, and every index it computes stays in bounds while
+    # doing it. Whatever moves one must move the other.
+    index_scale: torch.Tensor | None = None
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried
     # here because the layer-id -> linear-attn-index mapping already lives in
@@ -75,20 +89,13 @@ class KVCacheConfig:
 
 
 class CUDAGraphMode(enum.Enum):
-    """Constants for the cudagraph mode in CompilationConfig.
-    Meanwhile, the subset enum `NONE`, `PIECEWISE` and `FULL` are also
-    treated as concrete runtime mode for cudagraph runtime dispatching.
-    """
+    """Constants for the cudagraph mode in CompilationConfig."""
 
     NONE = 0
-    PIECEWISE = 1
+    TR_HYBRID = 1
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
-    FULL_AND_PIECEWISE = (FULL, PIECEWISE)
-    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
-    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
-    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
-    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
+    FULL_AND_TR_HYBRID = (FULL, TR_HYBRID)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
@@ -96,15 +103,10 @@ class CUDAGraphMode(enum.Enum):
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
 
-    def is_attn_ffn_piecewise(self) -> bool:
-        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
-        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
-        return self is CUDAGraphMode.AF_PIECEWISE
-
-    def requires_piecewise_compilation(self) -> bool:
+    def uses_tr_hybrid(self) -> bool:
         return (
-            self.decode_mode() == CUDAGraphMode.PIECEWISE
-            or self.mixed_mode() == CUDAGraphMode.PIECEWISE
+            self.decode_mode() == CUDAGraphMode.TR_HYBRID
+            or self.mixed_mode() == CUDAGraphMode.TR_HYBRID
         )
 
     def max_cudagraph_mode(self) -> "CUDAGraphMode":
@@ -139,7 +141,6 @@ class CompilationConfig:
     use_cudagraph: bool = True
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
-    # cudagraph_capture_sizes: Optional[list[int]] = [1,2,4,8]
     cudagraph_capture_sizes: list[int] | None = None
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
@@ -165,41 +166,32 @@ class CompilationConfig:
     The mode of the cudagraph:
 
     - NONE, no cudagraph capture.
-    - PIECEWISE. (v1 default)
+    - TR_HYBRID. (default at level 3)
     - FULL.
     - FULL_DECODE_ONLY.
-    - FULL_AND_PIECEWISE.
-    - AF_PIECEWISE.
+    - FULL_AND_TR_HYBRID.
 
-    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
-    core is ALSO captured into its own cudagraph with zero-copy public buffers
-    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
-    attention gap between the dense pieces. Falls back to plain PIECEWISE
-    behavior for models that don't implement the attention-core capture.
-
-    PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
-    incompatiable ops (i.e. some attention ops) outside the cudagraph
-    for general flexibility.
-    This is the default mode.
+    TR_HYBRID mode mixes token graphs and request graphs: the compiled forward
+    is recorded as a `TokenGraph` per token bucket, breaking only at the split
+    ops whose launches depend on host data (`eager_region`), which run between
+    its segments -- eagerly, or as a `ReqGraph` where the request bucket fixes
+    their launches.
 
     FULL mode: Capture full cudagraph for all batches. Can be good for small
     models or workloads with small prompts; not supported by many backends.
-    Generally for performance FULL_AND_PIECEWISE is better.
 
     FULL_DECODE_ONLY mode: Capture full cudagraph for decode batches only.
     Mixed prefill-decode batches are run without cudagraphs. Can be good for
     decode instances in a P/D setup where prefill is not as important so we
     can save some memory.
 
-    FULL_AND_PIECEWISE mode: Capture full cudagraph for decode batches and
-    piecewise cudagraph for prefill and mixed prefill-decode batches.
-    This is like the most performant mode for most models.
+    FULL_AND_TR_HYBRID mode: the native runner records it as TR_HYBRID --
+    decode replays token graphs too, not a full graph (`_tr_hybrid_active`).
 
-    Currently, the cudagraph mode is only used for the v1 engine.
     Note that the cudagraph logic is generally orthogonal to the
-    compilation logic. While piecewise cudagraphs require piecewise
-    compilation (level=PIECEWISE and non-empty splitting_ops), full
-    cudagraphs are supported with and without compilation.
+    compilation logic: full cudagraphs and token graphs are recorded with and
+    without compilation; piecewise compilation (level=PIECEWISE and non-empty
+    splitting_ops) only decides where the compiled pieces split.
 
     Warning: This flag is new and subject to change in addition
     more modes may be added.
@@ -219,7 +211,8 @@ class CompilationConfig:
     are always used, it can set this to False. Otherwise, it should
     set this to True, and the compiler will copy the input to an
     internally managed buffer. Default is False.
-    Note that this flag is only effective when cudagraph_mode is PIECEWISE.
+    Note that this flag is only effective at level 3, whenever cudagraph_mode
+    is not NONE (`VllmBackend`).
     """
 
     inductor_compile_config: dict = field(default_factory=dict)
@@ -337,7 +330,8 @@ class QuantizationConfig:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time.
+        # models at load time. For IQ2R only the non-IQ2R layers qualify;
+        # should_skip_online_quant keeps the IQ2R experts as they are.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
@@ -349,7 +343,9 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "modelopt",
             "compressed-tensors",
+            "iq2r",
         ]:
             self.online_quant = True
             if self.quant_method == "compressed-tensors":
@@ -374,6 +370,44 @@ class QuantizationConfig:
         self.global_spec = parsed_quant_config.global_spec
         self.layer_pattern_specs = parsed_quant_config.layer_pattern_specs
         self.exclude_layers = list(parsed_quant_config.exclude_layers)
+        self._validate_nvfp4_online_quant()
+
+    def _validate_nvfp4_online_quant(self):
+        """Reject NVFP4 checkpoint specs when no online config was given.
+
+        NVFP4 runs only after online conversion to MXFP4. This fails while the
+        config is parsed, before any layer is built;
+        `validate_nvfp4_online_target` checks each NVFP4 layer's target as it
+        is built.
+        """
+        if self.online_quant:
+            return
+        specs = [self.global_spec, *(spec for _, spec in self.layer_pattern_specs)]
+        if any(spec.quant_dtype == NVFP4_DTYPE for spec in specs):
+            raise ValueError(
+                "The checkpoint has NVFP4 layers, but no online quantization "
+                "config was given. NVFP4 weights cannot run directly: pass "
+                "--online_quant_config with an mxfp4 target, for example "
+                '\'{"global_quant_config": "mxfp4"}\'.'
+            )
+
+    @property
+    def blockscale_e8m0_scale(self) -> bool:
+        """Whether 128x128 FP8 block scales (weight and activation) are E8M0.
+
+        ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE decides when set. Otherwise E8M0 on
+        every arch but gfx942, and only for a checkpoint whose scales are
+        declared ``scale_fmt: ue8m0`` (DeepSeek-V4): those are powers of two, so
+        E8M0 restates them exactly, while an FP32 scale loaded into an E8M0
+        parameter would be rounded, altering the weight.
+        """
+        if envs.is_set("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE"):
+            return envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+        if (self.hf_quant_config or {}).get("scale_fmt") != "ue8m0":
+            return False
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx() != "gfx942"
 
     # -- typed API (preferred) ----------------------------------------------
 
@@ -427,7 +461,7 @@ class QuantizationConfig:
         return self.global_spec.quant_type
 
     @property
-    def quant_dtype(self) -> torch.dtype:
+    def quant_dtype(self) -> torch.dtype | str:
         return self.global_spec.quant_dtype
 
     @property
@@ -537,10 +571,11 @@ class QuantizationConfig:
         self,
         hf_config: PretrainedConfig,
         packed_modules_mapping: dict | None = None,
-        weights_mapper={},
+        weights_mapper: dict | None = None,
         quant_exclude_name_mapping: dict[str, str] | None = None,
     ):
         model_type = hf_config.model_type
+        weights_mapper = weights_mapper or {}
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
@@ -558,9 +593,10 @@ class QuantizationConfig:
                     "gate_proj": ("gate_up_proj", 0),
                     "up_proj": ("gate_up_proj", 1),
                 }
-        elif model_type == "qwen3_moe" or model_type == "qwen3_next":
-            if getattr(hf_config, "mlp_only_layers", []):
-                self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        elif model_type in ("qwen3_moe", "qwen3_next") and getattr(
+            hf_config, "mlp_only_layers", []
+        ):
+            self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
 
         if weights_mapper:
             self.exclude_layers = [
@@ -597,6 +633,13 @@ class QuantizationConfig:
         for name in self.exclude_layers:
             new_exclude.extend(_remap_layer_name(name))
         self.exclude_layers = list(dict.fromkeys(new_exclude))
+
+        # Both lists have been through the same remap here, which is what makes
+        # them comparable; `quant_exclude_name_mapping` below rewrites only the
+        # exclude side.
+        if self.quant_method == "modelopt":
+            self._validate_packed_layer_specs()
+
         if self.online_quant:
             new_online_pattern_specs = []
             for pattern, spec in self.online_layer_pattern_specs:
@@ -615,28 +658,64 @@ class QuantizationConfig:
         if quant_exclude_name_mapping:
             self.apply_exclude_name_mapping(quant_exclude_name_mapping)
 
+    def _validate_packed_layer_specs(self):
+        """Reject fused parameters whose source projections disagree.
 
-# Rows per block that `deepgemm_fp8_paged_mqa_logits` requires to stay in its
-# preshuffled layout, which is the only layout it computes correctly -- with
-# `Preshuffle=False` it disagrees with the flat `fp8_mqa_logits` kernel by ~100%
-# at every block size, and aiter's assert guards only the preshuffle side. Any
-# cache that kernel pages over must therefore hold a multiple of this many rows
-# per block. Sizing constants belong to whoever enforces them, and the block
-# size is set here.
-_MQA_LOGITS_PRESHUFFLE_ROWS = 16
+        ModelOpt records one entry per source projection, while ATOM builds one
+        packed parameter per fused name. Siblings that disagree collapse into
+        duplicate patterns during the remap above, and `get_layer_quant_config`
+        returns whichever comes first -- so a packed (N, K/2) uint8 NVFP4 weight
+        can be loaded into an (N, K) fp8 parameter with nothing said.
+
+        A projection absent from the config is deliberately not an error: a
+        model's packed mapping lists every projection that *may* fuse, and real
+        exports legitimately omit the ones a given layer does not have (M3 has
+        `index_q_proj`/`index_k_proj` only on its indexer layers).
+        """
+        seen: dict[str, LayerQuantConfig] = {}
+        for pattern, spec in self.layer_pattern_specs:
+            previous = seen.setdefault(pattern, spec)
+            if previous != spec:
+                raise ValueError(
+                    f"Conflicting quantization specs for packed layer {pattern!r}: "
+                    f"{previous} vs {spec}. Source projections fused into one ATOM "
+                    "parameter must share one spec."
+                )
+        for pattern in seen:
+            # FusedMoE resolves its experts container with check_children=True,
+            # so an exclude entry naming one expert de-quantizes all of them.
+            if self._is_excluded(pattern, self.exclude_layers, check_children=True):
+                raise ValueError(
+                    f"Packed layer {pattern!r} is quantized by at least one source "
+                    "projection and excluded by another. Exclude all of them or "
+                    "none: a partial exclusion de-quantizes the whole fused layer "
+                    "to bf16 while the checkpoint still holds packed weights."
+                )
 
 
 def glm5_kpool_block_size(index_kpool: int) -> int:
     """Tokens per KV block that lets GLM-5.3's pooled index cache be exact.
 
     A block of B tokens needs ``B // index_kpool`` index rows, and that count
-    must be a multiple of `_MQA_LOGITS_PRESHUFFLE_ROWS`. The smallest B that
+    must be a multiple of `MQA_LOGITS_PRESHUFFLE_ROWS`. The smallest B that
     satisfies it is the product, and the smallest is what we want: a larger
     block only adds paging waste, while a smaller one forces the cache to be
     padded back up to one row per token -- which is the whole cost being
     removed here.
     """
-    return index_kpool * _MQA_LOGITS_PRESHUFFLE_ROWS
+    return index_kpool * MQA_LOGITS_PRESHUFFLE_ROWS
+
+
+def _glm5_next_unsupported_features(config: "Config") -> list[str]:
+    """Return parallel modes that do not yet preserve GLM-5.3 k-pool state."""
+    unsupported = []
+    if config.prefill_context_parallel_size > 1:
+        unsupported.append("PCP")
+    if config.decode_context_parallel_size > 1:
+        unsupported.append("DCP")
+    if config.enable_tbo or config.enable_tbo_decode:
+        unsupported.append("TBO")
+    return unsupported
 
 
 _CONFIG_REGISTRY: dict[str, str] = {
@@ -663,18 +742,20 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
     "glm5_next": "text_config",  # GLM-5.3-Flash: text-only hybrid KDA/DSA runtime
+    "qwen4_exp": "text_config",
 }
 
 # Text sub-config model_types that this image's transformers has no class for.
 # Loaded as a bare PretrainedConfig; the ATOM model normalizes the aliases it
 # needs at construction time.
 _PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
-    {"kimi_linear", "glm5_next_text"}
+    {"kimi_linear", "glm5_next_text", "qwen4_exp_text"}
 )
 
 # multimodal models fully supported by plugin mode
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
+    "kimi_k3",
     "qwen3_5",
     "qwen3_5_moe",
 }
@@ -685,6 +766,10 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         model,
     )
     model_type = config_dict.get("model_type")
+    if model_type == "deepseek_v41":
+        from atom.models.deepseek_v41.config import normalize_hf_config
+
+        return normalize_hf_config(config_dict)
 
     def _get_hf_token() -> str | None:
         token = os.getenv("HF_TOKEN")
@@ -778,7 +863,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code
         )
-    except ValueError as e:
+    except ValueError:
         # For the unsupported model in current transformers, try vllm if in plugin mode
         if is_vllm():
             from vllm.transformers_utils.config import get_config
@@ -789,7 +874,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             hf_config = get_config(model, trust_remote_code=trust_remote_code)
             hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
         else:
-            raise e
+            raise
     return hf_config
 
 
@@ -819,16 +904,77 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     return False
 
 
+_MINIMAX_M3_MLP_LAYER_TYPES = {"dense": 0, "sparse": 1}
+
+
+def _normalize_minimax_m3_mlp_layer_types(config: PretrainedConfig) -> None:
+    """Express `mlp_layer_types` as the `moe_layer_freq` list the model reads.
+
+    MiniMax-M3 exports carry one of the two fields, and a config without
+    `moe_layer_freq` builds every layer as MoE, so a list that cannot be read
+    exactly must fail here rather than build the wrong layers.
+    """
+    layer_types = getattr(config, "mlp_layer_types", None)
+    if layer_types is None:
+        return
+    num_layers = config.num_hidden_layers
+    if len(layer_types) != num_layers:
+        raise ValueError(
+            f"MiniMax-M3 mlp_layer_types has {len(layer_types)} entries, but "
+            f"num_hidden_layers is {num_layers}."
+        )
+    unknown = sorted(
+        {repr(label) for label in layer_types}
+        - {repr(label) for label in _MINIMAX_M3_MLP_LAYER_TYPES}
+    )
+    if unknown:
+        raise ValueError(
+            f"MiniMax-M3 mlp_layer_types has unknown labels {', '.join(unknown)}; "
+            "expected 'dense' or 'sparse'."
+        )
+    moe_layer_freq = [_MINIMAX_M3_MLP_LAYER_TYPES[label] for label in layer_types]
+    existing = getattr(config, "moe_layer_freq", None)
+    if existing is None:
+        config.moe_layer_freq = moe_layer_freq
+    elif (
+        not isinstance(existing, (list, tuple))
+        or [int(freq != 0) for freq in existing] != moe_layer_freq
+    ):
+        raise ValueError(
+            "MiniMax-M3 config sets both mlp_layer_types and moe_layer_freq, and "
+            "they disagree on which layers are MoE."
+        )
+
+
 def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    if isinstance(text_config, dict):
+        # The remote MiniMaxM3VLConfig bundled with some exports (MiniMax-M3.1)
+        # coerces text_config in a way transformers 5 undoes, leaving the raw
+        # dict. The text block has no model_type, so keep every field as a
+        # plain PretrainedConfig attr.
+        text_config = PretrainedConfig.from_dict(text_config)
+        hf_config.text_config = text_config
+    if text_config is not None and text_config is not hf_config:
+        # Some exports (Quark NVFP4) carry the layer layout on the VL root; it
+        # replaces the text config's own, then is checked like any other.
+        for attr_name in ("mlp_layer_types", "moe_layer_freq"):
+            attr_value = getattr(hf_config, attr_name, None)
+            if attr_value is not None:
+                setattr(text_config, attr_name, attr_value)
+    _normalize_minimax_m3_mlp_layer_types(
+        text_config if text_config is not None else hf_config
+    )
     if text_config is None or text_config is hf_config:
         return
 
-    if getattr(text_config, "hidden_act", None) == "swigluoai":
-        if getattr(text_config, "swiglu_beta", None) is None:
-            text_config.swiglu_beta = 1.0
+    if (
+        getattr(text_config, "hidden_act", None) == "swigluoai"
+        and getattr(text_config, "swiglu_beta", None) is None
+    ):
+        text_config.swiglu_beta = 1.0
 
     for attr_name in (
         "use_index_cache",
@@ -884,7 +1030,10 @@ class ParallelConfig:
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
-    data_parallel_base_port: int = get_open_port()
+    data_parallel_base_port: int = 0
+    """Model-runner rendezvous port. Zero requests an OS-assigned port locally."""
+    _managed_distributed_store: bool = field(default=False, init=False, repr=False)
+    """CoreManager owns the store; every model runner connects as a client."""
 
     data_parallel_master_ip: str = "127.0.0.1"
 
@@ -934,17 +1083,6 @@ class ParallelConfig:
             backend="gloo",
         )
         return dp_group
-
-    @staticmethod
-    def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
-        tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
-        # dp rank 0: has_unfinished_seqs=True
-        # dp rank 1: has_unfinished_seqs=False
-        # aggregated: has_unfinished_seqs=True
-        # so this is an OR operation, i.e. MAX in integers
-        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
-        aggregated_has_unfinished = bool(tensor.item())
-        return aggregated_has_unfinished
 
     def compute_hash(self):
         """
@@ -1033,6 +1171,47 @@ def _resolve_sequential_drafter_max_spec(
     return _SERIAL_MTP_DEFAULT_MAX_SPEC
 
 
+# Standalone DSpark draft architectures: their own checkpoint, normalized by
+# `_normalize_draft_dspark_config`. Inline drafts (V4-Pro-DSpark) are not
+# listed; they ship inside the target checkpoint and are told by
+# `dspark_block_size`.
+_STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset(
+    {"K3DSparkModel", "DSparkMiniMaxDraftModel"}
+)
+# Where the standalone drafts name each field ATOM reads, in lookup order:
+# Kimi-K3's top-level names, then MiniMax-M3.1's `dspark_*` names and its DFlash
+# geometry under `dflash_config`. A dotted alias reads into that sub-config.
+_STANDALONE_DSPARK_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "dspark_target_layer_ids": (
+        "target_layer_ids",
+        "dspark_target_layer_ids",
+        "dflash_config.target_layer_ids",
+    ),
+    "dspark_noise_token_id": (
+        "mask_token_id",
+        "dspark_noise_token_id",
+        "dflash_config.mask_token_id",
+    ),
+    "dspark_markov_rank": ("markov_rank", "dspark_markov_rank"),
+}
+
+
+def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
+    """The value of the first alias of `field` the draft config sets, or None."""
+    for alias in _STANDALONE_DSPARK_FIELD_ALIASES[field]:
+        value = hf_config
+        for part in alias.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = getattr(value, part, None)
+            if value is None:
+                break
+        if value is not None:
+            return value
+    return None
+
+
 def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
@@ -1041,32 +1220,34 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
 
     - INLINE (e.g. V4-Pro-DSpark) ships inside the target checkpoint and already
       uses the ``dspark_*`` names the rest of ATOM reads. It never comes here.
-    - STANDALONE drafts are their OWN checkpoint (``architectures:
-      ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
-      their DSpark fields at the config top level: ``target_layer_ids``,
-      ``mask_token_id``, ``markov_rank``, and optionally a training block width.
+    - STANDALONE drafts are their OWN checkpoint (an architecture in
+      ``_STANDALONE_DSPARK_ARCHS``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``)
+      and name their DSpark fields as ``_STANDALONE_DSPARK_FIELD_ALIASES``
+      lists: ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
     """
-    target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+    target_layer_ids = _standalone_dspark_field(hf_config, "dspark_target_layer_ids")
     if not target_layer_ids:
         raise ValueError(
-            "K3DSparkModel config is missing `target_layer_ids` (the target "
-            "decoder layers whose hidden states the draft consumes). Without "
-            "it the draft has no context input."
+            "Standalone DSpark draft config is missing `target_layer_ids` (the "
+            "target decoder layers whose hidden states the draft consumes). "
+            "Without it the draft has no context input."
         )
     # 0-based target decoder-layer indices, matching ATOM's `layers[i]` aux-tap
     # convention: the reference indexes `hidden_states[layer_id + 1]`, i.e. the
     # OUTPUT of layer `layer_id`, which is the layer this convention taps.
     hf_config.dspark_target_layer_ids = [int(i) for i in target_layer_ids]
 
-    mask_token_id = getattr(hf_config, "mask_token_id", None)
+    mask_token_id = _standalone_dspark_field(hf_config, "dspark_noise_token_id")
     if mask_token_id is None:
         raise ValueError(
-            "K3DSparkModel config is missing `mask_token_id` (the noise token "
-            "the draft block is seeded with)."
+            "Standalone DSpark draft config is missing `mask_token_id` (the "
+            "noise token the draft block is seeded with)."
         )
     hf_config.dspark_noise_token_id = int(mask_token_id)
 
-    hf_config.dspark_markov_rank = int(getattr(hf_config, "markov_rank", 0) or 0)
+    hf_config.dspark_markov_rank = int(
+        _standalone_dspark_field(hf_config, "dspark_markov_rank") or 0
+    )
     # Synthesized marker, not a checkpoint field: the flavor discriminator the
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
@@ -1078,7 +1259,7 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # DSparkProposer._resolve_mtp_k falls back to that.
 
     logger.info(
-        "Detected MLA DSpark drafter with a separate draft model "
+        "Detected DSpark drafter with a separate draft model "
         f"(markov_rank={hf_config.dspark_markov_rank}, "
         f"target_layers={hf_config.dspark_target_layer_ids}, "
         f"mask_token_id={hf_config.dspark_noise_token_id})"
@@ -1157,8 +1338,11 @@ class SpeculativeConfig:
         "qwen3_5_moe": "qwen3_5_mtp",
         "qwen3_5_text": "qwen3_5_mtp",
         "qwen3_5_moe_text": "qwen3_5_mtp",
+        "qwen4_exp_text": "qwen4_exp_mtp",
         "mimo_v2": "mimo_v2_mtp",
         "mimo_v2_flash": "mimo_v2_mtp",
+        "glm5_next": "glm5_next_mtp",
+        "glm5_next_text": "glm5_next_mtp",
     }
 
     # mtp_model_type → (n_predict_attr, architecture)
@@ -1167,6 +1351,8 @@ class SpeculativeConfig:
         "deepseek_v4_mtp": ("num_nextn_predict_layers", "DeepseekV4MTPModel"),
         "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
+        "glm5_next_mtp": ("num_nextn_predict_layers", "Glm5NextMTPModel"),
+        "qwen4_exp_mtp": ("mtp_num_hidden_layers", "Qwen4ExpMTPModel"),
     }
 
     def use_dspark(self) -> bool:
@@ -1199,8 +1385,8 @@ class SpeculativeConfig:
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
         :func:`_normalize_draft_dspark_config`, which runs from
-        :meth:`hf_config_override` when the draft's ``architectures`` is
-        ``["K3DSparkModel"]``, so it is set for exactly the configs that went
+        :meth:`hf_config_override` when the draft's architecture is in
+        ``_STANDALONE_DSPARK_ARCHS``, so it is set for exactly the configs that went
         through that normalization.
         """
         cfg = self.draft_model_hf_config
@@ -1269,7 +1455,15 @@ class SpeculativeConfig:
             )
         # For multimodal models, extract text_config
         if hasattr(self.draft_model_hf_config, "text_config"):
-            self.draft_model_hf_config = self.draft_model_hf_config.text_config
+            root = self.draft_model_hf_config
+            self.draft_model_hf_config = root.text_config
+            # A multimodal draft (MiniMax-M3.1 DSpark) records its quantization
+            # on the root only; the text config is what the draft reads.
+            root_qc = getattr(root, "quantization_config", None)
+            if root_qc and not getattr(
+                self.draft_model_hf_config, "quantization_config", None
+            ):
+                self.draft_model_hf_config.quantization_config = root_qc
         self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
@@ -1297,7 +1491,7 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        if arch.endswith("DSparkModel"):
+        if arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)
             return
         if arch == "LlamaForCausalLMEagle3":
@@ -1310,6 +1504,10 @@ class SpeculativeConfig:
         # config fields. Route it to the DSpark draft model and skip the MTP
         # n_predict=1 rewrite (DSpark uses dspark_block_size, not n_predict).
         if getattr(hf_config, "dspark_block_size", None):
+            if hf_config.model_type in ("deepseek_v41", "deepseek_v41_text"):
+                hf_config.model_type = "deepseek_v41_dspark"
+                hf_config.architectures = ["DeepseekV41DSparkModel"]
+                return
             hf_config.model_type = "deepseek_v4_dspark"
             hf_config.architectures = ["DeepseekV4DSparkModel"]
             logger.info(
@@ -1379,6 +1577,16 @@ class KVEventsConfig:
     # Bounded in-process queue between scheduler and sender thread. When full,
     # oldest batch is dropped — KV events are advisory, never stall inference.
     buffer_steps: int = 10_000
+    # New fields go after the pre-existing ones so positional constructor
+    # calls keep binding the same way.
+    # ROUTER endpoint subscribers use to request replay of missed batches by
+    # sequence number. Empty string keeps replay disabled (PUB-only).
+    replay_endpoint: str = ""
+    # Size of the replay ring buffer (distinct from buffer_steps). Bounds the
+    # long-lived retention of encoded payloads; only allocated when replay is
+    # enabled. Each entry can be sizable (includes token_ids), so tune per the
+    # expected event rate and memory budget.
+    replay_buffer_steps: int = 10_000
 
     @classmethod
     def from_env(cls) -> "KVEventsConfig":
@@ -1390,8 +1598,10 @@ class KVEventsConfig:
             publisher=envs.ATOM_KV_EVENTS_PUBLISHER,
             endpoint=envs.ATOM_KV_EVENTS_ENDPOINT,
             topic=envs.ATOM_KV_EVENTS_TOPIC,
+            replay_endpoint=envs.ATOM_KV_EVENTS_REPLAY_ENDPOINT,
             hwm=envs.ATOM_KV_EVENTS_HWM,
             buffer_steps=envs.ATOM_KV_EVENTS_BUFFER_STEPS,
+            replay_buffer_steps=envs.ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS,
         )
 
 
@@ -1415,8 +1625,10 @@ class DSparkConfig:
         buckets to capture for the ragged path (e.g. "1,3,6" or "8").
       - q_buckets: CUDA-graph query-length buckets for the (older) batch-uniform
         q-bucket verify path (independent of the ragged path).
-      - disable_sps_calib: skip SPS calibration (replays captured graphs at
-        warmup); fall back to the synthetic SPS stub.
+      - disable_sps_calib: skip automatic SPS calibration (replays captured
+        graphs at warmup). Without an explicit profile, use the synthetic stub.
+      - calibration_profile: JSON file containing model/runtime-bound SPS and
+        STS measurements. Takes precedence over automatic calibration.
     """
 
     confidence_schedule: bool = False
@@ -1424,6 +1636,18 @@ class DSparkConfig:
     ragged_graph_sizes: str = ""
     q_buckets: str = ""
     disable_sps_calib: bool = False
+    # Explicit offline measurements; compatibility is checked before use.
+    calibration_profile: str | None = None
+
+    def __post_init__(self):
+        if self.calibration_profile is not None and (
+            not isinstance(self.calibration_profile, str)
+            or not self.calibration_profile
+            or not self.confidence_schedule
+        ):
+            raise ValueError(
+                "DSpark calibration_profile requires a path and confidence_schedule=True"
+            )
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
@@ -1521,10 +1745,17 @@ class DCPConfig:
     enable_query_replication: bool = True
     enable_project_before_merge: bool = True
     comm_backend: str = "a2a"
+    # Context-parallelize the MiniMax-M3 lightning indexer INSTEAD of the KV
+    # cache: every rank scores all index heads over 1/P of the blocks, then an
+    # all-to-all routes each head's candidates to the rank that owns it. Sparse
+    # attention, KV geometry and MoE stay TP. Requires
+    # decode_context_parallel_size == 1 -- see indexer_cp_unsupported_reason.
+    indexer_dcp_only: bool = False
 
     def __post_init__(self):
         self.interleave_size = int(self.interleave_size)
         assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+        self.indexer_dcp_only = bool(self.indexer_dcp_only)
         self.enable_query_replication = bool(self.enable_query_replication)
         self.enable_project_before_merge = bool(self.enable_project_before_merge)
         self.comm_backend = str(self.comm_backend)
@@ -1550,9 +1781,7 @@ class DCPConfig:
         return cls(**cfg)
 
 
-def qrep_unsupported_reason(
-    dcp_size: int, speculative_config, mxfp4_bmm: bool
-) -> str | None:
+def qrep_unsupported_reason(dcp_size: int, mxfp4_bmm: bool) -> str | None:
     """Why DCP query replication cannot run here, or None if it can.
 
     Kept a module-level pure function so it is unit-testable: the alternative,
@@ -1562,12 +1791,173 @@ def qrep_unsupported_reason(
     if dcp_size <= 1:
         # No DCP group means there is no AllGather Q to remove.
         return "decode_context_parallel_size <= 1 (no DCP group)"
-    if speculative_config is not None:
-        # MTP / eagle3 / dspark run a qlen>1 verify on the cprr kernel.
-        return "speculative decode (qlen>1 cprr path)"
     if mxfp4_bmm:
         # fp4 (mxfp4) absorbed BMM has a different scale structure.
         return "fp4 (mxfp4) BMM weights"
+    return None
+
+
+def q_proj_is_qrep_widened(q_proj, qrep_num_heads: int, qk_head_dim: int) -> bool:
+    """Whether `q_proj` was actually built with `qrep_tp_override`.
+
+    Requires both provenance (`q_proj.effective_tp_overridden`) and shape
+    (`weight.shape[0] == qrep_num_heads * qk_head_dim`). Shape alone isn't
+    enough: at `tp == dcp`, `override_tp_size` becomes 1 (a no-op), so a
+    QREP-widened q_proj and a plain, never-sharded one end up the same
+    width. Provenance alone isn't enough either: it says intent, not that
+    the resulting shape is what `_local_q_proj`/`W_K_qrep` actually assume.
+
+    Known residual gap: if `q_proj` is a wrapper that hides `.weight`
+    (`getattr` returns None, e.g. GLM-5.3's `_ZeroRopePad`) while its
+    wrapped linear actually was overridden, this returns False and the
+    caller falls back to AllGather -- safe today because no wrapper of
+    that shape is ever also wired to `qrep_tp_override`, but nothing here
+    would catch a future model that combines both.
+
+    Dependency-free so it stays importable, and testable, without triton/aiter.
+    """
+    if not getattr(q_proj, "effective_tp_overridden", False):
+        return False
+    weight = getattr(q_proj, "weight", None)
+    return weight is not None and weight.shape[0] == qrep_num_heads * qk_head_dim
+
+
+# Quant types `make_row_view` narrows safely for a single-partition q_proj
+# (unquantized/per_Tensor never hit its per-output-channel branch there;
+# per_1x128/per_Token are the two it explicitly handles). Named, not
+# imported from aiter's QuantType enum, so this stays importable without
+# triton/aiter; the aiter side is pybind11-bound but its members' `.name` is
+# this same string.
+_ROW_SLICEABLE_QUANT_TYPE_NAMES = frozenset(
+    {"No", "per_Tensor", "per_1x128", "per_Token"}
+)
+
+
+def q_proj_has_row_sliceable_scale(q_proj) -> bool:
+    """Whether `_local_q_proj`'s row view can safely narrow `q_proj`'s scale.
+
+    `make_row_view` narrows a 2D per-output-channel `weight_scale` only for
+    `per_1x128`/`per_Token`; anything else (e.g. mxfp4's `per_1x32`) raises
+    `NotImplementedError` on first use. `qrep_unsupported_reason`'s mxfp4
+    gate only checks a global env var, not any layer's actual quant type, so
+    this catches it per layer instead.
+
+    Keyed on `quant_type` alone, not `weight_scale`'s presence/shape:
+    `quant_type` is set unconditionally in `LinearBase.__init__`, but
+    `weight_scale` is not -- the online-quant-streaming path
+    (`source_quant_dtype` set) defers building it to
+    `process_weights_after_loading`, well after this runs. Reading
+    `weight_scale is None` as "safe" there would be checking a scale that
+    does not exist yet, not one that will never exist.
+    """
+    name = getattr(getattr(q_proj, "quant_type", None), "name", None)
+    return name is None or name in _ROW_SLICEABLE_QUANT_TYPE_NAMES
+
+
+def qrep_enabled_for_layer(
+    wants_qrep: bool, q_proj, qrep_num_heads: int, qk_head_dim: int
+) -> bool:
+    """The per-layer QREP decision, kept testable on its own: asserting only
+    `q_proj_is_qrep_widened`'s behavior can't catch the `and` being dropped
+    (or weakened) at the call site. Also requires `q_proj_has_row_sliceable_scale`
+    so a layer that is genuinely QREP-widened but whose on-disk quant type
+    `_local_q_proj` cannot row-slice falls back to AllGather instead of
+    raising the first time prefill runs.
+    """
+    return (
+        wants_qrep
+        and q_proj_is_qrep_widened(q_proj, qrep_num_heads, qk_head_dim)
+        and q_proj_has_row_sliceable_scale(q_proj)
+    )
+
+
+def qrep_for_step(
+    qrep_enabled: bool, use_seg_mla: bool, is_prefill: bool, prefill_qrep: bool
+) -> bool:
+    """Whether this forward produces the DCP group's query heads locally (QREP)
+    instead of gathering them.
+
+    Decode always does when the layer has QREP. Prefill reaches the QREP-aware
+    branch only as sparse (DSA) prefill -- dense prefill takes the MHA path and
+    never gathers q -- and joins only under ``ATOM_DCP_PREFILL_QREP``
+    (``prefill_qrep``). The seg path is excluded because its q_out is allocated
+    at the per-rank head count. Pure so the prefill clause can be pinned by a
+    test instead of living only as an inline expression.
+    """
+    return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
+
+
+def indexer_cp_unsupported_reason(
+    arches,
+    tp_size: int,
+    num_kv_heads: int,
+    sparse_block_size: int,
+    dcp_size: int,
+    enable_tbo: bool,
+    plugin_mode: bool = False,
+) -> str | None:
+    """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
+
+    Pure and module-level for the same reason as ``qrep_unsupported_reason``:
+    the alternative is a real model directory and an HF config.
+
+    Note the DCP relationship is EXCLUSIVE, not a prerequisite. This shards the
+    indexer's block scoring; real DCP shards the KV cache itself (BlockManager
+    scales the prefix-cache hash granularity by dcp_world_size), and M3 has no
+    DCP-aware attention path at all. The two cannot both own the context axis.
+
+    ``plugin_mode`` belongs here rather than only in ``indexer_cp_enabled``
+    because this gate is what clears the FLAG. Leaving it set under a bridge
+    left the config claiming CP while the runtime gate silently served TP, so
+    the startup line an A/B is diagnosed from ("indexer_dcp_only enabled") said
+    the opposite of what ran -- and ``compute_hash`` keyed on a value the model
+    never used.
+    """
+    if not any("MiniMaxM3" in str(a) for a in arches):
+        return "not a MiniMax-M3 model"
+    if plugin_mode:
+        # The vLLM/SGLang bridges run ATOM's own linear.py and minimax_m3/model.py, so
+        # the flag would widen index_q underneath them -- and both reshape it
+        # with a ``view`` on the width they assume, yielding 4x the rows with no
+        # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
+        # flag so nothing downstream (log line, compile hash) disagrees.
+        return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
+    if dcp_size > 1:
+        return (
+            "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
+            "axis; indexer_dcp_only replaces it, it does not extend it)"
+        )
+    if tp_size != num_kv_heads:
+        # Below TP4 a rank holds >1 kv head, which the candidate merge and the
+        # gluon decode kernel both reject (they assume per-rank num_kv_heads
+        # == 1). Above it the group is a strided subset of TP -- not wired yet.
+        return (
+            f"tensor_parallel_size ({tp_size}) != num_key_value_heads "
+            f"({num_kv_heads}); v1 supports only the square case"
+        )
+    if sparse_block_size != 128:
+        return f"sparse_block_size {sparse_block_size} != 128"
+    # Speculative decoding is deliberately NOT rejected. The whole chain takes
+    # max_query_len as a runtime argument and validates against it --
+    # indexer_context_scores, local_candidate_keys, merge_candidate_keys --
+    # and ``tests/model_ops/test_indexer_cp_parity.py`` pins torch.equal against
+    # the native kernel at both qlen 1 and qlen 4 (EAGLE3 with 3 draft tokens).
+    #
+    # Rejecting it is also a throughput loss, though NOT for the reason an
+    # earlier revision of this comment gave. That version claimed drafting
+    # "fills the MMA tile" (1x1 = 6% -> 4x4 = 100%). Measured on MI355X, both
+    # arms run the score kernel at 5.5-7.5 TB/s against an ~8 TB/s roof: the
+    # kernel is BANDWIDTH-bound, never MMA-starved, and the CP win is the 4x
+    # byte ratio (every rank reads 1/P of the blocks from a REPLICATED one-head
+    # index cache). The tile width does matter, but with the opposite sign --
+    # both kernels size the dot's N as max(16, next_pow2(heads * query_len)), so
+    # TP's N is 16 for every qlen <= 16 (flat: 90.2/92.2/90.8us at q=1/4/8)
+    # while CP's doubles at q=5 (20.3/20.4/24.0us). q=4 is CP's exact fill point
+    # and free; q=8 costs it 17% for nothing. Pair this flag with MTP3.
+    if enable_tbo:
+        # Two ubatch threads issuing all-to-alls on one group with no ordering
+        # discipline deadlock.
+        return "TBO (two-batch overlap)"
     return None
 
 
@@ -1593,6 +1983,28 @@ class Config:
     # `StateSlotPool.mark_speculative` for the measurement and
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
+    # DeepSeek-V4.1 decoder SWA bounded replay
+    # (models/deepseek_v41/bounded_replay.py). On by default;
+    # --no-decoder-swa-bounded-replay turns it off. No effect on other models.
+    enable_decoder_swa_bounded_replay: bool = True
+    # The fewest rows the forward that finishes a prompt runs: one that resumes
+    # closer to the prompt's end starts that much earlier, recomputing rows
+    # the cache already holds (`BlockManager.replay_start`). Set by the model,
+    # not a flag: V4.1's decoder bounded replay reads the last `window` rows.
+    min_final_prefill_rows: int = 0
+    # The tokens before a replaying forward a backend reads (`Replay.history_ids`).
+    # Set by the model: V4.1's Engram n-gram lookback.
+    replay_history_tokens: int = 0
+    # How far below a prefix hit with no state checkpoint behind it a prefill
+    # starts to rebuild that state exactly (`BlockManager.replay_start`), 0 =
+    # such a hit is not taken. Set by the model, not a flag: DeepSeek-V4's
+    # window receptive field under ATOM_DSV4_STATE_REPLAY (`deepseek_v4_replay`).
+    state_replay_tokens: int = 0
+    # DeepSeek-V4.1 encoder SWA bounded replay: a prefix hit keeps no state
+    # checkpoint and rebuilds it by recomputing the window rows below the hit
+    # (`--encoder-swa-bounded-replay`). On by default;
+    # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
+    enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -1603,6 +2015,25 @@ class Config:
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
+    # Number of vocabulary positions that carry a real token. A checkpoint
+    # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
+    # 151665 up to 151936 -- leaves the tail rows holding whatever the padding
+    # was initialised to, which is neither zero nor -inf, so sampling can land
+    # on an id the tokenizer cannot decode. Take it from the tokenizer, not
+    # from the model card. 0 means "not padded", which is the right answer for
+    # every model whose embedding matrix matches its tokenizer.
+    true_vocab_size: int = 0
+    # Sleep (`release_memory`) normally frees the weights and the KV pool and
+    # recaptures the decode CUDA graphs on wake. Set this to keep both
+    # allocated instead, so the addresses the graphs captured stay valid and
+    # nothing is recaptured -- recapture is what faults under
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
+    #
+    # The cost is that sleep no longer returns that memory to the allocator, so
+    # a colocated trainer that sleeps the rollout engine to get its memory back
+    # will not get it back. That is why it is opt-in. No effect under
+    # `enforce_eager`, where there are no graphs to keep valid.
+    sleep_keeps_memory_resident: bool = False
     hf_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
@@ -1621,6 +2052,13 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    # None reads ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR once the feature is on; see
+    # `_resolve_dynamic_chunking`.
+    dynamic_chunking_smooth_factor: float | None = None
+    # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
+    # rebuild, so the floor is what bounds that amplification.
+    dynamic_chunking_min_chunk_size: int = 4096
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -1746,7 +2184,7 @@ class Config:
             return list(declared)
         sizes = self.compilation_config.cuda_graph_sizes
         if len(sizes) == 1:
-            return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
+            return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
     def __post_init__(self):
@@ -1893,19 +2331,17 @@ class Config:
                 "speculative decode for block-level interleave."
             )
 
-        # DCP Query Replication (QREP) first-cut gating: turn the flag OFF
-        # (warn, not error) for combinations not yet wired, so it can default to
-        # on without breaking mixed runs.
+        # DCP Query Replication (QREP) gating: turn the flag OFF (warn, not
+        # error) for combinations that cannot use it, so it can default to on
+        # without breaking mixed runs.
         if self.dcp_config.enable_query_replication:
             qrep_off = qrep_unsupported_reason(
                 self.decode_context_parallel_size,
-                self.speculative_config,
                 envs.ATOM_USE_TRITON_MXFP4_BMM,
             )
             if qrep_off is not None:
                 logger.warning(
-                    "dcp_config.enable_query_replication disabled: %s not "
-                    "supported in the first cut.",
+                    "dcp_config.enable_query_replication disabled: %s not supported.",
                     qrep_off,
                 )
                 self.dcp_config.enable_query_replication = False
@@ -1945,11 +2381,11 @@ class Config:
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
-        if self.generation_config is not None:
-            if (
-                eos_ids := getattr(self.generation_config, "eos_token_id", None)
-            ) is not None:
-                self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
+        if self.generation_config is not None and (
+            (eos_ids := getattr(self.generation_config, "eos_token_id", None))
+            is not None
+        ):
+            self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.online_quant_config,
@@ -2003,11 +2439,15 @@ class Config:
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
         ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
             self.compilation_config.set_splitting_ops_for_v1()
-            # Keep an explicit cudagraph_mode (e.g. FULL); default to
-            # PIECEWISE only when unset. splitting_ops/sizes are set either
-            # way so the model is still piece-split-compiled at level 3.
+            # Default to TR_HYBRID, except V4.1 whose Engram stream fork/join
+            # currently requires a FULL graph. Explicit choices are preserved.
+            # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL
+                    if self.hf_config.model_type == "deepseek_v41_text"
+                    else CUDAGraphMode.TR_HYBRID
+                )
             self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (
@@ -2027,6 +2467,24 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if self.kv_transfer_config:
+            # The offload namespace hashes the model's cache geometry. A worker
+            # normalises `hf_config` while it builds the model (Kimi-K3 derives
+            # `head_dim`, `ModelRunner.get_num_blocks` fills a missing one) and
+            # the scheduler never does, so hashing the live config gives each a
+            # different namespace and every scheduler lookup misses. Snapshot it
+            # here, before the config is shipped to either process.
+            from atom.kv_transfer.offload.config import (
+                snapshot_kv_encoding,
+                snapshot_page_hf_geometry,
+            )
+
+            self.offload_page_hf_geometry = snapshot_page_hf_geometry(self.hf_config)
+            # Likewise how K and V are encoded (the RoPE settings above all):
+            # llama.py adds a key to the live `rope_parameters` while a worker
+            # builds the model.
+            self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_dynamic_chunking()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2089,7 +2547,10 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
+        is_deepseek_v4 = any(
+            str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
+            for a in arches
+        )
         if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
@@ -2107,15 +2568,7 @@ class Config:
         # set here and the attention builder sizes the index cache from it.
         is_glm5_next = any("Glm5Next" in str(a) for a in arches)
         if is_glm5_next:
-            unsupported_features = []
-            if self.prefill_context_parallel_size > 1:
-                unsupported_features.append("PCP")
-            if self.decode_context_parallel_size > 1:
-                unsupported_features.append("DCP")
-            if self.speculative_config is not None:
-                unsupported_features.append("speculative decoding")
-            if self.enable_tbo or self.enable_tbo_decode:
-                unsupported_features.append("TBO")
+            unsupported_features = _glm5_next_unsupported_features(self)
             if unsupported_features:
                 raise ValueError(
                     "GLM-5.3-Flash text serving does not yet support "
@@ -2154,6 +2607,42 @@ class Config:
                         "override."
                     )
 
+        # MiniMax-M3 indexer-only context parallelism. Off by default: it trades
+        # a fixed per-layer all-to-all for a large long-context score win, so it
+        # is a loss below roughly batch*context ~ 1M tokens. Warn and fall back
+        # rather than raise -- this is a performance flag, never correctness.
+        # Ops override wins over the config field, in both directions.
+        if envs.ATOM_M3_INDEXER_CP is not None:
+            self.dcp_config.indexer_dcp_only = envs.ATOM_M3_INDEXER_CP == "1"
+        if self.dcp_config.indexer_dcp_only:
+            text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
+            sparse_cfg = getattr(text_cfg, "sparse_attention_config", None) or {}
+            indexer_cp_off = indexer_cp_unsupported_reason(
+                arches,
+                self.tensor_parallel_size,
+                getattr(text_cfg, "num_key_value_heads", 0),
+                sparse_cfg.get("sparse_block_size", 0),
+                self.decode_context_parallel_size,
+                self.enable_tbo or self.enable_tbo_decode,
+                is_plugin_mode(),
+            )
+            if indexer_cp_off is not None:
+                logger.warning(
+                    "dcp_config.indexer_dcp_only disabled: %s.", indexer_cp_off
+                )
+                self.dcp_config.indexer_dcp_only = False
+            else:
+                # Announce the ON case too. The "Engine kwargs" dump is emitted
+                # before this runs (arg_utils.py), so it prints the pre-override
+                # value -- reading it as the live setting is how an A/B ends up
+                # comparing a config against itself.
+                logger.info(
+                    "dcp_config.indexer_dcp_only enabled: MiniMax-M3 indexer "
+                    "scores all %d index heads over 1/%d of the blocks.",
+                    getattr(text_cfg, "num_key_value_heads", 0),
+                    self.tensor_parallel_size,
+                )
+
         # Keep ``None`` intact until the model architecture is known so an
         # omitted index-cache option remains distinguishable from an explicit
         # fp8/bf16 override. Native single-node V4 defaults to the FP4 indexer
@@ -2161,15 +2650,93 @@ class Config:
         # not yet describe the separate FP4 scale pool, so those integrations
         # retain FP8 until their layouts support it. Every other model keeps
         # the historical KV-cache-dtype default.
-        if self.index_cache_dtype is None and is_deepseek_v4:
-            if self.plugin_config is None and not self.kv_transfer_config:
-                from aiter.jit.utils.chip_info import get_gfx
+        if self.index_cache_dtype is None:
+            if is_deepseek_v4:
+                if self.plugin_config is None and not self.kv_transfer_config:
+                    from aiter.jit.utils.chip_info import get_gfx
 
-                self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
-            else:
+                    self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
+                else:
+                    self.index_cache_dtype = "fp8"
+            elif self.hf_config.model_type == "deepseek_v41_text":
+                # CSA2 reads its index plane with the paged scorer and has no
+                # other, so the plane's format does not follow the main pool's.
+                # Only the default: an explicit value is carried through to the
+                # V4.1 runtime gate, which refuses anything else before weights
+                # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
-        elif self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
+            else:
+                self.index_cache_dtype = self.kv_cache_dtype
+
+        if self.hf_config.model_type == "deepseek_v41_text":
+            # CSA2's index plane is paged by the same scorer GLM's is, so a
+            # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
+            # tiles -- and its ratio-2 owners halve the PAGE before that count
+            # is taken, which makes the floor twice the tile. 128 rather than
+            # that floor: the block table is `[max_num_seqs, max_model_len /
+            # block_size]` int32 held twice and copied to the device every
+            # forward, 17 MB here against 134 MB at the 16 this field defaults
+            # to. Not the 256 DeepSeek-V4 takes: a PAGE is also the prefix
+            # cache's hash block, so it is the granularity of prefix reuse and
+            # of the rows encoder bounded replay recomputes below a hit: one
+            # PAGE, which must cover the window - 1 rows a row at the hit reads.
+            self.kv_cache_block_size = 128
+            if self.enable_decoder_swa_bounded_replay:
+                self.min_final_prefill_rows = self.hf_config.sliding_window
+            self.replay_history_tokens = self.hf_config.engram_max_ngram_size - 1
+
+            from atom.models.deepseek_v41.config import validate_runtime_config
+
+            validate_runtime_config(self)
+
+        if is_deepseek_v4:
+            from atom.model_ops.attentions.deepseek_v4_replay import (
+                state_replay_tokens,
+            )
+
+            self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_dynamic_chunking(self) -> None:
+        """Validate dynamic chunking, or turn it off where it cannot size a chunk.
+
+        Everything here, the env read included, runs only when the feature is
+        on: a stale ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
+        must not stop a server that never asked for dynamic chunking.
+        """
+        if not self.enable_dynamic_chunking:
+            return
+        if self.dynamic_chunking_smooth_factor is None:
+            try:
+                self.dynamic_chunking_smooth_factor = (
+                    envs.ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR must be a number: {exc}"
+                ) from None
+        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+            raise ValueError(
+                "dynamic_chunking_smooth_factor must be in [0, 1], got "
+                f"{self.dynamic_chunking_smooth_factor}"
+            )
+        if self.dynamic_chunking_min_chunk_size <= 0:
+            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+        if self.pipeline_parallel_size <= 1:
+            reason = "pipeline_parallel_size is 1"
+        elif not self.enable_chunked_prefill:
+            reason = "chunked prefill is off"
+        elif self.enable_rapidserve:
+            reason = "the RapidServe prefill scheduler never chunks"
+        elif (self.kv_transfer_config or {}).get("kv_role") == "kv_consumer":
+            reason = "a P/D decode instance does not run the prefills it would size"
+        else:
+            return
+        # Same degrade-to-fixed path as a failed profile or a rejected fit.
+        # Raising would make the flag a hard failure in a shared launch script.
+        logger.warning(
+            "Dynamic chunking disabled because %s; chunking stays fixed", reason
+        )
+        self.enable_dynamic_chunking = False
 
     def compute_hash(self) -> str:
         """
@@ -2199,16 +2766,33 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         # PCP changes the compiled graph: when pcp>1 the indexer runs through the
-        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
-        # query) and the indexer takes the round-robin all-gather / separate-rope
-        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # opaque `sparse_attn_indexer_pcp` op and takes the round-robin all-gather
+        # / separate-rope path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
         # identically, so without this factor pcp2 loads pcp1's cached artifact
         # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
         # runtime — the same stale-artifact hazard documented for the vocab-embed
         # flag below.
         factors.append(self.prefill_context_parallel_size)
+        # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
+        # is this rank's one head under TP and all `sparse_num_index_heads` of
+        # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
+        # captured buffer strides differ. Exactly the pcp hazard above -- two
+        # runs of the same model and source otherwise hash identically, so
+        # starting one mode after the other would load the opposite mode's
+        # artifact and trip assert_size_stride at runtime.
+        #
+        # This reads the field AFTER __post_init__, which is the only correct
+        # value: it already folds in the ATOM_M3_INDEXER_CP override AND every
+        # indexer_cp_unsupported_reason fallback (plugin mode, TP != kv heads,
+        # block != 128, DCP, TBO). Two topologies that both fall back therefore
+        # share one artifact, as they should.
+        factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
+        # graphs (early + late layers) instead of one; both compile under the
+        # `backbone` tag, so the flag must key the artifacts.
+        factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
@@ -2241,6 +2825,24 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 decides whether the MoE calls
+        # shared_experts() and how many experts it routes over (129 / top-5 vs
+        # 128 / top-4), so it changes the compiled graph the same way.
+        factors.append(bool(envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4))
+        # The sparse-attention indexer bakes max_model_len and max_num_seqs into
+        # the graph as constants, so a cache built for a smaller max_model_len
+        # faults on the first decode past the old width.
+        factors.append(self.max_model_len)
+        factors.append(self.max_num_seqs)
+        # The drafter graph bakes its draft width in as a constant (DSpark traces
+        # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
+        # would otherwise load the other width's artifact: draft 6 over a draft 3
+        # cache hands MoE half the rows it expects. Acceptance-length knobs only
+        # steer sampling and stay out.
+        spec = self.speculative_config
+        factors.append(
+            None if spec is None else (spec.method, spec.num_speculative_tokens)
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

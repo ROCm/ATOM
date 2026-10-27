@@ -25,8 +25,8 @@ Tips on server configuration:
 - **MoE backend**: V4-Pro routes 6 experts out of 384 with hash-based selection. The default fused MoE path with `AITER_BF16_FP8_MOE_BOUND=0` + `ATOM_MOE_GU_ITLV=1` handles the FP4 e2m1 microscaling weights correctly — measured GSM8K (1319 samples, 3-shot flexible-extract) = 0.9522 on MI355X/gfx950.
 - Use `--kv_cache_dtype fp8` for memory efficiency. On native single-node V4,
   the CSA indexer's compressed K cache defaults to FP4 except on gfx942, where
-  it remains FP8. Plugin and PD-disaggregated paths also retain FP8 until their
-  cache layouts support the separate FP4 scale pool. Use
+  it remains FP8. Plugin paths retain FP8. Native Mooncake PD supports explicit
+  FP4 index selection, including the separate e8m0 scale pool. Use
   `--index-cache-dtype fp8` to force the legacy path, or explicitly select
   `fp4` on a supported native path.
 - Set `AITER_LOG_LEVEL=WARNING` before starting to suppress aiter kernel log noise.
@@ -95,6 +95,37 @@ Notes:
   its private expert-weight layout to the rebalancer via `get_eplb_weight_views`,
   so expert migration operates on the live fused weights.
 
+### MegaMoE on gfx1250 (mori v2 transport, EP + DP attention)
+
+On gfx1250 the EP + DP MoE all2all runs on mori's `dispatch_combine_v2`
+(`ATOM_MORI_V2=1`), and by default each routed-MoE layer is handed to aiter's
+`MegaMoEGfx1250`, which owns dispatch, both grouped GEMMs and combine. Two
+switches control how much of that layer is fused; both default to on:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `ATOM_MEGA_STAGE2_FUSED` | `1` | The gemm2 epilogue P2P-writes each weighted route into the peers' combine staging, so combine only barriers and sums. `0` falls back to mori's plain gather combine. Formerly `ATOM_MORI_V2_FUSED`. |
+| `ATOM_MEGA_STAGE1_FUSED` | `1` | Compact stage 1: routing/layout planning fused with the flydsl TDM dispatch, which writes the grouped GEMM1's per-expert rows directly. Needs stage 2 fused and a quantizing `MEGA_DISPATCH_WIRE` (`fp4`, or `fp8` with `AITER_FORCE_A8W4=1`); on a `bf16` wire it is ignored. When on, dispatch runs on flydsl TDM rather than mori. |
+
+```bash
+ATOM_MORI_V2=1 MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 \
+MEGA_DISPATCH_WIRE=fp4 ATOM_MEGA_COMBINE_WIRE=fp4 \
+ATOM_MOE_GU_ITLV=1 ATOM_DP_LM_HEAD_MODE=allgather \
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-V4-Pro \
+  --kv_cache_dtype fp8 -tp 4 \
+  --enable-expert-parallel --enable-dp-attention
+```
+
+Notes:
+- The log line `[MegaMoEGfx1250] Created: ... dispatch=flydsl wire=fp4 ...
+  stage1_fused=True` confirms the compact stage-1 path is active.
+- Compact stage 1 cannot run with the Triton experts (`ATOM_USE_TRITON_MOE*`);
+  set `ATOM_MEGA_STAGE1_FUSED=0` to fall back to mori dispatch, which they can
+  run on.
+- `ATOM_DP_LM_HEAD_MODE=allgather` avoids RCCL `all_to_all_single`, which
+  cannot be captured into a hipGraph on gfx1250.
+
 ### FP8 on MI308 / gfx942 (V4-Flash-Base, FP8 per-block routed experts)
 
 [DeepSeek-V4-Flash-Base](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base) ships the same V4 architecture (mHC + CSA + HCA + sparse attn + MTP) as V4-Pro, but **routed experts are FP8 e4m3 per-block 128×128** (instead of V4-Pro's FP4 e2m1 microscaling). This trades a small expert-memory increase for end-to-end ROCm `gfx942` (MI308) compatibility — `aiter`'s FP8 grouped GEMM has been tuned for `gfx942`, while the FP4 path was authored for `gfx950` (MI355X).
@@ -141,6 +172,23 @@ For V4-Flash-Base's HF `quantization_config = {"quant_method": "fp8", "fmt": "e4
 
 For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without MTP), see
 [recipes/mesh/DeepSeek-V4.md](mesh/DeepSeek-V4.md).
+
+On gfx950, native Mooncake PD can use FP4 index storage by setting both P and D:
+
+```bash
+--kv-cache-dtype fp8 --index-cache-dtype fp4
+```
+
+The main attention KV precision is independent of the index precision. Packed
+index data and its separate e8m0 scales travel as per-layer PAGE regions;
+SWA and compressor-state transfer is unchanged. This also works with a P-side
+`multi` connector combining Mooncake and LMCache offload.
+
+Both endpoints must run the FP4 PD support code and use matching index layouts.
+The producer checks the consumer's PAGE roles and block widths before writing,
+and rejects missing scales, reordered layers, or FP4/FP8 mismatches. Existing FP8
+peers may omit the new role metadata. Moriio FP4 index PD and V4 transfer with
+pipeline parallelism greater than one remain unsupported.
 
 ### EPLB (Expert Parallel Load Balancing)
 

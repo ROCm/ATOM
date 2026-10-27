@@ -28,11 +28,13 @@ import pytest
 
 from atom.utils.selector import Family, attn_family, has_mla_indexer
 
-GDN, KIMI_MLA, MHA, MLA, V4 = (
+CSA2, GDN, KIMI_MLA, MHA, MLA, QSA_GDN, V4 = (
+    Family.CSA2,
     Family.GDN,
     Family.KIMI_MLA,
     Family.MHA,
     Family.MLA,
+    Family.QSA_GDN,
     Family.V4,
 )
 
@@ -126,6 +128,10 @@ class TestThePriorityBetweenFamilies:
     def test_the_gdn_hybrids(self, model_type):
         assert attn_family(cfg(model_type=model_type)) == GDN
 
+    def test_qwen4_exp_wins_over_gdn(self):
+        """Qwen3.8-Flash-Next is a GDN hybrid whose full-attn layers are QSA."""
+        assert attn_family(cfg(model_type="qwen4_exp_text")) == Family.QSA_GDN
+
 
 class TestWhatRidesAnMlaPool:
 
@@ -152,3 +158,33 @@ class TestWhatRidesAnMlaPool:
 
     def test_an_mla_model_without_an_indexer_does_not(self):
         assert not has_mla_indexer(cfg(model_type="deepseek_v3", kv_lora_rank=512))
+
+
+class TestWhatKeepsAnAccumulatingState:
+    """Which families a token's order matters to: a paged write lands at the
+    token's own position, so repeating it is idempotent; a recurrent state
+    advances, so it is not."""
+
+    @pytest.mark.parametrize(
+        "family, expected",
+        [
+            (KIMI_MLA, True),
+            (QSA_GDN, True),
+            (GDN, True),
+            (V4, False),
+            (MLA, False),
+            (MHA, False),
+            # CSA2's window write alone would be idempotent, but its STATE
+            # slot also carries a cursor, compressor rings and Engram history
+            # that advance per token: a P/D producer that decodes T0 hands
+            # over a cursor one past the prompt, which the consumer rejects.
+            (CSA2, True),
+        ],
+    )
+    def test_the_hybrids_and_pure_gdn_answer_together(self, family, expected):
+        assert family.has_recurrent_state is expected
+
+    def test_every_family_is_covered(self):
+        """A new family must state its answer rather than inherit False, the
+        one that fails silently: a state pool nobody knows about."""
+        assert set(Family) == {KIMI_MLA, QSA_GDN, GDN, V4, MLA, MHA, CSA2}

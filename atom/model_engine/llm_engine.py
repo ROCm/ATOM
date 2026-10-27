@@ -13,8 +13,10 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-from atom.model_engine.multimodal import get_mrope_input_positions
+from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
+from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
+from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
 
@@ -87,11 +89,10 @@ class LLMEngine:
             )
             config.enable_tbo = False
             config.enable_tbo_decode = False
-        # PCP and DP-attention are not yet compatible: PCP stripe-splits
-        # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
-        # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
-        # the FULL (un-split) token count, so all_gatherv asserts
-        # `1/pcp_size != full`.
+        # PCP and DP-attention together are unverified. The refusal's original
+        # cause, a DP all-gather of the hash-routing input ids sized for the
+        # un-split token count, is gone: the MoE now routes before its DP
+        # gather, on rank-local ids.
         if config.enable_dp_attention and config.pipeline_parallel_size > 1:
             raise ValueError(
                 "--enable-dp-attention and pipeline-parallel (pp>1) "
@@ -101,11 +102,9 @@ class LLMEngine:
             raise ValueError(
                 "prefill_context_parallel_size > 1 (-pcp) combined with "
                 "--enable-dp-attention is not supported yet (may be supported "
-                "in a future release): PCP splits tokens to 1/pcp_size while "
-                "DP-attention's id-gather expects the full token count, "
-                "causing an all_gatherv size mismatch. For now, disable one of "
-                "them (use -tp N -pcp M without DP-attention, or -dp N "
-                "--enable-dp-attention without -pcp)."
+                "in a future release): the combination is unverified. For "
+                "now, disable one of them (use -tp N -pcp M without "
+                "DP-attention, or -dp N --enable-dp-attention without -pcp)."
             )
         # PCP + TBO prefill: supported via coordinated splitting.
         # PCP + TBO decode: not yet supported (pcp_all_reduce semantics under
@@ -196,6 +195,22 @@ class LLMEngine:
         multimodal_data_list: list[dict] | None = None,
         request_ids: list[str] | None = None,
     ):
+        """Submit one batch of prompts.
+
+        ``SamplingParams.n > 1`` fans out: a prompt becomes ``n`` sibling
+        sequences, and the batch handed to the scheduler is prompt-major --
+        prompt 0's siblings in order, then prompt 1's. Sequence ids are assigned
+        in that same order, which is what makes :meth:`generate`'s flat list
+        line up with a prompt list expanded by ``n``. It is one request per
+        sibling from here on; nothing downstream reassembles them.
+
+        This used to reach ``io_processor.preprocess``, which returns a single
+        sequence and refuses ``n > 1`` outright, so offline ``n > 1`` raised
+        before a token was generated. That guard is still there and still right
+        for a caller that expects one sequence back -- the two entry points
+        differ in whether the caller is prepared for siblings, not in what they
+        support.
+        """
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
             sampling_params_iter = itertools.repeat(sampling_params_list)
@@ -251,14 +266,14 @@ class LLMEngine:
             mm_data_iter,
             request_id_iter,
         ):
-            req = self.io_processor.preprocess(
+            fanout = self.io_processor.preprocess_fanout(
                 prompt,
                 sampling_param,
                 stream_callback=callback,
                 multimodal_data=mm_data,
-                request_id=request_id,
+                parent_request_id=request_id,
             )
-            reqs.append(req)
+            reqs.extend(fanout)
         self.core_mgr.add_request(reqs)
 
     def step(self) -> list[Sequence]:
@@ -274,6 +289,14 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         request_ids: list[str] | None = None,
     ) -> list[str]:
+        """Complete every prompt and return the outputs as ONE flat list.
+
+        Not one entry per prompt: ``SamplingParams.n`` of them, prompt-major
+        (see :meth:`add_request`), because the sort below is over sequence ids
+        and those are assigned in fan-out order. A caller pairing prompts with
+        outputs has to expand its own list by ``n`` to do it -- with ``n = 1``,
+        the usual case, that is the identity and the list is 1:1 as before.
+        """
         # Reset DP routing state (round-robin cursor + in-flight load) so a
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()
@@ -486,10 +509,9 @@ class LLMEngine:
         a local dict lookup: no round trip, no deadline, and nothing that can
         fail just because the engine is busy.
         """
+        latest_metrics = self.core_mgr.latest_metrics.copy()
         rank_stats = [
-            stats
-            for stats in self.core_mgr.latest_metrics.values()
-            if stats.get("enabled", False)
+            stats for stats in latest_metrics.values() if stats.get("enabled", False)
         ]
 
         def summed(key: str) -> int:
@@ -554,6 +576,12 @@ class LLMEngine:
             key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
             for key in cache_keys
         }
+        # Keep the admitted supplemental reuse population aligned with the HBM
+        # and input counters. Missing older snapshots are not a zero tier hit.
+        if all("offload_tokens" in stats for stats in cache_rank_stats):
+            cache_totals["offload_tokens"] = sum(
+                int(stats["offload_tokens"]) for stats in cache_rank_stats
+            )
         # NOTE: `full`, while `get_cache_statistics` divides by `reusable`, so
         # this endpoint reads lower for the same engine — `full` counts the
         # trailing block no cache is offered, and that fixed size weighs more
@@ -570,6 +598,12 @@ class LLMEngine:
             "saved_tokens",
             "loads_pending",
             "saves_pending",
+            # Why a waiting request is not costing a tier lookup per step, and
+            # whether its one external-tier attempt was already spent. Both are
+            # what an operator reads when the engine looks stalled with the
+            # GPUs idle; see `OffloadSchedulerMixin._init_tier_hit_memo`.
+            "lookups_skipped_by_memo",
+            "suppressed_load_retries",
         )
         offload_totals = {
             key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)
@@ -591,6 +625,25 @@ class LLMEngine:
             "kv_blocks_total": kv_total,
             "kv_blocks_indexed": summed("kv_blocks_indexed"),
             "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
+            "scheduler_metrics": [
+                {
+                    "dp_rank": rank,
+                    "engine_role": stats.get("role") or "default",
+                    **stats["scheduler_metrics"],
+                    "kv_blocks": (
+                        {
+                            "used": stats["kv_blocks_used"],
+                            "evictable": stats["kv_blocks_evictable"],
+                            "vacant": stats["kv_blocks_vacant"],
+                            "total": stats["kv_blocks_total"],
+                        }
+                        if "kv_blocks_total" in stats
+                        else {}
+                    ),
+                }
+                for rank, stats in latest_metrics.items()
+                if stats.get("enabled") and "scheduler_metrics" in stats
+            ],
             "mtp": {
                 "enabled": bool(mtp_rank_stats),
                 "total_draft_tokens": mtp_draft,
@@ -631,12 +684,17 @@ class LLMEngine:
 
 
 class InputOutputProcessor:
+    # Class default: a processor built without `__init__` ships nothing.
+    prefix_hash_block_size = 0
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        self.segment_tokenizer = SegmentTokenizer.maybe_create(
+            tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
+        )
         # `has_per_req_cache` flags model architectures that need a
         # per-request stateful buffer outside the paged KV pool. Sequences
         # constructed for these models trigger BlockManager to reserve a
@@ -655,6 +713,14 @@ class InputOutputProcessor:
             )
         if self.config.hf_config.model_type in self._per_req_cache_model_types():
             self.has_per_req_cache = True
+        # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
+        # 0 = no prefix cache. The engine rehashes on a mismatch.
+        self.prefix_hash_block_size = 0
+        self._reuse_block_hashes = envs.ATOM_TOKENIZE_CACHE_BLOCK_HASHES
+        if getattr(config, "enable_prefix_caching", False):
+            self.prefix_hash_block_size = hash_block_size_for(
+                block_size, config.decode_context_parallel_size
+            )
 
     @staticmethod
     def _per_req_cache_model_types() -> frozenset[str]:
@@ -674,6 +740,8 @@ class InputOutputProcessor:
                 "kimi_linear",
                 "glm5_next_text",
                 "deepseek_v4",
+                "deepseek_v41_text",
+                "qwen4_exp_text",
             }
         )
 
@@ -744,13 +812,34 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        request_validator = getattr(self.config.hf_config, "validate_request", None)
+        if request_validator is not None:
+            request_validator(
+                num_draft_tokens=self.num_speculative_tokens,
+                multimodal_data=multimodal_data,
+                enable_dp_attention=self.config.enable_dp_attention,
+            )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
-        tokens = (
-            self.tokenizer.encode(prompt_or_tokens)
-            if isinstance(prompt_or_tokens, str)
-            else prompt_or_tokens
-        )
+        prefix_encoding = None
+        segment_tokenizer = getattr(self, "segment_tokenizer", None)
+        if not isinstance(prompt_or_tokens, str):
+            tokens = prompt_or_tokens
+        elif segment_tokenizer is not None:
+            if (
+                getattr(self, "_reuse_block_hashes", False)
+                and self.prefix_hash_block_size
+                and envs.ATOM_FRONTEND_PREFIX_HASH
+                and multimodal_data is None
+            ):
+                prefix_encoding = segment_tokenizer.encode_with_prefix(
+                    prompt_or_tokens, self.prefix_hash_block_size
+                )
+                tokens = prefix_encoding.token_ids
+            else:
+                tokens = segment_tokenizer.encode(prompt_or_tokens)
+        else:
+            tokens = self.tokenizer.encode(prompt_or_tokens)
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:
@@ -808,6 +897,19 @@ class InputOutputProcessor:
                 self._external_to_internal[seq.external_request_id] = seq.id
                 self._internal_to_external[seq.id] = seq.external_request_id
             seqs.append(seq)
+
+        # Runs in an executor or submit thread, not the event loop. Siblings
+        # share a prompt and seed, so one chain serves them all.
+        if self.prefix_hash_block_size:
+            ship_prompt_hash_chain(
+                seqs[0],
+                self.prefix_hash_block_size,
+                block_hashes=(
+                    None if prefix_encoding is None else prefix_encoding.block_hashes
+                ),
+            )
+            for seq in seqs[1:]:
+                seq.prompt_hash_chain = seqs[0].prompt_hash_chain
 
         if n == 1:
             logger.info(

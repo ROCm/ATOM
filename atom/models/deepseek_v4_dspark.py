@@ -48,9 +48,15 @@ import torch
 from torch import nn
 
 from atom.config import get_current_atom_config
-from atom.models.dspark_draft import DSparkDraftModel
-from atom.utils import envs, mark_spliting_op
+from atom.models.dspark_draft import (
+    DSparkConfidenceHead,
+    DSparkDraftModel,
+    DSparkMarkovHead,
+    linear_out,
+)
+from atom.utils import mark_spliting_op
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import eager_region
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -70,6 +76,7 @@ def _dspark_block_attention_fake(
 @mark_spliting_op(
     is_custom=True, gen_fake=_dspark_block_attention_fake, mutates_args=[]
 )
+@eager_region()
 def dspark_block_attention(
     x: torch.Tensor,  # [B, T, dim] per-block hidden (post attn_norm)
     positions: torch.Tensor,  # [B] anchor position per request
@@ -88,8 +95,8 @@ def dspark_block_attention(
     only be called once``.
 
     The V4 target calls the very same kernel and is fine precisely because its
-    call site (``DeepseekV4Attention._attn_compress``) is reachable only through
-    ``torch.ops.aiter.v4_attn_compress``, a splitting op. This mirrors that,
+    call site (``DeepseekV4Attention._launch_compressors``) is reachable only
+    through ``torch.ops.aiter.v4_attn_compress_launch``, a splitting op. This mirrors that,
     at the WIDE granularity (``v4_attention_with_output``): the whole attention
     sub-layer stays eager.
 
@@ -106,137 +113,12 @@ def dspark_block_attention(
     return layer.dspark_attention(x, positions, draft_pos, valid_target, topk_idxs)
 
 
-class DSparkMarkovHead(nn.Module):
-    """Low-rank first-order Markov transition bias (paper §3.1, Eq. 5).
-
-    The full ``V x V`` transition matrix is factorized as ``B = W1 @ W2`` with
-    ``W1 in R^{V x r}`` (embedding lookup of the previous token) and
-    ``W2 in R^{V x r}`` (logit projection).  Given the previously sampled token
-    ``x_{k-1}``, the bias added to position ``k``'s base logits is
-
-        B(x_{k-1}, :) = W1[x_{k-1}] @ W2^T   in R^V
-
-    ``r = dspark_markov_rank`` (512 for V4-Pro-DSpark) keeps both storage and
-    per-step compute small, so the sequential sampling loop stays lightweight
-    relative to the parallel backbone.
-
-    Checkpoint shapes: markov_w1.weight [V, r], markov_w2.weight [V, r].
-    Both are nn.Embedding-style [V, r] tables; the logit projection uses
-    ``W1[x] @ W2.weight^T`` ( == @ W2 with W2 viewed as [r, V] ).
-    """
-
-    def __init__(self, vocab_size: int, rank: int):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.rank = rank
-        # Read once here rather than per sampled position: envs re-reads the
-        # environment on every attribute access.
-        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
-        # W1: per-token embedding lookup table [V, r].
-        self.markov_w1 = nn.Embedding(vocab_size, rank)
-        # W2: logit projection stored as [V, r] (matches checkpoint); applied as
-        # embed @ W2.weight^T to produce a [*, V] bias. fp32 for precision parity
-        # with the reference (the bias enters a softmax that gates acceptance).
-        self.markov_w2 = nn.Embedding(vocab_size, rank)
-
-    def forward(self, token_ids: torch.Tensor):
-        """Compute the per-position transition bias and the Markov embedding.
-
-        Args:
-            token_ids: [*]  ids of the previously sampled token x_{k-1}.
-
-        Returns:
-            logits_bias: [*, V]  bias to add to base logits at the next position.
-            markov_embed: [*, r]  W1[x_{k-1}], reused by the confidence head.
-        """
-        markov_embed = self.markov_w1(token_ids)  # [*, r]
-        # bias = W1[x] @ W2^T : [*, r] x [r, V] -> [*, V]. fp32 matmul.
-        logits_bias = torch.matmul(
-            markov_embed.float(), self.markov_w2.weight.float().t()
-        )
-        return logits_bias, markov_embed
-
-    def sample_next(self, token_ids: torch.Tensor, base_logits: torch.Tensor):
-        """One greedy block position: the argmax of the biased logits, and W1[x].
-
-        Same contract as the Kimi-K3 head's ``sample_next``; the fused path
-        never materializes the ``[*, V]`` bias, keeping ``W2`` bf16 and reducing
-        straight to ids with an fp32 accumulator (see the op's module docstring
-        for the numerics). ``markov_embed`` is still returned because the
-        confidence head consumes it.
-
-        Args:
-            token_ids:   [B]     ids of the previously sampled token x_{k-1}.
-            base_logits: [B, V]  this position's base logits.
-        Returns:
-            next_ids:     [B]     argmax over the biased logits.
-            markov_embed: [B, r]  W1[x_{k-1}].
-        """
-        if self.fused_sample:
-            # Imported here, not at module scope: this file keeps its Triton /
-            # AITER dependencies behind the guarded import block below so the
-            # head stays constructible on a runner with no AITER build.
-            from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
-
-            markov_embed = self.markov_w1(token_ids)
-            next_ids = dspark_markov_argmax(
-                base_logits, markov_embed, self.markov_w2.weight
-            )
-            return next_ids, markov_embed
-        bias, markov_embed = self(token_ids)
-        # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
-        # .float() would only materialize it twice for the same sum.
-        return (base_logits + bias).argmax(dim=-1), markov_embed
-
-
-class DSparkConfidenceHead(nn.Module):
-    """Per-position survival-probability estimator (paper §3.2.1, Eq. 7).
-
-        c_k = sigma( w^T [ h_k ; W1[x_{k-1}] ] )
-
-    Input is the concatenation of ``h_k`` (dim) and the Markov embedding
-    ``W1[x_{k-1}]`` (rank), so the projection weight has shape
-    ``[1, hidden + rank]`` (checkpoint: confidence_head.proj.weight [1, 7680]).
-
-    ``h_k`` is the PRE-norm mHC head reduction, not the post-norm tensor the LM
-    head consumes; feeding the normed one miscalibrates every score.
-
-    The sigmoid lives here rather than in the caller (as in the reference):
-    VerifyScheduler consumes ``c_k`` as an absolute probability, so the (0, 1)
-    range is part of this module's contract.
-    """
-
-    def __init__(self, hidden_size: int, rank: int):
-        super().__init__()
-        self.proj = nn.Linear(hidden_size + rank, 1, bias=False)
-
-    def forward(
-        self, hidden_states: torch.Tensor, markov_embeds: torch.Tensor
-    ) -> torch.Tensor:
-        """Args:
-            hidden_states: [*, hidden]  PRE-norm mHC head reduction h_k.
-            markov_embeds: [*, rank]    W1[x_{k-1}].
-        Returns:
-            confidence: [*]  sigmoid survival probability in (0, 1).
-        """
-        # Confidence is computed in fp32 (the checkpoint head is fp32 and the
-        # downstream scheduler needs calibrated absolute probabilities).
-        x = torch.cat([hidden_states, markov_embeds], dim=-1).float()
-        logit = torch.nn.functional.linear(x, self.proj.weight.float()).squeeze(-1)
-        return torch.sigmoid(logit)
-
-
 # ---------------------------------------------------------------------------
 # Numerical helpers (mirror the public DSpark HF reference; see vLLM PR #46965).
 # These are deliberately plain-torch so they run on ROCm without new kernels.
 # GPU-VERIFY: on-device, the dense fmha below can be swapped for
 # aiter.fmha_fwd_with_sink_asm (q block=5, kv=window128+block) for speed.
 # ---------------------------------------------------------------------------
-
-
-def _linear_out(output):
-    """ATOM quantized linears may return (tensor, scale); take the tensor."""
-    return output[0] if isinstance(output, tuple) else output
 
 
 def _ckpt_index_path(model_path: str) -> str:
@@ -668,7 +550,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         the same lanes for real on its way into an fp8 window; doing both would
         quantize twice, and under two different amax floors."""
         a = self.attn
-        qr_kv = _linear_out(a.wqkv_a(main_x))
+        qr_kv = linear_out(a.wqkv_a(main_x))
         _, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
         kv = a.kv_norm(kv).view(-1, 1, a.head_dim)
         rope_dim = a.rope_head_dim
@@ -789,16 +671,16 @@ class DSparkLayer(Block):  # type: ignore[misc]
         a = self.attn
         B, T, _ = x.shape
         flat = x.view(B * T, -1)
-        qr_kv = _linear_out(a.wqkv_a(flat))
+        qr_kv = linear_out(a.wqkv_a(flat))
         qr, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
         # q_norm runs in fused_quant mode: it returns (qr_fp8, qr_scale) so the
         # downstream wq_b can skip its own input quant (x_scale=qr_scale).
         qr_normed = a.q_norm(qr)
         if isinstance(qr_normed, tuple):
             qr_q, qr_scale = qr_normed
-            q = _linear_out(a.wq_b(qr_q, x_scale=qr_scale))
+            q = linear_out(a.wq_b(qr_q, x_scale=qr_scale))
         else:
-            q = _linear_out(a.wq_b(qr_normed))
+            q = linear_out(a.wq_b(qr_normed))
         # q stays 2-D [B*T, H*D], kv 2-D [B*T, D] — the fused kernel wants 2-D.
 
         # Draft positions (anchor+1 .. anchor+T) come from the shared block plan.
@@ -836,7 +718,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             # accessor (lazy); `bufs.views` raises if stage 0 did not fill first.
             bufs = self.index_buffers(T, W, x.device)
             if self.stage_id == 0:
-                bufs.build(a.swa_window, slots, positions)
+                bufs.build(a.swa_window, slots, positions, a.n_local_heads)
             kv_indices, kv_indptr, draft_rows = bufs.views(B)
             batch_ids = bufs.batch_ids[: B * T]
 
@@ -887,6 +769,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 q_rope_in=qkn.q_rope,
                 qo_indptr=bufs.qo_indptr[: B * T + 1],
                 prefix=f"{a.layer_name}.dspark_attn_fp8",
+                split_plan=bufs.split_plan,
             )  # [B*T, n_heads, head_dim]
             out = out.view(B, T, a.n_local_heads, a.head_dim)
         else:
@@ -940,7 +823,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         o = a._wo_a_grouped_lora(
             o, draft_pos_flat, prefix=f"{a.layer_name}.dspark_wo_a"
         )
-        out_final = _linear_out(a.wo_b(o)).view(B, T, -1)
+        out_final = linear_out(a.wo_b(o)).view(B, T, -1)
         return out_final
 
     def forward_block(
@@ -1026,7 +909,9 @@ class DeepseekV4DSpark(DSparkDraftModel):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config: "Config", prefix: str = "") -> None:
+    def __init__(self, config: "Config", prefix: str = "", *, alt_stream=None) -> None:
+        # `alt_stream` is the drafter's uniform contract; V4's DSpark layers
+        # keep their shared expert on the one stream, so it goes unused here.
         super().__init__()
         self.atom_config = config
         self.hf_config = config.hf_config
@@ -1125,6 +1010,11 @@ class DeepseekV4DSpark(DSparkDraftModel):
         for layer in self.model.layers:
             layer.reset_kv_cache(max_num_seqs, device, dtype)
 
+    def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
+        self.model.index_buffers(
+            num_draft, int(self.window_size), metadata_builder.row_ids.device
+        ).mask_pad_tail(metadata_builder.row_ids, scheduled_bs, running_bs)
+
     # ---- drafting entry points (called by the proposer) --------------------
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
@@ -1135,7 +1025,7 @@ class DeepseekV4DSpark(DSparkDraftModel):
         own kv cache and attention linears).
         """
         stage0 = self.model.mtp[0]
-        return stage0.main_norm(_linear_out(stage0.main_proj(aux_concat)))
+        return stage0.main_norm(linear_out(stage0.main_proj(aux_concat)))
 
     @property
     def context_layers(self):
@@ -1380,11 +1270,13 @@ class _DSparkInner(nn.Module):
         out_ids[:, 0] = anchor_ids
         markov_embeds = []
         for k in range(T):
-            # Greedy (temperature handled upstream).
-            out_ids[:, k + 1], m_embed = last.markov_head.sample_next(
-                out_ids[:, k], base_logits[:, k]
+            # Greedy (temperature handled upstream). The column is the op's
+            # destination, so no id is written twice.
+            markov_embeds.append(
+                last.markov_head.sample_next(
+                    out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+                )
             )
-            markov_embeds.append(m_embed)
         confidence = last.confidence_head(
             hc_hidden, torch.stack(markov_embeds, dim=1)
         )  # [B, T]

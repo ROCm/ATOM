@@ -36,26 +36,21 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
 * ``build_connector_meta`` — returns :class:`MultiConnectorMetadata` carrying one
   sub-metadata per connector, in connector order. The worker de-multiplexes by
   index in ``start_load_kv``.
-* ``get_finished`` — union the completion sets, **but** see the send/save
-  pairing below.
+* ``get_finished`` — union each sub-connector's completion sets independently.
 * ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
   the composite by ``_adopt_state_tier`` at ``register_kv_caches`` time (which
-  also refuses a config that lists two offload subs). Mirroring the sub's tier
-  on the composite keeps the attribute defined, so a probe for it resolves to
-  the real tier instead of raising ``AttributeError``.
+  also refuses two subs that each built one). Mirroring the sub's tier on the
+  composite keeps the attribute defined, so a probe for it resolves to the real
+  tier instead of raising ``AttributeError``. A config that lists two offload
+  subs never gets that far: ``_build_subconnectors`` refuses it before either
+  is built.
 
-Send/save pairing (the one tricky correctness point)
-----------------------------------------------------
-On a producer node the scheduler frees a finished request's blocks as soon as it
-sees ``finished_sending`` (``scheduler.py``: producer path), and it can *also*
-free on ``finished_saving`` when the connector does not defer. If offload is
-still reading those blocks for its save when the moriio send completes (or vice
-versa), the free would corrupt the in-flight transfer. So when a request needs
-**both** a send and one or more saves, ``MultiConnector`` withholds *both*
-completion signals until every known save is done, then emits them together.
-The scheduler's ``finished_sending`` handler frees first; the
-``finished_saving`` handler then finds nothing to free and no-ops. This is the
-analogue of vLLM's ``_extra_async_saves`` refcount.
+Completion reporting and source-block retention
+----------------------------------------------
+Send and save completions are reported immediately so each transfer can make
+progress independently. The scheduler retains source blocks through the
+sub-connectors' ``should_defer_free`` predicates until pending sends, active
+saves, and computed KV awaiting save dispatch have all finished.
 """
 
 from __future__ import annotations
@@ -71,9 +66,6 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
-    SaveCompletionId,
-    StateStoreOperationId,
-    completion_req_key,
     connector_metadata_has_work,
 )
 
@@ -105,7 +97,7 @@ def _build_subconnectors(config: Any, role: str) -> list:
             "kv_transfer_config"
         )
 
-    connectors = []
+    offload_subs = []
     for i, sub in enumerate(subs):
         if not isinstance(sub, dict) or "kv_connector" not in sub:
             raise ValueError(
@@ -114,6 +106,23 @@ def _build_subconnectors(config: Any, role: str) -> list:
             )
         if sub["kv_connector"] == "multi":
             raise ValueError("multi connector cannot nest another 'multi'")
+        name = KVConnectorFactory.canonical_name(
+            sub["kv_connector"], path=f"kv_transfer_config.connectors[{i}]"
+        )
+        if KVConnectorFactory.is_offload_backend(name):
+            offload_subs.append(name)
+    # Before any sub is built: an offload scheduler's `process_completions`
+    # rewrites the completion sets it is handed, and no completion names the
+    # sub it belongs to, so two offload subs would retire each other's saves
+    # and loads (`MultiConnectorScheduler.process_completions`).
+    if len(offload_subs) > 1:
+        raise ValueError(
+            "multi permits at most one offload sub-connector; got "
+            + ", ".join(offload_subs)
+        )
+
+    connectors = []
+    for i, sub in enumerate(subs):
         cfg_i = copy.copy(config)
         cfg_i.kv_transfer_config = sub
         connectors.append(KVConnectorFactory.create_connector(cfg_i, role=role))
@@ -122,6 +131,20 @@ def _build_subconnectors(config: Any, role: str) -> list:
             i,
             sub["kv_connector"],
             role,
+        )
+    # Completion reports name a request, not a connector: with two senders the
+    # first `finished_sending` would retire both claims and free the source
+    # under the other's live RDMA read. Refuse the config rather than grow
+    # per-child completion identities for a topology nobody runs. (Two offload
+    # subs were refused above, before anything was built.)
+    if sum(bool(getattr(c, "is_producer", False)) for c in connectors) > 1:
+        raise ValueError(
+            "multi permits at most one producer/send sub-connector; got "
+            + ", ".join(
+                sub["kv_connector"]
+                for sub, c in zip(subs, connectors)
+                if getattr(c, "is_producer", False)
+            )
         )
     return connectors
 
@@ -228,35 +251,11 @@ class MultiConnector(KVConnectorBase):
             getattr(c, "is_producer", False) for c in self._connectors
         )
 
-        pp_rank = getattr(
-            getattr(config, "parallel_config", None),
-            "pipeline_parallel_rank",
-            0,
-        )
-        self._pp_is_head = pp_rank == 0
-
-        # Send/save pairing state, all keyed by str(req_id). See module
-        # docstring. The values below are completion identities, not keys: a
-        # pending save is named by its SaveOperationId, or by the bare req_id
-        # when the metadata carries none -- whichever the worker will report.
-        self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
-        self._sent: dict[str, Any] = {}
-        self._saved: dict[str, set[SaveCompletionId]] = {}
         # The state tier of whichever sub owns one. Adopted in
         # `register_kv_caches` via `_adopt_state_tier`; set to None here so the
         # attribute exists before the subs register -- a probe for it must
         # resolve, not raise `AttributeError`.
         self._state_tier = None
-
-    @property
-    def _pairs_send_and_save(self) -> bool:
-        """Whether this rank has a send to pair its saves against.
-
-        Only a producer's PP stage 0 does: mooncake reports done_sending on
-        stage 0 alone (via ``_record_release``). Every other rank passes both
-        completions straight through and must keep no pairing state.
-        """
-        return self.is_producer and self._pp_is_head
 
     def register_kv_caches(
         self,
@@ -271,12 +270,13 @@ class MultiConnector(KVConnectorBase):
     def _adopt_state_tier(self) -> None:
         """Take over the one sub-connector's state tier, or refuse two.
 
-        Nothing in ``_build_subconnectors`` stops a config from listing
-        ``lmcache_offload`` twice, which would leave two live tiers and no
-        answer to "which one packs this spill". Picking the first is wrong
-        rather than arbitrary: a hash could be reported indexed by a tier that
-        never stored it, then fetched from one that cannot produce it. Raising
-        at model load costs nothing and is loud.
+        ``_build_subconnectors`` refuses a config that lists two offload
+        backends, so two live tiers -- and no answer to "which one packs this
+        spill" -- should not reach here; this keeps the guard should a
+        non-offload sub ever build a tier. Picking the first is wrong rather
+        than arbitrary: a hash could be reported indexed by a tier that never
+        stored it, then fetched from one that cannot produce it. Raising at
+        model load costs nothing and is loud.
         """
         tiers = [
             c for c in self._connectors if getattr(c, "_state_tier", None) is not None
@@ -301,22 +301,6 @@ class MultiConnector(KVConnectorBase):
         for c, m in zip(self._connectors, metas):
             if m is None:
                 continue
-            # Remember what offload is about to save, so get_finished can hold
-            # the send until it finishes.
-            if self._pairs_send_and_save:
-                reqs = getattr(m, "requests", None)
-                if reqs:
-                    for req in reqs:
-                        has_save = (
-                            getattr(req, "save_spec", None) is not None
-                            or getattr(req, "slot_save_spec", None) is not None
-                        )
-                        if not has_save:
-                            continue
-                        operation = getattr(req, "save_operation", None)
-                        self._pending_save_ops.setdefault(
-                            completion_req_key(req.req_id), set()
-                        ).add(operation if operation is not None else req.req_id)
             c.start_load_kv(m)
 
     def record_kv_cache_ready(self, req_ids: list) -> None:
@@ -344,55 +328,15 @@ class MultiConnector(KVConnectorBase):
             save_now.extend(o.finished_saving)
             completions |= o.connector_completions
 
-        out = KVConnectorOutput(
+        return KVConnectorOutput(
+            finished_sending=set(send_now),
+            finished_saving=set(save_now),
             finished_recving=recv,
             failed_recving=failed,
             finished_loading=loaded,
             failed_loading=load_failed,
             connector_completions=completions,
         )
-
-        if not self._pairs_send_and_save:
-            out.finished_sending = set(send_now)
-            out.finished_saving = set(save_now)
-            return out
-
-        # Pair each request's send and save before releasing either.
-        for r in send_now:
-            self._sent[str(r)] = r
-        # State-tier store completions (`StateStoreOperationId`: a
-        # (prefix_hash, generation) pair) have no send counterpart to pair
-        # against. Parking them in `self._saved` leaked for the life of the
-        # process -- their key never enters `self._sent`, so the pop below never
-        # fired. They are terminal on their own: release immediately. Match on
-        # the exact type, not `hasattr(r, "req_id")` -- a bare `ReqId` save
-        # completion (a plain str/int) has no `req_id` attribute either and must
-        # still go through send/save pairing on a producer node.
-        state_saves: set = set()
-        for r in save_now:
-            if isinstance(r, StateStoreOperationId):
-                state_saves.add(r)
-                continue
-            key = completion_req_key(r)
-            self._saved.setdefault(key, set()).add(r)
-            pending_ops = self._pending_save_ops.get(key)
-            if pending_ops is not None:
-                pending_ops.discard(r)
-                if not pending_ops:
-                    self._pending_save_ops.pop(key, None)
-
-        rel_send: set = set()
-        rel_save: set = set()
-        for key, raw in list(self._sent.items()):
-            if self._pending_save_ops.get(key):
-                continue  # hold: save still in flight for this request
-            rel_send.add(raw)
-            del self._sent[key]
-            rel_save.update(self._saved.pop(key, set()))
-
-        out.finished_sending = rel_send
-        out.finished_saving = rel_save | state_saves
-        return out
 
     def get_finished_recv_blocks(self) -> list[int]:
         blocks: list[int] = []
@@ -423,6 +367,51 @@ class MultiConnector(KVConnectorBase):
 
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
+
+    def bind_block_manager(self, block_manager: Any) -> None:
+        """Bind native checkpoint owners before any request can be admitted."""
+        for connector in self._connectors:
+            bind = getattr(connector, "bind_block_manager", None)
+            if callable(bind):
+                bind(block_manager)
+
+    def lookup_pending(self, seq: Any) -> bool:
+        """True while any sub's external-tier lookup for `seq` is in flight."""
+        for connector in self._connectors:
+            pending = getattr(connector, "lookup_pending", None)
+            if callable(pending) and pending(seq):
+                return True
+        return False
+
+    def _sub_methods(self, name: str) -> list:
+        """Bound `name` of every sub-connector that implements it."""
+        methods = (getattr(c, name, None) for c in self._connectors)
+        return [m for m in methods if callable(m)]
+
+    def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        """True only if every sub-connector with a tier lookup can detach it."""
+        checks = self._sub_methods("can_detach_lookup")
+        return bool(checks) and all(check(seq, num_hbm_tokens) for check in checks)
+
+    def detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        """Detach the lookup on every sub-connector.
+
+        Called after `can_detach_lookup` agreed, so every sub-connector is
+        asked rather than stopping at the first refusal.
+        """
+        results = [
+            bool(detach(seq, num_hbm_tokens))
+            for detach in self._sub_methods("detach_lookup")
+        ]
+        return all(results)
+
+    def prefetch_lookups(self, seqs: Any) -> None:
+        """Let each sub send its external-tier lookups ahead of admission."""
+        seqs = list(seqs)
+        for connector in self._connectors:
+            prefetch = getattr(connector, "prefetch_lookups", None)
+            if callable(prefetch):
+                prefetch(seqs)
 
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
@@ -465,9 +454,9 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         face on every layout, so `_first_with(..., "enqueue_state_stores")`
         would pick a non-tier offload shell -- whose `_impl` has no tier and
         returns False / empty for every state call -- ahead of the shell that
-        owns the tier. At most one sub can host the tier: two `lmcache_offload`
-        sub-connectors are refused at startup (`_offload_subconfig`), so "first"
-        here is "only". Returns None when no sub hosts a tier -- the legal
+        owns the tier. At most one sub can host the tier: two offload
+        sub-connectors are refused at startup (`_build_subconnectors`), so
+        "first" here is "only". Returns None when no sub hosts a tier -- the legal
         `[producer]`-only shape -- and the state-face forwarders then fall to
         their no-tier defaults.
 
@@ -555,6 +544,32 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         for c in self._connectors:
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)
+
+    def source_blocks_released(self, seq: Any) -> None:
+        # The terminal half of `request_finished` for whichever sub deferred
+        # the free. Fanned to all: only the offload sub keeps block-lifetime
+        # state, and P/D backends explicitly do nothing.
+        for c in self._connectors:
+            fn = getattr(c, "source_blocks_released", None)
+            if callable(fn):
+                fn(seq)
+
+    def waits_for_transfer_report(self, seq: Any) -> bool:
+        """True only if every sub still deferring this request waits for reports.
+
+        Clock-based reclaim is skipped only when no deferring sub would act on
+        it; a P/D send or an in-process save still gets its abandon path.
+        """
+        deferring = 0
+        for connector in self._connectors:
+            should_defer = getattr(connector, "should_defer_free", None)
+            if not callable(should_defer) or not should_defer(seq):
+                continue
+            deferring += 1
+            callback = getattr(connector, "waits_for_transfer_report", None)
+            if not callable(callback) or callback(seq) is not True:
+                return False
+        return deferring > 0
 
     def abandon_save(self, req_id: Any) -> None:
         # Reclamation of a stalled offload save (see
@@ -713,6 +728,25 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             protected.update(blocks)
         return frozenset(protected)
 
+    def can_partially_deallocate_state(self, seq: Any) -> bool:
+        """True only if every sub still deferring this request guarantees it.
+
+        Fail-closed like ``protected_block_ids``: releasing the state slot is
+        safe only when no deferring sub still needs the request alive, and a
+        missing method is not approval. ``protected_block_ids`` narrows PAGE
+        blocks only, so it cannot stand in for a sub's state guarantee.
+        """
+        deferring = 0
+        for connector in self._connectors:
+            should_defer = getattr(connector, "should_defer_free", None)
+            if not callable(should_defer) or not should_defer(seq):
+                continue
+            deferring += 1
+            callback = getattr(connector, "can_partially_deallocate_state", None)
+            if not callable(callback) or callback(seq) is not True:
+                return False
+        return deferring > 0
+
     def activate_block_leases(self, seq: Any, block_ids) -> None:
         for connector in self._connectors:
             callback = getattr(connector, "activate_block_leases", None)
@@ -742,9 +776,8 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 callback(count)
 
     def has_pending_work(self) -> bool:
-        # Scheduler-side only: the send/save pairing state lives on the worker
-        # instance, and a pending send is already visible to the engine through
-        # the scheduler's deferred_free_blocks.
+        # A pending send is visible to the engine through the scheduler's
+        # deferred_free_blocks; sub-connectors report their offload work here.
         return any(
             c.has_pending_work()
             for c in self._connectors
@@ -768,12 +801,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         plus a WARNING per foreign completion at steady state. There is no shared
         key by which the composite could split the sets per sub.
 
-        That case is now unrepresentable: `_offload_subconfig` refuses two
-        `lmcache_offload` sub-connectors at startup, and only `lmcache_offload`
-        subs define `process_completions`, so `handlers` is 0 or 1. The direct
-        call is byte-for-byte the single-offload (`[producer, offload]`)
-        behaviour. `>1` is guarded loudly in case that refusal is ever bypassed
-        -- silently corrupting saves is the worse failure.
+        That case is now unrepresentable: `_build_subconnectors` refuses two
+        offload sub-connectors (every backend registered with `offload=True`)
+        before either is built, and only offload subs define
+        `process_completions`, so `handlers` is 0 or 1. The direct call is
+        byte-for-byte the single-offload (`[producer, offload]`) behaviour.
+        `>1` is guarded loudly in case that refusal is ever bypassed --
+        silently corrupting saves is the worse failure.
         """
         handlers = [
             handler
@@ -786,7 +820,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             raise RuntimeError(
                 "multi has >1 offload sub-connector with process_completions; "
                 "their completion sets cannot be partitioned per sub and this "
-                "composite is refused at startup (_offload_subconfig)."
+                "composite is refused at startup (_build_subconnectors)."
             )
         return handlers[0](output)
 
@@ -794,6 +828,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         for c in self._connectors:
             if hasattr(c, "save_finished"):
                 c.save_finished(req_id)
+
+    def send_finished(self, req_id: Any) -> None:
+        # Offload subs explicitly do nothing; fanning out saves the composite
+        # from tracking which index owns the send.
+        for c in self._connectors:
+            if hasattr(c, "send_finished"):
+                c.send_finished(req_id)
 
     def load_failed(self, req_id: Any) -> None:
         for c in self._connectors:
@@ -844,7 +885,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         guard and renders `{}` when it is absent -- so under `multi` the whole
         offload metrics block silently reads empty. Sum overlapping int keys
         across every sub that reports (only offload subs do), rather than
-        first-hit. At most one offload sub is legal (`_offload_subconfig`), but
+        first-hit. At most one offload sub is legal (`_build_subconnectors`), but
         summing stays correct for that one and for any future producer that
         grows int counters.
         """

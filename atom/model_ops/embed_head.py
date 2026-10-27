@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from aiter import topk_select
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -322,7 +323,12 @@ class ParallelLMHead(VocabParallelEmbedding):
             return out.copy_(self._dp_sharded_logits(x, "argmax"))
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
-            return out.copy_(logits.argmax(dim=-1))
+            # `output_idx=out` rather than a returned tensor: a draft pass is
+            # recorded, and a capture bakes the address the answer lands at.
+            # `tie="low"` keeps the lowest-index pick promised above; `logits`
+            # stays bf16, since the reduction widens as it reads.
+            topk_select(logits, 1, tie="low", output_idx=out.view(-1, 1))
+            return out
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
         packed = lm_head_argmax_pack(logits, self.vocab_start_idx)

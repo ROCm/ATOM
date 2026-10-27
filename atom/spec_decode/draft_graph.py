@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from atom.utils import envs
+from atom.utils.region_graph import ReqGraph
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -72,17 +73,21 @@ class DraftGraph:
     Everything here counts SEQUENCES, in the target's own words:
     ``scheduled_bs`` is what this rank was handed, ``running_bs`` is the
     DP-agreed batch a recording holds, and ``capture_sizes`` is the ladder
-    the startup sweep warms.
+    the startup sweep warms. A recording is a `ReqGraph` bucket per
+    ``running_bs``.
     """
 
     forward: Callable[..., Any]  # (running_bs, **staged) -> Any
     epilogue: Callable[..., Any] | None = None  # (fwd_out, running_bs, **staged)
     capture_epilogue: bool = False
+    capture_supported: bool = True
     inputs: "Mapping[str, StagedInput]" = field(default_factory=dict)
     warmup_inputs: Callable[..., None] | None = None
 
     _buffers: dict[str, torch.Tensor] = field(init=False, default_factory=dict)
-    _cuda_graphs: dict[int, tuple] = field(init=False, default_factory=dict)
+    # Keyed by `running_bs` alone: a pass drafts the same tokens per sequence
+    # on every step.
+    _graph: ReqGraph = field(init=False, default_factory=ReqGraph)
 
     @property
     def name(self) -> str:
@@ -118,9 +123,8 @@ class DraftGraph:
 
     @property
     def will_capture(self) -> bool:
-        """Whether warmup also captures. The name `envs.ATOM_DRAFT_CUDAGRAPH`
-        points at, and the only thing that decides it."""
-        return envs.ATOM_DRAFT_CUDAGRAPH
+        """Capture only a supported pass when the deployment enables it."""
+        return self.capture_supported and envs.ATOM_DRAFT_CUDAGRAPH
 
     def label(self, scheduled_bs: int, running_bs: int) -> str:
         """``bs=<scheduled>/<running>``, plus ``graph`` when this step replays.
@@ -224,7 +228,24 @@ class DraftGraph:
         reason: ``Drafter.warmup_draft_graphs`` records on a real decode-shaped
         context, and this pass is that shape whatever the target just did.
         """
-        return running_bs in self._cuda_graphs
+        return running_bs in self._graph
+
+    def release_graphs(self) -> int:
+        """Drop every recording, so what it captured can be freed.
+
+        A draft pass WRITES the KV it attends, so its recording holds the base
+        of the pool exactly the way a decode graph does: a sleep that frees the
+        pool has to drop these too, or the first replay after the wake reads a
+        pool that has since been reallocated. `is_captured` answers False
+        afterwards, so `run` calls the pass directly until the next warmup
+        records it again -- which `capture_cudagraph` ends in with request
+        graphs and token graphs alike.
+
+        The staged `_buffers` stay: they are ordinary allocations, sized once at
+        `bind` for the very reason that a capture must not be the thing that
+        allocates them.
+        """
+        return self._graph.release_graphs()
 
     @property
     def _to_capture(self) -> Callable[..., Any]:
@@ -245,14 +266,10 @@ class DraftGraph:
         allocator's does. Only ``capture_epilogue`` can put a survivor in
         there; the eager path allocates normally and needs no copy.
         """
-        captured = (
-            self._cuda_graphs.get(running_bs) if self.is_captured(running_bs) else None
-        )
-        if captured is None:
+        if running_bs not in self._graph:
             out = self._to_capture(running_bs, **staged)
         else:
-            graph, out = captured
-            graph.replay()
+            out = self._graph.replay(key=running_bs)
             if self.capture_epilogue:
                 out = _owned(out, tuple(staged.values()))
         return (
@@ -272,23 +289,16 @@ class DraftGraph:
         )
 
     @torch.inference_mode()
-    def warmup(self, running_bs: int, *, pool=None, stream=None):
-        """Run the pass once at one captured size, paying its per-shape JIT here."""
+    def warmup(self, running_bs: int):
+        """Run the pass once at one captured size, paying its per-shape JIT
+        here, then record it on the current stream -- a capture stream."""
         staged = {role: self._stage_one(role, running_bs, None) for role in self.inputs}
         if self.warmup_inputs is not None:
             self.warmup_inputs(running_bs, **staged)
         # forward AND epilogue, so nothing serving runs is left cold.
         self._forward_and_epilogue(running_bs, **staged)
         if not self.will_capture:
-            return pool
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        # thread_local, not the "global" default: global invalidates a capture
-        # when ANY thread makes an unsafe HIP call, and the NCCL watchdog polls
-        # `hipEventQuery` every ~100ms. Same reasoning as `cuda_graph.py`'s.
-        with torch.cuda.graph(
-            graph, pool, stream=stream, capture_error_mode="thread_local"
-        ):
-            out = self._to_capture(running_bs, **staged)
-        self._cuda_graphs[running_bs] = (graph, out)
-        return pool or graph.pool()
+            return
+        self._graph.record(
+            lambda: self._to_capture(running_bs, **staged), key=running_bs
+        )

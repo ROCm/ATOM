@@ -17,7 +17,6 @@ forward time (`RuntimeError: expected scalar type BFloat16 but found
 Float8_e4m3fnuz`). This test locks in that fix for both dialects.
 """
 
-import sys
 import unittest
 
 import pytest
@@ -26,26 +25,6 @@ import pytest
 # chain pulls atom.model_ops -> AITER (GPU-only). Skip on the non-GPU unit
 # gate; runs in GPU CI (and locally on the box) where AITER is present.
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-
-# Loading the real atom source wipes the conftest.py stubs; snapshot and
-# restore sys.modules so this file's effect stays local to its own collection
-# (mirrors test_dummy_weight_init.py / test_mxfp4_moe_has_bias.py).
-_saved_atom_modules: dict[str, object] = {}
-
-
-def setUpModule():
-    global _saved_atom_modules
-    _saved_atom_modules = {
-        name: mod for name, mod in sys.modules.items() if name.startswith("atom")
-    }
-    for name in list(_saved_atom_modules):
-        del sys.modules[name]
-
-
-def tearDownModule():
-    for name in [n for n in sys.modules if n.startswith("atom")]:
-        del sys.modules[name]
-    sys.modules.update(_saved_atom_modules)
 
 
 def _make_wo_a(dtype, out_features=256, in_features=128, block=128):
@@ -90,8 +69,10 @@ class _FakeAttention:
 
     Values coherent with ``_make_wo_a``'s 256 x 128 weight: the gfx950
     batched-GEMM path wants ``out_dim == n_local_groups * o_lora_rank``, so
-    2 x 128. ``_is_gfx950`` and ``_is_preshuffle`` are False because this is
-    the gfx942 dtype gate -- the BF16 fallback is the path under test.
+    2 x 128. ``_is_gfx950``, ``_is_gfx1250`` and ``_is_preshuffle`` are False
+    because this is the gfx942 dtype gate -- the BF16 fallback is the path
+    under test, and production takes the mxscale one on ``_is_gfx950 or
+    _is_gfx1250``.
     """
 
     def __init__(self, wo_a):
@@ -99,6 +80,7 @@ class _FakeAttention:
         self.n_local_groups = 2
         self.o_lora_rank = 128
         self._is_gfx950 = False
+        self._is_gfx1250 = False
         self._is_preshuffle = False
 
     def __getattr__(self, name):

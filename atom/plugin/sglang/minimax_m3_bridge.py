@@ -41,6 +41,39 @@ def _m3_index_dim(config: Any) -> int:
     return int(index_dim)
 
 
+def minimax_m3_num_idx_heads(config: Any, tp_size: int) -> int:
+    """TP-local index heads -- the selector has one row per (index head, token).
+
+    M3 ties the index head count to the KV head count, so this is the KV heads
+    this rank holds. An sglang carrying the dp-attention split answers the
+    world size exactly, since attention's differs from the model's there;
+    without that module the caller's is the answer.
+
+    `tp_size` is the caller's rather than a literal 1, because a wrong count
+    here is not an error anywhere downstream: the row bounds come out the wrong
+    length, aiter's predicate declines them, and the Triton selector serves at
+    full correctness -- so nothing would ever report the fast path was lost.
+    """
+    heads = int(getattr(_text_config(config), "num_key_value_heads", 1))
+    try:
+        from sglang.srt.distributed.parallel_state import (
+            get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
+        )
+    except ImportError:  # an sglang without the dp-attention split
+        try:
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+        except ImportError:
+            pass
+        else:
+            tp_size = get_attention_tp_size()
+    else:
+        # Only the import is guarded. This runs inside a forward, where the
+        # attention group is up -- unlike `_local_kv_heads`, which answers the
+        # same question while the memory pools are still being sized.
+        tp_size = get_attention_tp_size()
+    return max(1, heads // max(1, int(tp_size)))
+
+
 def _dtype_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
@@ -64,7 +97,7 @@ def _resolve_m3_index_cache_dtype(fallback: torch.dtype) -> torch.dtype:
         index_cache_dtype = getattr(
             get_current_atom_config(), "index_cache_dtype", None
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         index_cache_dtype = None
 
     if str(index_cache_dtype).startswith("fp8"):
@@ -211,106 +244,140 @@ class ATOMMiniMaxM3SGLangKVPool:
         self, layer_id: int
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         mapped = self._layer_mapping.get(int(layer_id))
-        if mapped is None or not self.k_scale_buffer:
-            return None, None
-        return self.k_scale_buffer[mapped], self.v_scale_buffer[mapped]
+        if mapped is not None and self.k_scale_buffer:
+            return self.k_scale_buffer[mapped], self.v_scale_buffer[mapped]
+        # Prefer scales that already live on the upstream pool (FP8/MXFP4).
+        getter = getattr(self.main_pool, "get_kv_scale_buffer", None)
+        if getter is not None:
+            return getter(layer_id)
+        return None, None
+
+
+def _minimax_sparse_kv_scale_buffer(self, layer_id: int):
+    """FP8/MXFP4 scale view that MiniMaxSparseKVPool does not expose.
+
+    Index-K already lives on the upstream pool (``get_index_k_buffer``).
+    Scale tensors live on ``main_pool`` when SGLang quantized the KV cache;
+    otherwise return ``(None, None)`` so BF16/PTPC does not invent buffers.
+    """
+
+    main = self.main_pool
+    getter = getattr(main, "get_kv_scale_buffer", None)
+    if getter is not None:
+        return getter(layer_id)
+    k_buf = getattr(main, "k_scale_buffer", None)
+    v_buf = getattr(main, "v_scale_buffer", None)
+    if not k_buf or not v_buf:
+        return None, None
+    idx = int(layer_id) - int(getattr(main, "start_layer", 0) or 0)
+    return k_buf[idx], v_buf[idx]
+
+
+def _atom_m3_index_dtype(owner: Any) -> torch.dtype:
+    """ATOM index dtype for MiniMax-M3: fp8 when KV/index config says fp8."""
+
+    fallback = getattr(owner, "model_dtype", torch.bfloat16)
+    index_dtype = _resolve_m3_index_cache_dtype(fallback)
+    if _is_fp8_dtype(index_dtype):
+        return index_dtype
+    kv_dtype = getattr(owner, "kv_cache_dtype", None)
+    kv_str = str(getattr(owner, "kv_cache_dtype_str", "") or "")
+    if _is_fp8_dtype(kv_dtype) or kv_str.startswith("fp8"):
+        from aiter import dtypes
+
+        return dtypes.d_dtypes["fp8"]
+    return index_dtype
+
+
+def _is_minimax_m3_owner(owner: Any) -> bool:
+    model_config = getattr(owner, "model_config", None)
+    return is_minimax_m3_config(getattr(model_config, "hf_config", None))
+
+
+def install_minimax_mono_plugin_refusal() -> None:
+    """Refuse MiniMax mono before the TR_HYBRID cudagraph check.
+
+    ``#2419`` builds every ``_config_refusal`` clause up front. SGLang leaves
+    ``compilation_config.cudagraph_mode`` as None, so
+    ``uses_tr_hybrid`` crashes before the ``plugin mode``
+    clause can refuse. Mono is unsupported here; return that reason without
+    reading ``cudagraph_mode``.
+
+    The stand-in must take exactly what ``MonoDecode.__init__`` passes.
+    ``#2479`` folded the ``use_index_cache`` clause into ``common_refusals``
+    and dropped ``text_config`` from the native signature and its one call
+    site, but left this stand-in demanding it -- so every SGLang MiniMax-M3
+    launch raised ``TypeError`` at model construction instead of refusing.
+    Nothing static catches a signature drift across a rebind like this, and
+    only an SGLang MiniMax-M3 launch executes it, which is why the pairing is
+    pinned by ``tests/plugin/test_minimax_m3_mono_refusal.py``.
+    """
+    from atom.models.minimax_m3.mono import dispatch
+
+    if getattr(dispatch, "_atom_sglang_mono_plugin_refusal", False):
+        return
+    dispatch._config_refusal_native = dispatch._config_refusal
+
+    def _config_refusal(atom_config):
+        del atom_config
+        return "plugin mode"
+
+    dispatch._config_refusal = _config_refusal
+    dispatch._atom_sglang_mono_plugin_refusal = True
 
 
 def install_minimax_m3_pool_patch() -> None:
-    """Patch older SGLang builds that lack MiniMaxSparseKVPool support."""
+    """Keep ATOM FP8 index dtype + scale ABI on MiniMaxSparseKVPool.
 
-    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
+    SGLang 0.5.19+ builds ``MiniMaxSparseKVPool`` natively, but ``index_dtype``
+    stays ``model_dtype`` (bf16) unless NVIDIA ``m3_fp8_attn_gemm`` is on.
+    ATOM's sparse kernels follow ``index_cache_dtype`` (fp8 when KV is fp8).
 
-    if getattr(mixin.ModelRunnerKVCacheMixin, "_atom_minimax_m3_pool_patched", False):
+    ``pool_configurator`` also bills index-K at ``model_dtype`` during
+    ``_resolve_memory_pool_config`` (before the pool builder). Wrap
+    ``configure()`` so budget accounting and allocation use the same dtype.
+    Also attach ``get_kv_scale_buffer``, which upstream still omits.
+    """
+
+    try:
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+    except ImportError:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "MiniMaxSparseKVPool is unavailable in this SGLang build; "
+            "ATOM MiniMax-M3 SGLang pool shim is not installed"
+        )
         return
 
-    original_resolve = mixin.ModelRunnerKVCacheMixin._resolve_memory_pool_config
-    original_init_pools = mixin.ModelRunnerKVCacheMixin._init_pools
+    if not hasattr(MiniMaxSparseKVPool, "get_kv_scale_buffer"):
+        MiniMaxSparseKVPool.get_kv_scale_buffer = _minimax_sparse_kv_scale_buffer
 
-    def _is_m3_runner(runner) -> bool:
-        return is_minimax_m3_config(getattr(runner.model_config, "hf_config", None))
+    cls = KVCacheConfigurator
+    if getattr(cls, "_atom_minimax_m3_pool_patched", False):
+        return
 
-    def _local_kv_heads(runner) -> int:
+    original_configure = cls.configure
+
+    def configure(self, *, pre_model_load_memory: int):
+        if not _is_minimax_m3_owner(self):
+            return original_configure(self, pre_model_load_memory=pre_model_load_memory)
+        wanted = _atom_m3_index_dtype(self)
+        # Upstream picks index_dtype = model_dtype when m3_fp8_attn_gemm is off.
+        # Main KV still uses kv_cache_dtype; this swap only affects index-K
+        # cell_size billing and MiniMaxSparseKVPool.index_dtype.
+        old_model_dtype = self.model_dtype
+        if wanted != old_model_dtype:
+            self.model_dtype = wanted
         try:
-            from sglang.srt.layers.dp_attention import get_attention_tp_size
+            return original_configure(self, pre_model_load_memory=pre_model_load_memory)
+        finally:
+            if wanted != old_model_dtype:
+                self.model_dtype = old_model_dtype
 
-            return int(runner.model_config.get_num_kv_heads(get_attention_tp_size()))
-        except Exception:
-            hf_config = _text_config(runner.model_config.hf_config)
-            tp_size = max(1, int(getattr(runner, "tp_size", 1)))
-            return max(1, int(getattr(hf_config, "num_key_value_heads", 1)) // tp_size)
-
-    def _resolve_memory_pool_config(self, pre_model_load_memory: int):
-        config = original_resolve(self, pre_model_load_memory)
-        if not _is_m3_runner(self):
-            return config
-
-        hf_config = _text_config(self.model_config.hf_config)
-        kv_dtype = self.kv_cache_dtype
-        use_fp8_scales = _is_fp8_dtype(self.kv_cache_dtype) or str(
-            self.kv_cache_dtype
-        ).startswith("fp8")
-        index_dtype = _resolve_m3_index_cache_dtype(
-            getattr(self, "dtype", getattr(self, "torch_dtype", torch.bfloat16))
-        )
-        num_layers = int(
-            getattr(self, "num_effective_layers", hf_config.num_hidden_layers)
-        )
-        main_bytes = (
-            2
-            * num_layers
-            * _local_kv_heads(self)
-            * int(hf_config.head_dim)
-            * _dtype_size(kv_dtype)
-        )
-        index_bytes = (
-            len(_m3_sparse_layer_ids(self.model_config.hf_config))
-            * _m3_index_dim(self.model_config.hf_config)
-            * _dtype_size(index_dtype)
-        )
-        scale_bytes = 0
-        if use_fp8_scales:
-            scale_bytes = (
-                2 * num_layers * _local_kv_heads(self) * _dtype_size(torch.float32)
-            )
-        extra_bytes = index_bytes + scale_bytes
-        if main_bytes <= 0 or extra_bytes <= 0:
-            return config
-
-        old_tokens = int(config.max_total_num_tokens)
-        new_tokens = (old_tokens * main_bytes) // (main_bytes + extra_bytes)
-        page_size = int(self.server_args.page_size)
-        new_tokens = max(page_size, (new_tokens // page_size) * page_size)
-        if new_tokens < old_tokens:
-            config.max_total_num_tokens = new_tokens
-            config.max_running_requests = self._resolve_max_num_reqs(new_tokens)
-        return config
-
-    def _init_pools(self):
-        original_init_pools(self)
-        if not _is_m3_runner(self):
-            return
-        pool = getattr(self, "token_to_kv_pool", None)
-        if pool is None or hasattr(pool, "get_kv_scale_buffer"):
-            return
-        use_fp8_scales = _is_fp8_dtype(self.kv_cache_dtype) or str(
-            self.kv_cache_dtype
-        ).startswith("fp8")
-        index_dtype = _resolve_m3_index_cache_dtype(
-            getattr(self, "dtype", getattr(self, "torch_dtype", torch.bfloat16))
-        )
-        self.token_to_kv_pool = ATOMMiniMaxM3SGLangKVPool(
-            pool,
-            self.model_config.hf_config,
-            index_dtype,
-            use_fp8_scales=use_fp8_scales,
-        )
-
-    mixin.ModelRunnerKVCacheMixin._resolve_memory_pool_config = (
-        _resolve_memory_pool_config
-    )
-    mixin.ModelRunnerKVCacheMixin._init_pools = _init_pools
-    mixin.ModelRunnerKVCacheMixin._atom_minimax_m3_pool_patched = True
+    cls.configure = configure
+    cls._atom_minimax_m3_pool_patched = True
 
 
 def maybe_get_minimax_m3_pools_from_sglang_batch(forward_batch=None):
@@ -382,7 +449,7 @@ def _page_size(token_to_kv_pool) -> int:
 def _is_stream_capturing() -> bool:
     try:
         return bool(torch.cuda.is_current_stream_capturing())
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -488,8 +555,9 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
     token_to_kv_pool,
     req_to_token_pool,
     max_model_len: int,
+    num_idx_heads: int,
 ):
-    from atom.utils.forward_context import AttentionMetaData
+    from atom.utils.forward_context import AttentionMetaData, AttnState
 
     page_size = _page_size(token_to_kv_pool)
     bs = int(forward_batch.batch_size)
@@ -534,6 +602,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
             slot_mapping=slot_mapping,
             max_seq_len=max_seq_len,
             max_query_len=tokens_per_req,
+            num_idx_heads=num_idx_heads,
         )
         cu_q = torch.arange(
             0,
@@ -544,11 +613,13 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
         )
         metadata = AttentionMetaData(
             cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_q,
             max_seqlen_q=tokens_per_req,
             max_seqlen_k=max_seq_len,
             slot_mapping=slot_mapping,
             context_lens=seq_lens,
             block_tables=block_table,
+            state=AttnState.DECODE,
         )
         metadata.sparse_attention_metadata = sparse_md
         return metadata
@@ -583,6 +654,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
             max_seq_len=max_seq_len,
             num_prefills=bs,
             num_prefill_tokens=total_tokens,
+            num_idx_heads=num_idx_heads,
         )
         sparse_md.prefill.qo_indptr = torch.arange(
             total_tokens + 1,
@@ -634,6 +706,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
         slot_mapping=slot_mapping,
         max_seq_len=max_seq_len,
         max_query_len=tokens_per_req,
+        num_idx_heads=num_idx_heads,
     )
     cu_q = torch.arange(
         0,
@@ -644,11 +717,13 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
     )
     md = AttentionMetaData(
         cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_q,
         max_seqlen_q=tokens_per_req,
         max_seqlen_k=max_seq_len,
         slot_mapping=slot_mapping,
         context_lens=seq_lens,
         block_tables=block_table,
+        state=AttnState.DECODE,
     )
     md.sparse_attention_metadata = sparse_md
     return md
@@ -671,6 +746,8 @@ def _get_index_cache_view(
     *,
     k_buffer: torch.Tensor,
     index_dim: int,
+    model=None,
+    index_cache_dtype: str | None = None,
 ) -> torch.Tensor:
     """Return SGLang MiniMaxSparseKVPool's existing index-K cache view."""
 
@@ -684,10 +761,75 @@ def _get_index_cache_view(
     num_blocks = max(1, num_slots // page_size)
     expected = (num_blocks, page_size, int(index_dim))
     index_buffer = token_to_kv_pool.get_index_k_buffer(layer_id)
+    if index_cache_dtype == "fp8" and not (
+        index_buffer.dtype == torch.uint8 or _is_fp8_dtype(index_buffer.dtype)
+    ):
+        # SGLang only allocates an fp8 indexer cache when its M3 fp8 attn-GEMM
+        # mode is on, which requires the trtllm_mha backend + SM100 and so is
+        # never active on ROCm. The ATOM fused qk-norm/index-insert kernel is in
+        # fp8 sparse insert mode whenever the main KV cache is fp8 and rejects a
+        # bf16 indexer, so own fp8 indexer storage here instead.
+        return _atom_owned_index_cache(
+            model, layer_id, shape=expected, device=index_buffer.device
+        )
     return index_buffer[: num_blocks * page_size].view(*expected)
 
 
+def _atom_owned_index_cache(
+    model,
+    layer_id: int,
+    *,
+    shape: tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate (once per layer) an ATOM-owned fp8 indexer-K cache."""
+    from aiter import dtypes
+
+    cache = getattr(model, "_atom_sglang_m3_index_cache", None)
+    if cache is None:
+        cache = {}
+        model._atom_sglang_m3_index_cache = cache
+
+    entry = cache.get(layer_id)
+    if entry is None or tuple(entry.shape) != tuple(shape) or entry.device != device:
+        entry = torch.zeros(shape, dtype=dtypes.d_dtypes["fp8"], device=device)
+        cache[layer_id] = entry
+    return entry
+
+
+def _atom_owned_kv_scales(
+    model,
+    layer_id: int,
+    *,
+    shape: tuple[int, int, int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate (once per layer) ATOM-owned fp8 KV dequant-scale buffers.
+
+    Shape matches the page-128 SHUFFLE scale view ``[num_blocks, nkv, page]``
+    that ``_to_page16_shuffle`` reinterprets as ``[num_blocks*8, nkv, 16]``.
+    """
+    cache = getattr(model, "_atom_sglang_m3_native_kv_scale", None)
+    if cache is None:
+        cache = {}
+        model._atom_sglang_m3_native_kv_scale = cache
+
+    entry = cache.get(layer_id)
+    if (
+        entry is None
+        or tuple(entry[0].shape) != tuple(shape)
+        or entry[0].device != device
+    ):
+        entry = (
+            torch.zeros(shape, dtype=torch.float32, device=device),
+            torch.zeros(shape, dtype=torch.float32, device=device),
+        )
+        cache[layer_id] = entry
+    return entry
+
+
 def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
+    install_minimax_m3_pool_patch()
     if token_to_kv_pool is None or not hasattr(token_to_kv_pool, "get_kv_buffer"):
         return False
 
@@ -715,6 +857,18 @@ def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
         else:
             k_scale = None
             v_scale = None
+        if k_scale is None and k_buffer.element_size() == 1:
+            # SGLang's own MiniMaxSparseKVPool carries no dequant-scale storage,
+            # but the fp8 fused qk-norm/KV-insert kernel writes per-token scales.
+            # Own them here (same fallback the EAGLE3 bridge uses for SGLang's
+            # native draft KV pool) and cache them on the model so rebinding
+            # keeps the already-written scales.
+            k_scale, v_scale = _atom_owned_kv_scales(
+                model,
+                layer_id,
+                shape=(num_blocks, num_kv_heads, page_size),
+                device=k_buffer.device,
+            )
         if not is_sparse_layer:
             pass
         elif getattr(impl, "skip_index_topk", False):
@@ -727,6 +881,8 @@ def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
                 layer_id,
                 k_buffer=k_buffer,
                 index_dim=impl.index_head_dim,
+                model=model,
+                index_cache_dtype=getattr(impl, "index_cache_dtype", None),
             )
         impl.max_model_len = int(getattr(token_to_kv_pool, "size", live_slots))
         if is_sparse_layer:
@@ -735,10 +891,8 @@ def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
             )
             if impl.index_topk_cache_state is None:
                 impl.index_topk_cache_state = {}
-                setattr(
-                    token_to_kv_pool,
-                    "_atom_minimax_m3_topk_cache_state",
-                    impl.index_topk_cache_state,
+                token_to_kv_pool._atom_minimax_m3_topk_cache_state = (
+                    impl.index_topk_cache_state
                 )
         kv_cache_data[f"layer_{layer_id}"] = KVCacheTensor(
             layer_num=layer_id,

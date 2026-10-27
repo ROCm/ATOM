@@ -3,6 +3,26 @@ from typing import Any
 import torch
 
 
+def real_batch_size(forward_batch: Any) -> int:
+    """Live request count, excluding CUDA-graph / DP dummy rows.
+
+    SGLang decode graphs pad to the next captured bucket. The replay view
+    exposes that as ``num_padding`` (and sometimes ``_original_batch_size``
+    for DP/MLP-sync). Dummy rows keep the previous request's
+    ``req_pool_indices`` / page tables after a completion frees those pages;
+    QSA/GDN must not read them.
+    """
+    bs = int(getattr(forward_batch, "batch_size", 0) or 0)
+    real = bs
+    orig = getattr(forward_batch, "_original_batch_size", None)
+    if orig is not None:
+        real = min(real, int(orig))
+    pad = getattr(forward_batch, "num_padding", None)
+    if pad:
+        real = min(real, max(bs - int(pad), 0))
+    return max(real, 0)
+
+
 def resolve_attn_backend(forward_batch: Any) -> Any:
     try:
         from sglang.srt.model_executor.forward_context import (
@@ -60,39 +80,34 @@ def reconstruct_linear_metadata(
 
     mode = forward_batch.forward_mode
     batch_size = forward_batch.batch_size
-    # SGLang records the request count before DP/MLP-sync appends dummy rows.
-    # Without padding this field is None and every batch row is real.
-    real_batch_size = getattr(forward_batch, "_original_batch_size", None)
-    real_batch_size = batch_size if real_batch_size is None else int(real_batch_size)
-    real_batch_size = min(real_batch_size, batch_size)
+    live_bs = real_batch_size(forward_batch)
     device = indices.device
-    if real_batch_size < indices.shape[0]:
-        # Mark DP/MLP-sync padding rows so they cannot read or write state.
+    if live_bs < indices.shape[0]:
+        # Mark DP/MLP-sync and CUDA-graph padding rows so they cannot
+        # read or write state (including a just-finished request's slot).
         indices = indices.clone()
-        indices[real_batch_size:] = -1
+        indices[live_bs:] = -1
 
     if mode.is_decode_or_idle():
         # Give each real decode request one token and every padded row zero tokens.
         query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
-        query_start_loc[real_batch_size + 1 :] = real_batch_size
+        query_start_loc[live_bs + 1 :] = live_bs
     elif mode.is_extend():
         # Build variable-length query offsets using only real extend requests.
         query_start_loc = torch.empty(
             (batch_size + 1,), dtype=torch.int32, device=device
         )
-        if real_batch_size:
+        if live_bs:
             # End at the final real request instead of a synthetic padded row.
-            query_start_loc[:real_batch_size] = forward_batch.extend_start_loc[
-                :real_batch_size
-            ]
+            query_start_loc[:live_bs] = forward_batch.extend_start_loc[:live_bs]
             end = (
-                forward_batch.extend_start_loc[real_batch_size - 1]
-                + forward_batch.extend_seq_lens[real_batch_size - 1]
+                forward_batch.extend_start_loc[live_bs - 1]
+                + forward_batch.extend_seq_lens[live_bs - 1]
             )
         else:
             # An empty real batch makes every synthetic row a zero-length query.
             end = 0
-        query_start_loc[real_batch_size:] = end
+        query_start_loc[live_bs:] = end
     else:
         return None
 

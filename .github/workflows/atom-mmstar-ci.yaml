@@ -177,7 +177,6 @@ jobs:
           env-vars: ${{ matrix.env_vars }}
           hf-token: ${{ env.HF_TOKEN }}
           pull-policy: "always"
-          disable-mmap: "false"  # mmstar never set ATOM_DISABLE_MMAP; keep parity
 
       - name: Install aiter wheel
         run: |

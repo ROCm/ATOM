@@ -271,6 +271,80 @@ def mtp_prepare_decode_mla_kernel(
         tl.store(context_lens_ptr + offs, ctx + 1, mask=mask_bs)
 
 
+@triton.jit(do_not_specialize=["n_slots", "n_iota"])
+def decompose_slots_kernel(
+    slots_ptr,
+    n_slots,
+    n_iota,
+    row_lut_ptr,
+    slot_page_ptr,
+    slot_row_ptr,
+    slot_lut_row_ptr,
+    iota_page_ptr,
+    iota_row_ptr,
+    iota_lut_row_ptr,
+    LOG2_BLOCK: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    # Widen before the multiply so large offsets don't wrap in i32.
+    offs = tl.program_id(0).to(tl.int64) * TILE + tl.arange(0, TILE)
+    # Shift/mask, not // and %: triton's division truncates, torch's floors.
+    mask = offs < n_slots
+    slot = tl.load(slots_ptr + offs, mask=mask, other=0)
+    row = slot & ((1 << LOG2_BLOCK) - 1)
+    tl.store(slot_page_ptr + offs, slot >> LOG2_BLOCK, mask=mask)
+    tl.store(slot_row_ptr + offs, row, mask=mask)
+    tl.store(slot_lut_row_ptr + offs, tl.load(row_lut_ptr + row), mask=mask)
+
+    mask = offs < n_iota
+    token = offs.to(tl.int32)
+    row = token & ((1 << LOG2_BLOCK) - 1)
+    tl.store(iota_page_ptr + offs, token >> LOG2_BLOCK, mask=mask)
+    tl.store(iota_row_ptr + offs, row, mask=mask)
+    tl.store(iota_lut_row_ptr + offs, tl.load(row_lut_ptr + row), mask=mask)
+
+
+def decompose_slots_triton(
+    slots: torch.Tensor, n_iota: int, block_size: int, row_lut: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Split int32 `slots` and `arange(n_iota)` into (page, row, row_lut[row]).
+
+    Returns six int32 tensors, `slots`' three then the iota's, in one launch.
+    Sizes are not specialized; call once at startup to keep the JIT out of serving.
+    """
+    if block_size & (block_size - 1) or block_size <= 0:
+        raise ValueError(f"block_size must be a power of two, got {block_size}")
+    if slots.dtype != torch.int32 or row_lut.dtype != torch.int32:
+        raise TypeError(
+            f"slots and row_lut must be int32, got {slots.dtype} and {row_lut.dtype}"
+        )
+    if n_iota < 0:
+        raise ValueError(f"n_iota must be non-negative, got {n_iota}")
+    if row_lut.numel() != block_size:
+        raise ValueError(
+            f"row_lut must have {block_size} entries, got {row_lut.numel()}"
+        )
+    slots = slots.contiguous()
+    n_slots = slots.numel()
+    dev = slots.device
+    out = tuple(
+        torch.empty(n, dtype=torch.int32, device=dev)
+        for n in (n_slots, n_slots, n_slots, n_iota, n_iota, n_iota)
+    )
+    tile = 1024
+    grid = (max(triton.cdiv(max(n_slots, n_iota), tile), 1),)
+    decompose_slots_kernel[grid](
+        slots,
+        n_slots,
+        n_iota,
+        row_lut,
+        *out,
+        LOG2_BLOCK=block_size.bit_length() - 1,
+        TILE=tile,
+    )
+    return out
+
+
 if __name__ == "__main__":
     # Example usage and test
 

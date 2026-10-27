@@ -4,10 +4,9 @@
 import importlib.util
 import logging
 from functools import cache
-from typing import List, Optional, Tuple, Union
 
 import torch
-from aiter import QuantType, dtypes, per_tensor_quant
+from aiter import QuantType, dtypes, get_hip_quant, per_tensor_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
@@ -45,8 +44,62 @@ def _has_module(module_name: str) -> bool:
 MXFP4_QUANT_BLOCK_SIZE = 32
 
 
+def dynamic_per_batched_tensor_quant(
+    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+):
+    DTYPE_MAX = torch.finfo(dtype).max
+    min_val, max_val = x.aminmax()
+    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-10)
+    scale = DTYPE_MAX / amax
+    x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
+    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+
+
+_per_tensor_fp8_quant = get_hip_quant(QuantType.per_Tensor)
+# HIP quantization launches one workgroup per row. Limit atomic-reduction
+# contention while keeping enough workgroups to fill gfx950; each reshaped
+# row must contain complete 16-element vectors.
+_QUANT_ROWS_TARGET = 256
+
+
+@cache
+def _quant_rows(m: int) -> int:
+    """Choose up to 256 rows containing whole 16-element vectors."""
+    for rows in range(min(m, _QUANT_ROWS_TARGET), 0, -1):
+        if m % rows == 0:
+            return rows
+    return 1
+
+
+def quant_fp8_per_tensor(x: torch.Tensor):
+    """Quantize FMHA activations with AITER HIP and return a shape-[1] descale.
+
+    The per-tensor amax is shape-independent. Reshape contiguous input into
+    at most 256 rows to reduce atomic contention, with 16-element-aligned rows
+    for the HIP vector loads. Strided inputs are materialized before dispatch;
+    partial vectors use the torch reference. Explicitly request FP8 because
+    AITER's default output dtype is int8.
+    """
+    if not x.is_contiguous():
+        x = x.contiguous()
+    n = x.numel()
+    if n == 0:
+        return torch.empty_like(x, dtype=dtypes.fp8), torch.ones(
+            1, device=x.device, dtype=torch.float32
+        )
+    if n % 16:
+        # FMHA's head dimensions are multiples of 16. Keep the helper safe
+        # for other callers without passing a partial vector to the HIP op.
+        x8, descale = dynamic_per_batched_tensor_quant(x)
+        return x8, descale.reshape(1)
+    # Preserve complete 16-element vectors in every reshaped row.
+    rows = _quant_rows(n // 16)
+    x8, descale = _per_tensor_fp8_quant(x.view(rows, n // rows), quant_dtype=dtypes.fp8)
+    return x8.view(x.shape), descale
+
+
 def per_tensor_dequantize(
-    tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
+    tensor: torch.Tensor, inv_scale: float | torch.Tensor
 ) -> torch.Tensor:
     fake_qweight = tensor.to(torch.float)
     dq_weight = fake_qweight * inv_scale
@@ -56,8 +109,8 @@ def per_tensor_dequantize(
 def normalize_e4m3fn_to_e4m3fnuz(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    input_scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    input_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     def _double_scale(scale: torch.Tensor) -> torch.Tensor:
         if scale.dtype == dtypes.fp8_e8m0:
             scale_u8 = scale.view(torch.uint8)
@@ -91,9 +144,9 @@ def normalize_e4m3fn_to_e4m3fnuz(
 def requantize_with_max_scale(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    logical_widths: List[int],
+    logical_widths: list[int],
     normalize_e4m3fn_to_e4m3fnuz=False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     # Max scale to be used for requanitzation.
     if normalize_e4m3fn_to_e4m3fnuz:
         quant_dtype = torch.float8_e4m3fnuz
@@ -154,7 +207,27 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
 
         weight = tensor.data
         if weight.dim() == 2:
-            tensor.data = shuffle_weight(weight, layout=layout)
+            shuffled = shuffle_weight(weight, layout=layout)
+            # Write through the existing storage, the way the 3D branch below
+            # already does, so that an online weight update does not move an
+            # address a captured CUDA graph holds. Rebind only when shuffling
+            # changes the shape or dtype, which no captured graph can survive
+            # anyway.
+            if shuffled.shape == weight.shape and shuffled.dtype == weight.dtype:
+                try:
+                    weight.copy_(shuffled)
+                except NotImplementedError:
+                    # `copy_` is not implemented for every storage dtype on
+                    # every device, where the rebind this replaced was: MXFP4's
+                    # `Float4_e2m1fn_x2` has no CPU copy kernel before torch
+                    # 2.10, and `linear.py`'s online-quant path shuffles
+                    # exactly that dtype. Keep the address where it can be
+                    # kept, and stay portable where it cannot -- a weight being
+                    # shuffled on a device with no copy kernel for it is not
+                    # one a captured decode graph is replaying against.
+                    tensor.data = shuffled
+            else:
+                tensor.data = shuffled
         elif weight.dim() == 3:
             # Split fully on dim0 and shuffle each 2D slice independently.
             for i in range(weight.shape[0]):
@@ -166,6 +239,34 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
             )
 
         tensor.is_shuffled = True
+
+
+def shuffle_expert_slices(
+    tensor: torch.nn.Parameter,
+    expert_ids: list[int],
+    layout: tuple[int, int] = (16, 16),
+) -> None:
+    """Re-apply the expert layout to selected slices of a 3D expert buffer.
+
+    ``shuffle_weights`` covers the whole buffer, which is what an initial load
+    wants. An online weight update rewrites some experts and must leave the
+    rest alone: shuffling an already-shuffled slice does not undo the first
+    shuffle, it produces a third layout.
+
+    Per slice and in place, so the buffer keeps the address a captured CUDA
+    graph holds. Equivalent to what the load did, because
+    ``shuffle_weights``'s own 3D branch shuffles each slice independently.
+    """
+    if not isinstance(tensor, torch.nn.Parameter):
+        raise TypeError(f"Expected torch.nn.Parameter, but got {type(tensor)}")
+    weight = tensor.data
+    if weight.dim() != 3:
+        raise ValueError(
+            f"Expected a 3D expert buffer to shuffle per expert, got {weight.dim()}D"
+        )
+    for expert_id in expert_ids:
+        weight[expert_id].copy_(shuffle_weight(weight[expert_id], layout=layout))
+    tensor.is_shuffled = True
 
 
 def all_close_1d(x: torch.Tensor) -> bool:

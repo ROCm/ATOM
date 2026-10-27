@@ -48,6 +48,10 @@ CLIENT_COMMAND="${MATRIX_CLIENT_COMMAND:-}"
 ENV_VARS="${MATRIX_ENV_VARS:-}"
 LM_EVAL_NUM_FEWSHOT="${MATRIX_LM_EVAL_NUM_FEWSHOT:-3}"
 ACCURACY_TEST_THRESHOLD="${MATRIX_ACCURACY_TEST_THRESHOLD:-0.0}"
+# Empty unless the cell speculates: an acceptance floor only means
+# something where there is a draft.
+MTP_ACCEPT_THRESHOLD="${MATRIX_MTP_ACCEPT_THRESHOLD:-}"
+MTP_PER_POS_THRESHOLD="${MATRIX_MTP_PER_POS_THRESHOLD:-}"
 
 if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
   echo "ERROR: MATRIX_MODEL_NAME and MATRIX_MODEL_PATH are required" >&2
@@ -179,6 +183,8 @@ elif [[ -d "/mnt/dcgpuval/models" ]]; then
   MODEL_CACHE_MOUNT="-v /mnt/dcgpuval/models:/models"
 elif [[ -d "/shared_nfs/huggingface_models" ]]; then
   MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
+elif [[ -d "/shared_nfs/models" ]]; then
+  MODEL_CACHE_MOUNT="-v /shared_nfs/models:/models"
 elif [[ -d "/shareddata/models" ]]; then
   MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
 elif [[ -d "/data/models" ]]; then
@@ -260,3 +266,12 @@ if [[ "${result}" -eq 1 ]]; then
 fi
 
 echo "Accuracy test passed for ${MODEL_NAME}"
+
+# The acceptance gate, shared with the nightly workflow. It was written twice
+# and the copies diverged: this one checked the overall rate only, so a
+# per-position collapse -- a draft still landing its first token and nothing
+# after it -- passed here while the nightly caught it.
+if [[ -n "${MTP_ACCEPT_THRESHOLD}" ]]; then
+  "${REPO_ROOT}/.github/scripts/check_mtp_acceptance.sh" \
+    "${result_file}" "${MTP_ACCEPT_THRESHOLD}" "${MTP_PER_POS_THRESHOLD}"
+fi

@@ -9,9 +9,8 @@ use crate::policies::LoadBalancingPolicy;
 pub trait WorkerSource: Send + Sync {
     /// `worker_type` is matched by variant: `Prefill { bootstrap_port: _ }` returns
     /// any prefill regardless of bootstrap_port. Other variants match exactly.
-    /// Adapters wrapping `WorkerRegistry` (which uses strict `PartialEq` on the full
-    /// `WorkerType` value) must dispatch Prefill queries through
-    /// `WorkerRegistry::get_prefill_workers()` to honor this contract.
+    /// Adapters must not compare the bootstrap_port field when filtering prefill
+    /// workers, including when querying a restricted candidate snapshot.
     fn workers_filtered(
         &self,
         model_id: Option<&str>,

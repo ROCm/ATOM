@@ -16,7 +16,9 @@ from atom.config import (
     ParallelConfig,
     SpeculativeConfig,
 )
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -29,6 +31,85 @@ def parse_size_list(size_str: str) -> list[int]:
         return ast.literal_eval(size_str)
     except (ValueError, SyntaxError) as e:
         raise ValueError(f"Error parsing size list: {size_str}") from e
+
+
+# ATOM_KV_OFFLOAD value -> the offload connector it selects.
+_KV_OFFLOAD_MODES = {
+    "lmcache": "lmcache_offload",
+    "lmcache_mp": "lmcache_mp",
+    "mooncake_store": "mooncake_store",
+}
+
+
+def kv_offload_connector_config(mode: str, extra_config: str) -> dict | None:
+    """The offload connector ATOM_KV_OFFLOAD selects, or None when it is off.
+
+    ``lmcache`` is the in-process LMCache backend, ``lmcache_mp`` the standalone
+    ``lmcache server`` one, and ``mooncake_store`` a Mooncake Store reached
+    without LMCache. ATOM_KV_OFFLOAD_EXTRA_CONFIG, a JSON object, becomes the
+    connector's ``kv_connector_extra_config``, which every backend reads.
+    """
+    mode = mode.strip().lower()
+    if mode in ("", "0", "off", "none"):
+        if extra_config.strip():
+            raise ValueError(
+                "ATOM_KV_OFFLOAD_EXTRA_CONFIG is set but ATOM_KV_OFFLOAD is off"
+            )
+        return None
+    if mode not in _KV_OFFLOAD_MODES:
+        raise ValueError(
+            f"ATOM_KV_OFFLOAD={mode!r}: expected one of {sorted(_KV_OFFLOAD_MODES)}"
+        )
+    offload = {"kv_connector": _KV_OFFLOAD_MODES[mode], "kv_role": "offload"}
+    if extra_config.strip():
+        extra = json.loads(extra_config)
+        if not isinstance(extra, dict):
+            raise TypeError("ATOM_KV_OFFLOAD_EXTRA_CONFIG must be a JSON object")
+        offload["kv_connector_extra_config"] = extra
+    return offload
+
+
+def compose_kv_offload_config(kv_transfer_config: str, offload: dict | None) -> str:
+    """Fold the ATOM_KV_OFFLOAD connector into the --kv-transfer-config JSON string.
+
+    Without a transfer connector the offload connector stands alone; with one,
+    both become subs of a ``multi`` connector (appended if it already is one).
+    """
+    if offload is None:
+        return kv_transfer_config
+    transfer = json.loads(kv_transfer_config or "{}")
+    if not transfer:
+        return json.dumps(offload)
+    is_multi = _connector_name(transfer) == "multi"
+    subs = transfer.get("connectors", []) if is_multi else [transfer]
+    if any(_is_offload_connector(sub) for sub in subs):
+        raise ValueError(
+            "ATOM_KV_OFFLOAD conflicts with an offload connector already set in "
+            "--kv-transfer-config; use only one of them"
+        )
+    if is_multi:
+        return json.dumps({**transfer, "connectors": [*subs, offload]})
+    return json.dumps({"kv_connector": "multi", "connectors": [transfer, offload]})
+
+
+def _connector_name(cfg: object) -> str:
+    name = cfg.get("kv_connector", "") if isinstance(cfg, dict) else ""
+    return str(name).strip().casefold()
+
+
+def _is_offload_connector(cfg: object) -> bool:
+    """Whether a transfer config names a backend registered as an offload tier.
+
+    Resolved by name or alias, in any case, as the factory resolves it when it
+    builds the connector; a name it does not know is not an offload tier here
+    (building it fails later, with the factory's error).
+    """
+    name = cfg.get("kv_connector") if isinstance(cfg, dict) else None
+    try:
+        canonical = KVConnectorFactory.canonical_name(name)
+    except ValueError:
+        return False
+    return KVConnectorFactory.is_offload_backend(canonical)
 
 
 @dataclass
@@ -59,14 +140,21 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
+    enable_decoder_swa_bounded_replay: bool = True
+    enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
+    # feature is on (see Config._resolve_dynamic_chunking).
+    dynamic_chunking_smooth_factor: float | None = None
+    dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
-    cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
+    cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
     level: int = 3
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None
@@ -242,7 +330,7 @@ class EngineArgs:
         parser.add_argument(
             "--cudagraph-capture-sizes",
             type=str,
-            default="[1,2,4,8,16,32,48,64,128,256,512]",
+            default=EngineArgs.cudagraph_capture_sizes,
             help="Sizes to capture cudagraph. Example: [1,2,4,8,16]",
         )
         parser.add_argument(
@@ -252,12 +340,12 @@ class EngineArgs:
             "--cudagraph-mode",
             type=str,
             default="FULL",
-            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE", "AF_PIECEWISE"],
+            choices=["NONE", "TR_HYBRID", "FULL", "FULL_AND_TR_HYBRID"],
             help="CUDA graph runtime mode. FULL = manual whole-forward capture "
-            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
-            "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
-            "the attention core is also captured into its own cudagraph with "
-            "zero-copy buffers (DeepSeek-V4 DSpark).",
+            "(default, existing behavior). TR_HYBRID = a token graph per token "
+            "bucket, breaking only where a launch depends on host data, which "
+            "runs eagerly or as a request graph; recorded at any --level. "
+            "FULL_AND_TR_HYBRID is recorded as TR_HYBRID.",
         )
         parser.add_argument(
             "--load_dummy",
@@ -432,6 +520,38 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--decoder-swa-bounded-replay",
+            "--enable-decoder-swa-bounded-replay",
+            dest="enable_decoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: in prefill, run the decoder (the last KV-source "
+                "layer and those after it) only on each request's last window "
+                "rows, their windows truncated there, and the last layer on its "
+                "last row (the V4.1 report's SWA Bounded Replay). Faster "
+                "prefill; not numerically equivalent to a full prefill. On by "
+                "default; --no-decoder-swa-bounded-replay turns it off. No "
+                "effect on other models."
+            ),
+        )
+        parser.add_argument(
+            "--encoder-swa-bounded-replay",
+            "--enable-encoder-swa-bounded-replay",
+            dest="enable_encoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: a prefix hit resumes without a state checkpoint, "
+                "rebuilding the sliding-window state by recomputing the hash "
+                "block below the hit (no cached row is rewritten); no state "
+                "checkpoint is kept, so no prefill chunk is cut for one. Not "
+                "numerically equivalent to resuming a checkpoint. On by "
+                "default; --no-encoder-swa-bounded-replay keeps checkpoints. No "
+                "effect on other models."
+            ),
+        )
+        parser.add_argument(
             "--state-checkpoint-demand",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -439,8 +559,8 @@ class EngineArgs:
                 "Let a hit that was refused for want of a checkpoint place a "
                 "rung of its own. --no-state-checkpoint-demand leaves the "
                 "prompt-end anchor as the only placement. On measured traces a "
-                "demand is 47% of all checkpoint writes but reads back 2.8% of "
-                "the time, against 85.2% for an anchor, so the rung's write "
+                "demand is 47%% of all checkpoint writes but reads back 2.8%% of "
+                "the time, against 85.2%% for an anchor, so the rung's write "
                 "traffic may cost more in evictions than its reuse is worth."
             ),
         )
@@ -478,6 +598,37 @@ class EngineArgs:
             "line's prefix cache hit rate (default: 1000, matching vLLM). "
             "Must be > 0. Only the status line is windowed; /metrics and "
             "[Cache Stats] stay cumulative.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            help=(
+                "Equalize the runtime of a PP prefill request's chunks to shorten "
+                "pipeline fill/drain. Requires --pipeline-parallel-size > 1. Helps "
+                "single-stream long prefill and costs throughput once several "
+                "requests prefill at once, so it is meant for latency-bound "
+                "deployments; see docs/dynamic_chunking_guide.md."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-smooth-factor",
+            type=float,
+            default=None,
+            help=(
+                "Interpolation between the initial chunk size (0) and the "
+                "equal-latency prediction (1). Defaults to "
+                "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR or 0.75, read only when "
+                "--enable-dynamic-chunking is set."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-min-chunk-size",
+            type=int,
+            default=4096,
+            help=(
+                "Floor for solved chunk sizes. Every extra chunk rebuilds the "
+                "cached prefix again, so this bounds how much work shrinking adds."
+            ),
         )
         parser.add_argument(
             "--max-num-seqs",
@@ -725,6 +876,19 @@ class EngineArgs:
             "rccl": "rccl",
             "none": "none",
         }[all2all_backend]
+
+        # ATOM_KV_OFFLOAD → folded into kv_transfer_config, so offload does not
+        # compete with a P/D connector (or a launcher owning that flag) for it.
+        offload = kv_offload_connector_config(
+            envs.ATOM_KV_OFFLOAD, envs.ATOM_KV_OFFLOAD_EXTRA_CONFIG
+        )
+        kwargs["kv_transfer_config"] = compose_kv_offload_config(
+            kwargs["kv_transfer_config"], offload
+        )
+        if offload is not None:
+            logger.info(
+                "ATOM_KV_OFFLOAD: kv_transfer_config=%s", kwargs["kv_transfer_config"]
+            )
 
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).

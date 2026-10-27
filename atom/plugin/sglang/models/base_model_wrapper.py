@@ -501,9 +501,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
             draft_path = None
             try:
-                from sglang.srt.server_args import get_global_server_args
+                from atom.plugin.config import get_sglang_server_args
 
-                server_args = get_global_server_args()
+                server_args = get_sglang_server_args()
                 draft_path = getattr(server_args, "speculative_draft_model_path", None)
             except Exception:
                 logger.exception("Failed to resolve SGLang EAGLE3 draft model path")

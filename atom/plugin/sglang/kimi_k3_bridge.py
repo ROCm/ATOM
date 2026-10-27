@@ -1,4 +1,4 @@
-"""Native ATOM attention bridge for Kimi-K3 on SGLang 0.5.15."""
+"""Native ATOM attention bridge for Kimi-K3 on SGLang 0.5.19+."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import torch
 # plus the rotary lane: kv_lora_rank (512) + qk_rope_head_dim (64).
 KIMI_K3_MLA_CACHE_ENTRY_DIM = 576
 logger = logging.getLogger(__name__)
+# Provenance key for RuntimeContext.override — process-scoped, not id(owner).
+_KIMI_K3_MEM_FRACTION_OVERRIDE = "atom-kimi-k3-mem-fraction"
 
 
 def is_kimi_k3_config(config: Any) -> bool:
@@ -19,69 +21,168 @@ def is_kimi_k3_config(config: Any) -> bool:
     return any("KimiK3ForConditionalGeneration" in str(arch) for arch in archs)
 
 
-def _is_kimi_k3_runner(runner: Any) -> bool:
-    return is_kimi_k3_config(getattr(runner.model_config, "hf_config", None))
+def _is_kimi_k3_owner(owner: Any) -> bool:
+    model_config = getattr(owner, "model_config", None)
+    return is_kimi_k3_config(getattr(model_config, "hf_config", None))
 
 
-def _restore_kimi_k3_mem_fraction(runner: Any) -> None:
-    if getattr(runner, "_atom_kimi_k3_mem_fraction_restored", False):
+def _kimi_k3_pool_latent_dims(pool: Any) -> tuple[int, int]:
+    """Return the K/V widths SGLang actually allocated.
+
+    0.5.19 hybrid pools are MHA buffers with ``head_dim`` / ``v_head_dim``.
+    0.5.20 allocates an ``MLATokenToKVPool`` whose latent width is
+    ``kv_cache_dim`` and which has no separate V head.
+    """
+    if hasattr(pool, "head_dim"):
+        k_dim = int(pool.head_dim)
+        return k_dim, int(getattr(pool, "v_head_dim", k_dim))
+    kv_dim = getattr(pool, "kv_cache_dim", None)
+    if kv_dim is None:
+        buffers = getattr(pool, "kv_buffer", None)
+        if buffers:
+            kv_dim = int(buffers[0].shape[-1])
+    if kv_dim is None:
+        raise RuntimeError(
+            "Kimi-K3 KV pool ABI mismatch: cannot read latent width from "
+            f"{type(pool).__name__}"
+        )
+    width = int(kv_dim)
+    return width, width
+
+
+def _kimi_k3_mem_fraction_already_restored(ctx: Any) -> bool:
+    # 0.5.20: overrides_log is a method (not a property). Prefer the public
+    # API; fall back to the private list for older trees / plain mocks.
+    log = getattr(ctx, "overrides_log", None)
+    if callable(log):
+        entries = log()
+    elif log is not None:
+        entries = log
+    else:
+        entries = getattr(ctx, "_overrides_log", None) or ()
+    for source, fields in entries:
+        if source == _KIMI_K3_MEM_FRACTION_OVERRIDE and "mem_fraction_static" in fields:
+            return True
+    return False
+
+
+def _restore_kimi_k3_mem_fraction(owner: Any) -> None:
+    """Undo SGLang AITER long-context 0.85 mem_fraction reserve for K3.
+
+    Mirror upstream ``attention_hook``: only undo when the *resolved* backend
+    is aiter, context_len > 8192, and the 0.85 scale was actually applied
+    (not skipped via ``SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION``). Write
+    through ``RuntimeContext.override``; dedupe by override source name.
+    """
+
+    model_config = getattr(owner, "model_config", None)
+    context_len = int(getattr(model_config, "context_len", 0) or 0)
+    try:
+        from sglang.srt.runtime_context import get_context, get_exec, get_schedule
+
+        ctx = get_context()
+        # Resolved leaf — not server_args.attention_backend (operator raw input).
+        attention_backend = str(
+            getattr(getattr(get_exec(), "kernel", None), "attention_backend", "") or ""
+        )
+        current = float(get_schedule().mem_fraction_static)
+        server_args = ctx.server_args
+    except Exception as exc:  # noqa: BLE001 - first call may precede publish
+        logger.warning(
+            "Kimi-K3 mem_fraction restore skipped: schedule/exec unread (%s)",
+            exc,
+        )
         return
-    server_args = runner.server_args
-    context_len = int(getattr(runner.model_config, "context_len", 0) or 0)
-    attention_backend = str(getattr(server_args, "attention_backend", ""))
-    current = float(
-        getattr(runner, "mem_fraction_static", server_args.mem_fraction_static)
+
+    if _kimi_k3_mem_fraction_already_restored(ctx):
+        return
+
+    if attention_backend != "aiter" or context_len <= 8192:
+        return
+
+    explicit_mem_fraction = (getattr(server_args, "_raw_input", None) or {}).get(
+        "mem_fraction_static"
+    ) is not None
+    try:
+        # Must import ``envs`` (the Envs instance), not the environ module.
+        from sglang.srt.environ import envs
+    except ImportError:
+        honor_explicit = False
+    else:
+        honor_explicit = bool(envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get())
+
+    if explicit_mem_fraction and honor_explicit:
+        # Upstream did not apply the 0.85 scale; do not divide it back out.
+        return
+
+    restored = current / 0.85
+    if restored > 1.0:
+        return
+
+    ctx.override(_KIMI_K3_MEM_FRACTION_OVERRIDE, mem_fraction_static=restored)
+    logger.info(
+        "Kimi-K3 restored mem_fraction_static %.4f -> %.4f after "
+        "SGLang AITER long-context reserve",
+        current,
+        restored,
     )
-    if attention_backend == "aiter" and context_len > 8192:
-        restored = current / 0.85
-        if restored <= 1.0:
-            runner.mem_fraction_static = restored
-            server_args.mem_fraction_static = restored
-            logger.info(
-                "Kimi-K3 restored mem_fraction_static %.4f -> %.4f after "
-                "SGLang AITER long-context reserve",
-                current,
-                restored,
-            )
-    runner._atom_kimi_k3_mem_fraction_restored = True
 
 
 def install_kimi_k3_pool_patch() -> None:
-    """Allocate K3 full-attention KV with ATOM's true-MLA cache ABI."""
+    """Allocate K3 full-attention KV with ATOM's true-MLA cache ABI.
 
-    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
+    SGLang moved pool construction from ``ModelRunnerKVCacheMixin`` into
+    ``KVCacheConfigurator`` and replaced the ``ModelRunner.kimi_linear_config``
+    property with ``hybrid_arch.kimi_linear_config(model_config)``. Patch those
+    surfaces for 0.5.19+.
+
+    Important: several SGLang modules already did
+    ``from sglang.srt.configs.hybrid_arch import kimi_linear_config`` before
+    prepare_model runs. Rebinding only ``hybrid_arch.kimi_linear_config``
+    leaves those local names on the original function, so also rebind the
+    known importers.
+    """
+
+    import sys
+
+    from sglang.srt.configs import hybrid_arch
     from sglang.srt.configs.kimi_linear import KimiLinearConfig
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-    cls = mixin.ModelRunnerKVCacheMixin
+    cls = KVCacheConfigurator
     if getattr(cls, "_atom_kimi_k3_pool_patched", False):
         return
 
-    original_kimi_property = ModelRunner.kimi_linear_config
+    original_kimi_linear_config = hybrid_arch.kimi_linear_config
     original_resolve = cls._resolve_memory_pool_config
     original_init_pools = cls._init_pools
 
-    def _kimi_linear_config(self):
-        config = original_kimi_property.__get__(self, type(self))
+    def _kimi_linear_config(model_config):
+        config = original_kimi_linear_config(model_config)
         if config is not None:
             return config
-        text_config = getattr(self.model_config, "hf_text_config", None)
-        if not _is_kimi_k3_runner(self):
+        if not is_kimi_k3_config(getattr(model_config, "hf_config", None)):
             return None
+
+        text_config = getattr(model_config, "hf_text_config", None)
+        if text_config is None:
+            text_config = getattr(
+                getattr(model_config, "hf_config", None), "text_config", None
+            )
         if isinstance(text_config, KimiLinearConfig):
             return text_config
         if getattr(text_config, "model_type", None) != "kimi_linear":
             return None
 
         cache_name = "_atom_kimi_k3_linear_config"
-        config = getattr(self, cache_name, None)
-        if config is None:
-            config = KimiLinearConfig(**text_config.to_dict())
-            setattr(self, cache_name, config)
-        return config
+        cached = getattr(model_config, cache_name, None)
+        if cached is None:
+            cached = KimiLinearConfig(**text_config.to_dict())
+            setattr(model_config, cache_name, cached)
+        return cached
 
     def _resolve_memory_pool_config(self, pre_model_load_memory: int):
-        if not _is_kimi_k3_runner(self):
+        if not _is_kimi_k3_owner(self):
             return original_resolve(self, pre_model_load_memory)
 
         _restore_kimi_k3_mem_fraction(self)
@@ -95,45 +196,58 @@ def install_kimi_k3_pool_patch() -> None:
         # retained solely to satisfy SGLang's pool interface.
         native_row = 2 * KIMI_K3_MLA_CACHE_ENTRY_DIM
         if old_row > 0 and old_row != native_row:
-            page_size = int(self.server_args.page_size)
+            page_size = int(getattr(self, "page_size", 0) or self.server_args.page_size)
             tokens = int(config.max_total_num_tokens) * old_row // native_row
             config.max_total_num_tokens = max(
                 page_size, (tokens // page_size) * page_size
             )
-            config.max_running_requests = self._resolve_max_num_reqs(
+            config.max_running_requests = self.resolve_max_num_reqs(
                 config.max_total_num_tokens
             )
         return config
 
-    def _init_pools(self):
-        if not _is_kimi_k3_runner(self):
-            return original_init_pools(self)
+    def _init_pools(
+        self,
+        *,
+        sizes,
+        req_to_token_pool,
+        token_to_kv_pool_allocator,
+    ):
+        if not _is_kimi_k3_owner(self):
+            return original_init_pools(
+                self,
+                sizes=sizes,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
 
         old_head_dim = self.model_config.head_dim
         old_v_head_dim = self.model_config.v_head_dim
         self.model_config.head_dim = KIMI_K3_MLA_CACHE_ENTRY_DIM
         self.model_config.v_head_dim = KIMI_K3_MLA_CACHE_ENTRY_DIM
         try:
-            original_init_pools(self)
+            pools = original_init_pools(
+                self,
+                sizes=sizes,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
         finally:
             self.model_config.head_dim = old_head_dim
             self.model_config.v_head_dim = old_v_head_dim
 
-        pool = getattr(self, "token_to_kv_pool", None)
+        pool = pools.token_to_kv_pool
         full_pool = getattr(pool, "full_kv_pool", pool)
         if full_pool is None:
             raise RuntimeError("Kimi-K3 SGLang full-attention KV pool is missing")
-        if (
-            int(full_pool.head_dim) != KIMI_K3_MLA_CACHE_ENTRY_DIM
-            or int(full_pool.v_head_dim) != KIMI_K3_MLA_CACHE_ENTRY_DIM
-        ):
+        k_dim, v_dim = _kimi_k3_pool_latent_dims(full_pool)
+        if k_dim != KIMI_K3_MLA_CACHE_ENTRY_DIM or v_dim != KIMI_K3_MLA_CACHE_ENTRY_DIM:
             raise RuntimeError(
                 "Kimi-K3 KV pool ABI mismatch: "
-                f"K={full_pool.head_dim}, V={full_pool.v_head_dim}, "
-                "expected "
+                f"K={k_dim}, V={v_dim}, expected "
                 f"{KIMI_K3_MLA_CACHE_ENTRY_DIM}/{KIMI_K3_MLA_CACHE_ENTRY_DIM}"
             )
-        req_pool = getattr(self, "req_to_token_pool", None)
+        req_pool = pools.req_to_token_pool
         if req_pool is None or not hasattr(req_pool, "get_mamba_indices"):
             raise RuntimeError("Kimi-K3 HybridReqToTokenPool is missing")
         pool._atom_kimi_k3_req_pool = req_pool
@@ -143,18 +257,38 @@ def install_kimi_k3_pool_patch() -> None:
             "Kimi-K3 attention owner=ATOM, KV owner=SGLang, "
             "layout=MLA/NHD, latent_dim=576"
         )
+        return pools
 
-    ModelRunner.kimi_linear_config = property(_kimi_linear_config)
+    hybrid_arch.kimi_linear_config = _kimi_linear_config
+    # Rebind already-imported local names. prepare_model runs after SGLang has
+    # imported these modules, so module-attribute patch alone is a no-op there.
+    rebound = []
+    for mod_name in (
+        "sglang.srt.mem_cache.kv_cache_configurator",
+        "sglang.srt.mem_cache.kv_cache_builder",
+        "sglang.srt.layers.attention.attention_registry",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "kimi_linear_config"):
+            mod.kimi_linear_config = _kimi_linear_config
+            rebound.append(mod_name)
     cls._resolve_memory_pool_config = _resolve_memory_pool_config
     cls._init_pools = _init_pools
     cls._atom_kimi_k3_pool_patched = True
+    logger.info(
+        "Kimi-K3 patched hybrid_arch.kimi_linear_config; rebound imports: %s",
+        rebound or "(none yet imported)",
+    )
 
 
 @contextmanager
 def kimi_k3_native_attention_construction():
     """Construct K3 full-attention layers with native ATOM attention."""
 
-    from atom.models import kimi_k3
+    # the module, not the package: `KimiFullAttention` resolves `Attention` in
+    # `atom.models.kimi_k3.model`'s globals, and an assignment on the package
+    # would bind a name nothing reads
+    from atom.models.kimi_k3 import model as kimi_k3
 
     previous = kimi_k3.Attention
     kimi_k3.Attention = SGLangATOMKimiK3Attention
@@ -363,6 +497,106 @@ def _build_block_table(
     )
 
 
+def _sglang_mla_work_metadata(forward_metadata: Any) -> torch.Tensor | None:
+    """SGLang names this buffer ``work_metadata``; ATOM reads ``work_meta_data``."""
+
+    for name in ("work_meta_data", "work_metadata"):
+        value = getattr(forward_metadata, name, None)
+        if torch.is_tensor(value):
+            return value
+    return None
+
+
+def retarget_kimi_k3_decode_mla_plan(
+    forward_metadata: Any,
+    *,
+    batch_size: int,
+    num_heads: int,
+    dtype_q,
+    dtype_kv,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+    max_split_per_batch: int | None,
+) -> bool:
+    """Rewrite SGLang's persistent MLA plan onto ATOM's per-token pages.
+
+    PR #1821 attached SGLang's decode plan unchanged. ``make_mla_meta_data``
+    builds that plan with ``kv_granularity=page_size`` (128 on this server)
+    and stores it on ``ForwardMetadata.work_metadata``. ATOM's K3 kernel, with
+    ``ATOM_MLA_PAGE_SIZE=1``, reads ``work_meta_data`` and consumes one KV slot
+    per index at granularity 16. The old lookup never saw SGLang's buffer, so
+    the 128-granularity plan stayed in place: padding no longer clobbers slot
+    0, but decode still attends the wrong tokens.
+
+    ``get_mla_metadata_v1`` writes the existing work buffers in place, so a
+    captured CUDA graph keeps its pointers and only the contents change.
+    """
+
+    if forward_metadata is None or batch_size <= 0:
+        return False
+    kv_indptr = getattr(forward_metadata, "kv_indptr", None)
+    work_metadata = _sglang_mla_work_metadata(forward_metadata)
+    work_buffers = (
+        work_metadata,
+        getattr(forward_metadata, "work_info_set", None),
+        getattr(forward_metadata, "work_indptr", None),
+        getattr(forward_metadata, "reduce_indptr", None),
+        getattr(forward_metadata, "reduce_final_map", None),
+        getattr(forward_metadata, "reduce_partial_map", None),
+        kv_indptr,
+    )
+    if not all(torch.is_tensor(buf) for buf in work_buffers):
+        return False
+    last_page = getattr(forward_metadata, "kv_last_page_len", None)
+    if not torch.is_tensor(last_page) or int(last_page.numel()) < batch_size:
+        return False
+
+    # Page size 1 means every occupied page holds one token.
+    last_page[:batch_size].fill_(1)
+    qo = getattr(forward_metadata, "qo_indptr", None)
+    if torch.is_tensor(qo) and int(qo.numel()) >= batch_size + 1:
+        qo_indptr = qo[: batch_size + 1]
+        qo_indptr.copy_(
+            torch.arange(batch_size + 1, dtype=qo_indptr.dtype, device=qo_indptr.device)
+        )
+    else:
+        qo_indptr = torch.arange(
+            batch_size + 1, dtype=torch.int32, device=kv_indptr.device
+        )
+
+    from aiter import get_mla_metadata_v1
+
+    get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr[: batch_size + 1],
+        last_page[:batch_size],
+        max(int(num_heads), 16),
+        1,
+        True,
+        work_metadata,
+        forward_metadata.work_info_set,
+        forward_metadata.work_indptr,
+        forward_metadata.reduce_indptr,
+        forward_metadata.reduce_final_map,
+        forward_metadata.reduce_partial_map,
+        page_size=1,
+        kv_granularity=16,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
+        fast_mode=fast_mode,
+        max_split_per_batch=(
+            -1 if max_split_per_batch is None else int(max_split_per_batch)
+        ),
+        intra_batch_mode=intra_batch_mode,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
+    )
+    # The captured kernel and ATOM's decode path both have to see this buffer.
+    forward_metadata.work_metadata = work_metadata
+    forward_metadata.work_meta_data = work_metadata
+    return True
+
+
 def _attach_sglang_mla_metadata(metadata: Any) -> Any:
     """Reuse the active SGLang backend's graph-stable MLA decode buffers."""
 
@@ -383,7 +617,7 @@ def _attach_sglang_mla_metadata(metadata: Any) -> Any:
     metadata.kv_indptr = getattr(forward_metadata, "kv_indptr", None)
     metadata.kv_indices = getattr(forward_metadata, "kv_indices", None)
     metadata.kv_last_page_lens = getattr(forward_metadata, "kv_last_page_len", None)
-    metadata.work_meta_data = getattr(forward_metadata, "work_meta_data", None)
+    metadata.work_meta_data = _sglang_mla_work_metadata(forward_metadata)
     metadata.work_info_set = getattr(forward_metadata, "work_info_set", None)
     metadata.work_indptr = getattr(forward_metadata, "work_indptr", None)
     metadata.reduce_indptr = getattr(forward_metadata, "reduce_indptr", None)
@@ -487,6 +721,14 @@ def build_kimi_k3_attention_metadata(
         metadata.dtype_q = dtype_q
         return _attach_sglang_mla_metadata(metadata)
 
+    num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+    real_bs = max(bs - num_padding, 0)
+    if num_padding > 0:
+        # Graph / DP padding rows arrive as seq_len=1 with out_cache_loc on
+        # request 0. Zero the length and invalidate the write slot in place
+        # on the tensors this metadata publishes.
+        seq_lens = seq_lens.clone()
+        seq_lens[real_bs:].zero_()
     max_seq_len = (
         int(req_to_token_pool.req_to_token.shape[1])
         if _is_stream_capturing()
@@ -504,6 +746,9 @@ def build_kimi_k3_attention_metadata(
         max_seq_len=max_seq_len,
     )
     slot_mapping = forward_batch.out_cache_loc[:bs]
+    if num_padding > 0 and torch.is_tensor(slot_mapping):
+        slot_mapping = slot_mapping.clone()
+        slot_mapping[real_bs:].fill_(-1)
     metadata = AttentionMetaData(
         cu_seqlens_q=torch.arange(
             0, bs + 1, dtype=torch.int32, device=positions.device

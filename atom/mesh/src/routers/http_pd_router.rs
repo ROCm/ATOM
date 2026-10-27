@@ -1,23 +1,31 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
+
+#[cfg(test)]
+mod load_tests;
+
 use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+use crate::routers::prepare::inference::{InferenceMetadata, InferenceRequest};
 
 use crate::{
     config::types::{AtomPdRankMappingPolicy, BackendType, RetryConfig},
@@ -39,14 +47,11 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
+        metrics::{metrics_labels, MeshMetrics},
     },
     policies::PolicyRegistry,
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        common::{InputIds, StringOrArray},
-        completion::CompletionRequest,
-        generate::GenerateRequest,
+        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     },
     routers::{
         comm::{
@@ -58,15 +63,7 @@ use crate::{
     },
 };
 
-/// Construct a full API URL from a base URL and path.
-fn api_path(url: &str, api_path: &str) -> String {
-    if api_path.starts_with('/') {
-        format!("{}{}", url, api_path)
-    } else {
-        format!("{}/{}", url, api_path)
-    }
-}
-
+#[derive(Clone)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -95,15 +92,223 @@ impl std::fmt::Debug for PDRouter {
     }
 }
 
+/// Reserve both workers once, then transfer each guard to its actual execution.
+pub(crate) struct ReservedPair {
+    pub prefill: Arc<dyn Worker>,
+    pub decode: Arc<dyn Worker>,
+    load: parking_lot::Mutex<Option<[WorkerLoadGuard; 2]>>,
+    canceled: tokio::sync::watch::Sender<bool>,
+}
+
+impl ReservedPair {
+    fn take_load(&self) -> Result<[WorkerLoadGuard; 2], Response> {
+        self.load.lock().take().ok_or_else(|| {
+            error::internal_error(
+                "placement_unavailable",
+                "Reserved placement was already executed or canceled",
+            )
+        })
+    }
+
+    #[cfg(feature = "ext-proc")]
+    pub(crate) fn cancel(&self) {
+        self.canceled.send_replace(true);
+        // An unaccepted execution still owns both guards here.
+        self.load.lock().take();
+    }
+}
+
+/// Owns one worker attempt through response consumption, including cancellation.
+struct WorkerOutcome {
+    worker: Option<Arc<dyn Worker>>,
+    policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
+    status: Option<StatusCode>,
+}
+
+impl WorkerOutcome {
+    fn record_error(&self, worker: &dyn Worker) {
+        let kind = match worker.worker_type() {
+            crate::core::WorkerType::Prefill { .. } => metrics_labels::WORKER_PREFILL,
+            _ => metrics_labels::WORKER_DECODE,
+        };
+        let error = self
+            .status
+            .filter(|s| s.is_client_error() || s.is_server_error())
+            .map(error_type_from_status)
+            .unwrap_or(metrics_labels::ERROR_BACKEND);
+        MeshMetrics::record_worker_error(kind, metrics_labels::CONNECTION_HTTP, error);
+    }
+
+    fn finish(&mut self, body_ok: bool) {
+        if let Some(worker) = self.worker.take() {
+            let success = body_ok
+                && self
+                    .status
+                    .is_some_and(|s| s.is_success() || s.is_redirection());
+            if !body_ok || self.status.is_some_and(|s| s.is_server_error()) {
+                worker.record_outcome(false);
+            } else if success {
+                worker.record_outcome(true);
+            }
+            if !body_ok
+                || self
+                    .status
+                    .is_some_and(|s| s.is_client_error() || s.is_server_error())
+            {
+                self.record_error(worker.as_ref());
+            }
+            self.policy.on_request_complete(worker.url(), success);
+        }
+    }
+}
+
+impl Drop for WorkerOutcome {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            // Cancellation alone is not evidence of an unhealthy worker.
+            if self.status.is_some_and(|s| s.is_server_error()) {
+                worker.record_outcome(false);
+                self.record_error(worker.as_ref());
+            }
+            self.policy.on_request_complete(worker.url(), false);
+            debug!(
+                worker_url = worker.url(),
+                "worker response canceled before completion"
+            );
+        }
+    }
+}
+
+struct WorkerResponse {
+    inner: reqwest::Response,
+    outcome: WorkerOutcome,
+}
+
+impl WorkerResponse {
+    fn status(&self) -> StatusCode {
+        self.inner.status()
+    }
+    fn headers(&self) -> &HeaderMap {
+        self.inner.headers()
+    }
+
+    async fn bytes(self) -> Result<bytes::Bytes, reqwest::Error> {
+        let Self { inner, mut outcome } = self;
+        let result = inner.bytes().await;
+        outcome.finish(result.is_ok());
+        result
+    }
+
+    async fn drain(self) -> Result<(), reqwest::Error> {
+        let Self { inner, mut outcome } = self;
+        let mut stream = inner.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            if let Err(error) = chunk {
+                outcome.finish(false);
+                return Err(error);
+            }
+        }
+        outcome.finish(true);
+        Ok(())
+    }
+
+    async fn text(self) -> Result<String, reqwest::Error> {
+        let Self { inner, mut outcome } = self;
+        let result = inner.text().await;
+        outcome.finish(result.is_ok());
+        result
+    }
+
+    async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error> {
+        let Self { inner, mut outcome } = self;
+        let result = inner.json().await;
+        outcome.finish(result.is_ok());
+        result
+    }
+
+    fn bytes_stream(
+        self,
+    ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send {
+        let Self { inner, outcome } = self;
+        futures_util::stream::unfold(
+            (Box::pin(inner.bytes_stream()), outcome),
+            |(mut stream, mut outcome)| async move {
+                match stream.next().await {
+                    Some(result) => {
+                        if result
+                            .as_ref()
+                            .is_ok_and(|b| memmem::find(b, b"data: [DONE]").is_some())
+                        {
+                            outcome.finish(true);
+                        } else if result.is_err() {
+                            outcome.finish(false);
+                        }
+                        Some((result, (stream, outcome)))
+                    }
+                    None => {
+                        outcome.finish(true);
+                        None
+                    }
+                }
+            },
+        )
+    }
+}
+
+/// Cancel prefill on dispatch errors; successful streams can detach its drain.
+struct PrefillTask(Option<tokio::task::JoinHandle<()>>);
+
+impl PrefillTask {
+    async fn finish(mut self) {
+        match tokio::time::timeout(Duration::from_secs(5), self.0.as_mut().unwrap()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "prefill task failed"),
+            Err(_) => warn!("prefill response drain timed out; canceling task"),
+        }
+    }
+}
+
+impl PrefillTask {
+    fn detach(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for PrefillTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PDRequestContext<'a> {
     route: &'static str,
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
-    request_text: Option<String>,
+    request_text: Option<&'a str>,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
+}
+
+impl<'a> PDRequestContext<'a> {
+    fn from_metadata(
+        metadata: &'a InferenceMetadata,
+        headers: Option<&HeaderMap>,
+        model: Option<&'a str>,
+    ) -> Self {
+        Self {
+            route: metadata.route,
+            batch_size: metadata.batch_size,
+            is_stream: metadata.stream,
+            return_logprob: metadata.return_logprob,
+            request_text: Some(&metadata.text),
+            model_id: model.or_else(|| metadata.model.as_deref().filter(|model| !model.is_empty())),
+            headers: headers.cloned().map(Arc::new),
+        }
+    }
 }
 
 impl PDRouter {
@@ -217,6 +422,64 @@ impl PDRouter {
         })
     }
 
+    pub(crate) fn reserve_pair(
+        &self,
+        plan: PlacementPlan,
+        headers: Option<&HeaderMap>,
+    ) -> Result<Arc<ReservedPair>, Response> {
+        let PlacementPlan::Pair {
+            prefill,
+            decode,
+            prefill_policy,
+            decode_policy,
+        } = plan
+        else {
+            return Err(error::internal_error(
+                "unexpected_single_plan",
+                "PD execution requires a pair",
+            ));
+        };
+        let prefill = if matches!(self.backend, BackendType::Atom) {
+            self.apply_atom_pd_rank_mapping_policy(prefill, &decode)
+        } else {
+            prefill
+        };
+        for (worker, kind, policy) in [
+            (&prefill, metrics_labels::WORKER_PREFILL, prefill_policy),
+            (&decode, metrics_labels::WORKER_DECODE, decode_policy),
+        ] {
+            MeshMetrics::record_worker_selection(
+                kind,
+                metrics_labels::CONNECTION_HTTP,
+                worker.model_id(),
+                policy,
+            );
+        }
+        Ok(Arc::new(ReservedPair {
+            load: parking_lot::Mutex::new(Some([
+                WorkerLoadGuard::new(prefill.clone(), headers),
+                WorkerLoadGuard::new(decode.clone(), headers),
+            ])),
+            canceled: tokio::sync::watch::channel(false).0,
+            prefill,
+            decode,
+        }))
+    }
+
+    /// Execute exactly this reserved pair. Selection and retries belong to the caller.
+    #[cfg(feature = "ext-proc")]
+    pub(crate) async fn execute_placement(
+        &self,
+        headers: &HeaderMap,
+        body: Value,
+        metadata: &InferenceMetadata,
+        placement: Arc<ReservedPair>,
+    ) -> Response {
+        let context = PDRequestContext::from_metadata(metadata, Some(headers), None);
+        self.execute_reserved(Some(headers), body, context, placement)
+            .await
+    }
+
     fn apply_atom_pd_rank_mapping_policy(
         &self,
         prefill: Arc<dyn Worker>,
@@ -262,7 +525,15 @@ impl PDRouter {
 
         let mapped_url = format!("{}@{}", prefill.base_url(), decode_dp_rank);
         match self.worker_registry.get_by_url(&mapped_url) {
-            Some(mapped) if mapped.is_healthy() => {
+            Some(mapped)
+                if mapped.is_available()
+                    && mapped.model_id() == prefill.model_id()
+                    && matches!(
+                        mapped.worker_type(),
+                        crate::core::WorkerType::Prefill { .. }
+                    )
+                    && mapped.connection_mode().matches(prefill.connection_mode()) =>
+            {
                 info!(
                     "ATOM PD rank mapping policy=idx2idx: prefill {} -> {}, decode={}",
                     prefill.url(),
@@ -449,200 +720,39 @@ impl PDRouter {
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
-    fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
-        // GenerateRequest doesn't support batch via arrays, only via input_ids
-        if let Some(InputIds::Batch(batches)) = &req.input_ids {
-            if !batches.is_empty() {
-                return Some(batches.len());
-            }
-        }
-        None
-    }
-
-    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
-        if let Some(n) = req.n {
-            if n > 1 {
-                return Some(n as usize);
-            }
-        }
-        None
-    }
-
-    fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
-        if let StringOrArray::Array(arr) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
-        }
-        None
-    }
-
-    /// Dispatch a request based on backend type. SGLang uses dual-dispatch+bootstrap;
-    /// vLLM uses Mooncake fire-and-forget P + streamed D with kv_transfer_params.
     async fn dispatch_pd<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
         context: PDRequestContext<'_>,
     ) -> Response {
-        match self.backend {
-            BackendType::Sglang => {
-                self.execute_dual_dispatch(headers, original_request, context)
-                    .await
-            }
-            BackendType::Vllm => {
-                self.execute_vllm_mooncake(headers, original_request, context)
-                    .await
-            }
-            BackendType::Atom => {
-                self.execute_atom_relay(headers, original_request, context)
-                    .await
-            }
-        }
-    }
-
-    async fn plan_pd_pair(
-        &self,
-        context: &PDRequestContext<'_>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, PairCtx), Response> {
-        let descriptor = RequestDescriptor {
-            model_id: context.model_id,
-            protocol: Some(Protocol::Http),
-            text: context.request_text.as_deref(),
-            tokens: None,
-            headers: context.headers.as_deref(),
-            stream: context.is_stream,
+        let request = match serde_json::to_value(original_request) {
+            Ok(value) => value,
+            Err(error) => return Self::handle_serialization_error(error),
         };
-
-        let (mut prefill, decode, prefill_policy, decode_policy) =
-            match self.planner.plan(&descriptor).await {
-                Ok(PlacementPlan::Pair {
-                    prefill,
-                    decode,
-                    prefill_policy,
-                    decode_policy,
-                    ..
-                }) => (prefill, decode, prefill_policy, decode_policy),
-                Ok(PlacementPlan::Single { .. }) => {
-                    return Err(error::internal_error(
-                        "unexpected_single_plan",
-                        "Planner returned Single plan for PD router",
-                    ));
-                }
-                Err(err) => return Err(placement_err_to_response(err, context.model_id)),
-            };
-
-        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        MeshMetrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            prefill_policy,
-        );
-        MeshMetrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            decode_policy,
-        );
-
-        if let BackendType::Atom = self.backend {
-            prefill = self.apply_atom_pd_rank_mapping_policy(prefill, &decode);
-            info!(
-                "ATOM PD DP ranks selected: policy={} prefill={} prefill_dp_rank={:?} decode={} decode_dp_rank={:?}",
-                self.atom_pd_rank_mapping_policy,
-                prefill.url(),
-                prefill.dp_rank(),
-                decode.url(),
-                decode.dp_rank()
-            );
-        }
-
-        let ctx = self
-            .adapter
-            .prepare_pair(prefill.as_ref(), decode.as_ref())
-            .map_err(Self::handle_serialization_error)?;
-        Ok((prefill, decode, ctx))
-    }
-
-    /// vLLM Mooncake mode: fire prefill request as background task, stream decode response.
-    /// Replaces the dual-dispatch+bootstrap protocol used for SGLang.
-    async fn execute_vllm_mooncake<T: Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        original_request: &T,
-        context: PDRequestContext<'_>,
-    ) -> Response {
-        let start_time = Instant::now();
-
-        let route = context.route;
-        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        let endpoint = route_to_endpoint(route);
-
-        MeshMetrics::record_router_request(
+        let endpoint = route_to_endpoint(context.route);
+        let observation = crate::observability::request::RequestMetrics::new(
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_PD,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            endpoint,
-            bool_to_static_str(context.is_stream),
+            context.model_id.unwrap_or(UNKNOWN_MODEL_ID),
+            context.route,
+            context.is_stream,
         );
-
-        let shared_request = Arc::new(original_request.clone());
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
-            {
-                move |attempt: u32| {
-                    let shared_request = Arc::clone(&shared_request);
-                    let context = context.clone();
-                    async move {
-                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
-                            Ok(t) => t,
-                            Err(resp) => return resp,
-                        };
-
-                        debug!(
-                            "vLLM PD retry attempt {} prefill={} decode={}",
-                            attempt,
-                            prefill.url(),
-                            decode.url()
-                        );
-
-                        let mut prefill_request_json =
-                            match serde_json::to_value(shared_request.as_ref()) {
-                                Ok(v) => v,
-                                Err(e) => return Self::handle_serialization_error(e),
-                            };
-                        let mut decode_request_json = prefill_request_json.clone();
-                        if let Err(e) = self
-                            .adapter
-                            .inject_prefill_fields(&mut prefill_request_json, &ctx)
-                        {
-                            return Self::handle_serialization_error(e);
-                        }
-                        if let Err(e) = self
-                            .adapter
-                            .inject_decode_fields(&mut decode_request_json, &ctx)
-                        {
-                            return Self::handle_serialization_error(e);
-                        }
-                        let correlation_id = self.adapter.correlation_id(&ctx);
-
-                        self.dispatch_vllm_mooncake_internal(
-                            headers,
-                            prefill_request_json,
-                            decode_request_json,
-                            context,
-                            Arc::clone(&prefill),
-                            Arc::clone(&decode),
-                            start_time,
-                            correlation_id,
-                        )
+            |_attempt| {
+                let request = request.clone();
+                let context = context.clone();
+                async move {
+                    let placement = match self.plan_pd_pair(&context).await {
+                        Ok(pair) => pair,
+                        Err(response) => return response,
+                    };
+                    self.execute_reserved(headers, request, context, placement)
                         .await
-                    }
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            |response, _| is_retryable_status(response.status()),
             |delay, attempt| {
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
@@ -660,29 +770,97 @@ impl PDRouter {
             },
         )
         .await;
+        observation.wrap_response(response)
+    }
 
-        let duration = start_time.elapsed();
-        if response.status().is_success() {
-            MeshMetrics::record_router_duration(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_PD,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                duration,
-            );
-        } else if !is_retryable_status(response.status()) {
-            MeshMetrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_PD,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                error_type_from_status(response.status()),
-            );
-        }
+    async fn plan_pd_pair(
+        &self,
+        context: &PDRequestContext<'_>,
+    ) -> Result<Arc<ReservedPair>, Response> {
+        let descriptor = RequestDescriptor {
+            model_id: context.model_id,
+            protocol: Some(Protocol::Http),
+            text: context.request_text.as_deref(),
+            tokens: None,
+            headers: context.headers.as_deref(),
+            stream: context.is_stream,
+        };
+        let plan = self
+            .planner
+            .plan(&descriptor)
+            .await
+            .map_err(|error| placement_err_to_response(error, context.model_id))?;
+        self.reserve_pair(plan, context.headers.as_deref())
+    }
 
-        response
+    async fn execute_reserved(
+        &self,
+        headers: Option<&HeaderMap>,
+        mut body: Value,
+        context: PDRequestContext<'_>,
+        placement: Arc<ReservedPair>,
+    ) -> Response {
+        let prefill = placement.prefill.clone();
+        let decode = placement.decode.clone();
+        let ctx = match self.adapter.prepare_pair(prefill.as_ref(), decode.as_ref()) {
+            Ok(ctx) => ctx,
+            Err(error) => return Self::handle_serialization_error(error),
+        };
+        let started = Instant::now();
+        let response = match self.backend {
+            BackendType::Sglang => {
+                let injected = match context.batch_size {
+                    Some(n) => self.adapter.inject_batch_prefill_fields(&mut body, &ctx, n),
+                    None => self.adapter.inject_prefill_fields(&mut body, &ctx),
+                };
+                if let Err(error) = injected {
+                    return Self::handle_serialization_error(error);
+                }
+                self.execute_dual_dispatch_internal(
+                    headers,
+                    body,
+                    context,
+                    placement.clone(),
+                    started,
+                )
+                .await
+            }
+            BackendType::Vllm | BackendType::Atom => {
+                let mut decode_body = body.clone();
+                if let Err(error) = self.adapter.inject_prefill_fields(&mut body, &ctx) {
+                    return Self::handle_serialization_error(error);
+                }
+                if let Err(error) = self.adapter.inject_decode_fields(&mut decode_body, &ctx) {
+                    return Self::handle_serialization_error(error);
+                }
+                let correlation = self.adapter.correlation_id(&ctx);
+                if matches!(self.backend, BackendType::Vllm) {
+                    self.dispatch_vllm_mooncake_internal(
+                        headers,
+                        body,
+                        decode_body,
+                        context,
+                        placement.clone(),
+                        started,
+                        correlation,
+                    )
+                    .await
+                } else {
+                    self.dispatch_atom_relay_internal(
+                        headers,
+                        body,
+                        decode_body,
+                        context,
+                        placement.clone(),
+                        ctx,
+                        started,
+                        correlation,
+                    )
+                    .await
+                }
+            }
+        };
+        crate::core::AttachedBody::wrap_response(response, placement)
     }
 
     /// Core vLLM Mooncake dispatch: fire P as background task, stream D response back to client.
@@ -693,16 +871,18 @@ impl PDRouter {
         prefill_request_json: Value,
         decode_request_json: Value,
         context: PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        placement: Arc<ReservedPair>,
         _start_time: Instant,
         correlation_id: Option<String>,
     ) -> Response {
-        // Load tracking: streaming uses guards inside create_streaming_response.
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Take the existing reservations before preparing or sending requests.
+        // Streaming requests also count while waiting for response headers.
+        let prefill = placement.prefill.clone();
+        let decode = placement.decode.clone();
+        let [prefill_guard, decode_guard] = match placement.take_load() {
+            Ok(guards) => guards,
+            Err(response) => return response,
+        };
 
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
@@ -710,8 +890,8 @@ impl PDRouter {
         }
         .emit();
 
-        // P request: fire-and-forget background task. Mooncake coordinates KV transfer
-        // via its own out-of-band channel; we only need to ensure P starts processing.
+        // Mooncake coordinates KV transfer out of band. Keep prefill owned until
+        // decode succeeds, then allow its drain to complete independently.
         let prefill_post = match self
             .build_worker_post_with_headers(
                 &self.client,
@@ -727,10 +907,16 @@ impl PDRouter {
             Err(resp) => return resp,
         };
         let prefill_url_for_log = prefill.url().to_string();
-        let prefill_for_outcome = prefill.clone();
+        let prefill_worker = prefill.clone();
+        let prefill_router = self.clone();
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
-        tokio::spawn(async move {
-            match prefill_post.send().await {
+        let mut canceled = placement.canceled.subscribe();
+        let work = async move {
+            let _prefill_guard = prefill_guard;
+            match prefill_router
+                .send_worker(prefill_post, prefill_worker)
+                .await
+            {
                 Ok(res) => {
                     let status = res.status();
                     if status.is_success() {
@@ -745,18 +931,31 @@ impl PDRouter {
                         );
                     }
                     // Drain body so the connection can be reused.
-                    let _ = res.bytes().await;
-                    prefill_for_outcome.record_outcome(status.is_success());
+                    if let Err(error) = res.drain().await {
+                        warn!(%error, "failed to drain prefill response");
+                    }
                 }
                 Err(e) => {
                     error!(
                         "vLLM prefill {} request_id={} failed: {}",
                         prefill_url_for_log, correlation_for_log, e
                     );
-                    prefill_for_outcome.record_outcome(false);
                 }
             }
-        });
+        };
+        let prefill_task = PrefillTask(Some(tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = async {
+                    if canceled.wait_for(|value| *value).await.is_err() {
+                        // Dropping a reservation is not explicit cancellation:
+                        // an HTTP prefill may still be draining after decode ends.
+                        std::future::pending::<()>().await;
+                    }
+                } => {},
+                _ = work => {},
+            }
+        })));
 
         // D request: client sees the streamed (or buffered) response from D.
         let decode_post = match self
@@ -773,7 +972,7 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = decode_post.send().await;
+        let decode_result = self.send_worker(decode_post, decode.clone()).await;
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -785,7 +984,7 @@ impl PDRouter {
                     error_debug = ?e,
                     "vLLM decode request failed"
                 );
-                decode.record_outcome(false);
+
                 return error::bad_gateway(
                     "decode_server_error",
                     format!("Decode server error: {}", e),
@@ -795,8 +994,6 @@ impl PDRouter {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let not_error = status.is_success() || status.is_client_error();
-        decode.record_outcome(not_error);
 
         if !status.is_success() {
             error!(
@@ -804,32 +1001,31 @@ impl PDRouter {
                 decode.url(),
                 status
             );
-            MeshMetrics::record_worker_error(
-                metrics_labels::WORKER_DECODE,
-                metrics_labels::CONNECTION_HTTP,
-                error_type_from_status(status),
-            );
             return self
-                .handle_decode_error_response(res, &context, prefill, decode)
+                .handle_decode_error_response(res, &context, decode_guard, decode)
                 .await;
         }
 
         if context.is_stream {
             let response_headers = header_utils::preserve_response_headers(res.headers());
-            self.create_streaming_response(
+            let response = self.create_streaming_response(
                 res.bytes_stream(),
                 status,
                 None,
                 false,
                 None,
                 Some(response_headers),
-                prefill,
-                decode,
-            )
+                decode_guard,
+            );
+            // Preserve detached HTTP prefill draining. Execution leases can
+            // still cancel the task through the reservation's cancellation signal.
+            prefill_task.detach();
+            response
         } else {
             let response_headers = header_utils::preserve_response_headers(res.headers());
             match res.bytes().await {
                 Ok(decode_body) => {
+                    prefill_task.finish().await;
                     let mut response = Response::new(Body::from(decode_body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -843,128 +1039,6 @@ impl PDRouter {
         }
     }
 
-    /// ATOM Mooncake mode: P must run first and return kv_transfer_params; mesh
-    /// enriches them with remote_dp_size/remote_tp_size, then forwards to D.
-    /// Decode's response is streamed (or buffered) back to the client.
-    async fn execute_atom_relay<T: Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        original_request: &T,
-        context: PDRequestContext<'_>,
-    ) -> Response {
-        let start_time = Instant::now();
-
-        let route = context.route;
-        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        let endpoint = route_to_endpoint(route);
-
-        MeshMetrics::record_router_request(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_PD,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            endpoint,
-            bool_to_static_str(context.is_stream),
-        );
-
-        let shared_request = Arc::new(original_request.clone());
-        let response = RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
-            {
-                move |attempt: u32| {
-                    let shared_request = Arc::clone(&shared_request);
-                    let context = context.clone();
-                    async move {
-                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
-                            Ok(t) => t,
-                            Err(resp) => return resp,
-                        };
-
-                        debug!(
-                            "ATOM PD retry attempt {} prefill={} decode={}",
-                            attempt,
-                            prefill.url(),
-                            decode.url()
-                        );
-
-                        let mut prefill_request_json =
-                            match serde_json::to_value(shared_request.as_ref()) {
-                                Ok(v) => v,
-                                Err(e) => return Self::handle_serialization_error(e),
-                            };
-                        let mut decode_request_json = prefill_request_json.clone();
-                        if let Err(e) = self
-                            .adapter
-                            .inject_prefill_fields(&mut prefill_request_json, &ctx)
-                        {
-                            return Self::handle_serialization_error(e);
-                        }
-                        if let Err(e) = self
-                            .adapter
-                            .inject_decode_fields(&mut decode_request_json, &ctx)
-                        {
-                            return Self::handle_serialization_error(e);
-                        }
-                        let correlation_id = self.adapter.correlation_id(&ctx);
-
-                        self.dispatch_atom_relay_internal(
-                            headers,
-                            prefill_request_json,
-                            decode_request_json,
-                            context,
-                            Arc::clone(&prefill),
-                            Arc::clone(&decode),
-                            ctx,
-                            start_time,
-                            correlation_id,
-                        )
-                        .await
-                    }
-                }
-            },
-            |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
-                MeshMetrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
-                MeshMetrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
-                MeshMetrics::record_worker_retry_backoff(attempt, delay);
-            },
-            || {
-                MeshMetrics::record_worker_retries_exhausted(
-                    metrics_labels::WORKER_PREFILL,
-                    endpoint,
-                );
-                MeshMetrics::record_worker_retries_exhausted(
-                    metrics_labels::WORKER_DECODE,
-                    endpoint,
-                );
-            },
-        )
-        .await;
-
-        let duration = start_time.elapsed();
-        if response.status().is_success() {
-            MeshMetrics::record_router_duration(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_PD,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                duration,
-            );
-        } else if !is_retryable_status(response.status()) {
-            MeshMetrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_PD,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                error_type_from_status(response.status()),
-            );
-        }
-
-        response
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_atom_relay_internal(
         &self,
@@ -972,16 +1046,19 @@ impl PDRouter {
         prefill_request_json: Value,
         mut decode_request_json: Value,
         context: PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        placement: Arc<ReservedPair>,
         ctx: PairCtx,
         _start_time: Instant,
         correlation_id: Option<String>,
     ) -> Response {
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Take the reserved pair before the first await, including streaming requests.
+        // D remains reserved while P runs because this request already selected D.
+        let prefill = placement.prefill.clone();
+        let decode = placement.decode.clone();
+        let [prefill_guard, decode_guard] = match placement.take_load() {
+            Ok(guards) => guards,
+            Err(response) => return response,
+        };
 
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
@@ -1007,7 +1084,7 @@ impl PDRouter {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let prefill_result = prefill_post.send().await;
+        let prefill_result = self.send_worker(prefill_post, prefill.clone()).await;
         let prefill_resp = match prefill_result {
             Ok(r) => r,
             Err(e) => {
@@ -1017,7 +1094,7 @@ impl PDRouter {
                     correlation_for_log,
                     e
                 );
-                prefill.record_outcome(false);
+
                 return error::bad_gateway(
                     "prefill_server_error",
                     format!("Prefill server error: {}", e),
@@ -1026,7 +1103,7 @@ impl PDRouter {
         };
 
         let prefill_status = prefill_resp.status();
-        prefill.record_outcome(prefill_status.is_success());
+
         if !prefill_status.is_success() {
             let body_text = prefill_resp
                 .text()
@@ -1063,6 +1140,9 @@ impl PDRouter {
                 );
             }
         };
+
+        // P has completed its work; D's output stream must not keep P loaded.
+        drop(prefill_guard);
 
         let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
             Some(v) => v,
@@ -1101,6 +1181,13 @@ impl PDRouter {
                 format!("Failed to enrich decode kv: {}", e),
             );
         }
+        let carried_ids = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv_params);
+        debug!(
+            "ATOM PD request_id={} carried {} prompt token ids to decode {}",
+            correlation_for_log,
+            carried_ids,
+            decode.url()
+        );
 
         let decode_obj = match decode_request_json.as_object_mut() {
             Some(o) => o,
@@ -1127,7 +1214,7 @@ impl PDRouter {
             Ok(req) => req,
             Err(resp) => return resp,
         };
-        let decode_result = decode_post.send().await;
+        let decode_result = self.send_worker(decode_post, decode.clone()).await;
         events::RequestReceivedEvent {}.emit();
 
         let res = match decode_result {
@@ -1138,7 +1225,7 @@ impl PDRouter {
                     error = %e,
                     "ATOM decode request failed"
                 );
-                decode.record_outcome(false);
+
                 return error::bad_gateway(
                     "decode_server_error",
                     format!("Decode server error: {}", e),
@@ -1148,8 +1235,6 @@ impl PDRouter {
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let not_error = status.is_success() || status.is_client_error();
-        decode.record_outcome(not_error);
 
         if !status.is_success() {
             error!(
@@ -1157,13 +1242,8 @@ impl PDRouter {
                 decode.url(),
                 status
             );
-            MeshMetrics::record_worker_error(
-                metrics_labels::WORKER_DECODE,
-                metrics_labels::CONNECTION_HTTP,
-                error_type_from_status(status),
-            );
             return self
-                .handle_decode_error_response(res, &context, prefill, decode)
+                .handle_decode_error_response(res, &context, decode_guard, decode)
                 .await;
         }
 
@@ -1176,8 +1256,7 @@ impl PDRouter {
                 false,
                 None,
                 Some(response_headers),
-                prefill,
-                decode,
+                decode_guard,
             )
         } else {
             let response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1196,151 +1275,11 @@ impl PDRouter {
         }
     }
 
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        original_request: &T,
-        context: PDRequestContext<'_>,
-    ) -> Response {
-        let start_time = Instant::now();
-
-        let route = context.route;
-        let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        let endpoint = route_to_endpoint(route);
-
-        // Record request start (Layer 2)
-        MeshMetrics::record_router_request(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_PD,
-            metrics_labels::CONNECTION_HTTP,
-            model,
-            endpoint,
-            bool_to_static_str(context.is_stream),
-        );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
-        let response = RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
-            {
-                move |attempt: u32| {
-                    // Clone Arc (cheap reference count increment) instead of cloning the entire request
-                    let shared_request = Arc::clone(&shared_request);
-                    let context = context.clone();
-                    async move {
-                        let (prefill, decode, ctx) = match self.plan_pd_pair(&context).await {
-                            Ok(t) => t,
-                            Err(resp) => return resp,
-                        };
-
-                        debug!(
-                            "PD retry attempt {} using prefill={} decode={}",
-                            attempt,
-                            prefill.url(),
-                            decode.url()
-                        );
-
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
-
-                        let inject_result = match context.batch_size {
-                            Some(n) => {
-                                self.adapter
-                                    .inject_batch_prefill_fields(&mut json_request, &ctx, n)
-                            }
-                            None => self.adapter.inject_prefill_fields(&mut json_request, &ctx),
-                        };
-                        if let Err(e) = inject_result {
-                            return Self::handle_serialization_error(e);
-                        }
-
-                        let response = self
-                            .execute_dual_dispatch_internal(
-                                headers,
-                                json_request,
-                                context,
-                                Arc::clone(&prefill),
-                                Arc::clone(&decode),
-                                start_time,
-                            )
-                            .await;
-
-                        let status = response.status();
-                        let not_error = status.is_success() || status.is_client_error();
-                        prefill.record_outcome(not_error);
-                        decode.record_outcome(not_error);
-
-                        // Record worker errors for server errors (5xx)
-                        if status.is_server_error() {
-                            let error_type = error_type_from_status(status);
-                            MeshMetrics::record_worker_error(
-                                metrics_labels::WORKER_PREFILL,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                            MeshMetrics::record_worker_error(
-                                metrics_labels::WORKER_DECODE,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                        }
-
-                        response
-                    }
-                }
-            },
-            |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
-                // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
-                MeshMetrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
-                MeshMetrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
-                MeshMetrics::record_worker_retry_backoff(attempt, delay);
-            },
-            || {
-                MeshMetrics::record_worker_retries_exhausted(
-                    metrics_labels::WORKER_PREFILL,
-                    endpoint,
-                );
-                MeshMetrics::record_worker_retries_exhausted(
-                    metrics_labels::WORKER_DECODE,
-                    endpoint,
-                );
-            },
-        )
-        .await;
-
-        // Record Layer 2 metrics
-        let duration = start_time.elapsed();
-        if response.status().is_success() {
-            MeshMetrics::record_router_duration(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_PD,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                duration,
-            );
-        } else if !is_retryable_status(response.status()) {
-            MeshMetrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_PD,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                error_type_from_status(response.status()),
-            );
-        }
-
-        response
-    }
-
     async fn handle_decode_error_response(
         &self,
-        res: reqwest::Response,
+        res: WorkerResponse,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
+        decode_guard: WorkerLoadGuard,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -1361,10 +1300,7 @@ impl PDRouter {
                 }
             };
 
-            let sse_data = format!(
-                "data: {{'error': {}}}",
-                serde_json::to_string(&error_payload).unwrap_or_default()
-            );
+            let sse_data = format!("data: {}\n\n", json!({"error": error_payload}));
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
             let decode_url = decode.url().to_string();
@@ -1375,8 +1311,7 @@ impl PDRouter {
                 context.return_logprob,
                 Some(decode_url),
                 Some(response_headers),
-                prefill,
-                decode,
+                decode_guard,
             )
         } else {
             // Handle non-streaming error response
@@ -1422,34 +1357,44 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         json_request: Value,
         context: PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        placement: Arc<ReservedPair>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        let prefill = placement.prefill.clone();
+        let decode = placement.decode.clone();
+        let [prefill_guard, decode_guard] = match placement.take_load() {
+            Ok(guards) => guards,
+            Err(response) => return response,
+        };
 
-        // Build both requests
-        let prefill_request = self.build_post_with_headers(
-            &self.client,
-            prefill.url(),
-            context.route,
-            &json_request,
-            headers,
-            false,
-        );
-        let decode_request = self.build_post_with_headers(
-            &self.client,
-            decode.url(),
-            context.route,
-            &json_request,
-            headers,
-            false,
-        );
+        let prefill_request = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                json_request.clone(),
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+        let decode_request = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                decode.as_ref(),
+                context.route,
+                json_request,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
 
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
@@ -1459,124 +1404,105 @@ impl PDRouter {
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        enum DispatchError {
+            Prefill(WorkerResponse, WorkerLoadGuard),
+            Decode(WorkerResponse, WorkerLoadGuard),
+            Response(Response),
+        }
+
+        // Drain successful P responses independently of D's headers. Return
+        // HTTP errors on headers so try_join! drops the peer and its reservation
+        // before we await a potentially stalled error body below.
+        let results = tokio::try_join!(
+            async {
+                let result = self.send_worker(prefill_request, prefill.clone()).await;
+                let result = match result {
+                    Ok(res) if !res.status().is_success() => {
+                        return Err(DispatchError::Prefill(res, prefill_guard));
+                    }
+                    result => result,
+                };
+                let result = self
+                    .process_prefill_response(result, prefill.url(), context.return_logprob)
+                    .await
+                    .map_err(DispatchError::Response);
+                drop(prefill_guard);
+                result
+            },
+            async {
+                let res = self
+                    .send_worker(decode_request, decode.clone())
+                    .await
+                    .map_err(|e| {
+                        error!(decode_url = %decode.url(), error = %e, "Decode request failed");
+                        DispatchError::Response(error::bad_gateway(
+                            "decode_server_error",
+                            format!("Decode server error: {}", e),
+                        ))
+                    })?;
+                if !res.status().is_success() {
+                    return Err(DispatchError::Decode(res, decode_guard));
+                }
+                Ok((res, decode_guard))
+            }
+        );
 
         events::RequestReceivedEvent {}.emit();
-
-        // Process decode response
-        match decode_result {
-            Ok(res) => {
-                let status = StatusCode::from_u16(res.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                debug!("Decode response status: {}", status);
-
-                if !status.is_success() {
-                    error!(
-                        "Decode server returned error status decode_url={} status={}",
-                        decode.url(),
-                        status
-                    );
-
-                    return self
-                        .handle_decode_error_response(res, &context, prefill, decode)
-                        .await;
-                }
-
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
-
-                if context.is_stream {
-                    // Streaming response
-                    let prefill_logprobs = if context.return_logprob {
-                        prefill_body
-                            .as_ref()
-                            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
-                            .and_then(|json| {
-                                json.pointer("/meta_info/input_token_logprobs").cloned()
-                            })
-                    } else {
-                        None
-                    };
-
-                    let response_headers = header_utils::preserve_response_headers(res.headers());
-
-                    self.create_streaming_response(
-                        res.bytes_stream(),
-                        status,
-                        prefill_logprobs,
-                        context.return_logprob,
-                        None,
-                        Some(response_headers),
-                        prefill,
-                        decode,
-                    )
-                } else {
-                    // Non-streaming response
-                    if context.return_logprob {
-                        self.process_non_streaming_response(
-                            res,
-                            status,
-                            context.return_logprob,
-                            prefill_body,
-                        )
-                        .await
-                    } else {
-                        // Direct passthrough when no logprobs needed
-                        let response_headers =
-                            header_utils::preserve_response_headers(res.headers());
-
-                        match res.bytes().await {
-                            Ok(decode_body) => {
-                                let mut response = Response::new(Body::from(decode_body));
-                                *response.status_mut() = status;
-                                *response.headers_mut() = response_headers;
-                                response
-                            }
-                            Err(e) => {
-                                error!("Failed to read decode response: {}", e);
-                                error::internal_error(
-                                    "read_response_failed",
-                                    "Failed to read response",
-                                )
-                            }
-                        }
-                    }
-                }
+        let ((_, prefill_body), (res, decode_guard)) = match results {
+            Ok(results) => results,
+            Err(DispatchError::Response(response)) => return response,
+            Err(DispatchError::Prefill(res, _prefill_guard)) => {
+                // Keep only the failing worker reserved while reading its body.
+                return self.handle_prefill_error_response(res, prefill.url()).await;
             }
-            Err(e) => {
-                error!(
-                    decode_url = %decode.url(),
-                    error = %e,
-                    error_debug = ?e,
-                    "Decode request failed"
-                );
-                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
+            Err(DispatchError::Decode(res, decode_guard)) => {
+                return self
+                    .handle_decode_error_response(res, &context, decode_guard, decode)
+                    .await;
+            }
+        };
+        let status = res.status();
+
+        if context.is_stream {
+            let prefill_logprobs = if context.return_logprob {
+                prefill_body
+                    .as_ref()
+                    .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                    .and_then(|json| json.pointer("/meta_info/input_token_logprobs").cloned())
+            } else {
+                None
+            };
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            self.create_streaming_response(
+                res.bytes_stream(),
+                status,
+                prefill_logprobs,
+                context.return_logprob,
+                None,
+                Some(response_headers),
+                decode_guard,
+            )
+        } else if context.return_logprob {
+            self.process_non_streaming_response(res, status, true, prefill_body)
+                .await
+        } else {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            match res.bytes().await {
+                Ok(decode_body) => {
+                    let mut response = Response::new(Body::from(decode_body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => {
+                    error!("Failed to read decode response: {}", e);
+                    error::internal_error("read_response_failed", "Failed to read response")
+                }
             }
         }
     }
 
+    #[cfg(test)]
     fn policies_need_request_text(&self) -> bool {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
@@ -1592,53 +1518,39 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        decode_guard: WorkerLoadGuard,
     ) -> Response {
-        use crate::core::AttachedBody;
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-        tokio::spawn(async move {
-            futures_util::pin_mut!(stream);
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
+        // Poll the upstream only when the downstream asks for data. Dropping the
+        // response also drops the upstream, including while it is idle.
+        let stream = futures_util::stream::unfold(
+            (Box::pin(stream), false, prefill_logprobs, decode_url),
+            move |(mut stream, finished, prefill_logprobs, decode_url)| async move {
+                if finished {
+                    return None;
+                }
+                let result = stream.next().await?;
+                let (result, finished) = match result {
                     Ok(chunk) => {
-                        let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
-
-                        let result = if return_logprob && prefill_logprobs.is_some() {
+                        let finished = memmem::find(&chunk, b"data: [DONE]").is_some();
+                        let chunk = if return_logprob && prefill_logprobs.is_some() {
                             Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
                                 .unwrap_or(chunk)
                         } else {
                             chunk
                         };
-
-                        if tx.send(Ok(result)).is_err() {
-                            break;
-                        }
-
-                        if is_done {
-                            break;
-                        }
+                        (Ok(chunk), finished)
                     }
-                    Err(e) => {
+                    Err(error) => {
                         if let Some(ref url) = decode_url {
-                            error!("Stream error from decode server {}: {}", url, e);
+                            error!("Stream error from decode server {}: {}", url, error);
                         }
-                        let _ = tx.send(Err(format!("Stream error: {}", e)));
-                        break;
+                        (Err(error), true)
                     }
-                }
-            }
-        });
-
-        let stream = UnboundedReceiverStream::new(rx);
+                };
+                Some((result, (stream, finished, prefill_logprobs, decode_url)))
+            },
+        );
         let body = Body::from_stream(stream);
-
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -1647,13 +1559,14 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, guards)
+        // Transfer the existing reservation instead of incrementing load again.
+        crate::core::AttachedBody::wrap_response(response, decode_guard)
     }
 
     // Helper to process non-streaming decode response with logprob merging
     async fn process_non_streaming_response(
         &self,
-        res: reqwest::Response,
+        res: WorkerResponse,
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<bytes::Bytes>,
@@ -1696,10 +1609,31 @@ impl PDRouter {
         }
     }
 
+    async fn handle_prefill_error_response(
+        &self,
+        response: WorkerResponse,
+        prefill_url: &str,
+    ) -> Response {
+        let status = response.status();
+        let error_msg = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown prefill error".to_string());
+        error!(
+            "Prefill server returned error status prefill_url={} status={} body={}",
+            prefill_url, status, error_msg
+        );
+        error::create_error(
+            status,
+            "prefill_error",
+            format!("Prefill server error ({}): {}", status, error_msg),
+        )
+    }
+
     // Helper to process prefill response and extract body if needed for logprobs
     async fn process_prefill_response(
         &self,
-        prefill_result: Result<reqwest::Response, reqwest::Error>,
+        prefill_result: Result<WorkerResponse, reqwest::Error>,
         prefill_url: &str,
         return_logprob: bool,
     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
@@ -1729,23 +1663,9 @@ impl PDRouter {
 
         // Check if prefill succeeded
         if !prefill_status.is_success() {
-            // Get error body from prefill
-            let error_msg = prefill_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown prefill error".to_string());
-
-            error!(
-                "Prefill server returned error status prefill_url={} status={} body={}",
-                prefill_url, prefill_status, error_msg
-            );
-
-            let error_response = error::create_error(
-                prefill_status,
-                "prefill_error",
-                format!("Prefill server error ({}): {}", prefill_status, error_msg),
-            );
-            return Err(error_response);
+            return Err(self
+                .handle_prefill_error_response(prefill_response, prefill_url)
+                .await);
         }
 
         // Read prefill body if needed for logprob merging
@@ -1760,8 +1680,8 @@ impl PDRouter {
         } else {
             // For non-logprob requests, just consume the response without storing
             debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
+            match prefill_response.drain().await {
+                Ok(()) => debug!("Prefill response consumed successfully"),
                 Err(e) => warn!("Error consuming prefill response: {}", e),
             }
             None
@@ -1770,29 +1690,30 @@ impl PDRouter {
         Ok((prefill_status, prefill_body))
     }
 
-    fn build_post_with_headers(
+    async fn send_worker(
         &self,
-        client: &Client,
-        url: &str,
-        route: &'static str,
-        json_request: &Value,
-        headers: Option<&HeaderMap>,
-        connection_close: bool,
-    ) -> reqwest::RequestBuilder {
-        let mut request = client.post(api_path(url, route)).json(json_request);
-        if connection_close {
-            request = request.header("Connection", "close");
-        }
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    if let Ok(val) = value.to_str() {
-                        request = request.header(name, val);
-                    }
-                }
+        request: reqwest::RequestBuilder,
+        worker: Arc<dyn Worker>,
+    ) -> Result<WorkerResponse, reqwest::Error> {
+        let policy = match worker.worker_type() {
+            crate::core::WorkerType::Prefill { .. } => self.policy_registry.get_prefill_policy(),
+            _ => self.policy_registry.get_decode_policy(),
+        };
+        let mut outcome = WorkerOutcome {
+            worker: Some(worker),
+            policy,
+            status: None,
+        };
+        match request.send().await {
+            Ok(inner) => {
+                outcome.status = Some(inner.status());
+                Ok(WorkerResponse { inner, outcome })
+            }
+            Err(error) => {
+                outcome.finish(false);
+                Err(error)
             }
         }
-        request
     }
 
     async fn build_worker_post_with_headers(
@@ -1826,14 +1747,22 @@ impl PDRouter {
         if connection_close {
             request = request.header("Connection", "close");
         }
+        let api_key = worker.api_key();
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
+                // bearer_auth appends, so omit client credentials when the worker has its own.
+                if name == AUTHORIZATION && api_key.is_some() {
+                    continue;
+                }
                 if header_utils::should_forward_request_header(name.as_str()) {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
                     }
                 }
             }
+        }
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
         }
         Ok(request)
     }
@@ -2031,27 +1960,8 @@ impl RouterTrait for PDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.return_logprob.unwrap_or(false);
-
-        let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().map(|s| s.to_string())
-        } else {
-            None
-        };
-
-        let batch_size = Self::get_generate_batch_size(body);
-
-        let context = PDRequestContext {
-            route: "/generate",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            headers: headers.cloned().map(Arc::new),
-        };
-
+        let metadata = body.metadata();
+        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
         self.dispatch_pd(headers, body, context).await
     }
 
@@ -2061,39 +1971,8 @@ impl RouterTrait for PDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
-
-        let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
-        } else {
-            None
-        };
-
-        // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(body);
-
-        let context = PDRequestContext {
-            route: "/v1/chat/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            headers: headers.cloned().map(Arc::new),
-        };
-
+        let metadata = body.metadata();
+        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
         self.dispatch_pd(headers, body, context).await
     }
 
@@ -2103,30 +1982,8 @@ impl RouterTrait for PDRouter {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs.is_some();
-
-        let request_text = if self.policies_need_request_text() {
-            match &body.prompt {
-                StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-            }
-        } else {
-            None
-        };
-
-        let batch_size = Self::get_completion_batch_size(body);
-
-        let context = PDRequestContext {
-            route: "/v1/completions",
-            batch_size,
-            is_stream,
-            return_logprob,
-            request_text,
-            model_id,
-            headers: headers.cloned().map(Arc::new),
-        };
-
+        let metadata = body.metadata();
+        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
         self.dispatch_pd(headers, body, context).await
     }
 
@@ -2143,7 +2000,315 @@ mod tests {
         WorkerType,
     };
 
-    fn create_test_pd_router() -> PDRouter {
+    #[derive(Debug, Default)]
+    struct CompletionPolicy(std::sync::Mutex<Vec<bool>>);
+    #[async_trait::async_trait]
+    impl crate::policies::LoadBalancingPolicy for CompletionPolicy {
+        async fn select_worker(
+            &self,
+            _: &[Arc<dyn Worker>],
+            _: &crate::policies::SelectWorkerInfo<'_>,
+        ) -> Option<usize> {
+            Some(0)
+        }
+        fn on_request_complete(&self, _: &str, success: bool) {
+            self.0.lock().unwrap().push(success);
+        }
+        fn name(&self) -> &'static str {
+            "completion-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn worker_outcome_completes_policy_once_and_cancellation_is_neutral() {
+        for (status, body, successes, failures, completed) in [
+            (Some(StatusCode::OK), Some(true), 1, 0, true),
+            (Some(StatusCode::OK), Some(false), 0, 1, false),
+            (
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                Some(true),
+                0,
+                1,
+                false,
+            ),
+            (Some(StatusCode::BAD_REQUEST), Some(true), 0, 0, false),
+            (Some(StatusCode::OK), None, 0, 0, false),
+            (None, None, 0, 0, false),
+            (None, Some(false), 0, 1, false),
+        ] {
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("http://worker").build());
+            let policy = Arc::new(CompletionPolicy::default());
+            let mut outcome = WorkerOutcome {
+                worker: Some(worker.clone()),
+                policy: policy.clone(),
+                status,
+            };
+            if let Some(ok) = body {
+                outcome.finish(ok);
+                outcome.finish(ok);
+            }
+            drop(outcome);
+            assert_eq!(*policy.0.lock().unwrap(), vec![completed]);
+            assert_eq!(worker.circuit_breaker().total_successes(), successes);
+            assert_eq!(worker.circuit_breaker().total_failures(), failures);
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_worker_body_is_failure_but_unread_body_is_neutral() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for consume in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            });
+            let router = create_test_pd_router();
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            );
+            let response = router
+                .send_worker(router.client.get(&url), worker.clone())
+                .await
+                .unwrap();
+            assert_eq!(worker.circuit_breaker().total_successes(), 0);
+            if consume {
+                let mut stream = Box::pin(response.bytes_stream());
+                let mut failed = false;
+                while let Some(chunk) = stream.next().await {
+                    failed |= chunk.is_err();
+                }
+                assert!(failed);
+            } else {
+                drop(response);
+            }
+            server.await.unwrap();
+            assert_eq!(
+                worker.circuit_breaker().total_failures(),
+                u64::from(consume)
+            );
+            assert_eq!(worker.circuit_breaker().total_successes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_vllm_decode_drains_slow_prefill_and_decode_error_does_not_blame_prefill() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let backend = axum::Router::new()
+            .route(
+                "/prefill",
+                axum::routing::post(|| async {
+                    Body::from_stream(futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Ok::<_, std::convert::Infallible>("{}")
+                    }))
+                }),
+            )
+            .route(
+                "/decode",
+                axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                    if body["fail"] == true {
+                        (StatusCode::SERVICE_UNAVAILABLE, "decode failed")
+                    } else {
+                        (StatusCode::OK, "decode done")
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, backend).await.unwrap();
+        });
+        for fail in [false, true] {
+            let router = create_test_pd_router();
+            let prefill: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("{url}/prefill"))
+                    .worker_type(WorkerType::Prefill {
+                        bootstrap_port: None,
+                    })
+                    .build(),
+            );
+            let decode: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("{url}/decode"))
+                    .worker_type(WorkerType::Decode)
+                    .build(),
+            );
+            let context = PDRequestContext {
+                route: "",
+                batch_size: None,
+                is_stream: false,
+                return_logprob: false,
+                request_text: None,
+                model_id: None,
+                headers: None,
+            };
+            let placement = router
+                .reserve_pair(
+                    PlacementPlan::Pair {
+                        prefill: prefill.clone(),
+                        decode: decode.clone(),
+                        prefill_policy: "round_robin",
+                        decode_policy: "round_robin",
+                    },
+                    None,
+                )
+                .unwrap();
+            let response = router
+                .dispatch_vllm_mooncake_internal(
+                    None,
+                    json!({}),
+                    json!({"fail":fail}),
+                    context,
+                    placement,
+                    Instant::now(),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                response.status(),
+                if fail {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                }
+            );
+            drop(response);
+            tokio::task::yield_now().await;
+            assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+            assert_eq!(
+                prefill.circuit_breaker().total_successes(),
+                u64::from(!fail)
+            );
+            assert_eq!(decode.circuit_breaker().total_failures(), u64::from(fail));
+            assert_eq!(decode.circuit_breaker().total_successes(), u64::from(!fail));
+            assert_eq!(prefill.load(), 0);
+            assert_eq!(decode.load(), 0);
+        }
+        server.abort();
+    }
+
+    #[cfg(feature = "ext-proc")]
+    #[tokio::test]
+    async fn http_retries_replan_but_reserved_execution_never_replans_or_counts_twice() {
+        use crate::core::placement::types::PlacementError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingPlanner {
+            inner: Arc<dyn PdPlanner>,
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl PdPlanner for CountingPlanner {
+            async fn plan(
+                &self,
+                request: &RequestDescriptor<'_>,
+            ) -> Result<PlacementPlan, PlacementError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.plan(request).await
+            }
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback({
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut router = create_test_pd_router();
+        router.retry_config.max_retries = 2;
+        router.retry_config.initial_backoff_ms = 1;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/prefill"))
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8001),
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("{url}/decode"))
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        router.worker_registry.register(prefill.clone());
+        router.worker_registry.register(decode.clone());
+        let planner = Arc::new(CountingPlanner {
+            inner: router.planner.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        router.planner = planner.clone();
+        let request: CompletionRequest =
+            serde_json::from_value(json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"})).unwrap();
+        let response = router.route_completion(None, &request, None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(planner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!((prefill.load(), decode.load()), (0, 0));
+        let pair = router
+            .reserve_pair(
+                PlacementPlan::Pair {
+                    prefill: prefill.clone(),
+                    decode: decode.clone(),
+                    prefill_policy: "round_robin",
+                    decode_policy: "round_robin",
+                },
+                None,
+            )
+            .unwrap();
+        let metadata = request.metadata().execution_metadata();
+        let response = router
+            .execute_placement(
+                &HeaderMap::new(),
+                serde_json::to_value(&request).unwrap(),
+                &metadata,
+                pair,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(planner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!((prefill.load(), decode.load()), (0, 0));
+        let rendered = handle.render();
+        let request_counts: Vec<_> = rendered
+            .lines()
+            .filter(|line| line.starts_with("mesh_router_requests_total{"))
+            .collect();
+        assert_eq!(request_counts.len(), 1, "{rendered}");
+        assert!(request_counts[0].ends_with(" 1"), "{rendered}");
+        server.abort();
+    }
+
+    pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
@@ -2244,9 +2409,26 @@ mod tests {
         router.worker_registry.register(prefill_rank_2.clone());
         router.worker_registry.register(prefill_rank_5.clone());
 
-        let mapped = router.apply_atom_pd_rank_mapping_policy(prefill_rank_2, &decode_rank_5);
-        assert_eq!(mapped.url(), "http://prefill@5");
-        assert_eq!(mapped.dp_rank(), Some(5));
+        let pair = router
+            .reserve_pair(
+                PlacementPlan::Pair {
+                    prefill: prefill_rank_2.clone(),
+                    decode: decode_rank_5.clone(),
+                    prefill_policy: "round_robin",
+                    decode_policy: "round_robin",
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(pair.prefill.url(), "http://prefill@5");
+        assert_eq!(pair.prefill.dp_rank(), Some(5));
+        assert_eq!(prefill_rank_2.load(), 0);
+        assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
+        let execution = pair.clone();
+        drop(pair);
+        assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (1, 1));
+        drop(execution);
+        assert_eq!((prefill_rank_5.load(), decode_rank_5.load()), (0, 0));
     }
 
     #[test]
@@ -2307,7 +2489,7 @@ mod tests {
         assert_eq!(decode_ref.load(), 0);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
 
         {
             let response = router.create_streaming_response(
@@ -2317,12 +2499,11 @@ mod tests {
                 false,
                 None,
                 None,
-                prefill_ref.clone(),
-                decode_ref.clone(),
+                WorkerLoadGuard::new(decode_ref.clone(), None),
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // Only D remains loaded after P has completed.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
@@ -2330,7 +2511,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
 
             // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);
@@ -2352,7 +2533,7 @@ mod tests {
             r#"{"model": "test", "messages": [{"role": "user", "content": "hi"}]}"#,
         )
         .unwrap();
-        assert_eq!(PDRouter::get_chat_batch_size(&req), None);
+        assert_eq!(req.metadata().batch_size, None);
     }
 
     #[test]
@@ -2361,7 +2542,7 @@ mod tests {
             r#"{"model": "test", "messages": [{"role": "user", "content": "hi"}], "n": 1}"#,
         )
         .unwrap();
-        assert_eq!(PDRouter::get_chat_batch_size(&req), None);
+        assert_eq!(req.metadata().batch_size, None);
     }
 
     #[test]
@@ -2370,7 +2551,7 @@ mod tests {
             r#"{"model": "test", "messages": [{"role": "user", "content": "hi"}], "n": 4}"#,
         )
         .unwrap();
-        assert_eq!(PDRouter::get_chat_batch_size(&req), Some(4));
+        assert_eq!(req.metadata().batch_size, Some(4));
     }
 
     // --- merge_logprobs_in_json ---

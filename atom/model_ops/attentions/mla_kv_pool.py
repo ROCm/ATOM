@@ -31,6 +31,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     carve_layer_major,
     entry_bytes_for,
 )
+from atom.model_ops.sparse_indexer_fp4 import fp4_index_block_shapes
 
 
 class MlaKvPool:
@@ -55,6 +56,8 @@ class MlaKvPool:
         index_rows_per_block: int = 0,
         index_dim: int = 0,
         index_dtype: torch.dtype | None = None,
+        index_head_dim: int = 0,
+        index_fp4: bool = False,
     ):
         self.layers = layers
         self.block_size = block_size
@@ -62,8 +65,17 @@ class MlaKvPool:
         self.cache_fields = [
             EntryField("kv", layers, (block_size, entry_dim), kv_dtype)
         ]
-        self.index_fields = (
-            [
+        self.index_fields: list[EntryField] = []
+        if index_layers and index_fp4:
+            data_shape, scale_shape = fp4_index_block_shapes(
+                index_rows_per_block, index_head_dim
+            )
+            self.index_fields = [
+                EntryField("index", index_layers, data_shape, torch.uint8),
+                EntryField("index_scale", index_layers, scale_shape, torch.uint8),
+            ]
+        elif index_layers:
+            self.index_fields = [
                 EntryField(
                     "index",
                     index_layers,
@@ -71,9 +83,6 @@ class MlaKvPool:
                     index_dtype,
                 )
             ]
-            if index_layers
-            else []
-        )
         self.index_dim = index_dim
         # The regions a block is charged for, in layout order; one list for the
         # price and the allocation both.
@@ -95,9 +104,10 @@ class MlaKvPool:
             self.field_groups, entries, device, buf
         )
         self._views = {
-            name: arena.view(name)
-            for name, arena in (("kv", self.cache), ("index", self.index))
+            field.name: arena.view(field.name)
+            for arena in (self.cache, self.index)
             if arena is not None
+            for field in arena.fields
         }
 
     def release(self) -> None:

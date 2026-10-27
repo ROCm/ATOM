@@ -1,0 +1,585 @@
+name: LMCache ROCm torch 2.10 Wheel
+
+# Builds an LMCache wheel for the ATOM image's torch ABI from any LMCache commit
+# and, when asked, publishes it as a wheel-only image on Docker Hub.
+#
+# The ATOM image ships AMD's ROCm 7.2.4 / torch 2.10.0 build. LMCache only
+# publishes a wheel for that ABI with tagged releases; its rolling nightly-rocm
+# wheel is built against torch 2.11 for the upstream vLLM image and fails to
+# load here (undefined c10::cuda::CUDACachingAllocator symbols). Waiting for a
+# tag is what this workflow removes: ATOM can pick up an LMCache fix as soon as
+# it lands on dev.
+#
+# The build itself is LMCache's: the scripts under .github/scripts at the
+# requested commit, run inside the same digest-pinned rocm/pytorch image that
+# LMCache's build_rocm_torch210_artifacts.yml uses. Nothing here re-implements
+# how LMCache compiles; this workflow only chooses the commit, the version and
+# where the result lives.
+#
+# Versioning follows LMCache's nightlies (setuptools-scm's guess-next-dev from
+# the last stable tag), with the commit and the torch ABI in the local segment:
+#
+#   lmcache-0.5.6.dev98+g05fc77a0.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
+#
+# Published wheels are FROM scratch images holding only the wheel at /, pushed
+# as rocm/atom-dev:lmcache-v<version>-g<sha8>-rocm-torch210 and never
+# overwritten. They are deliberately not GitHub Releases: a release needs a git
+# tag, and a tag reachable from main is what setuptools-scm's git describe picks
+# up when computing ATOM's own version. The Dockerfiles pin the image by digest
+# and the wheel by sha256; after publishing, the workflow opens a draft PR that
+# moves that pin to the new wheel. source_run_id publishes the wheel an earlier
+# run built instead of rebuilding it, while that run's artifact is still kept.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lmcache_commit:
+        description: "Full 40-character LMCache commit SHA to build (e.g. from LMCache/LMCache dev)."
+        type: string
+        required: true
+      publish:
+        description: "Push the wheel to Docker Hub as rocm/atom-dev:lmcache-v...-rocm-torch210. Off = build and validate only."
+        type: boolean
+        required: false
+        default: false
+      source_run_id:
+        description: "Optional: publish the wheel built by this earlier run of this workflow instead of building (its lmcache_commit must match)."
+        type: string
+        required: false
+        default: ''
+      bump_pr:
+        description: "After publishing, open a draft PR that pins the new wheel in the Dockerfiles."
+        type: boolean
+        required: false
+        default: true
+      runner:
+        description: "Runner to build on. A GPU runner also runs LMCache's HIP transfer kernels."
+        type: choice
+        required: false
+        default: 'build-only-atom'
+        options:
+          - build-only-atom
+          - linux-atom-mi35x-1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lmcache-rocm-wheel-${{ inputs.lmcache_commit }}
+  cancel-in-progress: false
+
+env:
+  # Mirrors LMCache's build_rocm_torch210_artifacts.yml and the torch that
+  # docker/Dockerfile ships. Bump together.
+  ROCM_PYTORCH_IMAGE: >-
+    rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e
+  EXPECTED_TORCH_VERSION: 2.10.0+rocm7.2.4.git3d3aa833
+  EXPECTED_TORCH_GIT_VERSION: 3d3aa833db84eed6b7f5595cb5f162c2f78300a4
+  EXPECTED_HIP_VERSION: "7.2.53211"
+  EXPECTED_ROCM_VERSION: "7.2.4"
+  EXPECTED_PYTHON_ABI: cp312
+  EXPECTED_CXX11_ABI: "1"
+  EXPECTED_WHEEL_TAG: cp312-cp312-manylinux_2_39_x86_64
+  MANYLINUX_PLATFORM: manylinux_2_39_x86_64
+  PYTORCH_ROCM_ARCH: gfx942;gfx950
+  ROCM_TORCH210_LOCAL_VERSION: rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1
+
+jobs:
+  # Both the build and the source_run_id publish path rely on these, so they
+  # are checked once, before either runs.
+  check-inputs:
+    name: Check inputs
+    runs-on: ubuntu-latest
+    env:
+      LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      PUBLISH: ${{ inputs.publish }}
+    steps:
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          # A branch name would make the image tag say one thing and hold another
+          # the next time someone reruns it.
+          if ! [[ "${LMCACHE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "lmcache_commit must be a full 40-character lowercase SHA, got '${LMCACHE_COMMIT}'."
+            exit 1
+          fi
+          if [ -n "${SOURCE_RUN_ID}" ]; then
+            if ! [[ "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]; then
+              echo "source_run_id must be the numeric run ID (.../actions/runs/<id>), got '${SOURCE_RUN_ID}'."
+              exit 1
+            fi
+            # Otherwise both jobs skip and the run is green having done nothing.
+            if [ "${PUBLISH}" != "true" ]; then
+              echo "source_run_id only selects the wheel to publish; set publish=true as well."
+              exit 1
+            fi
+          fi
+
+  build:
+    name: Build and validate LMCache ${{ inputs.lmcache_commit }}
+    needs: check-inputs
+    if: ${{ inputs.source_run_id == '' }}
+    runs-on: ${{ inputs.runner || 'build-only-atom' }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      wheel: ${{ steps.wheel.outputs.wheel }}
+      sha256: ${{ steps.wheel.outputs.sha256 }}
+      artifact: ${{ steps.wheel.outputs.artifact }}
+    steps:
+      - name: Checkout ATOM
+        uses: actions/checkout@v4
+        with:
+          path: atom-src
+
+      - name: Checkout LMCache
+        uses: actions/checkout@v4
+        with:
+          repository: LMCache/LMCache
+          ref: ${{ inputs.lmcache_commit }}
+          path: lmcache-src
+          # Tags are needed to derive the version from the last stable release.
+          fetch-depth: 0
+
+      - name: Resolve the wheel version
+        id: version
+        working-directory: lmcache-src
+        env:
+          LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+        run: |
+          set -euo pipefail
+          base_tag=$(git tag --merged HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -z "${base_tag}" ]; then
+            echo "No stable vX.Y.Z tag is reachable from ${LMCACHE_COMMIT}."
+            exit 1
+          fi
+          distance=$(git rev-list --count "${base_tag}..HEAD")
+          IFS=. read -r major minor patch <<< "${base_tag#v}"
+          if [ "${distance}" -eq 0 ]; then
+            base="${base_tag#v}"
+          else
+            base="${major}.${minor}.$((patch + 1)).dev${distance}"
+          fi
+          short="${LMCACHE_COMMIT:0:8}"
+          version="${base}+g${short}.${ROCM_TORCH210_LOCAL_VERSION}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "LMCache ${LMCACHE_COMMIT} -> ${version}"
+
+      - name: Build the wheel
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          script=lmcache-src/.github/scripts/build_rocm_torch210_wheel.sh
+          if [ ! -f "${script}" ]; then
+            echo "${script} does not exist at this LMCache commit; it predates the torch 2.10 wheel build."
+            exit 1
+          fi
+          docker run --rm \
+            -e EXPECTED_TORCH_VERSION -e EXPECTED_TORCH_GIT_VERSION \
+            -e EXPECTED_HIP_VERSION -e EXPECTED_ROCM_VERSION \
+            -e EXPECTED_PYTHON_ABI -e EXPECTED_CXX11_ABI -e EXPECTED_WHEEL_TAG \
+            -e PYTORCH_ROCM_ARCH -e MANYLINUX_PLATFORM \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${VERSION}" \
+            -e MAX_JOBS=16 \
+            -v "${PWD}/lmcache-src:/work/LMCache" \
+            --entrypoint bash "${ROCM_PYTORCH_IMAGE}" \
+            /work/LMCache/.github/scripts/build_rocm_torch210_wheel.sh
+
+      - name: Record the wheel
+        id: wheel
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          wheels=(lmcache-src/dist_rocm_torch210/*.whl)
+          test "${#wheels[@]}" -eq 1
+          wheel=$(basename "${wheels[0]}")
+          # The publish job and the Dockerfiles parse the version from this name.
+          if [ "${wheel}" != "lmcache-${VERSION}-${EXPECTED_WHEEL_TAG}.whl" ]; then
+            echo "Unexpected wheel name ${wheel}; the Dockerfiles expect lmcache-${VERSION}-${EXPECTED_WHEEL_TAG}.whl."
+            exit 1
+          fi
+          sha256=$(sha256sum "${wheels[0]}" | cut -d' ' -f1)
+          echo "wheel=${wheel}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+          echo "artifact=lmcache-rocm-torch210-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "${sha256}  ${wheel}"
+
+      # A clean container of the build image, so nothing from the build tree or
+      # an ATOM layer can mask a missing dependency or an ABI mismatch.
+      - name: Validate the wheel in a clean container
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gpu_args=()
+          if [ -e /dev/kfd ]; then
+            gpu_args=(--device /dev/kfd --device /dev/dri --group-add video -e LMCACHE_ROCM_REQUIRE_GPU=1)
+          fi
+          docker run --rm "${gpu_args[@]}" \
+            -e EXPECTED_TORCH_VERSION -e EXPECTED_TORCH_GIT_VERSION \
+            -e EXPECTED_HIP_VERSION -e EXPECTED_ROCM_VERSION \
+            -e EXPECTED_PYTHON_ABI -e EXPECTED_CXX11_ABI -e EXPECTED_WHEEL_TAG \
+            -e VERSION \
+            -v "${PWD}/lmcache-src/dist_rocm_torch210:/wheel:ro" \
+            -v "${PWD}/lmcache-src/.github/scripts/validate_rocm_torch210_wheel.py:/validate_rocm_torch210_wheel.py:ro" \
+            -v "${PWD}/atom-src/.github/scripts/validate_lmcache_wheel_for_atom.py:/validate_lmcache_wheel_for_atom.py:ro" \
+            --entrypoint bash "${ROCM_PYTORCH_IMAGE}" -lc '
+              set -euo pipefail
+              python -m pip uninstall -y lmcache
+              # The dependency set LMCache validates its own wheel with. Never
+              # resolve the unpinned torch dependency from the wheel metadata.
+              python -m pip install \
+                aiohttp "numpy<=2.2.6" cachetools msgspec numba \
+                "prometheus-client>=0.18.0,<=0.24.1" psutil py-cpuinfo pyyaml \
+                "pyzmq>=25.0.0" requests sortedcontainers
+              python -m pip install --no-deps --force-reinstall /wheel/*.whl
+              cd /tmp
+              python /validate_rocm_torch210_wheel.py
+              python /validate_lmcache_wheel_for_atom.py --expected-version "${VERSION}"
+            '
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lmcache-rocm-torch210-${{ github.run_id }}-${{ github.run_attempt }}
+          path: lmcache-src/dist_rocm_torch210/*.whl
+          retention-days: 14
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## LMCache ROCm torch 2.10 Wheel"
+            echo "- **LMCache commit**: [${{ inputs.lmcache_commit }}](https://github.com/LMCache/LMCache/commit/${{ inputs.lmcache_commit }})"
+            echo "- **Version**: ${{ steps.version.outputs.version }}"
+            echo "- **Wheel**: ${{ steps.wheel.outputs.wheel || '(build failed)' }}"
+            echo "- **sha256**: ${{ steps.wheel.outputs.sha256 }}"
+            echo "- **Build image**: ${ROCM_PYTORCH_IMAGE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The build container writes as root; leave the self-hosted workspace
+      # clean for the next checkout.
+      - name: Cleanup build tree
+        if: always()
+        run: |
+          if [ -d lmcache-src ]; then
+            docker run --rm -v "${PWD}:/ws" --entrypoint rm "${ROCM_PYTORCH_IMAGE}" -rf /ws/lmcache-src || true
+          fi
+
+  publish:
+    name: Publish the wheel image to Docker Hub
+    needs: [check-inputs, build]
+    # With source_run_id the build job is skipped on purpose.
+    if: >-
+      ${{ !cancelled() && inputs.publish && needs.check-inputs.result == 'success' &&
+          (needs.build.result == 'success' ||
+           (inputs.source_run_id != '' && needs.build.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.wheel.outputs.version }}
+      image: ${{ steps.push.outputs.image }}
+      image_tag: ${{ steps.wheel.outputs.image_tag }}
+      wheel: ${{ steps.wheel.outputs.wheel }}
+      sha256: ${{ steps.wheel.outputs.sha256 }}
+      artifact: ${{ steps.wheel.outputs.artifact }}
+      source_run: ${{ steps.wheel.outputs.source_run }}
+    env:
+      IMAGE_REPO: rocm/atom-dev
+      LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      BUILT_SHA256: ${{ needs.build.outputs.sha256 }}
+    steps:
+      - name: Checkout ATOM
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/actions
+            .github/scripts
+
+      - name: Resolve the wheel artifact
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILT_ARTIFACT: ${{ needs.build.outputs.artifact }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_PATH: .github/workflows/lmcache-rocm-wheel.yaml
+        run: |
+          set -euo pipefail
+          if [ -z "${SOURCE_RUN_ID}" ]; then
+            # Named after the attempt that ran the build, which "Re-run failed
+            # jobs" reuses when only this job failed.
+            echo "run_id=${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+            echo "artifact=${BUILT_ARTIFACT}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          api="repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
+          read -r path branch < <(gh api "${api}" --jq '"\(.path) \(.head_branch)"')
+          # Only this workflow's build and validation can vouch for the wheel,
+          # and only as defined on the default branch or the branch publishing it.
+          if [ "${path}" != "${WORKFLOW_PATH}" ]; then
+            echo "Run ${SOURCE_RUN_ID} is ${path}, not ${WORKFLOW_PATH}."
+            exit 1
+          fi
+          if [ "${branch}" != "${DEFAULT_BRANCH}" ] && [ "${branch}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Run ${SOURCE_RUN_ID} ran on ${branch}; publish it from ${branch} or ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+          # A run re-run in full has one artifact per attempt; take the latest.
+          artifact=$(gh api "${api}/artifacts?per_page=100" --jq "
+            [.artifacts[] | select(.expired | not)
+             | select(.name | startswith(\"lmcache-rocm-torch210-${SOURCE_RUN_ID}-\"))]
+            | sort_by(.name | split(\"-\") | last | tonumber) | last | .name // empty")
+          if [ -z "${artifact}" ]; then
+            echo "Run ${SOURCE_RUN_ID} has no unexpired wheel artifact."
+            exit 1
+          fi
+          attempt="${artifact##*-}"
+          IFS=$'\t' read -r build_name build < <(gh api "${api}/attempts/${attempt}/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.name | startswith("Build and validate"))][0] | "\(.name)\t\(.conclusion)"')
+          if [ "${build}" != "success" ]; then
+            echo "Run ${SOURCE_RUN_ID} attempt ${attempt}: build job concluded '${build}', not success."
+            exit 1
+          fi
+          # The wheel name only carries 8 hex digits; the job name has the full
+          # commit the source run was dispatched with.
+          if [ "${build_name}" != "Build and validate LMCache ${LMCACHE_COMMIT}" ]; then
+            echo "Run ${SOURCE_RUN_ID} built '${build_name#Build and validate LMCache }', not ${LMCACHE_COMMIT}."
+            exit 1
+          fi
+          echo "run_id=${SOURCE_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "artifact=${artifact}" >> "$GITHUB_OUTPUT"
+          echo "Publishing ${artifact} from ${branch}"
+
+      - name: Download the wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.artifact }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/wheel-artifacts
+
+      - name: Check the wheel
+        id: wheel
+        env:
+          ARTIFACT: ${{ steps.source.outputs.artifact }}
+          SOURCE_RUN: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          mapfile -t wheels < <(find "${RUNNER_TEMP}/wheel-artifacts" -name '*.whl')
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "Expected exactly one wheel, found ${#wheels[@]}: ${wheels[*]}"
+            exit 1
+          fi
+          path="${wheels[0]}"
+          wheel=$(basename "${path}")
+          # lmcache-<base>+g<sha8>.<abi>-<wheel tag>.whl, as the build job names it.
+          suffix=".${ROCM_TORCH210_LOCAL_VERSION}-${EXPECTED_WHEEL_TAG}.whl"
+          short="${LMCACHE_COMMIT:0:8}"
+          if [[ "${wheel}" != lmcache-*"+g${short}${suffix}" ]]; then
+            echo "${wheel} is not an lmcache_commit ${LMCACHE_COMMIT} wheel for this ABI."
+            exit 1
+          fi
+          version="${wheel#lmcache-}"
+          version="${version%-${EXPECTED_WHEEL_TAG}.whl}"
+          base="${version%%+*}"
+          sha256=$(sha256sum "${path}" | cut -d' ' -f1)
+          if [ -n "${BUILT_SHA256}" ] && [ "${sha256}" != "${BUILT_SHA256}" ]; then
+            echo "Downloaded wheel sha256 ${sha256} does not match the build's ${BUILT_SHA256}."
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/wheel-image"
+          cp "${path}" "${RUNNER_TEMP}/wheel-image/"
+          {
+            echo "wheel=${wheel}"
+            echo "version=${version}"
+            echo "sha256=${sha256}"
+            echo "image_tag=lmcache-v${base}-g${short}-rocm-torch210"
+            echo "artifact=${ARTIFACT}"
+            echo "source_run=${SOURCE_RUN}"
+          } >> "$GITHUB_OUTPUT"
+          echo "${sha256}  ${wheel}"
+
+      - name: Log in to Docker Hub
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push the wheel image
+        id: push
+        env:
+          VERSION: ${{ steps.wheel.outputs.version }}
+          IMAGE_TAG: ${{ steps.wheel.outputs.image_tag }}
+          SHA256: ${{ steps.wheel.outputs.sha256 }}
+          SOURCE_RUN: ${{ steps.wheel.outputs.source_run }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ref="${IMAGE_REPO}:${IMAGE_TAG}"
+          # The Dockerfiles pin the digest, so a moved tag would not change what
+          # they install, but it would make the tag lie about the pinned wheel.
+          # Anything but "no such manifest" (rate limit, 5xx, network) is not
+          # proof that the tag is free.
+          if err=$(docker manifest inspect "${ref}" 2>&1 >/dev/null); then
+            echo "${ref} already exists; not overwriting it."
+            exit 1
+          elif [[ "${err}" != *"no such manifest"* ]]; then
+            echo "Could not check whether ${ref} exists: ${err}"
+            exit 1
+          fi
+          cat > "${RUNNER_TEMP}/wheel-image/Dockerfile" <<'EOF'
+          FROM scratch
+          COPY *.whl /
+          EOF
+          docker build \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.description=LMCache ${VERSION} wheel for ATOM's ROCm 7.2.4 / torch 2.10.0 image" \
+            --label "com.amd.atom.lmcache.commit=${LMCACHE_COMMIT}" \
+            --label "com.amd.atom.lmcache.version=${VERSION}" \
+            --label "com.amd.atom.lmcache.wheel-sha256=${SHA256}" \
+            --label "com.amd.atom.lmcache.build-run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" \
+            -t "${ref}" "${RUNNER_TEMP}/wheel-image"
+          .github/scripts/docker_push_retry.sh "${ref}"
+          # The registry's answer does not depend on the local image store
+          # (RepoDigests reads differently under containerd).
+          digest=$(docker buildx imagetools inspect "${ref}" --format '{{.Manifest.Digest}}')
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not read the pushed digest of ${ref}."
+            exit 1
+          fi
+          echo "image=${ref}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish summary
+        env:
+          VERSION: ${{ steps.wheel.outputs.version }}
+          IMAGE: ${{ steps.push.outputs.image }}
+          WHEEL: ${{ steps.wheel.outputs.wheel }}
+          SHA256: ${{ steps.wheel.outputs.sha256 }}
+          SOURCE_RUN: ${{ steps.wheel.outputs.source_run }}
+        run: |
+          {
+            echo "## LMCache wheel image"
+            echo "- **LMCache commit**: [${LMCACHE_COMMIT}](https://github.com/LMCache/LMCache/commit/${LMCACHE_COMMIT})"
+            echo "- **Version**: \`${VERSION}\`"
+            echo "- **Wheel**: \`${WHEEL}\`"
+            echo "- **Built by**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}"
+            if [ "${SOURCE_RUN}" = "${GITHUB_RUN_ID}" ]; then
+              echo "- **Build image**: \`${ROCM_PYTORCH_IMAGE}\`"
+            else
+              echo "- **Build image**: see the build run's summary"
+            fi
+            echo
+            echo "Pin in docker/Dockerfile and docker/atom_release.dockerfile:"
+            echo
+            echo '```'
+            echo "ARG LMCACHE_WHEEL_IMAGE=\"${IMAGE}\""
+            echo "ARG LMCACHE_WHEEL_SHA256=${SHA256}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  bump-pr:
+    name: Open a PR pinning the new wheel
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' && inputs.bump_pr }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # download-artifact with run-id reads through the Actions API.
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      LMCACHE_COMMIT: ${{ inputs.lmcache_commit }}
+      VERSION: ${{ needs.publish.outputs.version }}
+      IMAGE: ${{ needs.publish.outputs.image }}
+      IMAGE_TAG: ${{ needs.publish.outputs.image_tag }}
+      WHEEL: ${{ needs.publish.outputs.wheel }}
+      SHA256: ${{ needs.publish.outputs.sha256 }}
+      SOURCE_RUN: ${{ needs.publish.outputs.source_run }}
+    steps:
+      - name: Checkout ATOM
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download the wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.publish.outputs.artifact }}
+          run-id: ${{ needs.publish.outputs.source_run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/new-wheel
+
+      - name: Compare dependencies with the current pin
+        run: |
+          set -euo pipefail
+          # The Dockerfiles install LMCache with --no-deps and list its
+          # requirements by hand, so a new Requires-Dist has to be added there
+          # in the PR. Surface the difference instead of leaving it to the
+          # image build to find.
+          old_image="$(sed -n 's/^ARG LMCACHE_WHEEL_IMAGE="\(.*\)"$/\1/p' docker/Dockerfile)"
+          # A FROM scratch image has no command; create is enough for docker cp.
+          cid="$(docker create "${old_image}" /none)"
+          docker cp "${cid}:/" "${RUNNER_TEMP}/old-image"
+          docker rm "${cid}" >/dev/null
+          cp "${RUNNER_TEMP}"/old-image/*.whl "${RUNNER_TEMP}/old.whl"
+          requires() {
+            unzip -p "$1" '*.dist-info/METADATA' | sed -n 's/^Requires-Dist: //p' | sort
+          }
+          requires "${RUNNER_TEMP}/old.whl" > "${RUNNER_TEMP}/old-requires.txt"
+          requires "${RUNNER_TEMP}/new-wheel/${WHEEL}" > "${RUNNER_TEMP}/new-requires.txt"
+          diff -u "${RUNNER_TEMP}/old-requires.txt" "${RUNNER_TEMP}/new-requires.txt" \
+            > "${RUNNER_TEMP}/requires.diff" || true
+
+      - name: Open the PR
+        run: |
+          set -euo pipefail
+          .github/scripts/bump_lmcache_wheel_pin.py \
+            --image "${IMAGE}" --sha256 "${SHA256}"
+          branch="ci/lmcache-wheel-${IMAGE_TAG#lmcache-}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "${branch}"
+          git commit -am "build(docker): pin LMCache ${VERSION} wheel" \
+            -m "Built from LMCache/LMCache@${LMCACHE_COMMIT} by ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${SOURCE_RUN}."
+          # The branch name is fixed per wheel and owned by this job, so a re-run
+          # after a failure below replaces what the previous attempt pushed.
+          git push --force origin "${branch}"
+          {
+            echo "Pins the LMCache wheel image \`${IMAGE}\` in docker/Dockerfile and docker/atom_release.dockerfile."
+            echo
+            echo "- LMCache commit: [${LMCACHE_COMMIT}](https://github.com/LMCache/LMCache/commit/${LMCACHE_COMMIT})"
+            echo "- Version: \`${VERSION}\`"
+            echo "- sha256: \`${SHA256}\`"
+            echo "- Built by: ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${SOURCE_RUN}"
+            echo
+            echo "## Requires-Dist changes"
+            echo
+            if [[ -s "${RUNNER_TEMP}/requires.diff" ]]; then
+              echo "The Dockerfiles install the wheel with \`--no-deps\`; add new requirements to the \`pip install\` before it."
+              echo
+              echo '```diff'
+              tail -n +3 "${RUNNER_TEMP}/requires.diff"
+              echo '```'
+            else
+              echo "None."
+            fi
+            echo
+            echo "Opened as a draft by the LMCache wheel workflow. PRs created with the workflow token do not start CI; mark it ready for review to run the checks."
+          } > "${RUNNER_TEMP}/pr.md"
+          pr_url="$(gh pr list --head "${branch}" --state open --json url --jq '.[0].url // empty')"
+          if [ -z "${pr_url}" ]; then
+            pr_url="$(gh pr create --draft \
+              --base "${{ github.event.repository.default_branch }}" \
+              --head "${branch}" \
+              --title "build(docker): pin LMCache ${VERSION} wheel" \
+              --body-file "${RUNNER_TEMP}/pr.md")"
+          fi
+          echo "- **Bump PR**: ${pr_url}" >> "$GITHUB_STEP_SUMMARY"

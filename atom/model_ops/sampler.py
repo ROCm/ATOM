@@ -4,7 +4,7 @@
 import warnings
 
 import torch
-from aiter import mixed_sample_outer_exponential
+from aiter import mixed_sample_outer_exponential, topk_select
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
@@ -31,6 +31,26 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 SAMPLER_EPS = 1e-10
 
 
+def _apply_greedy_tokens(
+    probs: torch.Tensor, temperatures: torch.Tensor, next_tokens: torch.Tensor
+) -> torch.Tensor:
+    """Keep row selection on the device, with a fixed-size int32 result.
+
+    A Python test of ``greedy_mask.any()`` waits for the GPU. Boolean indexing
+    also needs a data-dependent output size. Reduce all rows and select with
+    ``where`` so neither operation needs to read the mask back on the CPU.
+    ``tie="low"`` preserves argmax's lowest-token-ID tie breaking.
+
+    A greedy row is one at or below ``SAMPLER_EPS``: the runner clamps every
+    temperature to it before the sampler sees them (``prepare_sample``), so a
+    requested 0 never arrives as 0.
+    """
+    greedy_tokens = topk_select(probs, 1, tie="low")[1].view(-1)
+    return torch.where(
+        temperatures <= SAMPLER_EPS, greedy_tokens, next_tokens.view(-1).to(torch.int)
+    )
+
+
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
     This is key to deterministic inference, as it ensures that the same random values are used for each token across different runs.
@@ -46,12 +66,53 @@ class Sampler(nn.Module):
         super().__init__()
         self.eps = SAMPLER_EPS
 
+    def sample_verification_tokens(
+        self,
+        logits: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sample each draft-conditioned target row with independent noise.
+
+        Accepting a draft when it matches this draw and stopping at the first
+        mismatch preserves the target distribution. Sharing noise across rows
+        would condition later draws on earlier acceptance decisions.
+        """
+        rows = logits.shape[0]
+        if rows == 0:
+            return torch.empty(0, device=logits.device, dtype=torch.int32)
+        request_indices = torch.searchsorted(
+            cu_num_draft_tokens,
+            torch.arange(rows, device=logits.device, dtype=cu_num_draft_tokens.dtype),
+            right=True,
+        )
+
+        def expand(values):
+            if not isinstance(values, torch.Tensor) or values.numel() == 1:
+                return values
+            return values[request_indices]
+
+        return self(
+            logits,
+            temperatures[request_indices],
+            expand(top_ks),
+            expand(top_ps),
+            all_greedy=False,
+            needs_independent_noise=True,
+        )
+
     def forward(
         self,
         logits: torch.Tensor,  # (num_tokens, vocab_size)
         temperatures: torch.Tensor,  # (num_tokens,)
-        top_ks: torch.Tensor | None = None,  # (num_tokens,) int32, -1 means disabled
-        top_ps: torch.Tensor | None = None,  # (num_tokens,) float32, 1.0 means disabled
+        top_ks: (
+            int | torch.Tensor | None
+        ) = None,  # (num_tokens,) int32, -1 means disabled
+        top_ps: (
+            float | torch.Tensor | None
+        ) = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
     ) -> torch.Tensor:  # (num_tokens,)
@@ -61,8 +122,8 @@ class Sampler(nn.Module):
         Args:
             logits: Raw logits from model (num_tokens, vocab_size)
             temperatures: Temperature for each token (num_tokens,), pre-clamped to eps
-            top_ks: Top-k value per token, -1 means disabled (num_tokens,)
-            top_ps: Top-p value per token, 1.0 means disabled (num_tokens,)
+            top_ks: Uniform CPU scalar or per-token tensor; -1 means disabled
+            top_ps: Uniform CPU scalar or per-token tensor; 1.0 means disabled
             all_greedy: True if all requests use greedy sampling (checked on CPU)
             needs_independent_noise: True when the batch contains fan-out
                 siblings (SamplingParams.n>1). Forces fresh per-row random
@@ -73,11 +134,20 @@ class Sampler(nn.Module):
         Returns:
             Sampled token IDs (num_tokens,)
         """
+        # Every path starts here: an all-greedy batch is an argmax whatever its
+        # filters. `tie="low"` is what makes this the pick `torch.argmax` made:
+        # the default promises no direction among equal scores, so a tie would
+        # resolve differently from one run (or TP rank) to the next. `logits` is
+        # bf16 and stays bf16 -- the reduction widens each element as it reads it.
+        if all_greedy:
+            return topk_select(logits, 1, tie="low")[1].view(-1)
+
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
-            return self._temperature_sample(
+            sampled = self._temperature_sample(
                 logits, temperatures, needs_independent_noise=needs_independent_noise
             )
+            return _apply_greedy_tokens(logits, temperatures, sampled)
 
         # Apply top-k/top-p filtering
         return self._topk_topp_sample(
@@ -85,14 +155,13 @@ class Sampler(nn.Module):
             temperatures,
             top_ks,
             top_ps,
-            all_greedy,
             needs_independent_noise=needs_independent_noise,
         )
 
     def _needs_filtering(
         self,
-        top_ks: torch.Tensor | None,
-        top_ps: torch.Tensor | None,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
     ) -> bool:
         """Check if any request needs top-k or top-p filtering.
 
@@ -135,9 +204,8 @@ class Sampler(nn.Module):
         self,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor | None,
-        top_ps: torch.Tensor | None,
-        all_greedy: bool,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
         needs_independent_noise: bool = False,
     ) -> torch.Tensor:
         """Top-K/Top-P sampling with temperature scaling.
@@ -149,11 +217,6 @@ class Sampler(nn.Module):
         """
         # Accepted but unused here; see docstring.
         del needs_independent_noise
-        # Fast path: if ALL requests are greedy (temperature=0), just do argmax
-        # This avoids the overhead of softmax and top-k/top-p filtering
-        if all_greedy:
-            return logits.argmax(dim=-1).to(torch.int)
-
         # Apply temperature scaling
         # Temperatures are pre-clamped to eps in model_runner.prepare_sample()
         scaled_logits = logits / temperatures.unsqueeze(-1)
@@ -170,23 +233,25 @@ class Sampler(nn.Module):
         else:
             return self._native_sample(probs, top_ks, top_ps, temperatures)
 
-    def _to_tensor_scalar(self, x: torch.Tensor):
-        """Convert to (tensor, scalar) tuple for aiter ops.
+    def _to_tensor_scalar(self, x: float | torch.Tensor | None):
+        """Adapt filters to AITER's tensor/scalar arguments.
 
-        If tensor has size 1 (uniform value optimization from model_runner),
-        extract the scalar value for more efficient aiter kernel dispatch.
+        The runner supplies uniform filters as CPU scalars, avoiding a device
+        readback. Singleton tensors remain supported for existing callers.
         """
         if x is None:
             return (None, 0)
-        if x.numel() == 1:  # Uniform value - use scalar for efficiency
-            return (None, x[0].item())
+        if not isinstance(x, torch.Tensor):
+            return (None, x)
+        if x.numel() == 1:
+            return (None, x.item())
         return (x, 0)
 
     def _aiter_sample(
         self,
         probs: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
         has_topk: bool,
         has_topp: bool,
         temperatures: torch.Tensor,
@@ -220,18 +285,13 @@ class Sampler(nn.Module):
             # Neither - just multinomial from probs
             next_tokens = torch.multinomial(probs, num_samples=1)
 
-        # Handle greedy sampling (temperature=0)
-        greedy_mask = temperatures == 0
-        if greedy_mask.any():
-            next_tokens[greedy_mask] = probs[greedy_mask].argmax(dim=-1).unsqueeze(-1)
-
-        return next_tokens.view(-1).to(torch.int)
+        return _apply_greedy_tokens(probs, temperatures, next_tokens)
 
     def _native_sample(
         self,
         probs: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
         temperatures: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -251,7 +311,7 @@ class Sampler(nn.Module):
             )
             _NATIVE_SAMPLING_WARNING_ISSUED = True
 
-        batch_size, vocab_size = probs.shape
+        vocab_size = probs.shape[-1]
         device = probs.device
 
         # Sort probs descending
@@ -262,15 +322,21 @@ class Sampler(nn.Module):
         # The mask keeps tokens where cumsum - current_prob <= top_p
         # (i.e., before we exceed the threshold)
         if top_ps is not None:
-            topp_mask = (cumsum_probs - sorted_probs) <= top_ps.unsqueeze(-1)
+            p = top_ps.unsqueeze(-1) if isinstance(top_ps, torch.Tensor) else top_ps
+            topp_mask = (cumsum_probs - sorted_probs) <= p
         else:
             topp_mask = torch.ones_like(sorted_probs, dtype=torch.bool)
 
         # Top-k mask: keep first k tokens
         if top_ks is not None:
             indices = torch.arange(vocab_size, device=device).unsqueeze(0)
-            effective_k = torch.where(top_ks == -1, vocab_size, top_ks)
-            topk_mask = indices < effective_k.unsqueeze(-1)
+            if isinstance(top_ks, torch.Tensor):
+                effective_k = torch.where(top_ks == -1, vocab_size, top_ks).unsqueeze(
+                    -1
+                )
+            else:
+                effective_k = vocab_size if top_ks == -1 else top_ks
+            topk_mask = indices < effective_k
         else:
             topk_mask = torch.ones_like(sorted_probs, dtype=torch.bool)
 
@@ -287,12 +353,7 @@ class Sampler(nn.Module):
         sampled_idx = torch.multinomial(filtered_probs, num_samples=1).squeeze(-1)
         next_tokens = sorted_indices.gather(1, sampled_idx.unsqueeze(-1)).squeeze(-1)
 
-        # Handle greedy (temperature=0)
-        greedy_mask = temperatures == 0
-        if greedy_mask.any():
-            next_tokens[greedy_mask] = probs[greedy_mask].argmax(dim=-1)
-
-        return next_tokens.to(torch.int)
+        return _apply_greedy_tokens(probs, temperatures, next_tokens)
 
     # Legacy methods kept for reference
     def greedy_sample(

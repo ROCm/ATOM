@@ -5,6 +5,8 @@ pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        #[cfg(feature = "ext-proc")]
+        config.ext_proc.validate(config)?;
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -151,14 +153,7 @@ impl ConfigValidator {
     }
 
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
-        if config.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "port".to_string(),
-                value: config.port.to_string(),
-                reason: "Port must be > 0".to_string(),
-            });
-        }
-
+        // Port 0 lets the OS atomically allocate an available listening port.
         if config.max_payload_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_payload_size".to_string(),
@@ -214,14 +209,7 @@ impl ConfigValidator {
     }
 
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
-        if metrics.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "metrics.port".to_string(),
-                value: metrics.port.to_string(),
-                reason: "Port must be > 0".to_string(),
-            });
-        }
-
+        // Port 0 lets the OS atomically allocate an available listening port.
         if metrics.host.is_empty() {
             return Err(ConfigError::InvalidValue {
                 field: "metrics.host".to_string(),

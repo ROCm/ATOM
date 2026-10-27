@@ -32,6 +32,7 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils.region_graph import ReqGraph
 
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
 
@@ -61,6 +62,9 @@ class MockConfig:
             "throughput_log_interval": 10.0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
+            "enable_dynamic_chunking": False,
+            "dynamic_chunking_smooth_factor": 0.75,
+            "dynamic_chunking_min_chunk_size": 4096,
             "max_num_seqs": 4,
             "max_num_batched_tokens": 64,
             "long_prefill_token_threshold": 0,
@@ -158,6 +162,91 @@ def reset_sequence_counter():
     Sequence.counter = count()
 
 
+def _duplicated_atom_classes():
+    """Atom classes held by a module other than the one `sys.modules` publishes.
+
+    Checking `sys.modules` identity alone is not enough: a fixture that pops
+    atom modules, re-imports under a stub and then restores its snapshot leaves
+    `sys.modules` looking untouched, while whatever imported during the window
+    still refers to the SECOND copy. What is observable afterwards is a class
+    whose own module no longer publishes it -- two `QuantType.No` objects that
+    print identically and compare unequal.
+    """
+    out = []
+    for name, module in list(sys.modules.items()):
+        if not (name == "atom" or name.startswith("atom.")):
+            continue
+        for attr, value in list(vars(module).items()):
+            origin = getattr(value, "__module__", None)
+            if not isinstance(value, type) or not isinstance(origin, str):
+                continue
+            if not (origin == "atom" or origin.startswith("atom.")):
+                continue
+            home = sys.modules.get(origin)
+            if home is not None and getattr(home, value.__name__, value) is not value:
+                out.append(
+                    f"{name}.{attr} is a stale copy of {origin}.{value.__name__}"
+                )
+    return sorted(set(out))
+
+
+_atom_duplicates_seen: set[str] = set()
+
+
+@pytest.fixture(autouse=True)
+def atom_modules_are_imported_once():
+    """Fail the test that leaves a second copy of an `atom.*` class alive.
+
+    Test modules used to delete every `atom.*` entry from `sys.modules` and let
+    the imports run again. Restoring the snapshot afterwards does not undo it:
+    whatever imported during the window keeps the SECOND copy, so
+    `atom.quant_spec` ends up existing twice and two `QuantType.No` objects
+    compare unequal while printing identically. The victim was
+    `test_qwen4_exp_quantization`, three files away -- it read
+    `quant_type != QuantType.No` as true, built a quantized layer, and died on
+    a `weight_scale` that branch never creates.
+
+    The check is the duplicate itself, not a grep for `del sys.modules` and not
+    `sys.modules` identity: a fixture that restores its snapshot leaves
+    `sys.modules` pristine and the duplicate held elsewhere, which is exactly
+    the case that got past the first version of this guard.
+
+    Already-reported duplicates are remembered rather than re-reported, so the
+    test that introduces one is named once instead of every test after it.
+    """
+    yield
+    fresh = [d for d in _duplicated_atom_classes() if d not in _atom_duplicates_seen]
+    _atom_duplicates_seen.update(fresh)
+    assert not fresh, (
+        "this test left a second copy of these atom classes alive, which makes "
+        f"`is` and `==` disagree for every later test: {fresh}"
+    )
+
+
+@pytest.fixture(autouse=True)
+def keep_envs_lazy():
+    """Undo the permanent damage `monkeypatch.setattr(envs, ...)` leaves behind.
+
+    `atom.utils.envs` reads each variable through a module-level `__getattr__`,
+    which Python consults only for names NOT in the module dict. `monkeypatch`
+    restores by `setattr`, so the value it read at patch time lands in that
+    dict -- and from then on every `monkeypatch.setenv` for that name is
+    ignored, in every later test, for the life of the process. The victim is
+    whichever test asserts on that variable next, which is why this surfaced as
+    three unrelated tests that pass alone and fail in the suite.
+
+    Forty call sites across nine files use that idiom, so this is the one place
+    to undo it rather than the forty. None of the lazy names is in the module
+    dict after import, so finding one there is unambiguous.
+    """
+    yield
+    from atom.utils import envs
+
+    for name in list(vars(envs)):
+        if name in envs.environment_variables:
+            delattr(envs, name)
+
+
 @pytest.fixture
 def seq_factory():
     """Factory for creating Sequence objects with sensible defaults."""
@@ -167,3 +256,38 @@ def seq_factory():
         return Sequence(token_ids, block_size, sampling_params=sp, **kwargs)
 
     return make_sequence
+
+
+class ReqGraphRecordings:
+    """What a warmup's capture leaves in request graphs, held on the CPU: a
+    bucket of ``running_bs`` requests replays to ``out``."""
+
+    def __init__(self):
+        self.by_requests = {}
+
+    def add(self, running_bs, out, on_replay=None):
+        def replay():
+            if on_replay is not None:
+                on_replay()
+            return out
+
+        self.by_requests[running_bs] = replay
+
+
+@pytest.fixture
+def req_graph_recordings(monkeypatch):
+    """`ReqGraph`'s interface served from `ReqGraphRecordings`, for a draft
+    pass (`DraftGraph`, keyed by its request count) and a test without a GPU
+    to record it on."""
+    recordings = ReqGraphRecordings()
+    held = recordings.by_requests
+
+    def release_graphs(self):
+        dropped = len(held)
+        held.clear()
+        return dropped
+
+    monkeypatch.setattr(ReqGraph, "has", lambda self, key, phase=None: key in held)
+    monkeypatch.setattr(ReqGraph, "replay", lambda self, key=None, **_: held[key]())
+    monkeypatch.setattr(ReqGraph, "release_graphs", release_graphs)
+    return recordings

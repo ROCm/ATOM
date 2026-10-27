@@ -28,6 +28,7 @@
 
       "accuracy_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
       "accuracy_test_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+      "accuracy_timeout_minutes": { "type": "integer", "minimum": 1 },
 
       "mtp_accept_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
       "mtp_per_pos_threshold": { "type": "string" },

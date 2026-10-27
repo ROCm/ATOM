@@ -29,6 +29,17 @@ class KVConnectorBase(ABC):
 
     is_producer: bool
 
+    @classmethod
+    def kv_budget_reserve_bytes(cls, config: Any) -> int:
+        """GPU bytes this backend allocates once the KV cache is sized.
+
+        The model runner holds them back from the KV cache budget (see
+        :meth:`KVConnectorFactory.kv_budget_reserve_bytes`). It asks before
+        any connector is built, so the answer comes from ``config`` alone.
+        Backends that allocate nothing in ``register_kv_caches`` keep 0.
+        """
+        return 0
+
     @abstractmethod
     def register_kv_caches(
         self,
@@ -75,7 +86,11 @@ class KVConnectorBase(ABC):
 
 
 class KVConnectorSchedulerBase(ABC):
-    """Scheduler-side KV connector interface."""
+    """Scheduler-side KV connector interface.
+
+    Every backend implements the retention hooks explicitly, including no-ops
+    for lifecycle events it does not own.
+    """
 
     is_producer: bool
 
@@ -101,4 +116,34 @@ class KVConnectorSchedulerBase(ABC):
     @abstractmethod
     def request_finished(self, seq: Any) -> None:
         """Populate KV transfer output metadata when a request completes."""
+        ...
+
+    @abstractmethod
+    def should_defer_free(self, seq: Any) -> bool:
+        """Whether this connector still owns the request's source blocks.
+
+        A pure predicate used for preemption and final block release. Producers
+        retain advertised blocks until their send claim is retired.
+        """
+        ...
+
+    @abstractmethod
+    def send_finished(self, req_id: Any) -> None:
+        """Retire a P/D send claim; explicit no-op for backends without sends."""
+        ...
+
+    @abstractmethod
+    def source_blocks_released(self, seq: Any) -> None:
+        """The scheduler has returned this request's source blocks to the pool.
+
+        The terminal half of `request_finished` for a connector that deferred
+        the free: at `request_finished` time `should_defer_free` is still True,
+        so any state whose lifetime is the *blocks* rather than the *request*
+        cannot be dropped yet. This is the call that says it can.
+
+        Deliberately not `request_finished` called a second time: that one also
+        takes the P/D send claim, and re-invoking it would re-arm the very claim
+        the release just cleared. Backends without block-lifetime cleanup
+        implement an explicit no-op.
+        """
         ...

@@ -112,6 +112,8 @@ def main():
             else:
                 print(f"Output: {generated_text}\n")
 
+    llm.close()
+
 
 if __name__ == "__main__":
     main()

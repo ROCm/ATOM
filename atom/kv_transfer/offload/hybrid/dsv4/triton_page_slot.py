@@ -304,6 +304,7 @@ def _gather_region_items_unchecked(
     *,
     buffer_offset: int,
     stream: torch.cuda.Stream | None,
+    prepared_item_ids: torch.Tensor | None = None,
 ) -> None:
     """Launch a gather whose plan, ids, buffer, offset, and stream are validated."""
 
@@ -312,7 +313,11 @@ def _gather_region_items_unchecked(
     if not ids:
         return
     with _stream_context(stream):
-        item_ids_d = _device_i64(ids, dst.device)
+        item_ids_d = (
+            _device_i64(ids, dst.device)
+            if prepared_item_ids is None
+            else prepared_item_ids
+        )
         grid = (len(ids), plan.tiles_per_item)
         _gather_region_items_kernel[grid](
             dst,
@@ -361,6 +366,7 @@ def _scatter_region_items_unchecked(
     *,
     buffer_offset: int,
     stream: torch.cuda.Stream | None,
+    prepared_item_ids: torch.Tensor | None = None,
 ) -> None:
     """Launch a scatter whose plan, ids, buffer, offset, and stream are validated."""
 
@@ -369,7 +375,11 @@ def _scatter_region_items_unchecked(
     if not ids:
         return
     with _stream_context(stream):
-        item_ids_d = _device_i64(ids, src.device)
+        item_ids_d = (
+            _device_i64(ids, src.device)
+            if prepared_item_ids is None
+            else prepared_item_ids
+        )
         grid = (len(ids), plan.tiles_per_item)
         _scatter_region_items_kernel[grid](
             src,

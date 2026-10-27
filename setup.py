@@ -28,9 +28,13 @@ def build_atomesh() -> None:
 
     root = Path(__file__).resolve().parent
     mesh_dir = root / "atom" / "mesh"
+    command = ["cargo", "build", "--release"]
+    features = get_build_env("ATOM_MESH_FEATURES")
+    if features:
+        command.extend(["--features", features])
     print(f"Building atomesh from {mesh_dir}...", flush=True)
     subprocess.run(
-        ["cargo", "build", "--release"],
+        command,
         cwd=mesh_dir,
         check=True,
         text=True,

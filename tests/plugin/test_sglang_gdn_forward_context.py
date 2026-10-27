@@ -120,6 +120,35 @@ def test_resolve_backend_falls_back_to_forward_batch(monkeypatch):
     assert SGLangGDNForwardContext._resolve_attn_backend(forward_batch) is batch_backend
 
 
+def test_decode_fallback_marks_num_padding_rows_as_zero_length():
+    pool = _MambaPool()
+    forward_batch = SimpleNamespace(
+        forward_mode=_DecodeMode(),
+        batch_size=4,
+        req_pool_indices=torch.tensor([-6, -2, -10, 99], dtype=torch.int32),
+        req_to_token_pool=pool,
+        num_padding=1,
+    )
+    linear_backend = SimpleNamespace(
+        forward_metadata=None,
+        req_to_token_pool=pool,
+    )
+
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, linear_backend
+    )
+
+    assert metadata is not None
+    assert torch.equal(
+        metadata.non_spec_query_start_loc,
+        torch.tensor([0, 1, 2, 3, 3], dtype=torch.int32),
+    )
+    assert torch.equal(
+        metadata.non_spec_state_indices_tensor,
+        torch.tensor([4, 8, 0, -1], dtype=torch.int32),
+    )
+
+
 def test_decode_fallback_marks_cuda_graph_padding_as_zero_length():
     pool = _MambaPool()
     forward_batch = SimpleNamespace(
@@ -180,6 +209,47 @@ def test_extend_fallback_marks_padded_requests_as_empty():
         metadata.non_spec_state_indices_tensor,
         torch.tensor([4, 8, -1], dtype=torch.int32),
     )
+    assert metadata.flydsl_prefill_metadata is None
+
+
+def test_extend_metadata_carries_per_step_prefill_indices():
+    """GatedDeltaNet prefill reads these per-step fields (#2534).
+
+    Left at None, the non-FlyDSL prefill fails in ``index_select`` and the
+    state write-back in ``index_copy_``. SGLang never forks a request's state
+    here, so the read and write slots are the same.
+    """
+    pool = _MambaPool()
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=2,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        req_to_token_pool=pool,
+        extend_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0, 5], dtype=torch.int32),
+        extend_num_tokens=5,
+    )
+    linear_backend = SimpleNamespace(
+        forward_metadata=None,
+        req_to_token_pool=pool,
+    )
+
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, linear_backend
+    )
+
+    assert metadata is not None
+    assert metadata.non_spec_state_indices_i64.dtype == torch.int64
+    assert torch.equal(
+        metadata.non_spec_state_indices_i64,
+        torch.tensor([10, 11], dtype=torch.int64),
+    )
+    assert torch.equal(
+        metadata.non_spec_state_indices_in_i64,
+        metadata.non_spec_state_indices_i64,
+    )
+    assert torch.equal(metadata.no_initial_state, torch.tensor([True, False]))
 
 
 def test_build_context_falls_back_to_local_decode_mode(monkeypatch):
@@ -198,6 +268,50 @@ def test_build_context_falls_back_to_local_decode_mode(monkeypatch):
 
     assert context.running_tokens_are_unified
     assert num_tokens == 2
+
+
+def test_build_context_draft_extend_uses_packed_positions(monkeypatch):
+    """DRAFT_EXTEND_V2 is not is_extend(); width is positions, not batch_size."""
+    monkeypatch.setattr(
+        attention_gdn,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(enable_dp_attention=False),
+    )
+
+    class _DraftExtend:
+        @staticmethod
+        def is_target_verify():
+            return False
+
+        @staticmethod
+        def is_draft_extend_v2():
+            return True
+
+        @staticmethod
+        def is_extend():
+            return False
+
+        @staticmethod
+        def is_prefill():
+            return False
+
+        @staticmethod
+        def is_idle():
+            return False
+
+        @staticmethod
+        def is_decode_or_idle():
+            return False
+
+    forward_batch = SimpleNamespace(
+        forward_mode=_DraftExtend(),
+        positions=torch.arange(6),
+        batch_size=2,
+    )
+    context, num_tokens = SGLangGDNForwardContext._build_context(forward_batch)
+    assert num_tokens == 6
+    assert context.is_prefill is False
+    assert context.scheduled_tokens == 6
 
 
 def test_bind_preserves_outer_attention_metadata(monkeypatch):
@@ -243,3 +357,228 @@ def test_bind_preserves_outer_attention_metadata(monkeypatch):
     assert current_context.attn_metadata is outer_metadata
     assert current_context.kv_cache_data is outer_kv
     assert kv_updates[0] is bound_kv
+
+
+def _qwen4_flydsl_atom_config():
+    impl = SimpleNamespace(
+        allow_aiter_flydsl=True,
+        dt_bias=torch.zeros(1, dtype=torch.bfloat16),
+        gdn_flydsl_policy=None,
+    )
+    return (
+        SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={"Linear_0": SimpleNamespace(impl=impl)}
+            ),
+            enable_dp_attention=False,
+        ),
+        impl,
+    )
+
+
+class _TemporalPool:
+    def __init__(self, temporal):
+        self.mamba_map = {0: None}
+        self._cache = SimpleNamespace(
+            conv=[torch.zeros(2, 4)],
+            temporal=temporal,
+        )
+
+    @staticmethod
+    def get_mamba_indices(req_pool_indices):
+        return req_pool_indices
+
+    def mamba2_layer_cache(self, layer_id):
+        return self._cache
+
+
+def test_extend_attaches_flydsl_prefill_metadata_for_qwen4(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    attention_gdn._PREFILL_SCHEDULES.clear()
+    cfg, impl = _qwen4_flydsl_atom_config()
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    schedule = object()
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.build_prefill_metadata",
+        lambda lengths, cu_seqlens: schedule,
+    )
+    pool = _MambaPool()
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        req_to_token_pool=pool,
+        extend_start_loc=torch.tensor([0], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+    )
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, SimpleNamespace(forward_metadata=None, req_to_token_pool=pool)
+    )
+    assert metadata is not None
+    assert metadata.flydsl_prefill_metadata is schedule
+    assert impl.allow_aiter_flydsl
+
+
+def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
+    """Same query lengths keep one schedule and do not reread the GPU offsets."""
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    attention_gdn._PREFILL_SCHEDULES.clear()
+    cfg, impl = _qwen4_flydsl_atom_config()
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    calls = []
+
+    def _build(lengths, cu_seqlens):
+        calls.append(tuple(lengths))
+        return ("schedule", tuple(lengths))
+
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.build_prefill_metadata",
+        _build,
+    )
+    # GPU offsets disagree with the scheduler list. The schedule must follow
+    # the host list, so this step does not sync query_start_loc.
+    query_start_loc = torch.tensor([0, 99], dtype=torch.int32)
+    indices = torch.tensor([3], dtype=torch.int32)
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+        extend_seq_lens_cpu=[8],
+    )
+    linear = SimpleNamespace(
+        forward_metadata=SimpleNamespace(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=indices,
+        ),
+        req_to_token_pool=_MambaPool(),
+    )
+    first = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+    second = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+    assert calls == [(8,)]
+    assert first.flydsl_prefill_metadata is second.flydsl_prefill_metadata
+    assert first.flydsl_prefill_metadata == ("schedule", (8,))
+
+    other_loc = torch.tensor([0, 8], dtype=torch.int32)
+    linear.forward_metadata.query_start_loc = other_loc
+    third = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+    assert calls == [(8,), (8,)]
+    assert third.flydsl_prefill_metadata is not first.flydsl_prefill_metadata
+
+
+def test_extend_skips_flydsl_metadata_when_prefill_disabled(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=False, decode=True)
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.build_prefill_metadata",
+        lambda lengths, cu_seqlens: object(),
+    )
+    pool = _MambaPool()
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        req_to_token_pool=pool,
+        extend_start_loc=torch.tensor([0], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+    )
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, SimpleNamespace(forward_metadata=None, req_to_token_pool=pool)
+    )
+    assert metadata is not None
+    assert metadata.flydsl_prefill_metadata is None
+
+
+def test_ensure_flydsl_policy_binds_qwen4_impls_once(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    calls = []
+
+    def _select_policy(**kwargs):
+        calls.append(kwargs)
+        return GDNFlyDSLPolicy(prefill=True, decode=True)
+
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.select_policy",
+        _select_policy,
+    )
+    state = torch.zeros(2, 24, 128, 128)
+    first = attention_gdn._ensure_flydsl_policy(state)
+    second = attention_gdn._ensure_flydsl_policy(state)
+    assert first.decode and first.prefill
+    assert second is first
+    assert impl.gdn_flydsl_policy is first
+    assert len(calls) == 1
+
+
+def test_gfx950_keeps_flydsl_prefill_off(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.select_policy",
+        lambda **kwargs: GDNFlyDSLPolicy(prefill=True, decode=False),
+    )
+    monkeypatch.setattr(
+        attention_gdn, "_flydsl_prefill_supported", lambda device: False
+    )
+    state = torch.zeros(2, 24, 128, 128)
+    policy = attention_gdn._ensure_flydsl_policy(state)
+    assert policy.prefill is False
+    assert policy.decode is False
+    assert impl.gdn_flydsl_policy is policy
+
+
+def test_kv_cache_uses_zero_copy_kv_view_when_flydsl_decode(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(
+        attention_gdn,
+        "_ensure_flydsl_policy",
+        lambda state: GDNFlyDSLPolicy(prefill=True, decode=True),
+    )
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
+    raw = torch.zeros(4, 24, 128, 128)
+    pool = _TemporalPool(raw)
+    out = SGLangGDNForwardContext._build_kv_cache_tensors(
+        SimpleNamespace(req_to_token_pool=pool),
+        SimpleNamespace(req_to_token_pool=pool),
+    )
+    view = out["layer_0"].v_cache
+    assert view.data_ptr() == raw.data_ptr()
+    assert view.stride()[-2:] == (1, 128)
+    assert impl.gdn_flydsl_policy.decode
+
+
+def test_kv_cache_keeps_mamba_layout_without_qwen4_flydsl(monkeypatch):
+    monkeypatch.setattr(
+        attention_gdn,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={}),
+            enable_dp_attention=False,
+        ),
+    )
+    raw = torch.zeros(4, 24, 128, 128)
+    pool = _TemporalPool(raw)
+    out = SGLangGDNForwardContext._build_kv_cache_tensors(
+        SimpleNamespace(req_to_token_pool=pool),
+        SimpleNamespace(req_to_token_pool=pool),
+    )
+    view = out["layer_0"].v_cache
+    assert view is raw
+    assert view.stride()[-2:] == (128, 1)

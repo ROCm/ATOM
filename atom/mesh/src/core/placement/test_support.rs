@@ -206,6 +206,22 @@ impl LoadBalancingPolicy for RecordingPolicy {
         self.inner.needs_request_text()
     }
 
+    fn needs_tokens(&self) -> bool {
+        self.inner.needs_tokens()
+    }
+
+    fn on_request_complete(&self, worker_url: &str, success: bool) {
+        self.inner.on_request_complete(worker_url, success);
+    }
+
+    fn update_loads(&self, loads: &HashMap<String, isize>) {
+        self.inner.update_loads(loads);
+    }
+
+    fn reset(&self) {
+        self.inner.reset();
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -466,6 +482,55 @@ mod fixture_smoke_tests {
             Some(&"1".parse().unwrap())
         );
         assert_eq!(calls[0].candidate_urls, vec!["http://w:8000".to_string()]);
+    }
+
+    #[test]
+    fn recording_policy_forwards_capabilities_and_state_callbacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug, Default)]
+        struct Delegate(AtomicUsize);
+        #[async_trait]
+        impl LoadBalancingPolicy for Delegate {
+            async fn select_worker(
+                &self,
+                _: &[Arc<dyn Worker>],
+                _: &SelectWorkerInfo<'_>,
+            ) -> Option<usize> {
+                None
+            }
+            fn name(&self) -> &'static str {
+                "delegate"
+            }
+            fn needs_tokens(&self) -> bool {
+                true
+            }
+            fn needs_request_text(&self) -> bool {
+                true
+            }
+            fn on_request_complete(&self, url: &str, success: bool) {
+                assert_eq!(url, "worker");
+                assert!(success);
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn update_loads(&self, loads: &HashMap<String, isize>) {
+                assert_eq!(loads["worker"], 2);
+                self.0.fetch_add(2, Ordering::SeqCst);
+            }
+            fn reset(&self) {
+                self.0.fetch_add(4, Ordering::SeqCst);
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let delegate = Arc::new(Delegate::default());
+        let wrapped = RecordingPolicy::wrap(delegate.clone());
+        assert!(wrapped.needs_tokens());
+        assert!(wrapped.needs_request_text());
+        wrapped.on_request_complete("worker", true);
+        wrapped.update_loads(&HashMap::from([("worker".into(), 2)]));
+        wrapped.reset();
+        assert_eq!(delegate.0.load(Ordering::SeqCst), 7);
     }
 
     #[tokio::test]

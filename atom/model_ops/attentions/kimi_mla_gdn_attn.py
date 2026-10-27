@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _MQA_LOGITS_PRESHUFFLE_ROWS
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
+)
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
+    speculative_kpool_history_size,
 )
 from atom.utils import envs
 
@@ -60,6 +62,105 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
             return (MLA_ROWS,)
         return ()
+
+    def get_kv_transfer_tensors(self):
+        """MLA PAGE regions plus the native checkpoint contract, for `lmcache_mp`.
+
+        K3 keeps its KDA checkpoint images in ordinary MLA PAGE units, laid out
+        by `_page_unit_regions` -- one region per MLA row, then each index
+        layer. Those are exactly the leading regions the MLA builder publishes,
+        in the same order and per-unit size, so publishing the checkpoint spec
+        and copy callback over them lets `lmcache_mp` store and restore the KDA
+        state with the KV. Without them the MP worker refuses K3 rather than
+        restoring KV under stale recurrent state.
+
+        KDA heads are TP-sharded, so every rank's image differs: STATE is never
+        TP-replicated even though the MLA KV beside it is.
+        """
+        transfer = super().get_kv_transfer_tensors()
+        if transfer is None or not self._uses_paged_checkpoints():
+            return self._with_kda_disagg_regions(transfer)
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            return self._with_kda_disagg_regions(transfer)
+        bases, sizes = self._page_unit_regions()
+        count = len(bases)
+        published = [
+            (page.region.base_addr, page.region.unit_bytes)
+            for page in transfer.pages[:count]
+        ]
+        if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
+            raise RuntimeError(
+                "Kimi-K3 transfer regions do not match its checkpoint PAGE unit: "
+                f"{len(transfer.pages)} published, {count} in a unit"
+            )
+        transfer.paged_state_checkpoint_spec = spec
+        transfer.execute_paged_state_copies = self.execute_paged_state_copies
+        transfer.paged_state_region_count = count
+        transfer.native_state_tp_replication_factor = 1
+        return self._with_kda_disagg_regions(transfer)
+
+    def _with_kda_disagg_regions(self, tensors):
+        """The MLA base's block regions, plus the KDA state pool it omits.
+
+        This backend's cache is in two halves and the base class describes one:
+        the full-attention layers sit in the paged pool it walks, the KDA
+        layers in the slot-indexed recurrent-state pool `build_kv_cache_tensor`
+        tags `per_request_state=True`. A request's KDA state is not derivable
+        from its MLA blocks, so shipping only the base's answer would leave
+        decode running most of the model on a zeroed state -- fluently, and
+        with nothing downstream able to tell. The connector transfers whatever
+        regions it is handed and reports success either way, which is why the
+        two halves have to be joined here rather than checked later.
+
+        Joined in this class rather than in `GDNStateMixin` because only a
+        hybrid has a base answer to extend; the pure-GDN backends own no block
+        regions. The slot half itself comes from the mixin, next to the other
+        two methods that name the same bytes.
+        """
+        from atom.kv_transfer.disaggregation.factory import resolve_pd_backend
+
+        if tensors is None:
+            return None
+
+        # A non-empty `kv_transfer_config` alone does not mean disaggregation:
+        # the aggregated LMCache offload tier configures one too, and it reads
+        # the state pool through `state_backend` instead of through regions.
+        connector = resolve_pd_backend(self.model_runner.config.kv_transfer_config)
+        if connector is None:
+            return tensors
+
+        config = self.model_runner.config
+        model_type = config.hf_config.model_type
+
+        if connector != "mooncake":
+            raise NotImplementedError(
+                f"{model_type} disaggregated serving requires the mooncake "
+                f"connector, but kv_connector={connector!r} is configured. Only "
+                "mooncake transfers the slot-indexed regions the KDA recurrent "
+                f"state lives in; every other connector would move the "
+                f"{len(self.mla_idx_by_layer)} full-attention layers and "
+                f"silently drop the state of the other "
+                f"{len(self.kda_idx_by_layer)}. Set "
+                'kv_transfer_config["kv_connector"] = "mooncake".'
+            )
+
+        if getattr(config, "pipeline_parallel_size", 1) > 1:
+            # `_consumer_region_map` shifts a stage's regions onto the peer's
+            # list group-major over `num_hidden_layers`. The slot regions below
+            # are group-major over the KDA layers only, a shorter axis, so the
+            # shift would land them on the wrong peer regions -- writing one
+            # layer's state over another's rather than failing.
+            raise NotImplementedError(
+                f"{model_type} disaggregated serving does not support pipeline "
+                f"parallelism (pipeline_parallel_size="
+                f"{config.pipeline_parallel_size}): the KDA state regions are "
+                "keyed by KDA layer index, which `_consumer_region_map` cannot "
+                "align across stages. Run the P and D instances with PP=1."
+            )
+
+        tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
+        return tensors
 
     def _uses_paged_checkpoints(self) -> bool:
         """Whether this run keeps checkpoints as PAGE images rather than slots.
@@ -188,14 +289,21 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 f"index_kpool={kpool}; Config sets the block size for exactly this"
             )
         rows = runner.block_size // kpool
-        if rows % _MQA_LOGITS_PRESHUFFLE_ROWS:
+        if rows % MQA_LOGITS_PRESHUFFLE_ROWS:
             raise ValueError(
                 f"{rows} pooled rows per block is not a multiple of "
-                f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
+                f"{MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
                 "cannot stay in the preshuffled layout -- the only one it computes "
                 "correctly. Raise kv_cache_block_size."
             )
         return rows
+
+    def _kpool_history_size(self) -> int:
+        """Return the documented ring bound for speculative rejection."""
+        pool = self._kpool_size()
+        spec = self.model_runner.config.speculative_config
+        num_speculative_tokens = None if spec is None else spec.num_speculative_tokens
+        return speculative_kpool_history_size(pool, num_speculative_tokens)
 
     def _kpool_tail_bytes(self) -> int:
         """Per-request tail bytes across every indexer-owning layer."""
@@ -204,7 +312,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return 0
         hf = self.model_runner.config.hf_config
         index_cache_layer_ids, _ = self._index_cache_layout()
-        per_layer = 2 * kpool * hf.index_head_dim * torch.bfloat16.itemsize
+        per_layer = (
+            2 * self._kpool_history_size() * hf.index_head_dim * torch.bfloat16.itemsize
+        )
         return len(index_cache_layer_ids) * per_layer
 
     def _kpool_tail_plane_shape(self) -> tuple[int, int] | None:
@@ -263,7 +373,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 len(index_cache_layer_ids),
                 entries.get(STATE_SLOT_CLASS, 0),
                 2,  # 0 = K, 1 = gate score
-                self._kpool_size(),
+                self._kpool_history_size(),
                 hf.index_head_dim,
             ),
             dtype=torch.bfloat16,
@@ -386,8 +496,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         return None
 
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
-        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
+        attn_metadata, positions = super().prepare_prefill(
+            batch, running_bs, running_tokens
+        )
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
@@ -416,14 +530,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         )
         return attn_metadata, positions
 
-    def build_for_cudagraph_capture(self, bs: int):
-        if self.block_size == 1:
-            var = self.model_runner.forward_vars
-            var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
-            var["kv_indptr"].copy_to_gpu(bs + 1)
-            var["kv_indices"].gpu[:bs].zero_()
-            var["kv_last_page_lens"].gpu[:bs].fill_(1)
+    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
+        # Kimi's dense MLA warmup needs a page even with page_size=1.
+        # The parent owns the single upload, including DCP + MTP capture.
+        return True
 
+    def build_for_cudagraph_capture(self, bs: int):
         attn_metadata, context = super().build_for_cudagraph_capture(bs)
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context

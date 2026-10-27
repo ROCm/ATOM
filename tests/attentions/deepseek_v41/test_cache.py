@@ -1,0 +1,832 @@
+# SPDX-License-Identifier: MIT
+"""Paging, sparse causality and exact state recovery across request lifetimes."""
+
+from dataclasses import replace
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
+pytest.importorskip("aiter", reason="the paged cache and V4 kernels reach AITER")
+
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+    PagedStateCheckpointSpec,
+)
+from atom.model_ops.attentions.deepseek_v41.cache import (
+    PagedAttentionCache,
+)
+from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
+from atom.model_ops.v4_kernels import make_compress_plans
+from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+from atom.utils import CpuGpuBuffer
+from tests.attentions.deepseek_v41.helpers import geometry
+
+
+def carried(geo, entry):
+    """The bytes of a STATE entry a checkpoint image holds, in image order."""
+    return torch.cat([entry[at : at + n] for at, n in geo.checkpoint_image_ranges])
+
+
+def checkpoint_spec(geo):
+    return PagedStateCheckpointSpec(
+        page_unit_bytes=geo.paged_bytes,
+        slot_bytes=geo.state_bytes,
+        layout_id=geo.layout_id,
+        image_bytes=geo.checkpoint_image_bytes,
+    )
+
+
+def window_lens(geo, *, start, extend):
+    """Each compression group's `window_len`: its leading tokens read from the
+    compressor tails rather than from this forward."""
+    buffers = {
+        ratio: {
+            "compress": CpuGpuBuffer(
+                extend + 1, 4, dtype=torch.int32, device="cpu", pin_memory=False
+            ),
+            "write": CpuGpuBuffer(
+                extend + 1, 4, dtype=torch.int32, device="cpu", pin_memory=False
+            ),
+        }
+        for ratio, _ in geo.compress_ratios
+    }
+    plans = make_compress_plans(
+        np.asarray([extend], dtype=np.int32),
+        np.asarray([start + extend], dtype=np.int32),
+        geo.compress_ratios,
+        plan_buffers=buffers,
+        extra_write=0,
+    )
+    return {
+        ratio: buffers[ratio]["compress"].np[: plan.num_compress, 3]
+        for ratio, plan in plans.items()
+    }
+
+
+@pytest.mark.parametrize("extend", [1, 2, 3, 64])
+def test_a_resume_at_a_page_boundary_reads_no_compressor_tail(small_config, extend):
+    """Checkpoints leave the compressor tails out, which holds only while no
+    group straddles a PAGE boundary; a forward starting off one does read them."""
+    geo = geometry(small_config)
+    assert 2 in dict(geo.compress_ratios)
+    for start in (geo.block_size, 3 * geo.block_size):
+        for lens in window_lens(geo, start=start, extend=extend).values():
+            assert not lens.any()
+    if extend > 1:
+        assert window_lens(geo, start=geo.block_size + 1, extend=extend)[2].any()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
+    small_config, device, packed
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    # A window wide enough that one image outgrows a PAGE unit: an FP8 index
+    # plane puts 32 tokens in a PAGE, and the fixture's own 4-token window
+    # leaves a state entry that fits in a single one.
+    geo = replace(
+        geometry(small_config), kv_dtype="fp4" if packed else "bf16", window_size=32
+    )
+    spec = checkpoint_spec(geo)
+    assert spec.units_per_checkpoint > 1
+    # Enough PAGEs for the interleaved unit ids below, which is what makes the
+    # image land in units that are not consecutive.
+    pages = max(40, 2 * spec.units_per_checkpoint)
+    cache = PagedAttentionCache(geo, pages, 4, device)
+    # Exactly the pages the scheduler can name, as V4's pool is: the sentinel
+    # rows of a CUDAGraph-sized compression plan are skipped rather than
+    # landed somewhere, so the pool buys nothing for them.
+    assert cache.num_pages == pages
+    assert cache.backing.numel() == geo.paged_extents(pages)[1] + 4 * geo.state_bytes
+    copies = StateCopies(cache, spec, 4)
+    copies.warmup()
+    # Fill ALL bytes, including padding and FP32 compressor tails. The cursor
+    # remains interpretable while the rest proves byte-exact recovery.
+    cache.state_bytes[2].copy_(
+        torch.randint(
+            0, 256, cache.state_bytes[2].shape, dtype=torch.uint8, device=device
+        )
+    )
+    cache.cursor[2] = torch.tensor([3, 19, -1, 27], device=device)
+    original = carried(geo, copies.entry(2))
+    units = tuple(range(1, 2 * spec.units_per_checkpoint, 2))
+    store = CheckpointStoreOp(2, units, spec.image_bytes, spec.layout_id)
+    restore = CheckpointRestoreOp(1, units, spec.image_bytes, spec.layout_id)
+    copies.execute([store], [restore])
+    torch.testing.assert_close(carried(geo, copies.entry(1)), original, rtol=0, atol=0)
+    cache.state_bytes[1].fill_(93)  # rejected / cancelled tentative suffix
+    copies.execute([], [restore])
+    torch.testing.assert_close(carried(geo, copies.entry(1)), original, rtol=0, atol=0)
+    # The compressor tails are not in the image: a restore leaves the slot's own.
+    image_bytes = torch.zeros(geo.state_bytes, dtype=torch.bool, device=device)
+    for at, n in geo.checkpoint_image_ranges:
+        image_bytes[at : at + n] = True
+    assert (copies.entry(1)[~image_bytes] == 93).all()
+    restored = copies.entry(1).clone()
+    cache.state_bytes[0].fill_(71)
+    old_zero = copies.entry(0).clone()
+    copies.relocate([(1, 0), (0, 1)])
+    torch.testing.assert_close(copies.entry(0), restored, rtol=0, atol=0)
+    torch.testing.assert_close(copies.entry(1), old_zero, rtol=0, atol=0)
+    span = PagedRequest(27, 3, 0, 1, 0, (32, 33))
+    step = begin_step(cache, [span])
+    np.testing.assert_array_equal(cache.prepare_state(step), [[19, -1, 27]])
+    # Recycled slot begins at zero and drops every old state field.
+    fresh = begin_step(cache, [replace(span, request_id=28, position=0)])
+    np.testing.assert_array_equal(cache.prepare_state(fresh), [[-1, -1, -1]])
+    assert cache.state.view("window")[:, 0].count_nonzero() == 0
+    assert cache.state.view("compress_kv")[:, 0].count_nonzero() == 0
+    assert cache.cursor[0, 0] == 0
+    with pytest.raises(ValueError, match="recoverable boundary"):
+        cache.prepare_state(step)
+    for bad in (
+        replace(restore, layout_id="wrong"),
+        replace(restore, total_bytes=3),
+        replace(restore, unit_ids=(0,) * len(units)),
+    ):
+        with pytest.raises(ValueError):
+            copies.execute([], [bad])
+    with pytest.raises(IndexError):
+        copies.entry(-1)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
+    small_config, packed
+):
+    """The native MP layout reads back exactly the image `StateCopies` stored.
+
+    `get_kv_transfer_tensors` publishes each plane of a PAGE unit as a region;
+    `build_native_state_mp_layout` cuts the image into per-ordinal aliases of
+    those regions. Both have to walk a unit's regions in the same order, or
+    LMCache stores a checkpoint whose bytes a restore scatters into the wrong
+    planes.
+    """
+    from atom.kv_transfer.offload.mp.native_state_layout import (
+        build_native_state_mp_layout,
+    )
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+
+    geo = replace(
+        geometry(small_config), kv_dtype="fp4" if packed else "bf16", window_size=32
+    )
+    spec = checkpoint_spec(geo)
+    assert spec.units_per_checkpoint > 1
+    pages = max(40, 2 * spec.units_per_checkpoint)
+    cache = PagedAttentionCache(geo, pages, 4, "cpu")
+    copies = StateCopies(cache, spec, 4)
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={"kv_connector": "lmcache_mp"},
+            tensor_parallel_size=2,
+        ),
+        state_runtime=SimpleNamespace(checkpoint_spec=spec),
+    )
+    builder.cache, builder.copies = cache, copies
+
+    transfer = builder.get_kv_transfer_tensors()
+    transfer.set_block_count(pages)
+    assert transfer.paged_state_region_count == len(transfer.pages)
+    assert [page.region.unit_bytes for page in transfer.pages] == [
+        size for _, size in cache.unit_regions()
+    ]
+    assert transfer.tp_replication_factor == 2
+    assert transfer.native_state_tp_replication_factor == 2
+    layout = build_native_state_mp_layout(
+        transfer, block_size=geo.block_size, chunk_size=geo.block_size
+    )
+
+    cache.state_bytes[2].copy_(
+        torch.randint(0, 256, cache.state_bytes[2].shape, dtype=torch.uint8)
+    )
+    units = tuple(range(1, 2 * spec.units_per_checkpoint, 2))
+    transfer.execute_paged_state_copies(
+        [CheckpointStoreOp(2, units, spec.image_bytes, spec.layout_id)], []
+    )
+    ordinal = {
+        index: group.engine_group_id - 1
+        for group in layout.kernel_groups
+        for index in group.tensor_indices
+    }
+    image = torch.cat(
+        [
+            layout.tensors[index][units[ordinal[index]]].flatten()
+            for index in range(len(transfer.pages), len(layout.tensors))
+        ]
+    )
+    torch.testing.assert_close(
+        image,
+        carried(geo, cache.state_bytes[2]),
+        rtol=0,
+        atol=0,
+    )
+
+    builder.model_runner.config.kv_transfer_config = None
+    assert builder.get_kv_transfer_tensors() is None
+
+
+def test_pd_transfer_publishes_the_state_slot(small_config):
+    """Mooncake P/D: PAGE units plus the whole STATE slot, slot-indexed.
+
+    The connector writes `src_slot * unit` to `dst_slot * unit`, and sends the
+    consumer's slot only when `slot_regions` is non-empty. Encoder bounded
+    replay keeps no checkpoint, so the spec may be None. `lmcache_mp` gets no
+    slot region: it moves STATE through checkpoint copies.
+    """
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+            tensor_parallel_size=2,
+        ),
+        state_runtime=SimpleNamespace(checkpoint_spec=None),
+    )
+    builder.cache = cache
+    transfer = builder.get_kv_transfer_tensors()
+    assert not transfer.swa_block_regions and transfer.staging_region is None
+    (region,) = transfer.slot_regions
+    assert transfer.num_slots == 4
+    assert region.unit_bytes == geo.state_bytes and not region.reverse_indexed
+    for slot in range(4):
+        assert region.unit_addr(slot) == cache.state_bytes[slot].data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("topk", [4, 64])
+def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(
+    packed, ratio, topk
+):
+    """The indptr reserves what the writer writes, per row, to the slot.
+
+    `_indptr_scan` derives a row's length from its position; `_indices` writes
+    one id per non-negative selection, and the window -- at the other end of
+    the same slice on the packed pool, as `_window_rows`'s own list on a BF16
+    decode. A row where the two disagree leaves the difference between them
+    untouched, and the decode kernel dereferences every slot the indptr
+    claims, so that gap is an out-of-range read of whatever the allocation
+    held.
+
+    Checked against the writer's own rule rather than against the scan's,
+    which is the only way the two can be caught disagreeing.
+    """
+
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    geo = V41PoolGeometry(
+        2,
+        ((0, ratio),),
+        32,
+        8,
+        512,
+        32,
+        kv_dtype="fp4" if packed else "bf16",
+        layer_ratios=(ratio,),
+        index_topk=topk,
+    )
+    cache = PagedAttentionCache(geo, 32, 4, "cuda")
+    # Decode rows on both sides of the window boundary, and a request whose
+    # visible count is under `topk` beside one well over it: the short row is
+    # where the writer's per-row count and the scan's can disagree, and the
+    # long one is what keeps `topk` from being the only bound in play.
+    spans = (
+        PagedRequest(1, 3, 0, 1, 0, (0, 1, 2)),
+        PagedRequest(2, 200, 1, 1, 1, tuple(range(3, 16))),
+    )
+    step = begin_step(cache, spans, running_bs=2, running_tokens=2, max_q_len=1)
+    assert step.decode
+    visible = (step.positions + 1) // ratio
+    # The selection the scorers emit: ascending ids, `-1` past `min(visible,
+    # topk)`, which is the count the scan assumes.
+    counts = visible.clamp(max=topk)
+    columns = torch.arange(topk, device="cuda")
+    selection = torch.where(
+        columns < counts[:, None], columns.expand(step.width, topk), -1
+    ).int()
+    step.selected[0] = selection.unsqueeze(0)
+    spec = LayerAttentionSpec(1, ratio, AttentionMode.REUSE, 0, 0)
+    _, pptr, _, wptr = cache.attention_indices(spec, step)
+    window = (step.positions + 1).clamp(max=geo.window_size)
+    selected = (selection >= 0).sum(-1)
+    written = selected + window if packed else selected
+    assert torch.equal(pptr.diff().long(), written.long()), (
+        f"reserved={pptr.diff().tolist()} written={written.tolist()} "
+        f"window={window.tolist()} visible={visible.tolist()}"
+    )
+    if not packed:
+        assert torch.equal(wptr.diff().long(), window.long())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
+    """A run's launch against the launches it replaces, plane by plane, on the
+    packed pool (whose decode lists each layer's window in its prefix).
+
+    The run shares every input but its ring, so what this catches is the one
+    thing the grid's second axis has to get right: layer `j` addressing layer
+    `j`'s window. A stride off by a layer still produces valid-looking rows --
+    another layer's -- so the comparison has to be against a build that names
+    each layer, not against a formula rewritten here.
+    """
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    layers = 4
+    geo = V41PoolGeometry(
+        layers,
+        ((0, ratio),),
+        32,
+        8,
+        512,
+        32,
+        kv_dtype="fp4",
+        layer_ratios=(ratio,),
+        index_topk=8,
+    )
+    cache = PagedAttentionCache(geo, 32, 4, "cuda")
+    spans = (
+        PagedRequest(1, 3, 0, 1, 0, (0, 1, 2)),
+        PagedRequest(2, 200, 1, 1, 1, tuple(range(3, 16))),
+    )
+    step = begin_step(cache, spans, running_bs=2, running_tokens=2, max_q_len=1)
+    assert step.decode
+    selection = torch.where(
+        torch.arange(8, device="cuda") < ((step.positions + 1) // ratio)[:, None],
+        torch.arange(8, device="cuda").expand(step.width, 8),
+        -1,
+    ).int()
+    step.selected[0] = selection.unsqueeze(0)
+
+    def built(size):
+        rows = []
+        step.group_indices.clear()
+        for layer in range(layers):
+            spec = LayerAttentionSpec(
+                layer,
+                ratio,
+                AttentionMode.REUSE,
+                0,
+                0,
+                index_group_start=0,
+                index_group_size=size,
+            )
+            prefix, pptr, _, _ = cache.attention_indices(spec, step)
+            # A plane is reserved for the widest row and written to the indptr,
+            # so comparing past it compares two `torch.empty` tails.
+            rows.append(prefix[: int(pptr[-1])].clone())
+        return rows
+
+    alone, grouped = built(1), built(layers)
+    # Two layers' rings must differ, or every stride passes.
+    assert not torch.equal(alone[0], alone[1])
+    assert all(torch.equal(a, b) for a, b in zip(alone, grouped, strict=True))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_a_bf16_decode_reads_each_layers_own_window_through_its_ring():
+    """A BF16 decode's window rows are one list for every layer, read through
+    the layer's own ring (`ring_view`); its selection is one plane a group.
+
+    What a layer gathers that way must be its own ring's entries at the row's
+    window positions -- checked against the state's `window` field, not a row
+    formula rewritten here, with every (slot, layer, ring position) holding a
+    distinct value, so a list offset by a layer or a slot gathers wrong ones.
+    """
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    layers = 4
+    geo = V41PoolGeometry(
+        layers, ((0, 2),), 32, 8, 512, 32, layer_ratios=(2,), index_topk=8
+    )
+    cache = PagedAttentionCache(geo, 32, 4, "cuda")
+    rings = cache.state.view("window")
+    ring_slots = rings.shape[2]
+    for layer in range(layers):
+        for slot in range(rings.shape[1]):
+            codes = torch.arange(ring_slots, device="cuda") + 8 * layer + 32 * slot
+            rings[layer, slot] = codes[:, None].to(rings.dtype)
+    spans = (
+        PagedRequest(1, 3, 0, 1, 0, (0, 1, 2)),
+        PagedRequest(2, 200, 1, 1, 1, tuple(range(3, 16))),
+    )
+    step = begin_step(cache, spans, running_bs=3, running_tokens=3, max_q_len=1)
+    assert step.decode
+    step.selected[0] = torch.where(
+        torch.arange(8, device="cuda") < ((step.positions + 1) // 2)[:, None],
+        torch.arange(8, device="cuda").expand(step.width, 8),
+        -1,
+    ).int()[None]
+    planes = set()
+    for layer in range(layers):
+        spec = LayerAttentionSpec(
+            layer, 2, AttentionMode.REUSE, 0, 0, index_group_size=layers
+        )
+        prefix, _, window, wptr = cache.attention_indices(spec, step)
+        planes.add(prefix.data_ptr())
+        view = cache.ring_view(layer)
+        bounds = wptr.tolist()
+        for t, request in enumerate(spans):
+            pos = request.position
+            ring = [p % ring_slots for p in range(max(0, pos - 7), pos + 1)]
+            rows = window[bounds[t] : bounds[t + 1]].long()
+            assert torch.equal(view[rows, 0], rings[layer, request.slot, ring, 0])
+        # the padding row reads nothing
+        assert bounds[-1] == bounds[len(spans)]
+    assert len(planes) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_a_bf16_decode_builds_an_ungrouped_layers_selection_from_its_own_owner():
+    """A layer that declares no index group names no group start (it defaults
+    to 0), yet on a BF16 decode it still reads its own owner's selection rather
+    than the one an earlier ungrouped layer built: two layers on one KV owner,
+    their selections in opposite orders."""
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    geo = V41PoolGeometry(2, ((0, 2),), 32, 8, 512, 32, layer_ratios=(2,), index_topk=8)
+    cache = PagedAttentionCache(geo, 32, 4, "cuda")
+    spans = (PagedRequest(1, 200, 0, 1, 0, tuple(range(13))),)
+    step = begin_step(cache, spans, running_bs=1, running_tokens=1, max_q_len=1)
+    assert step.decode
+    ids = torch.arange(8, dtype=torch.int32, device="cuda")[None, None]
+    step.selected[0], step.selected[1] = ids, ids.flip(-1)
+    first = cache.attention_indices(
+        LayerAttentionSpec(0, 2, AttentionMode.FULL, 0, 0), step
+    )[0]
+    second = cache.attention_indices(
+        LayerAttentionSpec(1, 2, AttentionMode.REINDEX, 0, 1), step
+    )[0]
+    assert torch.equal(second, first.flip(-1))
+
+
+def test_graph_plan_sentinel_rows_do_not_write_to_live_pages():
+    """Capacity padding is skipped without compacting the scatter's input.
+
+    Two owner fields make each plane noncontiguous across PAGE boundaries;
+    flattening that view would copy it and lose every intended write.
+    """
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+    from atom.model_ops.v4_kernels import make_compress_plans
+    from atom.utils import CpuGpuBuffer
+
+    # Two owners, because one leaves a PAGE exactly `rows * dim` wide and the
+    # scatter's plane contiguous -- the shape that hides a destination folding
+    # the two axes into one.
+    geo = V41PoolGeometry(2, ((0, 2), (1, 2)), 32, 4, 512, 32, speculative_tokens=1)
+    cache = PagedAttentionCache(geo, 6, 2, "cpu")
+    running_bs, max_q_len = 2, 2
+    spans = (PagedRequest(1, 4, 0, 2, 0, (3, 5)),)
+    plans = make_compress_plans(
+        np.asarray([2], dtype=np.int32),
+        np.asarray([6], dtype=np.int32),
+        geo.compress_ratios,
+        plan_buffers={
+            2: {
+                name: CpuGpuBuffer(
+                    8, 4, dtype=torch.int32, device="cpu", pin_memory=False
+                )
+                for name in ("compress", "write")
+            }
+        },
+        running_bs=running_bs,
+        max_q_len=max_q_len,
+        extra_write=1,
+    )
+    step = begin_step(
+        cache,
+        spans,
+        running_bs=running_bs,
+        running_tokens=running_bs * max_q_len,
+        plans=plans,
+    )
+    plan = step.plans[2]
+    # The capacity, which is what the kernel's grid and every row derived from
+    # it are; `num_compress` is the count this batch happened to produce.
+    assert plan.compress_plan_gpu.shape[0] > plan.num_compress > 0
+    live = plan.compress_plan_gpu[:, 1] >= 0
+    # Positive control: with no sentinel row there is nothing to place, and the
+    # assertions below would hold for a scatter that ignores the question.
+    assert live.any() and not live.all()
+    # Derived here rather than handed to the scatter: the scatter works the
+    # same rows out of the plan itself, so these assertions check that
+    # derivation instead of echoing a value the test supplied.
+    rows = plan.compress_plan_gpu[:, 2] // 2
+    per_page = geo.rows_per_page(2)
+    pages = cache.pages.view("main_0")[0]
+    pages.fill_(0)
+    # A value no row shares, so a row that landed says which one it was.
+    value = torch.arange(1, rows.numel() + 1, dtype=pages.dtype, device=pages.device)
+    filled = value[None, :, None].expand(1, -1, pages.shape[-1])
+    cache._scatter_rows(pages, step, filled, 2)
+    table = step.block_tables[plan.compress_plan_gpu[:, 1].long()]
+    for i in live.nonzero().flatten().tolist():
+        page = table[i, rows[i] // per_page]
+        assert pages[page, rows[i] % per_page, 0] == value[i]
+    # Exactly the live rows were written: a sentinel reaching `-1` would have
+    # landed on the last page's last row, which is a live request's.
+    assert int((pages != 0).any(-1).sum()) == int(live.sum())
+
+
+def test_key_rope_positions_span_the_grid_and_carry_its_sentinels():
+    """Where every plan row's index key gets rotated, published by the plan.
+
+    A boundary's key is rotated at its compression group's FIRST token and not
+    at its own: `fused_compress` rotated that group's main latent there, and a
+    key rotated anywhere else selects other rows.
+
+    Two things a shorter or hand-filled tensor would get past: the grid is the
+    capacity rather than `num_compress`, so a sentinel row needs a position
+    too -- and at ratio 2 a sentinel's is `-2`, which is what a fill that
+    reasoned "sentinels are -1" would most likely miss.
+    """
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+    from atom.model_ops.v4_kernels import make_compress_plans
+    from atom.utils import CpuGpuBuffer
+
+    geo = V41PoolGeometry(2, ((0, 2), (1, 2)), 32, 4, 512, 32, speculative_tokens=1)
+
+    def build(with_key_rope):
+        buffers = {
+            name: CpuGpuBuffer(8, 4, dtype=torch.int32, device="cpu", pin_memory=False)
+            for name in ("compress", "write")
+        }
+        if with_key_rope:
+            buffers["key_rope"] = CpuGpuBuffer(8, dtype=torch.int64, device="cpu")
+        return make_compress_plans(
+            np.asarray([2], dtype=np.int32),
+            np.asarray([6], dtype=np.int32),
+            geo.compress_ratios,
+            plan_buffers={2: buffers},
+            running_bs=2,
+            max_q_len=2,
+            extra_write=1,
+        )[2]
+
+    plan = build(True)
+    positions = plan.compress_plan_gpu[:, 2]
+    # Armed: the grid really does run past the rows this batch filled, so the
+    # sentinel half of the comparison below is not vacuous.
+    assert plan.compress_plan_gpu.shape[0] > plan.num_compress > 0
+    assert (positions < 0).any()
+    assert plan.key_rope_positions_gpu.dtype == torch.int64
+    assert torch.equal(plan.key_rope_positions_gpu, positions.long() // 2 * 2)
+    # Named rather than left to the comparison: this is the value the ratio-1
+    # intuition gets wrong, and naming it makes the failure say so.
+    assert plan.key_rope_positions_gpu[plan.num_compress] == -2
+    # A caller that declares no buffer pays nothing and is handed nothing.
+    assert build(False).key_rope_positions_gpu is None
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_a_deferred_prepare_state_names_the_stale_slot_one_step_later(
+    small_config, device
+):
+    """`histories=False` ships the rows without waiting; the verdict follows.
+
+    The caller that asks for no history is the one whose Engram rows and
+    advanced cursor are both worked out on the device, so nothing on the host
+    reads this step's committed history -- and nothing needs this step's
+    verdict either. What must not happen is the verdict going missing: a slot
+    holding the wrong position has to be named, late but named, and by the
+    request that wanted it.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.cursor[0] = torch.tensor([3, 19, -1, 27], device=device)
+
+    good = PagedRequest(27, 3, 0, 1, 0, (0, 1))
+    step = begin_step(cache, [good])
+    assert cache.prepare_state(step, histories=False) is None
+
+    # Same slot, but the scheduler believes it is four tokens further on than
+    # the cursor says. Deferred, so this call is the one that ships the rows.
+    stale = PagedRequest(28, 7, 0, 1, 0, (0, 1))
+    later = begin_step(cache, [stale])
+    assert cache.prepare_state(later, histories=False) is None
+    with pytest.raises(ValueError, match="Request 28 needs state at 7"):
+        cache.prepare_state(begin_step(cache, [good]), histories=False)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, device):
+    """A fresh request reuses whatever the last tenant left; that is not stale."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.cursor[0] = torch.tensor([91, 19, -1, 27], device=device)
+    fresh = PagedRequest(31, 0, 0, 1, 0, (0, 1))
+    cache.prepare_state(begin_step(cache, [fresh]), histories=False)
+    assert cache.cursor[0, 0] == 0
+    # The probe carries slot 0's pre-reset row; position 0 is what excludes it.
+    cache.prepare_state(begin_step(cache, [replace(fresh, request_id=32)]))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("histories", [True, False])
+def test_a_forward_recomputing_below_its_state_keeps_it(
+    small_config, device, histories
+):
+    """A forward starting below the point its state is at (decoder bounded
+    replay backing off): the slot must be at that point, keeps its state, and
+    its cursor's history starts over from the forward's own start; a rebuild
+    from the same start (encoder replay: no state came along) resets it."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.state_bytes[0].fill_(5)
+    cache.cursor[0] = torch.tensor([48, 19, -1, 27], device=device)
+    kept = [cache.state.view(name)[:, 0].clone() for name in ("window", "compress_kv")]
+    request = PagedRequest(41, 32, 0, 20, 0, (0, 1))
+    start = np.asarray([[7, 8, 9]], np.int64)
+
+    def prepare(cached_until):
+        step = begin_step(
+            cache,
+            [request],
+            floors=np.asarray([32], np.int32),
+            cached_until=np.asarray([cached_until], np.int32),
+            start_histories=start,
+        )
+        return cache.prepare_state(step, histories=histories)
+
+    restored = prepare(48)
+    if histories:
+        np.testing.assert_array_equal(restored, start)
+    assert cache.cursor[0, 1:].tolist() == [7, 8, 9]
+    for name, before in zip(("window", "compress_kv"), kept):
+        assert torch.equal(cache.state.view(name)[:, 0], before)
+    # where the slot is not at the point the forward resumes from
+    cache.cursor[0, 0] = 40
+    with pytest.raises(ValueError, match="needs state at 48"):
+        prepare(48)
+        cache.prepare_state(begin_step(cache, [replace(request, request_id=42)]))
+    # a rebuild: nothing kept below its start, the slot starts over there
+    cache.cursor[0] = torch.tensor([91, 19, -1, 27], device=device)
+    prepare(0)
+    for name in ("window", "compress_kv"):
+        assert cache.state.view(name)[:, 0].count_nonzero() == 0
+    assert cache.cursor[0, 1:].tolist() == [7, 8, 9]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("width", [0, 96, 1025])
+@pytest.mark.parametrize(
+    "ratios", [(0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)]
+)
+def test_shared_indptr_launch_matches_row_counts_and_replay(
+    packed, decode, width, ratios
+):
+    """A packed decode counts each row's window and selection in one prefix; a
+    BF16 decode (the window its own list, `splits_window`) counts the selection
+    there and the window in the extend indptr; a prefill counts its history
+    and selection, and its own rows' reach in the extend."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    geo = V41PoolGeometry(
+        len(ratios),
+        tuple((i, ratio) for i, ratio in enumerate(ratios) if ratio),
+        32,
+        128,
+        512,
+        32,
+        kv_dtype="fp4" if packed else "bf16",
+        layer_ratios=ratios,
+        index_topk=64,
+    )
+    split = decode and not packed
+    live = max(0, width - 7)
+    lengths = [live // 3, live // 3, live - 2 * (live // 3)]
+    cu = torch.tensor(
+        [0, lengths[0], sum(lengths[:2]), live], dtype=torch.int32, device="cuda"
+    )
+    batches = torch.cat(
+        [
+            torch.full((n,), b, device="cuda", dtype=torch.int32)
+            for b, n in enumerate(lengths)
+        ]
+        + [torch.full((width - live,), -1, device="cuda", dtype=torch.int32)]
+    )
+    positions = torch.zeros(width, device="cuda", dtype=torch.int32)
+    buffers = {
+        r: (
+            torch.full((width + 1,), -7, device="cuda", dtype=torch.int32),
+            torch.full((width + 1,), -9, device="cuda", dtype=torch.int32),
+        )
+        for r in geo.layer_ratios
+    }
+    step = SimpleNamespace(
+        width=width,
+        decode=decode,
+        positions=positions,
+        batch_ids=batches,
+        cu_seqlens_q=cu,
+    )
+    assert tuple(fill_step_indptrs(step, geo, buffers)) == ratios
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        built = fill_step_indptrs(step, geo, buffers)
+    for starts in [(0, 127, 300), (511, 3, 120)]:
+        pos = []
+        windows, reaches = [], []
+        for start, n in zip(starts, lengths):
+            for j in range(n):
+                absolute = start + j
+                pos.append(absolute)
+                windows.append(
+                    max(0, (absolute + 1 if decode else start) - max(absolute - 127, 0))
+                )
+                reaches.append(min(j + 1, 128))
+        positions.copy_(
+            torch.tensor(pos + [0] * (width - live), device="cuda", dtype=torch.int32)
+        )
+        graph.replay()
+        pad = [0] * (width - live)
+        for ratio, (prefix, extend, topk) in built.items():
+            counts = [
+                (0 if split else w) + (min((p + 1) // ratio, topk) if ratio else 0)
+                for w, p in zip(windows, pos)
+            ] + pad
+            expected = torch.tensor(
+                [0] + list(np.cumsum(counts)), device="cuda", dtype=torch.int32
+            )
+            torch.testing.assert_close(prefix, expected, rtol=0, atol=0)
+            if decode and not split:
+                assert extend.data_ptr() == prefix.data_ptr()
+            else:
+                second = windows if split else reaches
+                expected = torch.tensor(
+                    [0] + list(np.cumsum(second + pad)),
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+                torch.testing.assert_close(extend, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_candidate_blocks_are_bound_once_a_forward(small_config, monkeypatch):
+    """Every REINDEX layer one source bounds reads one binding, rebuilt once the
+    next forward begins: the table is a fresh allocation, so a binding that
+    outlived `begin_forward` would be one a captured graph never rebuilds."""
+    from atom.model_ops.attentions.deepseek_v41 import cache as cache_module
+    from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
+
+    builds = []
+
+    def counted(*args, **kwargs):
+        builds.append(args)
+        return bind_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "bind_candidates", counted)
+    geo = geometry(small_config)
+    cache = PagedAttentionCache(geo, 8, 2, "cuda")
+    step = begin_step(cache, [PagedRequest(0, 40, 0, 3, 0, (3, 5))])
+    source, ratio = small_config.candidate_source_layer_id, 1
+    # ascending logical blocks, the newest visible one kept
+    newest = (step.visible[ratio] - 1) // geo.index_block_rows
+    kept = torch.stack([torch.zeros_like(newest), newest], dim=1).to(torch.int32)
+    step.candidates[source] = kept
+
+    first = cache.candidate_blocks(step, source, ratio)
+    assert cache.candidate_blocks(step, source, ratio) is first
+    assert len(builds) == 1
+    expected = bind_candidates(
+        kept,
+        step.block_tables,
+        step.batch_ids,
+        geo.index_blocks_per_page(ratio),
+        step.visible[ratio],
+        rows_per_block=geo.index_block_rows,
+    )
+    assert torch.equal(first.table, expected.table)
+    assert torch.equal(first.context, expected.context)
+
+    step.begin_forward()
+    step.candidates[source] = kept
+    assert cache.candidate_blocks(step, source, ratio) is not first
+    assert len(builds) == 2

@@ -7,18 +7,19 @@ import logging
 import os
 import pprint
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any
 
 import torch
-import torch.fx as fx
+from torch import fx
+from torch._dispatch.python import enable_python_dispatcher
+
 from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.utils import (
     compilation_counter,
     is_torch_equal_or_newer,
 )
-from torch._dispatch.python import enable_python_dispatcher
 
 from .compiler_inferface import (
     CompilerInterface,
@@ -27,10 +28,6 @@ from .compiler_inferface import (
 )
 
 logger = logging.getLogger("atom")
-
-
-def get_static_graph_wrapper_cls(cls) -> str:
-    return "atom.utils.cuda_graph.CUDAGraphWrapper"
 
 
 def make_compiler(compilation_config: CompilationConfig) -> CompilerInterface:
@@ -63,7 +60,7 @@ class CompilerManager:
     """
 
     def __init__(self, compilation_config: CompilationConfig):
-        self.cache: dict[tuple[Optional[int], int, str], Any] = dict()
+        self.cache: dict[tuple[int | None, int, str], Any] = {}
         self.is_cache_updated = False
         self.compilation_config = compilation_config
         self.compiler = make_compiler(compilation_config)
@@ -118,8 +115,8 @@ class CompilerManager:
         graph: fx.GraphModule,
         example_inputs: list[Any],
         graph_index: int,
-        runtime_shape: Optional[int] = None,
-    ) -> Optional[Callable]:
+        runtime_shape: int | None = None,
+    ) -> Callable | None:
         if (runtime_shape, graph_index, self.compiler.name) not in self.cache:
             return None
         handle = self.cache[(runtime_shape, graph_index, self.compiler.name)]
@@ -128,15 +125,14 @@ class CompilerManager:
         )
         if runtime_shape is None:
             logger.debug(
-                "Directly load the %s-th graph for dynamic shape from %s via "
-                "handle %s",
+                "Directly load the %s-th graph for dynamic shape from %s via handle %s",
                 graph_index,
                 self.compiler.name,
                 handle,
             )
         else:
             logger.debug(
-                "Directly load the %s-th graph for shape %s from %s via " "handle %s",
+                "Directly load the %s-th graph for shape %s from %s via handle %s",
                 graph_index,
                 str(runtime_shape),
                 self.compiler.name,
@@ -152,7 +148,7 @@ class CompilerManager:
         compilation_config: CompilationConfig,
         graph_index: int = 0,
         num_graphs: int = 1,
-        runtime_shape: Optional[int] = None,
+        runtime_shape: int | None = None,
     ) -> Any:
         # print("runtime_shape", runtime_shape)
         if graph_index == 0:
@@ -215,7 +211,7 @@ class CompilerManager:
                     )
             if runtime_shape is None:
                 logger.debug(
-                    "Store the %s-th graph for dynamic shape from %s via " "handle %s",
+                    "Store the %s-th graph for dynamic shape from %s via handle %s",
                     graph_index,
                     self.compiler.name,
                     handle,
@@ -420,32 +416,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 self.vllm_backend,
             )
 
-            # Wrap each compiled dense piece in a PIECEWISE CUDAGraphWrapper so
-            # it captures/replays its own cudagraph (attention runs eager between
-            # pieces). Gated on cudagraph_mode requesting piecewise; otherwise
-            # keep the bare piecewise_backend (compiled, no per-piece cudagraph —
-            # the pre-existing behavior, e.g. FULL manual capture in the runner).
-            _cg_mode = self.compilation_config.cudagraph_mode
-            # Driven by --cudagraph-mode. Default FULL -> requires_piecewise is
-            # False -> bare piecewise_backend (compiled pieces inside the manual
-            # FULL whole-forward capture, i.e. existing behavior). PIECEWISE ->
-            # wrap each piece in its own cudagraph.
-            _pw_cg = _cg_mode is not None and _cg_mode.requires_piecewise_compilation()
-            if _pw_cg:
-                from .cuda_graph import CUDAGraphOptions, CUDAGraphWrapper
-
-                self.module.__dict__[target] = CUDAGraphWrapper(
-                    runnable=piecewise_backend,
-                    vllm_config=self.vllm_config,
-                    runtime_mode=CUDAGraphMode.PIECEWISE,
-                    cudagraph_options=CUDAGraphOptions(
-                        debug_log_enable=piecewise_backend.is_first_graph,
-                        gc_disable=not piecewise_backend.is_first_graph,
-                        weak_ref_output=piecewise_backend.is_last_graph,
-                    ),
-                )
-            else:
-                self.module.__dict__[target] = piecewise_backend
+            # A compiled piece is graphed with the rest of the forward: a
+            # `TokenGraph` records it inline, breaking only at the split ops
+            # declared `eager_region`.
+            self.module.__dict__[target] = piecewise_backend
 
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
 
@@ -473,6 +447,26 @@ def set_model_tag(tag: str):
 
 
 VLLM_CACHE_ROOT = os.path.expanduser("~/.cache/atom")
+# Cache dirs `VllmBackend` derived from the config and the first graph's
+# traced code, as opposed to one the user set (`_graph_tag`).
+_DERIVED_CACHE_DIRS: set[str] = set()
+
+
+def _hash_traced_files(files) -> str:
+    """md5 over the paths and contents of the files Dynamo traced; the code
+    factor of a graph's compile-cache key."""
+    import hashlib
+
+    content = []
+    for filepath in files:
+        content.append(filepath)
+        if filepath == "<string>" or filepath == "<frozen os>":
+            # This means the function was dynamically generated, with
+            # e.g. exec() or frozen os module. We can't actually check these.
+            continue
+        with open(filepath) as f:
+            content.append(f.read())
+    return hashlib.md5("\n".join(content).encode(), usedforsecurity=False).hexdigest()
 
 
 class VllmBackend:
@@ -550,6 +544,26 @@ class VllmBackend:
     #             self.post_grad_pass_manager.add(inductor_config[PASS_KEY])
     #     inductor_config[PASS_KEY] = self.post_grad_pass_manager
 
+    def _graph_tag(self) -> str:
+        """This graph's cache subdirectory when another graph of the model
+        derived the cache dir first.
+
+        The derived dir hashes only the files the FIRST graph traced, after
+        which `traced_files` is cleared. A later graph of the same model (the
+        DSpark drafter, V4.1's late layers under bounded replay) would
+        otherwise load a stale artifact after an edit to a file only it
+        traces, so its own traced files key its subdirectory. A cache dir the
+        user configured keeps the plain tag.
+        """
+        if self.compilation_config.cache_dir not in _DERIVED_CACHE_DIRS:
+            return self.prefix
+        files = sorted(self.compilation_config.traced_files)
+        self.compilation_config.traced_files.clear()
+        if not files:
+            return self.prefix
+        code = _hash_traced_files(files)[:10]
+        return f"{self.prefix}-{code}"
+
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
 
         vllm_config = self.vllm_config
@@ -572,33 +586,21 @@ class VllmBackend:
 
             # 2. factors come from the code files that are traced by Dynamo (
             #    it mainly summarizes how the model is used in forward pass)
-            forward_code_files = list(sorted(self.compilation_config.traced_files))
+            forward_code_files = sorted(self.compilation_config.traced_files)
             self.compilation_config.traced_files.clear()
             logger.debug(
                 "Traced files (to be considered for compilation cache):\n%s",
                 "\n".join(forward_code_files),
             )
-            hash_content = []
-            for filepath in forward_code_files:
-                hash_content.append(filepath)
-                if filepath == "<string>" or filepath == "<frozen os>":
-                    # This means the function was dynamically generated, with
-                    # e.g. exec() or frozen os module. We can't actually check these.
-                    continue
-                with open(filepath) as f:
-                    hash_content.append(f.read())
-            import hashlib
-
-            code_hash = hashlib.md5(
-                "\n".join(hash_content).encode(), usedforsecurity=False
-            ).hexdigest()
-            factors.append(code_hash)
+            factors.append(_hash_traced_files(forward_code_files))
 
             # 3. compiler hash
             compiler_hash = self.compiler_manager.compute_hash(vllm_config)
             factors.append(compiler_hash)
 
             # combine all factors to generate the cache dir
+            import hashlib
+
             hash_key = hashlib.md5(
                 str(factors).encode(), usedforsecurity=False
             ).hexdigest()[:10]
@@ -611,6 +613,10 @@ class VllmBackend:
                 # "e6292aa343",
             )
             self.compilation_config.cache_dir = cache_dir
+            _DERIVED_CACHE_DIRS.add(cache_dir)
+            graph_tag = self.prefix
+        else:
+            graph_tag = self._graph_tag()
 
         cache_dir = self.compilation_config.cache_dir
         os.makedirs(cache_dir, exist_ok=True)
@@ -618,7 +624,7 @@ class VllmBackend:
         # rank = vllm_config.parallel_config.rank
         rank = torch.cuda.current_device()
         # dp_rank = vllm_config.parallel_config.data_parallel_rank
-        local_cache_dir = os.path.join(cache_dir, f"rank_{rank}", self.prefix)
+        local_cache_dir = os.path.join(cache_dir, f"rank_{rank}", graph_tag)
         os.makedirs(local_cache_dir, exist_ok=True)
         self.compilation_config.local_cache_dir = local_cache_dir
 
@@ -632,7 +638,7 @@ class VllmBackend:
             )
 
         self.compiler_manager.initialize_cache(
-            local_cache_dir, disable_cache, self.prefix
+            local_cache_dir, disable_cache, graph_tag
         )
 
         # when dynamo calls the backend, it means the bytecode
@@ -677,7 +683,7 @@ class VllmBackend:
 
         graph_path = os.path.join(local_cache_dir, "computation_graph.py")
         if not os.path.exists(graph_path):
-            # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30 # noqa
+            # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30
             # use `print_readable` because it can include submodules
             src = (
                 "from __future__ import annotations\nimport torch\n"

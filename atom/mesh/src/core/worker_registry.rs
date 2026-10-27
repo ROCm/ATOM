@@ -703,7 +703,6 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
-                .api_key("test_api_key")
                 .build(),
         );
 
@@ -737,7 +736,6 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels1)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
-                .api_key("test_api_key")
                 .build(),
         );
 
@@ -748,7 +746,6 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels2)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
-                .api_key("test_api_key")
                 .build(),
         );
 
@@ -759,7 +756,6 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .labels(labels3)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
-                .api_key("test_api_key")
                 .build(),
         );
 

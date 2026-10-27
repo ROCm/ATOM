@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -30,8 +31,8 @@ from atom.sampling_params import SamplingParams
 class _OffloadMixinStub(OffloadSchedulerMixin):
     """Concrete `OffloadSchedulerMixin` for scheduler tests.
 
-    `OffloadSchedulerMixin` declares the six save/load lifecycle methods abstract
-    so a missing forwarder is a construction-time TypeError. These test doubles
+    `OffloadSchedulerMixin` declares the seven save/load lifecycle methods
+    abstract so a missing forwarder is a construction-time TypeError. These test doubles
     exercise only the scheduler's deferred-free / preemption paths, so this base
     fills the contract with harmless defaults and each local `_Connector`
     overrides the methods it drives.
@@ -43,6 +44,7 @@ class _OffloadMixinStub(OffloadSchedulerMixin):
     def save_finished(self, req_id) -> None: ...
     def abandon_save(self, req_id) -> None: ...
     def release_stalled_save(self, seq) -> None: ...
+    def source_blocks_released(self, seq) -> None: ...
     def load_failed(self, req_id) -> bool:
         return False
 
@@ -284,9 +286,9 @@ class TestThroughputSection:
 
     def test_hit_rate_is_na_until_something_is_measured(self, caplog):
         """Prefix caching enabled but nothing observed yet — "0.0%" would be a
-        claim about reuse made without ever having looked. This is the shape a
-        P/D decode engine is in permanently (it never reaches `update_cache`)
-        and the aggregated scheduler is in until its first prefill."""
+        claim about reuse made without ever having looked. This is the shape
+        a scheduler is in before its first local prefill or completed remote
+        prefill admission."""
         stats = EngineStats(
             enable_log_stats=True,
             enable_prefix_caching=True,
@@ -391,6 +393,21 @@ class TestScheduleTicksTheWindow:
         assert sched.engine_stats.num_prompt_tokens == 4
 
 
+class TestGroupPrefillTick:
+    """An idle DP rank dummy-prefills beside a peer's prefill only when the
+    runners recorded prefill token graphs, whatever ATOM_TOKEN_GRAPH_SIZES
+    says: a backend without `supports_token_graph` records none, and its
+    dummy prefill would have no bucket to run on."""
+
+    @pytest.mark.parametrize("recorded", [False, True])
+    def test_follows_recorded_graphs_not_the_env(self, monkeypatch, recorded):
+        monkeypatch.setenv("ATOM_TOKEN_GRAPH_SIZES", "256,512")
+        sched = Scheduler(MockConfig(), prefill_token_graphs=recorded)
+        sched.set_prefill_delayer(SimpleNamespace(is_local=False))
+        decision = PrefillDecision(allow=True, prefillable_ranks=1)
+        assert sched._group_prefill_tick(decision) is recorded
+
+
 # ── add / extend / query ───────────────────────────────────────────────────
 
 
@@ -427,7 +444,7 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
-    def test_non_offload_abort_keeps_existing_receive_cleanup(self):
+    def test_non_offload_abort_retains_receive_until_terminal(self):
         seq = SimpleNamespace(
             id=96,
             status=SequenceStatus.ABORTED,
@@ -435,6 +452,7 @@ class TestSchedule:
         )
         sched = Scheduler.__new__(Scheduler)
         sched._rejected = []
+        sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
@@ -443,14 +461,73 @@ class TestSchedule:
 
         sched._reject_aborted_waiting(seq)
 
-        assert sched.deferred_free_blocks == {}
-        assert sched._num_parked_remote_kv == 0
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert sched._num_parked_remote_kv == 1
+        assert seq._awaiting_aborted_load_cleanup
         assert sched._rejected == [seq]
 
+    @staticmethod
+    def _parked_pd_receive(seq_factory, max_num_seqs=4):
+        """A decode with a P/D request whose blocks are allocated and parked."""
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_producer=False,
+            is_offload=False,
+            build_connector_meta=lambda: None,
+        )
+        free_before = sched.block_manager.pool_occupancy()["free"]
+        seq = seq_factory(list(range(8)))
+        sched.add(seq)
+        bm = sched.block_manager
+        assert bm.allocate(seq, bm.can_allocate(seq))
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched._count_inflight_load(seq)
+        return sched, seq, free_before
+
+    def test_a_failed_pd_receive_aborts_the_request(self, seq_factory):
+        """The decode does not prefill it, so its blocks go back at once."""
+        sched, seq, free_before = self._parked_pd_receive(seq_factory, 1)
+        sched.running.append(SimpleNamespace(id=-1))  # no free seq slot
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(failed_recving={str(seq.id)})
+        )
+
+        assert seq.status == SequenceStatus.FINISHED
+        assert seq.leave_reason == "aborted"
+        assert sched.take_rejected() == [seq]
+        assert seq not in sched.waiting
+        assert sched.failed_recving_kv_req_ids == []
+        assert sched._num_parked_remote_kv == 0
+        assert sched.deferred_free_blocks == {}
+        assert sched.block_manager.pool_occupancy()["free"] == free_before
+
+    def test_a_client_abort_frees_a_pd_receive_only_at_its_failure(self, seq_factory):
+        """The connector reports the failure once no late write can land."""
+        sched, seq, free_before = self._parked_pd_receive(seq_factory)
+        assert sched.abort_request(seq.id)
+        assert sched.block_manager.pool_occupancy()["free"] < free_before
+
+        sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={seq.id}))
+
+        assert sched.take_rejected() == [seq]
+        assert sched._num_parked_remote_kv == 0
+        assert sched.block_manager.pool_occupancy()["free"] == free_before
+
+    @pytest.mark.parametrize("producer", [False, True])
+    @pytest.mark.parametrize("load_outcome", ["finished_loading", "failed_loading"])
     @pytest.mark.parametrize("first_terminal", ["load", "save"])
     def test_aborted_load_and_save_both_finish_before_release(
         self,
         first_terminal,
+        load_outcome,
+        producer,
     ):
         load = 97
         save = 97
@@ -465,13 +542,18 @@ class TestSchedule:
 
         class _Connector(_OffloadMixinStub):
             is_offload = True
-            is_producer = False
+            is_producer = producer
 
             def __init__(self):
                 self.pending_save = True
+                self.pending_send = False
 
             def load_finished(self, operation):
                 events.append(("load_finished", operation))
+                return operation == load
+
+            def load_failed(self, operation):
+                events.append(("load_failed", operation))
                 return operation == load
 
             def save_finished(self, operation):
@@ -481,15 +563,24 @@ class TestSchedule:
 
             def should_defer_free(self, value):
                 assert value is seq
-                return self.pending_save
+                return self.pending_save or self.pending_send
 
             def request_finished(self, value):
                 events.append(("request_finished", value.id))
+                self.pending_send = self.is_producer
+
+            def send_finished(self, req_id):
+                assert req_id == seq.id
+                self.pending_send = False
+
+            def source_blocks_released(self, value):
+                events.append(("source_blocks_released", value.id))
 
         sched = Scheduler.__new__(Scheduler)
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
+        sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
@@ -504,7 +595,7 @@ class TestSchedule:
         assert seq._awaiting_aborted_load_cleanup is True
 
         outputs = {
-            "load": KVConnectorOutput(finished_loading={load}),
+            "load": KVConnectorOutput(**{load_outcome: {load}}),
             "save": KVConnectorOutput(finished_saving={save}),
         }
         second_terminal = "save" if first_terminal == "load" else "load"
@@ -518,8 +609,13 @@ class TestSchedule:
 
         assert sched.deferred_free_blocks == {}
         assert sched._num_parked_remote_kv == 0
+        assert not sched.kv_connector.pending_send
         assert events.count(("request_finished", seq.id)) == 1
         assert events.count(("deallocate", seq.id)) == 1
+        assert events[-2:] == [
+            ("deallocate", seq.id),
+            ("source_blocks_released", seq.id),
+        ]
 
     def test_empty_returns_none(self, scheduler):
         assert scheduler.schedule() is None
@@ -1620,7 +1716,278 @@ class TestPreempt:
         assert len(seq.block_table) == 0
 
 
+def _spec_config(mtp_k):
+    """Stand-in for SpeculativeConfig, carrying the two members the scheduler
+    reads: the draft width and whether the drafter consumes the target's token
+    stream."""
+    return SimpleNamespace(
+        num_speculative_tokens=mtp_k,
+        use_dspark=lambda: False,
+    )
+
+
+class TestProducerPreemptability:
+    """A P/D producer must not make its own running requests unpreemptable.
+
+    `_is_preemptable` negates `should_defer_free`, the predicate that now
+    carries the send's claim. Claiming at alloc instead of at
+    `request_finished` would pin every running request on a prefill node.
+    """
+
+    def test_preemptable_until_the_send_is_published(self, scheduler, seq_factory):
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        published: set[str] = set()
+        scheduler.kv_connector = SimpleNamespace(
+            is_producer=True,
+            # Claim only once the peer has the addresses, as the real ones do.
+            request_finished=lambda s: published.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in published,
+        )
+
+        assert scheduler._is_preemptable(seq) is True
+        scheduler.kv_connector.request_finished(seq)
+        assert scheduler._is_preemptable(seq) is False
+
+        published.clear()
+        assert scheduler._preempt_one_running() is True
+        assert seq.status == SequenceStatus.WAITING
+
+
+class TestPreemptStripsExactlyThePlaceholders:
+    """`preempt()` and `postprocess()` have to agree on the placeholder width.
+
+    postprocess appends `mtp_k + is_deferred_out - num_rejected` trailing
+    `eos_token_id` slots and records the count on the sequence. preempt has to
+    delete that many and no more. Leave one behind and it stops being a
+    placeholder: the recompute prefills a context ending in `<|endoftext|>`, so
+    the model starts a new document and the placeholder is also handed back as
+    generated output. Delete one too many and a real token goes with it, along
+    with its logprob.
+    """
+
+    def _sched(self, mtp_k):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=64,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                max_num_batched_tokens=256,
+                speculative_config=_spec_config(mtp_k) if mtp_k else None,
+            )
+        )
+
+    @staticmethod
+    def _deferred_prefill_output():
+        """A deferred-output forward whose sampled token is still in flight: no
+        row for the sequence, so postprocess only appends placeholders."""
+        return ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            is_deferred_out=True,
+        )
+
+    @pytest.mark.parametrize("mtp_k", [0, 1, 3])
+    def test_no_placeholder_survives_into_the_recompute(self, mtp_k, seq_factory):
+        """`is_deferred_out` is `pipeline_parallel_size == 1`, so a TP-only
+        engine -- the normal MTP deployment -- carries `mtp_k + 1`
+        placeholders. A `mtp_k`-wide strip leaves exactly one EOS."""
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        assert seq.num_placeholder_tokens == mtp_k + 1
+        assert list(seq.token_ids) == prompt + [sched.eos_token_id] * (mtp_k + 1)
+
+        assert sched.preempt(seq) is True
+
+        assert sched.eos_token_id not in list(seq.token_ids)
+        assert list(seq.token_ids) == prompt
+        assert list(seq.output_tokens) == []
+        assert seq.num_tokens == seq.num_prompt_tokens
+        assert seq.num_completion_tokens == 0
+        assert seq.num_placeholder_tokens == 0
+
+    @pytest.mark.parametrize("num_rejected", [0, 1, 2, 3])
+    def test_rejected_drafts_narrow_the_strip(self, num_rejected, seq_factory):
+        """postprocess appends *fewer* placeholders as more drafts are
+        rejected. Re-deriving the width as `mtp_k + num_rejected` moves it the
+        other way, so the strip eats `2 * num_rejected - 1` real tokens."""
+        mtp_k = 3
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        real = [41, 42, 43]
+        for token in real:
+            seq.append_token(token)
+        # What a verify step leaves behind: this many of the seq's drafts did
+        # not survive, so the placeholder run appends a narrower block.
+        seq.num_rejected = num_rejected
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        appended = mtp_k + 1 - num_rejected
+        assert seq.num_placeholder_tokens == appended
+        assert list(seq.token_ids) == prompt + real + [sched.eos_token_id] * appended
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt + real
+        assert list(seq.output_tokens) == real
+        assert seq.num_tokens == len(prompt) + len(real)
+        assert seq.num_completion_tokens == len(real)
+
+    def test_strip_is_bounded_by_what_is_there(self, seq_factory):
+        """A truncating stop moves `num_tokens` back over the placeholders
+        without shortening the arrays. An unbounded `del token_ids[-strip:]`
+        then clears the whole list and drives the completion count negative."""
+        sched = self._sched(mtp_k=3)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+        # Wider than the sequence has to give, in either direction.
+        seq.num_placeholder_tokens = seq.num_tokens + 10
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt
+        assert seq.num_tokens == seq.num_prompt_tokens
+        assert seq.num_completion_tokens == 0
+
+    @staticmethod
+    def _verify_output(seq_id, tokens, num_rejected, mtp_k):
+        """A step that actually verified drafts.
+
+        The row is what the other cases in this class do not have. Without one,
+        postprocess skips the in-place overwrite entirely and only appends, so
+        the two widths coincide and nothing here is under test.
+
+        `num_new + num_rejected == drafts + 1` is a law of the verify step -- the
+        model is given one anchor plus `drafts` drafts and hands back the
+        accepted prefix plus one -- so a pair that breaks it describes a step no
+        engine runs.
+        """
+        return ScheduledBatchOutput(
+            req_ids=[seq_id],
+            token_ids=[tuple(tokens)],
+            num_rejected=np.array([num_rejected], dtype=np.int32),
+            num_bonus=np.array([0], dtype=np.int32),
+            draft_token_ids=np.array([[900 + i for i in range(mtp_k)]], dtype=np.int32),
+            is_deferred_out=True,
+        )
+
+    @staticmethod
+    def _trailing_eos(seq, eos):
+        tokens = list(seq.token_ids)
+        count = 0
+        while count < len(tokens) and tokens[-1 - count] == eos:
+            count += 1
+        return count
+
+    @pytest.mark.parametrize(
+        "mtp_k,accepted", [(1, 0), (1, 1), (2, 0), (2, 2), (3, 0), (3, 1), (3, 3)]
+    )
+    def test_a_verify_step_widens_the_run_and_the_strip_follows(
+        self, mtp_k, accepted, seq_factory
+    ):
+        """The overwrite consumes only part of the window it is given.
+
+        The window is `num_placeholder + mtp_k` wide on a verify step, and the
+        step hands back `mtp_k - num_rejected + 1` tokens for it, so
+        `mtp_k + num_rejected` slots of it are still `eos_token_id` when the run
+        for the NEXT step is appended behind them. The trailing run settles at
+        `2 * mtp_k + 1`, whatever the acceptance rate, and the width recorded for
+        `preempt` used to name only the appended part of it -- leaving that many
+        EOS in the recomputed context, which is the fault this class is about.
+        """
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        sched.postprocess(list(sched.running), self._deferred_prefill_output())
+
+        # Three steps, so the tail reaches its steady state rather than the
+        # narrower run the prefill step alone leaves.
+        real = []
+        for step in range(3):
+            sched.schedule()
+            rows = [200 + 10 * step + i for i in range(accepted + 1)]
+            real += rows
+            sched.postprocess(
+                list(sched.running),
+                self._verify_output(seq.id, rows, mtp_k - accepted, mtp_k),
+            )
+
+        eos = sched.eos_token_id
+        assert self._trailing_eos(seq, eos) == 2 * mtp_k + 1
+        assert seq.num_placeholder_tokens == 2 * mtp_k + 1
+
+        assert sched.preempt(seq) is True
+
+        assert eos not in list(seq.token_ids)
+        assert list(seq.token_ids) == prompt + real
+        assert list(seq.output_tokens) == real
+        assert seq.num_completion_tokens == len(real)
+
+    def test_transferred_drafts_are_stripped_but_t0_is_kept(self, seq_factory):
+        """The P/D first-decode path appends the remote's T0 -- a real
+        generated token -- followed by its drafts, which are placeholders in
+        the same sense. A remote that sent fewer than `mtp_k` drafts has the
+        verify window padded out with `eos_token_id`, so the recorded width is
+        the whole window: the padding is a placeholder too, and leaving it
+        behind would put an EOS in the recomputed context."""
+        mtp_k = 3
+        sched = self._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        t0, drafts = 77, [101, 102]  # fewer drafts than mtp_k
+        seq.kv_transfer_params = {"first_token_id": t0, "draft_token_ids": drafts}
+        sched._schedule_first_decode_after_remote_kv(seq)
+
+        assert seq.num_placeholder_tokens == mtp_k
+        assert sched.eos_token_id in list(seq.token_ids)[-mtp_k:]
+
+        assert sched.preempt(seq) is True
+
+        assert list(seq.token_ids) == prompt + [t0]
+        assert seq.num_completion_tokens == 1
+
+
 # ── postprocess ────────────────────────────────────────────────────────────
+
+
+class _DSparkSpecConfig:
+    """The two fields Scheduler reads off speculative_config, DSpark-shaped."""
+
+    def __init__(self, num_speculative_tokens: int):
+        self.num_speculative_tokens = num_speculative_tokens
+
+    def use_dspark(self) -> bool:
+        return True
+
+
+class _EagleSpecConfig:
+    """Same surface, serial MTP / EAGLE: the drafter reads the successor."""
+
+    def __init__(self, num_speculative_tokens: int):
+        self.num_speculative_tokens = num_speculative_tokens
+        self.method = "eagle"
+
+    def use_dspark(self) -> bool:
+        return False
 
 
 class TestPostprocess:
@@ -1683,6 +2050,101 @@ class TestPostprocess:
             sched.engine_stats.num_generation_tokens == 2
         ), "the post-EOS token must not be counted"
 
+    @staticmethod
+    def _sched_with_kv_role(kv_config):
+        """Scheduler carrying a kv_transfer_config, without standing up a real
+        connector (Mooncake's needs a distributed config and open ports)."""
+        cfg = MockConfig(
+            speculative_config=_DSparkSpecConfig(3), kv_transfer_config=kv_config
+        )
+        with mock.patch(
+            "atom.utils.forward_context.get_kvconnector", return_value=None
+        ):
+            return Scheduler(cfg)
+
+    def test_a_pd_producer_does_not_speculate(self):
+        """The producer hands off after T0 and never proposes, so speculation
+        must be off: with it on, postprocess pads mtp_k placeholders that hold
+        num_tokens short of max_tokens and the handoff never fires."""
+        for kv_config in (
+            {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                ],
+            },
+        ):
+            sched = self._sched_with_kv_role(kv_config)
+            assert sched.use_spec is False
+            assert sched.mtp_k == 0
+            # DSpark does not read the successor, so the producer stays off it.
+            assert sched.drafter_needs_next_token is False
+
+    def test_an_eagle_producer_still_records_the_successor(self, seq_factory):
+        """Verification stays off; the successor token does not.
+
+        `use_spec` sizes the decode window. EAGLE's middle-chunk draft KV and
+        the DP alignment anchor both read `next_token_ids`, which is a
+        property of the drafter and has to survive on a producer.
+        """
+        cfg = MockConfig(
+            speculative_config=_EagleSpecConfig(3),
+            kv_transfer_config={
+                "kv_connector": "mooncake",
+                "kv_role": "kv_producer",
+            },
+            max_num_batched_tokens=6,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+            enable_chunked_prefill=True,
+        )
+        with mock.patch(
+            "atom.utils.forward_context.get_kvconnector", return_value=None
+        ):
+            sched = Scheduler(cfg)
+        assert sched.use_spec is False
+        assert sched.mtp_k == 0
+        assert sched.drafter_needs_next_token is True
+
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+        batch, _ = sched.schedule()
+        assert batch.total_tokens_num_prefill == 6
+        assert batch.next_token_ids == [6]
+
+    def test_a_pd_consumer_still_speculates(self):
+        sched = self._sched_with_kv_role(
+            {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+        )
+        assert sched.use_spec is True
+        assert sched.mtp_k == 3
+
+    def test_absent_drafts_leave_spec_token_ids_empty(self, seq_factory):
+        """A P/D producer runs with mtp_k set but never calls propose(): it
+        disables deferred output so the consumer consumes T0 once, and the
+        runner only drafts on the deferred path. postprocess used to index the
+        resulting None and take the prefill engine down on the first request."""
+        sched = Scheduler(MockConfig(speculative_config=_DSparkSpecConfig(3)))
+        assert sched.mtp_k == 3
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+
+        # What the runner emits with propose() skipped: counts are still real
+        # zero-filled arrays, only the drafts are absent.
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(10,)],
+                num_rejected=np.zeros(1, dtype=np.int32),
+                num_bonus=np.zeros(1, dtype=np.int32),
+                draft_token_ids=None,
+            ),
+        )
+
+        assert list(seq.spec_token_ids) == []
+
     def test_eos_finishes(self, scheduler, seq_factory):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         finished = scheduler.postprocess(
@@ -1744,6 +2206,452 @@ class TestPostprocess:
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
 
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    def test_producer_retains_blocks_until_send_finishes(self, seq_factory, pp_size):
+        # The claim lives on the connector, not on a producer branch here: the
+        # scheduler only asks `should_defer_free` and retires via `send_finished`.
+        sched = Scheduler(MockConfig(pipeline_parallel_size=pp_size))
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        pending_send: set[str] = set()
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True,
+            request_finished=lambda s: pending_send.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        sched.postprocess([seq], self._output(seq.id, [2]))
+
+        assert seq.block_table
+        assert not sched.is_finished()
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={seq.id})
+        )
+        assert not seq.block_table
+        assert sched.is_finished()
+
+    def test_per_request_state_without_capability_keeps_whole_request_deferred(
+        self, seq_factory
+    ):
+        sched = Scheduler(
+            MockConfig(
+                pool_entries={"state": 2},
+                pool_entries_per_req={"state": 1},
+            )
+        )
+        seq = self._prefill(
+            sched,
+            seq_factory([1, 2, 3, 4], has_per_req_cache=True),
+        )
+        pending: set[str] = set()
+        sched.kv_connector = SimpleNamespace(
+            request_finished=lambda s: pending.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending,
+            protected_block_ids=lambda _s: frozenset(),
+        )
+
+        sched.postprocess([seq], self._output(seq.id, [sched.eos_token_id]))
+
+        assert sched.deferred_free_blocks[seq.id] is seq
+        assert seq.block_table
+        assert seq.state_slot >= 0
+
+    @pytest.mark.parametrize("pp_size", [1, 4])
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize(
+        "tokens,max_tokens,stop_sequences",
+        [
+            ([7], 100, []),
+            ([2, 7], 100, []),
+            ([7, 8], 1, []),
+            ([7, 8], 100, [[7]]),
+            ([9, 8], 100, []),
+        ],
+        ids=["abort", "eos", "max_tokens", "stop_sequence", "stop_token"],
+    )
+    def test_an_aborted_producer_request_gets_its_blocks_back(
+        self,
+        seq_factory,
+        pp_size,
+        streaming,
+        tokens,
+        max_tokens,
+        stop_sequences,
+    ):
+        """The claim is conditional on `leave_reason`, so it must be set first.
+
+        A backend declines to claim an abort because an abort never sends and
+        nothing would ever retire the claim. That guard only works if
+        `postprocess` has assigned `seq.leave_reason` by the time it calls
+        `request_finished` -- it used to assign it afterwards, so every aborted
+        request on a producer node was claimed and then parked forever.
+        """
+        sched = Scheduler(
+            MockConfig(pipeline_parallel_size=pp_size, stop_token_ids=[9])
+        )
+        seq = self._prefill(
+            sched,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(max_tokens=max_tokens),
+                stop_token_sequences=stop_sequences,
+            ),
+        )
+        pending_send: set[str] = set()
+        seen_reasons: list = []
+
+        def _finish(s):
+            seen_reasons.append(getattr(s, "leave_reason", None))
+            if getattr(s, "leave_reason", None) != "aborted":
+                pending_send.add(str(s.id))
+
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True,
+            request_finished=_finish,
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        seq.status = SequenceStatus.ABORTED
+
+        stream = mock.Mock() if streaming else None
+        finished = sched.postprocess([seq], self._output(seq.id, tokens), stream)
+
+        assert finished == [seq]
+        assert seen_reasons == ["aborted"], "exactly once, with the reason settled"
+        assert not pending_send
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+        assert sched.is_finished()
+        # Cancellation now finishes before consuming sampled output; the
+        # engine delivers the terminal sequence through its output queue.
+        assert seq.num_tokens == seq.num_prompt_tokens
+        if streaming:
+            stream.put_nowait.assert_not_called()
+
+    def test_an_abort_retires_a_claim_the_backend_took_anyway(self, seq_factory):
+        """The scheduler does not depend on every backend re-deriving the guard.
+
+        Whether a send will be issued is the scheduler's knowledge; a backend
+        that claims unconditionally must not be able to strand the blocks.
+        """
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        pending_send: set[str] = set()
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True,
+            request_finished=lambda s: pending_send.add(str(s.id)),
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        seq.status = SequenceStatus.ABORTED
+
+        sched.postprocess([seq], self._output(seq.id, [7]), mock.Mock())
+
+        assert not pending_send, "the scheduler retired the claim itself"
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+
+    def test_the_release_tells_the_connector_its_blocks_are_back(self, seq_factory):
+        """`source_blocks_released`, not a second `request_finished`.
+
+        The offload schedulers key their save tracker on the *blocks*, so they
+        can only drop it at the release -- and the release must not re-arm the
+        P/D send claim that `request_finished` takes.
+        """
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        saving = {str(seq.id)}
+        finished: list = []
+        released: list = []
+        sched.kv_connector = SimpleNamespace(
+            is_producer=False,
+            request_finished=finished.append,
+            should_defer_free=lambda s: str(s.id) in saving,
+            source_blocks_released=released.append,
+        )
+
+        sched.postprocess([seq], self._output(seq.id, [2]), mock.Mock())
+        assert finished == [seq] and released == []
+        assert seq.id in sched.deferred_free_blocks
+
+        saving.clear()
+        sched._maybe_release_deferred(seq)
+
+        assert released == [seq], "the terminal the deferred path never reached"
+        assert finished == [seq], "and not by finishing the request a second time"
+        assert not seq.block_table
+
+    def test_producer_without_a_send_claim_frees_immediately(self, seq_factory):
+        # No claim -> nothing defers it. The old producer branch parked it
+        # anyway, waiting for a send that was never issued.
+        sched = Scheduler(MockConfig())
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+        sched.kv_connector = SimpleNamespace(
+            is_producer=True, should_defer_free=lambda s: False
+        )
+        sched.postprocess([seq], self._output(seq.id, [2]))
+
+        assert not seq.block_table
+        assert not sched.deferred_free_blocks
+        assert sched.is_finished()
+
+
+# ── chunked-prefill finality ───────────────────────────────────────────────
+
+
+class TestChunkedPrefillFinality:
+    """A prefill ends at the admitted length, not at the prompt boundary.
+
+    A sequence re-admitted after `preempt` has to recompute prompt *plus*
+    every token it had already generated, so `num_cached_tokens >=
+    num_prompt_tokens` is the normal state of one of its middle chunks. Ending
+    the prefill there leaves the rest of the context with no KV, and the
+    sequence then decodes against blocks still holding whatever the previous
+    owner wrote into them.
+    """
+
+    PROMPT = tuple(range(10, 18))  # 8 tokens
+    GENERATED = tuple(range(100, 112))  # 12 more to recompute -> 20 admitted
+
+    def _sched(self, max_num_batched_tokens=16):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=64,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seqs=4,
+            )
+        )
+
+    def _readmitted(self, sched, seq_factory):
+        """A sequence as `preempt` leaves it: back in `waiting`, owing a
+        prefill over prompt + everything it had generated."""
+        seq = seq_factory(self.PROMPT)
+        for token in self.GENERATED:
+            seq.append_token(token)
+        assert seq.num_tokens > seq.num_prompt_tokens
+        sched.add(seq)
+        return seq
+
+    @staticmethod
+    def _output(seq_id, tokens):
+        return ScheduledBatchOutput(
+            req_ids=[seq_id],
+            token_ids=[tuple(tokens)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+        )
+
+    def _batch(self, seq, chunk, cached, is_final):
+        return ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[chunk],
+            total_tokens_num=chunk,
+            total_tokens_num_prefill=chunk,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            num_cached_tokens=[cached],
+            is_final_chunk=is_final,
+        )
+
+    def test_schedule_measures_finality_against_the_admitted_length(self, seq_factory):
+        """The 337-token recompute split into 256 + 81 was declared complete
+        after the first chunk, because `256 >= 128` held against the prompt."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+
+        batch, _ = sched.schedule()
+        first = int(batch.num_scheduled_tokens[0])
+
+        assert first < seq.num_tokens
+        assert first >= seq.num_prompt_tokens, "the interesting case: past the prompt"
+        assert batch.is_final_chunk == [False]
+        # A batch of middle chunks yields no token for the head to consume.
+        assert batch.produces_output() is False
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+        batch2, _ = sched.schedule()
+
+        assert int(batch2.num_scheduled_tokens[0]) == seq.num_tokens - first
+        assert batch2.is_final_chunk == [True]
+
+    def test_postprocess_takes_finality_from_the_batch(self, seq_factory):
+        """`num_cached_tokens < num_prompt_tokens` is not a usable predicate
+        here: it calls this middle chunk final, and by the time postprocess
+        runs `num_tokens` may have grown by the sampled token, so neither
+        length is a valid bound."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        chunk = 16
+        batch, _ = sched.schedule()
+        assert int(batch.num_scheduled_tokens[0]) == chunk
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        assert seq.num_cached_tokens == chunk
+        assert seq.num_cached_tokens >= seq.num_prompt_tokens  # the length trap
+        assert seq.is_partial_prefill is True
+        assert sched._partial_prefill_count == 1
+        # A middle chunk's sampled token is not real output.
+        assert 99 not in list(seq.token_ids)
+
+    def test_postprocess_clears_partial_on_the_final_chunk(self, seq_factory):
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        sched.schedule()  # first chunk: 16 of the 20 admitted tokens
+        seq.num_cached_tokens = 16
+        seq.is_partial_prefill = True
+        sched._partial_prefill_count = 1
+        batch = self._batch(seq, chunk=4, cached=16, is_final=[True])
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        assert seq.num_cached_tokens == 20
+        assert seq.is_partial_prefill is False
+        assert sched._partial_prefill_count == 0
+
+    def test_postprocess_falls_back_to_lengths_without_the_field(self, seq_factory):
+        """The fallback is for callers that hand a batch without the field; the
+        scheduler itself always sets it."""
+        sched = self._sched()
+        seq = self._readmitted(sched, seq_factory)
+        sched.schedule()
+        seq.num_cached_tokens = 0
+        batch = self._batch(seq, chunk=4, cached=0, is_final=None)
+        assert batch.is_final_chunk is None
+
+        sched.postprocess(list(sched.running), self._output(seq.id, [99]), batch=batch)
+
+        # 4 < 8 prompt tokens, so the length comparison still says partial.
+        assert seq.is_partial_prefill is True
+
+
+# ── offload-resume admission ───────────────────────────────────────────────
+
+
+class TestOffloadResumeAdmission:
+    """An offload resume is sized by what it owes, not by its prompt.
+
+    A sequence re-admitted after `preempt` has to recompute prompt *plus* the
+    tokens it had already generated, and `_mark_offload_load_ready` sets
+    `num_cached_tokens` to whatever the tier returned, which is not bounded by
+    the prompt. Sized against `num_prompt_tokens` that width is non-positive:
+    `_prefill_chunk_for_budget` answers None and the sequence goes back to the
+    head of `waiting` with the loop broken -- every tick, forever.
+    """
+
+    PROMPT = tuple(range(8))
+    GENERATED = tuple(range(100, 112))  # owes 20 positions in total
+
+    def _sched(self, **overrides):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                **overrides,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+            # Reached only by a sequence that is not resuming: nothing on the
+            # tier for it, so nothing to park for and nothing to arm.
+            get_num_new_matched_tokens=lambda seq: (0, False),
+            update_state_after_alloc=lambda seq: None,
+        )
+        return sched
+
+    def _parked(self, sched, seq_factory, cached):
+        """A sequence as the offload connector leaves it: blocks still held
+        from the pre-park allocate, load reported, ready to resume."""
+        seq = seq_factory(self.PROMPT)
+        for token in self.GENERATED:
+            seq.append_token(token)
+        seq.block_table = [0, 1, 2, 3, 4]
+        seq.offload_loaded = True
+        seq.num_cached_tokens = cached
+        sched.waiting.append(seq)
+        return seq
+
+    def test_a_resume_past_the_prompt_boundary_is_admitted(self, seq_factory):
+        sched = self._sched()
+        # The tier came back with the prompt and four of the generated tokens.
+        seq = self._parked(sched, seq_factory, cached=12)
+        assert seq.num_cached_tokens > seq.num_prompt_tokens, "the failing case"
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "nothing scheduled: the resume was requeued"
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == seq.num_tokens - 12
+        assert not sched.waiting
+
+    def test_a_resume_at_exactly_the_prompt_boundary_is_admitted(self, seq_factory):
+        """The two failure modes differ by one token, and both are reachable
+        with chunked prefill on: a `num_prompt_tokens`-sized width is negative
+        above the boundary, which trips `_assert_positive_prefill_chunk`, and
+        exactly zero on it, which `_prefill_chunk_for_budget` reports as None
+        -- the silent requeue-and-break."""
+        sched = self._sched()
+        seq = self._parked(sched, seq_factory, cached=len(self.PROMPT))
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "the silent starvation case"
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == len(self.GENERATED)
+
+    def test_a_resume_the_tier_covered_entirely_is_admitted(self, seq_factory):
+        """The tier's lookup runs over the whole prompt and is not bounded
+        below it, unlike the HBM match whose loop stops one hash block short
+        precisely so a prefill always has something to forward. A first
+        admission whose prompt is wholly resident therefore arrives with
+        `num_cached_tokens == num_tokens`, and a width of zero is the silent
+        requeue-and-break again -- this time with nothing left to size."""
+        sched = self._sched()
+        seq = seq_factory(list(self.PROMPT))
+        seq.block_table = [0, 1, 2, 3, 4]
+        seq.offload_loaded = True
+        seq.num_cached_tokens = seq.num_tokens
+        sched.waiting.append(seq)
+
+        batch, scheduled = sched.schedule()
+
+        assert batch is not None, "nothing scheduled: the resume was requeued"
+        assert seq.id in scheduled
+        # One token still has to be forwarded: the first decode samples from
+        # the logits this prefill produces.
+        assert int(batch.num_scheduled_tokens[0]) >= 1
+        assert not sched.waiting
+
+    def test_a_resume_short_of_the_prompt_boundary_still_works(self, seq_factory):
+        """The same arithmetic on a first admission, where the two lengths
+        agree up to the generated tail."""
+        sched = self._sched()
+        seq = self._parked(sched, seq_factory, cached=4)
+
+        batch, scheduled = sched.schedule()
+
+        assert seq.id in scheduled
+        assert int(batch.num_scheduled_tokens[0]) == seq.num_tokens - 4
+
+    def test_it_does_not_starve_the_queue_behind_it(self, seq_factory):
+        """The symptom an operator sees: one resume at the head of `waiting`
+        holds up every request queued behind it, because the admission loop
+        `break`s rather than skipping."""
+        sched = self._sched()
+        self._parked(sched, seq_factory, cached=12)
+        behind = seq_factory([7, 7, 7, 7])
+        sched.add(behind)
+
+        _, scheduled = sched.schedule()
+
+        assert behind.id in scheduled, "starved behind the offload resume"
+
 
 # ── get_next_batch_info ────────────────────────────────────────────────────
 
@@ -1797,6 +2705,33 @@ class TestScheduledBatchPDFirstDecodeMTP:
         )
 
         assert list(batch.scheduled_tokens) == [t0, *drafts]
+
+    def test_window_starts_at_t0_when_the_producer_sent_no_drafts(self):
+        """The producer does not speculate, so the handoff carries T0 alone.
+        The window must still open at T0: unpadded, the trailing mtp_k+1 slice
+        reaches back into the prompt and verifies prompt tokens as drafts."""
+        mtp_k = 3
+        prompt = [11, 22, 33, 44, 55, 66]
+        t0 = 14
+        sched = Scheduler(MockConfig(speculative_config=_DSparkSpecConfig(mtp_k)))
+        seq = Sequence(prompt, block_size=16)
+        seq.kv_transfer_params = {"first_token_id": t0}
+
+        sched._schedule_first_decode_after_remote_kv(seq)
+        seq.type = SequenceType.DECODE
+
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+
+        assert next(iter(batch.scheduled_tokens)) == t0
+        assert not set(batch.scheduled_tokens) & set(prompt)
 
     def test_normal_decode_window_unchanged(self):
         """offset >= 0 path is byte-for-byte the trailing mtp_k+1 slice."""
@@ -1997,6 +2932,119 @@ class TestStalledOffloadSaveReclaim:
         # Notified with the string request id, matching the connector's sid keys.
         assert abandoned == ["1"]
 
+    def test_save_timeout_does_not_release_a_pending_producer_send(self, monkeypatch):
+        """Abandoning the save must not free a source the RDMA still reads.
+
+        The reclaimer drops offload's work, then re-asks the composite: an
+        unreported send keeps its claim, so the blocks stay put -- but the seq
+        stays stalled, so every later pass tries again. Giving up after the
+        first attempt (by clearing the stamp) is how a claim nobody would ever
+        answer -- an abort's above all -- lost its blocks for good.
+        """
+        import time as _time
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        pending_send = {"1"}
+        abandoned: list = []
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=abandoned.append,
+            should_defer_free=lambda s: str(s.id) in pending_send,
+            send_finished=lambda rid: pending_send.discard(str(rid)),
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector=connector)
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert not freed
+        assert seq.id in s.deferred_free_blocks
+        # Counted as abandoned though nothing was released, and still stamped so
+        # a later pass revisits it.
+        assert s._abandoned_saves == 1
+        assert abandoned == ["1"]
+        assert seq._deferred_save_at is not None
+
+        # A second pass retries the release without re-abandoning the save.
+        s._next_save_reconcile_at = 0.0
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert s._abandoned_saves == 1
+        assert abandoned == ["1"]
+
+        # Once the send reports, that retry is what collects the blocks.
+        connector.send_finished(1)
+        s._next_save_reconcile_at = 0.0
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [seq.id]
+        assert not s.deferred_free_blocks
+        assert seq._deferred_save_at is None
+
+    def test_a_connector_that_waits_for_reports_is_left_alone(
+        self, monkeypatch, caplog
+    ):
+        """LMCache MP cannot prove a stalled DMA stopped, keeps the blocks until
+        a report and fails stop itself at its deadline. Reclaim must neither
+        abandon it nor, after the retries, log it as a wedged P/D send."""
+        import logging
+        import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        abandoned: list = []
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=abandoned.append,
+            should_defer_free=lambda _seq: True,
+            waits_for_transfer_report=lambda _seq: True,
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector=connector)
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            for _ in range(sched_mod._RELEASE_WEDGE_ATTEMPTS + 1):
+                s._next_save_reconcile_at = 0.0
+                assert s._reconcile_stalled_deferred_saves() == 0
+        assert not abandoned and not freed
+        assert s._abandoned_saves == 0
+        assert seq.id in s.deferred_free_blocks
+        assert not caplog.records
+
+    def test_a_claim_nobody_will_retire_is_escalated(self, monkeypatch, caplog):
+        """The retry is not an escape hatch on its own, so it must be visible.
+
+        Dropping the save no longer guarantees the release: `abandon_save` does
+        not clear an active load, and a send whose report is never coming keeps
+        its claim. The reclaimer then retries forever with nothing to show for
+        it -- the same wedge it exists to prevent, only silent. One ERROR after
+        `_RELEASE_WEDGE_ATTEMPTS` passes is what makes it diagnosable.
+        """
+        import logging
+        import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
+
+        seq = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=lambda rid: None,
+            should_defer_free=lambda s: True,  # a claim that never clears
+        )
+        s, freed = self._sched(monkeypatch, [seq], connector=connector)
+
+        with caplog.at_level(logging.ERROR, logger=sched_mod.logger.name):
+            for _ in range(sched_mod._RELEASE_WEDGE_ATTEMPTS - 1):
+                s._next_save_reconcile_at = 0.0
+                s._reconcile_stalled_deferred_saves()
+            assert not caplog.records, "a merely slow send must not trip it"
+
+            s._next_save_reconcile_at = 0.0
+            s._reconcile_stalled_deferred_saves()
+            assert len(caplog.records) == 1
+            assert "[1]" in caplog.records[0].getMessage()
+
+            s._next_save_reconcile_at = 0.0
+            s._reconcile_stalled_deferred_saves()
+            assert len(caplog.records) == 1, "once per request, not once per pass"
+
+        assert not freed
+        assert s._abandoned_saves == 1, "the save is still only abandoned once"
+
     def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
         import time as _time
 
@@ -2182,3 +3230,49 @@ class TestTheTierSplitPartitionsServedReuse:
         with caplog.at_level(logging.INFO, logger="atom"):
             s._log_pools()
         assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("partial", [True, False])
+def test_cancel_without_sampled_output_releases_state_and_pages(partial):
+    from atom.model_engine.kv_block import STATE_SLOT_CLASS
+
+    config = MockConfig(
+        max_num_seqs=2,
+        max_model_len=64,
+        max_num_batched_tokens=4,
+        kv_cache_block_size=4,
+        num_kvcache_blocks=32,
+        pool_entries={STATE_SLOT_CLASS: 2},
+    )
+    scheduler = Scheduler(config)
+    seq = Sequence(list(range(1, 13 if partial else 5)), 4, has_per_req_cache=True)
+    scheduler.add(seq)
+    batch, seqs = scheduler.schedule()
+    empty = ScheduledBatchOutput(
+        req_ids=[],
+        token_ids=[],
+        num_rejected=None,
+        num_bonus=None,
+        draft_token_ids=None,
+        is_deferred_out=True,
+    )
+    scheduler.postprocess(list(seqs.values()), empty, batch=batch)
+    assert seq.is_partial_prefill == partial
+    assert seq.state_slot >= 0 and seq.block_table
+    scheduler.kv_connector = SimpleNamespace(
+        request_finished=mock.Mock(),
+        send_finished=mock.Mock(),
+        should_defer_free=lambda seq: False,
+    )
+    seq.status = SequenceStatus.ABORTED
+    # A completed middle chunk or deferred first decode carries no sampled
+    # token for this request. It must still drive the normal finish/free path.
+    finished = scheduler.postprocess([], empty)
+    assert finished == [seq]
+    assert seq.leave_reason == "aborted" and seq.status == SequenceStatus.FINISHED
+    assert seq.state_slot == -1 and not seq.block_table
+    assert scheduler._partial_prefill_count == 0
+    assert not scheduler.running
+    assert scheduler.total_finished_requests == 1
+    scheduler.kv_connector.request_finished.assert_called_once_with(seq)
+    scheduler.kv_connector.send_finished.assert_called_once_with(seq.id)

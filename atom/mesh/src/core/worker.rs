@@ -1693,7 +1693,6 @@ mod tests {
         let dp_aware_regular: Box<dyn Worker> = Box::new(
             DPAwareWorkerBuilder::new("http://dp:8080", 0, 2)
                 .worker_type(WorkerType::Regular)
-                .api_key("test_api_key")
                 .build(),
         );
         let dp_aware_prefill: Box<dyn Worker> = Box::new(
@@ -1701,13 +1700,11 @@ mod tests {
                 .worker_type(WorkerType::Prefill {
                     bootstrap_port: None,
                 })
-                .api_key("test_api_key")
                 .build(),
         );
         let dp_aware_decode: Box<dyn Worker> = Box::new(
             DPAwareWorkerBuilder::new("http://dp-decode:8080", 0, 4)
                 .worker_type(WorkerType::Decode)
-                .api_key("test_api_key")
                 .build(),
         );
 

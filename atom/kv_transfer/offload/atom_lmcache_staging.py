@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -61,40 +60,6 @@ class _StagingBuffer:
             self.free_event = torch.cuda.Event(blocking=False)
 
 
-def _env_flag(name: str, default: str = "0") -> bool:
-    # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
-    # flag inline, and a bare membership test reads the empty string as ON --
-    # the opposite of what the operator wrote. `VAR="off "` did the same.
-    raw = os.environ.get(name, default).strip().lower()
-    return bool(raw) and raw not in ("0", "false", "no", "off")
-
-
-def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}, got {value}")
-    return value
-
-
-def _env_optional_int(name: str, *, min_value: int = 1) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}, got {value}")
-    return value
-
-
 class _ThreadTransferState:
     def __init__(
         self,
@@ -146,11 +111,19 @@ def run_staged_pipeline(
     """
 
     staging_buffer = state.staging_buffer
+    # One stream orders the two stages by itself, so the handshake around them
+    # is a no-op -- but only semantically. Each of the four calls still enters
+    # the GPU runtime, and each of those releases the GIL and has to take it
+    # back; with a model co-resident that is about an interpreter switch
+    # interval apiece, charged per staging group. Skipping them is what makes
+    # the single-stream mode cheaper than the two-stream one, rather than
+    # merely differently ordered.
+    fenced = stage_a.stream is not stage_b.stream
     used_buffer = False
     buffer_safe_to_release = True
     try:
         for group in groups:
-            if staging_buffer.free_event_valid:
+            if fenced and staging_buffer.free_event_valid:
                 stage_a.stream.wait_event(staging_buffer.free_event)
             with state.stream_ctx(stage_a.stream):
                 # ``ensure_buffer`` may allocate device storage. Allocate it on
@@ -160,12 +133,16 @@ def run_staged_pipeline(
                 device_buf = ensure_buffer(staging_buffer, group_nbytes(group))
                 used_buffer = True
                 stage_a.run(group, device_buf)
-            staging_buffer.ready_event.record(stage_a.stream)
-            stage_b.stream.wait_event(staging_buffer.ready_event)
+            if fenced:
+                staging_buffer.ready_event.record(stage_a.stream)
+                stage_b.stream.wait_event(staging_buffer.ready_event)
             with state.stream_ctx(stage_b.stream):
                 stage_b.run(group, device_buf)
-            staging_buffer.free_event.record(stage_b.stream)
-            staging_buffer.free_event_valid = True
+            if fenced:
+                staging_buffer.free_event.record(stage_b.stream)
+                # Only ever true when an event was actually recorded: a stale
+                # event must never gate a later transfer.
+                staging_buffer.free_event_valid = True
             if stage_b_enqueued is not None:
                 stage_b_enqueued(group, stage_b.stream)
         stage_b.stream.synchronize()

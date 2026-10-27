@@ -36,12 +36,8 @@ on:
         description: "Benchmark DeepSeek-V4-Pro EPLB r0 + MegaMoE (8k1k, c=512/4096)"
         type: boolean
         default: true
-      glm-5-2-fp8:
-        description: "Benchmark GLM-5.2-FP8"
-        type: boolean
-        default: true
-      glm-5-2-mxfp4:
-        description: "Benchmark GLM-5.2-MXFP4 (+ MTP3)"
+      deepseek-v41-flash:
+        description: "Benchmark DeepSeek-V4.1-Flash DSpark (TP4, c<=64)"
         type: boolean
         default: true
       deepseek-r1-0528-mxfp4:
@@ -50,10 +46,6 @@ on:
         default: true
       gpt-oss-120b:
         description: "Benchmark gpt-oss-120b"
-        type: boolean
-        default: true
-      kimi-k27-code-mxfp4:
-        description: "Benchmark Kimi-K2.7-Code-MXFP4"
         type: boolean
         default: true
       kimi-k3:
@@ -84,9 +76,9 @@ on:
         description: "Extra arguments to pass to the ATOM server"
         type: string
       image:
-        description: "Image to use for the benchmark"
+        description: "Docker image; empty uses rocm/atom-dev:latest"
         type: string
-        default: "rocm/atom-dev:latest"
+        default: ""
       runner:
         description: "Optional runner label override for manual runs; leave empty to use model defaults"
         type: string
@@ -112,6 +104,10 @@ on:
         description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
         type: string
         default: ""
+      aiter_commit:
+        description: "ROCm/aiter commit SHA, tag, or branch to reinstall before benchmarking; leave empty to keep the image version"
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -135,10 +131,14 @@ jobs:
     outputs:
       configs_json: ${{ steps.build.outputs.configs_json }}
       has_cells: ${{ steps.build.outputs.has_cells }}
+      checkout_sha: ${{ steps.revision.outputs.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.atom_commit || github.ref }}
+          ref: ${{ inputs.atom_commit || github.sha }}
+      - name: Record checked-out commit
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - id: build
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -171,6 +171,7 @@ jobs:
       suffix: ${{ matrix.config.suffix }}
       model_path: ${{ matrix.config.model_path }}
       server_args: ${{ matrix.config.server_args }}
+      bench_kind: ${{ matrix.config.bench_kind }}
       bench_args: ${{ matrix.config.bench_args }}
       env_vars: ${{ matrix.config.env_vars }}
       runner: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.config.runner }}
@@ -183,7 +184,8 @@ jobs:
       enable_profiler: ${{ inputs.enable_profiler || false }}
       enable_rtl: ${{ inputs.enable_rtl || false }}
       extra_args: ${{ inputs.extra_args || '' }}
-      atom_commit: ${{ inputs.atom_commit || '' }}
+      atom_commit: ${{ needs.build-matrix.outputs.checkout_sha }}
+      aiter_commit: ${{ inputs.aiter_commit || '' }}
 
   summarize-benchmark-result:
     concurrency:
@@ -437,9 +439,17 @@ jobs:
           image: ${{ inputs.image || 'rocm/atom-dev:latest' }}
           container-name: atom-regression
           model-path: ${{ matrix.cell.model_path }}
+          runner: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.cell.runner }}
           env-vars: ${{ matrix.cell.env_vars }}
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           download-required: "false"
+
+      - name: Reinstall AITER from requested ref
+        if: ${{ inputs.aiter_commit != '' }}
+        env:
+          CONTAINER_NAME: atom-regression
+          AITER_GIT_REF: ${{ inputs.aiter_commit }}
+        run: bash .github/scripts/install_aiter_from_ref.sh
 
       - name: Launch server
         env:

@@ -37,55 +37,58 @@ from .tool_parser import (
 )
 
 _DSML = "｜DSML｜"
+
+
 # The model often DROPS the ``｜DSML｜`` marker and emits bare
 # ``<invoke name=...>``/``<parameter ...>``/``<tool_calls>`` tags, so the marker
 # is matched OPTIONALLY everywhere.
-_OPT = r"(?:" + re.escape(_DSML) + r")?"  # optional ｜DSML｜ prefix
-# The end-of-input alternative is what keeps the part of a value that
-# arrived before `max_tokens`; requiring `</parameter>` yielded `{}`.
-_PARAM_RE = re.compile(
-    r"<" + _OPT + r'parameter\s+name="(.*?)"(?:\s+string="(true|false)")?\s*>'
-    # The tool_calls? lookahead is the fifth terminator `parse_region` names:
-    # a value ends where the next call opens, or it swallows that call's
-    # wrapper as data.
-    r"(.*?)(?:</" + _OPT + r"parameter>"
-    r"|(?=<" + _OPT + r"parameter\s)"
-    r"|(?=</" + _OPT + r"invoke>)"
-    r"|(?=<" + _OPT + r"tool_calls?>)"
-    r"|\Z)",
-    re.DOTALL,
-)
-# Long-form `<invoke name="x">...</invoke>` OR self-closing `<invoke name="x"/>`
-# (the zero-arg shape; group(2) is None for self-closing). Matches SGLang's V4
-# detector, which accepts both.
-# A call's body may not contain another opener -- that literal is what opens
-# one. Without the guard the non-greedy body ran from a *quoted* opener in
-# prose all the way to the real call's closer, so an answer explaining
-# "you write <invoke name="NAME">" before making a real call produced one call named after the
-# placeholder, carrying the real call's arguments, with the sentence deleted.
-# `finditer` then resumed past the real call, so the call the model actually
-# made never went out. GLM was given this guard first; this is the sweep.
-_NOT_NESTED = r"(?:(?!<" + _OPT + r"invoke\s).)"
-# `closed | self-closing | unclosed`, in one pattern. Recovering truncation
-# in an `else:` under `if invokes:` instead meant no cut-off call could be
-# recovered once any complete invoke existed in the region -- the ordinary
-# `max_tokens` shape -- and it was not monotone in arrived bytes, which the
-# early announcement (`parse_region` over a prefix) requires.
-_INVOKE_RE = re.compile(
-    r"<"
-    + _OPT
-    + r'invoke\s+name="([^"]*)"\s*(?:/>|>('
-    + _NOT_NESTED
-    + r"*?)</"
-    + _OPT
-    + r"invoke>)"
-    + r"|<"
-    + _OPT
-    + r'invoke\s+name="([^"]*)"\s*>('
-    + _NOT_NESTED
-    + r"*)",
-    re.DOTALL,
-)
+def _compile_patterns(marker: str, section: str) -> tuple[re.Pattern, re.Pattern]:
+    """Compile the shared DSML recovery grammar for one tag spelling."""
+    optional = r"(?:" + re.escape(marker) + r")?"
+    param_re = re.compile(
+        r"<" + optional + r'parameter\s+name="(.*?)"(?:\s+string="(true|false)")?\s*>'
+        # The tool_calls? lookahead is the fifth terminator `parse_region` names:
+        # a value ends where the next call opens, or it swallows that call's
+        # wrapper as data.
+        r"(.*?)(?:</" + optional + r"parameter>"
+        r"|(?=<" + optional + r"parameter\s)"
+        r"|(?=</" + optional + r"invoke>)"
+        r"|(?=<" + optional + section + r">)"
+        r"|\Z)",
+        re.DOTALL,
+    )
+    # Long-form `<invoke name="x">...</invoke>` OR self-closing `<invoke name="x"/>`
+    # (the zero-arg shape; group(2) is None for self-closing). Matches SGLang's V4
+    # detector, which accepts both.
+    # A call's body may not contain another opener -- that literal is what opens
+    # one. Without the guard the non-greedy body ran from a *quoted* opener in
+    # prose all the way to the real call's closer, so an answer explaining
+    # "you write <invoke name="NAME">" before making a real call produced one call named after the
+    # placeholder, carrying the real call's arguments, with the sentence deleted.
+    # `finditer` then resumed past the real call, so the call the model actually
+    # made never went out. GLM was given this guard first; this is the sweep.
+    not_nested = r"(?:(?!<" + optional + r"invoke\s).)"
+    # `closed | self-closing | unclosed`, in one pattern. Recovering truncation
+    # in an `else:` under `if invokes:` instead meant no cut-off call could be
+    # recovered once any complete invoke existed in the region -- the ordinary
+    # `max_tokens` shape -- and it was not monotone in arrived bytes, which the
+    # early announcement (`parse_region` over a prefix) requires.
+    invoke_re = re.compile(
+        r"<"
+        + optional
+        + r'invoke\s+name="([^"]*)"\s*(?:/>|>('
+        + not_nested
+        + r"*?)</"
+        + optional
+        + r"invoke>)"
+        + r"|<"
+        + optional
+        + r'invoke\s+name="([^"]*)"\s*>('
+        + not_nested
+        + r"*)",
+        re.DOTALL,
+    )
+    return param_re, invoke_re
 
 
 def _unwrap_wrapper_args(args: Any, allowed: set) -> Any:
@@ -176,7 +179,7 @@ _CALL_CONTINUES = (
 
 
 def _is_truncated_call(
-    name: str, body: str, param_types: dict, *, at_end: bool
+    name: str, body: str, param_types: dict, tokens: tuple[str, ...], *, at_end: bool
 ) -> bool:
     """Is this unclosed `<invoke name=...>` a cut-off call, or prose?
 
@@ -188,13 +191,15 @@ def _is_truncated_call(
     if not declared_tools_allow(name, param_types):
         return False
     rest = body.lstrip()
-    return (not rest and at_end) or continues_a_call(
-        rest, _CALL_CONTINUES, arrived=not at_end
-    )
+    return (not rest and at_end) or continues_a_call(rest, tokens, arrived=not at_end)
 
 
 class DsmlParser(ToolCallParser):
     NAME: ClassVar[str] = "dsml"
+    DSML_PREFIX: ClassVar[str] = _DSML
+    SECTION: ClassVar[str] = "tool_calls"
+    PARAM_RE, INVOKE_RE = _compile_patterns(_DSML, r"tool_calls?")
+    CALL_CONTINUES: ClassVar[tuple[str, ...]] = _CALL_CONTINUES
     # Region-start markers, both marked and marker-less variants.
     START_MARKERS: ClassVar[tuple[str, ...]] = (
         "<" + _DSML + "tool_call",  # marked (covers tool_call / tool_calls)
@@ -244,12 +249,12 @@ class DsmlParser(ToolCallParser):
     @classmethod
     def render_call(cls, name: str, args: dict[str, str]) -> str:
         body = "".join(
-            f'<{_DSML}parameter name="{k}" string="true">{v}</{_DSML}parameter>'
+            f'<{cls.DSML_PREFIX}parameter name="{k}" string="true">{v}</{cls.DSML_PREFIX}parameter>'
             for k, v in args.items()
         )
         return (
-            f'<{_DSML}tool_calls><{_DSML}invoke name="{name}">'
-            f"{body}</{_DSML}invoke></{_DSML}tool_calls>"
+            f'<{cls.DSML_PREFIX}{cls.SECTION}><{cls.DSML_PREFIX}invoke name="{name}">'
+            f"{body}</{cls.DSML_PREFIX}invoke></{cls.DSML_PREFIX}{cls.SECTION}>"
         )
 
     @classmethod
@@ -262,7 +267,7 @@ class DsmlParser(ToolCallParser):
         # complete invokes start and end where their own matches do, one span
         # each.
         spans: list[tuple[int, int]] = []
-        invokes = list(_INVOKE_RE.finditer(region))
+        invokes = list(cls.INVOKE_RE.finditer(region))
         if invokes:
             for m in invokes:
                 closed = m.group(1) is not None
@@ -276,7 +281,7 @@ class DsmlParser(ToolCallParser):
                 if not usable_tool_name(name):
                     continue
                 if not closed and not _is_truncated_call(
-                    name, body, param_types, at_end=at_end
+                    name, body, param_types, cls.CALL_CONTINUES, at_end=at_end
                 ):
                     continue
                 spans.append(
@@ -290,7 +295,7 @@ class DsmlParser(ToolCallParser):
                     pm.group(1): _coerce(
                         pm.group(3), pm.group(2), types.get(pm.group(1))
                     )
-                    for pm in _PARAM_RE.finditer(body)
+                    for pm in cls.PARAM_RE.finditer(body)
                 }
                 # Direct-JSON parameter body (DSML "Format 2", also accepted by
                 # vLLM/SGLang): `<invoke name="x"> { "k": "v" } </invoke>` with no
@@ -334,7 +339,7 @@ class DsmlParser(ToolCallParser):
             # is why it went two rounds unseen while deleting 152 characters
             # of such an answer down to 18 and dispatching a name it had
             # invented.
-            matches = list(_PARAM_RE.finditer(region))
+            matches = list(cls.PARAM_RE.finditer(region))
             if matches and cls.markup_begin(region, matches[0].start()) == 0:
                 raw = {pm.group(1): (pm.group(3), pm.group(2)) for pm in matches}
                 # No `or "unknown"`: a signature matching nothing declared is

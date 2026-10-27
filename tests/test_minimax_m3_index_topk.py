@@ -8,6 +8,12 @@ against another kernel -- a comparison can only catch a defect the two
 implementations do not share, and the second implementation was removed once
 it lost.
 
+One test breaks that rule on purpose:
+`test_the_two_selectors_agree_where_the_dispatch_switches`. Two selectors are
+live again, chosen by row width, and the dispatch's whole claim is that the
+cheaper one computes the same answer -- so agreement between them is the
+property, not a stand-in for one.
+
 The whole file needs triton, because the module under test defines
 `@triton.jit` kernels and a decorator runs at import. CI has no triton, so
 nothing here runs there; a skip rather than a collection error, which would
@@ -21,6 +27,7 @@ import torch
 
 pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
 
+from atom.model_ops.minimax_m3 import index_topk as m
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_SCORE_MIN_BLOCKS,
     DECODE_SCORE_TARGET_GRID,
@@ -306,3 +313,252 @@ def test_emitted_order_is_full_blocks_by_score_then_the_partial_tail():
         expect += [0] * (TOPK * pages - len(expect))
         assert [int(v) for v in sbt[r]] == expect, f"row {r}"
         assert {int(v) for v in emitted[r] if v >= 0} == set(want)
+
+
+@gpu
+class TestMetadataRowBounds:
+    """`MiniMaxM3SparseMetadata.n_valid_column_per_row`, and what it selects.
+
+    The counts are `ceil(causal_len / SPARSE_BLOCK_SIZE)` repeated per index
+    head; the selection they enable still owes the forced-regime answer.
+    """
+
+    @staticmethod
+    def _want(causal, heads):
+        valid = torch.div(
+            causal + SPARSE_BLOCK_SIZE - 1, SPARSE_BLOCK_SIZE, rounding_mode="floor"
+        )
+        return valid.repeat(heads).to(torch.int32)
+
+    @staticmethod
+    def _dummy_slot_mapping():
+        return torch.zeros(1, dtype=torch.int64, device="cuda")
+
+    @pytest.mark.parametrize(
+        "qlens,prefixes",
+        [
+            ([1147] * 4, [0] * 4),
+            ([500, 600, 400, 700], [647, 580, 550, 600]),
+        ],
+    )
+    @pytest.mark.parametrize("heads", [1, 2])
+    def test_prefill_counts(self, qlens, prefixes, heads):
+        from atom.model_ops.minimax_m3.sparse_attn import make_sparse_prefill_metadata
+
+        kw = _inputs(qlens, prefixes, heads, "cuda")
+        md = make_sparse_prefill_metadata(
+            cu_seqlens_q=kw["cu_seqlens_q"],
+            seq_lens=kw["seq_lens"],
+            block_table=kw["block_table"],
+            slot_mapping=self._dummy_slot_mapping(),
+            max_query_len=kw["max_query_len"],
+            max_seq_len=kw["max_seq_len"],
+            num_prefills=len(qlens),
+            num_prefill_tokens=sum(qlens),
+            num_idx_heads=heads,
+        )
+        causal = torch.cat(
+            [torch.arange(p + 1, p + n + 1) for n, p in zip(qlens, prefixes)]
+        )
+        assert torch.equal(md.n_valid_column_per_row.cpu(), self._want(causal, heads))
+
+    @pytest.mark.parametrize("q_per_req", [1, 4])
+    @pytest.mark.parametrize("heads", [1, 2])
+    def test_decode_counts(self, q_per_req, heads):
+        from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+        batch, ctx = 4, 1677
+        kw = _inputs([q_per_req] * batch, [ctx - q_per_req] * batch, heads, "cuda")
+        md = make_sparse_decode_metadata(
+            seq_lens=kw["seq_lens"],
+            block_table=kw["block_table"],
+            slot_mapping=self._dummy_slot_mapping(),
+            max_seq_len=ctx,
+            max_query_len=q_per_req,
+            num_idx_heads=heads,
+        )
+        causal = (
+            torch.full((batch,), ctx - q_per_req).repeat_interleave(q_per_req)
+            + torch.arange(q_per_req).repeat(batch) + 1
+        )  # fmt: skip
+        assert torch.equal(md.n_valid_column_per_row.cpu(), self._want(causal, heads))
+
+    @pytest.mark.parametrize("q_per_req", [1, 4])
+    def test_narrow_rows_still_answer_with_the_bounds_published(self, q_per_req):
+        """Publishing the bounds must not change the answer where they are unused.
+
+        14 columns is under `_AITER_MIN_WIDTH_WITH_EMIT`, so Triton serves it
+        with a tensor in hand that it never reads -- the common decode shape.
+        """
+        from atom.model_ops.minimax_m3 import index_topk as m
+        from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+        batch, heads, ctx = 4, 1, 1677
+        kw = _inputs([q_per_req] * batch, [ctx - q_per_req] * batch, heads, "cuda")
+        md = make_sparse_decode_metadata(
+            seq_lens=kw["seq_lens"],
+            block_table=kw["block_table"],
+            slot_mapping=self._dummy_slot_mapping(),
+            max_seq_len=ctx,
+            max_query_len=q_per_req,
+            num_idx_heads=heads,
+        )
+        idx, _, sctx = m.minimax_m3_index_topk_decode(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            ctx, TOPK, INIT, LOCAL, heads, kw["sm_scale"],
+            emit_sparse_block_table=True, max_query_len=q_per_req,
+            n_valid_column_per_row=md.n_valid_column_per_row,
+        )  # fmt: skip
+        causal = (
+            torch.full((batch,), ctx - q_per_req).repeat_interleave(q_per_req)
+            + torch.arange(q_per_req).repeat(batch) + 1
+        )  # fmt: skip
+        TestForcedSelection._check(idx, sctx, causal)
+
+    def test_empty_batch_publishes_nothing(self):
+        from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+        i32 = {"dtype": torch.int32, "device": "cuda"}
+        md = make_sparse_decode_metadata(
+            seq_lens=torch.empty(0, **i32),
+            block_table=torch.empty((0, 4), **i32),
+            slot_mapping=self._dummy_slot_mapping(),
+            max_seq_len=0,
+            num_idx_heads=2,
+        )
+        assert md.n_valid_column_per_row is None
+
+
+@gpu
+class TestPerForwardHoist:
+    """`n_valid_column_per_row_for_forward`, the plugins' stand-in for the field.
+
+    One build per forward, no crosstalk between a hybrid batch's two phases,
+    and -- the load-bearing one -- a new owner builds fresh, since that is what
+    caching with no content key rests on.
+    """
+
+    class _Owner:
+        """Stands in for a framework's per-forward metadata / batch object."""
+
+    @staticmethod
+    def _call(owner, phase, batch, total_q, heads, decode_max_q):
+        from atom.model_ops.minimax_m3.index_topk import (
+            n_valid_column_per_row_for_forward,
+        )
+
+        i32 = {"dtype": torch.int32, "device": "cuda"}
+        if decode_max_q:
+            lens = torch.full((batch,), 1677, **i32)
+            starts = prefix = lens
+        else:
+            q = total_q // batch
+            starts = torch.arange(0, total_q + 1, q, **i32)
+            prefix = torch.zeros(batch, **i32)
+        return n_valid_column_per_row_for_forward(
+            owner,
+            phase,
+            starts,
+            prefix,
+            batch=batch,
+            total_q=total_q,
+            num_idx_heads=heads,
+            decode_max_q=decode_max_q,
+        )
+
+    def test_second_layer_reads_the_first_layer_s_tensor(self):
+        owner = self._Owner()
+        first = self._call(owner, "decode", 4, 4, 2, 1)
+        assert self._call(owner, "decode", 4, 4, 2, 1) is first
+
+    def test_the_two_phases_of_one_batch_do_not_share(self):
+        owner = self._Owner()
+        decode = self._call(owner, "decode", 4, 4, 2, 1)
+        prefill = self._call(owner, "prefill", 4, 512, 2, 0)
+        assert decode is not prefill
+        assert self._call(owner, "decode", 4, 4, 2, 1) is decode
+
+    def test_a_new_forward_builds_new(self):
+        first = self._call(self._Owner(), "decode", 4, 4, 2, 1)
+        assert self._call(self._Owner(), "decode", 4, 4, 2, 1) is not first
+
+    def test_an_owner_that_refuses_attributes_still_answers(self):
+        class Slotted:
+            __slots__ = ()
+
+        owner = Slotted()
+        got = self._call(owner, "decode", 4, 4, 2, 1)
+        # Correct, just rebuilt per layer: 1677 keys is 14 blocks of 128.
+        assert torch.equal(
+            got.cpu(),
+            torch.full((8,), -(-1677 // SPARSE_BLOCK_SIZE), dtype=torch.int32),
+        )
+        assert self._call(owner, "decode", 4, 4, 2, 1) is not got
+
+
+class TestSelectorDispatch:
+    """`_aiter_selector_wins`: which selector a row width is cheaper on.
+
+    The thresholds are a fit to measured device time (the table beside them);
+    what is asserted is only that it is applied as stated -- monotone in width,
+    stricter when the call also emits.
+    """
+
+    def test_narrow_rows_stay_on_triton(self):
+        for width in (1, 64, 512, m._AITER_MIN_WIDTH - 1):
+            assert not m._aiter_selector_wins(width, emit=False)
+            assert not m._aiter_selector_wins(width, emit=True)
+
+    def test_emission_raises_the_bar(self):
+        between = m._AITER_MIN_WIDTH
+        assert between < m._AITER_MIN_WIDTH_WITH_EMIT
+        assert m._aiter_selector_wins(between, emit=False)
+        assert not m._aiter_selector_wins(between, emit=True)
+
+    def test_wide_rows_take_aiter(self):
+        for width in (m._AITER_MIN_WIDTH_WITH_EMIT, 8192):
+            assert m._aiter_selector_wins(width, emit=False)
+            assert m._aiter_selector_wins(width, emit=True)
+
+
+@gpu
+def test_the_two_selectors_agree_where_the_dispatch_switches():
+    """Above the width threshold both paths must return the same selection.
+
+    The dispatch claims only that aiter computes the same answer more cheaply,
+    so agreement is the property. 262144 tokens is 2048 columns, the first
+    width `_aiter_selector_wins` takes with emission on.
+    """
+    from atom.model_ops.minimax_m3 import index_topk as m2
+    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+    if m2.topk_per_row_small_k is None:
+        pytest.skip("aiter's small-k selector is not installed")
+    batch, heads, ctx = 2, 1, m2._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE
+    kw = _inputs([1] * batch, [ctx - 1] * batch, heads, "cuda")
+    md = make_sparse_decode_metadata(
+        seq_lens=kw["seq_lens"],
+        block_table=kw["block_table"],
+        slot_mapping=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        max_seq_len=ctx,
+        max_query_len=1,
+        num_idx_heads=heads,
+    )
+
+    def run(bounds):
+        return m2.minimax_m3_index_topk_decode(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            ctx, TOPK, INIT, LOCAL, heads, kw["sm_scale"],
+            emit_sparse_block_table=True, max_query_len=1,
+            n_valid_column_per_row=bounds,
+        )  # fmt: skip
+
+    ait_idx, ait_bt, ait_ctx = run(md.n_valid_column_per_row)
+    tri_idx, tri_bt, tri_ctx = run(None)
+    rows = heads * batch
+    assert torch.equal(
+        torch.sort(ait_idx.reshape(rows, TOPK), dim=1).values,
+        torch.sort(tri_idx.reshape(rows, TOPK), dim=1).values,
+    )
+    assert torch.equal(ait_ctx, tri_ctx)
+    assert torch.equal(ait_bt, tri_bt)

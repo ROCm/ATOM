@@ -2,10 +2,12 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 
 import torch
 
 from atom.utils.forward_context import set_kv_cache_data
+from atom.utils.graph_holders import release_registered_graphs
 
 logger = logging.getLogger("atom")
 
@@ -24,18 +26,139 @@ _POOL_VIEW_ATTRS = (
 )
 
 
+# Both of these take the runner rather than being methods on the mixin below,
+# because its methods are called unbound on stand-ins that provide only the
+# attributes they touch -- `tests/test_rollout_memory_manager.py` hands
+# `_release_kv_cache` a `SimpleNamespace`.
+def sleep_keeps_memory_resident(runner) -> bool:
+    """Whether sleep should leave *runner*'s weights and KV pool allocated.
+
+    Keeping them costs the whole footprint the caller went to sleep to
+    reclaim, so it is opt-in (`Config.sleep_keeps_memory_resident`) rather
+    than the default for every non-eager deployment. What it buys is that
+    nothing a decode graph captured moves, so nothing has to be recaptured --
+    recapture is what faults under
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
+
+    Both reads go through `getattr`, and `enforce_eager` defaults to True,
+    i.e. to releasing: a host that defines neither gets the behaviour every
+    caller had before this option existed.
+    """
+    if getattr(runner, "enforce_eager", True):
+        return False
+    return bool(
+        getattr(getattr(runner, "config", None), "sleep_keeps_memory_resident", False)
+    )
+
+
+def release_cudagraphs(runner) -> None:
+    """Drop every captured graph *runner* holds, and mark them for recapture.
+
+    A graph replays the addresses it captured: every weight, and the base of
+    the KV pool. Whichever of the two a release frees, the graphs that
+    captured it can no longer be replayed, so both release paths come through
+    here. Releasing the KV pool alone -- what `AsyncLLMEngine.sleep(level=1)`
+    does, and the default level -- used to leave the graphs in place to be
+    replayed against a pool that had since been freed and reallocated.
+
+    The graphs sit in more than one store, and not all in the one the default
+    configuration fills: under TR_HYBRID the graphs are the model's token
+    graphs and `runner.req_graph` stays empty however much was
+    captured. So each store is asked separately and the answers are OR-ed --
+    "was anything captured" is not a question one store can answer. Gating the
+    whole function on one, which is what this used to do, made the release a
+    no-op on precisely the configuration whose fault it exists to prevent.
+    """
+    if getattr(runner, "enforce_eager", True):
+        return
+    released = _release_draft_graphs(runner)
+    released |= _release_manual_graphs(runner)
+    released |= _release_token_graphs(runner)
+    if not released:
+        return
+    # What `_recapture_cudagraphs_if_needed` gates on. Not `_graphs_backup_keys`:
+    # that list belongs to the manual store and is empty under TR_HYBRID, which
+    # is how the recapture came to be skipped there along with the release.
+    runner._graphs_released_for_sleep = True
+    logger.info(f"{runner.label}: CUDA graphs released for sleep")
+    _warn_if_recapture_will_fault(runner)
+
+
+def _release_draft_graphs(runner) -> bool:
+    """The drafter's recordings, one per captured batch.
+
+    Walked rather than registered, because this store is reachable from here. A
+    draft pass writes the KV it attends, so its recording holds the base of the
+    pool the way a decode graph does, and `ATOM_DRAFT_CUDAGRAPH` is on by
+    default. Wake recaptures them: `capture_cudagraph` ends in
+    `warmup_draft_graphs` with request graphs and token graphs alike.
+    """
+    drafter = getattr(runner, "drafter", None)
+    released = False
+    for pass_ in getattr(drafter, "draft_graphs", None) or ():
+        released |= bool(pass_.release_graphs())
+    if released:
+        logger.info(f"{runner.label}: draft CUDA graphs released for sleep")
+    return released
+
+
+def _release_manual_graphs(runner) -> bool:
+    """The whole-forward store a FULL capture fills: its request buckets
+    (`ReqGraph`, which holds the logits it recorded only weakly)."""
+    req_graph = runner.req_graph
+    if req_graph is None or not req_graph.keys():
+        return False
+    runner._graphs_backup_keys = list(req_graph.keys())
+    req_graph.release_graphs()
+    return True
+
+
+def _release_token_graphs(runner) -> bool:
+    """The token buckets, which their modules' `TokenGraph`s hold,
+    registered. The buckets go with their recordings (`TokenGraph.captured_sizes`),
+    so no step pads to one until the recapture records it anew -- one that
+    did would replay a graph holding the pool this release frees."""
+    dropped = release_registered_graphs()
+    if dropped:
+        logger.info(f"{runner.label}: {dropped} token graphs released for sleep")
+    return bool(dropped)
+
+
+def _warn_if_recapture_will_fault(runner) -> None:
+    """Say so before the fault, not after.
+
+    `expandable_segments` is what makes a recapture fault, and
+    `sleep_keeps_memory_resident` is the way out -- but it is opt-in, so the
+    default configuration walks into it. The failure handler in
+    `_recapture_cudagraphs_if_needed` only gets to speak once the recapture has
+    already gone wrong, and by then it has pinned the runner to eager.
+    """
+    if "expandable_segments" not in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+        return
+    if getattr(getattr(runner, "config", None), "sleep_keeps_memory_resident", False):
+        return
+    logger.warning(
+        f"{runner.label}: released CUDA graphs for sleep with "
+        f"PYTORCH_CUDA_ALLOC_CONF=expandable_segments set. Recapture on wake "
+        f"is what faults under expandable segments; set "
+        f"Config.sleep_keeps_memory_resident=True to keep the weights and the "
+        f"KV pool -- and so the graphs -- valid across sleep instead."
+    )
+
+
 class MemoryManagerMixin:
     """Mixin providing GPU memory lifecycle management for ModelRunner.
 
     Host class must provide:
       - self.model (nn.Module)
       - self.device (torch.device)
-      - self.config (Config) — with num_kvcache_blocks
+      - self.config (Config) — with num_kvcache_blocks and
+        sleep_keeps_memory_resident
       - self.kv_cache — KV cache tensor
       - self.enforce_eager (bool)
       - self.label (str)
       - self.tokenID_processor — tokenIDProcessor instance
-      - self.graphs (dict), self.graph_pool — CUDA graph state
+      - self.req_graph — the decode `ReqGraph` (CUDA graph state)
       - self.allocate_kv_cache(num_blocks) — method
       - self.capture_cudagraph() — method
       - self.get_num_blocks() — method
@@ -100,13 +223,15 @@ class MemoryManagerMixin:
     def _release_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
             return
+        if sleep_keeps_memory_resident(self):
+            logger.info(
+                f"{self.label}: sleep keeps the weights and the CUDA graphs "
+                f"resident (Config.sleep_keeps_memory_resident)"
+            )
+            return
         # Release CUDA graphs first — they hold references to weight memory
         # and prevent freeing GPU memory.
-        if not self.enforce_eager and hasattr(self, "graphs") and self.graphs:
-            self._graphs_backup_keys = list(self.graphs.keys())
-            self.graphs.clear()
-            self.graph_pool = None
-            logger.info(f"{self.label}: CUDA graphs released for sleep")
+        release_cudagraphs(self)
         # Discard GPU weight data but keep shape/dtype metadata so that
         # weight sync (SHM or IPC) can do param.data.copy_() later.
         # The weights are always overwritten after resume, so offloading
@@ -122,6 +247,12 @@ class MemoryManagerMixin:
 
     def _resume_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
+            return
+        if sleep_keeps_memory_resident(self) and not getattr(
+            self, "_weights_discarded", False
+        ):
+            # Nothing was released, so there is nothing to restore -- and the
+            # point of the option is that no parameter moves.
             return
         if getattr(self, "_weights_discarded", False):
             # Weights were discarded — allocate empty GPU tensors with the
@@ -144,6 +275,15 @@ class MemoryManagerMixin:
     def _release_kv_cache(self) -> None:
         if not hasattr(self, "kv_cache") or self.kv_cache is None:
             return
+        if sleep_keeps_memory_resident(self):
+            logger.info(
+                f"{self.label}: sleep keeps the KV pool resident "
+                f"(Config.sleep_keeps_memory_resident); clear_kv_cache() still "
+                f"zeroes it"
+            )
+            return
+        # The graphs captured the base of the pool this is about to free.
+        release_cudagraphs(self)
         self._kv_cache_num_blocks = self.config.num_kvcache_blocks
 
         # Clear per-module KV cache views that share the underlying storage.
@@ -197,6 +337,14 @@ class MemoryManagerMixin:
         return models
 
     def _resume_kv_cache(self) -> None:
+        # The matching half of the release guard: the pool was never freed, so
+        # there is nothing to re-allocate and rebind.
+        if (
+            sleep_keeps_memory_resident(self)
+            and getattr(self, "kv_cache", None) is not None
+        ):
+            return
+
         if (
             not hasattr(self, "_kv_cache_num_blocks")
             or self._kv_cache_num_blocks is None
@@ -204,19 +352,23 @@ class MemoryManagerMixin:
             logger.warning(f"{self.label}: No KV cache num_blocks to resume from")
             return
         saved_blocks = self._kv_cache_num_blocks
-        self._kv_cache_num_blocks = None
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        available_blocks = self.get_num_blocks()["num_kvcache_blocks"]
-        num_blocks = min(saved_blocks, available_blocks)
-        if num_blocks < saved_blocks:
-            logger.warning(
-                f"{self.label}: KV cache blocks reduced from {saved_blocks} to "
-                f"{num_blocks} due to changed GPU memory availability"
-            )
-        self.allocate_kv_cache(num_blocks)
+        # The size the pool slept at, not a fresh reading: `BlockManager`'s
+        # `BlockPool` is sized in the engine process from the startup count and
+        # nothing carries a wake-time one back, and the decode graphs were
+        # captured against the original pool.
+        free, total = torch.cuda.mem_get_info()
         logger.info(
-            f"{self.label}: KV cache re-allocated and bound ({num_blocks} blocks)"
+            f"{self.label}: re-allocating {saved_blocks} KV blocks "
+            f"({free / (1 << 30):.2f}GB free of {total / (1 << 30):.2f}GB)"
+        )
+        # After the allocation, which can now OOM: clearing it first would lose
+        # the only record of the size, and the next wake would then take the
+        # guard above and report success with no pool.
+        self.allocate_kv_cache(saved_blocks)
+        self._kv_cache_num_blocks = None
+        logger.info(
+            f"{self.label}: KV cache re-allocated and bound ({saved_blocks} blocks)"
         )
 
     def _recapture_cudagraphs_if_needed(self) -> None:
@@ -228,10 +380,17 @@ class MemoryManagerMixin:
 
         We only recapture when **both** weights and KV cache are on GPU
         (i.e., the model is fully ready for inference).
+
+        Nothing to do under `sleep_keeps_memory_resident`: nothing was
+        released, so the flag `release_cudagraphs` sets is absent and this
+        returns below. That flag, and not `_graphs_backup_keys`, because the
+        manual store is empty under TR_HYBRID whatever was captured -- keying on
+        it left the default configuration releasing nothing and, when the
+        release was fixed, would have left it recapturing nothing.
         """
-        if self.enforce_eager:
+        if getattr(self, "enforce_eager", True):
             return
-        if not hasattr(self, "_graphs_backup_keys") or not self._graphs_backup_keys:
+        if not getattr(self, "_graphs_released_for_sleep", False):
             return
         # Only recapture if both weights and KV cache are on GPU
         has_weights_on_gpu = any(p.is_cuda for p in self.model.parameters())
@@ -241,14 +400,33 @@ class MemoryManagerMixin:
         logger.info(f"{self.label}: Recapturing CUDA graphs after sleep/wake cycle")
         try:
             self.capture_cudagraph()
-            del self._graphs_backup_keys
+            self._graphs_released_for_sleep = False
+            # Absent when only the token-graph store had anything in it.
+            if hasattr(self, "_graphs_backup_keys"):
+                del self._graphs_backup_keys
             logger.info(f"{self.label}: CUDA graph recapture completed")
         except Exception:
             logger.exception(f"{self.label}: CUDA graph recapture failed")
             # Fall back to eager mode rather than crashing
             self.enforce_eager = True
-            self.graphs = {}
-            self.graph_pool = None
+            self.req_graph = None
+            self._graphs_released_for_sleep = False
             if hasattr(self, "_graphs_backup_keys"):
                 del self._graphs_backup_keys
             logger.warning(f"{self.label}: Falling back to enforce_eager=True")
+            # `sleep_keeps_memory_resident` reads `enforce_eager` first and
+            # answers False for an eager runner, which is right -- there are no
+            # graphs left to keep valid -- but it means an operator who set the
+            # option now silently gets the release-and-restore behaviour it was
+            # set to avoid. Say which of the two states we are in, because from
+            # here the option's log lines never appear again.
+            if getattr(
+                getattr(self, "config", None), "sleep_keeps_memory_resident", False
+            ):
+                logger.warning(
+                    f"{self.label}: Config.sleep_keeps_memory_resident is set "
+                    f"but now inert: with no captured graphs there is nothing "
+                    f"to keep valid, so sleep releases and restores the "
+                    f"weights and the KV pool as it would without the option. "
+                    f"Restart to recapture."
+                )

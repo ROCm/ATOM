@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ATOM benchmark v1 request",
+  "type": "object",
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "phase": {
+      "enum": [
+        "warmup",
+        "profiling",
+        "drain"
+      ]
+    },
+    "status": {
+      "enum": [
+        "success",
+        "error",
+        "cancelled"
+      ]
+    },
+    "start_ns": {
+      "type": "string",
+      "pattern": "^[0-9]+$"
+    },
+    "end_ns": {
+      "type": "string",
+      "pattern": "^[0-9]+$"
+    }
+  },
+  "required": [
+    "request_id",
+    "phase",
+    "status",
+    "start_ns",
+    "end_ns"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "success"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "ttft_s",
+          "e2el_s"
+        ],
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ttft_s": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "e2el_s": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        }
+      }
+    }
+  ]
+}

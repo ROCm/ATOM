@@ -60,9 +60,12 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.model_ops.activation import SiluAndMul
-from atom.model_ops.attention_mla import MLAModules, mla_min_query_heads
+from atom.model_ops.attention_mla import (
+    MLAModules,
+    mla_min_query_heads,
+    qrep_tp_override,
+)
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -70,88 +73,14 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    uses_mxfp4_n32k4_scale,
 )
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
-from atom.models.dspark_draft import DSparkDraftModel
+from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _effective_layer_quant
-from atom.utils import envs
 
 if TYPE_CHECKING:
     from atom.config import Config
-
-
-def _linear_out(output):
-    """ATOM quantized linears may return (tensor, scale); take the tensor."""
-    return output[0] if isinstance(output, tuple) else output
-
-
-class DSparkMarkovHead(nn.Module):
-    """Low-rank first-order Markov transition bias over the draft logits.
-
-    The full ``V x V`` transition matrix is factorized as ``B = W1 @ W2^T`` with
-    ``W1, W2 in R^{V x r}``. Given the previously sampled token ``x_{k-1}``, the
-    bias added to position ``k``'s base logits is ``W1[x_{k-1}] @ W2^T in R^V``.
-
-    Because the bias is added INSIDE a per-position softmax (a local correction,
-    not a global renormalization), per-token probabilities stay exact, which is
-    what lets speculative verification remain lossless.
-
-    Both tables stay replicated across TP ranks: the bias is added to the
-    full-vocab logits the shared LM head produces, so a sharded ``W2`` would have
-    to be gathered anyway. Same choice ATOM's V4 DSpark makes.
-    """
-
-    def __init__(self, vocab_size: int, rank: int):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.rank = rank
-        self.markov_w1 = nn.Embedding(vocab_size, rank)
-        self.markov_w2 = nn.Embedding(vocab_size, rank)
-        # Read once here rather than per sampled position: envs re-reads the
-        # environment on every attribute access.
-        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
-
-    def forward(self, token_ids: torch.Tensor):
-        """Args:
-            token_ids: [*]  ids of the previously sampled token x_{k-1}.
-        Returns:
-            logits_bias:  [*, V]  bias to add to the next position's logits.
-            markov_embed: [*, r]  W1[x_{k-1}].
-        """
-        markov_embed = self.markov_w1(token_ids)
-        # fp32 matmul: the bias enters the softmax that gates acceptance.
-        logits_bias = torch.matmul(
-            markov_embed.float(), self.markov_w2.weight.float().t()
-        )
-        return logits_bias, markov_embed
-
-    def sample_next(self, token_ids: torch.Tensor, base_logits: torch.Tensor):
-        """One greedy block position: the argmax of the biased logits, and W1[x].
-
-        The bias itself is never returned, which is what lets the fused path
-        skip materializing it: ``dspark_markov_argmax`` keeps ``W2`` bf16 and
-        reduces straight to ids, with the same fp32 accumulation the softmax
-        guarantee above asks for (see that module for the numerics argument).
-        ``markov_embed`` is still returned because V4's confidence head
-        consumes it.
-
-        Args:
-            token_ids:   [B]     ids of the previously sampled token x_{k-1}.
-            base_logits: [B, V]  this position's base logits.
-        Returns:
-            next_ids:     [B]     argmax over the biased logits.
-            markov_embed: [B, r]  W1[x_{k-1}].
-        """
-        if self.fused_sample:
-            markov_embed = self.markov_w1(token_ids)
-            next_ids = dspark_markov_argmax(
-                base_logits, markov_embed, self.markov_w2.weight
-            )
-            return next_ids, markov_embed
-        bias, markov_embed = self(token_ids)
-        # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
-        # .float() would only materialize it twice for the same sum.
-        return (base_logits + bias).argmax(dim=-1), markov_embed
 
 
 def _dspark_block_width(draft_config, atom_config) -> int:
@@ -229,6 +158,10 @@ class K3DSparkMLAAttention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.scaling = self.qk_head_dim**-0.5
 
+        # No-op unless QREP is on (see qrep_tp_override); the draft shares the
+        # target's DCP group, so this is all the wiring QREP needs here.
+        q_qrep_override = qrep_tp_override(tp_size)
+
         # q_a_proj and kv_a_proj_with_mqa share an input, so the checkpoint's two
         # weights load into one merged projection (see packed_modules_mapping).
         self.fused_qkv_a_proj = MergedReplicatedLinear(
@@ -250,6 +183,7 @@ class K3DSparkMLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
+            **q_qrep_override,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -385,9 +319,7 @@ class K3DSparkMLAAttention(nn.Module):
         (vLLM's reference computes the full projection here too, and offers a
         cross-layer fused fast path on top; that optimization is not ported.)
         """
-        kv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))[
-            ..., self.q_lora_rank :
-        ]
+        kv_lora = linear_out(self.fused_qkv_a_proj(ctx_hidden))[..., self.q_lora_rank :]
         # norm + rope + concat + store live behind one call so every cache
         # layout stays in the attention impl: the normal store hardcodes
         # attn_metadata.slot_mapping, which is the draft block's, not these
@@ -412,9 +344,7 @@ class K3DSparkMLAAttention(nn.Module):
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
-        qkv_lora = _linear_out(
-            self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
-        )
+        qkv_lora = linear_out(self.fused_qkv_a_proj(hidden_states, hidden_states_scale))
         q_lora, kv_c, k_pe = qkv_lora.split(
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -437,7 +367,7 @@ class K3DSparkMLAAttention(nn.Module):
             from atom.model_ops.linear import use_triton_gemm
             from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
 
-            if not use_triton_gemm():
+            if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
                 q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
                     q_lora.shape[0]
                 )
@@ -493,8 +423,8 @@ class K3DSparkMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
-        return _linear_out(
-            self.down_proj(self.act_fn(_linear_out(self.gate_up_proj(x, x_scale))))
+        return linear_out(
+            self.down_proj(self.act_fn(linear_out(self.gate_up_proj(x, x_scale))))
         )
 
 
@@ -682,7 +612,7 @@ class KimiK3DSpark(DSparkDraftModel):
         the same projected tensor to all five, which each apply their own KV
         projection to it.
         """
-        return self.context_norm(_linear_out(self.context_proj(aux_concat)))
+        return self.context_norm(linear_out(self.context_proj(aux_concat)))
 
     @property
     def context_layers(self):
@@ -780,7 +710,8 @@ class KimiK3DSpark(DSparkDraftModel):
         out_ids[:, 0] = anchor_ids
         for k in range(T):
             # Greedy: temperature/sampling is applied by the target's verify.
-            out_ids[:, k + 1], _ = self.markov_head.sample_next(
-                out_ids[:, k], base_logits[:, k]
+            # The column is the op's destination, so no id is written twice.
+            self.markov_head.sample_next(
+                out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
             )
         return out_ids[:, 1:]

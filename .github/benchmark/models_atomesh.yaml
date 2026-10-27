@@ -46,12 +46,13 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/DeepSeek-V4-Pro/"
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro/"
     precision: FP4
     env:
       common:
         AITER_BF16_FP8_MOE_BOUND: "0"
         ATOM_MOE_GU_ITLV: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
     server:
@@ -178,19 +179,29 @@ models:
 
   GLM-5.2-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/GLM-5.2-MXFP4"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/GLM-5.2-MXFP4"
     precision: MXFP4
     env:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         AITER_USE_FLYDSL_MOE_SORTING: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
+    env_by_runner:
+      # Spur MI350X hosts have 1007 GiB per NUMA node and GPUs 0-3 all sit on
+      # NUMA0. Measured MoE staging is ~80-96 GiB/rank (~360 GiB for cpp4), so
+      # suites' 256 and the earlier 210 GiB/rank LMCache caps still overflow
+      # NUMA0 (4*212 + 360 > 1007). Cap at 160 GiB/rank (~647 GiB LMCache +
+      # staging fits with headroom).
+      atomesh-cicd-mi350:
+        prefill:
+          LMCACHE_MAX_LOCAL_CPU_SIZE: "160"
     service:
       prefill:
-        cudagraph_mode: FULL_AND_PIECEWISE
+        cudagraph_mode: FULL
       decode:
-        cudagraph_mode: FULL_AND_PIECEWISE
+        cudagraph_mode: FULL
     server:
       common_args:
         trust_remote_code: true
@@ -216,10 +227,15 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
-            decode:
+            decode: &glm52_agentic_lmcache_cpp4_dcp4_env_decode
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -245,7 +261,11 @@ models:
 
         # Keep each AgentX concurrency in its own job so every measurement starts
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
-        - <<: &glm52_agentic_tp4_tp4
+
+        # 1) CPP4 prefill (PP4 x TP1) paired with TP4+DCP4 decode on one node.
+        #    MTP3 with fixed acceptance length 2.99 (standalone DCP recipe at C48).
+        - &glm52_agentic_lmcache_cpp4_dcp4
+          <<: &glm52_agentic_tp4_tp4
             topology: 1p1d
             pd_worker_layout: single_node
             nodes: "${ATOMESH_1P1D_NODES}"
@@ -255,26 +275,28 @@ models:
               common_args: &glm52_agentic_args
                 kv_cache_dtype: fp8
                 block_size: 16
-                gpu_memory_utilization: 0.9
+                gpu_memory_utilization: 0.95
                 max_model_len: ""
                 max_num_seqs: 512
                 enable_prefix_caching: true
                 decode_max_num_seqs: 512
-                max_num_batched_tokens: ""
-                decode_max_num_batched_tokens: ""
+                max_num_batched_tokens: 16384
+                decode_max_num_batched_tokens: 16384
                 online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
-            prefill:
+                extra_args: "--method mtp --num-speculative-tokens 5 --spec-decode-acceptance-length 3.61"
+            prefill: &glm52_agentic_tp4_worker
               workers: 1
               tp: 4
-            decode:
-              workers: 1
-              tp: 4
-              cudagraph: none
+              cudagraph: "[1,2]"
+            decode: *glm52_agentic_tp4_worker
             env:
+              common:
+                MC_DISABLE_HIP: "1"
+                PYTHONNOUSERSITE: "1"
+                PYTHONHASHSEED: "0"
               prefill:
                 HIP_VISIBLE_DEVICES: "0,1,2,3"
               decode:
-                MAX_JOBS: "16"
                 HIP_VISIBLE_DEVICES: "4,5,6,7"
             benchmark: &agentic_1m_aiperf
               kind: aiperf_agentic
@@ -300,54 +322,155 @@ models:
               wait_server_timeout: 4500
               wait_router_timeout: 600
             run_eval: false
-          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
-          concurrency: [1]
-          server:
-            common_args: &glm52_agentic_mtp_args
-              <<: *glm52_agentic_args
-              extra_args: "--method mtp --num-speculative-tokens 4 --spec-decode-acceptance-rate 0.5825"
-
-        - <<: *glm52_agentic_tp4_tp4
-          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
-          concurrency: [2]
-          server:
-            common_args: *glm52_agentic_mtp_args
-
-        - <<: *glm52_agentic_tp4_tp4
-          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
-          concurrency: [4]
-          server:
-            common_args: *glm52_agentic_mtp_args
-
-        - <<: *glm52_agentic_tp4_tp4
-          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
-          concurrency: [8]
-          server:
-            common_args: *glm52_agentic_mtp_args
-
-        # CPP4 prefill (PP4 x TP1) paired with TP4+DCP4 decode on one node.
-        - &glm52_agentic_lmcache_cpp4_dcp4
-          <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48
           topology: 1p1d_cpp4_dcp4
           pd_worker_layout: single_node
           concurrency: [48]
+          server:
+            common_args: &glm52_agentic_lmcache_cpp4_dcp4_args
+              kv_cache_dtype: fp8
+              block_size: 16
+              max_num_seqs: 512
+              enable_prefix_caching: true
+              decode_max_num_seqs: 512
+              max_model_len: ""
+              max_num_batched_tokens: ""
+              decode_max_num_batched_tokens: ""
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}'
+              gpu_memory_utilization: 0.85
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.99"
+          prefill:
+            workers: 1
+            tp: 1
+            cudagraph: none
+            # uvicorn's 5 s keep-alive default is shorter than the router's
+            # 50 s pool idle timeout; a request sent on a socket the server just
+            # closed makes the router retry P+D and orphans the first KV.
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192 --timeout-keep-alive 900"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+            # Decode memory bundle (with AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+            # below): about 28% more decode KV blocks. The retained prefix pool
+            # keeps P->D re-pulls down, and decode KV caps the request rate
+            # once prefill keeps up. MTP decode batches stay far below 2048
+            # tokens.
+            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL --gpu-memory-utilization 0.94 --max-num-batched-tokens 2048 --timeout-keep-alive 900"
+          env:
+            common: &glm52_agentic_lmcache_cpp4_dcp4_env_common
+              MC_DISABLE_HIP: "1"
+              ATOM_MLA_PAGE_SIZE: "1"
+              ATOM_ONLINE_QUANT_STREAMING: "0"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
+              ATOM_USE_TRITON_MLA: "0"
+              MAX_JOBS: "16"
+              PYTHONHASHSEED: "0"
+              TOPK_FORCE_PATH: "one"
+            prefill: &glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: "auto"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              # Every PP stage runs a lookup server so each stage refreshes its
+              # own LRU; with only stage 0 looking up, stages 1-3 evict FIFO
+              # and loads fail all-or-nothing once the CPU tier is full.
+              LMCACHE_LOOKUP_SERVER_WORKER_IDS: "0,1,2,3"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              <<: &glm52_cpp4_dcp4_decode_env
+                HIP_VISIBLE_DEVICES: "4,5,6,7"
+                # Ranks share identical communicator groups instead of creating
+                # duplicates, freeing decode memory for KV.
+                AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+                DECODE_KV_TRANSFER_CONFIG: >-
+                  {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+              # Decode GPUs 4-7 sit on other rails than prefill GPUs 0-3, and
+              # Spur MI350X rails do not route to each other (QP->RTR times
+              # out). Registering decode memory on every HCA lets
+              # MC_ENABLE_DEST_DEVICE_AFFINITY pick the prefill GPU's rail.
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          env_by_runner:
+            # MI350X ionic NICs: under DCP4 load (every request fans out to
+            # all 4 decode ranks) Mooncake's default transport settings hit
+            # "ionic_comp_msn: wqe is not posted" after ~20 requests and then
+            # spin on CQ poll errors, flooding the log. One QP per endpoint
+            # alone does not avoid it; with a single worker per context, a
+            # smaller WR depth and no relaxed ordering it does not occur.
+            # Both sides must use the same QP count to connect.
+            atomesh-cicd-mi350:
+              common:
+                MC_NUM_QP_PER_EP: "1"
+                MC_WORKERS_PER_CTX: "1"
+                MC_MAX_WR: "64"
+                MC_IB_PCI_RELAXED_ORDERING: "0"
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c64
+          concurrency: [64]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c72
+          concurrency: [72]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c80
+          concurrency: [80]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c96
+          concurrency: [96]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c112
+          concurrency: [112]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c128
+          concurrency: [128]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c144
+          concurrency: [144]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c160
+          concurrency: [160]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c192
+          concurrency: [192]
+
+        # 2-3) 1P1D: CPP4 prefill (PP4×TP1, GPU 0-3) + DPA4 decode (dp4×tp1,
+        # GPU 4-7) on a single node. MTP4 with fixed acceptance length 3.33.
+        # dp_sticky session-affinity routing via is_agentic_dpa().
+        - &glm52_agentic_lmcache_cpp4_dpa4_1p1d
+          <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c36
+          topology: 1p1d_cpp4_dpa4
+          display_topology: 1P1D-CPP4-DPA4-MTP4
+          pd_worker_layout: single_node
+          concurrency: [36]
           server:
             common_args:
               kv_cache_dtype: fp8
               block_size: 16
               max_num_seqs: 512
               enable_prefix_caching: true
-              decode_max_num_seqs: 512
-              # Empty means "do not pass the flag", so the model config's own
-              # context length applies. The 16384 the model defaults carry would
-              # truncate this suite's 1M agentic traces.
+              decode_max_num_seqs: 128
               max_model_len: ""
               max_num_batched_tokens: ""
               decode_max_num_batched_tokens: ""
-              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
-              gpu_memory_utilization: 0.85
-              extra_args: "--level 3 --method mtp --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.6633"
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}'
+              gpu_memory_utilization: 0.9
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 4 --spec-decode-acceptance-length 3.33"
           prefill:
             workers: 1
             tp: 1
@@ -356,36 +479,24 @@ models:
           decode:
             workers: 1
             tp: 4
-            cudagraph: >-
-              [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
-            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16]"
+            extra_args: >-
+              --enable-dp-attention
+              --dp-load-balance least_requests
+              --cudagraph-mode FULL
           env:
             common:
-              ATOM_MLA_PAGE_SIZE: "1"
-              ATOM_ONLINE_QUANT_STREAMING: "0"
+              MC_DISABLE_HIP: "1"
               ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
-              ATOM_USE_TRITON_MLA: "0"
-              MAX_JOBS: "16"
               PYTHONHASHSEED: "0"
-              TOPK_FORCE_PATH: "one"
+              MAX_JOBS: "16"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
               VLLM_PP_LAYER_PARTITION: "20,20,20,18"
               LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: "auto"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
-              # NVMe (L3) tier under the CPU hot cache. Both variables are
-              # required together; LMCACHE_MAX_LOCAL_CPU_SIZE must stay > 0
-              # because LocalDiskBackend stages through the host allocator.
-              # scale_cpu_size_for_pp splits only the CPU budget across PP
-              # stages, so this size is per rank: 4 x 500GiB on a pp4 prefill.
-              # pd_server_atom.sh empties the directory around the run.
-              # The path follows the default atomesh-cicd fleet, where /mnt is
-              # local and already holds ATOMESH_MODEL_ROOT. The mi350 and crusoe
-              # fleets keep their models on /data and /shared_nfs instead, so a
-              # dispatch onto those needs this pointed at their own local disk.
-              LMCACHE_LOCAL_DISK: "/mnt/lmcache-job"
-              LMCACHE_MAX_LOCAL_DISK_SIZE: "500"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
@@ -393,59 +504,366 @@ models:
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
 
-        - <<: *glm52_agentic_lmcache_cpp4_dcp4
-          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c32
-          concurrency: [32]
-
-        - <<: *glm52_agentic_lmcache_cpp4_dcp4
-          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c40
+        - <<: *glm52_agentic_lmcache_cpp4_dpa4_1p1d
+          name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c40
           concurrency: [40]
 
-        - <<: *glm52_agentic_lmcache_cpp4_dcp4
-          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c56
-          concurrency: [56]
-
-        - &glm52_agentic_lmcache_tp4_dpa
+        # 4-5) 1P2D: CPP4 prefill (PP4×TP1, node 0) paired with 2× DPA4 decode
+        # (dp4×tp1 each, node 1 GPU 0-3 and GPU 4-7). MTP4 with fixed
+        # acceptance length 3.33. dp_sticky session-affinity routing via
+        # is_agentic_dpa(). RDMA between nodes for KV transfer.
+        - &glm52_agentic_lmcache_cpp4_dpa4_1p2d
           <<: *glm52_agentic_tp4_tp4
-          name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24
-          topology: 1p1d_dpa
-          pd_worker_layout: single_node
-          concurrency: [24]
+          name: glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c48
+          topology: 1p2d_cpp4_dpa4
+          display_topology: 1P2D-CPP4-DPA4-MTP4
+          pd_worker_layout: decode_single_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [48]
+          server:
+            common_args:
+              kv_cache_dtype: fp8
+              block_size: 16
+              max_num_seqs: 512
+              enable_prefix_caching: true
+              decode_max_num_seqs: 128
+              max_model_len: ""
+              max_num_batched_tokens: ""
+              decode_max_num_batched_tokens: ""
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}'
+              gpu_memory_utilization: 0.9
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 4 --spec-decode-acceptance-length 3.33"
           prefill:
             workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 2
             tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16]"
             extra_args: >-
               --enable-dp-attention
-              --attn-prefill-chunk-size 131072
-              --long-prefill-token-threshold 131072
-          decode:
-            workers: 1
-            tp: 4
-            cudagraph: none
-            extra_args: "--enable-dp-attention"
+              --dp-load-balance least_requests
+              --cudagraph-mode FULL
           env:
             common:
+              MC_DISABLE_HIP: "1"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
               PYTHONHASHSEED: "0"
+              MAX_JOBS: "16"
             prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
               LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: "auto"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-              HIP_VISIBLE_DEVICES: "0,1,2,3"
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
+
+        - <<: *glm52_agentic_lmcache_cpp4_dpa4_1p2d
+          name: glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c56
+          concurrency: [56]
+
+      # 6-8) 1P3D: CPP4 prefill with pure TP4+MTP5 decodes (no DCP).
+      # Packed layout fills 8-GPU nodes prefill-first; 1P3D uses 2 nodes.
+      # Aligned with the standalone TP4 recipe.
+      agentic_multi_decode:
+        - &glm52_agentic_cpp4_tp4_mtp5
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c12
+          topology: 1p3d_cpp4_tp4_mtp5
+          pd_worker_layout: packed_nodes
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [12]
+          router:
+            policy: cache_aware
+            balance_abs_threshold: 2
+          server:
+            common_args:
+              <<: &glm52_agentic_cpp4_tp4_mtp5_args
+                <<: *glm52_agentic_lmcache_cpp4_dcp4_args
+                online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}'
+                extra_args: "--level 3 --method mtp --num-speculative-tokens 5 --spec-decode-acceptance-length 3.61"
+                decode_max_num_batched_tokens: 16384
+              decode_max_num_seqs: 24
+          decode:
+            <<: &glm52_agentic_tp4_mtp5_decode
+              tp: 4
+              extra_args: "--gpu-memory-utilization 0.95 --cudagraph-mode FULL --disable-uvicorn-access-log"
+            workers: 3
+            cudagraph: "[1,2,4,8,12,16,20,24]"
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
+              TOPK_FORCE_PATH: "one"
+            decode:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_decode
+              PYTHONNOUSERSITE: "1"
+              MC_DISABLE_HIP: "1"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16
+          topology: 1p3d_cpp4_tp4_mtp5
+          concurrency: [16]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 32
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 3
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32]"
+
+        - <<: *glm52_agentic_cpp4_tp4_mtp5
+          name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c24
+          topology: 1p3d_cpp4_tp4_mtp5
+          concurrency: [24]
+          server:
+            common_args:
+              <<: *glm52_agentic_cpp4_tp4_mtp5_args
+              decode_max_num_seqs: 48
+          decode:
+            <<: *glm52_agentic_tp4_mtp5_decode
+            workers: 3
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
+
+        # 1P1D with a full node per role (multi_node, 2 nodes) and a TP8+DCP8
+        # decode. MTP3 with fixed acceptance length 2.99, the standalone DCP
+        # recipe's depth for C48 and above; each of the 8 prefill ranks gets
+        # 256 GiB of LMCache CPU tier.
+        # TP8+DCP8 prefill: DCP on the prefill side runs MTP draft steps after
+        # a prefill target step, which needs the per-token DCP block table.
+        - &glm52_agentic_dcp8_dcp8
+          name: glm-52-mxfp4-1p1d-dcp8-dcp8-agentic-lmcache-1m-c96
+          topology: 1p1d_dcp8_dcp8
+          display_topology: 1P1D-DCP8-DCP8-MTP3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [96]
+          server:
+            common_args: &glm52_agentic_dcp8_args
+              kv_cache_dtype: fp8
+              block_size: 16
+              max_num_seqs: 512
+              enable_prefix_caching: true
+              decode_max_num_seqs: 512
+              max_model_len: ""
+              max_num_batched_tokens: ""
+              decode_max_num_batched_tokens: ""
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}'
+              gpu_memory_utilization: 0.85
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.99"
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            cudagraph: none
+            extra_args: "--enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            cudagraph: >-
+              [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+            extra_args: "--cudagraph-mode FULL"
+          env:
+            common: &glm52_agentic_dcp8_env_common
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
+              ATOM_MLA_PAGE_SIZE: "1"
+              ATOM_ONLINE_QUANT_STREAMING: "0"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
+              ATOM_USE_TRITON_MLA: "0"
               MAX_JOBS: "16"
-              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              PYTHONHASHSEED: "0"
+              TOPK_FORCE_PATH: "one"
+            prefill: &glm52_agentic_dcp8_env_prefill
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: "auto"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode: &glm52_agentic_dcp8_env_decode
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
+          run_eval: false
 
-        - <<: *glm52_agentic_lmcache_tp4_dpa
-          name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32
-          concurrency: [32]
+        # Same decode, CPP8 prefill (PP8 x TP1). 78 target layers split 10x7 + 8;
+        # the last stage also hosts the MTP layer, as in the CPP4 20,20,20,18 split.
+        - <<: *glm52_agentic_dcp8_dcp8
+          name: glm-52-mxfp4-1p1d-cpp8-dcp8-agentic-lmcache-1m-c96
+          topology: 1p1d_cpp8_dcp8
+          display_topology: 1P1D-CPP8-DCP8-MTP3
+          prefill: &glm52_agentic_cpp8_prefill
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 8 --enforce-eager --max-num-batched-tokens 8192"
+          env: &glm52_agentic_cpp8_env
+            common: *glm52_agentic_dcp8_env_common
+            prefill:
+              <<: *glm52_agentic_dcp8_env_prefill
+              VLLM_PP_LAYER_PARTITION: "10,10,10,10,10,10,10,8"
+            decode: *glm52_agentic_dcp8_env_decode
 
-        - <<: *glm52_agentic_lmcache_tp4_dpa
-          name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
+      # Manual accuracy suite: the two deployments above, GSM8K only and without
+      # forced acceptance, which would otherwise commit draft tokens the target
+      # rejected. 20-shot prompts (~3.5k tokens) exceed the DSA top-k of 2048, so
+      # the sparse indexer's selection -- and on CPP8 its top-k handoff across PP
+      # stages -- decides what each token attends to.
+      accuracy:
+        - &glm52_dcp8_dcp8_gsm8k
+          <<: *glm52_agentic_dcp8_dcp8
+          name: glm-52-mxfp4-1p1d-dcp8-dcp8-gsm8k-only-c64
+          isl: [4096]
+          osl: 1024
+          concurrency: [64]
+          server:
+            common_args:
+              <<: *glm52_agentic_dcp8_args
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3"
+          benchmark:
+            kind: random
+            wait_server_timeout: 5400
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            eval_concurrency: [64]
+            model_type: local-completions
+            endpoint: completions
+            # Single-node GLM-5.2-MXFP4 GSM8K threshold (baseline 0.9447).
+            threshold: 0.92
+
+        - <<: *glm52_dcp8_dcp8_gsm8k
+          name: glm-52-mxfp4-1p1d-cpp8-dcp8-gsm8k-only-c64
+          topology: 1p1d_cpp8_dcp8
+          display_topology: 1P1D-CPP8-DCP8-MTP3
+          prefill: *glm52_agentic_cpp8_prefill
+          env: *glm52_agentic_cpp8_env
+
+      # The nightly lmcache-1m cells with their prefix tier in a Mooncake Store
+      # and no LMCache anywhere: ATOM's mooncake_store offload connector moves
+      # each PP stage's 256-token KV chunks between its GPU and the Store, and
+      # the launcher starts the Store's master and owners on the prefill node
+      # (pd_server_atom.sh: MOONCAKE_STORE) and hands the prefill workers
+      # ATOM_KV_OFFLOAD=mooncake_store. Dispatch-only, never scheduled
+      # (suite=mooncake_store). The owner sizes and NICs fit pit2-p03 (TW
+      # MI355X) nodes only: about 1.5 TiB per NUMA node, NUMA1's NICs named
+      # rdma4-7 (Spur MI350X hosts name theirs ionic_N). Their own
+      # display_topology keeps them off the nightly cells' dashboard series.
+      mooncake_store:
+        - &glm52_agentic_mcstore_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c48
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE
           concurrency: [48]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            # Restated: a merge cannot drop the nightly cells' LMCACHE_* keys.
+            prefill: &glm52_agentic_mcstore_cpp4_dcp4_env_prefill
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              MOONCAKE_STORE: "1"
+              # <numa>:<GiB>[:<rdma,...>] per owner, on NIC pairs of rdma4-7,
+              # disjoint from the stages' own NICs (their GPUs' rdma0-3) and
+              # from each other. Resize by overriding
+              # ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS, at most 832 GiB per
+              # owner (an ionic NIC's registration limit).
+              MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+              # The clean page cache of every model on the node goes before the
+              # owners pin huge pages, not just this one's: compaction would
+              # reclaim it otherwise.
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              # P/D only; the launcher adds mooncake_store through ATOM_KV_OFFLOAD.
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            # The launcher adds MC_NUM_QP_PER_EP=1 for the P->D transfer engine.
+            decode: *glm52_cpp4_dcp4_decode_env
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c56
+          concurrency: [56]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c72
+          concurrency: [72]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c96
+          concurrency: [96]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c112
+          concurrency: [112]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c128
+          concurrency: [128]
+
+        # The same cells on two nodes that each give the job only GPUs 0-3
+        # with their NUMA node's memory and NICs (rdma0-3): the other half of
+        # each node belongs to another job. Prefill on the first node, decode
+        # on the second, both on GPUs 0-3. The Store pools both nodes' NUMA0
+        # memory, 4 x 240 GiB on each. Those owners must share the stages'
+        # NICs, so each NIC is a pool of its own (MOONCAKE_STORE_POOLS=per_nic):
+        # one master for all eight owners stalled reads for good. The page
+        # cache drop covers both nodes, the co-tenant's models included (page
+        # cache is per file, node-wide).
+        - &glm52_agentic_mcstore_2n_cpp4_dcp4
+          <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-2n-1m-c96
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE-2N
+          pd_worker_layout: multi_node
+          concurrency: [96]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_mcstore_cpp4_dcp4_env_prefill
+              MOONCAKE_STORE_POOLS: "per_nic"
+              MOONCAKE_STORE_MASTER_NUMA: "0"
+              MOONCAKE_STORE_OWNERS: "0:240:rdma0;0:240:rdma1;0:240:rdma2;0:240:rdma3"
+              MOONCAKE_STORE_DECODE_OWNERS: "0:240:rdma0;0:240:rdma1;0:240:rdma2;0:240:rdma3"
+            decode:
+              <<: *glm52_cpp4_dcp4_decode_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+
+        - <<: *glm52_agentic_mcstore_2n_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-2n-1m-c112
+          concurrency: [112]
 
     accuracy:
       task: gsm8k
@@ -456,7 +874,7 @@ models:
 
   Kimi-K3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K3"
+    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
     precision: MXFP4
     env:
       common:
@@ -465,10 +883,15 @@ models:
         AITER_SITUV2_A4W4: "1"
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         AITER_FLYDSL_STAGE2_FP8: "1"
-        # AgentX enables comm-group reuse only on C56/C64.
+        # AgentX enables comm-group reuse from CONC 56 up (C56/C64/C72).
         AITER_REUSE_IDENTICAL_COMM_GROUPS: "0"
-        ATOM_MLA_MAX_SPLIT_PER_BATCH: "256"
+        ATOM_GDN_SSM_DTYPE: "fp16"
+        # Already the ATOM default; pinned so a default flip cannot silently
+        # move the published numbers.
+        ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "1"
         ATOM_STATE_CHECKPOINT_DEMAND: "0"
+        # AgentX runs FlyDSL FP8 prefill attention on every band.
+        ATOM_USE_FLYDSL_FP8_PREFILL_ATTN: "1"
         # AgentX band default: ReplaySSM off on CONC 1/2/4, on for the mid band
         # (CONC 8-16), off again from CONC 32. Cases that declare their own env
         # block must restate the key, because a YAML merge key loses to an
@@ -484,6 +907,11 @@ models:
         enable_prefix_caching: true
         max_model_len: ""
         state_checkpoint_interval_tokens: -1
+        # ATOM resolves the tool-call format from the chat template at startup.
+        # Naming it fails closed: should the template ever stop rendering a tools
+        # payload, the auto path degrades to plain-text tool calls, which the
+        # vendor verifier reads as a model that cannot call tools at all.
+        extra_args: "--tool-call-parser kimi_k3"
         online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
     suites:
       nightly:
@@ -497,11 +925,11 @@ models:
             osl: 1024
             server:
               common_args: &kimi_k3_agentic_dspark7_args
-                gpu_memory_utilization: 0.88
+                gpu_memory_utilization: 0.90
                 max_num_seqs: 32
                 max_num_batched_tokens: 8192
                 method: dspark
-                draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+                draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
                 num_speculative_tokens: 7
                 spec_decode_acceptance_length: 3.84
             prefill:
@@ -511,7 +939,7 @@ models:
               workers: 1
               tp: 8
               # AgentX pins the compile path and captures the dense query-token
-              # range 2..2*CONC*(1+spec) that `auto` derives per concurrency.
+              # range 1..2*CONC*(1+spec) that `auto` derives per concurrency.
               cudagraph: auto
               cudagraph_mode: FULL
               compilation_level: 3
@@ -538,12 +966,12 @@ models:
           display_topology: 1P1D-TP8-DCP8-DSPARK3
           concurrency: [8]
           server:
-            common_args: &kimi_k3_agentic_dspark3_args
-              gpu_memory_utilization: 0.88
+            common_args:
+              gpu_memory_utilization: 0.90
               max_num_seqs: 32
-              max_num_batched_tokens: 4096
+              max_num_batched_tokens: 8192
               method: dspark
-              draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
               num_speculative_tokens: 3
               spec_decode_acceptance_length: 3.00
           prefill:
@@ -565,53 +993,18 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "128"
               LMCACHE_CHUNK_SIZE: "1024"
               LMCACHE_NUMA_MODE: auto
-              LMCACHE_ENABLE_OUTPUT_PATH_MODE: "1"
-              LMCACHE_ENABLE_LAYOUT_FILE_MODE: "1"
               ATOM_NUMA_BIND: "1"
               ATOM_NUMA_NODE: "0,0,0,0,1,1,1,1"
               # Auto-binding off so the explicit ATOM_NUMA_NODE map is what takes effect.
               ATOM_AUTO_NUMA_BIND: "0"
-              OFFLOAD_KV_FOR_HYBRID: "1"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_GPU_STAGING_CHUNKS: "32"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
 
         - <<: *kimi_k3_agentic_dcp8_lmcache
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c12
-          concurrency: [12]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_dspark3_args
-              max_num_seqs: 24
-
-        # C14 runs the C16 server verbatim and only moves the client, so it also
-        # keeps C16's CUDA-graph width: deriving it from 2*CONC gives 28 and the
-        # server dies during graph warmup. cudagraph_max_num_seqs pins the window
-        # back to 32, which lands the same graph_max 128 as C16.
-        - <<: *kimi_k3_agentic_dcp8_lmcache
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c14
-          concurrency: [14]
-          server:
-            common_args: &kimi_k3_agentic_dspark3_8192_args
-              <<: *kimi_k3_agentic_dspark3_args
-              max_num_seqs: 32
-              max_num_batched_tokens: 8192
-              gpu_memory_utilization: 0.86
-          decode:
-            workers: 1
-            tp: 8
-            dcp: 8
-            cudagraph: auto
-            cudagraph_max_num_seqs: 32
-            cudagraph_mode: FULL
-            compilation_level: 3
-
-        - <<: *kimi_k3_agentic_dcp8_lmcache
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16
           concurrency: [16]
-          server:
-            common_args: *kimi_k3_agentic_dspark3_8192_args
 
         - &kimi_k3_agentic_no_dspark
           <<: *kimi_k3_agentic_dcp8_lmcache
@@ -620,7 +1013,7 @@ models:
           concurrency: [32]
           server:
             common_args: &kimi_k3_agentic_no_dspark_args
-              gpu_memory_utilization: 0.86
+              gpu_memory_utilization: 0.90
               max_num_seqs: 64
               max_num_batched_tokens: 8192
           env:
@@ -632,13 +1025,15 @@ models:
             prefill: *kimi_k3_agentic_lmcache128_env
 
         - <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c40
-          concurrency: [40]
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c48
+          concurrency: [48]
           server:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
-              max_num_seqs: 80
+              max_num_seqs: 96
 
+        # From CONC 56 up the CPU tier grows to 192 GiB and AITER reuses
+        # identical comm groups; everything else still tracks 2 * CONC.
         - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c56
           concurrency: [56]
@@ -646,7 +1041,7 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 112
-          env:
+          env: &kimi_k3_agentic_lmcache192_env
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
@@ -661,10 +1056,204 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 128
+          env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+          env: *kimi_k3_agentic_lmcache192_env
+
+        # High-concurrency DSpark4 PD recipe: recipes/mesh/Agentic-Kimi-K3.md.
+        # State and paged KV share the existing 224 GiB per-rank CPU pool.
+        # Raise only the state retention cap to 128 GiB.
+        # On-demand keeps observed shared-prefix checkpoints in addition to
+        # prompt-end anchors; the fixed-interval ladder remains disabled.
+        - &kimi_k3_agentic_hc_dspark4
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c48
+          display_topology: 1P1D-TP8-DCP8-DSPARK4
+          concurrency: [48]
+          server:
+            common_args: &kimi_k3_agentic_hc_dspark4_args
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 96
+              method: dspark
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.36
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+            prefill: &kimi_k3_agentic_hc_dspark4_prefill_env
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "128"
+
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c56
+          concurrency: [56]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark4_args
+              max_num_seqs: 112
+          env: &kimi_k3_agentic_hc_dspark4_reuse_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill: *kimi_k3_agentic_hc_dspark4_prefill_env
+
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark4_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_hc_dspark4_reuse_env
+
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark4_args
+              max_num_seqs: 176
+          env: *kimi_k3_agentic_hc_dspark4_reuse_env
+
+        # 1P2D: the DSpark4 C48 cell with a second TP8+DCP8 decode node (three
+        # nodes), so each decode carries about half the sessions while the one
+        # prefill is not yet the limit. The router picks a decode at random, as
+        # in the 1P1D cells. `decode` is restated whole: `<<` merges one level.
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p2d-tp8-dcp8-dspark4-agentic-lmcache-1m-c48
+          topology: 1p2d
+          display_topology: 1P2D-TP8-DCP8-DSPARK4
+          nodes: "${ATOMESH_2P1D_NODES}"
+          decode:
+            workers: 2
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+
+        # Non-disaggregated counterpart to the no-draft C72 cell: one server does
+        # prefill and decode on a single node, same workload and same server
+        # knobs, so the pair isolates what the P/D split itself is worth.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72
+          topology: agg
+          display_topology: AGG-TP8-DCP8
+          # Placement only; `topology: agg` above is what says there is no
+          # prefill/decode split to place. The other single_node cells halve the
+          # node between two services, so this one keeps all 8 GPUs at TP8.
+          pd_worker_layout: single_node
+          concurrency: [72]
+          # Unused here; the aggregated server is configured by the decode block.
+          prefill: {}
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
           env:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            # The aggregated server reads env.decode. These are the C72 prefill's
+            # LMCache settings, spelled out rather than merged from its anchor:
+            # that anchor also carries the mooncake half of the `multi`
+            # connector, which has no peer to stream KV to here. What is left is
+            # the same 192 GiB CPU tier behind a standalone offload connector.
+            decode:
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              LMCACHE_CHUNK_SIZE: "1024"
+              LMCACHE_NUMA_MODE: auto
+              ATOM_NUMA_BIND: "1"
+              ATOM_NUMA_NODE: "0,0,0,0,1,1,1,1"
+              ATOM_AUTO_NUMA_BIND: "0"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              # AgentX throughput band (CONC 16 up): with prefill and decode on
+              # one server, a ready prefill waits four decode passes, and the
+              # PrefillDelayer coalesces queued prefill for up to 5 s.
+              ATOM_PREFILL_DECODE_INTERVAL: "4"
+              ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
+        - &kimi_k3_agentic_2p1d
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
+          topology: 2p1d
+          display_topology: 2P1D-TP8-DCP8
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [72]
+          prefill:
+            workers: 2
+            tp: 8
+            dcp: 8
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 256
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256
+          concurrency: [256]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 512
+
+      # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
+      # the published dashboard. The stop_profile export stalls both engines,
+      # which makes this cell's aiperf numbers incomparable with its C72 twin.
+      profile:
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72-torch-profile
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              # 30 s starting 900 s into the aiperf Profiling phase, on every
+              # prefill and decode server; traces land under ${RUN_DIR}/torch_traces/<worker>/rank_<tp>/.
+              ATOMESH_TORCH_PROFILE_START: "900"
+              ATOMESH_TORCH_PROFILE_DURATION: "30"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
+              # Kernel names and durations only; shapes/stacks on a TP8 window
+              # risk OOMing the ranks during export.
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_TIMEOUT: "1800"
             prefill:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
@@ -681,15 +1270,18 @@ models:
 
   Kimi-K2.5-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/Kimi-K2.5-MXFP4/"
     precision: MXFP4
     env:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: "INT4"
         # PR #1566: enable MXFP4 intermediate output for INT4 quick reduce.
         AITER_MXFP4_INTERMEDIATE: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
-      decode: {}
+      decode:
+        DECODE_KV_TRANSFER_CONFIG: >-
+          {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
     server:
       common_args:
         trust_remote_code: true
@@ -722,6 +1314,9 @@ models:
             common_args:
               decode_max_num_seqs: 256
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
@@ -805,6 +1400,53 @@ models:
           run_eval: true
           eval_concurrency: [128, 768]
 
+      # gsm8k-only PD cell over MoRI IO. Prefill and decode each own a node, so
+      # the KV transfer crosses the ionic fabric rather than staying local.
+      accuracy:
+        - name: kimi-k25-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: >-
+              [8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+          server:
+            common_args:
+              decode_max_num_seqs: 256
+              # Kimi-K2.5 thinks by default. lm_eval scores message content,
+              # and a reasoning model cut off at max_gen_toks mid-thought
+              # returns none. The template's own switch is named "thinking".
+              extra_args: '--default-chat-template-kwargs {"thinking":false}'
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+            decode:
+              # Empty drops the model-level Mooncake JSON for the built-in config.
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy:
+            # Chat completions, so the template switch above applies.
+            task: gsm8k
+            fewshot: 5
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            max_gen_toks: 4096
+            apply_chat_template: true
+            threshold: 0.90
+
     accuracy:
       task: gsm8k
       fewshot: 3
@@ -812,12 +1454,13 @@ models:
 
   MiniMax-M3-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP4"
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3-MXFP4"
     precision: MXFP4
     env:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         ATOM_FORCE_ATTN_TRITON: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
     server:
@@ -853,10 +1496,15 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -895,7 +1543,7 @@ models:
           server:
             common_args:
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 1
@@ -904,10 +1552,15 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -924,7 +1577,7 @@ models:
             common_args:
               decode_max_num_seqs: 1024
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 2
@@ -952,12 +1605,13 @@ models:
 
   MiniMax-M3-MXFP8:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-MXFP8"
+    model_path: "${ATOMESH_MODEL_ROOT}/MiniMaxAI/MiniMax-M3-MXFP8"
     precision: MXFP8
     env:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         ATOM_FORCE_ATTN_TRITON: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
     server:
@@ -992,10 +1646,15 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -1025,6 +1684,78 @@ models:
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
+        - name: minimax-m3-fp8-2p1d-tp8
+          topology: 2p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: minimax-m3-fp8-2p1d-dpa-tp8
+          topology: 2p1d_dpa
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+              online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo prefill"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: minimax-m3-fp8-2p1d-dpa-tp8-eagle3
+          topology: 2p1d_dpa_eagle3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+              method: eagle3
+              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              num_speculative_tokens: 3
+              online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo prefill"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
         - name: minimax-m3-fp8-1p1d-tp4-eagle3
           topology: 1p1d_eagle3
           pd_worker_layout: single_node
@@ -1035,7 +1766,7 @@ models:
           server:
             common_args:
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 1
@@ -1044,10 +1775,15 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
@@ -1064,7 +1800,7 @@ models:
             common_args:
               decode_max_num_seqs: 1024
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
               online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
           prefill:
@@ -1090,3 +1826,262 @@ models:
       max_gen_toks: 16384
       apply_chat_template: true
       fewshot_as_multiturn: true
+
+  DeepSeek-V4-Pro-0813:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro-0813/"
+    model_path_by_runner:
+      atomesh-cicd-mi355-crusoe: /shared_nfs/huggingface_models/deepseek-ai/DeepSeek-V4-Pro-0813
+    precision: FP4
+    env:
+      common:
+        AITER_BF16_FP8_MOE_BOUND: "0"
+        ATOM_MOE_GU_ITLV: "1"
+        MC_GID_INDEX: "1"
+        ATOM_MOONCAKE_MATCHED_RAILS: auto
+        NCCL_IB_DISABLE: "1"
+        ATOM_DISABLE_MMAP: "true"
+        ATOM_NUMA_BIND: "1"
+        ATOM_DP_MASTER_PORT: "29510"
+        ATOM_DP_BASE_PORT: "29610"
+        ATOM_PREFIX_CACHE_POLICY: lru
+        ATOM_PREFIX_CACHE_PROTECTED_RATIO: "0.5"
+        ATOM_ENABLE_PREFILL_DELAYER: "0"
+      prefill:
+        GPU_MAX_HW_QUEUES: "5"
+        PREFILL_KV_TRANSFER_CONFIG: >-
+          {"kv_role":"kv_producer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+      decode:
+        DECODE_KV_TRANSFER_CONFIG: >-
+          {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 256
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.9
+        max_model_len: ""
+        max_num_batched_tokens: 16384
+        method: dspark
+        num_speculative_tokens: 3
+        # Benchmark-only AL from recipes/DeepSeek-V4-Agentic-PD-Max.md.
+        spec_decode_acceptance_length: 3.01
+        state_checkpoint_interval_tokens: 8192
+        extra_args: "--index-cache-dtype fp4 --attn-prefill-chunk-size 16384 --enable-prefix-caching"
+    suites:
+      weekly:
+        # Follow GLM AgentX: a fresh P/D allocation for every concurrency.
+        # Only plain Mooncake connectors; no LMCache CPU/NVMe offload pool.
+        - &dsv4_0813_agentic_dpa_no_offload
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c128
+          router:
+            policy: cache_aware
+          topology: 1p1d_dpa
+          display_topology: 1P1D-DPA-TP8-DSPARK3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [128]
+          server:
+            common_args:
+              max_num_seqs: 256
+              decode_max_num_seqs: 256
+          prefill:
+            workers: 1
+            tp: 8
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention --enable-tbo"
+          decode: &dsv4_0813_agentic_dpa_decode
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-dp-attention"
+          benchmark: *agentic_1m_aiperf
+          run_eval: false
+
+        - <<: *dsv4_0813_agentic_dpa_no_offload
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c192
+          concurrency: [192]
+          server:
+            common_args:
+              max_num_seqs: 384
+              decode_max_num_seqs: 384
+          decode:
+            <<: *dsv4_0813_agentic_dpa_decode
+            cudagraph: "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48]"
+
+        - <<: *dsv4_0813_agentic_dpa_no_offload
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256
+          concurrency: [256]
+          env:
+            common:
+              ROUTER_BALANCE_ABS_THRESHOLD: "40"
+          server:
+            common_args:
+              max_num_seqs: 512
+              decode_max_num_seqs: 512
+          decode:
+            <<: *dsv4_0813_agentic_dpa_decode
+            cudagraph: "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64]"
+
+        # Keep at least 32 global slots for the low-concurrency DPA cases.
+        - &dsv4_0813_agentic_dpa_low_concurrency
+          <<: *dsv4_0813_agentic_dpa_no_offload
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c1
+          concurrency: [1]
+          server:
+            common_args:
+              max_num_seqs: 32
+              decode_max_num_seqs: 32
+          decode:
+            <<: *dsv4_0813_agentic_dpa_decode
+            cudagraph: "[1,2,3,4]"
+
+        - <<: *dsv4_0813_agentic_dpa_low_concurrency
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c2
+          concurrency: [2]
+
+        - <<: *dsv4_0813_agentic_dpa_low_concurrency
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c16
+          concurrency: [16]
+
+        - <<: *dsv4_0813_agentic_dpa_low_concurrency
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c32
+          concurrency: [32]
+          server:
+            common_args:
+              max_num_seqs: 64
+              decode_max_num_seqs: 64
+          decode:
+            <<: *dsv4_0813_agentic_dpa_decode
+            cudagraph: "[1,2,3,4,5,6,7,8]"
+
+      # Manual accuracy suite: no performance workload or synthetic acceptance.
+      accuracy:
+        - name: ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
+          topology: 1p1d
+          display_topology: 1P1D-TP8-DSPARK3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [4096]
+          osl: 4096
+          concurrency: [16]
+          router:
+            policy: cache_aware
+          server:
+            common_args:
+              max_model_len: 8192
+              max_num_seqs: 32
+              decode_max_num_seqs: 32
+              spec_decode_acceptance_length: ""
+          prefill:
+            workers: 1
+            tp: 8
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: ""
+          benchmark:
+            kind: random
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 5
+            eval_concurrency: [16]
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            max_gen_toks: 4096
+            apply_chat_template: true
+
+  # Bring-up model for the MoRI IO PD KV path. Text-only, ships a real
+  # tokenizer.json so the router can register one, and its FP8 weights keep
+  # quantization out of the picture -- but the KV path under test is the same
+  # 61-layer MLA as the MXFP4 models.
+  DeepSeek-V3:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V3/"
+    precision: FP8
+    env:
+      common:
+        # Mooncake's RoCE GID index. MoRI IO reads MORI_IB_GID_INDEX instead,
+        # so setting this once keeps the two cells below differing in nothing
+        # but KV_CONNECTOR.
+        MC_GID_INDEX: "1"
+        # MoRI IO only, set here for the same reason; see the Kimi-K2.5 cell.
+        ATOM_MORIIO_MODE: write
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        enable_prefix_caching: false
+        gpu_memory_utilization: 0.9
+        max_num_seqs: 256
+        max_num_batched_tokens: 32768
+        max_model_len: 32768
+        extra_args: ""
+    suites:
+      accuracy:
+        # A control and its variant. Neither sets a *_KV_TRANSFER_CONFIG, so
+        # both take the built-in config and the merge key makes the connector
+        # the only difference between them. A score gap therefore lands on the
+        # connector rather than on the model, the eval, or ATOM's PD layer.
+        - &dsv3_pd_gsm8k
+          name: ds-v3-1p1d-tp8-mooncake-gsm8k
+          topology: 1p1d_tp8_mooncake
+          display_topology: 1P1D-MOONCAKE-TP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[8,16,24,32,40,48,56,64]"
+          server:
+            common_args:
+              decode_max_num_seqs: 256
+          env:
+            common:
+              KV_CONNECTOR: mooncake
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy:
+            threshold: 0.90
+        - <<: *dsv3_pd_gsm8k
+          name: ds-v3-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          display_topology: 1P1D-MORIIO-TP8
+          env:
+            common:
+              KV_CONNECTOR: moriio
+
+    accuracy:
+      task: gsm8k
+      fewshot: 5
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      # V3 is not a reasoning model, so gsm8k answers are short.
+      max_gen_toks: 512
+      apply_chat_template: true

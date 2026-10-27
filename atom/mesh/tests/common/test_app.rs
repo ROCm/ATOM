@@ -84,7 +84,6 @@ pub fn create_test_app(
     let app_state = Arc::new(AppState {
         router,
         context: app_context,
-        concurrency_queue_tx: None,
         router_manager: None,
     });
 
@@ -116,7 +115,6 @@ pub fn create_test_app_with_context(
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: None,
         router_manager: None,
     });
 

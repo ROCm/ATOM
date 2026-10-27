@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict, deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Hashable, Iterator, Mapping
 from dataclasses import dataclass
 from time import monotonic
 
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+
+_CHANGE_LOG_LIMIT = 4096
 
 logger = logging.getLogger("atom")
 
@@ -88,6 +90,19 @@ class PagedStateCheckpointSpec:
         )
 
 
+def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:
+    """PAGE checkpoint copies one batch's descriptor holds, stores and restores.
+
+    One store and one restore per sequence. The runner sizes its pinned
+    descriptor staging with this (`AttentionMetadataBuilder.
+    _checkpoint_staging`), and the coordinator bounds how many queued midstep
+    stores one batch begins with it (`attach_midstep_scratch`). Both read it
+    from here: a coordinator that began more than the staging holds would make
+    `build()` raise mid-serving.
+    """
+    return 2 * int(max_num_seqs or 0)
+
+
 @dataclass(frozen=True)
 class CheckpointStoreOp:
     """Scatter the checkpointed part of an Active Slot into PAGE units."""
@@ -116,6 +131,14 @@ class CheckpointRecord:
     pin_count: int = 0
 
 
+@dataclass(frozen=True)
+class SuspendedCheckpointRestore:
+    """A queued restore removed from execution while retaining its source pin."""
+
+    checkpoint_id: int
+    operation: CheckpointRestoreOp
+
+
 @dataclass
 class _OffloadPin:
     """A store that has been dispatched to the worker but not yet indexed.
@@ -134,6 +157,9 @@ class _OffloadPin:
     checkpoint_id: int
     pinned_at: float
     source_released: bool = False
+    # Explicit connector leases may still have DMA reading their PAGE units
+    # after a timeout. Only a release or terminal completion can end them.
+    timeout_reclaimable: bool = True
 
 
 class PageUnitCheckpointStore:
@@ -153,6 +179,12 @@ class PageUnitCheckpointStore:
         # hold 127 blocks per checkpoint out of the pool forever.
         self._offload_sink = offload_sink
         self.hash_to_checkpoint: dict[int, int] = {}
+        # Bumped whenever the READY set can change (publish, unindex, evict,
+        # release, clear), so callers can cache `contains` answers. The log
+        # names the hash behind each recent bump (None: every hash), so a
+        # caller can invalidate only the answers that bump can affect.
+        self.generation = 0
+        self._changes: deque[tuple[int, int | None]] = deque(maxlen=_CHANGE_LOG_LIMIT)
         self.records: dict[int, CheckpointRecord] = {}
         self._pending_by_hash: dict[int, int] = {}
         self._lru: OrderedDict[int, None] = OrderedDict()
@@ -382,6 +414,89 @@ class PageUnitCheckpointStore:
                 kept.append((checkpoint_id, op))
         self._queued_restores = kept
 
+    def suspend_queued_restore(
+        self, dst_slot: int
+    ) -> SuspendedCheckpointRestore | None:
+        """Remove one queued restore without releasing its checkpoint pin.
+
+        An external full-snapshot restore uses this to prevent an older local
+        checkpoint copy from overwriting the destination SLOT later.  The
+        caller must eventually either resume or release the returned lease.
+        """
+        found: SuspendedCheckpointRestore | None = None
+        kept: list[tuple[int, CheckpointRestoreOp]] = []
+        for checkpoint_id, op in self._queued_restores:
+            if op.dst_slot == dst_slot:
+                if found is not None:
+                    raise AssertionError(
+                        f"multiple queued checkpoint restores target slot {dst_slot}"
+                    )
+                found = SuspendedCheckpointRestore(checkpoint_id, op)
+            else:
+                kept.append((checkpoint_id, op))
+        self._queued_restores = kept
+        return found
+
+    def resume_suspended_restore(self, restore: SuspendedCheckpointRestore) -> None:
+        """Put a suspended restore back on the next maintenance batch."""
+        record = self.records.get(restore.checkpoint_id)
+        if record is None or record.pin_count <= 0:
+            raise AssertionError("suspended checkpoint restore lost its source pin")
+        self._queued_restores.append((restore.checkpoint_id, restore.operation))
+
+    def release_suspended_restore(self, restore: SuspendedCheckpointRestore) -> None:
+        """Release a suspended restore whose destination was filled elsewhere."""
+        self._release_restore_pin(restore.checkpoint_id)
+
+    def _note_change(self, prefix_hash: int | None) -> None:
+        self.generation += 1
+        self._changes.append((self.generation, prefix_hash))
+
+    def changed_since(self, generation: int) -> set[int] | None:
+        """Hashes whose READY state may have changed after ``generation``.
+
+        None when that cannot be told: the log no longer reaches back that
+        far, or a `clear` touched every hash.
+        """
+        if generation >= self.generation:
+            return set()
+        if not self._changes or self._changes[0][0] > generation + 1:
+            return None
+        changed: set[int] = set()
+        for bumped_at, prefix_hash in reversed(self._changes):
+            if bumped_at <= generation:
+                break
+            if prefix_hash is None:
+                return None
+            changed.add(prefix_hash)
+        return changed
+
+    def adopt_units(
+        self, unit_ids: tuple[int, ...], owner: Hashable, prefix_hash: int
+    ) -> bool:
+        """Publish reserved units as a READY checkpoint without a copy.
+
+        The units change owner in place, so no other allocation can observe
+        them free in between. When `prefix_hash` is already READY or pending,
+        the units are released instead and False is returned. The adopted
+        checkpoint is not nominated for offload: it just arrived from that tier.
+        """
+        if self.contains_or_pending(prefix_hash):
+            self.pool.release_units(unit_ids, owner)
+            return False
+        checkpoint_id = self._new_identity()
+        self.pool.rekey_units(unit_ids, owner, ("state-checkpoint", checkpoint_id))
+        record = CheckpointRecord(
+            prefix_hash=int(prefix_hash),
+            unit_ids=tuple(unit_ids),
+            state=READY,
+        )
+        self.records[checkpoint_id] = record
+        self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
+        self._lru[checkpoint_id] = None
+        self._note_change(record.prefix_hash)
+        return True
+
     def complete_inflight(self) -> None:
         stores, self._inflight_stores = self._inflight_stores, []
         for checkpoint_id in stores:
@@ -401,6 +516,7 @@ class PageUnitCheckpointStore:
                 continue
             record.state = READY
             self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
+            self._note_change(record.prefix_hash)
             self._lru[checkpoint_id] = None
             self._queue_offload_store(checkpoint_id, record)
 
@@ -491,13 +607,9 @@ class PageUnitCheckpointStore:
                 # cannot spin this call.
                 deferred.append(checkpoint_id)
                 continue
-            self._offload_generation += 1
-            op = StateStoreOperationId(
-                int(record.prefix_hash), self._offload_generation
+            out.append(
+                self._pin_offload_source(checkpoint_id, timeout_reclaimable=True)
             )
-            record.pin_count += 1
-            self._offload_pins[op] = _OffloadPin(checkpoint_id, monotonic())
-            out.append((op, record.unit_ids))
         # Re-queue the deferred nominations for the next drain, once the
         # colliding in-flight generation has had a chance to settle. The drain
         # is `popleft()` (oldest at the left), so `extend` would append these
@@ -507,6 +619,43 @@ class PageUnitCheckpointStore:
         if deferred:
             self._offload_ready.extendleft(reversed(deferred))
         return out
+
+    def acquire_checkpoint_source(
+        self, prefix_hash: int, *, max_inflight: int | None = None
+    ) -> tuple[StateStoreOperationId, tuple[int, ...]] | None:
+        """Lease the existing READY image for an admitted external transfer.
+
+        The caller must finish scheduler admission before acquiring this
+        source. A lease pins the image's
+        existing PAGE units; it neither copies an Active Slot nor queues a
+        checkpoint. Missing, COPYING, or already dispatched hashes return
+        None, as does a full optional operation limit. The limit includes
+        operations whose source was released but whose result is outstanding.
+
+        Release with `release_offload_store_source` once every reader has
+        stopped, then `settle_offload_store` on terminal completion. Settlement
+        can also release a source for a transfer known to have stopped or never
+        started. These leases are never reclaimed by elapsed time: a missing
+        report cannot prove that another process has stopped its DMA.
+        """
+        if max_inflight is not None and len(self._offload_pins) >= max_inflight:
+            return None
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id < 0 or self._hash_in_flight(prefix_hash):
+            return None
+        return self._pin_offload_source(checkpoint_id, timeout_reclaimable=False)
+
+    def _pin_offload_source(
+        self, checkpoint_id: int, *, timeout_reclaimable: bool
+    ) -> tuple[StateStoreOperationId, tuple[int, ...]]:
+        record = self.records[checkpoint_id]
+        self._offload_generation += 1
+        op = StateStoreOperationId(int(record.prefix_hash), self._offload_generation)
+        record.pin_count += 1
+        self._offload_pins[op] = _OffloadPin(
+            checkpoint_id, monotonic(), timeout_reclaimable=timeout_reclaimable
+        )
+        return op, record.unit_ids
 
     def _hash_in_flight(self, prefix_hash: int) -> bool:
         """Whether some generation of `prefix_hash` is already pinned.
@@ -606,12 +755,18 @@ class PageUnitCheckpointStore:
         `BlockManager.settle_state_store` refuses to index it. The reclaim
         recovers the memory and forfeits the entry, which is the only pair of
         outcomes this can honestly offer.
+
+        Explicit `acquire_checkpoint_source` leases are excluded. Their
+        connector must confirm source release or terminal completion; the
+        legacy nomination path's timeout policy does not apply to them.
         """
         if timeout_s <= 0 or not self._offload_pins:
             return 0
         cutoff = monotonic() - timeout_s
         stale = [
-            op for op, pin in self._offload_pins.items() if pin.pinned_at <= cutoff
+            op
+            for op, pin in self._offload_pins.items()
+            if pin.timeout_reclaimable and pin.pinned_at <= cutoff
         ]
         for op in stale:
             pin = self._offload_pins.pop(op)
@@ -678,6 +833,7 @@ class PageUnitCheckpointStore:
             self._release_record(checkpoint_id)
 
     def unindex(self, prefix_hash: int) -> bool:
+        self._note_change(prefix_hash)
         checkpoint_id = self.hash_to_checkpoint.pop(prefix_hash, -1)
         if checkpoint_id < 0:
             checkpoint_id = self._pending_by_hash.pop(prefix_hash, -1)
@@ -694,6 +850,7 @@ class PageUnitCheckpointStore:
         return True
 
     def clear(self) -> None:
+        self._note_change(None)
         self.hash_to_checkpoint.clear()
         self._pending_by_hash.clear()
         self._lru.clear()
@@ -708,6 +865,7 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         if record.state != READY or record.pin_count:
             raise AssertionError("only an unpinned READY checkpoint is evictable")
+        self._note_change(record.prefix_hash)
         if self.hash_to_checkpoint.get(record.prefix_hash) == checkpoint_id:
             del self.hash_to_checkpoint[record.prefix_hash]
         record.state = EVICTING
@@ -717,6 +875,7 @@ class PageUnitCheckpointStore:
 
     def _release_record(self, checkpoint_id: int) -> None:
         record = self.records.pop(checkpoint_id)
+        self._note_change(record.prefix_hash)
         self._lru.pop(checkpoint_id, None)
         if self.hash_to_checkpoint.get(record.prefix_hash) == checkpoint_id:
             del self.hash_to_checkpoint[record.prefix_hash]
@@ -729,25 +888,35 @@ class PagedStateCheckpointCoordinator:
     """Schedules PAGE-backed checkpoints for per-request state."""
 
     successor_room = 0.0
-    # A PAGE image is written by a copy the runner issues after the forward that
-    # produced the state, out of the slot that forward left behind. There are no
-    # interior positions to slice: unlike a chunk kernel's `h`, the compressor
-    # ring is not materialized at boundaries inside a step. So the engine keeps
-    # cutting prefill chunks onto rungs for this class, and the three methods
-    # below are the no-ops `StateCache` documents for a class that is not
-    # readable midstep — present because `BlockManager` calls them across every
-    # member of `state_caches` without asking which kind it holds.
-    readable_midstep = False
 
-    def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
-        del seq, positions
-        return []
-
-    def publish_midstep(self, reservations: list[tuple], seq=None) -> None:
-        del reservations, seq
-
-    def cancel_midstep(self, reservations: list[tuple]) -> None:
-        del reservations
+    # ------------------------- midstep checkpointing ------------------------ #
+    #
+    # A PAGE image is written by a copy the runner issues before a later batch,
+    # out of a slot. Unreadable by default: the image then comes from the slot
+    # a forward *ended* in, so the engine cuts prefill chunks onto rungs.
+    #
+    # A backend whose kernel exposes interior states (GDN's `h`) can declare
+    # `readable_midstep`, and then a position inside a forward reaches the
+    # image through a scratch slot borrowed from the state pool:
+    #
+    #   `reserve_midstep`  before the forward, borrow a scratch slot per
+    #                      position. The runner copies the interior state in.
+    #   `publish_midstep`  after it, queue `(hash, scratch)` for storing.
+    #   `take_checkpoint_ops`
+    #                      while building the next batch, `begin_store` each
+    #                      queued scratch, exactly as `checkpoint`'s pending
+    #                      boundaries are begun. Not at publish: `begin_store`
+    #                      enters the store's inflight list, which the *next*
+    #                      `complete_previous_batch` turns READY, so begun at
+    #                      publish the image would be READY -- and restorable
+    #                      -- one batch before its copy ran.
+    #   `complete_previous_batch`
+    #                      the batch carrying those copies has been issued, so
+    #                      the scratch goes back to the state pool. A later
+    #                      writer of the slot runs after it on the same stream.
+    #
+    # A scratch slot is never a request's runtime slot, so nothing the owner
+    # does next can overwrite it before its store is issued.
 
     def __init__(
         self,
@@ -755,8 +924,20 @@ class PagedStateCheckpointCoordinator:
         spec: PagedStateCheckpointSpec,
         enabled: bool,
         offload=None,
+        readable_midstep: bool = False,
     ) -> None:
         self.enabled = enabled
+        self.readable_midstep = bool(readable_midstep)
+        # The state pool scratch slots are borrowed from, and how many stores
+        # one batch's copy descriptor has room for. Set by
+        # `attach_midstep_scratch`; a readable coordinator without them
+        # reserves nothing.
+        self._scratch = None
+        self._max_ops_per_batch = 0
+        # Published `(hash, scratch slot)` not yet begun, oldest first.
+        self._scratch_queued: list[tuple[int, int]] = []
+        # Scratch slots whose store rides the batch built last pass.
+        self._scratch_issued: list[int] = []
         # The CPU tier beneath this one, or None. Not a member of
         # `BlockManager.state_caches`: every one of those is a veto over where a
         # prefix may resume, and this does the opposite -- it makes MORE
@@ -773,12 +954,90 @@ class PagedStateCheckpointCoordinator:
         # for -- that is one boundary reached twice, not two boundaries.
         self._pending: dict[tuple[int, int], tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
+        # External loads write temporary PAGE images before a runner gathers
+        # them into an Active Slot. Owners include a transfer generation, so a
+        # late release can never release a newer reservation.
+        self._transfer_units: dict[Hashable, tuple[int, ...]] = {}
         self.checkpoints_kept = 0
         self.checkpoints_dropped = 0
         self.checkpoints_orphaned = 0
 
     def applies(self, seq: Sequence) -> bool:
         return self.enabled and seq.has_per_req_cache
+
+    def attach_midstep_scratch(self, slot_pool, max_ops_per_batch: int) -> None:
+        """Where scratch slots come from, and the per-batch copy budget.
+
+        `max_ops_per_batch` is what the runner's descriptor staging holds,
+        stores and restores together (`AttentionMetadataBuilder.
+        _checkpoint_staging`). A sequence can now publish several positions in
+        one forward, so the one-store-per-sequence bound no longer holds on its
+        own; `take_checkpoint_ops` begins only what fits and leaves the rest
+        queued, still held in their scratch slots, for the next batch.
+        """
+        self._scratch = slot_pool
+        self._max_ops_per_batch = int(max_ops_per_batch)
+
+    def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
+        """Borrow a scratch slot for each `(position, hash)` this forward covers.
+
+        Best-effort and order-preserving, like the slot pool's: stops at the
+        first position no slot is free for. A hash already stored, or already
+        on its way, is skipped -- writing it again would be refused by
+        `begin_store` after spending the slot and the copy.
+        """
+        if not (self.readable_midstep and self.applies(seq)):
+            return []
+        if self._scratch is None:
+            return []
+        queued = {h for h, _slot in self._scratch_queued}
+        out = []
+        for pos, h in positions:
+            if h in queued or self.store.contains_or_pending(h):
+                continue
+            if not self._scratch.has_free():
+                self.checkpoints_dropped += 1
+                break
+            out.append((self._scratch.pop(), pos, h))
+        return out
+
+    def publish_midstep(self, reservations: list[tuple], seq=None) -> None:
+        """Queue each written scratch slot for storing under its hash.
+
+        Nothing is findable yet: the image is begun at the next
+        `take_checkpoint_ops` and READY one batch after that, the same two
+        steps `checkpoint`'s boundaries take.
+        """
+        del seq
+        for slot, _pos, h in reservations:
+            self._scratch_queued.append((h, slot))
+
+    def cancel_midstep(self, reservations: list[tuple]) -> None:
+        """Hand back scratch slots whose forward never ran."""
+        for slot, _pos, _h in reservations:
+            self._scratch.release(slot)
+
+    def _take_scratch_stores(self, budget: int) -> None:
+        """Begin queued scratch stores, at most `budget` of them."""
+        queued, self._scratch_queued = self._scratch_queued, []
+        for i, (h, slot) in enumerate(queued):
+            if budget <= 0:
+                self._scratch_queued = queued[i:]
+                return
+            op = None
+            if not self.store.contains_or_pending(h):
+                op = self.store.begin_store(h, slot)
+            if op is None:
+                # Already stored, or no units for it: the scratch holds
+                # nothing anybody will read, and the forward that wrote it has
+                # completed, so it can go back now.
+                self._scratch.release(slot)
+                self.checkpoints_dropped += 1
+                continue
+            self._store_ops.append(op)
+            self._scratch_issued.append(slot)
+            self.checkpoints_kept += 1
+            budget -= 1
 
     def resumable_hit(
         self,
@@ -906,11 +1165,20 @@ class PagedStateCheckpointCoordinator:
                 continue
             self._store_ops.append(op)
             self.checkpoints_kept += 1
+        restores = self.store.take_restore_ops()
+        if self._scratch_queued:
+            self._take_scratch_stores(
+                self._max_ops_per_batch - len(self._store_ops) - len(restores)
+            )
         stores, self._store_ops = self._store_ops, []
-        return tuple(stores), self.store.take_restore_ops()
+        return tuple(stores), restores
 
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
+        # The batch that carried these stores has been issued.
+        issued, self._scratch_issued = self._scratch_issued, []
+        for slot in issued:
+            self._scratch.release(slot)
 
     def has_available_units(
         self, count: int, protected_hash: int | None = None
@@ -919,6 +1187,61 @@ class PagedStateCheckpointCoordinator:
 
     def ensure_free_units(self, count: int) -> bool:
         return self.store.ensure_free_units(count)
+
+    def reserve_transfer_units(self, owner: Hashable) -> tuple[int, ...] | None:
+        """Reserve one raw checkpoint image for an admitted external load.
+
+        `owner` must uniquely identify this transfer attempt, including its
+        generation. Duplicate active owners and insufficient available units
+        are refused. The caller releases these units only after both the
+        transfer and restore stop using them. No checkpoint is published and no Active Slot is touched.
+        """
+        if owner is None:
+            raise ValueError("a transfer reservation needs an owner")
+        if owner in self._transfer_units:
+            return None
+        if not self.store.ensure_free_units(self.store.units_per_checkpoint):
+            return None
+        units = self.store.pool.reserve_units(
+            self.store.units_per_checkpoint, ("state-transfer", owner)
+        )
+        if units is None:
+            return None
+        self._transfer_units[owner] = tuple(units)
+        return self._transfer_units[owner]
+
+    def release_transfer_units(self, owner: Hashable) -> None:
+        """Release a completed or safely cancelled load reservation, once."""
+        units = self._transfer_units.pop(owner, None)
+        if units is not None:
+            self.store.pool.release_units(units, ("state-transfer", owner))
+
+    def adopt_transfer_units(self, owner: Hashable, prefix_hash: int) -> bool:
+        """Publish a completed external image without exposing it to reuse.
+
+        Returns ``True`` when the transfer's units became the canonical READY
+        checkpoint. If the same hash was published concurrently, the incoming
+        units are released and ``False`` is returned. The adopted checkpoint is
+        deliberately not nominated for offload: it just arrived from that tier.
+        """
+        units = self._transfer_units.get(owner)
+        if units is None:
+            return False
+        adopted = self.store.adopt_units(units, ("state-transfer", owner), prefix_hash)
+        # Only now: if adoption raised, the units stay reachable for release.
+        del self._transfer_units[owner]
+        return adopted
+
+    def suspend_queued_restore(
+        self, dst_slot: int
+    ) -> SuspendedCheckpointRestore | None:
+        return self.store.suspend_queued_restore(dst_slot)
+
+    def resume_suspended_restore(self, restore: SuspendedCheckpointRestore) -> None:
+        self.store.resume_suspended_restore(restore)
+
+    def release_suspended_restore(self, restore: SuspendedCheckpointRestore) -> None:
+        self.store.release_suspended_restore(restore)
 
     def contains(self, h: int) -> bool:
         """Whether HBM holds a READY image for `h` right now.
@@ -951,6 +1274,14 @@ class PagedStateCheckpointCoordinator:
     ) -> list[tuple[StateStoreOperationId, tuple[int, ...]]]:
         """`(operation, unit_ids)` to hand the tier now. See the store."""
         return self.store.take_offload_stores(max_inflight)
+
+    def acquire_checkpoint_source(
+        self, prefix_hash: int, *, max_inflight: int | None = None
+    ) -> tuple[StateStoreOperationId, tuple[int, ...]] | None:
+        """Lease an admitted transfer's exact READY image. See the store."""
+        return self.store.acquire_checkpoint_source(
+            prefix_hash, max_inflight=max_inflight
+        )
 
     def release_offload_store_source(self, op: StateStoreOperationId) -> None:
         """The gather drained; hand the units back but keep the pin. See store."""

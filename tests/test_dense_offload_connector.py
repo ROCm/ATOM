@@ -1,22 +1,33 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from types import SimpleNamespace
+import sys
+import threading
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
+from atom.kv_transfer.disaggregation.multi.multi_connector import (
+    MultiConnectorScheduler,
+)
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
     SaveSpec,
@@ -67,6 +78,9 @@ def _arm_load(scheduler, seq, *, hbm=0, lmcache=8):
         can_load=True,
     )
     scheduler._reqs_need_recv[sid] = seq
+    # An armed load always comes from a lookup, and the pin it took is what the
+    # dispatch confirms before handing the retrieve to the worker.
+    scheduler._lookup_results[sid] = (seq, lmcache)
 
 
 def _engine_scheduler(connector):
@@ -76,6 +90,60 @@ def _engine_scheduler(connector):
     scheduler.failed_recving_kv_req_ids = []
     scheduler.deferred_free_blocks = {}
     return scheduler
+
+
+def _stub_dcp_ops_without_triton(monkeypatch):
+    """BlockManager pulls get_dcp_local_seq_lens from dcp_ops, which imports Triton."""
+
+    def get_dcp_local_seq_lens(
+        seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+    ):
+        full_chunks = seq_lens // (cp_kv_cache_interleave_size * dcp_size)
+        base = full_chunks * cp_kv_cache_interleave_size
+        remainder_total = seq_lens - base * dcp_size
+        remainder = np.clip(
+            remainder_total - dcp_rank * cp_kv_cache_interleave_size,
+            0,
+            cp_kv_cache_interleave_size,
+        )
+        return base + remainder
+
+    fake_dcp_ops = ModuleType("atom.model_ops.dcp_ops")
+    fake_dcp_ops.get_dcp_local_seq_lens = get_dcp_local_seq_lens
+    monkeypatch.setitem(sys.modules, "atom.model_ops.dcp_ops", fake_dcp_ops)
+
+
+@pytest.mark.parametrize("hbm", [0, 8])
+def test_loaded_prefix_can_publish_suffix_and_be_reused(
+    monkeypatch, mock_config, seq_factory, hbm
+):
+    _stub_dcp_ops_without_triton(monkeypatch)
+    mock_config.enable_prefix_caching = True
+    mock_config.decode_context_parallel_size = 2
+    mock_config.num_kvcache_blocks = 16
+    host = Scheduler(mock_config)
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    seq = seq_factory(list(range(25)))
+    host.block_manager.allocate(seq)
+    if hbm:
+        host.block_manager.hash_blocks(seq, hbm)
+        seq.num_cached_tokens = hbm
+    _arm_load(connector, seq, hbm=hbm, lmcache=16)
+
+    metadata = connector.build_connector_meta()
+    assert len(metadata.requests) == 1
+    # Model all ranks reporting successful load, then compute the next block.
+    host._mark_offload_load_ready(seq)
+    assert seq.num_cached_tokens == 16
+    assert seq.offload_promoted_tokens == 16 - hbm
+    host.block_manager.hash_blocks(seq, 8)
+    seq.num_cached_tokens = 24
+
+    following = seq_factory(list(range(25)))
+    matched = host.block_manager.can_allocate(following)
+    assert matched == 3
+    host.block_manager.allocate(following, matched)
+    assert following.num_cached_tokens == 24
 
 
 @pytest.mark.parametrize(
@@ -326,6 +394,222 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
             worker._load_executor.shutdown(wait=True)
 
 
+def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
+    trace = []
+    rpc_stream = object()
+    rpc_thread = threading.get_ident()
+    events = []
+
+    class Event:
+        def __init__(self):
+            events.append(self)
+
+        def record(self, stream):
+            # The fence is recorded once, on the dispatching RPC thread, so a
+            # save thread never records its own (unordered) event.
+            assert threading.get_ident() == rpc_thread
+            assert stream is rpc_stream
+            trace.append(("record", self))
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: rpc_stream)
+
+    class Engine:
+        gpu_connector = object()
+
+        @staticmethod
+        def store(_tokens, **kwargs):
+            trace.append(("store", kwargs["producer_event"]))
+
+    worker = DenseOffloadConnector(_config("kv_producer"))
+    worker.chunk_size = 8
+    worker._engine = Engine()
+    metadata = LMCacheOffloadMetadata()
+    metadata.requests.extend(
+        [
+            LMCacheReqMeta(
+                req_id=req_id,
+                token_ids=list(range(8)),
+                block_ids=[req_id],
+                save_spec=SaveSpec(skip_leading_tokens=0),
+            )
+            for req_id in (31, 32)
+        ]
+    )
+
+    try:
+        worker.start_load_kv(metadata)
+        worker.close()
+
+        assert len(events) == 1
+        event = events[0]
+        assert trace[0] == ("record", event)
+        assert trace[1:] == [
+            ("store", event),
+            ("store", event),
+        ]
+    finally:
+        worker.close()
+
+
+def test_guard_forwards_keyword_arguments_and_logs_function_name(caplog):
+    worker = DenseOffloadConnector(_config("kv_producer"))
+    seen = []
+
+    def fail_save(req, *, producer_event):
+        seen.append((req.req_id, producer_event))
+        raise RuntimeError("boom")
+
+    request = LMCacheReqMeta(
+        req_id=41,
+        token_ids=list(range(8)),
+        block_ids=[1],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id=41, generation=0),
+    )
+    try:
+        with caplog.at_level("ERROR", logger="atom"):
+            worker._guard("save", fail_save, request, producer_event="fence")
+        assert seen == [(41, "fence")]
+        assert "fail_save failed for 41" in caplog.text
+        assert worker.get_finished().finished_saving == {request.save_operation}
+    finally:
+        worker.close()
+
+
+def test_dense_save_fence_failure_does_not_drop_the_step_load(monkeypatch):
+    load_operation = LoadOperationId(req_id=33, generation=1)
+    save_operation = SaveOperationId(req_id=33, generation=1)
+    second_save_operation = SaveOperationId(req_id=34, generation=2)
+    record_calls = []
+
+    class Event:
+        @staticmethod
+        def record(_stream):
+            record_calls.append(1)
+            raise RuntimeError("sticky HIP error")
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", object)
+
+    worker = DenseOffloadConnector(_config("kv_both"))
+    worker.chunk_size = 8
+    worker._engine = SimpleNamespace(
+        gpu_connector=object(),
+        lookup_unpin=lambda _req_id: None,
+        store=lambda *_args, **_kwargs: pytest.fail(
+            "an unfenced save must not be submitted"
+        ),
+    )
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=33,
+            token_ids=list(range(8)),
+            block_ids=[3],
+            load_spec=LoadSpec(
+                hbm_cached_tokens=0,
+                lmcache_cached_tokens=0,
+                can_load=True,
+            ),
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            load_operation=load_operation,
+            save_operation=save_operation,
+        )
+    )
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=34,
+            token_ids=list(range(8)),
+            block_ids=[4],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=second_save_operation,
+        )
+    )
+
+    try:
+        worker.start_load_kv(metadata)
+        worker.close()
+        output = worker.get_finished()
+
+        assert output.finished_loading == {load_operation}
+        assert output.failed_loading == set()
+        assert record_calls == [1]
+        assert output.finished_saving == {save_operation, second_save_operation}
+        assert (
+            ConnectorCompletion("dense.page.store", save_operation, False)
+            in output.connector_completions
+        )
+        assert (
+            ConnectorCompletion("dense.page.source_quiescent", save_operation, True)
+            in output.connector_completions
+        )
+        assert (
+            ConnectorCompletion(
+                "dense.page.source_quiescent", second_save_operation, True
+            )
+            in output.connector_completions
+        )
+    finally:
+        worker.close()
+
+
+def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
+    trace = []
+    stats = {}
+    producer_event = SimpleNamespace(
+        synchronize=lambda: pytest.fail("producer event must not host-synchronize")
+    )
+    pack_stream = SimpleNamespace(
+        wait_event=lambda event: trace.append(("wait", event))
+    )
+    state = SimpleNamespace(pack_stream=pack_stream, copy_stream=object())
+    connector = BlockGPUConnector.__new__(BlockGPUConnector)
+    connector._capture_transfer_stats = lambda: nullcontext(stats)
+    connector._prepare_transfer = lambda *_args, **_kwargs: (state, [object()])
+    connector._record_transfer_shape = lambda *_args: None
+
+    def prepare_block_id_stage(*_args):
+        # The block-ID upload is the first pack-stream work of a transfer; it
+        # must already be ordered behind the producer.
+        trace.append(("block_ids", None))
+        return object(), None, False
+
+    connector._prepare_block_id_stage = prepare_block_id_stage
+    connector._run_staged_pipeline = lambda *_args, **_kwargs: trace.append(
+        ("pipeline", None)
+    )
+
+    connector.batched_from_gpu(
+        [object()],
+        [0],
+        [8],
+        producer_event=producer_event,
+    )
+
+    assert trace == [
+        ("wait", producer_event),
+        ("block_ids", None),
+        ("pipeline", None),
+    ]
+    assert stats["producer_fenced"] == 1
+
+
+def test_block_gpu_connector_producer_event_is_keyword_only():
+    connector = BlockGPUConnector.__new__(BlockGPUConnector)
+    with pytest.raises(TypeError):
+        connector.batched_from_gpu([object()], [0], [8], object())
+
+
+def test_block_gpu_connector_refuses_producer_fence_without_pack_stream():
+    producer_event = SimpleNamespace(
+        synchronize=lambda: pytest.fail("must not fall back to host sync")
+    )
+    state = SimpleNamespace(pack_stream=None, copy_stream=None)
+    with pytest.raises(RuntimeError, match="pack stream"):
+        BlockGPUConnector._wait_for_save_source(state, producer_event)
+
+
 @pytest.mark.parametrize("outcome", ["exception", "miss"])
 def test_dense_worker_load_failure_reports_exact_operation(outcome):
     worker = DenseOffloadConnector(_config("kv_consumer"))
@@ -507,7 +791,7 @@ def test_scheduler_abort_before_allocation_releases_lookup_pin(
     scheduler.add(seq)
     allocation_attempts = []
 
-    def cannot_allocate(value):
+    def cannot_allocate(value, **_kwargs):
         allocation_attempts.append(value.id)
         return -1
 
@@ -577,6 +861,319 @@ def test_hbm_catches_up_after_a_pending_cpu_lookup(monkeypatch):
     assert metadata.requests == []
 
 
+def _counting_lookup(calls, hit):
+    def lookup(_tokens, lookup_id):
+        calls.append(lookup_id)
+        return hit
+
+    return SimpleNamespace(lookup=lookup, clear_lookup_status=lambda _sid: None)
+
+
+def test_native_retry_on_a_full_kv_cache_reuses_the_lookup(
+    monkeypatch, scheduler, seq_factory
+):
+    """One lookup per frontier, not one per scheduler step.
+
+    ATOM's own scheduler runs the external-tier lookup at the top of its waiting
+    loop, ahead of `can_allocate`, and every failure path puts the sequence back
+    at the head of `waiting` with its frontier untouched -- so the next step
+    asks the identical question. A complete miss pins nothing, so
+    `build_connector_meta` dispatches the lookup's cleanup and the step after
+    that hashes the whole prompt again. With the KV cache full that is every
+    step, on the scheduler thread, which is how the engine livelocks.
+    """
+
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    connector._lookup_client = _counting_lookup(calls, 0)
+    scheduler.kv_connector = connector
+    seq = seq_factory(list(range(24)))
+    scheduler.add(seq)
+    monkeypatch.setattr(
+        scheduler.block_manager, "can_allocate", lambda seq, **_kwargs: -1
+    )
+
+    for _ in range(8):
+        scheduler.schedule()
+
+    assert list(scheduler.waiting) == [seq]
+    assert calls == [str(seq.id)]
+    assert connector.total_lookups_skipped_by_memo == 7
+
+
+def test_native_admission_spends_the_memo(monkeypatch, scheduler, seq_factory):
+    """Admission spends the remembered hit.
+
+    Once the request is scheduled its load spec has been dispatched and its
+    frontier moves, so the next question about this id is a different one and
+    has to reach the tier. A preempted request therefore pays for one lookup,
+    not for a replay of an answer that no longer describes anything.
+    """
+
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    connector._lookup_client = _counting_lookup(calls, 0)
+    scheduler.kv_connector = connector
+    seq = seq_factory(list(range(24)))
+    scheduler.add(seq)
+    kv_full = {"yes": True}
+    can_allocate = scheduler.block_manager.can_allocate
+    monkeypatch.setattr(
+        scheduler.block_manager,
+        "can_allocate",
+        lambda seq, **kwargs: -1 if kv_full["yes"] else can_allocate(seq, **kwargs),
+    )
+
+    scheduler.schedule()
+    assert calls == [str(seq.id)]
+    assert str(seq.id) in connector._tier_hit_memo
+
+    kv_full["yes"] = False
+    scheduler.schedule()
+
+    assert list(scheduler.waiting) == []
+    assert connector._tier_hit_memo == {}
+
+
+@pytest.mark.parametrize("settled", ["offload_loaded", "offload_load_failed"])
+def test_prefetch_skips_a_request_that_resumes_after_its_load(monkeypatch, settled):
+    """A resumed request skips the match, so its lookup would never be consumed."""
+
+    sched = _scheduler(monkeypatch)
+    submitted = []
+    sched._lookup_client = SimpleNamespace(
+        submit=lambda _tokens, sid: submitted.append(sid) or True,
+        pump=lambda: None,
+        pending_ids=lambda: (),
+    )
+    resumed = _load_seq(70, num_prompt_tokens=16)
+    setattr(resumed, settled, True)
+    preempted = _load_seq(71, num_prompt_tokens=16)
+    setattr(preempted, settled, True)
+    preempted.block_table = []
+
+    sched.prefetch_lookups([resumed, preempted])
+
+    assert submitted == ["71"]
+
+
+@pytest.mark.parametrize(
+    "flags, blocks",
+    [
+        ({}, [0]),
+        ({"offload_loaded": True}, [0]),
+        ({"offload_load_failed": True}, [0]),
+        ({"offload_loaded": True}, []),
+    ],
+)
+def test_prefetch_skips_exactly_what_admission_resumes(monkeypatch, flags, blocks):
+    """A lookup is prefetched iff admission will match the request again."""
+
+    sched = _scheduler(monkeypatch)
+    submitted = []
+    sched._lookup_client = SimpleNamespace(
+        submit=lambda _tokens, sid: submitted.append(sid) or True,
+        pump=lambda: None,
+        pending_ids=lambda: (),
+    )
+    seq = _load_seq(74, num_prompt_tokens=16)
+    seq.block_table = blocks
+    for name, value in flags.items():
+        setattr(seq, name, value)
+    admission = SimpleNamespace(_connector_flag=lambda name: name == "is_offload")
+
+    sched.prefetch_lookups([seq])
+
+    resumes = Scheduler._is_offload_prefill_resume(admission, seq)
+    assert (submitted == []) == resumes
+
+
+def test_prefetch_skips_a_finished_load_before_admission(monkeypatch):
+    """Promoted to the head after its load, `offload_loaded` is still unset."""
+
+    sched = _scheduler(monkeypatch)
+    submitted = []
+    sched._lookup_client = SimpleNamespace(
+        submit=lambda _tokens, sid: submitted.append(sid) or True,
+        pump=lambda: None,
+        pending_ids=lambda: (),
+    )
+    loaded = _load_seq(72, num_prompt_tokens=16)
+    loaded.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    fresh = _load_seq(73, num_prompt_tokens=16)
+    fresh.status = SequenceStatus.WAITING
+
+    sched.prefetch_lookups([loaded, fresh])
+
+    assert submitted == ["73"]
+
+
+def test_a_declined_load_is_not_looked_up_again_every_step(monkeypatch):
+    """The plugin's shape: the decline is what releases the lookup.
+
+    vLLM hands ATOM the real HBM frontier, so `should_park_for_load_after_alloc`
+    routinely declines a hit -- already covered by HBM, unaligned, or below the
+    transfer floor. Declining clears the pending load, which makes the lookup
+    dispatchable, so the pin is gone by the next step. The request is still at
+    the head of the waiting queue, so without the remembered hit the next step
+    pays the tier again. A declined hit parks nothing, so the remembered answer
+    is the whole answer and no lookup is needed to escalate it.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 8192  # every hit here is "too small" to transfer
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    seq = _load_seq(60, num_prompt_tokens=24)
+
+    for _ in range(8):
+        need, _park = sched.get_num_new_matched_tokens(seq)
+        assert not (need > 0 and sched.should_park_for_load_after_alloc(seq))
+        sched.build_connector_meta()
+
+    assert calls == ["60"]
+    assert sched.total_lookups_skipped_by_memo == 7
+    assert "60" not in sched._load_specs
+
+
+def test_a_moved_frontier_is_re_derived_from_the_same_hit(monkeypatch):
+    """The frontier moves; the tier's answer about the prompt does not.
+
+    How much of the prompt the tier holds is a property of the prompt, so the
+    HBM frontier is not part of the question -- it only decides how much of
+    that hit is still worth transferring. Re-asking the tier because the
+    frontier moved would pay for the one expensive input again to learn
+    something already known.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 0
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    seq = _load_seq(61, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    sched.build_connector_meta()
+    seq.num_cached_tokens = 8
+
+    assert sched.get_num_new_matched_tokens(seq) == (8, True)
+    assert calls == ["61"]
+
+
+def test_a_failed_lookup_backs_off_before_it_is_retried(monkeypatch):
+    """A timeout is not an answer, but retrying it every step is what hurts.
+
+    Each retry costs `lmcache.mp.lookup_timeout` seconds *of the scheduler
+    thread*, so a tier that has stopped replying would stall the engine harder
+    than the hashing did. The non-answer is remembered too, for
+    `OFFLOAD_LOOKUP_RETRY_STEPS` steps, and then the tier is asked again -- a
+    dropped reply must not become a permanent miss for the rest of the
+    request's life.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 0
+    sched._tier_retry_steps = 1
+    replies = [None, 16]
+    calls = []
+
+    def lookup(_tokens, lookup_id):
+        calls.append(lookup_id)
+        return replies.pop(0)
+
+    sched._lookup_client = SimpleNamespace(
+        lookup=lookup, clear_lookup_status=lambda _sid: None
+    )
+    seq = _load_seq(62, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    sched.build_connector_meta()
+
+    # Inside the backoff: answered from the remembered non-answer.
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert calls == ["62"]
+    sched.build_connector_meta()
+
+    # Budget spent: the tier is asked again.
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    assert calls == ["62", "62"]
+
+
+def test_a_stale_memo_expires_and_asks_the_tier_again(monkeypatch):
+    """The remembered hit describes a tier that keeps moving.
+
+    Nothing tells this connector that another engine stored a longer prefix, or
+    that this one evicted the prefix it matched. So the memo is a bounded
+    optimisation, not a cache: after `OFFLOAD_LOOKUP_MEMO_STEPS` replays the
+    question is put to the tier again.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 8192  # every hit here is declined after alloc
+    sched._tier_memo_steps = 2
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    seq = _load_seq(65, num_prompt_tokens=24)
+
+    for _ in range(4):
+        need, _park = sched.get_num_new_matched_tokens(seq)
+        if need > 0:
+            sched.should_park_for_load_after_alloc(seq)
+        sched.build_connector_meta()
+
+    assert calls == ["65", "65"]
+
+
+def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
+    """Losing to another sub must not cost a fresh hash every step.
+
+    `MultiConnectorScheduler` queries *every* sub on every scheduler pass and
+    cancels the pending load of everyone but the winner, so under the supported
+    `[moriio, lmcache_offload]` ordering the offload sub arms a load and has it
+    taken away. The cancel does not forget the hit: the tier did not stop
+    holding the prefix because another connector won this step. So when moriio
+    stops matching -- its `kv_async_tagged` is one-shot -- the offload sub
+    answers from what it already knows, and only the dispatch pays the tier.
+    """
+
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    sched._min_load_tokens = 0
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 16)
+    moriio_matched = {"yes": False}
+
+    def moriio_match(_seq):
+        if moriio_matched["yes"]:
+            return 0, False
+        moriio_matched["yes"] = True
+        return 16, True
+
+    moriio = SimpleNamespace(get_num_new_matched_tokens=moriio_match)
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [moriio, sched]
+    multi._load_winner = {}
+    seq = _load_seq(64, num_prompt_tokens=24)
+
+    for _ in range(5):
+        assert multi.get_num_new_matched_tokens(seq) == (16, True)
+        sched.build_connector_meta()
+
+    assert calls == ["64"]
+    assert sched._load_specs["64"].lmcache_cached_tokens == 16
+
+
+def test_a_finished_request_leaves_no_memo_behind(monkeypatch):
+    sched = _scheduler(monkeypatch, "kv_consumer")
+    calls = []
+    sched._lookup_client = _counting_lookup(calls, 0)
+    seq = _load_seq(63, num_prompt_tokens=24)
+
+    sched.get_num_new_matched_tokens(seq)
+    sched.request_finished(seq)
+
+    assert sched._tier_hit_memo == {}
+
+
 def test_cpu_pin_is_retained_until_retrieve_finishes(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_consumer")
     scheduler._min_load_tokens = 0
@@ -606,3 +1203,243 @@ def test_cpu_pin_is_retained_until_retrieve_finishes(monkeypatch):
         }
     finally:
         worker.close()
+
+
+def test_dense_worker_records_the_blocks_a_failed_load_left_unfilled():
+    """The id alone does not truncate anything.
+
+    vLLM caches the whole external prefix unless the failure also names blocks:
+    `_update_requests_with_invalid_blocks` cuts `num_computed_tokens` at the
+    first block reported here. Blocks below the HBM frontier are deliberately
+    excluded -- they hold valid KV and may be shared with another request.
+
+    The grid is the virtual block size (block_size 4 x dcp 2 = 8), matching the
+    one `BlockGPUConnector` maps chunks with; the physical size would index
+    different entries of the very same table.
+    """
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    request = LMCacheReqMeta(
+        req_id=61,
+        token_ids=list(range(16)),
+        block_ids=[10, 11, 12, 13],
+        load_spec=LoadSpec(
+            hbm_cached_tokens=4,
+            lmcache_cached_tokens=12,
+            can_load=True,
+        ),
+        load_operation=LoadOperationId(req_id=61, generation=1),
+    )
+
+    try:
+        with worker._lock:
+            worker._record_load_error_blocks(request)
+
+        # Tokens [4, 12) on a grid of 8 are entries 0 and 1 of the table.
+        assert worker.take_load_error_blocks() == {10, 11}
+        # Drained, so the next step does not truncate a request all over again.
+        assert worker.take_load_error_blocks() == set()
+    finally:
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+
+def test_dense_worker_fences_in_flight_jobs_for_a_preempted_request():
+    """Preemption hands the blocks to somebody else in the same step.
+
+    A save still gathering from them stores the new occupant's bytes under the
+    preempted request's key -- a poisoned cache entry, not a lost one. The fence
+    is the only thing standing between the two.
+    """
+    import threading
+
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    release = threading.Event()
+    finished = []
+
+    def slow_job(_request):
+        release.wait(timeout=5)
+        finished.append(True)
+
+    try:
+        worker._track_job(
+            71,
+            worker._save_executor.submit(
+                worker._guard, "save", slow_job, SimpleNamespace(req_id=71)
+            ),
+        )
+        assert worker._inflight_jobs["71"]
+
+        # Another request's ids are not this request's business.
+        worker.wait_for_requests(["72"])
+        assert finished == []
+
+        release.set()
+        worker.wait_for_requests(["71"])
+
+        assert finished == [True]
+        assert "71" not in worker._inflight_jobs
+    finally:
+        release.set()
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+
+def test_dense_load_failure_by_request_resolves_the_parked_generation(monkeypatch):
+    """vLLM hands back plain strings; `load_failed` refuses a raw id.
+
+    Routing the failure through `load_finished` instead would pop the floor
+    recording that the [HBM, LMCache) range is NOT persisted, so the recomputed
+    chunks would never be saved.
+    """
+    connector = _scheduler(monkeypatch)
+    seq = _load_seq(81, num_prompt_tokens=16)
+    operation = LoadOperationId(req_id=81, generation=3)
+    connector._save_tracker["81"] = [seq, 16]
+    connector._load_save_floors["81"] = 8
+    connector._active_load_operations["81"] = (seq, operation)
+
+    assert connector.load_failed_by_request("81") is True
+
+    assert connector._save_tracker["81"] == [seq, 8]
+    assert "81" not in connector._active_load_operations
+
+
+def test_dense_worker_pool_widths_follow_env(monkeypatch):
+    """A single load thread saturates once the CPU tier serves real traffic.
+
+    Measured on the radix workload with the HBM pool squeezed to 7900 blocks:
+    88% duty cycle inside `retrieve` on every rank, which turned a +57.8pp
+    hit-rate win into a throughput loss. Both pools must be tunable, and both
+    must keep their one-thread default so existing deployments are unchanged.
+    """
+
+    worker = DenseOffloadConnector(_config())
+    try:
+        assert (worker.save_workers, worker.load_workers) == (1, 1)
+        assert worker._save_executor._max_workers == 1
+        assert worker._load_executor._max_workers == 1
+    finally:
+        worker.close()
+
+    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "4")
+    monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "3")
+    worker = DenseOffloadConnector(_config())
+    try:
+        assert (worker.save_workers, worker.load_workers) == (4, 3)
+        assert worker._save_executor._max_workers == 4
+        assert worker._load_executor._max_workers == 3
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("var", ["OFFLOAD_COPY_WORKERS", "OFFLOAD_LOAD_WORKERS"])
+def test_dense_worker_rejects_non_positive_pool_width(monkeypatch, var):
+    monkeypatch.setenv(var, "0")
+    with pytest.raises(ValueError, match="worker count must be positive"):
+        DenseOffloadConnector(_config())
+
+
+class _StubLookupClient:
+    """Lookup client that always reports the same hit length."""
+
+    def __init__(self, hit):
+        self.hit = hit
+        self.calls = 0
+        self.cleared = []
+
+    def lookup(self, token_ids, lookup_id):
+        self.calls += 1
+        return self.hit
+
+    def clear_lookup_status(self, lookup_id):
+        self.cleared.append(lookup_id)
+
+
+def _lookup_scheduler(monkeypatch, hit, *, role="offload"):
+    sched = _scheduler(monkeypatch, role)
+    sched._lookup_client = _StubLookupClient(hit)
+    sched._min_load_tokens = 0  # these prompts are far below the 8192 default
+    return sched
+
+
+def _dispatch_and_fail_load(sched, seq):
+    """Run the alloc + metadata step, then fail the load it dispatched.
+
+    The metadata build is what releases the lookup memo, so a later pass is a
+    fresh lookup rather than the "older lifecycle still owns the pin" deferral.
+    """
+
+    sched.update_state_after_alloc(seq)
+    meta = sched.build_connector_meta()
+    (load,) = [req for req in meta.requests if req.load_spec is not None]
+    assert sched.load_failed(load.load_operation) is True
+
+
+def test_dense_full_prompt_hit_is_floored_to_a_loadable_chunk(monkeypatch):
+    # A hit covering the whole prompt is decremented so something is left to
+    # compute. With a prompt length that is an exact multiple of the chunk
+    # size, that decrement lands off the chunk boundary -- and LMCache resolves
+    # at chunk granularity, so the resulting spec asks for tokens the tier can
+    # never return and the load fails every time. The floor is what keeps the
+    # spec satisfiable. Scaled-down mirror of the production shape observed on
+    # GLM-5.2 (chunk 64, prompt 32768: 32767 requested, 32704 available).
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    assert sched.chunk_size == 8
+    seq = _load_seq(940, num_prompt_tokens=16)
+
+    assert sched.get_num_new_matched_tokens(seq) == (8, True)
+    assert sched._load_specs["940"].lmcache_cached_tokens == 8
+
+
+def test_dense_partial_hit_off_a_chunk_boundary_is_floored(monkeypatch):
+    # The same arithmetic with no decrement involved: any unaligned hit names
+    # tokens the tier does not hold at chunk granularity.
+    sched = _lookup_scheduler(monkeypatch, hit=13)
+    seq = _load_seq(941, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (8, True)
+    assert sched._load_specs["941"].lmcache_cached_tokens == 8
+
+
+def test_dense_failed_load_is_not_retried_for_the_same_request(monkeypatch):
+    # `load_failed` clears the pending load and the lookup memo, so without a
+    # record of the attempt the next scheduler pass looks up, hits, parks the
+    # request in WAITING_FOR_REMOTE_KVS and fails again -- forever, holding its
+    # KV blocks and concurrency slot. One attempt per request; after that the
+    # request prefills normally.
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    seq = _load_seq(942, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    _dispatch_and_fail_load(sched, seq)
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched.total_suppressed_load_retries == 1
+    assert sched._load_specs == {}
+    assert sched._lookup_client.calls == 1
+
+
+def test_dense_new_sequence_reusing_request_id_gets_a_fresh_attempt(monkeypatch):
+    # The mark is against the sequence, not the ID: a request ID leased to a
+    # new sequence has spent nothing.
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    seq = _load_seq(943, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    _dispatch_and_fail_load(sched, seq)
+
+    reused = _load_seq(943, num_prompt_tokens=24)
+    assert sched.get_num_new_matched_tokens(reused) == (16, True)
+    assert sched.total_suppressed_load_retries == 0
+
+
+def test_dense_request_finished_releases_the_failed_load_mark(monkeypatch):
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    seq = _load_seq(944, num_prompt_tokens=24)
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    _dispatch_and_fail_load(sched, seq)
+    assert sched._load_failed_seqs == {"944": seq}
+
+    sched.request_finished(seq)
+    assert sched._load_failed_seqs == {}

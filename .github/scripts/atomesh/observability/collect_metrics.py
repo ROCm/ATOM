@@ -24,6 +24,7 @@ import export_report
 
 PROMETHEUS_VERSION = "3.5.0"
 REPORT_STEP = 5
+DEFAULT_SCRAPE_INTERVAL_SECONDS = 1.0
 
 
 def save_json(path: Path, value) -> None:
@@ -32,8 +33,37 @@ def save_json(path: Path, value) -> None:
     temporary.replace(path)
 
 
-def scrape_config(prefill: list[str], decode: list[str], mesh: str) -> dict:
-    """Accept the server script's resolved addresses, including per-worker ports."""
+def scrape_interval_seconds(value: str | float) -> float:
+    """Normalize to Prometheus's millisecond precision and duration range."""
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("scrape interval must be numeric") from exc
+    # Prometheus durations are stored as a signed 64-bit nanosecond count.
+    max_ms = ((1 << 63) - 1) // 1_000_000
+    if not math.isfinite(seconds) or not 0.001 <= seconds <= max_ms / 1000:
+        raise argparse.ArgumentTypeError(
+            "scrape interval must be finite, at least 0.001 seconds, "
+            "and within Prometheus's duration range"
+        )
+    return round(seconds * 1000) / 1000
+
+
+def scrape_config(
+    prefill: list[str],
+    decode: list[str],
+    mesh: str | None,
+    interval: float = DEFAULT_SCRAPE_INTERVAL_SECONDS,
+    *,
+    standalone: list[str] | None = None,
+) -> dict:
+    """Accept the server script's resolved addresses, including per-worker ports.
+
+    An aggregated deployment passes `standalone` and no `mesh`: one process
+    answers both roles, so listing it as a prefill target and again as a decode
+    target would scrape the same endpoint twice and double it in every
+    cross-role total, and no router runs to scrape.
+    """
 
     def target(address):
         parsed = urlsplit("http://" + address)
@@ -43,19 +73,30 @@ def scrape_config(prefill: list[str], decode: list[str], mesh: str) -> dict:
             raise ValueError(f"Invalid metrics target: {address}")
         return address
 
-    return {
-        "global": {"scrape_interval": "5s", "scrape_timeout": "4s"},
-        "scrape_configs": [
-            {
-                "job_name": "atom",
-                "static_configs": [
-                    {
-                        "targets": [target(t) for t in addresses],
-                        "labels": {"observer": "api", "role": role},
-                    }
-                    for role, addresses in (("prefill", prefill), ("decode", decode))
-                ],
-            },
+    interval = scrape_interval_seconds(interval)
+    milliseconds = round(interval * 1000)
+    duration = (
+        f"{milliseconds // 1000}s" if milliseconds % 1000 == 0 else f"{milliseconds}ms"
+    )
+    api_roles = (
+        (("standalone", standalone),)
+        if standalone
+        else (("prefill", prefill), ("decode", decode))
+    )
+    scrape_configs = [
+        {
+            "job_name": "atom",
+            "static_configs": [
+                {
+                    "targets": [target(t) for t in addresses],
+                    "labels": {"observer": "api", "role": role},
+                }
+                for role, addresses in api_roles
+            ],
+        }
+    ]
+    if mesh:
+        scrape_configs.append(
             {
                 "job_name": "atom-mesh",
                 "static_configs": [
@@ -64,8 +105,14 @@ def scrape_config(prefill: list[str], decode: list[str], mesh: str) -> dict:
                         "labels": {"observer": "mesh", "role": "router"},
                     }
                 ],
-            },
-        ],
+            }
+        )
+    return {
+        "global": {
+            "scrape_interval": duration,
+            "scrape_timeout": duration if interval < 1 else "1s",
+        },
+        "scrape_configs": scrape_configs,
     }
 
 
@@ -119,9 +166,18 @@ def get_json(url: str) -> dict:
         return json.load(response)
 
 
-def wait_for_prometheus(process, log: Path, target_count: int) -> str:
-    deadline = time.monotonic() + 45
+def wait_for_prometheus(
+    process,
+    log: Path,
+    target_count: int,
+    *,
+    timeout: float = 45,
+    interrupted: Callable[[], bool] | None = None,
+) -> str:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if interrupted is not None and interrupted():
+            raise RuntimeError("Metrics collection interrupted during startup")
         if process.poll() is not None:
             raise RuntimeError(f"Prometheus exited with code {process.returncode}")
         match = re.search(r"address=127\.0\.0\.1:([1-9]\d*)", log.read_text())
@@ -137,7 +193,7 @@ def wait_for_prometheus(process, log: Path, target_count: int) -> str:
                 pass
         time.sleep(0.5)
     raise RuntimeError(
-        "Prometheus or its metrics targets did not become ready in 45 seconds"
+        f"Prometheus or its metrics targets did not become ready in {timeout:g} seconds"
     )
 
 
@@ -159,9 +215,11 @@ def wait_for_final_scrape(
     benchmark_end: float,
     target_count: int,
     interrupted: Callable[[], bool],
+    *,
+    timeout: float = 30,
 ) -> float:
     """Wait for post-benchmark scrapes and a query step that includes them."""
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + timeout
     query_end = None
     while time.monotonic() < deadline:
         if interrupted():
@@ -188,21 +246,27 @@ def wait_for_final_scrape(
         if query_end is not None and time.time() >= query_end:
             return query_end
         time.sleep(0.2)
-    raise RuntimeError("Final metrics scrapes did not complete in 30 seconds")
+    raise RuntimeError(f"Final metrics scrapes did not complete in {timeout:g} seconds")
 
 
-def empty_report(start, end, model, notes):
-    panels = export_report.panels_for("pd")
+def report_title(deployment: str) -> str:
+    if deployment == "standalone":
+        return "Agentic aggregated inference report"
+    return "Agentic PD inference report"
+
+
+def empty_report(start, end, model, notes, *, window=60, deployment="pd"):
+    panels = export_report.panels_for(deployment)
     for panel in panels:
-        panel["series"] = {key: [] for key in export_report.STATISTICS}
+        panel["series"] = {key: [] for key in export_report.statistics_for(panel)}
     return {
         "meta": {
-            "title": "Agentic PD latency report",
+            "title": report_title(deployment),
             "model": model,
             "start": start,
             "end": max(end, start + 1),
             "step": REPORT_STEP,
-            "window": 60,
+            "window": window,
             "kind": "recorded",
             "notes": notes,
         },
@@ -215,7 +279,8 @@ def finalize_report(data: dict, status: dict, notes: list[str]) -> None:
     missing = [
         p["id"]
         for p in data["panels"]
-        if not any(
+        if not p.get("records")
+        and not any(
             any(v is not None for _, v in points) for points in p["series"].values()
         )
     ]
@@ -251,9 +316,19 @@ def publish_report(output: Path, data: dict, status: dict) -> None:
 
 
 def run(args) -> int:
+    interval = scrape_interval_seconds(args.scrape_interval_seconds)
+    window = max(60, math.ceil(4 * interval))
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    config = scrape_config(args.prefill, args.decode, args.mesh)
+    deployment = "standalone" if args.standalone else "pd"
+    # Every target Prometheus must have scraped before a report means anything:
+    # the API endpoints plus the router, when one runs.
+    target_count = len(args.standalone or [*args.prefill, *args.decode]) + bool(
+        args.mesh
+    )
+    config = scrape_config(
+        args.prefill, args.decode, args.mesh, interval, standalone=args.standalone
+    )
     # JSON is valid YAML and avoids a YAML dependency inside the model image.
     save_json(output / "prometheus.yml", config)
     status = {
@@ -299,10 +374,17 @@ def run(args) -> int:
                 prometheus_url = wait_for_prometheus(
                     collector,
                     output / "prometheus.log",
-                    len(args.prefill) + len(args.decode) + 1,
+                    target_count,
+                    timeout=max(45, 2 * interval + 5),
+                    interrupted=lambda: received_signal is not None,
                 )
                 # Establish counter baselines before the next benchmark begins.
-                time.sleep(6)
+                baseline_deadline = time.monotonic() + max(6, 2 * interval)
+                while received_signal is None:
+                    remaining = baseline_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.5, remaining))
                 save_json(
                     output / "targets-before.json",
                     get_json(prometheus_url + "/api/v1/targets"),
@@ -344,14 +426,16 @@ def run(args) -> int:
             notes = [
                 (
                     "Collected during the complete AIPerf invocation, including its warmup and drain. "
-                    "Each point summarizes the preceding 60 seconds; percentiles are histogram estimates."
+                    f"Histogram points summarize the preceding {window} seconds; queue and KV curves show sampled state. Percentiles are histogram estimates."
                 )
             ]
             if benchmark_rc:
                 notes.append(
                     f"Benchmark exited with code {benchmark_rc}; available samples are retained."
                 )
-            data = empty_report(start, end, args.model, [])
+            data = empty_report(
+                start, end, args.model, [], window=window, deployment=deployment
+            )
             try:
                 if prometheus_url is None:
                     raise RuntimeError("No Prometheus collector is available")
@@ -361,8 +445,9 @@ def run(args) -> int:
                         prometheus_url,
                         start,
                         end,
-                        len(args.prefill) + len(args.decode) + 1,
+                        target_count,
                         lambda: received_signal is not None,
+                        timeout=max(30, 2 * interval + REPORT_STEP + 5),
                     )
                 except (OSError, ValueError, KeyError, RuntimeError) as exc:
                     # Export whatever is available even if a target stays down.
@@ -372,9 +457,11 @@ def run(args) -> int:
                     prometheus_url,
                     start,
                     max(collection_end, start + 1),
+                    deployment=deployment,
                     step=REPORT_STEP,
+                    window=window,
                     model=args.model,
-                    title="Agentic PD latency report",
+                    title=report_title(deployment),
                     diagnostics=status["errors"],
                 )
                 targets = get_json(prometheus_url + "/api/v1/targets")
@@ -411,6 +498,13 @@ def run(args) -> int:
                 end=max(collection_end, start + 1),
                 benchmark_end=end,
                 collection_end=collection_end,
+                instances=[
+                    {"role": group["labels"]["role"], "instance": target}
+                    for job in config["scrape_configs"]
+                    if job["job_name"] == "atom"
+                    for group in job["static_configs"]
+                    for target in group["targets"]
+                ],
             )
             notes.append(
                 f"The report includes {max(0, collection_end - end):.3f} seconds "
@@ -439,11 +533,33 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--prefill", action="append", required=True)
-    parser.add_argument("--decode", action="append", required=True)
-    parser.add_argument("--mesh", required=True)
+    parser.add_argument("--prefill", action="append")
+    parser.add_argument("--decode", action="append")
+    parser.add_argument(
+        "--standalone",
+        action="append",
+        help="Address of an aggregated server answering both roles. Replaces "
+        "--prefill/--decode, and needs no --mesh because no router runs.",
+    )
+    parser.add_argument("--mesh")
+    parser.add_argument(
+        "--scrape-interval-seconds",
+        type=scrape_interval_seconds,
+        default=DEFAULT_SCRAPE_INTERVAL_SECONDS,
+        help="Prometheus scrape interval in seconds (default: %(default)g; minimum: 0.001).",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    args.prefill = args.prefill or []
+    args.decode = args.decode or []
+    args.standalone = args.standalone or []
+    if args.standalone and (args.prefill or args.decode):
+        parser.error(
+            "--standalone names the single server answering both roles and "
+            "cannot be combined with --prefill or --decode"
+        )
+    if not args.standalone and not (args.prefill and args.decode):
+        parser.error("--prefill and --decode are required without --standalone")
     if args.command[:1] == ["--"]:
         args.command.pop(0)
     if not args.command:

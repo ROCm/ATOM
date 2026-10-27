@@ -99,13 +99,13 @@ ATOM uses a module-level global `ForwardContext` to pass metadata through CUDA g
 
 - **`Context`** — lightweight struct: `positions`, `is_prefill`, `batch_size`, `running_bs`, `running_tokens`, `is_draft`. The last two are the step's DP-unified padded shape: sequences and hidden_states rows respectively.
 
-- **`DPMetadata`** — data parallel metadata with `num_tokens_across_dp()` (all-reduce), `max_tokens_across_dp`, and `chunked_sizes()` context manager.
+- **`DPMetadata`** — data parallel metadata holding every rank's running tokens (`running_tokens_per_dp_rank`, a numpy array), with `gather_running_tokens()` (all-reduce, for a caller that knows only its own count), `max_tokens_across_dp`, and `get_sizes_across_dp()`.
 
 **Global accessors:**
 
 | Function | Purpose |
 |---|---|
-| `set_forward_context(attn_metadata, atom_config, context, ...)` | Set the global context before a forward pass |
+| `set_forward_context(attn_metadata, atom_config, context, running_tokens_per_dp_rank, ...)` | Set the global context before a forward pass |
 | `get_forward_context()` | Retrieve the current context (used by attention backends) |
 | `reset_forward_context()` | Clear after forward pass completes |
 | `set_kv_cache_data(kv_cache_data)` | Register KV cache tensors at initialization |
@@ -155,7 +155,9 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 | Socket | Type | Direction | Purpose |
 |---|---|---|---|
 | Input | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | Send requests and control commands |
+| Control | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | Serialized utility and collective-RPC commands |
 | Output | `PUSH` (EngineCore) / `PULL` (CoreManager) | EngineCore → CoreManager | Return finished sequences and stream outputs |
+| Worker RPC output | one `PUSH` / `PULL` pair per TP rank | ModelRunner → AsyncIOProcManager | One correlated collective-RPC reply per worker |
 
 **Process hierarchy:**
 
@@ -166,6 +168,53 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 **Data-parallel variant** (`DPEngineCoreProc`):
 
 When `data_parallel_size > 1`, each EngineCore process is a `DPEngineCoreProc` that synchronizes with other DP ranks via `torch.distributed.all_reduce` on a Gloo process group. The `busy_loop()` override ensures all DP ranks stay in lockstep: if one rank has a prefill batch while another does not, the idle rank executes a dummy prefill (`dummy_prefill_execution()`) to keep NCCL collectives synchronized.
+
+### Collective worker RPC
+
+`AsyncLLMEngine.collective_rpc()` sends a small control call to every DP
+engine and every TP worker, returning `RpcResult` entries in DP-major,
+TP-rank order. The wire types and request-id router live in
+`atom/model_engine/collective_rpc.py`; worker dispatch and per-rank reply
+sockets live in `atom/model_engine/async_proc.py`; capability aggregation is
+split between `atom/model_engine/capabilities.py` and
+`atom/rollout/capabilities.py`.
+
+Every call carries a request id and a finite deadline. Both ordinary utility
+replies and collective replies are routed to the caller holding that id; a
+late reply is dropped rather than becoming the next utility caller's answer.
+Worker exceptions are returned as `RpcResult.error`, preserving successful
+rank results as well.
+
+The API is synchronous and intended for control messages, not bulk tensor
+transfer. A target returns plain data -- `None`, `bool`, `int`, `float`, `str`
+and `bytes`, in lists, tuples and dicts -- since its reply is unpickled in
+EngineCore and again in the API server; anything else, a tensor included, is
+returned as that rank's error. Only the runner methods listed in
+`COLLECTIVE_RPC_METHODS` run on this generic path, and they are exactly what
+`get_worker_capabilities` advertises: the rest of a runner -- weight updates,
+memory release/resume, its profiler, KV allocation, graph capture, dummy
+forwards -- has EngineCore state around it that a direct call would bypass.
+Pipeline-parallel and prefill/decode-disaggregated engines are also rejected
+because their engine processes are not one-to-one DP ranks.
+RPC targets must not perform cross-DP collectives: each EngineCore dequeues
+control work independently, so another DP engine may already be waiting in the
+busy loop's state all-reduce.
+
+Direct, SHM and IPC weight updates are fenced sessions. The first bucket stops
+serving; CoreManager clears the fence only after every DP engine completes the
+final bucket. Built-in senders abort from ``finally`` if iteration stops early,
+and asynchronous weight-update utility sends are rejected because they have no
+owner to finish or abort them. ``AsyncLLMEngine.get_weight_sync_status()``
+reports a fence, an in-progress session and its last failure.
+
+Every update carries the id of the sync it belongs to: one per
+``weight_sync_session()`` until that sync finishes, and one per update sent
+outside a session. A session whose update failed sends nothing more, and an
+engine refuses the remaining updates and the finish of a failed or aborted
+sync, so the rest of a failed sync cannot commit as a new one. Recovering takes
+a new, complete sync. Weights may be resumed while fenced, since after
+``sleep(level=2)`` only a resume gives released parameters storage again; the
+fence keeps serving off until that complete sync commits.
 
 ## Sequence lifecycle
 

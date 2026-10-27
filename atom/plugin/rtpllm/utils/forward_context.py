@@ -36,6 +36,7 @@ from atom.model_ops.attentions.gdn_attn import (
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
+    DPMetadata,
     _forward_kv_cache_context,
     reset_forward_context,
     running_tokens_from_bs,
@@ -83,6 +84,100 @@ class AiterFlashAttentionMetadataForPluginMode:
 if triton is not None:
 
     @triton.jit
+    def _target_verify_state_slots_graph_kernel(
+        block_table,
+        sequence_lengths,
+        prefix_lengths,
+        read_slots,
+        write_slots,
+        invalid_live_rows,
+        rows,
+        table_stride_row,
+        table_stride_col,
+        table_cols: tl.constexpr,
+        block_size: tl.constexpr,
+        query_len: tl.constexpr,
+        tile: tl.constexpr,
+    ):
+        row = tl.program_id(0) * tile + tl.arange(0, tile)
+        live = row < rows
+        length = tl.load(sequence_lengths + row, live, 0)
+        read_col = tl.maximum(length - 2, 0) // block_size
+        write_col = tl.maximum(length - 1, 0) // block_size
+        # Speculative candidates have separate state slots even when their
+        # token positions fall in the same ordinary linear-cache block.
+        max_write_col = write_col + query_len - 1
+        # RTP frees old linear-cache pages, including column zero. It sets
+        # prefix length to zero only for Graph padding; a target verify always
+        # follows at least one real prompt token.
+        real = live & (tl.load(prefix_lengths + row, live, 0) > 0)
+        invalid = (
+            live & real & ((read_col >= table_cols) | (max_write_col >= table_cols))
+        )
+        for token in tl.static_range(query_len):
+            column = write_col + token
+            slot = tl.load(
+                block_table
+                + row * table_stride_row
+                + tl.minimum(column, table_cols - 1) * table_stride_col,
+                live & (column < table_cols) & (length >= 2),
+                -1,
+            )
+            invalid |= live & real & (slot < 0)
+            # RTP reserves and zeroes state block 0 for Graph padding. The
+            # recurrent consumer cannot safely dereference a negative slot.
+            tl.store(write_slots + row * query_len + token, tl.maximum(slot, 0), live)
+        previous = tl.load(
+            block_table
+            + row * table_stride_row
+            + tl.minimum(read_col, table_cols - 1) * table_stride_col,
+            live & (read_col < table_cols) & (length >= 2),
+            -1,
+        )
+        invalid |= live & real & (previous < 0)
+        invalid_count = tl.sum(invalid.to(tl.int32), 0)
+        # Each tile owns one flag, overwritten on every Graph replay. This
+        # avoids both an atomic update and a separate counter-reset kernel.
+        tl.store(invalid_live_rows + tl.program_id(0), invalid_count)
+        for token in tl.static_range(query_len):
+            tl.store(
+                read_slots + row * query_len + token, tl.maximum(previous, 0), live
+            )
+
+    @triton.jit
+    def _previous_state_slots_graph_kernel(
+        block_table,
+        positions,
+        query_lengths,
+        output_slots,
+        input_slots,
+        rows,
+        table_stride_row,
+        table_stride_col,
+        table_cols: tl.constexpr,
+        block_size: tl.constexpr,
+        tile: tl.constexpr,
+        has_query_lengths: tl.constexpr,
+        unit_query_length: tl.constexpr,
+    ):
+        row = tl.program_id(0) * tile + tl.arange(0, tile)
+        live = row < rows
+        position = tl.load(positions + row, live, -1)
+        if has_query_lengths:
+            position -= tl.load(query_lengths + row, live, 0)
+        elif unit_query_length:
+            position -= 1
+        output_slot = tl.load(output_slots + row, live, -1)
+        column = tl.minimum(tl.maximum(position - 1, 0) // block_size, table_cols - 1)
+        previous = tl.load(
+            block_table + row * table_stride_row + column * table_stride_col,
+            live & (position > 0),
+            -1,
+        )
+        input_slot = tl.where(position > 0, previous, output_slot)
+        tl.store(input_slots + row, tl.where(position >= 0, input_slot, -1), live)
+
+    @triton.jit
     def _expand_block_table_for_atom_indexer_kernel(
         block_table,
         output,
@@ -106,18 +201,24 @@ if triton is not None:
         kernel_cols: tl.constexpr,
         physical_cols: tl.constexpr,
         block_ratio: tl.constexpr,
+        kernel_row_stride: tl.constexpr,
+        kernel_col_stride: tl.constexpr,
+        output_row_stride: tl.constexpr,
+        output_col_stride: tl.constexpr,
     ):
         row = tl.program_id(0)
         col = tl.program_id(1)
         kernel_col = col * block_ratio
         value = tl.load(
-            kernel_block_table + row * kernel_cols + kernel_col,
+            kernel_block_table
+            + row * kernel_row_stride
+            + kernel_col * kernel_col_stride,
             mask=kernel_col < kernel_cols,
             other=-1,
         )
         physical = value // block_ratio
         physical = tl.where(value >= 0, physical, -1)
-        tl.store(output + row * physical_cols + col, physical)
+        tl.store(output + row * output_row_stride + col * output_col_stride, physical)
 
 
 @dataclass(frozen=True)
@@ -397,11 +498,14 @@ class RTPForwardContext:
         block_ratio = int(seq_size_per_block // kernel_seq_size_per_block)
         bs_now = int(kernel_block_table.shape[0])
         kernel_cols = int(kernel_block_table.shape[1])
-        if kernel_cols < block_ratio or kernel_cols % block_ratio != 0:
-            return kernel_block_table.to(
-                device=kernel_block_table.device, dtype=torch.int32, non_blocking=True
-            ).contiguous()
-        physical_cols = (kernel_cols + block_ratio - 1) // block_ratio
+        if kernel_cols < block_ratio:
+            raise ValueError(
+                "RTP plugin kernel block table has no complete physical page"
+            )
+        # MTP Graph tables can append reserved state columns that do not make
+        # up a full physical page. Never reinterpret those kernel block IDs as
+        # physical page IDs; only recover complete groups of block_ratio.
+        physical_cols = kernel_cols // block_ratio
         in_capture = torch.cuda.is_current_stream_capturing()
         if in_capture and cg_bufs is not None:
             if triton is None:
@@ -427,6 +531,10 @@ class RTPForwardContext:
                 kernel_cols,
                 physical_cols,
                 block_ratio,
+                kernel_block_table.stride(0),
+                kernel_block_table.stride(1),
+                out_view.stride(0),
+                out_view.stride(1),
             )
             return out_view
 
@@ -513,17 +621,33 @@ class RTPForwardContext:
         num_tokens: int,
         state_indices_cache: dict[tuple[int, bool], torch.Tensor] | None = None,
         layer_group_map: dict[int, int] | None = None,
+        cg_bufs: dict | None = None,
     ) -> GDNAttentionMetadata:
         block_table = getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
         if block_table is None or block_table.numel() == 0:
             raise ValueError(
                 "RTP plugin requires kv_cache_kernel_block_id_device for GDN metadata."
             )
+        if getattr(attn_inputs, "is_target_verify", False):
+            raise ValueError("MTP target verification requires RTPQwen4ExpContext")
         target_device = block_table.device
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-        query_start_loc = RTPForwardContext._query_start_loc(
-            attn_inputs, device=target_device
-        )
+        if (
+            not is_prefill
+            and torch.cuda.is_current_stream_capturing()
+            and cg_bufs is not None
+            and "query_start_loc" in cg_bufs
+        ):
+            # Graph decode captures one token per request. Host sequence lengths
+            # are fixed at capture time, while device lengths change on replay.
+            batch_size = int(attn_inputs.input_lengths.numel())
+            if num_tokens != batch_size:
+                raise ValueError("GDN Graph decode requires one token per request")
+            query_start_loc = cg_bufs["query_start_loc"][: batch_size + 1]
+        else:
+            query_start_loc = RTPForwardContext._query_start_loc(
+                attn_inputs, device=target_device
+            )
         state_indices = RTPForwardContext._state_indices(
             attn_inputs=attn_inputs,
             is_prefill=is_prefill,
@@ -1606,6 +1730,7 @@ class RTPForwardContext:
                 num_tokens=int(positions.numel()),
                 state_indices_cache=state_indices_cache,
                 layer_group_map=layer_group_map,
+                cg_bufs=cg_bufs,
             )
             # Keep raw RTP attention inputs in metadata so GDN can resolve per-layer
             # block-map/state-index semantics (same idea as RTP's select_block_map_for_layer).
@@ -1800,7 +1925,10 @@ class RTPForwardContext:
                 attn_metadata=attn_md,
                 atom_config=get_current_atom_config(),
                 context=forward_context.context,
-                num_tokens=forward_context.num_tokens,
+                running_tokens_per_dp_rank=DPMetadata.gather_running_tokens(
+                    get_current_atom_config().parallel_config,
+                    forward_context.num_tokens,
+                ),
             )
             yield
         finally:
@@ -1881,6 +2009,151 @@ class RTPForwardMLAContext(RTPForwardContext):
 
 @dataclass(frozen=True)
 class RTPForwardQwen35HybridContext(RTPForwardContext):
+    @staticmethod
+    def _previous_state_slots(
+        block_table: torch.Tensor,
+        positions: torch.Tensor,
+        output_slots: torch.Tensor,
+        block_size: int,
+        graph_output: torch.Tensor | None = None,
+        query_lengths: torch.Tensor | None = None,
+        unit_query_length: bool = False,
+    ) -> torch.Tensor:
+        """Read the state before the first new token, write the final block."""
+        if block_size <= 0 or block_table.ndim != 2 or block_table.shape[1] == 0:
+            raise ValueError(
+                "GDN requires a nonempty two-dimensional state block table"
+            )
+        positions = positions.reshape(-1)
+        if (
+            positions.numel() != output_slots.numel()
+            or block_table.shape[0] != positions.numel()
+        ):
+            raise ValueError(
+                "GDN requires one starting position and output state per request"
+            )
+        if graph_output is not None:
+            if (
+                graph_output.shape != output_slots.shape
+                or graph_output.dtype != torch.int32
+            ):
+                raise ValueError("GDN Graph previous-state buffer has wrong shape")
+            _previous_state_slots_graph_kernel[(triton.cdiv(positions.numel(), 128),)](
+                block_table,
+                positions,
+                query_lengths,
+                output_slots,
+                graph_output,
+                positions.numel(),
+                block_table.stride(0),
+                block_table.stride(1),
+                block_table.shape[1],
+                block_size,
+                128,
+                query_lengths is not None,
+                unit_query_length,
+            )
+            return graph_output
+        positions = positions.to(torch.int64)
+        if query_lengths is not None:
+            positions = positions - query_lengths
+        elif unit_query_length:
+            positions = positions - 1
+        previous_columns = torch.div(
+            torch.clamp(positions - 1, min=0), block_size, rounding_mode="floor"
+        )
+        rows = torch.arange(output_slots.numel(), device=block_table.device)
+        previous_slots = block_table[
+            rows, previous_columns.clamp(max=block_table.shape[1] - 1)
+        ]
+        invalid = (positions > 0) & (
+            (previous_columns >= block_table.shape[1]) | (previous_slots < 0)
+        )
+        if bool(torch.any(invalid)):
+            raise ValueError("GDN previous state block is invalid or out of range")
+        return torch.where(positions > 0, previous_slots, output_slots).to(torch.int32)
+
+    @classmethod
+    def _build_gdn_metadata(
+        cls,
+        attn_inputs: Any,
+        *,
+        seq_size_per_block: int,
+        num_tokens: int,
+        state_indices_cache: dict[tuple[int, bool], torch.Tensor] | None = None,
+        layer_group_map: dict[int, int] | None = None,
+        cg_bufs: dict | None = None,
+    ) -> GDNAttentionMetadata:
+        metadata = super()._build_gdn_metadata(
+            attn_inputs,
+            seq_size_per_block=seq_size_per_block,
+            num_tokens=num_tokens,
+            state_indices_cache=state_indices_cache,
+            layer_group_map=layer_group_map,
+            cg_bufs=cg_bufs,
+        )
+        output_slots = metadata.non_spec_state_indices_tensor
+        device = output_slots.device
+        next_lengths = None
+        query_lengths = None
+        unit_query_length = False
+        if bool(getattr(attn_inputs, "is_prefill", False)):
+            positions = cls._non_empty_int32(
+                getattr(attn_inputs, "prefix_lengths_device", None), device=device
+            )
+            if positions is None:
+                positions = cls._non_empty_int32(
+                    getattr(attn_inputs, "prefix_lengths", None), device=device
+                )
+        else:
+            next_lengths = cls._non_empty_int32(
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
+                device=device,
+            )
+            if next_lengths is not None:
+                positions = next_lengths
+                batch_size = int(output_slots.numel())
+                if num_tokens == batch_size:
+                    unit_query_length = True
+                else:
+                    query_start_loc = metadata.non_spec_query_start_loc
+                    query_lengths = (
+                        query_start_loc[1:] - query_start_loc[:-1]
+                    ).contiguous()
+            else:
+                positions = cls._non_empty_int32(
+                    getattr(attn_inputs, "sequence_lengths", None), device=device
+                )
+        if positions is None:
+            raise ValueError(
+                "GDN requires per-request prefix or decode starting lengths"
+            )
+        graph_output = None
+        if torch.cuda.is_current_stream_capturing():
+            if cg_bufs is None or "previous_state_slots_i32" not in cg_bufs:
+                raise RuntimeError("GDN Graph requires prewarmed previous-state slots")
+            graph_output = cg_bufs["previous_state_slots_i32"][: output_slots.numel()]
+        block_table = cls._select_block_table_for_layer(attn_inputs=attn_inputs)
+        metadata.non_spec_state_indices_in_tensor = cls._previous_state_slots(
+            block_table,
+            positions,
+            output_slots,
+            seq_size_per_block,
+            graph_output,
+            query_lengths,
+            unit_query_length,
+        )
+        if metadata.has_initial_state is not None:
+            # The non-FlyDSL prefill path gathers/scatters the recurrent state
+            # with int64 indices. Standalone builds these once in its metadata
+            # builder; RTP must do the same when it constructs the metadata.
+            metadata.no_initial_state = ~metadata.has_initial_state
+            metadata.non_spec_state_indices_i64 = output_slots.to(torch.int64)
+            metadata.non_spec_state_indices_in_i64 = (
+                metadata.non_spec_state_indices_in_tensor.to(torch.int64)
+            )
+        return metadata
+
     @staticmethod
     def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
         """Qwen3.5 decode-cudagraph compatible seq_lens priority."""
@@ -1978,7 +2251,27 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         return RTPForwardContext._select_block_table_for_layer(attn_inputs=attn_inputs)
 
     @staticmethod
+    def _is_fixed_mtp_draft_prefill(
+        attn_inputs: Any,
+        num_tokens: int,
+        batch_size: int,
+        cg_bufs: dict | None,
+    ) -> bool:
+        # A token-count multiple is not a model-role signal: generation-prefill
+        # and embedding Graph buckets can have the same geometry. Only the
+        # Qwen4Exp runtime's draft-prefill buffers carry this explicit marker.
+        width = (cg_bufs or {}).get("mtp_window_width")
+        return bool(
+            width in (2, 3, 4)
+            and getattr(attn_inputs, "is_prefill", False)
+            and not getattr(attn_inputs, "is_target_verify", False)
+            and getattr(attn_inputs, "prefill_cuda_graph_copy_params", None) is not None
+            and num_tokens == batch_size * width
+        )
+
+    @classmethod
     def _build_query_start_loc_for_plugin(
+        cls,
         *,
         attn_inputs: Any,
         seq_lens: torch.Tensor,
@@ -1993,6 +2286,44 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             )
 
         in_capture = torch.cuda.is_current_stream_capturing()
+        fixed_draft_prefill = cls._is_fixed_mtp_draft_prefill(
+            attn_inputs, num_tokens, batch_size, cg_bufs
+        )
+        draft_width = (cg_bufs or {}).get("mtp_window_width")
+        if (
+            draft_width in (2, 3, 4)
+            and getattr(attn_inputs, "is_prefill", False)
+            and not getattr(attn_inputs, "is_target_verify", False)
+            and getattr(attn_inputs, "prefill_cuda_graph_copy_params", None) is not None
+        ):
+            if not fixed_draft_prefill:
+                raise ValueError(
+                    "RTP MTP draft prefill requires batch_size * window_width tokens"
+                )
+            input_lengths = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "input_lengths_device", None), device=device
+            )
+            if input_lengths is None:
+                input_lengths = RTPForwardContext._non_empty_int32(
+                    getattr(attn_inputs, "input_lengths", None), device=device
+                )
+            if input_lengths is None or input_lengths.numel() != batch_size:
+                raise ValueError(
+                    "RTP MTP draft prefill requires one input length per request"
+                )
+            # RTP captures a fixed-capacity draft window, but live requests
+            # may have fewer valid tokens after acceptance. A zero-length row
+            # is Graph padding; no row may exceed the captured window.
+            valid_lengths = torch.all(
+                (input_lengths >= 0) & (input_lengths <= draft_width)
+            )
+            if in_capture:
+                torch._assert_async(
+                    valid_lengths,
+                    "RTP MTP draft prefill length exceeds capture window",
+                )
+            elif not bool(valid_lengths):
+                raise ValueError("RTP MTP draft prefill length exceeds capture window")
         if in_capture and cg_bufs is not None:
             return cg_bufs["query_start_loc"][: batch_size + 1]
 
@@ -2000,6 +2331,15 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             raise ValueError(
                 "RTP plugin capture requires prewarmed cg_bufs for query_start_loc "
                 f"(batch={batch_size}, num_tokens={int(num_tokens)})."
+            )
+
+        if fixed_draft_prefill:
+            # RTP's draft prefill graph keeps Bmax*(gamma+1) HC rows even when some
+            # request rows are padding. Warmup must use the same geometry as
+            # capture/replay rather than the sum of live input_lengths.
+            width = num_tokens // batch_size
+            return torch.arange(
+                0, num_tokens + 1, width, dtype=torch.int32, device=device
             )
 
         qsl = RTPForwardContext._query_start_loc(attn_inputs, device=device)
@@ -2108,7 +2448,14 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
 
         is_dummy_warmup = False
         if in_capture:
-            max_query_len = 1
+            is_fixed_mtp_window = getattr(
+                attn_inputs, "is_target_verify", False
+            ) or cls._is_fixed_mtp_draft_prefill(
+                attn_inputs, num_actual_tokens, batch_size, cg_bufs
+            )
+            max_query_len = (
+                num_actual_tokens // batch_size if is_fixed_mtp_window else 1
+            )
             if cg_max_seq_len <= 0:
                 raise RuntimeError(
                     "RTP plugin cuda-graph capture requires cg_max_seq_len; "
@@ -2191,6 +2538,9 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             context=None,
         )
         plugin_md.rtp_cu_seqlens_q = query_start_loc
+        # PLE and QSA consume the same role-specific Graph buffers selected
+        # for this forward; the generic builder exposes this attribute too.
+        plugin_md.cg_bufs = cg_bufs
         plugin_md.is_dummy_warmup = bool(is_dummy_warmup)
         prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
         if (

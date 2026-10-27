@@ -44,6 +44,7 @@ export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
 export PYTHONUNBUFFERED=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_FORCE_ATTN_TRITON=1
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export ATOM_HOST_IP=${NODE_IP}
 export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 rm -rf /root/.cache/atom/* 2>/dev/null || true
@@ -112,12 +113,15 @@ python3 -m atom.entrypoints.openai_server \
     --max-num-seqs 256 \
     --max-num-batched-tokens 32768 \
     --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
-    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}' \
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}' \
     --cudagraph-capture-sizes "[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]" \
     --no-enable_prefix_caching \
     --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
     2>&1 | tee decode.log
 ```
+
+The single-node decode consumer registers its KV buffers on up to eight
+available HCAs so prefill GPUs 0-3 can reach decode GPUs 4-7 across rails.
 
 ### Router
 

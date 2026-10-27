@@ -9,7 +9,6 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
-from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 
@@ -17,8 +16,9 @@ from atom.config import get_current_atom_config
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
+    dense_decode_splits,
     gluon_decode_over_limit,
-    run_pa_decode_gluon,
+    run_pa_decode,
     run_pa_fwd_asm,
 )
 from atom.utils import envs
@@ -265,6 +265,24 @@ class PagedAttentionImpl(nn.Module):
                 q_raw, k_raw, v_raw = torch.split(
                     qkv, [q_size, kv_size, kv_size], dim=-1
                 )
+            if isinstance(self.q_norm, GemmaRMSNorm) and (
+                q_raw.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
+                and self._use_asm_cache_layout(
+                    k_cache, v_cache, use_triton_attn=use_triton_attn
+                )
+            ):
+                q, k, v = self._gemma_norm_rope_then_cache(
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    position,
+                    k_cache,
+                    v_cache,
+                    k_scale,
+                    v_scale,
+                    attn_metadata,
+                )
+            elif isinstance(self.q_norm, GemmaRMSNorm):
                 # Reshape V cache to SHUFFLE layout for the Triton kernel
                 x = 16 // k_cache.element_size()
                 if k_cache.dim() == 5 and v_cache.dim() == 4:
@@ -406,6 +424,56 @@ class PagedAttentionImpl(nn.Module):
         # gathers. Keeping the gather out of here also means dispatch_backend
         # sees q/k with matching token counts (sq == sk).
         return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    def _gemma_norm_rope_then_cache(
+        self, q, k, v, position, k_cache, v_cache, k_scale, v_scale, attn_metadata
+    ):
+        """Unfused twin of triton_fused_norm_rope_cache for long batches.
+
+        The one-kernel version loses at prefill sizes (113 us against 83 us for
+        the separate kernels at 16384 tokens, Qwen3.5 TP4 on MI355X), so
+        above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS run them separately:
+        Gemma q/k norm in one launch, the Qwen3.5 MRoPE Triton kernel (or the
+        module's own rotary when that declines), then the per-token FP8 cache
+        write. Same SHUFFLE layout and scales the fused kernel writes.
+        """
+        from atom.model_ops.layernorm import DualRMSNorm
+        from atom.model_ops.triton_mrope import try_mrope_qk_fused
+
+        if getattr(self, "_dual_qk_norm", None) is None:
+            self._dual_qk_norm = DualRMSNorm(
+                self.q_norm,
+                self.k_norm,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                prefix=f"layer_{self.layer_num}.qk_norm",
+            )
+        q, k = self._dual_qk_norm(q, k)
+        roped = try_mrope_qk_fused(
+            self.rotary_emb,
+            position,
+            q,
+            k,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        q, k = roped if roped is not None else self.rotary_emb(position, q, k)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        aiter.reshape_and_cache_with_pertoken_quant(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            attn_metadata.slot_mapping,
+            asm_layout=True,
+        )
+        return q, k, v
 
     def _gather_prefix_and_concat_kv(
         self,
@@ -570,9 +638,10 @@ class PagedAttentionImpl(nn.Module):
         )
         assert num_q_heads_total % num_kv_heads == 0
 
-        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        max_context_partition_num = dense_decode_splits(num_seqs, num_kv_heads)
 
         context_partition_size = 256
+        # Left after the split so a sliding-window layer still overrides both.
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
@@ -601,7 +670,7 @@ class PagedAttentionImpl(nn.Module):
         compute_type = (
             torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
         )
-        run_pa_decode_gluon(
+        run_pa_decode(
             output=o,
             q=q,
             k_cache=k_cache,
@@ -623,6 +692,12 @@ class PagedAttentionImpl(nn.Module):
             sinks=self.sinks,
             sliding_window=self.sliding_window,
             ps=True,
+            # The capture-owned dense plan, read off the context this call
+            # already holds, never the thread-local one: a TBO worker thread
+            # that never installed its own shares the other ubatch's. No
+            # max_context_length: the block-table bound is the same in graph
+            # and eager, so both pick the same kernel specialization.
+            work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
         )
 
         return o
@@ -771,17 +846,19 @@ class PagedAttentionImpl(nn.Module):
         fwd_ctx: ForwardContext,
     ) -> bool:
         attn_metadata = fwd_ctx.attn_metadata
+        # A prefix-cache hit is allowed: by now k/v hold the gathered cached+new
+        # rows, so k can be longer than q, and the asm kernel's bottom-right
+        # causal mask handles sq < sk through cu_seqlens_q / cu_seqlens_k.
         return (
             envs.ATOM_AITER_FP8_PREFILL_ATTN
             and get_gfx() == "gfx950"
             and self.head_dim == 256
             and self.kv_cache_dtype.startswith("fp8")
-            and not attn_metadata.has_cached
             and self.sliding_window == -1
             and self.sinks is None
             and (self.logits_soft_cap is None or self.logits_soft_cap == 0.0)
             and getattr(attn_metadata, "dropout_p", 0.0) == 0.0
-            and q.shape[0] == k.shape[0] == v.shape[0]
+            and k.shape[0] == v.shape[0]
             and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256
         )
 
@@ -794,10 +871,9 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
         # Prefix-cache hit: gather cached+new KV from the paged cache into a
         # dense packed [total_kv, ...] tensor (new tokens were already written
-        # during rope_cache). flash_attn_varlen_func then attends over the full
-        # sequence; cu_seqlens_q / cu_seqlens_k carry the new vs cached+new
-        # lengths (sq < sk), which the varlen kernel handles via bottom-right
-        # causal.
+        # during rope_cache). The varlen kernel below (FP8 asm or BF16) then
+        # attends over the full sequence; cu_seqlens_q / cu_seqlens_k carry the
+        # new vs cached+new lengths (sq < sk), handled via bottom-right causal.
         if attn_metadata.has_cached:
             q, k, v, k_cache, v_cache, k_scale, v_scale = (
                 self._gather_prefix_and_concat_kv(
@@ -1136,10 +1212,33 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.index_rotary_emb = (
             index_rotary_emb if index_rotary_emb is not None else rotary_emb
         )
-        self.index_q_size = index_q_size
         self.index_head_dim = index_head_dim
-        # M3 has one index head per kv head (num_idx_heads == num_kv_heads).
-        self.num_idx_heads = num_kv_heads
+        # Under TP, M3 has one index head per kv head. Under indexer-only CP
+        # every rank projects ALL index heads and shards the CONTEXT instead, so
+        # the group's world size is the full index-head count. Resolved once
+        # here so no per-forward branch reaches the compiled model.
+        from atom.distributed.indexer_cp import (
+            get_indexer_cp_group,
+            get_indexer_cp_rank,
+            get_indexer_cp_world_size,
+            indexer_cp_enabled,
+        )
+
+        self.indexer_cp_group = None
+        self.indexer_cp_rank = 0
+        self.indexer_cp_world = 1
+        if indexer_cp_enabled():
+            self.indexer_cp_group = get_indexer_cp_group()
+            self.indexer_cp_rank = get_indexer_cp_rank()
+            self.indexer_cp_world = get_indexer_cp_world_size()
+        self.num_idx_heads = (
+            self.indexer_cp_world if self.indexer_cp_group is not None else num_kv_heads
+        )
+        self.index_q_size = (
+            self.num_idx_heads * index_head_dim
+            if self.indexer_cp_group is not None
+            else index_q_size
+        )
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
@@ -1158,35 +1257,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Rotated indexer query produced by rope_cache, consumed (and cleared) by
         # dispatch_backend within the same single-threaded layer forward.
         self._index_q: torch.Tensor | None = None
-
-    @staticmethod
-    def _to_page16_shuffle(k_cache, v_cache, k_scale, v_scale):
-        """Reinterpret the standard page-128 SHUFFLE KV/scale views as page-16
-        SHUFFLE for the MiniMax-M3 ASM/gluon kernels. Zero-copy (128 == 8*16):
-
-            K:     [N, nkv, hd//x, 128, x] -> [N*8, nkv, hd//x, 16, x]
-            V:     [N, nkv, 128//x, hd, x] -> [N*8, nkv, 16//x, hd, x]
-            scale: [N, nkv, 128]           -> [N*8, nkv, 16]   (fp8 only)
-
-        Scales are re-viewed only when present (fp8); bf16 passes them through
-        (None).
-        """
-        from atom.model_ops.minimax_m3.sparse_attn import (
-            ASM_PAGE_SIZE,
-            PAGES_PER_SPARSE_BLOCK,
-        )
-
-        n_blocks, nkv = k_cache.shape[0], k_cache.shape[1]
-        x = k_cache.shape[-1]
-        head_dim = k_cache.shape[2] * x
-        num_phys16 = n_blocks * PAGES_PER_SPARSE_BLOCK
-
-        k16 = k_cache.view(num_phys16, nkv, head_dim // x, ASM_PAGE_SIZE, x)
-        v16 = v_cache.view(num_phys16, nkv, ASM_PAGE_SIZE // x, head_dim, x)
-        if k_scale is not None and v_scale is not None:
-            k_scale = k_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
-            v_scale = v_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
-        return k16, v16, k_scale, v_scale
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
@@ -1218,8 +1288,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # page-16 view is a pure zero-copy reinterpretation of the page-128 view.
         # We re-view here (at attention time) instead of at bind time so the binder
         # has no M3-specific KV/scale code.
+        from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
+
         layer = kv_cache_data[f"layer_{self.layer_num}"]
-        k_cache, v_cache, k_scale, v_scale = self._to_page16_shuffle(
+        k_cache, v_cache, k_scale, v_scale = to_page16_shuffle(
             layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
         )
 
@@ -1235,7 +1307,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         qkv = qkv.contiguous()
         num_tokens = qkv.shape[0]
-        from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
+        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
 
         cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
 
@@ -1404,6 +1476,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.num_kv_heads,
             max_query_len,
             max_seq_len,
+            # index_q_shape already separates CP (T,4,128) from TP (T,1,128),
+            # but the arm is what decides the value's meaning; keep it explicit.
+            self.indexer_cp_group is not None,
         )
 
     def _load_cached_topk(self, sparse_metadata, key: tuple):
@@ -1457,6 +1532,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
+            if self.indexer_cp_group is not None:
+                # Prefill stays TP: its scorer is causal-tiled over ragged
+                # chunks with per-token prefix_lens, which the decode-shaped CP
+                # kernels do not model. Head r of the replicated projection is
+                # exactly the head this rank would have projected alone, so the
+                # slice is an identity, not an approximation.
+                index_q = index_q[:, self.indexer_cp_rank : self.indexer_cp_rank + 1]
             topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk(
                 index_q,
                 self.index_cache,
@@ -1472,6 +1554,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.num_kv_heads,
                 self.scale,
                 emit_sparse_block_table=True,
+                n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
@@ -1509,6 +1592,63 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             tbo_yield()
         return output
 
+    def _cp_index_topk_decode(
+        self, index_q, block_table, seq_lens, max_seq_len, max_query_len
+    ):
+        """Decode top-k with the context sharded across the indexer-CP group.
+
+        Score all index heads over this rank's 1/P of the blocks, reduce to this
+        shard's own top-k, exchange, then merge to the global top-k for the one
+        head this rank owns. The result is bit-identical to the TP path, so this
+        is an exact swap and not an approximation.
+
+        Only the shard's own top-k crosses the wire, so the payload is
+        world*topk keys per token at any context length.
+        """
+        from atom.distributed.indexer_cp import exchange_candidates
+        from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
+            local_candidate_keys,
+            merge_candidate_keys,
+        )
+        from atom.model_ops.minimax_m3.indexer_context_parallel import (
+            indexer_context_scores,
+        )
+
+        global_blocks = block_table.shape[1]
+        scores = indexer_context_scores(
+            index_q,
+            self.index_cache,
+            block_table,
+            seq_lens,
+            max_seq_len,
+            self.indexer_cp_rank,
+            self.indexer_cp_world,
+            max_query_len,
+            self.scale,
+        )
+        # Forced blocks are pinned in BOTH passes on purpose: one that lost its
+        # owner shard's top-k would never arrive at the merge to be pinned.
+        keys = local_candidate_keys(
+            scores,
+            seq_lens,
+            self.topk,
+            self.indexer_cp_rank,
+            self.indexer_cp_world,
+            max_query_len,
+            global_blocks,
+            self.init_blocks,
+            self.local_blocks,
+        )
+        return merge_candidate_keys(
+            exchange_candidates(keys),
+            block_table,
+            seq_lens,
+            self.topk,
+            self.init_blocks,
+            self.local_blocks,
+            max_query_len,
+        )
+
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
     def _sparse_decode(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -1536,20 +1676,30 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
-            topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
-                index_q,
-                self.index_cache,
-                decode_md.block_table,
-                decode_md.seq_lens,
-                sparse_metadata.max_seq_len,
-                self.topk,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                self.scale,
-                emit_sparse_block_table=True,
-                max_query_len=max_query_len,
-            )
+            if self.indexer_cp_group is not None:
+                topk_idx, sparse_bt, sparse_ctx = self._cp_index_topk_decode(
+                    index_q,
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    sparse_metadata.max_seq_len,
+                    max_query_len,
+                )
+            else:
+                topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
+                    index_q,
+                    self.index_cache,
+                    decode_md.block_table,
+                    decode_md.seq_lens,
+                    sparse_metadata.max_seq_len,
+                    self.topk,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    self.scale,
+                    emit_sparse_block_table=True,
+                    max_query_len=max_query_len,
+                    n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
+                )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
@@ -1570,6 +1720,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             v_scale=v_scale,
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
+            # Once per step only when the tail block is forced (see sparse_attn).
+            plan_step_owner=decode_md if self.local_blocks >= 1 else None,
         )
         self._index_q = None
         self._index_q_cache_key_info = None

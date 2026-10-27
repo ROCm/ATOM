@@ -13,11 +13,21 @@ Design:
   (``K=(nb,H,D//x,bs,x)``). We pass an ATOM ``GPUConnectorInterface``
   implementation that moves opaque per-block bytes with
   :class:`DenseKVByteCodec`.
-* **Daemon-after-forward copies** — ``start_load_kv`` only ``submit``s to a single
-  serial copy daemon (ThreadPoolExecutor max_workers=1) and returns immediately, so
-  the worker RPC thread is free for ``forward``; completions are polled in
-  ``get_finished`` (called post-forward by ``async_proc_aggregation``). This is the
-  fix for 005's "load blocks/starves prefill" (corr(TTFT, prefill-conc)=0.773).
+* **Daemon-after-forward copies** — ``start_load_kv`` records at most one CUDA
+  event per save-bearing step and otherwise only ``submit``s to a single serial
+  copy daemon (ThreadPoolExecutor max_workers=1) and returns immediately, so the
+  worker RPC thread is free for ``forward``; completions are polled in
+  ``get_finished`` (called post-forward by ``async_proc_aggregation``). This is
+  the fix for 005's "load blocks/starves prefill" (corr(TTFT, prefill-conc)=0.773).
+* **Producer fence for saves** — the scheduler emits a save only for chunks
+  whose forward this worker has already enqueued (under PP, chunks of batches
+  dispatched before the save's metadata, which every stage takes in dispatch
+  order), but a non-final prefill chunk yields no token, so nothing
+  host-synchronizes on that forward before the next step dispatches
+  metadata. The event recorded here on the dispatching stream is therefore the
+  only ordering between the producing kernels and the save thread's pack
+  stream; it travels through ``engine.store(**kwargs)`` to
+  ``BlockGPUConnector.batched_from_gpu``.
 * **Cross-process hit lookup** — scheduler (EngineCore process) queries worker hits
   via LMCache's ZMQ ``LookupClient``/``LookupServer`` (no homegrown mirror).
 """
@@ -42,9 +52,11 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
     build_offload_engine,
     pp_aware_rank_and_world,
+    tokens_to_tensor,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.chunked_scheduler import (
+    DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
     ChunkedOffloadSchedulerBase,
@@ -135,6 +147,13 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             rank=rank,
         )
         self.chunk_size = int(cfg.chunk_size)
+        # Kept, not just passed on: a hybrid model stores its recurrent state in
+        # the same LMCache instance through a second codec, and that codec has
+        # to be keyed by the same model name, world size and worker id or the
+        # two tiers would disagree about what "the same prefix on this rank"
+        # means. Re-deriving it there would be a copy of this call's arguments
+        # that nothing keeps in sync.
+        self._lmcache_metadata = meta
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
@@ -151,7 +170,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
             "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
             "gpu_staging_buffer_bytes=%d release_gpu_staging=%s "
-            "save=%s load=%s",
+            "save=%s load=%s save_workers=%d load_workers=%d",
             rank,
             self._codec.bytes_per_block,
             self.chunk_size,
@@ -161,6 +180,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             gpu_connector.release_gpu_staging_after_transfer,
             self._do_save,
             self._do_load,
+            self.save_workers,
+            self.load_workers,
         )
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
@@ -176,11 +197,58 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         for lookup_id in metadata.lookup_requests_in_step:
             if str(lookup_id) not in loading_lookup_ids:
                 self._lookup_unpin(lookup_id)
+        save_ready_event = None
+        save_fence_failed = False
         for req in metadata.requests:
+            # The futures are tracked, not discarded: `wait_for_requests` fences
+            # them when vLLM preempts a request and reuses its blocks.
             if req.load_spec is not None and self._do_load:
-                self._load_executor.submit(self._guard, "load", self._do_load_req, req)
+                self._track_job(
+                    req.req_id,
+                    self._load_executor.submit(
+                        self._guard, "load", self._do_load_req, req
+                    ),
+                )
             if req.save_spec is not None and self._do_save:
-                self._save_executor.submit(self._guard, "save", self._do_save_req, req)
+                if save_fence_failed:
+                    self._record_save_failure(req, source_quiescent=True)
+                    continue
+                if save_ready_event is None:
+                    # Metadata is dispatched before this step's forward, but the
+                    # scheduler's save frontier (`build_connector_meta`) covers
+                    # only chunks whose forward this worker already enqueued on
+                    # this stream (under PP, chunks of earlier batches, which a
+                    # stage takes in dispatch order), so an event recorded on
+                    # the current stream now is ordered after the kernels that
+                    # produced every token in this step's saves.
+                    # Create the shared step fence lazily so a HIP error here
+                    # rejects this step's saves; loads must still be submitted
+                    # and report a terminal result.
+                    try:
+                        candidate_event = torch.cuda.Event()
+                        candidate_event.record(torch.cuda.current_stream())
+                        save_ready_event = candidate_event
+                        self._save_fence_failure_logged = False
+                    except Exception:
+                        save_fence_failed = True
+                        if not getattr(self, "_save_fence_failure_logged", False):
+                            logger.exception(
+                                "LMCache offload: dense save fence creation failed req=%s",
+                                req.req_id,
+                            )
+                            self._save_fence_failure_logged = True
+                        self._record_save_failure(req, source_quiescent=True)
+                        continue
+                self._track_job(
+                    req.req_id,
+                    self._save_executor.submit(
+                        self._guard,
+                        "save",
+                        self._do_save_req,
+                        req,
+                        producer_event=save_ready_event,
+                    ),
+                )
 
     # -- copy daemon thread ----------------------------------------------
     def _source_group_safe(self, identity: SaveSourceGroupId) -> None:
@@ -201,9 +269,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             operation, SaveOperationId
         ):
             with self._lock:
-                # Keep the legacy terminal channel as well: MultiConnector's
-                # producer send/save pairing consumes this field before
-                # connector-owned completions reach the scheduler.
+                # Reported independently of the P/D send: this terminal is
+                # what dispatches the next chunk. The dedicated channel below
+                # carries store success/failure and lease cleanup.
                 self._done_save.add(operation)
                 self._connector_completions.add(
                     ConnectorCompletion(
@@ -212,11 +280,30 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                         succeeded,
                     )
                 )
+                if succeeded:
+                    self._connector_completions.add(
+                        ConnectorCompletion(
+                            DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True
+                        )
+                    )
             return
         with self._lock:
             self._done_save.add(self._save_completion_id(req))
 
-    def _record_save_failure(self, req) -> None:
+    def _record_save_failure(self, req, *, source_quiescent=False) -> None:
+        if (
+            source_quiescent
+            and getattr(self, "_early_release", False)
+            and isinstance(req.save_operation, SaveOperationId)
+        ):
+            with self._lock:
+                self._connector_completions.add(
+                    ConnectorCompletion(
+                        DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
+                        req.save_operation,
+                        True,
+                    )
+                )
         self._record_store_terminal(req, False)
 
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
@@ -243,6 +330,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             self._lookup_unpin(req.req_id)
             with self._lock:
                 self._failed_load.add(self._load_completion_id(req))
+                self._record_load_error_blocks(req)
             return
 
         mask = torch.ones(len(toks), dtype=torch.bool)
@@ -251,7 +339,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         t_retrieve0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         ret_mask = self._engine.retrieve(
-            torch.tensor(toks),
+            tokens_to_tensor(toks),
             mask=mask,
             block_ids=req.block_ids,
             req_id=str(req.req_id),
@@ -265,6 +353,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._done_load.add(self._load_completion_id(req))
             else:
                 self._failed_load.add(self._load_completion_id(req))
+                self._record_load_error_blocks(req)
         total_ms = (time.perf_counter() - t_total0) * 1000
         if self._profile_enabled():
             logger.info(
@@ -299,7 +388,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 total_ms,
             )
 
-    def _do_save_req(self, req: LMCacheReqMeta) -> None:
+    def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
         toks = req.token_ids
@@ -314,7 +403,14 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:skip] = False
 
+        tok_tensor = tokens_to_tensor(toks)
         t_store0 = time.perf_counter()
+        # Wait on the producing stream before this thread reads KV. An event
+        # that only records the fence (the unit-test double) has no
+        # synchronize; the same event is still handed to store() below.
+        synchronize = getattr(producer_event, "synchronize", None)
+        if synchronize is not None:
+            synchronize()
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
         track_source = getattr(gpu_connector, "track_save_source", None)
@@ -323,13 +419,20 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if getattr(self, "_early_release", False) and callable(track_source)
             else nullcontext()
         )
+        store_kwargs = {
+            "mask": mask,
+            "block_ids": req.block_ids,
+            "req_id": str(req.req_id),
+        }
+        if producer_event is not None:
+            # LMCache forwards extra store kwargs to batched_from_gpu(), which
+            # enqueues the wait on the pack stream of whichever thread reads
+            # KV. This is the one cross-repo assumption of the fence:
+            # `producer_fenced` in the transfer stats reports whether the
+            # connector actually saw the event.
+            store_kwargs["producer_event"] = producer_event
         with source_context:
-            self._engine.store(
-                torch.tensor(toks),
-                mask=mask,
-                block_ids=req.block_ids,
-                req_id=str(req.req_id),
-            )
+            self._engine.store(tok_tensor, **store_kwargs)
         store_ms = (time.perf_counter() - t_store0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
         total_ms = (time.perf_counter() - t_total0) * 1000
@@ -339,8 +442,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 "chunks=%d groups=%d max_chunk_bytes=%d max_group_bytes=%d "
                 "gpu_staging_chunk_bytes=%d "
                 "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
-                "total_bytes=%d pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
-                "transfer_ms=%.2f effective_gbps=%.2f "
+                "total_bytes=%d producer_fenced=%d pack_ms=%.2f copy_ms=%.2f "
+                "sync_ms=%.2f transfer_ms=%.2f effective_gbps=%.2f "
                 "store_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
@@ -354,6 +457,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 int(transfer_stats.get("gpu_staging_buffer_chunks", 0)),
                 int(transfer_stats.get("gpu_staging_buffer_bytes", 0)),
                 int(transfer_stats.get("total_bytes", 0)),
+                int(transfer_stats.get("producer_fenced", 0)),
                 float(transfer_stats.get("pack_ms", 0.0)),
                 float(transfer_stats.get("copy_ms", 0.0)),
                 float(transfer_stats.get("sync_ms", 0.0)),

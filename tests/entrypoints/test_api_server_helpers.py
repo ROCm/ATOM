@@ -144,6 +144,110 @@ def _boom(*_args, **_kwargs):
     raise RuntimeError("boom")
 
 
+class TestMultimodalInputs:
+    @pytest.mark.parametrize(
+        "part",
+        [
+            {"type": "video_url", "video_url": {"url": "unused.mp4"}},
+            {"type": "audio_url", "audio_url": {"url": "unused.wav"}},
+            {"type": "input_audio", "input_audio": {"data": "YWJj", "format": "wav"}},
+        ],
+    )
+    def test_audio_and_video_reach_validation_instead_of_text_only_path(
+        self, monkeypatch, part
+    ):
+        from atom.entrypoints.openai.protocol import ChatMessage
+
+        messages = [ChatMessage(role="user", content=[part])]
+        monkeypatch.setattr(api_server, "_get_engine_config", lambda: None)
+        monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: None)
+        assert api_server._has_multimodal_content(messages)
+        with pytest.raises(ValueError, match="supported modalities: image"):
+            api_server._prepare_multimodal_inputs(messages, {})
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "Qwen3_5ForConditionalGeneration",
+            "KimiK3ForConditionalGeneration",
+            "Glm5NextForConditionalGeneration",
+        ],
+    )
+    def test_online_and_offline_image_inputs_match(self, monkeypatch, architecture):
+        import base64
+        import io
+
+        import numpy as np
+
+        from atom.entrypoints.openai.protocol import ChatMessage
+        from atom.multimodal.processing import prepare_multimodal_inputs
+
+        image_module = pytest.importorskip("PIL.Image")
+        image = image_module.new("RGB", (2, 2), "red")
+        encoded = io.BytesIO()
+        image.save(encoded, format="PNG")
+        data_url = (
+            "data:image/png;base64," + base64.b64encode(encoded.getvalue()).decode()
+        )
+
+        class Processor:
+            def apply_chat_template(self, messages, **kwargs):
+                image_token = (
+                    "<|image|>"
+                    if architecture == "Glm5NextForConditionalGeneration"
+                    else "<|image_pad|>"
+                )
+                return f"{image_token} prompt"
+
+            def __call__(self, **kwargs):
+                images = kwargs.get("images")
+                if images is None:
+                    images = [item["image"] for item in kwargs["medias"]]
+                return {
+                    "input_ids": np.array([[9, 42, 8]]),
+                    "pixel_values": np.stack([np.asarray(image) for image in images]),
+                    "image_grid_thw": np.array([[1, 2, 2]]),
+                    "grid_thws": np.array([[1, 2, 2]]),
+                }
+
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]),
+            multimodal_config=SimpleNamespace(
+                media_placeholder_token_id=42,
+                vision_config=SimpleNamespace(merge_kernel_size=2),
+            ),
+        )
+        processor = Processor()
+        monkeypatch.setattr(api_server, "_get_engine_config", lambda: config)
+        monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: processor)
+        online = [
+            ChatMessage(
+                role="user",
+                content=[
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                    {"type": "text", "text": "describe"},
+                ],
+            )
+        ]
+        offline = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "describe"},
+                ],
+            }
+        ]
+        online_ids, online_data = api_server._prepare_multimodal_inputs(online, {})
+        offline_ids, offline_data = prepare_multimodal_inputs(
+            config, processor, offline, {"image": image}
+        )
+        assert online_ids == offline_ids == [9, 42, 8]
+        assert online_data.keys() == offline_data.keys()
+        for key in online_data:
+            np.testing.assert_array_equal(online_data[key], offline_data[key])
+
+
 class TestCoerceN:
     """``_coerce_n`` normalizes the request ``n`` before engine fan-out."""
 
@@ -230,6 +334,20 @@ class TestDPSessionAffinityHeaders:
             "child",
             "parent",
         )
+
+    def test_mlperf_session_id_header(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={"x-session-id": "conv", "x-correlation-id": "fallback"}
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == ("conv", None)
+
+    def test_dynamo_session_id_wins_over_session_id(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={"x-dynamo-session-id": "child", "x-session-id": "conv"}
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == ("child", None)
 
     def test_correlation_id_is_session_fallback(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "true")
@@ -572,7 +690,7 @@ class TestLifespanOwnsTheBackgroundTasks:
     does -- the tasks above are only reachable through here."""
 
     @staticmethod
-    def _run(monkeypatch):
+    def _run(monkeypatch, interval="3600"):
         started = []
         for name in ("tune_gc", "maybe_attach_gc_debug_callback", "freeze_gc_heap"):
             monkeypatch.setattr(api_server, name, lambda *a, **k: 0)
@@ -580,7 +698,7 @@ class TestLifespanOwnsTheBackgroundTasks:
         monkeypatch.setattr(api_server, "engine", None)
         # Long enough that neither step runs: this is about the tasks existing
         # and being cancelled, not about what they do.
-        monkeypatch.setattr(api_server, "_METRICS_REFRESH_INTERVAL_SECONDS", 3600)
+        monkeypatch.setenv("ATOM_METRICS_UPDATE_INTERVAL_S", interval)
         monkeypatch.setattr(api_server, "_GC_WATCH_INTERVAL_SECONDS", 3600)
 
         async def drive():
@@ -609,6 +727,26 @@ class TestLifespanOwnsTheBackgroundTasks:
 
         assert all(t.cancelled() for t in tasks)
         assert api_server._background_tasks == []
+
+    @pytest.mark.parametrize(
+        "configured,expected", [("0.25", 0.25), ("0", 1.0), ("bad", 1.0)]
+    )
+    def test_metrics_refresh_uses_shared_interval(
+        self, monkeypatch, configured, expected
+    ):
+        intervals = {}
+        periodic = api_server._periodic
+
+        def capture(interval, step):
+            intervals[step.__name__] = interval
+            return periodic(interval, step)
+
+        monkeypatch.setattr(api_server, "_periodic", capture)
+        self._run(monkeypatch, interval=configured)
+        assert intervals == {
+            "_refresh_metrics_once": expected,
+            "_reclaim_watch_once": 3600,
+        }
 
 
 class TestTheCensusEndpointKeepsTheLoopFree:
@@ -699,6 +837,36 @@ class TestTheCensusEndpointKeepsTheLoopFree:
         assert asyncio.run(call()) == [False, False], "two walks ran at once"
 
 
+def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
+    events = []
+    loop_thread = threading.get_ident()
+
+    def initialize():
+        assert threading.get_ident() != loop_thread
+        events.append("initialize")
+
+    for name in (
+        "tune_gc",
+        "maybe_attach_gc_debug_callback",
+        "freeze_gc_heap",
+        "arm_reclaim_watch",
+    ):
+        monkeypatch.setattr(api_server, name, lambda *a, **k: None)
+    monkeypatch.setattr(api_server, "engine", None)
+    monkeypatch.setattr(api_server, "initialize_tracing", initialize)
+    monkeypatch.setattr(
+        api_server, "shutdown_tracing", lambda: events.append("shutdown")
+    )
+
+    async def drive():
+        async with api_server.lifespan(api_server.app):
+            assert events == ["initialize"]
+            events.append("serving")
+
+    asyncio.run(drive())
+    assert events == ["initialize", "serving", "shutdown"]
+
+
 def _fake_video_reader(monkeypatch, video_specs):
     """Replace file decoding while exercising ATOM's sampling and metadata path."""
     import decord
@@ -743,12 +911,23 @@ def test_video_with_unknown_fps_keeps_processor_fallback(monkeypatch):
     assert metadata.frames_indices == [0, 1, 2, 3]
 
 
-def test_video_metadata_stays_aligned_through_processor_input(monkeypatch):
+def test_glm_video_metadata_stays_aligned_through_processor_input(monkeypatch):
     import torch
+
+    from atom.entrypoints.openai.protocol import ChatMessage
 
     _fake_video_reader(
         monkeypatch,
         {"first.mp4": (24, 96), "second.mp4": (30, 91)},
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_get_engine_config",
+        lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Glm5NextForConditionalGeneration"]
+            )
+        ),
     )
     received = {}
 
@@ -762,7 +941,7 @@ def test_video_metadata_stays_aligned_through_processor_input(monkeypatch):
 
     monkeypatch.setattr(api_server, "_get_multimodal_processor", Processor)
     messages = [
-        SimpleNamespace(
+        ChatMessage(
             role="user",
             content=[
                 {"type": "video_url", "video_url": {"url": "first.mp4"}},
@@ -783,3 +962,30 @@ def test_video_metadata_stays_aligned_through_processor_input(monkeypatch):
     assert first.frames_indices == [0, 12, 24, 36, 48, 60, 72, 84]
     assert second.frames_indices == [0, 15, 30, 45, 60, 75, 90, 90]
     assert second.timestamps[-2:] == [3.0, 3.0]
+
+
+def test_glm_rejects_mixed_image_and_video_before_decoding(monkeypatch):
+    from atom.entrypoints.openai.protocol import ChatMessage
+
+    monkeypatch.setattr(
+        api_server,
+        "_get_engine_config",
+        lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Glm5NextForConditionalGeneration"]
+            )
+        ),
+    )
+    monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: object())
+    messages = [
+        ChatMessage(
+            role="user",
+            content=[
+                {"type": "image_url", "image_url": {"url": "image.png"}},
+                {"type": "video_url", "video_url": {"url": "clip.mp4"}},
+            ],
+        )
+    ]
+
+    with pytest.raises(ValueError, match="Mixing images and videos"):
+        api_server._prepare_multimodal_inputs(messages, {})

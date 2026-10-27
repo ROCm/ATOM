@@ -751,6 +751,7 @@ the programmatic API.
 | `--torch-profiler-dir <dir>` | CLI arg to set the trace output directory |
 | `ATOM_TORCH_PROFILER_DIR` env var | Sets the default `torch_profiler_dir` in `Config` |
 | `ATOM_PROFILER_MORE=1` env var | Enables detailed profiling: `record_shapes`, `with_stack`, `profile_memory` |
+| `ATOM_PROFILER_RECORD_SHAPES`, `ATOM_PROFILER_WITH_STACK`, `ATOM_PROFILER_PROFILE_MEMORY` env vars | Set to `1`/`0` to enable/disable one detailed option; takes precedence over `ATOM_PROFILER_MORE`, which applies when unset |
 | `ATOM_PROFILER_TIMEOUT=<seconds>` env var | Overrides the `stop_profile` timeout; default is 300 seconds |
 | `ATOM_ENABLE_DETAILED_ANNOTATION=1` env var | Appends attention FLOP aggregates (`sqsq`, `sqsk`, `sk`) to the `prefill[]`/`decode[]` trace labels while profiling is active (see [CUDA-graph capture traces](#cuda-graph-capture-traces)) |
 
@@ -863,7 +864,8 @@ rank. Each file is a gzip-compressed Chrome trace viewable with
 `chrome://tracing` or TensorBoard.
 
 Like the run-phase profiler, these traces carry `record_shapes`, `with_stack`,
-and `profile_memory` only when `ATOM_PROFILER_MORE=1`. Leave it unset unless you
+and `profile_memory` only when enabled by `ATOM_PROFILER_MORE=1` or the
+per-option flags (see [Configuration](#configuration)). Leave them unset unless you
 need the shapes or Python stacks — stack capture runs on every rank and
 noticeably stretches server bring-up.
 

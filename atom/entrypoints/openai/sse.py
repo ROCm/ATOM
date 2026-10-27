@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""SSE frame encoding for the streaming endpoints.
+"""SSE frame encoding and inspection for the streaming endpoints.
 
 One frame is encoded per streamed chunk per request, so at high concurrency
 this is one of the fixed per-token costs that caps the API server before the
@@ -19,6 +19,8 @@ the non-standard literals. Any float that can reach a frame (logprobs, for
 instance) has to be sanitised before it gets here.
 """
 
+import re
+from collections.abc import Iterator
 from typing import Any
 
 import msgspec
@@ -34,3 +36,20 @@ def data_frame(payload: Any) -> str:
 def event_frame(event: str, payload: Any) -> str:
     """Encode one named-event SSE frame."""
     return f"event: {event}\ndata: {_encoder.encode(payload).decode()}\n\n"
+
+
+def iter_sse_data(chunk: str) -> Iterator[str]:
+    """Read data from complete local frames, including coalesced sends.
+
+    The endpoint generators yield whole frames before ASGI encodes them. No
+    cross-chunk byte buffer is needed here. Named events, comments, multiline
+    data and both LF/CRLF delimiters are supported.
+    """
+    for frame in re.split(r"\r?\n\r?\n", chunk):
+        data = [
+            line[5:].removesuffix("\r").lstrip(" ")
+            for line in frame.split("\n")
+            if line.startswith("data:")
+        ]
+        if data:
+            yield "\n".join(data)

@@ -260,6 +260,67 @@ else:
     _copy_tiles_kernel = None
 
 
+class DescriptorStaging:
+    """Pinned copy-descriptor rows, one buffer per slot, each fenced on its upload.
+
+    A non-blocking H2D reads its pinned source when the stream reaches the
+    copy, not when it is enqueued. Refilling a buffer whose last upload is
+    still queued would rewrite the descriptor under an earlier copy, so each
+    slot waits for its own previous upload before handing its rows out again.
+
+    Slot 0 serves `build()`; every other slot is an independent buffer, so an
+    out-of-band restore never shares staging with a step. Buffers are reused
+    because allocating pinned memory synchronizes; `reserve` allocates them
+    before serving.
+    """
+
+    def __init__(self, rows: int, device: torch.device | str) -> None:
+        self._rows = rows
+        self._device = torch.device(device)
+        # slot -> (pinned host rows, device rows, upload fence)
+        self._slots: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.cuda.Event | None]
+        ] = {}
+        self._pending: set[int] = set()
+
+    def reserve(self, slots: Sequence[int]) -> None:
+        for slot in slots:
+            self._slot(slot)
+
+    def rows(self, slot: int = 0) -> np.ndarray:
+        """This slot's host rows, safe to overwrite."""
+        host, _, uploaded = self._slot(slot)
+        if slot in self._pending:
+            uploaded.synchronize()
+            self._pending.discard(slot)
+        return host.numpy()
+
+    def upload(self, slot: int, count: int) -> torch.Tensor:
+        """Copy the first ``count`` rows to the device on the current stream."""
+        host, device, uploaded = self._slot(slot)
+        descriptor = device[:count].copy_(host[:count], non_blocking=True)
+        if uploaded is not None:
+            uploaded.record()
+            self._pending.add(slot)
+        return descriptor
+
+    def _slot(
+        self, slot: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Event | None]:
+        if slot < 0:
+            raise ValueError("checkpoint descriptor slot must be non-negative")
+        entry = self._slots.get(slot)
+        if entry is None:
+            cuda = self._device.type == "cuda"
+            host = torch.zeros(self._rows, 3, dtype=torch.int64, pin_memory=cuda)
+            entry = self._slots[slot] = (
+                host,
+                torch.zeros_like(host, device=self._device),
+                torch.cuda.Event() if cuda else None,
+            )
+        return entry
+
+
 def launch_copy_descriptor(descriptor: torch.Tensor, plan: SegmentedCopyPlan) -> None:
     """Copy every span a resident descriptor names, in one launch.
 

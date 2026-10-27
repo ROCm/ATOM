@@ -7,6 +7,32 @@ NODE0_ADDR="${NODE0_ADDR:-127.0.0.1}"
 IPADDRS="${IPADDRS:-127.0.0.1}"
 RUN_DIR="${RUN_DIR:-/run_logs/slurm_job-${SLURM_JOB_ID:-local}}"
 
+# Servers start from this checkout, and `python -m` puts the working directory
+# first on sys.path, so its atom package shadows the image's editable install
+# (/app/ATOM). `image` launches the servers from / instead. PYTHONSAFEPATH would
+# also hide the checkout, but every subprocess inherits it, and scripts that
+# import modules beside themselves (e.g. aiter's JIT gen_instances.py) break.
+ATOMESH_ATOM_SOURCE="${ATOMESH_ATOM_SOURCE:-mounted}"
+case "${ATOMESH_ATOM_SOURCE}" in
+  mounted) ATOM_SOURCE_ENV=() ;;
+  image) ATOM_SOURCE_ENV=(--chdir=/) ;;
+  *)
+    echo "ERROR: ATOMESH_ATOM_SOURCE must be mounted or image, got '${ATOMESH_ATOM_SOURCE}'" >&2
+    exit 1
+    ;;
+esac
+atom_origin="$(env "${ATOM_SOURCE_ENV[@]}" python3 -c \
+  'import importlib.util as u; s = u.find_spec("atom"); print(s.origin if s else "")')"
+atom_version="$(python3 -c \
+  'import importlib.metadata as m; print(m.version("atom"))' 2>/dev/null || echo unknown)"
+echo "[atom] source=${ATOMESH_ATOM_SOURCE} package=${atom_origin:-<missing>} image_dist=${atom_version}"
+if [[ -z "${atom_origin}" ]] \
+  || { [[ "${ATOMESH_ATOM_SOURCE}" == "mounted" ]] && [[ "${atom_origin}" != "${PWD}"/* ]]; } \
+  || { [[ "${ATOMESH_ATOM_SOURCE}" == "image" ]] && [[ "${atom_origin}" == "${PWD}"/* ]]; }; then
+  echo "ERROR: atom resolves to '${atom_origin}', which does not match ATOMESH_ATOM_SOURCE=${ATOMESH_ATOM_SOURCE} (cwd ${PWD})" >&2
+  exit 1
+fi
+
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"
@@ -16,6 +42,7 @@ ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
 SINGLE_NODE_PD=0
 PREFILL_SINGLE_NODE_PD=0
 DECODE_SINGLE_NODE_PD=0
+PACKED_NODES_PD=0
 case "${ATOMESH_PD_WORKER_LAYOUT}" in
   single_node)
     SINGLE_NODE_PD=1
@@ -26,7 +53,17 @@ case "${ATOMESH_PD_WORKER_LAYOUT}" in
   decode_single_node)
     DECODE_SINGLE_NODE_PD=1
     ;;
+  packed_nodes)
+    PACKED_NODES_PD=1
+    ;;
 esac
+
+# The layout above only says where workers go; whether prefill and decode split
+# at all comes from the name: `<P>p<D>d` splits, `agg*` is one server doing both.
+AGGREGATED=0
+if [[ "${TOPOLOGY,,}" == agg* ]]; then
+  AGGREGATED=1
+fi
 
 xP="${xP:-1}"
 yD="${yD:-1}"
@@ -48,6 +85,14 @@ PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
 PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29700}"
 DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
+# Mooncake Store (MOONCAKE_STORE=1): master RPC, its HTTP metadata and metrics
+# servers, and the owners' service ports (owner i uses the base + i). Below
+# the ephemeral port range (32768+), where an outgoing connection of this job
+# or another could hold one when a master or owner binds it.
+ATOMESH_MOONCAKE_MASTER_PORT="${ATOMESH_MOONCAKE_MASTER_PORT:-26051}"
+ATOMESH_MOONCAKE_METADATA_PORT="${ATOMESH_MOONCAKE_METADATA_PORT:-26080}"
+ATOMESH_MOONCAKE_METRICS_PORT="${ATOMESH_MOONCAKE_METRICS_PORT:-26090}"
+ATOMESH_MOONCAKE_OWNER_PORT="${ATOMESH_MOONCAKE_OWNER_PORT:-26052}"
 ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
 ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
 case "${ATOMESH_EXECUTION_PHASE}" in
@@ -70,6 +115,10 @@ PREFILL_DP_MASTER_PORT=$((PREFILL_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 PREFILL_DP_BASE_PORT=$((PREFILL_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 DECODE_DP_MASTER_PORT=$((DECODE_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 DECODE_DP_BASE_PORT=$((DECODE_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_MOONCAKE_MASTER_PORT=$((ATOMESH_MOONCAKE_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_MOONCAKE_METADATA_PORT=$((ATOMESH_MOONCAKE_METADATA_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_MOONCAKE_METRICS_PORT=$((ATOMESH_MOONCAKE_METRICS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_MOONCAKE_OWNER_PORT=$((ATOMESH_MOONCAKE_OWNER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 validate_shifted_port() {
   local name="$1"
   local value="${!name}"
@@ -90,10 +139,20 @@ for shifted_port_name in \
   DECODE_DP_BASE_PORT; do
   validate_shifted_port "${shifted_port_name}"
 done
+# The Store's ports only bound the offset when it runs (mooncake_store_requested).
+if [[ "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE:-${MOONCAKE_STORE:-0}}" == "1" ]]; then
+  for shifted_port_name in \
+    ATOMESH_MOONCAKE_MASTER_PORT \
+    ATOMESH_MOONCAKE_METADATA_PORT \
+    ATOMESH_MOONCAKE_METRICS_PORT \
+    ATOMESH_MOONCAKE_OWNER_PORT; do
+    validate_shifted_port "${shifted_port_name}"
+  done
+fi
 unset shifted_port_name
 unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
-if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" || "${PACKED_NODES_PD}" == "1" || "${AGGREGATED}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
 fi
 
@@ -110,6 +169,29 @@ ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
+
+# Catalog paths name the Hugging Face org (<root>/<org>/<model>), but some
+# clusters keep the same weights flat under <root>/<model>.
+resolve_model_path() {
+  local path="$1"
+  local trimmed="${path%/}"
+  if [[ "${trimmed}" != /* || -e "${trimmed}" ]]; then
+    printf '%s' "${path}"
+    return 0
+  fi
+  local flat
+  flat="$(dirname -- "$(dirname -- "${trimmed}")")"
+  flat="${flat%/}/$(basename -- "${trimmed}")"
+  if [[ -e "${flat}" ]]; then
+    echo "[paths] ${path} not found; using ${flat}" >&2
+    printf '%s' "${flat}"
+  else
+    printf '%s' "${path}"
+  fi
+}
+MODEL_PATH="$(resolve_model_path "${MODEL_PATH}")"
+DRAFT_MODEL_PATH="$(resolve_model_path "${DRAFT_MODEL_PATH}")"
+
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
 SPEC_DECODE_ACCEPTANCE_LENGTH="${SPEC_DECODE_ACCEPTANCE_LENGTH:-}"
 STATE_CHECKPOINT_INTERVAL_TOKENS="${STATE_CHECKPOINT_INTERVAL_TOKENS:-}"
@@ -137,6 +219,19 @@ is_agentic_dpa() {
       has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
         || has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"
     }
+}
+
+# More than one prefill process. Distinct from DPA, which is ranks inside one process.
+is_agentic_multi_prefill() {
+  [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
+    && "${xP}" =~ ^[0-9]+$ \
+    && "${xP}" -gt 1 ]]
+}
+
+# Agentic traces are multi-turn. A later turn has to reach the worker that kept
+# the prefix: a DP rank under DPA, or one prefill instance when several are up.
+is_agentic_session_affinity() {
+  is_agentic_dpa || is_agentic_multi_prefill
 }
 
 ISL_LIST="${ISL_LIST:-8192}"
@@ -201,6 +296,13 @@ AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTA
 AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT:-1800}"
 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT:-1800}"
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
+# Torch profiler window inside the aiperf Profiling phase; off while DURATION is
+# 0. START counts from the phase start rather than from aiperf launch, so a
+# warmup of any length does not move the window. Once every rank's trace is on
+# disk, aiperf is stopped and the run passes regardless of its exit code.
+ATOMESH_TORCH_PROFILE_START="${ATOMESH_TORCH_PROFILE_START:-300}"
+ATOMESH_TORCH_PROFILE_DURATION="${ATOMESH_TORCH_PROFILE_DURATION:-0}"
+ATOMESH_TORCH_PROFILE_ROLES="${ATOMESH_TORCH_PROFILE_ROLES:-prefill,decode}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
@@ -216,7 +318,11 @@ fi
 mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
-if [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
+if [[ "${AGGREGATED}" == "1" ]]; then
+  # The aggregated server launches with decode_parallel, so its GPU count is the
+  # decode TP. Rank 0 would otherwise fall through to the prefill TP below.
+  role_tp="${DECODE_TP_SIZE}"
+elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
   role_tp="${DECODE_TP_SIZE}"
 elif [[ "${NODE_RANK}" -ge "${xP}" ]]; then
   role_tp="${DECODE_TP_SIZE}"
@@ -236,7 +342,7 @@ dump_launch_info() {
   echo "  ${role} launch info"
   echo "========================================"
   echo "--- environment ---"
-  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|UCX_)' | sort || true
+  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|MORI_|UCX_)' | sort || true
   echo "--- command ---"
   printf '%q ' "$@"
   echo ""
@@ -283,6 +389,61 @@ apply_role_env() {
   apply_prefixed_env "${prefix}" "${role_ip}"
 }
 
+# KV_CONNECTOR (env.common) picks the connector of the built-in kv-transfer
+# configs. MoRI IO advertises get_ip(), which falls back to the default-route
+# address, so pin it to the address the router and the peer role dial.
+prepare_kv_connector() {
+  case "${KV_CONNECTOR:-mooncake}" in
+    mooncake) ;;
+    moriio)
+      export ATOM_HOST_IP="${ATOM_HOST_IP:-${host_ip}}"
+      python3 - <<'PY' || true
+import importlib.metadata as md
+
+for dist in ("amd-mori-nightly", "amd-mori", "mori"):
+    try:
+        print(f"[kv] moriio with {dist} {md.version(dist)}")
+        break
+    except md.PackageNotFoundError:
+        continue
+else:
+    print("[kv] moriio: no MoRI distribution metadata found")
+PY
+      ;;
+    *)
+      echo "ERROR: unsupported KV_CONNECTOR=${KV_CONNECTOR} (expected mooncake or moriio)" >&2
+      return 2
+      ;;
+  esac
+}
+
+# A role's catalog JSON wins over the built-in config, but must not name a
+# different connector than an explicit KV_CONNECTOR.
+kv_transfer_config() {
+  local role="$1"
+  local override="$2"
+  local ip="$3"
+  local port="$4"
+  if [[ -z "${override}" ]]; then
+    local extra=""
+    if [[ "${KV_CONNECTOR:-mooncake}" == moriio ]]; then
+      extra=',"moriio_mode":"write"'
+    fi
+    printf '{"kv_role":"%s","kv_connector":"%s","proxy_ip":"%s","handshake_port":%s%s}' \
+      "${role}" "${KV_CONNECTOR:-mooncake}" "${ip}" "${port}" "${extra}"
+    return 0
+  fi
+  if [[ -n "${KV_CONNECTOR:-}" ]]; then
+    local named
+    named="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("kv_connector", ""))' "${override}")" || return 2
+    if [[ "${named}" != "${KV_CONNECTOR}" ]]; then
+      echo "ERROR: KV_CONNECTOR=${KV_CONNECTOR} but the ${role} kv-transfer-config names '${named}'" >&2
+      return 2
+    fi
+  fi
+  printf '%s' "${override}"
+}
+
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
 if [[ -z "${host_ip}" ]]; then
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -290,6 +451,13 @@ fi
 host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
+prepare_kv_connector || exit 2
+
+# GPU timing is opt-in; agentic reports need it on both service roles.
+if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
+  export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+  export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+fi
 
 IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"
 
@@ -299,7 +467,14 @@ prefill_ports=()
 decode_args=()
 decode_ips=()
 decode_ports=()
-if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${AGGREGATED}" == "1" ]]; then
+  # One server answers both roles, so both endpoint lists name it. `*_args` stay
+  # empty: they only ever feed the router, which this layout does not start.
+  prefill_ips+=("${IP_ARRAY[0]}")
+  prefill_ports+=("${ROUTER_PORT}")
+  decode_ips+=("${IP_ARRAY[0]}")
+  decode_ports+=("${ROUTER_PORT}")
+elif [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   if [[ "${xP}" != "1" || "${yD}" != "1" ]]; then
     echo "ERROR: single_node PD worker layout currently supports only 1 prefill and 1 decode worker" >&2
     exit 1
@@ -310,6 +485,56 @@ if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   decode_ips+=("${IP_ARRAY[0]}")
   decode_ports+=("${DECODE_PORT}")
   decode_args+=(--decode "http://${IP_ARRAY[0]}:${DECODE_PORT}")
+elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
+  # PP size is not a top-level env var on this launcher; parse it from extra_args.
+  _pp_from_args() {
+    local args="$1"
+    if [[ "${args}" =~ --pipeline-parallel-size[=\ ]+([0-9]+) ]]; then
+      echo "${BASH_REMATCH[1]}"
+    else
+      echo 1
+    fi
+  }
+  PREFILL_PP_SIZE="$(_pp_from_args "${PREFILL_SERVER_ARGS}")"
+  DECODE_PP_SIZE="$(_pp_from_args "${DECODE_SERVER_ARGS}")"
+  prefill_nodes=()
+  prefill_gpus=()
+  decode_nodes=()
+  decode_gpus=()
+  packed_node=0
+  packed_used=0
+  place_packed_worker() {
+    local width="$1"
+    local -n placed_nodes="$2"
+    local -n placed_gpus="$3"
+    if (( width > 8 )); then
+      echo "ERROR: packed_nodes workers must fit on one 8-GPU node" >&2
+      exit 2
+    fi
+    if (( packed_used + width > 8 )); then
+      packed_node=$((packed_node + 1))
+      packed_used=0
+    fi
+    placed_nodes+=("${packed_node}")
+    placed_gpus+=("$(seq -s, "${packed_used}" "$((packed_used + width - 1))")")
+    packed_used=$((packed_used + width))
+  }
+  for idx in $(seq 0 $((xP - 1))); do
+    place_packed_worker "$((PREFILL_PP_SIZE * PREFILL_TP_SIZE))" prefill_nodes prefill_gpus
+    prefill_ips+=("${IP_ARRAY[${prefill_nodes[$idx]}]:-}")
+    prefill_ports+=("$((PREFILL_PORT + idx))")
+    prefill_args+=(--prefill "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}")
+  done
+  for idx in $(seq 0 $((yD - 1))); do
+    place_packed_worker "$((DECODE_PP_SIZE * DECODE_TP_SIZE))" decode_nodes decode_gpus
+    decode_ips+=("${IP_ARRAY[${decode_nodes[$idx]}]:-}")
+    decode_ports+=("$((DECODE_PORT + idx))")
+    decode_args+=(--decode "http://${decode_ips[$idx]}:${decode_ports[$idx]}")
+  done
+  if (( packed_node + 1 != ${#IP_ARRAY[@]} )); then
+    echo "ERROR: packed_nodes needs $((packed_node + 1)) node(s), got ${#IP_ARRAY[@]}" >&2
+    exit 2
+  fi
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   for idx in $(seq 0 $((xP - 1))); do
     prefill_port=$((PREFILL_PORT + idx))
@@ -370,7 +595,7 @@ if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
 fi
 
 # AgentX captures every query-token count the engine can produce, i.e. the dense
-# range [2, graph_max] with graph_max = seqs * (1 + spec_tokens), where seqs
+# range [1, graph_max] with graph_max = seqs * (1 + spec_tokens), where seqs
 # defaults to 2 * CONC. Concurrencies whose in-flight window is wider than
 # 2 * CONC pin seqs explicitly via cudagraph_max_num_seqs.
 auto_cudagraph_capture_sizes() {
@@ -385,11 +610,11 @@ auto_cudagraph_capture_sizes() {
     seqs=$(( 2 * conc ))
   fi
   graph_max=$(( seqs * (1 + spec) ))
-  if (( graph_max < 2 )); then
-    graph_max=2
+  if (( graph_max < 1 )); then
+    graph_max=1
   fi
-  echo "[${role}] cudagraph auto range 2..${graph_max} (seqs=${seqs} spec=${spec})" >&2
-  echo "[$(seq -s, 2 "${graph_max}")]"
+  echo "[${role}] cudagraph auto range 1..${graph_max} (seqs=${seqs} spec=${spec})" >&2
+  echo "[$(seq -s, 1 "${graph_max}")]"
 }
 
 build_cudagraph_args() {
@@ -429,6 +654,62 @@ decode_cudagraph_args=()
 build_cudagraph_args prefill prefill_cudagraph_args
 build_cudagraph_args decode decode_cudagraph_args
 
+# Where a worker's FlyDSL cache lives. Preferred: the node-wide AOT cache
+# pd_slurm_job.sh extracted from the image, used in place (FlyDSL locks each
+# key, so workers share it safely). Fallback: copy the AOT kernels into the
+# worker's private dir, from that shared dir if it is readable but not
+# writable, else from the image itself when this uid can read it. Otherwise the
+# private dir starts empty and every tuned kernel JIT-compiles on first use.
+resolve_flydsl_cache_dir() {
+  local role="$1"
+  local private_dir="$2"
+  local shared="${ATOMESH_FLYDSL_AOT_DIR:-}"
+  local src=""
+
+  if [[ -n "${shared}" && -f "${shared}/.complete" ]]; then
+    if [[ -w "${shared}" ]]; then
+      echo "[runtime] ${role} flydsl cache=${shared} (shared AOT)" >&2
+      echo "${shared}"
+      return 0
+    fi
+    src="${shared}"
+  fi
+  if [[ -z "${src}" ]]; then
+    src="$(python3 -c 'import importlib.util as u, os; s = u.find_spec("aiter"); print(os.path.join(os.path.dirname(s.origin), "jit", "flydsl_cache") if s else "")' 2>/dev/null || true)"
+  fi
+  if [[ -n "${src}" && -d "${src}" ]] && cp -R "${src}/." "${private_dir}/" 2>/dev/null; then
+    echo "[runtime] ${role} flydsl cache=${private_dir} (copied AOT from ${src})" >&2
+  else
+    echo "[runtime] WARN: ${role} flydsl cache=${private_dir} has no AOT kernels; tuned kernels JIT-compile on first use" >&2
+  fi
+  echo "${private_dir}"
+}
+
+# Once AITER_JIT_DIR is set, aiter imports modules only from that dir, so a
+# fresh per-worker dir would JIT-rebuild every module the image already ships
+# (stalling the engine whenever a new one is first needed). Link the image's
+# prebuilt .so files in; modules it lacks still build into the writable dir.
+seed_aiter_jit_dir() {
+  local role="$1"
+  local dir="$2"
+  local src so linked=0
+
+  src="$(python3 -c 'import importlib.util as u, os; s = u.find_spec("aiter"); print(os.path.join(os.path.dirname(s.origin), "jit") if s else "")' 2>/dev/null || true)"
+  if [[ -n "${src}" && -d "${src}" && "${src}" != "${dir}" ]]; then
+    for so in "${src}"/*.so; do
+      [[ -r "${so}" ]] || continue
+      if [[ -e "${dir}/${so##*/}" ]] || ln -s "${so}" "${dir}/"; then
+        linked=$((linked + 1))
+      fi
+    done
+  fi
+  if (( linked > 0 )); then
+    echo "[runtime] ${role} aiter jit=${dir} (linked ${linked} prebuilt modules from ${src})" >&2
+  else
+    echo "[runtime] WARN: ${role} aiter jit=${dir} has no prebuilt modules linked; aiter JIT-builds modules on first use" >&2
+  fi
+}
+
 build_server_cache_env() {
   local role="$1"
   local server_port="$2"
@@ -439,6 +720,10 @@ build_server_cache_env() {
   cache_root="${cache_base}/${role}-${server_port}"
   mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
 
+  seed_aiter_jit_dir "${role}" "${cache_root}/aiter/jit"
+  local flydsl_dir
+  flydsl_dir="$(resolve_flydsl_cache_dir "${role}" "${cache_root}/flydsl")"
+
   out=(
     "HOME=${cache_root}/home"
     "XDG_CACHE_HOME=${cache_root}/xdg"
@@ -446,10 +731,14 @@ build_server_cache_env() {
     "TRITON_CACHE_DIR=${cache_root}/triton"
     "AITER_CACHE_DIR=${cache_root}/aiter"
     "AITER_JIT_DIR=${cache_root}/aiter/jit"
-    "FLYDSL_RUNTIME_CACHE_DIR=${cache_root}/flydsl"
+    "FLYDSL_RUNTIME_CACHE_DIR=${flydsl_dir}"
   )
   echo "[runtime] ${role} cache root=${cache_root} (port=${server_port})"
 }
+
+if [[ -n "${AITER_JIT_DIR:-}" ]] && mkdir -p "${AITER_JIT_DIR}" 2>/dev/null; then
+  seed_aiter_jit_dir "container" "${AITER_JIT_DIR}"
+fi
 
 server_common=(
   --model "${MODEL_PATH}"
@@ -508,6 +797,7 @@ wait_http() {
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
+    exit_if_mooncake_store_died
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -533,6 +823,7 @@ wait_router_closed() {
   while true; do
     if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
       miss_count=0
+      exit_if_mooncake_store_died
       if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
         set +e
         wait "${server_pid}"
@@ -559,7 +850,14 @@ start_logged_process() {
   local log_file="$2"
   shift 2
 
-  if command -v setsid >/dev/null 2>&1; then
+  if [[ "${PACKED_NODES_PD:-0}" == "1" ]]; then
+    echo "[runtime] logging ${log_file} (file-only, packed layout)"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$@" >"${log_file}" 2>&1 &
+    else
+      "$@" >"${log_file}" 2>&1 &
+    fi
+  elif command -v setsid >/dev/null 2>&1; then
     setsid "$@" > >(tee "${log_file}") 2>&1 &
   else
     "$@" > >(tee "${log_file}") 2>&1 &
@@ -574,7 +872,9 @@ process_is_running() {
   if [[ -r "/proc/${pid}/stat" ]]; then
     state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
     [[ -n "${state}" && "${state}" != "Z" ]]
-    return
+    # Not a bare return: in a function the EXIT trap runs, that returns the
+    # trap's $? (the exit status), and cleanup would then wait on live servers.
+    return $?
   fi
 
   kill -0 "${pid}" 2>/dev/null
@@ -594,11 +894,21 @@ terminate_process_group() {
   done
   if process_is_running "${pid}"; then
     kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+    # A process in uninterruptible sleep (a GPU or RDMA teardown) outlives
+    # SIGKILL, and `wait` would block on it until the job's time limit.
+    deadline=$(( $(date +%s) + 30 ))
+    while process_is_running "${pid}" && [[ "$(date +%s)" -lt "${deadline}" ]]; do
+      sleep 1
+    done
+    if process_is_running "${pid}"; then
+      echo "[cleanup] WARNING: pid ${pid} is still running 30s after SIGKILL (state $(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || echo '?')); not waiting for it" >&2
+      return 0
+    fi
   fi
   wait "${pid}" 2>/dev/null || true
 }
 
-# LMCache's NVMe tier lives on a host bind mount, so unlike the container's own
+# LMCache's disk tier lives on a host bind mount, so unlike the container's own
 # /tmp it survives `docker run --rm`. Every concurrency runs as its own job, and
 # a tier left behind would both serve the previous job's KV and hold its
 # LMCACHE_MAX_LOCAL_DISK_SIZE of disk per rank. Start empty, leave nothing.
@@ -607,29 +917,919 @@ lmcache_disk_dir=""
 reset_lmcache_disk() {
   local dir="${LMCACHE_LOCAL_DISK:-}"
   [[ -n "${dir}" && "${dir}" != "/" ]] || return 0
+  # The repository working directory is read-only in the container. Resolve
+  # relative paths under the writable logs, isolated by job, phase and node rank.
+  if [[ "${dir}" != /* ]]; then
+    dir="${RUNTIME_LOG_DIR}/rank-${NODE_RANK}/${dir#./}"
+  fi
+  export LMCACHE_LOCAL_DISK="${dir}"
   # Several prefill workers can share this shell, so only the first one empties
   # the tier; a later one would delete a running worker's cache underneath it.
   [[ "${lmcache_disk_dir}" != "${dir}" ]] || return 0
   lmcache_disk_dir="${dir}"
   rm -rf -- "${dir}"
   mkdir -p -- "${dir}"
-  echo "[lmcache] NVMe tier ${dir} reset (${LMCACHE_MAX_LOCAL_DISK_SIZE:-0}GiB per rank)"
+  echo "[lmcache] disk tier ${dir} reset (${LMCACHE_MAX_LOCAL_DISK_SIZE:-0}GiB per rank)"
 }
 
 purge_lmcache_disk() {
   [[ -n "${lmcache_disk_dir}" ]] || return 0
   rm -rf -- "${lmcache_disk_dir}"
-  echo "[lmcache] NVMe tier ${lmcache_disk_dir} removed"
+  echo "[lmcache] disk tier ${lmcache_disk_dir} removed"
   lmcache_disk_dir=""
+}
+
+# MOONCAKE_STORE=1 (prefill role env) gives this shell's prefill workers a
+# Mooncake Store as their KV offload tier: ATOM's mooncake_store offload
+# connector saves each PP stage's full chunks of a prompt to the Store, whose
+# memory belongs to owner processes started here, and loads a prefix hit back
+# over RDMA, with no CPU tier in the workers. Its settings, all in the prefill
+# role env, which a decode node reads as well:
+#  - MOONCAKE_STORE_OWNERS: one owner per "<numa>:<GiB>[:<rdma,...>]" entry,
+#    bound to that NUMA node by numa_exec.py; an entry without NICs serves on
+#    rdma4-rdma7. The default "0:768:rdma4,rdma5;1:768:rdma6,rdma7" fits
+#    pit2-p03 (TW MI355X) nodes: about 1.5 TiB per NUMA node, rdma4-7 on
+#    NUMA1. An owner above 832 GiB may not register on an ionic NIC. ATOM gives
+#    each prefill stage its GPU's NIC and, under one shared master, refuses one
+#    an owner uses: owners and requesters sharing NICs stall concurrent reads.
+#  - MOONCAKE_STORE_MASTER_NUMA (default 1): the NUMA node the masters run on.
+#  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
+#    the stages' NICs: one master per owner NIC, every owner on exactly one
+#    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
+#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners the decode node
+#    starts on its own memory, joining the prefill node's masters
+#    (pd_worker_layout multi_node, one prefill node and one decode node). The
+#    prefill workers start once every pool counts the owners of both nodes.
+#  - MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated, default the model):
+#    the owners pin huge pages under MPOL_BIND, so the clean page cache of
+#    these goes first; each node must then fit its pins with 128 GiB to spare,
+#    and is compacted for them (numa_memory_budget.py --compact).
+#  - MOONCAKE_STORE_COMPACT_TIMEOUT (default 600 s) stops each NUMA node's
+#    compaction; a node that does not compact in time can leave an owner 4 KiB
+#    pages its NICs refuse to register.
+#  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
+#    Store once this node has compacted: for every pool to count its owners,
+#    and on a decode node for the prefill node's masters. A wait on the other
+#    node's part also allows for that node's compaction, which its Store waits
+#    for: 2 x MOONCAKE_STORE_COMPACT_TIMEOUT, one per NUMA node.
+# Every Mooncake process runs with MC_NUM_QP_PER_EP=1, the decode workers' P->D
+# transfer engine included (peers with different QP counts cannot connect).
+# The launcher owns the workers' ATOM_KV_OFFLOAD and
+# ATOM_KV_OFFLOAD_EXTRA_CONFIG, so PREFILL_KV_TRANSFER_CONFIG names the P/D
+# connector only. A node runs one Store, for one prefill worker whose GPUs its
+# owners' NICs are placed around, so a layout that starts several prefill
+# workers on one node is refused. validate_mooncake_store_settings refuses a
+# conflicting setting, or an image without the Store, before the node starts
+# anything. Master and owners start before the workers, which connect (and
+# round-trip a probe chunk) while they build their engines and never retry,
+# and stop after them. A Store lives as long as this shell, which starts each
+# worker once and restarts none: the Store and its objects end with the job,
+# so one a worker marked tainted (a put it gave up on may still write the
+# owners' memory) is never loaded from again.
+mooncake_store_pids=()
+mooncake_store_logs=()
+mooncake_store_names=()
+# Exit status of the first Store failure: a process that died before it was
+# stopped, or owner capacity the master lost during the run.
+mooncake_store_failed_rc=""
+mooncake_page_cache_dropper_pid=""
+mooncake_owner_plan_numa=()
+mooncake_owner_plan_gib=()
+mooncake_owner_plan_devices=()
+# One entry per pool, numbered alike on every node: its NIC under per_nic (""
+# for the one shared pool), and the segment bytes its master counts once the
+# owners of every node have mounted.
+mooncake_pool_devices=()
+mooncake_pool_capacity=()
+# The first entries of mooncake_store_pids are this node's masters: one per
+# pool on the prefill node, none on a decode node.
+mooncake_store_master_count=0
+# Set once every pool counts its planned capacity, and once the masters'
+# metrics of the run are saved.
+mooncake_store_ready=0
+mooncake_store_metrics_saved=0
+# The prefill workers' env for the running Store, set by start_mooncake_store.
+mooncake_store_prefill_env=()
+
+# The prefill role env asks for it; the decode role reads the same variable
+# from ATOMESH_PREFILL_ENV_ on any node.
+mooncake_store_requested() {
+  [[ "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE:-${MOONCAKE_STORE:-0}}" == "1" ]]
+}
+
+# mooncake_setting <name> [default]: a Store setting of the prefill role env,
+# read the same way on a decode node, where only ATOMESH_PREFILL_ENV_<name>
+# carries it.
+mooncake_setting() {
+  local prefixed="ATOMESH_PREFILL_ENV_$1"
+  local plain="$1"
+  printf '%s' "${!prefixed:-${!plain:-${2:-}}}"
+}
+
+# mooncake_pool_port <base port> <pool>: the pool's master, metadata or
+# metrics port, 100 apart (check_mooncake_store_ports refuses a plan whose
+# owners' service ports reach one).
+mooncake_pool_port() {
+  echo $(( $1 + 100 * $2 ))
+}
+
+# mooncake_pool_suffix <pool>: the pool's log and metrics file suffix; none
+# for the one shared pool.
+mooncake_pool_suffix() {
+  if [[ "${#mooncake_pool_devices[@]}" -gt 1 || -n "${mooncake_pool_devices[0]:-}" ]]; then
+    printf -- '-pool%s' "$1"
+  fi
+}
+
+# Every Mooncake process needs one QP per endpoint; refuses any other value.
+require_mooncake_qp_per_endpoint() {
+  if [[ -n "${MC_NUM_QP_PER_EP:-}" && "${MC_NUM_QP_PER_EP}" != "1" ]]; then
+    echo "[mooncake-store][FAIL] MC_NUM_QP_PER_EP=${MC_NUM_QP_PER_EP}: the Mooncake Store needs 1 in every Mooncake process, P->D included" >&2
+    exit 2
+  fi
+}
+
+# Each Store client and owner is given its NICs: a prefill worker the GPU's
+# own, an owner its --device_names. MC_MS_AUTO_DISC=1 makes Mooncake take every
+# NIC of the node instead, which stalls concurrent reads; the workers refuse it
+# only once their model has loaded.
+refuse_mooncake_nic_auto_discovery() {
+  local auto_discovery="${MC_MS_AUTO_DISC:-}"
+  if [[ "${auto_discovery//[[:space:]]/}" == "1" ]]; then
+    echo "[mooncake-store][FAIL] MC_MS_AUTO_DISC=1 makes the Store's clients and owners use every NIC instead of the ones they are given; unset it" >&2
+    exit 2
+  fi
+}
+
+# parse_mooncake_owner_spec <setting> <numa[]> <gib[]> <devices[]>: appends
+# the "<numa>:<GiB>[:<rdma,...>]" entries of MOONCAKE_STORE_OWNERS or
+# MOONCAKE_STORE_DECODE_OWNERS to the named arrays, an entry without NICs on
+# rdma4-rdma7; exits 2 on an invalid configuration.
+parse_mooncake_owner_spec() {
+  local setting="$1"
+  local -n numa_out="$2"
+  local -n gib_out="$3"
+  local -n devices_out="$4"
+  local default_spec=""
+  if [[ "${setting}" == "MOONCAKE_STORE_OWNERS" ]]; then
+    default_spec="0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+  fi
+  local spec
+  spec="$(mooncake_setting "${setting}" "${default_spec}")"
+  local device_list='[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*'
+  local -a entries=()
+  IFS=';' read -r -a entries <<< "${spec}"
+  if [[ "${#entries[@]}" -eq 0 ]]; then
+    echo "[mooncake-store][FAIL] ${setting} is empty" >&2
+    exit 2
+  fi
+  local entry
+  for entry in "${entries[@]}"; do
+    if [[ ! "${entry}" =~ ^([0-9]+):([0-9]+)(:(${device_list}))?$ ]] \
+      || (( 10#${BASH_REMATCH[2]} == 0 )); then
+      echo "[mooncake-store][FAIL] ${setting} entry '${entry}' is not <numa>:<GiB>[:<rdma,...>] with GiB > 0" >&2
+      exit 2
+    fi
+    numa_out+=("$(( 10#${BASH_REMATCH[1]} ))")
+    gib_out+=("$(( 10#${BASH_REMATCH[2]} ))")
+    devices_out+=("${BASH_REMATCH[4]:-rdma4,rdma5,rdma6,rdma7}")
+  done
+}
+
+# plan_mooncake_store_owners [setting]: fills the mooncake_owner_plan_* arrays
+# with this node's owners, MOONCAKE_STORE_OWNERS on the prefill node (the
+# default) or MOONCAKE_STORE_DECODE_OWNERS on a decode node.
+plan_mooncake_store_owners() {
+  mooncake_owner_plan_numa=()
+  mooncake_owner_plan_gib=()
+  mooncake_owner_plan_devices=()
+  parse_mooncake_owner_spec "${1:-MOONCAKE_STORE_OWNERS}" \
+    mooncake_owner_plan_numa mooncake_owner_plan_gib mooncake_owner_plan_devices
+}
+
+# Fills mooncake_pool_devices and mooncake_pool_capacity from the owners of
+# every node, numbering the pools alike on each; exits 2 on an invalid setting.
+plan_mooncake_store_pools() {
+  local mode
+  mode="$(mooncake_setting MOONCAKE_STORE_POOLS shared)"
+  local -a numa=() gib=() devices=()
+  parse_mooncake_owner_spec MOONCAKE_STORE_OWNERS numa gib devices
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
+    parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
+  fi
+  mooncake_pool_devices=()
+  mooncake_pool_capacity=()
+  local i device bytes
+  case "${mode}" in
+    shared)
+      bytes=0
+      for i in "${!gib[@]}"; do
+        bytes=$(( bytes + gib[i] * 1024 * 1024 * 1024 ))
+      done
+      mooncake_pool_devices=("")
+      mooncake_pool_capacity=("${bytes}")
+      ;;
+    per_nic)
+      for i in "${!devices[@]}"; do
+        if [[ "${devices[i]}" == *,* ]]; then
+          echo "[mooncake-store][FAIL] MOONCAKE_STORE_POOLS=per_nic gives each NIC a pool of its own, so every owner needs exactly one NIC; ${numa[i]}:${gib[i]}:${devices[i]} names several" >&2
+          exit 2
+        fi
+      done
+      while read -r device; do
+        bytes=0
+        for i in "${!devices[@]}"; do
+          if [[ "${devices[i]}" == "${device}" ]]; then
+            bytes=$(( bytes + gib[i] * 1024 * 1024 * 1024 ))
+          fi
+        done
+        mooncake_pool_devices+=("${device}")
+        mooncake_pool_capacity+=("${bytes}")
+      done < <(printf '%s\n' "${devices[@]}" | sort -u -V)
+      ;;
+    *)
+      echo "[mooncake-store][FAIL] MOONCAKE_STORE_POOLS=${mode} is neither shared nor per_nic" >&2
+      exit 2
+      ;;
+  esac
+}
+
+# Refuses a Store port outside the TCP range, or one that two Store processes
+# of a node would bind: each pool's master, metadata and metrics ports, and the
+# owners' service ports, on the prefill node, which runs the masters; the
+# decode node's owners only join them. Needs both plans.
+check_mooncake_store_ports() {
+  local -a names=() ports=() decode_numa=() decode_gib=() decode_devices=()
+  local pool base i
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    for base in ATOMESH_MOONCAKE_MASTER_PORT ATOMESH_MOONCAKE_METADATA_PORT ATOMESH_MOONCAKE_METRICS_PORT; do
+      names+=("pool ${pool}'s port ${base} + 100 x ${pool}")
+      ports+=("$(mooncake_pool_port "${!base}" "${pool}")")
+    done
+  done
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    names+=("owner ${i}'s port ATOMESH_MOONCAKE_OWNER_PORT + ${i}")
+    ports+=("$(( ATOMESH_MOONCAKE_OWNER_PORT + i ))")
+  done
+  local -A bound_by=()
+  local port
+  for i in "${!ports[@]}"; do
+    port="${ports[i]}"
+    if (( port > 65535 )); then
+      echo "[mooncake-store][FAIL] ${names[i]} = ${port} is outside the valid TCP port range" >&2
+      exit 2
+    fi
+    if [[ -n "${bound_by[${port}]:-}" ]]; then
+      echo "[mooncake-store][FAIL] ${names[i]} = ${port} is ${bound_by[${port}]} too; move ATOMESH_MOONCAKE_OWNER_PORT clear of the master, metadata and metrics ports of every pool" >&2
+      exit 2
+    fi
+    bound_by[${port}]="${names[i]}"
+  done
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
+    parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS \
+      decode_numa decode_gib decode_devices
+    port=$(( ATOMESH_MOONCAKE_OWNER_PORT + ${#decode_numa[@]} - 1 ))
+    if (( port > 65535 )); then
+      echo "[mooncake-store][FAIL] decode owner $(( ${#decode_numa[@]} - 1 ))'s port ATOMESH_MOONCAKE_OWNER_PORT + $(( ${#decode_numa[@]} - 1 )) = ${port} is outside the valid TCP port range" >&2
+      exit 2
+    fi
+  fi
+}
+
+# The owners' devices, each once, in plan order.
+mooncake_owner_devices_csv() {
+  local devices csv="" device
+  for devices in "${mooncake_owner_plan_devices[@]}"; do
+    for device in ${devices//,/ }; do
+      [[ ",${csv}," == *",${device},"* ]] || csv+="${csv:+,}${device}"
+    done
+  done
+  printf '%s' "${csv}"
+}
+
+# kv_transfer_offload_connector <kv-transfer-config JSON>: prints the first
+# offload connector the config names, matched by name or alias as ATOM matches
+# them (KVConnectorFactory: every name and alias of a backend registered with
+# offload=True, in any case, outer whitespace ignored); fails when it names
+# none. A test keeps this list equal to the factory's.
+kv_transfer_offload_connector() {
+  local config="${1,,}" name
+  config="${config//[[:space:]]/}"
+  for name in lmcache_offload lmcacheoffloadconnector lmcacheconnectorv1 \
+    lmcache_mp lmcachempconnector mooncake_store; do
+    if [[ "${config}" == *"\"kv_connector\":\"${name}\""* ]]; then
+      printf '%s' "${name}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# require_mooncake_store_number <name> <default> <kind>: refuses a numeric
+# Store setting that is not one of its kind, before anything starts. The
+# helpers and bash arithmetic would misread it later: a compaction timeout of 0
+# skips the compaction, and a wait timeout bash cannot add aborts the wait
+# without stopping what it waited for. Kinds: positive_integer, integer (>= 0)
+# and positive (a decimal).
+require_mooncake_store_number() {
+  local name="$1" value valid=0
+  value="$(mooncake_setting "$1" "$2")"
+  case "$3" in
+    positive_integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && ((10#${value} > 0)) && valid=1 ;;
+    integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && valid=1 ;;
+    positive) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ && "${value}" =~ [1-9] ]] && valid=1 ;;
+  esac
+  if ((!valid)); then
+    echo "[mooncake-store][FAIL] ${name}=${value} is not a ${3//_/ } number" >&2
+    exit 2
+  fi
+}
+
+# mooncake_store_wait_timeout: MOONCAKE_STORE_WAIT_TIMEOUT in decimal, once
+# require_mooncake_store_number has validated it. Bash arithmetic reads a
+# leading zero as octal: 0600 would wait 384 s, and 0900 abort the launcher.
+mooncake_store_wait_timeout() {
+  local value
+  value="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)"
+  printf '%d' "$(( 10#${value} ))"
+}
+
+# Refuses a prefill setting the Store cannot run with, and fills the owner
+# plan. Independent of the node: the owners' devices and memory are checked
+# where the Store starts.
+check_mooncake_store_settings() {
+  local name
+  for name in ATOM_KV_OFFLOAD ATOM_KV_OFFLOAD_EXTRA_CONFIG; do
+    if [[ -n "${!name:-}" ]]; then
+      echo "[mooncake-store][FAIL] ${name} is set by the launcher under MOONCAKE_STORE=1; remove it from the case" >&2
+      exit 2
+    fi
+  done
+  local connector
+  if connector="$(kv_transfer_offload_connector "${PREFILL_KV_TRANSFER_CONFIG:-}")"; then
+    echo "[mooncake-store][FAIL] PREFILL_KV_TRANSFER_CONFIG names the offload connector ${connector}; under MOONCAKE_STORE=1 the launcher adds mooncake_store through ATOM_KV_OFFLOAD, and a worker runs one offload connector, so keep only the P/D connector there" >&2
+    exit 2
+  fi
+  require_mooncake_qp_per_endpoint
+  refuse_mooncake_nic_auto_discovery
+  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}" num_decode="${yD:-1}"
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
+    && [[ "${layout}" != "multi_node" || "${num_prefill}" != "1" || "${num_decode}" != "1" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node, here ${layout}), one prefill node (here ${num_prefill}), whose masters they join, and one decode node (here ${num_decode}): the pools count the decode owners once" >&2
+    exit 2
+  fi
+  # This shell starts one Store, planned for its first prefill worker's GPUs;
+  # a second worker would find it only once the first is up. The packed
+  # layout's node of each prefill worker is in prefill_nodes.
+  local workers_on_a_node=1 node
+  local -A prefill_workers_on=()
+  case "${layout}" in
+    prefill_single_node) workers_on_a_node="${num_prefill}" ;;
+    packed_nodes)
+      for node in ${prefill_nodes[@]+"${prefill_nodes[@]}"}; do
+        prefill_workers_on[${node}]=$(( ${prefill_workers_on[${node}]:-0} + 1 ))
+        if (( ${prefill_workers_on[${node}]} > workers_on_a_node )); then
+          workers_on_a_node="${prefill_workers_on[${node}]}"
+        fi
+      done
+      ;;
+  esac
+  if (( workers_on_a_node > 1 )); then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its owners' NICs are placed around; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node" >&2
+    exit 2
+  fi
+  require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
+  require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
+  require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
+  plan_mooncake_store_owners
+  plan_mooncake_store_pools
+  check_mooncake_store_ports
+}
+
+# The image must carry the Store: the master and owner binaries, which only a
+# Mooncake built WITH_STORE=ON installs (atom_release.dockerfile builds it
+# unless INSTALL_MOONCAKE_STORE=0), and the mooncake.store module the prefill
+# workers' connector imports. Without them a Store process would only
+# "exit unexpectedly", or the workers fail late in their startup.
+check_mooncake_store_image() {
+  local binary
+  for binary in mooncake_master mooncake_client; do
+    if ! command -v "${binary}" >/dev/null 2>&1; then
+      echo "[mooncake-store][FAIL] ${binary} is not on PATH: MOONCAKE_STORE=1 needs an image whose Mooncake is built WITH_STORE=ON (not INSTALL_MOONCAKE_STORE=0)" >&2
+      exit 2
+    fi
+  done
+  local import_error
+  if ! import_error="$(python3 -c 'import mooncake.store' 2>&1)"; then
+    printf '%s\n' "${import_error}" >&2
+    echo "[mooncake-store][FAIL] python3 cannot import mooncake.store, which the prefill workers' mooncake_store connector needs" >&2
+    exit 2
+  fi
+}
+
+# Runs before this node starts anything: the prefill settings as start_prefill
+# will see them, the decode's QP count as start_decode will, and the image.
+# Each role env is applied in a subshell, so none of it stays in this shell.
+validate_mooncake_store_settings() {
+  # Before the switch check, so a decode-only MOONCAKE_STORE is caught too.
+  local name
+  while IFS='=' read -r name _; do
+    if [[ "${name}" == ATOMESH_DECODE_ENV_MOONCAKE_STORE \
+      || "${name}" == ATOMESH_DECODE_ENV_MOONCAKE_STORE_* ]]; then
+      echo "[mooncake-store][FAIL] ${name}: the Mooncake Store settings belong to the prefill role env (ATOMESH_PREFILL_ENV_), which every node reads; in the decode role env only the decode node would see them" >&2
+      exit 2
+    fi
+  done < <(env)
+  mooncake_store_requested || return 0
+  if [[ "${AGGREGATED:-0}" == "1" ]]; then
+    # start_prefill starts the Store, and an aggregated cell has no prefill:
+    # its server would run without the offload the case asked for.
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE needs a P/D prefill; an aggregated cell starts none" >&2
+    exit 2
+  fi
+  (
+    apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+    check_mooncake_store_settings
+  )
+  (
+    # The decode node's owners start from the decode role env.
+    apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+    require_mooncake_qp_per_endpoint
+    refuse_mooncake_nic_auto_discovery
+  )
+  check_mooncake_store_image
+}
+
+# Every owner device needs an ACTIVE port, and one owner's devices must sit on
+# one NUMA node: Mooncake spreads a segment over the nodes of its NICs,
+# overriding numa_exec.py's binding.
+check_mooncake_owner_devices() {
+  local ib_root="${ATOMESH_IB_SYSFS_ROOT:-/sys/class/infiniband}"
+  local i device node nodes
+  for i in "${!mooncake_owner_plan_devices[@]}"; do
+    nodes=""
+    for device in ${mooncake_owner_plan_devices[i]//,/ }; do
+      if [[ ! -e "${ib_root}/${device}" ]]; then
+        echo "[mooncake-store][FAIL] owner${i} RDMA device ${device} is not in ${ib_root}" >&2
+        exit 2
+      fi
+      if ! grep -qs '^4:' "${ib_root}/${device}"/ports/*/state; then
+        echo "[mooncake-store][FAIL] owner${i} RDMA device ${device} has no ACTIVE port" >&2
+        exit 2
+      fi
+      node="$(cat "${ib_root}/${device}/device/numa_node" 2>/dev/null || echo '?')"
+      [[ " ${nodes} " == *" ${node} "* ]] || nodes+="${nodes:+ }${node}"
+    done
+    if [[ "${nodes}" == *" "* ]]; then
+      echo "[mooncake-store][FAIL] owner${i}'s RDMA devices ${mooncake_owner_plan_devices[i]} sit on NUMA nodes ${nodes}: Mooncake would spread its segment over them instead of keeping it on node ${mooncake_owner_plan_numa[i]}; give each owner the devices of one node" >&2
+      exit 2
+    fi
+  done
+}
+
+# prepare_mooncake_store_memory: drops the clean page cache that the owners'
+# huge-page faults would otherwise reclaim through compaction, then refuses pins
+# that do not fit a NUMA node (numa_memory_budget.py warns when they exceed its
+# free memory), and compacts each node for its pins: owners that fault a
+# fragmented node from many threads get 4 KiB pages, which the NICs refuse.
+prepare_mooncake_store_memory() {
+  local -a drop_dirs=()
+  IFS=':' read -r -a drop_dirs <<< "$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS "${MODEL_PATH}")"
+  echo "[mooncake-store] dropping the page cache of ${drop_dirs[*]}"
+  python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" "${drop_dirs[@]}"
+  local -a pins=()
+  local i
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    pins+=("${mooncake_owner_plan_numa[i]}:${mooncake_owner_plan_gib[i]}")
+  done
+  if ! python3 "${ATOMESH_SCRIPT_DIR}/numa_memory_budget.py" \
+    --reserve-gib 128 \
+    --compact \
+    --compact-timeout "$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
+    ${pins[@]+"${pins[@]}"}; then
+    echo "[mooncake-store][FAIL] this node's Store owners must fit their NUMA nodes, see numa-budget above" >&2
+    exit 2
+  fi
+}
+
+mooncake_store_running() {
+  local pid
+  for pid in ${mooncake_store_pids[@]+"${mooncake_store_pids[@]}"}; do
+    [[ -n "${pid}" ]] && return 0
+  done
+  return 1
+}
+
+# Returns 1 and records the first exit status when a Store process exited.
+reap_dead_mooncake_store() {
+  local i rc any_died=0
+  for i in "${!mooncake_store_pids[@]}"; do
+    [[ -n "${mooncake_store_pids[i]}" ]] || continue
+    process_is_running "${mooncake_store_pids[i]}" && continue
+    set +e
+    wait "${mooncake_store_pids[i]}"
+    rc=$?
+    set -e
+    [[ "${rc}" -eq 0 ]] && rc=1
+    mooncake_store_pids[i]=""
+    mooncake_store_failed_rc="${mooncake_store_failed_rc:-${rc}}"
+    tail -n 50 "${mooncake_store_logs[i]}" >&2 || true
+    echo "[mooncake-store][FAIL] ${mooncake_store_names[i]} exited unexpectedly rc=${rc}, see ${mooncake_store_logs[i]}" >&2
+    any_died=1
+  done
+  [[ "${any_died}" -eq 0 ]]
+}
+
+# Without the Store the prefill workers' lookups answer nothing and their saves
+# fail, which they only log.
+exit_if_mooncake_store_died() {
+  reap_dead_mooncake_store || exit "${mooncake_store_failed_rc}"
+}
+
+# mooncake_metrics_file <pool>: where the pool master's final metrics go.
+mooncake_metrics_file() {
+  printf '%s' "${RUNTIME_LOG_DIR}/mooncake-master-rank-${NODE_RANK}$(mooncake_pool_suffix "$1").metrics"
+}
+
+# Saves each running master's metrics: the puts, gets, evictions and capacity
+# of the whole run. cleanup_processes calls it before stopping anything: a
+# decode node stops its owners once the router closes, and a master drops an
+# owner client_ttl (10 s) after its last heartbeat.
+save_mooncake_store_metrics() {
+  [[ "${mooncake_store_metrics_saved}" == "0" ]] || return 0
+  local pool
+  for (( pool = 0; pool < mooncake_store_master_count; pool++ )); do
+    [[ -n "${mooncake_store_pids[pool]:-}" ]] || continue
+    curl -s --max-time 10 \
+      "http://${host_ip}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")/metrics" \
+      > "$(mooncake_metrics_file "${pool}")" 2>/dev/null || true
+  done
+  mooncake_store_metrics_saved=1
+}
+
+# check_mooncake_store_capacity <pool>: records a failure when the pool
+# master's final metrics count less than its owners' segments: an owner whose
+# heartbeats lapse past client_ttl loses its segment while it keeps running,
+# which nothing else reports.
+check_mooncake_store_capacity() {
+  local pool="$1" metrics counted want
+  [[ "${mooncake_store_ready}" == "1" ]] || return 0
+  metrics="$(mooncake_metrics_file "${pool}")"
+  want="${mooncake_pool_capacity[pool]}"
+  counted="$(awk '$1 == "master_total_capacity_bytes" { print $2 }' "${metrics}" 2>/dev/null || true)"
+  if [[ -z "${counted}" ]]; then
+    echo "[mooncake-store] WARNING: ${metrics} has no master_total_capacity_bytes; the owners' capacity at shutdown is unknown" >&2
+    return 0
+  fi
+  if awk -v counted="${counted}" -v want="${want}" \
+    'BEGIN { exit !(counted + 0 < want + 0) }'; then
+    echo "[mooncake-store][FAIL] the master of pool ${pool} counts ${counted} of its owners' ${want} bytes at shutdown: an owner lost its segment during the run, see the owner logs" >&2
+    mooncake_store_failed_rc="${mooncake_store_failed_rc:-1}"
+  fi
+}
+
+# Returns non-zero when a Store process died before it was stopped, or a
+# master lost owner capacity during the run.
+stop_mooncake_store() {
+  if mooncake_page_cache_dropper_running; then
+    terminate_process_group "${mooncake_page_cache_dropper_pid}"
+  fi
+  mooncake_page_cache_dropper_pid=""
+  mooncake_store_running || return 0
+  save_mooncake_store_metrics
+  reap_dead_mooncake_store || true
+  local pool
+  for (( pool = 0; pool < mooncake_store_master_count; pool++ )); do
+    # A dead master answers for nobody.
+    if [[ -n "${mooncake_store_pids[pool]:-}" ]]; then
+      check_mooncake_store_capacity "${pool}"
+    fi
+  done
+  local i
+  # Owners before the master they report to.
+  for (( i = ${#mooncake_store_pids[@]} - 1; i >= 0; i-- )); do
+    [[ -n "${mooncake_store_pids[i]}" ]] || continue
+    terminate_process_group "${mooncake_store_pids[i]}"
+    mooncake_store_pids[i]=""
+    echo "[mooncake-store] ${mooncake_store_names[i]} stopped, log ${mooncake_store_logs[i]}"
+  done
+  [[ -z "${mooncake_store_failed_rc}" ]]
+}
+
+# Fails startup (stopping what it started) unless <condition> holds within
+# <timeout> seconds; a dying Store process fails it at once.
+wait_for_mooncake_store() {
+  local what="$1" timeout="$2"
+  shift 2
+  local deadline=$(( $(date +%s) + timeout ))
+  local log
+  until "$@"; do
+    if ! reap_dead_mooncake_store; then
+      echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
+      stop_mooncake_store || true
+      exit "${mooncake_store_failed_rc}"
+    fi
+    for log in "${mooncake_store_logs[@]}"; do
+      if grep -q -E "Failed to setup client|Failed to mount|Check failed|FATAL" "${log}" 2>/dev/null; then
+        tail -n 50 "${log}" >&2 || true
+        echo "[wait][FAIL] mooncake-store ${what}: see ${log}" >&2
+        stop_mooncake_store || true
+        exit 1
+      fi
+    done
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      for log in "${mooncake_store_logs[@]}"; do
+        tail -n 20 "${log}" >&2 || true
+      done
+      echo "[wait][FAIL] mooncake-store ${what} not ready after ${timeout}s" >&2
+      stop_mooncake_store || true
+      exit 1
+    fi
+    sleep 2
+  done
+}
+
+# mooncake_master_ready <addr> <pool>: the HTTP metadata server answers about
+# a second before the master's RPC server listens, so the pool's master is
+# ready once both do.
+mooncake_master_ready() {
+  local addr="$1" pool="$2"
+  # Any HTTP answer, a 404 for the probe key included, means it is serving.
+  curl -s -o /dev/null --max-time 5 \
+    "http://${addr}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")/metadata?key=atomesh_probe" \
+    && timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ \
+      "${addr}" "$(mooncake_pool_port "${ATOMESH_MOONCAKE_MASTER_PORT}" "${pool}")" 2>/dev/null
+}
+
+# mooncake_masters_ready <addr>: every pool's master on <addr> is ready.
+mooncake_masters_ready() {
+  local pool
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    mooncake_master_ready "$1" "${pool}" || return 1
+  done
+}
+
+# mooncake_store_capacity_reaches <addr>: every pool's master on <addr> counts
+# the segments of its owners on all nodes.
+mooncake_store_capacity_reaches() {
+  local pool
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    curl -s --max-time 5 \
+      "http://$1:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")/metrics" 2>/dev/null \
+      | awk -v want="${mooncake_pool_capacity[pool]}" \
+        '$1 == "master_total_capacity_bytes" { found = ($2 + 0 >= want) } END { exit !found }' \
+      || return 1
+  done
+}
+
+# mooncake_owner_pool <devices>: the pool of an owner on those devices.
+mooncake_owner_pool() {
+  local pool
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    if [[ -z "${mooncake_pool_devices[pool]}" || "${mooncake_pool_devices[pool]}" == "$1" ]]; then
+      echo "${pool}"
+      return 0
+    fi
+  done
+  echo "[mooncake-store][FAIL] no pool serves owner devices $1" >&2
+  exit 2
+}
+
+# Drops the model's page cache every 45 s for 30 min while the workers load
+# weights, which would refill it; page cache is per file, so this serves every
+# node.
+start_mooncake_page_cache_dropper() {
+  setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
+    --every 45 --for 1800 "${MODEL_PATH}" &
+  mooncake_page_cache_dropper_pid=$!
+  # Until the child execs, its cmdline is this shell's, and a cleanup in that
+  # window would take the dropper for another process and leave it running:
+  # wait for the exec, two seconds at most.
+  local i
+  for ((i = 0; i < 100; i++)); do
+    mooncake_page_cache_dropper_running && return 0
+    kill -0 "${mooncake_page_cache_dropper_pid}" 2>/dev/null || return 0
+    sleep 0.02
+  done
+}
+
+# Whether the page-cache dropper this shell started still runs. It exits on its
+# own after --for, and the kernel may have given its pid to another process
+# since, which no signal of the cleanup may reach: the pid must still run the
+# dropper.
+mooncake_page_cache_dropper_running() {
+  local pid="${mooncake_page_cache_dropper_pid}" cmdline i
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  # A process's command line reads empty while it execs, and the dropper execs
+  # more than once as it starts (setsid, then python3): read it again.
+  for ((i = 0; i < 50; i++)); do
+    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || return 1
+    [[ -n "${cmdline}" ]] && break
+    sleep 0.01
+  done
+  [[ "${cmdline}" == *"/drop_page_cache.py --every "* ]]
+}
+
+# start_mooncake_store_owners <master addr>: starts this node's owners
+# (mooncake_owner_plan_*), each joining its pool's master on <master addr>.
+start_mooncake_store_owners() {
+  local master_addr="$1"
+  # No GPU: a process that sees one makes Mooncake probe every buffer through HIP.
+  # glibc's THP malloc makes the whole segment huge pages, which the NICs
+  # register in under a second per 64 GiB MR; eno1 is firewalled, so the
+  # transfer engine binds the role IP.
+  local -a owner_env=(
+    HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 MC_NUM_QP_PER_EP=1
+    GLIBC_TUNABLES=glibc.malloc.hugetlb=1 MC_MAX_MR_SIZE=68719476736
+    "MC_TCP_BIND_ADDRESS=${host_ip}"
+  )
+  local i pool log
+  local -a cmd=()
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    pool="$(mooncake_owner_pool "${mooncake_owner_plan_devices[i]}")"
+    log="${RUNTIME_LOG_DIR}/mooncake-owner-rank-${NODE_RANK}-${i}.log"
+    cmd=(
+      python3 "${ATOMESH_SCRIPT_DIR}/numa_exec.py" "${mooncake_owner_plan_numa[i]}"
+      mooncake_client
+      --host="${host_ip}" --port="$(( ATOMESH_MOONCAKE_OWNER_PORT + i ))"
+      --master_server_address="${master_addr}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_MASTER_PORT}" "${pool}")"
+      --metadata_server="http://${master_addr}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")/metadata"
+      --protocol=rdma --device_names="${mooncake_owner_plan_devices[i]}"
+      --global_segment_size="$(( mooncake_owner_plan_gib[i] * 1024 * 1024 * 1024 ))"
+      --local_buffer_size=0 --threads=4
+    )
+    dump_launch_info "MOONCAKE_OWNER" "${owner_env[@]}" "${cmd[@]}"
+    env "${owner_env[@]}" setsid "${cmd[@]}" >"${log}" 2>&1 &
+    mooncake_store_pids+=("$!")
+    mooncake_store_logs+=("${log}")
+    mooncake_store_names+=("owner${i}")
+  done
+}
+
+# Reports each owner of this node once it mounted: pid, node, NICs and how much
+# of its memory is huge pages.
+report_mooncake_store_owners() {
+  local i pid
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    pid="${mooncake_store_pids[mooncake_store_master_count + i]}"
+    echo "[mooncake-store] owner${i} pid=${pid} numa=${mooncake_owner_plan_numa[i]} devices=${mooncake_owner_plan_devices[i]} $(grep -h AnonHugePages "/proc/${pid}/smaps_rollup" 2>/dev/null || echo 'AnonHugePages: ?')"
+  done
+}
+
+# mooncake_store_cross_node_timeout <owner setting>: the wait for the other
+# node's part of the Store, whose owners <owner setting> lists:
+# MOONCAKE_STORE_WAIT_TIMEOUT plus that node's compaction, which comes first
+# there: numa_memory_budget.py compacts each NUMA node with pins in turn, and
+# stops each after MOONCAKE_STORE_COMPACT_TIMEOUT.
+mooncake_store_cross_node_timeout() {
+  local -a numa=() gib=() devices=()
+  parse_mooncake_owner_spec "$1" numa gib devices
+  local nodes
+  nodes="$(printf '%s\n' "${numa[@]}" | sort -u | wc -l)"
+  awk -v wait="$(mooncake_store_wait_timeout)" \
+    -v compact="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
+    -v nodes="${nodes}" \
+    'BEGIN { s = wait + nodes * compact; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
+}
+
+# The connector's mooncake_store.pools for per_nic pools: each pool's NIC and
+# its master.
+mooncake_pools_json() {
+  local pool sep=""
+  printf '{'
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    printf '%s"%s":{"master":"%s:%s","metadata":"http://%s:%s/metadata"}' "${sep}" \
+      "${mooncake_pool_devices[pool]}" \
+      "${host_ip}" "$(mooncake_pool_port "${ATOMESH_MOONCAKE_MASTER_PORT}" "${pool}")" \
+      "${host_ip}" "$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")"
+    sep=","
+  done
+  printf '}'
+}
+
+# The prefill workers' connector config, which the launcher derives from the
+# Store it starts: the stage on a NIC reads that NIC's pool, whose owners share
+# the NIC, under per_nic; otherwise every stage reads the one master and stays
+# off the owners' NICs.
+mooncake_store_launcher_config_json() {
+  printf '{"mooncake_store.local_hostname":"%s","mooncake_store.protocol":"rdma",' "${host_ip}"
+  if [[ -n "${mooncake_pool_devices[0]}" ]]; then
+    printf '"mooncake_store.pools":%s}' "$(mooncake_pools_json)"
+  else
+    printf '"mooncake_store.master":"%s:%s",' "${host_ip}" "${ATOMESH_MOONCAKE_MASTER_PORT}"
+    printf '"mooncake_store.metadata":"http://%s:%s/metadata",' "${host_ip}" "${ATOMESH_MOONCAKE_METADATA_PORT}"
+    printf '"mooncake_store.owner_rdma_devices":"%s"}' "$(mooncake_owner_devices_csv)"
+  fi
+}
+
+start_mooncake_store() {
+  mooncake_store_requested || return 0
+  check_mooncake_store_settings
+  check_mooncake_owner_devices
+  prepare_mooncake_store_memory
+  start_mooncake_page_cache_dropper
+  mooncake_store_pids=()
+  mooncake_store_logs=()
+  mooncake_store_names=()
+  mooncake_store_ready=0
+  mooncake_store_metrics_saved=0
+  local -a store_env=(HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 MC_NUM_QP_PER_EP=1)
+  local pool log
+  local -a cmd=()
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    log="${RUNTIME_LOG_DIR}/mooncake-master-rank-${NODE_RANK}$(mooncake_pool_suffix "${pool}").log"
+    cmd=(
+      python3 "${ATOMESH_SCRIPT_DIR}/numa_exec.py" "${MOONCAKE_STORE_MASTER_NUMA:-1}"
+      mooncake_master
+      --rpc_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_MASTER_PORT}" "${pool}")" --rpc_thread_num=32
+      --enable_http_metadata_server=true
+      --http_metadata_server_host="${host_ip}"
+      --http_metadata_server_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")"
+      --metrics_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")"
+      --default_kv_lease_ttl=10000
+      --eviction_high_watermark_ratio=0.90 --eviction_ratio=0.05
+      --allocation_strategy=random --memory_allocator=offset --client_ttl=10
+    )
+    dump_launch_info "MOONCAKE_MASTER" "${store_env[@]}" "${cmd[@]}"
+    env "${store_env[@]}" setsid "${cmd[@]}" >"${log}" 2>&1 &
+    mooncake_store_pids+=("$!")
+    mooncake_store_logs+=("${log}")
+    mooncake_store_names+=("master$(mooncake_pool_suffix "${pool}")")
+  done
+  mooncake_store_master_count="${#mooncake_pool_devices[@]}"
+  wait_for_mooncake_store masters 120 mooncake_masters_ready "${host_ip}"
+  start_mooncake_store_owners "${host_ip}"
+  local capacity=0
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    capacity=$(( capacity + mooncake_pool_capacity[pool] ))
+  done
+  echo "[wait] mooncake-store pools=${#mooncake_pool_devices[@]} owners here=${#mooncake_owner_plan_numa[@]} capacity=${capacity} bytes"
+  local owners_timeout
+  owners_timeout="$(mooncake_store_wait_timeout)"
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
+    # The decode node mounts its owners only once it has compacted its memory.
+    owners_timeout="$(mooncake_store_cross_node_timeout MOONCAKE_STORE_DECODE_OWNERS)"
+  fi
+  wait_for_mooncake_store "owners" "${owners_timeout}" \
+    mooncake_store_capacity_reaches "${host_ip}"
+  mooncake_store_ready=1
+  report_mooncake_store_owners
+  mooncake_store_prefill_env=(
+    "ATOM_KV_OFFLOAD=mooncake_store"
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG=$(mooncake_store_launcher_config_json)"
+    # One load worker by default, as PR #2459 settled on for this Store: four
+    # hung its PP prefill pipeline at c96.
+    "OFFLOAD_LOAD_WORKERS=${OFFLOAD_LOAD_WORKERS:-1}"
+    "MC_NUM_QP_PER_EP=1"
+    "MC_MAX_MR_SIZE=${MC_MAX_MR_SIZE:-1073741824}"
+    "MC_TCP_BIND_ADDRESS=${host_ip}"
+  )
+  echo "[wait][OK] mooncake-store masters=${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}+100/pool pools=${mooncake_pool_devices[*]:-shared} metrics=http://${host_ip}:${ATOMESH_MOONCAKE_METRICS_PORT}/metrics"
+}
+
+# On a decode node: starts MOONCAKE_STORE_DECODE_OWNERS on this node's memory,
+# joining the prefill node's masters, before the decode workers load. Waits
+# until every pool counts the owners of all nodes, as the prefill node does
+# before its workers start.
+start_mooncake_store_decode_owners() {
+  mooncake_store_requested || return 0
+  [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] || return 0
+  plan_mooncake_store_pools
+  plan_mooncake_store_owners MOONCAKE_STORE_DECODE_OWNERS
+  check_mooncake_owner_devices
+  prepare_mooncake_store_memory
+  start_mooncake_page_cache_dropper
+  mooncake_store_pids=()
+  mooncake_store_logs=()
+  mooncake_store_names=()
+  mooncake_store_master_count=0
+  local timeout
+  timeout="$(mooncake_store_wait_timeout)"
+  # The prefill node starts its masters only once it has compacted its memory.
+  wait_for_mooncake_store "prefill-node masters" \
+    "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_OWNERS)" \
+    mooncake_masters_ready "${NODE0_ADDR}"
+  start_mooncake_store_owners "${NODE0_ADDR}"
+  echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"
+  wait_for_mooncake_store "owners" "${timeout}" \
+    mooncake_store_capacity_reaches "${NODE0_ADDR}"
+  report_mooncake_store_owners
+  echo "[wait][OK] mooncake-store decode owners mounted on ${NODE0_ADDR}'s pools ${mooncake_pool_devices[*]:-shared}"
 }
 
 cleanup_processes() {
   local rc=$?
   local pid
+  # Before the router's end reaches a decode node, which then stops its owners.
+  save_mooncake_store_metrics
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
   purge_lmcache_disk
+  # Last: the workers read and write the Store until they exit.
+  if ! stop_mooncake_store && [[ "${rc}" -eq 0 ]]; then
+    rc="${mooncake_store_failed_rc}"
+  fi
   return "${rc}"
 }
 
@@ -658,14 +1858,38 @@ write_metadata() {
 EOF
 }
 
+# ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
+# passes its own torch_profiler_dir (None by default), which overrides the env
+# default in Config, so the profiler is off unless the flag is on the command.
+# One directory per worker keeps P/D ranks that share a node apart.
+build_torch_profiler_args() {
+  local log_name="$1"
+  local -n out_args="$2"
+  out_args=()
+  (( ATOMESH_TORCH_PROFILE_DURATION > 0 )) || return 0
+  local dir="${RUN_DIR}/torch_traces/${log_name}"
+  mkdir -p "${dir}"
+  out_args=(--torch-profiler-dir "${dir}")
+}
+
 start_prefill() {
   local log_name="$1"
   local server_port="${2:-${PREFILL_PORT}}"
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
+  local visible_devices="${6:-}"
   apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  if [[ -n "${visible_devices}" ]]; then
+    export HIP_VISIBLE_DEVICES="${visible_devices}"
+  fi
   reset_lmcache_disk
+  start_mooncake_store
+  # On the env command line, not exported: decode starts from this same shell.
+  local -a prefill_offload_env=()
+  if mooncake_store_running; then
+    prefill_offload_env=("${mooncake_store_prefill_env[@]}")
+  fi
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local -a prefill_dp_env=()
@@ -676,11 +1900,9 @@ start_prefill() {
     )
   fi
   local prefill_kv_transfer_config
-  if [[ -n "${PREFILL_KV_TRANSFER_CONFIG}" ]]; then
-    prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG}"
-  else
-    prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
-  fi
+  prefill_kv_transfer_config="$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
+  local -a prefill_profiler_args=()
+  build_torch_profiler_args "${log_name}" prefill_profiler_args
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -690,10 +1912,11 @@ start_prefill() {
     --max-num-seqs "${MAX_NUM_SEQS}"
     --kv-transfer-config "${prefill_kv_transfer_config}"
     "${prefill_cudagraph_args[@]}"
+    "${prefill_profiler_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
-  dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
+  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -702,7 +1925,12 @@ start_decode() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
+  local visible_devices="${6:-}"
   apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  if [[ -n "${visible_devices}" ]]; then
+    export HIP_VISIBLE_DEVICES="${visible_devices}"
+  fi
+  start_mooncake_store_decode_owners
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
@@ -720,6 +1948,13 @@ start_decode() {
   fi
   local -a decode_cache_env=()
   build_server_cache_env "decode" "${server_port}" decode_cache_env
+  # The P->D transfer engine on both sides reads MC_NUM_QP_PER_EP, which the
+  # prefill's Mooncake Store sets to 1 (validate_mooncake_store_settings
+  # refused any other value); endpoints with other QP counts cannot connect.
+  local -a decode_mooncake_env=()
+  if mooncake_store_requested; then
+    decode_mooncake_env=("MC_NUM_QP_PER_EP=1")
+  fi
   local -a decode_dp_env=()
   if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
     decode_dp_env=(
@@ -728,11 +1963,9 @@ start_decode() {
     )
   fi
   local decode_kv_transfer_config
-  if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
-    decode_kv_transfer_config="${DECODE_KV_TRANSFER_CONFIG}"
-  else
-    decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
-  fi
+  decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
+  local -a decode_profiler_args=()
+  build_torch_profiler_args "${log_name}" decode_profiler_args
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -743,10 +1976,67 @@ start_decode() {
     "${decode_max_num_batched_tokens_args[@]}"
     --kv-transfer-config "${decode_kv_transfer_config}"
     "${decode_cudagraph_args[@]}"
+    "${decode_profiler_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
-  dump_launch_info "DECODE" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
+  dump_launch_info "DECODE" "${decode_mooncake_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_mooncake_env[@]}" "${decode_cmd[@]}"
+}
+
+# The aggregated server reads the `decode` service block and `env.decode`: it is
+# the role that decodes, and folding prefill into it changes no decode-side
+# knob. Unlike the P/D roles it gets no default connector -- a lone server has
+# no peer to hand KV to -- so DECODE_KV_TRANSFER_CONFIG is honoured only when a
+# recipe sets one (e.g. standalone lmcache_offload) and omitted otherwise.
+start_aggregated() {
+  local log_name="${1:-server-rank-${NODE_RANK}}"
+  local server_port="${2:-${ROUTER_PORT}}"
+  local dp_master_port="${3:-${DECODE_DP_MASTER_PORT}}"
+  local dp_base_port="${4:-${DECODE_DP_BASE_PORT}}"
+  apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  reset_lmcache_disk
+  local max_conc
+  max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
+  local server_max_num_seqs="${MAX_NUM_SEQS}"
+  if [[ -n "${DECODE_MAX_NUM_SEQS}" ]]; then
+    server_max_num_seqs="${DECODE_MAX_NUM_SEQS}"
+  fi
+  local -a server_max_num_batched_tokens_args=()
+  if [[ -n "${DECODE_MAX_NUM_BATCHED_TOKENS}" ]]; then
+    server_max_num_batched_tokens_args=(
+      --max-num-batched-tokens "${DECODE_MAX_NUM_BATCHED_TOKENS}"
+    )
+  fi
+  if [[ "${ISL_LIST}" == "1024" && "${OSL}" == "1024" ]]; then
+    server_max_num_seqs="${max_conc}"
+  fi
+  local -a server_cache_env=()
+  build_server_cache_env "server" "${server_port}" server_cache_env
+  local -a server_dp_env=(
+    "ATOM_DP_MASTER_PORT=${dp_master_port}"
+    "ATOM_DP_BASE_PORT=${dp_base_port}"
+  )
+  local -a server_kv_transfer_args=()
+  if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
+    server_kv_transfer_args=(--kv-transfer-config "${DECODE_KV_TRANSFER_CONFIG}")
+  fi
+  local -a server_profiler_args=()
+  build_torch_profiler_args "${log_name}" server_profiler_args
+  echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
+  local -a server_cmd=(
+    python3 -m atom.entrypoints.openai_server
+    "${server_common[@]}"
+    --server-port "${server_port}"
+    "${decode_parallel[@]}"
+    --max-num-seqs "${server_max_num_seqs}"
+    "${server_max_num_batched_tokens_args[@]}"
+    "${server_kv_transfer_args[@]}"
+    "${decode_cudagraph_args[@]}"
+    "${server_profiler_args[@]}"
+    ${DECODE_SERVER_ARGS}
+  )
+  dump_launch_info "SERVER" "${server_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_cmd[@]}"
 }
 
 start_router() {
@@ -770,11 +2060,32 @@ start_router() {
     )
   fi
   local -a router_dp_aware_args=()
+  local -a router_prefill_policy_args=()
   if is_agentic_dpa; then
-    router_policy="dp_sticky"
+    # Respect explicit cache-aware routing for DPA workloads.
+    if [[ "${router_policy}" != "cache_aware" ]]; then
+      router_policy="dp_sticky"
+    fi
     router_dp_aware_args=(--dp-aware)
+  elif is_agentic_multi_prefill; then
+    # Pin the session to one prefill. Decode keeps ROUTER_POLICY: a single
+    # decode has nothing to stick, and --dp-aware is only for ranks that share
+    # one endpoint.
+    router_prefill_policy_args=(--prefill-policy dp_sticky)
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
+  fi
+  local -a router_policy_args=(--policy "${router_policy}")
+  if [[ "${router_policy}" == "cache_aware" ]]; then
+    # Keep the InferenceX defaults, with a case-level absolute-load override.
+    router_policy_args+=(
+      --prefill-policy cache_aware --decode-policy cache_aware
+      --cache-threshold 0.8
+      --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
+      --balance-rel-threshold 2.0
+      --eviction-interval 300
+    )
+    router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch
@@ -783,7 +2094,8 @@ start_router() {
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${router_policy}"
+    "${router_policy_args[@]}"
+    "${router_prefill_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
     --backend atom
@@ -804,13 +2116,17 @@ run_benchmark() {
   local bench_root="/tmp/atomesh-inferencex"
   local bench_repo_url="https://github.com/SemiAnalysisAI/InferenceX.git"
   local bench_repo_dir="${bench_root}/InferenceX"
-  local bench_serving_dir="${bench_repo_dir}/utils/bench_serving"
-  local bench_script="${bench_serving_dir}/benchmark_serving.py"
+  local bench_pkg_root="${bench_repo_dir}/inferencex-e2e"
+  local bench_script="${bench_pkg_root}/infx/bench_serving/benchmark_serving.py"
   if [[ ! -f "${bench_script}" ]] || [[ "$(git -C "${bench_repo_dir}" config --get remote.origin.url 2>/dev/null || true)" != "${bench_repo_url}" ]]; then
     rm -rf "${bench_root}"
     mkdir -p "${bench_root}"
     git clone --depth 1 --filter=blob:none --sparse "${bench_repo_url}" "${bench_repo_dir}"
-    git -C "${bench_repo_dir}" sparse-checkout set utils/bench_serving
+  fi
+  git -C "${bench_repo_dir}" sparse-checkout set inferencex-e2e/infx
+  if [[ ! -f "${bench_script}" ]]; then
+    echo "[bench][FAIL] ${bench_script} not found in ${bench_repo_url}" >&2
+    return 1
   fi
   IFS=',' read -r -a isls <<< "${ISL_LIST}"
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
@@ -819,7 +2135,9 @@ run_benchmark() {
     for conc in "${concs[@]}"; do
       local result_file="pd-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${isl}-osl${OSL}-conc${conc}-${RANDOM_RANGE_RATIO}.json"
       echo "[bench] ${result_file}"
-      PYTHONDONTWRITEBYTECODE=1 python "${bench_script}" \
+      # benchmark_serving uses package-relative imports, so it must run as a module.
+      PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${bench_pkg_root}${PYTHONPATH:+:${PYTHONPATH}}" \
+        python -m infx.bench_serving.benchmark_serving \
         --model="${MODEL_PATH}" \
         --backend=vllm \
         --base-url="http://127.0.0.1:${ROUTER_PORT}" \
@@ -867,116 +2185,7 @@ ensure_aiperf() {
 }
 
 write_aiperf_dashboard_json() {
-  local aiperf_json="$1"
-  local out_json="$2"
-  local conc="$3"
-  python3 - "${aiperf_json}" "${out_json}" "${conc}" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-conc = int(sys.argv[3])
-data = json.loads(src.read_text(encoding="utf-8"))
-
-
-def avg(name):
-    value = data.get(name)
-    if isinstance(value, dict):
-        return value.get("avg")
-    return value
-
-
-def pct(name, key):
-    value = data.get(name)
-    if isinstance(value, dict):
-        return value.get(key)
-    return None
-
-
-def total_tokens(name):
-    """Return one of AIPerf's profiling-only aggregate token counters."""
-    value = avg(name)
-    return int(value) if isinstance(value, (int, float)) else None
-
-
-# These aggregates contain successful profiling records only: AIPerf excludes
-# its internal warmup and requests cancelled during grace-period draining.
-cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
-cache_total_tokens = total_tokens("total_usage_prompt_tokens")
-
-payload = {
-    "benchmark_backend": "atom",
-    # Directory holding this run's profile_export.jsonl, so process_result.py can
-    # find the per-request records both interactivity definitions are computed
-    # from, without reconstructing the directory name.
-    "aiperf_artifact_dir": src.parent.name,
-    "benchmark_model_name": os.environ.get("MODEL_NAME")
-    or data.get("model")
-    or data.get("model_id"),
-    "backend": "atom",
-    "benchmark_kind": os.environ.get("BENCHMARK_KIND") or "aiperf_agentic",
-    "scenario": os.environ.get("AIPERF_SCENARIO"),
-    "public_dataset": os.environ.get("AIPERF_PUBLIC_DATASET"),
-    "topology": os.environ.get("TOPOLOGY") or data.get("topology"),
-    "display_topology": os.environ.get("DISPLAY_TOPOLOGY")
-    or data.get("display_topology"),
-    "precision": os.environ.get("PRECISION") or data.get("precision"),
-    "random_input_len": int(
-        data.get("max_context_length")
-        or os.environ.get("AIPERF_MAX_CONTEXT_LENGTH")
-        or 0
-    ),
-    "random_output_len": 1024,
-    "max_concurrency": conc,
-    "random_range_ratio": "",
-    "request_throughput": avg("request_throughput"),
-    "mean_ttft_ms": avg("time_to_first_token"),
-    "median_ttft_ms": pct("time_to_first_token", "p50"),
-    "p90_ttft_ms": pct("time_to_first_token", "p90"),
-    "p99_ttft_ms": pct("time_to_first_token", "p99"),
-    "mean_itl_ms": avg("inter_token_latency"),
-    "median_itl_ms": pct("inter_token_latency", "p50"),
-    "p90_itl_ms": pct("inter_token_latency", "p90"),
-    "p99_itl_ms": pct("inter_token_latency", "p99"),
-    "mean_e2el_ms": avg("request_latency"),
-    "median_e2el_ms": pct("request_latency", "p50"),
-    "p90_e2el_ms": pct("request_latency", "p90"),
-    "p99_e2el_ms": pct("request_latency", "p99"),
-    "input_throughput": avg("input_token_throughput"),
-    "output_throughput": avg("output_token_throughput"),
-    "total_token_throughput": avg("total_token_throughput"),
-    "successful_requests": avg("request_count"),
-    "completed": avg("request_count"),
-    "benchmark_duration_s": avg("benchmark_duration")
-    or data.get("benchmark_duration_s"),
-    "total_input_tokens": avg("total_usage_prompt_tokens"),
-    "total_output_tokens": avg("total_usage_completion_tokens"),
-    "cache_hit_tokens": cache_hit_tokens,
-    "cache_total_tokens": cache_total_tokens,
-    "cache_hit_rate": (
-        round(cache_hit_tokens / cache_total_tokens, 4)
-        if cache_hit_tokens is not None and cache_total_tokens
-        else None
-    ),
-}
-
-payload = {key: value for key, value in payload.items() if value is not None}
-dst.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-if cache_hit_tokens is not None and cache_total_tokens:
-    print(
-        f"[aiperf] prefix cache hit: {cache_hit_tokens}/{cache_total_tokens} "
-        f"tokens ({cache_hit_tokens / cache_total_tokens:.2%})"
-    )
-else:
-    print(
-        "[aiperf] prefix cache hit: unavailable "
-        "(AIPerf profiling cache-read counters were not produced)"
-    )
-print(f"[aiperf] dashboard json: {dst}")
-PY
+  AGGREGATED="${AGGREGATED}" python3 "${ATOMESH_SCRIPT_DIR}/../aiperf_dashboard.py" "$@"
 }
 
 write_aiperf_chrome_trace() {
@@ -996,10 +2205,179 @@ write_aiperf_chrome_trace() {
     || echo "[aiperf] WARNING: chrome trace conversion failed for ${out_dir}" >&2
 }
 
+# stop_profile holds each engine until its kineto export is on disk, so the tail
+# of the window stalls the run: aiperf numbers from a profiled cell are not
+# comparable to an unprofiled one.
+run_torch_profile_window() {
+  local out_dir="$1"
+  local done_file="$2"
+  local trace_ok_file="$3"
+  local aiperf_pid_file="$4"
+  set +e
+  local -a roles=() targets=()
+  local -A seen=()
+  local role idx target
+  IFS=',' read -r -a roles <<< "${ATOMESH_TORCH_PROFILE_ROLES}"
+  for role in "${roles[@]}"; do
+    role="${role//[[:space:]]/}"
+    case "${role}" in
+      prefill)
+        for idx in "${!prefill_ips[@]}"; do
+          target="${prefill_ips[$idx]}:${prefill_ports[$idx]}"
+          [[ -n "${seen[$target]:-}" ]] || { seen[$target]=1; targets+=("${target}"); }
+        done
+        ;;
+      decode)
+        for idx in "${!decode_ips[@]}"; do
+          target="${decode_ips[$idx]}:${decode_ports[$idx]}"
+          [[ -n "${seen[$target]:-}" ]] || { seen[$target]=1; targets+=("${target}"); }
+        done
+        ;;
+      "") ;;
+      *) echo "[profile] ignoring unknown role '${role}'" ;;
+    esac
+  done
+  if [[ "${#targets[@]}" -eq 0 ]]; then
+    echo "[profile] no targets for roles=${ATOMESH_TORCH_PROFILE_ROLES}; skipping"
+    return 0
+  fi
+
+  # $$ is the launcher shell: under set -e a failed aiperf exits it without
+  # touching done_file, and this watcher must not outlive it.
+  aiperf_gone() { [[ -e "${done_file}" ]] || ! kill -0 "$$" 2>/dev/null; }
+
+  echo "[profile] waiting for the aiperf Profiling phase; targets=${targets[*]}"
+  until grep -qiE 'Phase profiling .*started|Credit phase start: profiling' \
+    "${out_dir}/logs/aiperf.log" "${out_dir}/aiperf.log" 2>/dev/null; do
+    if aiperf_gone; then
+      echo "[profile] aiperf exited before its Profiling phase; no trace taken"
+      return 0
+    fi
+    sleep 2
+  done
+
+  local deadline=$(( $(date +%s) + ATOMESH_TORCH_PROFILE_START ))
+  echo "[profile] Profiling phase started at $(date -Is); window opens in ${ATOMESH_TORCH_PROFILE_START}s"
+  while (( $(date +%s) < deadline )); do
+    if aiperf_gone; then
+      echo "[profile] aiperf exited before the window opened; no trace taken"
+      return 0
+    fi
+    sleep 2
+  done
+
+  # Wait on the curl pids only: a bare `wait` also waits on the caller's tee
+  # process substitution, which cannot end before this function does.
+  local -a pids=()
+  local start_marker="${out_dir}/.torch_trace_start"
+  touch "${start_marker}"
+  echo "[profile] start_profile at $(date -Is)"
+  for target in "${targets[@]}"; do
+    curl -sS -X POST --max-time 120 "http://${target}/start_profile" \
+      | sed "s|^|[profile] ${target} start: |" &
+    pids+=($!)
+  done
+  wait "${pids[@]}"
+
+  deadline=$(( $(date +%s) + ATOMESH_TORCH_PROFILE_DURATION ))
+  while (( $(date +%s) < deadline )) && ! aiperf_gone; do
+    sleep 2
+  done
+
+  # The server waits ATOM_PROFILER_TIMEOUT for its ranks; give curl headroom
+  # past that so the client never abandons an export still being written.
+  local stop_timeout=$(( ${ATOM_PROFILER_TIMEOUT:-300} + 300 ))
+  echo "[profile] stop_profile at $(date -Is) (client timeout ${stop_timeout}s)"
+  pids=()
+  local -a stop_files=()
+  local stop_file
+  for target in "${targets[@]}"; do
+    stop_file="${out_dir}/.stop_profile_${target//[:.]/_}.json"
+    stop_files+=("${stop_file}")
+    {
+      curl -sS -X POST --max-time "${stop_timeout}" "http://${target}/stop_profile" \
+        > "${stop_file}"
+      sed "s|^|[profile] ${target} stop: |" "${stop_file}"
+      echo
+    } &
+    pids+=($!)
+  done
+  wait "${pids[@]}"
+  echo "[profile] stop_profile returned at $(date -Is)"
+
+  if ! wait_for_torch_traces "${start_marker}" "${stop_files[@]}"; then
+    echo "[profile] traces incomplete; leaving aiperf to finish on its own"
+    return 0
+  fi
+  touch "${trace_ok_file}"
+  local aiperf_pid
+  aiperf_pid="$(cat "${aiperf_pid_file}" 2>/dev/null)"
+  if [[ -n "${aiperf_pid}" ]] && kill -0 "${aiperf_pid}" 2>/dev/null; then
+    # SIGTERM, not SIGINT: a background job of a non-interactive shell starts
+    # with SIGINT ignored. collect_metrics forwards it to aiperf's group.
+    echo "[profile] traces complete; stopping aiperf (pid ${aiperf_pid})"
+    kill -TERM "${aiperf_pid}"
+  fi
+}
+
+# stop_profile returns once TP rank 0 has exported, while the other ranks may
+# still be writing. Each rank writes a raw .pt.trace.json, gzips it, then
+# removes the raw file, so a rank is done once it holds a .gz newer than the
+# window start and no raw .json.
+wait_for_torch_traces() {
+  local marker="$1"
+  shift
+  local stop_file trace_dir worker_dir rank_dir
+  local -A worker_dirs=()
+  for stop_file in "$@"; do
+    if ! grep -qE '"status" *: *"success"' "${stop_file}" 2>/dev/null; then
+      echo "[profile] stop_profile failed: $(cat "${stop_file}" 2>/dev/null)"
+      return 1
+    fi
+    while IFS= read -r trace_dir; do
+      [[ -n "${trace_dir}" ]] && worker_dirs["$(dirname "${trace_dir}")"]=1
+    done < <(grep -oE '"trace_dir" *: *"[^"]+"' "${stop_file}" \
+      | sed -E 's/.*"([^"]+)"$/\1/')
+  done
+  if [[ "${#worker_dirs[@]}" -eq 0 ]]; then
+    echo "[profile] stop_profile reported no trace_dir"
+    return 1
+  fi
+
+  local deadline=$(( $(date +%s) + ${ATOM_PROFILER_TIMEOUT:-300} ))
+  local pending ranks
+  while :; do
+    pending=0
+    ranks=0
+    for worker_dir in "${!worker_dirs[@]}"; do
+      for rank_dir in "${worker_dir}"/rank_*/; do
+        ranks=$(( ranks + 1 ))
+        if [[ ! -d "${rank_dir}" ]] \
+          || [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
+          || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' \
+            -newer "${marker}" -print -quit)" ]]; then
+          pending=$(( pending + 1 ))
+        fi
+      done
+    done
+    if (( pending == 0 )); then
+      echo "[profile] all ${ranks} rank traces on disk at $(date -Is): ${!worker_dirs[*]}"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      echo "[profile] ${pending}/${ranks} rank traces still missing after ${ATOM_PROFILER_TIMEOUT:-300}s"
+      return 1
+    fi
+    sleep 5
+  done
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
 
-  if is_agentic_dpa; then
+  if is_agentic_session_affinity; then
+    # dp_sticky keys off X-Session-ID. Without it every turn is placed by load
+    # and the prefix written by one turn is invisible to the next.
     export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
   else
     unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
@@ -1007,19 +2385,25 @@ run_aiperf_agentic_benchmark() {
 
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
-  local -a report_args=(
-    --model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}"
-    --mesh "127.0.0.1:${PROMETHEUS_PORT}"
-  )
+  local -a report_args=(--model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}")
   local idx
-  for idx in "${!prefill_ips[@]}"; do
-    server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
-    report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
-  done
-  for idx in "${!decode_ips[@]}"; do
-    server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
-    report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
-  done
+  if [[ "${AGGREGATED}" == "1" ]]; then
+    # Both endpoint lists name the same server, so scrape it once: naming it
+    # per role would double it in every cross-role total. No --mesh either,
+    # since this layout starts no router to answer on the Prometheus port.
+    server_metrics_args+=("http://${decode_ips[0]}:${decode_ports[0]}/metrics")
+    report_args+=(--standalone "${decode_ips[0]}:${decode_ports[0]}")
+  else
+    report_args+=(--mesh "127.0.0.1:${PROMETHEUS_PORT}")
+    for idx in "${!prefill_ips[@]}"; do
+      server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
+      report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
+    done
+    for idx in "${!decode_ips[@]}"; do
+      server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
+      report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
+    done
+  fi
 
   local conc
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
@@ -1043,6 +2427,20 @@ run_aiperf_agentic_benchmark() {
 
     echo "[aiperf] ${result_file}"
     mkdir -p "${out_dir}"
+    local profile_pid=""
+    local profile_done="${out_dir}/.aiperf_done"
+    local trace_ok="${out_dir}/.torch_trace_ok"
+    local aiperf_pid_file="${out_dir}/.aiperf_pid"
+    rm -f "${profile_done}" "${trace_ok}" "${aiperf_pid_file}"
+    if (( ATOMESH_TORCH_PROFILE_DURATION > 0 )); then
+      if (( AIPERF_BENCHMARK_DURATION < ATOMESH_TORCH_PROFILE_START + ATOMESH_TORCH_PROFILE_DURATION )); then
+        echo "[profile] WARNING: benchmark duration ${AIPERF_BENCHMARK_DURATION}s ends before the" \
+          "trace window (${ATOMESH_TORCH_PROFILE_START}s + ${ATOMESH_TORCH_PROFILE_DURATION}s)" >&2
+      fi
+      run_torch_profile_window "${out_dir}" "${profile_done}" "${trace_ok}" "${aiperf_pid_file}" \
+        > >(tee "${out_dir}/torch_profile.log") 2>&1 &
+      profile_pid=$!
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
@@ -1080,8 +2478,32 @@ run_aiperf_agentic_benchmark() {
       "${server_metrics_args[@]}" \
       --output-artifact-dir "${out_dir}" \
       --public-dataset "${AIPERF_PUBLIC_DATASET}" \
-      2>&1 | tee "${out_dir}/aiperf.log"
+      > >(tee "${out_dir}/aiperf.log") 2>&1 &
+    local aiperf_pid=$!
+    echo "${aiperf_pid}" > "${aiperf_pid_file}"
+    local aiperf_rc=0
+    wait "${aiperf_pid}" || aiperf_rc=$?
 
+    if [[ -n "${profile_pid}" ]]; then
+      touch "${profile_done}"
+      wait "${profile_pid}" || true
+    fi
+
+    # The trace is the deliverable of a profiled cell; once it is on disk,
+    # aiperf was stopped on purpose and its exit code no longer matters.
+    if [[ -f "${trace_ok}" ]]; then
+      echo "[profile] torch traces captured; treating the run as passed (aiperf rc=${aiperf_rc})"
+      if [[ -f "${aiperf_json}" ]]; then
+        write_aiperf_dashboard_json "${aiperf_json}" "${dashboard_json}" "${conc}" \
+          || echo "[aiperf] WARNING: dashboard JSON skipped for the stopped run" >&2
+        write_aiperf_chrome_trace "${out_dir}"
+      fi
+      continue
+    fi
+    if (( aiperf_rc != 0 )); then
+      echo "[aiperf][FAIL] aiperf exited with code ${aiperf_rc}" >&2
+      return "${aiperf_rc}"
+    fi
     if [[ ! -f "${aiperf_json}" ]]; then
       echo "[aiperf][FAIL] ${aiperf_json} was not produced" >&2
       return 1
@@ -1229,6 +2651,7 @@ run_eval() {
 
   IFS=',' read -r -a eval_concs <<< "${EVAL_CONCURRENCY}"
   local eval_conc tag result_dir
+  local below=()
   for eval_conc in "${eval_concs[@]}"; do
     eval_conc="${eval_conc//[[:space:]]/}"
     [[ -n "${eval_conc}" ]] || continue
@@ -1246,15 +2669,17 @@ run_eval() {
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
+      --log_samples \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" <<'PY'
+    if ! python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 result_dir = Path(sys.argv[1])
 eval_conc = sys.argv[2]
+threshold = sys.argv[3]
 json_files = list(result_dir.rglob("*.json")) if result_dir.is_dir() else []
 if not json_files:
     print("[eval] ERROR: no result JSON found")
@@ -1271,10 +2696,27 @@ print("=========================================")
 print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
+if threshold:
+    if not isinstance(score, (int, float)) or score < float(threshold):
+        raise SystemExit(
+            f"[eval] FAIL: concurrent={eval_conc} gsm8k score {score} "
+            f"is below threshold {float(threshold):.4f}"
+        )
+    print(
+        f"[eval] PASS: concurrent={eval_conc} gsm8k score {score:.4f} "
+        f">= threshold {float(threshold):.4f}"
+    )
 PY
+    then
+      below+=("${eval_conc}")
+    fi
   done
 
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
+  if (( ${#below[@]} )); then
+    echo "[eval] FAIL: concurrency ${below[*]} did not pass" >&2
+    return 1
+  fi
 }
 
 run_benchmark_and_eval() {
@@ -1299,15 +2741,33 @@ run_benchmark_and_eval() {
   fi
 }
 
+validate_mooncake_store_settings
 write_metadata
 
-if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
+# Every branch installs its EXIT trap before its first start (the pids expand
+# at exit): start_prefill and start_decode start the Store's masters and owners
+# before their server, so a start that fails stops what it and the starts
+# before it left running.
+if [[ "${AGGREGATED}" == "1" ]]; then
+  if [[ "${NODE_RANK}" -ne 0 ]]; then
+    echo "[server] rank=${NODE_RANK} idle: aggregated serves from a single node"
+    exit 0
+  fi
+  trap 'cleanup_processes ${aggregated_pid:-}' EXIT
+  start_aggregated "server-rank-0"
+  aggregated_pid="${server_pid}"
+  # No router to wait on: the server owns ROUTER_PORT, so the benchmark and eval
+  # clients reach it at the same address they use for a P/D cell.
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
+  run_benchmark_and_eval
+  cleanup_processes "${aggregated_pid}"
+elif [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
+  trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   start_prefill "prefill-rank-0"
   prefill_pid="${server_pid}"
   decode_handshake_port=$((HANDSHAKE_PORT + PREFILL_TP_SIZE))
   start_decode "decode-rank-0" "${DECODE_PORT}" "${decode_handshake_port}"
   decode_pid="${server_pid}"
-  trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   for ip in "${prefill_ips[@]}"; do
     wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
   done
@@ -1318,8 +2778,66 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
+elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
+  worker_pids=()
+  declare -A local_worker_pid=()
+  trap 'cleanup_processes ${router_pid:-} ${worker_pids[*]:-}' EXIT
+  # Save the base handshake port; each worker overrides it so
+  # apply_role_env expands ${HANDSHAKE_PORT} to the per-worker value.
+  PACKED_BASE_HANDSHAKE_PORT="${HANDSHAKE_PORT}"
+  for idx in "${!prefill_nodes[@]}"; do
+    [[ "${prefill_nodes[$idx]}" -eq "${NODE_RANK}" ]] || continue
+    gpu_start="${prefill_gpus[$idx]%%,*}"
+    export HANDSHAKE_PORT="$((PACKED_BASE_HANDSHAKE_PORT + gpu_start))"
+    start_prefill "prefill-rank-${NODE_RANK}-worker-${idx}" "${prefill_ports[$idx]}" \
+      "${HANDSHAKE_PORT}" \
+      "$((PREFILL_DP_MASTER_PORT + idx * 400))" "$((PREFILL_DP_BASE_PORT + idx * 400))" \
+      "${prefill_gpus[$idx]}"
+    worker_pids+=("${server_pid}")
+    local_worker_pid["prefill-${idx}"]="${server_pid}"
+  done
+  for idx in "${!decode_nodes[@]}"; do
+    [[ "${decode_nodes[$idx]}" -eq "${NODE_RANK}" ]] || continue
+    gpu_start="${decode_gpus[$idx]%%,*}"
+    export HANDSHAKE_PORT="$((PACKED_BASE_HANDSHAKE_PORT + gpu_start))"
+    start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_ports[$idx]}" \
+      "${HANDSHAKE_PORT}" \
+      "$((DECODE_DP_MASTER_PORT + idx * 400))" "$((DECODE_DP_BASE_PORT + idx * 400))" \
+      "${decode_gpus[$idx]}"
+    worker_pids+=("${server_pid}")
+    local_worker_pid["decode-${idx}"]="${server_pid}"
+  done
+  if [[ "${NODE_RANK}" -eq 0 ]]; then
+    for idx in "${!prefill_ips[@]}"; do
+      wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
+        "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
+        "${WAIT_SERVER_TIMEOUT}" "${local_worker_pid["prefill-${idx}"]:-}"
+    done
+    for idx in "${!decode_ips[@]}"; do
+      wait_http "http://${decode_ips[$idx]}:${decode_ports[$idx]}/health" \
+        "decode-${decode_ips[$idx]}:${decode_ports[$idx]}" \
+        "${WAIT_SERVER_TIMEOUT}" "${local_worker_pid["decode-${idx}"]:-}"
+    done
+    start_router
+    wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+    run_benchmark_and_eval
+  else
+    wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
+    # Monitor all local workers while waiting for the router to shut down.
+    for pid in "${worker_pids[@]}"; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        set +e; wait "${pid}"; rc=$?; set -e
+        [[ "${rc}" -eq 0 ]] && rc=1
+        echo "[wait][FAIL] packed worker ${pid} exited early rc=${rc}" >&2
+        exit "${rc}"
+      fi
+    done
+    wait_router_closed
+  fi
+  cleanup_processes "${router_pid:-}" "${worker_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
+  trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
   for idx in $(seq 0 $((xP - 1))); do
     gpu_start=$((idx * PREFILL_TP_SIZE))
     gpu_end=$((gpu_start + PREFILL_TP_SIZE - 1))
@@ -1331,7 +2849,6 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
     start_prefill "prefill-rank-0-worker-${idx}" "${prefill_port}" "${handshake_port}" "${prefill_dp_master_port}" "${prefill_dp_base_port}"
     prefill_pids+=("${server_pid}")
   done
-  trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
   for idx in "${!prefill_ips[@]}"; do
     wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
@@ -1347,8 +2864,8 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
-  start_prefill "prefill-rank-0"
   trap 'cleanup_processes ${router_pid:-} ${server_pid:-}' EXIT
+  start_prefill "prefill-rank-0"
   for idx in "${!prefill_ips[@]}"; do
     wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
@@ -1365,6 +2882,7 @@ elif [[ "${NODE_RANK}" -eq 0 ]]; then
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
   decode_pids=()
+  trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
   for idx in $(seq 0 $((yD - 1))); do
     gpu_start=$((idx * DECODE_TP_SIZE))
     gpu_end=$((gpu_start + DECODE_TP_SIZE - 1))
@@ -1376,25 +2894,24 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
     start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_port}" "${decode_handshake_port}" "${decode_dp_master_port}" "${decode_dp_base_port}"
     decode_pids+=("${server_pid}")
   done
-  trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
   wait_router_closed
   cleanup_processes "${decode_pids[@]}"
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
-  start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_decode
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
-  start_prefill "prefill-rank-${NODE_RANK}"
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_prefill "prefill-rank-${NODE_RANK}"
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 else
-  start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_decode
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"

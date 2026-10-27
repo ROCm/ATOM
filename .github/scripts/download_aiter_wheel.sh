@@ -26,6 +26,7 @@ AITER_WORKFLOW_ARTIFACT_REPO="${AITER_WORKFLOW_ARTIFACT_REPO:-${GITHUB_REPOSITOR
 AITER_WORKFLOW_RUN_ID="${AITER_WORKFLOW_RUN_ID:-${GITHUB_RUN_ID:-}}"
 AITER_WORKFLOW_ARTIFACT_ID="${AITER_WORKFLOW_ARTIFACT_ID:-}"
 
+WHEEL_URL=""
 ARTIFACT_ID=""
 ARTIFACT_NAME=""
 ARTIFACT_RUN_ID=""
@@ -41,8 +42,9 @@ retry_cmd() {
   while true; do
     if "$@"; then
       return 0
+    else
+      rc=$?
     fi
-    rc=$?
     if [ "$attempt" -ge "$max_attempts" ]; then
       echo "Command failed after ${attempt} attempts" >&2
       return "$rc"
@@ -182,6 +184,7 @@ download_from_s3_manifest() {
   echo "Manifest wheel: $wheel_name"
   echo "Downloading manifest-selected wheel: $resolved_wheel_url"
   curl_with_retry "$resolved_wheel_url" -o "$AITER_WHEEL_OUTPUT_DIR/$wheel_name" || return 1
+  WHEEL_URL="$resolved_wheel_url"
   echo "Downloaded wheel from manifest: $AITER_WHEEL_OUTPUT_DIR/$wheel_name"
 
   rm -f "$manifest_file"
@@ -290,6 +293,7 @@ fi
 
 echo "Selected wheel: $AITER_WHL"
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  echo "aiter_wheel_url=${WHEEL_URL}" >> "$GITHUB_OUTPUT"
   echo "aiter_artifact_id=${ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
   echo "aiter_workflow_artifact_id=${AITER_WORKFLOW_ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
   echo "aiter_wheel_name=$(basename "$AITER_WHL")" >> "$GITHUB_OUTPUT"

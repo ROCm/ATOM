@@ -14,7 +14,9 @@ from atom.models.minimax_m3 import MiniMaxM3Attention, MiniMaxM3SparseAttention
 def minimax_m3_native_sparse_attention_construction():
     """Construct MiniMax-M3 attention layers with ATOM's native impls."""
 
-    import atom.models.minimax_m3 as minimax_m3
+    # The attention classes resolve ``Attention`` in the module that defines
+    # them; patching the package would leave construction untouched.
+    import atom.models.minimax_m3.model as minimax_m3
 
     previous = minimax_m3.Attention
 
@@ -135,7 +137,7 @@ class SGLangATOMMiniMaxM3Attention(BaseAttention):
 
 def _patch_minimax_m3_dense_attention_for_sglang(module: MiniMaxM3Attention) -> None:
     if not isinstance(getattr(module, "attn", None), SGLangATOMMiniMaxM3Attention):
-        raise RuntimeError(
+        raise TypeError(
             "MiniMax-M3 SGLang dense setup expected native ATOM attention. "
             "Ensure the MiniMax-M3 construction context is installed before "
             "model initialization."

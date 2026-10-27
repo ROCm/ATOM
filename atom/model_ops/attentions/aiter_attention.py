@@ -19,8 +19,9 @@ from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_generate_triton,
 )
+from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
-from atom.utils.tbo import TokenSplitPrefillState
+from atom.utils.tbo import TokenSplitPrefillState, decode_ubatch_request_ranges
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 from .mha_kv_pool import MhaKvPool
@@ -77,7 +78,7 @@ def _resolve_index_cache_dtype(config) -> torch.dtype:
     if index_cache_dtype in ("bf16", "fp8"):
         return dtypes.d_dtypes[index_cache_dtype]
     raise ValueError(
-        "index_cache_dtype must be 'bf16' or 'fp8', " f"got {index_cache_dtype!r}"
+        f"index_cache_dtype must be 'bf16' or 'fp8', got {index_cache_dtype!r}"
     )
 
 
@@ -258,6 +259,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             max_qlen = 1
 
         num_head_k = max(1, hf_config.num_key_value_heads // get_tp_group().world_size)
+        # Kept flydsl work plan here and refreshed once per prepare_*.
+        self._flydsl_kv_heads = num_head_k
+        self._flydsl_plans: dict[tuple, object] = {}
+        self._flydsl_plan_unplanned = False
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -278,6 +283,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     self.max_num_blocks_per_seq,
                     **i32_kwargs,
                 )
+            )
+        # MiniMax-M3's index selector reads one row per (index head, query
+        # token); `num_head_k` is that head count, the same TP-local division
+        # the sparse layers construct with.
+        self._num_idx_heads = num_head_k if self._has_sparse_attention else 0
+        if self._has_sparse_attention:
+            # Decode only, and persistent because `make_sparse_decode_metadata`
+            # refills it every step outside the graph while the captured
+            # selector reads the pointer baked in at capture. Prefill is not
+            # captured and allocates its own.
+            self.model_runner.forward_vars[
+                "sparse_attention_n_valid_column_per_row"
+            ] = torch.empty(
+                num_head_k * self.max_bs * max_qlen,
+                **i32_kwargs,
             )
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
@@ -305,13 +325,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 dtype=reduce_partial_map_type,
                 device=self.device,
             ),
-            "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            "kv_indptr": CpuGpuBuffer(
+                self.max_bs + 1, publication_group="mha_csr", **i32_kwargs
+            ),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             ),
         }
         self.model_runner.forward_vars.update(pa_persistent_metadata)
+        # Ready together before the CSR kernel, sharing prefill destinations
+        # without changing their addresses or padded publication counts.
+        self.h2d_group_members = {
+            "mha_decode": (
+                "slot_mapping",
+                "context_lens",
+                "block_tables",
+                "kv_indptr",
+                "positions",
+            ),
+        }
         # Per-ubatch buffers for CUDAGraph TBO
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(
@@ -356,20 +389,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         for ub_idx in range(self._NUM_TBO_UBATCHES):
             p = f"ub{ub_idx}_"
-            var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            host_i32 = dict(i32_kwargs, publication_group=f"{p}mha_metadata")
+            host_i64 = dict(i64_kwargs, publication_group=f"{p}mha_metadata")
+            var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **host_i32)
             var[f"{p}kv_indices"] = CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             )
-            var[f"{p}context_lens"] = CpuGpuBuffer(ub_max_bs, **i32_kwargs)
+            var[f"{p}context_lens"] = CpuGpuBuffer(ub_max_bs, **host_i32)
             var[f"{p}slot_mapping"] = CpuGpuBuffer(
                 ub_max_bs * max_seqlen_qo,
-                **i64_kwargs,
+                **host_i64,
             )
             var[f"{p}block_tables"] = CpuGpuBuffer(
-                ub_max_bs, self.block_table_cols, **i32_kwargs
+                ub_max_bs, self.block_table_cols, **host_i32
             )
-            var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **host_i32)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
                     0,
@@ -379,6 +414,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             )
             var[f"{p}cu_seqlens_q"].copy_to_gpu()
+
+            if self._has_sparse_attention:
+                # Per ubatch like everything else here: both ubatches' sparse
+                # metadata are alive at once, so one shared row-bound buffer
+                # would have the second overwrite the first.
+                var[f"{p}sparse_attention_n_valid_column_per_row"] = torch.empty(
+                    self._num_idx_heads * ub_max_bs * max_seqlen_qo, **i32_kwargs
+                )
 
             # PA work buffers per ubatch (GPU only)
             var[f"{p}work_meta_data"] = torch.empty(
@@ -692,6 +735,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             v_scale=module.v_scale,
         )
 
+    def _n_valid_column_per_row_buffer(self, prefix: str = "") -> torch.Tensor:
+        """The decode buffer `make_sparse_decode_metadata` refills each step.
+
+        `prefix` selects the ubatch's, on the same `ub<i>_` convention as every
+        other decode buffer here. Prefill passes no buffer at all: it is not
+        captured, so a per-forward allocation is safe there and the two prefill
+        ubatches then cannot collide.
+        """
+        return self.model_runner.forward_vars[
+            f"{prefix}sparse_attention_n_valid_column_per_row"
+        ]
+
     def _get_sparse_attention_block_tables(
         self,
         block_tables: torch.Tensor,
@@ -718,30 +773,120 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def get_kv_transfer_tensors(self):
-        from atom.kv_transfer.disaggregation.types import (
-            KVTransferRegion,
-            KVTransferTensors,
-        )
+        from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
         if not self.kv_pools:
             return None
-        # Every field of every pool, indexer cache included: a region per
-        # (pool, field, layer), in declared order.
         return KVTransferTensors(
-            block_regions=[
-                KVTransferRegion(
-                    base_addr=tensor.data_ptr(),
-                    total_bytes=tensor.numel() * tensor.element_size(),
-                    unit_bytes=tensor.stride(0) * tensor.element_size(),
-                    # The geometry, because a hybrid declares two pools whose
-                    # per-layer regions are otherwise named alike.
-                    semantic_role=f"mha.{geometry}.{role}",
-                )
+            # Every field of every pool, indexer cache included: a unit per
+            # (pool, field, layer), in declared order. The geometry is in the
+            # role because a hybrid declares two pools whose per-layer regions
+            # are otherwise named alike.
+            pages=[
+                page_region(tensor, semantic_role=f"mha.{geometry}.{role}")
                 for geometry, pool in self.kv_pools.items()
                 for role, tensor in pool.region_tensors()
             ],
-            slot_regions=[],
+            # GQA/MQA KV heads are sharded or only partially replicated across
+            # TP. In particular MiniMax-M3 must keep one stored shard per rank;
+            # whole-object TP collapse is unsafe for this PAGE layout.
+            tp_replication_factor=1,
         )
+
+    def refresh_flydsl_plan(self, context_lens, *, create=False):
+        """Build or refresh aiter's FlyDSL work plan for this forward.
+
+        Depends only on context_lens, which every layer of one forward shares,
+        so it is built here rather than per pa_decode call. Decode replays a
+        captured graph, so the plan must be visible to the op at capture time
+        (see build_for_cudagraph_capture) and its tensors must never be
+        reallocated afterwards -- hence one entry per batch, kept forever, and
+        refreshed in place before each replay. The refresh is a GPU kernel with
+        no readback. None when FlyDSL is off, or when the batch is out of range.
+        """
+        # The plan only feeds FlyDSL; building one with FlyDSL off is a
+        # refresh kernel per step that nothing reads.
+        if not envs.ATOM_PA_FLYDSL:
+            return None
+        # From base_attention, not duplicated: the op checks the same bound.
+        from aiter.ops.flydsl.pa_decode import plan_pa_decode
+
+        from atom.model_ops.base_attention import (
+            _FLYDSL_PLAN_MAX_BATCH,
+            flydsl_plan_shape,
+        )
+
+        n = int(context_lens.shape[0])
+        if not 1 <= n <= _FLYDSL_PLAN_MAX_BATCH:
+            return None
+        # plan_pa_decode rejects anything else. This builder serves several
+        # models; one of them handing int64 lengths would raise on the first step.
+        if (
+            context_lens.dtype is not torch.int32
+            or not context_lens.is_cuda
+            or context_lens.ndim != 1
+            or not context_lens.is_contiguous()
+        ):
+            return None
+
+        # `max_partitions` is never the static split count: that clamps every
+        # request alike and removes the planner's mechanism -- this tree did
+        # that once. It takes plan_pa_decode's own default, except at head_dim
+        # 256, where `flydsl_plan_shape` caps it at 64 with a 256-workgroup
+        # budget to keep aiter's reducer off its slow serial path; remove that
+        # once aiter #5949 is in the image. The shape is fixed per builder (its
+        # KV pools are), so the key needs no part of it; the op's runtime plans
+        # take the same shape from the call's own head size.
+        key = (n, self._flydsl_kv_heads, context_lens.device.index)
+        plan = self._flydsl_plans.get(key)
+        if plan is None and not create:
+            # This builder mints plans only during cudagraph capture, where the
+            # batch is a ladder rung and the cost lands at startup. aiter's
+            # planner takes batch as a tl.constexpr, so a new value is a kernel
+            # specialization -- 65-72 ms cold -- and a plan that is never freed
+            # because some captured graph may have baked its pointers in. A
+            # runtime batch with no capture-owned plan gets a runtime plan in
+            # run_pa_decode.
+            # Only once a capture has happened: before the first one every
+            # call lands here (profile run, eager warmup), and logging then
+            # burns the one shot on a step that says nothing.
+            if self._flydsl_plans and not self._flydsl_plan_unplanned:
+                self._flydsl_plan_unplanned = True
+                logger.info(
+                    "flydsl: batch %d has no capture-owned plan; an explicit "
+                    "runtime plan will be used; "
+                    "captured batches are %s",
+                    n,
+                    sorted({k[0] for k in self._flydsl_plans}),
+                )
+            return None
+        if plan is None:
+            # One head size across this builder's pools, or aiter's defaults.
+            head_dims = {geometry.head_dim for geometry in self.kv_pools}
+            plan = plan_pa_decode(
+                context_lens,
+                self._flydsl_kv_heads,
+                query_length=1,
+                **flydsl_plan_shape(head_dims.pop() if len(head_dims) == 1 else None),
+            )
+            self._flydsl_plans[key] = plan
+            logger.info(
+                "flydsl work plan: num_seqs=%d kv_heads=%d max_partitions=%d "
+                "capacity=%d",
+                n,
+                self._flydsl_kv_heads,
+                int(plan.max_partitions),
+                int(plan.capacity),
+            )
+        else:
+            plan_pa_decode(
+                context_lens,
+                self._flydsl_kv_heads,
+                query_length=1,
+                plan=plan,
+            )
+        return plan
 
     def prepare_mtp_decode(
         self,
@@ -792,6 +937,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             last_token_indices = slot_mapping
         # Dummy runs skip the draft attention, so keep this launch as a no-op:
         # their synthetic context_lens can point past block_tables.
+        skip_update = running_bs == 0 or get_forward_context().context.is_dummy_run
         _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(running_bs, 128)),)](
             context_lens,
             block_tables,
@@ -800,7 +946,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             positions_out,
             last_token_indices,
             running_bs,
-            running_bs == 0 or get_forward_context().context.is_dummy_run,
+            skip_update,
             update_context_lens,
             update_positions,
             select_positions,
@@ -829,18 +975,31 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 # argument: on the `only_update` path that carries the verify
                 # forward's width.
                 max_query_len=1,
+                num_idx_heads=self._num_idx_heads,
+                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
+        # Same short-circuit as the metadata launch above. A dummy step would
+        # refresh the live work_info from synthetic lengths, but every real
+        # decode refreshes before it replays, so this is wasted work rather
+        # than a wrong answer. Free here because skip_update is already
+        # computed; the GDN and Qwen4 overrides would have to reach for the
+        # forward context to save the same kernel.
+        workinfos["flydsl_work_plan"] = (
+            None if skip_update else self.refresh_flydsl_plan(context_lens[:running_bs])
+        )
         return workinfos
 
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(
-            self, batch, running_bs
+            self, batch, running_bs, running_tokens
         )
         if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill
-            attn_metadata.block_tables = self.model_runner.forward_vars[
-                "block_tables"
-            ].copy_to_gpu(bs)
+            attn_metadata.block_tables = block_table_state(
+                self.model_runner.forward_vars["block_tables"]
+            ).publish(bs)
         # `prefill_attention_triton` reads the paged KV cache, so it needs a
         # block_table even with no cached tokens. The base builder marshals one
         # every step but only uploads it when `has_cached`.
@@ -850,9 +1009,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and batch.block_tables
         ):
             bs = batch.total_seqs_num_prefill
-            attn_metadata.block_tables = self.model_runner.forward_vars[
-                "block_tables"
-            ].copy_to_gpu(bs)
+            attn_metadata.block_tables = block_table_state(
+                self.model_runner.forward_vars["block_tables"]
+            ).publish(bs)
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_prefill_metadata,
@@ -875,6 +1034,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seq_len=attn_metadata.max_seqlen_k,
                 num_prefills=bs,
                 num_prefill_tokens=batch.total_tokens_num_prefill,
+                num_idx_heads=self._num_idx_heads,
             )
         if self._tbo_token_split:
             self._stash_tbo_token_split_prefill_state(batch)
@@ -959,6 +1119,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seq_len=ub_max_seq_len,
                 num_prefills=ub_num_reqs,
                 num_prefill_tokens=ub_num_tokens,
+                num_idx_heads=self._num_idx_heads,
             )
             ub_attn.sparse_attention_metadata = sparse_md
         return ub_attn
@@ -1031,6 +1192,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
     ):
+        self._check_metadata_writable("mha_csr", "prefill", "positions", "mrope")
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
         dropout_p = 0.0
@@ -1047,7 +1209,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         max_seqlen_k = np.max(context_lens)
 
         # Before the slots, not after: `slot_mapping` reads this packed table.
-        self.prepare_block_tables(batch)
+        self.prepare_block_tables(batch, running_bs)
 
         var = self.model_runner.forward_vars
         scheduled_tokens = batch.total_tokens_num_decode
@@ -1060,14 +1222,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 self.model_runner.block_size,
                 scratch=self.token_axis_scratch,
             )
-        else:
-            # One token per sequence reduces the gather to its last row, and
-            # `last_block_num_tokens` names the offset without a position.
+        elif not batch.is_dummy_run:
+            # One token per sequence reduces the gather to its last position's
+            # block. Indexed by position, not `block_table[-1]`: under MTP the
+            # table also holds the draft round's lookahead blocks past the last
+            # token (`draft_kv_lookahead`). A dummy run's synthetic lengths can
+            # point past its rows, and it writes nowhere anyway.
+            bsz = self.model_runner.block_size
             slots = [
-                block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                for block_table, last_block_num in zip(
-                    block_tables, batch.last_block_num_tokens
-                )
+                block_table[(n - 1) // bsz] * bsz + (n - 1) % bsz
+                for block_table, n in zip(block_tables, context_lens.tolist())
             ]
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:scheduled_tokens] = slots[:scheduled_tokens]
@@ -1092,7 +1256,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ("kv_indptr", running_bs + 1),
         ]
 
-        ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
+        group = self.model_runner.h2d_groups["mha_decode"]
+        for name, count in vars_used:
+            group.counts[group.indices[name]] = count
+        group.counts[group.indices["positions"]] = (
+            None if self.model_runner.use_mrope else scheduled_tokens
+        )
+        block_table_state(var["block_tables"]).publish(running_bs, group=group)
+        ctx = {el: var[el].gpu[:num] for el, num in vars_used}
         # A view: `publish_cu_seqlens_q` already uploaded it this step, and
         # nothing here writes the host copy.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
@@ -1116,6 +1287,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
+        attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
+            attn_metadata.context_lens
+        )
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_decode_metadata,
@@ -1129,26 +1303,35 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.context_lens[:scheduled_bs],
                 scheduled_bs,
             )
+            # token -> request, -1 on the graph's pad tail: the mono kernels keep
+            # a pad row out of every cross-row decision (``row_live``)
+            attn_metadata.batch_id_per_q_token = self.publish_batch_ids(
+                np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
+                pad_to=running_tokens,
+            )
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
                 seq_lens=attn_metadata.context_lens[:scheduled_bs],
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=int(max_seqlen_k),
                 max_query_len=int(max_seqlen_q),
+                num_idx_heads=self._num_idx_heads,
+                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
         mrope_positions = self._build_mrope_decode_positions(
-            batch, context_lens, max_seqlen_q
+            batch, context_lens, max_seqlen_q, running_tokens=running_tokens
         )
         if mrope_positions is not None:
             positions = mrope_positions
         else:
-            positions = var["positions"].copy_to_gpu(scheduled_tokens)
+            positions = var["positions"].gpu[:scheduled_tokens]
         if self.model_runner.config.enable_tbo_decode and running_bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
                 running_bs,
                 max_seqlen_q,
                 context_lens,
+                split_bs=self._ubatch_split_bs,
             )
 
         return attn_metadata, positions
@@ -1159,18 +1342,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         bs: int,
         max_seqlen_q: int,
         context_lens: np.ndarray,
+        *,
+        split_bs: int | None = None,
     ):
-        """Compute per-ubatch forward_vars for CUDAGraph TBO.
+        """Compute per-ubatch forward_vars for TBO decode.
 
-        Splits the full-batch data into per-ubatch CpuGpuBuffers.
-        The split point is bs // 2 to match CUDAGraph's baked-in token slices.
+        Splits the full-batch data into per-ubatch CpuGpuBuffers, one per
+        micro-batch the step runs (`decode_ubatch_request_ranges` of
+        ``split_bs``, the step's `_ubatch_split_bs`; None: the scheduled
+        requests): a replayed TBO graph's halves of the bucket, or an eager
+        split's halves of the scheduled requests. Each is padded to its half
+        of the padded batch, which covers either.
         """
+        self._check_metadata_writable("ub0_mha_metadata", "ub1_mha_metadata")
         var = self.model_runner.forward_vars
         N = self._NUM_TBO_UBATCHES
-        half = bs // N
 
-        ub_ranges = [(0, half), (half, bs)]
-        running_bs_list = [half, bs - half]
+        ub_ranges = decode_ubatch_request_ranges(split_bs or scheduled_bs, N)
+        running_bs_list = [
+            end - start for start, end in decode_ubatch_request_ranges(bs, N)
+        ]
 
         for ub_idx, ((req_start, req_end), running_bs) in enumerate(
             zip(ub_ranges, running_bs_list)
@@ -1191,10 +1382,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ]
             var[f"{p}slot_mapping"].np[ub_real_tokens:ub_running_tokens] = -1
 
-            var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
-                req_start : req_start + ub_real_reqs
-            ]
-            var[f"{p}block_tables"].np[ub_real_reqs:running_bs] = 0
+            block_table_state(var["block_tables"]).slice_to(
+                var[f"{p}block_tables"], req_start, ub_real_reqs, pad_to=running_bs
+            )
 
             full_kv_indptr = var["kv_indptr"].np
             base = full_kv_indptr[req_start]
@@ -1224,8 +1414,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 (f"{p}kv_indptr", running_bs + 1),
                 (f"{p}cu_seqlens_q", running_bs + 1),
             ]
-            for el, num in vars_used:
-                var[el].copy_to_gpu(num)
+            group = self.model_runner.h2d_groups[f"{p}mha_metadata"]
+            for name, count in vars_used:
+                group.counts[group.indices[name]] = count
+            block_table_state(var[f"{p}block_tables"]).publish(running_bs, group=group)
 
             ub_max_seqlen_k = (
                 int(context_lens[req_start : req_start + ub_real_reqs].max())
@@ -1326,6 +1518,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 block_table=sparse_block_tables,
                 slot_mapping=attn.slot_mapping,
                 max_seq_len=attn.max_seqlen_k,
+                num_idx_heads=self._num_idx_heads,
+                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
             )
         return attn
 
@@ -1364,15 +1558,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 seq_lens,
                 bs,
             )
+            # the buffer every replay's prepare_decode publishes into
+            attn_metadata.batch_id_per_q_token = var["batch_id_per_q_token"].gpu[
+                :scheduled_tokens
+            ]
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
                 seq_lens=seq_lens,
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=attn_metadata.max_seqlen_k,
                 max_query_len=max_q_len,
+                num_idx_heads=self._num_idx_heads,
+                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
+        # Decode replays a captured graph, so the op must see a plan HERE
+        attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
+            attn_metadata.context_lens, create=True
+        )
         context = Context(
             positions=positions,
             is_prefill=False,
