@@ -256,6 +256,7 @@ depth is chosen per concurrency point.
 | Concurrency | Parallelism | `--num-speculative-tokens` | `--spec-decode-acceptance-length` |
 |---|---|---:|---:|
 | C1, C2 | TP4, mono decode | 3 | `2.99` |
+| C1 on 8 GPUs | TP8, mono decode (see [TP8 C1](#tp8-c1-mono-decode)) | 3 | `2.99` |
 | C4, C8 | TP4 | 5 | `3.61` |
 | C10 | TP4 | 4 | `3.33` |
 | C16, C24, C32, C40 | TP4 + DCP4 | 4 | `3.33` |
@@ -352,6 +353,43 @@ python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 16384 \
   2>&1 | tee "server-glm52-mtp${MTP_K}-c${CONC}.log"
 ```
+
+##### TP8 C1 (mono decode)
+
+Mono decode also serves TP8, on the external-indexer path (the fused indexer is
+TP4-only). To run `C1` on all eight GPUs, set `TP=8 CONC=1` before the block
+above and change nothing else: it is the TP4 `C1` command with `-tp 8` -- mono
+at MTP3, AL `2.99`, `--max-num-seqs 1`, graphs captured at `[1]`. An armed run
+logs `GLM-5.2 MonoKernel on: S=4 chunk=4 indexer=external`.
+
+```bash
+TP=8 CONC=1   # then run the server block above unchanged
+```
+
+AgentX C1, 3,600 s, forced AL `2.99`, `rocm/atom-dev:nightly_202610181506`
+(ATOM `df86c482` plus this TP8 admission). The TP4 column is InferenceX run
+39540045682 (job 121211066939) on a CI node; the TP8 column was measured on a
+different MI355X node.
+
+| Metric | TP8, mono | TP4, mono |
+|---|---:|---:|
+| p90 interactivity (tok/s/user, `1 / p90 ITL`) | 310.30 | 265.94 |
+| p50 interactivity (tok/s/user) | 324.00 | 275.76 |
+| Mean ITL (ms) | 3.07 | 3.61 |
+| Mean TTFT (ms) | 1,102.64 | 1,389.68 |
+| Total token throughput (tok/s) | 19,931.82 | 18,044.52 |
+| Total token throughput per GPU (tok/s) | 2,491.48 | 4,511.13 |
+| Requests completed | 266 | 253 |
+
+The replay runs for a fixed duration, so the faster server reaches further into
+the trace (266 vs 253 requests, mean ISL 267K vs 254K); the throughput rows
+compare different request mixes, the latency rows much less so.
+
+Accuracy at TP8 C1 (GSM8K, first 250, 3-shot completions, real MTP3
+acceptance, one request at a time so every decode step is mono's): mono on
+0.932 / 0.928 across two runs, mono off 0.932 / 0.932 (flexible-extract); MTP
+acceptance 76.4% / 76.5% on vs 75.1% / 75.2% off. Mono-on and mono-off outputs
+differ no more than two mono-off runs differ from each other.
 
 ##### Forced Acceptance Semantics
 
