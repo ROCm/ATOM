@@ -82,6 +82,18 @@ PA_DENSE_SPLIT_TARGET_WG = 128
 PA_DENSE_SPLIT_MAX = 32
 
 
+def window_left(sliding_window: int | None) -> int:
+    """aiter's inclusive left offset for an HF sliding-window span.
+
+    A span of W lets a query see itself and the W - 1 keys before it; aiter's
+    varlen and unified kernels attend over [i - left, i], so left = W - 1.
+    Anything not positive means no window.
+    """
+    if sliding_window is None or sliding_window <= 0:
+        return -1
+    return sliding_window - 1
+
+
 def dense_decode_splits(num_seqs: int, num_kv_heads: int) -> int:
     """KV splits for the dense paged decode.
 

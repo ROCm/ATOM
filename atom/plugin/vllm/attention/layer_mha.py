@@ -16,6 +16,7 @@ from atom.model_ops.base_attention import (
     gluon_decode_over_limit,
     run_pa_decode,
     run_pa_fwd_asm,
+    window_left,
 )
 from atom.plugin.vllm.attention.backend import (
     AiterMhaBackendForVllm,
@@ -655,11 +656,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             per_token_quant=self.per_token_quant,
         )
 
-        sliding_window = (
-            (self.sliding_window, 0, 0)
-            if self.sliding_window is not None
-            else (-1, -1, 0)
-        )
+        left = window_left(self.sliding_window)
+        sliding_window = (left, 0, 0) if left >= 0 else (-1, -1, 0)
         aiter.flash_attn_varlen_func(
             q=query,
             k=key_fetched,
@@ -940,11 +938,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             prefill_key = key[num_decode_tokens + num_extend_tokens :]
             prefill_value = value[num_decode_tokens + num_extend_tokens :]
 
-            sliding_window = (
-                (self.sliding_window, 0, 0)
-                if self.sliding_window is not None
-                else (-1, -1, 0)
-            )
+            left = window_left(self.sliding_window)
+            sliding_window = (left, 0, 0) if left >= 0 else (-1, 0, 0)
 
             aiter.flash_attn_varlen_func(
                 q=prefill_query,

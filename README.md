@@ -57,6 +57,7 @@
 | [GPT-OSS](https://huggingface.co/openai) | `GptOssForCausalLM` | MoE | Sliding window + attention sinks |
 | [Kimi-K2](https://huggingface.co/moonshotai/Kimi-K2-Thinking) | via `--trust-remote-code` | MoE | See [recipe](recipes/Kimi-K2-Thinking.md) |
 | [MiMo V2/V2.5](https://huggingface.co/XiaomiMiMo) | `MiMoV2ForCausalLM` | MoE | Hybrid full + SWA attention, 3-layer MTP. See [recipe](recipes/MiMo-V2.md) |
+| [Muse Spark Open](https://huggingface.co/amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4) | `MuseSparkForConditionalGeneration` | MoE | Text-only; 816B/A42B, MXFP4 experts, SWA + NoPE full attention, gated attention. See [recipe](recipes/Muse-Spark-Open.md) |
 
 ## 📋 Requirements
 
@@ -274,6 +275,7 @@ lm_eval --model local-completions \
 - [Kimi-K2-Thinking](recipes/Kimi-K2-Thinking.md) — MXFP4 MoE on 4 GPUs
 - [GLM-5](recipes/GLM-5.md) — FP8 MoE with MLA on 8 GPUs
 - [GPT-OSS-120B](recipes/GPT-OSS.md) — Single GPU or DP+EP on 2 GPUs
+- [Muse Spark Open](recipes/Muse-Spark-Open.md) — MXFP4 MoE, TP4 or TP8 (+EP)
 - [TBO (Two-Batch Overlap)](recipes/TBO.md) — Compute-communication overlap for MoE models with DP attention
 - [PD Disaggregation (Mooncake)](recipes/pd_disaggregation_guide.md) — Prefill/Decode separation with RDMA KV cache transfer (DeepSeek-R1, DeepSeek-V4-Pro)
 

@@ -412,5 +412,17 @@
     "accuracy_baseline": 0.9765,
     "accuracy_baseline_model": "zai-org/GLM-5.3",
     "_baseline_note": "Server args are the GLM-5.2-MXFP4 entry verbatim: the two checkpoints have byte-identical quantization_config, the same 1319-entry exclude list and the same 408 GB footprint, differing only in weights and a new moe_router_dtype key. Measured 2026-09-02, all 1319, chat 5-shot, temperature 0: flexible-extract=0.9765, strict-match=0.9773 -- level with the FP8 source (0.9719/0.9727), so MXFP4 costs nothing detectable here. Chat runs of this model have spanned 0.9719-0.9773 across five measurements, so 0.96 keeps ~1.6pp of headroom below the worst. The HF card ships this checkpoint with no evaluation at all. MUST run chat, not the default raw-completions client: GLM-5.3's template ends '<|assistant|><think>' and the server reports 'This chat template has no switch for reasoning', so few-shot completions suppress the reasoning the model is trained to do and score ~0.91 -- measured 0.9136 (MXFP4) and 0.9234 (FP8) over all 1319, which would fail this threshold on a healthy checkpoint. Chat 5-shot is also far steadier: two runs of identical code disagree on 13 of 1319 questions in chat versus 108 in 3-shot completions."
+  },
+  {
+    "model_name": "Muse-Spark-Open-MXFP4",
+    "model_path": "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4",
+    "extraArgs": "--kv_cache_dtype bf16 -tp 4 --max-model-len 32768",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.92,
+    "accuracy_baseline": 0.9409,
+    "accuracy_baseline_model": "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4",
+    "_baseline_note": "Text-only MuseSparkForConditionalGeneration, routed experts MXFP4 (a4w4), everything else BF16. Baseline is one full 1319-question 3-shot raw-completions run at TP4, level 3 + CUDA graphs, bf16 KV, on MI355X: flexible-extract=0.9409, strict-match=0.9416 (stderr 0.0065). 5-shot on the same build, compiled / eager: TP4 0.9439 / 0.9439, TP8 0.9431 / 0.9484, TP8 + expert parallel 0.9431 / 0.9424. The SGLang ROCm reference reports 0.955 5-shot with its own harness (max_new_tokens 2048). fp8 KV is not yet validated, hence bf16. The 0.92 bar is ~3 stderr below the single measured run; refresh after the first CI runs."
   }
 ]

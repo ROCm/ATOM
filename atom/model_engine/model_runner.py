@@ -146,6 +146,9 @@ support_model_arch_dict = {
     "MiniMaxM3SparseForConditionalGeneration": (
         "atom.models.minimax_m3.vl.MiniMaxM3SparseForConditionalGenerationVL"
     ),
+    "MuseSparkForConditionalGeneration": (
+        "atom.models.muse_spark.MuseSparkForConditionalGeneration"
+    ),
     "Glm5NextForConditionalGeneration": (
         "atom.models.glm5_next.Glm5NextForConditionalGeneration"
     ),
