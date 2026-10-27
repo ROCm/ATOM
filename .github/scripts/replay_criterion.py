@@ -35,17 +35,31 @@ _SHIPPED_METRICS = (
 def shipped_alerts(deltas):
     """Reproduce summarize.py's criterion over the metrics the delta shape carries.
 
-    This counts any one (configuration, metric) exceeding the regression threshold.
-    Note: summarize.py tracks four metrics (TRACKED_METRICS), including
+    This counts every (configuration, metric) pair that exceeds the regression
+    threshold -- see tests/test_replay_criterion.py's
+    test_shipped_alerts_counts_each_metric_separately, which asserts 3 for a
+    single configuration tripping on all three metrics. summarize.py counts
+    differently: its has_regression is a bool ORed across metrics (see the
+    `if has_regression:` block in print_regression_report), so it counts at
+    most one regression per configuration no matter how many metrics tripped.
+    That alone means this function can over-count a single configuration by
+    up to a factor of four relative to summarize.py's regression_count.
+
+    Separately, summarize.py tracks four metrics (TRACKED_METRICS), including
     output_throughput, but the delta dict carries only three (_SHIPPED_METRICS):
     tput_pct (mapped from total_token_throughput), tpot_pct, and ttft_pct. The
     output_throughput field is omitted because judge_family judges only on the
     single throughput field. Adding a second throughput metric would require
-    extending the delta contract with a field no criterion reads.
+    extending the delta contract with a field no criterion reads. That
+    omission would under-count by one metric.
 
-    Consequently, shipped_total is a lower bound on what summarize.py would report
-    from the same underlying data. The error is conservative: undercounting makes
-    the shipped criterion appear safer than it actually is.
+    These two errors pull in opposite directions and do not cancel out, so
+    shipped_total is neither an upper nor a lower bound on summarize.py's
+    regression_count -- the net direction is unknown, not conservative. Do
+    not compare the two numbers one-for-one; this is the per-(configuration,
+    metric) alert volume that the analysis in
+    /mnt/raid0/zufa/atom-perf-check/nightly-analysis/README.md reports, and
+    nothing more.
     """
     hits = 0
     for delta in deltas:
