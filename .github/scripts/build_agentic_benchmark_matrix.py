@@ -19,7 +19,11 @@ from catalog import build_args, build_env_vars
 
 CATALOG = ".github/benchmark/models_agentic.json"
 NIGHTLY_CATALOG = ".github/benchmark/models_agentic_nightly.json"
-PROFILE_CATALOGS = {"test": CATALOG, "nightly": NIGHTLY_CATALOG}
+PROFILE_CATALOGS = {
+    "test": CATALOG,
+    "nightly": NIGHTLY_CATALOG,
+    "dp-cache-ab": ".github/benchmark/models_agentic_dp_cache_ab.json",
+}
 
 
 def resolve_run_image(image):

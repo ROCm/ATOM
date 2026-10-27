@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "Preset — test: TP4 / c=2,4 / 900s; nightly: TP2+TP4 / 3600s"
+        description: "Preset — test: TP4 / 900s; nightly: 3600s; dp-cache-ab: DTP2 / c=128 / 900s"
         type: choice
-        options: [test, nightly]
+        options: [test, nightly, dp-cache-ab]
         default: test
       models:
         description: "Models (optional) — empty uses the preset; e.g. deepseek-v41-flash"
