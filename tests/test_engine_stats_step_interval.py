@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from atom.model_engine import engine_stats
 from atom.model_engine.engine_stats import EngineStats
 
 
@@ -35,6 +36,80 @@ def test_step_mode_ignores_the_clock():
     """A step window does not open just because time passed."""
     s = _stats(throughput_log_interval_s=10.0, throughput_log_interval_steps=4)
     assert not s.window_expired(s._throughput_last_log_time + 3600.0)
+
+
+def test_first_step_window_excludes_idle_heartbeats(monkeypatch, caplog):
+    now = [0.0]
+    monkeypatch.setattr(engine_stats.time, "monotonic", lambda: now[0])
+    s = _stats(throughput_log_interval_steps=2)
+    for idle_time in (10.0, 30.0, 60.0):
+        now[0] = idle_time
+        s.refresh_idle_throughput_clock(idle_time)
+        assert not s.window_expired(idle_time)
+    s.update_throughput(num_generation_tokens=10)
+    s.bump_step()
+    s.bump_step()
+    now[0] = 61.0
+    with caplog.at_level("INFO"):
+        s.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.5)
+    assert "step 2: " in caplog.text
+    assert "Avg generation throughput: 10.0 tokens/s" in caplog.text
+
+
+def test_idle_heartbeat_does_not_discard_a_partial_step_window():
+    s = _stats(throughput_log_interval_steps=4)
+    start = s._throughput_last_log_time
+    s.update_throughput(num_prompt_tokens=8, num_generation_tokens=2)
+    s.bump_step()
+    s.refresh_idle_throughput_clock(start + 60.0)
+    assert s._throughput_last_log_time == start
+    assert s._throughput_steps == 1
+    assert (s.num_prompt_tokens, s.num_generation_tokens) == (8, 2)
+
+
+def test_idle_heartbeat_keeps_a_dummy_only_partial_window():
+    s = _stats(throughput_log_interval_steps=4)
+    start = s._throughput_last_log_time
+    s.bump_step()
+    s.refresh_idle_throughput_clock(start + 60.0)
+    assert s._throughput_last_log_time == start
+    assert s._throughput_steps == 1
+
+
+def test_idle_heartbeat_keeps_tokens_scheduled_before_the_forward():
+    s = _stats(throughput_log_interval_steps=4)
+    start = s._throughput_last_log_time
+    s.update_throughput(num_prompt_tokens=8)
+    s.refresh_idle_throughput_clock(start + 60.0)
+    assert s._throughput_last_log_time == start
+    assert s.num_prompt_tokens == 8
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"throughput_log_interval_steps": 0}, {"enable_log_stats": False}],
+    ids=["time_mode", "disabled"],
+)
+def test_idle_refresh_keeps_other_logging_modes_unchanged(options):
+    s = _stats(**options)
+    start = s._throughput_last_log_time
+    s.refresh_idle_throughput_clock(start + 60.0)
+    assert s._throughput_last_log_time == start
+
+
+def test_ranks_refresh_the_same_idle_tick_despite_different_clock_origins():
+    busy = _stats(throughput_log_interval_steps=4)
+    idle = _stats(throughput_log_interval_steps=4)
+    busy._throughput_last_log_time = 0.0
+    idle._throughput_last_log_time = 0.1
+    # A 10s deadline would refresh only the first rank on this DP tick.
+    busy.refresh_idle_throughput_clock(10.05)
+    idle.refresh_idle_throughput_clock(10.05)
+    assert busy._throughput_last_log_time == idle._throughput_last_log_time == 10.05
+    for _ in range(4):
+        busy.bump_step()
+        idle.bump_step()
+    assert busy.window_expired(11.0) and idle.window_expired(11.0)
 
 
 def test_step_mode_opens_on_the_count():

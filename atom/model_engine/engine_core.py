@@ -440,8 +440,10 @@ class EngineCore:
                     # for an empty schedule, unlike the DP loop.
                     if self._process_engine_step():
                         self.scheduler.engine_stats.bump_step()
-                elif self.has_pending_kv_work():
-                    self._advance_idle_kv_transfer()
+                else:
+                    self.scheduler.engine_stats.refresh_idle_throughput_clock(now)
+                    if self.has_pending_kv_work():
+                        self._advance_idle_kv_transfer()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -929,6 +931,7 @@ class DPEngineCoreProc(EngineCore):
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
+                    self.scheduler.engine_stats.refresh_idle_throughput_clock(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
                     if self.has_pending_kv_work():

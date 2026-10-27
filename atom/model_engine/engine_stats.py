@@ -747,6 +747,22 @@ class EngineStats:
         if self.throughput_enabled:
             self._throughput_steps += 1
 
+    def refresh_idle_throughput_clock(self, now: float) -> None:
+        """Refresh an empty step window while the whole engine is idle.
+
+        DP callers must use global idleness: a locally idle rank can still
+        be executing dummies for its busy peers. Refresh every idle tick so
+        different rank clocks cannot choose different refresh deadlines.
+        """
+        if (
+            self.throughput_enabled
+            and self.throughput_log_interval_steps
+            and self._throughput_steps == 0
+            and self.num_prompt_tokens == 0
+            and self.num_generation_tokens == 0
+        ):
+            self._throughput_last_log_time = now
+
     def window_expired(self, now: float) -> bool:
         """Whether the throughput window is due to close.
 
