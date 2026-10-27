@@ -7,12 +7,14 @@ import subprocess
 from pathlib import Path
 
 run_id = os.environ['ATOMESH_ENV_ATOMESH_INSPECT_RUN_ID']
-if not run_id.isdecimal():
+if run_id != 'latest' and not run_id.isdecimal():
     raise ValueError('Inspection requires a numeric Actions run ID')
 root = Path(os.environ['SLURM_LOG_ROOT'])
 out = Path(os.environ['RESULT_DIR']) / 'inspection'
 out.mkdir(parents=True, exist_ok=True)
-runs = sorted(root.glob(f'*m31-vllm-*-{run_id}-*'))
+runs = sorted(root.glob('*m31-vllm-1p1d-tp4-mcstore-*-mooncake_store-*' if run_id == 'latest' else f'*m31-vllm-*-{run_id}-*'))
+if run_id == 'latest' and runs:
+    runs = [max(runs, key=lambda p: p.stat().st_mtime)]
 if not runs:
     raise RuntimeError(f'No native M3 vLLM run {run_id} in {root}')
 index = []

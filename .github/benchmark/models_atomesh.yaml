@@ -2150,4 +2150,4 @@ models:
           env:
             common:
               ATOMESH_VLLM_MODE: inspect
-              ATOMESH_INSPECT_RUN_ID: "40480405641"
+              ATOMESH_INSPECT_RUN_ID: "latest"

@@ -292,7 +292,7 @@ CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$\{USER\}/${CURRENT_USER}}"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$USER/${CURRENT_USER}}"
 # Read-only native experiment inspection runs on the submit runner, without sbatch.
-if [[ "${BACKEND}" == "vllm" && "${ATOMESH_ENV_ATOMESH_VLLM_MODE:-}" == "inspect" ]]; then
+if [[ "${DRY_RUN}" -eq 0 && "${BACKEND}" == "vllm" && "${ATOMESH_ENV_ATOMESH_VLLM_MODE:-}" == "inspect" ]]; then
   export SLURM_LOG_ROOT
   exec python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_vllm_inspect.py"
 fi
