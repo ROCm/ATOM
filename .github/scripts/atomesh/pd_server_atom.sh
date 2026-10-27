@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${BACKEND:-atom}" == "vllm" ]]; then
+  exec python3 "$(dirname -- "${BASH_SOURCE[0]}")/pd_vllm_m31.py"
+fi
+
 ATOMESH_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 NODE_RANK="${NODE_RANK:-0}"
 NODE0_ADDR="${NODE0_ADDR:-127.0.0.1}"

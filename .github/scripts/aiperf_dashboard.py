@@ -50,7 +50,7 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
     throughput = records_throughput(src) or {}
 
     payload = {
-        "benchmark_backend": "atom",
+        "benchmark_backend": env.get("BACKEND", "atom"),
         # Directory holding this run's profile_export.jsonl, so process_result.py can
         # find the per-request records both interactivity definitions are computed
         # from, without reconstructing the directory name.
@@ -58,7 +58,7 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
         "benchmark_model_name": env.get("MODEL_NAME")
         or data.get("model")
         or data.get("model_id"),
-        "backend": "atom",
+        "backend": env.get("BACKEND", "atom"),
         "benchmark_kind": env.get("BENCHMARK_KIND") or "aiperf_agentic",
         "scenario": env.get("AIPERF_SCENARIO"),
         "public_dataset": env.get("AIPERF_PUBLIC_DATASET"),

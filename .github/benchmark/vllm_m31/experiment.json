@@ -1,0 +1,169 @@
+{
+  "status": "ci_experiment_recipe",
+  "name": "m31-flash-vllm-mooncake-store-1p1d-tp4",
+  "image": "vllm/vllm-openai-rocm:minimax-m31-flash@sha256:ae8681212aa5291d8c27f06e90016435e3fca144a68fd5c439231f6475f74569",
+  "image_vllm_commit": "8d0f05a0c33c91cc4d3f0a6f189474420af47174",
+  "model": "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+  "model_revision": "1442d09d4926cb286fa2dc6646c83c4af2b3898c",
+  "topology": {
+    "nodes": 1,
+    "gpus": 8,
+    "gpu_type": "MI355X",
+    "prefill_gpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "decode_gpus": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "placement_note": "Choose physical GPU and NIC binding from allocated node topology; IDs are proposed host indices."
+  },
+  "common_args": {
+    "tensor-parallel-size": 4,
+    "gpu-memory-utilization": 0.9,
+    "language-model-only": true,
+    "trust-remote-code": true,
+    "reasoning-parser": "minimax_m3",
+    "tool-call-parser": "minimax_m3",
+    "enable-auto-tool-choice": true,
+    "block-size": 128,
+    "kv-cache-dtype": "nvfp4",
+    "moe-backend": "aiter",
+    "disable-hybrid-kv-cache-manager": true,
+    "max-model-len": 1048576,
+    "max-num-batched-tokens": 32768,
+    "max-num-seqs": 128,
+    "disable-uvicorn-access-log": true
+  },
+  "common_env": {
+    "VLLM_ROCM_USE_AITER": "1",
+    "VLLM_ROCM_USE_AITER_MOE": "1",
+    "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": "0",
+    "VLLM_USE_V2_MODEL_RUNNER": "1",
+    "DEBUG_HIP_DYNAMIC_QUEUES": "0",
+    "VLLM_KV_CACHE_LAYOUT": "LBHNC",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONUNBUFFERED": "1",
+    "VLLM_ENGINE_READY_TIMEOUT_S": "7200",
+    "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "900",
+    "VLLM_MOONCAKE_BOOTSTRAP_PORT": "8998",
+    "MOONCAKE_CONFIG_PATH": "/config/mooncake-store.json",
+    "PYTHONHASHSEED": "42"
+  },
+  "speculative_config": {
+    "method": "dspark",
+    "num_speculative_tokens": 3,
+    "attention_backend": "TRITON_ATTN",
+    "kv_cache_dtype": "fp8",
+    "draft_sample_method": "probabilistic",
+    "rejection_sample_method": "synthetic",
+    "synthetic_acceptance_length": 2.88
+  },
+  "prefill": {
+    "port": 8100,
+    "enable-prefix-caching": true,
+    "attention-config": {
+      "indexer_kv_dtype": "nvfp4"
+    },
+    "enable-dbo": true,
+    "dbo-prefill-token-threshold": 16384,
+    "dbo-decode-token-threshold": 32768,
+    "kv_transfer_config_file": "prefill-kv.json"
+  },
+  "decode": {
+    "port": 8200,
+    "enable-prefix-caching": true,
+    "attention-config": {
+      "indexer_kv_dtype": "nvfp4",
+      "indexer_decode_cp": true
+    },
+    "enable-dbo": false,
+    "kv_transfer_config_file": "decode-kv.json"
+  },
+  "proxy": {
+    "port": 8000,
+    "implementation": "sources/mooncake_connector_proxy.py",
+    "source_commit": "8d0f05a0c33c91cc4d3f0a6f189474420af47174"
+  },
+  "offload": {
+    "mooncake_store": true,
+    "cpu_offload": true,
+    "disk_offload": false,
+    "store_config_file": "mooncake-store.json",
+    "mode": "embedded",
+    "global_segment_size_per_rank_bytes": 137438953472,
+    "contributing_ranks": 8,
+    "total_pool_bytes": 1099511627776,
+    "local_buffer_size_per_rank_bytes": 4294967296,
+    "total_private_buffer_bytes": 34359738368,
+    "master_address": "127.0.0.1:50051",
+    "prefill_store_role": "kv_both",
+    "prefill_lookup": true,
+    "prefill_lookup_async": true,
+    "prefill_load_async": true,
+    "decode_store_role": "kv_consumer",
+    "decode_lookup": false,
+    "save_decode_cache": true,
+    "cache_prefix": "m31-flash-vllm-nvfp4-dspark3-tp4",
+    "note": "Proposed capacity; embedded eight 128 GiB rank segments, not two external 512 GiB owners. enable_offload=false in Store JSON disables disk tier only; CPU Store remains enabled. Host memory registration and Store binaries/imports must be checked in the exact image before execution."
+  },
+  "benchmark": {
+    "harness": "agentx-harness==1.0.12",
+    "dataset": "semianalysis_cc_traces_weka_062126",
+    "dataset_hf_repo": "semianalysisai/cc-traces-weka-062126",
+    "dataset_revision": "23f152f6f0f9399a85901b89a6458def0ef16729",
+    "dataset_entries": 393,
+    "seed": 42,
+    "concurrencies": [
+      32,
+      48,
+      64
+    ],
+    "formal_duration_seconds": 3600,
+    "warmup_requests_per_lane": 10,
+    "warmup_grace_seconds": 1800,
+    "formal_grace_seconds": 30,
+    "trace_idle_gap_cap_seconds": 300,
+    "system_idle_gap_cap_seconds": 10,
+    "trajectory_start_min_ratio": 0.25,
+    "trajectory_start_max_ratio": 0.75,
+    "ignore_eos": true,
+    "cache_bust": "first_turn_prefix",
+    "profile_trace": false,
+    "throughput_gpu_denominator": 8,
+    "cache_reset_policy": "Start each concurrency with fresh P/D engines and a fresh experiment-owned Store master/pool, then warm up. Keep GPU and CPU caches enabled during measurement.",
+    "store_metrics": [
+      "GPU/CPU prefix hit rate",
+      "Store PUT/GET bytes and latency",
+      "Store used capacity and eviction",
+      "P-to-D transfer bytes"
+    ]
+  },
+  "unverified": [
+    "Image has Mooncake ROCm dependency and native connector source; exact M3.1 + NVFP4 + DSpark + DBO PD combination needs GPU smoke verification.",
+    "RDMA device binding and host IP depend on allocated node.",
+    "Synthetic acceptance is for performance only; smoke correctness must use block rejection.",
+    "Exact dataset snapshot selection must be verified in harness logs before measuring.",
+    "Exact-image mooncake.store import and mooncake_master executable have not been checked; engine dependency presence alone is not sufficient.",
+    "Validate Store reload of target KV/scales/index/draft-required state and decode-written prefix reuse by P for M3.1.",
+    "Embedded 1 TiB pool plus 32 GiB private buffers and metadata requires host memory/RDMA registration verification.",
+    "P/D Store key namespace and registered cache regions must match; smoke must demonstrate cross-role hits."
+  ],
+  "not_a_runner_schema": false,
+  "diagnostic_variants": {
+    "decode_prefix_cache_off": {
+      "purpose": "Only for diagnosing P-to-D KV transfer; not the formal AgentX performance default.",
+      "decode_enable_prefix_caching": false
+    },
+    "store_off": {
+      "purpose": "Only for diagnosing Store overhead or correctness; not the main AgentX performance configuration.",
+      "mooncake_store": false,
+      "cpu_offload": false
+    }
+  }
+}

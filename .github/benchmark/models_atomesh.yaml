@@ -43,6 +43,14 @@ backends:
         policy: random
         prometheus_port: 29100
 
+  vllm:
+    image: vllm/vllm-openai-rocm:minimax-m31-flash@sha256:ae8681212aa5291d8c27f06e90016435e3fca144a68fd5c439231f6475f74569
+    server_script: .github/scripts/atomesh/pd_server_atom.sh
+    service:
+      prefill: {port: 8100, tp: 4}
+      decode: {port: 8200, tp: 4}
+      router: {port: 8000, policy: random, prometheus_port: 29100}
+
 models:
   DeepSeek-V4-Pro:
     backend: atom
@@ -2081,3 +2089,57 @@ models:
       # V3 is not a reasoning model, so gsm8k answers are short.
       max_gen_toks: 512
       apply_chat_template: true
+
+  MiniMax-M3.1-Flash-vLLM:
+    backend: vllm
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3.1-Flash-Quark-MXFP4"
+    precision: MXFP4
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: nvfp4
+        block_size: 128
+        gpu_memory_utilization: 0.9
+        max_model_len: 1048576
+        max_num_seqs: 128
+        decode_max_num_seqs: 128
+        max_num_batched_tokens: 32768
+        decode_max_num_batched_tokens: 32768
+        enable_prefix_caching: true
+    suites:
+      mooncake_store:
+        - &m31_vllm_pd
+          name: m31-vllm-1p1d-tp4-mcstore-smoke
+          topology: 1p1d
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [1]
+          prefill: {workers: 1, tp: 4}
+          decode: {workers: 1, tp: 4}
+          env:
+            common:
+              ATOMESH_VLLM_MODE: smoke
+          benchmark:
+            kind: aiperf_agentic
+            scenario: agentx
+            agentx_harness_version: "1.0.12"
+            public_dataset: semianalysis_cc_traces_weka_062126
+            max_context_length: 1048576
+            num_dataset_entries: 393
+            benchmark_duration: 3600
+            wait_server_timeout: 7200
+          run_eval: false
+        - <<: *m31_vllm_pd
+          name: m31-vllm-1p1d-tp4-mcstore-c32
+          concurrency: [32]
+          env: {common: {ATOMESH_VLLM_MODE: benchmark}}
+        - <<: *m31_vllm_pd
+          name: m31-vllm-1p1d-tp4-mcstore-c48
+          concurrency: [48]
+          env: {common: {ATOMESH_VLLM_MODE: benchmark}}
+        - <<: *m31_vllm_pd
+          name: m31-vllm-1p1d-tp4-mcstore-c64
+          concurrency: [64]
+          env: {common: {ATOMESH_VLLM_MODE: benchmark}}

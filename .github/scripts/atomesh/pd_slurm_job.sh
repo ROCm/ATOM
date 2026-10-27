@@ -456,6 +456,7 @@ EOF
     )
   fi
 
+  [[ "${BACKEND:-atom}" == "vllm" ]] && docker_args+=(--entrypoint "")
   docker_args+=(
     "${DOCKER_IMAGE}"
     bash -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh"
@@ -915,8 +916,10 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
           fi
         fi
       fi
+      native_entrypoint_args=()
+      [[ "'"${BACKEND:-atom}"'" == "vllm" ]] && native_entrypoint_args=(--entrypoint "")
       set +e
-      docker run --name "${container}" \
+      docker run "${native_entrypoint_args[@]}" --name "${container}" \
         --network host --ipc host --privileged \
         --device /dev/kfd --device /dev/dri --device /dev/infiniband \
         --group-add video --cap-add IPC_LOCK --cap-add NET_ADMIN \

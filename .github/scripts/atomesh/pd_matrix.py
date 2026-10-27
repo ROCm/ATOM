@@ -282,9 +282,9 @@ def build_cell(
         raise ValueError(
             f"Model {model_name} references unknown backend {backend_name}"
         )
-    if backend_name != "atom":
+    if backend_name not in {"atom", "vllm"}:
         raise ValueError(
-            f"Only atom backend is currently supported, got {backend_name}"
+            f"Unsupported backend {backend_name}"
         )
 
     prefill_cfg = deep_merge(
@@ -399,7 +399,16 @@ def build_cell(
         topology, suite_cfg, prefill_cfg, decode_cfg
     )
     cell_id = slug(f"{model_name}-{suite_cfg.get('name', topology)}-{suite_name}")
-    image = override_image or str(backend_cfg.get("image"))
+    # The workflow image override is for ATOM; preserve pinned vLLM images.
+    image = str((override_image if backend_name == "atom" else None)
+                or suite_cfg.get("image") or model_cfg.get("image")
+                or backend_cfg.get("image"))
+    if backend_name == "vllm" and (
+        pd_worker_layout != "single_node"
+        or prefill_cfg.get("workers", 1) != 1
+        or decode_cfg.get("workers", 1) != 1
+    ):
+        raise ValueError("Native vLLM launcher requires single-node 1P1D")
     eval_only = bool(suite_cfg.get("eval_only", False))
     if eval_only and not suite_cfg.get("run_eval", False):
         raise ValueError("eval_only requires run_eval=true")

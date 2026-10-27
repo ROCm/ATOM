@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Single-node native vLLM M3.1 PD experiment under the ATOMesh Slurm runner.
+
+Uses the pinned image as installed. Owns only the subprocesses it starts;
+all artifacts use the existing RUN_DIR and benchmark_results contracts.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONFIG = HERE.parents[1] / "benchmark/vllm_m31"
+PROCESSES: list[tuple[str, subprocess.Popen, Path]] = []
+
+
+def dump(path, data):
+    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def flags(values):
+    args = []
+    for name, value in values.items():
+        if value is True:
+            args.append("--" + name)
+        elif value is False:
+            args.append("--no-" + name)
+        elif value is not None:
+            args.extend(["--" + name, json.dumps(value) if isinstance(value, (dict, list)) else str(value)])
+    return args
+
+
+def role_env(common, role, ip):
+    env = dict(common)
+    prefix = f"ATOMESH_{role.upper()}_ENV_"
+    for key, value in os.environ.items():
+        if key.startswith(prefix):
+            env[key[len(prefix):]] = value.replace("${ROLE_IP}", ip)
+    for key in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        env.pop(key, None)
+    env["HIP_VISIBLE_DEVICES"] = "0,1,2,3" if role == "prefill" else "4,5,6,7"
+    return env
+
+
+def start(name, cmd, env, logs):
+    log = logs / f"{name}.log"
+    print(f"[{name}] {shlex.join(map(str, cmd))}", flush=True)
+    with log.open("w") as stream:
+        proc = subprocess.Popen(cmd, env=env, stdout=stream, stderr=subprocess.STDOUT,
+                                start_new_session=True, cwd="/tmp")
+    PROCESSES.append((name, proc, log))
+    return proc
+
+
+def check_services():
+    for name, proc, path in PROCESSES:
+        if name == "agentx":
+            continue
+        if proc.poll() is not None:
+            raise RuntimeError(f"{name} exited {proc.returncode}: {path.read_text(errors='replace')[-6000:]}")
+        if path.exists():
+            with path.open("rb") as stream:
+                stream.seek(max(0, path.stat().st_size - 16384))
+                tail = stream.read().decode(errors="replace")
+            for marker in ("Fatal Python error:", "Engine core initialization failed", "EngineCore failed"):
+                if marker in tail:
+                    raise RuntimeError(f"{name}: {marker}; {tail[-6000:]}")
+
+
+def request(url, body=None, timeout=10):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read().decode()
+
+
+def wait_http(url, timeout):
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        check_services()
+        try:
+            request(url)
+            print(f"[ready] {url}", flush=True)
+            return
+        except (OSError, urllib.error.URLError) as exc:
+            last = str(exc)
+        time.sleep(5)
+    raise TimeoutError(f"{url}: {last}")
+
+
+def cleanup():
+    # First stop all clients/engines, then wait before stopping the Store master.
+    for name, proc, _ in reversed(PROCESSES):
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=25)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def on_signal(signum, frame):
+    raise RuntimeError(f"Interrupted by signal {signum}")
+
+
+def reset_gpu_cache(url):
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        check_services()
+        result = json.loads(request(url + "/reset_prefix_cache", {}, timeout=30))
+        if result.get("success") is True:
+            return result
+        time.sleep(2)
+    raise TimeoutError(f"GPU prefix reset still refused: {url}")
+
+
+def store_load_bytes(metrics):
+    return sum(float(line.split()[-1]) for line in metrics.splitlines()
+               if line.startswith("vllm:mooncake_store_operation_bytes_total{")
+               and 'operation="load_get"' in line and 'status="ok"' in line)
+
+
+def verify_store_load(url, before, out, name):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        check_services()
+        metrics = request(url + "/metrics")
+        (out / f"{name}.prom").write_text(metrics)
+        delta = store_load_bytes(metrics) - before
+        if delta > 0:
+            return delta
+        time.sleep(2)
+    raise RuntimeError(f"{name}: no successful Store GET bytes observed")
+
+
+def smoke(model, model_path, p_url, d_url, proxy_url, out):
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    rows = []
+    for target in (1024, 32768, 131072):
+        prefix = ("Reference notes: one two three four five six seven eight nine ten.\n" * (target // 10 + 1))
+        ids = tokenizer.encode(prefix, add_special_tokens=False)[:target - 32]
+        prompt = tokenizer.decode(ids) + "\nQuestion: What is two plus two? Answer briefly.\nAnswer:"
+        body = {"model": model, "prompt": prompt, "max_tokens": 32,
+                "temperature": 0, "ignore_eos": True, "stream": False, "seed": 42}
+        # Exercise remote transfer before the direct-D reference can populate its cache.
+        before = request(d_url + "/metrics")
+        via_pd = json.loads(request(proxy_url + "/v1/completions", body, timeout=1200))
+        after = request(d_url + "/metrics")
+        (out / f"smoke-{target}-decode-before.prom").write_text(before)
+        (out / f"smoke-{target}-decode-after.prom").write_text(after)
+        # Drop D's local prefixes before computing the independent reference.
+        reset = reset_gpu_cache(d_url)
+        direct = json.loads(request(d_url + "/v1/completions", body, timeout=1200))
+        # Drop both GPU prefix caches. The repeated PD request must exercise CPU reuse.
+        reset_gpu_cache(p_url)
+        reset_gpu_cache(d_url)
+        load_before = store_load_bytes(request(p_url + "/metrics"))
+        repeated = json.loads(request(proxy_url + "/v1/completions", body, timeout=1200))
+        loaded = verify_store_load(p_url, load_before, out, f"smoke-{target}-store-reload")
+        a, b, c = (v["choices"][0]["text"] for v in (via_pd, direct, repeated))
+        row = {"target_tokens": target, "actual_tokens": len(tokenizer.encode(prompt)),
+               "pd": via_pd, "direct_decode_reference": direct, "after_gpu_reset": repeated,
+               "store_get_bytes": loaded, "matches_reference": a == b, "matches_after_reset": a == c, "reset_response": reset}
+        rows.append(row)
+        dump(out / "smoke.json", rows)
+        (out / f"smoke-{target}-prefill-after-reset.prom").write_text(request(p_url + "/metrics"))
+        print(f"[smoke] tokens={target} reference_match={a == b} store_reload_match={a == c}", flush=True)
+        if a != b or a != c:
+            raise RuntimeError(f"PD/Store greedy output mismatch at {target} tokens")
+
+    # A prompt seen only by D must become readable by P through the shared Store.
+    prompt = "Decode-only seed for cross-role Store validation. " * 256
+    body = {"model": model, "prompt": prompt, "max_tokens": 32,
+            "temperature": 0, "ignore_eos": True, "seed": 42}
+    direct = json.loads(request(d_url + "/v1/completions", body, timeout=300))
+    reset_gpu_cache(d_url)
+    reset_gpu_cache(p_url)
+    load_before = store_load_bytes(request(p_url + "/metrics"))
+    repeated = json.loads(request(proxy_url + "/v1/completions", body, timeout=300))
+    loaded = verify_store_load(p_url, load_before, out, "smoke-decode-to-prefill")
+    matches = direct["choices"][0]["text"] == repeated["choices"][0]["text"]
+    dump(out / "smoke-cross-role.json", {"store_get_bytes": loaded, "matches": matches,
+                                       "direct": direct, "pd": repeated})
+    if not matches:
+        raise RuntimeError("Decode-written Store reuse by P changed greedy output")
+
+
+def main():
+    if os.environ.get("ATOMESH_PD_WORKER_LAYOUT") != "single_node":
+        raise ValueError("This experiment requires single-node 1P1D")
+    if os.environ.get("CONC_LIST", "").count(","):
+        raise ValueError("One concurrency per CI cell is required for independent cache state")
+    if (os.environ.get("PREFILL_TP_SIZE") != "4"
+            or os.environ.get("DECODE_TP_SIZE") != "4"
+            or os.environ.get("xP") != "1" or os.environ.get("yD") != "1"):
+        raise ValueError("This recipe supports exactly 1P1D TP4+TP4")
+    plan = json.loads((CONFIG / "experiment.json").read_text())
+    out = Path(os.environ["RUN_DIR"])
+    logs = out / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    results = out / "benchmark_results"
+    results.mkdir(exist_ok=True)
+    common = dict(os.environ)
+    for key, value in os.environ.items():
+        if key.startswith("ATOMESH_ENV_"):
+            common[key[len("ATOMESH_ENV_"):]] = value
+    common.update(plan["common_env"])
+    common["VLLM_PLUGINS"] = ""
+    common["MC_DISABLE_HIP"] = "1"
+    ip = os.environ.get("NODE0_ADDR", "127.0.0.1")
+    common["VLLM_HOST_IP"] = ip
+    offset = int(os.environ.get("ATOMESH_SERVICE_PORT_OFFSET", "0"))
+    ports = {"prefill": int(os.environ.get("PREFILL_PORT", 8100)) + offset,
+             "decode": int(os.environ.get("DECODE_PORT", 8200)) + offset,
+             "proxy": int(os.environ.get("ROUTER_PORT", 8000)) + offset,
+             "master": 26051 + offset, "bootstrap": 8998 + offset}
+    for port in ports.values():
+        with socket.socket() as sock:
+            sock.bind(("0.0.0.0", port))
+    common["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(ports["bootstrap"])
+    for key in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        common.pop(key, None)
+    import importlib.metadata as md
+    import mooncake.store
+    import mooncake.engine
+    import torch
+    assert torch.cuda.device_count() == 8, "Expected one full eight-GPU allocation"
+    assert mooncake.engine.SUPPORT_HIP
+    assert all("MI355" in torch.cuda.get_device_name(i) for i in range(8))
+    assert shutil.which("mooncake_master"), "Pinned image is missing mooncake_master"
+    versions = {k: md.version(k) for k in ("vllm", "torch", "amd-aiter", "mooncake-transfer-engine-rocm")}
+    assert "8d0f05a0c" in versions["vllm"], versions
+    hardware = {"host": socket.gethostname(), "ip": ip, "versions": versions,
+                "gpus": [torch.cuda.get_device_name(i) for i in range(8)],
+                "infiniband": sorted(p.name for p in Path('/sys/class/infiniband').iterdir())}
+    dump(out / "image-hardware.json", hardware)
+    print(json.dumps(hardware), flush=True)
+    mem = dict(line.split(":", 1) for line in Path('/proc/meminfo').read_text().splitlines())
+    available = int(mem['MemAvailable'].split()[0]) * 1024
+    assert available > (1024 + 32 + 256) * 1024**3, f"Insufficient host memory: {available}"
+    # Reuse the cluster cache, while the model revision remains explicit.
+    from huggingface_hub import snapshot_download
+    model_root = Path(os.environ["MODEL_PATH"])
+    cache_root = model_root.parent / ".hf-vllm-m31"
+    if not model_root.is_absolute():
+        raise ValueError("Catalog must supply the shared model root")
+    cache_root.mkdir(parents=True, exist_ok=True)
+    model_path = snapshot_download(plan['model'], revision=plan['model_revision'], cache_dir=str(cache_root))
+    assert (Path(model_path) / 'dspark/config.json').exists()
+    plan["resolved_model_path"] = model_path
+    plan["runtime_ports"] = ports
+    plan["status"] = "running"
+    plan["concurrency"] = int(os.environ["CONC_LIST"])
+    dump(out / "resolved-experiment.json", plan)
+    store = json.loads((CONFIG / "mooncake-store.json").read_text())
+    store["master_server_address"] = f"{ip}:{ports['master']}"
+    nics = hardware['infiniband']
+    if not nics:
+        raise RuntimeError("RDMA devices missing")
+    # Explicit whitelist prevents a future host from silently selecting other links.
+    device_names = ",".join(nics)
+    store['device_name'] = device_names
+    dump(out / "mooncake-store.json", store)
+    common['MOONCAKE_CONFIG_PATH'] = str(out / "mooncake-store.json")
+    master = start('mooncake-master', ['mooncake_master', '--port', str(ports['master'])], common, logs)
+    deadline = time.monotonic() + 60
+    while True:
+        check_services()
+        try:
+            with socket.create_connection((ip, ports['master']), timeout=2):
+                break
+        except OSError:
+            if time.monotonic() > deadline:
+                raise TimeoutError('Store master did not bind')
+            time.sleep(2)
+    mode = common.get('ATOMESH_VLLM_MODE', 'benchmark')
+    spec = dict(plan['speculative_config'])
+    if mode == 'smoke':
+        spec.pop('synthetic_acceptance_length', None)
+        spec['rejection_sample_method'] = 'block'
+    for role in ('prefill', 'decode'):
+        env = role_env(common, role, ip)
+        cfg = json.loads((CONFIG / f'{role}-kv.json').read_text())
+        cfg['kv_connector_extra_config']['connectors'][0]['kv_connector_extra_config']['device_name'] = device_names
+        dump(out / f'{role}-kv.json', cfg)
+        args = dict(plan['common_args'])
+        args.update({'served-model-name': plan['model'], 'port': ports[role], 'host': '0.0.0.0',
+                     'enable-prefix-caching': True, 'enable-dbo': role == 'prefill', 'attention-config': plan[role]['attention-config'],
+                     'speculative-config': spec, 'kv-transfer-config': cfg})
+        if role == 'prefill':
+            args.update({'enable-dbo': True, 'dbo-prefill-token-threshold': 16384,
+                         'dbo-decode-token-threshold': 32768})
+        cmd = ['vllm', 'serve', model_path, *flags(args)]
+        dump(out / f'{role}-launch.json', {'argv': cmd, 'env': {k: env[k] for k in
+             sorted(env) if k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'HIP_VISIBLE', 'DEBUG_HIP'))}})
+        start(role, cmd, env, logs)
+    urls = {role: f'http://{ip}:{ports[role]}' for role in ('prefill', 'decode')}
+    for url in urls.values():
+        wait_http(url + '/health', int(os.environ.get('WAIT_SERVER_TIMEOUT', 7200)))
+    proxy_url = f'http://{ip}:{ports["proxy"]}'
+    start('proxy', [sys.executable, str(HERE / 'pd_vllm_proxy.py'),
+          '--host', '0.0.0.0', '--port', str(ports['proxy']), '--prefill', urls['prefill'],
+          str(ports['bootstrap']), '--decode', urls['decode']], common, logs)
+    wait_http(proxy_url + '/health', 300)
+    dump(out / 'metadata-rank-0.json', {'backend': 'vllm', 'model': os.environ['MODEL_NAME'],
+         'model_path': model_path, 'topology': '1p1d', 'display_topology': '1P1D-TP4-TP4',
+         'prefill_ips': ip, 'decode_ips': ip, 'prefill_ports': str(ports['prefill']),
+         'decode_ports': str(ports['decode']), 'pd_worker_layout': 'single_node'})
+    if mode == 'smoke':
+        smoke(plan['model'], model_path, urls['prefill'], urls['decode'], proxy_url, out)
+        # Smoke is a correctness artifact, not a performance number.
+        return
+    venv = Path(f'/tmp/m31-agentx-{os.environ.get("SLURM_JOB_ID", "local")}')
+    subprocess.run([sys.executable, '-m', 'venv', str(venv)], check=True)
+    subprocess.run([str(venv/'bin/pip'), 'install', 'agentx-harness==1.0.12'], check=True)
+    conc = int(os.environ['CONC_LIST'])
+    duration = int(os.environ.get('AIPERF_BENCHMARK_DURATION', 3600))
+    # Pin the HF loader's supported class-level revision inside the client venv.
+    # This changes dataset selection only; image packages and replay stay intact.
+    loader = next(venv.glob("lib/python*/site-packages/aiperf/dataset/loader/base_hf_dataset.py"))
+    loader_source = loader.read_text()
+    needle = "hf_revision: str | None = None"
+    if loader_source.count(needle) != 1:
+        raise RuntimeError("Unexpected AgentX dataset loader source")
+    loader.write_text(loader_source.replace(needle,
+        f"hf_revision: str | None = {plan['benchmark']['dataset_revision']!r}"))
+    dump(out / "harness-dataset-pin.json", {"version": "1.0.12", "file": str(loader),
+        "change": "Set BaseHFDatasetLoader.hf_revision", "revision": plan['benchmark']['dataset_revision']})
+    artifact = results / f'aiperf-m31-1p1d-c{conc}'
+    artifact.mkdir(exist_ok=True)
+    cmd = [str(venv/'bin/agentx'), 'profile', '--url', proxy_url, '--model', plan['model'],
+           '--tokenizer', model_path, '--tokenizer-trust-remote-code', '--concurrency', str(conc),
+           '--benchmark-duration', str(duration), '--random-seed', '42', '--server-metrics',
+           urls['prefill']+'/metrics', urls['decode']+'/metrics', '--output-artifact-dir', str(artifact),
+           '--public-dataset', plan['benchmark']['dataset']]
+    dump(out/'benchmark-command.json', cmd)
+    proc = start('agentx', cmd, common, logs)
+    deadline = time.monotonic() + duration + 3600
+    while proc.poll() is None:
+        check_services()
+        if time.monotonic() > deadline:
+            raise TimeoutError('AgentX exceeded measurement plus warmup/setup budget')
+        time.sleep(5)
+    if proc.returncode:
+        raise RuntimeError(f'AgentX failed {proc.returncode}')
+    raw = artifact/'profile_export_aiperf.json'
+    data = json.loads(raw.read_text())
+    dump(out/'measured-input-config.json', data.get('input_config'))
+    measured = data.get('input_config', {})
+    expected_phase = {"duration": duration, "concurrency": conc,
+                      "warmup_requests_per_lane": 10, "grace_period": 30.0,
+                      "agentic_warmup_grace_period": 1800.0,
+                      "trajectory_start_min_ratio": 0.25, "trajectory_start_max_ratio": 0.75}
+    phase = measured.get("phases", [{}])[0]
+    for key, value in expected_phase.items():
+        if phase.get(key) != value:
+            raise RuntimeError(f"Workload drift: {key}={phase.get(key)!r}, expected {value}")
+    dataset = measured.get("datasets", [{}])[0]
+    if dataset.get("entries") != 393 or dataset.get("random_seed") != 42:
+        raise RuntimeError(f"Dataset configuration drift: {dataset}")
+    summary_env = dict(common, BACKEND='vllm', AGGREGATED='0', AIPERF_MAX_CONTEXT_LENGTH='1048576')
+    filename = f'pd-vllm-{os.environ["MODEL_NAME"]}-1p1d-isl1048576-osl1024-conc{conc}-0.8.json'
+    subprocess.run([sys.executable, str(HERE.parent/'aiperf_dashboard.py'), str(raw),
+                    str(results/filename), str(conc)], env=summary_env, check=True)
+    for role, url in urls.items():
+        (out / f'{role}-final.prom').write_text(request(url+'/metrics'))
+
+
+if __name__ == '__main__':
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, on_signal)
+    try:
+        main()
+    finally:
+        cleanup()

@@ -1,0 +1,1 @@
+mooncake_connector_proxy.py is copied without changes from vllm-project/vllm commit 8d0f05a0c33c91cc4d3f0a6f189474420af47174, examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py. It accompanies the pinned MiniMax M3.1 ROCm image. SPDX license is retained in the source.
