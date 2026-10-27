@@ -200,6 +200,26 @@ def smoke(model, model_path, p_url, d_url, proxy_url, out):
         raise RuntimeError("Decode-written Store reuse by P changed greedy output")
 
 
+def store_preflight(common, ip, config, out, logs):
+    """Exercise the actual per-rank allocation before loading model weights."""
+    proc = start('store-preflight', [sys.executable, str(HERE / 'pd_vllm_store_probe.py'),
+                 '--ip', ip, '--config', str(config), '--output', str(out / 'store-preflight.json')],
+                 role_env(common, 'prefill', ip), logs)
+    try:
+        rc = proc.wait(timeout=900)
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError('Store allocation/PUT/GET preflight timed out') from exc
+    if rc:
+        tail = (logs / 'store-preflight.log').read_text(errors='replace')[-6000:]
+        raise RuntimeError(f'Store allocation/PUT/GET preflight failed ({rc}): {tail}')
+    result = json.loads((out / 'store-preflight.json').read_text())
+    if result.get('status') != 'passed':
+        raise RuntimeError('Store preflight did not confirm a successful round trip')
+    # A completed one-shot probe is not a long-running service.
+    PROCESSES[:] = [entry for entry in PROCESSES if entry[1] is not proc]
+    print('[store-preflight] per-rank allocation and PUT/GET passed', flush=True)
+
+
 def main():
     if os.environ.get("ATOMESH_PD_WORKER_LAYOUT") != "single_node":
         raise ValueError("This experiment requires single-node 1P1D")
@@ -254,11 +274,6 @@ def main():
     mem = dict(line.split(":", 1) for line in Path('/proc/meminfo').read_text().splitlines())
     available = int(mem['MemAvailable'].split()[0]) * 1024
     assert available > (1024 + 32 + 256) * 1024**3, f"Insufficient host memory: {available}"
-    # Reuse the cluster cache, while the model revision remains explicit.
-    # Bound download memory; Xet's concurrent shard reconstruction was killed
-    # with rc=137 during the first run, before Store or engines were started.
-    os.environ["HF_HUB_DISABLE_XET"] = "1"
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     memory = {"proc_meminfo": Path('/proc/meminfo').read_text(),
               "proc_cgroup": Path('/proc/self/cgroup').read_text()}
     for name in ('memory.max', 'memory.current', 'memory.events', 'memory.peak'):
@@ -266,20 +281,6 @@ def main():
         if path.exists():
             memory[name] = path.read_text()
     dump(out / "memory-before-download.json", memory)
-    print("[model] resolving pinned snapshot, HTTP streaming, max_workers=2", flush=True)
-    from huggingface_hub import snapshot_download
-    model_root = Path(os.environ["MODEL_PATH"])
-    cache_root = model_root.parent / ".hf-vllm-m31"
-    if not model_root.is_absolute():
-        raise ValueError("Catalog must supply the shared model root")
-    cache_root.mkdir(parents=True, exist_ok=True)
-    model_path = snapshot_download(plan['model'], revision=plan['model_revision'], cache_dir=str(cache_root), max_workers=2)
-    assert (Path(model_path) / 'dspark/config.json').exists()
-    plan["resolved_model_path"] = model_path
-    plan["runtime_ports"] = ports
-    plan["status"] = "running"
-    plan["concurrency"] = int(os.environ["CONC_LIST"])
-    dump(out / "resolved-experiment.json", plan)
     store = json.loads((CONFIG / "mooncake-store.json").read_text())
     store["master_server_address"] = f"{ip}:{ports['master']}"
     nics = hardware['infiniband']
@@ -301,6 +302,26 @@ def main():
             if time.monotonic() > deadline:
                 raise TimeoutError('Store master did not bind')
             time.sleep(2)
+    store_preflight(common, ip, out / 'mooncake-store.json', out, logs)
+    # Reuse the cluster cache, while the model revision remains explicit.
+    # Bound download memory; Xet's concurrent shard reconstruction was killed
+    # with rc=137 during the first run, before Store or engines were started.
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    print("[model] resolving pinned snapshot, HTTP streaming, max_workers=2", flush=True)
+    from huggingface_hub import snapshot_download
+    model_root = Path(os.environ["MODEL_PATH"])
+    cache_root = model_root.parent / ".hf-vllm-m31"
+    if not model_root.is_absolute():
+        raise ValueError("Catalog must supply the shared model root")
+    cache_root.mkdir(parents=True, exist_ok=True)
+    model_path = snapshot_download(plan['model'], revision=plan['model_revision'], cache_dir=str(cache_root), max_workers=2)
+    assert (Path(model_path) / 'dspark/config.json').exists()
+    plan["resolved_model_path"] = model_path
+    plan["runtime_ports"] = ports
+    plan["status"] = "running"
+    plan["concurrency"] = int(os.environ["CONC_LIST"])
+    dump(out / "resolved-experiment.json", plan)
     mode = common.get('ATOMESH_VLLM_MODE', 'benchmark')
     spec = dict(plan['speculative_config'])
     if mode == 'smoke':
@@ -320,11 +341,11 @@ def main():
                          'dbo-decode-token-threshold': 32768})
         cmd = ['vllm', 'serve', model_path, *flags(args)]
         dump(out / f'{role}-launch.json', {'argv': cmd, 'env': {k: env[k] for k in
-             sorted(env) if k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'HIP_VISIBLE', 'DEBUG_HIP'))}})
+             sorted(env) if k == 'GLIBC_TUNABLES' or k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'HIP_VISIBLE', 'DEBUG_HIP'))}})
         start(role, cmd, env, logs)
+        wait_http(f'http://{ip}:{ports[role]}/health',
+                  int(os.environ.get('WAIT_SERVER_TIMEOUT', 7200)))
     urls = {role: f'http://{ip}:{ports[role]}' for role in ('prefill', 'decode')}
-    for url in urls.values():
-        wait_http(url + '/health', int(os.environ.get('WAIT_SERVER_TIMEOUT', 7200)))
     proxy_url = f'http://{ip}:{ports["proxy"]}'
     start('proxy', [sys.executable, str(HERE / 'pd_vllm_proxy.py'),
           '--host', '0.0.0.0', '--port', str(ports['proxy']), '--prefill', urls['prefill'],

@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 PATH = Path(__file__).resolve().parents[1] / '.github/scripts/atomesh/pd_vllm_m31.py'
 SPEC = importlib.util.spec_from_file_location('m31_native', PATH)
@@ -49,6 +49,34 @@ class NativeExperimentTest(unittest.TestCase):
                              'kv-transfer-config': {'kv_role': 'kv_consumer'}})
         self.assertIn('--enable-prefix-caching', args)
         self.assertIn('--no-enable-dbo', args)
+
+
+class StorePreflightTest(unittest.TestCase):
+    def tearDown(self):
+        runner.PROCESSES.clear()
+
+    def test_successful_probe_is_removed_from_service_watch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / 'store-preflight.json').write_text('{"status": "passed"}')
+            proc = Mock()
+            proc.wait.return_value = 0
+            runner.PROCESSES.append(('store-preflight', proc, out / 'store-preflight.log'))
+            with patch.object(runner, 'start', return_value=proc):
+                runner.store_preflight({}, '127.0.0.1', out / 'config.json', out, out)
+            self.assertEqual(runner.PROCESSES, [])
+
+    def test_failed_native_setup_stops_phase_and_preserves_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / 'store-preflight.log').write_text('Failed to register local memory: INVALID_PARAMS')
+            proc = Mock()
+            proc.wait.return_value = 1
+            runner.PROCESSES.append(('store-preflight', proc, out / 'store-preflight.log'))
+            with patch.object(runner, 'start', return_value=proc):
+                with self.assertRaisesRegex(RuntimeError, 'INVALID_PARAMS'):
+                    runner.store_preflight({}, '127.0.0.1', out / 'config.json', out, out)
+            self.assertEqual(len(runner.PROCESSES), 1)
 
 
 class ValidatedSweepTest(unittest.TestCase):
