@@ -131,6 +131,9 @@ class GDNAttentionMetadata:
     no_initial_state: torch.Tensor | None = None
     non_spec_state_indices_i64: torch.Tensor | None = None
     non_spec_state_indices_in_i64: torch.Tensor | None = None
+    # True if any sequence reads its state from a slot other than the one it
+    # writes. Host-side so backends can skip fork handling without a device sync.
+    has_state_fork: bool = False
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
@@ -173,6 +176,13 @@ class GDNAttentionMetadata:
 
 
 class GDNStateMixin(PoolRowsMixin):
+    # Whether this backend's model moves a forked state onto the write slot
+    # before the spec kernels run. Neither spec kernel takes a read-side index,
+    # so a backend that does not do that cannot be handed a fork -- see the
+    # assert in `prepare_state_indices`. K3 is the only one, because pp>1 is
+    # the only thing that lands a fork on a decode forward at all.
+    spec_honours_state_fork = False
+
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
         self._init_gdn_state(model_runner)
@@ -223,8 +233,20 @@ class GDNStateMixin(PoolRowsMixin):
             )
 
         self.num_spec = 0
+        spec_config = getattr(model_runner.config, "speculative_config", None)
         if hasattr(model_runner, "drafter"):
             self.num_spec = model_runner.drafter.mtp_k
+        elif spec_config is not None:
+            # Under PP only the last stage has a drafter, but every stage runs the
+            # verify window over its own recurrent state; sized for one token it
+            # would advance state across rejected drafts with no rollback.
+            self.num_spec = int(spec_config.num_speculative_tokens or 0)
+            if self.num_spec == 0:
+                raise ValueError(
+                    "Speculative decoding is configured but "
+                    "num_speculative_tokens is unset, so a pipeline stage with "
+                    "no drafter cannot size its verify window."
+                )
         self.use_spec_decode = self.num_spec > 0
 
         # --- ReplaySSM ------------------------------------------------------
@@ -1196,9 +1218,13 @@ class GDNStateMixin(PoolRowsMixin):
         non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
         fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
-        assert not (with_spec and any(s >= 0 for s in fork_srcs)), (
+        self._has_state_fork = any(s >= 0 for s in fork_srcs)
+        assert not (
+            with_spec and self._has_state_fork and not self.spec_honours_state_fork
+        ), (
             "state fork on the spec-decode path: spec_state_indices_tensor has "
-            "no read-side counterpart (BlockManager only forks onto prefill)"
+            "no read-side counterpart, and this backend does not move the "
+            "forked state onto the write slot (spec_honours_state_fork)"
         )
         num_state_rows = len(batch.state_slots)
         non_spec_state_indices[num_state_rows:] = PAD_SLOT_ID
@@ -1219,6 +1245,11 @@ class GDNStateMixin(PoolRowsMixin):
                 non_spec_state_indices_in[idx] = src if src >= 0 else committed
             else:
                 spec_state_indices[idx, : len(slots)] = slots
+                # Same fork contract as the non-spec branch above. The spec
+                # kernels read `slots[0]`, so the source only has to reach the
+                # model, which moves the state over before they run.
+                src = fork_srcs[idx] if idx < len(fork_srcs) else -1
+                non_spec_state_indices_in[idx] = src if src >= 0 else committed
                 if self.replayssm:
                     # ReplaySSM holds one slot per request, and that same index
                     # addresses the checkpoint pool and the record buffers
@@ -1318,7 +1349,12 @@ class GDNStateMixin(PoolRowsMixin):
                 # 1-D tensor too; ship that to the device for `slot_idx`.
                 self.non_spec_state_indices_tensor.copy_to_gpu(num_reqs)
             non_spec_state_indices_tensor = None
-            non_spec_state_indices_in_tensor = None
+            # Only when forked: every other spec step ships None, as before.
+            non_spec_state_indices_in_tensor = (
+                self.non_spec_state_indices_in_tensor.copy_to_gpu(num_reqs)
+                if self._has_state_fork
+                else None
+            )
             spec_query_start_loc = query_start_loc
             non_spec_query_start_loc = None
             num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
@@ -1376,6 +1412,7 @@ class GDNStateMixin(PoolRowsMixin):
             no_initial_state=no_initial_state,
             non_spec_state_indices_i64=non_spec_state_indices_i64,
             non_spec_state_indices_in_i64=non_spec_state_indices_in_i64,
+            has_state_fork=getattr(self, "_has_state_fork", False),
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,

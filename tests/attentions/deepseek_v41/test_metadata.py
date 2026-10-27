@@ -524,7 +524,9 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
     builder.cache = PagedAttentionCache(geo, 4, 1, device, max_tokens=8)
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(1, 8, 4, device, geo),
-        tokenID_processor=SimpleNamespace(num_rejected=None),
+        tokenID_processor=SimpleNamespace(
+            num_rejected=None, verify_context_shift=lambda: None
+        ),
     )
     batch = SimpleNamespace(
         is_dummy_run=False,
