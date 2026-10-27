@@ -276,20 +276,6 @@ class ParallelLMHead(VocabParallelEmbedding):
             # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
 
-    def _argmax_row_lens(self, logits: torch.Tensor) -> torch.Tensor:
-        """Full-width row lengths for `logits`, one tensor per row count, kept.
-
-        Never evicted: a captured draft head reads the one it was recorded
-        with on every replay.
-        """
-        rows, width = logits.shape
-        cache = self.__dict__.setdefault("_row_lens_by_rows", {})
-        lens = cache.get(rows)
-        if lens is None:
-            lens = torch.full((rows,), width, dtype=torch.int32, device=logits.device)
-            cache[rows] = lens
-        return lens
-
     def compute_argmax_token(
         self, x: torch.Tensor, *, out: torch.Tensor
     ) -> torch.Tensor:
@@ -340,17 +326,8 @@ class ParallelLMHead(VocabParallelEmbedding):
             # `output_idx=out` rather than a returned tensor: a draft pass is
             # recorded, and a capture bakes the address the answer lands at.
             # `tie="low"` keeps the lowest-index pick promised above; `logits`
-            # stays bf16, since the reduction widens as it reads. `end` is ours
-            # for the same reason: left out, aiter reads a row-length tensor
-            # from an 8-entry LRU, which evicts (and frees) the one a recording
-            # baked once more than 8 batch sizes have been seen.
-            topk_select(
-                logits,
-                1,
-                tie="low",
-                end=self._argmax_row_lens(logits),
-                output_idx=out.view(-1, 1),
-            )
+            # stays bf16, since the reduction widens as it reads.
+            topk_select(logits, 1, tie="low", output_idx=out.view(-1, 1))
             return out
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.

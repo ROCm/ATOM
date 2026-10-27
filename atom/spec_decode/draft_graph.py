@@ -191,18 +191,12 @@ class DraftGraph:
             f"{self.name} has no staged input {role!r}; "
             f"declared roles are {sorted(self._buffers)}"
         )
-        capacity = self._max_bs(role)
+        capacity = self._buffers[role].numel() // math.prod(self.inputs[role].shape)
         assert 0 <= bs <= capacity, (
             f"{self.name} requested {bs} rows from draft input {role!r}, "
             f"whose capacity is {capacity}"
         )
         return self._view(role, bs)
-
-    def _max_bs(self, role: str) -> int:
-        buf = self._buffers[role]
-        if not self.inputs[role].batch_last:
-            return buf.shape[0]
-        return buf.shape[0] // math.prod(self.inputs[role].shape)
 
     def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
         """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
