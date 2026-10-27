@@ -2438,7 +2438,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=apply_router_weight_on_input,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
-                num_local_tokens=scheduled_tokens_gpu,
+                # Routing already sends rows past the real count to expert -1;
+                # only a prefilled shared column still needs the count. Passing
+                # it otherwise makes aiter discard its tuned inline-sort rows.
+                num_local_tokens=(
+                    scheduled_tokens_gpu if layer.num_fused_shared_experts > 0 else None
+                ),
                 **moe_extra_args,
             )
         return self.fused_experts(

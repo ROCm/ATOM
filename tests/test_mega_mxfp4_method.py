@@ -129,6 +129,7 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch, fp8_activati
         w2_bias="b2",
         expert_mask="mask",
         swiglu_limit=7.0,
+        num_fused_shared_experts=0,
     )
 
     result = method.apply(
@@ -268,3 +269,56 @@ def test_mega_backend_uses_global_dispatch_width(monkeypatch):
     assert output == "output"
     assert captured["experts"] == 264
     assert captured["topk"] == 9
+
+
+@pytest.mark.parametrize(
+    ("num_fused_shared_experts", "expect_count"), [(0, False), (1, True)]
+)
+def test_real_row_count_only_reaches_fused_moe_for_a_shared_column(
+    monkeypatch, num_fused_shared_experts, expect_count
+):
+    # Routing already sends pad rows to -1; the count is only for a prefilled
+    # shared column. Passing it otherwise makes aiter drop its tuned
+    # inline-sort rows (Kimi-K3 decode, M <= 64).
+    calls = []
+    monkeypatch.setattr(
+        moe_mod, "fused_moe", lambda *a, **kw: calls.append(kw) or "output"
+    )
+    method = object.__new__(moe_mod.Mxfp4MoEMethod)
+    method.fused_experts = None
+    method.quant_type = "mxfp4"
+    method.is_guinterleave = True
+    method.fp8_activations = False
+    method.hidden_pad = 0
+    method.intermediate_pad = 0
+    method.use_triton = False
+    method.use_triton_decode = False
+    method.use_triton_ep = False
+    layer = SimpleNamespace(
+        w13_weight="w1",
+        w2_weight="w2",
+        w13_weight_scale="w1_scale",
+        w2_weight_scale="w2_scale",
+        w13_input_scale=None,
+        w2_input_scale=None,
+        w13_bias=None,
+        w2_bias=None,
+        expert_mask=None,
+        swiglu_limit=None,
+        num_fused_shared_experts=num_fused_shared_experts,
+    )
+    count = torch.tensor([3], dtype=torch.int32)
+
+    method.apply(
+        layer=layer,
+        x="x",
+        topk_weights="topk_weights",
+        topk_ids="topk_ids",
+        global_num_experts=16,
+        expert_map=None,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        scheduled_tokens_gpu=count,
+    )
+
+    assert calls.pop()["num_local_tokens"] is (count if expect_count else None)
