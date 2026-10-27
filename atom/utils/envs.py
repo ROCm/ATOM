@@ -518,6 +518,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_M3_SPARSE_KV_MXFP4": lambda: (
         os.getenv("ATOM_M3_SPARSE_KV_MXFP4", "0") == "1"
     ),
+    # MiniMax-M3 MXFP4 index cache: the fused writer emits the indexer query as
+    # e4m3 (cast as is) and the scorer reads it, instead of bf16. Needs
+    # --index-cache-dtype mxfp4.
+    "ATOM_M3_INDEX_Q_FP8": lambda: os.getenv("ATOM_M3_INDEX_Q_FP8", "0") == "1",
     # With NVFP4 KV + FP4 index: decode index score + top-k through SGLang's fused
     # gfx950 verify kernel (>= 3 requests). 0 keeps the Triton scorer + top-k.
     "ATOM_M3_FUSED_VERIFY_TOPK": lambda: (

@@ -116,3 +116,9 @@ def test_the_baselines_are_never_refused():
     # Neither MXFP4 switch on: nothing to check, whatever else is set.
     check(arches=["LlamaForCausalLM"], index_cache_dtype="fp8", kv_mxfp4=False)
     check(index_cache_dtype="fp4", kv_mxfp4=False, kv_nvfp4=True, block_size=16)
+
+
+def test_an_fp8_index_q_needs_the_mxfp4_index():
+    check(index_q_fp8=True)
+    with pytest.raises(ValueError, match="INDEX_Q_FP8"):
+        check(index_cache_dtype="fp8", index_q_fp8=True)

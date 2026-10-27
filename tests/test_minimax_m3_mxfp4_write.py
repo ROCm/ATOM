@@ -74,7 +74,11 @@ def run(impl, qkv, position, slots, k_cache, v_cache, index_cache):
     return impl.rope_cache(None, None, None, qkv, position, ctx)
 
 
-def test_mxfp4_pages_match_the_bf16_write():
+@pytest.mark.parametrize("index_q_fp8", [False, True])
+def test_mxfp4_pages_match_the_bf16_write(index_q_fp8, monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_M3_INDEX_Q_FP8", index_q_fp8)
     T = 37
     g = torch.Generator(device="cuda").manual_seed(1)
     width = (NQ + 2 * NKV + NIQ + 1) * D
@@ -109,10 +113,15 @@ def test_mxfp4_pages_match_the_bf16_write():
 
     assert kc is kp and vc is vp and ks is None and vs is None
     assert q.dtype == torch.float8_e4m3fn and q.shape == (T, NQ, D)
-    assert impl._index_q.dtype == torch.bfloat16
-    torch.testing.assert_close(
-        impl._index_q.float(), iq_bf16.view(T, NIQ, D).float(), rtol=0, atol=0
-    )
+    if index_q_fp8:
+        assert impl._index_q.dtype == torch.float8_e4m3fn
+        got_iq, want_iq = impl._index_q.float(), iq_bf16.view(T, NIQ, D).float()
+        assert (got_iq - want_iq).norm() / want_iq.norm() < 0.04  # the e4m3 cast
+    else:
+        assert impl._index_q.dtype == torch.bfloat16
+        torch.testing.assert_close(
+            impl._index_q.float(), iq_bf16.view(T, NIQ, D).float(), rtol=0, atol=0
+        )
     qd = q.float().view(T, NQ * D)
     assert (qd - q_bf16.float()).norm() / q_bf16.float().norm() < 0.04  # e4m3 cast
 
