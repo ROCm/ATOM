@@ -98,6 +98,7 @@ class EngineUtilityHandler:
         "release_memory": "_handle_release_memory",
         "resume_memory": "_handle_resume_memory",
         "clear_kv_cache": "_handle_clear_kv_cache",
+        "reset_prefix_cache": "_handle_reset_prefix_cache",
         "configure_hidden_states": "_handle_configure_hidden_states",
         "start_profile": "_handle_start_profile",
         "stop_profile": "_handle_stop_profile",
@@ -620,6 +621,30 @@ class EngineUtilityHandler:
             timeout=_remaining_timeout(args, 300.0),
         )
         logger.info(f"{self.label}: resume_memory completed, tags={tags}")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_reset_prefix_cache(self, args: dict) -> dict:
+        """Executed on the scheduler thread; never zero physical KV memory."""
+        scheduler = self.scheduler
+        bm = getattr(scheduler, "block_manager", None)
+        if bm is None or not callable(getattr(bm, "clear_cache", None)):
+            result = {"status": "unsupported", "reason": "No prefix block manager"}
+        elif getattr(scheduler, "kv_connector", None) is not None or getattr(bm, "state_offload", None) is not None:
+            result = {"status": "unsupported", "reason": "External KV/offload cache reset is not supported"}
+        elif scheduler.has_requests() or getattr(scheduler, "prefill_waiting", ()):
+            result = {"status": "busy", "reason": "Scheduler still has queued or running requests"}
+        else:
+            try:
+                if not args.get("dry_run", False):
+                    bm.clear_cache()
+                result = {"status": "ok"}
+            except Exception as exc:
+                # Report failure without terminating the serving process.
+                reply = {"cmd": "reset_prefix_cache", "error": str(exc)}
+                self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+                return reply
+        reply = {"cmd": "reset_prefix_cache", "result": result}
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 

@@ -414,6 +414,9 @@ class LLMEngine:
             },
         }
 
+    def reset_prefix_cache(self, timeout: float = 30.0) -> dict[str, Any]:
+        return self.core_mgr.reset_prefix_cache(timeout=timeout)
+
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 

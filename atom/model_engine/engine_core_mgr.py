@@ -17,6 +17,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock, RLock, Thread, local
 
+from atom.model_engine.prefix_cache_reset import (
+    PrefixCacheBusyError, PrefixCacheResetGate, fence_prefix_cache_admission,
+)
+
 import zmq
 import zmq.asyncio
 
@@ -247,6 +251,7 @@ class CoreManager:
         self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
             config, "prefill_context_parallel_size", 1
         )
+        self._prefix_cache_reset_gate = PrefixCacheResetGate()
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -820,6 +825,9 @@ class CoreManager:
                         for seq in seqs:
                             delivered |= self._deliver_terminal_output(seq)
                             self._release_seq_load(seq.id)
+                            gate = getattr(self, "_prefix_cache_reset_gate", None)
+                            if gate is not None:
+                                gate.finished(seq.id)
                         if delivered and self._flush_stream_batch_fn is not None:
                             # The callbacks above only buffer into a thread-local;
                             # without this flush the chunk never reaches the
@@ -995,6 +1003,7 @@ class CoreManager:
                 [self.control_identities[dp_rank], payload], copy=copy
             )
 
+    @fence_prefix_cache_admission
     def add_request(self, seqs: list[Sequence]):
         tracing.bind_sequences(seqs)
         logger.debug(
@@ -1888,6 +1897,36 @@ class CoreManager:
                     f"{self.label}: could not tell DP rank {rank} to discard "
                     f"the failed {failed_cmd!r}"
                 )
+
+    def reset_prefix_cache(self, timeout: float = 30.0):
+        """Reset every local prefix index while admission is fenced.
+
+        A preflight checks all schedulers before mutation. The normal RPC
+        transport requires one acknowledgement per DP engine and raises on
+        errors or missing replies. A partial failure is never success.
+        """
+        if type(self) is not CoreManager or self.pp_size != 1:
+            raise NotImplementedError("Prefix reset currently supports non-disaggregated TP/DP serving")
+        with self._prefix_cache_reset_gate.resetting():
+            deadline = time.monotonic() + checked_timeout(timeout)
+            for dry_run in (True, False):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Prefix reset deadline expired")
+                replies = self.broadcast_utility_command_sync(
+                    "reset_prefix_cache", timeout=remaining, dry_run=dry_run
+                )
+                if not replies:
+                    raise RuntimeError("No schedulers acknowledged prefix reset")
+                for reply in replies:
+                    result = reply.get("result", {})
+                    if result.get("status") == "busy":
+                        raise PrefixCacheBusyError(result["reason"])
+                    if result.get("status") == "unsupported":
+                        raise NotImplementedError(result["reason"])
+                    if result.get("status") != "ok":
+                        raise RuntimeError(f"Unexpected prefix reset response: {reply}")
+            return {"success": True, "ranks": len(replies), "statistics_reset": False}
 
     def broadcast_utility_command_sync(
         self,
