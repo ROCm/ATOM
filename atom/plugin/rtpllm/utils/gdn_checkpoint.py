@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-from contextvars import ContextVar
-
 import torch
 import triton
 import triton.language as tl
-
-_NATIVE_VK_SNAPSHOT: ContextVar[bool] = ContextVar(
-    "rtp_native_vk_snapshot", default=False
-)
 
 
 def install_rtp_native_prefill_snapshot() -> None:
@@ -35,73 +29,33 @@ def install_rtp_native_prefill_snapshot() -> None:
         *,
         state_indices=None,
         has_initial_state=None,
+        snapshot_layout="kv",
     ):
-        if not is_rtpllm() or not keep_intermediate_states:
-            _NATIVE_VK_SNAPSHOT.set(False)
-            return original(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                initial_state,
-                cu_seqlens,
-                metadata,
-                keep_intermediate_states,
-                state_indices=state_indices,
-                has_initial_state=has_initial_state,
-            )
-        if not gdn_flydsl.prefill_supported(q, k, v, g, beta, metadata):
-            raise ValueError("Unsupported AITER FlyDSL prefill shape/metadata")
-        gdn_flydsl._log_dispatch("prefill K1-K5 (ATOM K6)")
-        schedule, chunks = metadata
-        q, k = (
-            gdn_flydsl.l2norm_fwd(q.contiguous()),
-            gdn_flydsl.l2norm_fwd(k.contiguous()),
+        use_native_snapshot = (
+            is_rtpllm() and keep_intermediate_states and snapshot_layout == "kv"
         )
-        w, u, gc = gdn_flydsl.ops()[1](
-            k=k,
-            v=v.contiguous(),
-            g=g.contiguous(),
-            beta=beta.contiguous(),
-            cu_seqlens=cu_seqlens,
-            BT=64,
-            use_exp2=True,
-            prefill_metadata=schedule,
-        )
-        h0 = gdn_flydsl.prepare_prefill_state(
-            initial_state, state_indices, has_initial_state
-        )
-        h, vn, ht = gdn_flydsl.ops()[2](
-            k=k,
-            w=w,
-            u=u,
-            g=gc,
-            initial_state=h0,
-            output_final_state=True,
-            chunk_size=64,
-            cu_seqlens=cu_seqlens,
-            state_dtype=torch.float32,
-            snapshot_dtype=torch.bfloat16,
-            use_exp2=True,
-            g_head_major=True,
-            bf16_convert_trunc=False,
-            prefill_metadata=schedule,
-        )
-        output = gdn_flydsl.chunk_fwd_o(
+        output, final_state, snapshot = original(
             q,
             k,
-            vn,
-            h,
-            gc,
-            cu_seqlens=cu_seqlens,
-            head_major_vk=True,
-            chunk_indices=chunks,
+            v,
+            g,
+            beta,
+            initial_state,
+            cu_seqlens,
+            metadata,
+            keep_intermediate_states,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+            snapshot_layout="vk" if use_native_snapshot else snapshot_layout,
         )
-        _NATIVE_VK_SNAPSHOT.set(True)
-        return output, ht.transpose(-1, -2), h
+        if not use_native_snapshot:
+            return output, final_state, snapshot
+        # The layout belongs to the returned tensor, not a context-wide flag.
+        snapshot._rtp_gdn_snapshot_vk = True
+        return output, final_state, snapshot
 
     prefill._rtp_native_snapshot = True
+    prefill._rtp_original = original
     gdn_flydsl.prefill = prefill
 
 
@@ -212,8 +166,13 @@ def write_rtp_gdn_checkpoints(
         raise ValueError("GDN checkpoint snapshot heads must be contiguous")
     if state.stride(0) < state_elements:
         raise ValueError("GDN state slot is smaller than its logical state")
-    if state_vk and state.stride(1) != state.shape[-2] * state.shape[-1]:
+    if state.stride(1) != state.shape[-2] * state.shape[-1]:
         raise ValueError("GDN state heads must be physically contiguous")
+    if state_vk:
+        if state.stride(-2) != 1 or state.stride(-1) != state.shape[-2]:
+            raise ValueError("GDN VK state has unexpected inner strides")
+    elif state.stride(-2) != state.shape[-1] or state.stride(-1) != 1:
+        raise ValueError("GDN KV state has unexpected inner strides")
     if not 0 < conv_state_len <= conv.shape[2]:
         raise ValueError("GDN convolution window is wider than the pool")
     if x.stride(-1) != 1:
@@ -278,8 +237,6 @@ def install_rtp_gdn_checkpoint_writer() -> None:
         conv_state_len,
         h_vk=False,
     ):
-        native_vk = _NATIVE_VK_SNAPSHOT.get()
-        _NATIVE_VK_SNAPSHOT.set(False)
         if not is_rtpllm():
             return original(
                 h,
@@ -310,7 +267,7 @@ def install_rtp_gdn_checkpoint_writer() -> None:
             cu_seqlens,
             chunk_size,
             conv_state_len,
-            h_vk=native_vk or h_vk,
+            h_vk=bool(getattr(h, "_rtp_gdn_snapshot_vk", False)) or h_vk,
         )
 
     write_state_checkpoints._rtp_gdn_checkpoint_writer = True

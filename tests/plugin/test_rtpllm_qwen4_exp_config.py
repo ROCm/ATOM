@@ -61,11 +61,6 @@ def test_qwen4_exp_prefix_ple_hook_is_instance_local(monkeypatch):
             return torch.zeros_like(normalized)
 
     monkeypatch.setattr(qwen4_exp_prefix_cache, "Qwen4ExpPLELayer", FakePLE)
-    monkeypatch.setattr(
-        qwen4_exp_prefix_cache,
-        "advance_ngram_state",
-        lambda *args, **kwargs: None,
-    )
     writes = []
     monkeypatch.setattr(
         qwen4_exp_prefix_cache,
@@ -90,9 +85,14 @@ def test_qwen4_exp_prefix_ple_hook_is_instance_local(monkeypatch):
     torch.testing.assert_close(
         plugin_ple.forward_with_state(hidden, ids, metadata), hidden + 1
     )
+    assert (
+        plugin_ple._state_checkpoint_writer
+        is qwen4_exp_prefix_cache.write_ple_checkpoints
+    )
+    assert not hasattr(standalone_ple, "_state_checkpoint_writer")
     metadata.rtp_checkpoint_targets = {"rows": torch.tensor([0])}
-    torch.testing.assert_close(
-        plugin_ple.forward_with_state(hidden, ids, metadata), hidden
+    plugin_ple._state_checkpoint_writer(
+        ids, hidden, metadata, history_width=2, conv_state_len=3
     )
     torch.testing.assert_close(writes[0], hidden)
     assert len(writes) == 1
@@ -825,10 +825,9 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path, monkeypatch):
     assert config.compute_dtype == torch.bfloat16
     config.attn_config.tokens_per_block = 64
     monkeypatch.setattr(
-        qwen4_exp_model._rtp_ops,
-        "supports_plugin_cache_block_copy",
-        True,
-        raising=False,
+        qwen4_exp_model,
+        "_rtp_compute_ops_module",
+        lambda: SimpleNamespace(supports_plugin_cache_block_copy=True),
     )
     kv_cache_config = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
     ATOMQwen4Exp._apply_kv_cache_config(config, kv_cache_config)
@@ -839,14 +838,33 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path, monkeypatch):
     assert config.atom_qwen4_exp_prefix_cache_enabled is True
 
     monkeypatch.setattr(
-        qwen4_exp_model._rtp_ops, "supports_plugin_cache_block_copy", False
+        qwen4_exp_model,
+        "_rtp_compute_ops_module",
+        lambda: SimpleNamespace(supports_plugin_cache_block_copy=False),
     )
     legacy = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
     ATOMQwen4Exp._apply_kv_cache_config(config, legacy)
     assert legacy.reuse_cache is False
     assert config.atom_qwen4_exp_prefix_cache_enabled is False
     monkeypatch.setattr(
-        qwen4_exp_model._rtp_ops, "supports_plugin_cache_block_copy", True
+        qwen4_exp_model,
+        "_rtp_compute_ops_module",
+        lambda: SimpleNamespace(supports_plugin_cache_block_copy=lambda: True),
+    )
+    callable_capability = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
+    ATOMQwen4Exp._apply_kv_cache_config(config, callable_capability)
+    assert callable_capability.reuse_cache is False
+    assert config.atom_qwen4_exp_prefix_cache_enabled is False
+
+    monkeypatch.setattr(qwen4_exp_model, "_rtp_compute_ops_module", lambda: None)
+    missing_extension = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
+    ATOMQwen4Exp._apply_kv_cache_config(config, missing_extension)
+    assert missing_extension.reuse_cache is False
+
+    monkeypatch.setattr(
+        qwen4_exp_model,
+        "_rtp_compute_ops_module",
+        lambda: SimpleNamespace(supports_plugin_cache_block_copy=True),
     )
 
     disabled = SimpleNamespace(seq_size_per_block=64, reuse_cache=False)

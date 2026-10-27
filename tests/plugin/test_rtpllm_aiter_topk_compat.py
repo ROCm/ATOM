@@ -15,6 +15,16 @@ from atom.plugin.rtpllm.utils.topk_compat import (
 )
 
 
+def test_topk_signature_without_text_signature_uses_legacy_abi(monkeypatch):
+    from atom.plugin.rtpllm.utils import topk_compat
+
+    def unavailable_signature(_function):
+        raise ValueError("no signature found")
+
+    monkeypatch.setattr(topk_compat.inspect, "signature", unavailable_signature)
+    assert topk_compat._accepts_valid_rows(lambda: None) is False
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_old_aiter_topk_masks_graph_padding_on_device(monkeypatch):
     import aiter

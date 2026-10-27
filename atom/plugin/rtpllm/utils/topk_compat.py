@@ -1,4 +1,4 @@
-"""RTP-only compatibility for AITER top-k wheels without valid-row masking."""
+"""RTP-only compatibility for older AITER top-k softmax signatures."""
 
 from __future__ import annotations
 
@@ -12,7 +12,12 @@ import triton.language as tl
 
 @lru_cache(maxsize=2)
 def _accepts_valid_rows(topk_softmax) -> bool:
-    return "num_valid_rows" in inspect.signature(topk_softmax).parameters
+    try:
+        return "num_valid_rows" in inspect.signature(topk_softmax).parameters
+    except (TypeError, ValueError):
+        # Older compiled wrappers can lack a Python text signature. They use
+        # the seven-argument ABI, so mask Graph padding after that call.
+        return False
 
 
 @triton.jit

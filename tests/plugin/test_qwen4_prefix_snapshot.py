@@ -16,7 +16,8 @@ def test_flydsl_snapshot_matches_prefix_final_state(monkeypatch):
     )
 
     monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "rtpllm")
-    monkeypatch.setattr(gdn_flydsl, "prefill", gdn_flydsl.prefill)
+    original_prefill = getattr(gdn_flydsl.prefill, "_rtp_original", gdn_flydsl.prefill)
+    monkeypatch.setattr(gdn_flydsl, "prefill", original_prefill)
     install_rtp_native_prefill_snapshot()
     prefill = gdn_flydsl.prefill
     build_prefill_metadata = gdn_flydsl.build_prefill_metadata
@@ -31,7 +32,11 @@ def test_flydsl_snapshot_matches_prefix_final_state(monkeypatch):
     beta = torch.rand(1, length, 24, device=device, dtype=torch.bfloat16)
     pool = torch.zeros(1, 24, 128, 128, device=device, dtype=torch.float32)
     cu_full = torch.tensor([0, length], device=device, dtype=torch.int32)
-    _, _, snapshots = prefill(
+    full_metadata = build_prefill_metadata((length,), cu_full)
+    original_output, original_final, original_snapshots = original_prefill(
+        q, k, v, g, beta, pool, cu_full, full_metadata, True
+    )
+    output, final_state, snapshots = prefill(
         q,
         k,
         v,
@@ -39,9 +44,13 @@ def test_flydsl_snapshot_matches_prefix_final_state(monkeypatch):
         beta,
         pool,
         cu_full,
-        build_prefill_metadata((length,), cu_full),
+        full_metadata,
         True,
     )
+    assert torch.equal(output, original_output)
+    assert torch.equal(final_state, original_final)
+    assert torch.equal(snapshots.transpose(-1, -2), original_snapshots)
+    assert snapshots._rtp_gdn_snapshot_vk is True
     cu_prefix = torch.tensor([0, prefix], device=device, dtype=torch.int32)
     _, final, _ = prefill(
         q[:, :prefix],
