@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Runner wiring only; storage and protocol tests do not require this import."""
 
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -122,3 +123,91 @@ def test_output_capacity_follows_server_limit_and_warmup_floor(max_num_seqs):
     )
     assert processor.recv_draft_token_ids().size == 0
     assert processor.recv_spec_status() == (None, None)
+
+
+class _FakeGpuTensor:
+    """What send_to_cpu_async sees of a GPU tensor: `.to` makes a host copy."""
+
+    def __init__(self, values):
+        self.values = values
+
+    def to(self, device, non_blocking=False):
+        return self.values.clone()
+
+
+@pytest.fixture
+def cpu_processor(monkeypatch):
+    def empty(*args, pin_memory=False, **kwargs):
+        return original_empty(*args, **kwargs)
+
+    original_empty = torch.empty
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch.cuda, "Event", mock.Mock)
+    monkeypatch.setattr(torch.cuda, "current_stream", mock.Mock)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: mock.MagicMock())
+    processor = object.__new__(runner_module.tokenIDProcessor)
+    processor.async_copy_stream = mock.Mock()
+    processor._output_request_capacity = 4
+    processor.num_spec_tokens = 2
+    processor.clean()
+    return processor
+
+
+def _record_alive_at(event, refs):
+    seen = []
+    event.synchronize.side_effect = lambda: seen.append(
+        [ref() is not None for ref in refs]
+    )
+    return seen
+
+
+def test_sampled_sources_are_held_until_recv_has_waited_on_copy_done(
+    cpu_processor,
+):
+    """The handle owns the GPU ids and logprobs until their copy is waited on."""
+    processor = cpu_processor
+    ids = _FakeGpuTensor(torch.tensor([3, 4], dtype=torch.int32))
+    logprobs = _FakeGpuTensor(torch.tensor([-0.5, -1.5]))
+    refs = [weakref.ref(ids), weakref.ref(logprobs)]
+    copy_done = mock.Mock()
+    seen = _record_alive_at(copy_done, refs)
+    processor.send_to_cpu_async(
+        ids, processor.token_ids_cpu, mock.Mock(), copy_done, gpu_logprobs=logprobs
+    )
+    del ids, logprobs
+    assert all(ref() is not None for ref in refs)
+
+    token_ids = processor.recv_async_output(processor.token_ids_cpu)
+    assert seen == [[True, True]]
+    assert all(ref() is None for ref in refs)
+    assert processor.token_ids_cpu == []
+    assert token_ids.tolist() == [3, 4]
+    assert processor.recv_logprobs() == [-0.5, -1.5]
+
+
+def test_clean_waits_for_every_queued_copy_before_dropping_it(cpu_processor):
+    processor = cpu_processor
+    ids = _FakeGpuTensor(torch.tensor([3, 4], dtype=torch.int32))
+    status = torch.tensor([[1, 1], [0, 0]], dtype=torch.int32)
+    draft = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
+    refs = [weakref.ref(t) for t in (ids, status, draft)]
+    copy_done = mock.Mock()
+    processor.send_to_cpu_async(ids, processor.token_ids_cpu, mock.Mock(), copy_done)
+    processor.spec_status_queue.send(status)
+    processor.send_draft_token_ids_to_cpu(draft)
+    events = [
+        copy_done,
+        processor.spec_status_queue._pending[0].copy_done,
+        processor._draft_token_ids_queue._pending[0].copy_done,
+    ]
+    seen = [_record_alive_at(event, refs) for event in events]
+    del ids, status, draft
+
+    processor.clean()
+    # Each copy is waited on exactly once, while its own source is held.
+    for i, alive in enumerate(seen):
+        assert len(alive) == 1 and alive[0][i]
+    assert all(ref() is None for ref in refs)
+    assert processor.token_ids_cpu == []
+    assert processor.recv_spec_status() == (None, None)
+    assert processor.recv_draft_token_ids().size == 0

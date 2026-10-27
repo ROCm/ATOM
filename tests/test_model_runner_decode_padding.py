@@ -10,12 +10,13 @@ pytest.importorskip("aiter")
 
 from atom.model_engine import model_runner as runner_module
 from atom.utils.forward_context import ForwardMode
+from atom.utils.tbo.ubatching import sync_dp_metadata
 
 
 @pytest.mark.parametrize("mrope", [False, True])
 @pytest.mark.parametrize("dummy", [False, True])
 @pytest.mark.parametrize(
-    "scheduled,running,seqs,q,unified,prefill,piecewise",
+    "scheduled,running,seqs,q,unified,prefill,token_graph",
     [
         (3, 4, 3, 1, True, False, False),
         (9, 12, 3, 3, True, False, False),
@@ -27,13 +28,22 @@ from atom.utils.forward_context import ForwardMode
     ],
 )
 def test_runner_model_height_and_sampling_rows(
-    monkeypatch, mrope, dummy, scheduled, running, seqs, q, unified, prefill, piecewise
+    monkeypatch,
+    mrope,
+    dummy,
+    scheduled,
+    running,
+    seqs,
+    q,
+    unified,
+    prefill,
+    token_graph,
 ):
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
     runner.config = SimpleNamespace(prefill_context_parallel_size=1)
     runner._detailed_label_suffix = lambda batch: ""
-    runner._piecewise_cg_active = lambda: piecewise
+    runner._tr_hybrid_active = lambda: token_graph
     runner._dynamic_chunking = runner_module.DynamicChunkingWorker(runner)
     ids = torch.full((32,), -99, dtype=torch.int32)
     ids[:scheduled] = torch.arange(1, scheduled + 1)
@@ -51,7 +61,7 @@ def test_runner_model_height_and_sampling_rows(
     else:
         positions = pos[:scheduled]
     mode = ForwardMode(
-        use_cudagraph=piecewise,
+        use_cudagraph=token_graph,
         is_prefill=prefill,
         scheduled_bs=seqs,
         scheduled_tokens=scheduled,
@@ -59,8 +69,16 @@ def test_runner_model_height_and_sampling_rows(
         running_tokens=running,
         running_tokens_are_unified=unified,
         max_seqlen_q=q,
-        piecewise_captured=piecewise,
         tbo_collective_active=False,
+        sync=sync_dp_metadata(
+            dp_group=None,
+            dp_size=1,
+            scheduled_tokens=scheduled,
+            scheduled_bs=seqs,
+            is_prefill=prefill,
+            tbo_on=False,
+        ),
+        token_graph=token_graph,
     )
     metadata = SimpleNamespace(
         slot_mapping=torch.full((running,), -1),

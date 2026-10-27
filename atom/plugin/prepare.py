@@ -114,8 +114,14 @@ def _prepare_model_atom_rtpllm(
         from atom.model_loader.loader import WeightsMapper
         from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
 
-        # The RTP bridge below currently feeds token IDs only. Do not build a
-        # vision tower that RTP never supplies pixel tensors or mRoPE grids to.
+        is_mtp = bool(getattr(getattr(config, "model_config", None), "is_mtp", False))
+        if is_mtp:
+            from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+
+            model_cls = Qwen4ExpMTP
+
+        # RTP's multimodal worker owns the vision tower and sends embeddings to
+        # this language-model worker. Avoid loading the tower twice here.
         atom_config.multimodal_config = None
         hf = (
             getattr(atom_config.hf_config, "text_config", None) or atom_config.hf_config
@@ -127,8 +133,15 @@ def _prepare_model_atom_rtpllm(
         atom_config.quant_config.remap_layer_name(
             atom_config.hf_config,
             packed_modules_mapping=packed,
-            weights_mapper=WeightsMapper(
-                orig_to_new_prefix={"model.language_model.": "model."}
+            # The draft modules themselves are named mtp.*. Rewriting their
+            # quant exclusions to model.* makes FP8-disabled checkpoint
+            # layers miss the exclusion and load BF16 weights as FP8.
+            weights_mapper=(
+                None
+                if is_mtp
+                else WeightsMapper(
+                    orig_to_new_prefix={"model.language_model.": "model."}
+                )
             ),
             quant_exclude_name_mapping=getattr(
                 model_cls, "quant_exclude_name_mapping", {}

@@ -35,6 +35,21 @@ def glm52_native_mla_attention_construction():
         deepseek_v2.Attention = previous
 
 
+def _pack_head_slice(tensor: torch.Tensor) -> torch.Tensor:
+    """Pack an 8-head slice whose token stride still covers the other heads.
+
+    A rope-pad view keeps ``stride(-2) > size(-1)`` and must stay a view: the
+    hd256 kernel reads that pitch. This only packs the slice whose row pitch
+    already equals the head dim.
+    """
+
+    if tensor.ndim < 3 or tensor.stride(-2) != tensor.shape[-1]:
+        return tensor
+    if tensor.stride(-3) == tensor.shape[-2] * tensor.stride(-2):
+        return tensor
+    return tensor.contiguous()
+
+
 class SGLangATOMGLM52MLAAttention(MLAAttention):
     """Use ATOM native ``MLAAttention`` under SGLang plugin runtime.
 
@@ -133,3 +148,136 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
             )
 
             return self.forward_impl(q_input, kv_c_normed, k_pe, positions, q_scale)
+
+    def _flash_attn_prefill(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        min_seqlen_q: int,
+        dropout_p: float,
+        causal: bool,
+        return_lse: bool = False,
+        q_fp8=None,
+        kv_fp8=None,
+        k_rope: torch.Tensor | None = None,
+    ):
+        """Run gfx950 hd256 varlen in the 8-head shape that already passes.
+
+        TP4 has 16 local heads. The causal-group kernel faults on that shape.
+        Heads are independent, so pack contiguous 8-head slices. Extents are
+        left unchanged: clamping them allocates a new tensor the captured
+        graph does not see.
+        """
+
+        n_heads = int(q.shape[1])
+        chunk_heads = (
+            n_heads > 8
+            and n_heads % 8 == 0
+            and int(q.shape[-1]) == 256
+            and int(k.shape[-1]) == 256
+            and int(v.shape[-1]) == 256
+            and int(k.shape[1]) == n_heads
+            and int(v.shape[1]) == n_heads
+        )
+        if not chunk_heads:
+            return super()._flash_attn_prefill(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                min_seqlen_q=min_seqlen_q,
+                dropout_p=dropout_p,
+                causal=causal,
+                return_lse=return_lse,
+                q_fp8=q_fp8,
+                kv_fp8=kv_fp8,
+                k_rope=k_rope,
+            )
+
+        outs = []
+        lses = []
+        for start in range(0, n_heads, 8):
+            head_slice = slice(start, start + 8)
+            # Keep a rope-pad pitch (stride(-2) wider than size(-1)): packing
+            # that view is what makes hd256 read off the allocation. A 16-head
+            # row sliced to 8 is the other way around — size(-1) already
+            # matches the row pitch, but the token stride still covers the
+            # unsliced heads. The group kernel treats that as packed and
+            # walks off the output.
+            q_piece = _pack_head_slice(q[:, head_slice])
+            k_piece = _pack_head_slice(k[:, head_slice])
+            v_piece = _pack_head_slice(v[:, head_slice])
+            rope = None if k_rope is None else _pack_head_slice(k_rope[:, head_slice])
+            piece = super()._flash_attn_prefill(
+                q_piece,
+                k_piece,
+                v_piece,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                min_seqlen_q=min_seqlen_q,
+                dropout_p=dropout_p,
+                causal=causal,
+                return_lse=return_lse,
+                q_fp8=None,
+                kv_fp8=None,
+                k_rope=rope,
+            )
+            if return_lse:
+                outs.append(piece[0])
+                lses.append(piece[1])
+            else:
+                outs.append(piece)
+        out = torch.cat(outs, dim=1)
+        if return_lse:
+            return out, torch.cat(lses, dim=0)
+        return out
+
+    def _forward_decode(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata,
+        return_lse: bool = False,
+        q_prepadded: bool = False,
+    ) -> torch.Tensor:
+        # Short MTP has no top-k selection. The dense KV table is the whole
+        # context; the sparse index buffer is not filled on this path.
+        # q==1 stays on sparse MLA: that is the FP8 decode graph.
+        short_dense = (
+            self.is_sparse_mla
+            and int(getattr(self, "dcp_world_size", 1) or 1) == 1
+            and int(getattr(attn_metadata, "max_seqlen_q", 1) or 1) > 1
+            and int(getattr(attn_metadata, "max_seqlen_k", 0) or 0)
+            <= int(self.topk_tokens or 0)
+        )
+        if not short_dense:
+            return super()._forward_decode(
+                q,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                return_lse=return_lse,
+                q_prepadded=q_prepadded,
+            )
+        saved = self.is_sparse_mla
+        self.is_sparse_mla = False
+        try:
+            return super()._forward_decode(
+                q,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                return_lse=return_lse,
+                q_prepadded=q_prepadded,
+            )
+        finally:
+            self.is_sparse_mla = saved

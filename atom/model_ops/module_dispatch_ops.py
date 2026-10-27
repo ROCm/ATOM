@@ -26,10 +26,10 @@ Currently registered:
 
 import torch
 
-from atom.config import CUDAGraphMode, get_current_atom_config
+from atom.config import get_current_atom_config
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils.forward_context import get_current_cudagraph_runtime_mode
+from atom.utils.forward_context import plugin_graph_is_piecewise
 
 # ---------------------------------------------------------------------------
 # Dual-stream MoE dispatch (V2 / V3.2 / V4 / K3)
@@ -53,18 +53,13 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
     # Under TBO the two micro-batches already overlap on separate threads
     from atom.utils.tbo.ubatching import tbo_active
 
-    # Graph ownership belongs to the active frontend.  Eager NONE and
-    # whole-model FULL capture both support the fork/join topology; PIECEWISE
-    # capture holds it too, but is opt-in (ATOM_DUAL_STREAM_PIECEWISE).
-    piecewise_blocked = (
-        get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
-        and not envs.ATOM_DUAL_STREAM_PIECEWISE
-    )
+    # Eager, FULL capture and a token-graph segment all hold the fork/join; a
+    # plugin frontend's own PIECEWISE graphs are left single-stream.
     return (
         self._use_dual_stream
         and 0 < num_tokens <= envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
         and not tbo_active()
-        and not piecewise_blocked
+        and not plugin_graph_is_piecewise()
     )
 
 
