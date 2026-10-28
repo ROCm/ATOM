@@ -44,12 +44,19 @@ def flags(values):
     return args
 
 
-def role_env(common, role, ip):
+def role_env(common, role, ip, overrides=None):
     env = dict(common)
+    # These belong to the role/worker, never to inherited launcher defaults.
+    for key in ('GLIBC_TUNABLES', 'MC_MAX_MR_SIZE', 'MC_TE_FILTERS', 'MC_DISABLE_HIP'):
+        env.pop(key, None)
     prefix = f"ATOMESH_{role.upper()}_ENV_"
     for key, value in os.environ.items():
         if key.startswith(prefix):
             env[key[len(prefix):]] = value.replace("${ROLE_IP}", ip)
+    env.update(overrides or {})
+    if role == 'decode':
+        env.pop('MOONCAKE_CONFIG_PATH', None)
+        env.pop('GLIBC_TUNABLES', None)
     for key in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         env.pop(key, None)
     env["HIP_VISIBLE_DEVICES"] = "0,1,2,3" if role == "prefill" else "4,5,6,7"
@@ -188,21 +195,11 @@ def smoke(model, model_path, p_url, d_url, proxy_url, out):
         if a != b or a != c:
             raise RuntimeError(f"PD/Store greedy output mismatch at {target} tokens")
 
-    # A prompt seen only by D must become readable by P through the shared Store.
-    prompt = "Decode-only seed for cross-role Store validation. " * 256
-    body = {"model": model, "prompt": prompt, "max_tokens": 32,
-            "temperature": 0, "ignore_eos": True, "seed": 42}
-    direct = json.loads(request(d_url + "/v1/completions", body, timeout=300))
-    reset_gpu_cache(d_url)
-    reset_gpu_cache(p_url)
-    load_before = store_load_bytes(request(p_url + "/metrics"))
-    repeated = json.loads(request(proxy_url + "/v1/completions", body, timeout=300))
-    loaded = verify_store_load(p_url, load_before, out, "smoke-decode-to-prefill")
-    matches = direct["choices"][0]["text"] == repeated["choices"][0]["text"]
-    dump(out / "smoke-cross-role.json", {"store_get_bytes": loaded, "matches": matches,
-                                       "direct": direct, "pd": repeated})
-    if not matches:
-        raise RuntimeError("Decode-written Store reuse by P changed greedy output")
+    dump(out / "smoke-store-scope.json", {
+        "store_roles": ["prefill"], "decode_connector": "MooncakeConnector",
+        "prefill_store_reload": "passed", "decode_to_prefill_store_reuse": "not_applicable",
+        "reason": "Decode has no Store connector and does not write Store objects.",
+    })
 
 
 def main():
@@ -226,7 +223,9 @@ def main():
             common[key[len("ATOMESH_ENV_"):]] = value
     common.update(plan["common_env"])
     common["VLLM_PLUGINS"] = ""
-    common["MC_DISABLE_HIP"] = "1"
+    for key in ('GLIBC_TUNABLES', 'MC_MAX_MR_SIZE', 'MC_TE_FILTERS', 'MC_DISABLE_HIP',
+                'MOONCAKE_CONFIG_PATH'):
+        common.pop(key, None)
     ip = os.environ.get("NODE0_ADDR", "127.0.0.1")
     common["VLLM_HOST_IP"] = ip
     offset = int(os.environ.get("ATOMESH_SERVICE_PORT_OFFSET", "0"))
@@ -258,7 +257,8 @@ def main():
     print(json.dumps(hardware), flush=True)
     mem = dict(line.split(":", 1) for line in Path('/proc/meminfo').read_text().splitlines())
     available = int(mem['MemAvailable'].split()[0]) * 1024
-    if available <= (1024 + 32 + 256) * 1024**3:
+    store_bytes = plan['offload']['total_pool_bytes'] + plan['offload']['total_private_buffer_bytes']
+    if available <= store_bytes + 128 * 1024**3:
         print(f'[store-memory][WARN] MemAvailable={available / 1024**3:.1f} GiB; '
               'continuing to actual Store registration', flush=True)
     # Reuse the cluster cache, while the model revision remains explicit.
@@ -289,14 +289,14 @@ def main():
     dump(out / "resolved-experiment.json", plan)
     store = json.loads((CONFIG / "mooncake-store.json").read_text())
     store["master_server_address"] = f"{ip}:{ports['master']}"
-    nics = hardware['infiniband']
-    if not nics:
-        raise RuntimeError("RDMA devices missing")
-    # Explicit whitelist prevents a future host from silently selecting other links.
-    device_names = ",".join(nics)
-    store['device_name'] = device_names
+    expected_nics = {f'rdma{i}' for i in range(8)}
+    if not expected_nics.issubset(hardware['infiniband']):
+        raise RuntimeError(f"Expected per-GPU RDMA rails {sorted(expected_nics)}, got {hardware['infiniband']}")
+    # Empty device_name lets MC_TE_FILTERS select one physical GPU rail in each
+    # worker, as in successful CI 40376309047. Never pass the eight-HCA list.
+    store['device_name'] = ''
     dump(out / "mooncake-store.json", store)
-    common['MOONCAKE_CONFIG_PATH'] = str(out / "mooncake-store.json")
+    common['ATOMESH_VLLM_STORE_CONFIG_PATH'] = str(out / "mooncake-store.json")
     common['PYTHONPATH'] = str(HERE) + (os.pathsep + common['PYTHONPATH'] if common.get('PYTHONPATH') else '')
     common['ATOMESH_VLLM_MEMORY_DIR'] = str(out)
     master = start('mooncake-master', ['mooncake_master', '--port', str(ports['master'])], common, logs)
@@ -316,10 +316,11 @@ def main():
         spec.pop('synthetic_acceptance_length', None)
         spec['rejection_sample_method'] = 'block'
     for role in ('prefill', 'decode'):
-        env = role_env(common, role, ip)
+        env = role_env(common, role, ip, plan[role]['env'])
+        if role == 'prefill':
+            env['MOONCAKE_CONFIG_PATH'] = common['ATOMESH_VLLM_STORE_CONFIG_PATH']
         env["ATOMESH_VLLM_ROLE"] = role
         cfg = json.loads((CONFIG / f'{role}-kv.json').read_text())
-        cfg['kv_connector_extra_config']['connectors'][0]['kv_connector_extra_config']['device_name'] = device_names
         dump(out / f'{role}-kv.json', cfg)
         args = dict(plan['common_args'])
         args.update({'served-model-name': plan['model'], 'port': ports[role], 'host': '0.0.0.0',
@@ -331,7 +332,7 @@ def main():
         cmd = ['vllm', 'serve', model_path, *flags(args)]
         recorded_env = {k: env[k] for k in sorted(env)
                         if k in ('GLIBC_TUNABLES', 'PYTHONPATH', 'ATOMESH_VLLM_ROLE',
-                                 'ATOMESH_VLLM_MEMORY_DIR')
+                                 'ATOMESH_VLLM_MEMORY_DIR', 'ATOMESH_VLLM_STORE_CONFIG_PATH')
                         or k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'NCCL_',
                                          'HIP_VISIBLE', 'DEBUG_HIP'))}
         dump(out / f'{role}-launch.json', {'argv': cmd, 'env': recorded_env})

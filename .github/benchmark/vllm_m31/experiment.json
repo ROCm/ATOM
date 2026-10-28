@@ -21,7 +21,7 @@
       6,
       7
     ],
-    "placement_note": "Choose physical GPU and NIC binding from allocated node topology; IDs are proposed host indices."
+    "placement_note": "One HCA per worker: MC_TE_FILTERS=rdma<physical GPU index>, set before native connector initialization."
   },
   "common_args": {
     "tensor-parallel-size": 4,
@@ -53,15 +53,13 @@
     "VLLM_ENGINE_READY_TIMEOUT_S": "7200",
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "900",
     "VLLM_MOONCAKE_BOOTSTRAP_PORT": "8998",
-    "MOONCAKE_CONFIG_PATH": "/config/mooncake-store.json",
     "PYTHONHASHSEED": "42",
-    "GLIBC_TUNABLES": "glibc.malloc.hugetlb=1",
-    "MC_MAX_MR_SIZE": "68719476736",
     "MC_MAX_CONCURRENT_REG_MR": "1",
     "NCCL_DMABUF_ENABLE": "0",
     "MC_GID_INDEX": "1",
     "MC_IB_TC": "104",
-    "MC_IB_PCI_RELAXED_ORDERING": "1"
+    "MC_IB_PCI_RELAXED_ORDERING": "1",
+    "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600"
   },
   "speculative_config": {
     "method": "dspark",
@@ -81,7 +79,11 @@
     "enable-dbo": true,
     "dbo-prefill-token-threshold": 16384,
     "dbo-decode-token-threshold": 32768,
-    "kv_transfer_config_file": "prefill-kv.json"
+    "kv_transfer_config_file": "prefill-kv.json",
+    "env": {
+      "MC_MAX_MR_SIZE": "1073741824",
+      "GLIBC_TUNABLES": "glibc.malloc.hugetlb=1"
+    }
   },
   "decode": {
     "port": 8200,
@@ -91,7 +93,10 @@
       "indexer_decode_cp": true
     },
     "enable-dbo": false,
-    "kv_transfer_config_file": "decode-kv.json"
+    "kv_transfer_config_file": "decode-kv.json",
+    "env": {
+      "MC_MAX_MR_SIZE": "268435456"
+    }
   },
   "proxy": {
     "port": 8000,
@@ -104,21 +109,21 @@
     "disk_offload": false,
     "store_config_file": "mooncake-store.json",
     "mode": "embedded",
-    "global_segment_size_per_rank_bytes": 137438953472,
-    "contributing_ranks": 8,
-    "total_pool_bytes": 1099511627776,
-    "local_buffer_size_per_rank_bytes": 4294967296,
-    "total_private_buffer_bytes": 34359738368,
+    "global_segment_size_per_rank_bytes": 224873414656,
+    "contributing_ranks": 4,
+    "total_pool_bytes": 899493658624,
+    "local_buffer_size_per_rank_bytes": 67108864,
+    "total_private_buffer_bytes": 268435456,
     "master_address": "127.0.0.1:50051",
     "prefill_store_role": "kv_both",
     "prefill_lookup": true,
-    "prefill_lookup_async": true,
+    "prefill_lookup_async": false,
     "prefill_load_async": true,
-    "decode_store_role": "kv_consumer",
+    "decode_store_role": null,
     "decode_lookup": false,
-    "save_decode_cache": true,
-    "cache_prefix": "m31-flash-vllm-nvfp4-dspark3-tp4",
-    "note": "Proposed capacity; embedded eight 128 GiB rank segments, not two external 512 GiB owners. enable_offload=false in Store JSON disables disk tier only; CPU Store remains enabled. Host memory registration and Store binaries/imports must be checked in the exact image before execution."
+    "save_decode_cache": false,
+    "cache_prefix": "",
+    "note": "Only the four Prefill ranks own embedded Store segments. Per-rank capacity matches successful CI 40376309047; TP4 gives half its TP8 total pool. Decode uses Mooncake Transfer only. enable_offload=false disables disk tier."
   },
   "benchmark": {
     "harness": "agentx-harness==1.0.12",
@@ -153,14 +158,13 @@
     ]
   },
   "unverified": [
-    "Image has Mooncake ROCm dependency and native connector source; exact M3.1 + NVFP4 + DSpark + DBO PD combination needs GPU smoke verification.",
-    "RDMA device binding and host IP depend on allocated node.",
-    "Synthetic acceptance is for performance only; smoke correctness must use block rejection.",
-    "Exact dataset snapshot selection must be verified in harness logs before measuring.",
-    "Exact-image mooncake.store import and mooncake_master executable have not been checked; engine dependency presence alone is not sufficient.",
-    "Validate Store reload of target KV/scales/index/draft-required state and decode-written prefix reuse by P for M3.1.",
-    "Embedded 1 TiB pool plus 32 GiB private buffers and metadata requires host memory/RDMA registration verification.",
-    "P/D Store key namespace and registered cache regions must match; smoke must demonstrate cross-role hits."
+    "MiniMax M3.1 + NVFP4 + DSpark + DBO requires GPU smoke with the fixed image.",
+    "Validate one HCA per process in the allocated node logs.",
+    "Smoke uses block rejection; synthetic acceptance remains performance-only.",
+    "Validate P Store reload after GPU cache reset and PD output against independent D computation.",
+    "Per-rank Store capacity and reduced MR limits require actual RDMA registration verification.",
+    "The successful reference uses Kimi K3 and a custom Mooncake wheel; this experiment retains the requested MiniMax image packages.",
+    "Verify exact dataset selection in harness logs before performance measurement."
   ],
   "not_a_runner_schema": false,
   "diagnostic_variants": {
@@ -173,5 +177,12 @@
       "mooncake_store": false,
       "cpu_offload": false
     }
+  },
+  "alignment_reference": {
+    "run_id": 40376309047,
+    "commit": "fc9bf7aa215f33067a8b0728279d076c0da5a313",
+    "scope": "Mooncake Store and RDMA configuration; retain MiniMax fixed image and single-node TP4+TP4",
+    "reference_prefill_ranks": 8,
+    "experiment_prefill_ranks": 4
   }
 }

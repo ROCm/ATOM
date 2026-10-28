@@ -1,6 +1,6 @@
 {
   "kv_connector": "MultiConnector",
-  "kv_role": "kv_producer",
+  "kv_role": "kv_both",
   "kv_load_failure_policy": "fail",
   "kv_connector_extra_config": {
     "connectors": [
@@ -10,19 +10,14 @@
         "kv_load_failure_policy": "fail",
         "kv_connector_extra_config": {
           "mooncake_protocol": "rdma",
-          "num_workers": 10,
-          "device_name": ""
+          "num_workers": 10
         }
       },
       {
         "kv_connector": "MooncakeStoreConnector",
         "kv_role": "kv_both",
         "kv_connector_extra_config": {
-          "cache_prefix": "m31-flash-vllm-nvfp4-dspark3-tp4",
-          "load_async": true,
-          "lookup_async": true,
-          "enable_lookup": true,
-          "save_decode_cache": false
+          "load_async": true
         }
       }
     ]

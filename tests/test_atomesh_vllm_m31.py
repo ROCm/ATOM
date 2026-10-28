@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[1] / '.github/scripts/atomesh/pd_vllm_m31.py'
@@ -26,6 +27,53 @@ class NativeExperimentTest(unittest.TestCase):
         for env in (p, d):
             self.assertNotIn('ROCR_VISIBLE_DEVICES', env)
             self.assertNotIn('CUDA_VISIBLE_DEVICES', env)
+
+    def test_role_settings_replace_inherited_store_and_rdma_defaults(self):
+        plan = json.loads((runner.CONFIG / 'experiment.json').read_text())
+        inherited = dict(plan['common_env'], GLIBC_TUNABLES='glibc.malloc.hugetlb=1',
+                         MC_MAX_MR_SIZE='68719476736', MC_TE_FILTERS='rdma0,rdma1',
+                         MC_DISABLE_HIP='1', MOONCAKE_CONFIG_PATH='/store.json',
+                         ATOMESH_VLLM_STORE_CONFIG_PATH='/store.json')
+        with patch.dict(os.environ, {}, clear=True):
+            p = runner.role_env(inherited, 'prefill', '127.0.0.1', plan['prefill']['env'])
+            d = runner.role_env(inherited, 'decode', '127.0.0.1', plan['decode']['env'])
+        self.assertEqual(p['MC_MAX_MR_SIZE'], str(1 << 30))
+        self.assertEqual(d['MC_MAX_MR_SIZE'], str(256 << 20))
+        self.assertEqual(p['GLIBC_TUNABLES'], 'glibc.malloc.hugetlb=1')
+        self.assertEqual(p['MOONCAKE_CONFIG_PATH'], '/store.json')
+        self.assertNotIn('GLIBC_TUNABLES', d)
+        self.assertNotIn('MOONCAKE_CONFIG_PATH', d)
+        for env in (p, d):
+            self.assertNotIn('MC_TE_FILTERS', env)  # Set per worker, after physical GPU mapping.
+            self.assertNotIn('MC_DISABLE_HIP', env)
+            self.assertEqual(env['ATOMESH_VLLM_STORE_CONFIG_PATH'], '/store.json')
+            self.assertEqual(env['MC_MAX_CONCURRENT_REG_MR'], '1')
+
+    def test_smoke_requires_prefill_store_reload_without_decode_store(self):
+        tokenizer = SimpleNamespace(encode=lambda text, **kwargs: list(range(len(text))),
+                                    decode=lambda ids: 'x' * len(ids))
+        auto_tokenizer = SimpleNamespace(from_pretrained=lambda *args, **kwargs: tokenizer)
+        def request(url, body=None, **kwargs):
+            if url.endswith('/metrics'):
+                return ''
+            return json.dumps({'choices': [{'text': 'four'}]})
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(sys.modules, {'transformers': SimpleNamespace(AutoTokenizer=auto_tokenizer)}), \
+             patch.object(runner, 'request', side_effect=request) as http, \
+             patch.object(runner, 'reset_gpu_cache', return_value={'success': True}), \
+             patch.object(runner, 'verify_store_load', return_value=128) as verify:
+            root = Path(tmp)
+            runner.smoke('model', '/snapshot', 'http://p', 'http://d', 'http://proxy', root)
+            self.assertEqual(verify.call_count, 3)
+            self.assertTrue(all(call.args[0] == 'http://p' for call in verify.call_args_list))
+            rows = json.loads((root / 'smoke.json').read_text())
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(all(row['matches_reference'] and row['matches_after_reset'] for row in rows))
+            completions = [call.args[0] for call in http.call_args_list if call.args[0].endswith('/v1/completions')]
+            self.assertEqual(completions, ['http://proxy/v1/completions', 'http://d/v1/completions',
+                                          'http://proxy/v1/completions'] * 3)
+            self.assertEqual(json.loads((root / 'smoke-store-scope.json').read_text())['decode_to_prefill_store_reuse'],
+                             'not_applicable')
 
     def test_reset_waits_for_async_store_block_references(self):
         with patch.object(runner, 'request', side_effect=[

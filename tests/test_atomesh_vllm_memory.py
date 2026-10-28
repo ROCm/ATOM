@@ -129,7 +129,7 @@ class THPPreparationTest(unittest.TestCase):
                          'MemFree': 128 * memory.GIB, 'Active(file)': 0, 'Inactive(file)': 0}), \
                      patch.object(memory.subprocess, 'run', side_effect=run), \
                      patch.object(memory, 'memory_failure') as failure:
-                    state = memory.prepare({'global_segment_size': memory.GIB // 4}, '/snapshot', root)
+                    state = memory.prepare({'global_segment_size': memory.GIB // 2}, '/snapshot', root)
                 self.assertEqual(probes, [0, 1])
                 self.assertEqual(state['status'], 'completed_with_warnings')
                 self.assertEqual(state['nodes'][1]['status'], 'completed')
@@ -164,10 +164,11 @@ class THPPreparationTest(unittest.TestCase):
             with patch.object(memory, 'cpu_numa_nodes', return_value=[0, 1]), \
                  patch('numa_memory_budget.node_meminfo', side_effect=info), \
                  patch.object(memory.subprocess, 'run', side_effect=run):
-                state = memory.prepare({'global_segment_size': 128 * memory.GIB,
-                                        'local_buffer_size': 4 * memory.GIB}, '/snapshot', tmp)
+                state = memory.prepare({'global_segment_size': 224873414656,
+                                        'local_buffer_size': 64 << 20}, '/snapshot', tmp)
             self.assertEqual(events, ['evict', ('meminfo', 0), ('probe', 0, '256'), ('meminfo', 1)])
-            self.assertEqual(state['nodes'][0]['desired_bytes'], 512 * memory.GIB)
+            self.assertEqual(state['nodes'][0]['desired_bytes'], 224873414656 * 4 // 2)
+            self.assertEqual(state['store_ranks'], 4)
             self.assertEqual(state['nodes'][1]['status'], 'skipped_low_memory')
             self.assertEqual(state['status'], 'completed_with_warnings')
 
@@ -188,7 +189,7 @@ class THPPreparationTest(unittest.TestCase):
                      patch('numa_memory_budget.node_meminfo', return_value={
                          'MemFree': 128 * memory.GIB, 'Active(file)': 0, 'Inactive(file)': 0}), \
                      patch.object(memory.subprocess, 'run', side_effect=run):
-                    state = memory.prepare({'global_segment_size': memory.GIB // 8}, '/snapshot', tmp)
+                    state = memory.prepare({'global_segment_size': memory.GIB // 4}, '/snapshot', tmp)
                 self.assertEqual(len(probes), 1)
                 self.assertEqual(state['nodes'][0]['status'], 'completed')
                 self.assertEqual(state['status'], 'completed_with_warnings')
@@ -233,7 +234,7 @@ class PostLoadPreparationTest(unittest.TestCase):
             self.assertEqual(result['status'], 'completed')
             self.assertEqual(len(result['workers']), 8)
 
-    def test_all_workers_attempt_store_after_partial_thp_and_timeout(self):
+    def test_all_workers_continue_after_partial_thp_and_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             registrations = []
@@ -244,7 +245,7 @@ class PostLoadPreparationTest(unittest.TestCase):
                     memory.write_json(Path(cmd[cmd.index('--output') + 1]), {'huge_bytes': memory.GIB // 2})
                 return subprocess.CompletedProcess(cmd, 0)
             def worker(role, rank):
-                memory.prepare_after_load({'global_segment_size': memory.GIB // 4}, '/snapshot', root, role, rank, 5)
+                memory.prepare_after_load({'global_segment_size': memory.GIB // 2}, '/snapshot', root, role, rank, 5)
                 registrations.append((role, rank))
             with patch.object(memory, 'cpu_numa_nodes', return_value=[0, 1]), \
                  patch('numa_memory_budget.node_meminfo', return_value={
@@ -290,30 +291,47 @@ class PostLoadPreparationTest(unittest.TestCase):
         class NativeWorker:
             def initialize_from_config(self, config):
                 events.append('store-init')
+                self.test.assertEqual(os.environ['MC_TE_FILTERS'], 'rdma0')
                 return config
         spec = importlib.util.spec_from_file_location('m31_test_worker', SCRIPTS / 'pd_vllm_worker.py')
         worker_module = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, {'vllm.v1.worker.gpu_worker': SimpleNamespace(Worker=NativeWorker)}):
             spec.loader.exec_module(worker_module)
         worker = worker_module.StoreMemoryWorker()
+        worker.test = self
         worker.local_rank = 0
         worker.parallel_config = SimpleNamespace(tensor_parallel_size=4)
         worker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model='/snapshot'))
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / 'store.json'
             config.write_text('{}')
-            with patch.dict(os.environ, {'MOONCAKE_CONFIG_PATH': str(config),
-                    'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill'}), \
+            with patch.dict(os.environ, {'ATOMESH_VLLM_STORE_CONFIG_PATH': str(config),
+                    'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill',
+                    'HIP_VISIBLE_DEVICES': '0,1,2,3', 'ROCR_VISIBLE_DEVICES': ''}), \
+                 patch.object(Path, 'exists', return_value=True), \
                  patch.object(worker_module, 'prepare_after_load', side_effect=lambda *args, **kw: events.append('prepare')):
                 self.assertEqual(worker.initialize_from_config('kv-config'), 'kv-config')
                 self.assertEqual(events, ['prepare', 'store-init'])
             events.clear()
-            with patch.dict(os.environ, {'MOONCAKE_CONFIG_PATH': str(config),
-                    'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill'}), \
+            with patch.dict(os.environ, {'ATOMESH_VLLM_STORE_CONFIG_PATH': str(config),
+                    'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill',
+                    'HIP_VISIBLE_DEVICES': '0,1,2,3', 'ROCR_VISIBLE_DEVICES': ''}), \
+                 patch.object(Path, 'exists', return_value=True), \
                  patch.object(worker_module, 'prepare_after_load', side_effect=RuntimeError('unexpected preparation error')):
                 with self.assertRaisesRegex(RuntimeError, 'unexpected preparation error'):
                     worker.initialize_from_config('kv-config')
                 self.assertEqual(events, [])
+
+    def test_worker_uses_physical_gpu_rail_for_both_tp_groups(self):
+        spec = importlib.util.spec_from_file_location('m31_hca_test_worker', SCRIPTS / 'pd_vllm_worker.py')
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'vllm.v1.worker.gpu_worker': SimpleNamespace(Worker=object)}):
+            spec.loader.exec_module(module)
+        self.assertEqual([module.mooncake_hca(i, {'HIP_VISIBLE_DEVICES': '0,1,2,3'}) for i in range(4)],
+                         ['rdma0', 'rdma1', 'rdma2', 'rdma3'])
+        self.assertEqual([module.mooncake_hca(i, {'HIP_VISIBLE_DEVICES': '4,5,6,7'}) for i in range(4)],
+                         ['rdma4', 'rdma5', 'rdma6', 'rdma7'])
+        self.assertEqual(module.mooncake_hca(1, {'ROCR_VISIBLE_DEVICES': '6,7', 'HIP_VISIBLE_DEVICES': '0,1'}), 'rdma7')
 
 
 class MemoryResubmitTest(unittest.TestCase):

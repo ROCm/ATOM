@@ -76,10 +76,10 @@ def prepare(store, model_path, out, timeout=600):
     out = Path(out)
     logs = out / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
-    state = {'status': 'running', 'nodes': [], 'warnings': [], 'reserve_gib': 64,
+    state = {'status': 'running', 'nodes': [], 'warnings': [], 'reserve_gib': 64, 'store_ranks': 4,
              'stage': 'after_model_load_before_store_init', 'started_at': time.time()}
     summary = out / 'memory-preparation.json'
-    segments = store['global_segment_size'] * 8
+    segments = store['global_segment_size'] * state['store_ranks']
     if segments <= 0:
         raise ValueError('Expected positive Store global_segment_size')
 
@@ -169,6 +169,8 @@ def prepare(store, model_path, out, timeout=600):
 def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
     """All eight workers reach KV initialization before one prepares host memory.
 
+    Only the four Prefill ranks own Store segments. All eight workers wait so
+    Decode's model loading cannot refill the shared node's cache during cleanup.
     This must run before Worker.initialize_from_config constructs the Store.
     Waiting before taking the lock lets both TP groups arrive without deadlock.
     A terminal result releases peers on success or failure; phase directories

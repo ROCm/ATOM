@@ -5,18 +5,38 @@ from pathlib import Path
 
 from vllm.v1.worker.gpu_worker import Worker
 
-from pd_vllm_memory import prepare_after_load
+from pd_vllm_memory import prepare_after_load, write_json
+
+
+def mooncake_hca(local_rank, environ=os.environ):
+    """Match the successful CI's physical GPU to RDMA rail mapping."""
+    visible = (environ.get('ROCR_VISIBLE_DEVICES') or environ.get('HIP_VISIBLE_DEVICES')
+               or environ.get('CUDA_VISIBLE_DEVICES') or '')
+    devices = [d for d in visible.split(',') if d]
+    physical_gpu = int(devices[local_rank]) if devices else local_rank
+    return f'rdma{physical_gpu}'
 
 
 class StoreMemoryWorker(Worker):
     def initialize_from_config(self, kv_cache_config):
         if self.parallel_config.tensor_parallel_size != 4:
             raise ValueError('Store memory preparation requires TP4 for both roles')
+        role = os.environ['ATOMESH_VLLM_ROLE']
+        out = Path(os.environ['ATOMESH_VLLM_MEMORY_DIR'])
+        hca = mooncake_hca(self.local_rank)
+        if not (Path('/sys/class/infiniband') / hca).exists():
+            raise RuntimeError(f'Missing physical GPU RDMA rail: {hca}')
+        os.environ['MC_TE_FILTERS'] = hca
+        write_json(out / f'{role}-rank-{self.local_rank}-mooncake.json', {
+            'role': role, 'local_rank': self.local_rank, 'MC_TE_FILTERS': hca,
+            'MC_MAX_MR_SIZE': os.environ.get('MC_MAX_MR_SIZE'),
+            'store_enabled': role == 'prefill',
+        })
+        print(f'[mooncake] {role} rank={self.local_rank} MC_TE_FILTERS={hca} store={role == "prefill"}', flush=True)
         prepare_after_load(
-            json.loads(Path(os.environ['MOONCAKE_CONFIG_PATH']).read_text()),
+            json.loads(Path(os.environ['ATOMESH_VLLM_STORE_CONFIG_PATH']).read_text()),
             self.vllm_config.model_config.model,
-            Path(os.environ['ATOMESH_VLLM_MEMORY_DIR']),
-            os.environ['ATOMESH_VLLM_ROLE'], self.local_rank,
+            out, role, self.local_rank,
             timeout=int(os.environ.get('VLLM_ENGINE_READY_TIMEOUT_S', '7200')),
         )
         return super().initialize_from_config(kv_cache_config)

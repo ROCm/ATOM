@@ -11,10 +11,23 @@ Those MI355X results used aggregated TP4. This experiment tests the same
 image in a new eight-GPU PD layout; it is not a published SA PD score.
 
 One node: prefill GPUs 0–3, decode GPUs 4–7, TP4 each. Both enable GPU prefix
-caching and use MultiConnector (Mooncake Transfer + Store). Store embeds
-128 GiB per rank, totaling 1 TiB, with 4 GiB of private buffers per rank.
-P does Store lookup/load/save; D saves completed decode blocks without Store
-lookup. CPU Store stays enabled; `enable_offload: false` disables its disk tier.
+caching. P uses MultiConnector (`kv_both`): Mooncake Transfer (`kv_producer`)
+plus Mooncake Store (`kv_both`, synchronous lookup, asynchronous load). D uses
+only Mooncake Transfer (`kv_consumer`) and does not write or allocate Store.
+Each P rank embeds 224,873,414,656 bytes (about 209.43 GiB), totaling about
+837.72 GiB across four ranks, with 64 MiB of private buffers per P rank
+(256 MiB total). CPU Store stays enabled; `enable_offload: false` disables its
+disk tier. Per-rank settings match successful CI `40376309047`; that reference
+has eight P ranks on a separate node, so its total pool is twice as large.
+
+Mooncake registration settings follow that reference: `MC_MAX_MR_SIZE` is
+1 GiB on P and 256 MiB on D; only P gets `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`
+and `MOONCAKE_CONFIG_PATH`. Each worker sets `MC_TE_FILTERS=rdma<physical GPU>`
+before connector initialization. Store's `device_name` is empty and the
+Transfer config omits it, allowing this filter to select one HCA per process.
+No `MC_DISABLE_HIP` override is forced. Per-rank selection and Store membership
+are recorded in `<role>-rank-<rank>-mooncake.json`; check engine logs for
+`Topology discovery complete. Found 1 HCAs.` to confirm actual discovery.
 
 The launcher uses installed image packages unchanged. The proxy is vendored
 at the image commit; a wrapper adds health/model metadata routes. AgentX
@@ -24,7 +37,8 @@ in artifacts. Replay behavior is unchanged.
 
 Smoke uses real block rejection, compares greedy PD with independent D
 computation, checks GPU reset success, requires Store GET bytes after GPU
-reset, and tests a D-only prefix subsequently loaded by P. It emits correctness
+reset on P. D-only Store reuse is marked not applicable in
+`smoke-store-scope.json` because D has no Store connector. It emits correctness
 artifacts, not performance results. Formal runs use DSpark3 synthetic AL2.88,
 393 AgentX traces, seed42, 3600 seconds per concurrency, with fresh engines and
 Store for each cell. Throughput normalization uses all eight GPUs.
@@ -50,12 +64,14 @@ Memory preparation follows successful CI `40376309047` (commit
 `fc9bf7aa215f33067a8b0728279d076c0da5a313`). The custom
 `pd_vllm_worker.StoreMemoryWorker` waits until all eight P/D workers reach
 `initialize_from_config`, after model loading/profiling and before native
-connector initialization. A file lock elects one worker to evict the pinned
+connector initialization. All eight wait so D cannot refill the shared node's
+model cache during cleanup, while only P contributes Store memory. A file lock
+elects one worker to evict the pinned
 snapshot's clean page cache (including its draft subdirectory) and fault/free
 THP with `numa_exec.py` + `compact_huge_pages.py`. There is no preparation or
 periodic cache eviction during model loading.
 
-Preparation is best effort: split the eight global Store segments equally over
+Preparation is best effort: split the four P global Store segments equally over
 NUMA nodes with CPUs, cap each node's target at `MemFree + Active(file) +
 Inactive(file) - 64 GiB`, and skip targets below 1 GiB. This matches the
 successful CI's sizing rule; private buffers are not added to the preparation
@@ -63,7 +79,7 @@ target. THP shortfall, a nonzero helper exit, missing measurements or a
 600-second per-node timeout only warn, then proceed to the remaining nodes and
 native Store registration. Available-memory estimates also only warn. Actual
 Store registration determines success; preparation never emits exit 86.
-Native Store retains the glibc THP hint and 64 GiB MR cap. The earlier malloc
+P uses the glibc THP hint and the role-specific MR limits above. The earlier malloc
 perturbation, sequential P/D startup and separate native Store PUT/GET preflight
 in `57888067b` were reverted.
 
@@ -78,8 +94,10 @@ The common environment explicitly sets `MC_MAX_CONCURRENT_REG_MR=1`,
 `MC_IB_PCI_RELAXED_ORDERING=1`. The first variable is parsed by the installed
 Mooncake 0.3.13.post1 but does not limit its RDMA registration path. Relaxed
 ordering is requested when libibverbs exposes the required symbol; verify the
-actual selection in engine logs. This alignment does not change the fixed
-image, native Mooncake package, Store buffer sizes or NIC selection.
+actual selection in engine logs. The Store/Transfer JSON configs match the
+successful reference. The MiniMax fixed image and native Mooncake package are
+retained; the reference ran Kimi K3 with a custom Mooncake wheel, so this is
+alignment of the Store/RDMA settings rather than a copy of its entire stack.
 
 A smoke-only dispatch uses suite `mooncake_store` and case
 `m31-vllm-1p1d-tp4-mcstore-smoke` with `publish_dashboard=false`. It records
@@ -103,5 +121,5 @@ trigger this retry path. A host cleanup timeout is fatal, not resubmitted.
 `thp-node-*.json` records measured hugepage bytes when the probe finishes;
 `vllm-memory-retry.json` binds the reason to the exact allocation;
 `host-memory-recovery.json` records whether cleanup succeeded or lacked permission.
-The model image, revisions, 1 TiB pool, per-rank 4 GiB buffer, prefix caches,
-DSpark3 and benchmark workload remain as specified above.
+The model image, revisions, prefix caches, DSpark3 and benchmark workload
+remain as specified above. Store belongs to P only, with the capacities above.
