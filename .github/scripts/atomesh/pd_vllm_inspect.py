@@ -123,6 +123,17 @@ for run in runs:
                 with source.open('rb') as stream:
                     stream.seek(max(0, source.stat().st_size - 2 * 1024 * 1024))
                     target.write_bytes(stream.read(2 * 1024 * 1024))
+            for relative in ('rank-0/container.log', 'rank-0/docker-state.json',
+                             'rank-0/container-events.log', 'job-result.json',
+                             'rank-rc-0', 'suite-status.json'):
+                source = job / relative
+                if not source.is_file() or not source.resolve().is_relative_to(job.resolve()):
+                    continue
+                target = recovery / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with source.open('rb') as stream:
+                    stream.seek(max(0, source.stat().st_size - 2 * 1024 * 1024))
+                    target.write_bytes(stream.read(2 * 1024 * 1024))
         row['runtime_stages'] = {}
         for role in ('prefill', 'decode'):
             row['runtime_stages'][role] = {
@@ -170,6 +181,13 @@ for run in runs:
                     row['container_events'].append(event)
         rows.append(row)
 result = {'kind': 'experiment_status_only', 'actions_run_id': int(run_id), 'jobs': rows}
+result['filesystem'] = {}
+for name, path in (('shared_logs', root), ('inspection_output', out)):
+    stat = os.statvfs(path)
+    result['filesystem'][name] = {'available_bytes': stat.f_bavail * stat.f_frsize,
+                                 'total_bytes': stat.f_blocks * stat.f_frsize,
+                                 'available_inodes': stat.f_favail}
+
 if shutil.which('squeue'):
     try:
         queue = subprocess.run(['squeue', '--name', prefix[:-1] + '-1', '--noheader',
