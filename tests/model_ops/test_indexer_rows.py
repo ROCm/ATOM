@@ -357,12 +357,16 @@ def test_striped_split_refuses_to_read_its_rows_in_place(kwargs):
         )
 
 
-@pytest.mark.parametrize("count, world", [(13, 4), (16, 4), (3, 4), (1, 2), (4097, 8)])
-def test_the_model_s_entry_returns_as_many_rows_as_its_fake(monkeypatch, count, world):
+@pytest.mark.parametrize(
+    "count, world",
+    [(13, 4), (16, 4), (3, 4), (1, 2), (4097, 8)],
+    ids=["max_tail", "no_tail", "short_tail", "one_row_max_tail", "tp8_max_tail"],
+)
+def test_the_model_s_entry_returns_the_step_s_rows_in_order(monkeypatch, count, world):
     """A striped split's selection carries its slots' tails past the step's
-    rows (`IndexRows.out_rows`); the V4 indexer's op entry hands back the
-    step's rows alone, row i at row i, in the shape its fake promises a
-    compiled graph."""
+    rows (`IndexRows.out_rows`), from none to world - 1 rows; the V4
+    indexer's op entry hands back the step's rows alone, row i at row i, in
+    the shape its fake promises a compiled graph."""
     import atom.models.deepseek_v4 as v4
     from atom.model_ops.module_dispatch_ops import _indexer_score_topk_fake
 

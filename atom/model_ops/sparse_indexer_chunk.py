@@ -131,7 +131,7 @@ def qsplit_rows(num_rows: int, rank: int, world_size: int) -> tuple[int, int, in
     The stride is uniform -- ``ceil(num_rows / world_size)`` for every rank --
     so a rank-major concatenation of stride-sized buffers lands row ``i`` back
     at row ``i``, with no index exchange. The price is that the last ranks'
-    buffers have tails of unscored rows: the gathered payload is
+    buffers can have tails of unscored rows: the gathered payload is
     ``world_size * ceil(num_rows / world_size)`` rows, at most
     ``world_size - 1`` more than ``num_rows``. Those tails sit at gathered
     indices ``>= num_rows`` and are never read back.

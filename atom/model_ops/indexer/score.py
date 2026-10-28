@@ -129,9 +129,9 @@ def _dense(x):
 
 def _gather_split(out, split):
     """Every rank's rows into `out`, in place: the input is this rank's own
-    slot inside the output, the form RCCL supports, so beyond the
-    communicator's own first-use buffers the gather allocates and copies
-    nothing. A slot's tail past its rank's rows is never used
+    slot inside the output, the form RCCL supports, so apart from what RCCL
+    sets aside on a group's first all-gather, the gather allocates and
+    copies nothing. A slot's tail past its rank's rows is never used
     (`IndexRows.out_rows`). A world of one already holds them all."""
     if split.world == 1:
         return
