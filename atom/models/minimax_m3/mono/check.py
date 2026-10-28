@@ -23,11 +23,19 @@ from aiter import topk_select
 
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.models.minimax_m3.mono.config import HIDDEN
-from atom.models.minimax_m3.mono.runner import N_DENSE, token_rows
+from atom.models.minimax_m3.mono.runner import N_DENSE, _sparse_metadata, token_rows
 from atom.mono.runtime.compare import compare
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+
+def _index_pages(lw, fwd, n: int) -> torch.Tensor:
+    """The index cache's pages this step's tokens land on, as bytes: a mono layer
+    and the original one must leave the same ones."""
+    slots = _sparse_metadata(fwd).slot_mapping[:n]
+    pages = (slots[slots >= 0] // 128).unique()
+    return lw.attn_impl.index_cache[pages].clone().view(torch.uint8)
 
 
 def forward_checked(
@@ -67,8 +75,18 @@ def forward_checked(
         res_in = res.clone()
         # mono first: it reads only the caches it inserts itself, as in a real step
         res = runner.run_sparse_layer(i, lw, fwd, positions, res, rows)
+        mono_index = _index_pages(lw, fwd, n) if lw.index_topk else None
         ref_partial, ref_res = layer(positions, h_in, res_in)
         ref_ar = tensor_model_parallel_all_reduce(ref_partial).view(n, HIDDEN)
+        if runner.rank == 0 and mono_index is not None:
+            ref_index = _index_pages(lw, fwd, n)
+            logger.info(
+                "mono check layer %d index cache (%s): %d of %d bytes differ",
+                lw.layer_id,
+                "MXFP4" if lw.index_mxfp4 else "FP8",
+                int((mono_index != ref_index).sum()),
+                mono_index.numel(),
+            )
         if runner.rank == 0:
             for k in range(n):
                 logger.info(

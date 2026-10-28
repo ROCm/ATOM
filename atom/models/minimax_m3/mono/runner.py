@@ -202,6 +202,11 @@ class MonoDecodeRunner:
             SparseMoeLayer.from_layer(layers[i], i, heads)
             for i in range(N_DENSE, len(layers))
         ]
+        # every layer's index cache is one format: E4M3 rows or MXFP4 pages
+        formats = {lw.index_mxfp4 for lw in self.sparse}
+        if len(formats) != 1:
+            raise MonoUnsupported("layers disagree on the index cache format")
+        self.index_mxfp4 = formats.pop()
         # a reusing layer reads the selection an earlier layer of the step left
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
@@ -266,6 +271,7 @@ class MonoDecodeRunner:
             timeline=self.timeline is not None,
             heads=heads,
             debug=self.debug,
+            index_mxfp4=self.index_mxfp4,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:

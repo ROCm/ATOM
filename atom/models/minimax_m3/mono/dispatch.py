@@ -55,8 +55,9 @@ def _config_refusal(atom_config) -> str | None:
         (not envs.ATOM_M3_SPARSE_KV_NVFP4, "sparse KV is NVFP4"),
         (not envs.ATOM_M3_SPARSE_KV_MXFP4, "sparse KV is MXFP4"),
         (
-            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "fp8",
-            "index cache not fp8",
+            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype)
+            in ("fp8", "mxfp4"),
+            "index cache not fp8 / mxfp4",
         ),
         (
             atom_config.kv_cache_block_size == 128,

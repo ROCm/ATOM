@@ -16,6 +16,7 @@ from aiter import QuantType, dtypes
 from atom.model_ops.linear import weight_is_stored_preshuffled
 from atom.models.minimax_m3.mono.config import (
     DENSE_INTER,
+    FP4_PAGE_BYTES,
     HEAD_DIM,
     HIDDEN,
     INTER,
@@ -87,6 +88,11 @@ def _cos_sin(attn, layer_id: int) -> torch.Tensor:
 class SparseMoeLayer:
     """Everything K1 / K4 read for one sparse-attention MoE layer."""
 
+    @property
+    def index_mxfp4(self) -> bool:
+        """The index cache is MXFP4 pages, not E4M3 rows."""
+        return bool(getattr(self.attn_impl, "index_mxfp4", False))
+
     layer_id: int
     attn_impl: object  # SparseMHAPagedAttentionImpl: index cache + page-16 KV views
     # the layer selects its blocks; else it reuses the step's last selecting
@@ -131,13 +137,27 @@ class SparseMoeLayer:
         )
         impl = attn.attn.impl
         _need(
-            impl.kv_cache_dtype == "fp8" and impl.index_cache is not None,
+            impl.kv_cache_dtype == "fp8"
+            and impl.index_cache is not None
+            and not getattr(impl, "kv_mxfp4", False),
             f"layer {layer_id}: caches",
         )
-        _need(
-            impl.index_cache.dtype == dtypes.fp8,
-            f"layer {layer_id}: index cache {impl.index_cache.dtype}",
-        )
+        if getattr(impl, "index_mxfp4", False):
+            # whole 8704 B MXFP4 pages (``kv_mxfp4``), one index head (no indexer CP)
+            _need(
+                impl.index_cache.dtype == torch.uint8
+                and impl.index_cache.dim() == 2
+                and impl.index_cache.shape[1] == FP4_PAGE_BYTES
+                and impl.index_cache.is_contiguous()
+                and heads.count == 1,
+                f"layer {layer_id}: MXFP4 index cache "
+                f"{impl.index_cache.dtype} {tuple(impl.index_cache.shape)}",
+            )
+        else:
+            _need(
+                impl.index_cache.dtype == dtypes.fp8,
+                f"layer {layer_id}: index cache {impl.index_cache.dtype}",
+            )
         w_qkv, s_qkv = _ptpc_fp8(
             attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
         )

@@ -23,14 +23,19 @@ from atom.mono.runtime.compile import check_traced
 
 
 def build_layer(
-    tokens: int, index_heads: int, fuse_k1: bool = True, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool = True,
+    index_topk: bool = True,
+    index_mxfp4: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
-    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``)."""
+    or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), over
+    an MXFP4 index cache or an FP8 one (``index_mxfp4``)."""
     heads = IndexHeads(index_heads, 0)
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
-        index_topk=index_topk,
+        index_topk=index_topk, index_mxfp4=index_mxfp4,
     )  # fmt: skip
 
 
@@ -40,11 +45,15 @@ def build_dense(tokens: int):
 
 
 def check_build(
-    tokens: int, index_heads: int, fuse_k1: bool = True, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool = True,
+    index_topk: bool = True,
+    index_mxfp4: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
-        build_layer(tokens, index_heads, fuse_k1, index_topk),
+        build_layer(tokens, index_heads, fuse_k1, index_topk, index_mxfp4),
         K4_ABI,
         mailbox_regions(tokens, index_heads, fuse_k1, index_topk),
     )
@@ -62,3 +71,6 @@ if __name__ == "__main__":
             for it in (True, False):
                 check_build(s, ih, index_topk=it)
                 print(f"S={s} index heads={ih} index_topk={it}: contract holds")
+        for it in (True, False):  # MXFP4 index keys: one index head (no indexer CP)
+            check_build(s, 1, index_topk=it, index_mxfp4=True)
+            print(f"S={s} MXFP4 index index_topk={it}: contract holds")

@@ -46,11 +46,13 @@ from atom.models.minimax_m3.mono.kernels.common import (
     ar_block_sums,
     ar_pack_sumsq,
     ld_bf16x4,
+    mxfp4_row_store,
     per_token_fp8_scale,
 )
 from atom.models.minimax_m3.mono.kernels.index_score import (
     emit_index_scores,
     index_scale_log2e,
+    q_chunk_offset,
     step_rows,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
@@ -175,7 +177,7 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
-    index_topk=True, dense=False, plain_norm=False,
+    index_topk=True, dense=False, plain_norm=False, index_mxfp4=False,
 ):  # fmt: skip
     """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
     each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
@@ -186,7 +188,8 @@ def emit_pre_attn(
     ``dense`` (a dense layer, no index heads, ``index_topk`` off): K inserted as
     the dense path's Triton rope-cache does -- quantized from f32, page-128.
     ``plain_norm`` (layer 0: no all-reduce in front): the norm's output rounded
-    to bf16, then the linear's own per-token quant, as the original layer does."""
+    to bf16, then the linear's own per-token quant, as the original layer does.
+    ``index_mxfp4``: the index cache holds 8704 B MXFP4 pages, not E4M3 rows."""
     rows = heads.rows
     (
         ar,
@@ -575,12 +578,15 @@ def emit_pre_attn(
                         )
                 if (ht == IK_TASK) & (slot >= 0):
                     qi = [bf16_round(out[j]) for j in range(ELEMS)]
-                    bo.buffer_store(
-                        fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
-                        rsrc(index_cache),
-                        (slot * HEAD_DIM + d0) // 4,
-                        cache_modifier=cm_out,
-                    )
+                    if const_expr(index_mxfp4):
+                        mxfp4_row_store(rsrc(index_cache), slot, qi, l32, cm_out)
+                    else:
+                        bo.buffer_store(
+                            fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
+                            rsrc(index_cache),
+                            (slot * HEAD_DIM + d0) // 4,
+                            cache_modifier=cm_out,
+                        )
 
         if const_expr(signal is not None):
             # every token's flag once the whole CTA's stores are out
@@ -600,6 +606,7 @@ def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
     region_ids=None, index_topk=True, dense=False, plain_norm=False,
+    index_mxfp4=False,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
     (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
@@ -664,7 +671,7 @@ def emit_k1(
         row = (tk * heads.count + head) * (HEAD_DIM // 2)
         return fx.Vector(
             fx.ptr_load(
-                qs + (row + (32 * s + 8 * (lane // 16)) // 2),
+                qs + (row + q_chunk_offset(s, lane // 16, index_mxfp4) // 2),
                 result_type=fx.Vector.make_type(4, fx.Float32),
             )
         ).bitcast(fx.BFloat16)
@@ -691,6 +698,7 @@ def emit_k1(
         index_topk,
         dense,
         plain_norm,
+        index_mxfp4,
     )  # fmt: skip
     stamp(5)
 
@@ -711,7 +719,7 @@ def emit_k1(
             Addr("iscore", Space.SCRATCH, iscore),
             q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
             block_table, seq_lens, bt_width, wait_new_keys if signal else None,
-            make_index_q, heads, q_frag_head, make_index_q_heads,
+            make_index_q, heads, q_frag_head, make_index_q_heads, index_mxfp4,
         )  # fmt: skip
     stamp(6)
 
@@ -741,6 +749,7 @@ class K1Build:
     timeline: bool = field(metadata={"sym": "tl"})
     dense: bool = field(metadata={"sym": "dn"})
     plain_norm: bool = field(metadata={"sym": "pn"})
+    index_mxfp4: bool = field(metadata={"sym": "im"})
     eps: float
     sm_scale: float
 
@@ -755,18 +764,20 @@ def build_pre_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     dense: bool = False,
     plain_norm: bool = False,
+    index_mxfp4: bool = False,
 ):
     """``@flyc.jit`` launcher of K1 for this model's RMSNorm epsilon, attention
     scale and sparse pinned blocks, a decode batch of ``tokens`` (<= MAX_TOKENS)
     rows and the fused projection's index q ``heads``. ``dense``: a dense layer's
     (``dense_pre``): q | k | v rows only, no indexer, K inserted as the dense
     path's rope-cache does; ``plain_norm``: layer 0's input norm
-    (``emit_pre_attn``)."""
+    (``emit_pre_attn``); ``index_mxfp4``: the index cache is MXFP4 pages."""
     assert 1 <= tokens <= MAX_TOKENS
     key = K1Build(
         tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
-        dense=dense, plain_norm=plain_norm, eps=eps, sm_scale=sm_scale,
+        dense=dense, plain_norm=plain_norm, index_mxfp4=index_mxfp4, eps=eps,
+        sm_scale=sm_scale,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     index_scale = index_scale_log2e(sm_scale)
@@ -844,6 +855,7 @@ def build_pre_attn_kernel(
             index_topk=not dense,
             dense=dense,
             plain_norm=plain_norm,
+            index_mxfp4=index_mxfp4,
         )  # fmt: skip
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 

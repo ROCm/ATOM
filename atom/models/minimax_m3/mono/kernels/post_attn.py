@@ -154,6 +154,7 @@ class K4Build:
     index_own: int = field(metadata={"sym": "io"})
     timeline: bool = field(metadata={"sym": "tl"})
     index_topk: bool = field(metadata={"sym": "it"})
+    index_mxfp4: bool = field(metadata={"sym": "im"})
     fuse_k1: bool
     sm_scale: float
     eps: float
@@ -178,6 +179,7 @@ def build_post_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     debug: bool = False,
     index_topk: bool = True,
+    index_mxfp4: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -188,12 +190,15 @@ def build_post_attn_kernel(
     a wait that gives up recorded in scratch ``diag`` (``Mailbox``).
     ``index_topk``: the layer scores and selects its blocks; else (the original
     path's ``skip_index_topk`` layer) it attends over the sparse table the last
-    selecting layer of the step left in scratch."""
+    selecting layer of the step left in scratch. ``index_mxfp4``: the index cache
+    is 8704 B MXFP4 pages (K1 writes and scores them so; no indexer CP)."""
     assert 1 <= tokens <= MAX_TOKENS
+    assert not (index_mxfp4 and heads.count > 1), "MXFP4 index keys: no indexer CP"
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
-        index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
+        index_topk=index_topk, index_mxfp4=index_mxfp4, fuse_k1=fuse_k1,
+        sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug,
     )  # fmt: skip
@@ -423,6 +428,7 @@ def build_post_attn_kernel(
                 diag,
                 REGION_IDS,
                 index_topk,
+                index_mxfp4=index_mxfp4,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS)
