@@ -111,6 +111,8 @@ jobs:
               for directory in sorted(root.glob(f'*{run}*')):
                   if run == 40706439005 and 'agentx-chunked' in directory.name:
                       continue
+                  if run == 40739638741 and 'gsm8k-5shot-chunked' not in directory.name:
+                      continue
                   latest[directory.name.rsplit(f'-{run}-', 1)[0]] = directory
               paths = list(latest.values())
               print(f'RUN {run}: {len(paths)} log directories', flush=True)
@@ -163,9 +165,12 @@ jobs:
                               continue
                           matches = collections.deque(maxlen=12)
                           trace = []
+                          storage_errors = collections.deque(maxlen=4)
                           in_trace = False
                           with log.open(errors='replace') as stream:
                               for line in stream:
+                                  if re.search(r'(?i)quota|no space', line):
+                                      storage_errors.append(line.rstrip()[:450])
                                   if 'Traceback (most recent call last)' in line and not trace:
                                       in_trace = True
                                   if in_trace and len(trace) < 90:
@@ -174,6 +179,8 @@ jobs:
                                       matches.append(line.rstrip()[:450])
                           print(f'{job.name}/{name}: {log.stat().st_size} bytes; owner_matches_runner={log.stat().st_uid == os.getuid()}', flush=True)
                           print('\n'.join(matches), flush=True)
+                          if storage_errors:
+                              print('TASK STORAGE ERRORS:\n' + '\n'.join(storage_errors), flush=True)
                           if trace:
                               print('FIRST ERROR CONTEXT:\n' + '\n'.join(trace), flush=True)
           result = subprocess.run(
