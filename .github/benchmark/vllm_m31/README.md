@@ -135,3 +135,14 @@ trigger this retry path. A host cleanup timeout is fatal, not resubmitted.
 `host-memory-recovery.json` records whether cleanup succeeded or lacked permission.
 The model image, revisions, prefix caches, DSpark3 and benchmark workload
 remain as specified above. Store belongs to P only, with the capacities above.
+
+The `m31-vllm-triton-probe` case runs no-model GPU diagnostics using the same
+container launcher and image. It starts no servers, connectors, Store, model
+loads, or downloads. Four subprocesses cover the P/D GPU masks (logical GPU 0,
+physical GPUs 0 and 4), with default and fresh Triton caches. Each checks a
+minimal write, installed vLLM device/UVA staged writes, and KV block zeroing.
+`triton-probe/summary.json` reports numeric correctness and failures. Each case
+saves host kernel/amdgpu version, HIP API versions, loaded GPU libraries,
+Triton target/cache location, and compiled IR/HSACO before binary loading.
+A missing command is recorded as unavailable. Run on the failed node with
+`atomesh_single_node=pit2-p03-g12`, case `m31-vllm-triton-probe`, dashboard off.

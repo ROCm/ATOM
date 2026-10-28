@@ -2,6 +2,9 @@
 set -euo pipefail
 
 if [[ "${BACKEND:-atom}" == "vllm" ]]; then
+  if [[ "${ATOMESH_ENV_ATOMESH_VLLM_MODE:-}" == "triton_probe" ]]; then
+    exec python3 "$(dirname -- "${BASH_SOURCE[0]}")/pd_vllm_triton_probe.py"
+  fi
   exec python3 "$(dirname -- "${BASH_SOURCE[0]}")/pd_vllm_m31.py"
 fi
 

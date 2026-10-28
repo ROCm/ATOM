@@ -2147,6 +2147,14 @@ models:
           env: {common: {ATOMESH_VLLM_MODE: benchmark}}
 
         - <<: *m31_vllm_pd
+          name: m31-vllm-triton-probe
+          runner:
+            exclude_nodes: pit2-p03-g09
+            time_limit: "00:20:00"
+          concurrency: [1]
+          env: {common: {ATOMESH_VLLM_MODE: triton_probe}}
+
+        - <<: *m31_vllm_pd
           name: m31-vllm-inspect-smoke
           concurrency: [1]
           env:
