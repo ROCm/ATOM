@@ -1657,7 +1657,8 @@ models:
           run_eval: false
 
         # Same C32 recipe and prefill budget; isolate incremental P->D transfer.
-        - <<: *m31_flash_mcstore_dspark7
+        - &m31_flash_mcstore_chunked_c32
+          <<: *m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32
           env:
             common: *m31_flash_mcstore_common_env
@@ -1666,6 +1667,14 @@ models:
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
             decode: *m31_flash_mcstore_decode_env
+
+        # C32 chunked transfer with a smaller per-step token budget.
+        - <<: *m31_flash_mcstore_chunked_c32
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-chunked-mbt8192-c32
+          server:
+            common_args:
+              max_num_batched_tokens: 8192
+              spec_decode_acceptance_length: 4.04
 
         - <<: *m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c48

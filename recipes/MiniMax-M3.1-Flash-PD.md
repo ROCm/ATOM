@@ -96,6 +96,17 @@ raw off/on differences do not measure transfer savings. Earlier reservation
 also holds decode KV for longer. If tracing a later experiment, inspect the gap
 between the last prefill forward and decode KV readiness separately.
 
+### C32 chunked transfer with an 8192-token budget
+
+To run only the smaller-budget experiment, select
+`minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-chunked-mbt8192-c32`
+under `suite=mooncake_store`. It inherits the chunked C32 case and sets
+`max_num_batched_tokens: 8192` in the shared server arguments for both roles.
+C32, TP4/TP4, DSpark K7/AL4.04, 1 TiB Store, graphs, AgentX 1.0.12, pinned
+image, and 3600-second formal profiling without torch traces are unchanged.
+This selection runs one case. The original off/on cases retain their 32768-token
+budget; comparing against them changes the budget as well.
+
 ## Runtime dependencies brought into the test branch
 
 These were open PRs when the recipe was inspected on 2026-10-27:
