@@ -111,6 +111,9 @@ class GDNAttentionMetadata:
     )
 
     spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
+    # Optional read-side mapping when the framework allocates a different
+    # physical block for the first speculative token at a block boundary.
+    spec_state_indices_in_tensor: torch.Tensor | None = None
     non_spec_state_indices_tensor: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes,]
     )
@@ -1930,8 +1933,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         self,
         batch: ScheduledBatch,
         running_bs: int,
+        running_tokens: int,
     ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
+        attn_metadata, positions = super().prepare_prefill(
+            batch, running_bs, running_tokens
+        )
         if batch.block_tables == []:
             if any(getattr(batch, "state_save_all", None) or ()):
                 raise RuntimeError(

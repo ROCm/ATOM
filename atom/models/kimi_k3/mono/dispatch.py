@@ -116,7 +116,7 @@ class MonoDecodeModel(nn.Module):
 
 
 def install_mono_decode(
-    model: nn.Module, atom_config, drafter, metadata_builder
+    model: nn.Module, atom_config, drafter, *, metadata_builder=None
 ) -> nn.Module:
     """``model`` wrapped for K3 mono decode, or ``model`` itself when this
     deployment is one mono does not serve."""

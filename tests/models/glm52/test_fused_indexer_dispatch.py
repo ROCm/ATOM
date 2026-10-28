@@ -67,6 +67,7 @@ from atom.models.glm52.mono.config import (
     FUSED_INDEX_MAX_SEQ,
     FUSED_INDEX_PAGE_SIZE,
 )
+from atom.models.glm52.mono.kernels.geometry_config import glm5_tp_config
 from atom.models.glm52.mono.runner import (
     Glm52MonoRunner,
     _GlmFusedLayerOp,
@@ -122,6 +123,25 @@ def test_opt_in_on_but_refused_stays_off(monkeypatch):
         atom_config=_fused_servable_atom_config(index_cache_dtype="fp4"),
     )
     assert runner._fused_indexer_on is False
+
+
+@pytest.mark.parametrize("tp, fused_on", [(4, True), (8, False)])
+def test_fused_indexer_and_its_cp_turn_on_at_tp4_only(monkeypatch, tp, fused_on):
+    # TP8 is a served shard, but the fused indexer's only build
+    # (`Glm5TP4MonoKernel`) refuses any TP but 4: with both switches on and
+    # every other condition fusion-compatible, TP8 must keep the
+    # external-indexer path instead of attempting that build.
+    monkeypatch.setenv("ATOM_GLM52_FUSED_INDEXER", "1")
+    monkeypatch.setenv("ATOM_GLM52_INDEXER_CP", "1")
+    runner = Glm52MonoRunner(
+        causal_lm=None,
+        atom_config=_fused_servable_atom_config(
+            tensor_parallel_size=tp, decode_context_parallel_size=1
+        ),
+    )
+    assert runner._shard == glm5_tp_config(tp)
+    assert runner._fused_indexer_on is fused_on
+    assert runner._indexer_cp is fused_on
 
 
 @pytest.mark.parametrize(

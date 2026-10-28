@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -390,6 +391,21 @@ class TestScheduleTicksTheWindow:
         sched.add(seq)
         sched.schedule()
         assert sched.engine_stats.num_prompt_tokens == 4
+
+
+class TestGroupPrefillTick:
+    """An idle DP rank dummy-prefills beside a peer's prefill only when the
+    runners recorded prefill token graphs, whatever ATOM_TOKEN_GRAPH_SIZES
+    says: a backend without `supports_token_graph` records none, and its
+    dummy prefill would have no bucket to run on."""
+
+    @pytest.mark.parametrize("recorded", [False, True])
+    def test_follows_recorded_graphs_not_the_env(self, monkeypatch, recorded):
+        monkeypatch.setenv("ATOM_TOKEN_GRAPH_SIZES", "256,512")
+        sched = Scheduler(MockConfig(), prefill_token_graphs=recorded)
+        sched.set_prefill_delayer(SimpleNamespace(is_local=False))
+        decision = PrefillDecision(allow=True, prefillable_ranks=1)
+        assert sched._group_prefill_tick(decision) is recorded
 
 
 # ── add / extend / query ───────────────────────────────────────────────────
@@ -1026,6 +1042,43 @@ class TestSchedule:
         assert failed.offload_load_failed is True
         assert failed in sched.running
         assert failed.block_table == [0]
+        assert sched._num_parked_remote_kv == 0
+
+    def test_a_retreated_joint_resumes_on_its_existing_blocks(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+        seq = seq_factory(list(range(32)))
+        seq.num_cached_tokens = 8
+        seq.block_table = [7, 8]
+        seq.offload_joint.boundary_tokens = 256
+        seq.offload_joint.load_hash = 99
+
+        def retreat(retreated):
+            retreated.num_cached_tokens = 16
+            retreated.offload_joint.load_hash = -1
+            retreated.offload_joint.reset_joint()
+            return True
+
+        sched.block_manager.retreat_joint_to_hbm = retreat
+        sched._park_for_remote_load(seq, deque())
+        sched.failed_recving_kv_req_ids.append(seq.id)
+        sched.waiting.append(seq)
+
+        sched.schedule()
+
+        assert seq.offload_load_failed is True
+        assert seq.block_table == [7, 8]
+        assert seq.num_cached_tokens == 16
+        assert seq in sched.running
         assert sched._num_parked_remote_kv == 0
 
     def test_a_resumed_offload_prefill_reports_the_hit_the_load_gave_it(
