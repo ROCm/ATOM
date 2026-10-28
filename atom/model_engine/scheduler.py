@@ -3958,13 +3958,10 @@ class Scheduler:
         if seq.is_partial_prefill:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1
-        if self._return_routed_experts:
-            # The marker counts rows planned, not delivered. Fall back to what
-            # was delivered, so a range whose patch is lost is asked for again
-            # on resume (read from the cache on a hit, else recomputed).
-            seq.routed_forwarded_end = min(
-                seq.routed_forwarded_end, seq.routed_expert_rows
-            )
+        # The marker counts rows planned, not delivered. Fall back to what was
+        # delivered, so a range whose patch is lost is asked for again on
+        # resume (read from the cache on a hit, else recomputed).
+        seq.routed_forwarded_end = min(seq.routed_forwarded_end, seq.routed_expert_rows)
         # This free runs no `request_finished`; drop any stall-escaped save
         # tracker now so the connector's save loop cannot later read these
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
