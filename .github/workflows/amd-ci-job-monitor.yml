@@ -6,6 +6,10 @@ on:
         description: Remove the verified duplicate metric from completed task 10772
         type: boolean
         default: false
+      reclaim_artifact_copies:
+        description: Remove hash-verified copies of completed task 10772 raw metric
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -14,6 +18,7 @@ jobs:
     timeout-minutes: 5
     env:
       RECLAIM_COMPLETED_METRIC: ${{ inputs.reclaim_completed_metric }}
+      RECLAIM_ARTIFACT_COPIES: ${{ inputs.reclaim_artifact_copies }}
     steps:
       - name: Read this task's Slurm states and progress logs
         shell: bash
@@ -47,6 +52,24 @@ jobs:
               # artifact 12830886598, confirmed before this dispatch.
               metric.unlink()
               print('RECLAIMED VERIFIED TASK DUPLICATE: 4716797276 bytes; artifact 12830886598 retained', flush=True)
+
+          if os.environ.get('RECLAIM_ARTIFACT_COPIES') == 'true':
+              cell = 'minimax-m3.1-flash-quark-mxfp4-minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32-mooncake_store'
+              reclaimed = 0
+              for runner in range(1, 21):
+                  copied = root.parent / f'atomesh-runner-{runner:02d}/_work/ATOM/ATOM/atomesh-results' / cell
+                  for metric in copied.glob('slurm_job-10772/benchmark_results/*/server_metrics_export.json'):
+                      digest = hashlib.sha256()
+                      with metric.open('rb') as stream:
+                          for chunk in iter(lambda: stream.read(16 * 1024 * 1024), b''):
+                              digest.update(chunk)
+                      if metric.stat().st_size != 4716797276 or digest.hexdigest() != '631331178b754bdeefae1c70b069721af495dd99f9baced3677293f17c663853':
+                          print('KEEPING NONMATCHING TASK COPY:', runner, flush=True)
+                          continue
+                      metric.unlink()
+                      reclaimed += 4716797276
+                      print('RECLAIMED VERIFIED TASK 10772 ARTIFACT COPY:', runner, flush=True)
+              print('ARTIFACT COPY BYTES RECLAIMED:', reclaimed, flush=True)
 
           import shutil
           usage = os.statvfs(root)
