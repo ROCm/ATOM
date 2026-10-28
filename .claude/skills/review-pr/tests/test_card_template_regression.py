@@ -163,15 +163,30 @@ def test_card_gate_rejects_missing_validation_line(tmp_path):
 
 # --- Validation (deterministic) entitlement -------------------------------------------
 #
-# The archived reports/PR-2705/card.md is the real fixture of the abuse this section
-# guards against: a model ran tests/plugin/test_minimax_m3_mono_refusal.py itself with
-# the Bash tool, wrote `Validation (deterministic): PASS -- ...`, and every gate passed
-# it because none of them checked that a head-matched validation_report.json actually
-# backed the claim. See .claude/skills/review-pr/reports/PR-2705/card.md (not edited by
-# this test -- it is evidence, read-only).
+# This is a trimmed, inline stand-in for the real fixture that motivated this section:
+# the archived .claude/skills/review-pr/reports/PR-2705/card.md (produced by the first
+# real end-to-end run, not committed -- reports/ is untracked runtime output written by
+# _collect.py, so it does not exist on a fresh checkout). In that run, a model ran
+# tests/plugin/test_minimax_m3_mono_refusal.py itself with the Bash tool, wrote
+# `Validation (deterministic): PASS -- ...`, and every gate passed it because none of
+# them checked that a head-matched validation_report.json actually backed the claim.
+# The line below exercises the same gate path: a bare `Validation (deterministic): PASS`
+# verdict with no validation_report.json in $WORK.
 
-ARCHIVED_PR_2705_CARD = (
-    pathlib.Path(__file__).resolve().parent.parent / "reports" / "PR-2705" / "card.md"
+ARCHIVED_PR_2705_CARD_TEXT = (
+    "## ATOM PR #2705 — fix(sglang): match the mono-refusal stand-in to the signature "
+    "it replaces\n\n"
+    "**Fixes the SGLang MiniMax-M3 mono-refusal stand-in to take the single "
+    "`atom_config` argument the native `_config_refusal` it replaces takes.**\n\n"
+    "Review: ⚠️ NEEDS WORK\n"
+    "Validation (deterministic): PASS — tests/plugin/test_minimax_m3_mono_refusal.py "
+    "at exact PR head (merge-commit tree e3a00a928, CPU-only container, python 3.12): "
+    "2 passed; revert-the-fix control reproduces the claimed 1 failed; black/ruff "
+    "clean; ci:sglang GPU launch stage not run (no GPU validator in this pipeline).\n\n"
+    "⚠️ [verified] The fix narrows the stand-in but leaves the existing test of this "
+    "rebind calling it with two positional arguments, so that test now raises "
+    "TypeError. **Author must** update the sibling test's calls to pass `atom_config` "
+    "only.\n"
 )
 
 
@@ -205,24 +220,26 @@ def _run_card_gate(tmp_path, card):
     )
 
 
-def test_archived_pr_2705_card_is_rejected_by_the_card_gate():
-    """The real fixture: a model-run test mislabelled as (deterministic) PASS.
+def test_archived_pr_2705_card_is_rejected_by_the_card_gate(tmp_path):
+    """The real-shaped fixture: a model-run test mislabelled as (deterministic) PASS.
 
     No validation_report.json was ever written for PR#2705 -- there is no validator in
-    this pipeline (P0) -- so the card gate must now reject this exact archived card.
+    this pipeline (P0) -- so the card gate must now reject this exact card shape.
     """
-    assert ARCHIVED_PR_2705_CARD.is_file(), "archived PR-2705 card fixture is missing"
+    card = _write(tmp_path, "card.md", ARCHIVED_PR_2705_CARD_TEXT)
     r = run(
         "card",
-        str(ARCHIVED_PR_2705_CARD),
+        str(card),
         "/dev/null",
         "/dev/null",
         "/dev/null",
         "/dev/null",
         "/dev/null",
     )
-    assert r.returncode != 0, "the PR-2705 card (a model self-run mislabelled PASS) " \
+    assert r.returncode != 0, (
+        "the PR-2705 card (a model self-run mislabelled PASS) "
         "must no longer clear the card gate"
+    )
     assert "UNENTITLED-VALIDATION" in (r.stdout + r.stderr)
 
 
