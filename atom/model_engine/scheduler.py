@@ -141,17 +141,22 @@ def _optimal_cu_fraction(
     at typical batch sizes.
 
     `decode_batch` is a token count, not a request count -- `mtp_k + 1` per
-    scheduled sequence, matching what `_schedule` reports. Zero is the only
-    value treated specially here; a floor below which masking stops being
-    worth it (the original note guessed 64) is a tuning question, and wants
-    the measurement that `ATOM_CU_POOL_FRACTIONS` exists to let you take.
+    scheduled sequence, matching what `_schedule` reports -- and it is a MAX
+    across the decode group, so its MAGNITUDE matters. One decoding request on
+    one rank is `mtp_k + 1` tokens, and treating any non-zero value as "mask"
+    pinned all eight prefill ranks to half their CUs for a whole agentic
+    warmup, on the strength of a continuous trickle of seven tokens.
+    `ATOM_CU_MASK_MIN_DECODE_TOKENS` is the floor below which the decode side
+    is not worth protecting.
 
     Any value returned must be in `ATOM_CU_POOL_FRACTIONS`, or no masked
     stream was built for it.
     """
     assert prefill_pending_tokens >= 0
     assert decode_batch >= 0
-    if prefill_pending_tokens == 0 or decode_batch == 0:
+    if prefill_pending_tokens == 0:
+        return None
+    if decode_batch < envs.ATOM_CU_MASK_MIN_DECODE_TOKENS:
         return None
     return 0.5
 

@@ -1143,6 +1143,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CU_POOL_FRACTIONS": lambda: _unit_fraction_list_env(
         "ATOM_CU_POOL_FRACTIONS", "0.5"
     ),
+    # Decode tokens below which masking is not worth it, so no mask is
+    # applied however much prefill is queued.
+    #
+    # Magnitude matters because the operand is a MAX across the decode group:
+    # ONE decoding request on ONE rank is `mtp_k + 1` tokens, and without a
+    # floor that was enough to pin all eight prefill ranks to half their CUs.
+    # Measured on an agentic warmup -- a continuous trickle of single-request
+    # decode held the mask on for the entire run.
+    #
+    # 64 is the value the original lookup table sketched in a comment and
+    # never applied. Set 0 to mask whenever there is any decode at all.
+    "ATOM_CU_MASK_MIN_DECODE_TOKENS": lambda: _int_env(
+        "ATOM_CU_MASK_MIN_DECODE_TOKENS", 64
+    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.

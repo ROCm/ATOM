@@ -1916,6 +1916,21 @@ class DecodeEngineCore(DPEngineCoreProc):
         # fire_vacuous, starving the process of everything else.
         return exiting
 
+    def _dummy_cu_fraction(self) -> float | None:
+        """Whatever this rank's real decode batch would have run on.
+
+        The decode ranks share an MoE all-to-all exactly as the prefill ranks
+        do, and a rank with no decode batch still enters it with a dummy. Left
+        at the base None, that dummy meets peers' masked batches on full CUs --
+        the same divergence that hung the prefill group for six minutes, just
+        on the other side of the pair.
+
+        Uniform by construction: `cu_fraction` is set from `group_busy` and
+        `_next_cu_fraction`, both derived from the one reduction, so every
+        decode rank holds the same value on the same tick.
+        """
+        return self.scheduler.cu_fraction
+
     def _sync_decode_group_state(self) -> DecodeGroupState:
         """One reduction carrying everything the whole decode group must agree on.
 
@@ -2054,11 +2069,26 @@ class DecodeEngineCore(DPEngineCoreProc):
         # Chosen on a free tick and remembered, so the batch dispatched under
         # it and every decode forward that overlaps it use one number.
         if not group_busy:
-            self._next_cu_fraction = (
+            chosen = (
                 _optimal_cu_fraction(group.max_decode_tokens, group.max_prefill_pending)
                 if self.scheduler.cu_masking
                 else None
             )
+            if chosen != self._next_cu_fraction:
+                # On change only -- this runs every tick. Nothing used to
+                # record the chosen split at all, so the only way to tell a
+                # masked run from an unmasked one was to infer it from
+                # throughput, which is how a mask stuck on for an entire
+                # warmup went unnoticed.
+                logger.info(
+                    "[cu-split] %s -> %s (max_decode_tokens=%d "
+                    "max_prefill_pending=%d)",
+                    self._next_cu_fraction,
+                    chosen,
+                    group.max_decode_tokens,
+                    group.max_prefill_pending,
+                )
+            self._next_cu_fraction = chosen
         # Decode masks exactly while a prefill batch is in flight SOMEWHERE,
         # which is reduced and therefore identical on every decode rank. The
         # decode ranks share an MoE all-to-all of their own, so a rank that
@@ -2070,9 +2100,7 @@ class DecodeEngineCore(DPEngineCoreProc):
         # the lower half. And on the tick that dispatches, `group_busy` is
         # still False -- the batch has not left yet -- so decode runs unmasked
         # for one step and then joins, which is when prefill actually starts.
-        self.scheduler.set_cu_fraction(
-            self._next_cu_fraction if group_busy else None
-        )
+        self.scheduler.set_cu_fraction(self._next_cu_fraction if group_busy else None)
 
         # `skip_delayer` is the all-reduced answer, never this rank's own: the
         # delayer's own tick is a cross-DP all_reduce, so the group skips it
