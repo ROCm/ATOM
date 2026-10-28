@@ -3,6 +3,7 @@
 A class with no owner routes a real failure to nobody, silently: the review
 died, someone needs to look, and no one is told.
 """
+
 import pathlib
 import re
 import sys

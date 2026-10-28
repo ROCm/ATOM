@@ -12,6 +12,7 @@ This fixture is a trimmed version of the real first end-to-end run (ATOM#2705,
 /tmp/review-pr-YCXQbE/), with one real finding and a `⚠️ NEEDS WORK` verdict -- the exact
 shape that could never go green before this fix.
 """
+
 import pathlib
 import subprocess
 import sys
@@ -54,8 +55,9 @@ INDEPENDENT = (
 
 
 def run(*args):
-    return subprocess.run([sys.executable, TRIAGE, *args],
-                          capture_output=True, text=True)
+    return subprocess.run(
+        [sys.executable, TRIAGE, *args], capture_output=True, text=True, check=False
+    )
 
 
 def _write(tmp_path, name, text):
@@ -64,7 +66,9 @@ def _write(tmp_path, name, text):
     return p
 
 
-def test_one_finding_non_clean_verdict_clears_refutations_and_independent_gates(tmp_path):
+def test_one_finding_non_clean_verdict_clears_refutations_and_independent_gates(
+    tmp_path,
+):
     card = _write(tmp_path, "card.md", CARD)
     diff = _write(tmp_path, "pr.diff", DIFF)
     refs = _write(tmp_path, "refutations.txt", REFUTATIONS)
@@ -73,58 +77,85 @@ def test_one_finding_non_clean_verdict_clears_refutations_and_independent_gates(
     r = run("refutations", str(refs), str(diff), str(card))
     assert r.returncode == 0, (
         "a card with one finding and a non-clean verdict must clear the refutations "
-        f"gate; got: {r.stdout}{r.stderr}")
+        f"gate; got: {r.stdout}{r.stderr}"
+    )
     assert "REFUTATIONS COMPLETE" in r.stdout
 
     r = run("independent", str(indep), str(card))
     assert r.returncode == 0, (
         "a card with one finding and a non-clean verdict must clear the independent "
-        f"gate; got: {r.stdout}{r.stderr}")
+        f"gate; got: {r.stdout}{r.stderr}"
+    )
     assert "INDEPENDENTLY REFUTED" in r.stdout
 
 
 def test_verdict_line_alone_is_not_counted_as_a_finding():
     sys.path.insert(0, str(SKILL))
-    import triage  # noqa: E402
+    import triage
 
     findings = [l for l in CARD.splitlines() if triage.FINDING.match(l.strip())]
     # Exactly one finding line (the 🔴/⚠️/📝 bullet) -- the `Review:` verdict line and the
     # `Validation (deterministic):` line must NOT be in this list.
-    assert len(findings) == 1, (
-        f"expected exactly 1 finding line, counted {len(findings)}: {findings}")
+    assert (
+        len(findings) == 1
+    ), f"expected exactly 1 finding line, counted {len(findings)}: {findings}"
 
 
 def test_clean_verdict_card_with_validation_line_passes_card_gate(tmp_path):
-    card = _write(tmp_path, "card.md", (
-        "## ATOM PR #9999 — docs: fix typo in comment\n\n"
-        "**Fixes a typo in a comment; no runtime behavior changes.**\n\n"
-        "Review: ✅ LGTM\n"
-        "Validation (deterministic): N/A -- no runtime surface changed\n"
-    ))
+    card = _write(
+        tmp_path,
+        "card.md",
+        (
+            "## ATOM PR #9999 — docs: fix typo in comment\n\n"
+            "**Fixes a typo in a comment; no runtime behavior changes.**\n\n"
+            "Review: ✅ LGTM\n"
+            "Validation (deterministic): N/A -- no runtime surface changed\n"
+        ),
+    )
     verdicts = _write(tmp_path, "verdicts.txt", "")
     diagnostic = _write(tmp_path, "ai_diagnostic.txt", "")
     answers = _write(tmp_path, "answers.txt", "")
     diff = _write(tmp_path, "pr.diff", "")
     late = _write(tmp_path, "late_findings.txt", "")
 
-    r = run("card", str(card), str(verdicts), str(diagnostic), str(answers), str(diff),
-            str(late))
-    assert r.returncode == 0, f"clean ✅ card with Validation line rejected: {r.stdout}{r.stderr}"
+    r = run(
+        "card",
+        str(card),
+        str(verdicts),
+        str(diagnostic),
+        str(answers),
+        str(diff),
+        str(late),
+    )
+    assert (
+        r.returncode == 0
+    ), f"clean ✅ card with Validation line rejected: {r.stdout}{r.stderr}"
 
 
 def test_card_gate_rejects_missing_validation_line(tmp_path):
-    card = _write(tmp_path, "card.md", (
-        "## ATOM PR #9999 — docs: fix typo in comment\n\n"
-        "**Fixes a typo in a comment; no runtime behavior changes.**\n\n"
-        "Review: ✅ LGTM\n"
-    ))
+    card = _write(
+        tmp_path,
+        "card.md",
+        (
+            "## ATOM PR #9999 — docs: fix typo in comment\n\n"
+            "**Fixes a typo in a comment; no runtime behavior changes.**\n\n"
+            "Review: ✅ LGTM\n"
+        ),
+    )
     verdicts = _write(tmp_path, "verdicts.txt", "")
     diagnostic = _write(tmp_path, "ai_diagnostic.txt", "")
     answers = _write(tmp_path, "answers.txt", "")
     diff = _write(tmp_path, "pr.diff", "")
     late = _write(tmp_path, "late_findings.txt", "")
 
-    r = run("card", str(card), str(verdicts), str(diagnostic), str(answers), str(diff),
-            str(late))
+    r = run(
+        "card",
+        str(card),
+        str(verdicts),
+        str(diagnostic),
+        str(answers),
+        str(diff),
+        str(late),
+    )
     assert r.returncode != 0, "a card missing the Validation line passed the card gate"
     assert "MISSING-VALIDATION" in (r.stdout + r.stderr)

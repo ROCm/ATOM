@@ -4,6 +4,7 @@ A gate that is silently renamed or dropped does not fail anything -- the
 review simply stops being checked on that axis. This test is the only thing
 that notices.
 """
+
 import pathlib
 import subprocess
 import sys
@@ -13,13 +14,24 @@ sys.path.insert(0, str(HERE))
 import _lib
 
 EXPECTED_GATES = [
-    "answers", "diagnostic", "corefiles", "ledger",
-    "card", "refutations", "independent",
+    "answers",
+    "diagnostic",
+    "corefiles",
+    "ledger",
+    "card",
+    "refutations",
+    "independent",
 ]
 EXPECTED_REQUIRED = [
-    "card.md", "verdicts.txt", "answers.txt", "ai_diagnostic.txt",
-    "core_files.txt", "refutations.txt", "independent.txt",
-    "rules.txt", "pr_meta.json",
+    "card.md",
+    "verdicts.txt",
+    "answers.txt",
+    "ai_diagnostic.txt",
+    "core_files.txt",
+    "refutations.txt",
+    "independent.txt",
+    "rules.txt",
+    "pr_meta.json",
 ]
 PROJ = str(HERE.parent.parent.parent)
 
@@ -54,12 +66,18 @@ def test_empty_work_dir_fails_closed(tmp_path):
     res = _lib.run_gates(str(tmp_path), PROJ)
     by_name = {name: rc for name, rc, _, _ in res}
     for gate in ("answers", "diagnostic", "corefiles", "ledger"):
-        assert by_name[gate] != 0, \
-            f"{gate} went green on an empty WORK dir -- it fails open"
+        assert (
+            by_name[gate] != 0
+        ), f"{gate} went green on an empty WORK dir -- it fails open"
 
     gates_py = HERE / "_gates.py"
-    p = subprocess.run([sys.executable, str(gates_py), str(tmp_path), PROJ],
-                      capture_output=True, text=True)
-    assert p.returncode != 0, \
-        ("_gates.py exited 0 on an empty WORK dir -- the pipeline would treat "
-         f"an unrun review as a passing one\nstdout:\n{p.stdout}\nstderr:\n{p.stderr}")
+    p = subprocess.run(
+        [sys.executable, str(gates_py), str(tmp_path), PROJ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert p.returncode != 0, (
+        "_gates.py exited 0 on an empty WORK dir -- the pipeline would treat "
+        f"an unrun review as a passing one\nstdout:\n{p.stdout}\nstderr:\n{p.stderr}"
+    )
