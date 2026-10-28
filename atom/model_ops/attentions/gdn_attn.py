@@ -1631,7 +1631,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # nowhere) and position 0, and the model's recording replays over them. The
     # GDN and attention regions run live and read the scheduled count, so the pad
     # rows reach no state, no KV and no sampled row.
-    supports_token_graph = True
+    #
+    # One DP rank only. Under DP attention a recorded prefill bucket is replayed
+    # by every rank of the group: a decoding rank on its decode rows, an idle one
+    # on a request-less dummy prefill (`Scheduler.dummy_prefill`). Neither has
+    # been brought up for this builder -- the dummy prefill's GDN step would index
+    # the state pool with a pad slot -- and with the GDN layers recorded inline
+    # (`ATOM_GDN_PREFILL_IN_GRAPH`) those ranks would replay prefill GDN kernels
+    # over another step's tables. Without recorded buckets a DP group runs its
+    # prefills eagerly, as before.
+    @property
+    def supports_token_graph(self) -> bool:
+        from aiter.dist.parallel_state import get_dp_group
+
+        return get_dp_group().world_size == 1
     # The bucket a padded prefill is being laid out at, while `prepare_prefill`
     # runs; None otherwise.
     _token_graph_tokens: int | None = None
@@ -2100,7 +2113,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             prepare_chunk_indices.prime(gpu.view(total, 2), query_start_loc, chunk_size)
 
     def _gdn_graph_prefill(self) -> bool:
-        return envs.ATOM_GDN_PREFILL_IN_GRAPH and not self.use_spec_decode_flydsl_prefill()
+        return (
+            envs.ATOM_GDN_PREFILL_IN_GRAPH
+            and self.supports_token_graph
+            and not self.use_spec_decode_flydsl_prefill()
+        )
 
     def use_spec_decode_flydsl_prefill(self) -> bool:
         return False
