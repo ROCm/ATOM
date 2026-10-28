@@ -27,6 +27,7 @@ from .bounded_replay import (
 from .config import validate_tbo_parallelism
 from .decoder_graph import DecoderGraph
 from .model import Block
+from .mono import config as mono_config
 from .multimodal import DeepseekV41MultimodalModel
 
 logger = logging.getLogger("atom")
@@ -254,10 +255,20 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         # Validate their final width here, before allocating model parameters.
         if getattr(config, "enable_tbo", False):
             validate_tbo_parallelism(config)
+        # WKV TP needs every rank's complete H rows. Choose the weight layout
+        # before loading; mono is installed later and may partition those rows.
+        tok_par_from = mono_config.token_parallel_from(config)
+        if tok_par_from is not None:
+            logger.info(
+                "Engram WKV uses full weights: mono token parallel is configured "
+                "from %d rows.",
+                tok_par_from,
+            )
         super().__init__(
             config.hf_config,
             max_length=config.max_model_len,
             online_quant_config=config.online_quant_config,
+            engram_tp=tok_par_from is None,
         )
         for i, layer in enumerate(self.layers):
             atom_config.compilation_config.static_forward_context[layer.layer_name] = (

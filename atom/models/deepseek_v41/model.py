@@ -46,6 +46,7 @@ class Block(nn.Module):
         prefix: str = "",
         *,
         moe_quant_config,
+        engram_tp: bool = True,
         alt_stream: torch.cuda.Stream | None = None,
         compress_stream: torch.cuda.Stream | None = None,
         index_stream: torch.cuda.Stream | None = None,
@@ -102,6 +103,7 @@ class Block(nn.Module):
                 hc,
                 config.rms_norm_eps,
                 quant_config=native_quant_config(),
+                enable_tp=engram_tp,
             )
 
     def process_weights_after_loading(self):
@@ -240,7 +242,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config, *, max_length, online_quant_config=None):
+    def __init__(self, config, *, max_length, online_quant_config=None, engram_tp=True):
         super().__init__()
         group = get_tp_group()
         config.validate_parallelism(group.world_size, group.world_size)
@@ -279,6 +281,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 spec,
                 prefix=f"layers.{spec.layer_id}",
                 moe_quant_config=self.moe_quant_config,
+                engram_tp=engram_tp,
                 alt_stream=self.alt_stream,
                 compress_stream=self.compress_stream,
                 index_stream=self.index_stream,

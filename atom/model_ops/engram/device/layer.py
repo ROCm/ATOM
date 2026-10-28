@@ -16,25 +16,31 @@ from atom.model_ops.utils import atom_parameter
 
 
 class _EngramWKV(ReplicatedLinear):
-    """One local Key/full-V weight; its prefix also serves small-token KV TP."""
+    """One local Key-shard/full-V weight, with a prefix for small-token KV TP."""
 
-    def __init__(self, input_size, hidden_size, hc_mult, quant_config=None):
+    def __init__(
+        self, input_size, hidden_size, hc_mult, quant_config=None, *, enable_tp=True
+    ):
         super().__init__(
             input_size, (hc_mult + 1) * hidden_size, quant_config=quant_config
         )
         self.hc_mult = self.local_hc = hc_mult
         self.hidden_size = hidden_size
+        self.local_key_rows = hc_mult * hidden_size
         self.kv_gather_rows = 0
         self.value_start = 0
         if (
-            self.native_a8_group_rows == 32
+            enable_tp
+            and self.native_a8_group_rows == 32
             and self.weight.dtype == torch.float8_e4m3fn
-            and self.tp_size in (2, 4)
-            and hc_mult % self.tp_size == 0
+            and self.tp_size in (2, 4, 8)
+            and (hc_mult % self.tp_size == 0 or (self.tp_size == 8 and hc_mult == 4))
+            and (hc_mult * hidden_size) % (32 * self.tp_size) == 0
             and hidden_size % 32 == 0
         ):
-            self.local_hc = hc_mult // self.tp_size
-            self.output_size = (self.local_hc + 1) * hidden_size
+            self.local_hc = max(1, hc_mult // self.tp_size)
+            self.local_key_rows = hc_mult * hidden_size // self.tp_size
+            self.output_size = self.local_key_rows + hidden_size
             self.output_partition_sizes = [self.output_size]
             # Preserve Parameter identities and their loader callbacks. Fresh
             # storage releases the full allocation, including on meta devices.
@@ -66,7 +72,7 @@ class _EngramWKV(ReplicatedLinear):
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        if self.local_hc != self.hc_mult:
+        if self.local_key_rows != self.hc_mult * self.hidden_size:
             group = 32 if param is self.weight_scale else 1
             branch_rows = self.hidden_size // group
             expected = (
@@ -79,7 +85,7 @@ class _EngramWKV(ReplicatedLinear):
                     f"Engram {name} is {tuple(loaded_weight.shape)}, expected "
                     f"full checkpoint shape {expected}"
                 )
-            rows = self.local_hc * branch_rows
+            rows = self.local_key_rows // group
             start = self.tp_rank * rows
             value = self.hc_mult * branch_rows
             value_start = self.value_start // group
@@ -113,6 +119,8 @@ class EngramOp(nn.Module):
         hc_mult: int = 4,
         norm_eps: float = 1e-20,
         quant_config: QuantizationConfig | None = None,
+        *,
+        enable_tp: bool = True,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -120,6 +128,7 @@ class EngramOp(nn.Module):
         self.engram_hidden_size = engram_hidden_size
         self.hc_mult = hc_mult
         self.norm_eps = norm_eps
+        self.fused_post = None
 
         # The checkpoint stores hc_mult Keys followed by one shared Value.
         # _EngramWKV selects local Keys and rotates V once at load time, so
@@ -129,6 +138,7 @@ class EngramOp(nn.Module):
             hidden_size,
             hc_mult,
             quant_config=quant_config,
+            enable_tp=enable_tp,
         )
         self.register_buffer("gate_weight", None, persistent=False)
         self.k_weight = atom_parameter(torch.ones(hc_mult, hidden_size))
@@ -169,8 +179,27 @@ class EngramOp(nn.Module):
                 f"hidden states cover {tuple(hidden_states.shape[:-2])} tokens "
                 f"but embeddings cover {tuple(embeddings.shape[:-1])}"
             )
+        m = embeddings.numel() // self.engram_hidden_size
+        use_fused = (
+            self.fused_post is not None
+            and 12 < m <= 128
+            and hidden_states.dtype == embeddings.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and embeddings.is_contiguous()
+            and (token_mask is None or token_mask.is_contiguous())
+        )
+        if use_fused:
+            kv = self.wkv(embeddings)
+            return self.fused_post(
+                hidden_states,
+                kv,
+                self.gate_weight,
+                token_mask,
+                value_start=self.wkv.value_start,
+                eps=self.norm_eps,
+            )
         kv = self.wkv(embeddings)
-        if self.wkv.local_hc != self.hc_mult:
+        if self.wkv.local_key_rows != self.key_rows:
             group = get_tp_group()
             if self.wkv.use_kv_gather(embeddings):
                 kv = group.all_gather(
@@ -200,6 +229,28 @@ class EngramOp(nn.Module):
     @torch.no_grad()
     def process_weights_after_loading(self):
         self.gate_weight = self.q_weight.float() * self.k_weight.float()
+        if (
+            self.fused_post is None
+            and self.wkv.local_key_rows != self.key_rows
+            and self.hidden_size == 5120
+            and self.hc_mult == 4
+            and self.gate_weight.is_cuda
+        ):
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            from atom.utils import envs
+
+            group = get_tp_group()
+            comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
+            if (
+                envs.ATOM_ENGRAM_FUSED_GATE
+                and get_gfx_runtime() == "gfx950"
+                and comm is not None
+                and not comm.disabled
+            ):
+                from aiter.ops.flydsl.engram_post_wkv import FusedEngramPost
+
+                self.fused_post = FusedEngramPost(group.cpu_group)
 
     @torch.no_grad()
     def load_checkpoint_weights(

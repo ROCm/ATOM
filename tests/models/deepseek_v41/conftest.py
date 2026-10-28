@@ -102,7 +102,7 @@ def unallocated_moe(monkeypatch):
 
 
 @pytest.fixture
-def build_v41(unallocated_moe):
+def build_v41(unallocated_moe, single_rank):
     """Build one V4.1 entry point by name, on the meta device.
 
     All four are here because the model is reachable four ways and each
@@ -117,6 +117,7 @@ def build_v41(unallocated_moe):
 
     def build(entrypoint, online=None, alt_stream=None):
         engine = SimpleNamespace(
+            tensor_parallel_size=single_rank.world_size,
             hf_config=hf,
             max_model_len=32,
             enforce_eager=True,

@@ -19,6 +19,9 @@ SUPPORTED_DPA = (2,)
 # target step is routed by its rows alone, however many requests they are and
 # however many rows each holds
 MAX_ROWS = 48
+# Token parallel starts at this width (and a multiple of TP). TP2 stays
+# replicated: its row gather cost more than the per-token work it saved.
+TOK_PAR_FROM = {4: 12}
 # the MoE's rows at most (``kernels.moe``): DP attention runs every rank's
 # step through one MoE, up to MAX_ROWS a rank over two ranks
 MAX_MOE_ROWS = 96
@@ -29,6 +32,25 @@ MAX_REQUESTS = 8
 ATTENTION_KEYS_MAX = 64 * 16
 # (top-k, candidate blocks, rows a block, index heads, index head dim)
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
+
+
+def token_parallel_from(atom_config) -> int | None:
+    """Configured first token-parallel width, or None for replicated rows.
+
+    Available before weight loading so Engram can choose one WKV layout.
+    The runner may still turn token parallel off if its custom gather cannot
+    fit the final row/aux buffers; keeping full WKV in that case is safe.
+    """
+    rows = TOK_PAR_FROM.get(atom_config.tensor_parallel_size)
+    if (
+        rows is None
+        or not envs.ATOM_MONO_ENABLE
+        or envs.ATOM_MONO_CHECK
+        or not envs.ATOM_USE_CUSTOM_ALL_GATHER
+        or config_refusal(atom_config) is not None
+    ):
+        return None
+    return rows
 
 
 def config_refusal(atom_config) -> str | None:

@@ -10,9 +10,12 @@ from .vision import Aligner, ViT
 
 
 class DeepseekV41MultimodalModel(DeepseekV41ForCausalLM):
-    def __init__(self, config, *, max_length, online_quant_config=None):
+    def __init__(self, config, *, max_length, online_quant_config=None, engram_tp=True):
         super().__init__(
-            config, max_length=max_length, online_quant_config=online_quant_config
+            config,
+            max_length=max_length,
+            online_quant_config=online_quant_config,
+            engram_tp=engram_tp,
         )
         vision_config = config._multimodal_config.vision_config
         self.vision = ViT(vision_config)

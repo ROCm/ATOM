@@ -75,7 +75,37 @@ def native(monkeypatch):
     monkeypatch.setattr(deployment, "is_vllm", lambda: False)
     monkeypatch.setattr(deployment, "is_sglang", lambda: False)
     monkeypatch.setenv("ATOM_MONO_ENABLE", "1")
+    monkeypatch.setenv("ATOM_MONO_CHECK", "0")
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     monkeypatch.setenv("ATOM_DSV41_SIDE_STREAMS", "0")
+
+
+@pytest.mark.parametrize("tp, first_row", [(2, None), (4, 12), (8, None)])
+def test_token_parallel_policy(native, tp, first_row):
+    assert (
+        mono_config.token_parallel_from(_atom_config(tensor_parallel_size=tp))
+        == first_row
+    )
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("ATOM_MONO_ENABLE", "0"),
+        ("ATOM_MONO_CHECK", "1"),
+        ("ATOM_USE_CUSTOM_ALL_GATHER", "0"),
+        ("ATOM_DSV41_SIDE_STREAMS", "1"),
+    ],
+)
+def test_token_parallel_policy_respects_switches(native, monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    assert mono_config.token_parallel_from(_atom_config()) is None
+
+
+def test_token_parallel_policy_follows_configured_tp(native, monkeypatch):
+    monkeypatch.setattr(mono_config, "TOK_PAR_FROM", {2: 16})
+    assert mono_config.token_parallel_from(_atom_config(tensor_parallel_size=2)) == 16
+    assert mono_config.token_parallel_from(_atom_config()) is None
 
 
 @pytest.mark.parametrize("tp", [2, 4, 8])
@@ -162,6 +192,7 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
 )
 def test_unsupported_deployment_is_refused(native, overrides, reason):
     assert reason in mono_config.config_refusal(_atom_config(**overrides))
+    assert mono_config.token_parallel_from(_atom_config(**overrides)) is None
 
 
 def test_dp_attention_with_expert_parallel_is_served(native):

@@ -117,6 +117,31 @@ class TinyBlock(RuntimeBlock):
         )
 
 
+@pytest.mark.parametrize("tp, first_row", [(2, None), (4, 12), (4, None)])
+def test_runtime_engram_layout_is_chosen_before_loading(
+    monkeypatch, single_rank, unallocated_moe, build_v41, tp, first_row
+):
+    from unittest.mock import Mock
+
+    from atom.models.deepseek_v41.mono import config as mono_config
+
+    single_rank.world_size = tp
+    unallocated_moe.engram_layer_ids = (1, 14)
+    policy = Mock(return_value=first_row)
+    monkeypatch.setattr(mono_config, "token_parallel_from", policy)
+    model = build_v41("runtime")
+    policy.assert_called_once()
+    assert policy.call_args.args[0].tensor_parallel_size == tp
+    for i in unallocated_moe.engram_layer_ids:
+        wkv = model.layers[i].engram.wkv
+        hc = 4 if first_row is not None else 4 // tp
+        assert wkv.local_hc == hc
+        assert wkv.weight.shape == ((hc + 1) * 5120, 6144)
+        assert wkv.weight_scale.shape == ((hc + 1) * 160, 192)
+        assert set(dict(wkv.named_parameters())) == {"weight", "weight_scale"}
+        assert bool(wkv.kv_gather_rows) == (first_row is None)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm compiler")
 @pytest.mark.parametrize("level, images", [(0, False), (0, True), (3, False)])
 @pytest.mark.parametrize("fuse_quant", [False, True])
@@ -143,6 +168,7 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 
     monkeypatch.setattr(VllmBackend, "__call__", record_backend)
     config = SimpleNamespace(
+        tensor_parallel_size=1,
         hf_config=SimpleNamespace(hc_mult=4, hidden_size=8),
         max_model_len=32,
         online_quant_config=None,

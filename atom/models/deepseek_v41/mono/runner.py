@@ -39,7 +39,11 @@ from atom.models.deepseek_v41.mono.check import (
     check_selection,
     decode_keys,
 )
-from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS
+from atom.models.deepseek_v41.mono.config import (
+    MAX_MOE_ROWS,
+    MAX_ROWS,
+    token_parallel_from,
+)
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import debug as kernel_debug
@@ -67,13 +71,6 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
-
-# token parallel from this many rows (and a multiple of the TP size), by TP
-# size: the sublayers' all-reduces become reduce-scatters, the per-token stages
-# run on each rank's own tokens. Below it the gather's extra hop costs more than
-# a rank's few tokens save; at TP 2 it never paid (12-48 rows: a K2 equal or
-# 0.5-4.9 us slower), so a TP size not here runs without it
-TOK_PAR_FROM = {4: 12}
 
 # K2a's and K2b's mailbox tags start past every layer's K1 and K2a
 POST_TAG0 = 64
@@ -205,7 +202,8 @@ class V41MonoDecodeRunner:
             if drafter is None
             else bind_aux_taps(drafter, model.config.hidden_size)
         )
-        self.tok_par_from = TOK_PAR_FROM.get(self.tp, self.max_rows + 1)
+        rows = token_parallel_from(get_current_atom_config())
+        self.tok_par_from = self.max_rows + 1 if rows is None else rows
         # DP attention gathers no rows: a rank's step is its own
         if self.dp == 1 and not self._custom_gather_fits():
             logger.warning(
