@@ -7,18 +7,19 @@ import logging
 import os
 import pprint
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any
 
 import torch
-import torch.fx as fx
+from torch import fx
+from torch._dispatch.python import enable_python_dispatcher
+
 from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.utils import (
     compilation_counter,
     is_torch_equal_or_newer,
 )
-from torch._dispatch.python import enable_python_dispatcher
 
 from .compiler_inferface import (
     CompilerInterface,
@@ -27,10 +28,6 @@ from .compiler_inferface import (
 )
 
 logger = logging.getLogger("atom")
-
-
-def get_static_graph_wrapper_cls(cls) -> str:
-    return "atom.utils.cuda_graph.CUDAGraphWrapper"
 
 
 def make_compiler(compilation_config: CompilationConfig) -> CompilerInterface:
@@ -63,7 +60,7 @@ class CompilerManager:
     """
 
     def __init__(self, compilation_config: CompilationConfig):
-        self.cache: dict[tuple[Optional[int], int, str], Any] = dict()
+        self.cache: dict[tuple[int | None, int, str], Any] = {}
         self.is_cache_updated = False
         self.compilation_config = compilation_config
         self.compiler = make_compiler(compilation_config)
@@ -118,8 +115,8 @@ class CompilerManager:
         graph: fx.GraphModule,
         example_inputs: list[Any],
         graph_index: int,
-        runtime_shape: Optional[int] = None,
-    ) -> Optional[Callable]:
+        runtime_shape: int | None = None,
+    ) -> Callable | None:
         if (runtime_shape, graph_index, self.compiler.name) not in self.cache:
             return None
         handle = self.cache[(runtime_shape, graph_index, self.compiler.name)]
@@ -128,15 +125,14 @@ class CompilerManager:
         )
         if runtime_shape is None:
             logger.debug(
-                "Directly load the %s-th graph for dynamic shape from %s via "
-                "handle %s",
+                "Directly load the %s-th graph for dynamic shape from %s via handle %s",
                 graph_index,
                 self.compiler.name,
                 handle,
             )
         else:
             logger.debug(
-                "Directly load the %s-th graph for shape %s from %s via " "handle %s",
+                "Directly load the %s-th graph for shape %s from %s via handle %s",
                 graph_index,
                 str(runtime_shape),
                 self.compiler.name,
@@ -152,7 +148,7 @@ class CompilerManager:
         compilation_config: CompilationConfig,
         graph_index: int = 0,
         num_graphs: int = 1,
-        runtime_shape: Optional[int] = None,
+        runtime_shape: int | None = None,
     ) -> Any:
         # print("runtime_shape", runtime_shape)
         if graph_index == 0:
@@ -215,7 +211,7 @@ class CompilerManager:
                     )
             if runtime_shape is None:
                 logger.debug(
-                    "Store the %s-th graph for dynamic shape from %s via " "handle %s",
+                    "Store the %s-th graph for dynamic shape from %s via handle %s",
                     graph_index,
                     self.compiler.name,
                     handle,
@@ -420,32 +416,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 self.vllm_backend,
             )
 
-            # Wrap each compiled dense piece in a PIECEWISE CUDAGraphWrapper so
-            # it captures/replays its own cudagraph (attention runs eager between
-            # pieces). Gated on cudagraph_mode requesting piecewise; otherwise
-            # keep the bare piecewise_backend (compiled, no per-piece cudagraph —
-            # the pre-existing behavior, e.g. FULL manual capture in the runner).
-            _cg_mode = self.compilation_config.cudagraph_mode
-            # Driven by --cudagraph-mode. Default FULL -> requires_piecewise is
-            # False -> bare piecewise_backend (compiled pieces inside the manual
-            # FULL whole-forward capture, i.e. existing behavior). PIECEWISE ->
-            # wrap each piece in its own cudagraph.
-            _pw_cg = _cg_mode is not None and _cg_mode.requires_piecewise_compilation()
-            if _pw_cg:
-                from .cuda_graph import CUDAGraphOptions, CUDAGraphWrapper
-
-                self.module.__dict__[target] = CUDAGraphWrapper(
-                    runnable=piecewise_backend,
-                    vllm_config=self.vllm_config,
-                    runtime_mode=CUDAGraphMode.PIECEWISE,
-                    cudagraph_options=CUDAGraphOptions(
-                        debug_log_enable=piecewise_backend.is_first_graph,
-                        gc_disable=not piecewise_backend.is_first_graph,
-                        weak_ref_output=piecewise_backend.is_last_graph,
-                    ),
-                )
-            else:
-                self.module.__dict__[target] = piecewise_backend
+            # A compiled piece is graphed with the rest of the forward: a
+            # `TokenGraph` records it inline, breaking only at the split ops
+            # declared `eager_region`.
+            self.module.__dict__[target] = piecewise_backend
 
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
 
@@ -612,7 +586,7 @@ class VllmBackend:
 
             # 2. factors come from the code files that are traced by Dynamo (
             #    it mainly summarizes how the model is used in forward pass)
-            forward_code_files = list(sorted(self.compilation_config.traced_files))
+            forward_code_files = sorted(self.compilation_config.traced_files)
             self.compilation_config.traced_files.clear()
             logger.debug(
                 "Traced files (to be considered for compilation cache):\n%s",
@@ -709,7 +683,7 @@ class VllmBackend:
 
         graph_path = os.path.join(local_cache_dir, "computation_graph.py")
         if not os.path.exists(graph_path):
-            # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30 # noqa
+            # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30
             # use `print_readable` because it can include submodules
             src = (
                 "from __future__ import annotations\nimport torch\n"

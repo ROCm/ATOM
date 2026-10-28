@@ -205,6 +205,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
     from atom.model_ops.deepseek_v41.index_write import write_index_rows
     from atom.model_ops.deepseek_v41.unit_table import unit_table
+    from atom.model_ops.indexer import score as shared
 
     torch.manual_seed(1921)
     rows, width, heads, dim, per_page = 7, 512, 32, 128, 128
@@ -245,7 +246,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
 
     full, candidates = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
     reindex, _ = scoring.score_topk_paged(*args, **kwargs, candidates=bind(candidates))
-    real_score = scoring.deepgemm_fp8_paged_mqa_logits
+    real_score = shared.deepgemm_fp8_paged_mqa_logits
     sizes = []
 
     def observe(*args, **kwargs):
@@ -263,7 +264,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     original_plane_rows = ws.plane_rows
     monkeypatch.setattr(ws, "plane_rows", lambda width: 3)
     monkeypatch.setattr(chunk, "plane_rows", lambda width: 3)
-    monkeypatch.setattr(scoring, "deepgemm_fp8_paged_mqa_logits", observe)
+    monkeypatch.setattr(shared, "deepgemm_fp8_paged_mqa_logits", observe)
     actual, chosen = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
     actual_reindex, _ = scoring.score_topk_paged(
         *args, **kwargs, candidates=bind(chosen)
@@ -313,7 +314,6 @@ def test_scoring_inside_the_candidates_picks_what_masking_the_full_width_picked(
     from atom.model_ops.deepseek_v41 import paged_scoring as scoring
     from atom.model_ops.deepseek_v41.candidate_table import (
         bind_candidates,
-        lift_candidate_selection,
     )
     from atom.model_ops.deepseek_v41.index_write import write_index_rows
     from atom.model_ops.deepseek_v41.indexer import restrict_to_candidates_reference
@@ -360,13 +360,18 @@ def test_scoring_inside_the_candidates_picks_what_masking_the_full_width_picked(
     # The path this replaces, assembled from the same pieces: full width, the
     # mask, then the same selector.
     from aiter.ops.topk import top_k_per_row_decode
+    from aiter.ops.triton.attention.pa_mqa_logits import (
+        deepgemm_fp8_paged_mqa_logits,
+    )
+
+    from atom.model_ops.indexer import fold_query_scale
 
     q_fp8, q_scale = scoring.quantize_query_rows(query)
-    scaled = scoring.scale_indexer_weights(
+    scaled = fold_query_scale(
         weights.contiguous(), q_scale.view(rows, heads, 1), kwargs["weights_scale"]
     )
     scores = torch.empty(rows, width, dtype=torch.float32, device="cuda")
-    scoring.deepgemm_fp8_paged_mqa_logits(
+    deepgemm_fp8_paged_mqa_logits(
         q_fp8.view(rows, 1, heads, dim),
         plane.view(-1, block, dim + 4).unsqueeze(-2),
         scaled,
@@ -393,12 +398,11 @@ def test_scoring_inside_the_candidates_picks_what_masking_the_full_width_picked(
     assert torch.equal(actual, expected), (actual, expected)
 
     # Armed: the ids leaving the selector are columns of the narrow width, so a
-    # missing lift would agree with the real rows only where a row kept its very
-    # first blocks.
-    raw, _ = scoring.score_topk_paged(*args, **kwargs, candidates=kept)
-    twice = raw.clone()
-    lift_candidate_selection(twice, candidates, rows_per_block=block)
-    assert not torch.equal(twice, raw)
+    # missing lift would keep every id inside it. Lifted, some name rows past
+    # it. (Lifting them again would index the candidate list with a lifted id,
+    # past its end.)
+    narrow = kept.ids.shape[1] * block
+    assert bool((actual >= narrow).any())
 
     # A plane paged at anything but the candidate length says so rather than
     # scoring the wrong rows: the ids would be read at one length and the
@@ -856,18 +860,20 @@ def test_scorer_runs_in_its_workspace_and_selects_the_same_rows():
     kwargs = {"topk": 64, "weights_scale": (heads * dim) ** -0.5, "candidate_count": 16}
     expected = scoring.score_topk_paged(*args, **kwargs)
 
+    from atom.model_ops.indexer import score as shared
+
     observed = []
-    real_score = scoring.deepgemm_fp8_paged_mqa_logits
+    real_score = shared.deepgemm_fp8_paged_mqa_logits
 
     def observe(*a, **k):
         observed.append(a[3].data_ptr())
         return real_score(*a, **k)
 
-    scoring.deepgemm_fp8_paged_mqa_logits = observe
+    shared.deepgemm_fp8_paged_mqa_logits = observe
     try:
         actual = scoring.score_topk_paged(*args, **kwargs, workspace=space)
     finally:
-        scoring.deepgemm_fp8_paged_mqa_logits = real_score
+        shared.deepgemm_fp8_paged_mqa_logits = real_score
     for got, want in zip(actual, expected):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert observed == [space.logits(1, 1).data_ptr()]

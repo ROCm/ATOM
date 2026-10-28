@@ -112,7 +112,7 @@ def runtime_config(**overrides):
         {"enable_rapidserve": True},
         {"online_quant_config": {}},
         {"eplb_enable": True},
-        {"kv_cache_dtype": "fp8"},
+        {"kv_cache_dtype": "fp16"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
         # a hit's one-PAGE rebuild would not cover the window
@@ -379,7 +379,7 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
             index_cache_dtype="fp8",
             enforce_eager=not graph,
             compilation_config=SimpleNamespace(
-                level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                level=0, cudagraph_mode=CUDAGraphMode.TR_HYBRID
             ),
         )
     )
@@ -416,7 +416,7 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         compilation_config=SimpleNamespace(
             level=level,
             cudagraph_mode=(
-                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.PIECEWISE
+                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.TR_HYBRID
             ),
         ),
         hf_config=SimpleNamespace(),
@@ -455,7 +455,7 @@ def test_level3_requires_full_graph_or_eager_runtime():
             runtime_config(
                 enforce_eager=False,
                 compilation_config=SimpleNamespace(
-                    level=3, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                    level=3, cudagraph_mode=CUDAGraphMode.TR_HYBRID
                 ),
             )
         )
@@ -472,13 +472,13 @@ def test_shortening_the_index_block_moves_bytes_without_adding_any(rows):
     the two regions interleave changes.
     """
     geo = V41PoolGeometry(
-        40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True, index_block_rows=rows
+        40, ((2, 2), (20, 1)), 64, 128, 512, 128, kv_dtype="fp4", index_block_rows=rows
     )
     assert geo.index_row_bytes == 132
     assert (
         geo.paged_bytes
         == V41PoolGeometry(
-            40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True
+            40, ((2, 2), (20, 1)), 64, 128, 512, 128, kv_dtype="fp4"
         ).paged_bytes
     )
 

@@ -12,6 +12,7 @@ from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
+from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -444,7 +445,7 @@ class DSparkProposer(Drafter):
         fully bound. Gating on the flag would let the second one through
         describing whatever the previous real step left behind.
         """
-        layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
+        layer_num = self.model.first_attention_layer_num
         cache_data = forward_context.kv_cache_data or {}
         entry = cache_data.get(f"layer_{layer_num}")
         bound = getattr(entry, "k_cache", None) if entry is not None else None
@@ -478,7 +479,7 @@ class DSparkProposer(Drafter):
             # for `final` so the caller does not cache a warmup-time guess.
             return from_config, False
         if bound.dtype != from_config:
-            layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
+            layer_num = self.model.first_attention_layer_num
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
@@ -649,10 +650,9 @@ class DSparkProposer(Drafter):
         attn_metadata = forward_context.attn_metadata
         context.is_draft = True
 
-        # Drafter-owned aux: our own forward-hook capture buffers, row-aligned to
-        # the target hidden states.
-        aux_hidden_states = self.aux_for(target_hidden_states)
-        if aux_hidden_states is None:
+        # Drafter-owned aux: our own forward-hook capture buffers. Checked, not
+        # read: `aux_for` would all_gather them again under a PCP prefill.
+        if not self._captures_aux:
             raise RuntimeError(
                 "DSpark requires target auxiliary hidden states from "
                 "dspark_target_layer_ids; none were captured."
@@ -723,6 +723,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and `num_draft` config, so
             # every rank reaches this height on its own.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
         label = self.block.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
@@ -953,6 +954,20 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
+        if not self.model.block_attention_is_mla:
+            # A draft that attends its block another way (MiniMax-M3.1's per-row
+            # MHA decode) builds what it reads itself; there is no MLA decode
+            # to plan.
+            self.model.prepare_paged_block(
+                attn_metadata,
+                block_tables,
+                block_positions,
+                slots,
+                ctx_lens,
+                block_table_state(self.runner.forward_vars["block_tables"]).lengths,
+                scheduled_bs,
+            )
+            return
 
         # Build persistent (ps=1) MLA-decode metadata
         from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
@@ -1083,6 +1098,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and T is config, so every
             # rank reaches this height on its own, none has to discover it.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
 
         # ---- 3. Block pass + Markov sampling ---------------------------------
