@@ -57,6 +57,10 @@ class IPCEventReclaimer:
         return entry.event
 
     def track_ready_event(self, event: Any, owner: Any) -> None:
+        # LMCache returns None when it rejects a transfer before submission.
+        # No DMA owns the event in that case; other submitted owners still do.
+        if owner is None:
+            return
         for entry in self._ready_events:
             if entry.event is event:
                 # The connector's pending tables own futures until terminal
