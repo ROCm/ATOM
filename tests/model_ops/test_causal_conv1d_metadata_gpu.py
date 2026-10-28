@@ -8,6 +8,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("needs a GPU", allow_module_level=True)
 
+import atom.model_ops.mamba_ops.causal_conv1d as conv_mod
 from atom.model_ops.mamba_ops.causal_conv1d import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
@@ -52,7 +53,7 @@ def test_short_bound_stays_in_bounds(monkeypatch):
 
 
 @pytest.mark.parametrize("variant", ["none", "exact", "short", "pad_slot_id"])
-def test_conv_matches_without_metadata(variant):
+def test_conv_matches_without_metadata(variant, monkeypatch):
     torch.manual_seed(0)
     kd, vd, width = 128, 256, 4
     dim, B, T = 2 * kd + vd, len(LENS), sum(LENS)
@@ -85,10 +86,18 @@ def test_conv_matches_without_metadata(variant):
         d, b, o = compute_causal_conv1d_metadata(qsl, num_tokens)
         return types.SimpleNamespace(nums_dict=d, batch_ptr=b, token_chunk_offset_ptr=o)
 
+    def reused(metadata):
+        # A map built for x's full width must be used as given, never rebuilt.
+        def no_rebuild(*args, **kwargs):
+            raise AssertionError("causal_conv1d_fn rebuilt a sufficient map")
+
+        monkeypatch.setattr(conv_mod, "compute_causal_conv1d_metadata", no_rebuild)
+        return run(metadata)
+
     expected = run(None)
     got = {
         "none": lambda: run(None),
-        "exact": lambda: run(meta(T)),
+        "exact": lambda: reused(meta(x.shape[1])),
         # The launcher rebuilds a map whose bound is short of x.
         "short": lambda: run(meta(1)),
         # Surplus programs carry -1 and must exit whatever pad_slot_id is.
