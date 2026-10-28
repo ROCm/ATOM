@@ -83,6 +83,10 @@ their trajectories: 22% of turns at c2048), `MODE` / `SPEC`
 `ATOM_PREFILL_DECODE_INTERVAL` in the environment overrides the DP points' default of 8 (0 is the
 scheduling before it; see [Prefill / decode interval](#prefill--decode-interval)).
 
+Traces: `TRACE_AT_MIN=5 TRACE_S=10 TRACE_STOP=1 bash run_ep.sh 16` takes a 10 s torch-profiler window of
+every rank 5 minutes into the benchmark (`$RUNS/c16/trace/rank_<r>/`) and then ends the point, so a
+traced point takes about 10 minutes.
+
 ## Results
 
 30-minute points on image `gfx1250-atom-20261026-dsv41-qwen-e15-08`; "tip" = the validated branch

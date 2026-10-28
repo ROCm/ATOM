@@ -74,6 +74,9 @@ esac
 SPEC=${SPEC:-0}
 [ "$SPEC" -gt 0 ] && ARGS+=(--method mtp --num-speculative-tokens $SPEC
   --online_quant_config '{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4"}}')
+# TRACE_DIR=<dir>: torch profiler on every rank, armed only; run_ep.sh's TRACE_AT_MIN takes the window
+# (traces under $TRACE_DIR/rank_<r>/). Unset, nothing changes.
+[ -n "$TRACE_DIR" ] && mkdir -p $TRACE_DIR && ARGS+=(--torch-profiler-dir $TRACE_DIR --mark-trace)
 [ -n "$EXTRA_ENV" ] && export $EXTRA_ENV
 printf '%q ' python3 -m atom.entrypoints.openai_server "${ARGS[@]}" $EXTRA_ARGS > $OUT/server_cmd.txt; echo >> $OUT/server_cmd.txt
 env | grep -E '^(ATOM|AITER|FLYDSL|HIP|HSA|MORI|MEGA|TRITON)_' | sort > $OUT/server_env.txt

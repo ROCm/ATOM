@@ -10,6 +10,9 @@
 # the cap, not an exhausted pool, ends every point), TURN_TIMEOUT=14400 (the benchmark's own; the drain
 # after the cap lasts until the in-flight turns finish).
 # Full compliant run: CAP_MIN=600 STOP_FIRST=0. SMOKE_ONLY=1 stops after the server checks.
+# Trace: TRACE_AT_MIN=<m> TRACE_S=<s> profiles every rank for <s> seconds (default 10) from minute <m>
+# of the benchmark into $D/trace; TRACE_STOP=1 then stops the client once the traces are written, so
+# a trace point takes minutes (its throughput: the engine stats in server.log).
 C=$1
 R=${R:-/work/qwen35_ep}; RUNS=${RUNS:-$R/runs}; D=$RUNS/c$C; ST=$RUNS/status.txt; mkdir -p $D
 S=$(cd "$(dirname "$0")" && pwd)   # serve_ep.sh, mkcfg.py, check_outputs.py live next to this script
@@ -37,6 +40,7 @@ for d in /usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib /opt/rocm/li
 done
 pkill -f atom.entrypoints.openai_server; sleep 10; pkill -9 -f atom.entrypoints.openai_server; pkill -9 -f 'ATOM[:][:]'; sleep 5
 rm -rf ~/.cache/atom
+[ -n "$TRACE_AT_MIN" ] && export TRACE_DIR=${TRACE_DIR:-$D/trace}
 MAXSEQ=$N bash $S/serve_ep.sh $MODE $D & SPID=$!
 for i in $(seq 1 360); do
   kill -0 $SPID 2>/dev/null || { echo "SERVER_DIED c=$C $(date -u +%FT%TZ)" >> $ST; exit 1; }
@@ -63,6 +67,21 @@ cmp -s $D/prefix_1.txt $D/prefix_2.txt && echo "PREFIX_OK" >> $ST || { echo "PRE
 
 $VENV/bin/python $S/mkcfg.py $BASE $DATASET $MODEL $C $D/report $D/client.yaml > /dev/null || { echo "CFG_FAIL c=$C" >> $ST; exit 1; }
 echo "BENCH c=$C $(date -u +%FT%TZ)" >> $ST
+if [ -n "$TRACE_AT_MIN" ]; then
+  ( sleep $(( TRACE_AT_MIN * 60 ))
+    curl -s -m 60 -X POST localhost:8000/start_profile > /dev/null; echo "TRACE_START $(date -u +%FT%TZ)" >> $ST
+    sleep ${TRACE_S:-10}
+    curl -s -m 900 -X POST localhost:8000/stop_profile > /dev/null; echo "TRACE_STOP $(date -u +%FT%TZ)" >> $ST
+    if [ "${TRACE_STOP:-0}" = 1 ]; then
+      # every rank's trace on disk and no longer growing, then end the point
+      for i in $(seq 1 120); do
+        n=$(find $TRACE_DIR -name '*.pt.trace.json*' -not -path '*capture_traces*' | wc -l)
+        a=$(du -sb $TRACE_DIR | cut -f1); sleep 5; b=$(du -sb $TRACE_DIR | cut -f1)
+        [ "$n" -ge 4 ] && [ "$a" = "$b" ] && break
+      done
+      pkill -f "[i]nference-endpoint benchmark"; echo "TRACE_CLIENT_STOPPED $(date -u +%FT%TZ)" >> $ST
+    fi ) &
+fi
 DRAIN=${TURN_TIMEOUT:-14400}
 (cd $EP && timeout $(( ${CAP_MIN:-30} * 60 + DRAIN + 900 )) $VENV/bin/inference-endpoint benchmark from-config --config $D/client.yaml --mode perf > $D/client.log 2>&1); rc=$?
 curl -s -m 10 localhost:8000/metrics > $D/server_metrics.txt 2>/dev/null
