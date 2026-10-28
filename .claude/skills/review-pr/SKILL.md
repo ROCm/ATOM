@@ -412,13 +412,17 @@ failure, because not writing it was the cheapest way past this check.
 - Output ONLY the card below. Nothing before it, nothing after it.
 - If there are no findings, the findings section is omitted entirely.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
+- The verdict line is mandatory and carries a label prefix, so it may never start with a
+  finding emoji (🔴/⚠️/📝) — that is what the `refutations`/`independent` gates count as
+  a reported finding, and a bare `⚠️ NEEDS WORK` verdict line gets counted as one, leaving
+  one more "finding" than the card actually has.
 
 ```
 ## ATOM PR #NNN — [title]
 
 **[One sentence: what this PR does, in plain terms. E.g. "Wraps the per_group emit_bf16 AllReduce path in a torch.library op so Dynamo can trace it."]**
 
-[✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
+Review: [✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
