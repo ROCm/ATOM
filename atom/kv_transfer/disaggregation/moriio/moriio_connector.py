@@ -446,7 +446,7 @@ class MoRIIOConnector(KVConnectorBase):
         self._start_handshake_listener(metadata)
 
     def _check_region_layout(self, remote_engine_id: str) -> dict[str, list[int]]:
-        """Peer layout. Kind, unit, reverse, and chunking must match. Counts may not."""
+        """Peer layout. Kind, unit, reverse, and chunking must match. Counts may differ."""
         remote = self.remote_moriio_metadata[remote_engine_id].region_layout
         if not remote:
             raise ValueError(
@@ -912,13 +912,7 @@ class MoRIIOConnector(KVConnectorBase):
 
                 per_layer_sessions.append((k_sessions, v_sessions))
 
-            if remote_layout is not None:
-                logger.info(
-                    "Prepared lazy sessions for %d region pseudo-layers of %s",
-                    len(per_layer_sessions),
-                    remote_engine_id,
-                )
-            else:
+            if remote_layout is None:
                 logger.info(
                     "Built %d K sessions + %d V sessions per layer for %s",
                     len(k_sessions),

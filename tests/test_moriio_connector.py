@@ -1321,26 +1321,6 @@ class RegionPseudoLayerTest(unittest.TestCase):
         request.update(overrides)
         return request
 
-    def test_reverse_indexed_unit_matches_the_region_address(self):
-        from_end = self.Fake._region_unit([self.SLOT, 16, 4, 1, 2], 0, "x")
-        # KVTransferRegion.unit_addr(0) = base + total - unit = base + 3 * unit.
-        self.assertEqual(from_end, 3)
-        self.assertEqual(self.Fake._region_unit([self.PAGE, 8, 10, 0, 4], 7, "x"), 7)
-        with self.assertRaises(ValueError):
-            self.Fake._region_unit([self.SLOT, 16, 4, 1, 2], 4, "x")
-        with self.assertRaises(ValueError):
-            self.Fake._region_unit([self.PAGE, 8, 10, 0, 4], -1, "x")
-
-    def test_plan_pairs_blocks_and_slots_per_region(self):
-        conn = self.make(*self.layouts())
-        req = self.request()
-        page, slot = conn._region_write_plan(req, "eng", [1, 5], [2, 9])
-        # Blocks 1->2 share chunk 0 on both ends; 5->9 is chunk 1 -> chunk 2.
-        self.assertEqual(page, {(0, 0): ([8], [16], [8]), (1, 2): ([8], [8], [8])})
-        # Local slot 0 is forward unit 3 (chunk 1, +16); remote slot 1 of a
-        # 6-unit region is forward unit 4 (chunk 2, +0).
-        self.assertEqual(slot, {(1, 2): ([16], [0], [16])})
-
     def test_a_missing_state_slot_is_refused(self):
         conn = self.make(*self.layouts())
         with self.assertRaises(ValueError) as caught:
@@ -1355,20 +1335,24 @@ class RegionPseudoLayerTest(unittest.TestCase):
             conn._write_blocks(self.request(src_slot=4), "eng")
         self.assertEqual(conn.writes, [])
         with self.assertRaises(ValueError):
-            conn._write_blocks(self.request(dst_block_ids=[12]), "eng")
+            conn._write_blocks(self.request(dst_block_ids=[-1]), "eng")
         self.assertEqual(conn.writes, [])
 
     def test_write_posts_one_batch_per_region_chunk_pair(self):
         conn = self.make(*self.layouts())
-        statuses = conn._write_blocks(self.request(), "eng")
-        self.assertEqual(statuses, ["status"] * 3)
-        sessions = [w[0] for w in conn.writes]
-        # Lazily built sessions, keyed by (region, local chunk) x remote chunk.
         self.assertEqual(
-            sessions,
-            [(("page.0.kv", 0), 0), (("page.0.kv", 1), 2), (("slot.0.kv", 1), 2)],
+            conn._write_blocks(self.request(), "eng"),
+            ["status"] * 3,
         )
-        self.assertEqual(conn.writes[2][1:], ([16], [0], [16]))
+        # PAGE 1->2 and 5->9, then SLOT 0 of 4 units into slot 1 of 6.
+        self.assertEqual(
+            conn.writes,
+            [
+                ((("page.0.kv", 0), 0), [8], [16], [8]),
+                ((("page.0.kv", 1), 2), [8], [8], [8]),
+                ((("slot.0.kv", 1), 2), [16], [0], [16]),
+            ],
+        )
 
     def test_layout_check_allows_only_unit_count_differences(self):
         local, remote = self.layouts()
