@@ -4,6 +4,9 @@ import numpy as np
 import pytest
 import torch
 
+pytest.importorskip("triton")
+pytest.importorskip("aiter")
+
 from atom.model_ops.attentions.gdn_attn import compute_causal_conv1d_metadata
 from atom.model_ops.mamba_ops.causal_conv1d import BLOCK_M
 
