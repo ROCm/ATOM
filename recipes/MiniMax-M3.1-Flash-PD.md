@@ -176,7 +176,8 @@ accuracy, benchmark and trace results must be verified from their CI jobs.
 The PP4 path combines this recipe's NVFP4/FP4 caches with the PP producer and
 DSpark aux-state relay from PR #2721. Prefill uses TP1 × PP4 on GPUs 0–3;
 decode uses TP4 on GPUs 4–7. Both roles must run this integrated revision.
-The existing CI cells above still select TP4 prefill.
+The original CI cells above select TP4 prefill. The additional `pp4-tp4`
+cells below select this integrated PP4 path.
 
 Start with the PP4 launch commands in
 [the M3 mesh recipe](mesh/MiniMax-M3.md#1p1d--pp4-prefill--tp4-decode-minimax-m31-flash-dspark),
@@ -218,3 +219,24 @@ CPU tests cover the model's registration hook, mixed-pool exports, physical
 KV/scale copies, draft planes, cached-prefix skipping and final chunk handoff.
 GPU GSM8K, actual acceptance, Store/RDMA and performance measurements are
 still required for this combined PP4/NVFP4 configuration.
+
+### PP4 CI validation
+
+The branch was rebased onto `up/main@c8f7f0583` on 2026-10-28. Select the
+following cases with the same pinned image and mounted source as above:
+
+- `suite=accuracy`:
+  `minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-gsm8k-5shot-c32`
+  and `minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-gsm8k-5shot-chunked-c32`.
+  Both run all 1319 GSM8K questions with real DSpark acceptance, without Store.
+  Flexible exact match must be at least 0.94; the FP8 PP4 reference in #2721
+  scores 0.9515. Retain strict-match and sample logs as well.
+- After accuracy passes, `suite=mooncake_store`:
+  `minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-c32`
+  and `minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32`.
+  Each runs AgentX for 3600 seconds with the recipe's synthetic AL 4.04 and
+  1 TiB Store. Run sequentially on the same node for the off/on comparison.
+
+These four cells disable draft PTPC, Mono and indexer CP on both roles.
+Prefill is TP1 × PP4, eager, with an 8192-token budget; decode is TP4 with
+CUDA graphs. The off/on pair changes only `enable_chunked_transfer`.

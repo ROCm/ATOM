@@ -1574,7 +1574,8 @@ models:
         cudagraph: *m31_capture_c32
     suites:
       accuracy:
-        - name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-gsm8k-5shot-c32
+        - &m31_flash_accuracy
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-gsm8k-5shot-c32
           topology: 1p1d
           pd_worker_layout: single_node
           nodes: "${ATOMESH_1P1D_NODES}"
@@ -1602,6 +1603,40 @@ models:
           run_eval: true
           eval_only: true
           eval_concurrency: [32]
+        - &m31_flash_pp4_accuracy
+          <<: *m31_flash_accuracy
+          name: minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-gsm8k-5shot-c32
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4
+          prefill: &m31_flash_pp4_prefill
+            workers: 1
+            tp: 1
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+          env:
+            common: &m31_flash_pp4_accuracy_env
+              MC_DISABLE_HIP: "1"
+              ATOM_M3_DSPARK_DRAFT_PTPC: "0"
+              ATOM_MONO_ENABLE: "0"
+              ATOM_M3_INDEXER_CP: "0"
+            prefill: &m31_flash_pp4_direct_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}
+            decode: &m31_flash_pp4_direct_decode_env
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          accuracy:
+            # PP4 FP8 reference: 0.9515 flexible exact match, all 1319 rows.
+            threshold: 0.94
+        - <<: *m31_flash_pp4_accuracy
+          name: minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-gsm8k-5shot-chunked-c32
+          env:
+            common: *m31_flash_pp4_accuracy_env
+            prefill:
+              <<: *m31_flash_pp4_direct_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_pp4_direct_decode_env
       mooncake_store:
         - &m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32
@@ -1655,6 +1690,33 @@ models:
             wait_server_timeout: 7200
             wait_router_timeout: 600
           run_eval: false
+
+        # PP4 integration: matched off/on pair with an 8192-token prefill budget.
+        - &m31_flash_pp4_mcstore
+          <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-c32
+          display_topology: 1P1D-PP4-TP4-DSPARK7-NVFP4-MCSTORE
+          prefill: *m31_flash_pp4_prefill
+          env:
+            common: &m31_flash_pp4_mcstore_common_env
+              <<: *m31_flash_mcstore_common_env
+              ATOM_M3_DSPARK_DRAFT_PTPC: "0"
+              ATOM_MONO_ENABLE: "0"
+              ATOM_M3_INDEXER_CP: "0"
+            prefill: &m31_flash_pp4_mcstore_prefill_env
+              <<: *m31_flash_mcstore_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}
+            decode: *m31_flash_mcstore_decode_env
+        - <<: *m31_flash_pp4_mcstore
+          name: minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32
+          env:
+            common: *m31_flash_pp4_mcstore_common_env
+            prefill:
+              <<: *m31_flash_pp4_mcstore_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_mcstore_decode_env
 
         # Same C32 recipe and prefill budget; isolate incremental P->D transfer.
         - &m31_flash_mcstore_chunked_c32
