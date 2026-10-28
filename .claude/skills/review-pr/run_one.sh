@@ -25,8 +25,21 @@ rm -f "$STATUS"   # fresh run: never inherit a previous run's verdict
 # agent/job timeout kills with SIGTERM, which skips a plain EXIT trap) that did NOT classify
 # itself still leaves a status so _notify.py routes it -- to the bot owner (flow) for triage --
 # instead of dying silently. Trap both the exit and the terminating signals.
-_on_exit() { local ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; return 0; }
-_on_signal() { [ -f "$STATUS" ] || printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; exit 143; }
+_on_exit() { local ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; _drop_worktrees; return 0; }
+_on_signal() { [ -f "$STATUS" ] || printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; _drop_worktrees; exit 143; }
+# Keeping WORK on failure is deliberate (see the success-path cleanup at the end) --
+# a human paged about a failure needs verdicts.txt and card.md to see what the run
+# actually produced. But the two git worktrees under it are ~99.5% of its size AND
+# leave registrations in $PROJ that nothing prunes on a failure path: on a long-lived
+# self-hosted runner shared with aiter's bot, that grows without bound. Drop the
+# checkouts (reproducible), keep the ~200K of text artifacts (not reproducible).
+_drop_worktrees() {
+  [ -n "${W:-}" ] || return 0
+  for wt in "$W/merge-target" "$W/head"; do
+    [ -d "$wt" ] && git -C "$PROJ" worktree remove --force "$wt" 2>/dev/null || true
+  done
+  git -C "$PROJ" worktree prune 2>/dev/null || true
+}
 trap _on_exit EXIT
 trap _on_signal TERM INT
 
