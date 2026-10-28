@@ -5,17 +5,14 @@ Manual `atomesh-benchmark.yaml` dispatch on `atomesh-cicd`, suite
 `m31-vllm-1p1d-tp4-mcstore-smoke` first; only after success run
 `m31-vllm-1p1d-tp4-mcstore-c32`, `-c48`, and `-c64`.
 
-Current diagnostic: main and DSpark draft KV use `bfloat16`, and the indexer
-uses `bf16`, so all device attention caches have the same storage dtype and
-`KVQuantMode.NONE`. The draft's Triton backend does not support NVFP4; using
-FP8 everywhere would still leave different main/indexer cache specs. This
-configuration lets vLLM's native mixed-precision predicate disable block
-zeroing without overriding its correctness guard. Each worker records the
-actual predicates in `<role>-rank-<rank>-kv-precision.json` before KV setup;
-expect `has_mixed_precision_kv_cache=false` and `needs_kv_cache_zeroing=false`.
-Run smoke only while diagnosing HIP 209. BF16 increases KV memory per token
-and selects different attention/indexer paths; it is not a performance
-comparison with the NVFP4 baseline at commit `57760f17a`.
+The active recipe uses main KV `nvfp4`, indexer KV `nvfp4`, and DSpark
+draft KV `fp8` with the draft's `TRITON_ATTN` backend. Verify that both P and D
+actually log `MiniMax M3 sparse attention selected ROCm NVFP4` before accepting
+smoke or performance results. The worker records vLLM's native mixed-precision
+and KV-zeroing predicates in `<role>-rank-<rank>-kv-precision.json`; those
+correctness guards remain enabled. The earlier uniform-BF16 diagnostic still
+failed with HIP 209 in `_apply_write_kernel`, so it is no longer active.
+The current target is a passing smoke followed by the C32 case.
 
 The image digest and model revision in `experiment.json` come from
 https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39929767608/attempts/1.
