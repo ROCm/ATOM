@@ -517,6 +517,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # 0.5.22 chooses the SWA allocator from this flag. ATOM keeps the
         # paged SWA bookkeeping path, so the flag stays on.
         self.needs_paged_swa_allocator = True
+        # Encoder-replay pools own a RequestWindow. ATOM stays on the paged
+        # SWA map, which 0.5.22 selects when this is None.
+        self.request_window = None
         self.unified_kv_pool = None
         self.c4_kv_pool = None
         self.c128_kv_pool = None

@@ -82,6 +82,7 @@ def test_proxy_geometry_matches_per_layer_cache_views():
         device="cpu",
     )
     assert pool.needs_paged_swa_allocator is True
+    assert pool.request_window is None
     geometry = _proxy_pool_geometry(pool)
 
     assert geometry.classes == (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
