@@ -347,3 +347,105 @@ def test_dspark_dcp_allocation_cap_and_global_sliding_window():
     )
     assert torch.all(md.dspark_dcp_lens[:8] == 516)
     assert torch.all(slots[0] == 123)
+
+
+def test_real_nvfp4_rope_writer_keeps_queries_for_unowned_tokens():
+    from types import SimpleNamespace
+
+    from aiter.rotary_embedding import get_rope
+
+    from atom.config import use_custom_atom_config
+    from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+    from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+    from atom.model_ops.layernorm import GemmaRMSNorm
+
+    cfg = SimpleNamespace(dcp_config=SimpleNamespace(indexer_dcp_only=False))
+    rows, heads, kv_heads, dim = 4, 64, 4, 128
+    positions = torch.tensor([127, 128, 511, 512], device="cuda", dtype=torch.int64)
+    slots = torch.tensor([3, 7, 128, 133], device="cuda", dtype=torch.int64)
+    packed = torch.randn(
+        rows, (heads + 2 * kv_heads + 4 + 1) * dim, device="cuda", dtype=torch.bfloat16
+    )
+    records = []
+    with use_custom_atom_config(cfg), torch.device("cuda"):
+        norm = GemmaRMSNorm(dim, eps=1e-6).to(dtype=torch.bfloat16)
+        norm.weight.data.zero_()
+        rope = get_rope(
+            dim, rotary_dim=64, max_position=1024, base=10000.0, rope_scaling=None
+        )
+        for masked in (False, True):
+            impl = SparseMHAPagedAttentionImpl(
+                heads,
+                dim,
+                dim**-0.5,
+                kv_heads,
+                kv_cache_dtype="fp8",
+                rotary_emb=rope,
+                q_norm=norm,
+                k_norm=norm,
+                index_q_norm=norm,
+                index_k_norm=norm,
+                index_q_size=4 * dim,
+                index_head_dim=dim,
+                index_cache_dtype="fp4",
+            )
+            pool = MhaKvPool(
+                layers=1,
+                block_size=128,
+                num_kv_heads=4,
+                head_dim=128,
+                kv_dtype=torch.float8_e4m3fn,
+                kv_format="nvfp4",
+            )
+            pool.allocate(2, "cuda")
+            kc, vc = pool.kv_views(0)
+            ks, vs = pool.scale_views(0)
+            for x in (kc, vc, ks, vs):
+                x.zero_()
+            impl.kv_nvfp4 = True
+            impl.kv_stage = torch.zeros(
+                1, 2, 128, 4, 128, device="cuda", dtype=torch.bfloat16
+            )
+            impl.kv_stage_slots = torch.arange(128, device="cuda", dtype=torch.int64)
+            impl.index_cache = torch.zeros(2, 128, 64, device="cuda", dtype=torch.uint8)
+            impl.index_scale = torch.zeros(2, 128, 8, device="cuda", dtype=torch.uint8)
+            impl.index_stage = torch.zeros(
+                1, 128, 128, device="cuda", dtype=torch.bfloat16
+            )
+            impl.index_stage_slots = impl.kv_stage_slots
+            mapping = slots.clone()
+            if masked:
+                mapping[1::2] = -1
+            layer = SimpleNamespace(k_cache=kc, v_cache=vc, k_scale=ks, v_scale=vs)
+            context = SimpleNamespace(
+                attn_metadata=SimpleNamespace(slot_mapping=mapping),
+                kv_cache_data={"layer_0": layer},
+            )
+            qkv = packed.clone()
+            q, k, v, _, _ = qkv.split(
+                [heads * dim, kv_heads * dim, kv_heads * dim, 4 * dim, dim], -1
+            )
+            out = impl.rope_cache(q, k, v, qkv, positions, context)[0]
+            records.append(
+                (
+                    out.clone(),
+                    impl._index_q.clone(),
+                    [
+                        x.clone()
+                        for x in (kc, vc, ks, vs, impl.index_cache, impl.index_scale)
+                    ],
+                )
+            )
+    torch.testing.assert_close(records[0][0], records[1][0], atol=0, rtol=0)
+    torch.testing.assert_close(records[0][1], records[1][1], atol=0, rtol=0)
+    for plane, (full, masked) in enumerate(zip(records[0][2], records[1][2])):
+        for i, slot in enumerate(slots.tolist()):
+            if plane < 4:
+                expected = full[slot // 128, :, slot % 128]
+                actual = masked[slot // 128, :, slot % 128]
+            else:
+                expected = full[slot // 128, slot % 128]
+                actual = masked[slot // 128, slot % 128]
+            torch.testing.assert_close(
+                actual, torch.zeros_like(actual) if i % 2 else expected, atol=0, rtol=0
+            )
