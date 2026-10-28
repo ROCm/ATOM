@@ -665,7 +665,7 @@ def test_a_dspark_dp_plan_rides_the_one_exchange_and_settles_the_shape(
         is_block_drafter=True,
         dp_size=2,
         dp_group=object(),
-        dp_plan=(np.array([0.5, 7.0]), apply),
+        dp_plan=types.SimpleNamespace(payload=np.array([0.5, 7.0]), apply=apply),
     )
     assert len(calls) == 1, "the plan must not add a collective"
     assert seen == [[[0.5, 7.0], [0.5, 7.0]]]
@@ -687,7 +687,9 @@ def test_a_dspark_dp_plan_that_declines_keeps_the_scheduled_shape(monkeypatch):
         is_block_drafter=True,
         dp_size=2,
         dp_group=object(),
-        dp_plan=(np.zeros(3), lambda gathered, sync: None),
+        dp_plan=types.SimpleNamespace(
+            payload=np.zeros(3), apply=lambda gathered, sync: None
+        ),
     )
     assert mode.max_seqlen_q == 6
     assert mode.running_tokens == 96
