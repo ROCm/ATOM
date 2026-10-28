@@ -4,8 +4,8 @@
 # container.  usage: run_ep.sh <concurrency>
 #
 # Concurrency: 1-2048, a power of two or three times one (1 2 3 4 6 8 12 16 24 ... 768 1024
-# 1536 2048). MTP with 3 draft tokens on every point; c <= 16: TP4, above: DP4 attention + EP4 MoE
-# (MODE=tp|dp, SPEC=<n> override; SPEC=0: no MTP).
+# 1536 2048). MTP on every point, 4 draft tokens on TP points and 3 on DP; c <= 16: TP4, above: DP4
+# attention + EP4 MoE (MODE=tp|dp, SPEC=<n> override; SPEC=0: no MTP).
 # 30-minute points (defaults): CAP_MIN=30, STOP_FIRST=1, TRAJ_X=4 (trajectories = max(613, 4 c):
 # the cap, not an exhausted pool, ends every point), TURN_TIMEOUT=14400 (the benchmark's own; the drain
 # after the cap lasts until the in-flight turns finish).
@@ -21,7 +21,8 @@ valid() { local m=$1; [ "$m" -ge 1 ] && [ "$m" -le 2048 ] || return 1
   while [ $((m % 2)) -eq 0 ]; do m=$((m / 2)); done; [ $m -eq 1 ] || [ $m -eq 3 ]; }
 [[ "$C" =~ ^[0-9]+$ ]] && valid "$C" || { echo "usage: run_ep.sh <c>, c in 1-2048, 2^k or 3*2^k (got '$C')"; exit 2; }
 MODE=${MODE:-$([ "$C" -le 16 ] && echo tp || echo dp)}
-export SPEC=${SPEC:-3}
+# TP (c16): 4 drafts accept 3.57 tokens a step against 3.14 for 3, and a 5th costs more than it accepts
+export SPEC=${SPEC:-$([ "$MODE" = tp ] && echo 4 || echo 3)}
 # sequences an engine: every concurrent trajectory, with 25% slack under DP for the session-affinity
 # imbalance, at most SEQ_CAP=512. On the 2026-10-26 gfx1250 images an engine decoding more than 512
 # sequences returns partly garbage (see the recipe's Known issues); concurrency above that queues.

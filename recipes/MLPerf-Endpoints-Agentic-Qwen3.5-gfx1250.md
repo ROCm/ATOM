@@ -27,12 +27,12 @@ The scripts are in [`mlperf_endpoints_qwen35/`](mlperf_endpoints_qwen35/). Relat
 | Dataset | `mlperf_agentic_inference_dataset`, 613 trajectories, 20,297 assistant turns |
 
 Concurrency: **1-2048, a power of two or three times one** (1, 2, 3, 4, 6, 8, 12, 16, 24, ..., 768,
-1024, 1536, 2048). Every point runs MTP with 3 draft tokens (`SPEC=0` turns it off); `run_ep.sh`
-picks the server from the concurrency:
+1024, 1536, 2048). Every point runs MTP, with 4 draft tokens on TP points and 3 on DP (`SPEC=<n>`
+overrides, `SPEC=0` turns it off); `run_ep.sh` picks the server from the concurrency:
 
 | Concurrency | Server |
 |---|---|
-| 1-16 | TP4, custom all-reduce |
+| 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p |
 | 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
