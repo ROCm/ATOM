@@ -514,7 +514,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3: store the sparse layers' K/V as MXFP4 (e2m1 + e8m0 per 32, one
     # 8704 B page per (page, kv head)); the fused qk-norm/rope kernel writes it
     # and an FP8 main Q, and FlyDSL's pa_decode_mxfp4 reads it. Pair with
-    # --index-cache-dtype mxfp4. Exclusive with ATOM_M3_SPARSE_KV_NVFP4.
+    # --index-cache-dtype mxfp4. Exclusive with ATOM_M3_SPARSE_KV_NVFP4. The mono
+    # decode (<= 16 tokens a step) writes and reads the same pages.
     "ATOM_M3_SPARSE_KV_MXFP4": lambda: (
         os.getenv("ATOM_M3_SPARSE_KV_MXFP4", "0") == "1"
     ),
