@@ -87,6 +87,20 @@ jobs:
           result = subprocess.run(['stat', '-f', '-c', '%T', str(root)], capture_output=True, text=True, timeout=15)
           print('TASK LOG FILESYSTEM TYPE:', result.stdout.strip(), flush=True)
 
+          import tempfile
+          with tempfile.TemporaryDirectory(prefix='m31-validation-write-probe-', dir=root) as probe_dir:
+              written = 0
+              try:
+                  with (Path(probe_dir) / 'probe.bin').open('wb') as stream:
+                      for _ in range(16):
+                          stream.write(os.urandom(1024 * 1024))
+                          stream.flush()
+                          os.fsync(stream.fileno())
+                          written += 1024 * 1024
+                  print('TASK LOG WRITE PROBE: PASS, fsynced bytes:', written, flush=True)
+              except OSError as error:
+                  print('TASK LOG WRITE PROBE:', type(error).__name__, error.errno, 'completed bytes:', written, flush=True)
+
           controller = os.environ.get('SPUR_CONTROLLER_ADDR', '')
           controller_args = ['--controller', controller] if controller else []
           print('EXPLICIT CONTROLLER CONFIGURED:', bool(controller), flush=True)
