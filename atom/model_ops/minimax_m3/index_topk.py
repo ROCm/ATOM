@@ -70,18 +70,16 @@ def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     if get_gfx() != "gfx1250":
         return 4, SCORE_NUM_STAGES
 
-    # Triton's default four warps mean 256 lanes on gfx950 (wave64), but only
-    # 128 on gfx1250 (wave32).  The 128x128 fp32 accumulator then doubles from
-    # 64 to 128 values per lane and spills heavily.  Eight wave32 warps restore
-    # the original lane count.  FP8 also prefers one pipeline stage on gfx1250;
-    # keep the existing setting for the supported BF16 fallback.
+    # For FP8 on wave32, a single pipeline stage cuts LDS/register pressure
+    # enough that four warps outperform eight on long-context prefill. Keep
+    # the BF16 configuration separate: it does not have the same tradeoff.
     fp8_dtypes = (
         getattr(torch, "float8_e4m3fn", None),
         getattr(torch, "float8_e4m3fnuz", None),
         getattr(torch, "float8_e5m2", None),
         getattr(torch, "float8_e5m2fnuz", None),
     )
-    return 8, 1 if dtype in fp8_dtypes else SCORE_NUM_STAGES
+    return (4, 1) if dtype in fp8_dtypes else (8, SCORE_NUM_STAGES)
 
 
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
