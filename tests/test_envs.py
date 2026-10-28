@@ -43,6 +43,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
+    "ATOM_SAMPLER_SPLIT_SOFTMAX",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
 ]
@@ -103,6 +104,9 @@ class TestEnvsDefaults:
 
     def test_gluon_fused_ar_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_GLUON_FUSED_AR is True
+
+    def test_sampler_split_softmax_default_disabled(self):
+        assert _get_envs().ATOM_SAMPLER_SPLIT_SOFTMAX is False
 
     def test_model_sensitive_rmsnorm_default_disabled(self):
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False

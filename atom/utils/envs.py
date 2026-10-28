@@ -994,6 +994,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
     ),
+    # --- Sampling ---
+    # Top-k / top-p sampling: compute softmax(logits / temperature) over the
+    # vocab with a split-row Triton kernel (atom/model_ops/split_softmax.py)
+    # instead of the eager division and torch's one-block-a-row softmax.
+    "ATOM_SAMPLER_SPLIT_SOFTMAX": lambda: (
+        os.getenv("ATOM_SAMPLER_SPLIT_SOFTMAX", "0") == "1"
+    ),
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",

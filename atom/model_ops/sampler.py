@@ -9,6 +9,9 @@ from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
 
+from atom.model_ops.split_softmax import can_split_softmax, split_softmax
+from atom.utils import envs
+
 # Try to import aiter top-k/top-p sampling ops
 try:
     import aiter.ops.sampling  # noqa: F401
@@ -219,8 +222,11 @@ class Sampler(nn.Module):
         del needs_independent_noise
         # Apply temperature scaling
         # Temperatures are pre-clamped to eps in model_runner.prepare_sample()
-        scaled_logits = logits / temperatures.unsqueeze(-1)
-        probs = scaled_logits.softmax(dim=-1, dtype=torch.float32).contiguous()
+        if envs.ATOM_SAMPLER_SPLIT_SOFTMAX and can_split_softmax(logits, temperatures):
+            probs = split_softmax(logits, temperatures)
+        else:
+            scaled_logits = logits / temperatures.unsqueeze(-1)
+            probs = scaled_logits.softmax(dim=-1, dtype=torch.float32).contiguous()
 
         # model_runner.prepare_sample passes None if filtering not needed for that type
         has_topk = top_ks is not None
