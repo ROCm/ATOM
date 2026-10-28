@@ -170,7 +170,9 @@ class CacheBalancer:
         Initial prompt lengths proxy each in-flight request's decode context;
         this needs no decode-step messages. For Phi=sum((n/mean_n)^2 +
         (context/mean_context)^2), the rank-dependent increment for adding a
-        request of length q is proportional to n + q*context/mean_length^2.
+        request of length q is proportional to n + q*context/mean_length^2,
+        where mean_length includes the incoming request. Both candidate
+        placements have the same post-placement totals and normalizers.
         These scores describe balance, not calibrated execution seconds.
         """
         count = sum(max(0, n) for n in requests)
@@ -179,7 +181,7 @@ class CacheBalancer:
             contexts[placement.rank] += placement.prompt_tokens
         if count <= 0 or not sum(contexts):
             return None
-        mean_length = sum(contexts) / count
+        mean_length = (sum(contexts) + prompt) / (count + 1)
         weight = prompt / (mean_length * mean_length)
         return [max(0, n) + weight * c for n, c in zip(requests, contexts)]
 

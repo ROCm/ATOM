@@ -9,6 +9,14 @@ dragging in the heavy ``engine_core`` -> ``async_proc`` -> ``aiter`` chain.
 """
 
 import enum
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class EngineCoreAbortRequest:
+    """Local admission-queue event, ordered with ADD by the input IO thread."""
+
+    req_id: int
 
 
 class EngineCoreRequestType(enum.Enum):

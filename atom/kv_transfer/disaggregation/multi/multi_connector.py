@@ -443,16 +443,17 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         """The sub that armed this request's KV load, or None.
 
         Recorded at `get_num_new_matched_tokens` time (first-hit-wins, losers
-        cancelled). The three load-side questions below --
+        cancelled). The load-side questions below --
         `should_park_for_load_after_alloc`, `adjust_prefill_chunk_after_alloc`,
-        `should_park_partial_prefill_for_load` -- ask "is there a load in flight
-        for this sequence, and must the forward wait for it?" That answer is the
-        winner's alone. Routing them through `_state_tier_sub()` instead (an
+        `pending_prefill_handoff`, `should_park_partial_prefill_for_load` -- ask
+        "is there a load in flight for this sequence, and must the forward wait
+        for it?" That answer is the winner's alone. Routing them through
+        `_state_tier_sub()` instead (an
         earlier fix) named the tier sub even when a *different* sub won the load
         -- e.g. moriio winning ahead of `kimi_k3` under `[moriio, kimi_k3]`: the
         tier sub armed nothing, its `_load_specs.get(sid)` was None, so it
         answered "don't park" and the prefill ran over moriio's in-flight KV.
-        The tier sub still owns the state-face forwarders; only these three
+        The tier sub still owns the state-face forwarders; only these
         load-side questions follow the load's owner.
         """
         return self._load_winner.get(getattr(seq, "id", None))
@@ -617,6 +618,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         if c is not None and hasattr(c, "adjust_prefill_chunk_after_alloc"):
             return c.adjust_prefill_chunk_after_alloc(seq, chunk)
         return chunk
+
+    def pending_prefill_handoff(self, seq: Any) -> tuple[int, int] | None:
+        """The load owner's alignment boundary and recoverable prefix, if any."""
+        callback = getattr(self._load_owner(seq), "pending_prefill_handoff", None)
+        return callback(seq) if callable(callback) else None
 
     def enqueue_state_loads(self, loads) -> bool:
         """First sub that can carry them owns them; False if none can.

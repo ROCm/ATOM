@@ -100,8 +100,10 @@ stale completions. Decode tokens do not produce per-token work updates.
 Placement also considers the joint imbalance of in-flight request counts and
 their initial prompt lengths. Prompt length is a proxy for decode context size;
 it does not track generated tokens or claim to measure sparse-attention runtime.
-The normalized squared-imbalance score makes short incoming requests emphasize
-batch size and long requests emphasize context load. New sessions use this score
+The normalized squared-imbalance score uses the request-count and context means
+after including the incoming request, identical for every candidate rank. Short
+incoming requests emphasize batch size and long requests emphasize context load.
+New sessions use this score
 among ranks within the existing minimum useful time-gain margin. A migration must
 meet the time-gain requirements and avoid increasing joint decode imbalance
 relative to staying with the owner. Explicit rank selection remains authoritative.

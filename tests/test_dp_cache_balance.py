@@ -347,12 +347,12 @@ class DecodeBalanceTest(unittest.TestCase):
         self.b.sessions["s"] = Session(
             owner=1, hints={1: PrefixHint(128, 128, -1, 0, 1)}
         )
-        # A short request would worsen the already larger batch on rank 1,
-        # so moving from 1 to 0 is allowed when the owner has a long queue.
-        allowed = self.b.place(
+        # The post-placement mean makes even this shorter request too costly
+        # for rank 0's context load, despite its smaller request count.
+        refused = self.b.place(
             "short", "s", 129, chain(129), [1, 3], [0, 100000], 2, can_migrate=True
         )
-        self.assertEqual(allowed.rank, 0)
+        self.assertEqual((refused.rank, refused.migration), (1, 0))
         self.b.finish("short", 3)
         self.b.sessions["s"].owner = 0
         self.b.sessions["s"].hints = {0: PrefixHint(896, 128, -1, 6, 4)}
@@ -372,7 +372,7 @@ class DecodeBalanceTest(unittest.TestCase):
         )
         self.assertEqual(refused.rank, 1)
         self.assertEqual(refused.migration, 0)
-        self.assertEqual(self.b.counters["migration_decode_balance_rejected"], 1)
+        self.assertEqual(self.b.counters["migration_decode_balance_rejected"], 2)
 
     def test_finished_context_is_not_left_in_the_balance_score(self):
         self.b.finish(0, 1)

@@ -20,7 +20,10 @@ from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
 )
-from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.engine_core_protocol import (
+    EngineCoreAbortRequest,
+    EngineCoreRequestType,
+)
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
@@ -70,7 +73,7 @@ class EngineCore:
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
-        self.input_queue = queue.Queue[Sequence]()
+        self.input_queue = queue.Queue[list[Sequence] | EngineCoreAbortRequest]()
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
             queue.Queue()
@@ -458,7 +461,19 @@ class EngineCore:
 
     def _process_engine_step(self):
         try:
-            return self._process_engine_step_inner()
+            executed = self._process_engine_step_inner()
+            if not executed and any(
+                seq.status == SequenceStatus.ABORTED for seq in self.scheduler.running
+            ):
+                # A cancelled partial prefill may leave no schedulable rows.
+                # Flush the previous forward before normal terminal cleanup,
+                # including on a single engine. DP must count this as its tick
+                # so its busy loop does not execute a second dummy collective.
+                self._execute_dummy_batch()
+                executed = True
+            elif not executed:
+                self._flush_cache_work()
+            return executed
         finally:
             # Swallow publisher errors so they cannot mask an exception from
             # the engine step itself.
@@ -544,9 +559,7 @@ class EngineCore:
             batch=batch,
         )
 
-        cache_work = self.scheduler.cache_admission.take_work()
-        if cache_work:
-            self.output_queue.put_nowait(("CACHE_WORK", cache_work))
+        self._flush_cache_work()
 
         # Send stream outputs to main process via output_queue
         try:
@@ -560,6 +573,29 @@ class EngineCore:
         if finished_seqs:
             self._release_multimodal_requests(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
+
+    def _flush_cache_work(self):
+        cache_work = self.scheduler.cache_admission.take_work()
+        if cache_work:
+            self.output_queue.put_nowait(("CACHE_WORK", cache_work))
+
+    def _execute_dummy_batch(self):
+        prefill = self.scheduler.dummy_prefill
+        fwd_out = self.runner_mgr.call_func("dummy_execution", prefill, wait_out=True)
+        if self.scheduler.running and (
+            prefill
+            or any(
+                seq.status == SequenceStatus.ABORTED for seq in self.scheduler.running
+            )
+        ):
+            # Flush deferred output and keep cancelled buffers live until the
+            # worker has completed this ordered forward. Cleanup owns the
+            # existing connector/DMA leases, just as after a real batch.
+            self._postprocess((), fwd_out, None)
+        else:
+            # Preemption can queue recomputation work while emptying running.
+            # Report it even if remote KV recovery delays the next real batch.
+            self._flush_cache_work()
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.
@@ -727,6 +763,15 @@ class EngineCore:
         recv_reqs = []
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
+            if isinstance(seqs, EngineCoreAbortRequest):
+                # Preserve input-IO order through admission. Fallback ADD and
+                # abort share the control socket; draining a separate utility
+                # queue first would cancel nothing, then resurrect the ADD.
+                if recv_reqs:
+                    self.scheduler.extend(recv_reqs)
+                    recv_reqs = []
+                self.scheduler.abort_request(seqs.req_id)
+                continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
                     logger.debug(f"{self.label}: input_queue get exit engine")
@@ -797,6 +842,12 @@ class EngineCore:
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
+                        if cmd == "abort_request":
+                            if reqs.get("req_id") is not None:
+                                self.input_queue.put_nowait(
+                                    EngineCoreAbortRequest(reqs["req_id"])
+                                )
+                            continue
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
@@ -977,23 +1028,6 @@ class DPEngineCoreProc(EngineCore):
                 self.scheduler.shutdown_kv_events()
             finally:
                 tracing.shutdown()
-
-    def _execute_dummy_batch(self):
-        prefill = self.scheduler.dummy_prefill
-        fwd_out = self.runner_mgr.call_func("dummy_execution", prefill, wait_out=True)
-        if self.scheduler.running and (
-            prefill
-            or any(
-                seq.status == SequenceStatus.ABORTED for seq in self.scheduler.running
-            )
-        ):
-            # This rank decoded last step and gave this tick to its peers'
-            # prefill: the tokens that step sampled come back with this
-            # forward (deferred output), and land like any step's. Aborted
-            # alignment-only prefills also need postprocess even when no real
-            # request was scheduled; their buffers stay live through this
-            # dummy forward before normal abort cleanup reclaims them.
-            self._postprocess((), fwd_out, None)
 
     def _sync_dp_state(
         self,
@@ -1462,15 +1496,8 @@ class DecodeEngineCore(EngineCore):
     def pull_and_process_input_queue(self):
         """Override: add new sequences to waiting queue, then allocate blocks
         and send BlockAssignment to prefill for any that fit."""
-        recv_reqs = []
-        while not self.input_queue.empty():
-            seqs = self.input_queue.get_nowait()
-            for seq in seqs:
-                if seq.status == SequenceStatus.EXIT_ENGINE:
-                    return True
-                recv_reqs.append(seq)
-        if recv_reqs:
-            self.scheduler.extend(recv_reqs)
+        if super().pull_and_process_input_queue():
+            return True
         for seq in self.scheduler.allocate_waiting():
             self._send_block_assignment(seq)
         return False
