@@ -27,7 +27,7 @@ jobs:
           import subprocess
           from pathlib import Path
           root = Path('/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG')
-          runs = (40706439005, 40737040374, 40739638741)
+          runs = (40706439005, 40739638741)
           jobs = []
           if os.environ.get('RECLAIM_COMPLETED_METRIC') == 'true':
               dirs = list(root.glob('*agentx-chunked-c32-mooncake_store-40706439005-20261028143137'))
@@ -64,7 +64,7 @@ jobs:
               for directory in paths:
                   print(directory.name, flush=True)
                   cell = directory.name.rsplit(f'-{run}-', 1)[0]
-                  attempt = 3 if run == 40706439005 else 1
+                  attempt = 4 if run == 40706439005 else 1
                   job_name = f'{cell}-{run}-{attempt}'
                   for runner in task_runners[run]:
                       results = runner_root / f'atomesh-runner-{runner:02d}/_work/ATOM/ATOM/atomesh-results'
@@ -83,6 +83,15 @@ jobs:
                   for result_file in directory.glob('slurm_job-*/benchmark_results/**/profile_export_aiperf.json'):
                       data = json.loads(result_file.read_text())
                       print('BENCHMARK:', {key: data.get(key) for key in ('was_cancelled', 'request_count', 'benchmark_duration', 'error_summary')}, flush=True)
+                  for result_file in directory.glob('slurm_job-*/**/results_*.json'):
+                      try:
+                          data = json.loads(result_file.read_text())
+                      except json.JSONDecodeError:
+                          print('EVAL RESULT STILL WRITING:', result_file.name, flush=True)
+                          continue
+                      if 'gsm8k' in data.get('results', {}):
+                          print('GSM8K RESULT:', data['results']['gsm8k'], flush=True)
+                          print('EVAL SAMPLE COUNT:', data.get('n-samples', {}), flush=True)
                   result = subprocess.run(
                       ['squeue', *controller_args, '--noheader', '--name', job_name,
                        '--format', '%A|%T|%M|%N|%R'],
