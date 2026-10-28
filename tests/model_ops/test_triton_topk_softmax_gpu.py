@@ -3,13 +3,14 @@
 
 """The Triton routing kernel must reproduce AITER's `topk_softmax` exactly.
 
-`rocm_aiter_topk_softmax_impl` swaps one for the other inside captured graphs
-and keeps AITER for eager calls, so the same request routes through both
-depending on the batch it lands in. Any difference -- an expert id, the order
-of tied experts, or the last bit of a weight -- would make outputs depend on
-batching, hence bit-exactness rather than a tolerance.
+`rocm_aiter_topk_softmax_impl` runs it, eager and captured alike, for the
+shapes it supports, and AITER for the rest or with
+`ATOM_TRITON_TOPK_SOFTMAX=0`. Any difference -- an expert id, the order of
+tied experts, or the last bit of a weight -- would make that switch change
+outputs, hence bit-exactness rather than a tolerance.
 """
 
+import functools
 import inspect
 
 import pytest
@@ -311,14 +312,41 @@ def test_num_valid_rows_follows_graph_replay(shared):
         _check_pad_rows(w, ids, w_full, ids_full, n)
 
 
+def _record_kernels(monkeypatch, topK):
+    """The kernel each later `rocm_aiter_topk_softmax_impl` call launches."""
+    used = []
+    triton_fn, aiter_fn = topK.triton_topk_softmax, aiter.topk_softmax
+
+    @functools.wraps(triton_fn)
+    def via_triton(*args, **kwargs):
+        used.append("triton")
+        return triton_fn(*args, **kwargs)
+
+    @functools.wraps(aiter_fn)
+    def via_aiter(*args, **kwargs):
+        used.append("aiter")
+        return aiter_fn(*args, **kwargs)
+
+    monkeypatch.setattr(topK, "triton_topk_softmax", via_triton)
+    monkeypatch.setattr(aiter, "topk_softmax", via_aiter)
+    return used
+
+
+# With the switch on, eager and captured passes both run Triton; off, both
+# run AITER. Either way both get the count.
+SWITCH = pytest.mark.parametrize("switch,kernel", [("1", "triton"), ("0", "aiter")])
+
+
 @needs_aiter_num_valid_rows
+@SWITCH
 @pytest.mark.parametrize("shared", [0, 1])
-def test_impl_passes_num_valid_rows_to_both_paths(shared, monkeypatch):
-    """Eager calls take AITER, captured calls take Triton; both must get the
-    count and agree bit for bit on every replay."""
+def test_impl_passes_num_valid_rows_to_both_paths(shared, switch, kernel, monkeypatch):
+    """Eager and captured calls run the same kernel, both get the count and
+    agree bit for bit on every replay."""
     from atom.model_ops import topK
 
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", switch)
+    used = _record_kernels(monkeypatch, topK)
     rows, max_rows = 48, 64
     torch.manual_seed(23 + shared)
     logits = _logits(rows, EXPERTS + shared, 2.0, False)
@@ -334,7 +362,7 @@ def test_impl_passes_num_valid_rows_to_both_paths(shared, monkeypatch):
         )  # fmt: skip
         return w[:rows], ids[:rows]
 
-    route()  # compile the Triton kernel outside the capture
+    route()  # eager: compiles the Triton kernel, when on, outside the capture
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         w_graph, ids_graph = route()
@@ -347,21 +375,26 @@ def test_impl_passes_num_valid_rows_to_both_paths(shared, monkeypatch):
         assert bool((ids_eager[n:, :TOPK] == -1).all())
         assert torch.equal(ids_graph, ids_eager)
         assert torch.equal(_bits(w_graph), _bits(w_eager))
+    assert used == [kernel] * (2 + 3)
 
 
 @needs_aiter_num_valid_rows
+@SWITCH
 @pytest.mark.parametrize("shared,offset", [(0, 0), (1, 0), (1, 32)])
-def test_select_experts_counts_the_pass_rows(shared, offset, monkeypatch):
+def test_select_experts_counts_the_pass_rows(
+    shared, offset, switch, kernel, monkeypatch
+):
     """Through `FusedMoE.select_experts`, which takes the pass's real row count
-    from the forward context (`scheduled_tokens_gpu`): the captured Triton
-    route follows the count on every replay, bit for bit with the eager AITER
-    one, and with a fused shared expert writes the rows `topk_meta_rows` gives
-    this (TBO micro-)batch at its offset."""
+    from the forward context (`scheduled_tokens_gpu`): the captured route
+    follows the count on every replay, bit for bit with the eager one (same
+    kernel), and with a fused shared expert writes the rows `topk_meta_rows`
+    gives this (TBO micro-)batch at its offset."""
     from atom.model_ops import topK
     from atom.model_ops.moe import FusedMoE
     from atom.utils import forward_context as fc
 
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", switch)
+    used = _record_kernels(monkeypatch, topK)
     rows, max_rows = 48, 128
     torch.manual_seed(31 + shared + offset)
     logits = _logits(rows, EXPERTS + shared, 2.0, False)
@@ -389,7 +422,7 @@ def test_select_experts_counts_the_pass_rows(shared, offset, monkeypatch):
             fused_shared_experts_scoring_func="sigmoid" if shared else None,
         )
 
-    route()  # compile the Triton kernel outside the capture
+    route()  # eager: compiles the Triton kernel, when on, outside the capture
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         w_graph, ids_graph = route()
@@ -407,6 +440,7 @@ def test_select_experts_counts_the_pass_rows(shared, offset, monkeypatch):
         assert bool((ids_eager[:n, :TOPK] >= 0).all())
         assert torch.equal(ids_graph, ids_eager)
         assert torch.equal(_bits(w_graph), _bits(w_eager))
+    assert used == [kernel] * (2 + 4)
     if shared:
         # Rows outside this batch's slice are never written.
         outside = torch.ones(max_rows, dtype=torch.bool, device="cuda")

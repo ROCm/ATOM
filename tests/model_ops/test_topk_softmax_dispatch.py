@@ -6,7 +6,8 @@
 `test_triton_topk_softmax_gpu.py` compares the two kernels bit for bit but
 skips on a GPU-less runner. These pin the choice itself: the Triton kernel
 takes exactly the shapes AITER's fused `topkGatingSoftmax` handles (its
-dispatch stops at 512 experts), never a layout it cannot store to.
+dispatch stops at 512 experts), never a layout it cannot store to, and eager
+and captured passes choose the same kernel.
 """
 
 import pytest
@@ -62,9 +63,23 @@ def test_refuses_unnormalized_and_strided_launches():
     assert not triton_topk_softmax_supported(w, ids_t, logits, True, 1)
 
 
+@pytest.mark.parametrize("experts", [512, 1024])
+def test_eager_and_captured_passes_choose_alike(experts, monkeypatch):
+    """A token's route must not depend on whether its batch is replayed from
+    a graph or run eagerly."""
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    launch = _launch(experts, 10, 1)
+    choices = set()
+    for capturing in (False, True):
+        monkeypatch.setattr(
+            torch.cuda, "is_current_stream_capturing", lambda c=capturing: c
+        )
+        choices.add(use_triton_topk_softmax(*launch, True, 1, "sigmoid"))
+    assert choices == {experts <= 512}
+
+
 @pytest.mark.parametrize("scoring_func,shared", [("", 0), ("sigmoid", 1)])
 def test_switch_and_scoring_func(scoring_func, shared, monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     launch = _launch(512, 10, shared)
     monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
     assert use_triton_topk_softmax(*launch, True, shared, scoring_func)

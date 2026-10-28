@@ -47,12 +47,12 @@ def use_triton_topk_softmax(
     shared_experts_scoring_func: str,
 ) -> bool:
     """Whether `rocm_aiter_topk_softmax_impl` runs `triton_topk_softmax` for
-    this launch rather than AITER's `topk_softmax`. Only inside a graph: the
-    Triton launch costs more host time than the HIP one, which matters for
-    eager (host-bound) prefill."""
+    this launch rather than AITER's `topk_softmax`. Eager and captured passes
+    choose alike, so a token routes through the same kernel whichever batch
+    it lands in, without relying on the two kernels matching bit for bit.
+    `ATOM_TRITON_TOPK_SOFTMAX=0` puts every pass on AITER."""
     return (
         envs.ATOM_TRITON_TOPK_SOFTMAX
-        and torch.cuda.is_current_stream_capturing()
         and shared_experts_scoring_func in ("", "sigmoid")
         and triton_topk_softmax_supported(
             topk_weights, topk_ids, gating_output, renormalize, num_shared_experts

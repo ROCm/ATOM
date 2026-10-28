@@ -928,9 +928,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
-    # Captured renormalized softmax top-k routing uses the Triton kernel in
-    # `model_ops/triton_topk_softmax.py` (same bits as AITER, ~2x faster at
-    # 512 experts). Eager calls always use AITER.
+    # Renormalized softmax top-k routing, eager and captured alike, uses the
+    # Triton kernel in `model_ops/triton_topk_softmax.py` for the shapes it
+    # supports (same bits as AITER, ~2x faster at 512 experts). 0 puts every
+    # pass on AITER's `topk_softmax`.
     "ATOM_TRITON_TOPK_SOFTMAX": lambda: (
         os.getenv("ATOM_TRITON_TOPK_SOFTMAX", "1").lower() == "1"
     ),
