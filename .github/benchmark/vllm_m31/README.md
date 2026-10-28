@@ -57,6 +57,16 @@ timeout stops startup. Native Store uses the PR's glibc THP hint and 64 GiB MR
 cap. The earlier malloc perturbation, sequential P/D startup and separate
 native Store PUT/GET preflight in `57888067b` were reverted.
 
+After successful THP preparation, each phase starts the same bounded page-cache
+dropper as ATOM: `drop_page_cache.py --every 45 --for 1800`, scoped only to the
+resolved model snapshot (including its draft files). It evicts clean file cache
+with `posix_fadvise(DONTNEED)` while the engines load; no sudo or file deletion
+is involved. `page-cache-dropper.json` records the command, scope and PID, and
+`logs/page-cache-dropper.log` captures helper output. Normal completion does not
+fail service health checks; an unexpected nonzero exit does. Phase teardown,
+startup failure and handled termination signals stop the registered process
+group, so subsequent phases and memory retries start their own helper.
+
 On the `atomesh-cicd` Spur runner, a memory-specific exit (86) first stops and
 removes this allocation's container. A job/token/node-validated recovery helper
 uses existing host write permissions or noninteractive `sudo -n` to sync, drop

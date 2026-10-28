@@ -66,11 +66,28 @@ def start(name, cmd, env, logs):
     return proc
 
 
+def start_page_cache_dropper(model_path, env, logs):
+    # Match ATOM's loading-time cache eviction, scoped to the pinned snapshot.
+    # Register the child so phase failure, signals and retries all stop it.
+    cmd = [sys.executable, str(HERE / "drop_page_cache.py"),
+           "--every", "45", "--for", "1800", str(model_path)]
+    proc = start("page-cache-dropper", cmd, env, logs)
+    dump(logs.parent / "page-cache-dropper.json", {
+        "argv": cmd, "model_path": str(model_path), "pid": proc.pid,
+        "interval_seconds": 45, "duration_seconds": 1800,
+    })
+    return proc
+
+
 def check_services():
     for name, proc, path in PROCESSES:
         if name == "agentx":
             continue
-        if proc.poll() is not None:
+        rc = proc.poll()
+        # This bounded helper normally finishes before the one-hour benchmark.
+        if name == "page-cache-dropper" and rc == 0:
+            continue
+        if rc is not None:
             raise RuntimeError(f"{name} exited {proc.returncode}: {path.read_text(errors='replace')[-6000:]}")
         if path.exists():
             with path.open("rb") as stream:
@@ -281,6 +298,7 @@ def main():
     model_path = snapshot_download(plan['model'], revision=plan['model_revision'], cache_dir=str(cache_root), max_workers=2)
     assert (Path(model_path) / 'dspark/config.json').exists()
     prepare_store_memory(json.loads((CONFIG / "mooncake-store.json").read_text()), model_path, out)
+    start_page_cache_dropper(model_path, common, logs)
     plan["resolved_model_path"] = model_path
     plan["runtime_ports"] = ports
     plan["status"] = "running"

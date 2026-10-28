@@ -2,6 +2,8 @@
 import importlib.util
 import os
 import json
+import signal
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,6 +51,73 @@ class NativeExperimentTest(unittest.TestCase):
                              'kv-transfer-config': {'kv_role': 'kv_consumer'}})
         self.assertIn('--enable-prefix-caching', args)
         self.assertIn('--no-enable-dbo', args)
+
+
+class PageCacheDropperTest(unittest.TestCase):
+    # Exercise real child lifecycles with inert helpers; never evict host cache.
+    def test_completed_dropper_does_not_hide_a_failed_engine(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(runner, 'PROCESSES', []):
+            root = Path(tmp)
+            logs = root / 'logs'
+            logs.mkdir()
+            (root / 'drop_page_cache.py').write_text('pass\n')
+            with patch.object(runner, 'HERE', root):
+                try:
+                    proc = runner.start_page_cache_dropper(root / 'snapshot', dict(os.environ), logs)
+                    proc.wait(timeout=10)
+                    runner.check_services()
+                    engine = runner.start('prefill', [sys.executable, '-c', 'raise SystemExit(9)'],
+                                          dict(os.environ), logs)
+                    engine.wait(timeout=10)
+                    with self.assertRaisesRegex(RuntimeError, 'prefill exited 9'):
+                        runner.check_services()
+                finally:
+                    runner.cleanup()
+
+    def test_failed_dropper_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(runner, 'PROCESSES', []):
+            root = Path(tmp)
+            logs = root / 'logs'
+            logs.mkdir()
+            (root / 'drop_page_cache.py').write_text('raise SystemExit(7)\n')
+            with patch.object(runner, 'HERE', root):
+                try:
+                    proc = runner.start_page_cache_dropper(root / 'snapshot', dict(os.environ), logs)
+                    proc.wait(timeout=10)
+                    with self.assertRaisesRegex(RuntimeError, 'page-cache-dropper exited 7'):
+                        runner.check_services()
+                finally:
+                    runner.cleanup()
+
+    def test_failed_or_interrupted_phase_reaps_its_dropper(self):
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(runner, 'PROCESSES', []), patch.dict(os.environ, {
+                     'RUN_DIR': tmp, 'CONC_LIST': '32,48,64',
+                     'ATOMESH_ENV_ATOMESH_VLLM_MODE': 'smoke_then_sweep'}):
+                root = Path(tmp)
+                snapshot = root / 'pinned snapshot'
+                (root / 'drop_page_cache.py').write_text('import time; time.sleep(3600)\n')
+                children = []
+                def phase():
+                    logs = Path(os.environ['RUN_DIR']) / 'logs'
+                    logs.mkdir(parents=True)
+                    children.append(runner.start_page_cache_dropper(snapshot, dict(os.environ), logs))
+                    if interrupted:
+                        runner.on_signal(signal.SIGTERM, None)
+                    raise RuntimeError('smoke failed')
+                with patch.object(runner, 'HERE', root):
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, 'smoke failed|Interrupted by signal'):
+                            runner.smoke_then_sweep(phase)
+                        self.assertEqual(len(children), 1)
+                        self.assertIsNotNone(children[0].poll())
+                        self.assertEqual(runner.PROCESSES, [])
+                        metadata = json.loads((root / 'smoke/page-cache-dropper.json').read_text())
+                        self.assertEqual(metadata['argv'][-1], str(snapshot))
+                        self.assertEqual(metadata['model_path'], str(snapshot))
+                    finally:
+                        runner.cleanup()
 
 
 class ValidatedSweepTest(unittest.TestCase):
