@@ -426,6 +426,7 @@ lm_eval() {
                 "EVAL_MODEL_TYPE": "local-completions",
                 "EVAL_ENDPOINT": "completions",
                 "MODEL_PATH": "/models/m",
+                "MODEL_SERVED_NAME": "served-model",
                 "ROUTER_PORT": "8000",
                 "TOPOLOGY": "1p1d",
             }

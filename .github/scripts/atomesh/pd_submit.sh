@@ -126,6 +126,7 @@ exports = {
     "BACKEND": cell["backend"],
     "DOCKER_IMAGE": cell["image"],
     "MODEL_PATH": cell["model_path"],
+    "MODEL_SERVED_NAME": server_args.get("served_model_name", ""),
     "PRECISION": cell.get("precision", ""),
     "TOPOLOGY": cell["topology"],
     "DISPLAY_TOPOLOGY": cell.get("display_topology", cell["topology"]),
@@ -142,6 +143,7 @@ exports = {
     "BENCHMARK_KIND": benchmark.get("kind", "random"),
     "AGENTX_HARNESS_VERSION": benchmark.get("agentx_harness_version", ""),
     "AGENTX_VENV": benchmark.get("agentx_venv", ""),
+    "AGENTX_RECIPE_DEFAULTS": str(benchmark.get("agentx_recipe_defaults", False)).lower(),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
     "AIPERF_APPLY_CHAT_TEMPLATE": str(

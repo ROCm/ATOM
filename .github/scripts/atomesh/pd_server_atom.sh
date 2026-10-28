@@ -190,6 +190,7 @@ resolve_model_path() {
   fi
 }
 MODEL_PATH="$(resolve_model_path "${MODEL_PATH}")"
+MODEL_SERVED_NAME="${MODEL_SERVED_NAME:-${MODEL_PATH}}"
 DRAFT_MODEL_PATH="$(resolve_model_path "${DRAFT_MODEL_PATH}")"
 
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
@@ -277,6 +278,7 @@ BENCHMARK_KIND="${BENCHMARK_KIND:-random}"
 # The AgentX client InferenceX benchmarks with (infx/bench/agentic/requirements.txt).
 AGENTX_HARNESS_VERSION="${AGENTX_HARNESS_VERSION:-1.0.9}"
 AGENTX_VENV="${AGENTX_VENV:-/tmp/atomesh-agentx-venv}"
+AGENTX_RECIPE_DEFAULTS="${AGENTX_RECIPE_DEFAULTS:-false}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-agentx}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
 AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-false}"
@@ -450,6 +452,12 @@ fi
 host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
+
+# Resolve nested drafts after the shared HF cache environment is exported.
+if [[ -n "${DRAFT_MODEL_PATH}" ]]; then
+  DRAFT_MODEL_PATH="$(python3 "${ATOMESH_SCRIPT_DIR}/resolve_draft_model.py" \
+    --model "${MODEL_PATH}" --draft "${DRAFT_MODEL_PATH}")"
+fi
 prepare_kv_connector || exit 2
 
 # GPU timing is opt-in; agentic reports need it on both service roles.
@@ -741,6 +749,7 @@ fi
 
 server_common=(
   --model "${MODEL_PATH}"
+  --served-model-name "${MODEL_SERVED_NAME}"
   --host 0.0.0.0
   --trust-remote-code
   --kv_cache_dtype "${KV_CACHE_DTYPE}"
@@ -2280,6 +2289,9 @@ run_torch_profile_window() {
     sleep 2
   done
 
+  local full_window=0
+  (( $(date +%s) >= deadline )) && full_window=1
+
   # The server waits ATOM_PROFILER_TIMEOUT for its ranks; give curl headroom
   # past that so the client never abandons an export still being written.
   local stop_timeout=$(( ${ATOM_PROFILER_TIMEOUT:-300} + 300 ))
@@ -2304,6 +2316,10 @@ run_torch_profile_window() {
   if ! wait_for_torch_traces "${start_marker}" "${stop_files[@]}"; then
     echo "[profile] traces incomplete; leaving aiperf to finish on its own"
     return 0
+  fi
+  if (( ! full_window )); then
+    echo "[profile][FAIL] aiperf ended before the full ${ATOMESH_TORCH_PROFILE_DURATION}s trace window"
+    return 1
   fi
   touch "${trace_ok_file}"
   local aiperf_pid
@@ -2366,6 +2382,57 @@ wait_for_torch_traces() {
     fi
     sleep 5
   done
+}
+
+# AgentX uses its own scenario defaults, matching recipe #2747. Keeping the
+# command in one builder also lets CPU tests inspect the actual launch argv.
+build_agentic_client_command() {
+  local -n out="$1"
+  local conc="$2" out_dir="$3"
+  if [[ "${AGENTX_RECIPE_DEFAULTS}" == "true" ]]; then
+    out=(
+      "${AGENTX_VENV}/bin/agentx" profile
+      --url "http://127.0.0.1:${ROUTER_PORT}"
+      --model "${MODEL_SERVED_NAME}"
+      --tokenizer "${MODEL_PATH}" --tokenizer-trust-remote-code
+      --concurrency "${conc}" --benchmark-duration "${AIPERF_BENCHMARK_DURATION}"
+      "${server_metrics_args[@]}"
+      --public-dataset "${AIPERF_PUBLIC_DATASET}"
+      --output-artifact-dir "${out_dir}"
+    )
+  else
+    out=(
+      "${AGENTX_VENV}/bin/agentx" profile
+      "${unsafe_args[@]}"
+      --scenario "${AIPERF_SCENARIO}"
+      --url "http://127.0.0.1:${ROUTER_PORT}"
+      --endpoint /v1/chat/completions
+      --endpoint-type chat
+      --streaming
+      --model "${MODEL_SERVED_NAME}"
+      --concurrency "${conc}"
+      --benchmark-duration "${AIPERF_BENCHMARK_DURATION}"
+      --stats-interval 30
+      --random-seed 42
+      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}"
+      --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}"
+      --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}"
+      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}"
+      --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}"
+      --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}"
+      --use-server-token-count
+      --no-gpu-telemetry
+      --tokenizer "${MODEL_PATH}"
+      --tokenizer-trust-remote-code
+      "${chat_template_args[@]}"
+      --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}"
+      --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}"
+      --slice-duration "${AIPERF_SLICE_DURATION}"
+      "${server_metrics_args[@]}"
+      --output-artifact-dir "${out_dir}"
+      --public-dataset "${AIPERF_PUBLIC_DATASET}"
+    )
+  fi
 }
 
 run_aiperf_agentic_benchmark() {
@@ -2437,42 +2504,23 @@ run_aiperf_agentic_benchmark() {
         > >(tee "${out_dir}/torch_profile.log") 2>&1 &
       profile_pid=$!
     fi
-    AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
-    AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
-    AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
-    AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
-    AIPERF_UI_REALTIME_METRICS_ENABLED=true \
+    local -a benchmark_cmd=() client_env=(env)
+    build_agentic_client_command benchmark_cmd "${conc}" "${out_dir}"
+    client_env+=("AIPERF_HTTP_TCP_USER_TIMEOUT=${AIPERF_HTTP_TCP_USER_TIMEOUT}")
+    if [[ "${AGENTX_RECIPE_DEFAULTS}" == "true" ]]; then
+      client_env+=("AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom:")
+    else
+      client_env+=(
+        "AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}"
+        "AIPERF_DATASET_CONFIGURATION_TIMEOUT=${AIPERF_DATASET_CONFIGURATION_TIMEOUT}"
+        "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}"
+        "AIPERF_UI_REALTIME_METRICS_ENABLED=true"
+      )
+    fi
+    "${client_env[@]}" \
       python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
       --output "${out_dir}/metrics" "${report_args[@]}" -- \
-      "${AGENTX_VENV}/bin/agentx" profile \
-      "${unsafe_args[@]}" \
-      --scenario "${AIPERF_SCENARIO}" \
-      --url "http://127.0.0.1:${ROUTER_PORT}" \
-      --endpoint /v1/chat/completions \
-      --endpoint-type chat \
-      --streaming \
-      --model "${MODEL_PATH}" \
-      --concurrency "${conc}" \
-      --benchmark-duration "${AIPERF_BENCHMARK_DURATION}" \
-      --stats-interval 30 \
-      --random-seed 42 \
-      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}" \
-      --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}" \
-      --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}" \
-      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \
-      --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}" \
-      --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}" \
-      --use-server-token-count \
-      --no-gpu-telemetry \
-      --tokenizer "${MODEL_PATH}" \
-      --tokenizer-trust-remote-code \
-      "${chat_template_args[@]}" \
-      --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}" \
-      --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}" \
-      --slice-duration "${AIPERF_SLICE_DURATION}" \
-      "${server_metrics_args[@]}" \
-      --output-artifact-dir "${out_dir}" \
-      --public-dataset "${AIPERF_PUBLIC_DATASET}" \
+      "${benchmark_cmd[@]}" \
       > >(tee "${out_dir}/aiperf.log") 2>&1 &
     local aiperf_pid=$!
     echo "${aiperf_pid}" > "${aiperf_pid_file}"
@@ -2494,6 +2542,10 @@ run_aiperf_agentic_benchmark() {
         write_aiperf_chrome_trace "${out_dir}"
       fi
       continue
+    fi
+    if (( ATOMESH_TORCH_PROFILE_DURATION > 0 )); then
+      echo "[profile][FAIL] requested P/D torch traces were not completed; see ${out_dir}/torch_profile.log" >&2
+      return 1
     fi
     if (( aiperf_rc != 0 )); then
       echo "[aiperf][FAIL] aiperf exited with code ${aiperf_rc}" >&2
@@ -2554,7 +2606,7 @@ run_swebench_lite_eval() {
     bash "${runner}" \
       --output-dir "${result_dir}" \
       --model-name "${MODEL_NAME}" \
-      --api-model "${MODEL_PATH}" \
+      --api-model "${MODEL_SERVED_NAME}" \
       --api-base "http://127.0.0.1:${ROUTER_PORT}/v1" \
       --run-id "${tag}" \
       --limit "${EVAL_LIMIT:-full}" \
@@ -2638,9 +2690,9 @@ run_eval() {
   fi
   local eval_model_args_base
   if [[ "${EVAL_MODEL_TYPE}" == "local-chat-completions" ]]; then
-    eval_model_args_base="model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
+    eval_model_args_base="model=${MODEL_SERVED_NAME},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
   else
-    eval_model_args_base="model=${MODEL_PATH},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
+    eval_model_args_base="model=${MODEL_SERVED_NAME},base_url=http://127.0.0.1:${ROUTER_PORT}/v1/${EVAL_ENDPOINT},num_concurrent="
     eval_model_args_extra="${eval_model_args_extra},tokenized_requests=False,trust_remote_code=True"
   fi
 

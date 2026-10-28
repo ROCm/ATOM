@@ -41,10 +41,18 @@ def _uses_dspark(atom_config) -> bool:
     return bool(use_dspark is not None and use_dspark())
 
 
+def _dspark_mode_supported(atom_config) -> bool:
+    if not _uses_dspark(atom_config):
+        return True
+    dspark = getattr(atom_config, "dspark", None)
+    return dspark is not None and not (dspark.confidence_schedule or dspark.ragged)
+
+
 def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
     checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
         (atom_config.kv_cache_dtype == "fp8", f"kv cache {atom_config.kv_cache_dtype}"),
+        (not envs.ATOM_M3_SPARSE_KV_NVFP4, "sparse KV is NVFP4"),
         (
             (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "fp8",
             "index cache not fp8",
@@ -57,9 +65,10 @@ def _config_refusal(atom_config) -> str | None:
             atom_config.max_model_len <= MAX_CONTEXT,
             f"max_model_len {atom_config.max_model_len} > {MAX_CONTEXT}",
         ),
-        # DSpark reads the target's aux hidden states through forward hooks on
-        # the decoder layers, which the mono kernels replace.
-        (not _uses_dspark(atom_config), "DSpark speculative decoding"),
+        (
+            _dspark_mode_supported(atom_config),
+            "DSpark confidence schedule / ragged",
+        ),
     ]
     return first_refusal(checks)
 
@@ -69,9 +78,16 @@ class MonoDecode:
 
     def __init__(self, causal_lm, atom_config) -> None:
         self._lm = causal_lm
+        self._uses_dspark = _uses_dspark(atom_config)
+        self._drafter = None
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
-            lambda: MonoDecodeRunner(causal_lm), "MiniMax-M3 mono decode"
+            lambda: MonoDecodeRunner(
+                causal_lm,
+                drafter=self._drafter,
+                require_aux=self._uses_dspark,
+            ),
+            "MiniMax-M3 mono decode",
         )
         if not envs.ATOM_MONO_ENABLE:
             self._mono.enabled = False
@@ -80,6 +96,13 @@ class MonoDecode:
         if why is not None:
             logger.info("MiniMax-M3 mono decode off: %s", why)
             self._mono.enabled = False
+
+    def bind_drafter(self, drafter) -> None:
+        if not self._uses_dspark:
+            return
+        if self._mono.runner is not None:
+            raise RuntimeError("cannot bind a DSpark drafter after Mono starts")
+        self._drafter = drafter
 
     def supports(
         self,

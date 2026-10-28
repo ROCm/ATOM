@@ -895,6 +895,8 @@ _KV_LAYOUT_ENV = (
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV",
     "ATOM_USE_UNIFIED_ATTN",
     "ATOM_FORCE_ATTN_TRITON",
+    "ATOM_M3_SPARSE_KV_NVFP4",
+    "ATOM_M3_DSPARK_DRAFT_PTPC",
 )
 
 
@@ -909,6 +911,8 @@ _KV_LAYOUT_ENV = (
         {"ATOM_USE_UNIFIED_ATTN": "1"},
         # fp8 MHA KV under one fixed scale instead of per-token scales.
         {"ATOM_FORCE_ATTN_TRITON": "1"},
+        {"ATOM_M3_SPARSE_KV_NVFP4": "1"},
+        {"ATOM_M3_DSPARK_DRAFT_PTPC": "1"},
     ],
 )
 def test_namespace_fingerprints_the_kv_layout_the_environment_selects(monkeypatch, env):
@@ -3735,3 +3739,47 @@ def test_mixed_windows_report_the_same_chunks(
     for index in range(4):
         expected = _page_pattern(2 * index) + _page_pattern(2 * index + 1)
         assert objects[_key(request.chunk_hashes, index)] == expected
+
+
+@pytest.mark.parametrize("model_type", ["minimax_m3", "minimax_m3_vl"])
+def test_m3_store_codec_includes_all_page_planes(model_type):
+    from atom.kv_transfer.disaggregation.page_region import page_region
+    from atom.kv_transfer.disaggregation.types import KVTransferTensors
+
+    config = _config()
+    config.hf_config.model_type = model_type
+    check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+    connector = object.__new__(MooncakeStoreOffloadConnector)
+    connector._config = config
+    fields = {
+        name: torch.zeros((4, width), dtype=torch.uint8)
+        for name, width in [
+            ("k", 2048),
+            ("v", 2048),
+            ("k_scale", 64),
+            ("v_scale", 64),
+            ("index", 144),
+            ("index_scale", 16),
+            ("draft", 2048),
+        ]
+    }
+    transfer = KVTransferTensors(
+        pages=[page_region(t, semantic_role=f"m3.{name}") for name, t in fields.items()]
+    )
+    transfer.set_block_count(4)
+    codec = connector._make_codec({}, transfer, 4)
+    assert codec.bytes_per_block == sum(t.shape[1] for t in fields.values())
+    for bad in (None, KVTransferTensors()):
+        with pytest.raises(ValueError, match="complete PAGE"):
+            connector._make_codec({}, bad, 4)
+
+
+def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatch):
+    config = _config()
+    config.hf_config.model_type = "minimax_m3_vl"
+    # Even with an identical page namespace, a legacy dense object must not
+    # be interpreted as complete M3 PAGE bytes containing the index cache.
+    monkeypatch.setattr(offcfg, "build_page_namespace", lambda *args: "same-page")
+    m3_namespace = keys.store_namespace(config, CHUNK)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: "dense")
+    assert keys.store_namespace(config, CHUNK) != m3_namespace

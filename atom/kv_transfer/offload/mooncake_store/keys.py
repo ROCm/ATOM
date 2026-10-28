@@ -76,7 +76,9 @@ def kv_layout_selectors() -> dict[str, Any]:
     with one fixed scale instead of the per-token scales the default path
     writes (``ATOM_FORCE_ATTN_TRITON``) -- so neither the codec's opaque bytes
     nor the size a load checks tell them apart. The scheduler and the workers
-    it spawns read the same environment. A switch a model does not use costs a
+    it spawns read the same environment. M3 sparse NVFP4 changes the layout;
+    draft PTPC changes the weights that produce the cached draft KV values.
+    A switch a model does not use costs a
     miss across servers that differ in it, never another layout's KV.
     """
     return {
@@ -85,6 +87,8 @@ def kv_layout_selectors() -> dict[str, Any]:
         "triton_mla_shuffle_kv": bool(envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV),
         "unified_attn": bool(envs.ATOM_USE_UNIFIED_ATTN),
         "force_attn_triton": bool(envs.ATOM_FORCE_ATTN_TRITON),
+        "m3_sparse_kv_nvfp4": bool(envs.ATOM_M3_SPARSE_KV_NVFP4),
+        "m3_dspark_draft_ptpc": bool(envs.ATOM_M3_DSPARK_DRAFT_PTPC),
     }
 
 
@@ -153,7 +157,11 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
             getattr(config, "hf_overrides", None), sort_keys=True, default=str
         ),
         "revision": str(getattr(hf, "_commit_hash", None)),
-        "codec": CODEC_ID,
+        "codec": (
+            "m3-complete-page-v1"
+            if offcfg.select_offload_layout(config) == "m3"
+            else CODEC_ID
+        ),
     }
     canonical = json.dumps(
         document, sort_keys=True, separators=(",", ":"), ensure_ascii=True

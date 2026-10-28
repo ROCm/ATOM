@@ -198,6 +198,102 @@ def test_decode_prefix_is_skipped_even_before_source_blocks_are_available():
     assert bytes(dst[0][8:12]) == bytes(4)
 
 
+@pytest.mark.parametrize("cached_blocks", [0, 1])
+def test_m3_nvfp4_index_and_draft_regions_follow_chunk_boundaries(cached_blocks):
+    """Exercise the real address planner with heterogeneous M3 PAGE planes."""
+    import torch
+
+    from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+    from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
+
+    def pools():
+        target = MhaKvPool(
+            layers=2,
+            num_kv_heads=1,
+            head_dim=128,
+            block_size=128,
+            kv_dtype=torch.float8_e4m3fnuz,
+            kv_format="nvfp4",
+            extra_fields=(
+                EntryField("index", 2, (128 * 64,), torch.uint8),
+                EntryField("index_scale", 2, (128 * 8,), torch.uint8),
+            ),
+        )
+        draft = MhaKvPool(
+            layers=1,
+            num_kv_heads=16,
+            head_dim=128,
+            block_size=128,
+            kv_dtype=torch.float8_e4m3fnuz,
+        )
+        regions = []
+        for name, pool in (("target", target), ("draft", draft)):
+            pool.allocate(10, "cpu")
+            regions.extend(
+                (f"{name}.{role}", tensor.view(torch.uint8).reshape(10, -1))
+                for role, tensor in pool.region_tensors()
+            )
+        return (target, draft), regions
+
+    source_pools, source = pools()
+    destination_pools, destination = pools()
+    for i, ((role, src), (dst_role, dst)) in enumerate(zip(source, destination)):
+        assert role == dst_role
+        for block in range(10):
+            src[block].fill_(1 + i * 11 + block)
+        dst.zero_()
+        if cached_blocks:
+            dst[2].copy_(src[5])
+    c, _, req, _, _ = producer()
+    c.tp_size = 4
+    c.block_size = 128
+    c.kv_caches_base_addr = [t.data_ptr() for _, t in source]
+    c._per_block_bytes_list = [t.shape[1] for _, t in source]
+    c._block_region_roles = [role for role, _ in source]
+    state = ChunkedPrefill(7, [5, 1, 8], 258, 128)
+    c._chunked_prefills["xfer-a"] = state
+    req.update(
+        consumer_tp_size=4,
+        consumer_num_layers=2,
+        consumer_base_addrs=[t.data_ptr() for _, t in destination],
+        consumer_block_bpb=c._per_block_bytes_list,
+        consumer_region_roles=c._block_region_roles,
+        num_computed_blocks=cached_blocks,
+        dst_block_ids=[2, 9, 4][cached_blocks:],
+    )
+    # The listener only dispatches admitted requests with a published page.
+    publish(state, (cached_blocks + 1) * 128)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(dispatch, c, req)
+        try:
+            for position in range(cached_blocks, 3):
+                if position > cached_blocks:
+                    publish(state, min((position + 1) * 128, 258))
+                sources, _, sizes = c.transfer_engine.writes.get(timeout=5)
+                assert sizes == c._per_block_bytes_list
+                assert sources == [
+                    t.data_ptr() + [5, 1, 8][position] * t.shape[1] for _, t in source
+                ]
+                for (_, src), (_, dst) in zip(source, destination):
+                    torch.testing.assert_close(
+                        dst[[2, 9, 4][position]], src[[5, 1, 8][position]]
+                    )
+                    for next_position in range(position + 1, 3):
+                        assert not dst[[2, 9, 4][next_position]].any()
+                assert not future.done()
+            handoff = {"first_token_id": 42, "draft_token_ids": list(range(43, 50))}
+            state.finish(handoff)
+            future.result(timeout=5)
+        finally:
+            state.cancel()
+    assert req["prefill_handoff"] == handoff
+    assert state.source_safe()
+    assert c.transfer_engine.writes.empty()
+    c._notify_transfer_result.assert_called_once_with(req, success=True)
+    # Keep both pools alive until every ctypes RDMA write has completed.
+    assert source_pools and destination_pools
+
+
 def test_no_delta_page_until_whole_dcp_destination_is_ready():
     state = ChunkedPrefill(1, [4, 9, 1, 7, 8], 18, 4, timeout=0.01)
     publish(state, 6)
