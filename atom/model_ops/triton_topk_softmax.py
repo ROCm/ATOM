@@ -4,9 +4,10 @@
 
 Bit-identical to AITER's `topk_softmax` with `need_renorm` (ids, tie order,
 weights, the sigmoid-scored shared-expert slots it appends, and the pad rows
-of its optional `num_valid_rows` count). On MI355X at
-512 experts it takes about 4 us per call where the HIP kernel takes 9-11 us.
-Each selection is a single int64 max over (value, -index).
+of its optional `num_valid_rows` count), also on rows with fewer than k finite
+logits. On MI355X at 512 experts it takes about 4 us per call where the HIP
+kernel takes 9-11 us. Each selection is a single int64 max over
+(value, -index).
 """
 
 import torch
@@ -33,12 +34,19 @@ def _topk_softmax_kernel(
     row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, E)
     x = tl.load(logits_ptr + row * stride_l + offs).to(tl.float32)
-    row_max = tl.max(x, 0)
     # High word: the float bits made order-preserving as int32 (-0.0 folded
     # into +0.0, which compare equal). Low word: E - 1 - index, so equal
     # values resolve to the lowest expert id.
-    b = tl.where(x == 0.0, 0, x.to(tl.int32, bitcast=True))
-    key = (b ^ ((b >> 31) & 0x7FFFFFFF)).to(tl.int64) * 4294967296 + (E - 1 - offs)
+    bits = x.to(tl.int32, bitcast=True)
+    b = tl.where(x == 0.0, 0, bits)
+    low = (E - 1 - offs).to(tl.int64)
+    # AITER picks with `>` and clears each pick to -inf: once the finite
+    # logits run out the lowest index (expert 0) is picked again, its slot
+    # already cleared. A NaN sorts below -inf, so it is never picked.
+    nan = (bits & 0x7FFFFFFF) > 0x7F800000
+    b = tl.where(nan, -2147483648, b ^ ((b >> 31) & 0x7FFFFFFF))
+    key = b.to(tl.int64) * 4294967296 + low
+    cleared = -2139095041 * 4294967296 + low  # -inf's high word
     kk = tl.arange(0, KP)
     wv = tl.zeros((KP,), dtype=tl.float32)
     iv = tl.zeros((KP,), dtype=tl.int32)
@@ -48,11 +56,13 @@ def _topk_softmax_kernel(
         idx = (E - 1 - (best & 0xFFFFFFFF)).to(tl.int32)
         hi = (best >> 32).to(tl.int32)
         v = (hi ^ ((hi >> 31) & 0x7FFFFFFF)).to(tl.float32, bitcast=True)
+        if k == 0:
+            row_max = v
         e = libdevice.exp(v - row_max)
         wv = tl.where(kk == k, e, wv)
         iv = tl.where(kk == k, idx, iv)
         total += e
-        key = tl.where(offs == idx, -9223372036854775807, key)
+        key = tl.where(offs == idx, cleared, key)
     wv = wv * (1.0 / total)
     if HAS_NUM_VALID_ROWS:
         pad = row >= tl.load(num_valid_rows_ptr)
@@ -95,6 +105,12 @@ def triton_topk_softmax(
     `topk_softmax(..., need_renorm=True, ...)` (k = `topk_ids.shape[1]`), and
     `topk_weights[:, k + s]` with sigmoid(shared logit s) for each of the
     `num_shared_experts` trailing logits.
+
+    As in AITER, a row with fewer than k finite logits picks expert 0 for the
+    rest, with weight 0. A NaN logit is never picked. AITER agrees unless the
+    NaN is the first element of one of its per-thread vector loads (16 bf16
+    below 512 experts, 32 at 512): there it may pick it, making every weight
+    NaN, or misorder the row, so rows with NaNs are not bit-identical.
 
     `num_valid_rows`, as in AITER (ROCm/aiter#6916): an optional int32 device
     tensor whose first element is the count of real rows. Rows at or past it
