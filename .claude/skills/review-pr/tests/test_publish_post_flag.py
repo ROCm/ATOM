@@ -30,7 +30,15 @@ def test_dry_run_never_calls_do_post(monkeypatch, capsys):
     assert "POST — postable" in out
 
 
-def test_post_flag_calls_do_post_exactly_once(monkeypatch):
+def test_post_flag_calls_do_post_exactly_once(monkeypatch, tmp_path):
+    # main() re-reads the card after a successful post to grade severity, so
+    # point REPORTS at a self-contained tmp tree: the test must not depend on
+    # a reports/ directory left behind by a local run (untracked -> absent in CI).
+    (tmp_path / "PR-2705").mkdir()
+    (tmp_path / "PR-2705" / "card.md").write_text(
+        "Review: \u2705 LGTM\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(_publish, "REPORTS", tmp_path)
     monkeypatch.setattr(_publish, "decide", lambda pr: ("POST", "postable"))
     calls = []
 
@@ -39,11 +47,6 @@ def test_post_flag_calls_do_post_exactly_once(monkeypatch):
         return True, "https://github.com/ROCm/ATOM/pull/2705#issuecomment-1"
 
     monkeypatch.setattr(_publish, "do_post", _fake_post)
-    monkeypatch.setattr(
-        _publish,
-        "severity",
-        lambda card_text: "ok",
-    )
     rc = _publish.main(["2705", "--post"])
     assert rc == 0
     assert calls == ["2705"], "do_post must be called exactly once, for the one PR"
