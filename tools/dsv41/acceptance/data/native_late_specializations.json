@@ -1,0 +1,52 @@
+{
+  "late_examples": [
+    {
+      "detail": "{'key': \"[('*bf16', 'DS'), ('*i64', 'DS'), ('*i32', 'DS'), ('*i32', 'DS'), ('*bf16', 'D'), ('i32', 'D'), ('i32', ''), ('constexpr', 512), ('i32', ''), ('*i32', 'DS'), ('constexpr', 512), ('constexpr', True), ('constexpr', 128), ('constexpr', 5153), ('constexpr', 128), ('constexpr', 128)]{'debug': False, 'instrumentation_mode': '', 'fpsan_homomorphic_casts': False}\"}",
+      "detail_characters": 368,
+      "detail_complete": true,
+      "detail_sha256": "349a1d2f224f16d13d040850c20b02a1286178dbfc605424072de60c4c43a15c",
+      "event": "triton_specialization",
+      "ns": 1793066945759103287
+    },
+    {
+      "detail": "{'key': \"[('*i32', 'DS'), ('*i64', 'DS'), ('*i32', 'DS'), (('*i32', '*i32', '*i32'), ('DS', 'DS', 'DS')), (('*i32', '*i32', '*i32'), ('DS', 'DS', 'DS')), ('i32', 'D'), ('*i32', 'DS'), ('*i32', 'S'), ('constexpr', False), ('constexpr', 128), ('constexpr', (0, 1, 2)), ('constexpr', (0, 512, 512)), ('constexpr', False), ('constexpr', 512)]{'debug': False, 'instrumentation_mode': '', 'fpsan_homomorphic_casts': False}\"}",
+      "detail_characters": 418,
+      "detail_complete": true,
+      "detail_sha256": "b38b77ad615a5716d201a67f15a8d48080bf7f46ae3364af3dce5ce4f1c0192b",
+      "event": "triton_specialization",
+      "ns": 1793067120313002912
+    },
+    {
+      "detail": "{'key': \"[('*i32', 'DS'), ('*i64', 'DS'), ('*i32', 'DS'), (('*i32', '*i32', '*i32'), ('DS', 'DS', 'DS')), (('*i32', '*i32', '*i32'), ('DS', 'DS', 'DS')), ('i32', 'D'), ('*i32', 'DS'), ('*i32', 'S'), ('constexpr', False), ('constexpr', 128), ('constexpr', (0, 1, 2)), ('constexpr', (0, 512, 512)), ('constexpr', False), ('constexpr', 1024)]{'debug': False, 'instrumentation_mode': '', 'fpsan_homomorphic_casts': False}\"}",
+      "detail_characters": 419,
+      "detail_complete": true,
+      "detail_sha256": "b4c51dd6d6ba809bc0b97c43d40d7c387f6a2dd9f82f1c9fbb1e481c73108012",
+      "event": "triton_specialization",
+      "ns": 1793067141366610387
+    },
+    {
+      "detail": "{'cache_key': \"(('_globals_', ((('GEMM_A16W16_DTYPE_FP16', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('scalar', 3)), (('GEMM_A16W16_DTYPE_FP32', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('scalar', 1)), (('GFX950_DMA_BYTES', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('scalar', 16)), (('__name__', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('scalar', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950')), (('const_expr', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('callable', 'flydsl.expr.primitive', 'const_expr')), (('fx', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('obj', 'module')), (('make_gemm_a16w16_gfx950_kernel_name', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('callable', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950', 'make_gemm_a16w16_gfx950_kernel_name')), (('rocdl', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('obj', 'module')), (('scf_ifexp_dispatch', 'aiter.ops.flydsl.kernels.gemm_a16w16_gfx950'), ('callable', 'flydsl.compiler.ast_rewriter', 'ReplaceIfWithDispatch.scf_ifexp_dispatch')))), ('_env_', (('FLYDSL_COMPILE_OPT_LEVEL', ''), ('FLYDSL_COMPILE_BACKEND', ''), ('FLYDSL_COMPILE_LLVM_DIR', ''), ('FLYDSL_DEBUG_ENABLE_DEBUG_INFO', ''), ('FLYDSL_EXTRA_SOURCE_DIRS', ''), ('FLYDSL_KTRACE_ENABLE', ''), ('FLYDSL_KTRACE_BLOCKS', ''), ('FLYDSL_KTRACE_BUFFER_BYTES', ''))), ('_target_', GPUTarget(backend='rocm', arch='gfx950', warp_size=64)), ('out', (<class 'flydsl.compiler.jit_argument.DLTensorJitArg'>, (4, 16, 1), 2, False, (-1, -1), (-1, 1))), ('a', (<class 'flydsl.compiler.jit_argument.DLTensorJitArg'>, (4, 16, 1), 2, False, (-1, -1), (-1, 1))), ('b', (<class 'flydsl.compiler.jit_argument.DLTensorJitArg'>, (4, 16, 1), 2, False, (-1, -1), (1, -1))), ('bias', (<class 'flydsl.compiler.jit_argument.DLTensorJitArg'>, (4, 16, 1), 2, False, (-1, -1), (-1, 1))), ('semaphore', (<class 'flydsl.compiler.jit_argument.TorchTensorJitArg'>, torch.int64, 8, False, (-1,), (1,))), ('signal', (<class 'flydsl.compiler.jit_argument.TorchTensorJitArg'>, torch.int32, 4, False, (-1,), (1,))), ('split_k', (<class 'flydsl.expr.numeric.Int32'>,)), ('param', (<class 'flydsl.expr.struct.GemmA16W16Gfx950Param[in_dtype_id=2, out_dtype_id=2, block_m=32, block_n=128, block_k=128, stages=4, is_split_k=False, m_waves=1, n_waves=4, k_waves=2, group_m=0, use_half_tile_interleaved=False, a_is_transposed=False, b_is_transposed=True, has_bias=False, mma_m=16, mma_n=16, mma_k=32, async_load_bytes=16, in_data_bytes=2, out_data_bytes=2, cshuffle_r2g_vec_size=8, ldg_x_threads=16, block_threads=512, ldg_a_iters=1, ldg_b_iters=4]'>,)), ('stream', (<class 'flydsl.expr.typing.Stream'>,)))\"}",
+      "detail_characters": 2633,
+      "detail_complete": true,
+      "detail_sha256": "5d86e1183cde40fa0782d505137fa89b55db50d9bde084a75afd1e330f57ec1b",
+      "event": "flydsl_compile_lock",
+      "ns": 1793067349400874633
+    },
+    {
+      "detail": "{}",
+      "detail_characters": 2,
+      "detail_complete": true,
+      "detail_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "event": "flydsl_ir_context",
+      "ns": 1793067349409379537
+    },
+    {
+      "detail": "{'func_name': 'gemm_a16w16_gfx950'}",
+      "detail_characters": 35,
+      "detail_complete": true,
+      "detail_sha256": "bf56c8d78b1f1a7a3f106f2f2306aa55a701bbe71550ec68a3a215e02855ca18",
+      "event": "flydsl_codegen",
+      "ns": 1793067349547725985
+    }
+  ]
+}
