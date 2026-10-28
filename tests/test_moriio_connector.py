@@ -1216,7 +1216,7 @@ class MergeContiguousBlocksTest(unittest.TestCase):
 
 
 def load_class_members(names: list[str], namespace: dict) -> dict:
-    """Lift methods of MoRIIOConnector (and top-level classes) from the source.
+    """Lift methods of MoRIIOConnector from the source.
 
     Static methods keep their decorator; everything else becomes a plain
     function, ready to be put on a stand-in class.
@@ -1226,16 +1226,15 @@ def load_class_members(names: list[str], namespace: dict) -> dict:
     wanted = set(names)
     nodes = []
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in wanted:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
             nodes.append(node)
             wanted.discard(node.name)
     if wanted:
         raise AssertionError(f"not found: {sorted(wanted)}")
     for node in nodes:
-        if isinstance(node, ast.FunctionDef):
-            node.decorator_list = [
-                d for d in node.decorator_list if ast.unparse(d) == "staticmethod"
-            ]
+        node.decorator_list = [
+            d for d in node.decorator_list if ast.unparse(d) == "staticmethod"
+        ]
         code = compile(ast.Module([node], []), str(CONNECTOR), "exec")
         exec(code, scope)  # noqa: S102
     return {name: scope[name] for name in names}
@@ -1258,7 +1257,6 @@ class RegionPseudoLayerTest(unittest.TestCase):
                 "_region_write_plan",
                 "_write_blocks",
                 "_source_covers",
-                "_LazySessions",
             ],
             {
                 "Any": object,
@@ -1268,7 +1266,6 @@ class RegionPseudoLayerTest(unittest.TestCase):
                 "_POST_FAILED": "post-failed",
             },
         )
-        cls.lazy = members.pop("_LazySessions")
         cls.Fake = type("FakeConnector", (), members)
 
     def make(self, local: dict, remote: dict):
@@ -1281,20 +1278,12 @@ class RegionPseudoLayerTest(unittest.TestCase):
         }
         conn.writes = []
 
-        def build_session(local_md, remote_md):
-            return (local_md, remote_md)
-
         def write(szs, l_offs, r_offs, session):
             conn.writes.append((session, l_offs, r_offs, szs))
             return "status"
 
-        conn.moriio_wrapper = types.SimpleNamespace(
-            build_session=build_session, write_remote_data_status=write
-        )
-        sessions = [
-            (self.lazy(conn.moriio_wrapper, [(n, i) for i in range(8)], range(8)), {})
-            for n in local
-        ]
+        conn.moriio_wrapper = types.SimpleNamespace(write_remote_data_status=write)
+        sessions = [({(0, 0): "page0", (1, 2): "page1"}, {}), ({(1, 2): "slot"}, {})]
         conn._get_or_build_sessions = lambda engine_id: (sessions, None)
         return conn
 
@@ -1321,21 +1310,12 @@ class RegionPseudoLayerTest(unittest.TestCase):
         request.update(overrides)
         return request
 
-    def test_a_missing_state_slot_is_refused(self):
-        conn = self.make(*self.layouts())
-        with self.assertRaises(ValueError) as caught:
-            conn._region_write_plan(self.request(dst_slot=-1), "eng", [1], [2])
-        self.assertIn("no state slot", str(caught.exception))
-
     def test_nothing_is_posted_when_any_region_is_out_of_range(self):
         conn = self.make(*self.layouts())
-        # Slot 4 is past the producer's 4-unit region; the page region before
-        # it must not have been posted either.
-        with self.assertRaises(ValueError):
-            conn._write_blocks(self.request(src_slot=4), "eng")
-        self.assertEqual(conn.writes, [])
-        with self.assertRaises(ValueError):
-            conn._write_blocks(self.request(dst_block_ids=[-1]), "eng")
+        # The page region is planned first and must not be posted either.
+        for bad in ({"src_slot": 4}, {"dst_slot": -1}, {"dst_block_ids": [-1]}):
+            with self.assertRaises(ValueError):
+                conn._write_blocks(self.request(**bad), "eng")
         self.assertEqual(conn.writes, [])
 
     def test_write_posts_one_batch_per_region_chunk_pair(self):
@@ -1348,9 +1328,9 @@ class RegionPseudoLayerTest(unittest.TestCase):
         self.assertEqual(
             conn.writes,
             [
-                ((("page.0.kv", 0), 0), [8], [16], [8]),
-                ((("page.0.kv", 1), 2), [8], [8], [8]),
-                ((("slot.0.kv", 1), 2), [16], [0], [16]),
+                ("page0", [8], [16], [8]),
+                ("page1", [8], [8], [8]),
+                ("slot", [16], [0], [16]),
             ],
         )
 

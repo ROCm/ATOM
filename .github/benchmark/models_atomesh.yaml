@@ -243,18 +243,10 @@ models:
         - &dsv4_moriio_gsm8k
           name: ds-v4-1p1d-tp8-moriio-gsm8k
           topology: 1p1d_tp8_moriio
-          display_topology: 1P1D-MORIIO-TP8
-          pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [8192]
           osl: 1024
           concurrency: [64]
-          prefill:
-            workers: 1
-            tp: 8
-          decode:
-            workers: 1
-            tp: 8
           server:
             common_args:
               gpu_memory_utilization: 0.95
@@ -266,17 +258,14 @@ models:
             wait_server_timeout: 4500
           run_eval: true
           eval_only: true
-          eval_concurrency: [64]
           accuracy:
             threshold: 0.90
         - <<: *dsv4_moriio_gsm8k
           name: ds-v4-2p1d-tp8-moriio-gsm8k
           topology: 2p1d_tp8_moriio
-          display_topology: 2P1D-MORIIO-TP8
           nodes: "${ATOMESH_2P1D_NODES}"
           prefill:
             workers: 2
-            tp: 8
 
     accuracy:
       task: gsm8k
