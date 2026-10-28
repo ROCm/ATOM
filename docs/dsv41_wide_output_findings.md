@@ -150,8 +150,18 @@ R3每次独立服务的总墙钟约748秒，其中正式生成约301秒，约447
 
 两对均正向；owner相对L2分别为0.000245–0.000325与0.000196–0.000267，与Native自重复同量级。`quant_pool/REVIEW.json`保存逐rank与原始记录。该实现仍是严格部署下的验证代码，直接依赖communicator私有pool，尚无所有生产调用者的显式借用合同或整网验收，因此**不晋级生产**，也不继承上一版GSM结果。下一架构边界应将norm→量化→通信暂存的owner、stream和最后读者统一，而不是把私有pool指针散布到各层；大GEMM及原生同步保持原样。本轮不再重复整网验收这个仅单层微收益的原型。
 
-## 7. 下一轮详细方案
+## 7. 输入融合实施
 
-[大 prefill 输入融合：从原生 Mega-MHC 直达专家消费布局](dsv41_prefill_input_fusion_plan.md) 已给出下一轮设计。首版使用 AITER 现有 external input registration，将 Q/scale 写入专用 arena；随后复用 Mega-MHC 的 BF16 norm＋MXFP8 输出能力，删除独立量化对 norm 的重读。保留 BF16 router、完整 M 的原生 shared/G1/G2 与本轮输出融合。
+[大 prefill 输入融合：从原生 Mega-MHC 直达专家消费布局](dsv41_prefill_input_fusion_plan.md) 已给出设计与本轮实施记录。首版使用 AITER 现有 external input registration，将 Q/scale 写入专用 arena；随后复用 Mega-MHC 的 BF16 norm＋MXFP8 输出能力，删除独立量化对 norm 的重读。保留 BF16 router、完整 M 的原生 shared/G1/G2 与本轮输出融合。
 
-外部注册路线、FFN fused producer、mutation/graph ABI 和整网增益均尚未实现或验收。新方案明确精确指针注册、communicator 生命周期、同 stream 复用、20.625 MiB/rank 的发送容量，以及包含 producer 的完整计时窗；也说明修改 traced producer 后，当前只切换 eager 出口的单次加载脚本需要怎样扩展。本文已有数字不变，不能据此为新设计计入收益。
+外部注册与FFN fused producer已完成真实单层检查：独立量化直写的完整FFN在M7835/16315为1.003358/1.006135×；融合producer直写的真实RuntimeBlock完整入口为1.001401/1.011296×，M7835有一对0.999404×。这些微收益尚未计入整网。
+
+整网初次启动因mutable custom-op返回列表而在编译阶段失败；后续使用固定tuple输出和uint8原始storage作为编译ABI，保留内部FP8/E8M0视图与原始算术。实际Inductor完整seam检查及四卡真实layer8 producer→AG均通过，后者两种M、三次更新的norm/状态L2为0，Q/scale字节一致。完整原生／融合双路径单次加载的768请求ABBA已复核：7382.218525→7864.803296 tok/s，1.065371239×，两对1.090342/1.041379×，正式zero-cold。全decode接受长度q同时从约2.20变为2.42，故该整网增量不能全部归因于少搬运。本候选全量GSM8K为1137/1319=86.2017%，未达91%门槛；完整2560性能臂未启动，短测不能计入可用收益，不继承输出版GSM。精确证据、边界及失败记录见新输入方案第13节。
+
+
+输入链后续定位到外部IPC注册的allocation offset合同：本地norm/Q/scale正确，scale经注册AG后损坏。四卡内部地址探针复现，独立cached HIP分配修复并通过真实producer＋Inductor＋AG；修复版全量GSM8K为1207/1319=91.5087%，通过91%门槛。首轮性能B1因遗漏DSpark融合KV投影的原生特化预热而拒收；无模型四卡预热验证完成后，保留有效A1/GSM，仅补跑B1/B2/A2。旧输入短测6.54%不计入可用收益。详见输入方案第13.4–13.5节。
+
+
+输入候选最终已完成相对原生产编译边界的四臂2560请求ABBA：**7799.804484→7809.306386 tok/s，1.001218223×（+0.1218%）**，两对0.999964115/1.002470838×。原生产重复变化−0.368811%，没有确认稳定收益；四rank正式zero-JIT/capture、完整图键、18层实际输入路径和原始结果复核均通过。新边界内768筛选的0.63%不替代这个结果。
+
+修复版GSM8K的1207/1319=91.5087%通过结论保留，但性能未晋级：输入候选及AITER destination patch已精确归档到仓外`input_delivery/archived_source/`，生产模型恢复已验收的输出融合版本，单独接入DSpark融合KV精确预热。未将历史倍率相乘。完整证据、为何收益小和后续结构边界见[输入方案13.7–13.9](dsv41_prefill_input_fusion_plan.md#137-原生产边界的完整结果与最终决定)。所有测试容器正常退役，用户的244395/155整节点allocation保留，无反向代理。

@@ -4,7 +4,7 @@
 
 实施分两步：先让独立量化直接写入专用、已注册的 Q/scale 发送缓冲；再复用原生 Mega-MHC 的融合量化能力，让 norm 的生产者直接写这些缓冲。两步分别度量，最终以包含生产者的完整 FFN 和整网净收益决定是否晋级。
 
-**状态：2026-10-28 设计，尚未实施或获得新 GPU 验收。** 源码基准为 ATOM `75a56a37a1e0c55fff748887c7846f64826ea885`，分支 `yifehuan/dsv41_fusedmoe`，主线截点仍为用户确认的 `ebd5f84f3`；AITER 依据 pinned reference `729feefb7210ebc3a87ebd00a44e0c43f30bf3f2`。本方案不改变这组基准，也不需要重跑已完成的输出实验。
+**状态：2026-10-28 两步已实现并完成整网验证，但未晋级生产。修复IPC allocation offset和DSpark融合KV预热漏项后，全量GSM8K为1207/1319=0.9150871873，通过0.91门槛；相对原生产编译边界的2560请求ABBA为1.001218223×（+0.1218%），第一对持平、第二对小幅正向，尚未确认稳定收益。候选精确源码已归档，模型恢复已验收的输出融合版本；生产只新增融合KV预热修复。旧错误版6.54%和新边界内768筛选0.63%均不计作已验收整网增量。** 源码基准为 ATOM `75a56a37a1e0c55fff748887c7846f64826ea885`，分支 `yifehuan/dsv41_fusedmoe`，主线截点仍为用户确认的 `ebd5f84f3`；AITER 依据 pinned reference `729feefb7210ebc3a87ebd00a44e0c43f30bf3f2`。本方案不改变这组基准，也不需要重跑已完成的输出实验。
 
 ## 1. 已知收益、失败与本轮选择
 
@@ -21,7 +21,7 @@
 
 本轮主方案采用 AITER 已有的 **external input registration**：runner 绑定专用发送 arena，借用原生 peer table、AllGather 和 `end_sync`。这样下一步可以把量化生产者接进来，而无需重新实现通信或复制 MoE forward。
 
-详细已测结果见 [大 M 输出与输入探针记录](dsv41_wide_output_findings.md)。下文的接口名称、arena 和融合 FFN 变体均是拟议设计。
+详细已测结果见 [大 M 输出与输入探针记录](dsv41_wide_output_findings.md)。下文保留归档候选的设计合同；实际实现、编译边界修复、完整结果与退役决定见第13节。本文中的输入arena及destination接口均指归档原型，不表示当前生产入口已启用。
 
 ## 2. 支持域先于算子选择
 
@@ -33,7 +33,7 @@
 | 层 | 已有 prequantized owner 路径中的非 hash 层 **2–19**，文本输入 |
 | 步形状 | 实际大 prefill **4096 ≤ M ≤ 16384**；L=ceil(M/4)，每 rank 形状 `[L,5120]` |
 | 状态 | 沿用当前 owner residual、pre/post/combination 和 pending；不改变 KV、投机提交/回滚 |
-| 通信 | 当前已验证类别的 torch-backed native IPC、TP4 fully connected，Q 和 scale 各自通过原生 `should_custom_ag` |
+| 通信 | 原生 IPC communicator、独立 cached HIP input allocation、TP4 fully connected；Q 和 scale 各自通过原生 `should_custom_ag` |
 | 执行 | 首版一个串行 stream、一个 arena slot；side streams 关闭，不允许并发重放共用 slot |
 | 图 | 第一步只在实际 eager seam 启用 registered 直写；捕获走现有 native 路径，后续单独验收融合 producer 图 |
 | 回退 | 超界 M、小步/decode、hash、图策略不支持、不同后端或任一原生 consumer 条件不满足，写入前选择现有完整路径 |
@@ -89,7 +89,7 @@ flowchart TD
 
 ### 4.1 专用注册发送 arena
 
-首版分配两个独立、连续的 CUDA tensor storage：Q `[Lmax,H]` 和 scale bytes `[Lmax,H/32]`。这里 arena 是这两个 storage 的生命周期集合，不要求把它们物理打包成一个 allocation。每步取从 offset 0 开始的前 L 行，始终使用同一个起始指针。
+当前实现用两个独立的 `IPCBuffer(raw_cached=True)` HIP allocation，通过非拥有的 uint8 tensor view 提供 Q `[Lmax,H]` 和 scale bytes `[Lmax,H/32]`；arena 强持有两个分配 owner。注册前核对 tensor 指针等于 HIP allocation 基址，不能以 `torch.empty` 的 `storage_offset()==0` 代替此条件。每步取从 offset 0 开始的前 L 行，始终使用同一个起始指针。
 
 在启动、预热和捕获之前，各 rank 按相同顺序执行一次 Q 注册、一次 scale 注册：
 
@@ -101,14 +101,14 @@ comm.all_gather_reg(q_encoded, out=q_receive, dim=0)
 comm.all_gather_reg(scale_encoded, out=scale_receive, dim=0)
 ```
 
-这些方法已经存在于 pinned AITER 的 `aiter/dist/device_communicators/custom_all_reduce.py`；**外部 arena 的实际 GPU 路线尚未测试**。原型直接借用内部 pool 的证据不能自动验收它。
+这些方法已经存在于 pinned AITER 的 `aiter/dist/device_communicators/custom_all_reduce.py`；外部 arena 已完成独立注册、真实完整FFN和四卡producer→AG检查；证据见第13节，不能用此前借用私有pool的结果代替。
 
 注册必须遵守以下源码事实：
 
-- `register_input_buffer` 交换真实 IPC handles 和 offsets；不能假设各 rank 地址相同或固定 stride。
-- C++ `get_buffer_RD` 按 **精确 data pointer** 查表，不按父 storage 的范围匹配。若以后把 scale 或其他 slot 放到非零 offset，必须单独注册其固定指针；注册父 tensor 不覆盖所有子 view。
+- 当前 IPC 路径的 `register_input_buffer` 交换真实 handles，但 Python pool 发送的 offset 固定为 0，因此输入必须位于 allocation 基址。不能假设各 rank 地址相同或固定 stride；非零 offset 子分配的缺陷与修复见13.4。
+- C++ `get_buffer_RD` 按 **精确 data pointer** 查表，不按父 storage 的范围匹配。注册父 tensor 不覆盖所有子 view。未来非零 offset 布局还必须先修复并验证 IPC metadata 的 offset 传递，单独调用当前注册函数并不够。
 - `register_input_buffer` 每次推进 rank-data 表，即使同一指针重复注册也会消耗容量。不能每层、每 M、每 replay 注册。
-- symm backend 上该 API 是 no-op；首版拒绝 symm、VMM、raw allocation 和未验证的 allocator 导出模式。支持更多后端需要新的实际 API 证据。
+- symm backend 上该 API 是 no-op；首版拒绝 symm、VMM 和未验证的 allocator 导出模式。专用 raw cached HIP allocation 已在四卡验证；它不同于未验证的 raw/VMM communicator backend。
 - 保留 `should_custom_ag` 对实际 encoded tensor 的原生判定；它与 `custom_all_gatherv` 的限制不同。不能为套用 arena 放宽大小上限、连通性或对齐条件。
 
 首版由 runner 建立 binding，communicator 的存活期内持有 arena 的强引用。IPC 路径未找到对应的逐 buffer unregister，因而不能在 communicator/旧图仍引用地址时释放或换址。不要直接套用 Mono `owned_peer_buffer` 的“runner 析构即释放”规则；这里只复用其明确 ownership 的原则。
@@ -300,7 +300,7 @@ CPU 阶段只检查有意义的拒绝条件、注册次数/精确指针模型、
 
 **阶段C/D修改了 traced `prepare_ffn` 的 producer，当前只切换 eager 出口的脚本不能覆盖。** 有两条合法验证路线：
 
-1. 在启动前绑定两种完整producer变体，各自完成compile/capture/warm，保留不同variant身份及完整图键，共享只读权重、按规则串行使用状态和arena；idle时切换完整已构建路径。此能力尚未实现，须先核验图路由，不能在原脚本中只改一个开关。
+1. 在启动前绑定两种完整producer变体，各自完成compile/capture/warm，保留不同variant身份及完整图键，共享只读权重、按规则串行使用状态和arena；idle时切换完整已构建路径。本轮已实现完整producer＋FFN的opaque seam，Inductor小测试及真实producer＋AG已通过；整网图路由仍由当前服务筛选验证。不能在原脚本中只改一个出口开关。
 2. 若双变体会显著扩大实现或内存成本，使用独立实例验证，复用精确版本的权重文件、native产物和已审核的cache恢复流程；初始化前检查source与graph配置，不能把旧编译缓存直接当新版本命中。
 
 先用768筛选，最终选定后再执行2560完整协议。短测排空尾段占比不同，不替代完整服务结论。改变TP/EP、权重布局或Spec0/DSpark5仍需独立配置验收；同实例切换不用于伪造主线对照。需要更新主线相对倍率时，单独运行新鲜主线对照，不能用输入增量乘历史C5。
@@ -338,3 +338,141 @@ pinned AITER reference 位于项目相邻 `/home/yifehuan/dsv41_origin_aiter_ref
 | `csrc/kernels/mega_mhc.cu` | `MegaMHCQuantOutput` 的BF16舍入后group32量化及native dispatch |
 
 项目仓外 `validation/whole_join_20261028/` 中的不可变证据：`node155/r3/PERFORMANCE_RESULT.json`、`node155/r3/EXTENDED_RESULT.json`、`node155/gsm_r4/GSM_REVIEW.json`、`single_load/REVIEW.json`、`single_load/TIME_SAVINGS.json`、`quant_destination/ROUTE_CORRECTION.json`、`quant_pool/REVIEW.json`、`FINAL_DELIVERY.json`。它们记录已完成实验，不是本设计的实现或验收凭据。
+
+
+## 13. 本轮实施与证据（2026-10-28）
+
+### 13.1 两步各自的实测范围
+
+所有数字来自node155、job244395；保留历史C5与输出R3原始结果，不相乘。
+
+| 变更与计时窗 | M7835 | M16315 | 证据与判断 |
+|---|---:|---:|---|
+| 独立量化直写专用注册Q/scale；真实layer8完整FFN | 1.590529 → 1.585206 ms，1.003358× | 2.852011 → 2.834619 ms，1.006135× | `registered_input/REVIEW.json`；两对均正向，但增量较小 |
+| Mega-MHC融合量化＋专用注册直写；包含producer的真实layer8完整链 | 1.670345 → 1.651230 ms，1.011576× | 2.984914 → 2.966640 ms，1.006160× | `producer_bound/REVIEW.json`；两对均正向，未计整网 |
+| 接入实际RuntimeBlock后的完整入口；含native seam费用 | 1.649393 → 1.647086 ms，1.001401× | 2.995900 → 2.962438 ms，1.011296× | `input_integration/PARTIAL_REVIEW.json`；M7835第二对0.999404×，不能称稳定收益 |
+
+不同实验的随机路由不同，表中横向差异不能全部归因于一次host优化。第一版destination wrapper重复构造protected-storage集合，单独测得约4.1μs；合并为一次集合检查后约1.4μs，保留全部alias拒绝。初版融合直写在M7835为0.990071×，该失败保存在`producer_input/REVIEW.json`，没有删去。
+
+使用2–19层真实mHC参数、变化的合成状态，有/无pending共468项producer检查：BF16 norm、Q及residual/pre/post/comb相对L2均为0，scale字节一致。128次producer graph replay后更新输入也已核验。真实FFN的owner输出另与native自重复比较，仍报告原始L2，不将producer的零误差扩展成整网精度结论。
+
+完整入口的4096、4097、7835、16315、16384已完成数值、Dynamo与native graph fallback检查；最后M16385触发550MB临时盘耗尽，保留该次失败。随后仅补了M768、M16385、错误stream的实际dispatch检查，native算术使用明确的test double，证明选择回退且不写arena；没有声称M16385完整FFN已经通过。服务使用原有1.1GB共享tmp/shm池，不扩大历史10GB总账。
+
+### 13.2 实现边界与地址合同
+
+`prefill_input.InputPlan`固定H5120、Mmax16384、TP4及group32；`RegisteredInput.bind`复用模型加载期的一致绑定机制，执行两次外部注册。communicator强引用arena，arena弱引用communicator；18层共享同一个串行slot。Q与scale接收结果仍为调用/图所有，native AG end_sync保持不变。
+
+归档候选由`ATOM_DSV41_PREFILL_INPUT_FUSION=1`启用，启动时要求EP4 owner profile、原生HIP backend及AITER destination API。最终该候选未晋级，开关和运行代码已从生产树撤回。AITER变更原位于`tools/dsv41/patches/aiter_mega_mhc_destinations.patch`，现连同候选保存在`input_delivery/archived_source/`；它只给native wrapper添加可选destination；测试实例只挂载该文件的已核对overlay，不改pinned reference或用户AITER工作树，也没有更换Mega-MHC设备算术。
+
+完整输入链收在`v41_owned_prefill_ffn_chain`：准入→producer→BF16 router→Q/scale/route AG→原生shared与G1/G2→已验收输出融合。`prequantized_owned_ffn`复用唯一后缀，接收可选的预量化输入和明确binding。原生与候选位于同一完整边界，capture仍走原生路径；不同stream、超界shape及consumer拒绝均在写状态前回退。
+
+整网首次启动暴露了此前`backend=eager`不能发现的AOT接口问题，正式请求数为0，失败与源代码已归档：
+
+1. 当前PyTorch不能functionalize“mutable输入＋Tensor[]返回”的custom op。普通attention的`v41_mhc_pre_delayed`恢复原有只读schema；destination采用独立的固定tuple返回，完整FFN seam也使用固定tuple，均显式声明Q/scale写入，不从guard返回输入alias。
+2. 实际FP8/E8M0输入基类型仍触发Inductor的`auto_functionalized_v2 was not removed`。编译边界改持有两个`uint8`原始storage，在opaque op内零拷贝取得FP8/E8M0 view；容量、内容编码和注册地址不变。
+3. 不能假定functionalization会保住指针：小测试中`aot_eager`确实克隆输入，而实际Inductor保留原地址。修复后完整ATOM seam在原生／融合四次切换中只编译一次，producer和consumer均核对实际destination指针。
+
+四卡进一步使用真实layer8 Mega-MHC、M4097和M16384、三次变化输入，运行Inductor→native producer→registered AG：norm/状态相对L2为0，Q/scale聚合字节一致；每rank恰好2次注册和12次实际registered AG。此检查不包含expert GEMM。证据为`input_compile_r5/REVIEW.json`与`input_bytes_tp4_r2/REVIEW.json`；中间编译及fixture失败同样保留。
+
+### 13.3 整网筛选与晋级
+
+`input_service_r2`在启动前绑定完整原生／融合路径；先预热原生完整图域，再预热注册路径，seal后按A1原生、B1融合、B2融合、A2原生各768请求执行。每次切换仅允许idle EngineCore，四rank确认，清空KV/state-checkpoint前缀索引，保留权重、arena与完整图地址。两臂都使用已验收的输出融合，本次只评估输入增量。
+
+筛选已完成并独立复核：每臂768请求、5,668,289输入token和706,891输出token相同，18层实际路径符合切换，四rank正式新增JIT/trace/compile/capture为0，权重、arena和39个原生图的完整绑定不变。总墙钟848.192s，正式生成371.272s。
+
+| 臂 | 输入链 | tok/s | mean TPOT ms | 全decode平均q | C256平均q |
+|---|---|---:|---:|---:|---:|
+| A1 | 原生 | 7360.376 | 28.4497 | 2.19617 | 2.15979 |
+| B1 | 融合注册 | 8025.330 | 27.3317 | 2.42859 | 2.23623 |
+| B2 | 融合注册 | 7710.573 | 27.5220 | 2.41599 | 2.24126 |
+| A2 | 原生 | 7404.191 | 28.2994 | 2.21236 | 2.16931 |
+
+Pooled 7382.218525→7864.803296 tok/s，**1.065371239×**；两对1.090342370/1.041379486×。Native重复1.005953×，candidate重复0.960780×，候选自身仍有明显时长波动。全decode q的变化比只看C256更大，完成相同输出的request cycles减少。因此不能将6.54%全部归因为少搬运数据，更不能与历史主线倍率相乘；单层时窗才是直接输入链费用的现有证据。后续GSM8K未达标，因此这项短测不能作为可用性能收益。
+
+`input_full_r1`保持相同模型源代码，下一轮只加载一次：609个既定warm请求之后，先在未seal阶段做全1319题GSM8K，确认新输入路径实际执行且score≥0.91，再seal并运行四臂2560请求。这样不需要为GSM再次加载，也不需要解除seal。每一性能臂仍清空KV/state-checkpoint前缀索引；精度阶段可能新增的图在正式计时前全部固定，完整图键不删减。实际全量GSM8K得到1137/1319=0.8620166793025019，低于0.91；四rank的18层注册输入路径均实际执行。驱动按既定门槛停止，四个2560请求性能臂均未启动，容器已退役。`input_full_r1/GSM_REVIEW.json`独立复核了完整样本、协议、路由和失败判定。提示、生成选项、seed及服务配置已与此前通过的输出版核对，未发现协议差异；尚未证明精度下降的根因。
+
+下一项诊断`input_diagnosis_r1`保留失败源码，只在仓外替换opaque op的CUDA观察入口：用真实GSM提示对18层做同输入candidate/native/native-self/独立重数量化对照，检查norm、Q/scale、实际AG接收以及FFN输出和mHC状态；首个candidate完成FFN前不插入额外GPU操作。随后在同一份已加载权重中运行新opaque seam内的native输入全量GSM，区分producer与编译入口接法的影响。该诊断及后续修复已在13.4闭合；旧q增加不作为优化收益。
+
+串行tmp/shm仍为1,099,997,184B。从原10GB总账未使用的headroom中增加5,000,000B输出预留，聚合新输出预算64MB→69MB，新的保守总上界9,997,345,856B；没有折扣旧节点账单，也没有扩大GPU临时盘。
+
+
+### 13.4 注册地址偏移缺陷与修复
+
+`input_diagnosis_r3`在真实GSM提示的M9543上完成18层、四rank分段诊断。第2层传入的五个状态张量全部有限；candidate与native的BF16 norm、residual/pre/post/comb相对L2为0，本地Q/scale与同一norm的独立量化一致，聚合Q也一致。但注册AG后的scale不一致，candidate FFN输出出现非有限值；重新量化并复制进注册缓冲仍复现。后续层已接收这次异常输出，因此不将后续逐层误差当成独立producer故障。
+
+同一实例切回新opaque seam内的native输入后，全1319题GSM8K为1211/1319=0.9181197877，通过0.91门槛，18层native路径均有实际执行。它用于隔离新编译入口，不能验收注册输入。
+
+AITER `IPCBufferPool._broadcast_ipc`返回handle与固定offset=0；HIP handle标识底层分配，`torch.empty`即使`storage_offset()==0`也可能只是该分配的内部子块。`input_ipc_offset`在四rank强制构造内部指针：本rank数据正确，另外三个rank数据错误。改用独立原生cached `IPCBuffer(raw_cached=True)`后，Q与scale的HIP allocation offset均为0，M4097/9543/16384、三次更新的AG全部与原生传输一致。
+
+当前修复将Q/scale分别置于独立cached HIP分配，以Mono已有`_DeviceBytes`建立非拥有的uint8视图；arena持有两个分配owner，communicator及模型持有arena，关闭IPC映射后才允许释放owner。注册前用`get_allocation_base`核对基地址，容量仍为21,626,880 B/rank。没有增加逐层buffer、每步注册或复制，也没有修改Mega-MHC设备算术、原生AG屏障或GEMM。
+
+`input_bytes_tp4_r3`用真实layer8 mHC参数验证修复后的Inductor→Mega-MHC→registered AG：三种M、三次更新、四rank的norm/状态L2=0，Q/scale字节一致，每rank恰好两次注册、18次AG。修复版`input_service_r3`的全GSM已得到1207/1319=0.9150871872630781，通过0.91门槛且18层注册输入实际执行；随后768筛选的A1完成且zero-cold，B1因正式阶段新增FlyDSL编译拒收；详见13.5。仍须完成性能复核，不继承旧6.54%。失败arena源文件保存在`failed_input_arena/SOURCE_ARCHIVE.json`；已完成诊断与旧服务日志无损压缩记录在`INPUT_DIAGNOSIS_ARCHIVE.json`、`INPUT_ACCEPTED_LOG_ARCHIVE.json`，解压SHA保留。
+
+
+### 13.5 尾段编译漏项与精确预热
+
+`input_service_r3/FAILURE_REVIEW.json`独立核对了933项源码绑定、原始客户端结果和四rank计数。有效A1为7359.692346 tok/s、mean TPOT 28.347160 ms。B1虽然完成768请求，但四rank各新增一次FlyDSL compile-lock，rank2实际新增IR context和codegen，因此B1不作为有效性能；B2/A2未启动。GSM8K在seal前已完整完成，其精度结论保留。
+
+漏项为原生`launch_bmm_a8w8_mxscale`的N1536/K5120/batch1、tile64x64x256、waves2x4、4 buffers、split4特化。完整key包含所有ABI、constexpr与全局/环境身份，未删减。它由原生调度在M97开始的一段行数域选择；M是runtime参数，不是该key的constexpr。不能将请求并发或名字中的数字当作实际GEMM行数。
+
+实际消费者为`DeepseekV41DSpark.write_context_kv`。`_context_kv_fusion()`把3个stage的512x5120 KV权重沿N拼为1536x5120，结果按需缓存于普通属性`_context_kv_fused`。原预热只遍历注册的`LinearBase`，因而看到了1792x5120的完整QKV，却遗漏该融合KV绑定。新预热在权重加载后调用同一个native getter，按实际weight/scale几何生成family，通过原生lookup枚举M1..16384、去重后调用AITER no-dispatch preload；不新增第二份权重、不改实际kernel选择。
+
+`input_draft_preload/REVIEW.json`验证四rank、无模型加载的真实native fusion getter与`native_quant_linear`：33个dispatch特化、38个代表/边界行数各重复2次，预加载后的真实调用无新增FlyDSL compile-lock/IR/codegen。合成权重为不受16x16 shuffle影响的stage常量；该试验验证预热与消费者ABI，不扩展整网精度范围。
+
+`input_service_r4`保留R3有效A1，只加载一次模型，沿用609 warm并补跑B1/B2/A2各768请求。A1来自前一实例，后三臂在同一新实例；不能宣称四臂共用同一组地址。各臂内部完整图键、权重与arena均固定，后三臂之间另核对身份不变。新增预热属于启动期变化，R3全部模型源码未变，复用已通过的GSM8K。
+
+本次比较的A/B均在新完整producer/FFN opaque边界内，只能判断该边界下输入融合的增量。若候选值得晋级，还需要与未启用输入融合的已验收生产编译边界作完整2560请求对照；不能将768筛选倍率乘上历史C5或输出R3倍率。
+
+
+### 13.6 有效768筛选与完整生产边界对照
+
+`input_service_r4/REVIEW.json`复核结果：pooled native 7368.941843 → registered 7415.143755 tok/s，**1.006269816×**；两对1.003377173/1.009186530×。Native重复1.002516718×，candidate重复1.008321094×。四臂请求/token相同，正式zero-JIT/capture，18层路径均实际执行。A1来自已复核R3；新B1/B2/A2共一次加载。补跑墙钟814.428秒，新运行三臂生成286.469秒；完整四臂生成382.518秒含保留A1的96.049秒，不能把二者混作本轮墙钟拆分。
+
+| 臂 | tok/s | mean TPOT ms | 全decode q |
+|---|---:|---:|---:|
+| A1 native | 7359.692346 | 28.347160 | 2.211564 |
+| B1 registered | 7384.547298 | 28.210634 | 2.211301 |
+| B2 registered | 7445.994809 | 28.212765 | 2.204336 |
+| A2 native | 7378.214619 | 28.210833 | 2.212270 |
+
+修复版q不再像错误版那样从约2.20升到2.42；不过768结果仍只是同一新opaque边界中的筛选，不直接晋级。有效A1实际9072次eligible层调用/rank；要使该96.049秒服务快1%，需少0.951秒，即每次调用约104.826微秒的墙钟预算。`INPUT_SERVICE_COST_SCALE.json`仅作量级核算，不是收益预测、上界或跨rank可加的归因。
+
+已完成`input_full_r2`：**全新A1→B1→B2→A2，每臂2560请求**。A1/A2只读挂载优化前四个模型源文件并使用原生AITER，实际worker核对源码SHA、无注册arena且无新增完整FFN opaque入口。B1/B2用当前候选并共享一次加载，总计三次加载；每臂切换前要求idle并清空前缀索引。两侧保留相同输出融合、TP/EP、DSpark和请求协议。完整结果已复核，见13.7；GSM复用本次未变候选的1207/1319。
+
+`INPUT_FULL_PREPARATION_ARCHIVE.json`记录66个已完成大JSON/日志的无损压缩，回收23,317,291字节，解压SHA均保留；新完整对照预留25MB输出，聚合69MB与总10GB合同不变。
+
+
+### 13.7 原生产边界的完整结果与最终决定
+
+`input_full_r2/REVIEW.json`已一次性复核932项源码绑定及四臂原始结果。每臂2560请求、18,859,319输入token、2,357,150输出token；四rank正式新增JIT/编译/捕获为0，完整图键不变，40层EP权重合同和18层实际输入路径均符合各自模式。所有实例正常退出并退役。
+
+| 臂 | 输入路径 | tok/s | mean TPOT ms | P99 TPOT ms | 全decode q |
+|---|---|---:|---:|---:|---:|
+| A1 | 原生产编译边界 | 7814.241007 | 30.770898 | 50.091364 | 2.194911 |
+| B1 | 融合producer＋注册直写 | 7813.960593 | 30.800905 | 50.483276 | 2.199628 |
+| B2 | 融合producer＋注册直写 | 7804.657720 | 30.788894 | 50.197709 | 2.188882 |
+| A2 | 原生产编译边界 | 7785.421205 | 30.910867 | 50.618359 | 2.198641 |
+
+按总输出/总时长合并，原生产**7799.804484 → 候选7809.306386 tok/s，1.001218223×（+0.1218%）**。两对为**0.999964115 / 1.002470838×**；原生产重复变化−0.368811%，候选重复变化−0.119055%。等样本mean TPOT为30.840882→30.794900ms；不合并P99。均值有微小正向变化，但第一对持平且原生产重复波动大于合并收益，未确认值得新增编译/IPC路径的稳定增益；这不是统计显著性检验，也不宣称证明了性能退化。
+
+**决定：保留原型和所有证据，不晋级输入候选。** 四个模型文件及输入观察hook恢复到原始archive的精确字节，归档新arena及AITER destination patch，生产继续使用已经验收的C5＋输出融合。C5相对锁定主线的历史1.324404976×保留；本轮没有新主线臂，不把任何输入/输出增量乘到该历史倍率上。
+
+修复后精度独立成立：GSM8K全1319题为1207/1319=91.5087%，满足当前BF16 KV、EP4部署下的91%门槛；3-shot/local-completions/flexible-extract/C65，保留与catalog FP8 KV的部署差异。真实layer8、四rank、三种M与三次输入更新的producer→Inductor→AG中，norm和mHC状态相对L2为0，Q/scale字节一致。该局部零误差不扩展为完整FFN或整网L2为0。
+
+### 13.8 收益为什么小、下一轮要证明什么
+
+两步确实删除了Q/scale的eager copy-in和独立量化对BF16 norm的重读；它们只影响2–19层的大prefill，常见C256/M768 decode不在域内。BF16 norm写出及router读取、两次原生AG的通信/接收、shared和G1/G2完整计算、route/sort以及输出归约仍然存在；本版也没有通信重叠。因此不能从“少两次复制/少一个量化”推导出几个百分点的整网收益。
+
+已有通过数值核对的单层原型，完整入口净节省约2.31μs（M7835）和33.46μs（M16315）；它们的路由、编译入口及分配版本不同于最终整网，不作为当前候选的精确分项归因。新完整A1实际每rank有33,354次eligible层调用，服务快1%需减少约2.987秒，即平均每次约89.54μs的墙钟预算；A2对应91.45μs。这个账本是所需节省的量级，不是预测、上界，也不能跨rank相加。见`input_full_r2/ANALYSIS.json`。
+
+当前证据支持停止晋级这个串行直写版本，不能推出融合或重叠已无空间。后续若继续同方向，应先核对真正的shared/G1消费者前仍有哪些重读、重排或等待，再选择能消掉更多完整中间结果的producer/consumer边界；同时保留完整M/K和原生GEMM权重复用。增加双缓冲之前，必须用完整链证明有可重叠的独立工作，并计入资源争用、最后读者和额外同步。没有这些新证据，不重复当前候选、不扩大Mono的行数guard，也不转成路由参数扫描。
+
+### 13.9 保留的预热修复、复现与周期成本
+
+`step12_draft_kv_preload.py`现已接入生产验收bootstrap，安装在原有EP/placement audit之后，与本轮实际运行顺序一致。它调用同一个native `_context_kv_fusion()`，按实际N/K/scale绑定覆盖完整M域的原生dispatch；不改模型算术、dispatch选择、图键或warm请求数量。字段`jit_preload_gpu_dispatches=0`仅指JIT预加载不执行kernel，native lazy binding中的`torch.cat`仍可能执行GPU操作。
+
+四卡38个代表/边界M的轻量消费者验证、修复后四臂zero-cold，以及新生产bootstrap的五项CPU导入/安装顺序与warmup返回链检查共同作为接入证据；不再为报告字段或安装位置重复加载模型。该修复单独收敛，不宣称提供服务吞吐增量。
+
+本次完整ABBA用三次模型加载：原生产A1、共用实例的B1/B2、原生产A2。实测总墙钟**2797.017秒（46分37秒）**，正式生成**1208.090秒（20分8秒）**，其余**1588.927秒（26分29秒）**包含初始化、预加载、请求预热及收尾，不能都叫权重加载。不同编译边界的A/B未伪装成单出口热切换；已完成的GSM及前三臂没有重复运行。下一次同类验证先做完整单层筛选；只有不改变traced边界的候选才直接复用已验证的单实例切换流程。
+
+仓外`validation/whole_join_20261028/input_delivery/SOURCE_ARCHIVE.json`保存9个精确源码版本的原路径→archive→SHA映射，涵盖输入候选、AITER patch以及预热/入口修改前版本；旧SOURCE、raw结果和失败证据不重写。`input_delivery/README.md`说明隔离复现和依赖；`BOOTSTRAP_REVIEW.json`记录最终入口检查。节点244395/155的全部测试实例已退役，8卡空闲，无反向代理；保留用户借用的整节点allocation至2026-10-29 06:51:29 UTC。

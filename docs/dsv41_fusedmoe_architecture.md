@@ -2,7 +2,7 @@
 
 本方案的目标是减少真实消费者之间的重复计算、HBM 往返和跨卡传输，并把依赖交接留在设备端。融合边界由数据所有权、数值语义和可调度性决定。不能用合并文件、少几个 launch、单个 GEMM 更快或换专家布局代替完整链路目标。
 
-R13/C5 性能候选、运行入口和分支已收敛到锁定主线；大 M 的 shared add＋ragged padding 输出融合也已完成整网与 GSM8K 验收。后续输入链、块完成发布和更深归约融合仍是设计，不能与已实现部分混算收益。下一轮的具体接口、缓冲生命周期、搬运账本和验证顺序见 [大 prefill 输入融合方案](dsv41_prefill_input_fusion_plan.md)。
+R13/C5 性能候选、运行入口和分支已收敛到锁定主线；大 M 的 shared add＋ragged padding 输出融合也已完成整网与 GSM8K 验收。输入链的专用注册缓冲及原生Mega-MHC融合量化已完成实现和整网验证：GSM8K通过，完整ABBA仅+0.1218%，未确认稳定收益，故已归档候选并恢复已验收模型路径。生产另保留DSpark融合KV预热修复。块完成发布和更深归约融合仍是设计，各阶段收益分别核对。下一轮的具体接口、缓冲生命周期、搬运账本和验证顺序见 [大 prefill 输入融合方案](dsv41_prefill_input_fusion_plan.md)。
 
 ## 1. 基线与证据边界
 
@@ -181,9 +181,15 @@ R13中H=5120：完整BF16行10240B，FP8 values5120B；scale字节由真实block
 
 ### B. 输入段：owner norm/quant/route → 完整expert tile就绪
 
-下一轮先做 [大 prefill 输入融合方案](dsv41_prefill_input_fusion_plan.md) 中的可闭合边界：runner 绑定专用已注册 Q/scale arena，先由独立量化直写，再接原生 Mega-MHC 的融合量化。BF16 norm 保留给 router，两次原生 AG 生成完整 M 的 shared/routed 消费布局。注册按精确指针且仅在加载期完成，生命周期绑定 communicator；首版一个串行 slot，不直接借用私有 pool。
+本轮按 [大 prefill 输入融合方案](dsv41_prefill_input_fusion_plan.md) 实施可闭合边界：runner 绑定专用已注册 Q/scale arena，先由独立量化直写，再接原生 Mega-MHC 的融合量化。BF16 norm 保留给 router，两次原生 AG 生成完整 M 的 shared/routed 消费布局。注册按精确指针且仅在加载期完成，生命周期绑定 communicator；首版一个串行 slot，不直接借用私有 pool。
 
-已有私有 pool 原型只在真实单层 eager FFN 获得 M7835/16315 的1.002444/1.004873×，尚未生产接入。专用外部注册、FFN fused producer 和整网收益均待验收；包含 Mega-MHC 的完整计时窗是晋级依据。以下 tile-ready/arrival-order 组织属于更后续设计，不是首版同时实施的前提。
+专用外部注册与FFN fused producer已实现并归档。真实单层完整入口含Mega-MHC后，M7835/16315曾观测1.001401/1.011296×，前者一对轻微负向。修复IPC allocation offset后，真实producer＋Inductor＋AG的norm/状态相对L2为0，全量GSM8K为1207/1319=91.5087%，达到91%门槛。旧错误版6.54%不可用；新边界内768筛选的0.63%也不作为最终整网增量。
+
+最终以原生产编译边界做全新四臂2560请求ABBA：7799.804484→7809.306386 tok/s，**1.001218223×**；两对0.999964115/1.002470838×，原生产重复变化−0.368811%，四rank正式zero-JIT/capture、完整图键和18层实际路径均通过。均值微升，但未确认稳定收益，停止晋级该串行输入候选；四个模型文件恢复原始精确字节，现有输出融合保留。源码和完整结果见输入方案13.7–13.9及仓外`input_delivery/SOURCE_ARCHIVE.json`。
+
+原型编译边界采用显式可写的uint8 arena与固定tuple输出，FP8/E8M0仅在opaque链内建立零拷贝view。此合同以及独立cached HIP allocation/communicator生命周期经验保留供后续复用；生产不留默认关闭的未晋级输入路径。独立的DSpark融合KV精确预热已接入验收bootstrap，不改模型算术或图键。
+
+下面仍为后续设计，尚未实现。当前结果只评价一个串行slot，不能推出融合/重叠没有空间；下一候选先证明实际消费者之前可删除的中间结果或可重叠等待，再进入完整链测量。
 
 全步只做一次route/sort/padding。按expert保留GEMM的权重复用，把完整K输入和对应scale都已到达的原生M tile标记为ready；G1可以完成并退休该任务后，再执行下一任务。
 
@@ -212,7 +218,7 @@ buffer由graph/runner持有，容量由immutable plan确定。保留地址、sha
 | 4 整网接入 | 同一LayerPlan接入真实early/late层与owner状态 | 小并发/尾段/填充/补请求/结束请求、KV与回滚、full-key warm、正式zero-cold |
 | 5 任务与服务验收 | 固定checkpoint/协议GSM8K；fresh主线/候选对照；清理前后对照 | 任务门槛、适用L2及真实路由证据；吞吐/TPOT/尾延迟各自报告 |
 
-上表记录总体递进顺序。输出布局融合已完成完整单层、整网和GSM验收；IPC逐包方案已停止，下一阶段转入第6节B的norm→quant→专用注册arena，具体实施与停止条件以 [新输入方案](dsv41_prefill_input_fusion_plan.md) 为准。若完整链不收益、GEMM退化吃掉节省、producer不能前进、数值/状态不合格或接口需要复制一整条forward，停止该候选并保留当前已验收生产路径，不用参数扫描或更多独立小包凑倍率。
+上表记录总体递进顺序。输出布局融合已完成完整单层、整网和GSM验收；IPC逐包方案已停止；第6节B的串行norm→quant→专用注册arena已完成整网验证并因未确认稳定收益而归档，后续候选的接口与停止条件以 [新输入方案](dsv41_prefill_input_fusion_plan.md) 为准。若完整链不收益、GEMM退化吃掉节省、producer不能前进、数值/状态不合格或接口需要复制一整条forward，停止该候选并保留当前已验收生产路径，不用参数扫描或更多独立小包凑倍率。
 
 不以2×作未经证据支持的预测。先保住实测1.3×，再用完整周期净节省制定下一阶段目标。小并发Mono应先在合法TP配置中做真实开关对照，保持同输入/状态和proposal预算；targetEP4＋draftTP4是独立部署设计，不能直接改全局config来恢复草稿Mono。
 
@@ -238,3 +244,6 @@ buffer由graph/runner持有，容量由immutable plan确定。保留地址、sha
 - `validation/consolidation_20261028/`：源码迁移、清理归档、入口及新性能验收凭据。
 
 新主线验收：`validation/rebase_main_20261028/STEP12_PERFORMANCE_C5_RESULT.json`、`FINAL_DELIVERY_RECHECK.json`；其中 A1 provenance 明确指向 C4，旧 C4 B1 预热接口故障原始证据独立保留。
+
+
+输入链后续定位到外部IPC注册的allocation offset合同：本地norm/Q/scale正确，scale经注册AG后损坏。四卡内部地址探针复现，独立cached HIP分配修复并通过真实producer＋Inductor＋AG；修复版GSM8K通过、完整ABBA仅+0.1218%，候选已归档。旧输入短测6.54%不计入可用收益，当前模型仍为已验收输出融合路径。详见输入方案第13.4–13.9节。
