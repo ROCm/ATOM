@@ -24,7 +24,7 @@ CONFIG = HERE.parents[1] / "benchmark/vllm_m31"
 PROCESSES: list[tuple[str, subprocess.Popen, Path]] = []
 # Explicit script path also supports CPU unit-test imports via importlib.
 sys.path.insert(0, str(HERE))
-from pd_vllm_memory import StoreMemoryUnavailable, memory_failure, prepare as prepare_store_memory
+from pd_vllm_memory import StoreMemoryUnavailable, memory_failure, valid_marker
 
 
 
@@ -66,27 +66,11 @@ def start(name, cmd, env, logs):
     return proc
 
 
-def start_page_cache_dropper(model_path, env, logs):
-    # Match ATOM's loading-time cache eviction, scoped to the pinned snapshot.
-    # Register the child so phase failure, signals and retries all stop it.
-    cmd = [sys.executable, str(HERE / "drop_page_cache.py"),
-           "--every", "45", "--for", "1800", str(model_path)]
-    proc = start("page-cache-dropper", cmd, env, logs)
-    dump(logs.parent / "page-cache-dropper.json", {
-        "argv": cmd, "model_path": str(model_path), "pid": proc.pid,
-        "interval_seconds": 45, "duration_seconds": 1800,
-    })
-    return proc
-
-
 def check_services():
     for name, proc, path in PROCESSES:
         if name == "agentx":
             continue
         rc = proc.poll()
-        # This bounded helper normally finishes before the one-hour benchmark.
-        if name == "page-cache-dropper" and rc == 0:
-            continue
         if rc is not None:
             raise RuntimeError(f"{name} exited {proc.returncode}: {path.read_text(errors='replace')[-6000:]}")
         if path.exists():
@@ -297,8 +281,6 @@ def main():
     cache_root.mkdir(parents=True, exist_ok=True)
     model_path = snapshot_download(plan['model'], revision=plan['model_revision'], cache_dir=str(cache_root), max_workers=2)
     assert (Path(model_path) / 'dspark/config.json').exists()
-    prepare_store_memory(json.loads((CONFIG / "mooncake-store.json").read_text()), model_path, out)
-    start_page_cache_dropper(model_path, common, logs)
     plan["resolved_model_path"] = model_path
     plan["runtime_ports"] = ports
     plan["status"] = "running"
@@ -314,6 +296,8 @@ def main():
     store['device_name'] = device_names
     dump(out / "mooncake-store.json", store)
     common['MOONCAKE_CONFIG_PATH'] = str(out / "mooncake-store.json")
+    common['PYTHONPATH'] = str(HERE) + (os.pathsep + common['PYTHONPATH'] if common.get('PYTHONPATH') else '')
+    common['ATOMESH_VLLM_MEMORY_DIR'] = str(out)
     master = start('mooncake-master', ['mooncake_master', '--port', str(ports['master'])], common, logs)
     deadline = time.monotonic() + 60
     while True:
@@ -332,6 +316,7 @@ def main():
         spec['rejection_sample_method'] = 'block'
     for role in ('prefill', 'decode'):
         env = role_env(common, role, ip)
+        env["ATOMESH_VLLM_ROLE"] = role
         cfg = json.loads((CONFIG / f'{role}-kv.json').read_text())
         cfg['kv_connector_extra_config']['connectors'][0]['kv_connector_extra_config']['device_name'] = device_names
         dump(out / f'{role}-kv.json', cfg)
@@ -343,14 +328,24 @@ def main():
             args.update({'enable-dbo': True, 'dbo-prefill-token-threshold': 16384,
                          'dbo-decode-token-threshold': 32768})
         cmd = ['vllm', 'serve', model_path, *flags(args)]
-        dump(out / f'{role}-launch.json', {'argv': cmd, 'env': {k: env[k] for k in
-             sorted(env) if k == 'GLIBC_TUNABLES' or k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'HIP_VISIBLE', 'DEBUG_HIP'))}})
+        recorded_env = {k: env[k] for k in sorted(env)
+                        if k in ('GLIBC_TUNABLES', 'PYTHONPATH', 'ATOMESH_VLLM_ROLE',
+                                 'ATOMESH_VLLM_MEMORY_DIR')
+                        or k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'NCCL_',
+                                         'HIP_VISIBLE', 'DEBUG_HIP'))}
+        dump(out / f'{role}-launch.json', {'argv': cmd, 'env': recorded_env})
         start(role, cmd, env, logs)
     urls = {role: f'http://{ip}:{ports[role]}' for role in ('prefill', 'decode')}
     try:
         for url in urls.values():
             wait_http(url + '/health', int(os.environ.get('WAIT_SERVER_TIMEOUT', 7200)))
     except RuntimeError:
+        # Worker-side THP failures preserve the same allocation retry contract.
+        root = Path(os.environ.get('ATOMESH_ALLOCATION_RUN_DIR', os.environ['RUN_DIR']))
+        marker = valid_marker(root, os.environ.get('SLURM_JOB_ID', ''),
+                              os.environ.get('ATOMESH_RUN_TOKEN', ''))
+        if marker and marker['phase'] == out.name:
+            memory_failure(marker['reason'], out)
         # Only Store registration ENOMEM during startup qualifies for memory
         # recovery; ordinary model, transport and correctness failures stay fatal.
         for path in (logs / 'prefill.log', logs / 'decode.log'):
@@ -429,7 +424,7 @@ def main():
         (out / f'{role}-final.prom').write_text(request(url+'/metrics'))
 
 
-def smoke_then_sweep(run_phase=None):
+def smoke_then_sweep(run_phase=None, *, smoke_only=False):
     """Use one allocation; each phase owns fresh engines and a fresh CPU Store."""
     run_phase = run_phase or main
     keys = ('RUN_DIR', 'CONC_LIST', 'ATOMESH_ENV_ATOMESH_VLLM_MODE')
@@ -438,10 +433,11 @@ def smoke_then_sweep(run_phase=None):
     root.mkdir(parents=True, exist_ok=True)
     phases = []
     try:
-        for name, mode, concurrency in (('smoke', 'smoke', 1),
-                                       ('c32', 'benchmark', 32),
-                                       ('c48', 'benchmark', 48),
-                                       ('c64', 'benchmark', 64)):
+        selected = [('smoke', 'smoke', 1)]
+        if not smoke_only:
+            selected += [('c32', 'benchmark', 32), ('c48', 'benchmark', 48),
+                         ('c64', 'benchmark', 64)]
+        for name, mode, concurrency in selected:
             os.environ.update(RUN_DIR=str(root / name), CONC_LIST=str(concurrency),
                               ATOMESH_ENV_ATOMESH_VLLM_MODE=mode)
             phases.append({'phase': name, 'concurrency': concurrency, 'status': 'running'})
@@ -472,8 +468,9 @@ if __name__ == '__main__':
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, on_signal)
     try:
-        if os.environ.get('ATOMESH_ENV_ATOMESH_VLLM_MODE') == 'smoke_then_sweep':
-            smoke_then_sweep()
+        mode = os.environ.get('ATOMESH_ENV_ATOMESH_VLLM_MODE')
+        if mode in ('smoke', 'smoke_then_sweep'):
+            smoke_then_sweep(smoke_only=mode == 'smoke')
         else:
             main()
     except StoreMemoryUnavailable as exc:

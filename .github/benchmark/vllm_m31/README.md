@@ -57,15 +57,29 @@ timeout stops startup. Native Store uses the PR's glibc THP hint and 64 GiB MR
 cap. The earlier malloc perturbation, sequential P/D startup and separate
 native Store PUT/GET preflight in `57888067b` were reverted.
 
-After successful THP preparation, each phase starts the same bounded page-cache
-dropper as ATOM: `drop_page_cache.py --every 45 --for 1800`, scoped only to the
-resolved model snapshot (including its draft files). It evicts clean file cache
-with `posix_fadvise(DONTNEED)` while the engines load; no sudo or file deletion
-is involved. `page-cache-dropper.json` records the command, scope and PID, and
-`logs/page-cache-dropper.log` captures helper output. Normal completion does not
-fail service health checks; an unexpected nonzero exit does. Phase teardown,
-startup failure and handled termination signals stop the registered process
-group, so subsequent phases and memory retries start their own helper.
+Memory preparation now follows the timing of successful CI `40376309047`
+(commit `fc9bf7aa215f33067a8b0728279d076c0da5a313`): the custom
+`pd_vllm_worker.StoreMemoryWorker` waits until all eight P/D workers reach
+`initialize_from_config`, after model loading/profiling and before native
+connector initialization. A file lock elects one worker to evict the pinned
+snapshot's page cache and prepare NUMA THP; all workers wait for success before
+initializing Store. There is no preparation or periodic cache eviction during
+model loading. A failed preparation publishes a terminal result for waiting
+workers and preserves the allocation-specific exit-86 recovery marker.
+`store-memory-gate/` records each worker's arrival and the preparation result.
+
+The common environment explicitly sets `MC_MAX_CONCURRENT_REG_MR=1`,
+`NCCL_DMABUF_ENABLE=0`, `MC_GID_INDEX=1`, `MC_IB_TC=104`, and
+`MC_IB_PCI_RELAXED_ORDERING=1`. The first variable is parsed by the installed
+Mooncake 0.3.13.post1 but does not limit its RDMA registration path. Relaxed
+ordering is requested when libibverbs exposes the required symbol; verify the
+actual selection in engine logs. This alignment does not change the fixed
+image, native Mooncake package, Store buffer sizes or NIC selection.
+
+A smoke-only dispatch uses suite `mooncake_store` and case
+`m31-vllm-1p1d-tp4-mcstore-smoke` with `publish_dashboard=false`. It records
+`smoke/` and `suite-status.json`, then exits without the C32/C48/C64 measurements.
+The workflow's separate `suite=smoke` is an RDMA test, not this model smoke.
 
 On the `atomesh-cicd` Spur runner, a memory-specific exit (86) first stops and
 removes this allocation's container. A job/token/node-validated recovery helper

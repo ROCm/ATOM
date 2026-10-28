@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -82,7 +83,8 @@ def prepare(store, model_path, out, timeout=600):
     out = Path(out)
     logs = out / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
-    state = {'status': 'running', 'nodes': []}
+    state = {'status': 'running', 'nodes': [],
+             'stage': 'after_model_load_before_store_init', 'started_at': time.time()}
     summary = out / 'memory-preparation.json'
     try:
         planned = plan_pins(store)
@@ -126,8 +128,68 @@ def prepare(store, model_path, out, timeout=600):
             memory_failure('thp_shortfall', out)
         write_json(summary, state)
     state['status'] = 'prepared'
+    state['finished_at'] = time.time()
     write_json(summary, state)
     print('[store-memory] full per-NUMA THP budget prepared and freed for Store', flush=True)
+
+
+def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
+    """All eight workers reach KV initialization before one prepares host memory.
+
+    This must run before Worker.initialize_from_config constructs the Store.
+    Waiting before taking the lock lets both TP groups arrive without deadlock.
+    A terminal result releases peers on success or failure; phase directories
+    are fresh for each run and are archived before any local memory retry.
+    """
+    if role not in ('prefill', 'decode') or rank not in range(4):
+        raise ValueError(f'Expected 1P1D TP4+TP4, got {role=} {rank=}')
+    out = Path(out)
+    gate = out / 'store-memory-gate'
+    gate.mkdir(parents=True, exist_ok=True)
+    participant = f'{role}-{rank}'
+    write_json(gate / f'{participant}.ready.json', {
+        'role': role, 'rank': rank, 'pid': os.getpid(),
+        'stage': 'after_model_load_before_store_init', 'arrived_at': time.time(),
+    })
+    expected = [gate / f'{r}-{i}.ready.json'
+                for r in ('prefill', 'decode') for i in range(4)]
+    terminal = gate / 'result.json'
+    deadline = time.monotonic() + timeout
+    print(f'[store-memory] {participant}: model loaded; waiting for all eight workers', flush=True)
+    with (gate / 'prepare.lock').open('a') as lock:
+        while True:
+            if terminal.exists():
+                result = json.loads(terminal.read_text())
+                if result['status'] != 'prepared':
+                    raise RuntimeError(f"Store memory preparation failed: {result.get('error')}")
+                print(f'[store-memory] {participant}: preparation complete; initializing Store', flush=True)
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Timed out waiting for all workers and Store memory preparation')
+            if all(path.exists() for path in expected):
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    try:
+                        # Another worker may have completed between our check and lock.
+                        if terminal.exists():
+                            continue
+                        print('[store-memory] all eight workers loaded; preparing once before Store initialization', flush=True)
+                        try:
+                            prepare(store, model_path, out)
+                        except Exception as exc:
+                            write_json(terminal, {'status': 'failed', 'coordinator': participant,
+                                                  'error': str(exc), 'finished_at': time.time()})
+                            raise
+                        write_json(terminal, {'status': 'prepared', 'coordinator': participant,
+                                              'workers': [p.stem for p in expected],
+                                              'finished_at': time.time()})
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    continue
+            time.sleep(0.2)
 
 
 def clean_host():

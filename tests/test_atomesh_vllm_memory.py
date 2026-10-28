@@ -1,11 +1,14 @@
 """Memory recovery gates without touching host memory, GPUs, sudo, or Slurm."""
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -100,6 +103,85 @@ class MemoryRecoveryTest(unittest.TestCase):
                     memory.prepare({}, '/models/snapshot', phase)
             self.assertEqual(memory.valid_marker(root, '42', 'token-42')['reason'], 'thp_shortfall')
             self.assertEqual(json.loads((phase / 'memory-preparation.json').read_text())['status'], 'thp_shortfall')
+
+
+
+class PostLoadPreparationTest(unittest.TestCase):
+    def test_both_roles_arrive_before_one_preparation_and_all_continue(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare') as prepare:
+            root = Path(tmp)
+            participants = [(role, rank) for role in ('prefill', 'decode') for rank in range(4)]
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(memory.prepare_after_load, {}, '/snapshot', root, r, i, 5)
+                           for r, i in participants[:-1]]
+                deadline = time.monotonic() + 3
+                while len(list(root.glob('store-memory-gate/*.ready.json'))) < 7:
+                    if time.monotonic() > deadline:
+                        self.fail('Workers did not reach preparation gate')
+                    time.sleep(0.01)
+                prepare.assert_not_called()
+                self.assertTrue(all(not future.done() for future in futures))
+                futures.append(pool.submit(memory.prepare_after_load, {}, '/snapshot', root, 'decode', 3, 5))
+                for future in futures:
+                    future.result(timeout=6)
+            prepare.assert_called_once_with({}, '/snapshot', root)
+            result = json.loads((root / 'store-memory-gate/result.json').read_text())
+            self.assertEqual(result['status'], 'prepared')
+            self.assertEqual(len(result['workers']), 8)
+
+    def test_missing_worker_times_out_without_cleaning(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare') as prepare:
+            with self.assertRaises(TimeoutError):
+                memory.prepare_after_load({}, '/snapshot', tmp, 'prefill', 0, timeout=0)
+            prepare.assert_not_called()
+
+    def test_thp_failure_releases_all_peers_and_preserves_retry_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            phase = root / 'smoke'
+            with patch.dict(os.environ, {'RUN_DIR': str(phase), 'ATOMESH_ALLOCATION_RUN_DIR': str(root),
+                    'SLURM_JOB_ID': '42', 'ATOMESH_RUN_TOKEN': 'token-42',
+                    'ATOMESH_ALLOCATED_NODE': 'pit2-p03-g12'}), \
+                 patch.object(memory, 'prepare', side_effect=lambda *args: memory.memory_failure('thp_timeout', phase)) as prepare:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = [pool.submit(memory.prepare_after_load, {}, '/snapshot', phase, r, i, 5)
+                               for r in ('prefill', 'decode') for i in range(4)]
+                    for future in futures:
+                        with self.assertRaisesRegex(RuntimeError, 'thp_timeout'):
+                            future.result(timeout=6)
+                prepare.assert_called_once()
+            self.assertEqual(memory.valid_marker(root, '42', 'token-42')['phase'], 'smoke')
+            self.assertEqual(json.loads((phase / 'store-memory-gate/result.json').read_text())['status'], 'failed')
+
+    def test_worker_only_initializes_store_after_preparation_succeeds(self):
+        events = []
+        class NativeWorker:
+            def initialize_from_config(self, config):
+                events.append('store-init')
+                return config
+        spec = importlib.util.spec_from_file_location('m31_test_worker', SCRIPTS / 'pd_vllm_worker.py')
+        worker_module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'vllm.v1.worker.gpu_worker': SimpleNamespace(Worker=NativeWorker)}):
+            spec.loader.exec_module(worker_module)
+        worker = worker_module.StoreMemoryWorker()
+        worker.local_rank = 0
+        worker.parallel_config = SimpleNamespace(tensor_parallel_size=4)
+        worker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model='/snapshot'))
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'store.json'
+            config.write_text('{}')
+            with patch.dict(os.environ, {'MOONCAKE_CONFIG_PATH': str(config),
+                    'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill'}), \
+                 patch.object(worker_module, 'prepare_after_load', side_effect=lambda *args, **kw: events.append('prepare')):
+                self.assertEqual(worker.initialize_from_config('kv-config'), 'kv-config')
+                self.assertEqual(events, ['prepare', 'store-init'])
+            events.clear()
+            with patch.dict(os.environ, {'MOONCAKE_CONFIG_PATH': str(config),
+                    'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill'}), \
+                 patch.object(worker_module, 'prepare_after_load', side_effect=memory.StoreMemoryUnavailable('shortfall')):
+                with self.assertRaises(memory.StoreMemoryUnavailable):
+                    worker.initialize_from_config('kv-config')
+                self.assertEqual(events, [])
 
 
 class MemoryResubmitTest(unittest.TestCase):

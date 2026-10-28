@@ -38,7 +38,8 @@
     "max-model-len": 1048576,
     "max-num-batched-tokens": 32768,
     "max-num-seqs": 128,
-    "disable-uvicorn-access-log": true
+    "disable-uvicorn-access-log": true,
+    "worker-cls": "pd_vllm_worker.StoreMemoryWorker"
   },
   "common_env": {
     "VLLM_ROCM_USE_AITER": "1",
@@ -55,7 +56,12 @@
     "MOONCAKE_CONFIG_PATH": "/config/mooncake-store.json",
     "PYTHONHASHSEED": "42",
     "GLIBC_TUNABLES": "glibc.malloc.hugetlb=1",
-    "MC_MAX_MR_SIZE": "68719476736"
+    "MC_MAX_MR_SIZE": "68719476736",
+    "MC_MAX_CONCURRENT_REG_MR": "1",
+    "NCCL_DMABUF_ENABLE": "0",
+    "MC_GID_INDEX": "1",
+    "MC_IB_TC": "104",
+    "MC_IB_PCI_RELAXED_ORDERING": "1"
   },
   "speculative_config": {
     "method": "dspark",
