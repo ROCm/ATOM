@@ -1920,15 +1920,21 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             )
             # The AITER fused decode reads a V-major state: expose that storage
             # as the logical KV view, zero-copy, as Qwen4Exp does for FlyDSL.
-            # ReplaySSM and the lossy decode keep their own state paths.
+            # ReplaySSM and the lossy decode keep their own state paths; with
+            # ReplaySSM, the fused verify kernel reads its K-major checkpoints.
             attention = module.impl
+            gated_norm = getattr(attention, "gated_norm", None) is not None
             attention.gdn_fused_decode = (
-                getattr(attention, "gated_norm", None) is not None
+                gated_norm
                 and not self.replayssm
                 and not envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST
             )
             if attention.gdn_fused_decode:
                 cache.v_cache = cache.v_cache.transpose(-1, -2)
+            if gated_norm and self.replayssm:
+                from atom.model_ops.fla_ops import gdn_fused_decode
+
+                attention.gdn_fused_verify = gdn_fused_decode.verify_available()
             return cache
         return super().build_kv_cache_tensor(module)
 

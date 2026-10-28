@@ -16,8 +16,6 @@ from atom.model_ops.fla_ops import (
 )
 from atom.model_ops.fla_ops.replayssm import (
     UT_MIN_QUERY_LEN,
-    fused_verify_variant,
-    replayssm_conv_gated_delta_rule,
     replayssm_gated_delta_rule,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
@@ -149,6 +147,7 @@ class GatedDeltaNet(nn.Module):
         # cache binding, with the state layout it needs.
         self.gated_norm = None
         self.gdn_fused_decode = False
+        self.gdn_fused_verify = False
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -292,54 +291,31 @@ class GatedDeltaNet(nn.Module):
                 core_attn_out[num_actual_tokens:].zero_()
             return core_attn_out
 
-        # Pure MTP-verify batch under ReplaySSM: one kernel takes the in_proj
-        # rows to the output (conv1d, gating, the recurrence and, for variant B,
-        # the gated norm), in place of the four kernels below.
-        variant = None
+        # Spec-decode-only batch on ReplaySSM state: one fused kernel runs the conv,
+        # the gating, the state rebuild, the update and record of each token, and
+        # the gated RMSNorm.
         if (
             z is not None
+            and self.gdn_fused_verify
             and use_replayssm
             and spec_sequence_masks is not None
             and gdn_metadata.num_prefills == 0
             and gdn_metadata.num_decodes == 0
             and gdn_metadata.replayssm_route in ("auto", "serial")
             and gdn_metadata.replayssm_max_query_len < UT_MIN_QUERY_LEN
-        ):
-            mode = envs.ATOM_GDN_FUSED_VERIFY
-            nsd = gdn_metadata.num_spec_decodes
-            hv = self.num_v_heads // self.tp_size
-            if mode in ("a", "b"):
-                variant = mode.upper()
-            elif mode == "auto":
-                variant = fused_verify_variant(nsd, hv)
-        if variant is not None:
-            replayssm_conv_gated_delta_rule(
+            and gdn_fused_decode.verify(
+                self,
                 mixed_qkv,
-                conv_weights,
-                self.conv1d.bias,
-                conv_state,
-                spec_state_indices_tensor[:, 0][:nsd],
-                num_accepted_tokens,
-                a,
                 b,
-                self.A_log,
-                self.dt_bias,
-                core_attn_out,
+                a,
+                z[:num_actual_tokens],
+                conv_state,
                 ssm_state,
-                layer_cache.replay_buf_k,
-                layer_cache.replay_buf_u,
-                layer_cache.replay_buf_g,
-                gdn_metadata.write_pos,
-                gdn_metadata.slot_idx[:nsd],
-                spec_query_start_loc[: nsd + 1],
-                gdn_metadata.replayssm_max_query_len,
-                self.num_k_heads // self.tp_size,
-                self.head_k_dim,
-                z=z[:num_actual_tokens],
-                norm_weight=self.gated_norm.weight,
-                norm_eps=self.gated_norm.eps,
-                fuse_norm=variant == "B",
+                layer_cache,
+                gdn_metadata,
+                core_attn_out[:num_actual_tokens],
             )
+        ):
             if num_actual_tokens < core_attn_out.shape[0]:
                 core_attn_out[num_actual_tokens:].zero_()
             return core_attn_out

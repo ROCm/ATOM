@@ -921,11 +921,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
         "ATOM_DP_LM_HEAD_MODE", "all2all"
     ).lower(),
-    # GDN MTP verify in one kernel from the in_proj rows (conv1d + gating +
-    # ReplaySSM, see replayssm_conv_gated_delta_rule): "auto" picks the variant
-    # by batch, "A" keeps the gated norm a separate launch and the V split,
-    # "B" fuses the norm with one program per head, "0" runs the separate kernels.
-    "ATOM_GDN_FUSED_VERIFY": lambda: os.getenv("ATOM_GDN_FUSED_VERIFY", "auto").lower(),
+    # Native ATOM Qwen3.5 GDN MTP verify under ReplaySSM as one AITER kernel on
+    # gfx1250 (fused_gdn_verify_qkvz; needs ATOM_GDN_FUSED_DECODE); "0" keeps the
+    # separate conv/gating/ReplaySSM/norm kernels.
+    "ATOM_GDN_FUSED_VERIFY": lambda: (
+        os.getenv("ATOM_GDN_FUSED_VERIFY", "1").lower() not in ("0", "false")
+    ),
     # All-greedy TP decode steps take the target's argmax from the LM head
     # (per-shard maxima, a [rows, 2] gather) instead of all-gathering the
     # [rows, vocab] logits. Token-identical; 0 restores the logits path.
