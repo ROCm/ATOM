@@ -276,6 +276,46 @@ def test_the_preallocated_scratch_drafts_exactly_what_allocation_does():
         assert torch.equal(a, b)
 
 
+def test_the_drafts_combine_without_1_over_z_keeps_the_max_and_argmax():
+    """The sampled draft reads only the row max and the raw argmax (its q is
+    normalized over the stored entries), so it combines without the sum: the
+    two it reads must be bit for bit what the full combine gives, on finite,
+    partly -inf and all -inf rows, and the sum buffers are never touched."""
+    torch.manual_seed(181)
+    tiles, rows = 37, 5
+    part_max = torch.randn(tiles, rows, device=DEV) * 4
+    part_max[::3, 1] = float("-inf")
+    part_max[:, 2] = float("-inf")
+    part_sum = torch.rand(tiles, rows, device=DEV)
+    part_val = torch.randn(tiles, rows, device=DEV).round()
+    part_val[:, 2] = float("-inf")
+    part_idx = torch.randint(0, 1 << 20, (tiles, rows), device=DEV).to(torch.int32)
+    outs = []
+    for with_inv_z in (True, False):
+        row_max = torch.full((rows,), -7.0, device=DEV)
+        row_argmax = torch.full((rows,), -7, dtype=torch.int32, device=DEV)
+        row_inv_z = torch.full((rows,), -7.0, device=DEV)
+        softmax_combine_kernel[(rows,)](
+            part_max,
+            part_sum if with_inv_z else None,
+            row_max,
+            row_inv_z if with_inv_z else None,
+            part_val,
+            part_idx,
+            row_argmax,
+            rows,
+            tiles,
+            BLOCK_TILE=triton.next_power_of_2(tiles),
+            WITH_ARGMAX=True,
+            WITH_INV_Z=with_inv_z,
+            num_warps=4,
+        )
+        outs.append((row_max, row_argmax))
+    (full_max, full_argmax), (max_only, argmax_only) = outs
+    assert torch.equal(full_max.view(torch.int32), max_only.view(torch.int32))
+    assert torch.equal(full_argmax, argmax_only)
+
+
 @pytest.mark.parametrize("width", [1, 7, 1024, 4096, 163840])
 def test_the_store_holds_exactly_the_top_of_q_at_any_width(width):
     """At the real vocab, K from one entry to all of V, with and without the

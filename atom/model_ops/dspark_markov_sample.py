@@ -56,7 +56,7 @@ import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.model_ops.sampling_scratch import SamplingScratch, take
-from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
+from atom.model_ops.softmax_tiles import softmax_combine_kernel
 
 # Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
@@ -573,9 +573,11 @@ def dspark_markov_argmax_tp(
 # acceptance: the draft samples from what is stored, whatever that is.
 #
 # Six launches per block position:
-#   1. GEMV + base + 1/T into the dense ``s`` scratch, with per-tile softmax
-#      and raw-argmax partials (the greedy op's stage 1, plus the scaling);
-#   2. `softmax_combine_kernel`: the row max (and the raw argmax);
+#   1. GEMV + base + 1/T into the dense ``s`` scratch, with per-tile max and
+#      raw-argmax partials (the greedy op's stage 1, plus the scaling);
+#   2. `softmax_combine_kernel`: the row max (and the raw argmax). No 1/Z:
+#      levels need only the max, and finalize normalizes over the stored
+#      entries itself, so a full-vocab sum would be read by nobody;
 #   3. histogram: per (row, V tile), how many ids sit at each level;
 #   4. cut: per row, the boundary level and each tile's output slot range;
 #   5. compact: per (row, V tile), write the chosen ids and exp(s - max);
@@ -653,7 +655,6 @@ def _dspark_markov_sample_stage1(
     embed_out_ptr,
     s_ptr,
     part_max_ptr,
-    part_sum_ptr,
     part_amax_val_ptr,
     part_amax_idx_ptr,
     num_rows,
@@ -670,8 +671,8 @@ def _dspark_markov_sample_stage1(
     BLOCK_K: tl.constexpr,
 ):
     """One (V tile, row tile): bias GEMV, add base, scale by 1/T, write ``s``
-    into the row's scratch row and publish this tile's (max, sum exp(s - max)),
-    plus the unscaled logits' (max, lowest id) a greedy row drafts from.
+    into the row's scratch row and publish this tile's max of ``s``, plus the
+    unscaled logits' (max, lowest id) a greedy row drafts from.
     """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
@@ -732,9 +733,9 @@ def _dspark_markov_sample_stage1(
         mask=(row_mask & (q_base >= 0))[:, None] & v_mask[None, :],
     )
 
-    tile_max, tile_sum = tile_max_sumexp(scaled, v_mask[None, :])
+    # Masked lanes are already -inf.
+    tile_max = tl.max(scaled, axis=1)
     tl.store(part_max_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
-    tl.store(part_sum_ptr + tile * num_rows + offs_row, tile_sum, mask=row_mask)
 
 
 @triton.jit
@@ -1150,10 +1151,8 @@ def _sample_scratch_shapes(num_rows: int, vocab_size: int):
     q_tiles = triton.cdiv(vocab_size, _Q_BLOCK_V)
     f32 = [
         (gemv_tiles, num_rows),  # part_max
-        (gemv_tiles, num_rows),  # part_sum
         (gemv_tiles, num_rows),  # part_amax_val
         (num_rows,),  # row_max
-        (num_rows,),  # row_inv_z
     ]
     i32 = [
         (gemv_tiles, num_rows),  # part_amax_idx
@@ -1310,7 +1309,7 @@ def dspark_markov_sample(
     q_tiles = triton.cdiv(vocab_size, _Q_BLOCK_V)
     f32_shapes, i32_shapes = _sample_scratch_shapes(num_rows, vocab_size)
     (
-        (part_max, part_sum, part_amax_val, row_max, row_inv_z),
+        (part_max, part_amax_val, row_max),
         (part_amax_idx, row_argmax, hist, tile_off, tile_quota, row_cut, row_n),
     ) = take(f32_shapes, i32_shapes, device, scratch_f32, scratch_i32)
 
@@ -1324,7 +1323,6 @@ def dspark_markov_sample(
         markov_embed,
         s_scratch,
         part_max,
-        part_sum,
         part_amax_val,
         part_amax_idx,
         num_rows,
@@ -1344,9 +1342,9 @@ def dspark_markov_sample(
     )
     softmax_combine_kernel[(num_rows,)](
         part_max,
-        part_sum,
+        None,
         row_max,
-        row_inv_z,
+        None,
         part_amax_val,
         part_amax_idx,
         row_argmax,
@@ -1354,6 +1352,7 @@ def dspark_markov_sample(
         gemv_tiles,
         BLOCK_TILE=triton.next_power_of_2(gemv_tiles),
         WITH_ARGMAX=True,
+        WITH_INV_Z=False,
         num_warps=4,
         num_stages=1,
     )

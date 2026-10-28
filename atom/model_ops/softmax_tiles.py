@@ -5,10 +5,10 @@ A full-vocab softmax over ``[rows, V]`` is computed in two launches: every
 program per row combines the tiles into the row's max and ``1/Z``. Consumers
 then evaluate ``exp(x - max) * inv_z`` for exactly the entries they need.
 
-Both the sampled DSpark draft (`dspark_markov_sample`) and the probability-ratio
-verify (`rejection_sampler`) build distributions this way, and the accept rule
-compares the two element by element, so they share the arithmetic rather than
-keeping two copies in sync by comment.
+The probability-ratio verify (`rejection_sampler`) builds the target's p this
+way. The sampled DSpark draft (`dspark_markov_sample`) takes only the row max
+(and the raw argmax) from the combine: its q is normalized over the entries it
+stores, not by a full-vocab 1/Z, so it skips the sum (``WITH_INV_Z=False``).
 """
 
 import triton
@@ -48,13 +48,15 @@ def softmax_combine_kernel(
     num_tiles,
     BLOCK_TILE: tl.constexpr,
     WITH_ARGMAX: tl.constexpr,
+    WITH_INV_Z: tl.constexpr = True,
 ):
     """One row: the online-softmax combine, global max and 1/Z from the
     per-tile pairs, so V is never read a second time just to normalize.
 
     ``WITH_ARGMAX`` also reduces per-tile ``(value, lowest id)`` pairs to the
     row's lowest-id argmax, the pick ``torch.argmax`` and ``topk_select(...,
-    tie="low")`` make.
+    tie="low")`` make. Without ``WITH_INV_Z`` only the max (and argmax) is
+    produced; ``part_sum_ptr`` and ``row_inv_z_ptr`` are not touched.
     """
     row = tl.program_id(0)
     offs_tile = tl.arange(0, BLOCK_TILE)
@@ -62,19 +64,22 @@ def softmax_combine_kernel(
     maxes = tl.load(
         part_max_ptr + offs_tile * num_rows + row, mask=tile_mask, other=float("-inf")
     )
-    sums = tl.load(part_sum_ptr + offs_tile * num_rows + row, mask=tile_mask, other=0.0)
     global_max = tl.max(maxes, axis=0)
-    # An all--inf tile contributes nothing, and must not contribute the NaN
-    # `exp(-inf - -inf)` would give when the whole row is -inf.
-    rescaled = tl.where(
-        tile_mask & (maxes > float("-inf")), sums * tl.exp(maxes - global_max), 0.0
-    )
-    z = tl.sum(rescaled, axis=0)
-    # An all--inf row (the fp8-KV warmup forward drafts before the pool is
-    # written) leaves Z at 0, and 1/0 would make every probability inf. Answer
-    # 0 instead, so every probability of that row is 0.
     tl.store(row_max_ptr + row, global_max)
-    tl.store(row_inv_z_ptr + row, tl.where(z > 0.0, 1.0 / z, 0.0))
+    if WITH_INV_Z:
+        sums = tl.load(
+            part_sum_ptr + offs_tile * num_rows + row, mask=tile_mask, other=0.0
+        )
+        # An all--inf tile contributes nothing, and must not contribute the NaN
+        # `exp(-inf - -inf)` would give when the whole row is -inf.
+        rescaled = tl.where(
+            tile_mask & (maxes > float("-inf")), sums * tl.exp(maxes - global_max), 0.0
+        )
+        z = tl.sum(rescaled, axis=0)
+        # An all--inf row (the fp8-KV warmup forward drafts before the pool is
+        # written) leaves Z at 0, and 1/0 would make every probability inf.
+        # Answer 0 instead, so every probability of that row is 0.
+        tl.store(row_inv_z_ptr + row, tl.where(z > 0.0, 1.0 / z, 0.0))
     if WITH_ARGMAX:
         vals = tl.load(
             part_amax_val_ptr + offs_tile * num_rows + row,
