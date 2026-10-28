@@ -117,7 +117,7 @@ jobs:
               for directory in paths:
                   print(directory.name, flush=True)
                   cell = directory.name.rsplit(f'-{run}-', 1)[0]
-                  attempt = 4 if run == 40706439005 else 1
+                  attempt = 5 if run == 40706439005 else 2
                   job_name = f'{cell}-{run}-{attempt}'
                   for runner in task_runners[run]:
                       results = runner_root / f'atomesh-runner-{runner:02d}/_work/ATOM/ATOM/atomesh-results'
