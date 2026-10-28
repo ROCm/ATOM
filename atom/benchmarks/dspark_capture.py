@@ -22,10 +22,24 @@ def install(runner, directory):
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     identity = calibration_identity(runner.config, runner.device)
-    (root / "identity.json").write_text(
-        json.dumps(identity, indent=2), encoding="utf-8"
-    )
-    output = (root / "confidence.jsonl").open("a", encoding="utf-8", buffering=1)
+    identity_path = root / "identity.json"
+    records = root / "confidence.jsonl"
+    if identity_path.exists():
+        # Observations are appended, and the fitter trusts the one identity
+        # file for all of them: a directory may only grow for its deployment.
+        recorded = json.loads(identity_path.read_text(encoding="utf-8"))
+        if recorded != identity:
+            raise ValueError(
+                f"{root} holds DSpark confidence records of another deployment; "
+                "use a fresh calibration directory"
+            )
+    elif records.exists() and records.stat().st_size:
+        raise ValueError(
+            f"{records} has records but no identity.json; use a fresh directory"
+        )
+    else:
+        identity_path.write_text(json.dumps(identity, indent=2), encoding="utf-8")
+    output = records.open("a", encoding="utf-8", buffering=1)
     previous = OrderedDict()
     active = None
     steps = 0
@@ -66,7 +80,10 @@ def install(runner, directory):
             and metadata.cache.pending is not None
             and any(span.request_id in previous for span in step.requests)
         ):
-            accepts = (last_indices - step.cu_seqlens_q[:-1]).detach().cpu().tolist()
+            # `cu_seqlens_q` spans the padded running batch; `last_indices` only
+            # the scheduled requests.
+            starts = step.cu_seqlens_q[: last_indices.shape[0]]
+            accepts = (last_indices - starts).detach().cpu().tolist()
             for span, accepted in zip(step.requests, accepts):
                 prior = previous.pop(span.request_id, None)
                 if prior is None or span.length != 6 or not 0 <= accepted <= 5:

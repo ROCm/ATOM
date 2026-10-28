@@ -10,23 +10,11 @@ from pathlib import Path
 import torch
 
 
-def single_node_parallel_config(world_size, dp_size, rank):
-    """Mirror CoreManager's node config then worker-local rank assignment."""
-    from atom.config import ParallelConfig
-
-    if dp_size < 1 or world_size % dp_size or not 0 <= rank < world_size:
-        raise ValueError("Invalid single-node TP/DP rank layout")
-    tp_size = world_size // dp_size
-    # __post_init__ validates the NODE's contiguous DP slice starting at zero;
-    # worker ranks are assigned afterwards, as in the production manager.
-    parallel = ParallelConfig(data_parallel_size=dp_size)
-    parallel.data_parallel_rank = rank // tp_size
-    parallel.data_parallel_rank_local = rank // tp_size
-    return parallel, tp_size, rank % tp_size
-
-
 def calibration_identity(config, device):
-    model = Path(config.model)
+    from atom.model_loader.weight_utils import local_model_dir
+
+    # A hub id joined onto file names is a relative path that does not exist.
+    model = Path(local_model_dir(config.model))
     files = ("config.json", "model.safetensors.index.json")
     return {
         "model_files": {
@@ -63,7 +51,17 @@ def calibration_identity(config, device):
 
 def validate_calibration(profile, identity, *, width, max_batch):
     recorded = profile.get("identity")
-    # Earlier version-1 profiles could only be produced for plain TP. Retain
+    if isinstance(recorded, dict) and not {"graph_mode", "compilation_level"} <= set(
+        recorded
+    ):
+        # Earlier profiles do not say which graph mode / compilation level
+        # they measured, and the cost of a shape depends on both.
+        raise ValueError(
+            "DSpark calibration predates graph-mode binding (no graph_mode / "
+            "compilation_level in its identity); regenerate it with "
+            "atom.benchmarks.fit_dspark, or drop it to measure at startup"
+        )
+    # Version-1 profiles could only be produced for plain TP. Retain
     # that compatibility, but never silently reinterpret one as DP or EP.
     if (
         isinstance(recorded, dict)

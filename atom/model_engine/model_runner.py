@@ -972,7 +972,7 @@ class ModelRunner:
         # Install after initialization warmup, which is not request traffic.
         # Graph capture runs later via RPC and bypasses run_model, so its
         # timing decorator does not run during capture.
-        calibration_dir = os.environ.get("ATOM_DSPARK_CALIBRATION_DIR")
+        calibration_dir = envs.ATOM_DSPARK_CALIBRATION_DIR
         if calibration_dir:
             from atom.benchmarks.dspark_capture import install
 
@@ -2444,6 +2444,42 @@ class ModelRunner:
             ),
         )
 
+    def _dspark_apply_dp_plan(self, batch, original, planner, gathered, sync):
+        """Resolve DSpark's joint DP plan from every rank's payload; when it
+        beats the per-rank ragged fallback already applied, rewrite this
+        rank's batch to its share and return ``(q, tokens per rank)``.
+
+        The ragged rewrite reproduces the planner's per-request lengths exactly
+        (they sit between ``num_bonus + 1`` and the scheduled width), so the
+        rows every peer assumed for this rank are the rows it now runs. A
+        difference would hand the group two shapes, so it is fatal here rather
+        than a hang inside the collectives.
+        """
+        fallback = (
+            int(np.max(sync.scheduled_tokens_per_dp_rank)),
+            sync.max_seqlen_q_across_dp or batch.num_spec_step + 1,
+        )
+        planned = planner.resolve(gathered, fallback)
+        if planned is None:
+            return None
+        q, tokens, plan = planned
+        (
+            batch.scheduled_tokens,
+            batch.num_scheduled_tokens,
+            batch.total_tokens_num,
+            batch.total_tokens_num_decode,
+        ) = original
+        self._dspark_apply_ragged(
+            batch, batch.total_seqs_num_decode, batch.num_spec_step + 1, plan
+        )
+        rank = planner.mesh.dp_rank
+        if int(batch.total_tokens_num) != int(tokens[rank]):
+            raise RuntimeError(
+                f"DSpark DP plan expects {int(tokens[rank])} tokens on this "
+                f"rank, the ragged layout has {batch.total_tokens_num}"
+            )
+        return q, tokens
+
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
 
@@ -2546,10 +2582,14 @@ class ModelRunner:
                 # erase the predicted graph saving, keep the reserved tokens.
                 # This only restores the existing rectangular path; no current
                 # draft confidence or speculative token value is consulted.
-                if (
-                    short_graph is None
-                    or full_graph is None
-                    or short_graph >= full_graph
+                # Keep the reserved tokens only when shrinking cannot help: it
+                # would leave a recorded graph for an eager step, or land on a
+                # graph no smaller. An uncovered full width (e.g. past a DP
+                # graph cap) does not veto a covered ragged layout.
+                if (short_graph is None and full_graph is not None) or (
+                    short_graph is not None
+                    and full_graph is not None
+                    and short_graph >= full_graph
                 ):
                     return
 
@@ -2751,17 +2791,31 @@ class ModelRunner:
     def prepare_model(self, batch: ScheduledBatch):
         verify = getattr(getattr(self, "drafter", None), "verify_scheduler", None)
         dp_planner = getattr(verify, "dp", None)
+        dp_plan = None
+        original = None
         if dp_planner is not None:
             # Unconditional with respect to local batch type and dummy/output
-            # state, before both the ragged mutation and DP shape agreement.
-            dp_planner.prepare(batch)
+            # state. The payload rides ForwardMode's DP exchange; the per-rank
+            # ragged budget below is the fallback the joint plan must beat.
+            payload = dp_planner.prepare(batch)
+            original = (
+                batch.scheduled_tokens,
+                batch.num_scheduled_tokens,
+                batch.total_tokens_num,
+                batch.total_tokens_num_decode,
+            )
+            dp_plan = (
+                payload,
+                lambda gathered, sync: self._dspark_apply_dp_plan(
+                    batch, original, dp_planner, gathered, sync
+                ),
+            )
         shrunk_q = self._dspark_apply_q_bucket(batch)
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
         # prepare_input_ids sizes the buffer, and because one call site is the
         # only way the step is guaranteed a single cross-DP collective.
         dp_size = self.config.parallel_config.data_parallel_size
-        planned_q = getattr(dp_planner, "selected_q", None)
         forward_mode = ForwardMode.decide(
             batch=batch,
             dp_size=dp_size,
@@ -2774,14 +2828,11 @@ class ModelRunner:
             ),
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
-            max_seqlen_q=(
-                planned_q
-                if planned_q is not None
-                else (batch.num_spec_step + 1 if shrunk_q is None else shrunk_q)
-            ),
+            max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             graph_shapes=self._producer_graph_shapes(),
             tbo_decode_graphs=self.tbo_decode_graphs,
+            dp_plan=dp_plan,
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -3438,10 +3489,34 @@ class ModelRunner:
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
         draft_token_ids: np.ndarray | None = None
+        online_sts = getattr(
+            getattr(getattr(self, "drafter", None), "verify_scheduler", None),
+            "sts",
+            None,
+        )
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
+                if online_sts is not None:
+                    # The previous forward's verdict, on the drafts recorded
+                    # the forward before it; before this forward records its
+                    # own. Labels need what that batch actually verified.
+                    if (
+                        prev_batch is not None
+                        and not prev_batch.is_dummy_run
+                        and not prev_batch.total_tokens_num_prefill
+                        and len(prev_bonus_num) == prev_batch.total_seqs_num
+                    ):
+                        n = prev_batch.total_seqs_num
+                        online_sts.observe(
+                            list(prev_batch.req_ids[:n]),
+                            prev_bonus_num,
+                            np.asarray(prev_batch.num_scheduled_tokens[:n]) - 1,
+                        )
+                    else:
+                        online_sts.observe()
+                    online_sts = None
                 self.tokenID_processor.spec_status_queue.send(
                     spec_counts, ready=self.forward_done_event
                 )
@@ -3487,6 +3562,9 @@ class ModelRunner:
                     num_reject_tokens,
                     anchors,
                 )
+
+        if online_sts is not None:
+            online_sts.observe()  # keep the per-forward count TP-aligned
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
@@ -4460,6 +4538,32 @@ class ModelRunner:
             return
         if verify_scheduler.calibration_profile is not None:
             return  # Explicit offline measurements must not be overwritten.
+        dspark = self.config.dspark
+        if (
+            dspark.ragged
+            and drafter.uses_confidence_schedule
+            and (
+                dspark.online_sps
+                or dspark.bucket_global
+                or self.config.hf_config.model_type == "deepseek_v41_text"
+            )
+        ):
+            # A measured curve is required here (V4.1 admits no stub; online
+            # SPS corrects a measured baseline). Ragged verification runs on
+            # decode token graphs: time those now, before the first request,
+            # as DeepInfer's startup profile does. Capture already ran these
+            # graphs on the same synthetic metadata, so no request state exists
+            # yet for the replays to disturb.
+            from atom.spec_decode.startup_sps import startup_sps_table
+
+            verify_scheduler.bind_sps(
+                startup_sps_table(
+                    self,
+                    self._dspark_capture_q_buckets(max_q_len),
+                    self.config.max_num_seqs * max_q_len,
+                )
+            )
+            return
         if self.req_graph is None or not self.req_graph.keys():
             return
         if self.config.dspark.disable_sps_calib:

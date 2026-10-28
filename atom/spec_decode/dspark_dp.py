@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """DP verification budgets from fixed N-2 confidence and group execution costs.
 
-The CPU planner runs before ForwardMode's shape agreement on EVERY forward.
+The CPU planner runs on EVERY forward. Its payload rides ForwardMode's one DP
+exchange (`sync_dp_metadata`), and every rank resolves the same plan from it.
 Only delayed survival probabilities leave the GPU; request ids remain local.
 The planner includes today's bonus floors before comparing executable graphs.
 """
@@ -11,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ class SPSMesh:
         self.tp_size = dist.get_world_size(tp_group)
         self.tp_rank = dist.get_rank(tp_group)
         self.dp_size = dist.get_world_size(dp_group)
+        self.dp_rank = dist.get_rank(dp_group)
 
     @staticmethod
     def gather(value, group, size):
@@ -126,12 +127,21 @@ def local_frontier(survival, floors, ceilings, candidates, qs, *, dummy=False):
     return result, lengths
 
 
-def choose_dp_candidate(frontiers, captured, full_rows, full_q, cost_ms):
-    """Maximize sum(expected output) / group time at the ACTUAL common graph.
+def choose_dp_candidate(
+    frontiers, captured, full_rows, full_q, cost_ms, fallback_graph=None
+):
+    """The joint plan, or None to keep each rank's own ragged budget.
 
-    The selected cap is passed to ForwardMode, even if all local maxima are
-    smaller. This matters for non-nested divisors (e.g. q=2 and q=3): changing
-    the cap could change the executable graph. Resolve rows after DP maxima.
+    Without a fallback: maximize sum(expected output) / time of the ACTUAL
+    common graph, and only when that graph is smaller than the full one.
+
+    With ``fallback_graph`` -- the graph the group runs anyway, set by its
+    busiest rank's own budget -- the plan only FILLS that graph: among
+    allocations whose common graph is exactly it, take the one with the most
+    expected output. The step costs the same, and ranks that shrank on their
+    own get back drafts the busiest rank is paying for regardless. Shrinking
+    below it is left to each rank's own budget: measured, a further joint
+    shrink lost more accepted tokens than the smaller graph saved.
     """
     full_graph = executable_graph(full_rows, full_q, captured)
     if full_graph is None:
@@ -145,16 +155,25 @@ def choose_dp_candidate(frontiers, captured, full_rows, full_q, cost_ms):
         graph = executable_graph(rows, q, captured)
         if graph is None:
             continue
-        ms = cost_ms(graph)
-        if not np.isfinite(ms) or ms <= 0:
-            continue
-        score = local[:, 0].sum() / ms
+        if fallback_graph is not None:
+            if graph != fallback_graph:
+                continue
+            score = local[:, 0].sum()
+        else:
+            ms = cost_ms(graph)
+            if not np.isfinite(ms) or ms <= 0:
+                continue
+            score = local[:, 0].sum() / ms
         # Prefer a larger graph on ties: do not discard free draft prefixes.
         if score > best_score or (
             score == best_score and best is not None and graph > best[1]
         ):
             best, best_score = (i, graph), score
-    return best[0] if best is not None and best[1] < full_graph else None
+    if best is None:
+        return None
+    if fallback_graph is None and best[1] >= full_graph:
+        return None
+    return best[0]
 
 
 @dataclass
@@ -174,12 +193,13 @@ class DPVerifyPlanner:
         self.mesh = mesh or SPSMesh()
         self.gamma = config.speculative_config.num_speculative_tokens
         self.qs = resolve_q_buckets(config.dspark.ragged_graph_sizes, self.gamma + 1)
-        profile = json.loads(Path(config.dspark.calibration_profile).read_text())
-        self.baseline_ms = np.array([1000.0 / x for x in profile["sps_table"]])
+        # The measured curve arrives through `bind` (offline profile at
+        # construction, or the startup sweep after graph capture). Until then
+        # no decode graph is plannable and every step keeps its full width.
+        self.baseline_ms = None
         self.observe_only = config.dspark.online_sps_observe_only
         self.mesh.agree(
             (
-                profile,
                 self.qs,
                 config.max_num_seqs,
                 self.observe_only,
@@ -204,6 +224,15 @@ class DPVerifyPlanner:
         self.planned = 0
         self.contracted = 0
         self.selected_q = None
+        self._ids = ()
+        self._lengths = None
+
+    def bind(self, baseline_sps):
+        # Every worker must plan with the same curve; a startup sweep reduces
+        # its timings by MAX over TP and DP, so this only catches divergence.
+        self.mesh.agree([round(float(x), 6) for x in baseline_sps])
+        self.baseline_ms = np.array([1000.0 / x for x in baseline_sps])
+        self._captured = None
 
     def capture(self, confidence):
         if self.mesh.tp_rank == 0:
@@ -232,7 +261,9 @@ class DPVerifyPlanner:
         if len(self.pending) >= 4:
             self.skipped_busy += 1
             return
-        capacity = (self.runner.config.max_num_seqs, self.gamma)
+        # Block drafters draft at least two requests (warmup does even with
+        # max_num_seqs=1), as TokenIDProcessor's output capacity allows.
+        capacity = (max(self.runner.config.max_num_seqs, 2), self.gamma)
         cpu = (
             self.free.pop()
             if self.free
@@ -269,19 +300,30 @@ class DPVerifyPlanner:
         ]
 
     def prepare(self, batch):
-        """Called on real, dummy, prefill, and output-less forward paths alike."""
+        """This rank's planning payload, built on real, dummy, prefill and
+        output-less forwards alike. It rides the step's one DP exchange
+        (`sync_dp_metadata`); `resolve` turns every rank's payload into the plan.
+        """
         from atom.utils.region_graph import TokenGraph
 
         self.epoch += 1
         self.selected_q = None
         self.survival = None
+        self._lengths = None
         n = batch.total_seqs_num
         ids = tuple(batch.req_ids[:n])
+        self._ids = ids
         if ids != self._request_set:
             self._local_context += 1
             self._request_set = ids
-        captured = tuple(
-            g for g in TokenGraph.captured_sizes("decode") if g < len(self.baseline_ms)
+        captured = (
+            tuple(
+                g
+                for g in TokenGraph.captured_sizes("decode")
+                if g < len(self.baseline_ms)
+            )
+            if self.baseline_ms is not None
+            else ()
         )
         if captured != self._captured:
             self.mesh.agree(captured)
@@ -313,7 +355,7 @@ class DPVerifyPlanner:
             ).astype(np.int64)
             + 1
         )
-        frontier, lengths = (
+        frontier, self._lengths = (
             local_frontier(
                 survival, floors, ceilings, self.candidates, self.qs, dummy=dummy
             )
@@ -334,8 +376,16 @@ class DPVerifyPlanner:
             ],
             dtype=np.float64,
         )
-        wire = torch.from_numpy(np.concatenate((header, frontier.reshape(-1))))
-        gathered = self.mesh.gather_dp(wire).numpy()
+        return np.concatenate((header, frontier.reshape(-1)))
+
+    def resolve(self, gathered, fallback=None):
+        """The group's plan from every rank's `prepare` payload ([dp, len]).
+
+        Identical on every rank, since every rank holds the same rows.
+        ``fallback``: ``(rows, q)`` the group runs without a plan -- every
+        rank's own ragged budget, DP-maxed. Returns ``(q, rows per rank,
+        {req_id: ell})`` for this rank, or None to keep the fallback.
+        """
         headers = gathered[:, :8]
         if not (headers[:, 6] == self.epoch).all():
             raise RuntimeError("DSpark DP forward epochs diverged")
@@ -350,9 +400,9 @@ class DPVerifyPlanner:
         runtime = self.scheduler.runtime
         if runtime is not None:
             runtime.dp_state = self.state
-        self.scheduler._ell_map = {}  # invalid generations never inherit a plan
-        if not self.state.pure_decode or not headers[:, 3].all() or not captured:
-            return
+            runtime.dp_planner = self
+        if not self.state.pure_decode or not headers[:, 3].all() or not self._captured:
+            return None
         model = runtime.model if runtime is not None and not self.observe_only else None
         cost = (
             (lambda g: model.estimate_ms(g, self.state.batch))
@@ -360,14 +410,23 @@ class DPVerifyPlanner:
             else (lambda g: self.baseline_ms[g])
         )
         self.planned += 1
+        frontiers = gathered[:, 8:].reshape(self.mesh.dp_size, -1, 4)
+        fallback_graph = (
+            executable_graph(int(fallback[0]), int(fallback[1]), self._captured)
+            if fallback is not None
+            else None
+        )
         choice = choose_dp_candidate(
-            gathered[:, 8:].reshape(self.mesh.dp_size, -1, 4),
-            captured,
+            frontiers,
+            self._captured,
             int(headers[:, 4].max()),
             int(headers[:, 5].max()),
             cost,
+            fallback_graph=fallback_graph,
         )
-        if choice is not None:
-            self.contracted += 1
-            self.selected_q = self.candidates[choice][0]
-            self.scheduler._ell_map = dict(zip(ids, (lengths[choice] - 1).tolist()))
+        if choice is None:
+            return None
+        self.contracted += 1
+        self.selected_q = self.candidates[choice][0]
+        plan = dict(zip(self._ids, (self._lengths[choice] - 1).tolist()))
+        return self.selected_q, frontiers[:, choice, 1].astype(np.int64), plan

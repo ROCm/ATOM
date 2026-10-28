@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from atom.spec_decode.calibration import validate_calibration
+from atom.spec_decode.startup_sps import sps_table_from_points
 
 
 def survival(confidence, temperatures):
@@ -74,23 +75,14 @@ def fit_sts(records, width=5, min_blocks=100):
 
 
 def fit_sps(points, max_rows):
-    grouped = {}
-    for rows, ms in points:
-        if type(rows) is not int or rows < 1 or not np.isfinite(ms) or ms <= 0:
-            raise ValueError("Invalid measured SPS point")
-        grouped.setdefault(rows, []).append(float(ms))
-    if not grouped or max(grouped) < max_rows:
-        raise ValueError("Measured SPS points do not cover the deployment row limit")
-    xs = sorted(grouped)
-    # Same row count can represent multiple rectangular graph shapes. Keep the
-    # slower median, then a monotone latency envelope before interpolation.
-    ys = np.maximum.accumulate([max(grouped[x]) for x in xs])
-    latency = np.interp(np.arange(max_rows + 1), xs, ys)
-    return (1000 / latency).tolist()
+    """Strict: the measurements must cover the deployment's row limit."""
+    return sps_table_from_points(points, max_rows)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    # The startup sweep's cache file (ATOM_DSPARK_SPS_CACHE_DIR) of the same
+    # deployment the confidence records came from.
     p.add_argument("--sps-measurements", type=Path, required=True)
     p.add_argument("--confidence", type=Path, nargs="+", required=True)
     p.add_argument("--output", type=Path, required=True)
@@ -114,7 +106,11 @@ def main():
         "draft_width": 5,
         "max_num_seqs": maximum,
         "sts_temperatures": temperatures,
-        "sps_table": fit_sps(measured["points"], maximum * 6),
+        # A DP graph cap leaves the largest row counts unrecorded; they extend
+        # along the last measured slope, as at startup.
+        "sps_table": sps_table_from_points(
+            measured["points"], maximum * 6, extrapolate=True
+        ),
         "fit": stats,
         "sps_scope": measured["scope"],
     }

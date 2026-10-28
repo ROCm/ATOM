@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import dataclasses
 import logging
 import threading
-from collections.abc import Container
+from collections.abc import Callable, Container
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -183,6 +184,7 @@ class ForwardMode:
         running_tokens_per_dp_rank: np.ndarray,
         graph_shapes: Container[tuple[int, int]] | None = None,
         tbo_decode_graphs: bool = False,
+        dp_plan: tuple[np.ndarray, Callable] | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -192,6 +194,14 @@ class ForwardMode:
 
         ``running_tokens_per_dp_rank`` is the caller's [dp_size] buffer, which
         every step settles in place from the group's scheduled tokens.
+
+        ``dp_plan``: ``(payload, apply)`` from DSpark's joint DP verification
+        planner. The payload rides this step's one exchange; ``apply`` receives
+        every rank's payload and the gathered sync (the per-rank ragged
+        fallback each rank already applied), rewrites this rank's batch to the
+        agreed plan and returns ``(q, scheduled tokens per rank)``, or None to
+        keep the fallback. Every rank decides from the same gathered rows, so
+        the plan needs no exchange of its own.
 
         Any new force-eager condition belongs here, not in a caller-side check.
         `step_needs_eager` is this rank's attention backend refusing a graph for
@@ -226,7 +236,23 @@ class ForwardMode:
             # Only a block drafter needs the group to agree on it; every other
             # flavor keeps its own and the extra wire row is not sent.
             max_seqlen_q=max_seqlen_q if is_block_drafter else None,
+            extra=dp_plan[0] if dp_plan is not None else None,
         )
+        if dp_plan is not None:
+            planned = dp_plan[1](sync.extra_across_dp, sync)
+            if planned is not None:
+                # The plan is the group's, computed identically on every rank
+                # from the rows just gathered; `apply` has already rewritten
+                # this rank's batch to its share of it.
+                planned_q, planned_tokens = planned
+                sync = dataclasses.replace(
+                    sync,
+                    scheduled_tokens_per_dp_rank=np.asarray(
+                        planned_tokens, dtype=np.int32
+                    ),
+                    max_seqlen_q_across_dp=planned_q,
+                )
+                scheduled_tokens = batch.total_tokens_num
         # The group's query length, taken BEFORE the rows are read off it: a
         # rank still on its local q settles on a different `running_tokens`
         # than its peers.

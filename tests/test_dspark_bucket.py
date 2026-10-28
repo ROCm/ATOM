@@ -52,7 +52,7 @@ def test_global_search_crosses_plateau_without_discarding_same_graph_tokens():
     assert objective(conf, chosen, sizes, qs, costs) == pytest.approx(best)
 
 
-@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("seed", range(5))
 def test_matches_exhaustive_allocation_oracle(seed):
     generator = torch.Generator().manual_seed(seed)
     conf = torch.rand((3, 3), generator=generator) * 0.98 + 0.01

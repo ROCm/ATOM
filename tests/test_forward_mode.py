@@ -635,3 +635,59 @@ def test_eager_or_prefill_tbo_does_not_replay_a_split_recording():
     )
     assert prefill.tbo_collective_active and not prefill.req_graphs
     assert prefill.ubatch_split_bs is None
+
+
+def test_a_dspark_dp_plan_rides_the_one_exchange_and_settles_the_shape(
+    monkeypatch,
+):
+    """The joint DP verification plan travels in the step's single collective:
+    `apply` sees every rank's payload, shrinks this rank's batch, and the group
+    shape comes from the planned rows and q -- not the unshrunk ones sent."""
+    calls = []
+
+    def fake_all_gather(out_list, local, group=None):
+        calls.append(local.numel())
+        for out in out_list:
+            out.copy_(local)  # an identical peer
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    batch = _batch(seqs=10, q=6)
+    seen = []
+
+    def apply(gathered, sync):
+        seen.append(gathered.tolist())
+        batch.total_tokens_num = batch.total_tokens_num_decode = 24
+        return 3, np.array([24, 30])
+
+    mode = _decide(
+        batch,
+        captured_tokens=[24, 30, 48, 96],
+        is_block_drafter=True,
+        dp_size=2,
+        dp_group=object(),
+        dp_plan=(np.array([0.5, 7.0]), apply),
+    )
+    assert len(calls) == 1, "the plan must not add a collective"
+    assert seen == [[[0.5, 7.0], [0.5, 7.0]]]
+    assert mode.max_seqlen_q == 3
+    assert mode.scheduled_tokens == 24
+    assert mode.running_tokens == 30, "group max of the planned rows, q=3 bucket"
+    assert mode.sync.scheduled_tokens_per_dp_rank.tolist() == [24, 30]
+
+
+def test_a_dspark_dp_plan_that_declines_keeps_the_scheduled_shape(monkeypatch):
+    def fake_all_gather(out_list, local, group=None):
+        for out in out_list:
+            out.copy_(local)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    mode = _decide(
+        _batch(seqs=10, q=6),
+        captured_tokens=[48, 96],
+        is_block_drafter=True,
+        dp_size=2,
+        dp_group=object(),
+        dp_plan=(np.zeros(3), lambda gathered, sync: None),
+    )
+    assert mode.max_seqlen_q == 6
+    assert mode.running_tokens == 96

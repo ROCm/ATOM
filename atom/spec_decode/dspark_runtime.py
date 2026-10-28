@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -29,6 +29,19 @@ def validate_online_runtime(config):
     ):
         raise ValueError(
             "Online DSpark SPS requires PP/PCP/DCP=1, graphs, and TBO disabled"
+        )
+    from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+
+    spec = getattr(config, "speculative_config", None)
+    width = getattr(spec, "num_speculative_tokens", 5) + 1
+    qs = resolve_q_buckets(getattr(config.dspark, "ragged_graph_sizes", ""), width)
+    if any(b % a for a, b in itertools.pairwise(qs)):
+        # The top-m search admits global survival prefixes per q cap; with a
+        # pair like 2 and 3 a non-prefix allocation can reach a smaller
+        # divisible graph that search never visits.
+        raise ValueError(
+            f"Online DSpark SPS / bucket_global need nested query buckets (each "
+            f"divides the next), got {qs}; e.g. 1,3,6 or 1,2,6"
         )
     mode = config.compilation_config.cudagraph_mode
     if mode is None or not mode.uses_tr_hybrid():
@@ -55,17 +68,15 @@ class DSparkRuntime:
         validate_online_runtime(runner.config)
         self.runner = runner
         cfg = runner.config.dspark
-        profile = json.loads(Path(cfg.calibration_profile).read_text(encoding="utf-8"))
-        self.model = OnlineSPS(
-            profile["sps_table"],
-            runner.config.max_num_seqs,
-            window=cfg.online_sps_window_steps,
-            cohort_steps=cfg.online_sps_update_interval,
-        )
+        # Bound to the measured curve by VerifyScheduler.bind_sps: from the
+        # offline profile at construction, or after graph capture.
+        self.model = None
+        self._window = cfg.online_sps_window_steps
         self.sample_interval = cfg.online_sps_sample_interval
         self.update_interval = cfg.online_sps_update_interval
         self.mesh = mesh
         self.dp_state = None
+        self.dp_planner = None
         if runner.config.parallel_config.data_parallel_size > 1 and mesh is None:
             from atom.spec_decode.dspark_dp import SPSMesh
 
@@ -93,11 +104,19 @@ class DSparkRuntime:
         self._send = torch.zeros((MAX_PENDING, 6), dtype=torch.float64, device="cpu")
         self._recv = [torch.empty_like(self._send) for _ in range(self.world_size)]
 
+    def bind(self, baseline_sps):
+        self.model = OnlineSPS(
+            baseline_sps, self.runner.config.max_num_seqs, window=self._window
+        )
+        self.table_cache.clear()
+
     def begin(self, batch, forward_mode):
         # Under DP the planner publishes a group-wide decode predicate and a
         # request-set generation before shape agreement. Dummy ranks take part
         # in both timing and publication; mixed P/D steps take part in neither.
         dp = self.dp_state
+        if self.model is None:
+            return None  # warmup and capture run before the curve exists
         if self.mesh is not None and (dp is None or not dp.pure_decode):
             return None
         if (
@@ -222,16 +241,19 @@ class DSparkRuntime:
             if self.rank == 0 and (
                 self.model.version == 1 or self.model.version % 16 == 0
             ):
+                snapshot = self.model.snapshot()
+                if self.dp_planner is not None:
+                    snapshot["dp_planned"] = self.dp_planner.planned
+                    snapshot["dp_contracted"] = self.dp_planner.contracted
                 logger.info(
-                    "DSpark online SPS %s",
-                    json.dumps(self.model.snapshot(), sort_keys=True),
+                    "DSpark online SPS %s", json.dumps(snapshot, sort_keys=True)
                 )
         # All ranks retire this epoch, including incomplete/unmatched samples.
         # Unfinished events stay owned until query() permits reuse.
         self.cutoff = self.step - 1
 
     def table(self, base_sps, batch):
-        if self.model.version == 0:
+        if self.model is None or self.model.version == 0:
             return base_sps
         if batch not in self.table_cache:
             rows = torch.arange(
@@ -248,7 +270,7 @@ class DSparkRuntime:
 
     def snapshot(self):
         return {
-            **self.model.snapshot(),
+            **(self.model.snapshot() if self.model is not None else {}),
             "decode_steps": self.step,
             "pending": len(self.pending),
             "skipped_busy": self.skipped_busy,

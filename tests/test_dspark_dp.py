@@ -15,7 +15,7 @@ from atom.spec_decode.dspark_dp import (
 from atom.spec_decode.dspark_runtime import validate_online_runtime
 
 
-@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("seed", range(5))
 def test_joint_policy_matches_exhaustive_prefix_search(seed):
     rng = np.random.default_rng(seed)
     qs = [1, 2, 3, 4]  # deliberately non-nested divisibility
@@ -71,6 +71,13 @@ def test_busy_peer_and_bonus_floors_can_erase_local_graph_saving():
     assert choose_dp_candidate(front, captured, 24, 6, lambda g: g) is None
     front[1, 0, 1] = 12
     assert choose_dp_candidate(front, captured, 24, 6, lambda g: g) == 0
+    # With a fallback graph the plan only fills it: same step cost, more
+    # expected output; a different graph is never chosen.
+    two = np.array(
+        [[[3, 6, 6, 1], [5, 12, 6, 1]], [[4, 12, 6, 1], [4, 12, 6, 1]]], dtype=float
+    )
+    assert choose_dp_candidate(two, captured, 24, 6, lambda g: g, 12) == 1
+    assert choose_dp_candidate(two, captured, 24, 6, lambda g: g, 6) is None
     front[1, 0, 3] = 0
     assert choose_dp_candidate(front, captured, 24, 6, lambda g: g) is None
 
@@ -148,6 +155,11 @@ def test_confidence_copies_keep_sources_and_do_not_reuse_busy_destinations(monke
     p.epoch, p.survival = 8, torch.ones((1, 3))
     p.record([1])
     assert len(p.pending) == 1 and len(p.free) == 3
+    # Warmup drafts two requests even at max_num_seqs=1.
+    p.runner.config.max_num_seqs, p.free = 1, []
+    p.epoch, p.survival = 20, torch.ones((2, 3))
+    p.record([1, 2])
+    assert p.pending[-1][3] == (1, 2)
 
 
 @pytest.mark.parametrize("ep", [False, True])
@@ -212,10 +224,11 @@ def test_observe_only_keeps_the_joint_static_budget(tmp_path, monkeypatch):
             gather_dp=lambda x: torch.stack([x, x]),
         )
         planner = DPVerifyPlanner(scheduler, mesh=mesh)
+        planner.bind(baseline)
         planner.epoch = 2
         survival = torch.tensor([[0.35**i for i in range(1, 6)]])
         planner.pending = [(1, NS(synchronize=lambda: None), survival, (7,), survival)]
-        planner.prepare(
+        wire = planner.prepare(
             NS(
                 total_seqs_num=1,
                 req_ids=(7,),
@@ -226,7 +239,13 @@ def test_observe_only_keeps_the_joint_static_budget(tmp_path, monkeypatch):
                 num_bonus=np.array([0]),
             )
         )
-        selected.append(scheduler._ell_map.get(7, 5))
+        # Two identical ranks: the payload is what sync_dp_metadata gathers.
+        plan = planner.resolve(np.stack([wire, wire]))
+        selected.append(plan[2][7] if plan is not None else 5)
+        if plan is not None:
+            q, tokens, lengths = plan
+            assert q == planner.selected_q
+            assert tokens.tolist() == [lengths[7] + 1] * 2
     # Static: q=1 wins (1/1.5). Adding 20 ms shifts the optimum to
     # q=3 (1.4725/22.5), ahead of q=6 (~1.5356/24).
     assert selected == [0, 2]

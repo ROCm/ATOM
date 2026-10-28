@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -32,17 +31,12 @@ class Event:
 
 
 @pytest.fixture
-def runtime(tmp_path, monkeypatch):
-    path = tmp_path / "profile.json"
-    path.write_text(
-        json.dumps({"sps_table": [1000 / (1 + i * 0.1) for i in range(49)]})
-    )
+def runtime(monkeypatch):
     config = SimpleNamespace(
         dspark=DSparkConfig(
             online_sps=True,
             confidence_schedule=True,
             ragged=True,
-            calibration_profile=str(path),
             online_sps_sample_interval=2,
             online_sps_update_interval=16,
         ),
@@ -57,9 +51,20 @@ def runtime(tmp_path, monkeypatch):
         enforce_eager=False,
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    return DSparkRuntime(
+    rt = DSparkRuntime(
         SimpleNamespace(config=config), group=object(), event_factory=Event
     )
+    # What VerifyScheduler.bind_sps hands it: offline profile or startup sweep.
+    rt.bind([1000 / (1 + i * 0.1) for i in range(49)])
+    return rt
+
+
+def test_nothing_is_timed_before_a_curve_is_bound(runtime):
+    """Warmup and capture forwards run before the startup sweep binds a curve."""
+    runtime.model = None
+    assert runtime.begin(batch(req_ids=[1]), MODE) is None
+    assert runtime.step == 0
+    assert runtime.table("base", 1) == "base"
 
 
 def batch(**overrides):
@@ -141,13 +146,6 @@ def test_non_decode_steps_do_not_advance_collective_cadence(runtime, overrides):
     assert runtime.step == 0
 
 
-def test_capture_and_eager_are_not_samples(runtime, monkeypatch):
-    assert runtime.begin(batch(), SimpleNamespace(token_graph=False)) is None
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert runtime.begin(batch(), MODE) is None
-    assert runtime.step == 0
-
-
 @pytest.mark.parametrize(
     "mode", [None, CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY]
 )
@@ -157,26 +155,22 @@ def test_online_rejects_graph_modes_that_do_not_apply_ragged(runtime, mode):
         validate_online_runtime(runtime.runner.config)
 
 
-def test_measured_cost_changes_verification_for_identical_confidence(runtime):
-    from atom.spec_decode.dspark_verify import VerifyScheduler
-
-    scheduler = VerifyScheduler.__new__(VerifyScheduler)
-    scheduler.runner = runtime.runner
-    scheduler.runtime = runtime
-    scheduler.sps_table = torch.tensor([1000 / (1 + i * 0.1) for i in range(49)])
-    scheduler.sts_temperatures = None
-    confidence = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5]])
-    initial = scheduler.compute_ell(confidence)
-    # A large measured post-target cost makes an extra accepted token cheaper
-    # than another target/draft round, without changing confidence or sampling.
-    for _ in range(10):
-        runtime.model.observe(1, 6, 1.6, 20.0)
-    runtime.model.publish()
-    updated = scheduler.compute_ell(confidence)
-    assert updated.item() > initial.item()
+@pytest.mark.parametrize("sizes,ok", [("1,3,6", True), ("1,2,3,6", False)])
+def test_online_requires_nested_query_buckets(runtime, sizes, ok):
+    """The top-m search only visits survival prefixes; with non-nested caps
+    (2 and 3) a smaller divisible graph can need a non-prefix allocation."""
+    runtime.runner.config.dspark.ragged_graph_sizes = sizes
+    if ok:
+        validate_online_runtime(runtime.runner.config)
+    else:
+        with pytest.raises(ValueError, match="nested query buckets"):
+            validate_online_runtime(runtime.runner.config)
 
 
-def test_observe_only_still_builds_measured_table_but_keeps_static_decision(runtime):
+@pytest.mark.parametrize("observe_only", [False, True])
+def test_measured_cost_steers_verification_unless_observe_only(runtime, observe_only):
+    """A large measured post-target cost makes another verified token cheaper
+    than another round; observe-only keeps the static decision."""
     from atom.spec_decode.dspark_verify import VerifyScheduler
 
     scheduler = VerifyScheduler.__new__(VerifyScheduler)
@@ -185,29 +179,15 @@ def test_observe_only_still_builds_measured_table_but_keeps_static_decision(runt
     scheduler.sts_temperatures = None
     confidence = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5]])
     before = scheduler.compute_ell(confidence)
-    runtime.runner.config.dspark.online_sps_observe_only = True
+    runtime.runner.config.dspark.online_sps_observe_only = observe_only
     for _ in range(10):
-        runtime.model.observe(1, 6, 1.6, 20)
+        runtime.model.observe(1, 6, 1.6, 20.0)
     runtime.model.publish()
     after = scheduler.compute_ell(confidence)
-    assert torch.equal(before, after)
-    assert 1 in runtime.table_cache
-    assert not torch.equal(runtime.table_cache[1], scheduler.sps_table)
-
-
-def test_publication_without_ready_timings_expires_and_invalidates_cache(runtime):
-    rt = runtime
-    rt.model.window = 20
-    for step in range(1, 11):
-        rt.model.observe(1, 6, 7.6, 2, step=step)
-    rt.model.publish(step=16)
-    base = torch.tensor([1000 / (1 + i * 0.1) for i in range(49)])
-    rt.table(base, 1)
-    rt.step = 64
-    rt._publish()
-    assert not rt.model.samples
-    assert rt.model.slope_ms == 0
-    assert not rt.table_cache
+    if observe_only:
+        assert torch.equal(before, after) and 1 in runtime.table_cache
+    else:
+        assert after.item() > before.item()
 
 
 def test_request_set_generation_only_changes_on_membership_or_order(runtime):
@@ -220,21 +200,3 @@ def test_request_set_generation_only_changes_on_membership_or_order(runtime):
     sample = rt.begin(batch(req_ids=[102]), MODE)
     assert sample.context == 2
     complete(rt, sample)
-
-
-def test_runtime_tables_use_batch_local_affine_coefficients(runtime):
-    rt = runtime
-    for i in range(12):
-        rows = 6 if i % 2 else 12
-        rt.model.observe(
-            1, rows, rt.model.baseline_ms[rows] + 7 + 0.2 * rows, 2, context=1
-        )
-    rt.model.publish()
-    base = torch.tensor([1000 / (1 + i * 0.1) for i in range(49)])
-    for b in [1, 2]:
-        table = rt.table(base, b)
-        for rows in [6, 12]:
-            assert table[rows].item() == pytest.approx(
-                1000 / rt.model.estimate_ms(rows, b)
-            )
-    assert not torch.equal(rt.table(base, 1), rt.table(base, 2))

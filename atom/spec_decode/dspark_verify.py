@@ -69,6 +69,20 @@ class VerifyScheduler:
             from atom.spec_decode.dspark_dp import DPVerifyPlanner
 
             self.dp = DPVerifyPlanner(self)
+        if self.sps_table is not None:
+            self.bind_sps(self.sps_table)
+        # No calibration profile supplies temperatures: fit them online.
+        self.sts = None
+        if (
+            self.sts_temperatures is None
+            and getattr(runner.config.dspark, "confidence_schedule", False)
+            and getattr(runner.config.dspark, "online_sts", True)
+        ):
+            from atom.spec_decode.online_sts import OnlineSTS
+
+            self.sts = OnlineSTS(
+                self, runner.config.speculative_config.num_speculative_tokens
+            )
         self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
         # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.
@@ -113,12 +127,15 @@ class VerifyScheduler:
         from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths_tensor
 
         bs, L = confidence.shape
+        sts = getattr(self, "sts", None)
+        if sts is not None:
+            sts.capture(confidence)
         dp = getattr(self, "dp", None)
         if dp is not None:
+            # The DP planner also consumes this confidence at N+2, jointly with
+            # every peer's frontier. The local budget below stays the fallback
+            # for every step the joint plan does not improve on.
             dp.capture(confidence)
-            # The DP planner consumes this confidence at N+2, with the current
-            # bonus floors and every peer's frontier. No local budget is final.
-            return torch.full((bs,), L, dtype=torch.long, device=confidence.device)
         sps_table = self.sps_table
         runtime = getattr(self, "runtime", None)
         if runtime is not None and sps_table is not None:
@@ -228,10 +245,12 @@ class VerifyScheduler:
         The copy is queued here; ``_resolve_ell`` adopts it once it is
         ``_ELL_GENERATION`` steps old.
         """
+        sts = getattr(self, "sts", None)
+        if sts is not None:
+            sts.record(req_ids)
         dp = getattr(self, "dp", None)
         if dp is not None:
             dp.record(req_ids)
-            return
         ell = self._last_ell
         if ell is None:
             self._ell_pending.clear()
@@ -266,6 +285,16 @@ class VerifyScheduler:
         if len(self._ell_pending) > _MAX_ELL_INFLIGHT:
             del self._ell_pending[:-_MAX_ELL_INFLIGHT]
 
+    def bind_sps(self, sps_table: torch.Tensor) -> None:
+        """Adopt the measured cost curve (offline profile or startup sweep)
+        and hand it to the online estimator and the DP planner as baseline."""
+        self.sps_table = sps_table
+        values = sps_table.detach().float().cpu().tolist()
+        if self.runtime is not None:
+            self.runtime.bind(values)
+        if self.dp is not None:
+            self.dp.bind(values)
+
     def _resolve_ell(self) -> None:
         """Adopt the ell from a FIXED generation back (``_ELL_GENERATION``).
 
@@ -299,9 +328,7 @@ class VerifyScheduler:
         """{req_id: ell} from a fixed generation back, so every TP rank adopts
         the SAME one — see ``_resolve_ell``. Read this at the top of a step; the
         sync it performs is a no-op there and a real stall anywhere later."""
-        dp = getattr(self, "dp", None)
-        if dp is None:
-            self._resolve_ell()
+        self._resolve_ell()
         return self._ell_map
 
     @ell_by_req.setter

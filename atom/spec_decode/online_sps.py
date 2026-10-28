@@ -1,10 +1,20 @@
 # SPDX-License-Identifier: MIT
 """Bounded affine correction of a measured DSpark cost curve.
 
-A constant runtime residual is an intercept, not a per-row cost. Additional
-marginal cost requires different graph sizes at the same batch/request-set
-generation within a short decode-step cohort. No request identities, tokens
-or confidence values are retained by the estimator.
+`latency(rows, batch) = baseline(rows) + fixed(batch) + slope * rows + post(batch)`.
+
+The slope is a marginal per-row cost, so it is fitted only from contrasts that
+share everything but the row count: the same batch size AND the same request
+set (context generation), whose graph sizes differ because the verify cap q
+changed. Comparing different batches or contexts would read their different
+fixed overheads (more requests, longer KV) as per-row cost. Each (batch,
+context, graph size) contributes one median residual; the slope is the median
+of the pairwise slopes inside each (batch, context), Theil-Sen style, so a
+constant offset cannot tilt it. A batch with its own contrasts gets its own
+slope; others share the slope pooled from every batch's within-context pairs,
+and with no contrasts at all the slope is zero (the measured curve's own
+marginal cost stands). No request identities, tokens or confidence values are
+retained by the estimator.
 """
 
 from __future__ import annotations
@@ -14,12 +24,36 @@ import math
 import statistics
 from collections import defaultdict, deque
 
+# Distinct graph sizes the contrasts of a fit must span: two sizes always admit
+# a line, so a level shift between two sizes would read as slope.
+_MIN_GRAPH_SIZES = 3
+
+
+def _within_context_slopes(samples):
+    """Pairwise slopes between graph sizes of the same context.
+
+    ``samples``: ``(context, rows, residual)`` of ONE batch size. Returns the
+    slopes, the distinct sizes they span, and the samples behind them.
+    """
+    by_size = defaultdict(lambda: defaultdict(list))
+    for context, rows, residual in samples:
+        by_size[context][rows].append(residual)
+    slopes, sizes, support = [], set(), 0
+    for per_rows in by_size.values():
+        if len(per_rows) < 2:
+            continue  # one size: no contrast, only a level
+        points = sorted((r, statistics.median(v)) for r, v in per_rows.items())
+        slopes.extend(
+            (b[1] - a[1]) / (b[0] - a[0]) for a, b in itertools.combinations(points, 2)
+        )
+        sizes.update(per_rows)
+        support += sum(len(v) for v in per_rows.values())
+    return slopes, sizes, support
+
 
 class OnlineSPS:
-    def __init__(
-        self, baseline_sps, max_batch, *, window=5000, min_samples=10, cohort_steps=64
-    ):
-        if window < min_samples or min_samples < 1 or max_batch < 1 or cohort_steps < 1:
+    def __init__(self, baseline_sps, max_batch, *, window=5000, min_samples=10):
+        if window < min_samples or min_samples < 1 or max_batch < 1:
             raise ValueError("Invalid online SPS window/batch limits")
         values = [float(v) for v in baseline_sps]
         if not values or any(not math.isfinite(v) or v <= 0 for v in values):
@@ -32,12 +66,13 @@ class OnlineSPS:
         self.max_batch = max_batch
         self.window = window
         self.min_samples = min_samples
-        self.cohort_steps = cohort_steps
         self.samples = deque()
         self.slope_by_batch = {}
         self.fixed_by_batch = {}
         self.support_by_batch = {}
         self.post_by_batch = {}
+        self.slope_global = 0.0
+        self.global_support = 0
         self.fixed_global = 0.0
         self.post_global = 0.0
         self.version = 0
@@ -94,37 +129,30 @@ class OnlineSPS:
         if not self._dirty:
             return False
 
-        groups = defaultdict(lambda: defaultdict(list))
-        for sample_step, batch, rows, residual, _, context in self.samples:
-            if context is not None:
-                groups[batch, context, sample_step // self.cohort_steps][rows].append(
-                    residual
-                )
-        contrasts = defaultdict(list)
-        support = defaultdict(int)
-        for (batch, _, _), graphs in groups.items():
-            # At least two samples per side prevent a single noisy timing from
-            # inventing a slope. Each graph is equally weighted within a cohort.
-            points = sorted(
-                (rows, statistics.median(v), len(v))
-                for rows, v in graphs.items()
-                if len(v) >= 2
-            )
-            if len(points) < 2:
-                continue
-            contrasts[batch].extend(
-                (b[1] - a[1]) / (b[0] - a[0]) for a, b in itertools.pairwise(points)
-            )
-            support[batch] += sum(p[2] for p in points)
-        self.support_by_batch = dict(support)
-        self.slope_by_batch = {
-            batch: max(0.0, statistics.median(values))
-            for batch, values in contrasts.items()
-            if support[batch] >= self.min_samples
-        }
+        def fit(slopes, sizes, support):
+            if len(sizes) < _MIN_GRAPH_SIZES or support < self.min_samples:
+                return None
+            return max(0.0, statistics.median(slopes))
 
-        # Estimate the fixed component after removing only a supported local
-        # slope. Unseen batches may borrow a fixed offset, never a positive slope.
+        per_batch = defaultdict(list)
+        for _, batch, rows, residual, _, context in self.samples:
+            per_batch[batch].append((context, rows, residual))
+        self.slope_by_batch, self.support_by_batch = {}, {}
+        pooled, pooled_sizes, pooled_support = [], set(), 0
+        for batch, samples in per_batch.items():
+            slopes, sizes, support = _within_context_slopes(samples)
+            self.support_by_batch[batch] = support
+            slope = fit(slopes, sizes, support)
+            if slope is not None:
+                self.slope_by_batch[batch] = slope
+            pooled += slopes
+            pooled_sizes |= sizes
+            pooled_support += support
+        self.global_support = pooled_support
+        self.slope_global = fit(pooled, pooled_sizes, pooled_support) or 0.0
+
+        # The fixed component is what is left after the slope: per batch from
+        # its recent samples, globally as the fallback.
         fixed = defaultdict(list)
         post = defaultdict(list)
         fixed_all, post_all = [], []
@@ -151,16 +179,12 @@ class OnlineSPS:
         return True
 
     def slope_ms_for(self, batch):
-        return self.slope_by_batch.get(batch, 0.0)
+        return self.slope_by_batch.get(batch, self.slope_global)
 
     @property
     def slope_ms(self):
-        """Aggregate diagnostic only; decisions use the batch-specific slope."""
-        return (
-            statistics.median(self.slope_by_batch.values())
-            if self.slope_by_batch
-            else 0.0
-        )
+        """The global slope; a batch with its own spread may differ."""
+        return self.slope_global
 
     def fixed_ms(self, batch):
         return self.fixed_by_batch.get(batch, self.fixed_global)
@@ -188,8 +212,8 @@ class OnlineSPS:
             "current_step": self.current_step,
             "oldest_sample_step": self.samples[0][0] if self.samples else None,
             "post_window_samples": 9,
-            "cohort_steps": self.cohort_steps,
             "slope_ms_per_row": self.slope_ms,
+            "slope_global_support": self.global_support,
             "slope_ms_per_row_by_batch": dict(self.slope_by_batch),
             "slope_support_by_batch": dict(self.support_by_batch),
             "fixed_ms_by_batch": dict(self.fixed_by_batch),

@@ -67,11 +67,16 @@ def run_scenarios(
         commit(metadata, last_indices)
         if pending is not None:
             verify_shapes.append([span.length for span in step.requests])
-            counts = (last_indices - step.cu_seqlens_q[:-1] + 1).tolist()
+            # The batch may be padded to a captured size; only the scheduled
+            # requests have a commit.
+            n = step.scheduled_bs
+            starts = step.cu_seqlens_q[:n]
+            counts = (last_indices[:n] - starts + 1).tolist()
             expected = [
                 span.position + count for span, count in zip(step.requests, counts)
             ]
-            assert metadata.cache.cursor[step.slots.long(), 0].tolist() == expected
+            slots = step.slots[:n].long()
+            assert metadata.cache.cursor[slots, 0].tolist() == expected
             accepted.extend(count - 1 for count in counts)
             last_commit.update(
                 {span.request_id: count for span, count in zip(step.requests, counts)}
