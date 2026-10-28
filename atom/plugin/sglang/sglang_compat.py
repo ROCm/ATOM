@@ -9,14 +9,44 @@ the attention-TP context lives under ``layer_boundary``.
 from __future__ import annotations
 
 
+def _distributed_symbol(name):
+    """Import a SGLang parallel helper.
+
+    0.5.22 still defines these on ``parallel_state`` but drops them from
+    ``sglang.srt.distributed``'s star-export, so ``from sglang.srt.distributed
+    import <name>`` raises ``ImportError``.
+    """
+
+    import importlib
+
+    try:
+        module = importlib.import_module("sglang.srt.distributed")
+        return getattr(module, name)
+    except (ImportError, AttributeError):
+        module = importlib.import_module("sglang.srt.distributed.parallel_state")
+        return getattr(module, name)
+
+
 def get_pp_group():
     try:
         from sglang.srt.runtime_context import get_parallel
     except ImportError:
-        from sglang.srt.distributed import get_pp_group as legacy_get_pp_group
-
-        return legacy_get_pp_group()
+        return _distributed_symbol("get_pp_group")()
     return get_parallel().pp_group
+
+
+def get_tp_group():
+    try:
+        from sglang.srt.runtime_context import get_parallel
+    except ImportError:
+        return _distributed_symbol("get_tp_group")()
+    return get_parallel().tp_group
+
+
+def get_tensor_model_parallel_rank():
+    # Prefer the old getter. 0.5.22 keeps it on parallel_state and only
+    # removes it from the distributed package export.
+    return _distributed_symbol("get_tensor_model_parallel_rank")()
 
 
 def get_attn_tp_context():

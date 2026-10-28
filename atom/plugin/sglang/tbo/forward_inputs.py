@@ -53,7 +53,7 @@ def _sync_atom_tbo_adapter_gate(
     if not dist.is_available() or not dist.is_initialized():
         return local_ready, tuple(ubatch_token_counts) if local_ready else None
 
-    from sglang.srt.distributed import get_tp_group
+    from atom.plugin.sglang.sglang_compat import get_tp_group
 
     # Keep the parameter in this adapter API because the caller's topology is
     # still useful context and older integrations pass it explicitly. The gate

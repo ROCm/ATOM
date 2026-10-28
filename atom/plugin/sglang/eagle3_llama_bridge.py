@@ -1040,10 +1040,11 @@ def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
 
     try:
         import sglang.srt.speculative.eagle_worker_v2 as eagle_worker_module
-        from sglang.srt.distributed import get_tp_group
         from sglang.srt.distributed.parallel_state import get_attn_tp_group
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        from atom.plugin.sglang.sglang_compat import get_tp_group
 
         if not hasattr(EagleVerifyInput, "sample"):
             import sglang.srt.speculative.eagle_utils as eagle_utils  # noqa: PLR0402

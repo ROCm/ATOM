@@ -74,7 +74,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
     ):
         if tensor is None or not input_scattered:
             return tensor
-        from sglang.srt.distributed import get_tp_group
+        from atom.plugin.sglang.sglang_compat import get_tp_group
 
         output = tensor.new_empty((total_tokens, *tensor.shape[1:]))
         get_tp_group().all_gather_into_tensor(output, tensor)
