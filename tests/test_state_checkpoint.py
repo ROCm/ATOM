@@ -2163,6 +2163,64 @@ class TestDemandDrivenCheckpoints:
         assert third.checkpoint_demand_pos == 0  # nothing left to want
         assert forward_on_the_ladder(bm, third) == []
 
+    @staticmethod
+    def _burst(head, n):
+        """`n` requests sharing `head`, then each its own 200 tokens."""
+        return [
+            stateful_seq(head + list(range(1000 + 300 * k, 1200 + 300 * k)))
+            for k in range(n)
+        ]
+
+    @staticmethod
+    def _burst_scheduler():
+        """Room for the whole burst, so only the batch budget can stop it."""
+        return make_scheduler(
+            demand_config(
+                max_num_batched_tokens=256,
+                num_kvcache_blocks=1000,
+                pool_entries={"state": 32},
+            )
+        )
+
+    def test_a_burst_behind_one_prefix_is_cut_once(self):
+        """One pass, one demand cut per prefix.
+
+        The rung is filed by the forward that ends on it, so every request in
+        the pass that branches off the same cached prefix finds it missing.
+        Cut at the demand, each takes 28 of the 256-token budget and lets the
+        next one in, until `max_num_seqs` stops the pass with every admitted
+        request holding the KV of its whole prompt. The first one files the
+        checkpoint; the second takes the rest of the budget as if it had no
+        demand.
+        """
+        sched = self._burst_scheduler()
+        run_prompt_on_the_ladder(sched.block_manager, stateful_seq(PROMPT))
+        burst = self._burst(PROMPT[:28], 8)
+        for seq in burst:
+            sched.add(seq)
+
+        batch, scheduled = sched.schedule()
+
+        assert list(scheduled) == [burst[0].id, burst[1].id]
+        assert [int(n) for n in batch.num_scheduled_tokens] == [28, 208]
+        assert burst[0].checkpoint_demand_pos == 28
+        assert burst[1].checkpoint_demand_pos == 0
+
+    def test_each_prefix_keeps_its_own_demand(self):
+        """Two prefixes, two cuts: the key is the prefix, not the position."""
+        other = list(range(500, 544))
+        sched = self._burst_scheduler()
+        run_prompt_on_the_ladder(sched.block_manager, stateful_seq(PROMPT))
+        run_prompt_on_the_ladder(sched.block_manager, stateful_seq(other))
+        burst = self._burst(PROMPT[:28], 1) + self._burst(other[:28], 1)
+        for seq in burst:
+            sched.add(seq)
+
+        batch, _ = sched.schedule()
+
+        assert [int(n) for n in batch.num_scheduled_tokens] == [28, 28]
+        assert [seq.checkpoint_demand_pos for seq in burst] == [28, 28]
+
     def test_a_demand_the_floor_would_refuse_is_not_recorded(self):
         """A cut costs a forward; buying one for a refused store is pure loss.
 
