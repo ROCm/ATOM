@@ -109,20 +109,8 @@ it does not track generated tokens or claim to measure sparse-attention runtime.
 The normalized squared-imbalance score makes short incoming requests emphasize
 batch size and long requests emphasize context load. New sessions use this score
 among ranks within the existing minimum useful time-gain margin. A migration must
-meet the time-gain requirements. If its joint balance score increases, the router
-allows it only when the higher load across the source/target pair increases by
-at most `decode_balance_tolerance_ratio` in **each** dimension, compared with
-placing the request on the owner. The default is 0.01 (1%). A lower batch-size
-peak cannot compensate for exceeding the context limit, or vice versa. The
-comparison includes the incoming request in both alternatives and only examines
-the affected pair, so an unrelated busy rank cannot hide a destination increase.
-This is a per-decision proxy bound, not a guarantee on decode latency or total
-imbalance over time. Explicit rank selection remains authoritative.
-
-Set `ATOM_DP_CACHE_BALANCE_CONFIG='{"decode_balance_tolerance_ratio": 0}'` to
-restore the strict rule that rejects every joint-score increase. The TTFT-gain
-margins, cooldown, preparation limits and prefix-admission acknowledgement apply
-with either setting. No calibrated decode-time penalty is assumed.
+meet the time-gain requirements and avoid increasing joint decode imbalance
+relative to staying with the owner. Explicit rank selection remains authoritative.
 
 ## Admission, copying, and failure
 
@@ -219,9 +207,6 @@ are being suppressed. These counters need throughput and latency measurements
 alongside them: fewer fallbacks alone are not evidence of a faster workload.
 `migration_decode_balance_rejected` counts otherwise profitable migration
 candidates rejected by the joint request-count/context balance constraint.
-`migration_decode_balance_tolerated` counts migrations actually started through
-the peak-load tolerance despite a higher joint score. It does not count
-unselected candidates, confirmed recoveries, or successful completions.
 
 ### Measured scope
 

@@ -70,10 +70,39 @@ These subsets overlap the preceding categories. The34 had predicted TTFT gain
 median0.392s and mean0.577s; those are uncalibrated predictions, not measured
 savings. The earlier498 rejected candidates had no individual audit records.
 
-The new1% per-dimension tolerance targets this narrow subset. Setting
-`decode_balance_tolerance_ratio=0` restores the strict guard used for both arms
-in this table. The tolerance's performance has not yet been measured. It changes
-ATOM placement only; LMCache transfer code and prefix-recovery checks are unchanged.
+A subsequent run tested a 1% per-dimension tolerance on this narrow subset.
+The tolerance was removed after the comparison below; the routing policy retains
+the strict guard. The two-worker benchmark default remains unchanged.
+
+## Rejected decode-guard tolerance (2026-10-28 UTC)
+
+A simultaneous 900-second comparison held both arms at two LMCache GPU workers,
+attention DP2 / MoE TP2, c128, fixed AL=3.51, synthetic acceptance, memory 0.95,
+main-compatible graph/replay settings and SA393/seed42. A used the strict guard;
+B allowed a higher joint score when each affected peak-load proxy grew at most 1%.
+
+| Metric | Strict guard | 1% tolerance | Change |
+| --- | ---: | ---: | ---: |
+| Output tokens/s/GPU | 1542.36 | 1522.19 | -1.31% |
+| Total tokens/s/GPU | 180986.24 | 177456.42 | -1.95% |
+| Mean TTFT | 1189.68 ms | 1122.66 ms | -5.63% |
+| P99 TTFT | 8476.20 ms | 6418.30 ms | -24.28% |
+| Mean ITL | 26.14 ms | 27.12 ms | +3.75% |
+
+The tolerance improved TTFT but did not improve throughput. Among 3343 matched
+successful requests, mean TTFT decreased 5.52% and mean ITL increased 3.66%.
+Migration starts were 278/343, commits 212/267 and fallbacks 66/76. B started
+30 migrations through the tolerance; formal-window fallbacks were all short
+recoverable prefixes, with no preparation timeouts. The policy, configuration
+field and tolerance counter were removed rather than left disabled by default.
+
+Throughput uses the same successful-token/request-span definition as above,
+with 925.630/929.857-second spans divided by two GPUs; total includes cached input.
+The clients exported 3390/3348 successful profiling requests and 1/0 errors.
+Both wrappers reported a disk-quota failure during finalization, so this was
+not a clean harness success. Aggregate JSON and raw JSONL remained readable;
+profiling success counts and input/output token totals agree, with zero corrupt
+JSONL rows. Counter samples bracketed the formal interval within 4.23 seconds.
 
 ## Incremental routing comparison (2026-10-27 UTC)
 

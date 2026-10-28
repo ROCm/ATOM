@@ -21,7 +21,6 @@ class CacheBalanceConfig:
     transfer_tokens_per_second: float = 2000000.0
     transfer_fixed_seconds: float = 0.01
     decode_request_seconds: float = 0.002
-    decode_balance_tolerance_ratio: float = 0.01
     min_gain_seconds: float = 0.05
     min_gain_ratio: float = 0.15
     cooldown_seconds: float = 30.0
@@ -71,8 +70,6 @@ class CacheBalanceConfig:
                 raise ValueError(f"{f.name} must be an integer")
         if result.min_gain_ratio >= 1:
             raise ValueError("min_gain_ratio must be less than one")
-        if result.decode_balance_tolerance_ratio >= 1:
-            raise ValueError("decode_balance_tolerance_ratio must be less than one")
         return result
 
 
@@ -167,13 +164,7 @@ class CacheBalancer:
         self.sessions[name] = session
         return session
 
-    def _decode_contexts(self):
-        contexts = [0] * self.ranks
-        for placement in self.requests.values():
-            contexts[placement.rank] += placement.prompt_tokens
-        return contexts
-
-    def _decode_placement_scores(self, prompt, requests, contexts=None):
+    def _decode_placement_scores(self, prompt, requests):
         """Increment in normalized request-count/context imbalance, up to a constant.
 
         Initial prompt lengths proxy each in-flight request's decode context;
@@ -183,31 +174,14 @@ class CacheBalancer:
         These scores describe balance, not calibrated execution seconds.
         """
         count = sum(max(0, n) for n in requests)
-        if contexts is None:
-            contexts = self._decode_contexts()
+        contexts = [0] * self.ranks
+        for placement in self.requests.values():
+            contexts[placement.rank] += placement.prompt_tokens
         if count <= 0 or not sum(contexts):
             return None
         mean_length = sum(contexts) / count
         weight = prompt / (mean_length * mean_length)
         return [max(0, n) + weight * c for n, c in zip(requests, contexts)]
-
-    def _within_decode_tolerance(self, source, target, prompt, requests, contexts):
-        """Bound each affected pair's peak load versus staying at the owner.
-
-        Count and context are independent limits, not execution-time estimates.
-        Checking the affected pair prevents an unrelated busy rank from hiding
-        a large increase on the destination. Zero restores the strict guard.
-        """
-        tolerance = self.config.decode_balance_tolerance_ratio
-        if tolerance <= 0:
-            return False
-        for loads, increment in ((requests, 1), (contexts, prompt)):
-            source_load, target_load = max(0, loads[source]), max(0, loads[target])
-            stay_peak = max(source_load + increment, target_load)
-            move_peak = max(source_load, target_load + increment)
-            if move_peak - stay_peak > stay_peak * tolerance:
-                return False
-        return True
 
     def place(
         self,
@@ -239,8 +213,7 @@ class CacheBalancer:
         lightest = min(
             range(self.ranks), key=lambda r: (waits[r], (r - self._cursor) % self.ranks)
         )
-        contexts = self._decode_contexts()
-        decode_scores = self._decode_placement_scores(prompt, requests, contexts)
+        decode_scores = self._decode_placement_scores(prompt, requests)
         if decode_scores is not None:
             # Inside the existing minimum useful TTFT-gain margin, prefer a
             # placement that balances both decode batch size and context work.
@@ -336,20 +309,17 @@ class CacheBalancer:
                     if gain > 0 and gain >= max(
                         cfg.min_gain_seconds, stay * cfg.min_gain_ratio
                     ):
-                        worse_balance = (
+                        # Moving prefill off the owner must not increase joint
+                        # decode imbalance across the ranks sharing MoE work.
+                        if (
                             decode_scores is not None
                             and decode_scores[target] > decode_scores[rank]
-                        )
-                        # A small score increase is acceptable only when both
-                        # peak-load proxies stay within the configured margin.
-                        if worse_balance and not self._within_decode_tolerance(
-                            rank, target, prompt, requests, contexts
                         ):
                             self.counters["migration_decode_balance_rejected"] += 1
                             continue
-                        candidates.append((finish, target, copy_time, worse_balance))
+                        candidates.append((finish, target, copy_time))
                 if candidates:
-                    _, target, copy_time, tolerated = min(candidates)
+                    _, target, copy_time = min(candidates)
                     self._generation += 1
                     placement.source = rank
                     placement.rank = target
@@ -360,8 +330,6 @@ class CacheBalancer:
                     placement.session_version = session.version
                     session.pending = request_id
                     self.counters["migration_started"] += 1
-                    if tolerated:
-                        self.counters["migration_decode_balance_tolerated"] += 1
             session.active.add(request_id)
         # Charge the same GPU work that won the cost comparison. Outstanding
         # restore work has its own queue above; it is not free or GPU prefill.
