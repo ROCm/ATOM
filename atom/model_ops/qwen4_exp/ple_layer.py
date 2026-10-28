@@ -352,6 +352,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
 
 class Qwen4ExpPLELayer(nn.Module):
+    # RTP may install a per-instance writer for prefix-cache side state.
+    _state_checkpoint_writer = None
+
     def __init__(
         self,
         config,

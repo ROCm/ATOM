@@ -1,4 +1,9 @@
-"""RTP-only compatibility for older AITER top-k softmax signatures."""
+"""RTP-only compatibility for the pinned AITER top-k softmax signature.
+
+RTP-LLM pins amd-aiter 0.1.23.dev134+g8449f416b, whose topk_softmax has
+the seven-argument ABI. Remove this shim once RTP-LLM ships an AITER wheel
+whose topk_softmax accepts the eighth num_valid_rows argument.
+"""
 
 from __future__ import annotations
 

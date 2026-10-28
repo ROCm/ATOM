@@ -4,10 +4,12 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
 def test_rtp_native_snapshot_keeps_shared_prefill_operations(monkeypatch):
+    pytest.importorskip("triton", reason="GDN prefill requires Triton")
     from atom.model_ops.fla_ops import gdn_flydsl
     from atom.plugin import prepare
 
@@ -71,6 +73,7 @@ def test_rtp_native_snapshot_keeps_shared_prefill_operations(monkeypatch):
 
 
 def test_shared_ple_forward_calls_optional_checkpoint_writer(monkeypatch):
+    pytest.importorskip("aiter", reason="Qwen4Exp PLE requires AITER")
     from atom.model_ops.qwen4_exp import ple_layer
 
     monkeypatch.setattr(ple_layer, "advance_ngram_state", lambda *args, **kwargs: None)
