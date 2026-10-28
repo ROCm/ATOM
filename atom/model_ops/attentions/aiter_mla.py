@@ -1605,6 +1605,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         block_region_consumer_indices = None
+        block_region_consumer_count = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
         if index_cache_layer_ids:
             local_index_layer_ids, global_index_layer_ids = self._index_cache_layout()
@@ -1706,6 +1707,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     + global_compact_index_slot_by_layer[layer_id]
                     for layer_id in local_index_layer_ids
                 ]
+            # Every consumer region above, so a draft pool merged after them
+            # (`merge_pages`) is numbered past the whole layout, not this stage's.
+            block_region_consumer_count = num_global_kv_layers + len(
+                global_index_layer_ids
+            ) * (2 if self._indexer_fp4 else 1)
 
         index_staging_region = None
         index_staging_pool_size = 0
@@ -1778,6 +1784,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVTransferTensors(
             pages=pages,
             block_region_consumer_indices=block_region_consumer_indices,
+            block_region_consumer_count=block_region_consumer_count,
             index_staging_region=index_staging_region,
             index_staging_pool_size=index_staging_pool_size,
             index_staging_chunk_pages=index_staging_chunk_pages,

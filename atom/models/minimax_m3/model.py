@@ -850,6 +850,73 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
+    def configure_kv_transfer_tensors(self, transfer_tensors, builder) -> None:
+        """Describe target PAGE regions before the runner appends draft regions.
+
+        Each KV/scale field spans all target layers; index rows are compact
+        over sparse layers. Use the same sparse-layer declaration as model
+        construction, and the pool's actual local row order, for the PP map.
+        """
+        from dataclasses import replace
+
+        from atom.model_ops.minimax_m3.sparse_attn import ASM_PAGE_SIZE
+
+        if len(builder.kv_pools) != 1:
+            raise ValueError("MiniMax-M3 transfer expects one KV-head geometry")
+        ((geometry, pool),) = builder.kv_pools.items()
+        num_layers = self.config.num_hidden_layers
+        index_slots = _sparse_attention_layer_ordinals(self.config)
+        local_layers = [
+            module.layer_num
+            for module, _ in sorted(
+                builder.pool_rows[geometry].items(), key=lambda item: item[1]
+            )
+        ]
+        # Sparse KV is written as page-16 SHUFFLE runs inside a scheduler
+        # block; dense KV uses the pool's page. Indexer keys are replicated.
+        head_runs = {
+            layer: (
+                builder.model_runner.block_size
+                // (ASM_PAGE_SIZE if layer in index_slots else pool.block_size),
+                pool.num_kv_heads,
+            )
+            for layer in local_layers
+        }
+        fields = pool.cache_fields + pool.scale_fields
+        layout = [
+            (field.name, row, layer, i * num_layers + layer, head_runs[layer])
+            for i, field in enumerate(fields)
+            for row, layer in enumerate(local_layers)
+        ]
+        index_offset = len(fields) * num_layers
+        layout.extend(
+            ("index", row, layer, index_offset + index_slots[layer], None)
+            for row, layer in enumerate(n for n in local_layers if n in index_slots)
+        )
+        pages = []
+        for page, (field, row, layer, _, runs) in zip(
+            transfer_tensors.pages, layout, strict=True
+        ):
+            # The names below assume the backend's unit order; refuse another.
+            if page.region.semantic_role != f"mha.{geometry}.{field}.layer_{row}":
+                raise RuntimeError(
+                    f"MiniMax-M3 transfer expected {field} row {row}, got "
+                    f"{page.region.semantic_role!r}"
+                )
+            # Keep the backend's byte views and addresses; only annotate layout.
+            pages.append(
+                replace(
+                    page,
+                    region=replace(
+                        page.region, semantic_role=f"m3.layer_{layer}.{field}"
+                    ),
+                    head_major_runs=runs,
+                )
+            )
+        transfer_tensors.pages = pages
+        transfer_tensors.block_region_consumer_indices = [e[3] for e in layout]
+        transfer_tensors.block_region_consumer_count = index_offset + len(index_slots)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings(input_ids)
 
@@ -933,6 +1000,9 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_input_embeddings(input_ids)
+
+    def configure_kv_transfer_tensors(self, transfer_tensors, builder) -> None:
+        self.language_model.configure_kv_transfer_tensors(transfer_tensors, builder)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.embed_input_ids(input_ids)
