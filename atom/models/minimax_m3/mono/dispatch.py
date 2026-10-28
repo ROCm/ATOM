@@ -173,3 +173,12 @@ class MonoDecode:
                 envs.ATOM_MONO_TRACE, sums,
             )  # fmt: skip
         return out
+
+
+def install_mono_decode(
+    model: torch.nn.Module, _atom_config, drafter, *, metadata_builder=None
+):
+    """Bind MiniMax's in-model Mono router after drafter hooks are armed."""
+    if drafter is not None:
+        model.bind_mono_drafter(drafter)
+    return model

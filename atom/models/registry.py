@@ -43,9 +43,8 @@ support_model_arch_dict = {
         "atom.models.glm5_next.Glm5NextForConditionalGeneration"
     ),
 }
-# Mono decode by wrapping the loaded model: the installer runs after the drafter
-# armed its hooks on the unwrapped layers. Architectures not listed here route
-# mono decode inside their own model class instead.
+# Model-specific Mono setup runs after the drafter arms the original layers.
+# An installer may wrap the model or finish binding routing already inside it.
 mono_decode_installers = {
     "DeepseekV4ForCausalLM": (
         "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
@@ -55,5 +54,11 @@ mono_decode_installers = {
     ),
     "KimiK3ForConditionalGeneration": (
         "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
+    ),
+    "MiniMaxM3SparseForCausalLM": (
+        "atom.models.minimax_m3.mono.dispatch.install_mono_decode"
+    ),
+    "MiniMaxM3SparseForConditionalGeneration": (
+        "atom.models.minimax_m3.mono.dispatch.install_mono_decode"
     ),
 }
