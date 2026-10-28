@@ -10,6 +10,9 @@ from atom.plugin.sglang.patches.prefill_compile_only_patch import (
 from atom.plugin.sglang.patches.triton_kernel_retention_patch import (
     apply_triton_kernel_retention_patch,
 )
+from atom.plugin.sglang.patches.xgrammar_hip_bitmask_patch import (
+    apply_xgrammar_hip_bitmask_patch,
+)
 
 logger = logging.getLogger("atom.plugin.sglang.register")
 
@@ -221,6 +224,7 @@ def register_plugin() -> None:
     _install_decode_graph_forward_context_patch()
     apply_prefill_compile_only_patch()
     apply_triton_kernel_retention_patch()
+    apply_xgrammar_hip_bitmask_patch()
     from atom.plugin.sglang.attention_backend.gdn_replayssm import (
         install_sglang_replayssm_commit,
     )

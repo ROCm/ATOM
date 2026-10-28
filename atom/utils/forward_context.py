@@ -538,6 +538,10 @@ class Context:
     # Set where the split is made; FusedMoE reads it to gather its routed rows
     # across the PCP group (`ATOM_PCP_MOE_MERGE`).
     pcp_split: bool = False
+    # Whether this step's TARGET forward row-split, fixed by ModelRunner right
+    # after it. Unlike `pcp_split` it survives drafting, which clears that per
+    # pass; the drafter's aux gather and draft prefill split read this one.
+    target_pcp_split: bool = False
     # `scheduled_tokens` on the device (`[1]` int32), an entry of the step's
     # `forward_vars["batch_info"]` read in place, so a replay reads its own
     # step whatever shape it was recorded at. A draft re-points it with
@@ -566,6 +570,7 @@ class Context:
         ubatch_token_offset: int = 0,
         draft_anchor_overrides: torch.Tensor | None = None,
         pcp_split: bool = False,
+        target_pcp_split: bool = False,
         scheduled_tokens_gpu: torch.Tensor | None = None,
     ):
         self.positions = positions
@@ -583,6 +588,7 @@ class Context:
         self.ubatch_token_offset = ubatch_token_offset
         self.draft_anchor_overrides = draft_anchor_overrides
         self.pcp_split = pcp_split
+        self.target_pcp_split = target_pcp_split
         self.scheduled_tokens_gpu = scheduled_tokens_gpu
 
 
