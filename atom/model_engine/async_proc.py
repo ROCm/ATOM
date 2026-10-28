@@ -15,6 +15,7 @@ This module provides:
 
 import logging
 import multiprocessing
+import os
 import pickle
 import queue
 import threading
@@ -223,7 +224,22 @@ class AsyncIOProc:
         runner_class = resolve_obj_by_qualname(runner_qualname)
         self.runners: list[object] = []
         self.runners = [runner_class(rank, *args, **kwargs)]
-        self.busy_loop()
+        self._run_busy_loop()
+
+    def _run_busy_loop(self):
+        """Make a fatal runner error observable by the parent's sentinel monitor."""
+        try:
+            self.busy_loop()
+        except Exception:  # noqa: BLE001 - any fatal runner error must end the worker
+            # Multiprocessing's normal exception exit joins non-daemon threads
+            # and children. A failed GPU/transfer worker can have one blocked
+            # forever, leaving a live process that no longer serves requests.
+            # The parent owns coordinated teardown; let its sentinel fire even
+            # when the failed runner cannot safely perform local cleanup.
+            try:
+                logger.exception("%s: fatal runner loop failure", self.label)
+            finally:
+                os._exit(1)
 
     def exit(self):
         if not getattr(self, "still_running", True):

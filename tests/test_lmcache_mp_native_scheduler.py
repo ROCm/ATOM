@@ -764,6 +764,78 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
 
 
 @pytest.mark.parametrize("succeeded", [True, False])
+def test_cache_migration_waits_for_joint_native_completion(monkeypatch, succeeded):
+    engine, _, _ = engine_scheduler(monkeypatch)
+    seq = Sequence(list(range(24)), 4, has_per_req_cache=True)
+    seq.dp_cache_balance = True
+    seq.dp_cache_migration = 1
+    seq.dp_cache_minimum_hit = 16
+    seq.dp_cache_prepare_timeout = 5
+    events = []
+    engine.dp_cache_admission_callback = events.append
+    engine.add(seq)
+    batch, scheduled = engine.schedule()
+    assert not scheduled and not events
+    [request] = batch.connector_meta_output.requests
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            **{
+                "finished_loading" if succeeded else "failed_loading": {
+                    request.load_operation
+                }
+            }
+        )
+    )
+    batch, scheduled = engine.schedule()
+    if succeeded:
+        assert events == [(seq.id, 1, 16)]
+        assert list(batch.num_cached_tokens) == [16]
+    else:
+        assert not scheduled and not events
+        assert engine.take_rejected() == [seq]
+        assert seq.dp_cache_retry_reason == "recoverable_prefix_too_short"
+
+
+def test_cache_migration_aligns_local_hit_before_native_copy(monkeypatch):
+    engine, connector, _ = engine_scheduler(monkeypatch, adapter=_ReachAdapter(32))
+    bm = engine.block_manager
+    warm = Sequence(list(range(12)) + [900] * 4, 4, has_per_req_cache=True)
+    assert bm.allocate(warm, bm.can_allocate(warm))
+    bm.hash_blocks(warm, 12)
+    checkpoint(connector, bm.paged_state_checkpoints, warm, 12)
+    bm.deallocate(warm)
+    seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    seq.dp_cache_balance = True
+    seq.dp_cache_migration = 2
+    seq.dp_cache_minimum_hit = 32
+    seq.dp_cache_prepare_timeout = 5
+    events = []
+    engine.dp_cache_admission_callback = events.append
+    engine.add(seq)
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    assert not events
+    assert list(batch.num_cached_tokens) == [12]
+    assert list(batch.num_scheduled_tokens) == [4]
+    assert connector.pending_prefill_handoff(seq) == (16, 32)
+    engine.postprocess(
+        [seq], ScheduledBatchOutput([seq.id], [(123,)], None, None, None), batch=batch
+    )
+    batch, scheduled = engine.schedule()
+    assert not scheduled and not events
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    [request] = batch.connector_meta_output.requests
+    assert request.load_spec.hbm_cached_tokens == 16
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={request.load_operation})
+    )
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    assert events == [(seq.id, 2, 32)]
+    assert list(batch.num_cached_tokens) == [32]
+
+
+@pytest.mark.parametrize("succeeded", [True, False])
 def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     monkeypatch, succeeded
 ):

@@ -19,7 +19,11 @@ from catalog import build_args, build_env_vars
 
 CATALOG = ".github/benchmark/models_agentic.json"
 NIGHTLY_CATALOG = ".github/benchmark/models_agentic_nightly.json"
-PROFILE_CATALOGS = {"test": CATALOG, "nightly": NIGHTLY_CATALOG}
+PROFILE_CATALOGS = {
+    "test": CATALOG,
+    "nightly": NIGHTLY_CATALOG,
+    "dp-cache-ab": ".github/benchmark/models_agentic_dp_cache_ab.json",
+}
 
 
 def resolve_run_image(image):
@@ -130,6 +134,16 @@ def build_configs(path=None, inputs=None):
     if selected - known:
         raise ValueError(f"Unknown agentic models: {sorted(selected - known)}")
     configs = [c for c in configs if not selected or c["prefix"] in selected]
+
+    variants = {
+        name.strip() for name in inputs.get("variants", "").split(",") if name.strip()
+    }
+    known_variants = {config["suffix"] for config in configs}
+    if variants - known_variants:
+        raise ValueError(
+            f"Unknown agentic variants: {sorted(variants - known_variants)}"
+        )
+    configs = [c for c in configs if not variants or c["suffix"] in variants]
 
     if inputs.get("concurrency", "").strip():
         values = _concurrency(

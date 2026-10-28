@@ -305,6 +305,19 @@ class TestBuildSamplingParams:
 
 
 class TestDPSessionAffinityHeaders:
+    @pytest.mark.parametrize("legacy_switch", ["0", "1"])
+    def test_cache_balance_reads_sessions_independently_of_legacy_switch(
+        self, monkeypatch, legacy_switch
+    ):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", legacy_switch)
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(core_mgr=SimpleNamespace(_cache_balancer=object())),
+        )
+        request = SimpleNamespace(headers={"x-correlation-id": "session"})
+        assert api_server._get_dp_session_affinity_ids(request) == ("session", None)
+
     def test_disabled_drops_session_metadata(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "0")
         request = SimpleNamespace(

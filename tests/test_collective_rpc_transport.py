@@ -786,6 +786,48 @@ def test_the_monitor_records_the_rank_that_died_before_tearing_down():
     assert seen == [{1: 3}]
 
 
+def _fatal_worker_with_blocked_thread(ready):
+    proc = _proc()
+    thread = threading.Thread(target=threading.Event().wait, daemon=False)
+    thread.start()
+    ready.set()
+    proc.get_func = lambda: ("raises", [])
+    proc._run_busy_loop()
+
+
+def test_fatal_runner_exits_with_a_blocked_non_daemon_thread():
+    """A fatal worker must become dead even if a library thread cannot drain."""
+    import multiprocessing
+    from multiprocessing.connection import wait
+
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Event()
+    proc = ctx.Process(target=_fatal_worker_with_blocked_thread, args=(ready,))
+    proc.start()
+    try:
+        assert ready.wait(timeout=30), "child failed to initialize"
+        assert wait([proc.sentinel], timeout=5), "fatal worker stayed alive"
+        proc.join(timeout=1)
+        assert proc.exitcode == 1
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+        proc.join(timeout=5)
+        proc.close()
+
+
+def test_run_busy_loop_preserves_graceful_exit_and_generic_rpc_errors():
+    proc = _proc()
+    payload = RpcPayload(request_id="recoverable-error")
+    calls = iter([("raises", [payload]), ("exit", [])])
+    proc.get_func = lambda: next(calls)
+    proc._run_busy_loop()
+    results = _drain(proc.rpc_queue)
+    assert len(results) == 1
+    assert not results[0].ok
+    assert "boom" in results[0].error
+
+
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), "soon"])
 def test_a_timeout_no_deadline_can_be_built_from_is_refused(timeout):
     """Every comparison with NaN is false, so its deadline never passed and

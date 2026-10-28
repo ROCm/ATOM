@@ -280,8 +280,10 @@ RESTORE
 - One MP server supports TP, single-host DP, and single-host DP-attention with
   EP. DP replicas use private request-session IDs but share the same
   content-addressed model namespace.
-- Multi-node DP, PP, PCP, DCP, and engine-driven transfers are rejected.
-  Multi-node DP needs one GPU-local LMCache server per host plus routing.
+- PP, PCP, DCP, and engine-driven transfers are rejected. Multi-node DP needs
+  an explicit `lmcache.mp.server_urls_by_rank` map to GPU-local MP servers
+  plus a shared backing tier. See the experimental
+  [cache-aware DP placement guide](../../../docs/dp_cache_balance.md).
 - PAGE tensors are registered as zero-copy `uint8` views, preserving FP8/BF16
   bit patterns and avoiding numerical dtype conversion in ROCm pointer paths.
 - DSv4 declares PAGE and native STATE fully TP-replicated. In `auto` mode, one

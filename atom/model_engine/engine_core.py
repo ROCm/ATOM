@@ -206,6 +206,9 @@ class EngineCore:
                     "prefill_token_graphs", wait_out=True
                 ),
             )
+            self.scheduler.dp_cache_admission_callback = lambda event: (
+                self.output_queue.put_nowait(("CACHE_ADMITTED", event))
+            )
             if (
                 config.parallel_config.data_parallel_size == 1
                 and config.pipeline_parallel_size == 1
@@ -541,6 +544,10 @@ class EngineCore:
             batch=batch,
         )
 
+        cache_work = self.scheduler.take_cache_work()
+        if cache_work:
+            self.output_queue.put_nowait(("CACHE_WORK", cache_work))
+
         # Send stream outputs to main process via output_queue
         try:
             while not self.stream_output_queue.empty():
@@ -822,6 +829,18 @@ class EngineCore:
                     socket.send(obj)
                     continue
 
+                if isinstance(item, tuple) and item[0] == "CACHE_ADMITTED":
+                    socket.send(
+                        pickle.dumps((EngineCoreRequestType.CACHE_ADMITTED, item[1]))
+                    )
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "CACHE_WORK":
+                    socket.send(
+                        pickle.dumps((EngineCoreRequestType.CACHE_WORK, item[1]))
+                    )
+                    continue
+
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
@@ -956,10 +975,18 @@ class DPEngineCoreProc(EngineCore):
     def _execute_dummy_batch(self):
         prefill = self.scheduler.dummy_prefill
         fwd_out = self.runner_mgr.call_func("dummy_execution", prefill, wait_out=True)
-        if prefill and self.scheduler.running:
+        if self.scheduler.running and (
+            prefill
+            or any(
+                seq.status == SequenceStatus.ABORTED for seq in self.scheduler.running
+            )
+        ):
             # This rank decoded last step and gave this tick to its peers'
             # prefill: the tokens that step sampled come back with this
-            # forward (deferred output), and land like any step's.
+            # forward (deferred output), and land like any step's. Aborted
+            # alignment-only prefills also need postprocess even when no real
+            # request was scheduled; their buffers stay live through this
+            # dummy forward before normal abort cleanup reclaims them.
             self._postprocess((), fwd_out, None)
 
     def _sync_dp_state(
