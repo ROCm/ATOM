@@ -41,6 +41,7 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
+from atom.distributed.token_sync import broadcast_from_rank0
 from atom.kv_transfer.disaggregation import (
     KVConnectorFactory,
     KVConnectorOutput,
@@ -3381,7 +3382,7 @@ class ModelRunner:
             needs_independent_noise=True,
         )
         if get_tp_group().world_size > 1:
-            tokens = get_tp_group().broadcast(tokens.contiguous(), src=0)
+            tokens = broadcast_from_rank0(tokens, get_tp_group())
         return tokens[:rows], tokens[rows:]
 
     @_profile_runner_stage
@@ -3476,8 +3477,8 @@ class ModelRunner:
                         top_ps,
                     )
                     if target_token_ids.numel() and get_tp_group().world_size > 1:
-                        target_token_ids = get_tp_group().broadcast(
-                            target_token_ids, src=0
+                        target_token_ids = broadcast_from_rank0(
+                            target_token_ids, get_tp_group()
                         )
                 bonus_token_ids = self.sampler(
                     logits=bonus_logits,
@@ -3512,7 +3513,7 @@ class ModelRunner:
             and not tokens_tp_synced
             and (self.tokenID_processor.is_deferred_out or hasattr(self, "drafter"))
         ):
-            sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            sampled_tokens = broadcast_from_rank0(sampled_tokens, get_tp_group())
 
         # Compute logprobs if any sequence requested them
         need_logprobs = any(batch.return_logprobs)

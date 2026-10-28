@@ -250,6 +250,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPEC_FUSED_VERIFY_SAMPLE": lambda: (
         os.getenv("ATOM_SPEC_FUSED_VERIFY_SAMPLE", "0") == "1"
     ),
+    # Sync sampled token ids across TP ranks with aiter's custom all-gather
+    # (rank 0's slice of it) instead of an RCCL broadcast. Bit-exact: the
+    # gather is a memcpy. Falls back to the broadcast where the custom gather
+    # is unavailable (ATOM_USE_CUSTOM_ALL_GATHER=0, no ca_comm, oversize).
+    "ATOM_TP_TOKEN_SYNC_ALLGATHER": lambda: (
+        os.getenv("ATOM_TP_TOKEN_SYNC_ALLGATHER", "0") == "1"
+    ),
     # Broadcast EAGLE3 verification predictions and acceptance decisions from
     # TP rank 0 so every tensor-parallel rank advances with identical results.
     # SGLang lacks this broadcast path; the ATOM plugin adds it to match native
