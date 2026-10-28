@@ -80,7 +80,7 @@ def check(rank):
         head_dim=128,
         rms_norm_eps=1e-6,
         partial_rotary_factor=0.5,
-        max_position_embeddings=1024,
+        max_position_embeddings=8192,
         rope_theta=10000.0,
         sparse_attention_config={
             "sparse_block_size": 128,
@@ -264,10 +264,118 @@ def check(rank):
         torch.cuda.synchronize()
         expected = reference(x, pos)
         torch.testing.assert_close(captured.float(), expected, atol=0.005, rtol=0.02)
+        check_draft(rank, cfg, hf)
         print(
             f"rank {rank}: real M3 layer prefill and q=8 graph replay match dense reference; max error {float((captured.float()-expected).abs().max()):.6f}",
             flush=True,
         )
+
+
+def check_draft(rank, cfg, hf):
+    from aiter import dtypes
+
+    from atom.models.minimax_m3.dspark import M3DSparkAttention
+
+    cfg.kv_cache_dtype = "fp8"
+    draft = M3DSparkAttention(cfg, hf, None, 0, prefix="test_draft")
+    assert draft.num_heads == 64 and draft.num_kv_heads == 4
+    widths = [8192, 512, 512]
+    w = torch.randn(sum(widths), 256, dtype=torch.bfloat16) * 0.02
+    draft.qkv_proj.weight.copy_(
+        torch.cat([part.chunk(4)[rank] for part in w.split(widths)])
+    )
+    ow = torch.randn(256, 8192, dtype=torch.bfloat16) * 0.02
+    draft.o_proj.weight.copy_(ow.chunk(4, 1)[rank])
+    draft.qkv_proj.process_weights_after_loading()
+    draft.o_proj.process_weights_after_loading()
+    draft.q_norm.weight.zero_()
+    draft.k_norm.weight.zero_()
+    prefix = 4224
+    total = prefix + 8
+
+    def pool(pages):
+        p = MhaKvPool(
+            layers=1,
+            block_size=128,
+            num_kv_heads=4,
+            head_dim=128,
+            kv_dtype=dtypes.fp8,
+        )
+        p.allocate(pages, "cuda")
+        k, v = p.kv_views(0, page_tokens=16)
+        ks, vs = p.scale_views(0, page_tokens=16)
+        for plane in (k, v, ks, vs):
+            plane.zero_()
+        return p, (k, v, ks, vs)
+
+    local_pool, local = pool((total + 511) // 512)
+    _full_pool, full = pool((total + 127) // 128)
+    draft.kv.k_cache, draft.kv.v_cache = local_pool.kv_views(0)
+    draft.kv.k_scale, draft.kv.v_scale = local_pool.scale_views(0)
+    context = torch.randn(prefix, 256, dtype=torch.bfloat16)
+    pos_ctx = torch.arange(prefix, dtype=torch.int64)
+
+    def slots(pos):
+        return torch.where((pos // 128) % 4 == rank, pos // 512 * 128 + pos % 128, -1)
+
+    draft.write_context_kv(context, pos_ctx, slots(pos_ctx))
+    _, k, v = (context @ w.T).split(widths, -1)
+    draft._norm_rope_write(k, k, v, 0, pos_ctx, pos_ctx, full)
+    # Independently computed P-side and DCP context cache must have identical
+    # physical page-16 bytes, including per-token K and V scale planes.
+    for a, b in zip(local, full):
+        a, b = a.view(torch.uint8).reshape(
+            -1, 8, *a.view(torch.uint8).shape[1:]
+        ), b.view(torch.uint8).reshape(-1, 8, *b.view(torch.uint8).shape[1:])
+        for page in range(rank, prefix // 128, 4):
+            torch.testing.assert_close(a[page // 4], b[page], atol=0, rtol=0)
+
+    pos = torch.arange(prefix, total, dtype=torch.int64)
+    x = torch.randn(8, 256, dtype=torch.bfloat16)
+    starts = ((pos - 4095).clamp_min(0) // 16 * 16).to(torch.int32)
+    md = NS(
+        slot_mapping=slots(pos),
+        block_tables=torch.arange((total + 511) // 512, dtype=torch.int32)[None, :],
+        dspark_dcp_req=torch.zeros(8, dtype=torch.int32),
+        dspark_dcp_lens=torch.full((8,), total, dtype=torch.int32),
+        dspark_dcp_start=starts,
+    )
+    fc._forward_context = fc.ForwardContext(
+        attn_metadata=md, context=fc.Context(positions=pos, is_prefill=False)
+    )
+
+    def reference():
+        q, k, v = (x @ w.T).split(widths, -1)
+        q, _ = draft._norm_rope_write(q, k, v, 64, pos, pos, full)
+        k16, v16, ks, vs = full
+        k = k16.float().permute(0, 3, 1, 2, 4).reshape(-1, 4, 128)[:total]
+        v = v16.float().permute(0, 2, 4, 1, 3).reshape(-1, 4, 128)[:total]
+        k *= ks.permute(0, 2, 1).reshape(-1, 4, 1)[:total]
+        v *= vs.permute(0, 2, 1).reshape(-1, 4, 1)[:total]
+        k = k.repeat_interleave(16, 1).transpose(0, 1)
+        v = v.repeat_interleave(16, 1).transpose(0, 1)
+        q = q.view(8, 64, 128).float().transpose(0, 1)
+        # Noncausal draft: every block row can read all eight new keys, with
+        # only the existing page-rounded left edge of the window masked.
+        mask = torch.arange(total)[None, :] >= starts[:, None]
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        return out.transpose(0, 1).reshape(8, 8192) @ ow.float().T
+
+    actual = draft(pos, x)
+    torch.testing.assert_close(actual.float(), reference(), atol=0.01, rtol=0.05)
+    with ps.graph_capture() as capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture.stream):
+            captured = draft(pos, x)
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = reference()
+    torch.testing.assert_close(captured.float(), expected, atol=0.01, rtol=0.05)
+    print(
+        f"rank {rank}: real DSpark context writes and noncausal 4096-window graph replay passed; max error {float((captured.float()-expected).abs().max()):.6f}",
+        flush=True,
+    )
 
 
 def main():

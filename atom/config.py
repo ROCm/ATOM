@@ -1935,8 +1935,8 @@ def indexer_cp_unsupported_reason(
 
     Note the DCP relationship is EXCLUSIVE, not a prerequisite. This shards the
     indexer's block scoring; real DCP shards the KV cache itself (BlockManager
-    scales the prefix-cache hash granularity by dcp_world_size), and M3 has no
-    DCP-aware attention path at all. The two cannot both own the context axis.
+    scales the prefix-cache hash granularity by dcp_world_size). M3 KV-cache
+    DCP has its own all-head attention path; both cannot own the context axis.
 
     ``plugin_mode`` belongs here rather than only in ``indexer_cp_enabled``
     because this gate is what clears the FLAG. Leaving it set under a bridge

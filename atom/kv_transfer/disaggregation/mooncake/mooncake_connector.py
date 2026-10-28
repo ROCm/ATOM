@@ -3000,8 +3000,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         # Under DCP the consumer rank owns only part of each block, so
         # whole-block descriptors no longer line up and the push becomes the
-        # per-region relayout described at the top of this file. Safe in token
-        # units because DCP only runs on MLA, which stores a token contiguously.
+        # per-region relayout described at the top of this file. MLA consumes
+        # contiguous token runs; M3 below uses each plane's physical token axes.
         dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
         interleave = request_data.get("consumer_dcp_interleave", 1)
         sharded_plan = None

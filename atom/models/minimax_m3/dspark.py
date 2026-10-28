@@ -34,10 +34,10 @@ through the per-row ASM / Gluon decode the target's sparse layers run and a
 page-16 table ``prepare_paged_block`` builds outside the graph; the block's own K/V
 are written into the cache first, except at positions past the request's
 allocated pages. No host sync and fixed shapes, so the block pass is CUDA-graph
-captured like the other drafts. The per-row decode takes one KV head per rank,
-so the draft needs TP >= its KV head count (4) to draft; a PP P/D producer
-never proposes and only writes context K/V, so it may hold several (all four
-on a TP1 stage).
+captured like the other drafts. TP decode takes one KV head per rank; DCP4
+gathers all heads and merges attention over each rank's owned token blocks.
+A PP P/D producer never proposes and only writes context K/V, so it may hold
+several heads (all four on a TP1 stage).
 
 Checkpoint layout (``<draft>/dspark``, MXFP8 [1, 32] linears, BF16 rest):
   language_model.model.dspark.fc.weight                       [6144, 5 * 6144]

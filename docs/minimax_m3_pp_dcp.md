@@ -74,6 +74,8 @@ each rank receives approximately one quarter, subject to block tails.
   four GPUs, including projection and fused writers, compared with dense
   PyTorch attention over unsharded quantized KV. Checks byte equality and q=8
   whole-layer graph replay with changed inputs (short contexts, all blocks selected).
+  Also checks the real DSpark layer: context writes, noncausal block attention,
+  the page-rounded 4096-token window, output reduction and full graph replay.
 - CI accuracy cases: `minimax-m31-flash-mxfp4-1p1d-pp4-dcp4-dspark7-nvfp4-gsm8k-5shot-c32`
   and its `gsm8k-5shot-chunked-c32` counterpart. They retain the PP4 integration's
   full 1319-question, five-shot, real-acceptance GSM8K gate (0.94).
