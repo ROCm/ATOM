@@ -244,6 +244,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_PREFILL_COMPILE_ONLY": lambda: (
         os.getenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "0") == "1"
     ),
+    # MTP verify under TP: sample the verify rows and the bonus rows in one
+    # sampler call with one TP broadcast, instead of two calls, a broadcast of
+    # the verify draws and a second one of the accepted tokens.
+    "ATOM_SPEC_FUSED_VERIFY_SAMPLE": lambda: (
+        os.getenv("ATOM_SPEC_FUSED_VERIFY_SAMPLE", "0") == "1"
+    ),
     # Broadcast EAGLE3 verification predictions and acceptance decisions from
     # TP rank 0 so every tensor-parallel rank advances with identical results.
     # SGLang lacks this broadcast path; the ATOM plugin adds it to match native
