@@ -89,8 +89,9 @@ Add these to the launch command:
   --num-speculative-tokens 7 \
 ```
 
-Seven is what the row cap wants: a step is served only at 8 rows or fewer, and
-bs=1 with seven speculative tokens is exactly 8 (see below).
+Seven draft tokens make one request exactly 8 rows. The buffers hold 16 rows
+(`atom/models/kimi_k3/mono/config.py:MAX_ROWS`), so up to 15 draft tokens are
+accepted for a single request; every number below was measured at 7.
 
 Add these to the launch's `exclude_layer` list:
 
@@ -102,18 +103,78 @@ The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or
 `Kimi-K3 mono decode off: <why>` naming the first condition that failed. Read
 it before concluding anything about a run.
 
-**A step is served only if it is at most 8 rows** (batch x query length).
-bs=1 with seven speculative tokens is 8 rows and is served; bs=2 at the same
-width is 16, which every step declines back to the production path -- the
-server still answers, just without mono.
+**A step is served only if it is at most 16 rows** (batch x query length). bs=1
+with seven speculative tokens is 8 rows and bs=2 at the same width is 16; both
+are served, including the bs=2 CUDA graph. A step past 16 rows declines back to
+the production path -- the server still answers, just without mono. The log
+names a declined row count once per distinct count (`Kimi-K3 mono decode
+declined a step: 24 rows > the 16-row buffers`), so the number of such lines is
+the number of distinct widths turned away, not the number of steps.
 
-The cap is a constant (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`), not a
-switch. 16 rows is correct -- the kernels stride over their columns rather
-than assuming one pass covers them -- and measurably faster (-13.4 % target
-forward against stock). It stays at 8 because no task-level accuracy run
-exists at any width and K2's latent MoE carries a real, unsettled precision
-cost, so raising it is a decision to make on accuracy evidence rather than on
-speed.
+The 16-row cap and K2 on the 24 full-attention (MLA) layers are fixed; there is
+no switch for either. Only `ATOM_MONO_ENABLE=0` turns them off, and it turns
+off mono on the KDA layers with them. What this means for a deployment that
+used to run the 8-row, KDA-only mono:
+
+- bs=2 steps (16 rows) and every CUDA-graph capture size up to 16 rows now run
+  on the kernels instead of the production path. The log line above no longer
+  appears for them.
+- The peer buffer doubles, 4.76 MB to 9.52 MB a rank, and is zeroed at every
+  step.
+- K2 on the MLA layers dequantizes those layers' latent-MoE weights: about
+  1.4 GB a rank (24 layers x about 58 MB, computed from the per-layer size in
+  `mono/weights.py`; not measured). The runner is built on the first eligible
+  decode step, which in the code is after the KV-cache block count is fixed:
+  `warmup_model` runs a prefill-only dummy batch (mono declines prefill),
+  `get_num_blocks` runs no forward, and the first decode forward that is not a
+  graph capture is the per-size warm-up forward in `capture_cudagraph` (the
+  first real decode step under `--enforce-eager`). So these weights
+  are not part of the KV-cache budget and come out of the memory left over
+  (`1 - gpu_memory_utilization` and the 2 % safety margin). That is read from
+  the code, not observed; whether the margin holds on a tight deployment is not
+  tested.
+- K2's latent MoE has a documented MXFP4 precision cost (rel_L2 vs stock median
+  0.24) and now covers 24 more layers. The task-level checks are paired GSM8K
+  runs (3-shot, 1319 questions, two concurrent requests, same configuration, no
+  synthetic acceptance length): 16 rows scored 0.9591 against 0.9439 at the
+  8-row cap (paired z = +2.4); MLA K2 against the 8-row control was +0.0038
+  (z = +0.6). Neither run showed a regression; the second is not distinguishable
+  from no change.
+- An MLA layer whose K2 cannot bind (for example a quantized `o_proj`; the
+  `exclude_layer` list above keeps `o_proj` bf16) stays on the production K2
+  alone and logs `Kimi-K3 mono: layer N keeps its production K2`; the other
+  layers keep mono. A KDA layer that cannot bind still turns the whole runner
+  off, as before.
+- At bs=1 K2 on the MLA layers cut the step ITL from 16.5 to 14.8 ms. The
+  benchmark below has no C1 number for the old default (8 rows, no K2).
+
+`ATOM_PREFILL_DECODE_INTERVAL=1000000` delays admitting a new prefill while any
+request is decoding, using the existing `PrefillDelayer`
+(`atom/model_engine/prefill_delayer.py`) in its local mode (DP=1, PP=1). After a
+prefill runs, the interval holds further prefill until the running-decode count
+reaches zero, so for the agentic trace requests mostly decode one at a time. It
+is not a hard bs=1 guarantee: while another request is in chunked prefill the
+running-decode count is zero, so a second request can be admitted then and two
+can decode together afterward. Launch with
+`--max-num-seqs 2 --cudagraph-capture-sizes "[1,2]"`; `--max-num-seqs 1` fails
+at startup on a DSpark deployment (the block drafter's warmup needs two
+sequences). Queued requests wait, so TTFT rises (mean 0.9 s to about 1.8 s on
+the agentic trace).
+
+Agentic trace, TP8, DSpark k=7, 16-row cap and MLA K2 on, official client 3600 s
+each, p90 interactivity (tok/s/user). This is a synthetic benchmark: the
+acceptance length is forced to 3.84, so throughput is meaningful but the
+generated text is not, and it says nothing about accuracy. Native vLLM (one
+request at a time) 177.4; ATOM without the delayer or the scheduler cap 177.1;
+with a scheduler admission cap (since removed) 216.6 and 217.5 on two machines;
+with `ATOM_PREFILL_DECODE_INTERVAL=1000000` instead 215.6 (0 errors; delayer held
+about 8 % of scheduler ticks). The 215 to 217 results need the delayer or the
+cap; without one ATOM is level with vLLM. The delayer run is 0.5 to 0.9 % below
+the cap runs; this is one run per arm, not a statistical equivalence test, and
+these runs were measured on the code before the cap was removed.
+At two-request concurrency (C2) ATOM gives 137.4 against vLLM's 130.1; that run
+also predates the removal of the switches, and this recipe does not record
+whether MLA K2 was on in it.
 
 For a performance A/B, keep the launch command and the workload identical and
 change only `ATOM_MONO_ENABLE` between `0` and `1`. Pin

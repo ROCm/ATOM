@@ -158,6 +158,35 @@ def test_speculative_config_detects_dspark():
     assert hf.architectures == ["DeepseekV4DSparkModel"]
 
 
+def test_speculative_config_detects_minimax_m31_standalone_dspark():
+    """MiniMax-M3.1's standalone draft keeps the `dspark_*` names and a
+    `dflash_config`, with an architecture outside the `*DSparkModel` pattern; it
+    must still route to the separate-draft flavor, not the inline V4 one."""
+    import types
+
+    import pytest
+
+    SpeculativeConfig = _real_hf_config_override()
+    if SpeculativeConfig is None:
+        pytest.skip("atom.config not importable in this sandbox")
+
+    hf = types.SimpleNamespace(
+        model_type="",
+        architectures=["DSparkMiniMaxDraftModel"],
+        dspark_block_size=7,
+        dspark_markov_rank=256,
+        dspark_noise_token_id=200058,
+        dspark_target_layer_ids=[3, 17, 31, 45, 59],
+        dflash_config={"target_layer_ids": [3, 17, 31, 45, 59], "mask_token_id": 1},
+    )
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+    assert hf.architectures == ["DSparkMiniMaxDraftModel"]
+    assert hf.dspark_with_draft is True
+    assert hf.dspark_target_layer_ids == [3, 17, 31, 45, 59]
+    assert hf.dspark_noise_token_id == 200058
+    assert hf.dspark_markov_rank == 256
+
+
 def test_speculative_config_mtp_not_misrouted_to_dspark():
     """A plain V4 MTP config (no dspark_block_size) still routes to MTP."""
     import types
@@ -808,9 +837,7 @@ def _proposer_with_graph_bs(
     )
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", False, raising=False)
-    monkeypatch.setattr(
-        DSparkProposer, "aux_for", lambda self, h: [torch.zeros(1)], raising=False
-    )
+    monkeypatch.setattr(DSparkProposer, "_captures_aux", True, raising=False)
     monkeypatch.setattr(DSparkProposer, "verify_scheduler", None, raising=False)
 
     p = DSparkProposer.__new__(DSparkProposer)
@@ -832,6 +859,9 @@ def _proposer_with_graph_bs(
             row_ids=torch.arange(p.config.max_num_seqs + 1, dtype=torch.int32)
         ),
         running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
+        forward_vars={
+            "batch_info": types.SimpleNamespace(gpu=torch.zeros(3, dtype=torch.int32))
+        },
     )
     p._build_draft_graphs()
     return p
@@ -1069,6 +1099,7 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
         scheduled_tokens=308,
         running_tokens=336,
         running_tokens_are_unified=False,
+        scheduled_tokens_gpu=torch.zeros(1, dtype=torch.int32),
     )
     assert fc.context.running_tokens_are_unified is False
     assert asked == [336], "a ragged height is discovered, and it is what RUNS"
@@ -1079,6 +1110,7 @@ def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypat
         scheduled_tokens=308,
         running_tokens=336,
         running_tokens_are_unified=True,
+        scheduled_tokens_gpu=torch.zeros(1, dtype=torch.int32),
     )
     assert fc.context.running_tokens_are_unified is True
     assert asked == [336], "an agreed height is worth no ask"
@@ -1097,24 +1129,27 @@ def test_publishing_a_shape_does_not_decide_whether_it_is_a_prefill():
     fc.context.is_prefill = True
 
     # dp_size 1: no metadata to build, so nothing but the flag is under test.
+    scheduled_tokens_gpu = torch.zeros(1, dtype=torch.int32)
     _bare_drafter(1)._publish_draft_shape(
         fc,
         scheduled_tokens=337,
         running_tokens=337,
         running_tokens_are_unified=False,
+        scheduled_tokens_gpu=scheduled_tokens_gpu,
     )
 
     assert fc.context.is_prefill is True
+    assert fc.context.scheduled_tokens_gpu is scheduled_tokens_gpu
 
 
 def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):
     """EPLB is not a reason to decline the padding, though it used to be.
 
-    The stated reason was the expert-load histogram: a pad row routes through
-    the draft's MoE and `select_experts_with_record` counts it. But the TARGET
-    pads on every cudagraph decode step and its rows reach the same recorder
-    (`eplb_map_and_record_fused` masks nothing), in far greater volume -- so
-    declining here protected nothing and only cost the draft its warmed shape.
+    The stated reason was the expert-load histogram: a pad row would route
+    through the draft's MoE and be counted. But the TARGET pads on every
+    cudagraph decode step, in far greater volume -- so declining here protected
+    nothing and only cost the draft its warmed shape. (Pad rows now route to -1,
+    which the recorder skips.)
 
     Asserting the two are EQUAL, not that either is 48: a future term that
     reads the config back into the width fails here whichever way it leans.
@@ -2058,6 +2093,56 @@ def test_sparse_attention_sizes_on_the_q_not_positions():
 # ---- the paged block's metadata build (Kimi-K3) ------------------------------
 
 
+def test_paged_mla_drafts_keep_the_historical_layer_num_lookup():
+    """The proposer used to read ``layers[0].self_attn.mla_attn.layer_num``.
+
+    That lookup is the base default, so an MLA draft that does not override
+    it still resolves its paged KV. Only a different module layout overrides.
+    """
+    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+    from atom.models.dspark_draft import DSparkDraftModel
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
+    from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    attn = types.SimpleNamespace(layer_num=17)
+    layer = types.SimpleNamespace(self_attn=types.SimpleNamespace(mla_attn=attn))
+
+    class _MlaDraft(DSparkDraftModel):
+        def __init__(self):
+            super().__init__()
+            self.layers = [layer]
+
+    draft = _MlaDraft()
+    assert draft.first_attention_layer_num == 17
+    cache = types.SimpleNamespace(k_cache=torch.zeros(2))
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.model = draft
+    assert (
+        proposer._bound_draft_k_cache(
+            types.SimpleNamespace(kv_cache_data={"layer_17": cache})
+        )
+        is cache.k_cache
+    )
+    # Kimi-K3 is that MLA layout. MiniMax-M3.1 binds a plain KV cache and
+    # must keep its own override; inheriting the default would look up
+    # ``mla_attn`` and fail.
+    assert (
+        KimiK3DSpark.first_attention_layer_num
+        is DSparkDraftModel.first_attention_layer_num
+    )
+    for draft_cls in (DeepseekV4DSpark, DeepseekV41DSpark):
+        assert (
+            draft_cls.first_attention_layer_num
+            is DSparkDraftModel.first_attention_layer_num
+        ), draft_cls.__name__
+    assert (
+        MiniMaxM3DSpark.first_attention_layer_num
+        is not DSparkDraftModel.first_attention_layer_num
+    )
+
+
 def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
     """A DSparkProposer carrying only what `_build_paged_block_metadata` reads.
 
@@ -2081,12 +2166,15 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
         kv_cache_dtype="auto",
     )
     p.dtype = torch.bfloat16
-    p.model = types.SimpleNamespace(window_size=None)
+    p.model = types.SimpleNamespace(window_size=None, block_attention_is_mla=True)
     n_cols = max_model_len // block_size
     block_tables = torch.zeros(p.config.max_num_seqs, n_cols, dtype=torch.int32)
     p.runner = types.SimpleNamespace(
         block_size=block_size,
-        forward_vars={"block_tables": types.SimpleNamespace(gpu=block_tables)},
+        forward_vars={
+            "block_tables": types.SimpleNamespace(gpu=block_tables),
+            "batch_info": types.SimpleNamespace(gpu=torch.zeros(3, dtype=torch.int32)),
+        },
     )
     p._init_draft_block_buffers()
 
@@ -2392,3 +2480,68 @@ def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
     )
     assert ids.tolist() == [5, 0, 99, 7, 7, 7]
     assert anchor_positions.tolist() == [6, 15, 27, 39, 39, 39]
+
+
+def test_page16_table_expands_every_page_into_its_eight_sub_pages():
+    """MiniMax-M3.1 DSpark block rows read a page-16 table built from the
+    page-128 block table: page p -> 8p .. 8p+7, in column order."""
+    import torch
+
+    from atom.models.minimax_m3.dspark import _page16_table
+
+    bt = torch.tensor([[0, 1, 0], [5, 7, 2]], dtype=torch.int32)
+    out = torch.full((2, 24), -1, dtype=torch.int32)
+    _page16_table(bt, out, torch.arange(8, dtype=torch.int32))
+    expect = (bt.repeat_interleave(8, dim=1) * 8) + torch.arange(8).repeat(3)
+    assert torch.equal(out, expect.to(torch.int32))
+
+
+@pytest.mark.parametrize("window", [0, 35])
+def test_window_rows_start_each_row_at_its_own_window(window):
+    """Each MiniMax-M3.1 DSpark block row starts at the page-16 holding the
+    first key of ITS window (position - window + 1), not one start shared by
+    the block, and not moved by the allocation cap on the request's length.
+    Pad rows repeat the last real anchor and read from their first page."""
+    import torch
+
+    from atom.models.minimax_m3.dspark import _window_rows
+
+    P, T, rb = 32, 3, 2
+    bt16_flat = torch.arange((rb + 1) * P, dtype=torch.int32)
+    # Request 0 is capped at 98 of its 100 keys; request 1 is padding.
+    ctx_eff = torch.tensor([98, 8], dtype=torch.int32)
+    positions = torch.tensor([97, 98, 99, 99, 99, 99])
+    row_req = torch.arange(rb).repeat_interleave(T)
+    tables = torch.empty(rb * T, P, dtype=torch.int32)
+    lens = torch.empty(rb * T, dtype=torch.int32)
+    _window_rows(
+        bt16_flat,
+        ctx_eff,
+        positions,
+        row_req,
+        window,
+        T,
+        torch.empty(rb * T, dtype=torch.int64),
+        tables,
+        lens,
+    )
+    # Window starts 63, 64, 65 -> page-16s 3, 4, 4.
+    start16 = [3, 4, 4] if window else [0, 0, 0]
+    expect_lens = [98 - 16 * s for s in start16] + [8, 8, 8]
+    assert lens.tolist() == expect_lens
+    for row, s in enumerate(start16 + [0, 0, 0]):
+        first = row_req[row].item() * P + s
+        assert tables[row].tolist() == list(range(first, first + P))
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
+    """The MiniMax-M3.1 draft decodes its block per row with one KV head per
+    rank; with 4 KV heads it refuses TP < 4 at construction rather than
+    failing on the first drafted block."""
+    import atom.models.minimax_m3.dspark as m3_dspark
+
+    monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: tp)
+    config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    with pytest.raises(ValueError, match="needs TP >= 4"):
+        m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)

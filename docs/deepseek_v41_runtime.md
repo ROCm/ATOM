@@ -84,9 +84,12 @@ arithmetic (E2M1, one E8M0 per 32 dims) in the row-group scorer's page-8
 layout, values and scales in two planes (`index_plane.py`); one aiter kernel
 norms, rotates, quantizes and stores a key, bit for bit the FP8 path's key
 chain before its quantization. The main pool is independent of it and takes
-`kv_cache_dtype="bf16"` or `"fp4"`; under FP4, main rows use their own format
-and SWA uses FP8. Both use the original V4 BF16 attention kernels and inverse
-RoPE; no V4 file is modified to serve V4.1.
+`kv_cache_dtype="fp8"` (the deployed configuration), `"bf16"` or `"fp4"`.
+Under FP8, main and SWA rows are MXFP8 (E4M3, one E8M0 per 32 dims) and
+attention runs on them through AITER's `mla_sparse_prefill_v41`; under FP4,
+main rows use their own format and SWA uses FP8. BF16 and FP4 use the original
+V4 BF16 attention kernels and inverse RoPE; no V4 file is modified to serve
+V4.1.
 
 Each plane format has one scorer, for every shape. It reads the plane in place and
 gives each query row its own bound and its own tile list, so a prefill token, a
@@ -129,15 +132,18 @@ backend to select and no capture exclusion.
 
 See [cache format and graph execution](deepseek_v41_performance.md) for cache
 formats, graph ownership and memory limits. Native five-token DSpark admits
-TP sizes that satisfy model dimension divisibility, with BF16 caches and
-optional target graphs; its draft
+TP sizes that satisfy model dimension divisibility, with FP8 or BF16 caches
+and optional target graphs; its draft
 windows, accepted-prefix state, calibration profile, supported scope and **quality
 limitations** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
 speculative caches and multimodal speculation are rejected, as are
 PP/CP, DP without DP attention, decode TBO, KV transfer other than `lmcache_mp`, RapidServe
 and EPLB — all before loading. Plugin execution is no longer among them: V4.1
 runs on the vLLM plugin backend, described in
-[the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units and
+[the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units. With
+encoder SWA bounded replay (the default) it moves PAGE alone, and a tier load
+resumes like an HBM hit: the forward replays the hash block below it
+(`BlockManager.tier_resume_replays`). With `--no-encoder-swa-bounded-replay` it
 restores STATE through the same PAGE-backed checkpoint images the local prefix
 cache uses (`get_kv_transfer_tensors` publishes each plane of a unit, in
 `StateCopies` order).
@@ -162,13 +168,14 @@ the CPU; moving the lookup to HBM and fusing it further is future work.
 `--tensor-parallel-size 4 --enable-dp-attention` starts four attention ranks,
 each with TP1 attention, embeddings and output head. Tensor-sharded routed
 experts exchange activations through the existing DP gather/scatter transport.
-For five-token DSpark, keep BF16 KV and the FP8 index plane:
+For five-token DSpark, use the FP8 KV cache (BF16 also works) and the FP4 or
+FP8 index plane:
 
 ```bash
 HIP_VISIBLE_DEVICES=0,1,2,3 python -m atom.entrypoints.openai_server \
   --model /mnt/DeepSeek-V4.1-Flash \
   --tensor-parallel-size 4 --enable-dp-attention \
-  --kv-cache-dtype bf16 --index-cache-dtype fp8 \
+  --kv-cache-dtype fp8 --index-cache-dtype fp4 \
   --method dspark --num-speculative-tokens 5 \
   --level 3 --cudagraph-mode FULL \
   --max-num-seqs 64 --max-num-batched-tokens 16384 \

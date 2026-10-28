@@ -88,7 +88,7 @@ def make_runner(
     runner.tokenID_processor = SimpleNamespace(num_rejected=None)
     runner.forward_vars = {
         name: CpuGpuBuffer(64, dtype=torch.int32, device=runner.device)
-        for name in ("input_ids", "decode_src")
+        for name in ("input_ids", "decode_src", "batch_info")
     }
     runner.forward_vars["positions"] = CpuGpuBuffer(
         64, dtype=torch.int64, device=runner.device, publication_group="positions"

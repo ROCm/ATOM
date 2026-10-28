@@ -338,7 +338,8 @@ _RUNTIME_PASSTHROUGH = {
 def _runtime_layer(modules, topk_weights, topk_ids, *, apply_router_weight=False):
     layer = _new_fused_moe(modules)
     method = SimpleNamespace(
-        select_experts_with_record=MagicMock(return_value=(topk_weights, topk_ids)),
+        select_experts=MagicMock(return_value=(topk_weights, topk_ids)),
+        place_experts=MagicMock(side_effect=lambda layer, w, ids, gathered: (w, ids)),
         quant_type=object(),
         hidden_pad=17,
         intermediate_pad=19,
@@ -356,6 +357,8 @@ def _runtime_layer(modules, topk_weights, topk_ids, *, apply_router_weight=False
         "shared_expert_scoring_func": None,
         "apply_router_weight_on_input": apply_router_weight,
         "swiglu_limit": 7.0,
+        # No prefilled shared columns to re-mark after the DPA gather.
+        "expert_layout": SimpleNamespace(mode=None),
     }
     for name, value in values.items():
         setattr(layer, name, value)
@@ -501,7 +504,6 @@ def test_runner_wiring_pins_flydsl_weight_layout(comm_fused_env):
 def test_dpa_runner_uses_reduce_scatter_group(comm_fused_env):
     backend, _, state, dp_group = _initialize_backend(comm_fused_env, dpa=True)
     assert backend is not None
-    assert not backend.supports_custom_routing
     assert state.shape_keys == [
         _ShapeKey(
             "gfx950",
@@ -550,10 +552,7 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
     )
 
     assert result is output
-    select_args = method.select_experts_with_record.call_args.kwargs
-    assert select_args["layer"] is layer
-    assert select_args["hidden_states"] is hidden_states
-    assert select_args["router_logits"] is router_logits
+    method.select_experts.assert_called_once_with(layer, hidden_states, router_logits)
     runtime_args = runtime.run.call_args.kwargs
     expected = {
         "hidden_states": hidden_states,
@@ -570,6 +569,9 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
         assert runtime_args[name] is getattr(layer, attribute)
     assert runtime_args["gate_mode"] == _GateMode.INTERLEAVE.value
     assert runtime_args["reuse_is_synchronized"] is False
+    # Routing sends pad rows to expert -1, and a TP layer has no expert_mask
+    # to switch the runtime's missing-route handling on by itself.
+    assert runtime_args["routes_may_be_missing"] is True
 
 
 def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
@@ -577,10 +579,11 @@ def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
 
     local_hidden = torch.randn(2, 8)
     local_router = torch.randn(2, 16)
+    topk_weights = torch.randn(2, 2)
+    topk_ids = torch.zeros(2, 2, dtype=torch.int32)
     gathered_hidden = torch.randn(16, 8)
-    gathered_router = torch.randn(16, 16)
-    topk_weights = torch.randn(16, 2)
-    topk_ids = torch.zeros(16, 2, dtype=torch.int32)
+    gathered_weights = torch.randn(16, 2)
+    gathered_ids = torch.zeros(16, 2, dtype=torch.int32)
     routed = torch.randn(2, 8)
     reduce_scatter_sizes = [3, 1, 1, 2, 2, 3, 2, 2]
     local_shared = torch.randn(2, 8)
@@ -589,8 +592,7 @@ def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
 
     backend._gather_dpa_inputs = MagicMock(
         return_value=(
-            gathered_hidden,
-            gathered_router,
+            (gathered_hidden, gathered_weights, gathered_ids),
             2,
             reduce_scatter_sizes,
         )
@@ -605,12 +607,15 @@ def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
     )
 
     torch.testing.assert_close(output, routed)
-    backend._gather_dpa_inputs.assert_called_once_with(local_hidden, local_router)
-    select_args = method.select_experts_with_record.call_args.kwargs
-    assert select_args["hidden_states"] is gathered_hidden
-    assert select_args["router_logits"] is gathered_router
+    # Routed on the local rows, then the routed rows gathered.
+    method.select_experts.assert_called_once_with(layer, local_hidden, local_router)
+    backend._gather_dpa_inputs.assert_called_once_with(
+        (local_hidden, topk_weights, topk_ids)
+    )
     runtime_args = backend.runtime.run.call_args.kwargs
     assert runtime_args["hidden_states"] is gathered_hidden
+    assert runtime_args["topk_weight"] is gathered_weights
+    assert runtime_args["topk_ids"] is gathered_ids
     assert runtime_args["shared_partial"] is local_shared
     assert runtime_args["before_stage2_for_rows"] is None
     assert runtime_args["reduce_scatter_sizes"] is reduce_scatter_sizes
@@ -623,19 +628,22 @@ def test_dpa_gather_inserts_bucket_padding_inside_each_rank_shard(
     modules, _, backend = _create_dpa_backend(comm_fused_env)
 
     local_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    local_router = torch.tensor([[5.0], [6.0]])
+    local_weights = torch.tensor([[5.0], [6.0]])
+    local_ids = torch.tensor([[7], [8]], dtype=torch.int32)
 
     class FakeGroup:
         world_size = 8
 
         def __init__(self):
             self.locals = []
+            self.sizes = []
+            self.device_communicator = SimpleNamespace(all_gatherv=self._all_gatherv)
 
-        def all_gather(self, tensor, *, use_custom, dim):
-            assert use_custom
+        def _all_gatherv(self, tensors, *, dim, sizes):
             assert dim == 0
-            self.locals.append(tensor.clone())
-            return torch.cat([tensor] * self.world_size, dim=0)
+            self.sizes.append(sizes)
+            self.locals.extend(t.clone() for t in tensors)
+            return [torch.cat([t] * self.world_size, dim=0) for t in tensors]
 
     group = FakeGroup()
     monkeypatch.setattr(modules.comm, "get_dp_group", lambda: group)
@@ -649,19 +657,27 @@ def test_dpa_gather_inserts_bucket_padding_inside_each_rank_shard(
         bucket_for=MagicMock(return_value=32),
         supports_ragged_m=MagicMock(return_value=False),
     )
-    gathered_hidden, gathered_router, local_tokens, sizes = backend._gather_dpa_inputs(
-        local_hidden, local_router
+    (gathered_hidden, gathered_weights, gathered_ids), local_tokens, sizes = (
+        backend._gather_dpa_inputs((local_hidden, local_weights, local_ids))
     )
 
     assert local_tokens == 2
     assert sizes is None
-    assert [tensor.shape for tensor in group.locals] == [(4, 2), (4, 1)]
-    torch.testing.assert_close(group.locals[0][:2], local_hidden)
-    torch.testing.assert_close(group.locals[0][2:], torch.zeros(2, 2))
-    torch.testing.assert_close(group.locals[1][:2], local_router)
-    torch.testing.assert_close(group.locals[1][2:], torch.zeros(2, 1))
+    # One grouped collective, every shard padded to the bucket's 4 rows.
+    assert group.sizes == [[4] * 8]
+    assert [tensor.shape for tensor in group.locals] == [(4, 2), (4, 1), (4, 1)]
+    hidden_sent, weights_sent, ids_sent = group.locals
+    torch.testing.assert_close(hidden_sent[:2], local_hidden)
+    torch.testing.assert_close(hidden_sent[2:], torch.zeros(2, 2))
+    torch.testing.assert_close(weights_sent[:2], local_weights)
+    torch.testing.assert_close(weights_sent[2:], torch.zeros(2, 1))
+    # The pad rows are routed nowhere (ids travel as their float carrier).
+    ids_sent = ids_sent.view(torch.int32)
+    assert torch.equal(ids_sent[:2], local_ids)
+    assert (ids_sent[2:] == -1).all()
     assert gathered_hidden.shape == (32, 2)
-    assert gathered_router.shape == (32, 1)
+    assert gathered_weights.shape == (32, 1)
+    assert gathered_ids.dtype == torch.int32 and gathered_ids.shape == (32, 1)
     backend.runtime.bucket_for.assert_called_once_with(24)
 
 
@@ -672,11 +688,11 @@ def test_dpa_window_gathers_compact_inputs_with_one_grouped_all_gatherv(
 
     sizes = [3, 5, 1, 7, 2, 6, 4, 8]
     local_hidden = torch.randn(sizes[1], 8)
-    local_router = torch.randn(sizes[1], 16, dtype=torch.float32)
+    local_weights = torch.randn(sizes[1], 2, dtype=torch.float32)
     gathered_hidden = torch.randn(sum(sizes), 8)
-    gathered_router = torch.randn(sum(sizes), 16, dtype=torch.float32)
+    gathered_weights = torch.randn(sum(sizes), 2, dtype=torch.float32)
     communicator = SimpleNamespace(
-        all_gatherv=MagicMock(return_value=[gathered_hidden, gathered_router])
+        all_gatherv=MagicMock(return_value=[gathered_hidden, gathered_weights])
     )
     group = SimpleNamespace(
         world_size=8,
@@ -698,21 +714,23 @@ def test_dpa_window_gathers_compact_inputs_with_one_grouped_all_gatherv(
         ),
         tokens=sizes[1],
     )
-    actual_hidden, actual_router, local_tokens, actual_sizes = (
-        backend._gather_dpa_inputs(local_hidden, local_router)
+    (actual_hidden, actual_weights), local_tokens, actual_sizes = (
+        backend._gather_dpa_inputs((local_hidden, local_weights))
     )
 
-    assert actual_hidden is gathered_hidden
-    assert actual_router is gathered_router
+    assert torch.equal(actual_hidden, gathered_hidden)
+    assert torch.equal(actual_weights, gathered_weights)
     assert local_tokens == sizes[1]
     assert actual_sizes == sizes
     backend.runtime.bucket_for.assert_called_once_with(64)
     backend.runtime.supports_ragged_m.assert_called_once_with(64)
-    communicator.all_gatherv.assert_called_once_with(
-        [local_hidden, local_router],
-        dim=0,
-        sizes=sizes,
-    )
+    communicator.all_gatherv.assert_called_once()
+    (sent,), kwargs = communicator.all_gatherv.call_args
+    assert kwargs == {"dim": 0, "sizes": sizes}
+    assert [torch.equal(s, t) for s, t in zip(sent, (local_hidden, local_weights))] == [
+        True,
+        True,
+    ]
     group.all_gather.assert_not_called()
 
 
@@ -775,31 +793,6 @@ def test_fused_moe_dispatches_optional_backend(monkeypatch, atom_modules, suppor
         call_args = ordinary_forward.call_args.args
         assert call_args[0] is hidden_states
         assert call_args[1] is router_logits
-
-
-def test_dpa_hash_routing_falls_back_from_padded_comm_fused(monkeypatch, atom_modules):
-    layer = _new_fused_moe(atom_modules)
-    hidden_states = torch.randn(4, 8)
-    router_logits = torch.randn(4, 16)
-    ordinary_output = torch.randn_like(hidden_states)
-    backend = SimpleNamespace(
-        supports_custom_routing=False,
-        supports=MagicMock(return_value=True),
-        forward=MagicMock(),
-    )
-    layer._comm_fused_moe = backend
-    layer.custom_routing_function = object()
-    ordinary_forward = MagicMock(return_value=ordinary_output)
-    monkeypatch.setattr(type(layer), "forward", ordinary_forward)
-
-    output, is_complete = layer.forward_maybe_comm_fused(
-        hidden_states, router_logits, None
-    )
-
-    assert output is ordinary_output
-    assert not is_complete
-    backend.supports.assert_not_called()
-    backend.forward.assert_not_called()
 
 
 @pytest.mark.parametrize("supported", [True, False])

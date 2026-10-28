@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # PP-stage offload KV status aggregation (GPU-free).
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 from aiter_stub import stubbed_aiter
 
@@ -412,3 +415,64 @@ def test_the_pp_head_gives_the_aggregator_the_scheduler_s_verdict():
 
     proc.scheduler.on_save_abandoned(3)
     assert proc.has_pending_kv_work() is False
+
+
+@pytest.mark.parametrize(
+    "kv_enabled,is_producer,chunked,is_offload,max_wait_ms",
+    [
+        (True, True, True, False, 1),
+        (True, True, True, True, 1),  # Chunked Mooncake + LMCache.
+        (True, True, False, False, 100),  # Legacy producer.
+        (True, False, True, False, 100),  # Consumer.
+        (True, False, False, True, 100),  # Offload only.
+        (False, False, False, False, 100),
+    ],
+)
+def test_downstream_reports_ready_without_waiting_for_a_forward(
+    kv_enabled, is_producer, chunked, is_offload, max_wait_ms
+):
+    """D-ready arriving during metadata receive must promptly reach the head."""
+    proc = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    proc.kv_transfer_enabled = kv_enabled
+    proc.scheduler = MagicMock()
+    proc.scheduler.kv_connector = SimpleNamespace(
+        is_producer=is_producer,
+        enable_chunked_transfer=chunked,
+        is_offload=is_offload,
+    )
+    proc.utility_handler = MagicMock()
+    proc.utility_queue = MagicMock()
+    proc.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+    proc._is_idle_rl_weights_offloaded = lambda: False
+    proc.runner_mgr = MagicMock()
+    proc.pp_transport = MagicMock()
+    report = KVConnectorOutput(
+        connector_completions={ConnectorCompletion("pd_admission_ready", 7, True)}
+    )
+    elapsed_ms = 0
+    reports = []
+
+    def recv_metadata(timeout_ms):
+        nonlocal elapsed_ms
+        # A worker becomes ready just after the blocking receive begins.
+        # Advance a virtual clock so the regression does not depend on load
+        # on the host running the test. No forward arrives to wake the stage.
+        proc.runner_mgr.call_func_with_aggregation.side_effect = [
+            report,
+            KVConnectorOutput(),  # Final shutdown poll.
+        ]
+        elapsed_ms += timeout_ms
+
+    def send_kv_status(output):
+        reports.append(output)
+        assert elapsed_ms <= max_wait_ms
+        assert proc.pull_and_process_input_queue.call_count == 1
+
+    proc.pp_transport.recv_metadata.side_effect = recv_metadata
+    proc.pp_transport.send_kv_status.side_effect = send_kv_status
+    proc._downstream_busy_loop()
+
+    assert elapsed_ms == max_wait_ms
+    assert reports == ([report] if kv_enabled else [])
+    assert all(c.args[0] != "forward" for c in proc.runner_mgr.call_func.call_args_list)
+    proc.pp_transport.send_tokens.assert_not_called()
