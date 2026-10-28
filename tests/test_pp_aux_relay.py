@@ -13,8 +13,14 @@ import pytest
 import torch
 from torch import nn
 
-relay_mod = pytest.importorskip("atom.spec_decode.pp_aux_relay")
-drafter_mod = pytest.importorskip("atom.spec_decode.drafter")
+# `exc_type`: a test collected after one that stubs `sys.modules["aiter"]`
+# (tests/test_pd_pp.py) imports the name and dies on a symbol.
+relay_mod = pytest.importorskip(
+    "atom.spec_decode.pp_aux_relay",
+    reason="the relay reaches the drafter, which imports aiter at module load",
+    exc_type=ImportError,
+)
+drafter_mod = pytest.importorskip("atom.spec_decode.drafter", exc_type=ImportError)
 
 from atom.models.utils import IntermediateTensors, PPMissingLayer
 
@@ -133,7 +139,9 @@ def test_pp_payload_keeps_relayed_taps_and_drops_strangers():
 def test_every_stage_warms_up_on_the_rows_the_last_stage_does(monkeypatch):
     """A block drafter warms up on >= 2 sequences. Read off the drafter, a
     stage without one sent 1 x 5000 rows to a last stage expecting 2 x 4096."""
-    runner_mod = pytest.importorskip("atom.model_engine.model_runner")
+    runner_mod = pytest.importorskip(
+        "atom.model_engine.model_runner", exc_type=ImportError
+    )
     monkeypatch.setattr(runner_mod.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(runner_mod.torch.cuda, "reset_peak_memory_stats", lambda: None)
     monkeypatch.setattr(
