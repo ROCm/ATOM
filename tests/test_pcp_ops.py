@@ -14,8 +14,10 @@ Groups:
   * metadata padding     --- `pcp_pad_dense` vs `pcp_pad_indptr`
   * ragged reindex       --- `pcp_reindex_ragged`, `pcp_local_indptr`
   * grouped gather       --- `pcp_allgather_rerange_many`
+  * DSpark context KV    --- `DSparkProposer._write_split_context_kv`
 """
 
+import types
 from types import SimpleNamespace
 
 import numpy as np
@@ -399,3 +401,88 @@ def test_draft_split_follows_the_target_not_the_current_pass(monkeypatch):
     assert ep._pcp_active_for_draft_model(None) is True
     ctx.context.target_pcp_split, ctx.context.pcp_split = False, True
     assert ep._pcp_active_for_draft_model(None) is False
+
+
+def test_dspark_split_context_kv_projects_each_rank_s_own_rows(monkeypatch):
+    """After a PCP prefill each rank projects its own round-robin aux rows at
+    their own positions and gathers the projected KV: the window gets exactly
+    what projecting every row writes. A draft whose layers cannot project
+    apart from writing keeps gathering the aux states instead."""
+    dp = pytest.importorskip("atom.spec_decode.dspark_proposer")
+    dr = pytest.importorskip("atom.spec_decode.drafter")
+    ws, n = 4, 10  # pads to 12: 3 rows per rank
+    n_local = 3
+    positions = torch.arange(50, 50 + n + 6)  # the forward buffer runs past n
+    aux_full = [torch.randn(n, 3), torch.randn(n, 2)]
+
+    class Layer:
+        def __init__(self, k):
+            self.k, self.written = k, []
+
+        def context_kv_rows(self, x, pos):
+            return x.sum(-1, keepdim=True) * self.k + pos[:, None].float()
+
+        def write_context_kv_rows(self, rows, pos):
+            self.written.append((rows, pos))
+
+    layers = [Layer(1.0), Layer(-2.0)]
+    model = SimpleNamespace(
+        context_kv_by_rows=True,
+        project_context=lambda a: a * 3,
+        context_layers=layers,
+    )
+    ctx = SimpleNamespace(
+        context=SimpleNamespace(target_pcp_split=True, scheduled_bs=2)
+    )
+    for mod in (dr, dp):
+        monkeypatch.setattr(mod, "get_pcp_world_size", lambda: ws)
+        monkeypatch.setattr(mod, "get_forward_context", lambda: ctx)
+
+    def run(rank, gather):
+        monkeypatch.setattr(pu, "get_pcp_rank", lambda: rank)
+        monkeypatch.setattr(dp, "pcp_allgather_rerange_many", gather)
+        # A hook buffer holds the rank's stripe, then rows of earlier steps.
+        bufs = [
+            torch.cat([pu.pcp_round_robin_split(pu.pcp_pad_dense(a, 2), ws), a])
+            for a in aux_full
+        ]
+        drafter = SimpleNamespace(model=model, _captures_aux=True, _aux_buffers=bufs)
+        drafter._write_split_context_kv = types.MethodType(
+            dp.DSparkProposer._write_split_context_kv, drafter
+        )
+        drafter.aux_for = lambda hidden: pytest.fail("gathered the aux states")
+        dp.DSparkProposer.compute_draft_kv(drafter, positions, torch.zeros(n, 7), None)
+
+    sent = []
+    for rank in range(ws):
+        run(rank, lambda ts, w: sent.append(ts) or [t.repeat(w, 1) for t in ts])
+    # Row t of the gather is rank t % ws's local row t // ws.
+    gathered = [
+        torch.stack([sent[r][i] for r in range(ws)], dim=1).reshape(ws * n_local, -1)
+        for i in range(len(layers))
+    ]
+    ctx_full = model.project_context(torch.cat(aux_full, dim=-1))
+    for layer, rows in zip(layers, gathered):
+        assert torch.allclose(rows[:n], layer.context_kv_rows(ctx_full, positions[:n]))
+
+    for layer in layers:
+        layer.written.clear()
+    run(0, lambda ts, w: gathered)
+    for layer, rows in zip(layers, gathered):
+        ((written, pos),) = layer.written
+        assert torch.equal(written, rows[:n]) and pos is positions
+
+    # Either half of the gate alone keeps the aux path: a draft that cannot
+    # project by rows, or a target forward that did not split.
+    aux_reads = []
+    for by_rows, split in ((False, True), (True, False)):
+        ctx.context.target_pcp_split = split
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                context_kv_by_rows=by_rows, write_context_kv=lambda x, p: None
+            ),
+            _captures_aux=True,
+            aux_for=lambda hidden: aux_reads.append(hidden) or aux_full,
+        )
+        dp.DSparkProposer.compute_draft_kv(drafter, positions, torch.zeros(n, 7), None)
+    assert len(aux_reads) == 2

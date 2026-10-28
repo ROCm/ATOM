@@ -52,6 +52,18 @@ class AuxCaptureSpec:
             raise ValueError("Aux capture must select layer input or output")
 
 
+def pcp_aux_rows(n: int) -> int | None:
+    """The rows a drafter's aux hooks hold after a PCP row-split target prefill
+    of `n` rows -- this rank's round-robin stripe -- or None when the target
+    did not split. Keyed on the batch-global `target_pcp_split`, never on
+    hook-side bookkeeping, which a cudagraph replay skips."""
+    pcp_ws = get_pcp_world_size()
+    ctx = getattr(get_forward_context(), "context", None)
+    if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
+        return pcp_pad_len(n, pcp_ws) // pcp_ws
+    return None
+
+
 # Descent bound for the `.model` wrapper chain below — big enough for every
 # nesting we ship (UBatchWrapper -> ForCausalLM -> Model), small enough that a
 # self-referential `.model` cannot spin.
@@ -464,16 +476,14 @@ class Drafter(abc.ABC):
         token counts.
 
         After a PCP row-split prefill the hooks hold only this rank's 1/pcp
-        stripe, so gather it. Keyed on the batch-global `target_pcp_split`, never
-        on hook-side bookkeeping, which a cudagraph replay skips.
+        stripe, so gather it (`pcp_aux_rows`).
         """
         if not self._captures_aux:
             return None
         n = target_hidden_states.shape[0]
-        pcp_ws = get_pcp_world_size()
-        ctx = getattr(get_forward_context(), "context", None)
-        if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
-            n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
+        n_local = pcp_aux_rows(n)
+        if n_local is not None:
+            pcp_ws = get_pcp_world_size()
             return [
                 pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n]
                 for buf in self._aux_buffers
