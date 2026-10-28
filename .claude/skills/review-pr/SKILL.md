@@ -415,12 +415,11 @@ failure, because not writing it was the cheapest way past this check.
 - Output ONLY the card below. Nothing before it, nothing after it.
 - If there are no findings, the findings section is omitted entirely.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
-- The verdict and `Validation (deterministic)` (or `Validation (advisory)`) lines are
-  both mandatory and both carry a label prefix, so neither line may ever start with a
-  finding emoji (🔴/⚠️/📝) — that is what the `refutations`/`independent` gates count as
-  a reported finding, and a bare `⚠️ NEEDS WORK` verdict line gets counted as one, leaving
-  one more "finding" than the card actually has. Never omit the `Validation` line:
-  silence on it reads as clearance, which is exactly what the spec forbids.
+- The verdict and `Validation (deterministic|advisory)` lines are both mandatory and both
+  carry a label prefix, so neither may ever start with a finding emoji (🔴/⚠️/📝) — that
+  is what the `refutations`/`independent` gates count as a reported finding, and a bare
+  `⚠️ NEEDS WORK` verdict line gets counted as one, leaving one more "finding" than the
+  card actually has. Never omit the `Validation` line: silence on it reads as clearance.
 
 ```
 ## ATOM PR #NNN — [title]
@@ -429,8 +428,8 @@ failure, because not writing it was the cheapest way past this check.
 
 Review: [✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
 Validation (deterministic): [<verdict> — target, exact runtime, skipped-stage evidence | N/A — no runtime surface changed | NOT RUN — <reason>]
-  ...or, when you ran something yourself and no $WORK/validation_report.json exists, this line instead:
-Validation (advisory): [<what you ran, where> — one run, this box, unverified by anything but your own say-so | N/A — ... | NOT RUN — ...]
+  ...or, with no $WORK/validation_report.json and you ran something yourself, this line instead:
+Validation (advisory): [<what, where> — one run, this box, unverified | N/A — ... | NOT RUN — ...]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
@@ -438,34 +437,28 @@ Validation (advisory): [<what you ran, where> — one run, this box, unverified 
 ```
 
 **`(deterministic)` is a claim about where the evidence came from, not how careful you
-were — write it only when `$WORK/validation_report.json` exists.** That file is written
-only by `fetch.sh`, only after its own identity gate confirms the report's
-`repo.head`/`repo.base`/`patch_sha256` match this exact PR; you cannot create or edit it
-by hand, and the card gate checks for its presence the moment you write anything other
-than `N/A`/`NOT RUN` on the `(deterministic)` line. **This pipeline ships no validator
-(P2's `validate-atom-pr`), so that file will not exist for you today — do not run a test
-yourself and label the result `(deterministic)`.** Running one yourself is real evidence,
-just a different kind: unreproducible from the card, unverified against the PR head by
-anything but your own say-so. Report it as `Validation (advisory): ...`, stating what you
-ran, on what box, and that it is one unverified run — never upgrade it to
-`(deterministic)` because it felt thorough.
+were — write it only when `$WORK/validation_report.json` exists.** Only `fetch.sh` writes
+that file, after its own identity gate confirms `repo.head`/`repo.base`/`patch_sha256`
+match this exact PR; the card gate checks for its presence the instant you write anything
+but `N/A`/`NOT RUN` there. **P0 ships no validator, so that file will not exist today —
+do not run a test yourself and label the result `(deterministic)`.** Running one yourself
+is real evidence, just unreproducible from the card and unverified against the PR head by
+anything but your own say-so — report it as `Validation (advisory): <what, where> — one
+run, this box, unverified`, never upgraded because it felt thorough.
 
 **Pick exactly one state per tier, never blend them:**
-- an exact-head report exists in `$WORK/validation_report.json` → `(deterministic)`: its
-  verdict plus target/runner/arch and any skipped stages.
-- you ran a test/check yourself with no such report → `(advisory)`: what you ran and
-  where, flagged as one unverified run — not a finding against the PR, not clearance.
+- exact-head report in `$WORK/validation_report.json` → `(deterministic)`: verdict plus
+  target/runner/arch and skipped stages. No such report but you ran something yourself →
+  `(advisory)`: what and where, flagged as one unverified run — not a finding, not
+  clearance either.
 - triage decided no runtime surface changed → `N/A — no runtime surface changed` (either
-  tier). Do not write `NOT RUN` here; there is no gap to report.
-- validation was required but no target/report exists (the common case in P0) →
-  `NOT RUN — <reason>`, e.g. `NOT RUN — the PR changes runtime code but ships no test
-  target` or `NOT RUN — no validator in this pipeline yet`.
-- required and a target existed, but the run itself could not happen (no idle GPU,
-  validator missing, disabled) → `NOT RUN — <reason>`; an environment gap, not a PR
-  defect.
-- `N/A` and `NOT RUN` are different facts and must never be merged into one word: `N/A`
-  means there was nothing to validate, `NOT RUN` means something should have been
-  validated and wasn't.
+  tier); never `NOT RUN` here, there is no gap to report.
+- required but no target/report exists (the common case in P0), or one existed but the
+  run itself couldn't happen (no idle GPU, validator missing, disabled) → `NOT RUN —
+  <reason>`, e.g. `NOT RUN — ships no test target` or `NOT RUN — no validator yet`; an
+  environment gap, not a PR defect.
+- `N/A` and `NOT RUN` are different facts, never merge them into one word: `N/A` = nothing
+  to validate, `NOT RUN` = something should have been validated and wasn't.
 
 Each finding must have **three parts**:
 1. **Problem** — what exactly is wrong, with file/line if relevant
