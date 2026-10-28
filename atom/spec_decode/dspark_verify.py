@@ -51,6 +51,10 @@ class VerifyScheduler:
             self.sps_table, self.sts_temperatures = load_calibration(
                 runner.config, runner.device
             )
+        # One set of TP/DP CPU groups for every DSpark collective below.
+        from atom.spec_decode.dspark_comm import DSparkComm
+
+        comm = DSparkComm()
         self.runtime = None
         self._bucket_lookup = None
         self._bucket_signature = None
@@ -61,14 +65,14 @@ class VerifyScheduler:
         if getattr(runner.config.dspark, "online_sps", False):
             from atom.spec_decode.dspark_runtime import DSparkRuntime
 
-            self.runtime = DSparkRuntime(runner)
+            self.runtime = DSparkRuntime(runner, comm=comm)
         self.dp = None
         if runner.config.parallel_config.data_parallel_size > 1 and (
             runner.config.dspark.online_sps or runner.config.dspark.bucket_global
         ):
             from atom.spec_decode.dspark_dp import DPVerifyPlanner
 
-            self.dp = DPVerifyPlanner(self)
+            self.dp = DPVerifyPlanner(self, comm=comm)
         if self.sps_table is not None:
             self.bind_sps(self.sps_table)
         # No calibration profile supplies temperatures: fit them online.
@@ -81,7 +85,7 @@ class VerifyScheduler:
             from atom.spec_decode.online_sts import OnlineSTS
 
             self.sts = OnlineSTS(
-                self, runner.config.speculative_config.num_speculative_tokens
+                self, runner.config.speculative_config.num_speculative_tokens, comm=comm
             )
         self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:

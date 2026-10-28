@@ -9,58 +9,13 @@ The planner includes today's bonus floors before comparing executable graphs.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
+from atom.spec_decode.dspark_delayed import DelayedRows
 from atom.spec_decode.dspark_scheduler import calibrate_confidence, resolve_q_buckets
-
-
-class SPSMesh:
-    """Orthogonal TP/DP CPU groups; no new communicator or device collective."""
-
-    def __init__(self, tp_group=None, dp_group=None):
-        if tp_group is None:
-            from aiter.dist.parallel_state import get_dp_group, get_tp_group
-
-            tp_group, dp_group = get_tp_group().cpu_group, get_dp_group().cpu_group
-        self.tp_group, self.dp_group = tp_group, dp_group
-        self.tp_size = dist.get_world_size(tp_group)
-        self.tp_rank = dist.get_rank(tp_group)
-        self.dp_size = dist.get_world_size(dp_group)
-        self.dp_rank = dist.get_rank(dp_group)
-
-    @staticmethod
-    def gather(value, group, size):
-        if size == 1:
-            return value.unsqueeze(0)
-        result = [torch.empty_like(value) for _ in range(size)]
-        dist.all_gather(result, value, group=group)
-        return torch.stack(result)
-
-    def broadcast_tp(self, value):
-        if self.tp_size > 1:
-            dist.broadcast(
-                value, src=dist.get_global_rank(self.tp_group, 0), group=self.tp_group
-            )
-
-    def gather_dp(self, value):
-        return self.gather(value, self.dp_group, self.dp_size)
-
-    def agree(self, value):
-        """Fail on all workers before variable-size planner exchanges."""
-        digest = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).digest()
-        local = torch.tensor(list(digest), dtype=torch.uint8, device="cpu")
-        tp = self.gather(local, self.tp_group, self.tp_size)
-        both = self.gather_dp(tp)
-        if not torch.all(both == local):
-            raise ValueError(
-                "DSpark DP workers disagree on profile or graph configuration"
-            )
 
 
 def executable_graph(rows, q, captured):
@@ -186,11 +141,15 @@ class DPState:
 class DPVerifyPlanner:
     """Joint DP plan, including TP leader publication and bounded async copies."""
 
-    def __init__(self, scheduler, *, mesh=None):
+    def __init__(self, scheduler, *, comm=None):
         self.scheduler = scheduler
         self.runner = scheduler.runner
         config = self.runner.config
-        self.mesh = mesh or SPSMesh()
+        if comm is None:
+            from atom.spec_decode.dspark_comm import DSparkComm
+
+            comm = DSparkComm()
+        self.comm = comm
         self.gamma = config.speculative_config.num_speculative_tokens
         self.qs = resolve_q_buckets(config.dspark.ragged_graph_sizes, self.gamma + 1)
         # The measured curve arrives through `bind` (offline profile at
@@ -198,7 +157,7 @@ class DPVerifyPlanner:
         # no decode graph is plannable and every step keeps its full width.
         self.baseline_ms = None
         self.observe_only = config.dspark.online_sps_observe_only
-        self.mesh.agree(
+        self.comm.agree(
             (
                 self.qs,
                 config.max_num_seqs,
@@ -211,8 +170,9 @@ class DPVerifyPlanner:
             )
         )
         self.epoch = 0
-        self.pending = []
-        self.free = []
+        self.copies = DelayedRows(
+            lambda: self.runner.tokenID_processor.async_copy_stream, self.gamma
+        )
         self.survival = None
         self._request_set = None
         self._local_context = 0
@@ -230,12 +190,12 @@ class DPVerifyPlanner:
     def bind(self, baseline_sps):
         # Every worker must plan with the same curve; a startup sweep reduces
         # its timings by MAX over TP and DP, so this only catches divergence.
-        self.mesh.agree([round(float(x), 6) for x in baseline_sps])
+        self.comm.agree([round(float(x), 6) for x in baseline_sps])
         self.baseline_ms = np.array([1000.0 / x for x in baseline_sps])
         self._captured = None
 
     def capture(self, confidence):
-        if self.mesh.tp_rank == 0:
+        if self.comm.tp_rank == 0:
             self.survival = (
                 calibrate_confidence(
                     confidence.detach(), self.scheduler.sts_temperatures
@@ -250,54 +210,27 @@ class DPVerifyPlanner:
             return
         # Every in-flight copy retains BOTH destination and source, even when
         # its epoch is no longer adoptable. Never recycle based on age alone.
-        keep = []
-        for entry in self.pending:
-            epoch, event, cpu, _, _ = entry
-            if epoch < self.epoch - 2 and event.query():
-                self.free.append(cpu)
-            else:
-                keep.append(entry)
-        self.pending = keep
-        if len(self.pending) >= 4:
+        self.copies.reap(before=self.epoch - 2)
+        if self.copies.busy():
             self.skipped_busy += 1
             return
         # Block drafters draft at least two requests (warmup does even with
         # max_num_seqs=1), as TokenIDProcessor's output capacity allows.
-        capacity = (max(self.runner.config.max_num_seqs, 2), self.gamma)
-        cpu = (
-            self.free.pop()
-            if self.free
-            else torch.empty(
-                capacity, dtype=torch.float32, device="cpu", pin_memory=True
-            )
-        )
-        n = source.shape[0]
-        if n > capacity[0] or len(req_ids) != n:
+        capacity = max(self.runner.config.max_num_seqs, 2)
+        if source.shape[0] > capacity or len(req_ids) != source.shape[0]:
             raise ValueError("DSpark DP confidence does not match request batch")
-        stream = self.runner.tokenID_processor.async_copy_stream
-        producer_stream = torch.cuda.current_stream()
-        event = torch.cuda.Event()
-        with torch.cuda.stream(stream):
-            stream.wait_stream(producer_stream)
-            cpu[:n].copy_(source, non_blocking=True)
-            event.record(stream)
-        self.pending.append((self.epoch, event, cpu, tuple(req_ids), source))
+        self.copies.push(self.epoch, req_ids, source, rows=capacity)
 
     def _delayed(self, req_ids):
-        for epoch, event, cpu, ids, _ in self.pending:
-            if epoch == self.epoch - 2 and ids == req_ids:
-                # Same fixed N-2 barrier as VerifyScheduler; never choose a
-                # newer generation based on rank-local event readiness.
-                event.synchronize()
-                return cpu[: len(ids)].numpy().copy()
-        return None
+        # Same fixed N-2 barrier as VerifyScheduler; never choose a newer
+        # generation based on rank-local event readiness.
+        taken = self.copies.take(self.epoch - 2, req_ids, wait=True)
+        return None if taken is None else taken[1]
 
     def invalidate(self):
         self.survival = None
         # Retain DMA ownership while making every old generation unadoptable.
-        self.pending = [
-            (-1, event, cpu, ids, source) for _, event, cpu, ids, source in self.pending
-        ]
+        self.copies.invalidate()
 
     def prepare(self, batch):
         """This rank's planning payload, built on real, dummy, prefill and
@@ -326,7 +259,7 @@ class DPVerifyPlanner:
             else ()
         )
         if captured != self._captured:
-            self.mesh.agree(captured)
+            self.comm.agree(captured)
             self._captured = captured
             self.candidates = [(q, g) for q in self.qs for g in captured if g % q == 0]
         previous = getattr(self.runner.tokenID_processor, "prev_batch", None)
@@ -337,12 +270,12 @@ class DPVerifyPlanner:
         # One TP leader provides the delayed statistics, so TP workers cannot
         # select different allocations due to tiny confidence rounding changes.
         confidence = torch.zeros(1 + n * self.gamma, dtype=torch.float64, device="cpu")
-        if self.mesh.tp_rank == 0 and ready:
+        if self.comm.tp_rank == 0 and ready:
             delayed = self._delayed(ids)
             if delayed is not None:
                 confidence[0] = 1
                 confidence[1:] = torch.from_numpy(delayed.reshape(-1))
-        self.mesh.broadcast_tp(confidence)
+        self.comm.broadcast_tp(confidence)
         ready = bool(confidence[0]) or dummy
         survival = confidence[1:].numpy().reshape(n, self.gamma)
         ceilings = np.asarray(batch.num_scheduled_tokens[:n], dtype=np.int64)
@@ -410,7 +343,7 @@ class DPVerifyPlanner:
             else (lambda g: self.baseline_ms[g])
         )
         self.planned += 1
-        frontiers = gathered[:, 8:].reshape(self.mesh.dp_size, -1, 4)
+        frontiers = gathered[:, 8:].reshape(self.comm.dp_size, -1, 4)
         fallback_graph = (
             executable_graph(int(fallback[0]), int(fallback[1]), self._captured)
             if fallback is not None

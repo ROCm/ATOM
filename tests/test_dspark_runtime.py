@@ -51,9 +51,14 @@ def runtime(monkeypatch):
         enforce_eager=False,
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    rt = DSparkRuntime(
-        SimpleNamespace(config=config), group=object(), event_factory=Event
+    # A single worker: every gather returns its own rows.
+    comm = SimpleNamespace(
+        dp_size=1,
+        tp_leader=True,
+        gather_tp=lambda value: value.unsqueeze(0),
+        gather_dp=lambda value: value.unsqueeze(0),
     )
+    rt = DSparkRuntime(SimpleNamespace(config=config), comm=comm, event_factory=Event)
     # What VerifyScheduler.bind_sps hands it: offline profile or startup sweep.
     rt.bind([1000 / (1 + i * 0.1) for i in range(49)])
     return rt

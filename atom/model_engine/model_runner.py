@@ -2467,7 +2467,7 @@ class ModelRunner:
         self._dspark_apply_ragged(
             batch, batch.total_seqs_num_decode, batch.num_spec_step + 1, plan
         )
-        rank = planner.mesh.dp_rank
+        rank = planner.comm.dp_rank
         if int(batch.total_tokens_num) != int(tokens[rank]):
             raise RuntimeError(
                 f"DSpark DP plan expects {int(tokens[rank])} tokens on this "

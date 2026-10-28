@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from atom.config import CUDAGraphMode, DSparkConfig
+from atom.spec_decode.dspark_delayed import DelayedCopy, DelayedRows
 from atom.spec_decode.dspark_dp import (
     DPVerifyPlanner,
     choose_dp_candidate,
@@ -98,11 +99,12 @@ def test_delayed_confidence_is_exact_epoch_and_exact_request_set():
 
     planner = DPVerifyPlanner.__new__(DPVerifyPlanner)
     planner.epoch = 12
+    planner.copies = DelayedRows(lambda: None, 3)
     event = Event()
-    planner.pending = [
-        (9, event, torch.zeros((1, 3)), (8,), None),
-        (10, event, torch.ones((1, 3)), (9,), None),
-        (11, event, torch.ones((1, 3)) * 2, (9,), None),
+    planner.copies.pending = [
+        DelayedCopy(9, event, torch.zeros((1, 3)), (8,), None),
+        DelayedCopy(10, event, torch.ones((1, 3)), (9,), None),
+        DelayedCopy(11, event, torch.ones((1, 3)) * 2, (9,), None),
     ]
     assert planner._delayed((8,)) is None
     assert event.calls == 0
@@ -110,7 +112,7 @@ def test_delayed_confidence_is_exact_epoch_and_exact_request_set():
     assert event.calls == 1
     planner.invalidate()
     assert planner._delayed((9,)) is None
-    assert len(planner.pending) == 3  # pending DMA still owns its buffers
+    assert len(planner.copies.pending) == 3  # pending DMA still owns its buffers
 
 
 def test_confidence_copies_keep_sources_and_do_not_reuse_busy_destinations(monkeypatch):
@@ -143,23 +145,25 @@ def test_confidence_copies_keep_sources_and_do_not_reuse_busy_destinations(monke
     p.runner = NS(
         config=NS(max_num_seqs=2), tokenID_processor=NS(async_copy_stream=stream)
     )
-    p.gamma, p.pending, p.free, p.skipped_busy = 3, [], [], 0
+    p.gamma, p.skipped_busy = 3, 0
+    p.copies = DelayedRows(lambda: stream, 3)
     for epoch in range(1, 7):
         p.epoch, p.survival = epoch, torch.full((1, 3), epoch, dtype=torch.float32)
         p.record([1])
-    assert len(p.pending) == 4 and p.skipped_busy == 2
-    assert len({x[2].data_ptr() for x in p.pending}) == 4
-    assert [int(x[4][0, 0]) for x in p.pending] == [1, 2, 3, 4]
-    for x in p.pending:
-        x[1].ready = True
+    pending = p.copies.pending
+    assert len(pending) == 4 and p.skipped_busy == 2
+    assert len({x.cpu.data_ptr() for x in pending}) == 4
+    assert [int(x.source[0, 0]) for x in pending] == [1, 2, 3, 4]
+    for x in pending:
+        x.event.ready = True
     p.epoch, p.survival = 8, torch.ones((1, 3))
     p.record([1])
-    assert len(p.pending) == 1 and len(p.free) == 3
+    assert len(p.copies.pending) == 1 and len(p.copies.free) == 3
     # Warmup drafts two requests even at max_num_seqs=1.
-    p.runner.config.max_num_seqs, p.free = 1, []
+    p.runner.config.max_num_seqs, p.copies.free = 1, []
     p.epoch, p.survival = 20, torch.ones((2, 3))
     p.record([1, 2])
-    assert p.pending[-1][3] == (1, 2)
+    assert p.copies.pending[-1].ids == (1, 2)
 
 
 @pytest.mark.parametrize("ep", [False, True])
@@ -216,18 +220,20 @@ def test_observe_only_keeps_the_joint_static_budget(tmp_path, monkeypatch):
         )
         runner = NS(config=cfg, tokenID_processor=NS(prev_batch=NS(req_ids=(7,))))
         scheduler = NS(runner=runner, runtime=NS(model=model), sts_temperatures=None)
-        mesh = NS(
+        comm = NS(
             tp_rank=0,
             dp_size=2,
             agree=lambda _: None,
             broadcast_tp=lambda _: None,
             gather_dp=lambda x: torch.stack([x, x]),
         )
-        planner = DPVerifyPlanner(scheduler, mesh=mesh)
+        planner = DPVerifyPlanner(scheduler, comm=comm)
         planner.bind(baseline)
         planner.epoch = 2
         survival = torch.tensor([[0.35**i for i in range(1, 6)]])
-        planner.pending = [(1, NS(synchronize=lambda: None), survival, (7,), survival)]
+        planner.copies.pending = [
+            DelayedCopy(1, NS(synchronize=lambda: None), survival, (7,), survival)
+        ]
         wire = planner.prepare(
             NS(
                 total_seqs_num=1,

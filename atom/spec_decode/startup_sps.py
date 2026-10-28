@@ -65,31 +65,22 @@ def sps_table_from_points(points, max_rows):
     return (1000.0 / latency).tolist()
 
 
-def _groups():
-    from aiter.dist.parallel_state import get_dp_group, get_tp_group
+def _comm():
+    from atom.spec_decode.dspark_comm import DSparkComm
 
-    return get_tp_group().cpu_group, get_dp_group().cpu_group
+    return DSparkComm()
 
 
 def _all_max(value: float) -> float:
-    t = torch.tensor([value], dtype=torch.float64)
-    for group in _groups():
-        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
-    return float(t.item())
+    return _comm().all_max([value])[0]
 
 
 def _all_max_list(values) -> list[float]:
-    t = torch.tensor(values, dtype=torch.float64)
-    for group in _groups():
-        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
-    return t.tolist()
+    return _comm().all_max(values)
 
 
 def _all_true(flag: bool) -> bool:
-    t = torch.tensor([int(flag)], dtype=torch.int64)
-    for group in _groups():
-        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group)
-    return bool(t.item())
+    return _comm().all_true(flag)
 
 
 def _dynamic_q(runner) -> bool:

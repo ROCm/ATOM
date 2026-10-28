@@ -54,6 +54,9 @@ def test_positions_without_enough_observations_keep_their_start():
     assert fitted[1:].tolist() == [1.0] * 4
 
 
+COMM = NS(tp_leader=True, broadcast_tp=lambda values: None)
+
+
 class Event:
     def query(self):
         return True
@@ -80,9 +83,7 @@ def test_verdicts_pair_with_the_drafts_two_forwards_back(monkeypatch):
         runner=NS(tokenID_processor=NS(async_copy_stream=stream), device="cpu"),
         sts_temperatures=None,
     )
-    sts = OnlineSTS(
-        scheduler, 5, group=object(), sample_interval=1, refit_interval=1000
-    )
+    sts = OnlineSTS(scheduler, 5, comm=COMM, sample_interval=1, refit_interval=1000)
     conf = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5], [0.1, 0.2, 0.3, 0.4, 0.5]])
     sts.observe()  # forward 1 drafts for requests 7, 8
     sts.capture(conf)
@@ -117,19 +118,19 @@ def test_free_buffers_are_reused_by_position_not_by_comparison(monkeypatch):
         ),
         sts_temperatures=None,
     )
-    sts = OnlineSTS(scheduler, 5, group=object(), sample_interval=1)
-    sts.free = [torch.zeros(8, 5), torch.zeros(16, 5)]
+    sts = OnlineSTS(scheduler, 5, comm=COMM, sample_interval=1)
+    sts.copies.free = [torch.zeros(8, 5), torch.zeros(16, 5)]
     sts.capture(torch.rand(10, 5))
     sts.record(list(range(10)))
-    assert len(sts.free) == 1 and sts.free[0].shape[0] == 8
-    assert sts.pending[0][2].shape[0] == 16
+    assert len(sts.copies.free) == 1 and sts.copies.free[0].shape[0] == 8
+    assert sts.copies.pending[0].cpu.shape[0] == 16
 
 
 def test_temperatures_publish_as_the_evidence_weighted_mean(monkeypatch):
     """No DP peers here: the published curve is the local fit, positions
     below the evidence floor stay at 1."""
     scheduler = NS(runner=NS(device="cpu"), sts_temperatures=None)
-    sts = OnlineSTS(scheduler, 5, group=object(), min_rows=10)
+    sts = OnlineSTS(scheduler, 5, comm=COMM, min_rows=10)
     sts.rows.extend((np.full(5, 0.5), 2, 1) for _ in range(20))
     sts._fitted = np.array([2.0, 1.5, 0.7, 1.0, 0.85])
     sts._publish()
@@ -141,10 +142,10 @@ def test_an_unrecorded_capture_is_dropped_at_the_next_forward(monkeypatch):
     """A forward that captured confidence but never recorded it (warmup, a
     skipped draft) must not lend it to the next forward's request ids."""
     scheduler = NS(runner=NS(device="cpu"), sts_temperatures=None)
-    sts = OnlineSTS(scheduler, 5, group=object(), sample_interval=1)
+    sts = OnlineSTS(scheduler, 5, comm=COMM, sample_interval=1)
     sts.capture(torch.rand(3, 5))
     sts.observe()
     called = []
     monkeypatch.setattr(torch.cuda, "Event", lambda: called.append(1))
     sts.record([1, 2, 3])
-    assert not sts.pending and not called
+    assert not sts.copies.pending and not called

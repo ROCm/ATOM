@@ -9,7 +9,6 @@ import logging
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 
 from atom.spec_decode.online_sps import OnlineSPS, common_rank_samples
 
@@ -64,7 +63,7 @@ class Timing:
 
 
 class DSparkRuntime:
-    def __init__(self, runner, *, group=None, event_factory=None, mesh=None):
+    def __init__(self, runner, *, comm=None, event_factory=None):
         validate_online_runtime(runner.config)
         self.runner = runner
         cfg = runner.config.dspark
@@ -74,22 +73,13 @@ class DSparkRuntime:
         self._window = cfg.online_sps_window_steps
         self.sample_interval = cfg.online_sps_sample_interval
         self.update_interval = cfg.online_sps_update_interval
-        self.mesh = mesh
+        if comm is None:
+            from atom.spec_decode.dspark_comm import DSparkComm
+
+            comm = DSparkComm()
+        self.comm = comm
         self.dp_state = None
         self.dp_planner = None
-        if runner.config.parallel_config.data_parallel_size > 1 and mesh is None:
-            from atom.spec_decode.dspark_dp import SPSMesh
-
-            self.mesh = SPSMesh()
-        if group is None and self.mesh is not None:
-            group = self.mesh.tp_group
-        if group is None:
-            from aiter.dist.parallel_state import get_tp_group
-
-            group = get_tp_group().cpu_group
-        self.group = group
-        self.world_size = dist.get_world_size(group) if dist.is_initialized() else 1
-        self.rank = dist.get_rank(group) if dist.is_initialized() else 0
         self.event_factory = event_factory or (
             lambda: torch.cuda.Event(enable_timing=True)
         )
@@ -102,7 +92,6 @@ class DSparkRuntime:
         self._request_set = None
         self._context = 0
         self._send = torch.zeros((MAX_PENDING, 6), dtype=torch.float64, device="cpu")
-        self._recv = [torch.empty_like(self._send) for _ in range(self.world_size)]
 
     def bind(self, baseline_sps):
         self.model = OnlineSPS(
@@ -117,7 +106,7 @@ class DSparkRuntime:
         dp = self.dp_state
         if self.model is None:
             return None  # warmup and capture run before the curve exists
-        if self.mesh is not None and (dp is None or not dp.pure_decode):
+        if self.comm.dp_size > 1 and (dp is None or not dp.pure_decode):
             return None
         if (
             batch is None
@@ -214,16 +203,13 @@ class DSparkRuntime:
                 dtype=torch.float64,
                 device="cpu",
             )
-        if self.world_size > 1:
-            dist.all_gather(self._recv, self._send, group=self.group)
-            rows = [r.tolist() for r in self._recv]
-        else:
-            rows = [self._send.tolist()]
-        if self.mesh is not None:
-            # All local fields above describe the SAME group workload. A DP
-            # rank's local bs/ids must not be used as the matching key here.
-            tp_rows = torch.tensor(rows, dtype=torch.float64, device="cpu")
-            rows = self.mesh.gather_dp(tp_rows).reshape(-1, MAX_PENDING, 6).tolist()
+        # All local fields describe the SAME group workload: a DP rank's local
+        # bs/ids must not be used as the matching key here.
+        rows = (
+            self.comm.gather_dp(self.comm.gather_tp(self._send))
+            .reshape(-1, MAX_PENDING, 6)
+            .tolist()
+        )
         matched = common_rank_samples(rows)
         contexts = {sample.step: sample.context for sample in available}
         for step, batch, executed_rows, target_ms, post_ms in matched:
@@ -238,7 +224,7 @@ class DSparkRuntime:
             )
         if self.model.publish(step=self.step):
             self.table_cache.clear()
-            if self.rank == 0 and (
+            if self.comm.tp_leader and (
                 self.model.version == 1 or self.model.version % 16 == 0
             ):
                 snapshot = self.model.snapshot()

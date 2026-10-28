@@ -32,7 +32,8 @@ from collections import deque
 
 import numpy as np
 import torch
-import torch.distributed as dist
+
+from atom.spec_decode.dspark_delayed import DelayedRows
 
 logger = logging.getLogger("atom")
 
@@ -110,36 +111,32 @@ class OnlineSTS:
         scheduler,
         gamma,
         *,
-        group=None,
+        comm=None,
         sample_interval=4,
         refit_interval=256,
         window=20000,
         min_rows=3000,
-        dp_group=None,
     ):
         self.scheduler = scheduler
         self.gamma = gamma
-        if group is None:
-            from aiter.dist.parallel_state import get_tp_group
+        # TP only. DP ranks fit independently: a DP rank's forward count is not
+        # the group's (idle ranks run dummies on paths that report no verdict),
+        # so a DP collective keyed on it would deadlock. Each rank's
+        # temperatures only size its own requests; the joint plan reads each
+        # rank's own survival, so per-rank temperatures need no agreement.
+        if comm is None:
+            from atom.spec_decode.dspark_comm import DSparkComm
 
-            group = get_tp_group().cpu_group
-        self.group = group
-        # DP ranks fit independently: a DP rank's forward count is not the
-        # group's (idle ranks run dummies on paths that report no verdict), so
-        # a DP collective keyed on it would deadlock. Each rank's temperatures
-        # only size its own requests; the joint plan reads each rank's own
-        # survival, so per-rank temperatures need no agreement.
-        self.dp_group = dp_group
-        initialized = dist.is_initialized()
-        self.world_size = dist.get_world_size(group) if initialized else 1
-        self.leader = (dist.get_rank(group) if initialized else 0) == 0
+            comm = DSparkComm()
+        self.comm = comm
         self.sample_interval = sample_interval
         self.refit_interval = refit_interval
         self.min_rows = min_rows
         self.rows = deque(maxlen=window)
         self.forward = 0
-        self.pending = []
-        self.free = []
+        self.copies = DelayedRows(
+            lambda: scheduler.runner.tokenID_processor.async_copy_stream, gamma
+        )
         self._confidence = None
         self._thread = None
         self._result = None
@@ -148,34 +145,16 @@ class OnlineSTS:
 
     # -- collection (TP leader) -------------------------------------------
     def capture(self, confidence):
-        if self.leader and self.forward % self.sample_interval == 0:
+        if self.comm.tp_leader and self.forward % self.sample_interval == 0:
             self._confidence = confidence.detach()
 
     def record(self, req_ids):
         source, self._confidence = self._confidence, None
         if source is None or source.shape[1] != self.gamma:
             return
-        n = source.shape[0]
-        if n != len(req_ids) or len(self.pending) >= 4:
+        if source.shape[0] != len(req_ids):
             return
-        index = next((i for i, b in enumerate(self.free) if b.shape[0] >= n), None)
-        if index is not None:
-            cpu = self.free.pop(index)  # by position: tensors do not compare
-        else:
-            cpu = torch.empty(
-                (max(n, 8), self.gamma),
-                dtype=torch.float32,
-                device="cpu",  # the default device may be CUDA during warmup
-                pin_memory=True,
-            )
-        stream = self.scheduler.runner.tokenID_processor.async_copy_stream
-        producer = torch.cuda.current_stream()
-        event = torch.cuda.Event()
-        with torch.cuda.stream(stream):
-            stream.wait_stream(producer)
-            cpu[:n].copy_(source, non_blocking=True)
-            event.record(stream)
-        self.pending.append((self.forward, event, cpu, list(req_ids), source))
+        self.copies.push(self.forward, req_ids, source)
 
     def observe(self, req_ids=None, accepted=None, verified=None):
         """Once per forward, before this forward's drafts are recorded.
@@ -191,30 +170,25 @@ class OnlineSTS:
         # never recorded (warmup, a skipped draft) must not be paired with a
         # later batch's request ids.
         self._confidence = None
-        if self.leader and req_ids is not None:
+        if self.comm.tp_leader and req_ids is not None:
             self._pair(req_ids, accepted, verified)
         if self.forward % self.refit_interval == 0:
             self._publish()
 
     def _pair(self, req_ids, accepted, verified):
-        keep = []
-        for entry in self.pending:
-            tag, event, cpu, ids, _ = entry
-            if tag == self.forward - 2 and event.query():
-                where = {r: i for i, r in enumerate(ids)}
-                for k, r in enumerate(req_ids):
-                    i = where.get(r)
-                    if i is None or k >= len(accepted) or k >= len(verified):
-                        continue
-                    a, v = int(accepted[k]), min(int(verified[k]), self.gamma)
-                    if 0 < v and 0 <= a <= v:
-                        self.rows.append((cpu[i].numpy().copy(), v, a))
-                self.free.append(cpu)
-            elif tag < self.forward - 2 and event.query():
-                self.free.append(cpu)
-            else:
-                keep.append(entry)
-        self.pending = keep
+        drafted = self.forward - 2
+        taken = self.copies.take(drafted, wait=False, release=True)
+        if taken is not None:
+            ids, confidence = taken
+            where = {r: i for i, r in enumerate(ids)}
+            for k, r in enumerate(req_ids):
+                i = where.get(r)
+                if i is None or k >= len(accepted) or k >= len(verified):
+                    continue
+                a, v = int(accepted[k]), min(int(verified[k]), self.gamma)
+                if 0 < v and 0 <= a <= v:
+                    self.rows.append((confidence[i].copy(), v, a))
+        self.copies.reap(before=drafted)
 
     # -- fitting and publication ------------------------------------------
     def _fit(self, rows, start):
@@ -226,7 +200,7 @@ class OnlineSTS:
     def _publish(self):
         # [log T * w, w] per position; w = verified observations behind it.
         values = torch.zeros(2 * self.gamma, dtype=torch.float64)
-        if self.leader:
+        if self.comm.tp_leader:
             if self._thread is not None and not self._thread.is_alive():
                 self._thread = None
                 if self._result is not None:
@@ -242,13 +216,7 @@ class OnlineSTS:
                     daemon=True,
                 )
                 self._thread.start()
-        # Only an explicitly supplied group (tests) averages across DP.
-        if self.dp_group is not None:
-            dist.all_reduce(values, group=self.dp_group)
-        if self.world_size > 1:
-            dist.broadcast(
-                values, src=dist.get_global_rank(self.group, 0), group=self.group
-            )
+        self.comm.broadcast_tp(values)
         log_sum, weight = values[: self.gamma].numpy(), values[self.gamma :].numpy()
         new = np.where(weight > 0, np.exp(log_sum / np.maximum(weight, 1)), 1.0)
         new = np.round(new, 3)
@@ -258,7 +226,7 @@ class OnlineSTS:
             self.scheduler.sts_temperatures = torch.tensor(
                 new, dtype=torch.float32, device=self.scheduler.runner.device
             )
-            if self.leader:
+            if self.comm.tp_leader:
                 logger.info(
                     "DSpark online STS v%d from %d verified blocks: %s",
                     self.version,
