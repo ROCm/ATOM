@@ -770,7 +770,7 @@ class EngineCore:
                 if recv_reqs:
                     self.scheduler.extend(recv_reqs)
                     recv_reqs = []
-                self.scheduler.abort_request(seqs.req_id)
+                self.utility_handler._handle_abort_request({"req_id": seqs.req_id})
                 continue
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:

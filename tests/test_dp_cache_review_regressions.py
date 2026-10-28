@@ -3,6 +3,7 @@
 
 import pickle
 import queue
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace as NS
 
@@ -23,7 +24,10 @@ from atom.model_engine.dp_cache.balance import (
 )
 from atom.model_engine.dp_cache.state import DPCacheState
 from atom.model_engine.engine_core_mgr import _add_frame
-from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.engine_core_protocol import (
+    EngineCoreAbortRequest,
+    EngineCoreRequestType,
+)
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
@@ -171,6 +175,23 @@ def test_fallback_add_then_abort_during_forward_cannot_resurrect_request(monkeyp
     [rejected] = scheduler.take_rejected()
     assert rejected.id == seq.id and rejected.leave_reason == "aborted"
     assert not scheduler.cache_admission._preparing
+
+
+def test_ordered_abort_supports_prefill_scheduler_without_abort_method():
+    # RapidServe's PrefillScheduler relies on the utility handler's status
+    # fallback. An ordered abort must keep supporting that scheduler surface.
+    scheduler = NS(waiting=deque(), running=[])
+    scheduler.extend = scheduler.waiting.extend
+    core, _ = engine(scheduler, "PrefillEngineCore")
+    core.utility_handler = EngineUtilityHandler(
+        None, core.output_queue, scheduler=scheduler
+    )
+    seq = Sequence([1, 2, 3], 16)
+    core.input_queue.put_nowait([seq])
+    core.input_queue.put_nowait(EngineCoreAbortRequest(seq.id))
+    assert not core.pull_and_process_input_queue()
+    assert list(scheduler.waiting) == [seq]
+    assert seq.status == SequenceStatus.ABORTED
 
 
 @pytest.mark.parametrize("kind", ["EngineCore", "DPEngineCoreProc"])
