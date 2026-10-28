@@ -23,7 +23,7 @@ class _ReadyEvent:
                 try:
                     if not owner.query():
                         return False
-                except Exception:
+                except Exception:  # noqa: BLE001 - unknown DMA status keeps the lease
                     return False
         return True
 
