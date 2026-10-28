@@ -7,9 +7,11 @@ from unittest.mock import Mock, sentinel
 
 import pytest
 import torch
-from aiter.jit.utils import chip_info
 
 from atom.distributed import quick_reduce_scatter as quick_rs
+
+# The arch gate imports AITER's chip_info lazily.
+chip_info = pytest.importorskip("aiter.jit.utils.chip_info")
 
 
 def tensor_metadata(shape=(8192, 1536), dtype=torch.bfloat16, **attributes):
