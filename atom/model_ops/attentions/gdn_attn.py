@@ -2196,6 +2196,23 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # the conv1d kernel reads the same flags by sequence, from a fixed address
         gdn_metadata.has_initial_state = flags_b[:n]
 
+    def _prefix_split_geometry(self) -> dict:
+        """What `prefix_split.build_plan`'s cost model needs, once: query heads
+        a KV head and KV heads on this rank (the FMHA's tiles), and the CU count
+        (its waves)."""
+        geometry = getattr(self, "_psplit_geometry", None)
+        if geometry is None:
+            from atom.utils import get_hf_text_config
+
+            text = get_hf_text_config(self.model_runner.config.hf_config)
+            kv_heads = max(1, text.num_key_value_heads // get_tp_group().world_size)
+            geometry = self._psplit_geometry = dict(
+                q_per_kv=max(1, self.num_attention_heads // kv_heads),
+                kv_heads=kv_heads,
+                num_cus=torch.cuda.get_device_properties(self.device).multi_processor_count,
+            )
+        return geometry
+
     def _attach_prefix_split(self, batch: ScheduledBatch, attn_metadata) -> None:
         """The split-KV layout for this step's prefix-cached prefill
         (`attentions.prefix_split`), built on the host and staged up; None when
@@ -2209,7 +2226,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         n = batch.total_seqs_num_prefill
         plan = prefix_split.build_plan(
-            batch.num_scheduled_tokens[:n], batch.context_lens[:n]
+            batch.num_scheduled_tokens[:n],
+            batch.context_lens[:n],
+            **self._prefix_split_geometry(),
         )
         if plan is None:
             return

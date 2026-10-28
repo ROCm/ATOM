@@ -19,6 +19,18 @@ and the K layout stays contiguous.
 
 The plan is built on the host from the step's lengths (`build_plan`) and
 uploaded by the attention metadata builder; `merge` is one Triton launch.
+
+How many slices: one workgroup holds a CU at a time, so the launch runs in
+waves of one workgroup a CU and lasts its number of waves times the slice
+walk. A count that leaves the last wave nearly empty wastes most of a wave:
+on 256 CUs, 816 new tokens over a 124k context (26 query tiles) take 306 us
+for the history at 20 slices (520 workgroups, the third wave 8 of them) and
+246 us at 9 (234, one wave). Given the step's query tiles and the device's CU
+count, `choose_slices` costs every slice count with a wave model fit on the
+gfx1250 FlyDSL FMHA (`_launch_us`), adds the repeated rows' copy and merge,
+and keeps the single causal launch unless a split beats it by a margin -- so
+a chunk whose tiles already fill whole waves (16k new tokens: 512 tiles) is
+not split, and one just past a wave (8k: 260 tiles) is.
 """
 import os
 
@@ -35,22 +47,87 @@ MAX_FULL_SLICES = 31
 # Below this prefix the single launch is already cheap. (Both knobs are for
 # tests that want the split exercised on short prompts.)
 MIN_PREFIX_KEYS = int(os.getenv("ATOM_PREFIX_SPLIT_MIN_KEYS", 4096))
-MAX_PARTIAL_ROWS = 16384
+# The repeated query rows (and the history launch's partials) the staging
+# buffers hold; the cost model prices them, this only bounds memory.
+MAX_PARTIAL_ROWS = 65536
+# 1: choose the slice count with the wave cost model (`choose_slices`);
+# 0: the SLICE_KEYS slicing capped at 16k repeated rows, as before.
+COST_MODEL = os.getenv("ATOM_PREFIX_SPLIT_COST_MODEL", "1") == "1"
+# The FMHA's query tile: 128 packed GQA rows (query tokens x the query heads of
+# one KV head) a workgroup.
+TILE_ROWS = 128
+# Wave model of the gfx1250 FlyDSL FMHA (a16w16 m32x8, head_dim 256), fit on
+# 816 / 8320 / 16384 new tokens over 124k keys: a wave costs WAVE_US plus its
+# slice's keys at KEY_NS_FULL a key when every CU runs one, falling to
+# KEY_NS_EMPTY as the wave empties (its workgroups share the memory with fewer
+# others). Within ~7% of the measured launches.
+WAVE_US = 15.0
+KEY_NS_FULL = 16.6
+KEY_NS_EMPTY = 12.0
+# Copying the repeated query rows and merging their partials, per
+# (slice x new token).
+ROW_NS = 1.5
+# A split must beat the single launch by this much, and an extra slice the
+# best so far by SLICE_GAIN: fewer slices, fewer rows to stage and merge.
+SPLIT_GAIN = 0.05
+SLICE_GAIN = 0.02
 
 
-def build_plan(seqlens_q: np.ndarray, context_lens: np.ndarray):
+def _launch_us(tiles: int, keys: float, num_cus: int) -> float:
+    """Estimated time of one launch of ``tiles`` workgroups that each walk
+    ``keys`` keys, run in waves of one workgroup a CU."""
+    full, rest = divmod(int(tiles), num_cus)
+    per_key = full * KEY_NS_FULL
+    if rest:
+        per_key += KEY_NS_EMPTY + (KEY_NS_FULL - KEY_NS_EMPTY) * rest / num_cus
+    return WAVE_US * (full + (rest > 0)) + keys * per_key / 1e3
+
+
+def choose_slices(seqlens_q, prefix, q_per_kv: int, kv_heads: int, num_cus: int) -> int:
+    """The slice count for the history launch, or 0 when the single causal
+    launch is expected to be as fast."""
+    tiles = kv_heads * int(sum(-(-int(t) * q_per_kv // TILE_ROWS) for t in seqlens_q))
+    keys = int(prefix.max())
+    tail_keys = int(seqlens_q.max()) / 2
+    total_q = int(seqlens_q.sum())
+    tail = _launch_us(tiles, tail_keys, num_cus)
+    best_n, best = 0, _launch_us(tiles, keys + tail_keys, num_cus) * (1 - SPLIT_GAIN)
+    for n in range(2, MAX_FULL_SLICES + 1):
+        if n * total_q > MAX_PARTIAL_ROWS or keys / n < TILE_ROWS:
+            break
+        est = _launch_us(tiles * n, -(-keys // n), num_cus) + tail + ROW_NS * n * total_q / 1e3
+        if est < best * (1 - SLICE_GAIN if best_n else 1):
+            best_n, best = n, est
+    return best_n
+
+
+def build_plan(
+    seqlens_q: np.ndarray,
+    context_lens: np.ndarray,
+    q_per_kv: int | None = None,
+    kv_heads: int = 1,
+    num_cus: int | None = None,
+):
     """The split layout for prefill rows with ``seqlens_q`` new tokens over
     ``context_lens`` keys each (both include the new tokens), or None when
-    the step does not qualify. int32 arrays plus the two launches' maxima."""
+    the step does not qualify. int32 arrays plus the two launches' maxima.
+    ``q_per_kv`` (query heads a KV head), ``kv_heads`` (KV heads on this rank)
+    and ``num_cus`` let the cost model choose the slice count; without them,
+    or with ATOM_PREFIX_SPLIT_COST_MODEL=0, the SLICE_KEYS rule does."""
     seqlens_q = np.asarray(seqlens_q, dtype=np.int64)
     context_lens = np.asarray(context_lens, dtype=np.int64)
     prefix = context_lens - seqlens_q
     if len(seqlens_q) == 0 or prefix.min() < MIN_PREFIX_KEYS or seqlens_q.min() <= 0:
         return None
-    n_full = int(min(MAX_FULL_SLICES, max(1, -(-int(prefix.max()) // SLICE_KEYS))))
-    # The repeated query rows and the slice partials scale with n_full * tokens;
-    # past ~16k rows the merge's reads outweigh the parallelism.
-    n_full = max(1, min(n_full, MAX_PARTIAL_ROWS // int(seqlens_q.sum())))
+    if COST_MODEL and q_per_kv and num_cus:
+        n_full = choose_slices(seqlens_q, prefix, q_per_kv, kv_heads, num_cus)
+        if n_full == 0:
+            return None
+    else:
+        n_full = int(min(MAX_FULL_SLICES, max(1, -(-int(prefix.max()) // SLICE_KEYS))))
+        # The repeated query rows and the slice partials scale with n_full *
+        # tokens; past ~16k rows the merge's reads outweigh the parallelism.
+        n_full = max(1, min(n_full, 16384 // int(seqlens_q.sum())))
     n = len(seqlens_q)
     cu_q = np.concatenate(([0], np.cumsum(seqlens_q)))
     cu_k = np.concatenate(([0], np.cumsum(context_lens)))
