@@ -2545,3 +2545,29 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
     with pytest.raises(ValueError, match="needs TP >= 4"):
         m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
+
+
+@pytest.mark.parametrize("online", [None, {"global_quant_config": "ptpc_fp8"}])
+def test_minimax_m31_draft_follows_online_quant_config(online):
+    """The MiniMax-M3.1 draft keeps its MXFP8 checkpoint quant and takes the
+    server's --online_quant_config on top, as the target does: under ptpc_fp8
+    its linears are re-quantized per channel at load; without one they stay
+    MXFP8."""
+    from aiter import QuantType
+
+    from atom.models.minimax_m3.dspark import _draft_quant_config
+
+    config = types.SimpleNamespace(
+        torch_dtype=torch.bfloat16,
+        quantization_config={
+            "quant_method": "mxfp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [1, 32],
+        },
+    )
+    qc = _draft_quant_config(config, online)
+    assert qc.quant_method == "mxfp8"
+    assert qc.global_spec.quant_type == QuantType.per_1x32
+    assert qc.online_quant is (online is not None)
+    if online is not None:
+        assert qc.online_global_spec.quant_type == QuantType.per_Token

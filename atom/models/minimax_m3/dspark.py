@@ -93,7 +93,9 @@ def _draft_rope_theta(config) -> float:
     return float(theta)
 
 
-def _draft_quant_config(config) -> QuantizationConfig:
+def _draft_quant_config(
+    config, online_quant_config: dict | None = None
+) -> QuantizationConfig:
     """The draft's own quantization, independent of the target's.
 
     The draft checkpoint is MXFP8 (``quant_method: mxfp8``, ``[1, 32]`` blocks)
@@ -102,8 +104,12 @@ def _draft_quant_config(config) -> QuantizationConfig:
     copies onto the draft, cannot be trusted to describe these weights. The
     checkpoint's own block goes through the registered parser here; a draft
     config without one is BF16.
+
+    ``--online_quant_config`` re-quantizes the draft at load as it does the
+    target: under ``ptpc_fp8`` the draft linears run the per-token FP8 GEMM
+    instead of MXFP8's triton block-scale GEMM plus a quant per linear.
     """
-    draft_qc = QuantizationConfig(config)
+    draft_qc = QuantizationConfig(config, online_quant_config)
     spec = draft_qc.global_spec
     if draft_qc.quant_method and (spec.quant_type, spec.quant_dtype) != (
         QuantType.per_1x32,
@@ -448,7 +454,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             )
         config = atom_config.hf_config
         self.hf_config = config
-        quant_config = _draft_quant_config(config)
+        quant_config = _draft_quant_config(config, atom_config.online_quant_config)
 
         self.hidden_size = config.hidden_size
         self.noise_token_id = int(config.dspark_noise_token_id)
