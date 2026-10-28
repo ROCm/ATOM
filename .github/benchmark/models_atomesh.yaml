@@ -2160,7 +2160,7 @@ models:
           env:
             common:
               ATOMESH_VLLM_MODE: inspect
-              ATOMESH_INSPECT_RUN_ID: "40721086376"
+              ATOMESH_INSPECT_RUN_ID: "latest"
               ATOMESH_INSPECT_CASE: triton-probe
 
         - <<: *m31_vllm_pd
@@ -2169,8 +2169,17 @@ models:
           env:
             common:
               ATOMESH_VLLM_MODE: inspect
-              ATOMESH_INSPECT_RUN_ID: "40487190671"
-              ATOMESH_INSPECT_CASE: validated-sweep
+              ATOMESH_INSPECT_RUN_ID: "latest"
+              ATOMESH_INSPECT_CASE: smoke
+
+        - <<: *m31_vllm_pd
+          name: m31-vllm-inspect-c32
+          concurrency: [1]
+          env:
+            common:
+              ATOMESH_VLLM_MODE: inspect
+              ATOMESH_INSPECT_RUN_ID: "latest"
+              ATOMESH_INSPECT_CASE: c32
 
         - <<: *m31_vllm_pd
           name: m31-vllm-1p1d-tp4-mcstore-validated-sweep

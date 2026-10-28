@@ -11,19 +11,29 @@ import shutil
 import subprocess
 from pathlib import Path
 
-run_id = os.environ['ATOMESH_ENV_ATOMESH_INSPECT_RUN_ID']
-if not run_id.isdecimal():
-    raise ValueError('Status inspection requires a numeric Actions run ID')
+requested_run_id = os.environ['ATOMESH_ENV_ATOMESH_INSPECT_RUN_ID']
+if not requested_run_id.isdecimal() and requested_run_id != 'latest':
+    raise ValueError('Status inspection requires a numeric Actions run ID or latest')
 root = Path(os.environ['SLURM_LOG_ROOT']).resolve()
 out = Path(os.environ['RESULT_DIR']) / 'inspection'
 out.mkdir(parents=True, exist_ok=True)
 # Exact task namespace and Actions ID; only its timestamp suffix is variable.
 case = os.environ.get('ATOMESH_ENV_ATOMESH_INSPECT_CASE', 'smoke')
-if case not in {'smoke', 'validated-sweep', 'triton-probe'}:
+if case not in {'smoke', 'c32', 'validated-sweep', 'triton-probe'}:
     raise ValueError('Unknown native experiment case')
-prefix = f'minimax-m3.1-flash-vllm-m31-vllm-1p1d-tp4-mcstore-{case}-mooncake_store-{run_id}-'
+task_prefix = f'minimax-m3.1-flash-vllm-m31-vllm-1p1d-tp4-mcstore-{case}-mooncake_store-'
 if case == 'triton-probe':
-    prefix = f'minimax-m3.1-flash-vllm-m31-vllm-triton-probe-mooncake_store-{run_id}-'
+    task_prefix = 'minimax-m3.1-flash-vllm-m31-vllm-triton-probe-mooncake_store-'
+run_id = requested_run_id
+if run_id == 'latest':
+    # Resolve only this experiment's exact case namespace; never inspect arbitrary jobs.
+    candidates = []
+    for path in root.glob(task_prefix + '*'):
+        match = re.fullmatch(re.escape(task_prefix) + r'(\d+)-(\d+)', path.name)
+        if match and path.parent.resolve() == root:
+            candidates.append(int(match[1]))
+    run_id = str(max(candidates)) if candidates else '0'
+prefix = task_prefix + run_id + '-'
 runs = [p for p in root.glob(prefix + '*')
         if p.parent.resolve() == root and p.name[len(prefix):].isdecimal()]
 rows = []
@@ -90,6 +100,8 @@ for run in runs:
                               'All prefiller instances are ready.' if role == 'proxy' else
                               'Application startup complete'),
                     'out_of_memory': 'out of memory',
+                    'hip209': 'no kernel image is available for execution on the device',
+                    'rocm_nvfp4_attention': 'MiniMax M3 sparse attention selected ROCm NVFP4',
                     'mr_failure': 'ibv_reg_mr failed'}.items():
                     row[f'{role}_{name}'] = marker in tail
         memory_file = current / 'memory-before-download.json'
