@@ -3,7 +3,11 @@ from copy import deepcopy
 
 import pytest
 
-from atom.spec_decode.calibration import calibration_identity, validate_calibration
+from atom.spec_decode.calibration import (
+    _PLAIN_TP,
+    deployment_identity,
+    validate_calibration,
+)
 
 
 def profile():
@@ -46,19 +50,19 @@ def test_profile_identity_binds_graph_mode_and_compilation_level(tmp_path, monke
         enforce_eager=False,
         compilation_config=NS(level=0, cudagraph_mode=CUDAGraphMode.TR_HYBRID),
     )
-    identity = calibration_identity(config, "cpu")
+    identity = deployment_identity(config, "cpu")
     data = profile()
     data["identity"] = identity
     config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
     with pytest.raises(ValueError, match="does not match"):
         validate_calibration(
-            data, calibration_identity(config, "cpu"), width=5, max_batch=4
+            data, deployment_identity(config, "cpu"), width=5, max_batch=4
         )
     config.compilation_config.cudagraph_mode = CUDAGraphMode.TR_HYBRID
     config.compilation_config.level = 3
     with pytest.raises(ValueError, match="does not match"):
         validate_calibration(
-            data, calibration_identity(config, "cpu"), width=5, max_batch=4
+            data, deployment_identity(config, "cpu"), width=5, max_batch=4
         )
 
 
@@ -81,7 +85,7 @@ def test_legacy_tp_profile_cannot_be_reused_for_dp_or_ep():
         ("moe_ep_flatten_tp_across_dp", True),
     ]:
         changed = {**identity, "parallelism": {**defaults, field: value}}
-        with pytest.raises(ValueError, match="does not match"):
+        with pytest.raises(ValueError, match="plain TP"):
             validate_calibration(data, changed, width=5, max_batch=4)
         measured = {**data, "identity": changed}
         validate_calibration(measured, changed, width=5, max_batch=4)
@@ -107,17 +111,27 @@ def test_incompatible_or_invalid_profile_is_rejected(field, value):
         validate_calibration(data, identity, width=5, max_batch=4)
 
 
-def test_a_profile_without_graph_fields_must_be_regenerated():
-    """Older profiles do not record the graph mode / compilation level they
-    measured; they are refused with a targeted message, not reinterpreted."""
+def test_a_profile_in_mains_format_still_loads():
+    """main's profiles carry neither parallelism nor graph fields: they load
+    on plain TP as they do on main, and a field they do carry still binds."""
     data = profile()
-    for field in ("graph_mode", "compilation_level"):
-        old = {
-            **data,
-            "identity": {k: v for k, v in data["identity"].items() if k != field},
-        }
-        with pytest.raises(ValueError, match="predates graph-mode binding"):
-            validate_calibration(old, data["identity"], width=5, max_batch=4)
+    identity = {**data["identity"], "parallelism": dict(_PLAIN_TP)}
+    legacy = {
+        **data,
+        "identity": {
+            k: v
+            for k, v in data["identity"].items()
+            if k not in ("graph_mode", "compilation_level")
+        },
+    }
+    validate_calibration(legacy, identity, width=5, max_batch=4)
+    validate_calibration(
+        legacy, {**identity, "graph_mode": "FULL"}, width=5, max_batch=4
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        validate_calibration(
+            data, {**identity, "graph_mode": "FULL"}, width=5, max_batch=4
+        )
 
 
 def test_identity_resolves_a_hub_id_to_its_local_snapshot(tmp_path, monkeypatch):
@@ -145,8 +159,7 @@ def test_identity_resolves_a_hub_id_to_its_local_snapshot(tmp_path, monkeypatch)
         enforce_eager=False,
         compilation_config=NS(level=0, cudagraph_mode=CUDAGraphMode.TR_HYBRID),
     )
-    identity = calibration_identity(config, 0)
+    identity = deployment_identity(config, 0)
     assert set(identity["model_files"]) == {
         "config.json",
-        "model.safetensors.index.json",
-    }
+        "model.safetensors.index

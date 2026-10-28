@@ -34,7 +34,7 @@ def test_uncovered_rows_extend_along_the_last_slope():
 def _runner(tmp_path, monkeypatch, *, cached_elsewhere=True):
     monkeypatch.setenv("ATOM_DSPARK_SPS_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(
-        "atom.spec_decode.calibration.calibration_identity",
+        "atom.spec_decode.calibration.deployment_identity",
         lambda config, device: {"deployment": "x"},
     )
     monkeypatch.setattr(

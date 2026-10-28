@@ -136,15 +136,15 @@ its own traffic (its temperatures only size its own requests). Until then T=1.
 The startup context is the capture context (about 128 tokens), so the curve is
 a short-context target-only baseline; `online_sps` adds what serving adds.
 
-**An explicit `calibration_profile`** takes precedence. A profile carries the
-SPS table and **confidence temperatures**, which rescale the drafter's
-per-position survival probabilities.
-
-Loading a profile validates the config and index-file hashes, model type, TP/DP/
-EP layout, cache types, graph mode and compilation level, GPU name and
-Torch/HIP versions, plus proposal width, batch coverage, positive finite
-temperatures and a non-increasing SPS table. Those hashes identify checkpoint
-metadata, not every weight byte. Recalibrate after a model or runtime change.
+**An explicit `calibration_profile`** takes precedence. It is main's existing
+interface for externally produced measurements (an SPS table and per-position
+**confidence temperatures**); no in-tree tool produces one, and startup SPS
+plus online STS are the supported path. A profile is validated against the
+deployment identity: model and index-file hashes, model type, TP size, cache
+types, graph setting, GPU name and Torch/HIP versions, plus proposal width,
+batch coverage, positive finite temperatures and a non-increasing SPS table.
+Profiles in main's format, which carry no DP/EP layout or graph mode, load on
+plain TP only; a field a profile does carry must match.
 
 ### Online SPS correction
 
@@ -296,7 +296,7 @@ generation-quality and throughput evaluation.
 
 Fixed-width DSpark is the default when speculation is explicitly selected.
 Dynamic verification measures its cost curve at startup on TR_HYBRID token
-graphs (cached per deployment) unless a calibrated profile is supplied; without
+graphs (cached per deployment) unless an external profile is supplied; without
 one, confidence temperatures are fitted online.
 Quality equivalence to non-speculative generation and a general throughput
 improvement have not been established.

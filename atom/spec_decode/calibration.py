@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""Offline DSpark calibration artifacts and their deployment compatibility."""
+"""DSpark deployment identity, and the optional calibration_profile interface.
+
+`deployment_identity` keys what a cost measurement is valid for. It serves two
+consumers: the startup SPS cache (`startup_sps.py`), and validation of an
+externally supplied `calibration_profile` (main's existing interface; no
+in-tree tool produces one -- startup SPS plus online STS replace it).
+"""
 
 import hashlib
 import json
@@ -10,7 +16,7 @@ from pathlib import Path
 import torch
 
 
-def calibration_identity(config, device):
+def deployment_identity(config, device):
     from atom.model_loader.weight_utils import local_model_dir
 
     # A hub id joined onto file names is a relative path that does not exist.
@@ -49,34 +55,36 @@ def calibration_identity(config, device):
     }
 
 
+# Fields a profile may omit: profiles in main's format predate them. A
+# profile without `parallelism` was measured on plain TP, so it is admitted
+# only there; without the graph fields it is admitted as main admits it.
+_PLAIN_TP = {
+    "data_parallel_size": 1,
+    "dp_attention": False,
+    "expert_parallel": False,
+    "moe_all2all_backend": "auto",
+    "moe_ep_flatten_tp_across_dp": False,
+}
+_OPTIONAL = ("parallelism", "graph_mode", "compilation_level")
+
+
 def validate_calibration(profile, identity, *, width, max_batch):
     recorded = profile.get("identity")
-    if isinstance(recorded, dict) and not {"graph_mode", "compilation_level"} <= set(
-        recorded
-    ):
-        # Earlier profiles do not say which graph mode / compilation level
-        # they measured, and the cost of a shape depends on both.
+    if profile.get("version") != 1 or not isinstance(recorded, dict):
         raise ValueError(
-            "DSpark calibration predates graph-mode binding (no graph_mode / "
-            "compilation_level in its identity); drop it to measure the cost "
-            "curve at startup and fit temperatures online"
+            "DSpark calibration does not match this model/hardware/runtime"
         )
-    # Version-1 profiles could only be produced for plain TP. Retain
-    # that compatibility, but never silently reinterpret one as DP or EP.
-    if (
-        isinstance(recorded, dict)
-        and "parallelism" not in recorded
-        and identity.get("parallelism")
-        == {
-            "data_parallel_size": 1,
-            "dp_attention": False,
-            "expert_parallel": False,
-            "moe_all2all_backend": "auto",
-            "moe_ep_flatten_tp_across_dp": False,
-        }
-    ):
-        recorded = {**recorded, "parallelism": identity["parallelism"]}
-    if profile.get("version") != 1 or recorded != identity:
+    expected = dict(identity)
+    for field in _OPTIONAL:
+        if field in recorded:
+            continue
+        if field == "parallelism" and identity.get(field, _PLAIN_TP) != _PLAIN_TP:
+            raise ValueError(
+                "DSpark calibration was measured on plain TP and cannot be "
+                "reused for DP or EP"
+            )
+        expected.pop(field, None)
+    if recorded != expected:
         raise ValueError(
             "DSpark calibration does not match this model/hardware/runtime"
         )
@@ -104,11 +112,10 @@ def load_calibration(config, device):
     profile = json.loads(Path(path).read_text())
     validate_calibration(
         profile,
-        calibration_identity(config, device),
+        deployment_identity(config, device),
         width=config.speculative_config.num_speculative_tokens,
         max_batch=config.max_num_seqs,
     )
     return (
         torch.tensor(profile["sps_table"], dtype=torch.float32, device=device),
-        torch.tensor(profile["sts_temperatures"], dtype=torch.float32, device=device),
-    )
+        torch.tensor(profile["sts_temperatures"], dtype=torch.float32, 

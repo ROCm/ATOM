@@ -186,9 +186,9 @@ def _measure(runner, shapes):
 
 def startup_sps_table(runner, qs, max_rows):
     """The deployment's SPS table: cached, or measured now on every rank."""
-    from atom.spec_decode.calibration import calibration_identity
+    from atom.spec_decode.calibration import deployment_identity
 
-    identity = calibration_identity(runner.config, runner.device)
+    identity = deployment_identity(runner.config, runner.device)
     shapes = _shapes(runner, qs)
     path = _cache_path(identity, shapes, qs)
     # Every rank must take the same branch: the sweep runs collectives.
