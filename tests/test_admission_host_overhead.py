@@ -25,7 +25,7 @@ from test_state_checkpoint import (
     stateful_seq,
 )
 
-from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.prefix_hash import (
     attach_shipped_chains,
     chained_block_hashes,
@@ -74,11 +74,12 @@ def pool_state(bm):
 
 def admit(bm, seq, chunk=None):
     """Phase 2: probe, record, allocate, forward."""
-    hashes = []
-    hit = bm.can_allocate(seq, record=False, block_hashes=hashes)
+    probe = AdmissionProbe()
+    hit = bm.can_allocate(seq, record=False, probe=probe)
+    hashes = probe.block_hashes
     if hit < 0:
         return (hit, hashes)
-    bm.record_allocation(seq, hit, hashes)
+    bm.record_allocation(seq, probe)
     assert bm.allocate(seq, hit)
     replay = seq.replays_hit, seq.replay_kv_load
     todo = seq.num_tokens - seq.num_cached_tokens

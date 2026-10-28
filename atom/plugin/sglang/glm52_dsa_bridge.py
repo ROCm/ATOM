@@ -1753,7 +1753,8 @@ def build_mtp_draft_extend_prefill_metadata(
     dtype_q = metadata_dtype(atom_config)
     md.dtype_q = dtype_q
 
-    if md.max_seqlen_k > topk:
+    md.run_sparse = md.max_seqlen_k > topk
+    if md.run_sparse:
         counts = extend_lens.astype(np.int32)
         local_offsets = np.concatenate(
             [np.arange(int(count), dtype=np.int32) for count in counts]
@@ -1886,7 +1887,8 @@ def build_prefill_metadata(
     dtype_q = metadata_dtype(atom_config)
     md.dtype_q = dtype_q
 
-    if md.max_seqlen_k > topk:
+    md.run_sparse = md.max_seqlen_k > topk
+    if md.run_sparse:
         counts = extend_lens.astype(np.int32)
         local_offsets = np.concatenate(
             [np.arange(int(count), dtype=np.int32) for count in counts]
