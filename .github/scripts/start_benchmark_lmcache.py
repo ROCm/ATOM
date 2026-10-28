@@ -16,10 +16,16 @@ def main():
     port = int(os.environ.get("ATOM_BENCHMARK_LMCACHE_PORT", "24850"))
     http_port = int(os.environ.get("ATOM_BENCHMARK_LMCACHE_HTTP_PORT", "24851"))
     l1_gb = float(os.environ.get("ATOM_BENCHMARK_LMCACHE_L1_GB", "256"))
+    # The DP2 benchmark connects two GPU clients to this shared MP server.
+    # Give each client its own STORE/RETRIEVE handler; same-client work stays
+    # ordered by LMCache's affinity pool. CPU handler defaults are unchanged.
+    gpu_workers = int(os.environ.get("ATOM_BENCHMARK_LMCACHE_GPU_WORKERS", "2"))
     if not (0 < port < 65536 and 0 < http_port < 65536 and port != http_port):
         raise ValueError("LMCache requires two distinct valid ports")
     if not 0 < l1_gb <= 256:
         raise ValueError("LMCache benchmark L1 must be in (0, 256] GiB")
+    if gpu_workers < 1:
+        raise ValueError("ATOM_BENCHMARK_LMCACHE_GPU_WORKERS must be positive")
     # Fail on an occupied endpoint; never reuse or stop another cache service.
     for endpoint in (port, http_port):
         with socket.socket() as sock:
@@ -43,6 +49,8 @@ def main():
         "--separate-object-groups",
         "--supported-transfer-mode",
         "lmcache_driven",
+        "--max-gpu-workers",
+        str(gpu_workers),
         "--l1-size-gb",
         str(l1_gb),
         "--l1-read-ttl-seconds",
@@ -76,7 +84,10 @@ def main():
                     f"http://127.0.0.1:{http_port}/healthcheck", timeout=2
                 ) as response:
                     if response.status == 200:
-                        print(f"LMCache MP ready on {port}; L1={l1_gb:g} GiB")
+                        print(
+                            f"LMCache MP ready on {port}; L1={l1_gb:g} GiB; "
+                            f"GPU workers={gpu_workers}"
+                        )
                         return
             except (urllib.error.URLError, TimeoutError):
                 pass
