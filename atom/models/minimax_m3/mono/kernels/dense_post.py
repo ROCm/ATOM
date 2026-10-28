@@ -207,18 +207,18 @@ def build_dense_post_kernel(
         def start(name):
             return first_task(bid, BASE[name])
 
-        def push_rows(region, row0, n_rows, only=None):
+        def push_rows(region, row0, n_rows, only=None, token0=0, token_count=tokens):
             """This task's bf16 partial rows (misc: token k's n_rows from k n_rows) to
             the peers' ``region``, a pair a lane, wave w -> peer w (itself too);
             ``only``: to that peer alone."""
             half = n_rows // 2
             to = (wave < W) if only is None else (wave == only)
-            for c in range_constexpr((half * tokens + 63) // 64):
+            for c in range_constexpr((half * token_count + 63) // 64):
                 i = lane + 64 * c
-                if to & (i < half * tokens):
+                if to & (i < half * token_count):
                     mb_put_bf(
                         preg(peer_dst, SY[region], region),
-                        (rank * MAX_TOKENS + i // half) * HIDDEN
+                        (rank * MAX_TOKENS + token0 + i // half) * HIDDEN
                         + row0
                         + (i % half) * 2,
                         [fx.ptr_load(misc + i * 2), fx.ptr_load(misc + (i * 2 + 1))],

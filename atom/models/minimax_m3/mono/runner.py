@@ -43,6 +43,7 @@ from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
     LOCAL_Q_HEADS,
+    M31_MAX_TOKENS,
     MAX_TOKENS,
     N_ROUTED,
     ONE_INDEX_HEAD,
@@ -59,6 +60,8 @@ from atom.models.minimax_m3.mono.kernels.post_attn import (
     K4_ABI,
     TL_POINTS,
     build_post_attn_kernel,
+    build_post_attn_m31_kernel,
+    build_post_attn_shared_fp8_kernel,
 )
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     K1_ABI,
@@ -66,11 +69,23 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
     build_pre_attn_kernel,
 )
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
+    LEGACY_SCRATCH_BYTES as K1_LEGACY_SCRATCH_BYTES,
+)
+from atom.models.minimax_m3.mono.kernels.pre_attn import (
     SCRATCH_BYTES as K1_SCRATCH_BYTES,
 )
-from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
+from atom.models.minimax_m3.mono.layout import (
+    SCRATCH,
+    diag_region_names,
+    scratch_layout,
+    sym_layout,
+)
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
-from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
+from atom.models.minimax_m3.mono.weights import (
+    DenseLayer,
+    SparseMoeLayer,
+    attention_mxfp8,
+)
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -170,8 +185,7 @@ class MonoDecodeRunner:
             kernels["dense_post"] = self._build_dense_post(n)
         return kernels
 
-    @staticmethod
-    def _layer_kernels(kernels: dict) -> list:
+    def _layer_kernels(self, kernels: dict) -> list:
         """A width's layer kernels, each with its ABI."""
         return [
             (launch, _KERNEL_ABI.get(kind, K4_ABI)) for kind, launch in kernels.items()
@@ -186,6 +200,13 @@ class MonoDecodeRunner:
             raise MonoUnsupported(f"TP {npes}")
         layers = model.layers
         self.dense_mono = dense_prefix_mono(layers)
+        attn_modes = {
+            attention_mxfp8(layers[i], i) for i in range(N_DENSE, len(layers))
+        }
+        if len(attn_modes) != 1:
+            raise MonoUnsupported(f"mixed attention layouts {attn_modes}")
+        self.native_mxfp8_attn = attn_modes.pop()
+        self.max_tokens = M31_MAX_TOKENS if self.native_mxfp8_attn else MAX_TOKENS
         if require_aux and drafter is None:
             raise MonoUnsupported("no DSpark drafter")
         self.aux = bind_aux_taps(drafter, config.hidden_size) if require_aux else None
@@ -199,9 +220,17 @@ class MonoDecodeRunner:
         # bounded mailbox waits, their records raised after the step (finish_step)
         self.debug = envs.ATOM_MONO_DEBUG
         self.sparse = [
-            SparseMoeLayer.from_layer(layers[i], i, heads)
+            SparseMoeLayer.from_layer(
+                layers[i], i, heads, attn_mxfp8=self.native_mxfp8_attn
+            )
             for i in range(N_DENSE, len(layers))
         ]
+        shared_modes = {lw.shared_fp8 for lw in self.sparse}
+        if len(shared_modes) != 1:
+            raise MonoUnsupported(f"mixed shared-expert layouts {shared_modes}")
+        self.shared_fp8 = shared_modes.pop()
+        if self.native_mxfp8_attn and not self.shared_fp8:
+            raise MonoUnsupported("native-MXFP8 attention needs independent shared MLP")
         # a reusing layer reads the selection an earlier layer of the step left
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
@@ -229,10 +258,13 @@ class MonoDecodeRunner:
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
         # the fused shared expert's routing weight is whatever the topK metadata holds
         # read through the module: the metadata is assigned after this file is imported
-        total_w, total_ids = topk_meta.aiter_topK_meta_data
-        if int(total_ids[0, TOP_K].item()) != N_ROUTED:
-            raise MonoUnsupported("fused shared expert id")
-        shared_weight = float(total_w[0, TOP_K].item())
+        if self.shared_fp8:
+            shared_weight = 1.0
+        else:
+            total_w, total_ids = topk_meta.aiter_topK_meta_data
+            if int(total_ids[0, TOP_K].item()) != N_ROUTED:
+                raise MonoUnsupported("fused shared expert id")
+            shared_weight = float(total_w[0, TOP_K].item())
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
@@ -252,21 +284,52 @@ class MonoDecodeRunner:
             else None
         )
         # the s-token layer kernel is ``self._build_k4(s)`` (``WidthBuilds``)
-        self._build_k4 = functools.partial(
-            build_post_attn_kernel,
-            npes,
-            self.sm_scale,
-            eps,
-            route_scale,
-            shared_weight,
-            experts.swiglu_limit,
-            impl.init_blocks,
-            impl.local_blocks,
-            fuse_k1=True,
-            timeline=self.timeline is not None,
-            heads=heads,
-            debug=self.debug,
-        )
+        if self.native_mxfp8_attn:
+            self._build_k4 = functools.partial(
+                build_post_attn_m31_kernel,
+                npes,
+                self.sm_scale,
+                eps,
+                route_scale,
+                experts.swiglu_limit,
+                impl.init_blocks,
+                impl.local_blocks,
+                fuse_k1=True,
+                timeline=self.timeline is not None,
+                heads=heads,
+                debug=self.debug,
+            )
+        elif self.shared_fp8:
+            self._build_k4 = functools.partial(
+                build_post_attn_shared_fp8_kernel,
+                npes,
+                self.sm_scale,
+                eps,
+                route_scale,
+                experts.swiglu_limit,
+                impl.init_blocks,
+                impl.local_blocks,
+                fuse_k1=True,
+                timeline=self.timeline is not None,
+                heads=heads,
+                debug=self.debug,
+            )
+        else:
+            self._build_k4 = functools.partial(
+                build_post_attn_kernel,
+                npes,
+                self.sm_scale,
+                eps,
+                route_scale,
+                shared_weight,
+                experts.swiglu_limit,
+                impl.init_blocks,
+                impl.local_blocks,
+                fuse_k1=True,
+                timeline=self.timeline is not None,
+                heads=heads,
+                debug=self.debug,
+            )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
             self._build_dense_pre = functools.partial(
@@ -289,11 +352,17 @@ class MonoDecodeRunner:
     def _allocate(self, group) -> None:
         """Scratch, the peer handshake and the activation buffers (every rank)."""
         dev = self.dev
-        self.scratch1 = torch.zeros(K1_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
-        self.scratch4 = torch.zeros(K4_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
+        scratch1_bytes = (
+            K1_SCRATCH_BYTES if self.native_mxfp8_attn else K1_LEGACY_SCRATCH_BYTES
+        )
+        scratch4_bytes = (
+            K4_SCRATCH_BYTES if self.native_mxfp8_attn else SCRATCH["_bytes"]
+        )
+        self.scratch1 = torch.zeros(scratch1_bytes, dtype=torch.uint8, device=dev)
+        self.scratch4 = torch.zeros(scratch4_bytes, dtype=torch.uint8, device=dev)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
-            sym_layout(self.npes)["_bytes"],
+            sym_layout(self.npes, self.max_tokens)["_bytes"],
             group,
             self.rank,
             self.npes,
@@ -307,18 +376,20 @@ class MonoDecodeRunner:
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the
         # previous layer's output) and writes ars[(i + 1) % 2], likewise h_mids
         self.ars = [
-            torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
+            torch.empty(self.max_tokens, HIDDEN, dtype=bf16, device=dev)
+            for _ in range(2)
         ]
         self.h_mids = [
-            torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
+            torch.empty(self.max_tokens, HIDDEN, dtype=bf16, device=dev)
+            for _ in range(2)
         ]
-        self.h = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
+        self.h = torch.empty(self.max_tokens, HIDDEN, dtype=bf16, device=dev)
         self.q = torch.empty(
-            MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
+            self.max_tokens, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
         )
-        self.iq = torch.empty(MAX_TOKENS, 1, HEAD_DIM, dtype=bf16, device=dev)
+        self.iq = torch.empty(self.max_tokens, 1, HEAD_DIM, dtype=bf16, device=dev)
         # layer 0's residual input: its K1 takes (embedding, 0), acc = embedding
-        self.zero_res = torch.zeros(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
+        self.zero_res = torch.zeros(self.max_tokens, HIDDEN, dtype=bf16, device=dev)
         # each layer's K1 pointers that do not change per step (K1_ARGS order)
         self.k1_args = []
         for i, lw in enumerate(self.sparse):
@@ -330,11 +401,27 @@ class MonoDecodeRunner:
                 "scratch": _ptr(self.scratch1),
             }  # fmt: skip
             self.k1_args.append(
-                torch.tensor([ptrs[a] for a in K1_ARGS], dtype=torch.int64, device=dev)
+                torch.tensor(
+                    [ptrs[a] for a in K1_ARGS]
+                    + (
+                        [
+                            _ptr(lw.shared_w13),
+                            _ptr(lw.shared_s13),
+                            _ptr(lw.shared_w2),
+                            _ptr(lw.shared_s2),
+                        ]
+                        if self.shared_fp8
+                        else []
+                    ),
+                    dtype=torch.int64,
+                    device=dev,
+                )
             )
 
     def prepare(self, n: int) -> bool:
         """Whether every rank holds the n-token kernel (``WidthBuilds``)."""
+        if not 1 <= n <= self.max_tokens:
+            return False
         return self.k4.prepare(n)
 
     def close(self) -> None:
@@ -522,9 +609,11 @@ class MonoDecodeRunner:
     def raise_on_given_up_waits(self, n: int) -> None:
         """A debug build's step: raise with every mailbox wait that gave up (its
         region, pair index, tags, CTA) and every rank the fence gave up on."""
-        off = SCRATCH["diag"]
+        off = scratch_layout(n, self.native_mxfp8_attn)["diag"]
         waits = given_up_waits(
             self.scratch4[off : off + DIAG_BYTES],
-            region_namer(diag_region_names(n, self.index_heads)),
+            region_namer(
+                diag_region_names(n, self.index_heads, shared_fp8=self.shared_fp8)
+            ),
         )
         raise_if_given_up("MiniMax-M3 mono", self.rank, n, waits, self.mailboxes)

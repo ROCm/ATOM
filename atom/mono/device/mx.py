@@ -54,19 +54,40 @@ def scale_index(row, col, cols):
     return ((((r32 * (cols // 8) + c8) * 4 + e) * 16 + b) * 2 + d) * 2 + a
 
 
-def fp4_tile_load(r_w, base, rg, k, st, at):
+def fp4_tile_load(r_w, base, rg, k, st, at, cache_modifier=CM_NT):
     """A lane's 16 B of an FP4 weight's (16, 16)-shuffled 16-row group ``rg``
     (K = ``k``) at 128-k step ``st``: dword ``base`` + the group's 2 k + 256 a
     step + ``at`` (``lane * 4``: 32 fp4, K block lane / 16 of row lane % 16).
-    Nontemporal: a weight a step reads once."""
+    Loads are nontemporal unless a tiled caller reuses the weight."""
     return fx.Vector(
         bo.buffer_load(
             r_w,
             base + rg * (2 * k) + st * 256 + at,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_NT,
+            cache_modifier=cache_modifier,
         )
+    )
+
+
+def mxfp8_a_tiles(r_w, rg, k, st, lane):
+    """A lane's two 64-k halves of a row-major FP8 16x128 weight tile.
+
+    Native Quark per-block [1, 32] weights are not shuffled.  The MFMA lane
+    mapping takes one 16-byte K segment from one of the tile's 16 rows in each
+    64-column half.
+    """
+    row = rg * 16 + lane % 16
+    k16 = st * 128 + (lane // 16) * 16
+    half = (row * k + k16) // 4
+    lo = fx.Vector(
+        bo.buffer_load(r_w, half, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
+    hi = fx.Vector(
+        bo.buffer_load(r_w, half + 16, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
+    return fx.Vector.from_elements(
+        [lo[i] for i in range(4)] + [hi[i] for i in range(4)], fx.Int32
     )
 
 

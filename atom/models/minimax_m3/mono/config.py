@@ -87,7 +87,30 @@ MAX_CONTEXT = 1 << 20
 MAX_INDEX_BLOCKS = MAX_CONTEXT // SPARSE_BLOCK
 PAGE16 = 16
 
-MAX_TOKENS = 16  # tokens one mono step serves (the MFMA B operand holds 16)
+TOKEN_TILE = 16  # columns in one MFMA B operand
+MAX_TOKENS = TOKEN_TILE  # the legacy M3 path's served rows
+M31_MAX_TOKENS = 32  # the native-MXFP8 M3.1 path walks TOKEN_TILE-row tiles
+
+
+def token_tiles(tokens: int) -> list[tuple[int, int]]:
+    """(first row, rows) of each MFMA token tile."""
+    return [
+        (first, min(TOKEN_TILE, tokens - first))
+        for first in range(0, tokens, TOKEN_TILE)
+    ]
+
+
+def tile_rows(tokens: int) -> int:
+    """Rows held in LDS for a token-tiled build."""
+    return min(tokens, TOKEN_TILE)
+
+
+def token_mask_i32(tokens: int) -> int:
+    """Low ``tokens`` bits without shifting a signed i32 by its width."""
+    assert 1 <= tokens <= 32
+    return -1 if tokens == 32 else (1 << tokens) - 1
+
+
 # indexer context parallelism: a rank computes every index q head
 MAX_QKV_ROWS = qkv_rows(TP)
 # a request past this many index blocks is selected by the split stage's long

@@ -17,7 +17,7 @@ from atom.models.minimax_m3.mono.layout import (
     XSC_ROW,
     shared_after_routing,
 )
-from atom.mono.device.mx import FP4, mfma_scaled
+from atom.mono.device.mx import FP4, FP8, mfma_scaled
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_pair,
@@ -132,7 +132,7 @@ def moe_narrow_defs(k4ctx):
             sh_w0 = sh_load(sh_j0)
             fetch_xn()
             gpu.barrier()
-            sh_compute(sh_j0, sh_w0[0], sh_w0[1])
+            sh_compute(sh_j0, sh_w0[0], sh_w0[1], 0, tokens)
         if ug_task_id(0)[1] | has_dn:
             # xn lands before the logits: stage it while waiting (a shared-expert
             # CTA has it already); a CTA's routed tasks are one token's
@@ -177,7 +177,7 @@ def moe_narrow_defs(k4ctx):
             stamp(7)
             if const_expr(sh_late):  # noqa: SIM102
                 if has_sh:  # while the first routed task's weights are in flight
-                    sh_compute(sh_j, sh_w[0], sh_w[1])
+                    sh_compute(sh_j, sh_w[0], sh_w[1], 0, tokens)
             # task i + 1's weights go out before task i's GEMV (software pipeline);
             # past the last task the load index is clamped and the result dropped
             for it in range_constexpr(UG_ITERS):
@@ -274,7 +274,7 @@ def moe_narrow_defs(k4ctx):
                     + g4
                 ),
                 c=fx.Vector.filled(4, 0.0, fx.Float32),
-                a_fmt=FP4,
+                a_fmt=FP8 if const_expr(k4ctx.get("shared_fp8", False)) else FP4,
             )
             sh = [sh[j4] + cu[j4] * wgt for j4 in range(4)]
         fx.ptr_store(

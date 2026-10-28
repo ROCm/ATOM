@@ -20,12 +20,16 @@ from atom.models.minimax_m3.mono.check import (
     trace_logits,
 )
 from atom.models.minimax_m3.mono.config import (
+    M31_MAX_TOKENS,
     MAX_CONTEXT,
     MAX_TOKENS,
     SUPPORTED_TP,
+    TOKEN_TILE,
     Dims,
 )
 from atom.models.minimax_m3.mono.runner import MonoDecodeRunner
+from atom.models.minimax_m3.mono.weights import attention_mxfp8
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.deployment import common_refusals, first_refusal
 from atom.mono.runtime.route import LazyRunner
 from atom.utils import envs
@@ -77,6 +81,11 @@ class MonoDecode:
 
     def __init__(self, causal_lm, atom_config) -> None:
         self._lm = causal_lm
+        try:
+            native_mxfp8 = attention_mxfp8(causal_lm.model.layers[3], 3)
+        except (AttributeError, IndexError, MonoUnsupported):
+            native_mxfp8 = False
+        self._max_tokens = M31_MAX_TOKENS if native_mxfp8 else MAX_TOKENS
         self._uses_dspark = _uses_dspark(atom_config)
         self._drafter = None
         # created on its first eligible step (``LazyRunner``)
@@ -115,7 +124,7 @@ class MonoDecode:
         n = input_ids.numel()  # a cudagraph's pad rows included
         if intermediate_tensors is not None or inputs_embeds is not None:
             return False
-        if not 1 <= n <= MAX_TOKENS:
+        if not 1 <= n <= getattr(self, "_max_tokens", MAX_TOKENS):
             return False
         # the kernels read every token's position and slot as an int64's low word
         if positions.dtype != torch.int64:
@@ -135,7 +144,7 @@ class MonoDecode:
         # q query tokens per request (speculative verify: q > 1), expanded to a
         # row per token by token_rows
         q = decode.max_query_len
-        if n % q:
+        if not 1 <= q <= TOKEN_TILE or n % q:
             return False
         bt = decode.block_table
         if bt.dtype != torch.int32 or decode.seq_lens.dtype != torch.int32:

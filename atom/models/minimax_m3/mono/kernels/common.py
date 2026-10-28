@@ -13,7 +13,7 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.mono.device.mx import FP8_MAX
+from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
 from atom.mono.device.ops import butterfly, hw_rcp, traced
 
 
@@ -43,6 +43,60 @@ def per_token_fp8_scale(amax):
     to zeros, not 0 * inf."""
     x_scale = amax * (1.0 / FP8_MAX)
     return x_scale, (amax == 0.0).select(fx.Float32(0.0), hw_rcp(x_scale))
+
+
+def e8m0_load(r_s, byte_idx):
+    """An E8M0 scale byte, still in flight for a scaled MFMA."""
+    return fx.Int32(bo.buffer_load(r_s, byte_idx, vec_width=1, dtype=T.i8))
+
+
+def shuffled_scale_index(lane, expert, rows, rg, kc, cols):
+    """This lane's A scale in aiter's shuffled expert-scale layout."""
+    base = (expert * (rows // 32) + rg // 2) * (cols // 8) + kc // 2
+    return (base * 64 + lane) * 4 + (kc % 2) * 2 + rg % 2
+
+
+def row_major_scale_index(row, col, cols):
+    """Byte of scale (row, col) in a contiguous [rows, cols] tensor."""
+    return row * cols + col
+
+
+def mx8_scale(vals, offsets):
+    """A 32-block's E8M0 code and reciprocal scale."""
+    amax = fx.max(vals[0], -vals[0])
+    for v in vals[1:]:
+        amax = fx.max(amax, fx.max(v, -v))
+    amax = butterfly(amax, offsets, fx.max)
+    e = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
+    return e, hw_rcp(pow2(e))
+
+
+def mx8_scale_quant(vals, offsets):
+    """ATOM ``quantize_fp8`` scale for one 32-element block."""
+    amax = fx.max(vals[0], -vals[0])
+    for v in vals[1:]:
+        amax = fx.max(amax, fx.max(v, -v))
+    amax = fx.max(butterfly(amax, offsets, fx.max), fx.Float32(1e-4))
+    e = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
+    return e, hw_rcp(pow2(e))
+
+
+def mx8_q(v, inv):
+    return clamp_fp8(v * inv)
+
+
+def mx8_b_tiles(xs, chunk_word, g4):
+    """This lane's scaled-MFMA B operand from a plain FP8 LDS row."""
+    v4f = fx.Vector.make_type(4, fx.Float32)
+    h = [
+        fx.Vector(
+            fx.ptr_load(xs + (chunk_word + 16 * j + 4 * g4), result_type=v4f)
+        ).bitcast(fx.Int32)
+        for j in range(2)
+    ]
+    return fx.Vector.from_elements(
+        [h[j][e] for j in range(2) for e in range(4)], fx.Int32
+    )
 
 
 def ar_pack_sumsq(vals):

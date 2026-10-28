@@ -21,9 +21,10 @@ from atom.models.minimax_m3.mono.kernels.dense_post import DENSE_POST_ABI
 from atom.models.minimax_m3.mono.kernels.post_attn import K4_ABI
 from atom.models.minimax_m3.mono.layout import dense_mailbox_regions, mailbox_regions
 from atom.mono.plan.check import ContractError, check
-from atom.mono.runtime.compile import trace
+from atom.mono.runtime.compile import launcher_resources, trace
 
 TOKENS = 4  # one request: the token and its 3 MTP drafts
+M31_TOKENS = (1, 16, 32)
 INDEX_HEADS = TP
 
 
@@ -32,8 +33,22 @@ def traces():
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("ARCH", "gfx950")
         patch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+        m31 = {
+            tokens: contract.build_m31_layer(tokens, INDEX_HEADS)
+            for tokens in M31_TOKENS
+        }
+        m31_single_s32 = contract.build_m31_layer(32, 1)
         return {
             "layer": trace(contract.build_layer(TOKENS, INDEX_HEADS), K4_ABI),
+            "m31": {
+                tokens: trace(launcher, K4_ABI) for tokens, launcher in m31.items()
+            },
+            "m31_single_s32": trace(m31_single_s32, K4_ABI),
+            "m31_resources": {
+                (16, INDEX_HEADS): launcher_resources(m31[16]),
+                (32, INDEX_HEADS): launcher_resources(m31[32]),
+                (32, 1): launcher_resources(m31_single_s32),
+            },
             "dense": trace(contract.build_dense(TOKENS), DENSE_POST_ABI),
         }
 
@@ -44,6 +59,25 @@ def test_the_layer_kernel_holds(traces):
 
 def test_the_dense_layer_kernel_holds(traces):
     check(traces["dense"], dense_mailbox_regions(TOKENS))
+
+
+def test_the_m31_layer_kernel_holds(traces):
+    for tokens, traced in traces["m31"].items():
+        check(
+            traced,
+            mailbox_regions(tokens, INDEX_HEADS, True, True, shared_fp8=True),
+        )
+    check(
+        traces["m31_single_s32"],
+        mailbox_regions(32, 1, True, True, shared_fp8=True),
+    )
+
+
+def test_the_m31_resource_boundaries_stay_fully_resident(traces):
+    for build, [resources] in traces["m31_resources"].items():
+        assert resources["vgpr_spill"] == 0, (build, resources)
+        assert resources["scratch"] == 0, (build, resources)
+        assert resources["lds"] <= 160 * 1024, (build, resources)
 
 
 def test_a_wrong_declaration_is_caught(traces):

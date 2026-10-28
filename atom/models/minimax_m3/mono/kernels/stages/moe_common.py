@@ -16,6 +16,7 @@ from atom.models.minimax_m3.mono.config import (
     SHARED_EXPERT,
     TOP_K,
 )
+from atom.models.minimax_m3.mono.kernels.common import row_major_scale_index
 from atom.models.minimax_m3.mono.kernels.stages.shared import (
     S2_BYTES,
     S13_BYTES,
@@ -32,7 +33,13 @@ from atom.models.minimax_m3.mono.layout import (
     XN8_ROW,
     XSC_ROW,
 )
-from atom.mono.device.mx import FP4, fp4_tile_load, mfma_scaled, scale_index
+from atom.mono.device.mx import (
+    FP4,
+    fp4_tile_load,
+    mfma_scaled,
+    mxfp8_a_tiles,
+    scale_index,
+)
 from atom.mono.device.ops import CM_NT, bf16_round, row_sum, rsrc, traced, uniform
 
 
@@ -66,11 +73,17 @@ def moe_common_defs(k4ctx):
     s13 = k4ctx["s13"]
     s2 = k4ctx["s2"]
     shared_weight = k4ctx["shared_weight"]
+    shared_fp8 = k4ctx.get("shared_fp8", False)
+    shared_w13 = k4ctx.get("shared_w13")
+    shared_s13 = k4ctx.get("shared_s13")
+    shared_w2 = k4ctx.get("shared_w2")
+    shared_s2 = k4ctx.get("shared_s2")
     stamp = k4ctx["stamp"]
     start = k4ctx["start"]
     swiglu_limit = k4ctx["swiglu_limit"]
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
+    sh_up = k4ctx["fpool"] + k4ctx["W_UPP"] if k4ctx["WIDE"] else opart
     w13 = k4ctx["w13"]
     w2 = k4ctx["w2"]
     wave = k4ctx["wave"]
@@ -161,6 +174,34 @@ def moe_common_defs(k4ctx):
     def sh_load(j, has=None):
         """The shared expert's half task j: gate rows 8 j .. + 8 on lanes l16 < 8,
         the up rows alike on the rest -- one MFMA tile; the waves split k."""
+        if const_expr(shared_fp8):
+            rg = j // 2
+            half = j % 2
+            w_bytes = 2 * INTER * HIDDEN
+            s_bytes = 2 * INTER * HIDDEN // 32
+            if const_expr(has is None):
+                r_w, r_s = rsrc(shared_w13), rsrc(shared_s13)
+            else:
+                r_w = rsrc(shared_w13, has.select(fx.Int32(w_bytes), fx.Int32(0)))
+                r_s = rsrc(shared_s13, has.select(fx.Int32(s_bytes), fx.Int32(0)))
+            wts = [[], []]
+            scs = [[], []]
+            for gu in range_constexpr(2):
+                rg_gu = gu * UG_PER_SLOT + rg
+                for i in range_constexpr(UG_CPW):
+                    kc = wave * UG_CPW + i
+                    wts[gu].append(mxfp8_a_tiles(r_w, rg_gu, HIDDEN, kc, lane))
+                    scs[gu].append(
+                        e8m0_load(
+                            r_s,
+                            row_major_scale_index(
+                                rg_gu * 16 + l16,
+                                kc * 4 + g4,
+                                HIDDEN // 32,
+                            ),
+                        )
+                    )
+            return wts, (scs, half)
         row = (l16 < 8).select(SH_ROWS * j + l16, INTER + SH_ROWS * j + l16 - 8)
         rg = row // 16
         if const_expr(has is None):
@@ -196,10 +237,40 @@ def moe_common_defs(k4ctx):
             scs.append(e8m0_load(r_s, sc_row + kc // 2 * 256 + kc % 2 * 2))
         return wts, scs
 
-    def sh_compute(j, wts, scs):
+    def sh_compute(j, wts, scs, t0, n):
         """Half task j's GEMV (B column l % 16 = token l % 16) -> swiglu -> the
         shared slot's mid rows 8 j .. + 8 of every token."""
-        col = fx.min(l16, tokens - 1)
+        col = fx.min(l16, n - 1)
+        if const_expr(shared_fp8):
+            scs, half = scs
+            cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
+            cu_ = fx.Vector.filled(4, 0.0, fx.Float32)
+            sbs = [
+                lds_i32(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4 + g4)
+                for i in range(UG_CPW)
+            ]
+            for i in range_constexpr(UG_CPW):
+                kc = wave * UG_CPW + i
+                xb = lds_b8(col * XN8_ROW + kc * 32)
+                cg_ = mfma_scaled(wts[0][i], xb, cg_, scs[0][i], sbs[i])
+                cu_ = mfma_scaled(wts[1][i], xb, cu_, scs[1][i], sbs[i])
+            fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
+            fx.ptr_store(cu_, sh_up + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            if tid < SH_ROWS * n:
+                r = tid % SH_ROWS
+                col = tid // SH_ROWS
+                rr = r + half * SH_ROWS
+                gsum = row_sum(red, rr, col)
+                usum = row_sum(sh_up, rr, col)
+                y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
+                mb_put(
+                    mr("mid"),
+                    ((t0 + col) * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
+                    bf16_round(y),
+                )
+            gpu.barrier()
+            return
         c = fx.Vector.filled(4, 0.0, fx.Float32)
         sbs = [
             lds_i32(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4 + g4)
@@ -213,7 +284,7 @@ def moe_common_defs(k4ctx):
         fx.ptr_store(c, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         # mid row r = tid % 8 of token tid / 8: gate in tile row r, up in r + 8
-        if tid < SH_ROWS * tokens:
+        if tid < SH_ROWS * n:
             r = tid % SH_ROWS
             col = tid // SH_ROWS
             gsum = row_sum(red, r, col)
@@ -221,7 +292,7 @@ def moe_common_defs(k4ctx):
             y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
             mb_put(
                 mr("mid"),
-                (col * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
+                ((t0 + col) * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
                 bf16_round(y),
             )
         gpu.barrier()
@@ -259,26 +330,38 @@ def moe_common_defs(k4ctx):
 
     def down_load_shared(td, has_dn):
         """The shared expert's down units of row group td (every token's)."""
-        dn_bytes = has_dn.select(fx.Int32(W2_BYTES), fx.Int32(0))
-        dn_scale_bytes = has_dn.select(fx.Int32(S2_BYTES), fx.Int32(0))
+        if const_expr(shared_fp8):
+            dn_bytes = has_dn.select(fx.Int32(HIDDEN * INTER), fx.Int32(0))
+            dn_scale_bytes = has_dn.select(fx.Int32(HIDDEN * INTER // 32), fx.Int32(0))
+        else:
+            dn_bytes = has_dn.select(fx.Int32(W2_BYTES), fx.Int32(0))
+            dn_scale_bytes = has_dn.select(fx.Int32(S2_BYTES), fx.Int32(0))
         rg_d = td * 2 + wave // 4
         units = []
         for i in range_constexpr(SH_UPW):
             j = (wave % 4) + 4 * i
             kc = fx.min(j, DN_KC - 1)
-            wv = fp4_tile_load(
-                rsrc(w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, dn_bytes),
-                0,
-                rg_d,
-                INTER,
-                kc,
-                lane * 4,
-            )
-            sc = e8m0_load(
-                rsrc(s2, dn_scale_bytes),
-                group_scale_byte(SHARED_EXPERT, HIDDEN, rg_d, kc, W2_SCALE_COLS),
-            )
-            wgt = (j < DN_KC).select(fx.Float32(shared_weight), fx.Float32(0.0))
+            if const_expr(shared_fp8):
+                wv = mxfp8_a_tiles(rsrc(shared_w2, dn_bytes), rg_d, INTER, kc, lane)
+                sc = e8m0_load(
+                    rsrc(shared_s2, dn_scale_bytes),
+                    row_major_scale_index(rg_d * 16 + l16, kc * 4 + g4, W2_SCALE_COLS),
+                )
+                wgt = (j < DN_KC).select(fx.Float32(1.0), fx.Float32(0.0))
+            else:
+                wv = fp4_tile_load(
+                    rsrc(w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, dn_bytes),
+                    0,
+                    rg_d,
+                    INTER,
+                    kc,
+                    lane * 4,
+                )
+                sc = e8m0_load(
+                    rsrc(s2, dn_scale_bytes),
+                    group_scale_byte(SHARED_EXPERT, HIDDEN, rg_d, kc, W2_SCALE_COLS),
+                )
+                wgt = (j < DN_KC).select(fx.Float32(shared_weight), fx.Float32(0.0))
             units.append((wv, sc, kc, wgt))
         return units
 
