@@ -805,6 +805,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_TOKENIZE_CACHE_BLOCK_HASHES", "1"
     )
     == "1",
+    # Also run the tokenizer cache for a tokenizer whose normalizer is not the
+    # identity (Qwen's NFC) when none of its added tokens is normalized: the
+    # backend normalizes each piece between added tokens on its own then, so
+    # encoding a piece alone stays exact (`AddedTokenSplitter.segments_exact`).
+    # Off: such tokenizers re-encode every prompt in full.
+    "ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER": lambda: os.getenv(
+        "ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER", "0"
+    )
+    == "1",
     # Warm the page cache with a background sequential reader instead of
     # leaving it to demand faults through the mmap. Measured on a local NVMe:
     # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and

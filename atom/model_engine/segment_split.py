@@ -153,8 +153,14 @@ class AddedTokenSplitter:
     def id_array(self, token: str) -> np.ndarray:
         return self._id_arrays[token]
 
-    def segments_exact(self) -> bool:
-        """Whether encoding the pieces of `parts` separately is exact."""
+    def segments_exact(self, per_segment_normalizer: bool = False) -> bool:
+        """Whether encoding the pieces of `parts` separately is exact.
+
+        `per_segment_normalizer` also accepts a normalizer other than the
+        identity when no added token is normalized: the backend extracts every
+        added token from the raw text and only then normalizes each piece
+        between them on its own, so a piece encoded alone is normalized exactly
+        as inside the prompt (Qwen's NFC)."""
         if not self.added or not self.wrapped:
             return False
         # With special tokens split like text, `parts` would still extract
@@ -172,10 +178,14 @@ class AddedTokenSplitter:
         if not _deterministic(description.get("model")):
             return False
         # A normalizer runs per segment too, and a normalized added token is
-        # matched after it runs; only the identity is accepted.
-        if not _normalizer_is_identity(description):
+        # matched after it runs; only the identity is accepted, unless no
+        # added token is matched after it (`per_segment_normalizer`).
+        identity = _normalizer_is_identity(description)
+        if not identity and (self._normalized or not per_segment_normalizer):
             return False
         if _offset_sensitive(description.get("pre_tokenizer")):
+            return False
+        if not identity and not self._normalizer_probes_match():
             return False
         return self._probes_match()
 
@@ -215,10 +225,24 @@ class AddedTokenSplitter:
 
     def _probes_match(self) -> bool:
         """A few added-token placements, encoded both ways once, at startup."""
+        return self._probes_agree(("a{}a b", "{} x\n{}", " y {}\t1 2"))
+
+    def _normalizer_probes_match(self) -> bool:
+        """`_probes_match` for text a normalizer rewrites, on either side of an
+        added token: an accent split from its letter, compatibility forms."""
+        return self._probes_agree(
+            (
+                "cafe{}\u0301 e\u0301{}e\u0301",
+                "\uff21\ufb01{}\u2163 \u1100\u1161{}\u11a8",
+            )
+        )
+
+    def _probes_agree(self, templates) -> bool:
         added = list(self.added)
         picks = {added[0], added[-1], min(added, key=len), max(added, key=len)}
         for tok in picks:
-            for probe in (f"a{tok}a b", f"{tok} x\n{tok}", f" y {tok}\t1 2"):
+            for template in templates:
+                probe = template.replace("{}", tok)
                 if self.encode_pieces(probe) != self.tokenizer.encode(probe):
                     return False
         return True

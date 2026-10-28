@@ -202,6 +202,42 @@ def test_normalized_added_tokens_need_an_identity_normalizer():
     assert seg._encode_cached(prompt) == tok.encode(prompt)
 
 
+def test_per_segment_normalizer_admits_nfc_without_normalized_added_tokens():
+    """Qwen's shape: an NFC normalizer, every added token non-normalized. The
+    backend normalizes each piece between added tokens on its own, so the
+    cache is exact -- but only on request, and never with a normalized one."""
+    from tokenizers import normalizers
+
+    rng = random.Random(15)
+    backend = Tokenizer(models.BPE(unk_token="[UNK]"))
+    backend.normalizer = normalizers.NFC()
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.train_from_iterator(
+        [_text(rng, 40) + " caf\u00e9 e\u0301" for _ in range(50)],
+        trainers.BpeTrainer(
+            vocab_size=300,
+            special_tokens=["[UNK]"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        ),
+    )
+    backend.add_special_tokens([AddedToken(t, special=True) for t in SPECIALS])
+    tok = transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
+    assert SegmentTokenizer.maybe_create(tok, 10**6) is None
+    seg = SegmentTokenizer.maybe_create(tok, 10**6, per_segment_normalizer=True)
+    assert seg is not None
+    seg._verified = seg_mod._VERIFY_FIRST  # past the window: unchecked
+    # An accent split from its letter by an added token stays uncomposed.
+    prompt = "<|begin|>cafe<|User|>\u0301 e\u0301<|Assistant|>\uff21\ufb01" * 3
+    for _ in range(4):
+        prompt += "<|User|>e" + _text(rng, 10) + "<|Assistant|>\u0301" + _text(rng, 5)
+        assert seg._encode_cached(prompt) == tok.encode(prompt)
+    normalized = _normalized_tokenizer(normalizers.NFC())
+    assert (
+        SegmentTokenizer.maybe_create(normalized, 10**6, per_segment_normalizer=True)
+        is None
+    )
+
+
 def test_segments_that_encode_to_nothing_are_not_cached(tok, monkeypatch):
     """They would take an entry each but no token budget, so eviction would
     never bound them."""
