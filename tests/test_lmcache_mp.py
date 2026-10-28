@@ -1291,9 +1291,11 @@ def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
     assert worker._pending_saves == {}
 
 
+@pytest.mark.parametrize("ipc_reclamation", [False, True])
 def test_worker_pre_submit_drops_are_immediately_terminal(
     fake_lmcache_modules,
     monkeypatch,
+    ipc_reclamation,
 ):
     adapter = _WorkerAdapter()
     monkeypatch.setattr(
@@ -1307,6 +1309,12 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
         lambda _request_id, _op, _event: None,
     )
     worker = _worker(adapter)
+    ready_event = object()
+    if ipc_reclamation:
+        from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
+
+        worker._event_reclaimer = IPCEventReclaimer()
+        ready_event = worker._event_reclaimer.acquire_ready_event(object)
     load_operation = LoadOperationId(req_id=14, generation=1)
     save_operation = SaveOperationId(req_id=15, generation=1)
     worker._submit_load(
@@ -1317,7 +1325,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        object(),
+        ready_event,
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1327,7 +1335,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        object(),
+        ready_event,
     )
 
     output = worker.get_finished()
@@ -1336,6 +1344,8 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
     assert output.finished_saving == {save_operation}
     assert worker._pending_loads == {}
     assert worker._pending_saves == {}
+    if ipc_reclamation:
+        assert worker._event_reclaimer.acquire_ready_event(object) is ready_event
 
 
 def _unprovable_request(kind: str) -> LMCacheReqMeta:
