@@ -290,6 +290,96 @@ def try_fused_qk_norm_mrope(
     )
 
 
+@functools.cache
+def _gfx1250_fused_qk_norm_mrope_cache():
+    """aiter's fused Q/K norm + MRoPE + KV cache write on gfx1250, or None (other
+    arch, or an aiter without it)."""
+    if get_gfx() != "gfx1250":
+        return None
+    try:
+        from aiter.ops.triton.fusions.fused_qk_norm_mrope import (
+            fused_qk_norm_mrope_cache,
+        )
+    except ImportError:
+        return None
+    return fused_qk_norm_mrope_cache
+
+
+def gfx1250_fused_qk_norm_mrope_cache_applies(
+    rotary_emb: nn.Module, head_size: int, kv_cache_dtype: str
+) -> bool:
+    """Whether ``try_fused_qk_norm_mrope_cache`` takes every batch of an attention:
+    gfx1250 with the aiter kernel, the interleaved Qwen3.5 MRoPE (head 256, rotary
+    64, Neox) and a cache that is not fp8."""
+    mrope_section = getattr(rotary_emb, "mrope_section", None)
+    return (
+        _gfx1250_fused_qk_norm_mrope_cache() is not None
+        and not kv_cache_dtype.startswith("fp8")
+        and head_size == 256
+        and getattr(rotary_emb, "rotary_dim", None) == 64
+        and mrope_section is not None
+        and len(mrope_section) >= 3
+        and getattr(rotary_emb, "mrope_interleaved", False)
+        and getattr(rotary_emb, "is_neox_style", False)
+    )
+
+
+def try_fused_qk_norm_mrope_cache(
+    q_norm: nn.Module,
+    k_norm: nn.Module,
+    rotary_emb: nn.Module,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    head_size: int,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The Q/K Gemma RMSNorm, the Qwen3.5 MRoPE and the K/V write into the SHUFFLE
+    KV cache in one aiter Gluon kernel on gfx1250.
+
+    Returns ``None`` where the kernel does not apply (also under ``torch.compile``
+    and for an fp8 cache), so callers keep their other paths.
+    """
+    if torch.compiler.is_compiling():
+        return None
+    fused_qk_norm_mrope_cache = _gfx1250_fused_qk_norm_mrope_cache()
+    if (
+        fused_qk_norm_mrope_cache is None
+        or k_cache.dtype != q.dtype
+        or k_cache.dim() != 5
+        or not _mrope_qk_supported(
+            rotary_emb, positions, q, k, num_q_heads, num_k_heads, head_size
+        )
+    ):
+        return None
+    if v_cache.dim() == 4:
+        # The SHUFFLE view of a [blocks, heads, head_size, block] V cache.
+        n, nh, hd, bs = v_cache.shape
+        x = k_cache.shape[4]
+        v_cache = v_cache.view(n, nh, bs // x, hd, x)
+    half = rotary_emb.rotary_dim // 2
+    return fused_qk_norm_mrope_cache(
+        q,
+        k,
+        v,
+        q_norm.weight,
+        k_norm.weight,
+        q_norm.variance_epsilon,
+        positions,
+        rotary_emb.cos_cache.view(-1, half),
+        rotary_emb.sin_cache.view(-1, half),
+        rotary_emb.mrope_section,
+        k_cache,
+        v_cache,
+        slot_mapping,
+    )
+
+
 def try_mrope_qk_fused(
     rotary_emb: nn.Module,
     positions: torch.Tensor,

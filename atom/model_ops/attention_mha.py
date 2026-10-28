@@ -260,11 +260,13 @@ class PagedAttentionImpl(nn.Module):
         ):
             from atom.model_ops.layernorm import GemmaRMSNorm
 
+            fused = None
             if isinstance(self.q_norm, GemmaRMSNorm):
                 # GemmaRMSNorm (1+w) path — use the Triton fused kernel
                 from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
                     triton_fused_norm_rope_cache,
                 )
+                from atom.model_ops.triton_mrope import try_fused_qk_norm_mrope_cache
 
                 # qkv is a packed [q, k, v] tensor — split
                 q_size = self.num_heads * self.head_dim
@@ -272,7 +274,27 @@ class PagedAttentionImpl(nn.Module):
                 q_raw, k_raw, v_raw = torch.split(
                     qkv, [q_size, kv_size, kv_size], dim=-1
                 )
-            if isinstance(self.q_norm, GemmaRMSNorm) and (
+                # gfx1250: norm, MRoPE and cache write in one aiter Gluon kernel.
+                fused = try_fused_qk_norm_mrope_cache(
+                    self.q_norm,
+                    self.k_norm,
+                    self.rotary_emb,
+                    position,
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    k_cache,
+                    v_cache,
+                    attn_metadata.slot_mapping,
+                )
+            if fused is not None:
+                q = fused[0].view(-1, self.num_heads, self.head_dim)
+                k = fused[1].view(-1, self.num_kv_heads, self.head_dim)
+                v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+            elif isinstance(self.q_norm, GemmaRMSNorm) and (
                 q_raw.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
                 and self._use_asm_cache_layout(
                     k_cache, v_cache, use_triton_attn=use_triton_attn
