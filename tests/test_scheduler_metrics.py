@@ -485,13 +485,14 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     second = Sequence(list(range(20)), block_size=4, request_id="second")
     first.type = second.type = SequenceType.PREFILL
     first.num_cached_tokens, second.num_cached_tokens = 4, 8
-    seqs = {seq.id: seq for seq in (decode, first, second)}
+    # A mixed batch is `[prefill | decode]`, as the scheduler builds it.
+    seqs = {seq.id: seq for seq in (first, second, decode)}
     for seq in seqs.values():
         metrics.enqueue(seq)
     monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
     scheduled = ScheduledBatch(
         seqs,
-        [1, 3, 4],
+        [3, 4, 1],
         8,
         total_tokens_num_decode=1,
         total_tokens_num_prefill=7,
@@ -596,13 +597,14 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     for i in (1, 2):
         metrics.enqueue(seqs[i])
     monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
+    # `[prefill | decode]`: request 3's prefill row, then 1 and 2 decoding.
     mixed = SimpleNamespace(
-        req_ids=[1, 2, 3],
+        req_ids=[3, 1, 2],
         is_dummy_run=False,
         total_seqs_num_decode=2,
         total_seqs_num_prefill=1,
         total_tokens_num_prefill=50,
-        context_lens=[1000, 9000, 300, 999999],
+        context_lens=[300, 1000, 9000, 999999],
     )
     metrics.record_forward(mixed, seqs)
     first = metrics.decode_request_context_tokens.collect()[0].samples
