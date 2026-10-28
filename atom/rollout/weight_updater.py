@@ -856,7 +856,13 @@ class WeightUpdaterMixin:
             q_weight, scale = quantize_weight_to_fp8_128x128_blockscale(
                 tensor_gpu,
                 fp8_dtype,
-                scale_dtype=module.weight_scale.dtype,
+                # Online quant rebuilds its own (maybe E8M0) scale; a
+                # checkpoint's scale keeps main's FP32 requantize.
+                scale_dtype=(
+                    module.weight_scale.dtype
+                    if getattr(module.quant_config, "online_quant", False)
+                    else torch.float32
+                ),
             )
             # The scale writes ride on the weight's fence: `_await_readers_of`
             # synchronizes the device, so the reader that held the weight held
