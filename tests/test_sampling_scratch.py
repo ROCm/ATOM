@@ -4,18 +4,32 @@
 import pytest
 import torch
 
+from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.sampling_scratch import SamplingScratch, take
 
 
 def test_views_are_laid_out_in_order_with_the_requested_shapes():
-    scratch = SamplingScratch(20, 10, "cpu")
+    scratch = SamplingScratch.for_shapes([(2, 3), (4,)], [(5,)], "cpu")
     (a, b), (c,) = take([(2, 3), (4,)], [(5,)], "cpu", scratch.f32, scratch.i32)
     assert a.shape == (2, 3) and b.shape == (4,) and c.shape == (5,)
     assert a.dtype is torch.float32 and c.dtype is torch.int32
     assert a.data_ptr() == scratch.f32.data_ptr()
-    # 6 elements, then up to the next 16-byte boundary.
-    assert b.data_ptr() == scratch.f32.data_ptr() + 8 * 4
+    # 6 elements, then up to the next boundary `plan_regions` places.
+    offsets, _ = plan_regions([6 * 4, 4 * 4])
+    assert b.data_ptr() == scratch.f32.data_ptr() + offsets[1]
     assert a.is_contiguous() and b.is_contiguous()
+
+
+def test_the_views_are_where_plan_regions_puts_them():
+    """One definition of a region's start, shared with the cache pools."""
+    shapes = [(3,), (0,), (5, 7), (1,)]
+    scratch = SamplingScratch.for_shapes(shapes, [], "cpu")
+    offsets, total = plan_regions([4 * 3, 0, 4 * 35, 4])
+    assert scratch.f32.numel() * 4 == total
+    views, _ = take(shapes, [], "cpu", scratch.f32, scratch.i32)
+    # Byte offsets in the buffer; an empty view's data_ptr means nothing.
+    assert [v.storage_offset() * 4 for v in views] == offsets
+    assert [v.shape for v in views] == [torch.Size(s) for s in shapes]
 
 
 @pytest.mark.parametrize("rows", range(1, 9))

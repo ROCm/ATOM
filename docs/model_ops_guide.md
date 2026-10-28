@@ -550,7 +550,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
 | `dspark_markov_sample.py` | `dspark_markov_sample`, `SparseQStore` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
 | `softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
-| `sampling_scratch.py` | `SamplingScratch`, `take` — the draft's and the ratio verify's per-step scratch, allocated once before KV sizing and carved into 16-byte-aligned views |
+| `sampling_scratch.py` | `SamplingScratch`, `take` — the draft's and the ratio verify's per-step scratch, allocated once before KV sizing and carved into views where `entry_arena.plan_regions` places them |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
 
