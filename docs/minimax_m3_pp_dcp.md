@@ -65,6 +65,9 @@ each rank receives approximately one quarter, subject to block tails.
 - `tests/test_m3_dcp_transfer.py`: bytewise real Mooncake CPU copies across PP
   stages, DCP2/4, S=1/16/128, physical KV formats, draft pools, malformed wire
   layouts, cached-prefix skips and incremental handoff.
+- `tests/test_dspark.py::test_dcp_block_metadata_matches_owned_tokens`: real
+  proposer metadata with GPU anchor lengths, S=1/16/128, all DCP4 ranks,
+  page boundaries, dropped out-of-range slots, padding and repeated updates.
 - `tests/test_m3_dcp_attention.py`: GPU comparisons with an independent PyTorch
   reference, real 64-query-head geometry, independent K/V scales, empty shards,
   causal block boundaries, global top-k and graph replay.
