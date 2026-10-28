@@ -15,7 +15,6 @@ checkpoint layout:
 Weight keys map directly to model attribute paths; no key rewriting needed.
 """
 
-import math
 from typing import ClassVar
 
 import torch
@@ -350,11 +349,13 @@ class Eagle3LlamaModel(nn.Module):
                 torch.zeros(draft_vocab, dtype=torch.int64),
                 requires_grad=False,
             )
-            # Round up for TP-sharded lm_head only (d2t keeps
-            # checkpoint size so the loader can populate it).
             tp_size = get_tensor_model_parallel_world_size()
             if draft_vocab % tp_size != 0:
-                draft_vocab = math.ceil(draft_vocab / tp_size) * tp_size
+                raise ValueError(
+                    f"draft_vocab_size={draft_vocab} is not divisible by "
+                    f"tensor_parallel_size={tp_size}. Use a tensor parallel "
+                    f"degree that evenly divides the draft vocab size."
+                )
 
         # Independent embedding (vocab matches target model). The draft embed is
         # NOT shared with the (still TP-sharded) lm_head, so it can be replicated

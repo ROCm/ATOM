@@ -25,7 +25,7 @@
 # limitations under the License.
 
 from collections.abc import Iterable
-from typing import Any, ClassVar, Union
+from typing import Any, ClassVar
 
 import torch
 
@@ -294,21 +294,23 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         **model_kwargs: dict[str, Any],
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[int, torch.Tensor]]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
         capture_layer_ids = model_kwargs.pop("capture_hidden_state_layers", None)
 
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         captured: dict[int, torch.Tensor] = {}
         for i, layer in enumerate(self.layers):
+            if capture_layer_ids is not None and i in capture_layer_ids:
+                captured[i] = (
+                    hidden_states if residual is None else hidden_states + residual
+                ).detach()
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 **model_kwargs,
             )
-            if capture_layer_ids is not None and i in capture_layer_ids:
-                captured[i] = (hidden_states + residual).detach()
 
         hidden_states, _ = self.norm(hidden_states, residual)
         if captured:

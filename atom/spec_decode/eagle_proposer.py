@@ -811,7 +811,7 @@ class EagleProposer(Drafter):
                         sample_hidden_states, out=exported
                     )
 
-                if self.model.has_draft_vocab:
+                if getattr(self.model, "has_draft_vocab", False):
                     ids = next_input_ids.long().clamp(max=self.model.d2t.shape[0] - 1)
                     next_input_ids = (next_input_ids + self.model.d2t[ids]).int()
                 if i < self.mtp_k - 1:
@@ -889,7 +889,7 @@ class EagleProposer(Drafter):
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k], contiguous: every consumer indexes by sequence.
         result = draft_token_ids.t().contiguous()
-        if self.model.has_draft_vocab:
+        if getattr(self.model, "has_draft_vocab", False):
             ids = result.long().clamp(max=self.model.d2t.shape[0] - 1)
             result = (result + self.model.d2t[ids]).to(result.dtype)
         return result
