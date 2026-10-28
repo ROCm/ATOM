@@ -847,16 +847,19 @@ class DSparkProposer(Drafter):
             page_idx, in_table = self._block_page_idx(
                 block_positions, virtual_block, block_tables
             )
-            local_off = torch.div(
-                torch.remainder(block_positions, virtual_block),
-                self.dcp_world_size,
-                rounding_mode="floor",
+            from atom.distributed.dcp_layout import dcp_local_index, dcp_owner_rank
+            from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+
+            interleave = self.config.dcp_config.interleave_size
+            local_off = (
+                dcp_local_index(block_positions, self.dcp_world_size, interleave)
+                % block_size
             )
             slots.copy_(
                 torch.where(
                     in_table
                     & (
-                        torch.remainder(block_positions, self.dcp_world_size)
+                        dcp_owner_rank(block_positions, self.dcp_world_size, interleave)
                         == self.dcp_rank
                     ),
                     torch.gather(block_tables, 1, page_idx) * block_size + local_off,
@@ -865,10 +868,8 @@ class DSparkProposer(Drafter):
             )
             # Of L global tokens this rank stores ceil((L - r) / dcp_world_size).
             ctx_lens.copy_(
-                torch.div(
-                    global_lens + (self.dcp_world_size - 1 - self.dcp_rank),
-                    self.dcp_world_size,
-                    rounding_mode="floor",
+                get_dcp_local_seq_lens(
+                    global_lens, self.dcp_world_size, self.dcp_rank, interleave
                 )
             )
         else:
@@ -963,7 +964,7 @@ class DSparkProposer(Drafter):
                 block_tables,
                 block_positions,
                 slots,
-                ctx_lens,
+                global_lens if self.dcp_world_size > 1 else ctx_lens,
                 block_table_state(self.runner.forward_vars["block_tables"]).lengths,
                 scheduled_bs,
             )

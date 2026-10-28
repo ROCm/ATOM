@@ -242,6 +242,11 @@ class M3DSparkAttention(nn.Module):
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        from atom.model_ops.minimax_m3.dcp import M3DCPProjection
+
+        self.dcp = M3DCPProjection(tp_size, self.total_num_kv_heads)
+        self.num_heads *= self.dcp.world
+        self.num_kv_heads *= self.dcp.world
         self.scaling = self.head_dim**-0.5
         self.kv_cache_dtype = atom_config.kv_cache_dtype
 
@@ -331,6 +336,7 @@ class M3DSparkAttention(nn.Module):
             return
         qkv = linear_out(self.qkv_proj(ctx_hidden))
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        k, v = (self.dcp.gather(x, self.head_dim) for x in (k, v))
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
@@ -354,11 +360,12 @@ class M3DSparkAttention(nn.Module):
         # The block's K/V go into the cache at the block's slots (positions
         # past the allocated pages are -1, dropped), then every block position
         # decodes as its own q_len=1 row.
+        q, k, v = (self.dcp.gather(x, self.head_dim) for x in (q, k, v))
         q, _ = self._norm_rope_write(
             q, k, v, self.num_heads, positions, md.slot_mapping, cache
         )
         out = self._block_attention_paged(q, md, cache)
-        return linear_out(self.o_proj(out))
+        return linear_out(self.o_proj(self.dcp.local_output(out)))
 
     def _block_attention_paged(self, q: torch.Tensor, md, cache) -> torch.Tensor:
         """``[context | block]`` attention as ``B * T`` q_len=1 paged decode rows.
@@ -371,6 +378,22 @@ class M3DSparkAttention(nn.Module):
         layers run -- no host sync, fixed shapes, so the block can be captured.
         The context is read once per block position, one KV head per rank.
         """
+        if self.dcp.world > 1:
+            from atom.model_ops.minimax_m3.dcp_attention import attention
+
+            q = q.view(-1, self.num_heads, self.head_dim)
+            return attention(
+                q,
+                cache,
+                md.block_tables,
+                md.dspark_dcp_req,
+                md.dspark_dcp_lens,
+                md.dspark_dcp_start,
+                world=self.dcp.world,
+                rank=self.dcp.rank,
+                group=self.dcp.group,
+                scale=self.scaling,
+            ).flatten(1)
         if self.num_kv_heads != 1:
             raise RuntimeError(
                 "Only a PP P/D producer runs below TP 4; it must not draft."
@@ -466,10 +489,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
 
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
-        if atom_config.decode_context_parallel_size > 1:
-            raise NotImplementedError(
-                "The MiniMax-M3.1 DSpark draft does not support DCP."
-            )
+        self.dcp_world = atom_config.decode_context_parallel_size
         config = atom_config.hf_config
         self.hf_config = config
         quant_config = _draft_quant_config(config)
@@ -628,12 +648,30 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         alloc = self._alloc[:running_bs]
         alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
         self._alloc_copied.record()
-        alloc.mul_(self.block_size)
+        alloc.mul_(self.block_size * self.dcp_world)
 
         slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
         # The rows' own lengths; `ctx_lens` is left as the proposer built it.
         ctx_eff = self._ctx_eff[:running_bs]
         torch.minimum(ctx_lens, alloc, out=ctx_eff)
+
+        if self.dcp_world > 1:
+            rows = running_bs * T
+            req = self._row_req[:rows]
+            lens = self._ctx_rows[:rows]
+            torch.index_select(ctx_eff, 0, req, out=lens)
+            start = self._start16[:rows]
+            if self.sliding_window:
+                torch.sub(block_positions.view(-1), self.sliding_window - 1, out=start)
+                start.clamp_(min=0).div_(16, rounding_mode="floor").mul_(16)
+            else:
+                start.zero_()
+            lens[scheduled_bs * T :].zero_()
+            start[scheduled_bs * T :].zero_()
+            attn_metadata.dspark_dcp_req = req
+            attn_metadata.dspark_dcp_lens = lens
+            attn_metadata.dspark_dcp_start = start
+            return
 
         bt16 = _page16_table(block_tables, self._bt16[:running_bs], self._sub_pages)
         if running_bs > scheduled_bs:

@@ -95,6 +95,10 @@ def configure_m3_kv_transfer_tensors(
                             layer,
                             field.name,
                             runs,
+                            pool.page_token_layout(
+                                field.name,
+                                page_tokens=page_tokens if per_head else None,
+                            ),
                         )
                     )
     if len(set(local_layers)) != len(local_layers):
@@ -103,7 +107,7 @@ def configure_m3_kv_transfer_tensors(
         raise ValueError("MiniMax-M3 index rows do not match the local sparse layers")
 
     pages = {}
-    for page, (native_role, layer, field, runs) in zip(
+    for page, (native_role, layer, field, runs, token_layout) in zip(
         transfer_tensors.pages, native_layout, strict=True
     ):
         if page.region.semantic_role != native_role:
@@ -118,6 +122,7 @@ def configure_m3_kv_transfer_tensors(
             page,
             region=replace(page.region, semantic_role=f"m3.layer_{layer}.{field}"),
             head_major_runs=runs,
+            token_layout=token_layout,
         )
     local_layers = set(local_layers)
     expected = {key for key in consumer_indices if key[0] in local_layers}

@@ -44,6 +44,10 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     chunked_topology_supported,
 )
 from atom.kv_transfer.disaggregation.mha_head_transfer import consumer_head_slices
+from atom.kv_transfer.disaggregation.mha_token_transfer import (
+    canonical_token_layout,
+    dcp_page_descriptors,
+)
 from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
@@ -871,6 +875,7 @@ class MooncakeConnector(KVConnectorBase):
     _rail_pool: RailEnginePool | None = None
     # Set by `register_kv_caches`; until then no units are cut by head.
     _block_head_major_runs: tuple = ()
+    _block_token_layouts: tuple = ()
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1331,6 +1336,7 @@ class MooncakeConnector(KVConnectorBase):
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
         self._block_head_major_runs = tuple(page.head_major_runs for page in tt.pages)
+        self._block_token_layouts = tuple(page.token_layout for page in tt.pages)
         self._fp4_index_layout = any(
             role is not None and role.startswith(INDEX_CACHE_FP4_PREFIX)
             for role in self._block_region_roles
@@ -1846,6 +1852,7 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
                 # For a producer at another TP size to cut its units by head.
                 "consumer_head_major_runs": self._block_head_major_runs,
+                "consumer_token_layouts": self._block_token_layouts,
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
@@ -3049,7 +3056,48 @@ class MooncakeConnector(KVConnectorBase):
         # producer/consumer layouts fail instead of silently corrupting KV.
         consumer_roles = request_data.get("consumer_region_roles")
         consumer_bpb = request_data.get("consumer_block_bpb")
-        head_cut = self._consumer_head_cut(request_data, dcp_size)
+        mha_dcp = sharded_plan is not None and any(
+            role and role.startswith("m3.layer_") for role in self._block_region_roles
+        )
+        if mha_dcp:
+            # Validate the complete stage, including draft planes, before any
+            # descriptor is submitted. All-head DCP is not TP head cutting.
+            layouts = request_data.get("consumer_token_layouts")
+            if (
+                self.tp_size != 1
+                or not layouts
+                or consumer_bpb is None
+                or consumer_roles is None
+            ):
+                raise RuntimeError(
+                    "M3 DCP transfer requires TP1 producer and explicit consumer layouts"
+                )
+            if len(self._block_token_layouts) != num_regions or len(layouts) != len(
+                consumer_base_addrs
+            ):
+                raise RuntimeError(
+                    "M3 DCP token layouts must cover every target and draft region"
+                )
+            for i, j in enumerate(cmap):
+                bpb = self._per_block_bytes_list[i]
+                if (
+                    consumer_bpb[j] != bpb
+                    or consumer_roles[j] != self._block_region_roles[i]
+                ):
+                    raise RuntimeError(
+                        "M3 DCP consumer must retain all producer heads and matching planes"
+                    )
+                source_layout = canonical_token_layout(
+                    self._block_token_layouts[i], self.block_size, bpb
+                )
+                destination_layout = canonical_token_layout(
+                    layouts[j], self.block_size, bpb
+                )
+                if source_layout != destination_layout:
+                    raise RuntimeError(
+                        "M3 DCP producer/consumer physical token layouts disagree"
+                    )
+        head_cut = None if mha_dcp else self._consumer_head_cut(request_data, dcp_size)
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx in range(num_regions):
@@ -3098,6 +3146,18 @@ class MooncakeConnector(KVConnectorBase):
                     f"region {region_idx} has {bpb}, consumer region "
                     f"{cmap[region_idx]} has {consumer_bpb[cmap[region_idx]]}"
                 )
+            if mha_dcp:
+                for src, dst, lengths in dcp_page_descriptors(
+                    sharded_plan,
+                    dst_block_ids,
+                    src_base,
+                    dst_base,
+                    bpb,
+                    self._block_token_layouts[region_idx],
+                ):
+                    if not queue_descriptors(src, dst, lengths):
+                        return False
+                continue
             if stages_sharded_index and role == INDEX_CACHE_ROLE:
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue

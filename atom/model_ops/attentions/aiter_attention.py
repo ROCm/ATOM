@@ -265,6 +265,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             max_qlen = 1
 
         num_head_k = max(1, hf_config.num_key_value_heads // get_tp_group().world_size)
+        if self._has_sparse_attention:
+            num_head_k *= self.dcp_world_size
         # Kept flydsl work plan here and refreshed once per prepare_*.
         self._flydsl_kv_heads = num_head_k
         self._flydsl_plans: dict[tuple, object] = {}
@@ -1321,7 +1323,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         scheduled_tokens = batch.total_tokens_num_decode
         var["slot_mapping"].np[:running_tokens] = -1
-        if max_seqlen_q > 1:
+        if self.dcp_world_size > 1 and not batch.is_dummy_run:
+            from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
+
+            slots = dcp_prefill_slot_mapping(
+                block_tables,
+                [int(n) - max_seqlen_q for n in context_lens],
+                [int(n) for n in context_lens],
+                self.model_runner.block_size,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+        elif max_seqlen_q > 1:
             slots = slot_mapping(
                 positions,
                 np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
@@ -1348,7 +1362,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[scheduled_bs:running_bs] = 0
 
         # Prepare kv_indptr and kv_indices for persistent attention
-        num_blocks_per_seq = cdiv(context_lens, self.block_size)
+        num_blocks_per_seq = cdiv(context_lens, self.block_size * self.dcp_world_size)
         kv_indptr = np.cumsum(num_blocks_per_seq)
         sum_blocks = kv_indptr[-1] if len(kv_indptr) > 0 else 0
 
@@ -1385,7 +1399,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ctx["kv_indices"],
             ctx["kv_indptr"],
             self.block_ratio,
-            max_seqlen_k,
+            cdiv(max_seqlen_k, self.dcp_world_size),
         )
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
