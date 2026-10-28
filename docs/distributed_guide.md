@@ -135,8 +135,8 @@ This ensures:
 
 When a DP rank has no real work but other ranks do, it executes dummy batches to participate in collective operations:
 
-- **`_execute_dummy_batch()`** — runs a 1-token decode dummy through the model, triggering AllReduce and MORI collectives so other ranks are not blocked.
-- **`_execute_dummy_prefill(num_tokens)`** — runs a dummy prefill with the same token count as the max across DP ranks, so that MORI dispatch/combine stays synchronized.
+- **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a one-sequence decode dummy through the model, triggering AllReduce and MORI collectives so other ranks are not blocked.
+- **Dummy prefill** — when prefill token graphs are recorded and a peer prefills, `Scheduler.dummy_prefill` makes the same call a request-less prefill instead. `ForwardMode._pad_to_token_graph` raises it, and without the prefill delayer a decoding rank's rows too, to the bucket every rank of the step replays, since ranks replaying different buckets hang the group.
 
 ### Device assignment
 
@@ -156,20 +156,18 @@ For example, with DP=2 and TP=4:
 The `DPMetadata` dataclass (in `atom/utils/forward_context.py`) tracks token distribution across DP ranks for padding and collective operations:
 
 ```python
-@dataclass
+@dataclass(frozen=True)
 class DPMetadata:
-    max_tokens_across_dp_cpu: torch.Tensor   # Max tokens on any DP rank
-    cu_tokens_across_dp_cpu: torch.Tensor    # Cumulative token counts
-    max_tokens_across_dp: int                # Pre-computed int for CUDA graph
+    running_tokens_per_dp_rank: np.ndarray   # [dp_size] int32: the rows each rank's forward runs
+    # max_tokens_across_dp / get_sizes_across_dp() are read off it
 ```
 
-`DPMetadata.num_tokens_across_dp()` gathers token counts via an AllReduce on the DP CPU group:
+`set_forward_context` takes `running_tokens_per_dp_rank` as a required argument, wraps it in `DPMetadata` when DP is on, and mirrors it onto `context.running_tokens_across_dp` as Python ints. The engine's table is one `[dp_size]` numpy buffer the runner owns: `ForwardMode.decide` settles it in place each step from the scheduled tokens exchanged in the step's one DP sync (a padding prefill rank raised to its token-graph bucket, every rank set to the group height on a unified step), and the capture loops fill the same buffer. A caller that knows only its own count uses `DPMetadata.gather_running_tokens(parallel_config, running_tokens)`, one AllReduce on the DP CPU group (skipped for a group of one):
 
 ```python
-num_tokens_across_dp = [0] * dp_size
-num_tokens_across_dp[dp_rank] = num_tokens
-num_tokens_tensor = torch.tensor(num_tokens_across_dp, device="cpu", dtype=torch.int32)
-dist.all_reduce(num_tokens_tensor, group=get_dp_group().cpu_group)
+table = np.zeros(dp_size, dtype=np.int32)
+table[dp_rank] = running_tokens
+dist.all_reduce(torch.from_numpy(table), group=get_dp_group().cpu_group)
 ```
 
 ### CoreManager (DP orchestration)
@@ -260,6 +258,7 @@ drained and warns if it is invoked while requests are still charged.
 - `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
 - CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens}`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
+- Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
   session once, then keep all later turns on its cache owner without spill.
 

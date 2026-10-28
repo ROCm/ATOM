@@ -68,6 +68,14 @@ class VerifyScheduler:
         # `_ell_pending` does NOT cancel its in-flight DMA, so queue length
         # alone cannot tell us a slot is free.
         self._ell_slot_event: list = [None] * _MAX_ELL_INFLIGHT
+        # The GPU ell each slot's D2H reads, kept with the slot's event and
+        # released when `_ell_stage` reuses the slot after that event: the
+        # copy runs on the shared side stream, and a dropped ell would go to
+        # the next default-stream allocation before a late copy reads it.
+        self._ell_slot_source: list = [None] * _MAX_ELL_INFLIGHT
+        # (event, ell) for copies into one-off buffers, which have no slot;
+        # pruned once their event has completed.
+        self._ell_oneoff_inflight: list = []
         # Ring index returned by the last `_ell_stage` call, or None when it
         # fell back to a one-off buffer. Consumed by `record_ell`.
         self._ell_last_slot: int | None = None
@@ -146,6 +154,8 @@ class VerifyScheduler:
             # buffer, torn reads. Park the index and take a one-off buffer.
             self._ell_last_slot = None
             return torch.zeros(n, dtype=torch.int64, device="cpu", pin_memory=True)
+        # The slot's previous copy has completed: its source can go.
+        self._ell_slot_source[idx] = None
         slot = ring[idx]
         self._ell_last_slot = idx
         self._ell_stage_idx = (idx + 1) % _MAX_ELL_INFLIGHT
@@ -177,12 +187,20 @@ class VerifyScheduler:
             copy_stream.wait_stream(default_stream)
             cpu_buf.copy_(ell, non_blocking=True)
             event.record(copy_stream)
-        # Bind the event to the ring slot this copy is landing in, so the slot
-        # is not handed out again until the DMA completes. This outlives the
-        # `_ell_pending` entry on purpose: the eviction below drops bookkeeping,
-        # not the copy itself. None -> one-off buffer, nothing to guard.
+        # Bind the event and the source to the ring slot this copy is landing
+        # in, so the slot is not handed out again, nor ell released, until the
+        # DMA completes. This outlives the `_ell_pending` entry on purpose: the
+        # eviction below drops bookkeeping, not the copy itself. A one-off
+        # buffer has no slot, so its source is held until its event completes.
+        if self._ell_oneoff_inflight:
+            self._ell_oneoff_inflight = [
+                (e, src) for e, src in self._ell_oneoff_inflight if not e.query()
+            ]
         if self._ell_last_slot is not None:
             self._ell_slot_event[self._ell_last_slot] = event
+            self._ell_slot_source[self._ell_last_slot] = ell
+        else:
+            self._ell_oneoff_inflight.append((event, ell))
         # Keep req_ids as a plain list snapshot (CPU-only, order-safe).
         self._ell_pending.append((event, cpu_buf, list(req_ids)))
         if len(self._ell_pending) > _MAX_ELL_INFLIGHT:

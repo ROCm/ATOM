@@ -149,28 +149,94 @@ models:
           benchmark:
             wait_server_timeout: 4500
 
-        # - name: ds-v4-2p1d-dpa-tp8
-        #   topology: 2p1d_dpa
-        #   pd_worker_layout: multi_node
-        #   nodes: "${ATOMESH_2P1D_NODES}"
-        #   env:
-        #     prefill:
-        #       GPU_MAX_HW_QUEUES: "5"
-        #       ATOM_NUMA_BIND: "1"
-        #   isl: [8192]
-        #   osl: 1024
-        #   concurrency: [256, 512, 1024, 2048]
-        #   prefill:
-        #     workers: 2
-        #     tp: 8
-        #     extra_args: "--enable-dp-attention --enable-tbo"
-        #   decode:
-        #     workers: 1
-        #     tp: 8
-        #     extra_args: "--enable-dp-attention"
-        #   benchmark:
-        #     wait_server_timeout: 4500
-        #   run_eval: true
+        - name: ds-v4-2p1d-tp8
+          topology: 2p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [128, 256]
+          prefill:
+            workers: 2
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128]
+
+        - name: ds-v4-2p1d-dpa-tp8
+          topology: 2p1d_dpa
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: ds-v4-2p1d-tp8-mtp3
+          topology: 2p1d_mtp3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [128, 256]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 3"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 3"
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128]
+
+        - name: ds-v4-2p1d-dpa-tp8-mtp1
+          topology: 2p1d_dpa_mtp1
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention --enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128, 512]
 
     accuracy:
       task: gsm8k
@@ -300,8 +366,7 @@ models:
                 HIP_VISIBLE_DEVICES: "4,5,6,7"
             benchmark: &agentic_1m_aiperf
               kind: aiperf_agentic
-              aiperf_commit: b7b16cf851885567988a643282266bce74e34437
-              scenario: inferencex-agentx-mvp
+              scenario: agentx
               public_dataset: semianalysis_cc_traces_weka_062126
               apply_chat_template: true
               max_context_length: 1048576
@@ -316,7 +381,6 @@ models:
               slice_duration: 1.0
               cancel_drain_timeout: 300
               http_tcp_user_timeout: 900000
-              dataset_weka_live_assistant_responses: 0
               dataset_configuration_timeout: 1800
               service_profile_configure_timeout: 1800
               wait_server_timeout: 4500
@@ -383,7 +447,7 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode:
+            decode: &glm52_cpp4_dcp4_lmcache_decode_env
               <<: &glm52_cpp4_dcp4_decode_env
                 HIP_VISIBLE_DEVICES: "4,5,6,7"
                 # Ranks share identical communicator groups instead of creating
@@ -512,6 +576,20 @@ models:
         - <<: *glm52_agentic_lmcache_cpp4_dpa4_1p1d
           name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c40
           concurrency: [40]
+
+        # Match the CPP4+DCP4 LMCache baseline, enabling chunked KV transfer
+        # only on the Mooncake producer; retain every other server/benchmark knob.
+        - &glm52_agentic_lmcache_chunked_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c32
+          concurrency: [32]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode: *glm52_cpp4_dcp4_lmcache_decode_env
 
         # 4-5) 1P2D: CPP4 prefill (PP4×TP1, node 0) paired with 2× DPA4 decode
         # (dp4×tp1 each, node 1 GPU 0-3 and GPU 4-7). MTP4 with fixed
@@ -943,9 +1021,7 @@ models:
               cudagraph: auto
               cudagraph_mode: FULL
               compilation_level: 3
-            benchmark:
-              <<: *agentic_1m_aiperf
-              aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+            benchmark: *agentic_1m_aiperf
             run_eval: false
           name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1
           concurrency: [1]
@@ -1400,6 +1476,53 @@ models:
           run_eval: true
           eval_concurrency: [128, 768]
 
+      # gsm8k-only PD cell over MoRI IO. Prefill and decode each own a node, so
+      # the KV transfer crosses the ionic fabric rather than staying local.
+      accuracy:
+        - name: kimi-k25-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: >-
+              [8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+          server:
+            common_args:
+              decode_max_num_seqs: 256
+              # Kimi-K2.5 thinks by default. lm_eval scores message content,
+              # and a reasoning model cut off at max_gen_toks mid-thought
+              # returns none. The template's own switch is named "thinking".
+              extra_args: '--default-chat-template-kwargs {"thinking":false}'
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+            decode:
+              # Empty drops the model-level Mooncake JSON for the built-in config.
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy:
+            # Chat completions, so the template switch above applies.
+            task: gsm8k
+            fewshot: 5
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            max_gen_toks: 4096
+            apply_chat_template: true
+            threshold: 0.90
+
     accuracy:
       task: gsm8k
       fewshot: 3
@@ -1636,6 +1759,78 @@ models:
             wait_server_timeout: 1800
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
+
+        - name: minimax-m3-fp8-2p1d-tp8
+          topology: 2p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: minimax-m3-fp8-2p1d-dpa-tp8
+          topology: 2p1d_dpa
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+              online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo prefill"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: minimax-m3-fp8-2p1d-dpa-tp8-eagle3
+          topology: 2p1d_dpa_eagle3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+              method: eagle3
+              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              num_speculative_tokens: 3
+              online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo prefill"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: true
+          eval_concurrency: [128, 768]
 
         - name: minimax-m3-fp8-1p1d-tp4-eagle3
           topology: 1p1d_eagle3
@@ -1885,3 +2080,84 @@ models:
             endpoint: chat/completions
             max_gen_toks: 4096
             apply_chat_template: true
+
+  # Bring-up model for the MoRI IO PD KV path. Text-only, ships a real
+  # tokenizer.json so the router can register one, and its FP8 weights keep
+  # quantization out of the picture -- but the KV path under test is the same
+  # 61-layer MLA as the MXFP4 models.
+  DeepSeek-V3:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V3/"
+    precision: FP8
+    env:
+      common:
+        # Mooncake's RoCE GID index. MoRI IO reads MORI_IB_GID_INDEX instead,
+        # so setting this once keeps the two cells below differing in nothing
+        # but KV_CONNECTOR.
+        MC_GID_INDEX: "1"
+        # MoRI IO only, set here for the same reason; see the Kimi-K2.5 cell.
+        ATOM_MORIIO_MODE: write
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 16
+        enable_prefix_caching: false
+        gpu_memory_utilization: 0.9
+        max_num_seqs: 256
+        max_num_batched_tokens: 32768
+        max_model_len: 32768
+        extra_args: ""
+    suites:
+      accuracy:
+        # A control and its variant. Neither sets a *_KV_TRANSFER_CONFIG, so
+        # both take the built-in config and the merge key makes the connector
+        # the only difference between them. A score gap therefore lands on the
+        # connector rather than on the model, the eval, or ATOM's PD layer.
+        - &dsv3_pd_gsm8k
+          name: ds-v3-1p1d-tp8-mooncake-gsm8k
+          topology: 1p1d_tp8_mooncake
+          display_topology: 1P1D-MOONCAKE-TP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[8,16,24,32,40,48,56,64]"
+          server:
+            common_args:
+              decode_max_num_seqs: 256
+          env:
+            common:
+              KV_CONNECTOR: mooncake
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy:
+            threshold: 0.90
+        - <<: *dsv3_pd_gsm8k
+          name: ds-v3-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          display_topology: 1P1D-MORIIO-TP8
+          env:
+            common:
+              KV_CONNECTOR: moriio
+
+    accuracy:
+      task: gsm8k
+      fewshot: 5
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      # V3 is not a reasoning model, so gsm8k answers are short.
+      max_gen_toks: 512
+      apply_chat_template: true

@@ -22,6 +22,7 @@ from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
 from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
     _hip_topk1_tree_builder,
     _hip_verify_tree_greedy,
+    bf16_config_avoiding_gfx950_hipblaslt,
     note_qwen4_exp_from_identity,
 )
 from atom.plugin.sglang.qwen4_exp_bridge import (
@@ -349,6 +350,24 @@ def test_qwen4_exp_identity_arms_hip_divert_without_is_qwen_qsa():
     note_qwen4_exp_from_identity("", "qwen4_exp")
     assert rocm_patch._qwen4_exp_hip is True
     rocm_patch._qwen4_exp_hip = False
+
+
+def test_qwen4_gfx950_bf16_hipblaslt_falls_back_to_torch():
+    tuned = {"libtype": "hipblaslt", "solidx": 21738, "kernelName": ""}
+    replaced = bf16_config_avoiding_gfx950_hipblaslt(tuned, qwen4=True, gfx="gfx950")
+    assert replaced == {"libtype": "torch", "solidx": 0, "kernelName": ""}
+    assert tuned["libtype"] == "hipblaslt"
+    assert (
+        bf16_config_avoiding_gfx950_hipblaslt(tuned, qwen4=False, gfx="gfx950") is tuned
+    )
+    assert (
+        bf16_config_avoiding_gfx950_hipblaslt(tuned, qwen4=True, gfx="gfx942") is tuned
+    )
+    flydsl = {"libtype": "flydsl", "solidx": 0}
+    assert (
+        bf16_config_avoiding_gfx950_hipblaslt(flydsl, qwen4=True, gfx="gfx950")
+        is flydsl
+    )
 
 
 def test_hip_topk1_tree_build_uses_triton_only_for_qwen4_exp():

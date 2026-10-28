@@ -19,6 +19,7 @@ def test_sglang_mono_refusal_ignores_missing_cudagraph_mode():
         assert why == "plugin mode"
         install_minimax_mono_plugin_refusal()
         assert dispatch._config_refusal(None, None) == "plugin mode"
+        assert dispatch._config_refusal(None) == "plugin mode"
     finally:
         dispatch._config_refusal = original
         dispatch._atom_sglang_mono_plugin_refusal = flag

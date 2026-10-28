@@ -19,16 +19,21 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("shape", [(1, 32), (3, 288), (17, 5120), (2, 3, 128), (0, 32)])
 def test_fp8_quantization_bytes_and_qat(shape):
     from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
 
     torch.manual_seed(312)
     x = torch.randn(shape, dtype=torch.bfloat16)
     if x.numel():
         x.reshape(-1)[: min(32, x.numel())] = 0
     q, s = quantize_fp8(x.cuda())
-    ref_q, ref_s = oracle.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+    # the zero group's scale is the floor's: ATOM's, not the reference's 1e-4
+    floor = AMAX_FLOOR.value
+    ref_q, ref_s = oracle.act_quant(
+        x, 32, "ue8m0", torch.float8_e8m0fnu, amax_floor=floor
+    )
     assert torch.equal(q.cpu().view(torch.uint8), ref_q.view(torch.uint8))
     assert torch.equal(s.cpu().view(torch.uint8), ref_s.view(torch.uint8))
-    expected = oracle.act_quant(x.clone(), 32, "ue8m0", inplace=True)
+    expected = oracle.act_quant(x.clone(), 32, "ue8m0", inplace=True, amax_floor=floor)
     assert torch.equal(quantize_fp8(x.cuda(), dequantize=True).cpu(), expected)
 
 

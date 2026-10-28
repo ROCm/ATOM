@@ -15,6 +15,9 @@ FP8_MAX = tl.constexpr(torch.finfo(FP8_DTYPE).max)
 FP8_TL_DTYPE = tl.constexpr(
     tl.float8e4b8 if FP8_DTYPE is torch.float8_e4m3fnuz else tl.float8e4nv
 )
+# The amax floor of every FP8 activation quant: aiter's MoE input quant's, so
+# one model's quant sites all agree
+AMAX_FLOOR = tl.constexpr(1e-10)
 
 
 @triton.jit
@@ -30,7 +33,7 @@ def quantize_fp8_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
     groups = tl.program_id(0) * 32 + tl.arange(0, 32)
     offsets = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
     x = tl.load(X + offsets, offsets < SIZE, other=0).to(tl.float32)
-    amax = tl.maximum(tl.max(tl.abs(x), 1), 1e-4)
+    amax = tl.maximum(tl.max(tl.abs(x), 1), AMAX_FLOOR)
     code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
     scale = (code << 23).to(tl.float32, bitcast=True)
     q = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX).to(FP8_TL_DTYPE)

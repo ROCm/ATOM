@@ -138,6 +138,7 @@ class KVOutputAggregator:
         if terminal_tombstone_limit <= 0:
             raise ValueError("terminal_tombstone_limit must be positive")
         self._world_size = world_size
+        self._received_handoffs: dict[ReqId, dict[int, object]] = {}
         self._sending = _TPCompletionGroup[ReqId](
             world_size,
             terminal_tombstone_limit,
@@ -184,6 +185,8 @@ class KVOutputAggregator:
             return KVConnectorOutput()
 
         for worker_idx, output in enumerate(worker_outputs):
+            for req_id, handoff in output.received_handoffs.items():
+                self._received_handoffs.setdefault(req_id, {})[worker_idx] = handoff
             self._sending.report_many(
                 worker_idx,
                 output.finished_sending,
@@ -239,7 +242,21 @@ class KVOutputAggregator:
             for key in keys
         }
 
+        received_handoffs = {}
+        for req_id in list(done_recving):
+            handoffs = self._received_handoffs.pop(req_id, None)
+            if handoffs is None:  # Legacy receive without an in-band handoff.
+                continue
+            if len(handoffs) != self._world_size or len(set(handoffs.values())) != 1:
+                done_recving.remove(req_id)
+                failed_recving.add(req_id)
+            else:
+                received_handoffs[req_id] = next(iter(handoffs.values()))
+        for req_id in failed_recving:
+            self._received_handoffs.pop(req_id, None)
+
         return KVConnectorOutput(
+            received_handoffs=received_handoffs,
             finished_sending=done_sending,
             finished_recving=done_recving,
             failed_recving=failed_recving,
@@ -251,6 +268,7 @@ class KVOutputAggregator:
 
     def reset(self) -> None:
         """Clear all internal tracking state."""
+        self._received_handoffs.clear()
         self._sending.reset()
         self._receiving.reset()
         self._saving.reset()

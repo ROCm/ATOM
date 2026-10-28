@@ -26,6 +26,7 @@ import pytest
 
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion, StateTouchId
 from atom.model_engine import state_offload as so
+from atom.model_engine.block_manager import AdmissionProbe
 from atom.model_engine.state_offload import (
     StateOffloadIndex,
     state_tier_budget_warning,
@@ -598,6 +599,7 @@ class TestAdmissionHold:
         )
         commits = []
         monkeypatch.setattr(bm, "_joint_kv_boundary", lambda *a: decision)
+        monkeypatch.setattr(bm, "_fit_joint", lambda d, probe: d)
         monkeypatch.setattr(
             bm, "_commit_joint_boundary", lambda seq, d: commits.append(d)
         )
@@ -610,12 +612,16 @@ class TestAdmissionHold:
         clock[0] += so._TIER_VERIFIED_FOR_S + 1
         seq = _seq()
 
-        assert not bm.record_allocation(seq, 2, [1, 2], defer_unverified=True)
+        assert not bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
         assert commits == [] and bm.state_offload.loads_deferred_for_verify == 1
         assert bm.state_offload.take_touches() == [77]
 
         bm.state_offload.apply_touch_verdict(77, True)
-        assert bm.record_allocation(seq, 2, [1, 2], defer_unverified=True)
+        assert bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
         assert len(commits) == 1
 
     def test_a_gone_image_is_not_parked_on(self, clock, monkeypatch):
@@ -625,7 +631,9 @@ class TestAdmissionHold:
         self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
         clock[0] += so._TIER_VERIFIED_FOR_S + 1
-        assert not bm.record_allocation(_seq(), 2, [1, 2], defer_unverified=True)
+        assert not bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
         bm.state_offload.take_touches()
         bm.state_offload.apply_touch_verdict(77, False)
         assert not bm._tier_can_serve(77)
@@ -634,7 +642,9 @@ class TestAdmissionHold:
         bm = _paged_bm()
         commits = self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
-        assert bm.record_allocation(_seq(), 2, [1, 2], defer_unverified=True)
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
         assert len(commits) == 1
 
     def test_a_state_resident_in_hbm_is_never_held(self, clock, monkeypatch):
@@ -642,14 +652,16 @@ class TestAdmissionHold:
         self._joint(bm, monkeypatch, from_hbm=True)
         bm.state_offload.note_stored(77)
         clock[0] += so._TIER_VERIFIED_FOR_S + 1
-        assert bm.record_allocation(_seq(), 2, [1, 2], defer_unverified=True)
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
 
     def test_the_fit_probe_path_never_holds(self, clock, monkeypatch):
         bm = _paged_bm()
         self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
         clock[0] += so._TIER_VERIFIED_FOR_S + 1
-        assert bm.record_allocation(_seq(), 2, [1, 2])
+        assert bm.record_allocation(_seq(), AdmissionProbe(2, [1, 2]))
 
     def test_an_hbm_hit_holds_only_for_a_tier_sourced_state(self, clock, monkeypatch):
         from atom.model_engine.block_manager import JointBoundaryDecision
@@ -667,9 +679,30 @@ class TestAdmissionHold:
         monkeypatch.setattr(
             bm.paged_state_checkpoints, "contains", lambda h: h in resident
         )
-        assert bm.record_allocation(_seq(), 2, [1, 2], defer_unverified=True)
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
         resident.clear()
-        assert not bm.record_allocation(_seq(), 2, [1, 2], defer_unverified=True)
+        assert not bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_the_hold_judges_the_joint_fit_kept(self, clock, monkeypatch):
+        """A joint `_fit_joint` drops is not loaded, so its stale image must not
+        hold an admission that resumes at an HBM-resident hit."""
+        bm = _paged_bm()
+        commits = self._joint(bm, monkeypatch)
+        monkeypatch.setattr(
+            bm, "_fit_joint", lambda d, probe: bm._no_joint("partial_chunk_no_room")
+        )
+        monkeypatch.setattr(bm.paged_state_checkpoints, "contains", lambda h: h == 2)
+        bm.state_offload.note_stored(77)
+        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2], 1), defer_unverified=True
+        )
+        assert [d.skip_reason for d in commits] == ["partial_chunk_no_room"]
+        assert bm.state_offload.loads_deferred_for_verify == 0
 
 
 def test_the_scheduler_retries_a_held_admission(monkeypatch):
@@ -681,11 +714,11 @@ def test_the_scheduler_retries_a_held_admission(monkeypatch):
     real = bm.record_allocation
     holds = [True]
 
-    def record(seq, n, hashes, *, defer_unverified=False):
+    def record(seq, probe, *, defer_unverified=False):
         assert defer_unverified, "admission asks to hold unverified loads"
         if holds.pop() if holds else False:
             return False
-        return real(seq, n, hashes, defer_unverified=defer_unverified)
+        return real(seq, probe, defer_unverified=defer_unverified)
 
     monkeypatch.setattr(bm, "record_allocation", record)
     seq = stateful_seq(list(range(12)))
