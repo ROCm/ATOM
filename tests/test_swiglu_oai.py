@@ -6,8 +6,6 @@
 import pytest
 import torch
 
-from atom.model_ops.swiglu_oai import swiglu_oai_split
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is None,
     reason="SwiGLU-OAI requires a ROCm GPU",
@@ -36,6 +34,9 @@ def _assert_reference(actual, x, alpha, beta, limit):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("limit", [None, 7.0])
 def test_compiled_swiglu_preserves_eager_fp32(dtype, limit):
+    # Import only after the ROCm skip gate; CPU CI does not install Triton.
+    from atom.model_ops.swiglu_oai import swiglu_oai_split
+
     # Runtime Python float arguments are FP64 in Inductor's Triton signature
     # on the affected stack, unlike eager Triton. Keep them as runtime scalars,
     # rather than replacing them with constexprs or pre-rounded constants.
@@ -62,6 +63,8 @@ def test_compiled_swiglu_preserves_eager_fp32(dtype, limit):
 @pytest.mark.parametrize("layout", ["contiguous", "row_strided", "column_strided"])
 @pytest.mark.parametrize("out_dtype", [None, torch.float32])
 def test_compiled_swiglu_tail_layout_and_output_dtype(dtype, layout, out_dtype):
+    from atom.model_ops.swiglu_oai import swiglu_oai_split
+
     def activate(x, alpha, beta, cap):
         return swiglu_oai_split(x, alpha, beta, cap, out_dtype=out_dtype)
 
