@@ -82,7 +82,6 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
-from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     batch_prefix_slots,
@@ -92,6 +91,7 @@ from atom.model_ops.fused_moe.routed_experts_capturer import (
     current_slot_mapping,
     fused_moe_modules,
 )
+from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
