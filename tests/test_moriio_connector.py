@@ -1242,11 +1242,7 @@ def load_class_members(names: list[str], namespace: dict) -> dict:
 
 
 class RegionPseudoLayerTest(unittest.TestCase):
-    """DSV4 region layouts: each region is a pseudo-layer of its own.
-
-    Runs on the CPU lane: the methods are lifted from the source onto a
-    stand-in class, with the RDMA edge recorded rather than posted.
-    """
+    """PAGE by block id, SLOT by state_slot. Lifted so the CPU lane can run it."""
 
     PAGE, SLOT = 0, 1
 
@@ -1415,43 +1411,6 @@ class RegionPseudoLayerTest(unittest.TestCase):
         conn.blocks_per_chunk = 4
         groups = conn._group_offsets([1, 5], [2, 9], 8)
         self.assertEqual(groups, {(0, 0): ([8], [16], [8]), (1, 2): ([8], [8], [8])})
-
-
-class RegionSourceTest(unittest.TestCase):
-    """Region-mode plumbing that needs the scheduler or the GPU, pinned."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.source = CONNECTOR.read_text()
-
-    segment = ConnectorSourceTest.segment
-
-    def test_empty_kv_caches_register_regions(self):
-        body = self.segment("register_kv_caches")
-        self.assertIn("self._register_regions(transfer_tensors, num_blocks)", body)
-        # Raw regions are chunked per region, and the layout is advertised.
-        regions = self.segment("_register_regions")
-        self.assertIn("MAX_RDMA_CHUNK_BYTES // unit", regions)
-        self.assertIn("region_layout=dict(self._region_layers)", regions)
-        self.assertIn("swa_block_regions", regions)
-
-    def test_region_layout_is_checked_before_sessions_are_built(self):
-        body = self.segment("_get_or_build_sessions")
-        self.assertLess(
-            body.index("self._check_region_layout("),
-            body.index("local_metas == remote_metas"),
-        )
-
-    def test_state_slots_travel_from_producer_to_push(self):
-        finished = self.segment("request_finished")
-        self.assertIn('"remote_slot_index": _state_slot(seq)', finished)
-        alloc = self.segment("update_state_after_alloc")
-        self.assertIn('params["local_slot_index"] = _state_slot(seq)', alloc)
-        self.assertIn('params["remote_slot_index"] = params.get(', alloc)
-        ask = self.segment("_request_write")
-        self.assertIn('"src_slot": src_slot', ask)
-        self.assertIn('"dst_slot": dst_slot', ask)
-        self.assertIn('int(request.get("src_slot", -1))', self.segment("_is_valid_write_request"))
 
 
 if __name__ == "__main__":

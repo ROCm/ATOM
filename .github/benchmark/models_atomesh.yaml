@@ -239,8 +239,7 @@ models:
           eval_concurrency: [128, 512]
 
       accuracy:
-        # gsm8k over MoRIIO write mode. 0.95 is required: the per-request
-        # state pool does not fit at the model default of 0.85.
+        # 0.95: the per-request state pool does not fit at 0.85.
         - &dsv4_moriio_gsm8k
           name: ds-v4-1p1d-tp8-moriio-gsm8k
           topology: 1p1d_tp8_moriio

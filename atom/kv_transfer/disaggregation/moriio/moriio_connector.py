@@ -69,8 +69,7 @@ if _MORIIO_AVAILABLE:
 
 logger = logging.getLogger("atom")
 
-# Region pseudo-layer kinds: PAGE units are keyed by block id, SLOT units by
-# the request's state slot.
+# 0 PAGE, keyed by block id. 1 SLOT, keyed by state_slot.
 _REGION_PAGE = 0
 _REGION_SLOT = 1
 
@@ -189,8 +188,7 @@ class MoRIIOConnector(KVConnectorBase):
         self.kv_cache_block_size: int = config.kv_cache_block_size
         self.blocks_per_chunk: int | None = None
         self.num_k_chunks: int = 0
-        # Region layouts only: pseudo-layer name -> the same five fields as
-        # MoRIIOAgentMetadata.region_layout. Empty for per-layer KV caches.
+        # name -> [kind, unit_bytes, num_units, reverse_indexed, units_per_chunk]
         self._region_layers: dict[str, list[int]] = {}
 
         # Session cache: remote_engine_id -> list[session]
@@ -287,9 +285,8 @@ class MoRIIOConnector(KVConnectorBase):
         ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
         ``self.num_k_chunks`` marks the K/V boundary.
 
-        A backend that publishes no per-layer KV tensors but a
-        ``KVTransferTensors`` region contract (DeepSeek-V4) is registered by
-        :meth:`_register_regions` instead, one pseudo-layer per region.
+        An empty cache with transfer regions is registered by
+        ``_register_regions``, one pseudo-layer per region.
         """
         self.kv_caches = kv_caches
         if not kv_caches:
@@ -389,19 +386,7 @@ class MoRIIOConnector(KVConnectorBase):
         self._handshake_listener_thread.start()
 
     def _register_regions(self, tt: Any, num_blocks: int | None) -> None:
-        """Register every transfer region as a pseudo-layer of its own.
-
-        Each region is one entry of ``layer_name_to_local_kv_cache_metadata``
-        with its own unit size and chunking, so the per-layer session grids and
-        ``_group_offsets`` serve it unchanged. PAGE regions are keyed by block
-        id; SLOT regions (the full per-request state, often reverse-indexed)
-        by the request's state slot. A reverse-indexed region numbers its units
-        back from its end, so slot ``i`` is forward unit ``num_units - 1 - i``;
-        everything after registration works in forward units.
-
-        The compressor staging pool is not registered: the full SLOT regions
-        already carry the compressor state.
-        """
+        """One pseudo-layer per PAGE or SLOT region. Staging is not registered."""
         if self.transfer_mode == "read" and not self.is_producer:
             raise ValueError(
                 "MoRIIO read mode does not support region layouts "
@@ -452,14 +437,13 @@ class MoRIIOConnector(KVConnectorBase):
 
         self.block_len = self.kv_cache_block_size
         self.num_blocks = int(num_blocks or tt.num_blocks)
+        n_page = sum(v[0] == _REGION_PAGE for v in self._region_layers.values())
+        n_slot = sum(v[0] == _REGION_SLOT for v in self._region_layers.values())
         logger.info(
-            "[moriio-layout] regions: %d PAGE + %d SLOT pseudo-layers, %d "
-            "descriptors, %d blocks, tp_replication_factor=%d",
-            sum(1 for v in self._region_layers.values() if v[0] == _REGION_PAGE),
-            sum(1 for v in self._region_layers.values() if v[0] == _REGION_SLOT),
-            sum(len(m) for m in self.layer_name_to_local_kv_cache_metadata.values()),
+            "[moriio-layout] %d PAGE + %d SLOT regions, %d blocks",
+            n_page,
+            n_slot,
             self.num_blocks,
-            int(getattr(tt, "tp_replication_factor", 1) or 1),
         )
         metadata = MoRIIOAgentMetadata(
             engine_id=self.engine_id,
@@ -473,13 +457,7 @@ class MoRIIOConnector(KVConnectorBase):
         self._start_handshake_listener(metadata)
 
     def _check_region_layout(self, remote_engine_id: str) -> dict[str, list[int]]:
-        """The peer's region layout, refused unless it pairs with ours.
-
-        Region by region, the kind, unit size, indexing direction, and chunking
-        must agree: offsets on both ends come from one unit size, so a mismatch
-        would land bytes at the wrong addresses without failing a transfer.
-        Unit counts may differ; the two ends size their pools independently.
-        """
+        """Peer layout. Kind, unit, reverse, and chunking must match. Counts may not."""
         remote = self.remote_moriio_metadata[remote_engine_id].region_layout
         if not remote:
             raise ValueError(
@@ -882,7 +860,6 @@ class MoRIIOConnector(KVConnectorBase):
                     remote_engine_id
                 ][ln]
                 if remote_layout is not None:
-                    # A region is its own pseudo-layer with its own chunking.
                     _, _, remote_units, _, upc = remote_layout[ln]
                     nk = len(local_metas)
                     remote_nk = -(-remote_units // upc)
@@ -912,8 +889,6 @@ class MoRIIOConnector(KVConnectorBase):
                     return self.moriio_wrapper.get_unpack_memory_metadata(packed)
 
                 if remote_layout is not None:
-                    # A large region spans many chunks on each end and a
-                    # request touches few pairs, so build those on first use.
                     per_layer_sessions.append(
                         (
                             _LazySessions(
@@ -1212,7 +1187,7 @@ class MoRIIOConnector(KVConnectorBase):
         lengths first. Each ``(local_chunk, remote_chunk)`` group is one batch
         on the matching session of the local x remote grid. Shared by both
         directions, so a read and a write of the same pair always touch the
-        same bytes. A region pseudo-layer passes its own ``blocks_per_chunk``.
+        same bytes. ``blocks_per_chunk`` overrides the per-layer chunk size.
         """
         bpc = blocks_per_chunk or self.blocks_per_chunk
         groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
@@ -1285,12 +1260,7 @@ class MoRIIOConnector(KVConnectorBase):
         src: list[int],
         dst: list[int],
     ) -> list[dict[tuple[int, int], tuple[list[int], list[int], list[int]]]]:
-        """Per pseudo-layer offset groups for a region push, in layer order.
-
-        PAGE layers pair the blocks; SLOT layers pair the producer's state
-        slot with the consumer's. Every id is bounds-checked against both ends
-        before anything is posted.
-        """
+        """PAGE pairs the blocks. SLOT pairs producer slot to consumer slot."""
         label = f"transfer {request['transfer_id']}"
         remote_layout = self.remote_moriio_metadata[engine_id].region_layout
         src_slot = int(request.get("src_slot", -1))
@@ -2036,8 +2006,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             ), "Only the decode (consumer) side handles do_remote_prefill"
             self._reqs_need_recv[seq.id] = (seq, list(seq.block_table))
             params["do_remote_prefill"] = False
-            # Per-request state moves slot to slot: keep the producer's final
-            # slot as the source and make ours the destination.
+            # Producer slot stays the source. Ours is the destination.
             params["remote_slot_index"] = params.get(
                 "remote_slot_index", params.get("local_slot_index", -1)
             )
@@ -2087,8 +2056,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
-            # The final state slot, the source of a SLOT region push. The send
-            # claim above defers its release with the blocks.
+            # Source slot for the SLOT push. The send claim holds it with the blocks.
             "local_slot_index": _state_slot(seq),
             "remote_slot_index": _state_slot(seq),
         }
