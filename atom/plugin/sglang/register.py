@@ -4,6 +4,9 @@ import os
 from atom.plugin.sglang.models.kimi_k3_processor import (
     register_kimi_k3_text_only_processor,
 )
+from atom.plugin.sglang.patches.ck_block_m16_fallback import (
+    apply_ck_block_m16_fallback,
+)
 from atom.plugin.sglang.patches.prefill_compile_only_patch import (
     apply_prefill_compile_only_patch,
 )
@@ -251,3 +254,7 @@ def register_plugin() -> None:
         apply_load_config_patch()
     except Exception:
         logger.exception("Failed to install ATOM SGLang load-config patch")
+    # gfx942 PTPC MoE tuned rows pick CK block_m=16, which this aiter
+    # heuristic cannot dispatch. Install after the other plugin imports so
+    # a CPU-only unit test does not pull aiter in first.
+    apply_ck_block_m16_fallback()
