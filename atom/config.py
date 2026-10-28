@@ -2789,6 +2789,10 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        # The KV cache dtype is fixed at trace time too: the DSpark drafter
+        # branches on it (`dspark_fp8_planned`), so a bf16 run over an fp8 run's
+        # cache loads a graph built for the other window layout.
+        factors.append(self.kv_cache_dtype)
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the
         # `backbone` tag, so the flag must key the artifacts.
