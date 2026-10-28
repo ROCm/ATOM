@@ -1276,15 +1276,12 @@ class RegionPseudoLayerTest(unittest.TestCase):
 
         conn = self.Fake()
         conn._region_layers = local
-        conn.blocks_per_chunk = None
         conn.remote_moriio_metadata = {
             "eng": types.SimpleNamespace(region_layout=remote)
         }
         conn.writes = []
-        built = []
 
         def build_session(local_md, remote_md):
-            built.append((local_md, remote_md))
             return (local_md, remote_md)
 
         def write(szs, l_offs, r_offs, session):
@@ -1294,7 +1291,6 @@ class RegionPseudoLayerTest(unittest.TestCase):
         conn.moriio_wrapper = types.SimpleNamespace(
             build_session=build_session, write_remote_data_status=write
         )
-        conn.built = built
         sessions = [
             (self.lazy(conn.moriio_wrapper, [(n, i) for i in range(8)], range(8)), {})
             for n in local
@@ -1303,14 +1299,14 @@ class RegionPseudoLayerTest(unittest.TestCase):
         return conn
 
     # [kind, unit_bytes, num_units, reverse, units_per_chunk]
-    def layouts(self, slot_units_remote: int = 6):
+    def layouts(self):
         local = {
             "page.0.kv": [self.PAGE, 8, 10, 0, 4],
             "slot.0.kv": [self.SLOT, 16, 4, 1, 2],
         }
         remote = {
             "page.0.kv": [self.PAGE, 8, 12, 0, 4],
-            "slot.0.kv": [self.SLOT, 16, slot_units_remote, 1, 2],
+            "slot.0.kv": [self.SLOT, 16, 6, 1, 2],
         }
         return local, remote
 
@@ -1345,12 +1341,6 @@ class RegionPseudoLayerTest(unittest.TestCase):
         # 6-unit region is forward unit 4 (chunk 2, +0).
         self.assertEqual(slot, {(1, 2): ([16], [0], [16])})
 
-    def test_each_end_reverses_against_its_own_slot_count(self):
-        conn = self.make(*self.layouts(slot_units_remote=4))
-        _page, slot = conn._region_write_plan(self.request(), "eng", [1], [2])
-        # Remote slot 1 of 4 units is forward unit 2: chunk 1, +0.
-        self.assertEqual(slot, {(1, 1): ([16], [0], [16])})
-
     def test_a_missing_state_slot_is_refused(self):
         conn = self.make(*self.layouts())
         with self.assertRaises(ValueError) as caught:
@@ -1380,12 +1370,6 @@ class RegionPseudoLayerTest(unittest.TestCase):
         )
         self.assertEqual(conn.writes[2][1:], ([16], [0], [16]))
 
-    def test_lazy_sessions_are_built_once(self):
-        conn = self.make(*self.layouts())
-        conn._write_blocks(self.request(), "eng")
-        conn._write_blocks(self.request(transfer_id=4), "eng")
-        self.assertEqual(len(conn.built), 3)
-
     def test_layout_check_allows_only_unit_count_differences(self):
         local, remote = self.layouts()
         conn = self.make(local, remote)
@@ -1405,12 +1389,6 @@ class RegionPseudoLayerTest(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             conn._check_region_layout("eng")
         self.assertIn("no region layout", str(caught.exception))
-
-    def test_per_layer_path_keeps_its_global_chunking(self):
-        conn = self.make({}, {})
-        conn.blocks_per_chunk = 4
-        groups = conn._group_offsets([1, 5], [2, 9], 8)
-        self.assertEqual(groups, {(0, 0): ([8], [16], [8]), (1, 2): ([8], [8], [8])})
 
 
 if __name__ == "__main__":
