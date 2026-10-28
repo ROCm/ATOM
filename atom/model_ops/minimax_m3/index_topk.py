@@ -681,7 +681,7 @@ def _score_chunk_blocks(max_block: int, q_tiles: int, batch: int, heads: int, de
 def _decode_score_chunks(batch: int, max_block: int) -> int:
     """Chunks one decode score row is split across.
 
-    A count, not a size: the grid is (request, chunk), so this IS the second
+    A count, not a size: the grid is (chunk, request), so this IS the first
     grid dim and it must stay shape-constant for a cuda graph to replay it.
     Enough chunks that a long context is not serialized inside a handful of
     CTAs, floored so no chunk shrinks to a single block -- DECODE_SCORE_MIN_BLOCKS
@@ -1087,8 +1087,11 @@ def _decode_index_score_tiled_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     IS_FP4: tl.constexpr = False,
 ):
-    pid_b = tl.program_id(0)
-    pid_chunk = tl.program_id(1)
+    # Chunk on the fastest grid axis: workgroups go to the XCDs round-robin by
+    # linear id, so with the request there a batch of 8 put every chunk of a
+    # request on one XCD and the longest request set the time (2.3x at bs 8).
+    pid_chunk = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
     seq_len = tl.load(seq_lens + pid_b)
     # The request's last query row is the one that sees the most blocks.
@@ -1390,7 +1393,7 @@ def minimax_m3_index_topk_decode(
     num_score_chunks = _decode_score_chunks(batch, max_block)
     is_fp4 = index_kv_scale is not None
     iks = index_kv_scale if is_fp4 else index_kv_cache
-    _decode_index_score_tiled_kernel[(batch, num_score_chunks)](
+    _decode_index_score_tiled_kernel[(num_score_chunks, batch)](
         idx_q,
         index_kv_cache,
         iks,
