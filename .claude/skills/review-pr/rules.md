@@ -49,6 +49,13 @@ Real example (ATOM#1498): "[MI308]" backbone change still affects gfx950 (MI355X
 **A3 — Activation condition broader than validated scope** ⚠️
 New dispatch enables kernel for model family X, tested only on subcase Y.
 Real example (vLLM#16435): FusedMoE activated for wrong families → follow-up restrict PR needed.
+Real example (ATOM, commit `4c7067735`, branch `mono-glm52-k3`, **not yet merged, no PR
+opened** — caught by an automated Copilot review pass, not a human, and cited here only as
+the fix): GLM-5.2's `config_refusal()` admitted a TP4/FP8 deployment on any arch, although the
+kernel is built specifically for gfx950's LDS budget and the runner always asks for native
+FP4 MFMA — the activation condition was broader than the validated scope, and an unsupported
+arch reached compile/launch instead of being refused. Same shape as the vLLM citation above;
+flagged here as real but unmerged evidence, not a landed/live-on-`main` instance.
 → `⚠️ A3: activation condition enables [X] but only [Y] was tested`
 
 **A4 — Distributed handshake or coordination invariant changes on one side only** ⚠️/🔴
@@ -75,6 +82,10 @@ _"The code looks complete but certain inputs silently take the wrong path."_
 New `if/elif/else`: for each parameter gated off — is it **asserted** or **forwarded**?
 Trigger params: `block_table`, `alibi_slopes`, `window_size`, `logits_soft_cap`, `dropout_p`.
 Real example (aiter#3576): `block_table is not None` False-branch computed dense attention silently.
+No ATOM-native instance found despite search — carried from aiter and labeled as such, the
+same way H1/G2 mark their uncited rules; kept because the trigger (new dispatch gate on one
+of five named params) matches B2/B6's well-evidenced siblings in the same `dispatch-change`
+family closely enough to be a sound preventive check, not because an ATOM PR proves it.
 → `🔴 B1: [param] silently ignored in [branch] — assert or forward`
 
 **B2 — Decode/prefill phase classified by size proxy** ⚠️
@@ -139,6 +150,12 @@ Real examples: ATOM#1423 valarLip: "not always bf16"; ATOM#1458 valarLip: "hard 
 `if "gfx942" in arch: treat_as_fnuz()` — wrong. Same arch can have both fn and fnuz tensors in flight (fnuz KV, fn Q).
 Use `tensor.dtype == fp8_fnuz` to check IS fnuz. Gating CONVERSION by arch is OK.
 Real example (aiter#4073): valarLip: "check _is_fnuz by tensor's DType instead of arch."
+No ATOM-native instance of this exact mechanism found despite search. The closest ATOM hit,
+PR#1793 (`fix(deepseek_v4): gfx942 dtype-dialect and MXFP4 swizzle fixes`), is adjacent, not a
+match: it fixes a dtype-literal check missing one fnuz dialect, not an arch-string substituting
+for a dtype check — cited here only as evidence that fn/fnuz dialect confusion is a real,
+recurring defect class on ATOM, not as a direct instance of C2's specific anti-pattern. Carried
+from aiter and labeled as such, same convention as H1/G2.
 → `⚠️ C2: fnuz check uses arch name — use tensor.dtype comparison`
 
 **C3 — New GPU arch string or arch-specific constant hardcoded in dispatch** ⚠️
@@ -160,7 +177,18 @@ _Rule numbers are aligned with aiter's D-section. D3 (hipblaslt tuning config) i
 Trigger: ATOM code passes a freshly-allocated `torch.empty()` tensor to an aiter kernel that uses atomic reductions internally (e.g., `fused_qk_norm_rope_cache_pts_quant_shuffle` v_amax buffers); or any new allocation on the `torch.empty` path near a kernel that calls `atomic_fmax`.
 Severity: 🔴 for atomic accumulation (atomic_fmax, atomicAdd) — garbage propagates into every output element. ⚠️ for partial-sum buffers where a zero-weight coefficient mathematically cancels the contribution (e.g., online softmax with empty batch: `exp(-inf) × garbage = 0`); still flag because `0.0 × NaN = NaN` on IEEE hardware if the allocator returns dirty pages.
 Real example (aiter#4015): yzhou103: "AiterTensor::empty does not zero-initialize... garbage in v_amax silently corrupts descale."
+Real example (ATOM, commit `1e0e51644`, **open PR#2357, not yet merged**): `init_aiter_topK_meta_data` allocates one process-wide buffer and initializes only the shared-expert columns; the `top_k` routed columns — which hold expert *ids* that `moe_sorting` and the scatter/reduce kernel use to index expert-sized storage — were left on `torch.empty`, so a row the routing kernel doesn't write in a given step reads whatever the allocator last left there: an out-of-range index, not just a wrong number. Fixed by zeroing the buffer. Same shape as the aiter citation, on ATOM's own MoE routing path.
 → `🔴 D1: [buffer] passed to atomic kernel not zero-initialized — use torch.zeros not torch.empty`
+
+**D2 ("new default path without rollback env-var") was landed here, then removed.** It had
+no ATOM citation from the start — inherited from a pre-pipeline checklist with no PR or
+commit behind it — and a targeted search (git log/PR search for a rollback-env-var
+discussion, a reverted default, or a review comment asking for one) found no ATOM instance.
+Unlike B1/C2/D4/E3 above, it does not clear the lower "sound preventive check borrowed from
+a well-evidenced sibling family" bar either — it has no aiter citation and no sibling rule
+with its own ATOM evidence to borrow plausibility from, just a one-line "is there an env var
+to revert?" question with no concrete trigger shape. Dropped rather than kept as a label with
+nothing under it. If an ATOM instance turns up later, re-add with that citation, not uncited.
 
 **D1b — Python-side UnboundLocalError from conditional assignment** 🔴
 A variable is assigned inside an `if/elif` branch but referenced unconditionally after the block. Python does not detect this statically — `UnboundLocalError` or `NameError` fires only at runtime when the skipped branch is exercised. Silent in test environments that never hit the uninitialized path.
@@ -169,14 +197,14 @@ Exception: if there is a definitive `else` branch that also assigns the variable
 Real example (ATOM#860): `needs_independent_noise` returned from `prepare_model()` tuple but assigned only in one branch of `prefill_forward` — other branch paths raised `NameError` when the sampler tried to use it.
 → `🔴 D1b: [var] assigned only inside [branch] but referenced unconditionally — add [var = default] before the if-block`
 
-**D2 — New default path without rollback env-var** ⚠️
-New implementation replaces existing default before wide validation: is there an env var to revert?
-→ `⚠️ D2: new default path needs rollback env-var for safe rollout`
-
 **D4 — Invariant reversal without citation** 🔴
 A documented safety invariant is reversed: old comment says "must X because Y" → new code removes X claiming "X not needed" but no spec/asm/test is cited to prove Y no longer holds.
 Trigger: `torch.zeros → torch.empty` where old comment mentions "must" / "required" / "read back as zero"; assert deletion without explanation; `.contiguous()` removal; zero-init removal with contradicting justification.
 Real example (aiter#4043): old: "trailing pad must read back as zero for the asm reader, so zero-initialise it here" → new: "trailing pad is never read by the asm reader, so no zero-init is needed" — two comments directly contradict; PR cites no spec.
+No ATOM-native instance found despite search — carried from aiter and labeled as such. Kept
+preventively: the trigger (a removed/reversed safety comment with no replacement citation) is
+the same class D1's own ATOM evidence shows actually happens on ATOM (an uninitialized-buffer
+invariant silently dropped), just not yet caught in this exact "comment reversal" shape.
 → `🔴 D4: [operation] reverses a documented safety invariant — cite the spec/asm/test proving new assumption is safe`
 
 **D5 — Verbatim duplication across backbone files** ⚠️
@@ -190,12 +218,17 @@ When a `gen_fake` / `_fake` / `abstract_impl` function is added or modified, its
 Trigger (1): diff contains a `_fake` / `gen_fake` function alongside the real op; compare each return tensor's dtype and shape against the real op's actual output.
 Trigger (2): real op's return dtype or arity changes in the diff but no corresponding `_fake` / `gen_fake` change appears — the existing fake is now stale.
 Real example (aiter#4110): `fused_allreduce_rmsnorm_quant_fake` returned `torch.empty_like(res_inp)` (bf16) as first element, but real op returns fp8 — wrong dtype for torch.compile's dtype checks.
+Real example (ATOM, PR#119, merged, commit `c5fab3e49`): the DS FP4/FP8 fused-quant fake function's `transpose_scale` argument controls whether the returned scale tensor's shape is transposed against the real op; an earlier revision dropped the argument from the fake while the real op kept it, desyncing the fake's output shape from the real op's — commit message: "Added transpose_scale back to fp8 fake function." Older history of the same fix (commit `9dc331cb7`) sits on a separate PR#116 that was closed without merging; the content landed via PR#119 instead.
 → `🔴 [fake_fn] return [N] dtype is [X] but real op returns [Y] — torch.compile will assert or silently miscompute`
 
-**D7 — New torch.compile op without fake function** 🔴
-A new op registered via `torch.library.custom_op` or `@compile_ops` has no corresponding `_fake` / `gen_fake` / `abstract_impl`. torch.compile traces using fake tensors; without a fake the op is a black box → runtime crash or silent fallback to eager inside a compiled region.
-Trigger: diff adds a new function decorated with `@compile_ops` or `torch.library.custom_op`; grep for a matching `_fake` / `gen_fake` function — if absent, flag.
-→ `🔴 D7: [op_name] has no fake/abstract implementation — torch.compile will crash or silently fall back to eager`
+**D7 ("new torch.compile op without fake function") was landed here, then removed.** It had
+no ATOM citation from the start and a targeted search (`register_fake`/`abstract_impl`/"no
+fake"/"missing fake" across the full commit history) found zero matches — not even an
+adjacent near-miss the way C2 and D6 had before D6 was evidenced. D6 above covers the
+sibling defect (a fake function that exists but has *drifted* from the real op) with a real,
+merged ATOM instance; D7's narrower claim — that a fake is missing *entirely* — has no ATOM
+instance to show for it. Dropped rather than kept as a label with nothing under it. If an
+ATOM instance turns up later, re-add with that citation, not uncited.
 
 **D8 — Kernel call missing contiguous check** ⚠️
 Python code calls a C++ / aiter kernel but doesn't assert `.is_contiguous()` or call `.contiguous()` on inputs that may arrive strided (slice of larger tensor, `.T`, output of non-contiguous `view()`). Kernel reads from wrong addresses — completely silent wrong result.
@@ -274,6 +307,10 @@ Real example (ATOM#1423): paged-SWA layout changed; bridge still used old layout
 **E3 — New param with backward-compatible default is dead code** 📝
 New aiter param added with default that preserves old behavior: fix only activates when consumer passes non-default. Who updates the consumer?
 Real example (aiter#3773): `max_seqlen=-1` — fix never activated until ATOM passed actual value.
+No ATOM-native instance found despite search — carried from aiter and labeled as such. Kept
+preventively in the same `plugin-bridge` family as E2, whose own ATOM evidence (#1423) shows
+the general "consumer doesn't pick up an upstream change" failure mode is real on this
+boundary; E3 covers the narrower default-param variant of it.
 → `📝 E3: new API param needs consumer-side update to activate — follow-up tracked?`
 
 **E4 — A production kernel or dispatch belongs in aiter, not ATOM** ⚠️
@@ -472,41 +509,24 @@ Trigger: `grid = lambda` or `tl.program_id` on an added line.
 
 ---
 
-### Performance Evidence
+### Performance Evidence (P1-P5) — landed here, then removed
 
-Not derived by the current pipeline -- P1-P5 are in `UNREACHABLE_BY_DESIGN`
-(see `triage.py` and `MAPPING.md`): the P0 minimal deriver does not emit this
-family, so nothing puts these on `$WORK/rules.txt` today. "Always check"
-described SKILL.md's pre-pipeline prose checklist, not what the deriver
-does; kept here as the rule bodies P1 regrows the family from.
+The whole family (perf-claim benchmark numbers, production shapes, reproducibility, TP/PP/DP/
+DCP/EP split coverage, hidden recurring cost) had zero ATOM citations from the start — carried
+in from a pre-pipeline checklist, not derived from any ATOM commit, PR, or review comment, and
+a targeted search for each of the five (benchmark-numbers asks, toy-shape complaints, missing
+repro info, TP-split shape bugs, hidden-setup-cost benchmarks) found no ATOM instance for any
+of them. P1-P5 were also the only rule ids in `UNREACHABLE_BY_DESIGN` whose containing section
+header claimed "always check" — i.e. doubly weak: no evidence AND no trigger, unlike D6/D8/D9,
+which stay `UNREACHABLE_BY_DESIGN` on the strength of real cited evidence reached by another
+route (a scanner, a fake-function diff). A rule with neither a citation nor a path to firing
+is not a weaker version of a real rule, it is prose with nothing under it.
 
-**P1 — Perf PR without benchmark numbers** ⚠️
-Trigger words: perf, optimize, fuse, faster, improve, +X%, replace kernel, OOM fix that changes algo.
-Description must have numbers with units (ms, tokens/s, TFLOPS, %). Accuracy tables (gsm8k, MMLU) do NOT count. Screenshots ≠ numbers.
-→ `⚠️ P1: perf claimed — no benchmark numbers with units`
-
-**P2 — Benchmark covers only toy shapes** ⚠️
-Numbers exist but only for M≤256, only 1 token, or one model.
-Production: DSv4 (E=385/topk=7, TP=4/8), GPT-OSS 120B, Kimi-K2.5, GLM5; token range 1→16384 decode + prefill 1k/4k/32k.
-Staleness guard: the production config list is a snapshot — verify current E/topk/TP and the model roster from `atom/config.py` or a recent benchmark before asserting what counts as "production".
-→ `⚠️ P2: benchmark missing production shapes — [what's absent]`
-
-**P3 — Perf claim not reproducible** ⚠️
-Missing: test script/command, ROCm version, GPU model, TP/DP config, model checkpoint.
-→ `⚠️ P3: perf claim missing reproduction info — [what's absent]`
-
-**P4 — TP split shapes not covered** ⚠️
-New attention / norm op tested only at full head count (TP=1 equivalent). At TP=4/8, `num_heads_q` / `num_heads_k` per device is divided by TP. A kernel passing at H=128 may OOB or produce wrong output at H=32 (TP=4) if shape math doesn't account for the split.
-Trigger: new kernel or dispatch path that takes per-device head count; PR shows only one head count without TP=4/8 variant.
-Beyond TP: `atom/config.py` also declares `pp_size`, `data_parallel_size`, and `decode_context_parallel_size` (`dcp_size`) alongside `tp_size` and MoE `ep_size`. The same per-device shape-math hazard P4 checks for under a TP split applies equally under a PP stage boundary, a DP batch split, DCP, or an EP expert split — a new shape-dependent kernel/dispatch path tested only at one setting of any of these dimensions (not just TP) should trigger P4, not only the TP=1-vs-TP=N case. (TensorRT-LLM `.claude/skills/trtllm-code-contribution/SKILL.md`'s "Check Parallelism Dimensions" table, borrowed for this broader framing — no new ATOM citation beyond P4's existing evidence.)
-→ `⚠️ P4: test covers only TP=1 head count — verify at num_heads÷TP=4 (e.g., [128→32]); also check PP/DP/DCP/EP splits if the new path is shape-dependent on those`
-
-**P5 — Benchmark hides a cost real users pay on every call or cold start** ⚠️
-The perf claim is measured with the timing window drawn so a *recurring* production cost is excluded: a first-call JIT compile on a path that is NOT cached across calls, or a setup step that runs on the live stream inside the timed region on every cold start. If that cost is real and recurring, omitting it can turn a net regression into an apparent speedup.
-Do NOT fire on a genuinely one-time, amortizable setup that production pays once at model init — excluding weight shuffle/preshuffle, model weight loading, or a first-call JIT whose result is cached forever from steady-state per-call latency is CORRECT methodology, not deception. `warmup_iters` before a steady-state loop is standard and by itself is not P5.
-FP self-check (do this before firing): is the excluded cost paid **once per deployment** (amortizable → do NOT fire) or **again on every call / every cold start / inside the timed stream** (→ fire)? If you cannot show it recurs, do not fire.
-Counter-example (does NOT trigger P5): aiter#4166 preshuffles the static weight once outside the timing loop and honestly reports a geomean 0.69x result — a correct steady-state benchmark, not a hidden cost. Charging that one-time shuffle against a single call to manufacture a "regression" is itself the false positive this rule must avoid.
-→ `⚠️ P5: timing window excludes [cost] that recurs per call / per cold start — re-run including it, or confirm it is one-time amortizable`
+The underlying asks have not disappeared from the skill: `triage.py`'s `perf_claims()` and
+`test_quality()` helpers still surface "no units/baseline named," "shapes are all small," and
+similar evidence for Step 1b/Step 3 to read and judge directly, without citing a rule id that
+has no ATOM instance behind it. If an ATOM-evidenced instance of any of these five turns up
+later, re-add the specific one with that citation — not the whole family uncited.
 
 ---
 

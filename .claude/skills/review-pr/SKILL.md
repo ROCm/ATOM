@@ -108,12 +108,16 @@ _Answer:_
 **The rule set this PR is actually adjudicated against is `$WORK/rules.txt`**, derived by
 `triage.py rules` in Step 1b and adjudicated in Step 7. Every rule id this step's checklist
 names below is pre-pipeline prose, carried over from before Step 1b existed: it is a reading
-aid for the human classifying the PR, not a derivation, and several of the ids it names
-(HK3, the P-family) are not emitted by the current deriver at all -- see `MAPPING.md`'s
-"deliberately never derived" list, which P1 owns closing. Treat this checklist as a prompt
-for what to look for, not as a citation of what will appear on the card.
+aid for the human classifying the PR, not a derivation, and some of the ids it names (HK3)
+are not emitted by the current deriver at all -- see `MAPPING.md`'s "deliberately never
+derived" list. Treat this checklist as a prompt for what to look for, not as a citation of
+what will appear on the card.
 
-- [ ] **Performance optimization** → P1 (benchmark numbers), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
+- [ ] **Performance optimization** → check for a benchmark number with units (ms, tokens/s,
+  TFLOPS, %; accuracy tables and screenshots do not count), production shapes (not only
+  M≤256 or a single token), reproduction info (test command, ROCm version, GPU, TP/PP/DP/
+  DCP/EP config), and whether the timing window excludes a cost real users pay on every
+  call or cold start (`perf_claims`/`test_quality` in Step 1b surface this evidence directly)
 - [ ] **New aiter op usage / aiter API change** → E1 (aiter dep), B5 (param added/removed/renamed propagation), B6 (new kwarg unhandled by all ATOM dispatch branches?), E3 (dead param)
 - [ ] **API signature change** (param added / removed / renamed in an ATOM function or base class, default or return type changed) → B5 (propagation to all receivers), E1 (aiter dep if aiter-side), E2 (plugin bridge sync)
 - [ ] **New constexpr / routing flag / new attribute key added** → B6 (do ALL dispatch branches handle the new value, or assert on it?), C3 (new arch string literal?)
@@ -127,7 +131,7 @@ for what to look for, not as a citation of what will appear on the card.
 - [ ] **Weight transform / new weight attr** → F1 (double HBM pin)
 - [ ] **Async / multi-stream / weight prep** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
-- [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
+- [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D6 (fake dtype/shape matches real op?)
 - [ ] **Kernel launcher / buffer-offset or index arithmetic (long-context or large-batch path)** → D9 (int32 overflow at production scale)
 - [ ] **New aiter / C-extension kernel call** → D8 (contiguous check)
 - [ ] **Removes or reverses a zero-init / assert / `.contiguous()` / documented invariant** → D4 (invariant reversal cited?)
@@ -285,7 +289,6 @@ that is already long enough that "read all of it" is a hope rather than a guaran
 | Perf claims only trace screenshots with no numeric values? | Screenshots ≠ numbers; reviewer will ask |
 | Test only shows token_num ≤ 256 or only M=1? | AI default toy shapes |
 | Dispatch gate: are gated-off params asserted or silent? | Silent → B1 |
-| New default path without env-var? | → D2 |
 | Unrelated files committed? | AI commit artifact → HK2 |
 | Root cause of bug fix explained? | "fix the issue" without mechanism → AI guess |
 | "Test Plan" / "Test Result" section left as template placeholder? | Untested PR, AI-generated description |
@@ -412,12 +415,12 @@ failure, because not writing it was the cheapest way past this check.
 - Output ONLY the card below. Nothing before it, nothing after it.
 - If there are no findings, the findings section is omitted entirely.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
-- The verdict and `Validation (deterministic)` lines are both mandatory and both carry a
-  label prefix, so neither line may ever start with a finding emoji (🔴/⚠️/📝) —
-  that is what the `refutations`/`independent` gates count as a reported finding, and a
-  bare `⚠️ NEEDS WORK` verdict line gets counted as one, leaving one more "finding" than
-  the card actually has. Never omit the `Validation` line: silence on it reads as
-  clearance, which is exactly what the spec forbids.
+- The verdict and `Validation (deterministic)` (or `Validation (advisory)`) lines are
+  both mandatory and both carry a label prefix, so neither line may ever start with a
+  finding emoji (🔴/⚠️/📝) — that is what the `refutations`/`independent` gates count as
+  a reported finding, and a bare `⚠️ NEEDS WORK` verdict line gets counted as one, leaving
+  one more "finding" than the card actually has. Never omit the `Validation` line:
+  silence on it reads as clearance, which is exactly what the spec forbids.
 
 ```
 ## ATOM PR #NNN — [title]
@@ -426,20 +429,37 @@ failure, because not writing it was the cheapest way past this check.
 
 Review: [✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
 Validation (deterministic): [<verdict> — target, exact runtime, skipped-stage evidence | N/A — no runtime surface changed | NOT RUN — <reason>]
+  ...or, when you ran something yourself and no $WORK/validation_report.json exists, this line instead:
+Validation (advisory): [<what you ran, where> — one run, this box, unverified by anything but your own say-so | N/A — ... | NOT RUN — ...]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
 📝 [note]
 ```
 
-**`Validation (deterministic)` — pick exactly one state, never blend them:**
-- an exact-head validator report exists → its verdict plus target/runner/arch and any
-  skipped stages.
-- triage decided no runtime surface changed → `N/A — no runtime surface changed`. Do not
-  write `NOT RUN` here; there is no gap to report.
-- validation was required but no target exists (P0 ships no validator at all, so this is
-  the common case today) → `NOT RUN — <reason>`, e.g. `NOT RUN — the PR changes runtime
-  code but ships no test target` or `NOT RUN — no validator in this pipeline yet`.
+**`(deterministic)` is a claim about where the evidence came from, not how careful you
+were — write it only when `$WORK/validation_report.json` exists.** That file is written
+only by `fetch.sh`, only after its own identity gate confirms the report's
+`repo.head`/`repo.base`/`patch_sha256` match this exact PR; you cannot create or edit it
+by hand, and the card gate checks for its presence the moment you write anything other
+than `N/A`/`NOT RUN` on the `(deterministic)` line. **This pipeline ships no validator
+(P2's `validate-atom-pr`), so that file will not exist for you today — do not run a test
+yourself and label the result `(deterministic)`.** Running one yourself is real evidence,
+just a different kind: unreproducible from the card, unverified against the PR head by
+anything but your own say-so. Report it as `Validation (advisory): ...`, stating what you
+ran, on what box, and that it is one unverified run — never upgrade it to
+`(deterministic)` because it felt thorough.
+
+**Pick exactly one state per tier, never blend them:**
+- an exact-head report exists in `$WORK/validation_report.json` → `(deterministic)`: its
+  verdict plus target/runner/arch and any skipped stages.
+- you ran a test/check yourself with no such report → `(advisory)`: what you ran and
+  where, flagged as one unverified run — not a finding against the PR, not clearance.
+- triage decided no runtime surface changed → `N/A — no runtime surface changed` (either
+  tier). Do not write `NOT RUN` here; there is no gap to report.
+- validation was required but no target/report exists (the common case in P0) →
+  `NOT RUN — <reason>`, e.g. `NOT RUN — the PR changes runtime code but ships no test
+  target` or `NOT RUN — no validator in this pipeline yet`.
 - required and a target existed, but the run itself could not happen (no idle GPU,
   validator missing, disabled) → `NOT RUN — <reason>`; an environment gap, not a PR
   defect.
@@ -457,7 +477,7 @@ Each finding must have **three parts**:
 - `[inferred]` — plausible but unconfirmed; say so and downgrade to "worth checking," do not assert it as the cause.
 A finding that stops at "likely / probably the root cause" without an evidence chain is not shippable — either trace it to [verified] or label it [inferred] and frame it as a question.
 
-Do NOT use rule codes (P1, D2, A1…) in output — they are internal labels only.
+Do NOT use rule codes (B1, D4, A1…) in output — they are internal labels only.
 
 Examples of good findings:
 - `🔴 deepseek_v2.py:1245 changes torch.zeros → torch.empty, but the old comment explicitly says "trailing pad must be zero for asm reader" and the new comment claims "never read" — if padding IS read, every quantized token in the batch gets corrupted output silently. **Author must** cite the asm spec or a test proving padding is not read.`
@@ -467,7 +487,7 @@ Examples of good findings:
 
 Examples of bad findings (too vague, missing action verb):
 - `⚠️ Missing perf numbers` — no impact, no action
-- `🔴 D2 violation` — rule code means nothing to a reviewer
+- `🔴 D4 violation` — rule code means nothing to a reviewer
 - `⚠️ The benchmark may not include setup cost` — no "Author must" conclusion
 
 ---

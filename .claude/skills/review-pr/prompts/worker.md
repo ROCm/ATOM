@@ -62,7 +62,7 @@ Each finding must have **three parts**:
 - `[inferred]` — plausible but unconfirmed; say so and downgrade to "worth checking," do not assert it as the cause.
 A finding that stops at "likely / probably the root cause" without an evidence chain is not shippable — either trace it to [verified] or label it [inferred] and frame it as a question.
 
-Do NOT use rule codes (P1, D2, A1…) in output — they are internal labels only.
+Do NOT use rule codes (B1, D4, A1…) in output — they are internal labels only.
 
 Examples of good findings:
 - `🔴 deepseek_v2.py:1245 changes torch.zeros → torch.empty, but the old comment explicitly says "trailing pad must be zero for asm reader" and the new comment claims "never read" — if padding IS read, every quantized token in the batch gets corrupted output silently. **Author must** cite the asm spec or a test proving padding is not read.`
@@ -72,7 +72,7 @@ Examples of good findings:
 
 Examples of bad findings (too vague, missing action verb):
 - `⚠️ Missing perf numbers` — no impact, no action
-- `🔴 D2 violation` — rule code means nothing to a reviewer
+- `🔴 D4 violation` — rule code means nothing to a reviewer
 - `⚠️ The benchmark may not include setup cost` — no "Author must" conclusion
 ```
 

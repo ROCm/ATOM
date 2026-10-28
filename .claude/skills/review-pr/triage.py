@@ -1310,8 +1310,8 @@ _P1_FAMILY_AXIS = ("the P0 minimal deriver does not emit this family; P1 owns re
                    "ATOM's full rule-family axis from real ATOM review history, and this "
                    "body is its raw material, not dead text")
 UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
-    "B3", "B4", "C3", "D1b", "D2", "D5", "D6", "D7", "D8", "D9", "F1",
-    "P1", "P2", "P3", "P4", "P5", "HK3", "HK6", "HK7",
+    "B3", "B4", "C3", "D1b", "D5", "D6", "D8", "D9", "F1",
+    "HK3", "HK6", "HK7",
 )}
 
 ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
@@ -1846,9 +1846,9 @@ def test_quality(diff_text):
     one of which is a benchmark. Neither is a rule worth having.
 
     What IS decidable is what the test contains, so this prints that: how many assertion
-    primitives, which tolerances, which shapes. Rule P2 and Step 6's check 5 are the
-    judgement; this is the evidence they need in front of them, the same way evidence.txt
-    serves the removed-guard rules."""
+    primitives, which tolerances, which shapes. Step 3's performance checklist and Step 6's
+    check 5 are the judgement; this is the evidence they need in front of them, the same way
+    evidence.txt serves the removed-guard rules."""
     rows = []
     for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
         head = blk.split("\n", 1)[0]
@@ -1901,7 +1901,7 @@ def render_test_quality(rows):
             note = "   <- loose for a kernel comparison" if worst >= 1e-1 else ""
             out.append(f"  tolerances           : {', '.join(r['tols'])}{note}")
         if r["shapes"]:
-            note = ("   <- every shape is small; P2 asks for production sizes"
+            note = ("   <- every shape is small; production configs run larger ones"
                     if max(r["shapes"]) <= 16 else "")
             out.append(f"  shapes               : "
                        f"{', '.join(str(x) for x in r['shapes'][:12])}{note}")
@@ -2104,7 +2104,8 @@ def perf_claims(body):
     `<4 x i32>`, `num_tokens x 384 x 7168` and `5% of elements`, so extracting claims from
     code produced more noise than signal over the 600-PR corpus -- 61% of what it called
     unbaselined claims were shapes, vector widths and error bounds. A perf claim lives in
-    the description; that is where P1 and P3 ask for it, and that is where this looks."""
+    the description; that is where a benchmark number with its units and comparison baseline
+    should be stated, and that is where this looks."""
     lines = (body or "").splitlines()
     # A markdown table states its baseline in the header: `| batch | before | after |
     # speedup |`. Judging each row alone called every row of aiter#4443's table
@@ -2158,8 +2159,8 @@ def render_perf_claims(rows):
                        f" against")
     if bare:
         out.append("")
-        out.append(f"{len(bare)} of {len(rows)} claim lines name no baseline. P1 wants the "
-                   f"number with its units AND its comparison; P3 wants it reproducible. "
+        out.append(f"{len(bare)} of {len(rows)} claim lines name no baseline. A real perf "
+                   f"claim needs the number with its units AND its comparison, reproducibly. "
                    f"Ask what the other side of the comparison was -- main, torch, CK, the "
                    f"previous kernel -- and on which shapes.")
     return "\n".join(out) + "\n"
@@ -2444,29 +2445,79 @@ LATE_MARK = re.compile(r"--\s*late finding:", re.IGNORECASE)
 # presence AND that whichever word is used carries its own reason, not just the other.
 VALIDATION_LINE = re.compile(r"^\s*Validation\s*\(deterministic\)\s*:\s*(.*)$",
                              re.IGNORECASE)
+# PR#2705 (archived at reports/PR-2705/card.md): the worker ran a test itself with the
+# Bash tool, labelled the result `(deterministic)`, and all seven gates passed it, because
+# this function checked only that the line was PRESENT, never that it was ENTITLED. In
+# SKILL.md's own vocabulary `(deterministic)` means a head-matched `validation_report.json`
+# that ships its own reproducer -- fetch.sh only ever writes that file after its identity
+# gate confirms the report's repo.head/base/patch_sha256 match this exact PR (see
+# fetch.sh's "same identity gate" block). So the file's mere presence next to card.md IS
+# the entitlement check: no separate head comparison belongs here, because a
+# non-head-matched report never reaches disk under this name in the first place.
+#
+# A model that ran something itself did real, often useful, work -- it is just evidence of
+# a different kind: unreproducible from the card, unverified against the PR head by
+# anything but the model's own say-so. `Validation (advisory)` is where that goes: not
+# penalized, just relabelled honestly, mirroring aiter SKILL.md's `Perf (deterministic)` /
+# `Perf (advisory)` split for the same kind of evidence gap.
+ADVISORY_LINE = re.compile(r"^\s*Validation\s*\(advisory\)\s*:\s*(.*)$", re.IGNORECASE)
 VALIDATION_REASON = re.compile(r"(?:--|—|:)\s*\S")
+VALIDATION_REPORT_NAME = "validation_report.json"
 
 
-def _check_validation_line(card_text):
+def _check_validation_line(card_text, work_dir=None):
     """Returns a list of (kind, text, why) problems, same shape as audit_card's."""
     for line in (card_text or "").splitlines():
-        m = VALIDATION_LINE.match(line.strip())
+        stripped = line.strip()
+        m = VALIDATION_LINE.match(stripped)
         if m:
             body = m.group(1).strip()
             if not body:
-                return [("EMPTY-VALIDATION", line.strip()[:70],
+                return [("EMPTY-VALIDATION", stripped[:70],
                          "no verdict after the colon -- state PASS/NEEDS_WORK/BLOCK/"
                          "INCONCLUSIVE, N/A, or NOT RUN")]
-            if re.match(r"(N/A|NOT RUN)\b", body, re.IGNORECASE) \
-                    and not VALIDATION_REASON.search(body):
+            is_na_or_not_run = re.match(r"(N/A|NOT RUN)\b", body, re.IGNORECASE)
+            if is_na_or_not_run and not VALIDATION_REASON.search(body):
+                return [("UNREASONED-VALIDATION", body[:70],
+                         "N/A and NOT RUN both need a reason after `--` -- e.g. `N/A -- "
+                         "no runtime surface changed` or `NOT RUN -- <why>`")]
+            if not is_na_or_not_run:
+                # Any other word (PASS, a verdict, a model's own test run, ...) claims the
+                # strongest evidence class this pipeline has, and that claim is only ever
+                # true when a report already passed fetch.sh's head/base/patch identity
+                # gate and was written to $WORK/validation_report.json. No report there
+                # means no entitlement, regardless of how real the work behind the line was.
+                report = pathlib.Path(work_dir or ".") / VALIDATION_REPORT_NAME
+                if not report.is_file():
+                    return [("UNENTITLED-VALIDATION", body[:70],
+                             f"`(deterministic)` claims a head-matched {VALIDATION_REPORT_NAME} "
+                             "that does not exist in $WORK -- a model running a test itself "
+                             "is not that report, however real the work was. Write "
+                             "`Validation (advisory): <what you ran> -- one run, this box, "
+                             "unverified by anything but the model's own say-so`, or, if "
+                             "nothing needed validating or nothing could run, the honest "
+                             "`Validation (deterministic): N/A -- <reason>` / "
+                             "`NOT RUN -- <reason>` forms")]
+            return []
+        m = ADVISORY_LINE.match(stripped)
+        if m:
+            body = m.group(1).strip()
+            if not body:
+                return [("EMPTY-VALIDATION", stripped[:70],
+                         "no content after the colon -- say what you ran, where, and that "
+                         "it is one unverified run, or use N/A / NOT RUN")]
+            is_na_or_not_run = re.match(r"(N/A|NOT RUN)\b", body, re.IGNORECASE)
+            if is_na_or_not_run and not VALIDATION_REASON.search(body):
                 return [("UNREASONED-VALIDATION", body[:70],
                          "N/A and NOT RUN both need a reason after `--` -- e.g. `N/A -- "
                          "no runtime surface changed` or `NOT RUN -- <why>`")]
             return []
     return [("MISSING-VALIDATION", "Validation (deterministic)",
-             "every card needs this line in every state -- silence on it reads as "
-             "clearance. Write `N/A -- <reason>` when nothing needed validating, or "
-             "`NOT RUN -- <reason>` when it did and could not run")]
+             "every card needs a Validation line in every state -- silence on it reads "
+             "as clearance. Write `Validation (deterministic): N/A -- <reason>` when "
+             "nothing needed validating, `NOT RUN -- <reason>` when it did and could not "
+             "run or no report exists, or `Validation (advisory): <what you ran> -- one "
+             "run, this box, unverified` when the model ran something itself")]
 
 
 def record_artifact_hash(path):
@@ -2525,7 +2576,7 @@ def backdated_artifacts(*paths):
 
 
 def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_text,
-               late_text="", answers_path=None):
+               late_text="", answers_path=None, work_dir=None):
     """Every finding in the card must trace back to something already adjudicated.
 
     The three gates before this one check that the work happened. None of them checks
@@ -2562,7 +2613,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
         if rid:
             reported.add(rid.group(1))
-        # SKILL.md's output rules say, in as many words, "Do NOT use rule codes (P1, D4,
+        # SKILL.md's output rules say, in as many words, "Do NOT use rule codes (B1, D4,
         # A1...) in output -- they are internal labels only". Claiming a FIRE by its rule
         # id was therefore something the card was forbidden to do, and every correctly
         # written card reported every fired rule as UNREPORTED-FIRE. A finding that names
@@ -2647,7 +2698,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                           "arrived late is reported with `-- late finding:` and recorded in "
                           "late_findings.txt; it is not written back into an artifact that "
                           "had already gone green")))
-    problems.extend(_check_validation_line(card_text))
+    problems.extend(_check_validation_line(card_text, work_dir))
     return findings, problems
 
 
@@ -2786,7 +2837,8 @@ if __name__ == "__main__":
             raise SystemExit(1)
         findings, problems = audit_card(_read(2), _read(3), _read(4), _read(5), _read(6),
                                         _read(7),
-                                        sys.argv[5] if len(sys.argv) > 5 else None)
+                                        sys.argv[5] if len(sys.argv) > 5 else None,
+                                        card_path.parent)
         if not findings and not problems:
             print("CARD: no findings, and no verdict fired")
             raise SystemExit(0)
