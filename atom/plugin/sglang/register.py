@@ -214,6 +214,37 @@ def _keep_atom_full_attn_for_native_qwen4_exp() -> None:
     qsa_config._atom_keep_full_attn = True
 
 
+_PREFILL_CP_PLATFORM_HOOK_REGISTERED = False
+
+
+def _allow_prefill_cp_on_hip_for_atom() -> None:
+    """0.5.20 rejects --enable-prefill-cp on HIP at server-arg resolution.
+
+    Upstream removed its own ROCm model-side CP code, but ATOM models run
+    prefill CP themselves and only read SGLang's CP groups and
+    attn_cp_metadata, which remain. Skip the rejection on HIP when ATOM's
+    external model package is active; every other case keeps the built-in
+    check.
+    """
+    global _PREFILL_CP_PLATFORM_HOOK_REGISTERED
+    if _PREFILL_CP_PLATFORM_HOOK_REGISTERED:
+        return
+    try:
+        from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
+    except Exception:  # noqa: BLE001 - SGLang without the hook registry
+        return
+
+    @register_resolution_hook("validate_prefill_cp_platform")
+    def validate_prefill_cp_platform_for_atom(server_args, previous):
+        from sglang.srt.utils import is_hip
+
+        if is_hip() and _is_atom_external_model_enabled():
+            return
+        previous(server_args)
+
+    _PREFILL_CP_PLATFORM_HOOK_REGISTERED = True
+
+
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
@@ -242,6 +273,7 @@ def register_plugin() -> None:
     # keeps Ling's Flash MTP adapter off atom/model_ops and eagle3_llama.
     apply_qwen4_exp_rocm_patch()
     _keep_atom_full_attn_for_native_qwen4_exp()
+    _allow_prefill_cp_on_hip_for_atom()
     install_sglang_replayssm_commit()
     register_kimi_k3_text_only_processor()
 
