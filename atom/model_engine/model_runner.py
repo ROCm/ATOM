@@ -1371,6 +1371,12 @@ class ModelRunner:
         )
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
+        # Prefix-hit prefill only, so the dummy forward above never reaches it.
+        # Here, before KV sizing, so its scratch (~245 MB at Qwen3.5 TP4)
+        # counts in the peak.
+        from atom.model_ops.attention_mha import warmup_unified_prefill_attention
+
+        warmup_unified_prefill_attention(self.model, self.config.torch_dtype)
         torch.cuda.empty_cache()
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"

@@ -390,6 +390,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_UNIFIED_ATTN_MAX_Q": lambda: int(
         os.getenv("ATOM_PREFILL_UNIFIED_ATTN_MAX_Q", "0")
     ),
+    # Compile the unified_attention kernels of the path above at start-up
+    # (end of warmup_model) instead of on the first request that needs each one.
+    "ATOM_PREFILL_UNIFIED_ATTN_WARMUP": lambda: (
+        os.getenv("ATOM_PREFILL_UNIFIED_ATTN_WARMUP", "1") == "1"
+    ),
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
