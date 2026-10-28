@@ -79,7 +79,7 @@ def environment(torch, triton):
             data['hip_api_versions'][name] = {'rc': rc, 'value': version.value, 'library': path}
         break
     from triton.runtime.cache import get_cache_manager
-    data['effective_triton_cache_dir'] = str(get_cache_manager('atomesh-probe-location').cache_dir)
+    data['effective_triton_cache_dir'] = str(get_cache_manager(hashlib.sha256(b'atomesh-probe-location').hexdigest()).cache_dir)
     return data
 
 
