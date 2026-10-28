@@ -36,6 +36,8 @@ def runner_with_buffers(monkeypatch, transport, pp_size=1, speculative=False):
     runner.enforce_eager = True
     runner.running_tokens_per_dp_rank = np.zeros(1, dtype=np.int32)
     runner.tokenID_processor = tokenIDProcessor(runner, 64)
+    # `prepare_sample` asks it whether a uniform top-k goes per row.
+    runner.sampler = SimpleNamespace(keep_top_k_ties=False)
     if speculative:
         from atom.spec_decode.drafter import Drafter
 

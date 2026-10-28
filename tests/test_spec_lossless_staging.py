@@ -18,6 +18,7 @@ from torch import nn
 pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops")
 
 from atom.model_ops.rejection_sampler import RejectionSampler
+from atom.model_ops.sampler import Sampler
 from atom.spec_decode import dspark_proposer
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.dspark_proposer import DSparkProposer
@@ -220,18 +221,15 @@ def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "kwargs, keeps",
+    "kwargs",
     [
-        ({}, True),
-        ({"lossless": False}, False),
-        ({"pp": 2}, False),
-        ({"pcp": 2}, False),
-        ({"model": SimpleNamespace(supports_lossless_draft=False)}, False),
-        # Never arms, but its decode peer verifies what it hands off, first
-        # token included.
-        ({"kv_transfer_config": {"kv_role": "kv_producer"}}, True),
-        ({"enable_rapidserve": True, "disagg_is_decode": False}, True),
-        ({"enable_rapidserve": True, "pp": 2, "disagg_is_decode": False}, True),
+        {},
+        {"lossless": False},
+        {"pp": 2},
+        {"pcp": 2},
+        {"model": SimpleNamespace(supports_lossless_draft=False)},
+        {"kv_transfer_config": {"kv_role": "kv_producer"}},
+        {"enable_rapidserve": True, "disagg_is_decode": False},
     ],
     ids=[
         "armed",
@@ -241,32 +239,16 @@ def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
         "unported-flavor",
         "pd-producer",
         "rapidserve-prefill",
-        "rapidserve-prefill-pp",
     ],
 )
-def test_sampler_keeps_top_k_ties_only_where_the_ratio_verify_serves(
-    monkeypatch, kwargs, keeps
+def test_every_sampler_keeps_top_k_ties_with_the_flag_set_armed_or_not(
+    monkeypatch, kwargs
 ):
-    """A drafter that refused the flag verifies by exact match against
-    `Sampler`'s flag-off law, so its bonus and first tokens must keep it."""
-    assert proposer(monkeypatch, **kwargs).keeps_top_k_ties is keeps
-
-
-@pytest.mark.parametrize("refusal", ["aiter", "head"])
-def test_a_producer_whose_peer_cannot_arm_keeps_the_flag_off_law(monkeypatch, refusal):
-    """The peer runs the same build and checkpoint, so it refuses too."""
-    prop = proposer(
-        monkeypatch, lossless=False, kv_transfer_config={"kv_role": "kv_producer"}
-    )
-    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
-    if refusal == "aiter":
-        monkeypatch.setattr(dspark_proposer, "AITER_TOPK_TOPP_AVAILABLE", False)
-    else:
-        monkeypatch.setattr(
-            dspark_proposer, "dspark_markov_sample_unsupported", lambda w1, w2: "no"
-        )
-    prop._init_lossless_sampling()
-    assert not prop.keeps_top_k_ties
+    """The law is the flag's, not the drafter's: a P/D producer and its
+    consumer agree whenever both set it, whatever either armed."""
+    lossless = kwargs.get("lossless", True)
+    proposer(monkeypatch, **kwargs)
+    assert Sampler().keep_top_k_ties is lossless
 
 
 def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
@@ -384,10 +366,3 @@ def test_relaxed_mtp_and_lossless_sampling_refuse_each_other_first(
         # Past the check, construction fails on the missing config instead.
         with pytest.raises(AttributeError):
             Drafter.__init__(drafter, None, None, None)
-
-
-def test_an_unported_drafter_keeps_samplers_flag_off_law(monkeypatch):
-    """MTP/EAGLE3 never reach the ratio verify, so the flag must not change
-    how their `Sampler` draws cut top-k."""
-    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
-    assert _Bare.__new__(_Bare).keeps_top_k_ties is False

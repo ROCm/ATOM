@@ -69,7 +69,6 @@ class DSparkProposer(Drafter):
     #: `_init_lossless_sampling` (tests build them bare) answers "not armed".
     draft_sampling = None
     _q_store = None
-    _peer_verifies_losslessly = False
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
@@ -107,7 +106,6 @@ class DSparkProposer(Drafter):
         self._q_store = None
         # The host-side staging policy and slot map (`DraftQStaging`).
         self._staging = None
-        self._peer_verifies_losslessly = False
         if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             return
         model = getattr(self, "model", None)
@@ -156,9 +154,6 @@ class DSparkProposer(Drafter):
                 "(prefill) engine: it drafts for handoff and verifies nothing. "
                 "Keeping the greedy draft here; the decode engine still arms."
             )
-            # The peer that verifies these requests does arm, so this side's
-            # first-token draw must follow its law (`keeps_top_k_ties`).
-            self._peer_verifies_losslessly = True
             return
         if self.config.pipeline_parallel_size > 1:
             # The draft's sampling inputs ride the runner's `sampling`
@@ -349,12 +344,6 @@ class DSparkProposer(Drafter):
         if self.draft_sampling is None:
             return
         self._staging.consume(self.runner.forward_step)
-
-    @property
-    def keeps_top_k_ties(self) -> bool:
-        """Armed here, or on the decode peer of a P/D producer: that peer
-        verifies the requests whose first token this side draws."""
-        return self.draft_sampling is not None or self._peer_verifies_losslessly
 
     def lossless_verify_inputs(self, bs: int):
         """The verify step's ``(draft_probs, q_row_base, ratio_scratch)``.

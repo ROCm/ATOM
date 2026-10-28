@@ -100,8 +100,8 @@ def _synthetic_generator(device: torch.device) -> torch.Generator:
 # mass: it compares a sum against top_p, so a tie group whose mass above lies
 # within rounding of top_p may survive in one and not the other. The bonus draw
 # must keep tie groups too: for a scalar top-k with a top-p at a large vocab,
-# aiter's joint op cuts exactly k ids first, so with the flag on the runner asks
-# every `Sampler` draw for ``keep_top_k_ties`` (the bonus, and the first token
+# aiter's joint op cuts exactly k ids first, so with the flag on every `Sampler`
+# draw keeps them (`Sampler.keep_top_k_ties`: the bonus, and the first token
 # after a prefill, so a request follows one law throughout). Only a batch with a
 # filter pays for any of it: three more reads of its rows (bf16 logits) -- but
 # a row whose filter is a top-k of at most 256 alone is not descended. Its

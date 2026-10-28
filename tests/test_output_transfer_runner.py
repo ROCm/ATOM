@@ -72,7 +72,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         rejection_sampler=SimpleNamespace(
             forward=mock.Mock(return_value=(sampled, verdict)),
         ),
-        drafter=SimpleNamespace(keeps_top_k_ties=False),
+        drafter=SimpleNamespace(),
         forward_done_event=mock.Mock(),
     )
     with pytest.raises(StatusSubmitted):
@@ -106,8 +106,8 @@ class _Reached(Exception):
 @pytest.mark.parametrize("verified", [False, True])
 @pytest.mark.parametrize("armed", [False, True])
 def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, armed):
-    """The ratio verify gets the batch's own `top_ks`/`top_ps`, and every
-    `Sampler` draw keeps top-k tie groups whole exactly when it is armed."""
+    """The ratio verify gets the batch's own `top_ks`/`top_ps`, and no draw
+    is told how to cut top-k: that is `Sampler`'s own, one law per process."""
     bs = 2
     top_ks, top_ps = torch.tensor([5, 0]), 0.9
     spec = (
@@ -128,9 +128,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, 
         runner_module, "get_tp_group", lambda: SimpleNamespace(world_size=1)
     )
     q = (object(), torch.zeros(bs), object()) if armed else (None, None, None)
-    drafter = SimpleNamespace(
-        keeps_top_k_ties=armed, lossless_verify_inputs=mock.Mock(return_value=q)
-    )
+    drafter = SimpleNamespace(lossless_verify_inputs=mock.Mock(return_value=q))
     runner = SimpleNamespace(
         tokenID_processor=SimpleNamespace(zero_spec_counts=torch.zeros(8)),
         sampler=mock.Mock(side_effect=None if verified else _Reached),
@@ -152,7 +150,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, 
             hidden_states=None,
         )
     runner.sampler.assert_called_once()
-    assert runner.sampler.call_args.kwargs["keep_top_k_ties"] is armed
+    assert "keep_top_k_ties" not in runner.sampler.call_args.kwargs
     if not verified:
         return
     forward = runner.rejection_sampler.forward.call_args.kwargs
@@ -162,8 +160,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, 
     assert runner.sampler.sample_verification_tokens.called is not armed
 
 
-@pytest.mark.parametrize("armed", [False, True])
-def test_a_rapidserve_prefill_draws_by_its_decode_peers_law(monkeypatch, armed):
+def test_a_rapidserve_prefill_draws_by_its_samplers_own_law(monkeypatch):
     sampled = torch.tensor([3, 4])
     prep = (torch.zeros(2), torch.ones(2), torch.tensor([5, 0]), 0.9, False, True)
     stream = mock.Mock()
@@ -180,18 +177,71 @@ def test_a_rapidserve_prefill_draws_by_its_decode_peers_law(monkeypatch, armed):
             "sampler",
             "_record_forward_vars_event",
             "_record_kv_cache_ready",
-            "drafter",
         ]
     )
     runner.prepare_model.return_value = prep
     runner.run_model.return_value = (torch.zeros(2, 8), None)
     runner.sampler.return_value = sampled
-    runner.drafter = SimpleNamespace(keeps_top_k_ties=armed)
     out = runner_module.RapidServeModelRunner.prefill_forward(runner, SimpleNamespace())
     assert out == [3, 4]
     args, kwargs = runner.sampler.call_args
     assert args[2] is prep[2] and args[3] is prep[3]
-    assert kwargs["keep_top_k_ties"] is armed
+    assert "keep_top_k_ties" not in kwargs
+
+
+@pytest.mark.parametrize("keeps", [False, True])
+@pytest.mark.parametrize(
+    "ks, ps",
+    [
+        ([4, 4], [0.9, 0.9]),
+        ([4, 4], [0.9, 0.7]),
+        ([4, 4], [1.0, 1.0]),
+        ([4], [0.9]),
+    ],
+    ids=["uniform-p", "per-row-p", "no-p", "bs1"],
+)
+def test_a_sampler_that_keeps_ties_gets_a_per_row_k_beside_a_top_p(
+    monkeypatch, keeps, ks, ps
+):
+    """A scalar k with a top-p would take aiter's top-k-first path, which
+    splits a tie group; the published per-row buffer stands in for it, so no
+    draw allocates one."""
+    import numpy as np
+
+    bs = len(ks)
+    buffers = {
+        name: SimpleNamespace(np=np.zeros(4, dtype), gpu=torch.zeros(4))
+        for name, dtype in (
+            ("temperatures", np.float32),
+            ("top_ks", np.int32),
+            ("top_ps", np.float32),
+        )
+    }
+    names = list(buffers)
+    group = SimpleNamespace(
+        counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
+    )
+    runner = SimpleNamespace(
+        forward_vars=buffers, sampler=SimpleNamespace(keep_top_k_ties=keeps)
+    )
+    batch = SimpleNamespace(
+        total_seqs_num=bs,
+        temperatures=np.ones(bs, np.float32),
+        top_ks=np.array(ks, np.int32),
+        top_ps=np.array(ps, np.float32),
+    )
+    _, top_ks, _, _, _ = runner_module.ModelRunner.prepare_sample(
+        runner, batch, publication_group=group
+    )
+    per_row = keeps and min(ps) < 1.0
+    if per_row:
+        assert top_ks.data_ptr() == buffers["top_ks"].gpu.data_ptr()
+        assert top_ks.shape == (bs,)
+        assert buffers["top_ks"].np[:bs].tolist() == ks
+        assert group.counts[group.indices["top_ks"]] == bs
+    else:
+        assert type(top_ks) is int and top_ks == ks[0]
+        assert group.counts[group.indices["top_ks"]] is None
 
 
 @pytest.mark.parametrize("max_num_seqs", [1, 64])

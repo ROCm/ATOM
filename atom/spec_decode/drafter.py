@@ -388,17 +388,6 @@ class Drafter(abc.ABC):
         return None, None, None
 
     @property
-    def keeps_top_k_ties(self) -> bool:
-        """Must this engine's `Sampler` draws keep a top-k tie group whole?
-
-        True only where the ratio verify serves the request: there the bonus
-        and first tokens must follow the same p_f it verifies against. Off it,
-        every draw keeps `Sampler`'s flag-off law, as the exact-match verify
-        (`Sampler.sample_verification_tokens`) does.
-        """
-        return False
-
-    @property
     def draft_kv_duplicates_propose(self) -> bool:
         """Is `compute_draft_kv` the pass propose's first draft step redoes?
 

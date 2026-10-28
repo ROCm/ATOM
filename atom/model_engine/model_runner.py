@@ -2687,7 +2687,11 @@ class ModelRunner:
         top_ks = top_ps = None
         top_k_count = top_p_count = None
         if needs_topk:
-            if bs == 1 or (batch.top_ks == batch.top_ks[0]).all():
+            uniform_k = bs == 1 or (batch.top_ks == batch.top_ks[0]).all()
+            # Except where `Sampler` keeps top-k ties with a top-p: a scalar
+            # k there would take aiter's top-k-first path, so it is handed
+            # the same k per row, from the buffer a mixed batch uses.
+            if uniform_k and not (self.sampler.keep_top_k_ties and needs_topp):
                 top_ks = int(batch.top_ks[0])
             else:
                 top_k_buffer = self.forward_vars["top_ks"]
@@ -3311,12 +3315,6 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         drafter = getattr(self, "drafter", None)
-        # Every draw for a request the ratio verify serves -- this step's
-        # bonus, and the first token after its prefill -- keeps a top-k tie
-        # group at the cut whole, as the p_f it is verified against does, or
-        # one request follows two laws. Keyed on the drafter's armed state,
-        # not the flag: a drafter that refused it verifies by exact match.
-        keep_ties = drafter is not None and drafter.keeps_top_k_ties
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3334,7 +3332,6 @@ class ModelRunner:
                 top_ps,
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
-                keep_top_k_ties=keep_ties,
             )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
@@ -3389,7 +3386,6 @@ class ModelRunner:
                 top_ps=top_ps,
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
-                keep_top_k_ties=keep_ties,
             )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
@@ -5001,10 +4997,6 @@ class RapidServeModelRunner(ModelRunner):
                 top_ks,
                 top_ps,
                 all_greedy,
-                # The decode side verifies this request's drafts; see
-                # `keep_ties` in `postprocess`.
-                keep_top_k_ties=hasattr(self, "drafter")
-                and self.drafter.keeps_top_k_ties,
             )
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()

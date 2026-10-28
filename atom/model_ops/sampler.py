@@ -9,6 +9,8 @@ from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
 
+from atom.utils import envs
+
 # Try to import aiter top-k/top-p sampling ops
 try:
     import aiter.ops.sampling  # noqa: F401
@@ -65,6 +67,13 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.eps = SAMPLER_EPS
+        # Keep a tie group at the top-k cut whole, as every aiter path but one
+        # does: for a scalar top-k (small k, large vocab) with a top-p, aiter's
+        # joint op selects exactly k ids first, splitting such a group. The
+        # ratio verify's p_f keeps it whole, so with the flag set every draw
+        # does, armed or not: one law for every request in the process, and
+        # for both sides of a P/D handoff that set it.
+        self.keep_top_k_ties = envs.ATOM_SPEC_LOSSLESS_SAMPLING
 
     def sample_verification_tokens(
         self,
@@ -115,7 +124,6 @@ class Sampler(nn.Module):
         ) = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
-        keep_top_k_ties: bool = False,
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -131,11 +139,6 @@ class Sampler(nn.Module):
                 exponential noise so sibling sequences with identical logits
                 do not produce identical tokens. Adds an O(bs * vocab_size)
                 allocation, so only enabled when actually needed.
-            keep_top_k_ties: keep a tie group at the top-k cut whole, as every
-                aiter path but one does: for a scalar top-k (small k, large
-                vocab) with a top-p, aiter's joint op selects exactly k ids
-                first, splitting such a group. The ratio verify's p_f keeps it
-                whole, so the bonus token it is paired with must too.
 
         Returns:
             Sampled token IDs (num_tokens,)
@@ -162,7 +165,6 @@ class Sampler(nn.Module):
             top_ks,
             top_ps,
             needs_independent_noise=needs_independent_noise,
-            keep_top_k_ties=keep_top_k_ties,
         )
 
     def _needs_filtering(
@@ -214,7 +216,6 @@ class Sampler(nn.Module):
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
         needs_independent_noise: bool = False,
-        keep_top_k_ties: bool = False,
     ) -> torch.Tensor:
         """Top-K/Top-P sampling with temperature scaling.
 
@@ -242,7 +243,6 @@ class Sampler(nn.Module):
                 has_topk,
                 has_topp,
                 temperatures,
-                keep_top_k_ties=keep_top_k_ties,
             )
         else:
             return self._native_sample(probs, top_ks, top_ps, temperatures)
@@ -269,18 +269,27 @@ class Sampler(nn.Module):
         has_topk: bool,
         has_topp: bool,
         temperatures: torch.Tensor,
-        keep_top_k_ties: bool = False,
     ) -> torch.Tensor:
         """Use aiter optimized ops for top-k/top-p sampling."""
         # Convert to tensor/scalar format for aiter
-        k_tensor, k_scalar = self._to_tensor_scalar(top_ks)
+        keep_ties = self.keep_top_k_ties and has_topk and has_topp
+        if keep_ties and isinstance(top_ks, torch.Tensor):
+            # Stays per row even at one element (a bs=1 batch, or a verify's
+            # one k for all its rows): `_to_tensor_scalar` would read it back
+            # to a scalar, and the scalar back to a tensor below.
+            k_tensor = top_ks.to(torch.int32).expand(probs.shape[0]).contiguous()
+            k_scalar = 0
+        else:
+            k_tensor, k_scalar = self._to_tensor_scalar(top_ks)
         p_tensor, p_scalar = self._to_tensor_scalar(top_ps)
 
         if has_topk and has_topp:
-            if keep_top_k_ties and k_tensor is None:
+            if keep_ties and k_tensor is None:
                 # A per-row k never takes the joint op's top-k-first path,
                 # which keeps exactly k ids; the fused kernel keeps whole tie
-                # groups (see `forward`).
+                # groups (see `__init__`). The runner hands this path a
+                # per-row k already (`prepare_sample`), so only a direct
+                # caller with a scalar allocates.
                 k_tensor = torch.full(
                     (probs.shape[0],), k_scalar, dtype=torch.int32, device=probs.device
                 )

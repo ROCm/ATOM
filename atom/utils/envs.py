@@ -649,12 +649,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # convention is that a behaviour-changing flag defaults off.
     #
     # A request with top-k/top-p is drafted within its own filters and verified
-    # against the target's p filtered as `Sampler` filters it, row by row. Its
-    # every `Sampler` draw (the first token after a prefill too, not only the
-    # bonus) then keeps a tie group at the top-k cut whole, as aiter's fused
-    # kernel does, instead of taking aiter's top-k-first path, which keeps
-    # exactly k ids (a uniform top-k <= 256 with a top-p, vocab >= 65536); on
-    # such a cut a filtered request's tokens can differ from the flag off.
+    # against the target's p filtered as `Sampler` filters it, row by row.
+    # With the flag set, every `Sampler` draw (the first token after a
+    # prefill, the bonus, an exact-match verify's own draw) keeps a tie group
+    # at the top-k cut whole, armed or not, as aiter's fused kernel does,
+    # instead of taking aiter's top-k-first path, which keeps exactly k ids (a
+    # uniform top-k <= 256 with a top-p, vocab >= 65536); on such a cut a
+    # filtered request's tokens can differ from the flag off. Read when
+    # `Sampler` is built, so a P/D producer and its consumer draw by one law
+    # whenever both set the flag.
     # What stays as with the flag off is the accept rule, not the draft path:
     # an all-greedy batch keeps the exact-match kernel; a greedy row of a mixed
     # batch is matched exactly (lowest-id argmax) inside the ratio kernel, so a
@@ -680,10 +683,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PP or PCP, on a P/D producer (which drafts for handoff and verifies
     # nothing), or on a build without aiter's top-k/top-p sampling ops
     # (`Sampler`'s native fallback filters by another rule than the verify's
-    # p_f); those warn and keep the greedy pair. A drafter that does not arm
-    # keeps Sampler's flag-off law as well: only a request the ratio verify
-    # serves (or, on a P/D producer, will serve) keeps top-k tie groups whole.
-    # Read at drafter construction, so it must be set before the server starts.
+    # p_f); those warn and keep the greedy pair (`Sampler` still keeps top-k
+    # tie groups whole there, as above). Read at drafter and `Sampler`
+    # construction, so it must be set before the server starts.
     "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
         os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
     ),
