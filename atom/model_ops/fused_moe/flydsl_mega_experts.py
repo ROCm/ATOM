@@ -41,7 +41,6 @@ import os
 
 import torch
 
-from atom.model_ops.fused_moe.triton_zero_pad_rows import zero_pad_rows_
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
 
@@ -224,14 +223,10 @@ def run_mega_moe(
     mtpr: int,
     swiglu_limit: float,
     quant: str = "a8w4",
-    mask_pad_rows: bool = False,
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
     local tokens, pre-dispatch). topk_ids: global (physical) expert ids. Returns
-    [tokens, model_dim] bf16.
-
-    mask_pad_rows: return this pass's DP pad rows as zeros without dispatching
-    them (see _enable_mega_pad_row_mask)."""
+    [tokens, model_dim] bf16."""
     from aiter.dist.parallel_state import get_ep_group
 
     # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
@@ -318,45 +313,12 @@ def run_mega_moe(
 
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
-    pad_rows = None
-    if mask_pad_rows:
-        from atom.utils.forward_context import step_pad_rows
-
-        pad_rows = step_pad_rows(run_tokens)
-    if pad_rows is not None:
-        # Whole rows: every top-k slot, the fused shared-expert slot included.
-        ids = torch.where(pad_rows, -1, ids)
-    # An aiter whose combine skips -1 slots returns the pad rows as zeros itself.
-    # The check is not free, so ask for it only on passes that mask rows.
-    combine_can_mask = getattr(mega, "supports_combine_mask", False)
-    forward_kwargs = (
-        {"mask_invalid_slots": pad_rows is not None} if combine_can_mask else {}
-    )
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
-        # construction (see the cache key above).
-        out = mega.forward(x.contiguous(), wts, ids, **forward_kwargs)
-    if pad_rows is not None and not combine_can_mask:
-        # Older aiter: combine sums every top-k slot, and a -1 slot holds whatever
-        # an earlier call left there (possibly non-finite). Zero those rows.
-        out = zero_pad_rows_(out, pad_rows)
+        # construction (see the cache key above). Routing sends a pad row's
+        # slots to -1, which combine must skip rather than sum stale data from.
+        out = mega.forward(x.contiguous(), wts, ids, mask_invalid_slots=True)
     return out
-
-
-def _enable_mega_pad_row_mask(mtpr: int) -> bool:
-    """Whether Mega masks DP pad rows (ATOM_MEGA_MASK_PAD_ROWS).
-
-    MegaMoEV2 never counts, sends or computes a top-k id < 0, so whole pad rows
-    routed to -1 cost nothing; only combine needs care (see run_mega_moe).
-    Allocates the device mask now, at layer init, before any graph capture
-    records its address. Plugin frontends never publish it.
-    """
-    if not envs.ATOM_MEGA_MASK_PAD_ROWS or is_plugin_mode():
-        return False
-    from atom.utils.forward_context import enable_pad_rows_device
-
-    enable_pad_rows_device(mtpr, torch.device("cuda"))
-    return True
 
 
 class MegaFusedExperts:
@@ -394,7 +356,6 @@ class MegaFusedExperts:
         self._inter_dim = inter_dim
         self._mtpr = mtpr
         self._quant = quant
-        self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
 
     def __call__(
         self,
@@ -408,10 +369,13 @@ class MegaFusedExperts:
         activation=None,
         apply_router_weight_on_input: bool = False,
         expert_map: torch.Tensor | None = None,
+        x_scale: torch.Tensor | None = None,
         **_ignored,
     ) -> torch.Tensor:
         from aiter import ActivationType
 
+        # The method declares no routed-rows wire: MegaMoE quantizes bf16 rows.
+        assert x_scale is None, "MegaMoE takes bf16 rows, not pre-quantized ones"
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "mega does not support apply_router_weight_on_input=True"
@@ -448,5 +412,4 @@ class MegaFusedExperts:
             mtpr=self._mtpr,
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
             quant=self._quant,
-            mask_pad_rows=self._mask_pad_rows,
         )

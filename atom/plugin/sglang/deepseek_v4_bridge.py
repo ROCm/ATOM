@@ -20,6 +20,72 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+
+
+def _fp4_rowgroup_decode_enabled() -> bool:
+    """Match native ``_fp4_rowgroup_decode``: gfx950 FP4 indexer only."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        from atom.config import get_current_atom_config
+        from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+            FP4_GFX1250_NATURAL,
+            fp4_indexer_layout_for_arch,
+        )
+        from atom.model_ops.v4_kernels import fp4_indexer_enabled
+
+        dtype = get_current_atom_config().index_cache_dtype
+    except Exception:  # noqa: BLE001 - ATOM config is absent outside a loaded model
+        return False
+    if not fp4_indexer_enabled(dtype):
+        return False
+    return fp4_indexer_layout_for_arch(get_gfx()) != FP4_GFX1250_NATURAL
+
+
+def _init_v4_split_plans(md) -> None:
+    """Publish the V4 decode split-plan fields on a base AttentionMetaData.
+
+    Native sparse attention reads ``split_plan_swa`` directly. The SGLang
+    bridge builds the shared metadata type, which does not declare those
+    fields. None lets aiter choose the plan.
+
+    ``fp4_decode_topk`` is the same kind of field. ``_attn_compress`` reads it
+    on every forward. The DSV4 dataclass defaults it to None; the base
+    metadata type does not have it, so CUDA-graph capture raises
+    AttributeError unless it is attached here. The FP4 row-group path
+    replaces None with a fixed buffer before returning.
+    """
+    md.split_plan_swa = None
+    md.split_plan_csa = None
+    md.split_plan_hca = None
+    md.fp4_decode_topk = None
+
+
+def _publish_fp4_decode_topk(md, n: int, storage: torch.Tensor | None) -> None:
+    """Point decode scoring at the persistent top-k buffer when FP4 is on."""
+    if storage is None or not _fp4_rowgroup_decode_enabled():
+        md.fp4_decode_topk = None
+        return
+    width = max(int(n), 0)
+    md.fp4_decode_topk = storage[:width]
+
+
+def _eager_fp4_decode_topk(proxy_pool, n: int, index_topk: int, device) -> torch.Tensor:
+    """Stable eager buffer. Graph paths use the persistent graph buffers."""
+    need = max(int(n), 1)
+    topk = max(int(index_topk), 1)
+    buf = getattr(proxy_pool, "_atom_v4_eager_fp4_decode_topk", None)
+    if (
+        buf is None
+        or buf.shape[0] < need
+        or buf.shape[1] != topk
+        or buf.device != device
+    ):
+        buf = torch.empty(need, topk, dtype=torch.int32, device=device)
+        proxy_pool._atom_v4_eager_fp4_decode_topk = buf
+    return buf
+
+
 try:
     from atom.model_ops.v4_kernels.v4_quant import (
         V4_DIM_QK_PACKED as ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
@@ -1247,6 +1313,9 @@ class _V4SGLangDecodeGraphBuffers:
         # Immutable empty extend CSR. Native stages this for the optional
         # H=128 prefill-ASM decode route; the model always reads the attribute.
         self.empty_kv_indptr = i32(t + 1)
+        # Device-only. ``score_decode_topk_into`` writes it and
+        # ``_sparse_attention`` reads the same address on replay.
+        self.fp4_decode_topk = torch.empty(t, topk, dtype=torch.int32, device=device)
         self.idx_swa = i32(t * max(1, win))
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
@@ -1335,6 +1404,7 @@ class _V4SGLangVerifyGraphBuffers:
         # Decode always reads this CSR, including when MTP verify/draft-extend
         # metadata is captured before the decode graph buffers exist.
         self.empty_kv_indptr = i32(t + 1)
+        self.fp4_decode_topk = torch.empty(t, topk, dtype=torch.int32, device=device)
         self.indptr_prefix_swa = i32(t + 1)
         self.indptr_prefix_csa = i32(t + 1)
         self.indptr_prefix_hca = i32(t + 1)
@@ -1667,6 +1737,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         block_tables=block_tables,
         state=AttnState.DECODE,
     )
+    _init_v4_split_plans(md)
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size
@@ -1801,6 +1872,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     if proxy_pool.use_fp8_kv:
         _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
     _publish_empty_kv_indptr(md, t_pad, bufs=bufs)
+    _publish_fp4_decode_topk(md, t_pad, bufs.fp4_decode_topk)
     return md
 
 
@@ -1909,6 +1981,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         block_tables=block_tables,
         state=AttnState.PREFILL_NATIVE,
     )
+    _init_v4_split_plans(md)
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size
@@ -2075,6 +2148,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     torch.index_select(md.block_tables, 0, safe_batch_ids, out=block_rows)
     md.block_tables_per_token = block_rows
     _publish_empty_kv_indptr(md, total, bufs=bufs)
+    _publish_fp4_decode_topk(md, total, bufs.fp4_decode_topk)
     return md
 
 
@@ -2176,6 +2250,7 @@ def build_atom_v4_attention_metadata_from_sglang(
         block_tables=block_tables,
         state=state,
     )
+    _init_v4_split_plans(md)
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size
@@ -2227,6 +2302,9 @@ def build_atom_v4_attention_metadata_from_sglang(
         if proxy_pool.use_fp8_kv:
             _stage_decode_fp8_page_metadata(md, total, total)
         _publish_empty_kv_indptr(md, total)
+        _publish_fp4_decode_topk(
+            md, total, _eager_fp4_decode_topk(proxy_pool, total, index_topk, device)
+        )
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
         # A decode scores paged off the per-token fields and reads none.

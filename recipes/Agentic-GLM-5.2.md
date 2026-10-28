@@ -255,7 +255,9 @@ depth is chosen per concurrency point.
 
 | Concurrency | Parallelism | `--num-speculative-tokens` | `--spec-decode-acceptance-length` |
 |---|---|---:|---:|
-| C2, C4, C8 | TP4 | 5 | `3.61` |
+| C1, C2 | TP4, mono decode | 3 | `2.99` |
+| C1, C2 on 8 GPUs | TP8, mono decode (see [TP8 C1/C2](#tp8-c1c2-mono-decode)) | 3 | `2.99` |
+| C4, C8 | TP4 | 5 | `3.61` |
 | C10 | TP4 | 4 | `3.33` |
 | C16, C24, C32, C40 | TP4 + DCP4 | 4 | `3.33` |
 | C48 | TP4 + DCP4 | 3 | `2.99` |
@@ -266,15 +268,27 @@ Acceptance lengths are the golden values from
 
 #### GLM-5.2 MXFP4 with TP + MTP (small concurrency)
 
-For small-concurrency runs, `C2`-`C8` use five speculative tokens and `C10` uses
-four; the case block resolves both the draft depth and its golden AL from
+For small-concurrency runs, `C1` and `C2` run the GLM-5.2 MonoKernel decode
+with three speculative tokens, `C4`-`C8` use five and `C10` uses four; the
+script resolves the draft depth, its golden AL and whether mono is on from
 `CONC`. These points run on the native GPU prefix cache alone -- LMCache CPU
-offload is only used from `C16` upwards.
+offload is only used from `C16` upwards. `C1` and `C2` cap the server at exactly
+`CONC` running sequences (`--max-num-seqs` 1 and 2); the other points admit
+2x `CONC`.
 
-The default recipe keeps MTP5 on the production path. The scaled-FP4
-MonoKernel has measured model-level evidence for MTP4 C1/C2 only; set
-`ENABLE_MTP4_MONO=1` for that controlled A/B. C4 and above remain on the
-production path because the current multi-chunk native schedule is slower.
+Mono's per-step cost grows with the verify width, so it is fastest at the
+shallowest served draft, while the production path is fastest at MTP5. In a C2
+AgentX sweep (TP4, 1800 s per point, golden AL per depth), mono at MTP3 reached
+239.82 output tok/s/user against 206.95 for the production path at MTP5
+(+15.9%; ROCm/ATOM#2535). C1 uses the same depth: swept on mono alone, it was
+also fastest at MTP3. C4 and above stay on the production path because the
+current multi-chunk native schedule is slower. Set `ENABLE_MONO=0` to run C1/C2
+on the production path (MTP5, AL 3.61) for an A/B.
+
+Check the server log before using a mono number: an armed run logs
+`GLM-5.2 MonoKernel on: S=<width> ...` on its first served step, and a refused
+deployment logs `GLM-5.2 MonoKernel off: <why>` and serves on the production
+path without any other sign.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -285,16 +299,20 @@ export AITER_USE_FLYDSL_MOE_SORTING=1
 
 export TP=${TP:-4}
 export CONC=${CONC:-8}
-export ENABLE_MTP4_MONO=${ENABLE_MTP4_MONO:-0}
+export ENABLE_MONO=${ENABLE_MONO:-1}
 ATOM_MONO_ENABLE=0
+
+# Admission is 2x CONC, except C1/C2, which admit exactly CONC sequences and
+# capture graphs only up to it.
+MAX_NUM_SEQS=$((CONC * 2))
 
 # MTP_K and MTP_AL move together: the AL is the golden value for that depth.
 case "${CONC}" in
   1)
-    CUDAGRAPH_CAPTURE_SIZES='[1,2]'; MTP_K=5; MTP_AL=3.61
+    CUDAGRAPH_CAPTURE_SIZES='[1]'; MAX_NUM_SEQS=1; MTP_K=5; MTP_AL=3.61
     ;;
   2)
-    CUDAGRAPH_CAPTURE_SIZES='[1,2,4]'; MTP_K=5; MTP_AL=3.61
+    CUDAGRAPH_CAPTURE_SIZES='[1,2]'; MAX_NUM_SEQS=2; MTP_K=5; MTP_AL=3.61
     ;;
   4)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8]';                   MTP_K=5; MTP_AL=3.61 ;;
   8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]';             MTP_K=5; MTP_AL=3.61 ;;
@@ -306,17 +324,11 @@ case "${CONC}" in
     ;;
 esac
 
-if [[ "${ENABLE_MTP4_MONO}" == "1" ]]; then
-  if [[ "${CONC}" != "1" && "${CONC}" != "2" ]]; then
-    echo "ENABLE_MTP4_MONO=1 supports only C1/C2" >&2
-    exit 2
-  fi
-  MTP_K=4
-  # the golden AL for depth 4, per the table above. 3.61 is MTP5's, and
-  # pinning it on a 4-token draft forces more accepted tokens than the depth
-  # can produce -- which overstates the mono arm in the very A/B this flag is
-  # for. MTP_K and MTP_AL move together.
-  MTP_AL=3.33
+# C1/C2 run mono decode at MTP3, mono's fastest depth; 2.99 is MTP3's golden
+# AL. ENABLE_MONO=0 keeps them on the production path (MTP5 above).
+if [[ "${ENABLE_MONO}" == "1" && ( "${CONC}" == "1" || "${CONC}" == "2" ) ]]; then
+  MTP_K=3
+  MTP_AL=2.99
   ATOM_MONO_ENABLE=1
 fi
 
@@ -333,7 +345,7 @@ python -m atom.entrypoints.openai_server \
   --online_quant_config \
     '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
   --tensor-parallel-size "${TP}" \
-  --max-num-seqs "$((CONC * 2))" \
+  --max-num-seqs "${MAX_NUM_SEQS}" \
   --cudagraph-capture-sizes "${CUDAGRAPH_CAPTURE_SIZES}" \
   --num-speculative-tokens "${MTP_K}" \
   --method mtp \
@@ -341,6 +353,56 @@ python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 16384 \
   2>&1 | tee "server-glm52-mtp${MTP_K}-c${CONC}.log"
 ```
+
+##### TP8 C1/C2 (mono decode)
+
+Mono decode also serves TP8, on the external-indexer path (the fused indexer is
+TP4-only). To run `C1` or `C2` on all eight GPUs, set `TP=8` and the `CONC`
+before the block above and change nothing else: each point is the TP4 command
+for that `CONC` with `-tp 8`, so both run mono at MTP3 with AL `2.99`, and each
+admits exactly `CONC` sequences.
+
+| Concurrency | `--max-num-seqs` | `--cudagraph-capture-sizes` | Mono width (`S`) |
+|---|---:|---|---:|
+| C1 | 1 | `[1]` | 4 |
+| C2 | 2 | `[1,2]` | 4, 8 |
+
+```bash
+TP=8 CONC=1   # C1: --max-num-seqs 1
+# or
+TP=8 CONC=2   # C2: --max-num-seqs 2
+# then run the server block above unchanged
+```
+
+An armed run logs `GLM-5.2 MonoKernel on: S=<width> ... indexer=external` on its
+first served step at each width (`S=4` for one request, `S=8` for two).
+
+The numbers below are C1 only; TP8 C2 has not been measured yet.
+
+AgentX C1, 3,600 s, forced AL `2.99`, `rocm/atom-dev:nightly_202610181506`
+(ATOM `df86c482` plus this TP8 admission). The TP4 column is InferenceX run
+39540045682 (job 121211066939) on a CI node; the TP8 column was measured on a
+different MI355X node.
+
+| Metric | TP8, mono | TP4, mono |
+|---|---:|---:|
+| p90 interactivity (tok/s/user, `1 / p90 ITL`) | 310.30 | 265.94 |
+| p50 interactivity (tok/s/user) | 324.00 | 275.76 |
+| Mean ITL (ms) | 3.07 | 3.61 |
+| Mean TTFT (ms) | 1,102.64 | 1,389.68 |
+| Total token throughput (tok/s) | 19,931.82 | 18,044.52 |
+| Total token throughput per GPU (tok/s) | 2,491.48 | 4,511.13 |
+| Requests completed | 266 | 253 |
+
+The replay runs for a fixed duration, so the faster server reaches further into
+the trace (266 vs 253 requests, mean ISL 267K vs 254K); the throughput rows
+compare different request mixes, the latency rows much less so.
+
+Accuracy at TP8 C1 (GSM8K, first 250, 3-shot completions, real MTP3
+acceptance, one request at a time so every decode step is mono's): mono on
+0.932 / 0.928 across two runs, mono off 0.932 / 0.932 (flexible-extract); MTP
+acceptance 76.4% / 76.5% on vs 75.1% / 75.2% off. Mono-on and mono-off outputs
+differ no more than two mono-off runs differ from each other.
 
 ##### Forced Acceptance Semantics
 
@@ -375,6 +437,13 @@ decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
 > on MI355X TP4/DCP4 (64K prompt: 4.73 s to 3.74 s; 16K: 1.23 s to 1.00 s), measured
 > as the time to the first token of a unique prompt with `max_tokens=1`, mean of
 > 4 runs per setting; the per-flag breakdown is in ROCm/ATOM#2506.
+>
+> The sparse-prefill indexer is also split across the DCP group by query row
+> instead of by key (ROCm/ATOM#2496). This has no switch and is always on under
+> DCP. On this configuration (AgentX, 3600 s per arm, the two arms differing
+> only in that commit) it cut per-request latency by a paired median of 4.15%
+> at C32 and 5.53% at C48, raised p90 ITL interactivity by 8.3% and 8.9%, and
+> raised throughput per GPU by 3.5% and 5.1%.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}

@@ -3,7 +3,7 @@
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) is a
 multimodal MoE model combining Gated DeltaNet (GDN), sparse attention (QSA),
 and n-gram memory. ATOM supports text and image inference with BF16 or FP8
-weights and BF16 activations/KV cache.
+weights, BF16 activations, and a BF16 or FP8 KV cache.
 
 ## Preparing the environment
 
@@ -23,8 +23,28 @@ python -m atom.entrypoints.openai_server \
 The API listens on port 8000 by default. Use
 `Qwen/Qwen3.8-Flash-Next-FP8` as the `model` in API requests.
 
-BF16 is the only supported KV cache format. The default block size already
-satisfies `indexer_compress_ratio` (4); no block-size override is needed.
+The KV cache is BF16 by default. The default block size already satisfies
+`indexer_compress_ratio` (4); no block-size override is needed.
+
+## FP8 KV cache
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model Qwen/Qwen3.8-Flash-Next-FP8 \
+  --trust-remote-code \
+  -tp 1 \
+  --kv_cache_dtype fp8 --index-cache-dtype bf16 --block-size 64
+```
+
+`--kv_cache_dtype fp8` stores the QSA K/V as E4M3 with one FP32 scale per
+token and KV head, which fits about 1.65x the tokens of a BF16 cache. The
+compressed index keys follow the KV dtype unless `--index-cache-dtype` is
+given: `bf16`, `fp8` (one FP32 scale a row) or `fp4` (MXFP4). The raw index
+keys stay BF16. With `--block-size 64` and a BF16 index cache, prefill index
+scoring runs on the FlyDSL kernel, which takes BF16 keys only; this is the
+recommended combination. FP4 index keys work but score slower than FP8 or
+BF16 on MI355X. The MTP draft layer keeps BF16 caches unless
+`ATOM_QSA_DRAFT_KV_BF16=0`.
 
 Choose a GPU with enough memory for the weights, recurrent state, and KV
 cache. Adjust `--max-num-seqs`, `--max-model-len`, and

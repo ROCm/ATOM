@@ -50,7 +50,9 @@ from atom.plugin.sglang.deepseek_v4_bridge import (
     ATOMDeepSeekV4ProxyKVPool,
     _geometry_serves_ratio,
     _geometry_supports_shared_prefill_writer,
+    _init_v4_split_plans,
     _proxy_pool_geometry,
+    _publish_fp4_decode_topk,
     _resolve_v4_pool_geometry,
     _write_dense_only_prefill_indices,
 )
@@ -262,3 +264,14 @@ def test_dense_only_prefill_indices_write_swa_without_calling_shared_writer():
     assert int(prefix_swa[0]) == dense.index(1, 13)
     assert "_write_dense_only_prefill_indices" in SGLANG_BRIDGE
     assert "_geometry_supports_shared_prefill_writer" in SGLANG_BRIDGE
+
+
+def test_sglang_v4_metadata_declares_fp4_decode_topk():
+    metadata = SimpleNamespace()
+    _init_v4_split_plans(metadata)
+    assert metadata.fp4_decode_topk is None
+
+    storage = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+    _publish_fp4_decode_topk(metadata, 2, storage)
+    # No ATOM config in this test, so the FP4 scorer stays off.
+    assert metadata.fp4_decode_topk is None

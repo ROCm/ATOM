@@ -1,4 +1,4 @@
-"""Fused sigmoid(gate) * attn_output + FP8 per-1x128 block-scale quantization.
+"""Fused sigmoid(gate) * attn_output with optional FP8 quantization.
 
 Replaces three separate ops (sigmoid, elementwise mul, FP8 quant) with a
 single Triton kernel. The output can be passed directly to
@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 from aiter import QuantType
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
 from torch import Tensor
 
 fp8_dtype = aiter.dtypes.fp8
@@ -450,6 +451,37 @@ def sigmoid_mul_fp8_group_quant(
     )
 
 
+def _sigmoid_mul_fake(attn_output: Tensor, gate: Tensor) -> Tensor:
+    return torch.empty_like(attn_output)
+
+
+# A custom op so AITER's wrapper runs its shape checks and mask choice at call
+# time: traced, they fix the token count to the one seen while compiling.
+@torch_compile_guard(gen_fake=_sigmoid_mul_fake, mutates_args=[])
+def sigmoid_mul(attn_output: Tensor, gate: Tensor) -> Tensor:
+    """Out-of-place sigmoid(gate) * attn_output, computed in FP32 and rounded
+    once by AITER's fused gate where its layout and dtype allow."""
+    if (
+        attn_output.is_cuda
+        and gate.device == attn_output.device
+        and attn_output.dtype == gate.dtype
+        and attn_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and attn_output.shape == gate.shape
+        and (
+            (attn_output.is_contiguous() and gate.is_contiguous())
+            or all(
+                t.ndim == 2 and t.stride(1) == 1 and t.stride(0) >= t.shape[1]
+                for t in (attn_output, gate)
+            )
+        )
+    ):
+        # AITER defaults to in-place output. Keep the out-of-place contract,
+        # including when attn_output and gate share storage.
+        out = torch.empty_like(attn_output)
+        return fused_sigmoid_mul(attn_output, gate, out=out)
+    return attn_output * torch.sigmoid(gate)
+
+
 def fused_sigmoid_mul_maybe_quant(
     attn_output: Tensor,
     gate: Tensor,
@@ -462,9 +494,12 @@ def fused_sigmoid_mul_maybe_quant(
     Unifies the quant and non-quant paths behind one call site so the caller
     always does ``o_proj(x, x_scale=scale)``:
 
-    - ``quant=False``: return ``(sigmoid(gate) * attn_output bf16, None)``. The
-      ``None`` scale makes ``o_proj(x, x_scale=None)`` fall back to its own
-      standalone activation quant.
+    - ``quant=False``: return ``(sigmoid(gate) * attn_output, None)``. Supported
+      GPU layouts use AITER's fused gate, computing in FP32 and rounding once
+      to the input dtype; eager low-precision sigmoid rounds before the mul.
+      The inputs are not mutated. With a ``None`` scale, ``o_proj`` uses its
+      configured input policy: an original BF16 projection consumes BF16
+      directly, while a quantized projection applies its own activation quant.
     - ``quant=True``: fuse sigmoid(gate) * attn_output + FP8 quant into one
       Triton kernel and return ``(x_fp8, x_scale)`` for o_proj's ``x_scale=``
       path. ``quant_type_value`` selects the scheme:
@@ -477,7 +512,7 @@ def fused_sigmoid_mul_maybe_quant(
     comparing the pybind11 type inside a traced ``forward``.
     """
     if not quant:
-        return attn_output * torch.sigmoid(gate), None
+        return sigmoid_mul(attn_output, gate), None
     if quant_type_value == QuantType.per_Token.value:
         return fused_sigmoid_mul_fp8_quant(attn_output, gate, per_token=True)
     if quant_type_value == QuantType.per_1x128.value:
