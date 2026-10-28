@@ -427,6 +427,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION` | `bool` | `True` | Enable fused input RMSNorm + quantization for DeepSeek models |
 | `ATOM_ENABLE_DS_QKNORM_QUANT_FUSION` | `bool` | `True` | Enable fused QK-norm + quantization for DeepSeek models |
 | `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` | `bool` | `True` | Enable fused all-reduce + RMSNorm kernel |
+| `ATOM_ENABLE_GLUON_FUSED_AR` | `bool` | `True` | Use aiter's Gluon fused all-reduce + RMSNorm for decode at TP4 (sets `AITER_GLUON_FUSED_AR=1`; aiter uses it on gfx1250 only) |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` | `bool` | `True` | Enable AITER Triton fused RMSNorm + quantization for LLaMA models |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` | `bool` | `True` | Enable AITER Triton fused SiLU + multiply + quantization for LLaMA models |
 

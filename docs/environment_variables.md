@@ -228,6 +228,7 @@ Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION** | bool | 1 (true) | If set to `1`, fuse allreduce with RMSNorm in tensor parallel mode. |
+| **ATOM_ENABLE_GLUON_FUSED_AR** | bool | 1 (true) | If set to `1`, ATOM sets `AITER_GLUON_FUSED_AR=1`, and aiter runs its Gluon all-reduce + residual add + RMSNorm for decode (fused calls up to 2 MiB) at TP4. aiter uses it on gfx1250 only. |
 
 ### DeepSeek-style
 

@@ -775,6 +775,8 @@ class ModelRunner:
             torch.float16,
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+        if envs.ATOM_ENABLE_GLUON_FUSED_AR:
+            os.environ["AITER_GLUON_FUSED_AR"] = "1"
         # Which attention this model's config asks for. The runner holds the
         # answer, not the question: what makes a model MLA or a hybrid is the
         # selector's to know, and it is asked the same way of a draft.
