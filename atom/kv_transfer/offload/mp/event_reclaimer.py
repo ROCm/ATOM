@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Defer HIP IPC event destruction until workers reach a forward rendezvous."""
+
+from __future__ import annotations
+
+import weakref
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class _ReadyEvent:
+    event: Any
+    owners: list[weakref.ReferenceType] = field(default_factory=list)
+
+    def reusable(self) -> bool:
+        for reference in self.owners:
+            owner = reference()
+            if owner is not None:
+                try:
+                    if not owner.query():
+                        return False
+                except Exception:
+                    return False
+        return True
+
+
+class IPCEventReclaimer:
+    """Keep event destructors out of asynchronous transfer bookkeeping.
+
+    HIP IPC event destruction can synchronize GPU streams. A worker doing
+    this before the next DP metadata collective can deadlock with a peer
+    waiting in that collective. Futures remain responsible for DMA lifetime;
+    their finalizers hand event ownership to this queue instead of destroying
+    events inline. Drain only after all peers have submitted the previous
+    forward, at the next forward's metadata rendezvous.
+    """
+
+    def __init__(self) -> None:
+        self._retired: deque[Any] = deque()
+        self._ready_events: list[_ReadyEvent] = []
+
+    def acquire_ready_event(self, factory: Any) -> Any:
+        # LMCache also retains exported events in a ring. Owning and reusing
+        # them here prevents a later ring eviction from destroying an event
+        # outside the rendezvous. Pool size follows peak in-flight batches;
+        # events are re-recorded only after every old transfer has completed.
+        for entry in self._ready_events:
+            if entry.reusable():
+                entry.owners.clear()
+                return entry.event
+        entry = _ReadyEvent(factory())
+        self._ready_events.append(entry)
+        return entry.event
+
+    def track_ready_event(self, event: Any, owner: Any) -> None:
+        for entry in self._ready_events:
+            if entry.event is event:
+                # The connector's pending tables own futures until terminal
+                # completion. A weak reference avoids retaining their imported
+                # completion events beyond normal transfer bookkeeping.
+                entry.owners.append(weakref.ref(owner))
+                return
+
+    def defer(self, event: Any) -> None:
+        self._retired.append(event)
+
+    def retain_until_released(self, owner: Any, event: Any) -> None:
+        if event is None:
+            return
+        finalizer = weakref.finalize(owner, self.defer, event)
+        # Runtime teardown owns shutdown; do not run these before live futures
+        # have drained merely because Python is executing atexit handlers.
+        finalizer.atexit = False
+
+    def release(self) -> None:
+        # Swap before dropping references: callbacks that retire more events
+        # while this batch is reclaimed leave them for the next safe point.
+        retired, self._retired = self._retired, deque()
+        retired.clear()
