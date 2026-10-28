@@ -98,6 +98,7 @@ allow = (
     "CONC_LIST",
     "BENCH_",
     "BENCHMARK_KIND",
+    "AGENTX_",
     "AIPERF_",
     "RANDOM_RANGE_RATIO",
     "REQUEST_RATE",

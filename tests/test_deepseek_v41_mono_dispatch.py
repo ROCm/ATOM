@@ -208,6 +208,12 @@ def test_switches_refuse(native, monkeypatch):
     assert mono_config.config_refusal(_atom_config()) == "ATOM_DSV41_SIDE_STREAMS"
 
 
+@pytest.mark.parametrize("arch", ["gfx942", "gfx1250"])
+def test_other_archs_are_refused(native, monkeypatch, arch):
+    monkeypatch.setattr(deployment, "_gfx", lambda: arch)
+    assert mono_config.config_refusal(_atom_config()) == f"arch {arch}"
+
+
 def test_plugin_mode_is_refused(native, monkeypatch):
     monkeypatch.setattr(deployment, "is_vllm", lambda: True)
     assert mono_config.config_refusal(_atom_config()) == "plugin mode"

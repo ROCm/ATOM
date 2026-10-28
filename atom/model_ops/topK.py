@@ -2,22 +2,23 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import lru_cache
-from typing import Optional
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
+from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.forward_context import get_forward_context
 
 
 def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     quant_config,
-    shared_expert_prefix: Optional[str] = None,
-    routed_expert_prefix: Optional[str] = None,
+    shared_expert_prefix: str | None = None,
+    routed_expert_prefix: str | None = None,
 ) -> bool:
     config = get_current_atom_config()
     if quant_config is None:
@@ -89,8 +90,8 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
 
 @torch_compile_guard()
 def is_rocm_aiter_fusion_shared_expert_enabled(
-    shared_expert_prefix: Optional[str] = None,
-    routed_expert_prefix: Optional[str] = None,
+    shared_expert_prefix: str | None = None,
+    routed_expert_prefix: str | None = None,
 ) -> bool:
     config = get_current_atom_config()
     return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -127,7 +128,7 @@ def init_aiter_topK_meta_data(
         dtype=torch.int32,
         device="cuda",
     )
-    ns_topk_ids, s_topk_ids = torch.split(
+    _, s_topk_ids = torch.split(
         total_topk_ids, [top_k, n_shared_experts + is_EP], dim=1
     )
     shared_expert_ids = [n_routed_experts + i for i in range(n_shared_experts + is_EP)]
@@ -146,11 +147,58 @@ def init_aiter_topK_meta_data(
         dtype=torch.float32,
         device="cuda",
     )
-    ns_topk_weights, s_topk_weights = torch.split(
+    _, s_topk_weights = torch.split(
         total_topk_weights, [top_k, n_shared_experts + is_EP], dim=1
     )
     s_topk_weights.fill_(shared_experts_score)
     aiter_topK_meta_data = (total_topk_weights, total_topk_ids)
+
+
+def topk_meta_rows(num_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """This pass's `num_rows` rows of the shared `aiter_topK_meta_data` buffer
+    (routed columns first, the prefilled shared ones after). A TBO micro-batch
+    takes the rows at its own offset in the whole forward, so two micro-batches
+    in flight never write the same rows."""
+    assert aiter_topK_meta_data is not None, (
+        "AITER topK meta data is not initialized. "
+        "Please ensure that init_aiter_topK_meta_data is called before this function."
+    )
+    context = get_forward_context().context
+    start = context.ubatch_token_offset if context is not None else 0
+    total_topk_weights, total_topk_ids = aiter_topK_meta_data
+    assert total_topk_weights.shape[0] >= start + num_rows, (
+        f"AITER topK meta data support {total_topk_weights.shape[0]} tokens which "
+        f"is determined by max_num_batched_tokens, but got rows "
+        f"[{start}, {start + num_rows}) now."
+    )
+    rows = slice(start, start + num_rows)
+    return total_topk_weights[rows], total_topk_ids[rows]
+
+
+def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
+    """On routed rows a gather moved between ranks, where the layer's routing
+    widened in the prefilled shared columns (LEGACY_AITER): give them this
+    rank's prefilled ids, in place. The prefill says by row position which
+    rows' shared expert this rank runs (under EP every ep_size-th row, from its
+    own rank), so the ids must follow a row's position in the gathered batch
+    -- as when routing ran after the gather -- not the one it had on the rank
+    that routed it. The weights stay: a scored shared column's are the row's
+    own. The shared columns are never written after the prefill, so any
+    micro-batch may read rows from 0."""
+    if layer.expert_layout.mode is not SharedExpertMode.LEGACY_AITER:
+        return
+    assert aiter_topK_meta_data is not None, (
+        "AITER topK meta data is not initialized. "
+        "Please ensure that init_aiter_topK_meta_data is called before this function."
+    )
+    _, total_topk_ids = aiter_topK_meta_data
+    rows = topk_ids.shape[0]
+    assert total_topk_ids.shape[0] >= rows, (
+        f"AITER topK meta data support {total_topk_ids.shape[0]} tokens, "
+        f"but {rows} rows were gathered."
+    )
+    top_k = layer.top_k
+    topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
 
 
 def rocm_aiter_topk_softmax_impl(
@@ -159,27 +207,18 @@ def rocm_aiter_topk_softmax_impl(
     renormalize: bool,
     num_fused_shared_experts: int = 0,
     num_routing_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
+    fused_shared_experts_scoring_func: str | None = None,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter import topk_softmax
 
     token = gating_output.shape[0]
     device = gating_output.device
     if num_fused_shared_experts > 0:
-        assert aiter_topK_meta_data is not None, (
-            "AITER topK meta data is not initialized. "
-            "Please ensure that init_aiter_topK_meta_data is called before this function."
-        )
-        total_topk_weights, total_topk_ids = aiter_topK_meta_data
-        assert total_topk_weights.shape[0] >= token, (
-            f"AITER topK meta data support {total_topk_weights.shape[0]} tokens which "
-            f"is determined by max_num_batched_tokens, but got {token} tokens now."
-        )
-        topk_weights = total_topk_weights[:token]
-        total_topk_ids = total_topk_ids[:token]
-        topk_ids, _ = torch.split(
-            total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
-        )
+        total_topk_weights, total_topk_ids = topk_meta_rows(token)
+        # The kernel scores the shared columns too when given a scoring func.
+        topk_weights = total_topk_weights
+        topk_ids = total_topk_ids[:, :topk]
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
@@ -199,23 +238,10 @@ def rocm_aiter_topk_softmax_impl(
         renormalize,
         fused_shared_experts_for_kernel,
         fused_shared_experts_scoring_func,
+        num_valid_rows,
     )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
-    return topk_weights, topk_ids
-
-
-def rocm_aiter_topk_softmax_fake(
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    num_fused_shared_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    token = gating_output.shape[0]
-    device = gating_output.device
-    topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
-    topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
     return topk_weights, topk_ids
 
 
@@ -228,6 +254,7 @@ def rocm_aiter_biased_grouped_topk_impl(
     topk: int,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_fused_shared_experts: int = 0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     from aiter import biased_grouped_topk
@@ -235,23 +262,9 @@ def rocm_aiter_biased_grouped_topk_impl(
     token = gating_output.shape[0]
     device = gating_output.device
     if num_fused_shared_experts > 0:
-        assert aiter_topK_meta_data is not None, (
-            "AITER topK meta data is not initialized. "
-            "Please ensure that init_aiter_topK_meta_data is called before this function."
-        )
-        total_topk_weights, total_topk_ids = aiter_topK_meta_data
-        assert total_topk_weights.shape[0] >= token, (
-            f"AITER topK meta data support {total_topk_weights.shape[0]} tokens which "
-            f"is determined by max_num_batched_tokens, but got {token} tokens now."
-        )
-        total_topk_weights = total_topk_weights[:token]
-        total_topk_ids = total_topk_ids[:token]
-        topk_weights, _ = torch.split(
-            total_topk_weights, [topk, total_topk_weights.shape[1] - topk], dim=1
-        )
-        topk_ids, _ = torch.split(
-            total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
-        )
+        total_topk_weights, total_topk_ids = topk_meta_rows(token)
+        topk_weights = total_topk_weights[:, :topk]
+        topk_ids = total_topk_ids[:, :topk]
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
@@ -264,6 +277,7 @@ def rocm_aiter_biased_grouped_topk_impl(
         topk_group,
         need_renorm,
         routed_scaling_factor,
+        num_valid_rows,
     )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
@@ -279,6 +293,7 @@ def rocm_aiter_biased_grouped_topk_fake(
     topk: int,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_fused_shared_experts: int = 0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = gating_output.shape[0]
     device = gating_output.device
@@ -320,8 +335,6 @@ def rocm_aiter_biased_grouped_topk_fake(
 
 def rocm_aiter_grouped_topk_impl(
     gating_output: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
@@ -329,6 +342,7 @@ def rocm_aiter_grouped_topk_impl(
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_fused_shared_experts: int = 0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     from aiter import grouped_topk
@@ -336,23 +350,9 @@ def rocm_aiter_grouped_topk_impl(
     token = gating_output.shape[0]
     device = gating_output.device
     if num_fused_shared_experts > 0:
-        assert aiter_topK_meta_data is not None, (
-            "AITER topK meta data is not initialized. "
-            "Please ensure that init_aiter_topK_meta_data is called before this function."
-        )
-        total_topk_weights, total_topk_ids = aiter_topK_meta_data
-        assert total_topk_weights.shape[0] >= token, (
-            f"AITER topK meta data support {total_topk_weights.shape[0]} tokens which "
-            f"is determined by max_num_batched_tokens, but got {token} tokens now."
-        )
-        total_topk_weights = total_topk_weights[:token]
-        total_topk_ids = total_topk_ids[:token]
-        topk_weights, _ = torch.split(
-            total_topk_weights, [topk, total_topk_weights.shape[1] - topk], dim=1
-        )
-        topk_ids, _ = torch.split(
-            total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
-        )
+        total_topk_weights, total_topk_ids = topk_meta_rows(token)
+        topk_weights = total_topk_weights[:, :topk]
+        topk_ids = total_topk_ids[:, :topk]
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
@@ -363,8 +363,9 @@ def rocm_aiter_grouped_topk_impl(
         num_expert_group,
         topk_group,
         need_renorm,
-        scoring_func,
+        scoring_func == "softmax",
         routed_scaling_factor,
+        num_valid_rows,
     )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
@@ -373,8 +374,6 @@ def rocm_aiter_grouped_topk_impl(
 
 def rocm_aiter_grouped_topk_fake(
     gating_output: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
@@ -382,6 +381,7 @@ def rocm_aiter_grouped_topk_fake(
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_fused_shared_experts: int = 0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = gating_output.shape[0]
     device = gating_output.device
@@ -427,7 +427,8 @@ def rocm_aiter_topk_softmax(
     renormalize: bool,
     num_fused_shared_experts: int = 0,
     num_routing_experts: int = 0,
-    fused_shared_experts_scoring_func: Optional[str] = None,
+    fused_shared_experts_scoring_func: str | None = None,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     return rocm_aiter_topk_softmax_impl(
         gating_output,
@@ -436,6 +437,7 @@ def rocm_aiter_topk_softmax(
         num_fused_shared_experts,
         num_routing_experts,
         fused_shared_experts_scoring_func,
+        num_valid_rows,
     )
 
 
@@ -462,9 +464,10 @@ def rocm_aiter_grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None,
+    e_score_correction_bias: torch.Tensor | None = None,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if e_score_correction_bias is not None:
         return torch.ops.aiter.rocm_aiter_biased_grouped_topk_impl(
@@ -476,6 +479,7 @@ def rocm_aiter_grouped_topk(
             topk,
             routed_scaling_factor,
             num_fused_shared_experts,
+            num_valid_rows,
         )
     else:
         assert scoring_func == "softmax" or scoring_func == "sigmoid"
@@ -488,6 +492,7 @@ def rocm_aiter_grouped_topk(
             scoring_func,
             routed_scaling_factor,
             num_fused_shared_experts,
+            num_valid_rows,
         )
 
 
@@ -504,12 +509,14 @@ def mm_topk(
     out_weights: torch.Tensor,
     *,
     image_mask: torch.Tensor | None = None,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
     """Fused two-bias routing from #2149, with an optional explicit image mask.
 
     V4 uses above-vocabulary IDs and may supply a text hash table. An explicit
     mask replaces sentinel detection; without hashing, IDs/vocabulary are unused.
     Output views may have a wider row stride for fused shared-expert columns.
+    Rows at or past `num_valid_rows` route to -1.
     """
     from atom.model_ops.triton_mm_topk import mm_topk_triton
 
@@ -525,4 +532,5 @@ def mm_topk(
         out_ids,
         out_weights,
         image_mask=image_mask,
+        num_valid_rows=num_valid_rows,
     )

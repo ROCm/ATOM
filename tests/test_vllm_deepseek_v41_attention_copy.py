@@ -40,7 +40,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # sha256 of core's `Attention.forward` and `_attend`, comments and blank
 # lines stripped.
 CORE_PREPARE_DIGEST = "6e6ba60ac60f4825"
-CORE_FORWARD_DIGEST = "1137e7d2471869cd"
+CORE_FORWARD_DIGEST = "efcc7dbf2f688954"
 
 
 @pytest.fixture

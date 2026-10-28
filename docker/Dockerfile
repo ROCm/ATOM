@@ -616,38 +616,27 @@ assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_proc
 assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
 print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)"
 
-# ========== SemiAnalysis aiperf agentic benchmark tool ==========
-# The SemiAnalysis fork, which is what carries the SA agentic datasets
-# (semianalysis_cc_traces_weka_062126*).
+# ========== AgentX harness (agentic benchmark client) ==========
+# agentx-harness is the client InferenceX benchmarks with: every one of its
+# agentic jobs installs the release pinned in
+# inferencex-e2e/infx/bench/agentic/requirements.txt into a fresh venv. Pin
+# the same release here and follow it by hand.
 #
-# Pinned to the commit InferenceX's `utils/aiperf` submodule points at, so our
-# image ships the aiperf they measure with. Their pointer is a deliberate,
-# frequently-moved pin -- four bumps in the first half of August 2026, and a
-# same-day revert on 2026-07-28 -- with commit titles that read "pin AIPerf v1
-# timing watchdog", "pin additive AIPerf main warmup". Tracking aiperf's master
-# instead would take in exactly the upstream changes they evaluate and
-# sometimes reject.
-#
-# It therefore has to be followed by hand. To re-check:
-#   git ls-tree main utils/aiperf     # in a clone of SemiAnalysisAI/InferenceX
-#
-# `SA_AIPERF_REF` accepts any ref; empty means "whatever HEAD points at", which
-# is why the checkout below is conditional rather than naming a branch (an
-# upstream default-branch rename would otherwise break unrelated builds).
-ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_REF="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
-RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
-        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
-        rm -rf /opt/aiperf && \
-        git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
-        cd /opt/aiperf && \
-        { [ -z "${SA_AIPERF_REF}" ] || git checkout "${SA_AIPERF_REF}"; } && \
-        echo "[ATOM] aiperf resolved to $(git rev-parse HEAD)" && \
-        "${VENV_PYTHON}" -m pip install -e . && \
-        "${VENV_PYTHON}" -m pip show aiperf || true && \
-        command -v aiperf && aiperf --help >/dev/null; \
+# Its own venv, as in InferenceX: the release pins prometheus-client~=0.23.1,
+# pyzmq~=26.4.0 and pandas~=2.3.3, which in /opt/venv would move the server's
+# packages. `agentx` and `aiperf` are linked onto PATH.
+ARG INSTALL_AGENTX_HARNESS=1
+ARG AGENTX_HARNESS_VERSION="1.0.9"
+RUN if [ "${INSTALL_AGENTX_HARNESS}" = "1" ]; then \
+        echo "========== [ATOM] Install agentx-harness==${AGENTX_HARNESS_VERSION} =========="; \
+        rm -rf /opt/agentx-venv && \
+        "${VENV_PYTHON}" -m venv /opt/agentx-venv && \
+        /opt/agentx-venv/bin/python -m pip install --no-cache-dir \
+            "agentx-harness==${AGENTX_HARNESS_VERSION}" && \
+        ln -sf /opt/agentx-venv/bin/agentx /opt/agentx-venv/bin/aiperf /usr/local/bin/ && \
+        test "$(agentx --version)" = "${AGENTX_HARNESS_VERSION}"; \
     else \
-        echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+        echo "========== Skipped agentx-harness (INSTALL_AGENTX_HARNESS=0) =========="; \
     fi
 
 # Install the paired runtime after dependency installation. Preserve old image

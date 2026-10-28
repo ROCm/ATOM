@@ -112,7 +112,7 @@ def runtime_config(**overrides):
         {"enable_rapidserve": True},
         {"online_quant_config": {}},
         {"eplb_enable": True},
-        {"kv_cache_dtype": "fp8"},
+        {"kv_cache_dtype": "fp16"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
         # a hit's one-PAGE rebuild would not cover the window
@@ -472,13 +472,13 @@ def test_shortening_the_index_block_moves_bytes_without_adding_any(rows):
     the two regions interleave changes.
     """
     geo = V41PoolGeometry(
-        40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True, index_block_rows=rows
+        40, ((2, 2), (20, 1)), 64, 128, 512, 128, kv_dtype="fp4", index_block_rows=rows
     )
     assert geo.index_row_bytes == 132
     assert (
         geo.paged_bytes
         == V41PoolGeometry(
-            40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True
+            40, ((2, 2), (20, 1)), 64, 128, 512, 128, kv_dtype="fp4"
         ).paged_bytes
     )
 

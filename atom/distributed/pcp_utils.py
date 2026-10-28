@@ -149,23 +149,12 @@ def pcp_allgather_rerange(
 #     original stripe tokens. No rerange/slice needed.
 
 
-def pcp_allgather_rankmajor(
-    input_: torch.Tensor, pcp_size: int | None = None
-) -> torch.Tensor:
-    """Gather this rank's 1/W stripe shard into the full rank-major sequence
-    via a plain all_gather (dim=0). Inverse of pcp_reduce_scatter."""
-    if pcp_size is None:
-        pcp_size = get_pcp_world_size()
-    if pcp_size <= 1:
-        return input_
-    return get_pcp_group().all_gather(input_.contiguous(), dim=0)
-
-
 def pcp_reduce_scatter(
     input_: torch.Tensor, pcp_size: int | None = None
 ) -> torch.Tensor:
     """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
-    stripe via a plain reduce_scatter (dim=0). Inverse of pcp_allgather_rankmajor."""
+    stripe via a plain reduce_scatter (dim=0). Inverse of the rank-major gather
+    (FusedMoE._run_experts gathers its routed rows that way)."""
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
@@ -207,14 +196,13 @@ def pcp_owned_rows_by_request(
     cu_seqlens_q: np.ndarray, first: int, stride: int, owned: int
 ) -> np.ndarray:
     """Starts of the rows a PCP rank owns (`first`, `first + stride`, ...,
-    `owned` of them) grouped by request (`cu_seqlens_q`), then the padding
-    rows past the last request as one more. Rows below `x` it owns number
-    `ceil((x - first) / stride)`, so this is arithmetic on the host."""
+    `owned` of them) grouped by request (`cu_seqlens_q`). Padding rows join
+    the last request's group: one group per `block_tables` row, and at
+    position 0 they read no key."""
     cu = np.asarray(cu_seqlens_q, dtype=np.int64)
     below = (np.maximum(cu - first, 0) + stride - 1) // stride
     starts = below - below[0]
-    if starts[-1] < owned:
-        starts = np.append(starts, owned)
+    starts[-1] = owned
     return starts.astype(np.int32)
 
 

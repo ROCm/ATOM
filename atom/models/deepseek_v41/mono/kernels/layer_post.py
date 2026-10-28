@@ -107,6 +107,8 @@ class LayerPostBuild:
     # or DP attention's ranks with the MoE TP over them: its widths those of
     # TP ``tp`` x ``moe_tp`` (each rank every expert's share), the rows as above
     moe_tp: int = 1
+    # the pool's rows are MXFP8 (``AttnPostBuild.kv_fp8``)
+    kv_fp8: bool = False
 
     @property
     def dp_ranks(self) -> int:
@@ -128,6 +130,7 @@ class LayerPostBuild:
             timeline=self.timeline,
             diag_off=self.diag_off,
             tok_par=self.tok_par,
+            kv_fp8=self.kv_fp8,
         )
         moe_diag = self.diag_off - moe_base(key_a) if self.diag_off >= 0 else -1
         key_b = MoeBuild(
@@ -259,7 +262,7 @@ def build_layer_post(key: LayerPostBuild):
     layout_b = {n: layout[n] for n in (*k2b.scratch_layout(key_b), "xrdy")}
     keyed = key_tuple(key, SOURCES)
     # K2a's stages, then K2b: one union (``attn_post_smem``)
-    members = attn_post_smem(s, False, key.index_bound_max, Dims(key.tp))
+    members = attn_post_smem(s, False, key.index_bound_max, Dims(key.tp), key.kv_fp8)
     Halves = lds_union("K2Lds", {**members, "moe": moe_smem(sm, rs, False)})
 
     @fx.struct
