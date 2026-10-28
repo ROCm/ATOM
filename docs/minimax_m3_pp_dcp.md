@@ -70,6 +70,10 @@ each rank receives approximately one quarter, subject to block tails.
   causal block boundaries, global top-k and graph replay.
 - `tests/models/minimax_m3/validate_dcp_collectives.py`: four-GPU AITER projection
   gathers, global top-k, FP32 merge and full attention graph replay.
+- `tests/models/minimax_m3/validate_dcp_module.py`: the real sparse layer on
+  four GPUs, including projection and fused writers, compared with dense
+  PyTorch attention over unsharded quantized KV. Checks byte equality and q=8
+  whole-layer graph replay with changed inputs (short contexts, all blocks selected).
 - CI accuracy cases: `minimax-m31-flash-mxfp4-1p1d-pp4-dcp4-dspark7-nvfp4-gsm8k-5shot-c32`
   and its `gsm8k-5shot-chunked-c32` counterpart. They retain the PP4 integration's
   full 1319-question, five-shot, real-acceptance GSM8K gate (0.94).

@@ -215,11 +215,15 @@ def test_owned_index_scores_and_global_topk(fp4):
     from atom.model_ops.minimax_m3.dcp_attention import _index_scores, index_topk
 
     k, _, table, caches = cache_fixture("nvfp4" if fp4 else "fp8", 128)
-    rows, heads, blocks = 8, 4, 2
+    rows, heads, blocks = 16, 4, 2
     q = (torch.randn(rows, heads, 128, device="cuda") * 0.1).bfloat16()
     req = torch.zeros(rows, device="cuda", dtype=torch.int32)
     lengths = torch.tensor(
-        [1, 127, 128, 129, 511, 513, 767, 768], device="cuda", dtype=torch.int32
+        # A q=8 graph padding row has causal lengths -7..0. It must never
+        # select or read a cache page, including when every shard is empty.
+        [-7, -6, -5, -4, -3, -2, -1, 0, 1, 127, 128, 129, 511, 513, 767, 768],
+        device="cuda",
+        dtype=torch.int32,
     )
     scores = []
     indices = []
