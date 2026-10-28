@@ -87,14 +87,48 @@ python3 "$SKILL/check_prompts.py" >/dev/null || fail flow 4 "prompts drifted fro
 # signal. claude-glm mode resolves its own endpoint, so there is nothing to probe here.
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   say "GLM health probe..."
+  # ANTHROPIC_BASE_URL names where to reach the backend, not what shape it speaks: an on-box
+  # GLM is usually OpenAI-compatible (/v1/chat/completions, tried first, below), but some boxes
+  # put an Anthropic-style endpoint behind this same var (serves /v1/messages, its own headers)
+  # -- e.g. a corporate gateway inherited into the environment. Forward any gateway-specific
+  # headers the operator configured (ANTHROPIC_CUSTOM_HEADERS, "Name: value, Name2: value2" --
+  # same format Claude Code itself reads) to both probe shapes.
+  _hdrs=(-H 'Content-Type: application/json')
+  if [ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then
+    while IFS= read -r _h; do
+      [ -n "$_h" ] && _hdrs+=(-H "$_h")
+    done < <(printf '%s' "$ANTHROPIC_CUSTOM_HEADERS" | tr ',' '\n' | sed 's/^ *//')
+  fi
   _code=$(curl -s -m "${ATOM_GLM_PROBE_TIMEOUT:-30}" --noproxy '*' \
-    "$ANTHROPIC_BASE_URL/v1/chat/completions" -H 'Content-Type: application/json' \
+    "$ANTHROPIC_BASE_URL/v1/chat/completions" "${_hdrs[@]}" \
     -d "{\"model\":\"${ANTHROPIC_MODEL:-/models/GLM-5.3}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
     -o /dev/null -w '%{http_code}' 2>/dev/null || true)
+  _code2=""
   if [ "$_code" != "200" ]; then
-    fail glm 5 "GLM backend unavailable at $ANTHROPIC_BASE_URL (deep inference probe returned '$_code')"
+    _code2=$(curl -s -m "${ATOM_GLM_PROBE_TIMEOUT:-30}" --noproxy '*' \
+      "$ANTHROPIC_BASE_URL/v1/messages" "${_hdrs[@]}" \
+      -H "x-api-key: ${ANTHROPIC_API_KEY:-}" -H 'anthropic-version: 2023-06-01' \
+      -d "{\"model\":\"${ANTHROPIC_MODEL:-claude-sonnet-5}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+      -o /dev/null -w '%{http_code}' 2>/dev/null || true)
+    [ "$_code2" = "200" ] && _code="$_code2"
   fi
-  say "GLM ok"
+  if [ "$_code" != "200" ]; then
+    # A 404 on BOTH shapes means the endpoint answered HTTP and simply doesn't recognize
+    # either path we tried -- a probe-shape/gateway-routing problem, not proof the backend is
+    # dead. A connection failure/timeout (curl reports "000" or empty) or a 5xx on either
+    # attempt is the real "wedged or down" signal this probe exists to catch, so that still
+    # aborts hard below -- only the specific both-404 case is ambiguous enough to not be worth
+    # paging the model owner over. If this were escalated at all it would be class `env` (a
+    # box/gateway configuration fact), never `glm` (the model owner didn't break this) -- but
+    # it doesn't warrant failing the run either, so this path warns and continues instead.
+    if [ "$_code" = "404" ] && [ "$_code2" = "404" ]; then
+      say "WARN: GLM health probe got 404 on both OpenAI- and Anthropic-shape endpoints at $ANTHROPIC_BASE_URL -- treating as a probe/shape mismatch, not a dead backend. Proceeding (a genuinely dead backend will still surface as an agent timeout/failure below)."
+    else
+      fail glm 5 "GLM backend unavailable at $ANTHROPIC_BASE_URL (deep inference probe returned '$_code'${_code2:+ / '$_code2'})"
+    fi
+  else
+    say "GLM ok"
+  fi
 fi
 
 # 1) fetch (the skill's own Step-1 fetcher) -> WORK dir

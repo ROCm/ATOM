@@ -277,5 +277,39 @@ t "recheck STALE still writes the generic text when fetch.sh's own verdict was g
 t "recheck APPLIES overwrites with the rechecked-tree message regardless" \
   "$(applies_recheck 0 "$double_app_msg" | grep -c 'rechecked on the merge-target worktree')" "1"
 
+echo "[GLM health probe]"
+# ANTHROPIC_BASE_URL promises nothing about shape. An on-box OpenAI-compatible GLM answers the
+# first probe; an Anthropic-style gateway (serves /v1/messages) needs the second shape tried
+# before concluding anything -- and a 404 on BOTH is a probe/shape mismatch, not proof the
+# backend is dead, so it must warn and continue rather than page the model owner (class glm).
+probe() {  # <1st curl http_code> <2nd curl http_code, or none> -> combined stdout+stderr
+  local c1="$1" c2="${2:-000}" cnt; cnt=$(mktemp)
+  { echo 'set -uo pipefail'
+    echo 'say() { echo "SAY:$*"; }'
+    echo 'fail() { echo "FAIL:$1:$3"; exit 5; }'
+    echo 'ATOM_GLM_PROBE_TIMEOUT=1'
+    echo 'ANTHROPIC_BASE_URL=http://example.invalid'
+    # _code / _code2 are each captured via `$(curl ...)`, which forks a subshell -- a plain
+    # counter variable bumped inside curl() would reset every call instead of advancing. A
+    # file survives the fork.
+    printf '_cnt=%q; _c1=%q; _c2=%q\n' "$cnt" "$c1" "$c2"
+    echo 'curl() { local n; n=$(( $(cat "$_cnt") + 1 )); echo "$n" > "$_cnt"; if [ "$n" = 1 ]; then printf "%s" "$_c1"; else printf "%s" "$_c2"; fi; }'
+    sed -n '/^if \[ -n "\${ANTHROPIC_BASE_URL/,/^fi$/p' "$S/run_one.sh"
+  } | ( echo 0 > "$cnt"; bash ) 2>&1
+  rm -f "$cnt"
+}
+t "OpenAI shape 200 on the first try: healthy, no second probe needed" \
+  "$(probe 200 | grep -c 'GLM ok')" "1"
+t "OpenAI shape 404, Anthropic shape 200: healthy via the second shape" \
+  "$(probe 404 200 | grep -c 'GLM ok')" "1"
+t "both shapes 404: warns and proceeds, does not abort" \
+  "$(probe 404 404 | grep -c '^FAIL:')" "0"
+t "both shapes 404: the warning says probe/shape mismatch, not glm class" \
+  "$(probe 404 404 | grep -c 'probe/shape mismatch')" "1"
+t "connection failure then 404: still aborts (class glm) -- not both-404" \
+  "$(probe 000 404 | grep -c '^FAIL:glm:')" "1"
+t "both shapes 500: still aborts (class glm) -- a real backend fault, not a 404" \
+  "$(probe 500 500 | grep -c '^FAIL:glm:')" "1"
+
 echo "=== $ok green / $bad red ==="
 [ "$bad" -eq 0 ]
