@@ -554,6 +554,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
         _partial_prefill_count=1,
         spec_decode_local=False,
         _connector_release_stalled_save=lambda seq: None,
+        _preempt_cache_work=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
     )
@@ -624,6 +625,7 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
         total_preemptions=0,
         spec_decode_local=False,
         _connector_release_stalled_save=lambda seq: None,
+        _preempt_cache_work=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
     )

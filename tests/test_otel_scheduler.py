@@ -366,7 +366,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
     monkeypatch.setattr(
         engine_core, "AsyncIOProcManager", lambda *a: SimpleNamespace(call_func=call)
     )
-    monkeypatch.setattr(engine_core, "Scheduler", lambda *a, **k: None)
+    monkeypatch.setattr(engine_core, "Scheduler", lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(engine_core, "EngineUtilityHandler", lambda *a, **k: None)
     monkeypatch.setattr(tracing, "initialize", lambda: events.append("initialize"))
     monkeypatch.setattr(

@@ -1148,7 +1148,11 @@ class TestSchedule:
                 draft_token_ids=None,
                 is_deferred_out=True,
             ),
-            batch=SimpleNamespace(req_ids=[seq.id], num_scheduled_tokens=[2]),
+            batch=SimpleNamespace(
+                req_ids=[seq.id],
+                num_scheduled_tokens=[2],
+                total_seqs_num_prefill=1,
+            ),
         )
 
         assert seq.num_cached_tokens == 10
