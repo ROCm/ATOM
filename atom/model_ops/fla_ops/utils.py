@@ -75,6 +75,17 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
         cache_entries.append((args, kwargs, result))
         return result
 
+    def prime(result, *args, **kwargs):
+        """Install ``result`` as the cached answer for ``args``/``kwargs`` (by
+        identity, as the lookup matches), so a caller that already holds the
+        answer -- the engine, with the lengths on the host -- spares the
+        function its own computation, and the device sync it may carry."""
+        nonlocal cache_entries
+        if len(cache_entries) >= cache_size:
+            cache_entries = cache_entries[1:]
+        cache_entries.append((args, kwargs, result))
+
+    wrapper.prime = prime
     return wrapper
 
 

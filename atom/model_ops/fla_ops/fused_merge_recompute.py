@@ -9,7 +9,12 @@ import triton.language as tl
 from .index import prepare_chunk_indices
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "HAS_NT": lambda args: args["nt_ptr"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=1, num_stages=4),  # swept-best on MI308
@@ -28,6 +33,7 @@ def _fused_merge_recompute_kernel(
     u_ptr,
     cu_seqlens,
     chunk_indices,
+    nt_ptr,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -35,8 +41,12 @@ def _fused_merge_recompute_kernel(
     V: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HAS_NT: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    if IS_VARLEN and HAS_NT:
+        if i_t >= tl.load(nt_ptr):
+            return
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -373,9 +383,10 @@ def fused_merge_recompute(
     Ai16: torch.Tensor,
     chunk_size: int = 64,
     cu_seqlens: Optional[torch.Tensor] = None,
+    plan=None,
 ):
     """
-    Fused merge + recompute.
+    Fused merge + recompute. ``plan``: see `fused_cumsum_kkt`.
 
     Args:
         k: [B, T, Hg, K]
@@ -393,7 +404,10 @@ def fused_merge_recompute(
     Hg, K = k.shape[2], k.shape[3]
     V = v.shape[3]
 
-    if cu_seqlens is not None:
+    nt_ptr = None
+    if plan is not None:
+        chunk_indices, NT, nt_ptr = plan.chunk_indices_64, plan.nt64_max, plan.nt64
+    elif cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
         NT = len(chunk_indices)
     else:
@@ -414,6 +428,7 @@ def fused_merge_recompute(
         u,
         cu_seqlens,
         chunk_indices,
+        nt_ptr,
         T,
         H,
         Hg,

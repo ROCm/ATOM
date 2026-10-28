@@ -887,6 +887,14 @@ class PagedAttentionImpl(nn.Module):
                     q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
                 )
             )
+        plan = getattr(attn_metadata, "prefix_split", None)
+        if (
+            plan is not None
+            and self.sinks is None
+            and self.sliding_window <= 0
+            and not self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx)
+        ):
+            return self._prefix_split_attention(q, k, v, plan)
         if self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx):
             output_dtype = q.dtype
             # On gfx950, kv_scale is 1.0; FMHA requires a 1-D per-tensor scale.
@@ -941,6 +949,43 @@ class PagedAttentionImpl(nn.Module):
             sink_ptr=self.sinks,
         )
         return o
+
+    def _prefix_split_attention(self, q, k, v, plan):
+        """Prefix-cached prefill attention as two FMHA launches and a merge
+        (`attentions.prefix_split`): the context in slices, every (request,
+        slice) a varlen sequence of the first launch; the new tokens' own keys
+        in the causal second. Rows past the scheduled ones (a padded step) are
+        left to the caller."""
+        from atom.model_ops.attentions.prefix_split import merge
+
+        o_a, lse_a = aiter.flash_attn_varlen_func(
+            q.index_select(0, plan.q_rep),
+            k,
+            v,
+            cu_seqlens_q=plan.cu_q_a,
+            cu_seqlens_k=plan.cu_k_a,
+            max_seqlen_q=plan.max_q,
+            max_seqlen_k=plan.max_k_a,
+            softmax_scale=self.scale,
+            causal=False,
+            return_lse=True,
+        )
+        o_b, lse_b = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=plan.cu_q_b,
+            cu_seqlens_k=plan.cu_k_b,
+            max_seqlen_q=plan.max_q,
+            max_seqlen_k=plan.max_q,
+            softmax_scale=self.scale,
+            causal=True,
+            return_lse=True,
+        )
+        rows = plan.merge_rows.numel() // plan.n_full
+        out = torch.empty_like(o_b)
+        merge(o_a, lse_a, o_b[:rows], lse_b, plan.merge_rows, plan.n_full, out=out[:rows])
+        return out
 
     def prefill_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext

@@ -569,7 +569,32 @@ class GatedDeltaNet(nn.Module):
                     beta_non_spec,
                     flydsl_metadata,
                 )
-            if use_flydsl_prefill:
+            plan = getattr(gdn_metadata, "varlen_plan", None)
+            if plan is not None:
+                # Bucket-shaped launches; the recurrence reads and writes the
+                # state pool by slot (`fla_ops.varlen_plan`). No checkpoints
+                # on this path: the builder keeps those steps eager.
+                wrote_core_attn_out = spec_sequence_masks is None
+                core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=ssm_state,
+                    output_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    o=(
+                        core_attn_out[:num_actual_tokens].unsqueeze(0)
+                        if wrote_core_attn_out
+                        else None
+                    ),
+                    keep_intermediate_states=False,
+                    plan=plan,
+                )
+            elif use_flydsl_prefill:
                 core_attn_out_non_spec, last_recurrent_state, flydsl_h = prefill(
                     query_non_spec,
                     key_non_spec,
@@ -617,12 +642,13 @@ class GatedDeltaNet(nn.Module):
                     # dropped on return otherwise.
                     keep_intermediate_states=ckpt is not None,
                 )
-            # Init cache
-            ssm_state.index_copy_(
-                0,
-                gdn_metadata.non_spec_state_indices_i64,
-                last_recurrent_state.to(ssm_state.dtype),
-            )
+            # Init cache (the planned path wrote its final states in place)
+            if last_recurrent_state is not None:
+                ssm_state.index_copy_(
+                    0,
+                    gdn_metadata.non_spec_state_indices_i64,
+                    last_recurrent_state.to(ssm_state.dtype),
+                )
             # SSM state cache: copy out every checkpoint this step reached.
             #
             # A checkpoint slot is never where the recurrence runs — the live

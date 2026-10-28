@@ -256,6 +256,7 @@ def _record_segments(fn: Callable, *args, pool=None, **kwargs) -> tuple[_Segment
 def eager_region(
     stream: Callable[[Any], torch.cuda.Stream | None] | None = None,
     live: Callable[[], dict[str, Any]] | None = None,
+    unless: Callable[..., bool] | None = None,
 ):
     """Declare a method as a break in a recorded forward.
 
@@ -265,6 +266,10 @@ def eager_region(
 
     ``live`` returns the arguments, by parameter name, that a replay must not
     take from the recording -- the step being served, not the one recorded.
+
+    ``unless``, called with the method's arguments while recording, says the
+    call needs no break this time: its launches are shaped by the bucket and
+    read the step from fixed addresses, so it is recorded inline.
 
     Not recording, the method is called directly; a side stream forks exactly
     as `side_stream` does, so a whole-forward graph captures the same fork.
@@ -277,7 +282,7 @@ def eager_region(
                 return fn(*args, **kwargs)
             side = None if stream is None else stream(args[0])
             recorder = _recorder()
-            if recorder is not None:
+            if recorder is not None and not (unless is not None and unless(*args, **kwargs)):
                 return recorder.eager(fn, args, kwargs, side, live)
             with forward_context.side_stream(side):
                 return fn(*args, **kwargs)

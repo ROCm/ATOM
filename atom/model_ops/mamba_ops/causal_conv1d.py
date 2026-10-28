@@ -725,7 +725,11 @@ def causal_conv1d_fn(
     else:
 
         def num_program(META, nums_dict):
-            tot = nums_dict[META["BLOCK_M"]]["tot"]
+            # `programs_max`: a bucket-shaped grid (the batch pointer's tail is
+            # pad slots, which the kernel skips)
+            tot = nums_dict[META["BLOCK_M"]].get(
+                "programs_max", nums_dict[META["BLOCK_M"]]["tot"]
+            )
 
             mlist = nums_dict[META["BLOCK_M"]]["mlist"]
             mlist_len = nums_dict[META["BLOCK_M"]]["mlist_len"]

@@ -137,6 +137,9 @@ class GDNAttentionMetadata:
     # tensors `_checkpoint_targets` builds, or None when it reaches none. Built
     # once per step and read by every layer.
     ssm_checkpoints: dict | None = None
+    # `fla_ops.varlen_plan.VarlenPlan`: this prefill's GDN kernels launch
+    # bucket-shaped grids and run inside the token graph.
+    varlen_plan: object | None = None
     # First chunk index of each sequence within this step's `h`, the same
     # mapping the chunk kernel builds internally. Only computed when there are
     # checkpoints to place against it.
@@ -1336,9 +1339,10 @@ class GDNStateMixin(PoolRowsMixin):
                 if cached is not None
                 else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
             )
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(non_spec_query_start_loc)
+            nums_dict, batch_ptr, token_chunk_offset_ptr = self._conv1d_metadata(
+                non_spec_query_start_loc, num_prefills
             )
+            self._prime_chunk_indices(non_spec_query_start_loc, num_prefills)
         else:
             has_initial_state = None
 
@@ -1398,6 +1402,14 @@ class GDNStateMixin(PoolRowsMixin):
         md.replayssm_max_query_len = self.replayssm_max_query_len
 
         if is_prefill:
+            # The live slots, from the host mirror `prepare_state_indices`
+            # filled this step: a boolean-mask index on the device tensor
+            # would be a nonzero(), a device sync on every prefill step.
+            slots = self.non_spec_state_indices_tensor.np[:num_reqs]
+            live_np = slots[slots >= 0]
+            if live_np.size:
+                write_pos.index_fill_(0, self._staged_i64("replay_live", live_np), -1)
+            return
             # A prefill (re)initialises the checkpoint wholesale via
             # `chunk_gated_delta_rule` and writes NO records, so the next
             # forward must fold none.  Parking the cursor at -1 rather than 0
@@ -1613,6 +1625,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # Inherited as True from the MHA builder, which made `EagleProposer` pass
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
+    # A prefill step pads to a token-graph bucket (`ForwardMode._pad_to_token_graph`,
+    # `ModelRunner._record_tr_graphs`): `prepare_prefill` lays the step out at
+    # `running_tokens`, the rows past the scheduled ones with slot -1 (written
+    # nowhere) and position 0, and the model's recording replays over them. The
+    # GDN and attention regions run live and read the scheduled count, so the pad
+    # rows reach no state, no KV and no sampled row.
+    supports_token_graph = True
+    # The bucket a padded prefill is being laid out at, while `prepare_prefill`
+    # runs; None otherwise.
+    _token_graph_tokens: int | None = None
+    # The step's row count while `prepare_prefill` runs (padded or not).
+    _prefill_running_tokens: int | None = None
 
     def _uses_paged_checkpoints(self) -> bool:
         """PAGE image for the Qwen GDN/MHA family; fork otherwise.
@@ -1908,9 +1932,17 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         running_bs: int,
         running_tokens: int,
     ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_prefill(
-            batch, running_bs, running_tokens
+        scheduled_tokens = batch.total_tokens_num_prefill
+        self._token_graph_tokens = (
+            running_tokens if running_tokens > scheduled_tokens else None
         )
+        self._prefill_running_tokens = running_tokens
+        try:
+            attn_metadata, positions = super().prepare_prefill(
+                batch, running_bs, running_tokens
+            )
+        finally:
+            self._token_graph_tokens = None
         if batch.block_tables == []:
             if any(getattr(batch, "state_save_all", None) or ()):
                 raise RuntimeError(
@@ -1925,7 +1957,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             batch, attn_metadata, is_prefill=True, prepare_block_tables=False
         )
 
-        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        gdn_metadata.ssm_checkpoints = (
+            batch.__dict__.pop("_gdn_checkpoint_targets")
+            if "_gdn_checkpoint_targets" in batch.__dict__
+            else self._checkpoint_targets(batch)
+        )
         gdn_metadata.ssm_conv_state_len = self._conv_state_len()
         if gdn_metadata.ssm_checkpoints is not None:
             # Same mapping the chunk kernel builds internally, computed once
@@ -1938,7 +1974,342 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             )
 
         attn_metadata.gdn_metadata = gdn_metadata
+        self._attach_gdn_plan(batch, attn_metadata, gdn_metadata, running_tokens)
+        self._prefill_running_tokens = None
+        self._attach_prefix_split(batch, attn_metadata)
         return attn_metadata, positions
+
+    # Small per-step index tables staged through pinned memory and sent up
+    # without a sync. One GPU buffer per table -- a fixed address, so a
+    # recorded graph that reads the table reads the step being served -- and
+    # a ring of pinned sources: a source is rewritten only after
+    # `_STAGING_SLOTS - 1` later uploads, by which time the copy that read it
+    # has long run; `query()` guards the rare case.
+    _STAGING_SLOTS = 4
+
+    def _staging(self, name: str, cap: int, dtype):
+        st = self.__dict__.setdefault("_staging_bufs", {})
+        if name not in st:
+            st[name] = {
+                "gpu": torch.zeros(cap, dtype=dtype, device=self.device),
+                "cpu": [torch.empty(cap, dtype=dtype, pin_memory=True) for _ in range(self._STAGING_SLOTS)],
+                "ev": [None] * self._STAGING_SLOTS,
+                "next": 0,
+            }
+        return st[name]
+
+    def _stage_upload(self, name: str, values: np.ndarray, cap: int, dtype):
+        ring = self._staging(name, cap, dtype)
+        i = ring["next"]
+        ring["next"] = (i + 1) % self._STAGING_SLOTS
+        cpu, gpu, ev = ring["cpu"][i], ring["gpu"], ring["ev"][i]
+        n = len(values)
+        if n > cpu.shape[0]:
+            return None
+        if ev is not None and not ev.query():
+            ev.synchronize()
+        cpu.numpy()[:n] = values
+        gpu[:n].copy_(cpu[:n], non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        ring["ev"][i] = ev
+        return gpu[:n]
+
+    def _staged_buffer(self, name: str, cap: int, dtype):
+        """The fixed GPU buffer behind a staged table (its whole capacity)."""
+        return self._staging(name, cap, dtype)["gpu"]
+
+    def _staged_i64(self, name: str, values: np.ndarray):
+        out = self._stage_upload(name, values, self.model_runner.max_bs + 1, torch.int64)
+        if out is None:
+            return torch.as_tensor(values, dtype=torch.int64, device=self.device)
+        return out
+
+    def _conv1d_metadata(self, query_start_loc, num_prefills: int):
+        """`compute_causal_conv1d_metadata` from the host copy of the query
+        prefix: the per-program (sequence, chunk) tables of the conv1d prefill
+        kernel, uploaded without a sync. The device-tensor version did a D2H
+        for the lengths and two pageable H2Ds, on every prefill step."""
+        BLOCK_M = 8
+        cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
+        lens = np.diff(cu).astype(np.int64)
+        nums = -(-lens // BLOCK_M)
+        tot = int(nums.sum())
+        cap = self.model_runner.max_num_batched_tokens // BLOCK_M + self.model_runner.max_bs + 1
+        mlist = np.repeat(np.arange(len(nums), dtype=np.int32), nums)
+        offsets = np.arange(tot, dtype=np.int32) - np.repeat(
+            (np.cumsum(nums) - nums).astype(np.int32), nums
+        )
+        programs_max = None
+        width = self._prefill_running_tokens
+        if width is not None and self._gdn_graph_prefill():
+            # a bucket-shaped grid: the tail of the batch table is pad slots,
+            # which the kernel skips, so the table is written to that width
+            programs_max = min(cap, width // BLOCK_M + envs.ATOM_GDN_GRAPH_MAX_SEQS)
+            if tot <= programs_max:
+                mlist = np.concatenate(
+                    (mlist, np.full(programs_max - tot, PAD_SLOT_ID, dtype=np.int32))
+                )
+                offsets = np.concatenate(
+                    (offsets, np.zeros(programs_max - tot, dtype=np.int32))
+                )
+            else:
+                programs_max = None
+        batch_ptr = self._stage_upload("conv1d_batch", mlist, cap, torch.int32)
+        offset_ptr = self._stage_upload("conv1d_offset", offsets, cap, torch.int32)
+        if batch_ptr is None or offset_ptr is None:
+            return compute_causal_conv1d_metadata(query_start_loc)
+        # The launcher's grid reads `tot` (or `programs_max`); with the
+        # pointers set it copies nothing.
+        nums_dict = {
+            BLOCK_M: {
+                "nums": torch.from_numpy(nums),
+                "tot": tot,
+                "mlist": torch.from_numpy(mlist[:tot]),
+                "mlist_len": tot,
+                "offsetlist": torch.from_numpy(offsets[:tot]),
+                "batch_ptr": batch_ptr,
+                "token_chunk_offset_ptr": offset_ptr,
+            }
+        }
+        if programs_max is not None:
+            nums_dict[BLOCK_M]["programs_max"] = programs_max
+        return nums_dict, batch_ptr, offset_ptr
+
+    # Chunk index tables for the GDN prefill kernels (`prepare_chunk_indices`:
+    # [(sequence, chunk-in-sequence)] per chunk, for the 16- and 64-token
+    # chunkings), built here from the host copy of the query prefix and sent
+    # up without a sync. Pinned staging, one GPU table per chunking.
+    _CHUNK_INDEX_SIZES = (16, 64)
+
+    def _prime_chunk_indices(self, query_start_loc, num_prefills: int) -> None:
+        from atom.model_ops.fla_ops.index import prepare_chunk_indices
+
+        cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
+        lens = np.diff(cu)
+        for chunk_size in self._CHUNK_INDEX_SIZES:
+            counts = -(-lens // chunk_size)
+            total = int(counts.sum())
+            flat = np.empty(2 * total, dtype=np.int64)
+            flat[0::2] = np.repeat(np.arange(len(lens)), counts)
+            flat[1::2] = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
+            cap = 2 * (self.model_runner.max_num_batched_tokens // chunk_size + self.model_runner.max_bs + 1)
+            gpu = self._stage_upload(f"chunk_idx_{chunk_size}", flat, cap, torch.int64)
+            if gpu is None:
+                return  # the kernels compute their own (with the sync)
+            prepare_chunk_indices.prime(gpu.view(total, 2), query_start_loc, chunk_size)
+
+    def _gdn_graph_prefill(self) -> bool:
+        return envs.ATOM_GDN_PREFILL_IN_GRAPH and not self.use_spec_decode_flydsl_prefill()
+
+    def use_spec_decode_flydsl_prefill(self) -> bool:
+        return False
+
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        """A prefill step the graphed GDN path cannot serve runs eagerly: one
+        that writes state checkpoints (their copies read the kernel's chunk
+        states, which the planned launch does not keep) or holds more prefill
+        requests than the plan's sequence capacity."""
+        if batch.total_tokens_num_prefill == 0 or not self._gdn_graph_prefill():
+            return False
+        if batch.total_seqs_num_prefill > envs.ATOM_GDN_GRAPH_MAX_SEQS:
+            return True
+        targets = self._checkpoint_targets(batch)
+        batch._gdn_checkpoint_targets = targets
+        return targets is not None
+
+    def _attach_gdn_plan(self, batch, attn_metadata, gdn_metadata, running_tokens) -> None:
+        """The `VarlenPlan` for this prefill's GDN kernels when the step runs
+        under the token graph; None keeps the eager path."""
+        gdn_metadata.varlen_plan = None
+        n = batch.total_seqs_num_prefill
+        n_max = envs.ATOM_GDN_GRAPH_MAX_SEQS
+        if (
+            not self._gdn_graph_prefill()
+            or gdn_metadata.ssm_checkpoints is not None
+            or n == 0
+            or n > n_max
+            or gdn_metadata.non_spec_state_indices_tensor is None
+        ):
+            return
+        from atom.model_ops.fla_ops.varlen_plan import VarlenPlan
+
+        runner = self.model_runner
+        cu = runner.forward_vars["cu_seqlens_q"].np[: n + 1]
+        lens = np.diff(cu).astype(np.int64)
+        c64 = -(-lens // 64)
+        c16 = -(-lens // 16)
+        nt64_max = running_tokens // 64 + n_max
+        nt16_max = running_tokens // 16 + n_max
+        cap64 = 2 * (runner.max_num_batched_tokens // 64 + runner.max_bs + 1)
+        cap16 = 2 * (runner.max_num_batched_tokens // 16 + runner.max_bs + 1)
+        if int(c64.sum()) > nt64_max or int(c16.sum()) > nt16_max:
+            return
+        # the tables `_prime_chunk_indices` staged this step, at their fixed addresses
+        ci64 = self._staged_buffer("chunk_idx_64", cap64, torch.int64)
+        ci16 = self._staged_buffer("chunk_idx_16", cap16, torch.int64)
+        offs = np.zeros(n_max + 1, dtype=np.int32)
+        offs[1 : n + 1] = np.cumsum(c64)
+        offs[n + 1 :] = offs[n]
+        counts = np.array([int(c64.sum()), int(c16.sum()), n], dtype=np.int32)
+        cached = attn_metadata.num_cached_tokens
+        has_h0 = np.zeros(n_max, dtype=np.int32)
+        if cached is not None:
+            has_h0[:n] = (np.asarray(batch.num_cached_tokens[:n]) > 0).astype(np.int32)
+        offs_t = self._stage_upload("gdn_chunk_offsets", offs, n_max + 1, torch.int32)
+        counts_t = self._stage_upload("gdn_counts", counts, 3, torch.int32)
+        flags_t = self._stage_upload("gdn_has_h0", has_h0, n_max, torch.int32)
+        flags_b = self._stage_upload("gdn_has_h0_bool", has_h0.astype(np.bool_), n_max, torch.bool)
+        if offs_t is None or counts_t is None or flags_t is None or flags_b is None:
+            return
+        gdn_metadata.varlen_plan = VarlenPlan(
+            chunk_indices_64=ci64.view(-1, 2)[:nt64_max],
+            nt64=counts_t[0:1],
+            nt64_max=nt64_max,
+            chunk_indices_16=ci16.view(-1, 2)[:nt16_max],
+            nt16=counts_t[1:2],
+            nt16_max=nt16_max,
+            chunk_offsets=offs_t,
+            num_seqs=counts_t[2:3],
+            n_max=n_max,
+            state_idx=self.non_spec_state_indices_tensor.gpu,
+            state_idx_in=self.non_spec_state_indices_in_tensor.gpu,
+            has_initial_state=flags_t,
+        )
+        # the conv1d kernel reads the same flags by sequence, from a fixed address
+        gdn_metadata.has_initial_state = flags_b[:n]
+
+    def _attach_prefix_split(self, batch: ScheduledBatch, attn_metadata) -> None:
+        """The split-KV layout for this step's prefix-cached prefill
+        (`attentions.prefix_split`), built on the host and staged up; None when
+        the step does not qualify or the switch is off."""
+        attn_metadata.prefix_split = None
+        if not attn_metadata.has_cached or not envs.ATOM_PREFIX_SPLIT_ATTN:
+            return
+        from types import SimpleNamespace
+
+        from atom.model_ops.attentions import prefix_split
+
+        n = batch.total_seqs_num_prefill
+        plan = prefix_split.build_plan(
+            batch.num_scheduled_tokens[:n], batch.context_lens[:n]
+        )
+        if plan is None:
+            return
+        runner = self.model_runner
+        cap_cu = runner.max_bs * (prefix_split.MAX_FULL_SLICES + 1) + 1
+        cap_rows = prefix_split.MAX_PARTIAL_ROWS + runner.max_num_batched_tokens
+        staged = {}
+        for name, cap in (
+            ("cu_q_a", cap_cu), ("cu_k_a", cap_cu), ("cu_q_b", cap_cu), ("cu_k_b", cap_cu),
+            ("q_rep", cap_rows), ("merge_rows", cap_rows),
+        ):
+            t = self._stage_upload(f"psplit_{name}", plan[name], cap, torch.int32)
+            if t is None:
+                return
+            staged[name] = t
+        attn_metadata.prefix_split = SimpleNamespace(
+            n_full=plan["n_full"], max_q=plan["max_q"], max_k_a=plan["max_k_a"], **staged
+        )
+
+    def _upload_prefill_mirrors(
+        self, scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
+    ):
+        width = self._token_graph_tokens
+        if width is None or width <= scheduled_tokens:
+            return super()._upload_prefill_mirrors(
+                scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens
+            )
+        # The per-row mirrors go up at the bucket's width. A pad row's KV slot
+        # is -1, which the cache writers skip; its position is 0 (the runner
+        # zeroes the device tail too, `_padded_inputs`).
+        var = self.model_runner.forward_vars
+        var["slot_mapping"].np[scheduled_tokens:width] = -1
+        var["positions"].np[scheduled_tokens:width] = 0
+        return super()._upload_prefill_mirrors(
+            scheduled_bs, running_bs, width, has_cached, cached_lens
+        )
+
+    def _build_mrope_prefill_positions(self, batch: ScheduledBatch):
+        width = self._token_graph_tokens
+        if width is None or not getattr(self.model_runner, "use_mrope", False):
+            return super()._build_mrope_prefill_positions(batch)
+        # The model reads MRoPE positions as a (3, running_tokens) view over
+        # the flat buffer (`_mrope_positions_view`), so a padded step has to
+        # be laid out at the bucket's width: the rows' stride is the width.
+        scheduled_tokens = batch.total_tokens_num_prefill
+        positions = self._mrope_cpu_view(width)
+        offset = 0
+        for req_id, seqlen, cached_seqlen in zip(
+            batch.req_ids, batch.context_lens, batch.num_cached_tokens
+        ):
+            num_tokens = int(seqlen) - int(cached_seqlen)
+            mrope_positions = batch.mrope_positions_by_req.get(req_id)
+            if mrope_positions is None:
+                positions[:, offset : offset + num_tokens] = np.arange(
+                    cached_seqlen, seqlen, dtype=np.int64
+                )[None, :]
+            else:
+                positions[:, offset : offset + num_tokens] = mrope_positions[
+                    :, cached_seqlen:seqlen
+                ]
+            offset += num_tokens
+        positions[:, scheduled_tokens:width] = 0
+        return self._copy_mrope_to_gpu(width)
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A prefill of ``tokens`` rows for recording that token-graph bucket
+        (`ModelRunner._record_tr_graphs`): one dummy prompt. With the GDN
+        layers recorded inline (`ATOM_GDN_PREFILL_IN_GRAPH`) it holds state
+        slot 0 and the dummy KV page so their kernels run for real; otherwise
+        it has no block table, its KV is written nowhere and the GDN layers
+        see no state (`gdn_metadata` None), the regions running live at every
+        replay on the step's own metadata."""
+        from types import SimpleNamespace
+
+        from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+
+        runner = self.model_runner
+        if not 0 < tokens <= runner.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket of {tokens} rows exceeds the "
+                f"{runner.max_num_batched_tokens}-row token buffers"
+            )
+        seq = Sequence([0] * tokens, block_size=runner.block_size, has_per_req_cache=True)
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.PREFILL
+        if self._gdn_graph_prefill():
+            # The GDN layers record inline on this prompt, so they run for real:
+            # state slot 0 and the dummy page, which no request holds at startup.
+            from atom.model_engine.sequence import new_block_table
+
+            seq.state_slots = [0]
+            seq.block_table = new_block_table([0] * (-(-tokens // runner.block_size)))
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=np.array([tokens], dtype=np.int32),
+            total_tokens_num=tokens,
+            total_tokens_num_prefill=tokens,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            is_dummy_run=True,
+        )
+        # What `prepare_model` publishes before `build`: the query prefix.
+        self.publish_cu_seqlens_q(batch, SimpleNamespace(running_bs=1))
+        attn_metadata, positions = self.prepare_prefill(batch, 1, tokens)
+        input_ids = runner.forward_vars["input_ids"].gpu[:tokens]
+        input_ids.zero_()
+        self.prepare_model_inputs(input_ids, attn_metadata)
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return attn_metadata, context
 
     def prepare_decode(  # type: ignore[override]
         self,
