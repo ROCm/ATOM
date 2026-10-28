@@ -43,6 +43,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     o: torch.Tensor | None = None,
     keep_intermediate_states: bool = False,
+    plan=None,
 ):
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
@@ -52,17 +53,28 @@ def chunk_gated_delta_rule_fwd(
         # chunk_local_cumsum + chunk_scaled_dot_kkt → fused_cumsum_kkt
         # solve_tril(BT=64) (full inverse) → solve_tril_16x16 (diag only)
         # recompute_w_u_fwd → fused_merge_recompute (cross-block inverse + w/u in SMEM)
-        g, A = fused_cumsum_kkt(g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens)
-        chunk_indices_16 = (
-            prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
+        g, A = fused_cumsum_kkt(
+            g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan
         )
-        NT_16 = len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
+        if plan is not None:
+            chunk_indices_16, NT_16, nt16_ptr = (
+                plan.chunk_indices_16, plan.nt16_max, plan.nt16
+            )
+        else:
+            chunk_indices_16 = (
+                prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
+            )
+            NT_16 = (
+                len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
+            )
+            nt16_ptr = None
         Ai16 = torch.empty(B, T, Hv, 16, device=A.device, dtype=torch.float32)
         solve_tril_16x16_kernel[(NT_16, B * Hv)](
             A=A,
             Ai=Ai16,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices_16,
+            nt_ptr=nt16_ptr,
             T=T,
             H=Hv,
             BT=64,
@@ -70,7 +82,7 @@ def chunk_gated_delta_rule_fwd(
             DOT_PRECISION="ieee",
         )
         w, u = fused_merge_recompute(
-            k, v, beta, g, A, Ai16, chunk_size=64, cu_seqlens=cu_seqlens
+            k, v, beta, g, A, Ai16, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan
         )
     else:
         g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
@@ -95,6 +107,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        plan=plan,
     )
     o = chunk_fwd_o(
         q=q,
@@ -105,6 +118,7 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         o=o,
+            plan=plan,
     )
     # `h` is the recurrent state at EVERY chunk boundary — [B, NT, H, K, V],
     # where h[:, j] is the state after j*chunk_size tokens. The SSM state cache
@@ -166,6 +180,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         o: torch.Tensor | None = None,
         keep_intermediate_states: bool = False,
+        plan=None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -186,6 +201,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             o=o,
             keep_intermediate_states=keep_intermediate_states,
+            plan=plan,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -218,6 +234,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     o: torch.Tensor | None = None,
     keep_intermediate_states: bool = False,
+    plan=None,
 ):
     r"""
     Args:
@@ -331,7 +348,11 @@ def chunk_gated_delta_rule(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+        if (
+            plan is None
+            and initial_state is not None
+            and initial_state.shape[0] != len(cu_seqlens) - 1
+        ):
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
@@ -368,6 +389,7 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel,
         o,
         keep_intermediate_states,
+        plan,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

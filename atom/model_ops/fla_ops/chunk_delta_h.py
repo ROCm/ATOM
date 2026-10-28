@@ -28,6 +28,8 @@ NUM_WARPS = [2, 4, 8, 16]
         "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "HAS_N": lambda args: args["n_ptr"] is not None,
+        "USE_STATE_IDX": lambda args: args["h0_idx"] is not None,
     }
 )
 @triton.autotune(
@@ -53,6 +55,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     ht,
     cu_seqlens,
     chunk_offsets,
+    n_ptr,
+    h0_idx,
+    ht_idx,
+    h0_flag,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -66,9 +72,15 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HAS_N: tl.constexpr,
+    USE_STATE_IDX: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
+    if IS_VARLEN and HAS_N:
+        # a bucket-shaped grid: programs past the step's sequence count have no work
+        if i_n >= tl.load(n_ptr):
+            return
     if IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -102,10 +114,20 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_h = H * K * V
     stride_k = Hg * K
     stride_w = H * K
-    if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * K * V
-    if STORE_FINAL_STATE:
-        ht = ht + i_nh * K * V
+    if USE_STATE_IDX:
+        # the state pool itself: this sequence's slots, and whether its
+        # initial state is to be read at all (a cold sequence starts at zero)
+        if USE_INITIAL_STATE:
+            h0 = h0 + (tl.load(h0_idx + i_n).to(tl.int64) * H + i_h) * K * V
+        if STORE_FINAL_STATE:
+            ht = ht + (tl.load(ht_idx + i_n).to(tl.int64) * H + i_h) * K * V
+        b_use_h0 = tl.load(h0_flag + i_n) != 0
+    else:
+        if USE_INITIAL_STATE:
+            h0 = h0 + i_nh * K * V
+        if STORE_FINAL_STATE:
+            ht = ht + i_nh * K * V
+        b_use_h0 = True
 
     # load initial state
     if USE_INITIAL_STATE:
@@ -113,7 +135,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         _p_h0_1_1 = (i_v * BV) + tl.arange(0, BV)
         b_h1 += tl.load(
             h0 + _p_h0_1_0[:, None] * (V) + _p_h0_1_1[None, :] * (1),
-            mask=(_p_h0_1_0[:, None] < (K)) & (_p_h0_1_1[None, :] < (V)),
+            mask=(_p_h0_1_0[:, None] < (K)) & (_p_h0_1_1[None, :] < (V)) & b_use_h0,
             other=0.0,
         ).to(tl.float32)
         if K > 64:
@@ -121,7 +143,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             _p_h0_2_1 = (i_v * BV) + tl.arange(0, BV)
             b_h2 += tl.load(
                 h0 + _p_h0_2_0[:, None] * (V) + _p_h0_2_1[None, :] * (1),
-                mask=(_p_h0_2_0[:, None] < (K)) & (_p_h0_2_1[None, :] < (V)),
+                mask=(_p_h0_2_0[:, None] < (K)) & (_p_h0_2_1[None, :] < (V)) & b_use_h0,
                 other=0.0,
             ).to(tl.float32)
         if K > 128:
@@ -129,7 +151,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             _p_h0_3_1 = (i_v * BV) + tl.arange(0, BV)
             b_h3 += tl.load(
                 h0 + _p_h0_3_0[:, None] * (V) + _p_h0_3_1[None, :] * (1),
-                mask=(_p_h0_3_0[:, None] < (K)) & (_p_h0_3_1[None, :] < (V)),
+                mask=(_p_h0_3_0[:, None] < (K)) & (_p_h0_3_1[None, :] < (V)) & b_use_h0,
                 other=0.0,
             ).to(tl.float32)
         if K > 192:
@@ -137,7 +159,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             _p_h0_4_1 = (i_v * BV) + tl.arange(0, BV)
             b_h4 += tl.load(
                 h0 + _p_h0_4_0[:, None] * (V) + _p_h0_4_1[None, :] * (1),
-                mask=(_p_h0_4_0[:, None] < (K)) & (_p_h0_4_1[None, :] < (V)),
+                mask=(_p_h0_4_0[:, None] < (K)) & (_p_h0_4_1[None, :] < (V)) & b_use_h0,
                 other=0.0,
             ).to(tl.float32)
 
@@ -363,33 +385,43 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    plan=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # This kernel is slightly different from fla to support Q/K with different head numbers.
-    # In fla, Q/K always have the same head number, so Hg is always equal to H.
+    """With ``plan`` (`varlen_plan.VarlenPlan`) ``initial_state`` is the
+    state pool: the kernel reads each sequence's initial state from its slot
+    and writes the final state back to its slot in place, so the returned
+    final state is None."""
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size
-
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
-    # N: the actual number of sequences in the batch with either equal or variable lengths
-    if cu_seqlens is None:
-        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
-    else:
-        N, NT, chunk_offsets = (
-            len(cu_seqlens) - 1,
-            len(chunk_indices),
-            prepare_chunk_offsets(cu_seqlens, BT),
+    n_ptr = h0_idx = ht_idx = h0_flag = None
+    if plan is not None:
+        N, NT, chunk_offsets = plan.n_max, plan.nt64_max, plan.chunk_offsets
+        n_ptr, h0_idx, ht_idx, h0_flag = (
+            plan.num_seqs, plan.state_idx_in, plan.state_idx, plan.has_initial_state
         )
+    else:
+        chunk_indices = (
+            prepare_chunk_indices(cu_seqlens, chunk_size)
+            if cu_seqlens is not None
+            else None
+        )
+        if cu_seqlens is None:
+            N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+        else:
+            N, NT, chunk_offsets = (
+                len(cu_seqlens) - 1,
+                len(chunk_indices),
+                prepare_chunk_offsets(cu_seqlens, BT),
+            )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
-
     h = k.new_empty(B, NT, H, K, V)
-    final_state = (
-        k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
-    )
+    if plan is not None:
+        final_state = initial_state if output_final_state else None
+    else:
+        final_state = (
+            k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+        )
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -408,6 +440,10 @@ def chunk_gated_delta_rule_fwd_h(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        n_ptr=n_ptr,
+        h0_idx=h0_idx,
+        ht_idx=ht_idx,
+        h0_flag=h0_flag,
         T=T,
         H=H,
         Hg=Hg,
@@ -415,4 +451,4 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
     )
-    return h, v_new, final_state
+    return h, v_new, (None if plan is not None else final_state)

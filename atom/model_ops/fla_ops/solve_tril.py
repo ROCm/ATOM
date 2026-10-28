@@ -26,7 +26,12 @@ assert (
 ), f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "HAS_NT": lambda args: args["nt_ptr"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -41,14 +46,19 @@ def solve_tril_16x16_kernel(
     Ai,
     cu_seqlens,
     chunk_indices,
+    nt_ptr,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    HAS_NT: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    if IS_VARLEN and HAS_NT:
+        if i_t >= tl.load(nt_ptr):
+            return
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = (

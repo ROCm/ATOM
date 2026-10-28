@@ -850,6 +850,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # single launch, which walks the whole context from a handful of
     # workgroups.
     "ATOM_PREFIX_SPLIT_ATTN": lambda: os.getenv("ATOM_PREFIX_SPLIT_ATTN", "1") == "1",
+    # The GDN layers of a prefill step recorded into its token graph (bucket-
+    # shaped kernel grids, state by slot; atom/model_ops/fla_ops/varlen_plan.py).
+    # A step that writes state checkpoints, or holds more prefill requests than
+    # ATOM_GDN_GRAPH_MAX_SEQS, runs eagerly as before. 0 keeps every GDN
+    # prefill eager.
+    "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1") == "1",
+    "ATOM_GDN_GRAPH_MAX_SEQS": lambda: int(os.getenv("ATOM_GDN_GRAPH_MAX_SEQS", "8")),
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1",

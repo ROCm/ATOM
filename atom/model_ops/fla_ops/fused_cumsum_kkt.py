@@ -14,7 +14,12 @@ def safe_exp(x):
     return tl.exp(tl.where(x <= 0, x, float("-inf")))
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "HAS_NT": lambda args: args["nt_ptr"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=4, num_stages=4),  # swept-best on MI308
@@ -30,14 +35,20 @@ def _fused_cumsum_kkt_kernel(
     A_ptr,
     cu_seqlens,
     chunk_indices,
+    nt_ptr,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HAS_NT: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    if IS_VARLEN and HAS_NT:
+        # a bucket-shaped grid: programs past the step's chunk count have no work
+        if i_t >= tl.load(nt_ptr):
+            return
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -106,9 +117,11 @@ def fused_cumsum_kkt(
     beta: torch.Tensor,
     chunk_size: int = 64,
     cu_seqlens: Optional[torch.Tensor] = None,
+    plan=None,
 ):
     """
-    Fused cumsum + KKT.
+    Fused cumsum + KKT. ``plan`` (`varlen_plan.VarlenPlan`) launches the
+    bucket's grid and lets the kernel read the step's chunk count.
 
     Args:
         g: [B, T, H]
@@ -122,7 +135,10 @@ def fused_cumsum_kkt(
     B, T, H = g.shape
     Hg, K = k.shape[2], k.shape[3]
 
-    if cu_seqlens is not None:
+    nt_ptr = None
+    if plan is not None:
+        chunk_indices, NT, nt_ptr = plan.chunk_indices_64, plan.nt64_max, plan.nt64
+    elif cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
         NT = len(chunk_indices)
     else:
@@ -140,6 +156,7 @@ def fused_cumsum_kkt(
         A,
         cu_seqlens,
         chunk_indices,
+        nt_ptr,
         T,
         H,
         Hg,

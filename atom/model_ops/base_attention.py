@@ -988,12 +988,27 @@ def linear_attention_with_output_base_fake(
     return torch.empty_like(core_attn_out)
 
 
+def _gdn_records_inline(*args, **kwargs) -> bool:
+    """A prefill whose GDN metadata carries a `VarlenPlan`: the GDN kernels
+    launch bucket-shaped grids and read the step from fixed addresses, so the
+    region records into the token graph instead of breaking it."""
+    fwd_ctx = get_forward_context()
+    context = getattr(fwd_ctx, "context", None)
+    md = getattr(getattr(fwd_ctx, "attn_metadata", None), "gdn_metadata", None)
+    return (
+        context is not None
+        and context.is_prefill
+        and md is not None
+        and getattr(md, "varlen_plan", None) is not None
+    )
+
+
 @mark_spliting_op(
     is_custom=True,
     gen_fake=linear_attention_with_output_base_fake,
     mutates_args=[],
 )
-@eager_region()
+@eager_region(unless=_gdn_records_inline)
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,

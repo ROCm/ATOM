@@ -23,6 +23,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     {
         "USE_G": lambda args: args["g"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "HAS_NT": lambda args: args["nt_ptr"] is not None,
     }
 )
 @triton.autotune(
@@ -45,6 +46,7 @@ def chunk_fwd_kernel_o(
     o,
     cu_seqlens,
     chunk_indices,
+    nt_ptr,
     scale,
     T,
     H: tl.constexpr,
@@ -56,11 +58,15 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HAS_NT: tl.constexpr,
     HEAD_MAJOR_VK: tl.constexpr = False,
     USE_EXP2: tl.constexpr = False,
 ):
     T_FLAT = T
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if IS_VARLEN and HAS_NT:
+        if i_t >= tl.load(nt_ptr):
+            return
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -182,6 +188,7 @@ def chunk_fwd_o(
     *,
     head_major_vk: bool = False,
     chunk_indices: torch.Tensor | None = None,
+    plan=None,
 ) -> torch.Tensor:
     """Returns the attention output tensor.
 
@@ -200,9 +207,13 @@ def chunk_fwd_o(
         if B != 1:
             raise ValueError("head-major VK output currently requires B=1")
         BT = chunk_size
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    nt_ptr = None
+    if plan is not None:
+        chunk_indices, NT, nt_ptr = plan.chunk_indices_64, plan.nt64_max, plan.nt64
+    else:
+        if chunk_indices is None and cu_seqlens is not None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
@@ -237,6 +248,7 @@ def chunk_fwd_o(
         o,
         cu_seqlens,
         chunk_indices,
+        nt_ptr,
         scale,
         T=T,
         H=H,
