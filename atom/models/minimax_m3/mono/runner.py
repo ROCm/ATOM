@@ -5,8 +5,11 @@ verify's q tokens of a request count as q, see ``token_rows``).
 
 Each dense layer 0..2 is three launches: K1 built dense (``dense_pre``: q, the
 K / V insert), its original attention kernel, then ``dense_post`` (o_proj
-through the MLP, both all-reduces in-kernel -> (ar, h_mid)). Every sparse MoE
-layer is one launch of K4 with the layer's K1 fused in front of its stages::
+through the MLP, both all-reduces in-kernel -> (ar, h_mid)). A model whose
+prefix layers are sparse-attention instead (M3.1) has no kernels for them and
+runs them on the original modules (``dense_prefix_mono``, ``run_dense``), mono
+taking over at the first MoE layer. Every sparse MoE layer is one launch of K4
+with the layer's K1 fused in front of its stages::
 
     K1 part        (ar, res) -> h, q; K / V / index cache insert; indexer scores
     K4 part        top-k, attention .. FFN, both all-reduces in-kernel
@@ -69,6 +72,7 @@ from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_l
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
+from atom.mono.runtime.aux_taps import bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import (
     DIAG_BYTES,
@@ -121,6 +125,21 @@ def token_rows(fwd, n: int) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
+def dense_prefix_mono(layers) -> bool:
+    """Whether layers 0..N_DENSE-1 run on the fused dense kernels.
+
+    The prefix never runs on the MoE kernels, so its FFN has to be the dense
+    MLP. M3's prefix is dense full-attention and takes ``dense_pre`` /
+    ``dense_post``; M3.1's is sparse attention + indexer, which only the
+    original modules serve (``run_dense``)."""
+    if len(layers) <= N_DENSE or any(layers[i].is_moe_layer for i in range(N_DENSE)):
+        raise MonoUnsupported(f"layers 0..{N_DENSE - 1} must be dense-MLP layers")
+    return not any(
+        getattr(layers[i].self_attn, "is_indexed_sparse_attention", False)
+        for i in range(N_DENSE)
+    )
+
+
 class MonoDecodeRunner:
     """Owns the per-layer weight views, scratch, peer buffers and compiled kernels.
 
@@ -128,14 +147,14 @@ class MonoDecodeRunner:
     shard, then all agree (``consensus.bind_agreed``) before the peer handshake, so a rank that
     refuses turns mono off on every rank instead of leaving the others waiting."""
 
-    def __init__(self, causal_lm) -> None:
+    def __init__(self, causal_lm, drafter=None, require_aux: bool = False) -> None:
         group = get_tp_group().cpu_group
-        bind_agreed(lambda: self._bind(causal_lm), group)
+        bind_agreed(lambda: self._bind(causal_lm, drafter, require_aux), group)
         self._allocate(group)
         # per decode batch size (every graph captures its own) a sparse layer
-        # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and
-        # the dense layers' (``self.k4[n]["dense_pre0" | "dense_pre" |
-        # "dense_post"]``), built and compiled on its first step (``prepare``)
+        # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and,
+        # with a mono dense prefix, the dense layers' (``self.k4[n]["dense_pre0"
+        # | "dense_pre" | "dense_post"]``), built and compiled on its first step
         self.k4 = WidthBuilds(
             self._build_layer_kernels, self._layer_kernels, group, "MiniMax-M3 mono"
         )
@@ -145,9 +164,10 @@ class MonoDecodeRunner:
             index_topk: self._build_k4(n, index_topk=index_topk)
             for index_topk in {lw.index_topk for lw in self.sparse}
         }
-        kernels["dense_pre0"] = self._build_dense_pre(n, plain_norm=True)
-        kernels["dense_pre"] = self._build_dense_pre(n)
-        kernels["dense_post"] = self._build_dense_post(n)
+        if self.dense_mono:
+            kernels["dense_pre0"] = self._build_dense_pre(n, plain_norm=True)
+            kernels["dense_pre"] = self._build_dense_pre(n)
+            kernels["dense_post"] = self._build_dense_post(n)
         return kernels
 
     @staticmethod
@@ -157,7 +177,7 @@ class MonoDecodeRunner:
             (launch, _KERNEL_ABI.get(kind, K4_ABI)) for kind, launch in kernels.items()
         ]
 
-    def _bind(self, causal_lm) -> None:
+    def _bind(self, causal_lm, drafter, require_aux: bool) -> None:
         """This rank's checks and weight views; raises ``MonoUnsupported``."""
         model = causal_lm.model
         config = causal_lm.config
@@ -165,12 +185,10 @@ class MonoDecodeRunner:
         if npes != TP:
             raise MonoUnsupported(f"TP {npes}")
         layers = model.layers
-        if len(layers) <= N_DENSE or any(
-            getattr(layers[i].self_attn, "is_indexed_sparse_attention", False)
-            or layers[i].is_moe_layer
-            for i in range(N_DENSE)
-        ):
-            raise MonoUnsupported("layers 0..2 must be dense full-attention layers")
+        self.dense_mono = dense_prefix_mono(layers)
+        if require_aux and drafter is None:
+            raise MonoUnsupported("no DSpark drafter")
+        self.aux = bind_aux_taps(drafter, config.hidden_size) if require_aux else None
         self.model = model
         self.npes = npes
         self.rank = get_tensor_model_parallel_rank()
@@ -188,7 +206,11 @@ class MonoDecodeRunner:
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
             raise MonoUnsupported("the first sparse layer reuses a selection")
-        self.dense = [DenseLayer.from_layer(layers[i], i) for i in range(N_DENSE)]
+        self.dense = (
+            [DenseLayer.from_layer(layers[i], i) for i in range(N_DENSE)]
+            if self.dense_mono
+            else []
+        )
         for d in self.dense:
             # the decode dispatch reads what the original rope_cache step sets on
             # the impl; mono skips that step (a decode can precede every prefill:
@@ -199,7 +221,7 @@ class MonoDecodeRunner:
                 or d.attn_impl.head_dim != 128
             )
         swiglu = {(d.swiglu_alpha, d.swiglu_beta, d.swiglu_limit) for d in self.dense}
-        if len(swiglu) != 1:
+        if self.dense_mono and len(swiglu) != 1:
             raise MonoUnsupported(f"dense layers' swiglu parameters {swiglu}")
         impl = self.sparse[0].attn_impl
         experts = layers[N_DENSE].block_sparse_moe.experts
@@ -246,22 +268,23 @@ class MonoDecodeRunner:
             debug=self.debug,
         )
         # a dense layer's kernels around its original attention
-        self._build_dense_pre = functools.partial(
-            build_pre_attn_kernel,
-            eps,
-            self.sm_scale,
-            impl.init_blocks,
-            impl.local_blocks,
-            dense=True,
-        )
-        self._build_dense_post = functools.partial(
-            build_dense_post_kernel,
-            npes,
-            eps,
-            *swiglu.pop(),
-            debug=self.debug,
-            index_heads=heads.count,
-        )
+        if self.dense_mono:
+            self._build_dense_pre = functools.partial(
+                build_pre_attn_kernel,
+                eps,
+                self.sm_scale,
+                impl.init_blocks,
+                impl.local_blocks,
+                dense=True,
+            )
+            self._build_dense_post = functools.partial(
+                build_dense_post_kernel,
+                npes,
+                eps,
+                *swiglu.pop(),
+                debug=self.debug,
+                index_heads=heads.count,
+            )
 
     def _allocate(self, group) -> None:
         """Scratch, the peer handshake and the activation buffers (every rank)."""
@@ -327,10 +350,15 @@ class MonoDecodeRunner:
         aux: list[torch.Tensor] = []
         self.mailboxes.begin_step()
         fwd = get_forward_context()
-        res = self.run_dense_mono(input_ids, positions, fwd, aux_layers, aux)
+        res = (
+            self.run_dense_mono(input_ids, positions, fwd, aux_layers, aux)
+            if self.dense_mono
+            else self.run_dense(input_ids, positions, aux_layers, aux)
+        )
         rows = token_rows(fwd, res.shape[0])
         for i, lw in enumerate(self.sparse):
             res = self.run_sparse_layer(i, lw, fwd, positions, res, rows)
+            self._write_aux(lw.layer_id - 1, self.h[: res.shape[0]])
             if lw.layer_id in aux_layers:
                 aux.append(self.h[: res.shape[0]].clone())
         hidden = self.finish_step(res)
@@ -418,9 +446,9 @@ class MonoDecodeRunner:
         aux_layers: tuple[int, ...] = (),
         aux: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Embedding and the dense layers on the original modules; leaves the first
+        """Embedding and the prefix layers on the original modules; leaves the first
         sparse layer's (ar, res) in ``self.ars[0][:S]`` and the returned residual.
-        Appends the aux hidden state of the dense ones among ``aux_layers``."""
+        Appends the aux hidden state of the prefix ones among ``aux_layers``."""
         n = input_ids.numel()
         hidden = self.model.get_input_embeddings(input_ids)
         residual = None
@@ -478,10 +506,18 @@ class MonoDecodeRunner:
         """The final norm (the mailboxes are cleared at the next step's start:
         ``StepMailboxes.begin_step``)."""
         ar = self.ars[len(self.sparse) % 2]
-        hidden, _ = self.model.norm(ar[: res.shape[0]], res)
+        hidden, residual = self.model.norm(ar[: res.shape[0]], res)
+        self._write_aux(self.sparse[-1].layer_id, residual)
         if self.debug and not torch.cuda.is_current_stream_capturing():
             self.raise_on_given_up_waits(res.shape[0])
         return hidden
+
+    def _write_aux(self, layer_id: int, value: torch.Tensor) -> None:
+        if self.aux is None or layer_id not in self.aux.layer_ids:
+            return
+        self.aux.buffers[self.aux.layer_ids.index(layer_id)][: value.shape[0]].copy_(
+            value
+        )
 
     def raise_on_given_up_waits(self, n: int) -> None:
         """A debug build's step: raise with every mailbox wait that gave up (its

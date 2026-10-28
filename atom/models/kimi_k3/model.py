@@ -56,6 +56,7 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.triton_fused_sigmoid_mul_quant import fused_sigmoid_mul_maybe_quant
 from atom.model_ops.utils import atom_parameter
+from atom.models.deepseek_v2 import Indexer
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -139,6 +140,44 @@ def _kda_packed_modules_mapping(
     return mapping
 
 
+def _kimi_packed_modules_mapping(config) -> dict[str, tuple[str, int]]:
+    mapping = _kda_packed_modules_mapping(config.kimi_kda_layers)
+    for layer_idx in getattr(config, "dsa_layer_indices", ()):
+        prefix = f".layers.{layer_idx}.self_attn."
+        mapping[f"{prefix}indexer.wk"] = (f"{prefix}fused_qkv_a_proj", 2)
+        mapping[f"{prefix}indexer.weights_proj"] = (f"{prefix}fused_qkv_a_proj", 3)
+    return mapping
+
+
+class K3FusedIndexerProjection(MergedReplicatedLinear):
+    """Pack four original BF16 projections and require all four checkpoint slices."""
+
+    def __init__(self, *args, require_checkpoint_shards: bool = True, **kwargs):
+        self._checkpoint_shards: set[int] = set()
+        self._require_checkpoint_shards = require_checkpoint_shards
+        super().__init__(*args, **kwargs)
+        if len(self.output_sizes) != 4:
+            raise ValueError(
+                "Fused indexer projection requires q_a, kv_a, wk and weights_proj"
+            )
+
+    def weight_loader(self, param, loaded_weight, loaded_shard_id=None):
+        if param is not self.weight or loaded_shard_id not in (0, 1, 2, 3):
+            raise ValueError("Unexpected fused indexer projection checkpoint slice")
+        if loaded_weight.dtype != torch.bfloat16 or param.dtype != torch.bfloat16:
+            raise ValueError("Fused indexer projection requires original BF16 weights")
+        super().weight_loader(param, loaded_weight, loaded_shard_id)
+        self._checkpoint_shards.add(loaded_shard_id)
+
+    def process_weights_after_loading(self):
+        if self._require_checkpoint_shards and self._checkpoint_shards != {0, 1, 2, 3}:
+            raise RuntimeError(
+                "Incomplete fused indexer projection: missing checkpoint slices "
+                f"{sorted({0, 1, 2, 3} - self._checkpoint_shards)}"
+            )
+        super().process_weights_after_loading()
+
+
 def _extract_layer_idx(prefix: str) -> int:
     for part in reversed(prefix.split(".")):
         if part.isdigit():
@@ -211,9 +250,10 @@ class KimiRMSNormGated(nn.Module):
         eps: float,
         quant_type: QuantType | None = None,
         quant_dtype: torch.dtype | None = None,
+        weight_dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        self.weight = atom_parameter(torch.ones(hidden_size))
+        self.weight = atom_parameter(torch.ones(hidden_size, dtype=weight_dtype))
         self.variance_epsilon = eps
         # When ``quant_type`` names a fusable per-token scheme, the per-head
         # sigmoid-gated norm also emits (quantized, scale) so the consuming
@@ -333,7 +373,7 @@ class KimiSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.gate.e_score_correction_bias = atom_parameter(
-            torch.empty(config.num_experts, dtype=torch.bfloat16)
+            torch.empty(config.num_experts, dtype=torch.float32)
         )
         self.experts = FusedMoE(
             num_experts=config.num_experts,
@@ -368,19 +408,6 @@ class KimiSparseMoeBlock(nn.Module):
             self.shared_experts = None
 
         if self.use_latent_moe:
-
-            def _routed_source_quant_dtype(layer_prefix: str) -> torch.dtype | None:
-                if quant_config is None:
-                    return None
-                layer_quant_config = quant_config.get_layer_quant_config(layer_prefix)
-                if (
-                    layer_quant_config.quant_type == QuantType.per_1x32
-                    and layer_quant_config.quant_dtype
-                    == getattr(torch, "float4_e2m1fn_x2", None)
-                ):
-                    return torch.bfloat16
-                return None
-
             down_proj_prefix = f"{prefix}.routed_expert_down_proj"
             up_proj_prefix = f"{prefix}.routed_expert_up_proj"
             self.routed_expert_down_proj = ReplicatedLinear(
@@ -388,7 +415,6 @@ class KimiSparseMoeBlock(nn.Module):
                 self.moe_hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                source_quant_dtype=_routed_source_quant_dtype(down_proj_prefix),
                 prefix=down_proj_prefix,
             )
             self.routed_expert_up_proj = ReplicatedLinear(
@@ -396,7 +422,6 @@ class KimiSparseMoeBlock(nn.Module):
                 config.hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                source_quant_dtype=_routed_source_quant_dtype(up_proj_prefix),
                 prefix=up_proj_prefix,
             )
             up_proj_quant_type, up_proj_quant_dtype = _effective_layer_quant(
@@ -719,14 +744,47 @@ class KimiFullAttention(nn.Module):
         self.scaling = self.q_head_dim**-0.5
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_local_heads = self.num_heads // self.tp_size
+        self.layer_num = _extract_layer_idx(prefix)
+        # A DSA layer's indexer key and head-weight projections ride in its
+        # fused q_a/kv_a projection.
+        has_indexer = self.layer_num in getattr(config, "dsa_layer_indices", ())
 
-        self.fused_qkv_a_proj = MergedReplicatedLinear(
-            self.hidden_size,
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fused_qkv_a_proj",
-        )
+        projection_sizes = [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+        self.projection_split_sizes = [
+            self.q_lora_rank,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+        ]
+        if has_indexer:
+            for name in ("fused_qkv_a_proj", "indexer.wk", "indexer.weights_proj"):
+                if (
+                    _effective_layer_quant(quant_config, f"{prefix}.{name}")[0]
+                    != QuantType.No
+                ):
+                    raise ValueError(
+                        "Indexer projection fusion requires unquantized BF16 "
+                        "projections"
+                    )
+            projection_sizes += [config.index_head_dim, config.index_n_heads]
+            self.projection_split_sizes += [config.index_head_dim, config.index_n_heads]
+            self.fused_qkv_a_proj = K3FusedIndexerProjection(
+                self.hidden_size,
+                projection_sizes,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.fused_qkv_a_proj",
+                require_checkpoint_shards=not bool(
+                    getattr(atom_config, "load_dummy", None)
+                ),
+            )
+        else:
+            self.fused_qkv_a_proj = MergedReplicatedLinear(
+                self.hidden_size,
+                projection_sizes,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_qkv_a_proj",
+            )
         self.q_a_layernorm = RMSNorm(
             self.q_lora_rank, eps=1e-6, prefix=f"{prefix}.q_a_layernorm"
         )
@@ -777,6 +835,20 @@ class KimiFullAttention(nn.Module):
             max_position_embeddings=rope_max_position,
             base=rope_theta,
         )
+        self.indexer = (
+            Indexer(
+                atom_config,
+                config,
+                self.hidden_size,
+                self.q_lora_rank,
+                quant_config,
+                atom_config.index_cache_dtype,
+                prefix=f"{prefix}.indexer",
+                external_k_weights=True,
+            )
+            if has_indexer
+            else None
+        )
         mla_modules = MLAModules(
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -788,11 +860,10 @@ class KimiFullAttention(nn.Module):
             q_proj=self.q_b_proj,
             kv_b_proj=self.kv_b_proj,
             o_proj=nn.Identity(),
-            indexer=None,
-            is_sparse=False,
-            topk_tokens=None,
+            indexer=self.indexer,
+            is_sparse=self.indexer is not None,
+            topk_tokens=config.index_topk if self.indexer is not None else None,
         )
-        self.layer_num = _extract_layer_idx(prefix)
         self.attn = Attention(
             self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -852,11 +923,12 @@ class KimiFullAttention(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
 
-        q_c, kv_c, k_rope = torch.split(
+        projected = torch.split(
             self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
+            self.projection_split_sizes,
             dim=-1,
         )
+        q_c, kv_c, k_rope = projected[:3]
         q_shuffle = False
         q_scale_shuffle_padding = False
         if self.qknorm_dtype == dtypes.fp4x2:
@@ -883,10 +955,20 @@ class KimiFullAttention(nn.Module):
             output_unquantized_inp1=False,
             transpose_scale=True,
         )
+        if self.indexer is not None:
+            # Projection weights retain checkpoint precision; the indexer owns
+            # the FP8 MQA/cache representation.
+            self.indexer(
+                hidden_states,
+                q,
+                q_scale,
+                positions,
+                projected_k_weights=(projected[3], projected[4]),
+            )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
         gate = self.g_proj(hidden_states, hidden_states_scale)
-        # sigmoid(gate) * attn_out, fused with fp8 quant when o_proj runs fp8
-        # (per-token ptpc_fp8 or per-1x128 block).
+        # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
+        # runs FP8, the same helper also folds in its activation quantization.
         attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
             attn_out,
             gate,
@@ -966,6 +1048,9 @@ class KimiKDAAttention(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.linear_num_key_heads
+        # The recurrence controls, short convolutions and output norm are small
+        # and run in FP32, whatever the large projections are stored in.
+        control_dtype = torch.float32
         self.head_dim = config.linear_key_head_dim
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -1035,10 +1120,14 @@ class KimiKDAAttention(nn.Module):
             prefix=f"{prefix}.v_conv1d",
         )
         for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d):
-            conv.weight.data = conv.weight.data.unsqueeze(1)
+            conv.weight.data = conv.weight.data.unsqueeze(1).to(control_dtype)
 
-        self.A_log = atom_parameter(torch.empty(self.num_local_heads))
-        self.dt_bias = atom_parameter(torch.empty(self.local_proj_size))
+        self.A_log = atom_parameter(
+            torch.empty(self.num_local_heads, dtype=control_dtype)
+        )
+        self.dt_bias = atom_parameter(
+            torch.empty(self.local_proj_size, dtype=control_dtype)
+        )
         # Lower bound of the KDA forget gate (Kimi uses -5.0). Consumed by both
         # the fla prefill path (_run_kda) and the fused decode kernel.
         self._kda_gate_lower_bound = (
@@ -1068,6 +1157,7 @@ class KimiKDAAttention(nn.Module):
             eps=config.rms_norm_eps,
             quant_type=o_type,
             quant_dtype=o_dtype,
+            weight_dtype=control_dtype,
         )
         self.o_proj = RowParallelLinear(
             self.proj_size,
@@ -1864,9 +1954,7 @@ class KimiLinearForCausalLM(nn.Module):
         _normalize_kimi_config(config)
         self.config = config
         self.quant_config = atom_config.quant_config
-        self.packed_modules_mapping = _kda_packed_modules_mapping(
-            config.kimi_kda_layers
-        )
+        self.packed_modules_mapping = _kimi_packed_modules_mapping(config)
         self.model = KimiLinearModel(atom_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1932,9 +2020,7 @@ class KimiK3ForCausalLM(nn.Module):
             _normalize_kimi_config(root_config)
         self.config = _text_config(root_config)
         self.quant_config = atom_config.quant_config
-        self.packed_modules_mapping = _kda_packed_modules_mapping(
-            self.config.kimi_kda_layers
-        )
+        self.packed_modules_mapping = _kimi_packed_modules_mapping(self.config)
         if rebuilt_quant_config:
             self.quant_config.remap_layer_name(
                 self.config,
