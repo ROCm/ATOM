@@ -24,11 +24,15 @@ from atom.models.glm52.mono.kernels.geometry_config import (
 from atom.mono.plan.shard import ShardError, shard_refusal
 
 
-def test_tp4_is_the_supported_shard():
-    assert SUPPORTED_TP == (4,)
+def test_tp4_and_tp8_are_the_supported_shards():
+    assert SUPPORTED_TP == (4, 8)
     dims = Dims(4)
     assert dims.local_heads == 16  # 64 attention heads / 4
     assert dims.inter == 512  # moe_intermediate_size 2048 / 4
+    dims = Dims(8)
+    assert dims.local_heads == GLM5_CONFIG.local_heads == 8
+    assert dims.inter == GLM5_CONFIG.inter == 256
+    assert glm5_tp_config(8) == GLM5_CONFIG
 
 
 @pytest.mark.parametrize("tp", [3, 5, 7])

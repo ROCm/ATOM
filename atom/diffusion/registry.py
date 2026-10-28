@@ -5,7 +5,8 @@
 
 The LLM side resolves a checkpoint to an implementation by looking up
 ``hf_config.architectures[0]`` in a dict of dotted paths
-(``model_runner.support_model_arch_dict``, ``multimodal._MULTIMODAL_ARCH_TO_MODEL``).
+(``models.registry.support_model_arch_dict``,
+``multimodal._MULTIMODAL_ARCH_TO_MODEL``).
 Diffusion checkpoints carry the same information under a different key:
 ``model_index.json`` names the pipeline that produced them in ``_class_name``.
 
