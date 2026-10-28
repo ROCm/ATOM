@@ -490,12 +490,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
     # DeepSeek-V4 prefill indexer under plain TP: each TP rank scores and
-    # top-ks only its slice of the query rows (each against the full key set)
-    # and the [rows, topk] results are all-gathered back over TP. The indexer is
+    # top-ks only every TP-th query row (each against the full key set) and the
+    # [rows, topk] results are all-gathered back over TP. The indexer is
     # replicated across TP, so without this every rank repeats the same scoring.
-    # A prefill step under `QSPLIT_MIN_LOGITS` index logits (deepseek_v4_attn.py)
-    # stays whole. 0 restores the full per-rank scoring.
+    # 0 restores the full per-rank scoring. This and the bound below must be the
+    # same on every rank: a split step's ranks gather together.
     "ATOM_V4_INDEXER_QSPLIT": lambda: os.getenv("ATOM_V4_INDEXER_QSPLIT", "1") == "1",
+    # The fewest index logits -- the keys a prefill step's rows see in all -- at
+    # which ATOM_V4_INDEXER_QSPLIT splits the step. The split saves index
+    # scoring, which grows with them, and on FP4 the logits bands a rank no
+    # longer launches; it pays a per-layer top-k gather, which grows with the
+    # rows. The default is a compromise measured on one setup (TP8 MI355X, FP4
+    # index, prefix hits).
+    "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
+        os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
+    ),
     # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
     # group's query heads locally, as decode does, instead of AllGather Q. The
     # pynccl gather lands rank-major, so the dim=1 reshape after it also copies

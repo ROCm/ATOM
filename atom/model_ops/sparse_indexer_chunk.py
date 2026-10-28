@@ -122,19 +122,19 @@ def flat_view(flat, rows, width):
 def qsplit_rows(num_rows: int, rank: int, world_size: int) -> tuple[int, int, int, int]:
     """This rank's slot in the gathered buffer and the rows it scores into it.
 
-    When every rank holds the whole key set -- under DCP after all-gathering
-    the index cache, under plain TP because the indexer is replicated -- all
-    ``world_size`` of them scoring every row recompute the same top-k that many
-    times. Each rank scores ``[row_lo, row_hi)`` instead, against the full key
-    set, and the selections are all-gathered back.
+    Under DCP every rank already all-gathers the whole index cache, so having
+    all ``world_size`` of them score every row recomputes the same top-k that
+    many times. Each rank scores ``[row_lo, row_hi)`` instead, against the full
+    key set, and the selections are all-gathered back. (V4's plain-TP split
+    deals its rows round-robin instead: `RowSplit.striped`.)
 
     The stride is uniform -- ``ceil(num_rows / world_size)`` for every rank --
     so a rank-major concatenation of stride-sized buffers lands row ``i`` back
-    at row ``i``, with no index exchange. The price is that the last rank's
-    buffer has a tail of unwritten rows: the gathered payload is
+    at row ``i``, with no index exchange. The price is that the last ranks'
+    buffers have tails of unscored rows: the gathered payload is
     ``world_size * ceil(num_rows / world_size)`` rows, at most
-    ``world_size - 1`` more than ``num_rows``. That tail sits at gathered
-    indices ``>= num_rows`` and is never read back.
+    ``world_size - 1`` more than ``num_rows``. Those tails sit at gathered
+    indices ``>= num_rows`` and are never read back.
 
     ``slot_lo`` is where this rank's stride sits in the gathered buffer, and it
     is deliberately NOT clamped, while ``row_lo``/``row_hi`` -- the rows to
@@ -161,7 +161,6 @@ def indexer_qsplit_world(
     *,
     physical_tp: int,
     enabled: bool,
-    pynccl: bool,
     plugin: bool,
     gfx1250_opus: bool,
     dp_attention: bool,
@@ -174,19 +173,17 @@ def indexer_qsplit_world(
 
     The V4 indexer is replicated across TP, so every rank would score the
     same rows. The split needs every TP rank to hold the same rows, which DP
-    attention, PCP and DCP each break; TBO interleaves two ubatches whose
-    collectives are not ordered against this one. Simulated TP (`--fake-eplb`
-    on fewer devices) reports a width the device group does not have. The
-    gather runs on the TP group's pynccl communicator (see `_gather_split`).
-    gfx1250 OPUS scores through its own plans and plugin bridges build their
-    own rows. Within this width a prefill step still splits only from
-    `QSPLIT_MIN_LOGITS` index logits (the V4 builder's `_prefill_row_split`).
+    attention, PCP and DCP each break; a prefill TBO's ubatch rows do not
+    take it yet. Simulated TP (`--fake-eplb` on fewer devices) reports a
+    width the device group does not have. gfx1250 OPUS scores through its own
+    plans and plugin bridges build their own rows. Within this width a
+    prefill step still splits only from `ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS`
+    index logits (the V4 builder's `_prefill_row_split`).
     """
     if (
         not enabled
         or tp <= 1
         or physical_tp != tp
-        or not pynccl
         or plugin
         or gfx1250_opus
         or dp_attention

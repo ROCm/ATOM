@@ -130,7 +130,6 @@ from atom.model_ops.indexer import (
     fp4_rows,
     fp8_rows,
 )
-from atom.model_ops.indexer.score import split_gather_comm_on_every_rank
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace, indexer_qsplit_world
 from atom.model_ops.v4_kernels import (
     build_v4_paged_decode_indptr,
@@ -414,15 +413,6 @@ class DeepseekV4Backend(AttentionBackend):
         return DeepseekV4AttentionMetadataBuilder
 
 
-# The prefill indexer's TP row split saves index scoring, which grows with a
-# step's index logits -- each request's new rows times its committed keys --
-# and, on FP4, the launches of logits bands a rank no longer needs. It pays a
-# per-layer top-k gather, which grows with the rows and waits on the slowest
-# rank. A step of few logits stays whole; the bound is a compromise measured on
-# one setup (TP8 MI355X, FP4 index, prefix hits).
-QSPLIT_MIN_LOGITS = 1 << 26
-
-
 class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     """Per-request cache owner for V4's state-cache buffers.
 
@@ -565,6 +555,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._indexer_qsplit_world = self._indexer_qsplit_world_size(
             model_runner.config
         )
+        self._indexer_qsplit_min_logits = envs.ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS
         if self.indexer_layout == FP4_GFX1250_NATURAL:
             if self.max_bs > 2048:
                 raise ValueError(
@@ -2101,8 +2092,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ``cu_seqlens_q``, or a PCP rank's share (`pcp_owned_rows_by_request`).
         ``buf_prefix_ubatch`` selects a TBO ubatch's buffers.
         ``rows_per_request``, the scheduled requests' new rows on the host,
-        gates the split across TP (`_prefill_row_split`); PCP and TBO, which
-        never split, pass none.
+        gates the split across TP (`_prefill_row_split`); PCP's rows and a TBO
+        ubatch's, which never split, pass none.
         """
         if not self.csa_layers:
             return
@@ -2133,21 +2124,35 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         into a plane as wide as the batch's longest request (a prefill is
         eager, so its width may follow the batch). FP8 gathers the requests'
         keys end to end and scores each row densely over its request's run of
-        them (`ConcatKeys`).
+        them (`ConcatKeys`). Split across TP (`_prefill_row_split`), the rows
+        are this rank's alone, every `world`-th of them.
 
         Reads `n_committed_csa_per_seq_cpu` and `batch_id_per_q_token`, set by
         `_attach_v4_per_fwd_meta`, which MUST run first.
         """
         n_committed = attn_metadata.n_committed_csa_per_seq_cpu[:scheduled_bs]
-        visible_end = visible_csa(positions_gpu[:total_tokens]).to(torch.int32)
         split = self._prefill_row_split(total_tokens, rows_per_request, n_committed)
+        rows = (
+            slice(0, total_tokens)
+            if split is None
+            else slice(split.rank, total_tokens, split.world)
+        )
+        visible_end = visible_csa(positions_gpu[rows]).to(torch.int32)
+        batch_ids = attn_metadata.batch_id_per_q_token[rows]
         if self._indexer_fp4:
+            max_qlen = None
+            if split is not None:
+                query_start_loc, max_qlen = self._split_query_starts(
+                    rows_per_request, split, buf_prefix_ubatch
+                )
             return self._index_rows(
                 attn_metadata,
                 visible_end,
                 max(int(n_committed.max()), 1),
                 query_start_loc=query_start_loc,
                 split=split,
+                max_qlen=max_qlen,
+                row_to_batch=batch_ids,
             )
 
         cu_committed_cpu = np.concatenate(
@@ -2161,7 +2166,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         cu_committed = self._stage(
             f"{buf_prefix_ubatch}v4_indexer_cu_committed", cu_committed_cpu
         )
-        batch_ids = attn_metadata.batch_id_per_q_token[:total_tokens]
         keys = ConcatKeys(
             block_tables=attn_metadata.block_tables,
             cu_committed=cu_committed,
@@ -2178,49 +2182,74 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     ) -> RowSplit | None:
         """This TP rank's share of a prefill's index rows, or None unsplit.
 
-        A step splits from `QSPLIT_MIN_LOGITS` index logits: each request's
-        `rows_per_request` times its `n_committed` keys, both the scheduled
-        batch's host metadata, the same on every rank. PCP and TBO, which
-        `indexer_qsplit_world` already keeps whole, pass no rows."""
+        A step splits from `ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS` index logits,
+        the keys its rows see in all: a request's `rows_per_request` new rows
+        see up to its `n_committed` keys, one fewer every 4 rows back, so
+        n_committed - n/8 on average. Both are the scheduled batch's host
+        metadata, the same on every rank. PCP's rows and a TBO ubatch's pass
+        none; `indexer_qsplit_world` keeps both whole anyway."""
         if self._indexer_qsplit_world <= 1 or rows_per_request is None:
             return None
-        # int64: a step's logits reach 2^31 (16K rows of a 512K-token request).
-        logits = int(np.dot(rows_per_request.astype(np.int64), n_committed))
-        if logits < QSPLIT_MIN_LOGITS:
+        # int64: a step's logits pass int32 (16K rows of a 1M-token request).
+        n = rows_per_request.astype(np.int64)
+        logits = int(np.dot(n, n_committed) - np.dot(n, n) // 8)
+        if logits < self._indexer_qsplit_min_logits:
             return None
-        return RowSplit.of(
+        return RowSplit.striped(
             total_tokens,
             get_tp_group().rank_in_group,
             self._indexer_qsplit_world,
             group="tp",
         )
 
+    def _split_query_starts(
+        self, rows_per_request: np.ndarray, split: RowSplit, buf_prefix_ubatch: str
+    ) -> tuple[torch.Tensor, int]:
+        """FP4's grouping of a striped split's rows: this rank's rows of each
+        request (`pcp_owned_rows_by_request`), and the most any request has."""
+        cu = np.concatenate(([0], np.cumsum(rows_per_request)))
+        starts = pcp_owned_rows_by_request(cu, split.rank, split.world, split.end)
+        return (
+            self._stage(f"{buf_prefix_ubatch}v4_indexer_local_cu", starts),
+            max(int(np.diff(starts).max()), 1),
+        )
+
     def _indexer_qsplit_world_size(self, config) -> int:
-        """See `indexer_qsplit_world`; read once, its inputs are fixed per run."""
+        """See `indexer_qsplit_world`; read once, its inputs are fixed per run.
+        A run that splits warms the split's gather here (`_warm_split_gather`)."""
         tp = get_tensor_model_parallel_world_size()
         if tp <= 1:
             return 1
-        tp_group = get_tp_group()
+        world = indexer_qsplit_world(
+            tp,
+            physical_tp=torch.distributed.get_world_size(get_tp_group().device_group),
+            enabled=envs.ATOM_V4_INDEXER_QSPLIT,
+            plugin=is_plugin_mode(),
+            gfx1250_opus=self.indexer_layout == FP4_GFX1250_NATURAL,
+            dp_attention=bool(config.enable_dp_attention),
+            # A TBO run's prefill does not split: its ubatches' rows do not take
+            # the split yet.
+            tbo=bool(config.enable_tbo),
+            pcp=get_pcp_world_size(),
+            dcp=int(config.decode_context_parallel_size),
+        )
+        if world > 1:
+            self._warm_split_gather(world)
+        return world
 
-        def world(pynccl: bool) -> int:
-            return indexer_qsplit_world(
-                tp,
-                physical_tp=torch.distributed.get_world_size(tp_group.device_group),
-                enabled=envs.ATOM_V4_INDEXER_QSPLIT,
-                pynccl=pynccl,
-                plugin=is_plugin_mode(),
-                gfx1250_opus=self.indexer_layout == FP4_GFX1250_NATURAL,
-                dp_attention=bool(config.enable_dp_attention),
-                tbo=bool(config.enable_tbo or config.enable_tbo_decode),
-                pcp=get_pcp_world_size(),
-                dcp=int(config.decode_context_parallel_size),
-            )
-
-        # The rest of the gate is the same on every rank, so only a run that
-        # would split asks the ranks about pynccl (a collective).
-        if world(pynccl=True) == 1:
-            return 1
-        return world(pynccl=split_gather_comm_on_every_rank(tp_group))
+    def _warm_split_gather(self, world: int) -> None:
+        """Gather once on the TP group's ProcessGroup before the memory
+        profile. Warmup's sampled-id broadcast would build its communicator
+        anyway, but RCCL also allocates on its first all-gather (hundreds of
+        MiB a GPU at TP 8): taken here it is counted, not left to the first
+        split prefill, past the KV budget."""
+        group = get_tp_group()
+        probe = torch.zeros(world, dtype=torch.int32, device=self.device)
+        torch.distributed.all_gather_into_tensor(
+            probe,
+            probe[group.rank_in_group : group.rank_in_group + 1],
+            group=group.device_group,
+        )
 
     def _index_rows(
         self,
@@ -2231,9 +2260,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         query_start_loc: torch.Tensor | None = None,
         recorded_as: str | None = None,
         split: RowSplit | None = None,
+        max_qlen: int | None = None,
+        row_to_batch: torch.Tensor | None = None,
     ) -> IndexRows:
         """Paged index rows: FP8 each row against its own `row_tables` row, FP4
-        a request's rows together, grouped by `query_start_loc`. Rows a graph
+        a request's rows together, grouped by `query_start_loc`, at most
+        `max_qlen` (the step's `max_seqlen_q` by default), each row's request
+        `row_to_batch` (the step's `batch_id_per_q_token`). Rows a graph
         records name the ubatch prefix they are `recorded_as`, whose launch
         arguments then keep fixed homes (`Fp4LaunchStorage`). `split`: a
         prefill's rows this TP rank scores (FP4 only; FP8 prefill rows are
@@ -2243,8 +2276,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return fp8_rows(row_ends, width, self.index_logits_workspace, row_tables)
         storage = None if recorded_as is None else self._fp4_launches[recorded_as]
         sequences = Fp4MqaRaggedMetadata(
-            query_start_loc, attn_metadata.max_seqlen_q, attn_metadata.block_tables
+            query_start_loc,
+            attn_metadata.max_seqlen_q if max_qlen is None else max_qlen,
+            attn_metadata.block_tables,
         )
+        if row_to_batch is None:
+            row_to_batch = attn_metadata.batch_id_per_q_token[: row_ends.shape[0]]
         return fp4_rows(
             row_ends,
             width,
@@ -2255,7 +2292,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             layout=(
                 NATURAL if self.indexer_layout == FP4_GFX1250_NATURAL else PRESHUFFLE
             ),
-            row_to_batch=attn_metadata.batch_id_per_q_token[: row_ends.shape[0]],
+            row_to_batch=row_to_batch,
             split=split,
             storage=storage,
         )
@@ -4324,8 +4361,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         }
         buffers = {f"{prefix}v4_indexer_cu_committed": CpuGpuBuffer(bs + 1, **i32)}
         if self._indexer_fp4:
-            # A PCP rank's own rows grouped by request: every request, one PCP
-            # dummy request, and the leading zero.
+            # A PCP or TP-split rank's own rows grouped by request: every
+            # request, one PCP dummy request, and the leading zero.
             buffers[f"{prefix}v4_indexer_local_cu"] = CpuGpuBuffer(bs + 2, **i32)
         return buffers
 

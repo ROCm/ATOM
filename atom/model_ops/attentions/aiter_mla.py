@@ -480,15 +480,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
-        if self._publishes_dcp_local_lens:
-            # Imported here, not at the top: the GLM builder tests stub
-            # `atom.model_ops.indexer` without its `score` submodule.
-            from atom.distributed.dcp_utils import get_dcp_group
-            from atom.model_ops.indexer.score import split_gather_comm_on_every_rank
-
-            # The indexer's row split gathers on pynccl where the group has it,
-            # so every DCP rank must agree on that (raises otherwise).
-            split_gather_comm_on_every_rank(get_dcp_group())
         self.indexes_by_token_table = indexes_by_token_table(
             self.is_sparse, self.dcp_world_size, self.index_kpool
         )
@@ -2759,12 +2750,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows = len(row_ends)
         var["index_row_ends"].np[:rows] = row_ends
         ends = var["index_row_ends"].copy_to_gpu(rows)
-        # Potential optimization: the GLM indexer is replicated across TP as well
-        # (ReplicatedLinear projections, unsharded index heads), so at dcp=1 every
-        # TP rank scores the same rows. Splitting over TP here, as the V4 builder
-        # does (`RowSplit.of(..., group="tp")`), would remove that; it also needs
-        # the `topk_indices` slack in deepseek_v2.py sized by the split's world,
-        # and the FP8 key all-gather there skipped (keys are already whole).
         split = RowSplit.of(rows, self.dcp_rank, self.dcp_world_size)
         if not self._indexer_fp4:
             keys = ConcatKeys(

@@ -725,28 +725,53 @@ def _assert_picks(got, want, ends, topk):
             assert len(chosen & best) / k > 0.99, r
 
 
-def _prefill_rows(batch, ctx_len, bands=None):
+def _prefill_rows(batch, ctx_len, bands=None, stripe=None, new_rows=None):
     """A ragged FP4 prefill over the writer's cache: one row per query token,
     each seeing `[0, its own position]` of its own sequence, a sequence's
-    rows together -- the rows the MLA builder publishes."""
+    rows together -- the rows the MLA builder publishes. `new_rows`: each
+    sequence's last that many tokens are its rows, the rest keys already
+    cached (a prefix hit); all of them by default. `stripe`: `(rank,
+    world)`, that rank's rows of a striped TP split as the V4 builder cuts
+    them, a sequence's from the sequence's own start."""
+    from atom.distributed.pcp_utils import pcp_owned_rows_by_request
     from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-    from atom.model_ops.indexer import IndexCache, fp4_rows
+    from atom.model_ops.indexer import IndexCache, RowSplit, fp4_rows
 
     torch.manual_seed(1)
     table, num_blocks, token, seq, slots = _paged_layout(batch, ctx_len)
     q_fp4, q_scale, weights, kv_cache, kv_scale = _fused_fp4(
         slots, token, num_blocks, weight_gain=0.1
     )
+    counts = [ctx_len] * batch if new_rows is None else list(new_rows)
+    if new_rows is not None:
+        picked = torch.cat(
+            [
+                torch.arange((s + 1) * ctx_len - n, (s + 1) * ctx_len, device="cuda")
+                for s, n in enumerate(counts)
+            ]
+        )
+        q_fp4, q_scale, weights = q_fp4[picked], q_scale[picked], weights[picked]
+        token, seq = token[picked], seq[picked]
     ends = (token + 1).to(torch.int32)
-    starts = torch.arange(0, (batch + 1) * ctx_len, ctx_len, device="cuda")
+    starts = torch.from_numpy(np.cumsum([0, *counts])).cuda()
+    max_qlen, split = max(counts), None
+    if stripe is not None:
+        rank, world = stripe
+        split = RowSplit.striped(ends.shape[0], rank, world, group="tp")
+        ends = ends[rank::world].contiguous()
+        owned = pcp_owned_rows_by_request(starts.cpu().numpy(), rank, world, split.end)
+        # As the builder groups them (`_split_query_starts`), an empty rank too.
+        starts = torch.from_numpy(owned).cuda()
+        max_qlen = max(int(np.diff(owned).max()), 1)
     rows = fp4_rows(
         ends,
         ctx_len,
         None,
-        Fp4MqaRaggedMetadata(starts.to(torch.int32), ctx_len, table),
+        Fp4MqaRaggedMetadata(starts.to(torch.int32), max_qlen, table),
         heads=HEADS,
         page_size=_BLOCK,
         bands=bands,
+        split=split,
     )
     want = _oracle(
         q_fp4, q_scale, kv_cache, kv_scale, table, ctx_len, weights,
@@ -789,6 +814,42 @@ def test_prefill_band_selects_as_the_whole_batch(on_gfx950, first):
     part = score_topk(query, weights, cache, band, **kwargs)
     span = slice(first, first + stride)
     assert torch.equal(part[span], full[span])
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize(
+    "new_rows",
+    [None, (13, 1, 29), (1, 2)],
+    ids=["whole_sequences", "prefix_hits", "one_row_ranks"],
+)
+def test_prefill_striped_rows_select_as_the_whole_batch(
+    on_gfx950, monkeypatch, new_rows, world
+):
+    """A rank's rows of a striped TP split -- every `world`-th row, planned a
+    sequence's together from its own counts -- select exactly as those rows
+    do in the whole batch, and come back at their own rows: a row grouped
+    under the wrong sequence scores another request's keys. Ragged prefix
+    hits leave a rank one row of a sequence, or none; three rows in all
+    leave a rank a single row, or no rows. One GPU holds one rank's slot, so
+    the gather is left out."""
+    from atom.model_ops.indexer import score as score_module
+    from atom.model_ops.indexer import score_topk
+
+    monkeypatch.setattr(score_module, "_gather_split", lambda out, split: None)
+    batch = 2 if new_rows is None else len(new_rows)
+    query, weights, cache, whole, ends, want = _prefill_rows(
+        batch, 512, new_rows=new_rows
+    )
+    kwargs = {"topk": 256, "weight_scale": WEIGHTS_SCALE, "stable": True}
+    full = score_topk(query, weights, cache, whole, **kwargs)
+    _assert_picks(full, want, ends, topk=256)
+    tokens = full.shape[0]
+    for rank in range(world):
+        *_, rows, _, _ = _prefill_rows(
+            batch, 512, stripe=(rank, world), new_rows=new_rows
+        )
+        got = score_topk(query, weights, cache, rows, **kwargs)
+        assert torch.equal(got[rank:tokens:world], full[rank::world]), rank
 
 
 def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):

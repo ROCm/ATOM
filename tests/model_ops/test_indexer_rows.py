@@ -6,6 +6,8 @@ query rows are cut into bands, grouped by request, and split across ranks.
 Host arithmetic only."""
 
 import itertools
+import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -114,7 +116,7 @@ def test_row_split_bands_only_this_rank_s_rows(world, count):
         covered += [r for b, e in rows.bands for r in range(b, e)]
     assert covered == list(range(count))
     # Without DCP, one rank's split: every row, nothing to gather.
-    assert rows_module.RowSplit.of(count) == (0, count, 0, count, 1, "dcp")
+    assert rows_module.RowSplit.of(count) == (0, count, 0, count, 1, "dcp", False)
 
 
 def test_pcp_owned_rows_group_by_request_and_pad():
@@ -160,7 +162,7 @@ def test_pcp_owned_rows_match_brute_force():
                 )
 
 
-# ---- The split's gather: which group, which communicator, which slot ---------
+# ---- The split's gather: which group, which slot, which order --------------
 
 score_module = pytest.importorskip(
     "atom.model_ops.indexer.score",
@@ -169,107 +171,220 @@ score_module = pytest.importorskip(
 )
 
 
-class _Pynccl:
-    def __init__(self, disabled=False):
-        self.disabled = disabled
-        self.calls = []
-
-    def all_gather(self, output, input_):
-        self.calls.append((output, input_))
-
-
 class _Group:
-    def __init__(self, name, pynccl):
+    def __init__(self, name):
         self.device_group = name
-        self.device_communicator = type("Comm", (), {"pynccl_comm": pynccl})()
 
 
-def _groups(monkeypatch, tp_pynccl, dcp_pynccl):
-    """Fake TP and DCP groups for the scorer, and a record of the torch
-    ProcessGroup gathers it falls back to."""
-    tp, dcp = _Group("tp", tp_pynccl), _Group("dcp", dcp_pynccl)
-    monkeypatch.setattr(score_module, "get_tp_group", lambda: tp)
-    monkeypatch.setattr(score_module, "get_dcp_group", lambda: dcp)
-    torch_calls = []
+def _groups(monkeypatch):
+    """Fake TP and DCP groups for the scorer, and a record of the gathers it
+    runs on their ProcessGroups."""
+    monkeypatch.setattr(score_module, "get_tp_group", lambda: _Group("tp"))
+    monkeypatch.setattr(score_module, "get_dcp_group", lambda: _Group("dcp"))
+    calls = []
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_into_tensor",
-        lambda out, inp, group: torch_calls.append((out, inp, group)),
+        lambda out, inp, group: calls.append((out, inp, group)),
     )
-    return torch_calls
+    return calls
 
 
 @pytest.mark.parametrize("group", ["dcp", "tp"])
+@pytest.mark.parametrize("make", ["of", "striped"])
 @pytest.mark.parametrize("count, rank, world", [(12, 7, 8), (13, 2, 4), (1, 1, 2)])
-def test_split_gathers_its_own_slot_on_its_group_s_pynccl(
-    monkeypatch, group, count, rank, world
+def test_split_gathers_its_own_slot_on_its_group(
+    monkeypatch, group, make, count, rank, world
 ):
-    """The gather runs on the split's group's pynccl communicator (built with
-    the group, so counted in the memory profile; the torch ProcessGroup's is
-    created at the first prefill), in place: the input is this rank's whole
-    slot of the output, an empty rank's (12 rows over 8, rank 7) included."""
-    tp, dcp = _Pynccl(), _Pynccl()
-    torch_calls = _groups(monkeypatch, tp, dcp)
-    split = rows_module.RowSplit.of(count, rank, world, group=group)
+    """The gather runs on the split's group's ProcessGroup, in place: the
+    input is this rank's whole slot of the output, an empty rank's (12 rows
+    over 8, rank 7) included."""
+    calls = _groups(monkeypatch)
+    split = getattr(rows_module.RowSplit, make)(count, rank, world, group=group)
     out = torch.zeros(split.stride * world + 3, 4, dtype=torch.int32)
     score_module._gather_split(out, split)
-    used, idle = (tp, dcp) if group == "tp" else (dcp, tp)
-    assert torch_calls == [] and idle.calls == []
-    [(region, mine)] = used.calls
+    [(region, mine, used)] = calls
+    assert used == group
     assert region.data_ptr() == out.data_ptr()
     assert region.shape[0] == split.stride * world
     assert mine.data_ptr() == out[split.slot].data_ptr()
     assert mine.shape[0] == split.stride
 
 
-@pytest.mark.parametrize("pynccl", [None, _Pynccl(disabled=True)])
-def test_split_without_pynccl_gathers_on_the_process_group(monkeypatch, pynccl):
-    """No usable pynccl on the DCP group: the gather falls back to its torch
-    ProcessGroup, as before. (The TP split is not turned on without one.)"""
-    torch_calls = _groups(monkeypatch, _Pynccl(), pynccl)
-    split = rows_module.RowSplit.of(9, 1, 4)
-    out = torch.zeros(split.stride * 4, 4, dtype=torch.int32)
-    score_module._gather_split(out, split)
-    [(region, mine, group)] = torch_calls
-    assert group == "dcp" and region.shape[0] == split.stride * 4
-    assert mine.data_ptr() == out[split.slot].data_ptr()
-
-
 def test_unsplit_rows_gather_nothing(monkeypatch):
-    tp, dcp = _Pynccl(), _Pynccl()
-    torch_calls = _groups(monkeypatch, tp, dcp)
+    calls = _groups(monkeypatch)
     score_module._gather_split(torch.zeros(5, 4), rows_module.RowSplit.of(5))
-    assert torch_calls == [] and tp.calls == [] and dcp.calls == []
+    assert calls == []
 
 
-def test_row_split_refuses_an_unknown_group():
+@pytest.mark.parametrize("make", ["of", "striped"])
+def test_row_split_refuses_an_unknown_group(make):
     """Anything but "dcp" / "tp" would otherwise gather on the DCP group."""
     with pytest.raises(ValueError):
-        rows_module.RowSplit.of(8, 0, 2, group="TP")
+        getattr(rows_module.RowSplit, make)(8, 0, 2, group="TP")
+
+
+@pytest.mark.parametrize("world", [2, 3, 4, 8])
+@pytest.mark.parametrize("count", [1, 7, 12, 13, 4097])
+def test_striped_split_deals_every_row_once(world, count):
+    """Rank r scores rows r, r + world, ...: its count of them from the
+    front of its rows, into a whole stride's slot at its rank's place."""
+    dealt = []
+    for rank in range(world):
+        split = rows_module.RowSplit.striped(count, rank, world)
+        assert (split.first, split.end) == (0, len(range(rank, count, world)))
+        assert split.stride == -(-count // world) >= split.end
+        assert split.slot == rank * split.stride and split.rank == rank
+        assert (split.world, split.group, split.stripe) == (world, "tp", True)
+        dealt += range(rank, count, world)
+    assert sorted(dealt) == list(range(count))
 
 
 @pytest.mark.parametrize(
-    "usable_on_ranks, expected",
-    [((1, 1), True), ((0, 0), False), ((1, 0), RuntimeError), ((0, 1), RuntimeError)],
+    "fp4, concat",
+    [(False, False), (False, True), (True, False)],
+    ids=["fp8", "fp8_concat", "fp4"],
 )
-def test_ranks_must_agree_on_the_gather_transport(
-    monkeypatch, usable_on_ranks, expected
-):
-    """pynccl is built per rank and only warns on failure: ranks that disagree
-    would gather over different transports (or not split at all) and hang, so
-    the startup check raises instead. The fake all_reduce folds in the other
-    rank's vote the way MIN over the CPU group would."""
-    mine, other = usable_on_ranks
-    group = _Group("tp", _Pynccl() if mine else None)
-    group.cpu_group = "cpu"
+@pytest.mark.parametrize("count, world", [(13, 4), (16, 4), (3, 4), (4097, 8)])
+def test_striped_rows_come_back_in_row_order(monkeypatch, fp4, concat, count, world):
+    """Each rank scores its rows of the step's query, every `world`-th from
+    its rank, into its slot; the slots gather rank-major, and every rank gets
+    the rows back in row order, the last slots' tails past them. A row scores
+    as its own id here, so the selection says which row landed where; its
+    weights, and FP4's scales, are the same rows. FP4's kernels address their
+    rows densely, so it scores copies."""
+    topk = 3
+    ids = torch.arange(count, dtype=torch.float32)
+    values = ids.view(count, 1, 1).expand(count, 1, 2).contiguous()
+    query = (values, values + 0.5) if fp4 else values
+    weights = ids.view(count, 1)
+    cache = rows_module.IndexCache(torch.zeros(1), torch.zeros(1) if fp4 else None, 64)
 
-    def all_reduce(votes, op, group):
-        assert group == "cpu"
-        votes.copy_(torch.minimum(votes, torch.tensor([other, -other])))
+    def score(query, weights, rows, out):
+        values = query[0] if fp4 else query
+        if fp4:
+            # Dense: a single row's stride too, which `is_contiguous` ignores.
+            assert all(
+                t.is_contiguous() and t.stride(0) == t.shape[1:].numel()
+                for t in (*query, weights)
+            )
+            assert torch.equal(query[1], values + 0.5)
+        assert torch.equal(weights[:, 0], values[:, 0, 0])
+        mine = values[: rows.split.end, 0, :1].to(torch.int32)
+        out[: rows.split.end] = mine.expand(-1, topk)
 
-    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-    if expected is RuntimeError:
-        with pytest.raises(RuntimeError):
-            score_module.split_gather_comm_on_every_rank(group)
-    else:
-        assert score_module.split_gather_comm_on_every_rank(group) is expected
+    monkeypatch.setattr(
+        score_module,
+        "_score_paged",
+        lambda query, weights, cache, rows, topk, scale, stable, on_band, out: (
+            score(query, weights, rows, out)
+        ),
+    )
+    monkeypatch.setattr(
+        score_module,
+        "_score_concat",
+        lambda query, weights, cache, rows, topk, stable, out, keys, local: (
+            score(query, weights, rows, out)
+        ),
+    )
+    monkeypatch.setattr(score_module, "get_tp_group", lambda: _Group("tp"))
+    # The ranks run as threads; the gather hands each every rank's slot.
+    caller, slots = threading.local(), [None] * world
+    barrier = threading.Barrier(world, timeout=60)
+
+    def all_gather_into_tensor(out, inp, group):
+        slots[caller.rank] = inp.clone()
+        barrier.wait()
+        out.copy_(torch.cat(slots))
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", all_gather_into_tensor
+    )
+    results, errors = {}, []
+
+    def rank_step(rank):
+        caller.rank = rank
+        split = rows_module.RowSplit.striped(count, rank, world)
+        rows = rows_module.IndexRows(
+            torch.zeros(split.end, dtype=torch.int32),
+            1,
+            ((0, split.end),),
+            split,
+            concat=SimpleNamespace() if concat else None,
+        )
+        try:
+            results[rank] = score_module.score_topk(
+                query, weights, cache, rows, topk=topk
+            )
+        except Exception as error:  # noqa: BLE001 - surfaced to the test thread
+            errors.append(error)
+            barrier.abort()
+
+    threads = [threading.Thread(target=rank_step, args=(r,)) for r in range(world)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors
+    want = torch.arange(count, dtype=torch.int32).unsqueeze(1).expand(-1, topk)
+    for rank in range(world):
+        assert results[rank].shape == (-(-count // world) * world, topk)
+        assert torch.equal(results[rank][:count], want), rank
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"out": torch.zeros(4, 3, dtype=torch.int32)},
+        {"on_band": lambda scores, span: None},
+        {"keys": ()},
+        {"request_local": False},
+    ],
+    ids=["out", "on_band", "keys", "request_global"],
+)
+def test_striped_split_refuses_to_read_its_rows_in_place(kwargs):
+    """A striped split hands its selection back transposed, in a new tensor:
+    `out` would hold rank-major slots, and the rest read rows where they are
+    scored."""
+    split = rows_module.RowSplit.striped(4, 0, 2)
+    rows = rows_module.IndexRows(
+        torch.zeros(split.end, dtype=torch.int32), 1, ((0, split.end),), split
+    )
+    cache = rows_module.IndexCache(torch.zeros(1), None, 64)
+    with pytest.raises(ValueError):
+        score_module.score_topk(
+            torch.zeros(4, 1, 2), torch.zeros(4, 1), cache, rows, topk=3, **kwargs
+        )
+
+
+@pytest.mark.parametrize("count, world", [(13, 4), (16, 4), (3, 4), (1, 2), (4097, 8)])
+def test_the_model_s_entry_returns_as_many_rows_as_its_fake(monkeypatch, count, world):
+    """A striped split's selection carries its slots' tails past the step's
+    rows (`IndexRows.out_rows`); the V4 indexer's op entry hands back the
+    step's rows alone, row i at row i, in the shape its fake promises a
+    compiled graph."""
+    import atom.models.deepseek_v4 as v4
+    from atom.model_ops.module_dispatch_ops import _indexer_score_topk_fake
+
+    topk = 8
+    split = rows_module.RowSplit.striped(count, world - 1, world)
+    rows = rows_module.IndexRows(
+        torch.zeros(split.end, dtype=torch.int32), 1, ((0, split.end),), split
+    )
+
+    def score_topk(query, weights, cache, rows, *, topk, weight_scale):
+        # Each row's selection tagged with its row.
+        return torch.arange(rows.out_rows, dtype=torch.int32)[:, None].repeat(1, topk)
+
+    monkeypatch.setattr(v4, "score_topk", score_topk)
+    monkeypatch.setattr(
+        v4,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=SimpleNamespace(index_rows=rows)),
+    )
+    layer = SimpleNamespace(index_cache=None, _weights_scale=1.0)
+    query, weights = torch.zeros(count, 2, 4), torch.zeros(count, 2)
+    got = v4.Indexer.indexer_score_topk(layer, query, weights, None, topk)
+    fake = _indexer_score_topk_fake(query, weights, None, "layer", topk)
+    assert got.shape == fake.shape == (count, topk)
+    assert torch.equal(got[:, 0], torch.arange(count, dtype=torch.int32))

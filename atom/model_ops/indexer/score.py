@@ -14,7 +14,7 @@ soon as it is scored, so nothing wider than one band is ever live. The result
 is `[rows, topk]` int32 column ids local to the row's request, `-1` past a
 row's bound; split across ranks (`RowSplit`: DCP, or TP for a TP-replicated
 indexer) each rank scores its share of the rows and the selections are
-all-gathered in place.
+all-gathered in place -- striped shares transposed back to row order.
 
 Under a token graph only the FP4 launch breaks: its plan follows the step's
 requests, which a token bucket does not fix. Everything else -- the bands, the
@@ -75,75 +75,73 @@ def score_topk(
     top-k: a scorer that reads more than the top-k off them (a layer picking
     its successors' candidate blocks) does it there. `keys`: FP8 concat rows'
     `(values, scales)` already gathered end to end (DCP's all-gathered
-    shards); gathered here from `cache` otherwise."""
+    shards); gathered here from `cache` otherwise.
+
+    A striped split (`RowSplit.striped`) scores this rank's rows of `query`
+    and `weights` into its slot and returns the gathered slots in row order,
+    a new tensor: `out`, `on_band`, `keys` and `request_local=False`, which
+    read the rows in place, do not apply."""
+    split = rows.split
+    if split.stripe:
+        if not (out is None and on_band is None and keys is None and request_local):
+            raise ValueError(
+                "a striped split returns its rows in a new tensor, not in place"
+            )
+        query, weights = _stripe_rows(query, weights, cache, split)
     if out is None:
         out = torch.empty(rows.out_rows, topk, dtype=torch.int32, device=weights.device)
+    mine = out[split.slot : split.slot + split.stride] if split.stripe else out
     if rows.concat is not None:
         _score_concat(
-            query, weights, cache, rows, topk, stable, out, keys, request_local
+            query, weights, cache, rows, topk, stable, mine, keys, request_local
         )
     else:
         _score_paged(
-            query, weights, cache, rows, topk, weight_scale, stable, on_band, out
+            query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
         )
-    _gather_split(out, rows.split)
+    _gather_split(out, split)
+    if split.stripe:
+        # Slot r holds rows r, r + world, ...: row j * world + r is its j-th.
+        return (
+            out.view(split.world, split.stride, topk).transpose(0, 1).reshape(-1, topk)
+        )
     return out
+
+
+def _stripe_rows(query, weights, cache, split):
+    """This rank's rows of a striped split, every `world`-th from its rank.
+    The FP4 kernels assert dense rows, so those are copied into new ones:
+    `.contiguous()` hands a single row back as is, the stripe's stride and
+    all. FP8 reads them strided."""
+    rows = slice(split.rank, None, split.world)
+    if cache.fp4:
+        values, scales = query
+        return (
+            (_dense(values[rows]), _dense(scales[rows])),
+            _dense(weights[rows]),
+        )
+    return query[rows], weights[rows]
+
+
+def _dense(x):
+    return x.clone(memory_format=torch.contiguous_format)
 
 
 def _gather_split(out, split):
     """Every rank's rows into `out`, in place: the input is this rank's own
-    slot inside the output, the form RCCL supports, so nothing is allocated
-    or copied. The last slot's tail past the rows is never read. A world of
-    one already holds them all.
-
-    Through the group's pynccl communicator, built with the group and so
-    counted in the memory profile, on the current stream. The group's torch
-    ProcessGroup would create its communicator and stream at the first
-    prefill instead -- after the KV budget is fixed -- since nothing else in
-    the step uses it."""
+    slot inside the output, the form RCCL supports, so beyond the
+    communicator's own first-use buffers the gather allocates and copies
+    nothing. A slot's tail past its rank's rows is never used
+    (`IndexRows.out_rows`). A world of one already holds them all."""
     if split.world == 1:
         return
     region = out[: split.stride * split.world]
-    mine = region[split.slot : split.slot + split.stride]
     group = get_tp_group() if split.group == "tp" else get_dcp_group()
-    pynccl = split_gather_comm(group)
-    if pynccl is not None:
-        # pynccl reads raw pointers and counts, so a strided view would be
-        # gathered wrong without an error (the ProcessGroup would refuse it).
-        assert region.is_contiguous(), "split gather needs contiguous rows"
-        pynccl.all_gather(region, mine)
-    else:
-        torch.distributed.all_gather_into_tensor(region, mine, group=group.device_group)
-
-
-def split_gather_comm(group):
-    """`group`'s pynccl communicator when it is usable, else None. Decided
-    at the group's construction; `split_gather_comm_on_every_rank` checks
-    the ranks agree."""
-    communicator = getattr(group, "device_communicator", None)
-    pynccl = getattr(communicator, "pynccl_comm", None)
-    return None if pynccl is None or pynccl.disabled else pynccl
-
-
-def split_gather_comm_on_every_rank(group) -> bool:
-    """Whether every rank of `group` has a usable pynccl communicator, checked
-    once at startup over the CPU group. aiter builds it per rank and only warns
-    when that fails, so ranks could disagree -- and a rank gathering on pynccl
-    while another uses the ProcessGroup (or does not split at all) hangs the
-    group. Raises on disagreement."""
-    usable = int(split_gather_comm(group) is not None)
-    # Explicitly on the host: builders run under the runner's CUDA default
-    # device, and the CPU group is gloo.
-    votes = torch.tensor([usable, -usable], dtype=torch.int64, device="cpu")
-    torch.distributed.all_reduce(
-        votes, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    torch.distributed.all_gather_into_tensor(
+        region,
+        region[split.slot : split.slot + split.stride],
+        group=group.device_group,
     )
-    if int(votes[0]) != -int(votes[1]):
-        raise RuntimeError(
-            "pynccl is usable on some ranks of the group and not on others; "
-            "the indexer row split's gather needs the same transport on every rank"
-        )
-    return bool(usable)
 
 
 def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_band, out):

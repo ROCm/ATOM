@@ -58,7 +58,10 @@ class RowSplit(NamedTuple):
     row i (`qsplit_rows`). `group` names the ranks: "dcp" (GLM under DCP,
     which all-gathers the keys) or "tp" (a TP-replicated indexer, V4 under
     plain TP). Without a split, a world of one: every row, nothing to
-    gather."""
+    gather.
+
+    `stripe`: the rows are dealt round-robin instead (`striped`), and the
+    rows' metadata holds this rank's alone, `[first, end)` all of them."""
 
     first: int
     end: int
@@ -66,6 +69,7 @@ class RowSplit(NamedTuple):
     stride: int
     world: int
     group: Literal["dcp", "tp"] = "dcp"
+    stripe: bool = False
 
     @classmethod
     def of(
@@ -81,6 +85,26 @@ class RowSplit(NamedTuple):
             raise ValueError(f"RowSplit group must be 'dcp' or 'tp', got {group!r}")
         stride, slot, first, end = qsplit_rows(rows, rank, world)
         return cls(first, end, slot, stride, world, group)
+
+    @classmethod
+    def striped(
+        cls, rows: int, rank: int, world: int, *, group: Literal["dcp", "tp"] = "tp"
+    ) -> "RowSplit":
+        """This rank's rows of `rows` dealt round-robin: rows rank,
+        rank + world, ... A prefill row's cost grows with its position, so
+        contiguous shares leave the last rank the most work; striped ones
+        even it out. The gathered slots are rank-major, so the scorer
+        transposes them back to row order."""
+        if group not in ("dcp", "tp"):
+            raise ValueError(f"RowSplit group must be 'dcp' or 'tp', got {group!r}")
+        stride = -(-rows // world)
+        count = len(range(rank, rows, world))
+        return cls(0, count, rank * stride, stride, world, group, stripe=True)
+
+    @property
+    def rank(self) -> int:
+        """This rank's place in the group (0 for a step of no rows)."""
+        return self.slot // self.stride if self.stride else 0
 
 
 class IndexRows(NamedTuple):
@@ -113,8 +137,9 @@ class IndexRows(NamedTuple):
 
     @property
     def out_rows(self) -> int:
-        """Rows of the selection: every rank's whole slot, under a split the
-        last one's past the rows."""
+        """Rows of the selection: every rank's whole slot. Under a split those
+        past the step's rows are slots' unscored tails, never used; a
+        striped split's land there once transposed back to row order."""
         return self.split.stride * self.split.world
 
 
