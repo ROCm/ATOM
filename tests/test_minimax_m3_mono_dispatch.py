@@ -42,6 +42,7 @@ def _atom_config(**overrides):
         "dspark": SimpleNamespace(confidence_schedule=False, ragged=False),
         "speculative_config": None,
         "compilation_config": SimpleNamespace(cudagraph_mode=_Mode(False)),
+        "enable_return_routed_experts": False,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -99,6 +100,7 @@ def test_supported_deployment_has_no_refusal(native):
             },
             "DYNAMO_AS_IS",
         ),
+        ({"enable_return_routed_experts": True}, "routed-expert capture"),
     ],
 )
 def test_each_unsupported_setting_is_refused(native, overrides, reason):

@@ -76,6 +76,7 @@ def _atom_config(**hf_overrides):
         prefill_context_parallel_size=1,
         enable_tbo=False,
         enable_tbo_decode=False,
+        enable_return_routed_experts=False,
         kv_transfer_config=None,
         compilation_config=SimpleNamespace(
             level=3,

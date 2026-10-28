@@ -574,6 +574,26 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
     assert runtime_args["routes_may_be_missing"] is True
 
 
+def test_forward_impl_captures_the_routed_experts_it_runs(monkeypatch, comm_fused_env):
+    """Route capture sees `select_experts`' ids, on the rank's own rows."""
+    modules, state, _, _ = comm_fused_env
+    backend = _create_backend(modules, state)
+    hidden_states, router_logits, topk_weights, topk_ids = (object() for _ in range(4))
+    layer, _ = _runtime_layer(modules, topk_weights, topk_ids)
+    backend.runtime = SimpleNamespace(run=MagicMock(return_value=object()))
+    captured = []
+    monkeypatch.setattr(
+        sys.modules[type(backend).__module__],
+        "maybe_capture_routed_experts",
+        lambda moe, ids: captured.append((moe, ids)),
+    )
+
+    backend.forward_impl(layer, hidden_states, router_logits, object())
+
+    assert captured == [(layer, topk_ids)]
+    assert backend.runtime.run.call_args.kwargs["topk_ids"] is topk_ids
+
+
 def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
     modules, _, backend = _create_dpa_backend(comm_fused_env)
 

@@ -65,6 +65,9 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
 )
 from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    maybe_capture_routed_experts,
+)
 from atom.model_ops.fused_moe.routed_rows import (
     RoutedRowsWire,
     gather_rows,
@@ -5439,6 +5442,7 @@ class FusedMoE(torch.nn.Module):
         topk_weights, topk_ids = self.quant_method.select_experts(
             self, hidden_states, router_logits
         )
+        maybe_capture_routed_experts(self, topk_ids)
         x_scale = None
         if use_dp_gather_scatter:
             ctx = get_forward_context()
@@ -5514,6 +5518,7 @@ class FusedMoE(torch.nn.Module):
         topk_weights, topk_ids = self.quant_method.select_experts(
             self, hidden_states, router_logits
         )
+        maybe_capture_routed_experts(self, topk_ids)
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
         local_rows = hidden_states.shape[0]
         if dp_repeat > 1:

@@ -2077,6 +2077,11 @@ class Config:
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
+    # Return per-request MoE routes from generate() as int16
+    # [seq_len - 1, num_layers, top_k]. Scatter is CUDA-graph-safe (device
+    # write inside fused MoE). Requires DCP=PCP=PP=1, no DP-attention, and
+    # no KV transfer / offload / RapidServe P/D; prefix cache stays on.
+    enable_return_routed_experts: bool = False
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
@@ -2518,6 +2523,13 @@ class Config:
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_dynamic_chunking()
+
+        if self.enable_return_routed_experts:
+            from atom.model_ops.fused_moe.routed_experts_capturer import (
+                check_return_routed_experts_config,
+            )
+
+            check_return_routed_experts_config(self)
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens

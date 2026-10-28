@@ -12,7 +12,7 @@ from aiter.dist.parallel_state import (
 )
 from torch import nn
 
-from atom.config import Config
+from atom.config import Config, get_current_atom_config
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import (
@@ -351,6 +351,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
 
         It indexes global expert ids into the local weights, hard-codes a
         320-wide intermediate, and reads FP8 weights with per-channel scales.
+        It routes outside `FusedMoE`, so routed-expert capture would miss it.
         """
         if self._single_token_ok is None:
             ex = self.experts
@@ -358,7 +359,8 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             s2 = getattr(ex, "w2_weight_scale", None)
             n, two_inter = ex.w13_weight.shape[:2]
             self._single_token_ok = (
-                ex.expert_map is None
+                not get_current_atom_config().enable_return_routed_experts
+                and ex.expert_map is None
                 and s13 is not None
                 and s2 is not None
                 and ex.w13_weight.dtype == dtypes.fp8

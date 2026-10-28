@@ -327,6 +327,16 @@ class MemoryManagerMixin:
         ):
             if hasattr(self, attr) and getattr(self, attr) is not None:
                 delattr(self, attr)
+        # Graphs that wrote capture slots are already dropped above. The
+        # singleton GPU buffer is not a view of `kv_cache`; leaving it live
+        # makes wake's get_num_blocks() treat it as overhead and allocate_kv_cache
+        # create a second buffer before replacing it.
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        RoutedExpertsCapturer.reset(owner=self)
+        self._routed_experts_capturer = None
         torch.cuda.empty_cache()
         logger.info(f"{self.label}: KV cache released (GPU memory freed)")
 

@@ -91,7 +91,7 @@ def common_refusals(
     and no expert or data parallelism -- or DP attention over one of
     ``supported_dpa`` ranks with the MoE expert parallel (``dims(1, ranks)``)
     or TP (``dims(ranks)``) over them; no pipeline or context parallelism, no
-    TBO, not a plugin.
+    TBO, not a plugin, no routed-expert capture (the fused kernels route in-kernel and never write it).
 
     ``refuse_tr_hybrid`` gates one more check: no TR_HYBRID graph mode.
     MiniMax-M3 and DeepSeek-V4.1 mono wraps the *compiled* inner model, so a
@@ -129,6 +129,7 @@ def common_refusals(
         (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
+        (not atom_config.enable_return_routed_experts, "routed-expert capture"),
         (
             not _takes_weight_updates(atom_config),
             "rollout weight updates (mono caches copies a sync cannot reach)",
