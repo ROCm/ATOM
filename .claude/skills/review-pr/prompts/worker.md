@@ -17,18 +17,40 @@ The Step 8 output rules are reproduced verbatim below, because the most-violated
 - Output ONLY the card below. Nothing before it, nothing after it.
 - If there are no findings, the findings section is omitted entirely.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
+- The verdict and `Validation (deterministic)` lines are both mandatory and both carry a
+  label prefix, so neither line may ever start with a finding emoji (🔴/⚠️/📝) —
+  that is what the `refutations`/`independent` gates count as a reported finding, and a
+  bare `⚠️ NEEDS WORK` verdict line gets counted as one, leaving one more "finding" than
+  the card actually has. Never omit the `Validation` line: silence on it reads as
+  clearance, which is exactly what the spec forbids.
 
 ```
 ## ATOM PR #NNN — [title]
 
 **[One sentence: what this PR does, in plain terms. E.g. "Wraps the per_group emit_bf16 AllReduce path in a torch.library op so Dynamo can trace it."]**
 
-[✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
+Review: [✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
+Validation (deterministic): [<verdict> — target, exact runtime, skipped-stage evidence | N/A — no runtime surface changed | NOT RUN — <reason>]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
 📝 [note]
 ```
+
+**`Validation (deterministic)` — pick exactly one state, never blend them:**
+- an exact-head validator report exists → its verdict plus target/runner/arch and any
+  skipped stages.
+- triage decided no runtime surface changed → `N/A — no runtime surface changed`. Do not
+  write `NOT RUN` here; there is no gap to report.
+- validation was required but no target exists (P0 ships no validator at all, so this is
+  the common case today) → `NOT RUN — <reason>`, e.g. `NOT RUN — the PR changes runtime
+  code but ships no test target` or `NOT RUN — no validator in this pipeline yet`.
+- required and a target existed, but the run itself could not happen (no idle GPU,
+  validator missing, disabled) → `NOT RUN — <reason>`; an environment gap, not a PR
+  defect.
+- `N/A` and `NOT RUN` are different facts and must never be merged into one word: `N/A`
+  means there was nothing to validate, `NOT RUN` means something should have been
+  validated and wasn't.
 
 Each finding must have **three parts**:
 1. **Problem** — what exactly is wrong, with file/line if relevant
