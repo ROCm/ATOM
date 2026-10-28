@@ -487,6 +487,7 @@ class WritePathTest(unittest.TestCase):
         conn._verify_rows = {}
         conn._verify_before = {}
         conn._failed_before_read = set()
+        conn._region_layers = {}
         conn.request_id_to_transfer_id = {}
         conn.layer_name_to_local_kv_cache_metadata = {name: [] for name in names}
         conn.kv_caches = {
@@ -1212,6 +1213,245 @@ class MergeContiguousBlocksTest(unittest.TestCase):
 
     def test_empty_input(self):
         self.assertEqual(self.merge([], [], []), ([], [], []))
+
+
+def load_class_members(names: list[str], namespace: dict) -> dict:
+    """Lift methods of MoRIIOConnector (and top-level classes) from the source.
+
+    Static methods keep their decorator; everything else becomes a plain
+    function, ready to be put on a stand-in class.
+    """
+    tree = ast.parse(CONNECTOR.read_text())
+    scope: dict = dict(namespace)
+    wanted = set(names)
+    nodes = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in wanted:
+            nodes.append(node)
+            wanted.discard(node.name)
+    if wanted:
+        raise AssertionError(f"not found: {sorted(wanted)}")
+    for node in nodes:
+        if isinstance(node, ast.FunctionDef):
+            node.decorator_list = [
+                d for d in node.decorator_list if ast.unparse(d) == "staticmethod"
+            ]
+        code = compile(ast.Module([node], []), str(CONNECTOR), "exec")
+        exec(code, scope)  # noqa: S102
+    return {name: scope[name] for name in names}
+
+
+class RegionPseudoLayerTest(unittest.TestCase):
+    """DSV4 region layouts: each region is a pseudo-layer of its own.
+
+    Runs on the CPU lane: the methods are lifted from the source onto a
+    stand-in class, with the RDMA edge recorded rather than posted.
+    """
+
+    PAGE, SLOT = 0, 1
+
+    @classmethod
+    def setUpClass(cls):
+        import logging
+
+        members = load_class_members(
+            [
+                "_region_unit",
+                "_group_offsets",
+                "_check_region_layout",
+                "_region_write_plan",
+                "_write_blocks",
+                "_source_covers",
+                "_LazySessions",
+            ],
+            {
+                "Any": object,
+                "_REGION_PAGE": cls.PAGE,
+                "_REGION_SLOT": cls.SLOT,
+                "logger": logging.getLogger("atom"),
+                "_POST_FAILED": "post-failed",
+            },
+        )
+        cls.lazy = members.pop("_LazySessions")
+        cls.Fake = type("FakeConnector", (), members)
+
+    def make(self, local: dict, remote: dict):
+        import types
+
+        conn = self.Fake()
+        conn._region_layers = local
+        conn.blocks_per_chunk = None
+        conn.remote_moriio_metadata = {
+            "eng": types.SimpleNamespace(region_layout=remote)
+        }
+        conn.writes = []
+        built = []
+
+        def build_session(local_md, remote_md):
+            built.append((local_md, remote_md))
+            return (local_md, remote_md)
+
+        def write(szs, l_offs, r_offs, session):
+            conn.writes.append((session, l_offs, r_offs, szs))
+            return "status"
+
+        conn.moriio_wrapper = types.SimpleNamespace(
+            build_session=build_session, write_remote_data_status=write
+        )
+        conn.built = built
+        sessions = [
+            (self.lazy(conn.moriio_wrapper, [(n, i) for i in range(8)], range(8)), {})
+            for n in local
+        ]
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        return conn
+
+    # [kind, unit_bytes, num_units, reverse, units_per_chunk]
+    def layouts(self, slot_units_remote: int = 6):
+        local = {
+            "page.0.kv": [self.PAGE, 8, 10, 0, 4],
+            "slot.0.kv": [self.SLOT, 16, 4, 1, 2],
+        }
+        remote = {
+            "page.0.kv": [self.PAGE, 8, 12, 0, 4],
+            "slot.0.kv": [self.SLOT, 16, slot_units_remote, 1, 2],
+        }
+        return local, remote
+
+    def request(self, **overrides):
+        request = {
+            "transfer_id": 3,
+            "dst_block_ids": [2, 9],
+            "src_block_ids": [1, 5, 6],
+            "src_slot": 0,
+            "dst_slot": 1,
+        }
+        request.update(overrides)
+        return request
+
+    def test_reverse_indexed_unit_matches_the_region_address(self):
+        from_end = self.Fake._region_unit([self.SLOT, 16, 4, 1, 2], 0, "x")
+        # KVTransferRegion.unit_addr(0) = base + total - unit = base + 3 * unit.
+        self.assertEqual(from_end, 3)
+        self.assertEqual(self.Fake._region_unit([self.PAGE, 8, 10, 0, 4], 7, "x"), 7)
+        with self.assertRaises(ValueError):
+            self.Fake._region_unit([self.SLOT, 16, 4, 1, 2], 4, "x")
+        with self.assertRaises(ValueError):
+            self.Fake._region_unit([self.PAGE, 8, 10, 0, 4], -1, "x")
+
+    def test_plan_pairs_blocks_and_slots_per_region(self):
+        conn = self.make(*self.layouts())
+        req = self.request()
+        page, slot = conn._region_write_plan(req, "eng", [1, 5], [2, 9])
+        # Blocks 1->2 share chunk 0 on both ends; 5->9 is chunk 1 -> chunk 2.
+        self.assertEqual(page, {(0, 0): ([8], [16], [8]), (1, 2): ([8], [8], [8])})
+        # Local slot 0 is forward unit 3 (chunk 1, +16); remote slot 1 of a
+        # 6-unit region is forward unit 4 (chunk 2, +0).
+        self.assertEqual(slot, {(1, 2): ([16], [0], [16])})
+
+    def test_each_end_reverses_against_its_own_slot_count(self):
+        conn = self.make(*self.layouts(slot_units_remote=4))
+        _page, slot = conn._region_write_plan(self.request(), "eng", [1], [2])
+        # Remote slot 1 of 4 units is forward unit 2: chunk 1, +0.
+        self.assertEqual(slot, {(1, 1): ([16], [0], [16])})
+
+    def test_a_missing_state_slot_is_refused(self):
+        conn = self.make(*self.layouts())
+        with self.assertRaises(ValueError) as caught:
+            conn._region_write_plan(self.request(dst_slot=-1), "eng", [1], [2])
+        self.assertIn("no state slot", str(caught.exception))
+
+    def test_nothing_is_posted_when_any_region_is_out_of_range(self):
+        conn = self.make(*self.layouts())
+        # Slot 4 is past the producer's 4-unit region; the page region before
+        # it must not have been posted either.
+        with self.assertRaises(ValueError):
+            conn._write_blocks(self.request(src_slot=4), "eng")
+        self.assertEqual(conn.writes, [])
+        with self.assertRaises(ValueError):
+            conn._write_blocks(self.request(dst_block_ids=[12]), "eng")
+        self.assertEqual(conn.writes, [])
+
+    def test_write_posts_one_batch_per_region_chunk_pair(self):
+        conn = self.make(*self.layouts())
+        statuses = conn._write_blocks(self.request(), "eng")
+        self.assertEqual(statuses, ["status"] * 3)
+        sessions = [w[0] for w in conn.writes]
+        # Lazily built sessions, keyed by (region, local chunk) x remote chunk.
+        self.assertEqual(
+            sessions,
+            [(("page.0.kv", 0), 0), (("page.0.kv", 1), 2), (("slot.0.kv", 1), 2)],
+        )
+        self.assertEqual(conn.writes[2][1:], ([16], [0], [16]))
+
+    def test_lazy_sessions_are_built_once(self):
+        conn = self.make(*self.layouts())
+        conn._write_blocks(self.request(), "eng")
+        conn._write_blocks(self.request(transfer_id=4), "eng")
+        self.assertEqual(len(conn.built), 3)
+
+    def test_layout_check_allows_only_unit_count_differences(self):
+        local, remote = self.layouts()
+        conn = self.make(local, remote)
+        self.assertIs(conn._check_region_layout("eng"), remote)
+
+        bad = {k: list(v) for k, v in remote.items()}
+        bad["slot.0.kv"][1] = 32
+        conn = self.make(local, bad)
+        with self.assertRaises(ValueError):
+            conn._check_region_layout("eng")
+
+        conn = self.make(local, {"page.0.kv": remote["page.0.kv"]})
+        with self.assertRaises(ValueError):
+            conn._check_region_layout("eng")
+
+        conn = self.make(local, None)
+        with self.assertRaises(ValueError) as caught:
+            conn._check_region_layout("eng")
+        self.assertIn("no region layout", str(caught.exception))
+
+    def test_per_layer_path_keeps_its_global_chunking(self):
+        conn = self.make({}, {})
+        conn.blocks_per_chunk = 4
+        groups = conn._group_offsets([1, 5], [2, 9], 8)
+        self.assertEqual(groups, {(0, 0): ([8], [16], [8]), (1, 2): ([8], [8], [8])})
+
+
+class RegionSourceTest(unittest.TestCase):
+    """Region-mode plumbing that needs the scheduler or the GPU, pinned."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = CONNECTOR.read_text()
+
+    segment = ConnectorSourceTest.segment
+
+    def test_empty_kv_caches_register_regions(self):
+        body = self.segment("register_kv_caches")
+        self.assertIn("self._register_regions(transfer_tensors, num_blocks)", body)
+        # Raw regions are chunked per region, and the layout is advertised.
+        regions = self.segment("_register_regions")
+        self.assertIn("MAX_RDMA_CHUNK_BYTES // unit", regions)
+        self.assertIn("region_layout=dict(self._region_layers)", regions)
+        self.assertIn("swa_block_regions", regions)
+
+    def test_region_layout_is_checked_before_sessions_are_built(self):
+        body = self.segment("_get_or_build_sessions")
+        self.assertLess(
+            body.index("self._check_region_layout("),
+            body.index("local_metas == remote_metas"),
+        )
+
+    def test_state_slots_travel_from_producer_to_push(self):
+        finished = self.segment("request_finished")
+        self.assertIn('"remote_slot_index": _state_slot(seq)', finished)
+        alloc = self.segment("update_state_after_alloc")
+        self.assertIn('params["local_slot_index"] = _state_slot(seq)', alloc)
+        self.assertIn('params["remote_slot_index"] = params.get(', alloc)
+        ask = self.segment("_request_write")
+        self.assertIn('"src_slot": src_slot', ask)
+        self.assertIn('"dst_slot": dst_slot', ask)
+        self.assertIn('int(request.get("src_slot", -1))', self.segment("_is_valid_write_request"))
 
 
 if __name__ == "__main__":

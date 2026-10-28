@@ -63,6 +63,10 @@ class MoRIIOAgentMetadata(
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
+    # Region layouts (KVTransferTensors) only: pseudo-layer name ->
+    # [kind (0 PAGE, 1 SLOT), unit_bytes, num_units, reverse_indexed,
+    # units_per_chunk]. None for the per-layer kv_cache layout.
+    region_layout: Optional[dict[str, list[int]]] = None
 
 
 # ---------------------------------------------------------------------------
