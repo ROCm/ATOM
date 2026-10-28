@@ -64,7 +64,7 @@ class MoRIIOAgentMetadata(
     block_len: int = 0
     attn_backend_name: str = "aiter"
     # name -> [kind, unit_bytes, num_units, reverse_indexed, units_per_chunk]
-    region_layout: Optional[dict[str, list[int]]] = None
+    region_layout: dict[str, list[int]] | None = None
 
 
 # ---------------------------------------------------------------------------
