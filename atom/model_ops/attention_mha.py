@@ -1609,6 +1609,40 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 "sparse_layer_ordinal": self.sparse_layer_ordinal,
             }
 
+    def _sparse_pa_mxfp4(self, q, k_cache, v_cache, sparse_bt, sparse_ctx, plan_owner):
+        from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
+
+        if self.local_blocks < 1:
+            # The plan is refreshed once a step, which holds only while every
+            # layer's rows have the same lengths -- i.e. the tail is always picked.
+            raise NotImplementedError("the MXFP4 KV path needs sparse_local_block >= 1")
+        return sparse_pa_mxfp4(
+            q,
+            k_cache,
+            v_cache,
+            sparse_bt,
+            sparse_ctx,
+            self.num_kv_heads,
+            self.scale,
+            self._out_dtype,
+            plan_owner,
+        )
+
+    def _mxfp4_select_kwargs(self, sparse_metadata, decode: bool) -> dict:
+        """What the selection needs to know about the MXFP4 caches: a block table
+        of one page-128 page a block for the MXFP4 KV, the MXFP4 scorer (and, on
+        decode, the step's work map) for the MXFP4 index."""
+        kw = {}
+        if self.kv_mxfp4:
+            kw.update(pages_per_block=1, block_page_stride=1)
+        if self.index_mxfp4:
+            kw["index_mxfp4"] = True
+            if decode:
+                kw["index_score_work_map"] = sparse_metadata.index_score_work_map
+                kw["index_score_max_block"] = sparse_metadata.index_score_max_block
+                kw["index_score_out"] = sparse_metadata.index_score_out
+        return kw
+
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -1663,14 +1697,20 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 emit_sparse_block_table=True,
                 n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
                 index_kv_scale=self.index_scale,
+                **self._mxfp4_select_kwargs(sparse_metadata, decode=False),
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        output = torch.empty_like(q)
-        if self.kv_nvfp4:
+        output = None if self.kv_mxfp4 else torch.empty_like(q)
+        if self.kv_mxfp4:
+            # plan-free: a prefill chunk's row count is new almost every forward
+            output = self._sparse_pa_mxfp4(
+                q, k_cache, v_cache, sparse_bt, sparse_ctx, None
+            )
+        elif self.kv_nvfp4:
             from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
                 nvfp4_sparse_attention_gfx950,
                 prefill_rows,
@@ -1861,14 +1901,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     max_query_len=max_query_len,
                     n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
                     index_kv_scale=self.index_scale,
+                    **self._mxfp4_select_kwargs(sparse_metadata, decode=True),
                 )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        output = torch.empty_like(q)
-        if self.kv_nvfp4:
+        output = None if self.kv_mxfp4 else torch.empty_like(q)
+        if self.kv_mxfp4:
+            output = self._sparse_pa_mxfp4(
+                q, k_cache, v_cache, sparse_bt, sparse_ctx, sparse_metadata
+            )
+        elif self.kv_nvfp4:
             from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
                 decode_rows,
                 nvfp4_sparse_attention_gfx950,
