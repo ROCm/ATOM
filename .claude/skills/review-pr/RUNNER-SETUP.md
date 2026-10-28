@@ -71,6 +71,14 @@ service install (section 5) cannot.
 
 ### Two runners on one box (box308 only)
 
+A second runner, not a shared one. aiter's unit is registered against `ROCm/aiter`,
+and a repository-scoped runner can only ever serve the repository it was registered
+to — there is no way to point it at `ROCm/ATOM` as well. Sharing one registration
+across both repos would require re-registering aiter's runner at the `ROCm`
+*organization* level, which changes a setup that is working today; that is a decision
+for whoever owns aiter's bot, not a prerequisite for this one. What ATOM needs is its
+own registration token for `ROCm/ATOM` and its own runner process on the same box.
+
 box308 already runs aiter's reviewer as a systemd unit named
 `actions.runner.ROCm-aiter.srdc-8-aiter-review.service`. GitHub names these units
 `actions.runner.<org>-<repo>.<name>.service`, so ATOM's runner — registered against
