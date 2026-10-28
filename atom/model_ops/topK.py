@@ -233,7 +233,7 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel = num_fused_shared_experts
     # Inside a graph only: the Triton launch costs more host time than the
     # HIP one, which matters for eager (host-bound) prefill.
-    if (
+    use_triton = (
         envs.ATOM_TRITON_TOPK_SOFTMAX
         and torch.cuda.is_current_stream_capturing()
         and fused_shared_experts_scoring_func in ("", "sigmoid")
@@ -244,7 +244,8 @@ def rocm_aiter_topk_softmax_impl(
             renormalize,
             fused_shared_experts_for_kernel,
         )
-    ):
+    )
+    if use_triton:
         triton_topk_softmax(
             topk_weights,
             topk_ids,
@@ -252,22 +253,20 @@ def rocm_aiter_topk_softmax_impl(
             fused_shared_experts_for_kernel,
             num_valid_rows,
         )
-        if num_fused_shared_experts > 0:
-            return total_topk_weights, total_topk_ids
-        return topk_weights, topk_ids
-    token_expert_indicies = torch.empty(
-        gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
-    )
-    topk_softmax(
-        topk_weights,
-        topk_ids,
-        token_expert_indicies,
-        gating_output,
-        renormalize,
-        fused_shared_experts_for_kernel,
-        fused_shared_experts_scoring_func,
-        num_valid_rows,
-    )
+    else:
+        token_expert_indicies = torch.empty(
+            gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
+        )
+        topk_softmax(
+            topk_weights,
+            topk_ids,
+            token_expert_indicies,
+            gating_output,
+            renormalize,
+            fused_shared_experts_for_kernel,
+            fused_shared_experts_scoring_func,
+            num_valid_rows,
+        )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
