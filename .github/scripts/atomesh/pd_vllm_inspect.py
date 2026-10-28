@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Publish only whitelisted numeric/boolean status for one known experiment.
+"""Inspect one known experiment; optionally recover bounded service log tails.
 
-Never copies logs, environment, scheduler text, arbitrary JSON, or file contents.
+Recovery reads only named logs and worker failures within this task namespace.
 No Slurm submission, SSH, container action, or shared-filesystem write occurs.
 """
 import json
@@ -107,6 +107,20 @@ for run in runs:
                     'rocm_nvfp4_attention': 'MiniMax M3 sparse attention selected ROCm NVFP4',
                     'mr_failure': 'ibv_reg_mr failed'}.items():
                     row[f'{role}_{name}'] = marker in tail
+        if os.environ.get('ATOMESH_ENV_ATOMESH_INSPECT_RECOVER_LOGS') == '1':
+            recovery = out / 'recovered' / job.name
+            sources = [current / 'logs' / f'{role}.log'
+                       for role in ('prefill', 'decode', 'proxy', 'mooncake-master')]
+            sources += [current / 'runtime-evidence' / f'{role}-rank-{rank}' / 'failure.txt'
+                        for role in ('prefill', 'decode') for rank in range(4)]
+            for source in sources:
+                if not source.is_file() or not source.resolve().is_relative_to(job.resolve()):
+                    continue
+                target = recovery / source.relative_to(current)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with source.open('rb') as stream:
+                    stream.seek(max(0, source.stat().st_size - 2 * 1024 * 1024))
+                    target.write_bytes(stream.read(2 * 1024 * 1024))
         row['runtime_stages'] = {}
         for role in ('prefill', 'decode'):
             row['runtime_stages'][role] = {
