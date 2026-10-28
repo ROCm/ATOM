@@ -666,6 +666,66 @@ def test_decode_inflight_block():
     assert seq.id in batch3.req_ids
 
 
+def test_mixed_batch_keeps_a_middle_chunk_out_of_flight():
+    """A mixed batch is `[prefill | decode]`. Its decode rows and final-chunk
+    prefill rows yield a token; a middle-chunk prefill row does not, so it is
+    neither blocked nor released by this batch -- only by its final chunk's."""
+    from types import SimpleNamespace
+
+    batch = SimpleNamespace(
+        req_ids=[1, 2, 3, 4],
+        total_seqs_num_prefill=2,
+        total_seqs_num_decode=2,
+        is_final_chunk=[False, True, False, False],
+    )
+    assert list(Scheduler._pp_inflight_req_ids(batch)) == [2, 3, 4]
+
+    sched = Scheduler(_pp_config())
+    sched._pp_inflight_token_block.add(1)  # held by its final-chunk batch
+    sched.release_pp_inflight(batch)
+    assert 1 in sched._pp_inflight_token_block
+
+
+def test_mixed_middle_chunk_completing_first_keeps_its_seq_blocked():
+    """valarLip's PP + mixed case, end to end. Batch M carries A's middle chunk
+    beside a decode, batch F A's final chunk. If M completes first, A must stay
+    blocked until F's token is back: it was advanced past its prompt when F was
+    scheduled, so decoding it now would read a stale token and position."""
+    cfg = _pp_config(enable_mixed_prefill_decode=True, max_num_batched_tokens=64)
+    sched = Scheduler(cfg)
+    block = cfg.kv_cache_block_size
+    d = _make_seq(16, block_size=block)
+    sched.add(d)
+    sched.schedule()  # d's whole prompt
+    d.token_ids.append(42)  # its token came back: d now decodes
+    d.num_tokens += 1
+    d.type = SequenceType.DECODE
+
+    a = _make_seq(100, block_size=block)
+    sched.add(a)
+    m, _ = sched.schedule()
+    assert m.is_mixed and m.req_ids == [a.id, d.id]
+    assert m.is_final_chunk[0] is False
+    sched.mark_pp_inflight(m)
+
+    f = None
+    for _ in range(4):
+        batch, _ = sched.schedule()
+        sched.mark_pp_inflight(batch)
+        if a.id in batch.req_ids and batch.is_final_chunk[batch.req_ids.index(a.id)]:
+            f = batch
+            break
+    assert f is not None
+
+    sched.release_pp_inflight(m)  # M completes before F
+    assert a.id in sched._pp_inflight_token_block
+    batch, _ = sched.schedule()
+    assert a.id not in batch.req_ids
+
+    sched.release_pp_inflight(f)
+    assert a.id not in sched._pp_inflight_token_block
+
+
 def test_multiple_seqs_partial_and_final():
     cfg = _pp_config(max_num_batched_tokens=200)
     sched = Scheduler(cfg)

@@ -1177,12 +1177,27 @@ class Scheduler:
         room = max(room, self._balance_min_tokens - batched_tokens)
         return max(min(room, cap_room), 0)
 
+    def _prefill_budget(self) -> int:
+        """Tokens this step's prefill may take: the batch budget less the
+        decode-first reserve. Under mixed batching every running decode keeps
+        the width the decode loop spends on it (`decode_spec_width + 1`);
+        without it the reserve is 0 and prefill takes the whole budget."""
+        if not self.enable_mixed_prefill_decode:
+            return self.max_num_batched_tokens
+        n_decode = sum(1 for s in self.running if not s.is_partial_prefill)
+        n_decode = min(n_decode, self.max_num_seqs)
+        reserve = min(
+            n_decode * (self.decode_spec_width + 1), self.max_num_batched_tokens
+        )
+        return self.max_num_batched_tokens - reserve
+
     def _estimate_prefill_chunk_cost(self) -> float:
-        """Cost of the chunk this rank would prefill with the whole batch
-        budget: resumable partials first, then the head of `waiting`, probing
-        the prefix cache without recording (`can_allocate_memoized`). An
-        estimate -- the real admission may park or skip some of these seqs."""
-        token_cap = self.max_num_batched_tokens
+        """Cost of the chunk this rank would prefill with its prefill budget
+        (`_prefill_budget`, the decode-first one under mixed batching):
+        resumable partials first, then the head of `waiting`, probing the
+        prefix cache without recording (`can_allocate_memoized`). An estimate
+        -- the real admission may park or skip some of these seqs."""
+        token_cap = self._prefill_budget()
         tokens, cost = 0, 0.0
         if self._partial_prefill_count > 0:
             for seq in self.running:
@@ -2106,7 +2121,8 @@ class Scheduler:
         # the step and mixed batches form naturally. ATOM keeps its existing
         # prefill-first phase bodies (lower risk), but reserves the in-flight
         # decodes' token budget up front so the prefill phases below only spend
-        # `max_num_batched_tokens - decode_token_reserve`. The decode phase then
+        # `_prefill_budget()` (the batch budget less that reserve, which the DP
+        # cost estimate prices too). The decode phase then
         # consumes the reserved remainder from the full budget. Net effect is
         # identical to decode-first for mixed-batch formation. Only active when
         # mixed batching is enabled; flag-off => reserve 0 => byte-identical to
@@ -2114,15 +2130,7 @@ class Scheduler:
         # Reserved at what the decode loop below actually spends per seq
         # (`decode_spec_width + 1`), not at `mtp_k + 1`: the two differ under
         # PP, where the loop spends no draft rows.
-        decode_token_reserve = 0
-        if self.enable_mixed_prefill_decode:
-            n_decode_inflight = sum(1 for s in self.running if not s.is_partial_prefill)
-            n_decode_inflight = min(n_decode_inflight, self.max_num_seqs)
-            decode_token_reserve = min(
-                n_decode_inflight * (self.decode_spec_width + 1),
-                self.max_num_batched_tokens,
-            )
-        prefill_budget = self.max_num_batched_tokens - decode_token_reserve
+        prefill_budget = self._prefill_budget()
 
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `delayer_allows` so cross-DP alignment still holds when one
@@ -4174,14 +4182,17 @@ class Scheduler:
         release_pp_inflight() MUST use this same predicate so every add() has a
         matching discard(); a seq spanning two batches (middle then final chunk)
         is only blocked/released by its final-chunk batch.
+
+        Rows are `[prefill | decode]`: every decode row yields a token, a
+        prefill row only on its final chunk. A mixed batch's middle-chunk
+        prefill rows are NOT in flight here -- releasing one with this batch
+        would unblock it while its final chunk's token is still in flight.
         """
         final = batch.is_final_chunk
-        if batch.total_seqs_num_decode > 0:
-            yield from batch.req_ids
-        elif final is not None:
-            for i, req_id in enumerate(batch.req_ids):
-                if final[i]:
-                    yield req_id
+        n_prefill = batch.total_seqs_num_prefill
+        for i, req_id in enumerate(batch.req_ids):
+            if i >= n_prefill or (final is not None and final[i]):
+                yield req_id
 
     def mark_pp_inflight(self, batch: ScheduledBatch) -> None:
         """Head: block re-scheduling of seqs whose token is now in flight.

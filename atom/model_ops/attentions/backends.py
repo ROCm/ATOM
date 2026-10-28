@@ -613,10 +613,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         (stale) sources while the metadata viewed the bank's never-uploaded
         GPU side.
 
-        Built lazily on first use (after all setup-time `forward_vars.update`
-        has run), so single-mode runs pay nothing. One per `forward_vars` ring
-        slot: a slot's bank is reused only when the slot is, which the runner's
-        own owner already gates on the slot's previous forward.
+        Built for every `forward_vars` ring slot by `build_mixed_prefill_banks`,
+        which the runner calls before warmup's memory profile, so the KV budget
+        counts them; a run without mixed batching builds none. A slot's bank is
+        reused only when the slot is, which the runner's own owner already
+        gates on the slot's previous forward.
 
         So the bank's own completion event covers only its uploads, and needs
         no more. Its GPU side is ordered by stream: uploads publish on the
@@ -629,24 +630,36 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         Returns ``(forward_vars, owner, groups)``; the last two are None for a
         runner without a publication registry.
         """
-        runner = self.model_runner
         banks = getattr(self, "_mixed_prefill_banks", None)
         if banks is None:
-            banks = self._mixed_prefill_banks = {}
-        slot = getattr(runner, "_fv_idx", 0)
-        bank = banks.get(slot)
-        if bank is None:
+            # Building here would allocate mid-serve, after the KV cache took
+            # the memory the profile left.
+            raise RuntimeError(
+                "mixed prefill banks were not built: the runner calls "
+                "build_mixed_prefill_banks() before warmup when "
+                "--enable-mixed-prefill-decode is set"
+            )
+        return banks[getattr(self.model_runner, "_fv_idx", 0)]
+
+    def build_mixed_prefill_banks(self) -> None:
+        """Build `_get_mixed_prefill_bank`'s bank for every `forward_vars` ring
+        slot. Called once, after the ring and its publication owners exist and
+        before warmup, so the memory profile and the KV budget see them."""
+        runner = self.model_runner
+        ring = getattr(runner, "_fv_ring", None) or [runner.forward_vars]
+        banks = {}
+        for slot, forward_vars in enumerate(ring):
             # `clone()` carries `pin_memory`: an unpinned source would make
             # `copy_(non_blocking=True)` synchronous.
             variables = {
                 name: (val.clone() if isinstance(val, CpuGpuBuffer) else val)
-                for name, val in runner.forward_vars.items()
+                for name, val in forward_vars.items()
             }
             owner = groups = None
             if getattr(runner, "h2d_groups", None) is not None:
                 owner, groups = runner.build_h2d_slot(variables, torch.cuda.Event())
-            bank = banks[slot] = (variables, owner, groups)
-        return bank
+            banks[slot] = (variables, owner, groups)
+        self._mixed_prefill_banks = banks
 
     @contextmanager
     def mixed_prefill_bank_selected(self):

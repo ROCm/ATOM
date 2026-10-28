@@ -520,7 +520,9 @@ class EngineCore:
                 # Arm post-prefill decode protection only after the prefill
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
-                self.scheduler.prefill_delayer.notify_prefill_executed()
+                self.scheduler.prefill_delayer.notify_prefill_executed(
+                    decoded=scheduled_batch.total_seqs_num_decode > 0
+                )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
