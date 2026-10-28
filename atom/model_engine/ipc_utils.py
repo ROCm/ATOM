@@ -307,7 +307,7 @@ def _expert_placement(model: nn.Module) -> dict:
 
 
 def export_model_weight_handles(
-    model: nn.Module, retain: list | None = None
+    model: nn.Module, retain: list | None = None, *, include_buffers: bool = True
 ) -> dict:
     """Export all model parameter tensors as CUDA IPC handles.
 
@@ -323,6 +323,9 @@ def export_model_weight_handles(
 
     Must be called from the process that allocated the weights (prefill),
     after load_model() completes.  Returns a dict {key: meta_dict}.
+
+    ``include_buffers=False`` exports parameters only -- see the buffer loop
+    for when that is the right call.
     """
     handles = {}
     tensor_attrs: dict[str, dict] = {}
@@ -356,7 +359,14 @@ def export_model_weight_handles(
             " ..." if len(empty_params) > 10 else "",
         )
     # Registered buffers (non-persistent included).
-    for name, buf in model.named_buffers():
+    #
+    # `include_buffers=False` is for a module that owns mutable scratch rather
+    # than only weights. A speculative drafter is the case in hand: some
+    # flavours register a private rolling target-KV window per layer
+    # (`reset_kv_cache`), and aliasing that would have the producer and the
+    # consumer writing one buffer. Weights are immutable after load and safe to
+    # share; scratch is not, and nothing here can tell the two apart by shape.
+    for name, buf in model.named_buffers() if include_buffers else ():
         if isinstance(buf, torch.Tensor) and buf.is_cuda and buf.numel() > 0:
             key = f"__buf__{name}"
             handles[key] = _export_tensor(buf, retain)

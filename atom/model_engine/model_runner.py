@@ -1007,9 +1007,23 @@ class ModelRunner:
         logger.info(f"Model warmup done: {self.config.model}")
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
-        """Extra GPU bytes to hold back from the KV cache budget beyond the
-        base overhead. Base runner reserves nothing; override point for
-        setups that share the GPU with another process."""
+        """Extra GPU bytes to hold back from the KV cache budget, beyond the
+        base overhead. Nothing reserves any today; this is where a reserve
+        goes back if one is ever needed again.
+
+        Sharing the GPU with a peer process is NOT a reason to. Rapidserve
+        used to hold back 8% of total HBM here -- 23GB on a 288GB card, for a
+        stated concern of a 512MB NCCL barrier buffer -- and it was double
+        counting: `non_torch` above already measures the peer, because it is
+        derived from the device's own free/total. Measured across a baseline
+        and a rapidserve run on the same 8xMI355X box, the two terms move
+        together and account for each other exactly:
+
+            free       134.61 -> 118.39 GB   (-16.22, decode's footprint)
+            non_torch   17.72 ->  33.94 GB   (+16.22, the same bytes)
+
+        The reserve on top of that cost 23GB of KV, nearly half the pool.
+        """
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
@@ -4052,9 +4066,7 @@ class ModelRunner:
                 _cq = getattr(_md, "cu_seqlens_q", None)
                 _fd = getattr(batch, "is_first_decode_without_local_prefill", None)
                 _ids = list(batch.req_ids)[: batch.total_seqs_num]
-                _cls = (
-                    _cl.tolist() if hasattr(_cl, "tolist") else list(_cl or [])
-                )
+                _cls = _cl.tolist() if hasattr(_cl, "tolist") else list(_cl or [])
                 _fds = list(_fd or [])
                 # PAIRED with the request id, not three leading values. A bare
                 # `ctx=[1088, 1109, 1148]` cannot be tied to a prompt, so the
@@ -4070,9 +4082,11 @@ class ModelRunner:
                     for i in range(min(4, len(_ids)))
                 )
                 _cuq = (
-                    "n/a" if _cq is None
-                    else str(_cq[:4].tolist() if hasattr(_cq, "tolist")
-                             else list(_cq)[:4])
+                    "n/a"
+                    if _cq is None
+                    else str(
+                        _cq[:4].tolist() if hasattr(_cq, "tolist") else list(_cq)[:4]
+                    )
                 )
                 _dp = self.config.parallel_config.data_parallel_rank
             except Exception as _e:  # noqa: BLE001
@@ -4115,7 +4129,9 @@ class ModelRunner:
         if align_only:
             return None
         if envs.ATOM_LOG_DRAFT_TOKENS:
-            self._log_draft_tokens(batch, next_token_ids, draft_token, num_reject_tokens)
+            self._log_draft_tokens(
+                batch, next_token_ids, draft_token, num_reject_tokens
+            )
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
         # reordered) batch. Keying by req_id (not batch position) is required:
@@ -5072,12 +5088,6 @@ class RapidServeModelRunner(ModelRunner):
             return
         super()._maybe_warmup()
 
-    def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
-        # Two processes share the GPU in disagg mode; reserve extra headroom so
-        # NCCL/system allocs (e.g. the 512MB NCCL barrier buffer) don't OOM.
-        safety_margin = int(total_bytes * 0.02)
-        return 4 * safety_margin
-
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
         # prefill.
@@ -5256,6 +5266,33 @@ class RapidServeModelRunner(ModelRunner):
             + str([p for p in paths if not os.path.exists(p)])
         )
 
+    @staticmethod
+    def _ipc_weight_root(module):
+        """The module whose `named_parameters()` keys both halves agree on.
+
+        `torch.compile` wraps a model in an `OptimizedModule` that prefixes
+        every parameter name with `_orig_mod.`, and the two halves do not
+        necessarily wrap alike: prefill forces `enforce_eager`, so a
+        compilation level that wraps on one side can leave the other bare.
+        Keys that disagree match NOTHING, and the import is silent about it --
+        it walks the handles and looks each name up, so an empty intersection
+        aliases no tensor and raises nothing. Export and import both come
+        through here, so the key space is the uncompiled module either way.
+        """
+        return getattr(module, "_orig_mod", module)
+
+    def _ipc_drafter_root(self):
+        """The drafter module to share, or None if this engine has no drafter.
+
+        One accessor for both halves, so the export and the import cannot
+        disagree about what "the drafter" is -- `self.drafter.model` is
+        reassigned by `torch.compile` at level 1, and `_ipc_weight_root`
+        unwraps that.
+        """
+        drafter = getattr(self, "drafter", None)
+        model = getattr(drafter, "model", None)
+        return None if model is None else self._ipc_weight_root(model)
+
     def export_model_weight_ipc_handles(self) -> list[str] | None:
         """Export all model parameters as CUDA IPC handles (prefill process only).
 
@@ -5272,16 +5309,35 @@ class RapidServeModelRunner(ModelRunner):
         # `.contiguous()` copy of a non-contiguous tensor) must not be collected
         # here or the consumer reads freed memory.
         self._disagg_export_retain = []
-        handles = export_model_weight_handles(
-            self.model, retain=self._disagg_export_retain
-        )
+        payload = {
+            "target": export_model_weight_handles(
+                self._ipc_weight_root(self.model), retain=self._disagg_export_retain
+            )
+        }
+        # The drafter travels too, under its own key. Two modules cannot share
+        # one dict: both name their tensors `model.layers.N...`, so merging
+        # them would have the target's handles silently overwrite the draft's.
+        #
+        # PARAMETERS ONLY. A drafter owns mutable scratch as well as weights --
+        # some DSpark flavours register a private rolling target-KV window per
+        # layer -- and aliasing that would have both processes writing one
+        # buffer. Decode keeps its own buffers; only the weights are shared.
+        draft = self._ipc_drafter_root()
+        if draft is not None:
+            payload["drafter"] = export_model_weight_handles(
+                draft, retain=self._disagg_export_retain, include_buffers=False
+            )
+            logger.info(
+                f"[WT-EXPORT] rank {self.rank}: exported "
+                f"{len(payload['drafter'])} drafter tensor(s)"
+            )
         if self._disagg_export_retain:
             logger.info(
                 f"[WT-EXPORT] rank {self.rank}: retaining "
                 f"{len(self._disagg_export_retain)} materialised tensor(s) that "
                 f"decode aliases"
             )
-        self._disagg_write_rank_file("weights", handles)
+        self._disagg_write_rank_file("weights", payload)
         paths = self._disagg_collect_rank_files("weights")
         if paths is not None:
             logger.info(
@@ -5299,6 +5355,13 @@ class RapidServeModelRunner(ModelRunner):
         Aliases EVERY parameter: prefill and decode run the same parallel
         shape, so every tensor matches and decode loads nothing itself.
 
+        The payload carries two sections. "target" is this process's model,
+        built on meta and filled entirely from here. "drafter" is the
+        speculative draft, which decode DOES load from the checkpoint -- so
+        those parameters are replaced rather than materialized, and the copies
+        they displace are freed by the collect below. See
+        `_import_drafter_weights`.
+
         Returns True as sentinel for wait_out=True.
         """
         import gc
@@ -5310,11 +5373,20 @@ class RapidServeModelRunner(ModelRunner):
         path = paths[self._disagg_paths_index]
         logger.info(f"ModelRunner rank {self.rank}: reading weight handles from {path}")
         with open(path, "rb") as f:
-            handles = pickle.load(f)
+            payload = pickle.load(f)
         os.remove(path)
         gb = 1 << 30
         free_start, dev_total = torch.cuda.mem_get_info()
-        import_model_weights(self.model, handles)
+        import_model_weights(self._ipc_weight_root(self.model), payload["target"])
+        # Before the collect below, so the drafter weights this replaces are
+        # reclaimed in the same pass as the target's.
+        #
+        # Before `_rebind_drafter_shared_weights_after_import` too, and that
+        # order matters: the drafter's embed/head are bound to the TARGET's
+        # module objects, so the rebind must have the last word on them. Both
+        # end up pointing at the same prefill pages -- prefill shared them the
+        # same way -- but only the rebind checks that it landed.
+        self._import_drafter_weights(payload.get("drafter"))
         # Three samples, not two. Folding the mapping and the cleanup into one
         # delta made `map_cost` read -2.22GB, which looks like mapping returning
         # memory and is really the reclaim below swamping a ~0 mapping cost.
@@ -5353,6 +5425,68 @@ class RapidServeModelRunner(ModelRunner):
             f"ModelRunner rank {self.rank}: weight IPC import complete — own weights freed"
         )
         return True
+
+    def _import_drafter_weights(self, handles: dict | None) -> None:
+        """Alias the drafter's weights onto prefill's, and say whether it took.
+
+        Decode loads the drafter from the checkpoint like any other engine --
+        unlike the target, which is built on meta and filled purely by this
+        import -- so these parameters are real tensors being REPLACED, and the
+        memory they held is reclaimed by the collect that follows. That is the
+        whole saving: a second copy of the draft weights on a GPU that is
+        already sharing everything else.
+
+        Checked by data pointer rather than trusted, because the way this fails
+        is silent. `import_model_weights` walks the handles and looks each name
+        up in the consumer's module; a key space that does not line up -- one
+        side `torch.compile`-wrapped and the other not, say -- intersects with
+        nothing, replaces nothing, and raises nothing. Decode would then keep
+        its own checkpoint-loaded weights, which is not WRONG (they are the
+        same values) but silently gives back the memory this exists to save.
+        A count of what actually moved is the only way to tell those apart.
+        """
+        draft = self._ipc_drafter_root()
+        if not handles or draft is None:
+            if handles and draft is None:
+                logger.warning(
+                    "ModelRunner rank %s: prefill exported drafter weights but "
+                    "this process has no drafter to import them into",
+                    self.rank,
+                )
+            return
+        from atom.model_engine.ipc_utils import import_model_weights
+
+        def _ptrs():
+            return {
+                n: p.data_ptr()
+                for n, p in draft.named_parameters(remove_duplicate=False)
+                if p is not None and not p.is_meta and p.numel() > 0
+            }
+
+        before = _ptrs()
+        import_model_weights(draft, handles)
+        after = _ptrs()
+        moved = sum(1 for n, ptr in before.items() if after.get(n) != ptr)
+        materialized = len(after) - len(before)
+        if moved or materialized:
+            logger.info(
+                "[WT-IMPORT] rank %s: drafter aliased %d/%d parameter(s) from "
+                "prefill (+%d materialized from meta)",
+                self.rank,
+                moved,
+                len(before),
+                materialized,
+            )
+        else:
+            logger.warning(
+                "[WT-IMPORT] rank %s: drafter import replaced NOTHING (%d "
+                "handles, %d local parameters). The two sides' parameter names "
+                "do not line up, so this process keeps its own copy of the "
+                "draft weights and the GPU holds two.",
+                self.rank,
+                len(handles),
+                len(before),
+            )
 
     def _rebind_drafter_shared_weights_after_import(self) -> None:
         """Re-point the drafter at the target tensors the import just installed.
@@ -5947,9 +6081,7 @@ class RapidServeModelRunner(ModelRunner):
                 sampled_cpu = [0] * int(batch.total_seqs_num)
             else:
                 logits = logits[: batch.total_seqs_num]
-                sampled = self.sampler(
-                    logits, temperatures, top_ks, top_ps, all_greedy
-                )
+                sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
                 sampled_cpu = sampled.view(-1).tolist()
             if envs.ATOM_LOG_EMITTED_TOKENS:
                 # Prefill's own copy of the `[emit]` line. It needs one because
@@ -5960,9 +6092,7 @@ class RapidServeModelRunner(ModelRunner):
                 # drafter does, so with speculation off T0 would go unrecorded
                 # on the one side that produces it.
                 self._emit_log_step = getattr(self, "_emit_log_step", 0) + 1
-                for _i, _rid in enumerate(
-                    list(batch.req_ids)[: len(sampled_cpu)]
-                ):
+                for _i, _rid in enumerate(list(batch.req_ids)[: len(sampled_cpu)]):
                     logger.info(
                         "[emit] step=%d dp=%s role=%s seq=%s n=1 tokens=%s",
                         self._emit_log_step,

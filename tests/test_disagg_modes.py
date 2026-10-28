@@ -1908,6 +1908,42 @@ class TestDelayerLivesOnDecode:
         assert attach > build
 
 
+class TestNoExtraKvReserveUnderRapidServe:
+    """Sharing the GPU with a peer is not a reason to hold back KV.
+
+    RapidServe used to reserve 8% of total HBM here -- 23GB on a 288GB card,
+    for a stated concern of a 512MB NCCL barrier buffer -- and it was double
+    counting. `non_torch` in the budget is `(total - free) - torch_reserved`,
+    derived from the device's own numbers, so it already measures the peer
+    process. Across a baseline and a rapidserve run on the same 8xMI355X box
+    the two terms moved together and accounted for each other exactly:
+
+        free       134.61 -> 118.39 GB   (-16.22, decode's footprint)
+        non_torch   17.72 ->  33.94 GB   (+16.22, the same bytes)
+
+    The reserve on top of that cost 23GB of KV: available_for_kv 87.94 -> 48.05
+    and the pool fell from 64,924 blocks to 34,306, nearly half.
+    """
+
+    def test_rapidserve_reserves_nothing_extra(self):
+        mr = pytest.importorskip("atom.model_engine.model_runner")
+
+        assert (
+            mr.RapidServeModelRunner._kv_budget_extra_reserve
+            is mr.ModelRunner._kv_budget_extra_reserve
+        ), "rapidserve must not override the reserve back in"
+
+    def test_the_reserve_is_zero_whatever_the_card_size(self):
+        """It used to scale with total HBM, so the bigger the card the more KV
+        it gave away."""
+        mr = pytest.importorskip("atom.model_engine.model_runner")
+
+        for gb in (80, 192, 288, 512):
+            assert (
+                mr.ModelRunner._kv_budget_extra_reserve(None, gb * (1 << 30)) == 0
+            ), gb
+
+
 class TestUnconstrainedEmitsOnlyTheNoneStream:
     """The pool's sole key in unconstrained mode is None, so that is the only
     fraction either side may put on a batch.
