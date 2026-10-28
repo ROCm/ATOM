@@ -43,6 +43,10 @@ from atom.model_ops.rejection_sampler import (
     RatioDraftQ,
     _draft_token,
     _finish_request,
+    _ratio_filter_count_kernel,
+    _ratio_filter_cut_kernel,
+    _ratio_filter_floor_kernel,
+    _ratio_filter_pass_kernel,
     _ratio_residual_pick_kernel,
     _ratio_residual_race_kernel,
     _ratio_scratch_shapes,
@@ -660,6 +664,30 @@ Q = {5: 0.2, _RATIO_BLOCK_V + 7: 0.1, VOCAB - 2: 0.7}
 def _rows_to_requests(cu_ptr, out_ptr, batch_size, steps):
     row = tl.program_id(0)
     tl.store(out_ptr + row, _request_of_row(cu_ptr, row, batch_size, steps))
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        _ratio_stats_kernel,
+        _ratio_filter_pass_kernel,
+        _ratio_filter_floor_kernel,
+        _ratio_filter_cut_kernel,
+        _ratio_filter_count_kernel,
+        _ratio_residual_race_kernel,
+        _ratio_residual_pick_kernel,
+        softmax_combine_kernel,
+    ],
+    ids=lambda k: k.fn.__name__,
+)
+def test_no_verify_kernel_specializes_on_the_batch(kernel):
+    """The verify launches eagerly at whatever batch arrives; a row or request
+    count Triton specialized on (== 1, % 16) would compile a new variant the
+    first time such a batch arrived, mid-serve."""
+    counts = {"num_tokens", "batch_size", "num_rows"}
+    params = [p for p in kernel.params if p.name in counts]
+    assert params
+    assert all(p.do_not_specialize for p in params), [p.name for p in params]
 
 
 @pytest.mark.parametrize(
