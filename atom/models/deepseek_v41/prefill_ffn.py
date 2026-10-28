@@ -6,10 +6,8 @@ import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_ops.blockscale import quantize_fp8
-from atom.model_ops.deepseek_v41.row_sharded_mhc import (
-    eligible,
-    v41_mhc_reduce_scatter,
-)
+from atom.model_ops.deepseek_v41.ffn_combine import v41_ffn_combine_scatter
+from atom.model_ops.deepseek_v41.row_sharded_mhc import eligible
 from atom.model_ops.module_dispatch_ops import _dual_stream_is_active
 
 from .prefill_router import owned_router_logits
@@ -93,4 +91,4 @@ def prequantized_owned_ffn(moe, local, rows):
     else:
         shared_output = shared()
         routed_output = routed()
-    return v41_mhc_reduce_scatter(routed_output + shared_output)
+    return v41_ffn_combine_scatter(routed_output, shared_output)

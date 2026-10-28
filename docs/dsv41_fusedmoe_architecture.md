@@ -153,6 +153,26 @@ R13中H=5120：完整BF16行10240B，FP8 values5120B；scale字节由真实block
 
 ### A. 输出段：G2/shared → owner归约 → 下一层消费者
 
+大并发的 Mono 以 expert tile 的权重复用、连续传输及跨卡流水为组织单位；小并发的逐 token 持久调度不是其可直接扩大的模板。这里复用小 Mono 的 ownership、真实 peer-pointer 表、设备就绪与最后读者确认，保留大 M 原生 GEMM。
+
+2026-10-28 已实现并完成整网验收的边界是 shared/G2 join 后的一次布局写入：
+
+```text
+原生 EP4 大 G1/G2 + shared TP4
+  → BF16 相加并写入 padded RCCL send buffer（一次写）
+  → 同一原生 RCCL reduce-scatter
+  → owner pending
+  → 原生 Mega-mHC post/pre/norm（及 attention MXFP8）
+```
+
+生产唯一入口为 `prefill_ffn.prequantized_owned_ffn` → `ffn_combine.v41_ffn_combine_scatter`。仅 TP4、H5120、连续同形 BF16、M≥4096 且 M%4≠0 启用；其他形状原生回退。buffer 由本次调用或捕获图拥有，不增加全局地址缓存；完整图键仍保留地址、bands、q 和布局。ELEMENTS/PADDED 是运行时参数，H5120 的整 tile 谓词提供实际向量 load/store，五个 ragged M 不再产生五份 JIT。
+
+真实整网 R3 对 C5 的增量为1.005464064×，两对1.010770831/1.000148327×，baseline漂移1.2329%；这是约0.55%的观测增量，不能承诺稳定1%，也不能乘到历史主线1.324404975757×上。所有正式阶段 zero-JIT/capture，原生图完整绑定稳定。全量 GSM8K 1212/1319=91.8878%，达到91%门槛；本部署BF16 KV/EP4与catalog FP8 KV的差异单独披露。详见 `dsv41_wide_output_findings.md` 和仓外 `validation/whole_join_20261028/`。
+
+早期32KiB逐包IPC直接写owner与owner拉取都已实测停止：整G2完成后才发布，没有产生G2内部流水，新增搬运与同步抵消收益。其 ready/ack 协议及失败数据保留在实测文档。当前不把这类原型接进生产，也不扩大小M Mono guard。
+
+当前原生 `finish_ffn` 已将 pending FFN 交给下一层 `prepare_attention`，Mega-mHC 已融合 post/pre/norm；Engram强制settle、最后层flush保持原生行为。下述块完成/归约直达消费者仍是后续架构目标：
+
 先在保持原生G1/G2矩阵形状和排序的前提下，设计以owner行×H输出块为单位的publication。每个输出块只有在本rank的全部有效expert贡献完成、shared对应部分完成后才发布。不能把某个expert/tile完成误当成整个owner块完成。
 
 接收端收齐所需rank贡献，按现行数值合同归约，直接写下一层所需的owner缓冲。若mHC需要整行H统计，则在整行片段齐全后执行；其前面的H块发布仍可推进。延迟residual/post需定义末层flush、图复用和原生fallback，不能只优化中间层。

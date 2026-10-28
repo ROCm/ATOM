@@ -12,6 +12,20 @@ class RouteProof:
         self.layers = None
         self.contracts = []
         self.counts = {"warmup": {}, "sealed": {}}
+        self.combine_counts = {"warmup": {}, "sealed": {}}
+        self.active_layer = None
+
+    def combine(self, rows, fused):
+        with self.audit.lock:
+            phase = "sealed" if self.audit.sealed else "warmup"
+            key = f"{self.active_layer}:{'fused' if fused else 'native'}"
+            row = self.combine_counts[phase].setdefault(
+                key, {"calls": 0, "rows": 0, "min_rows": rows, "max_rows": rows}
+            )
+            row["calls"] += 1
+            row["rows"] += rows
+            row["min_rows"] = min(row["min_rows"], rows)
+            row["max_rows"] = max(row["max_rows"], rows)
 
     def record(self, layer, rows):
         if not self.enabled or self.layers is None or layer not in self.layers:
@@ -36,6 +50,7 @@ class RouteProof:
                     "expected_layers": self.layers,
                     "contracts": self.contracts,
                     "counts": self.counts,
+                    "combine_counts": self.combine_counts,
                     "scope": "Completed actual guarded prequantized FFN calls; host counters only, no kernel timing or decode occupancy claim.",
                 }
             )
@@ -96,10 +111,42 @@ def bind(Runner, consumer, enabled, configure):
     Runner._maybe_warmup = warmup
     if enabled:
         original_consumer = consumer.prequantized_owned_ffn
+        # Both callbacks run inside the existing guarded FFN, outside Dynamo.
+        # Count the actual exit call; graph replay does not re-enter Python.
+        combined = hasattr(consumer, "v41_ffn_combine_scatter")
+        if combined:
+            from atom.model_ops.deepseek_v41.ffn_combine import supports_fused_combine
+
+            original_exit = consumer.v41_ffn_combine_scatter
+
+            @functools.wraps(original_exit)
+            def exit_call(routed, shared):
+                result = original_exit(routed, shared)
+                proof.combine(
+                    int(routed.shape[0]), supports_fused_combine(routed, shared, 4)
+                )
+                return result
+
+            consumer.v41_ffn_combine_scatter = exit_call
+        else:
+            original_exit = consumer.v41_mhc_reduce_scatter
+
+            @functools.wraps(original_exit)
+            def exit_call(value):
+                result = original_exit(value)
+                proof.combine(int(value.shape[0]), False)
+                return result
+
+            consumer.v41_mhc_reduce_scatter = exit_call
 
         @functools.wraps(original_consumer)
         def observed(moe, local, rows):
-            result = original_consumer(moe, local, rows)
+            previous = proof.active_layer
+            proof.active_layer = moe.layer_id
+            try:
+                result = original_consumer(moe, local, rows)
+            finally:
+                proof.active_layer = previous
             proof.record(moe.layer_id, int(rows))
             return result
 
