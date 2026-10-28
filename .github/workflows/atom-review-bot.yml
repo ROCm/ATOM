@@ -20,7 +20,7 @@
 # Two jobs so an unauthorized comment never touches the self-hosted box:
 #   gate    (ubuntu-latest, free): quote-aware trigger + allowlist check, reading
 #           authorized.txt from the default branch (or the ATOM_REVIEW_AUTHORIZED repo var).
-#   review  (self-hosted atom-bot-24): only when gate passes — checkout, claim 👀, run_one.sh
+#   review  (self-hosted atom-bot): only when gate passes — checkout, claim 👀, run_one.sh
 #           (headless GLM review), then _publish.py (posts the card for EVERY verdict) or
 #           _notify.py (routes a failed run to its owner).
 name: atom-review-bot
@@ -144,7 +144,7 @@ jobs:
   review:
     needs: gate
     if: needs.gate.outputs.ok == 'true'
-    runs-on: [self-hosted, atom-bot-24]        # label the runner with these at registration
+    runs-on: [self-hosted, atom-bot]        # label the runner with these at registration
     outputs:
       notified: ${{ steps.notify.outputs.notified }}
     timeout-minutes: 150    # bound a wedged review; the single runner must not be pinned for GitHub's 6h default

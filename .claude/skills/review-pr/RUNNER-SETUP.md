@@ -1,60 +1,104 @@
 # Runner setup — atom-review-bot
 
 The `atom-bot review` workflow (`.github/workflows/atom-review-bot.yml`) runs on a
-self-hosted runner labeled `atom-bot-24`, on host `srdc-24`. This is what that runner must
-provide. Verify the box with `bash .claude/skills/review-pr/preflight.sh` — it checks every item
-below and prints a fix hint for each red. This doc explains how to make those checks pass.
+self-hosted runner labeled `atom-bot`. This is what that runner must provide. Verify the
+box with `bash .claude/skills/review-pr/preflight.sh` — it checks every item below and
+prints a fix hint for each red. This doc explains how to make those checks pass.
 
-## Why this box, and what must not be copied from aiter's setup
+## Two boxes, two phases — read this before copying a command
 
-aiter's box serves its own GLM locally, which takes all eight GPUs. Copying that arrangement
-here would leave nothing for validation. On this box the review agent reaches its model over
-the network instead — the AMD gateway during development, box308's already-running GLM-5.3 in
-the end — and the eight local GPUs stay free. Concretely, that means **tunnel mode**: the
-runner's `.env` leaves `ATOM_REVIEW_AGENT` unset, so `run_one.sh` falls through to its own
-`claude-glm` default, and `preflight.sh`'s "headless agent" check takes the tunnel-mode branch
-(claude-glm on PATH + endpoint config), not the direct-agent branch aiter's identical-looking
-`.env` recipe would trigger. If you move this setup to a box that serves its own model, say so
-in this file, redo the GPU arithmetic, and switch to direct-agent mode deliberately (see
-section 2) — do not let it happen by accident because `.env` carried over an aiter-shaped line.
+This setup runs in two phases, on two different boxes, and the facts that matter invert
+between them. Do not read one box's section and assume it generalizes to the other.
 
-## Install on a data volume, not the root fs
+| | **srdc-24 — testing, now** | **box308 — production, later** |
+|---|---|---|
+| systemd | absent in the agent container: `PID 1` is `bash`, `systemctl is-system-running` returns `offline` | real: `PID 1` is `systemd`, `is-system-running` returns `running` |
+| `/mnt/raid0` | 100% full (126G free of a much larger disk, all spoken for) | 9.3T free |
+| runner install path | `/mnt/md0` instead (~9.6T free, persistent volume) | `/mnt/raid0/zufa/`, alongside aiter's own runner |
+| GPUs (8× MI308X) | all idle | all held by a local GLM-5.3 server (VRAM 98–99%) |
+| model endpoint | reached over the network (AMD gateway) | served locally, `localhost:30000` |
+| other runners on the box | none | aiter's `actions.runner.ROCm-aiter.srdc-8-aiter-review.service` |
 
-`/mnt/raid0` on this box is 100% full (126G free of a much larger disk, all of it already
-spoken for). The runner lives on `/mnt/md0` instead, which has ~9.6T free and — importantly —
-is a persistent volume that survives container rebuilds, unlike the container's own filesystem.
-Each review checks out the repo and builds two worktrees; a box whose volume fills up mid-review
-fails mid-review, silently if nobody is watching the disk.
+**Why both boxes still exist**: srdc-24 is where P0 is being built and verified, with
+idle GPUs and no neighbor runner to worry about. box308 is where this eventually has to
+live for real, because that is where aiter's bot already lives and where the box has
+spare GPU-review capacity *in principle* — except that in practice its GPUs are all
+taken (see below). The label `atom-bot` is deliberately machine-neutral so it survives
+the move from one to the other without a rename.
 
-## The container/host split — do sections 1 and 5 from the host, not from here
+### The GPU constraint this creates (live, not hypothetical, on box308)
 
-Agent sessions on this box (including whichever session produced this file) run inside a Docker
-container: `PID 1` is `bash`, `systemctl is-system-running` returns `offline`, and `/.dockerenv`
-exists. There is no systemd here, and no amount of `nohup` or a hand-rolled keeper loop fixes
-that — see the warning in section 5. The runner's **files** can live on `/mnt/md0` because that
-volume is reachable from both the container and the host. But **registering the runner
-(section 1) and installing it as a systemd service (section 5) must be done from the host**,
-logged in directly (SSH or console), not from inside this or any other agent container.
+On srdc-24 the model is reached over the network, so all eight GPUs stay free and
+`validate-atom-pr` (arriving in P2) has somewhere to run. On box308 the model is served
+*locally* by a GLM-5.3 that already holds all eight GPUs — so when `validate-atom-pr`
+arrives in P2, there is **no GPU on this box for it to use**. This is not a future
+problem to flag later; it is true today, as soon as review moves to box308.
 
-The reason this matters more than it looks: a runner process started by hand inside a container
-dies the moment that container stops or is rebuilt, and nothing reports it. GitHub does not see
-a crashed runner as a failure — it sees no runner, so the next `atom-bot review` job just
-sits in `queued` forever. That state fails nothing, notifies nobody, and looks from the PR like
-"review still in progress," not "broken." aiter's own box lost its runner to a plain reboot this
-same way and sat silently offline for days before anyone noticed. A systemd unit on the host,
-with the `Restart=always` drop-in in section 5, is what prevents both the reboot case (aiter's
-failure mode) and the container-lifecycle case (this box's extra failure mode, since aiter's
-box was never containerized).
+This is exactly the situation the design spec's **section 5.3** anticipates, and it
+lists the candidate resolutions: shrink the GLM's TP to free some GPUs, accept
+`NOT RUN — no idle GPU` on box308 (the gate supports this status), or run validation on
+a different box (srdc-24) while review runs on box308. **This document does not pick
+one** — that is P2's decision to make, once validate exists to make it about. What keeps
+all three options open is that `validate_pr.sh` is independently invocable and must
+stay that way: nothing in this setup may assume review and validate run on the same
+box.
 
-All of sections 1–5 below are **host-side, copy-pasteable commands for the user to run**, not
-something an agent container should attempt — `config.sh` and `svc.sh install` need a real
-systemd and, for registration, API credentials this environment's policy does not let an agent
-mint on your behalf. Section 2 (`.env`) and section 6 (`preflight.sh`) can be run from either
-side once the files exist, since they touch only `/mnt/md0`.
+### Why `/mnt/md0` on srdc-24, and `/mnt/raid0/zufa/` on box308
+
+The common reason, on both boxes, is the same: each review checks out the repo and
+builds two worktrees, and a runner whose volume fills up mid-review fails mid-review,
+often silently if nobody is watching the disk. Only the path changes, because only the
+disk changes: srdc-24's `/mnt/raid0` has no room, so the runner goes on `/mnt/md0`
+instead; box308's `/mnt/raid0` has 9.3T free, and aiter's own runner is already there
+under `/mnt/raid0/zufa/aiter-runner/`, so ATOM's runner goes alongside it at
+`/mnt/raid0/zufa/atom-runner/` for the same reason aiter's does — plenty of room, a
+persistent volume, consistent with the neighbor already running there.
+
+### The container/host split — do sections 1 and 5 from the host, not from here
+
+Agent sessions on srdc-24 (including whichever session produced this file) run inside a
+Docker container: `PID 1` is `bash`, `systemctl is-system-running` returns `offline`,
+and `/.dockerenv` exists. There is no systemd there, and no amount of `nohup` or a
+hand-rolled keeper loop fixes that — see the warning in section 5. box308 is different:
+it has real systemd (`is-system-running` returns `running`), so `svc.sh install` works
+there directly. What stays true on **both** boxes is that an agent session running
+inside a container cannot register a runner or install a systemd service — that still
+has to be done by a human, logged in to the box itself (SSH or console), not from
+inside this or any other agent container. The runner's **files** can be prepared from
+a container, because the install path (`/mnt/md0` on srdc-24, `/mnt/raid0/zufa/` on
+box308) is reachable from both the container and the host; registration (section 1) and
+service install (section 5) cannot.
+
+### Two runners on one box (box308 only)
+
+box308 already runs aiter's reviewer as a systemd unit named
+`actions.runner.ROCm-aiter.srdc-8-aiter-review.service`. GitHub names these units
+`actions.runner.<org>-<repo>.<name>.service`, so ATOM's runner — registered against
+`ROCm/ATOM` — produces `actions.runner.ROCm-ATOM.<name>.service`. The repo segment
+differs (`ROCm-aiter` vs `ROCm-ATOM`), so there is no name collision regardless of what
+`<name>` is chosen; pick something in aiter's style, e.g. `srdc-8-atom-review`, so the
+two units read as a matched pair in `systemctl list-unit-files`.
+
+`preflight.sh`'s persistence check greps `systemctl list-unit-files` for
+`actions.runner.*ATOM*` (falling back to `--user` scope). That pattern matches
+`actions.runner.ROCm-ATOM.srdc-8-atom-review.service` (contains `ATOM`) and does
+**not** match aiter's unit `actions.runner.ROCm-aiter.srdc-8-aiter-review.service`
+(contains `aiter`, not `ATOM`, and `glob`/regex matching here is case-sensitive) —
+confirmed by inspection of both unit strings against the pattern; a check that reported
+green by finding the neighbor's runner instead of its own would be exactly the kind of
+false pass this project keeps finding, so this is worth re-checking by eye any time
+either runner's name changes.
+
+The two runners will also compete for the box's CPU and disk during concurrent reviews
+— P0 needs no GPU, so that contention (not GPU contention) is the only one that exists
+today; it will get worse, not better, once P2's validation step needs a GPU too (see
+the constraint above).
 
 ---
 
 ## 1. Register the runner (host only — needs your GitHub credentials)
+
+### On srdc-24 (testing)
 
 ```bash
 sudo mkdir -p /mnt/md0/atom-runner && sudo chown "$(whoami)" /mnt/md0/atom-runner
@@ -81,13 +125,39 @@ Register with that token and the label this workflow expects:
 ```bash
 cd /mnt/md0/atom-runner
 ./config.sh --url https://github.com/zufayu/ATOM --token <token-from-above> \
-  --labels atom-bot-24 --name srdc24-atom-review --work _work --unattended --replace
+  --labels atom-bot --name srdc24-atom-review --work _work --unattended --replace
 ```
+
+### On box308 (production)
+
+Same binary, same label, different path and a name that pairs with aiter's
+`srdc-8-aiter-review`:
+
+```bash
+sudo mkdir -p /mnt/raid0/zufa/atom-runner && sudo chown "$(whoami)" /mnt/raid0/zufa/atom-runner
+cd /mnt/raid0/zufa/atom-runner
+curl -o actions-runner.tar.gz -L \
+  https://github.com/actions/runner/releases/latest/download/actions-runner-linux-x64.tar.gz
+tar xzf actions-runner.tar.gz && rm actions-runner.tar.gz
+
+env -u GH_TOKEN -u GITHUB_TOKEN gh api -X POST \
+  repos/ROCm/ATOM/actions/runners/registration-token --jq .token
+
+cd /mnt/raid0/zufa/atom-runner
+./config.sh --url https://github.com/ROCm/ATOM --token <token-from-above> \
+  --labels atom-bot --name srdc-8-atom-review --work _work --unattended --replace
+```
+
+This registers as `actions.runner.ROCm-ATOM.srdc-8-atom-review.service` once installed
+(section 5) — distinct from aiter's `actions.runner.ROCm-aiter.srdc-8-aiter-review.service`.
 
 ## 2. Box config via the runner `.env` (loaded into every job)
 
-The workflow's review step sets no environment on purpose, so box-specific config lives in
-`/mnt/md0/atom-runner/.env`, which the runner injects into every job:
+The workflow's review step sets no environment on purpose, so box-specific config lives
+in the runner's own `.env` (`/mnt/md0/atom-runner/.env` on srdc-24,
+`/mnt/raid0/zufa/atom-runner/.env` on box308), which the runner injects into every job.
+
+**srdc-24** (tunnel mode — model reached over the network):
 
 ```bash
 mkdir -p /mnt/md0/atom-runner/tmp /mnt/md0/atom-runner/gh-config
@@ -100,26 +170,45 @@ PATH=/usr/local/bin:/usr/bin:/bin
 EOF
 ```
 
-Deliberately **not** set here: `ATOM_REVIEW_AGENT`. Leaving it unset is what keeps this box in
-tunnel mode (`run_one.sh` defaults `AGENT` to `claude-glm`, which resolves the AMD gateway /
-box308 endpoint on its own) — see "Why this box" above. Only set `ATOM_REVIEW_AGENT` (to a local
-`claude` binary) together with `ANTHROPIC_BASE_URL` if this box is later reconfigured to serve
-its own model directly; doing one without the other is exactly the mismatch this file exists to
-prevent.
+Deliberately **not** set here: `ATOM_REVIEW_AGENT`. Leaving it unset is what keeps this
+box in tunnel mode (`run_one.sh` defaults `AGENT` to `claude-glm`, which resolves the
+AMD gateway on its own).
 
-Also **not** set here, because they are policy, not machine fact, and already live in the repo:
-`ATOM_RUN_BUDGET`, `ATOM_AGENT_TIMEOUT`, `ATOM_REVIEW_RETRIES`, any `*_OWNER`. A value parked in
-`.env` outlives the reason it was added, and nothing reviews it — follow `run_one.sh`'s own
-defaults and failure-message hints instead of pre-guessing a override here.
+**box308** (direct-agent mode — model served locally at `localhost:30000`):
+
+```bash
+mkdir -p /mnt/raid0/zufa/atom-runner/tmp /mnt/raid0/zufa/atom-runner/gh-config
+cat > /mnt/raid0/zufa/atom-runner/.env <<'EOF'
+TMPDIR=/mnt/raid0/zufa/atom-runner/tmp
+GH_CONFIG_DIR=/mnt/raid0/zufa/atom-runner/gh-config
+PATH=/usr/local/bin:/usr/bin:/bin
+ATOM_REVIEW_AGENT=/usr/local/bin/claude   # or wherever the local claude binary lives
+ANTHROPIC_BASE_URL=http://localhost:30000
+EOF
+```
+
+On box308, `ATOM_REVIEW_AGENT` and `ANTHROPIC_BASE_URL` must be set **together** —
+`preflight.sh`'s "headless agent" check takes the direct-agent branch only when
+`ATOM_REVIEW_AGENT` is set, and then requires `ANTHROPIC_BASE_URL` too. Setting one
+without the other is exactly the mismatch this section exists to prevent: do not copy
+aiter's `.env` verbatim without checking which branch it puts this box on.
+
+Also **not** set on either box, because they are policy, not machine fact, and already
+live in the repo: `ATOM_RUN_BUDGET`, `ATOM_AGENT_TIMEOUT`, `ATOM_REVIEW_RETRIES`, any
+`*_OWNER`. A value parked in `.env` outlives the reason it was added, and nothing
+reviews it — follow `run_one.sh`'s own defaults and failure-message hints instead of
+pre-guessing an override here.
 
 ## 3. gh auth off the job environment
 
 `fetch.sh` calls `gh` to read the PR. Authenticate it under `GH_CONFIG_DIR` rather than exporting
-`GH_TOKEN`, so the headless review agent never inherits a token from its environment:
+`GH_TOKEN`, so the headless review agent never inherits a token from its environment. Substitute
+the runner's own `GH_CONFIG_DIR` from section 2 (`/mnt/md0/atom-runner/gh-config` on srdc-24,
+`/mnt/raid0/zufa/atom-runner/gh-config` on box308):
 
 ```bash
-GH_CONFIG_DIR=/mnt/md0/atom-runner/gh-config gh auth login --with-token < <token-file>
-GH_CONFIG_DIR=/mnt/md0/atom-runner/gh-config gh api repos/ROCm/ATOM --jq .full_name
+GH_CONFIG_DIR=<gh-config-dir> gh auth login --with-token < <token-file>
+GH_CONFIG_DIR=<gh-config-dir> gh api repos/ROCm/ATOM --jq .full_name
 ```
 
 Expected output: `ROCm/ATOM` (or `zufayu/ATOM` while registered against the fork).
@@ -136,21 +225,23 @@ over untrusted PR content has no path to the token even though other steps in th
 
 ## 5. Keep it running across reboots *and* container restarts (host only)
 
-Registering a runner does not keep it running, and on this box there are **two** ways to lose
-it, not aiter's one:
+Registering a runner does not keep it running, and on srdc-24 there are **two** ways to lose
+it, not aiter's one (box308, having real systemd and no container in the loop, only has the
+first):
 
-- **Reboot** (aiter's failure mode): a hand-started runner (`./run.sh`, `nohup`, a keeper loop)
-  dies on the next reboot and never comes back. aiter's box lost its runner to exactly this and
-  sat silently offline for days before anyone noticed — nothing pages anyone, because with no
-  runner the job just sits `queued` instead of failing.
-- **Container lifecycle** (this box's own extra way to lose it): if the runner process is ever
-  started from inside an agent container instead of the host, it dies the moment that container
-  stops or is rebuilt — same silent `queued` outcome, on a schedule nobody controls.
+- **Reboot** (aiter's failure mode, and srdc-24's too): a hand-started runner (`./run.sh`,
+  `nohup`, a keeper loop) dies on the next reboot and never comes back. aiter's box lost its
+  runner to exactly this and sat silently offline for days before anyone noticed — nothing
+  pages anyone, because with no runner the job just sits `queued` instead of failing.
+- **Container lifecycle** (srdc-24's own extra way to lose it, while it is still a container):
+  if the runner process is ever started from inside an agent container instead of the host, it
+  dies the moment that container stops or is rebuilt — same silent `queued` outcome, on a
+  schedule nobody controls. This does not apply to box308, which is not containerized.
 
-A systemd unit, installed from the host, is the fix for both:
+A systemd unit, installed from the host, is the fix:
 
 ```bash
-cd /mnt/md0/atom-runner
+cd <atom-runner-dir>   # /mnt/md0/atom-runner on srdc-24, /mnt/raid0/zufa/atom-runner on box308
 sudo ./svc.sh install "$(whoami)"
 sudo ./svc.sh start
 U=$(systemctl list-unit-files 'actions.runner.*ATOM*' --no-legend | awk '{print $1; exit}')
@@ -161,12 +252,18 @@ sudo systemctl daemon-reload && sudo systemctl restart "$U"
 systemctl is-enabled "$U"; systemctl show -p Restart "$U"
 ```
 
+On box308, confirm `$U` resolved to ATOM's own unit
+(`actions.runner.ROCm-ATOM.srdc-8-atom-review.service`) and not aiter's — the `*ATOM*` glob
+does not match aiter's `actions.runner.ROCm-aiter.srdc-8-aiter-review.service`, but it is cheap
+to eyeball `$U` before proceeding, especially the first time both units exist side by side.
+
 Expected: `enabled`, `Restart=always`. The unit `svc.sh` writes on its own carries no `Restart=`,
 so it survives a reboot but not a crash — the drop-in above is the other half.
 
 Do **not** hand-roll a unit or a keeper loop, and do **not** attempt this from inside a
-container — there is no systemd to install into, and anything you start that way inherits the
-container's own lifetime, which is the second failure mode above, not a fix for the first.
+container on srdc-24 — there is no systemd to install into there, and anything you start that
+way inherits the container's own lifetime, which is the second failure mode above, not a fix
+for the first.
 
 ## 6. Verify
 
