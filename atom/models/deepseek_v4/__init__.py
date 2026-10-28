@@ -131,6 +131,7 @@ from atom.utils.forward_context import (
 from atom.utils.region_graph import token_graph
 from atom.utils.tbo.ubatching import (
     tbo_active,
+    tbo_mark_used_on_compute,
     tbo_switch_to_compute_sync,
     tbo_yield_and_switch_from_compute_to_comm,
 )
@@ -2039,6 +2040,7 @@ class DeepseekV4Attention(nn.Module):
         gathered = pcp_allgather_rerange_many(projected, get_pcp_world_size())
         if tbo:
             tbo_switch_to_compute_sync()
+            tbo_mark_used_on_compute(*gathered)
         return gathered
 
     def _compressor_streams(self):
@@ -2549,6 +2551,9 @@ class DeepseekV4Attention(nn.Module):
                     )
                 if _tbo_attn:
                     tbo_switch_to_compute_sync()
+                    tbo_mark_used_on_compute(
+                        k_packed_full, k_rope_full, kv_full, positions_full
+                    )
             else:
                 k_packed_full, k_rope_full = qkn.k_packed, qkn.k_rope
                 kv_full = qkn.kv

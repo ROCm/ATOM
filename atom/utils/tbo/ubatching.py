@@ -600,6 +600,18 @@ def tbo_switch_to_compute_sync():
     _get_current_tbo_context().switch_to_compute_sync()
 
 
+def tbo_mark_used_on_compute(*tensors: torch.Tensor | None):
+    """After `tbo_switch_to_compute_sync`: mark `tensors`, allocated on the comm
+    stream, as in use on the compute stream that reads them. Freed without it,
+    their memory goes back to the comm stream at once, and the comm stream
+    waits only on its own ubatch's compute: the other ubatch's next collective
+    can overwrite them before this ubatch's kernels have read them."""
+    stream = torch.cuda.current_stream()
+    for t in tensors:
+        if t is not None:
+            t.record_stream(stream)
+
+
 def tbo_yield_and_switch_from_comm_to_compute():
     """Record comm-done event, yield to other thread, switch to compute stream."""
     _get_current_tbo_context().yield_and_switch_from_comm_to_compute()

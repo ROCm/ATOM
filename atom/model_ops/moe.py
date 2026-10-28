@@ -112,6 +112,7 @@ from atom.utils.forward_context import get_forward_context, pass_scheduled_token
 from atom.utils.tbo.ubatching import (
     tbo_active,
     tbo_enabled,
+    tbo_mark_used_on_compute,
     tbo_switch_to_compute_sync,
     tbo_yield_and_switch_from_compute_to_comm,
 )
@@ -5379,6 +5380,7 @@ class FusedMoE(torch.nn.Module):
             reassign_gathered_shared_ids(self, topk_ids)
             if tbo:
                 tbo_switch_to_compute_sync()
+                tbo_mark_used_on_compute(hidden_states, topk_weights, topk_ids, x_scale)
         gathered = gathered or split
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
@@ -5404,6 +5406,7 @@ class FusedMoE(torch.nn.Module):
             output = pcp_reduce_scatter(output)
             if tbo:
                 tbo_switch_to_compute_sync()
+                tbo_mark_used_on_compute(output)
         elif pcp:
             output = pcp_all_reduce(output)
         return output
