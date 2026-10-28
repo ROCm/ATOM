@@ -46,8 +46,8 @@
         {
           "label": "DSpark5 DTP2 AL3.51",
           "suffix": "-agentic-dspark5-dtp2-al351",
-          "extra_args": "-tp 2 --enable-dp-attention",
-          "env_vars": "HIP_VISIBLE_DEVICES=0,1",
+          "extra_args": "-tp 2 --enable-dp-attention --gpu-memory-utilization 0.9 --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,48,64,128]' --dp-load-balance least_tokens",
+          "env_vars": "HIP_VISIBLE_DEVICES=0,1\nATOM_DP_SESSION_AFFINITY=1\nATOM_DP_LB_REQ_EQUIV=512\nATOM_PREFILL_DECODE_INTERVAL=10",
           "concurrency": [
             128
           ]
@@ -55,8 +55,8 @@
         {
           "label": "DSpark5 DEP2 AL3.51",
           "suffix": "-agentic-dspark5-dep2-al351",
-          "extra_args": "-tp 2 --enable-dp-attention --enable-expert-parallel",
-          "env_vars": "HIP_VISIBLE_DEVICES=0,1",
+          "extra_args": "-tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.9 --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,48,64,128]' --dp-load-balance least_tokens",
+          "env_vars": "HIP_VISIBLE_DEVICES=0,1\nATOM_DP_SESSION_AFFINITY=1\nATOM_DP_LB_REQ_EQUIV=512\nATOM_PREFILL_DECODE_INTERVAL=10",
           "concurrency": [
             128
           ]
