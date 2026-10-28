@@ -317,9 +317,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # AITER MegaMoeTP (ROCm/aiter#6514) for Ulysses SP MoE layers. Layers it
     # cannot serve keep the native MoE.
     "ATOM_SP_MOE_MEGA": lambda: os.getenv("ATOM_SP_MOE_MEGA", "1") == "1",
-    "ATOM_SP_MOE_MEGA_COMM_DTYPE": lambda: os.getenv(
-        "ATOM_SP_MOE_MEGA_COMM_DTYPE", "fp8"
-    ),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1

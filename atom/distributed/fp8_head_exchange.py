@@ -15,8 +15,10 @@ from aiter import dtypes
 from atom.config import get_current_atom_config
 from atom.distributed.ulysses_sp import (
     _all_gather_tokens,
+    exchange_heads,
     get_sp_group,
     get_sp_world_size,
+    head_exchange_communicator,
     ulysses_attention,
     ulysses_gather_heads,
 )
@@ -166,10 +168,6 @@ def gather_heads_fp8(x: torch.Tensor, group=None) -> tuple[torch.Tensor, torch.T
             ulysses_gather_heads(x, group=group), quant_dtype=dtypes.fp8
         )
     amax = _all_gather_tokens(head_amax(x), group=group)
-    from atom.distributed.sp_head_exchange import (
-        exchange_heads,
-        head_exchange_communicator,
-    )
     from atom.distributed.sp_registered_buffer import registered_input_view
 
     # The FP8 payload has half the row bytes of x; the exchange needs 16B rows.

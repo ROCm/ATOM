@@ -15,7 +15,6 @@ import math
 
 import torch
 
-from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 logger = logging.getLogger("atom")
@@ -429,7 +428,7 @@ def initialize_sp_mega_moe(model, config):
                 activation=activation,
                 swiglu_limit=swiglu_limit,
                 comm_mode="ag_rs",
-                comm_dtype=envs.ATOM_SP_MOE_MEGA_COMM_DTYPE,
+                comm_dtype="fp8",
                 lb_mt=lb_mt,
                 tail_eps=tail_eps,
                 fit_max_local=True,
@@ -461,11 +460,9 @@ def initialize_sp_mega_moe(model, config):
         decoder._sp_mega_layer_name = decoder.sp_mega_moe_experts.layer_name
     logger.info(
         "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens, "
-        "comm=%s, lb_mt=%s. Each tail supplies the next GemmaNorm/FP8 "
-        "(final layer BF16).",
+        "lb_mt=%s. Each tail supplies the next GemmaNorm/FP8 (final layer BF16).",
         len(layers),
         tile,
-        envs.ATOM_SP_MOE_MEGA_COMM_DTYPE,
         lb_mt,
     )
     return backend

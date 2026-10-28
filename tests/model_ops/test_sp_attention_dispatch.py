@@ -12,7 +12,7 @@ from aiter.dist import parallel_state
 from aiter.jit.utils import chip_info
 
 from atom import config
-from atom.distributed import fp8_head_exchange, sp_head_exchange, ulysses_sp
+from atom.distributed import fp8_head_exchange, ulysses_sp
 from atom.model_ops import gemma_norm_fp8
 from atom.plugin import prepare
 
@@ -29,7 +29,7 @@ def supported(monkeypatch):
     monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "atom")
     monkeypatch.setattr(fp8_head_exchange.dtypes, "fp8", torch.float8_e4m3fn)
     monkeypatch.setattr(gemma_norm_fp8, "_fused_per_token_quant", lambda *a, **k: None)
-    monkeypatch.setattr(sp_head_exchange, "_exchange", lambda *args: None)
+    monkeypatch.setattr(ulysses_sp, "_head_exchange_kernel", lambda: object())
     monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     with config.use_custom_atom_config(settings):
         yield settings
@@ -61,10 +61,7 @@ def test_unsupported_runtime_keeps_existing_kernels(monkeypatch, supported, case
     if case == "cpu":
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         monkeypatch.setattr(config, "_current_atom_config", None)
-        assert (
-            sp_head_exchange.head_exchange_communicator(_head_input(is_cuda=False))
-            is None
-        )
+        assert ulysses_sp.head_exchange_communicator(_head_input(is_cuda=False)) is None
     elif case == "sp1":
         monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1)
     elif case == "tp4":
@@ -84,11 +81,8 @@ def test_head_exchange_requires_usable_collective(monkeypatch, supported):
     ca = SimpleNamespace(disabled=False, _pool={}, should_custom_ag=lambda x: True)
     group = SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=ca))
     monkeypatch.setattr(ulysses_sp, "get_sp_group", lambda: group)
-    assert sp_head_exchange.head_exchange_communicator(_head_input()) is ca
-    assert (
-        sp_head_exchange.head_exchange_communicator(_head_input(shape=(8192, 1024)))
-        is ca
-    )
+    assert ulysses_sp.head_exchange_communicator(_head_input()) is ca
+    assert ulysses_sp.head_exchange_communicator(_head_input(shape=(8192, 1024))) is ca
     for tensor in (
         _head_input(is_cuda=False),
         _head_input(shape=(4, 2048)),
@@ -97,12 +91,12 @@ def test_head_exchange_requires_usable_collective(monkeypatch, supported):
         _head_input(dtype=torch.float16),
         _head_input(is_contiguous=lambda: False),
     ):
-        assert sp_head_exchange.head_exchange_communicator(tensor) is None
+        assert ulysses_sp.head_exchange_communicator(tensor) is None
     ca.disabled = True
-    assert sp_head_exchange.head_exchange_communicator(_head_input()) is None
+    assert ulysses_sp.head_exchange_communicator(_head_input()) is None
     ca.disabled = False
     ca.should_custom_ag = lambda x: False
-    assert sp_head_exchange.head_exchange_communicator(_head_input()) is None
+    assert ulysses_sp.head_exchange_communicator(_head_input()) is None
     ca.should_custom_ag = lambda x: True
     monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 2)
-    assert sp_head_exchange.head_exchange_communicator(_head_input()) is None
+    assert ulysses_sp.head_exchange_communicator(_head_input()) is None
