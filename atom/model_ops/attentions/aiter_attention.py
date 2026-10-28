@@ -45,6 +45,8 @@ class _IndexCacheSpec(NamedTuple):
     rows: int
     dim: int
     dtype: torch.dtype
+    # `--index-cache-dtype fp4`: two uint8 planes per key (index_fp4), not one.
+    fp4: bool = False
 
     def __str__(self) -> str:
         """How a row space names itself in a log line."""
@@ -77,8 +79,12 @@ def _resolve_index_cache_dtype(config) -> torch.dtype:
         index_cache_dtype = getattr(config, "kv_cache_dtype", "bf16")
     if index_cache_dtype in ("bf16", "fp8"):
         return dtypes.d_dtypes[index_cache_dtype]
+    if index_cache_dtype == "fp4":
+        # NVFP4 payload + E4M3 scale planes, both uint8 (see minimax_m3/index_fp4).
+        return torch.uint8
     raise ValueError(
-        f"index_cache_dtype must be 'bf16' or 'fp8', got {index_cache_dtype!r}"
+        "index_cache_dtype must be 'bf16', 'fp8' or 'fp4', "
+        f"got {index_cache_dtype!r}"
     )
 
 
@@ -536,7 +542,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim))
+            kv_format = ""
+            if _is_indexed_sparse_attention(module):
+                from atom.utils import envs
+
+                if envs.ATOM_M3_SPARSE_KV_NVFP4:
+                    kv_format = "nvfp4"
+            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, kv_format))
         return tuple(kinds)
 
     def _declare_kv_pools(self) -> dict[KvGeometry, MhaKvPool]:
@@ -577,6 +589,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 head_dim=geometry.head_dim,
                 kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
                 extra_fields=extra_fields,
+                kv_format=geometry.kv_format,
             )
             extra_fields = ()
         return pools
@@ -604,6 +617,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             rows=self.row_counts().get(INDEX_ROWS, 0),
             dim=sparse_cfg["sparse_index_dim"],
             dtype=_resolve_index_cache_dtype(runner.config),
+            fp4=getattr(runner.config, "index_cache_dtype", None) == "fp4",
         )
 
     def _index_cache_fields(self, entry_tokens: int) -> tuple[EntryField, ...]:
@@ -617,6 +631,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         spec = self._index_cache_spec()
         if spec is None:
             return ()
+        if spec.fp4:
+            from atom.model_ops.minimax_m3.index_fp4 import fp4_index_row_bytes
+
+            payload_bytes, scale_bytes = fp4_index_row_bytes(spec.dim)
+            return (
+                EntryField(
+                    "index", spec.rows, (entry_tokens * payload_bytes,), torch.uint8
+                ),
+                EntryField(
+                    "index_scale",
+                    spec.rows,
+                    (entry_tokens * scale_bytes,),
+                    torch.uint8,
+                ),
+            )
         return (
             EntryField(
                 "index",
@@ -625,6 +654,38 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 torch.uint8,
             ),
         )
+
+    def _bf16_stage(self, name: str, inner: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+        """A step's BF16 rows before FP4/NVFP4 quantization, shared by every
+        sparse layer (each quantizes its rows out before the next layer writes):
+        token-major page-128 ``[rows // 128, *inner]`` with the identity slot
+        mapping beside it. Sized for the largest step, a prefill chunk or a full
+        decode graph of ``max_num_seqs`` spec-verify rows. One buffer per
+        ``name`` -- the K/V stage and the index-key stage."""
+        stages = getattr(self, "_bf16_stages", None)
+        if stages is None:
+            stages = self._bf16_stages = {}
+        if name not in stages:
+            config = self.model_runner.config
+            spec = config.speculative_config
+            rows_per_seq = 1 + (
+                (spec.num_speculative_tokens or 0) if spec is not None else 0
+            )
+            tokens = max(
+                int(config.max_num_batched_tokens),
+                int(config.max_num_seqs) * rows_per_seq,
+            )
+            rows = -(-tokens // self.block_size) * self.block_size
+            device = torch.device("cuda", torch.cuda.current_device())
+            stages[name] = (
+                torch.zeros(
+                    (rows // self.block_size, *inner),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                torch.arange(rows, dtype=torch.int64, device=device),
+            )
+        return stages[name]
 
     def release_kv_pools(self) -> None:
         for pool in self.kv_pools.values():
@@ -695,12 +756,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             runner = self.model_runner
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
             spec = self._index_cache_spec()
-            module.impl.index_cache = pool.field_view(
-                "index",
-                self.pool_rows[INDEX_ROWS][module],
-                spec.dtype,
-                (-1, self.block_size, spec.dim),
-            )
+            row = self.pool_rows[INDEX_ROWS][module]
+            if spec.fp4:
+                from atom.model_ops.minimax_m3.index_fp4 import fp4_index_row_bytes
+
+                payload_bytes, scale_bytes = fp4_index_row_bytes(spec.dim)
+                module.impl.index_cache = pool.field_view(
+                    "index", row, torch.uint8, (-1, self.block_size, payload_bytes)
+                )
+                module.impl.index_scale = pool.field_view(
+                    "index_scale", row, torch.uint8, (-1, self.block_size, scale_bytes)
+                )
+                (
+                    module.impl.index_stage,
+                    module.impl.index_stage_slots,
+                ) = self._bf16_stage("index", (self.block_size, spec.dim))
+            else:
+                module.impl.index_cache = pool.field_view(
+                    "index", row, spec.dtype, (-1, self.block_size, spec.dim)
+                )
             module.impl.max_model_len = runner.config.max_model_len
             module.impl.index_topk_cache_state = getattr(
                 runner, "_sparse_attention_topk_cache_state", None
@@ -721,7 +795,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         row = self.pool_rows[geometry][module]
 
         k_cache, v_cache = pool.kv_views(row)
-        if config.kv_cache_dtype == "fp8":
+        if pool.kv_format == "nvfp4":
+            module.k_scale, module.v_scale = pool.scale_views(row)
+            module.impl.kv_nvfp4 = True
+            module.impl.kv_stage, module.impl.kv_stage_slots = self._bf16_stage(
+                "kv", (2, self.block_size, geometry.num_kv_heads, geometry.head_dim)
+            )
+        elif config.kv_cache_dtype == "fp8":
             module.k_scale, module.v_scale = pool.scale_views(row)
 
         module.max_model_len = config.max_model_len

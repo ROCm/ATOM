@@ -106,6 +106,7 @@ class MhaKvPool:
         kv_dtype: torch.dtype,
         blocks_per_entry: int = 1,
         extra_fields: Sequence[EntryField] = (),
+        kv_format: str = "",
     ):
         # `block_size` is the caller's block, the only token count the pool
         # shapes anything by. `blocks_per_entry` is how many of them the entry
@@ -118,8 +119,14 @@ class MhaKvPool:
                 f"an entry holds at least one block, not {blocks_per_entry}"
             )
         self.block_size = block_size
+        # "nvfp4": per (token, kv head) a D/2-byte e2m1 payload and D/16 E4M3
+        # block scales, token-major (minimax_m3/sparse_attn_nvfp4.py), instead
+        # of SHUFFLE values plus one fp32 scale per token.
+        self.kv_format = kv_format
         self.x = shuffle_pack(kv_dtype)
-        if head_dim % self.x or block_size % self.x:
+        if kv_format == "nvfp4":
+            self.x = 1
+        elif head_dim % self.x or block_size % self.x:
             raise ValueError(
                 f"SHUFFLE packs {self.x} elements of {kv_dtype} per "
                 f"{_TILE_BYTES}B tile, which has to divide both head_dim "
@@ -133,6 +140,22 @@ class MhaKvPool:
         # 256 B field alignment by the same factor -- 9% of the pool at 8
         # blocks an entry, almost all of it padding on the 64 B scale planes.
         entry_tokens = block_size * blocks_per_entry
+        if kv_format == "nvfp4":
+            payload = num_kv_heads * entry_tokens * (head_dim // 2)
+            scales = num_kv_heads * entry_tokens * (head_dim // 16)
+            self.cache_fields = [
+                EntryField("k", layers, (payload,), torch.uint8),
+                EntryField("v", layers, (payload,), torch.uint8),
+            ]
+            self.scale_fields = [
+                EntryField("k_scale", layers, (scales,), torch.uint8),
+                EntryField("v_scale", layers, (scales,), torch.uint8),
+            ]
+        else:
+            self._fp_fields(layers, entry_tokens, num_kv_heads, head_dim, kv_dtype)
+        self._finish_init(extra_fields)
+
+    def _fp_fields(self, layers, entry_tokens, num_kv_heads, head_dim, kv_dtype):
         self.cache_fields = mha_kv_fields(
             layers=layers,
             entry_tokens=entry_tokens,
@@ -146,6 +169,8 @@ class MhaKvPool:
             num_kv_heads=num_kv_heads,
             kv_dtype=kv_dtype,
         )
+
+    def _finish_init(self, extra_fields):
         self.extra_fields = [f for f in extra_fields if f.layers]
         # The regions an entry is charged for, in layout order. One list, walked
         # by both the price and the allocation, so a fourth group cannot be
@@ -259,6 +284,12 @@ class MhaKvPool:
         collapsing V's outer half to one.
         """
         x, nh, hd, bs = self.x, self.num_kv_heads, self.head_dim, self.block_size
+        if self.kv_format == "nvfp4":
+            shape = (-1, nh, bs, hd // 2)
+            return (
+                self.field_view("k", layer, torch.uint8, shape),
+                self.field_view("v", layer, torch.uint8, shape),
+            )
         return (
             self.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x)),
             self.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
@@ -270,6 +301,12 @@ class MhaKvPool:
         An fp8 cache only, which is the only kind that declares them: a
         `KeyError` here is a binder asking for a scale this dtype never needed.
         """
+        if self.kv_format == "nvfp4":
+            shape = (-1, self.num_kv_heads, self.block_size, self.head_dim // 16)
+            return (
+                self.field_view("k_scale", layer, torch.uint8, shape),
+                self.field_view("v_scale", layer, torch.uint8, shape),
+            )
         shape = (-1, self.num_kv_heads, self.block_size)
         return (
             self.field_view("k_scale", layer, torch.float32, shape),
