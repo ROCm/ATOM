@@ -207,6 +207,13 @@ class MonoDecodeRunner:
         if len(formats) != 1:
             raise MonoUnsupported("layers disagree on the index cache format")
         self.index_mxfp4 = formats.pop()
+        # and the K / V caches likewise: SHUFFLE E4M3 with scales, or MXFP4 pages
+        formats = {lw.kv_mxfp4 for lw in self.sparse}
+        if len(formats) != 1:
+            raise MonoUnsupported("layers disagree on the K / V cache format")
+        self.kv_mxfp4 = formats.pop()
+        if self.kv_mxfp4 and self.dense_mono:
+            raise MonoUnsupported("MXFP4 K / V caches: no dense-prefix kernels")
         # a reusing layer reads the selection an earlier layer of the step left
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
@@ -272,6 +279,7 @@ class MonoDecodeRunner:
             heads=heads,
             debug=self.debug,
             index_mxfp4=self.index_mxfp4,
+            kv_mxfp4=self.kv_mxfp4,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
@@ -486,13 +494,18 @@ class MonoDecodeRunner:
         block_table, seq_lens = rows
         stream = torch.cuda.current_stream()
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
-        k16, v16, ks16, vs16 = to_page16_shuffle(
-            kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
-        )
+        if self.kv_mxfp4:
+            # [pages, 1, 8704] uint8 pages: the page-128 view the kernel reads as is
+            k16, v16, ks16, vs16 = kv.k_cache, kv.v_cache, None, None
+        else:
+            k16, v16, ks16, vs16 = to_page16_shuffle(
+                kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
+            )
         args = {
             "h_in": _ptr(self.h), "q": _ptr(self.q), "block_table": _ptr(block_table),
             "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),
-            "k_scale": _ptr(ks16), "v_scale": _ptr(vs16), "w_o": _ptr(lw.w_o),
+            "k_scale": 0 if ks16 is None else _ptr(ks16),
+            "v_scale": 0 if vs16 is None else _ptr(vs16), "w_o": _ptr(lw.w_o),
             "s_o": _ptr(lw.s_o), "g_post": _ptr(lw.g_post), "w_gate": _ptr(lw.gate),
             "bias": _ptr(lw.bias), "w13": _ptr(lw.w13), "s13": _ptr(lw.s13),
             "w2": _ptr(lw.w2), "s2": _ptr(lw.s2), "h_mid": _ptr(self.h_mids[(i + 1) % 2]),

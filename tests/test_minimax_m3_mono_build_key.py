@@ -27,14 +27,15 @@ from atom.mono.runtime.compile import compile_only
 
 BASE = K4Build(
     npes=4, tokens=1, init_blocks=1, local_blocks=1, index_heads=1, index_own=0,
-    timeline=False, index_topk=True, index_mxfp4=False, fuse_k1=True, sm_scale=0.088,
+    timeline=False, index_topk=True, index_mxfp4=False, kv_mxfp4=False,
+    fuse_k1=True, sm_scale=0.088,
     eps=1e-6, route_scale=1.0, shared_weight=1.0, swiglu_limit=7.0, debug=False,
 )  # fmt: skip
 # one other value per field (index_heads with its own: a CP build of rank 0)
 OTHER = {
     "npes": 2, "tokens": 2, "init_blocks": 2, "local_blocks": 2, "index_heads": 4,
     "index_own": 1, "timeline": True, "index_topk": False, "index_mxfp4": True,
-    "fuse_k1": False,
+    "kv_mxfp4": True, "fuse_k1": False,
     "sm_scale": 0.09, "eps": 1e-5, "route_scale": 2.0, "shared_weight": 0.5,
     "swiglu_limit": 8.0, "debug": True,
 }  # fmt: skip
@@ -47,6 +48,7 @@ def _compile(key: K4Build) -> None:
         key.swiglu_limit, key.init_blocks, key.local_blocks, key.tokens,
         timeline=key.timeline, fuse_k1=key.fuse_k1, heads=heads, debug=key.debug,
         index_topk=key.index_topk, index_mxfp4=key.index_mxfp4,
+        kv_mxfp4=key.kv_mxfp4,
     )  # fmt: skip
     with compile_only():
         launch(*K4_ABI.zeros())

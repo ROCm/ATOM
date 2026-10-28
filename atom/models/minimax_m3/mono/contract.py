@@ -28,14 +28,16 @@ def build_layer(
     fuse_k1: bool = True,
     index_topk: bool = True,
     index_mxfp4: bool = False,
+    kv_mxfp4: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
     or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), over
-    an MXFP4 index cache or an FP8 one (``index_mxfp4``)."""
+    an MXFP4 index cache or an FP8 one (``index_mxfp4``), MXFP4 K / V caches or
+    FP8 ones (``kv_mxfp4``)."""
     heads = IndexHeads(index_heads, 0)
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=fuse_k1, heads=heads,
-        index_topk=index_topk, index_mxfp4=index_mxfp4,
+        index_topk=index_topk, index_mxfp4=index_mxfp4, kv_mxfp4=kv_mxfp4,
     )  # fmt: skip
 
 
@@ -50,10 +52,11 @@ def check_build(
     fuse_k1: bool = True,
     index_topk: bool = True,
     index_mxfp4: bool = False,
+    kv_mxfp4: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
-        build_layer(tokens, index_heads, fuse_k1, index_topk, index_mxfp4),
+        build_layer(tokens, index_heads, fuse_k1, index_topk, index_mxfp4, kv_mxfp4),
         K4_ABI,
         mailbox_regions(tokens, index_heads, fuse_k1, index_topk),
     )
@@ -71,6 +74,9 @@ if __name__ == "__main__":
             for it in (True, False):
                 check_build(s, ih, index_topk=it)
                 print(f"S={s} index heads={ih} index_topk={it}: contract holds")
-        for it in (True, False):  # MXFP4 index keys: one index head (no indexer CP)
-            check_build(s, 1, index_topk=it, index_mxfp4=True)
-            print(f"S={s} MXFP4 index index_topk={it}: contract holds")
+        for it in (True, False):  # MXFP4 caches: one index head (no indexer CP)
+            for kv in (False, True):
+                check_build(s, 1, index_topk=it, index_mxfp4=True, kv_mxfp4=kv)
+                print(
+                    f"S={s} MXFP4 index, kv_mxfp4={kv} index_topk={it}: contract holds"
+                )

@@ -7,11 +7,18 @@ all-reduce."""
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.minimax_m3.mono.config import HEAD_DIM, HIDDEN, MAX_TOKENS, PAGE16
+from atom.models.minimax_m3.mono.config import (
+    FP4_PAGE_BYTES,
+    FP4_SCALE_OFFSET,
+    HEAD_DIM,
+    HIDDEN,
+    MAX_TOKENS,
+    PAGE16,
+)
 from atom.models.minimax_m3.mono.kernels.common import ld_bf16x4, per_token_fp8_scale
 from atom.models.minimax_m3.mono.kernels.pre_attn import N_HEAD_TASKS as K1_HEAD_TASKS
 from atom.models.minimax_m3.mono.kernels.stages.shared import NEG, PAGE_BYTES
@@ -24,7 +31,14 @@ from atom.models.minimax_m3.mono.layout import (
     SPLIT_KEYS,
     H,
 )
-from atom.mono.device.mx import FP8_MAX, UNIT_SCALE, mfma_scaled
+from atom.mono.device.mx import (
+    FP4,
+    FP8,
+    FP8_MAX,
+    UNIT_SCALE,
+    clamp_fp8,
+    mfma_scaled,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -35,6 +49,7 @@ from atom.mono.device.ops import (
     hw_exp2,
     hw_rcp,
     mfma_fp8,
+    mxfp4_to_bf16x8,
     row_sum,
     rows_to_lds,
     rsrc,
@@ -64,6 +79,7 @@ def split_defs(k4ctx):
     k1_poll = k4ctx["k1_poll"]
     k_cache = k4ctx["k_cache"]
     k_scale = k4ctx["k_scale"]
+    kv_mxfp4 = k4ctx["kv_mxfp4"]
     l16 = k4ctx["l16"]
     lane = k4ctx["lane"]
     mb_put = k4ctx["mb_put"]
@@ -307,7 +323,238 @@ def split_defs(k4ctx):
                 mb_put(mr("sp_l"), ts * H + tid, lt)
             gpu.barrier()
 
-    return {"stage_split": stage_split}
+    # ================================== 1. split, over MXFP4 K / V pages
+    # The same task (one 256-key partition of one token, 16 heads) and the same
+    # outputs (sp_o, sp_m, sp_l), over a table of two page-128 pages. Wave w takes
+    # the 32 keys 32 w .. of the partition (page w / 4, tokens 32 (w % 4) ..), two
+    # 16-key tiles; per tile, lane (g, l16) holds token l16's elements 32 g ..
+    # + 32 (one 16 B load: its e8m0 group's data) and that group's scale byte.
+    #   QK: one v_mfma_scale_f32_16x16x128_f8f6f4, A = K (fp4, the group's scale
+    #       in scaleA), B = q as e4m3 (as the aiter writer's fp8 q, no scale):
+    #       lane (g, s) holds token 4 g + v's logit of head s.
+    #   softmax: the wave's own max per head (both tiles), P bf16 in registers --
+    #       the QK accumulator is the PV B operand's layout.
+    #   PV: V's e8m0 scale runs along head_dim and PV contracts over tokens, so no
+    #       scaled MFMA: the tile widens to bf16 into a wave-private LDS tile
+    #       [16 chunks of 8 dims][16 tokens][16 B] and is read back transposed
+    #       (ds_read_b64_tr_b16) as the A operand of 8 bf16 MFMAs, O^T[d][head].
+    # The 8 waves' (m, O) are merged through LDS (hst, opart). The V tiles share
+    # opart's LDS: a barrier between the last tile and the first partial store.
+    V_TILE_WORDS = HEAD_DIM // 8 * 16 * 16 // 4  # one wave's tile, f32 words
+
+    def stage_split_fp4():
+        r_k, r_v = rsrc(k_cache), rsrc(v_cache)
+        v4i = fx.Vector.make_type(4, fx.Int32)
+        v4bf = fx.Vector.make_type(4, fx.BFloat16)
+        scale_log2e = sm_scale * LOG2E
+        neg_inf = fx.Float32(float("-inf"))
+        zero = fx.Float32(0.0)
+        for ts in range(start("split"), N_SPLIT * tokens, G):
+            ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
+            tok = ts // N_SPLIT
+            t = ts % N_SPLIT
+            task_blocks(tok, t)
+            stamp(17)
+            if const_expr(fuse_k1):
+                # this token's q heads and every token's new K / V
+                if wave == 0:
+                    kv = lane - H
+                    k1_poll(
+                        [
+                            (
+                                hdone_mb,
+                                (lane < H).select(
+                                    tok * K1_HEAD_TASKS + lane,
+                                    fx.min(kv // 2, tokens - 1) * K1_HEAD_TASKS
+                                    + H
+                                    + kv % 2,
+                                ),
+                                1,
+                            )
+                        ]
+                    )
+                gpu.barrier()
+                acquire()
+            n_ctx = uniform(fx.ptr_load(blk + 16))
+            page = uniform(fx.ptr_load(blk + wave // 4))  # junk past the context
+            qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
+            # every independent load first: both tiles' K and V rows and scales
+            at = page * FP4_PAGE_BYTES
+            toks = [(wave % 4) * 32 + 16 * j + l16 for j in range(2)]
+            kd, vd, ksc, vsc = [], [], [], []
+            for j in range_constexpr(2):
+                for cache, r, rows, scs in (
+                    (k_cache, r_k, kd, ksc),
+                    (v_cache, r_v, vd, vsc),
+                ):
+                    rows.append(
+                        fx.Vector(
+                            bo.buffer_load(
+                                r,
+                                (at + toks[j] * (HEAD_DIM // 2) + g4 * 16) // 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=CM_K1,
+                            )
+                        )
+                    )
+                    scs.append(
+                        fx.Int32(
+                            bo.buffer_load(
+                                r,
+                                (at + FP4_SCALE_OFFSET + toks[j] * (HEAD_DIM // 32))
+                                // 4,
+                                vec_width=1,
+                                dtype=T.i32,
+                                cache_modifier=CM_K1,
+                            )
+                        )
+                    )
+            # e4m3, saturating as the aiter writer's q_out cast is: q beyond 448 is 448
+            fx.ptr_store(fp8_pack4(*[clamp_fp8(v) for v in qv]), q8 + tid)
+            gpu.barrier()
+            stamp(12)
+            # q (B operand): head l16's elements 16 g .. + 16 then 64 + 16 g .. + 16
+            q_lo = fx.Vector(fx.ptr_load(q8 + (l16 * 32 + 4 * g4), result_type=v4i))
+            q_hi = fx.Vector(
+                fx.ptr_load(q8 + (l16 * 32 + 16 + 4 * g4), result_type=v4i)
+            )
+            q_b = fx.Vector.from_elements(
+                [q_lo[i] for i in range(4)] + [q_hi[i] for i in range(4)], fx.Int32
+            )
+            key0 = t * SPLIT_KEYS + wave * 32
+            # logits (log2 domain) of tokens key0 + 16 j + 4 g4 + v, head l16
+            x = []
+            for j in range_constexpr(2):
+                a_k = fx.Vector.from_elements(
+                    [kd[j][i] for i in range(4)] + [fx.Int32(0) for _ in range(4)],
+                    fx.Int32,
+                )
+                acc = mfma_scaled(
+                    a_k,
+                    q_b,
+                    fx.Vector.filled(4, 0.0, fx.Float32),
+                    (ksc[j] >> (g4 * 8)) & 0xFF,
+                    fx.Int32(UNIT_SCALE),
+                    a_fmt=FP4,
+                    b_fmt=FP8,
+                )
+                x.append(
+                    [
+                        (key0 + 16 * j + 4 * g4 + v < n_ctx).select(
+                            acc[v] * scale_log2e, neg_inf
+                        )
+                        for v in range(4)
+                    ]
+                )
+            m_w = fx.max(
+                fx.max(fx.max(x[0][0], x[0][1]), fx.max(x[0][2], x[0][3])),
+                fx.max(fx.max(x[1][0], x[1][1]), fx.max(x[1][2], x[1][3])),
+            )
+            m_w = butterfly(m_w, (32, 16), fx.max)  # head l16's, in every lane of it
+            m_safe = (m_w > neg_inf).select(m_w, zero)
+            l_w = fx.Float32(0.0)
+            o_acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(8)]
+            for j in range_constexpr(2):
+                p = [hw_exp2(x[j][v] - m_safe) for v in range(4)]
+                l_w = l_w + ((p[0] + p[1]) + (p[2] + p[3]))
+                # V tile: widen to bf16 (a token past the context: scale 0, zeros)
+                vcode = (vsc[j] >> (g4 * 8)) & 0xFF
+                vscale = (key0 + 16 * j + l16 < n_ctx).select(
+                    (vcode << 23).bitcast(fx.Float32), zero
+                )
+                for i in range_constexpr(4):
+                    row = mxfp4_to_bf16x8(vd[j][i], vscale)
+                    fx.ptr_store(
+                        row.bitcast(fx.Float32),
+                        opart + (wave * V_TILE_WORDS + (4 * g4 + i) * 64 + l16 * 4),
+                    )
+                p_op = (
+                    fx.Vector.from_elements(p, fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int16)
+                )
+                # the transposed reads before any MFMA: their latency overlaps
+                v_ops = [
+                    fx.Vector(
+                        rocdl.ds_read_tr16_b64(
+                            v4bf,
+                            fx.to_llvm_ptr(
+                                opart
+                                + (
+                                    wave * V_TILE_WORDS
+                                    + ((l16 % 4) // 2) * 64
+                                    + (4 * g4 + l16 // 4) * 4
+                                    + (l16 % 2) * 2
+                                    + m * 128
+                                )
+                            ),
+                        ).result
+                    ).bitcast(fx.Int16)
+                    for m in range_constexpr(8)
+                ]
+                o_acc = [
+                    fx.Vector(
+                        rocdl.mfma_f32_16x16x16bf16_1k(
+                            T.vec(4, T.f32), [v_ops[m], p_op, o_acc[m]]
+                        )
+                    )
+                    for m in range_constexpr(8)
+                ]
+            # head l16's wave max and sum (one lane group stores)
+            l_w = butterfly(l_w, (32, 16))
+            if g4 == 0:
+                fx.ptr_store(m_w, hst + (wave * H + l16))
+                fx.ptr_store(l_w, hst + (WAVES * H + wave * H + l16))
+            stamp(13)
+            gpu.barrier()  # every wave's V tile read: opart takes the partials
+            for m in range_constexpr(8):
+                fx.ptr_store(
+                    o_acc[m], opart + (wave * O_K + l16 * HEAD_DIM + 16 * m + 4 * g4)
+                )
+            gpu.barrier()
+            stamp(15)
+            # merge the waves: thread = 4 dims of one head (the sp_o contract:
+            # the partition's O / l, then its max in natural log units and l)
+            e0 = tid * 4
+            head = e0 // HEAD_DIM
+            ms = [fx.ptr_load(hst + (w * H + head)) for w in range(WAVES)]
+            mx = ms[0]
+            for w in range_constexpr(1, WAVES):
+                mx = fx.max(mx, ms[w])
+            mx_safe = (mx > neg_inf).select(mx, zero)
+            wt = [hw_exp2(ms[w] - mx_safe) for w in range(WAVES)]
+            lsum = fx.ptr_load(hst + (WAVES * H + head)) * wt[0]
+            for w in range_constexpr(1, WAVES):
+                lsum = lsum + fx.ptr_load(hst + (WAVES * H + w * H + head)) * wt[w]
+            inv_l = (lsum > 0.0).select(hw_rcp(lsum), zero)
+            ov = []
+            for k in range_constexpr(4):
+                acc_k = fx.ptr_load(opart + (e0 + k)) * wt[0]
+                for w in range_constexpr(1, WAVES):
+                    acc_k = acc_k + fx.ptr_load(opart + (w * O_K + e0 + k)) * wt[w]
+                ov.append(acc_k * inv_l)
+            mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)
+            if tid < H:
+                hm = [fx.ptr_load(hst + (w * H + tid)) for w in range(WAVES)]
+                hmax = hm[0]
+                for w in range_constexpr(1, WAVES):
+                    hmax = fx.max(hmax, hm[w])
+                hsafe = (hmax > neg_inf).select(hmax, zero)
+                hl = zero
+                for w in range_constexpr(WAVES):
+                    hl = hl + fx.ptr_load(hst + (WAVES * H + w * H + tid)) * hw_exp2(
+                        hm[w] - hsafe
+                    )
+                mb_put(
+                    mr("sp_m"),
+                    ts * H + tid,
+                    (hmax > neg_inf).select(hmax * (1.0 / LOG2E), fx.Float32(NEG)),
+                )
+                mb_put(mr("sp_l"), ts * H + tid, hl)
+            gpu.barrier()
+
+    return {"stage_split": stage_split_fp4 if kv_mxfp4 else stage_split}
 
 
 @traced

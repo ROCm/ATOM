@@ -99,6 +99,7 @@ from atom.models.minimax_m3.mono.layout import (
     MID_ROW,
     O_K,
     O_ROWS,
+    PAGES_PER_BLOCK,
     SCRATCH,
     SPLIT_KEYS,
     UG_PER_SLOT,
@@ -155,6 +156,7 @@ class K4Build:
     timeline: bool = field(metadata={"sym": "tl"})
     index_topk: bool = field(metadata={"sym": "it"})
     index_mxfp4: bool = field(metadata={"sym": "im"})
+    kv_mxfp4: bool = field(metadata={"sym": "km"})
     fuse_k1: bool
     sm_scale: float
     eps: float
@@ -180,6 +182,7 @@ def build_post_attn_kernel(
     debug: bool = False,
     index_topk: bool = True,
     index_mxfp4: bool = False,
+    kv_mxfp4: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -191,14 +194,16 @@ def build_post_attn_kernel(
     ``index_topk``: the layer scores and selects its blocks; else (the original
     path's ``skip_index_topk`` layer) it attends over the sparse table the last
     selecting layer of the step left in scratch. ``index_mxfp4``: the index cache
-    is 8704 B MXFP4 pages (K1 writes and scores them so; no indexer CP)."""
+    is 8704 B MXFP4 pages (K1 writes and scores them so; no indexer CP);
+    ``kv_mxfp4``: so are the K / V caches (K1 writes them, the split stage reads
+    them, a selected block is one page-128 page)."""
     assert 1 <= tokens <= MAX_TOKENS
     assert not (index_mxfp4 and heads.count > 1), "MXFP4 index keys: no indexer CP"
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
-        index_topk=index_topk, index_mxfp4=index_mxfp4, fuse_k1=fuse_k1,
-        sm_scale=sm_scale, eps=eps,
+        index_topk=index_topk, index_mxfp4=index_mxfp4, kv_mxfp4=kv_mxfp4,
+        fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
         swiglu_limit=swiglu_limit, debug=debug,
     )  # fmt: skip
@@ -209,6 +214,9 @@ def build_post_attn_kernel(
     )
     W = npes
     G = BLOCKS
+    # page ids a selected block takes in the split task's table: page-16 pages of
+    # an FP8 block, the one page-128 page of an MXFP4 one
+    PPB = 1 if kv_mxfp4 else PAGES_PER_BLOCK
     BASE = stage_bases(tokens)
     SY = sym_layout(W)
     # fuse_k1: K1's outputs are read device-coherent (K1 stores them so)
@@ -429,6 +437,7 @@ def build_post_attn_kernel(
                 REGION_IDS,
                 index_topk,
                 index_mxfp4=index_mxfp4,
+                kv_mxfp4=kv_mxfp4,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS)

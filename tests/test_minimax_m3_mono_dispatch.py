@@ -68,12 +68,14 @@ def test_an_nvfp4_index_cache_is_refused(native):
     )
 
 
-@pytest.mark.parametrize("env", ["ATOM_M3_SPARSE_KV_MXFP4", "ATOM_M3_SPARSE_KV_NVFP4"])
-def test_a_fp4_main_kv_cache_is_refused(native, monkeypatch, env):
-    monkeypatch.setenv(env, "1")
-    assert "sparse KV" in dispatch._config_refusal(
-        _atom_config(index_cache_dtype="mxfp4")
-    )
+def test_an_mxfp4_main_kv_cache_is_served(native, monkeypatch):
+    monkeypatch.setenv("ATOM_M3_SPARSE_KV_MXFP4", "1")
+    assert dispatch._config_refusal(_atom_config(index_cache_dtype="mxfp4")) is None
+
+
+def test_an_nvfp4_main_kv_cache_is_refused(native, monkeypatch):
+    monkeypatch.setenv("ATOM_M3_SPARSE_KV_NVFP4", "1")
+    assert "NVFP4" in dispatch._config_refusal(_atom_config())
 
 
 @pytest.mark.parametrize(

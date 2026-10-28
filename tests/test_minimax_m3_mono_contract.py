@@ -38,6 +38,14 @@ def traces():
             "layer_mxfp4": trace(
                 contract.build_layer(TOKENS, 1, index_mxfp4=True), K4_ABI
             ),
+            "layer_mxfp4_kv": trace(
+                contract.build_layer(TOKENS, 1, index_mxfp4=True, kv_mxfp4=True),
+                K4_ABI,
+            ),
+            "layer_mxfp4_kv_wide": trace(
+                contract.build_layer(2 * TOKENS, 1, index_mxfp4=True, kv_mxfp4=True),
+                K4_ABI,
+            ),
         }
 
 
@@ -47,6 +55,11 @@ def test_the_layer_kernel_holds(traces):
 
 def test_the_layer_kernel_over_an_mxfp4_index_cache_holds(traces):
     check(traces["layer_mxfp4"], mailbox_regions(TOKENS, 1, True, True))
+
+
+def test_the_layer_kernel_over_mxfp4_k_v_caches_holds(traces):
+    check(traces["layer_mxfp4_kv"], mailbox_regions(TOKENS, 1, True, True))
+    check(traces["layer_mxfp4_kv_wide"], mailbox_regions(2 * TOKENS, 1, True, True))
 
 
 def test_the_dense_layer_kernel_holds(traces):

@@ -93,6 +93,12 @@ class SparseMoeLayer:
         """The index cache is MXFP4 pages, not E4M3 rows."""
         return bool(getattr(self.attn_impl, "index_mxfp4", False))
 
+    @property
+    def kv_mxfp4(self) -> bool:
+        """The K / V caches are MXFP4 pages (``[pages, 1, 8704]`` uint8 a layer),
+        not page-16 SHUFFLE E4M3 with per-token scales."""
+        return bool(getattr(self.attn_impl, "kv_mxfp4", False))
+
     layer_id: int
     attn_impl: object  # SparseMHAPagedAttentionImpl: index cache + page-16 KV views
     # the layer selects its blocks; else it reuses the step's last selecting
@@ -137,9 +143,7 @@ class SparseMoeLayer:
         )
         impl = attn.attn.impl
         _need(
-            impl.kv_cache_dtype == "fp8"
-            and impl.index_cache is not None
-            and not getattr(impl, "kv_mxfp4", False),
+            impl.kv_cache_dtype == "fp8" and impl.index_cache is not None,
             f"layer {layer_id}: caches",
         )
         if getattr(impl, "index_mxfp4", False):
