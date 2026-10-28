@@ -937,6 +937,8 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
 
     original_draft_extend_for_prefill = EagleDraftWorker._draft_extend_for_prefill
     original_draft_extend_for_decode = EagleDraftWorker._draft_extend_for_decode
+    prefill_params = inspect.signature(original_draft_extend_for_prefill).parameters
+    decode_params = inspect.signature(original_draft_extend_for_decode).parameters
 
     def _draft_extend_for_prefill(
         self,
@@ -944,13 +946,17 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
         target_hidden_states,
         next_token_ids,
         mm_input_embeds=None,
+        kv_loc_plan=None,
     ):
+        prefill_kwargs = {"mm_input_embeds": mm_input_embeds}
+        if "kv_loc_plan" in prefill_params:
+            prefill_kwargs["kv_loc_plan"] = kv_loc_plan
         ret = original_draft_extend_for_prefill(
             self,
             batch,
             target_hidden_states,
             next_token_ids,
-            mm_input_embeds=mm_input_embeds,
+            **prefill_kwargs,
         )
         # A fresh request has no rejected draft suffix.  Set an explicit
         # per-request zero vector so merging it into an active decode batch
@@ -960,7 +966,7 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
         )
         return ret
 
-    def _draft_extend_for_decode(self, batch, batch_result):
+    def _draft_extend_for_decode(self, batch, batch_result, *, kv_loc_plan=None):
         is_eagle3 = bool(
             getattr(
                 getattr(self, "speculative_algorithm", None),
@@ -968,8 +974,13 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
                 lambda: False,
             )()
         )
+        decode_kwargs = {}
+        if "kv_loc_plan" in decode_params:
+            decode_kwargs["kv_loc_plan"] = kv_loc_plan
         if not is_eagle3:
-            return original_draft_extend_for_decode(self, batch, batch_result)
+            return original_draft_extend_for_decode(
+                self, batch, batch_result, **decode_kwargs
+            )
 
         patched_next_token_ids = None
         original_next_token_ids = getattr(batch_result, "next_token_ids", None)
@@ -1008,7 +1019,9 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
             batch_result.next_token_ids = patched_next_token_ids
 
         try:
-            ret = original_draft_extend_for_decode(self, batch, batch_result)
+            ret = original_draft_extend_for_decode(
+                self, batch, batch_result, **decode_kwargs
+            )
         finally:
             if patched_next_token_ids is not None:
                 batch_result.next_token_ids = original_next_token_ids
