@@ -2006,6 +2006,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
+        # The graph runs bs * max_qlen tokens (max_qlen > 1 for an MTP verify),
+        # so slot_mapping needs one entry per token, as in `prepare_decode`.
+        # Sliced to bs, anything that sizes by its length -- routed-expert
+        # capture, the Triton KV cache write -- skips every token past bs.
         capture_tokens = bs * int(var["max_qlen"])
         attn_metadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:capture_tokens],

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 """GPU e2e: native LLM.generate() routed-expert capture.
 
-Covers tensor-parallel, CUDA-graph decode, and a prefix-cache hit. Dummy
-Qwen3-MoE weights keep the run small; tokenizer comes from a real Qwen3
-checkpoint so token ids stay in-vocab.
+Covers tensor-parallel, CUDA-graph decode, a prefix-cache hit, concurrent
+requests in one batch, and chunked prefill. Dummy Qwen3-MoE weights keep the
+run small; tokenizer comes from a real Qwen3 checkpoint so token ids stay
+in-vocab.
 
 Usage (ATOM Docker image, 2+ GPUs)::
 
@@ -12,6 +13,7 @@ Usage (ATOM Docker image, 2+ GPUs)::
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -108,7 +110,11 @@ def _assert_routes(routes, seq_len: int) -> None:
     assert arr.max() < _NUM_EXPERTS
 
 
-def test_generate_tp_cudagraph_prefix_hit_routes(tmp_path):
+_PROMPT = "Count from 1 to 40: " + " ".join(str(i) for i in range(1, 41))
+
+
+def _tp_engine(tmp_path, **overrides):
+    """A TP=2, FULL-cudagraph engine on the tiny dummy Qwen3-MoE."""
     n_gpu = torch.cuda.device_count()
     if n_gpu < 2:
         pytest.skip(f"TP e2e needs 2 GPUs, found {n_gpu}")
@@ -116,7 +122,6 @@ def test_generate_tp_cudagraph_prefix_hit_routes(tmp_path):
     from transformers import AutoTokenizer
 
     from atom.model_engine.arg_utils import EngineArgs
-    from atom.sampling_params import SamplingParams
 
     tok_path = _tokenizer_path()
     tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
@@ -142,25 +147,79 @@ def test_generate_tp_cudagraph_prefix_hit_routes(tmp_path):
         max_num_batched_tokens=256,
         gpu_memory_utilization=0.08,
     )
-    engine = engine_args.create_engine(tokenizer=tokenizer)
-    prompt = "Count from 1 to 40: " + " ".join(str(i) for i in range(1, 41))
-    params = SamplingParams(temperature=0.0, max_tokens=_MAX_NEW, ignore_eos=True)
+    engine_args = dataclasses.replace(engine_args, **overrides)
+    return engine_args.create_engine(tokenizer=tokenizer)
+
+
+def _greedy():
+    from atom.sampling_params import SamplingParams
+
+    return SamplingParams(temperature=0.0, max_tokens=_MAX_NEW, ignore_eos=True)
+
+
+def _assert_output_routes(out) -> None:
+    assert out["num_tokens_output"] == _MAX_NEW
+    _assert_routes(
+        out["routed_experts"], out["num_tokens_input"] + out["num_tokens_output"]
+    )
+
+
+def test_generate_tp_cudagraph_prefix_hit_routes(tmp_path):
+    engine = _tp_engine(tmp_path)
+    params = _greedy()
     try:
-        first, cached_first = _generate_tracked(engine, [prompt], params)
+        first, cached_first = _generate_tracked(engine, [_PROMPT], params)
         assert cached_first == 0
         out0 = first[0]
-        n_in = out0["num_tokens_input"]
-        n_out = out0["num_tokens_output"]
-        assert n_out == _MAX_NEW
-        seq_len = n_in + n_out
-        _assert_routes(out0["routed_experts"], seq_len)
+        _assert_output_routes(out0)
 
-        second, cached_second = _generate_tracked(engine, [prompt], params)
+        second, cached_second = _generate_tracked(engine, [_PROMPT], params)
         assert cached_second > 0, "second generate must prefix-hit the first prompt"
         out1 = second[0]
-        assert out1["num_tokens_input"] == n_in
-        assert out1["num_tokens_output"] == n_out
-        _assert_routes(out1["routed_experts"], seq_len)
+        assert out1["num_tokens_input"] == out0["num_tokens_input"]
+        _assert_output_routes(out1)
+        np.testing.assert_array_equal(out0["routed_experts"], out1["routed_experts"])
+        assert out0["token_ids"] == out1["token_ids"]
+    finally:
+        engine.close()
+
+
+def test_concurrent_requests_keep_their_own_routes(tmp_path):
+    """[A, B, A] in one batch: each request gets rows for its own length, and
+    the two copies of A route identically, so no request reads another's
+    slots."""
+    engine = _tp_engine(tmp_path)
+    other = "Name the planets in order from the sun:"
+    try:
+        outs, _ = _generate_tracked(engine, [_PROMPT, other, _PROMPT], _greedy())
+        assert len(outs) == 3
+        for out in outs:
+            _assert_output_routes(out)
+        a0, b, a1 = outs
+        assert b["num_tokens_input"] != a0["num_tokens_input"]
+        np.testing.assert_array_equal(a0["routed_experts"], a1["routed_experts"])
+        assert a0["token_ids"] == a1["token_ids"]
+    finally:
+        engine.close()
+
+
+def test_chunked_prefill_then_prefix_hit_routes(tmp_path):
+    """A prompt prefilled in several chunks, then re-run on a prefix hit whose
+    cached rows come from the KV blocks: both runs export the same routes."""
+    budget = 32
+    engine = _tp_engine(tmp_path, max_num_batched_tokens=budget)
+    params = _greedy()
+    try:
+        first, cached_first = _generate_tracked(engine, [_PROMPT], params)
+        assert cached_first == 0
+        out0 = first[0]
+        assert out0["num_tokens_input"] > 2 * budget, "prompt must span chunks"
+        _assert_output_routes(out0)
+
+        second, cached_second = _generate_tracked(engine, [_PROMPT], params)
+        assert cached_second > 0, "second generate must prefix-hit the first prompt"
+        out1 = second[0]
+        _assert_output_routes(out1)
         np.testing.assert_array_equal(out0["routed_experts"], out1["routed_experts"])
         assert out0["token_ids"] == out1["token_ids"]
     finally:

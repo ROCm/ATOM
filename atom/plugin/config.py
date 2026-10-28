@@ -491,6 +491,11 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         online_quant_config=(getattr(config, "additional_config", None) or {}).get(
             "online_quant_config"
         ),
+        # Carried across so Config refuses it: ATOM's MoE replaces the layer
+        # vLLM's own capture hooks, and ATOM's capture needs its ModelRunner.
+        enable_return_routed_experts=(
+            getattr(vllm_model_config, "enable_return_routed_experts", False) is True
+        ),
     )
 
 
@@ -748,6 +753,10 @@ def _generate_atom_config_from_sglang_config(config: Any):
         online_quant_config=online_quant_config,
         hf_overrides=hf_overrides,
         speculative_config=atom_speculative_config,
+        # Carried across so Config refuses it, as for vLLM.
+        enable_return_routed_experts=(
+            getattr(server_args, "enable_return_routed_experts", False) is True
+        ),
     )
 
 

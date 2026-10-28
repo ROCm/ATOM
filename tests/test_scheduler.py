@@ -3424,9 +3424,7 @@ class TestRoutedExpertPatches:
             assert batch.routed_prefix_ranges == []
         assert seq.routed_forwarded_end == 6
 
-    def test_postprocess_suffix_replace_then_trim_on_finish(
-        self, scheduler, seq_factory
-    ):
+    def test_postprocess_overlap_then_trim_on_finish(self, scheduler, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
         scheduler.schedule()
@@ -3443,16 +3441,16 @@ class TestRoutedExpertPatches:
             list(scheduler.running),
             self._output(seq.id, [11], self._patch((seq.id, 1, replacement))),
         )
-        assert seq.routed_expert_rows == 3
+        # The overlap rewrites rows 1-2 and keeps row 3.
+        assert seq.routed_expert_rows == 4
+        np.testing.assert_array_equal(seq.routed_experts[1:3], replacement)
         finished = scheduler.postprocess(
             list(scheduler.running), self._output(seq.id, [2])
         )
         assert finished[0].leave_reason == "eos"
-        # prompt 4 + tokens 10,11,eos => num_tokens=7, keep 6? Wait:
-        # started with 4 prompt tokens, appended 10, 11, then eos 2.
-        # num_tokens = 7, trim to 6. We only have 3 rows so truncate is no-op
-        # unless rows exceed num_tokens-1.
-        assert seq.routed_expert_rows == 3
+        # 4 prompt tokens + 10, 11, eos: num_tokens = 7, so finish keeps up to
+        # 6 rows; the 4 held are all kept.
+        assert seq.routed_expert_rows == 4
 
     def test_postprocess_trim_overlong_routes_on_eos(self, scheduler, seq_factory):
         scheduler._return_routed_experts = True
@@ -3482,12 +3480,22 @@ class TestRoutedExpertPatches:
         np.testing.assert_array_equal(seq.routed_experts, rows)
         assert seq.routed_expert_rows == 4
 
-    def test_middle_chunk_empty_tokens_still_merges_patch(self, scheduler, seq_factory):
-        seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+    def test_middle_chunk_empty_tokens_still_merges_patch(self, seq_factory):
+        scheduler = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)))
         scheduler.add(seq)
-        scheduler.schedule()
-        chunk = np.arange(4, dtype=np.int16).reshape(2, 1, 2)
-        empty = ScheduledBatchOutput(
+        batch, _ = scheduler.schedule()
+        chunk = np.arange(12, dtype=np.int16).reshape(6, 1, 2)
+        # What the runner returns for a pure middle chunk: the batch's
+        # req_ids, no sampled tokens.
+        middle = ScheduledBatchOutput(
             req_ids=[seq.id],
             token_ids=[],
             num_rejected=None,
@@ -3495,8 +3503,10 @@ class TestRoutedExpertPatches:
             draft_token_ids=None,
             routed_experts=self._patch((seq.id, 0, chunk)),
         )
-        scheduler.postprocess(list(scheduler.running), empty)
+        scheduler.postprocess(list(scheduler.running), middle, batch=batch)
         np.testing.assert_array_equal(seq.routed_experts, chunk)
+        assert seq.is_partial_prefill is True
+        assert seq.num_tokens == 10
 
     def test_abort_does_not_clear_accumulated_routes(self, scheduler, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
@@ -3547,3 +3557,108 @@ class TestRoutedExpertPatches:
         assert routes.shape[0] == seq.num_tokens - 1
         assert routes is seq.routed_experts
         assert not routes.flags.writeable
+
+    @staticmethod
+    def _routes_only(patch):
+        """A deferred step's late output: routes, no sampled row for the seq."""
+        return ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            routed_experts=patch,
+        )
+
+    def test_patch_in_flight_at_preemption_still_lands(self, seq_factory):
+        """Deferred output: a prefill chunk scheduled before the preemption
+        reports after it. The marker falls back to the rows held, and the
+        chunk's rows still land when they arrive."""
+        scheduler = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        scheduler._return_routed_experts = True
+        seq = seq_factory(list(range(10)))
+        scheduler.add(seq)
+        scheduler.schedule()
+        in_flight = list(scheduler.running)
+        assert seq.routed_forwarded_end == 6 and seq.routed_expert_rows == 0
+
+        assert scheduler.preempt(seq)
+        assert seq.routed_forwarded_end == 0
+
+        chunk = np.arange(12, dtype=np.int16).reshape(6, 1, 2)
+        scheduler.postprocess(
+            in_flight, self._routes_only(self._patch((seq.id, 0, chunk)))
+        )
+        np.testing.assert_array_equal(seq.routed_experts, chunk)
+
+    def test_patch_in_flight_at_abort_is_dropped(self, scheduler, seq_factory):
+        """Finishing freezes the routes; a step that reports afterwards
+        cannot change what the caller was handed."""
+        scheduler._return_routed_experts = True
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        rows = np.arange(4, dtype=np.int16).reshape(2, 1, 2)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [10], self._patch((seq.id, 0, rows))),
+        )
+        in_flight = list(scheduler.running)
+        seq.status = SequenceStatus.ABORTED
+        assert scheduler.postprocess(in_flight, self._routes_only(None)) == [seq]
+        frozen = seq.routed_experts
+
+        late = np.full((1, 1, 2), 9, dtype=np.int16)
+        scheduler.postprocess(
+            in_flight, self._routes_only(self._patch((seq.id, 2, late)))
+        )
+        assert seq.routed_experts is frozen
+        np.testing.assert_array_equal(frozen, rows)
+
+    def test_patch_for_a_request_outside_the_batch_is_dropped(self, caplog):
+        """Rows are matched by request id, never by position."""
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            Scheduler._apply_routed_experts_patch(
+                {}, self._patch((42, 0, np.zeros((3, 1, 2), np.int16)))
+            )
+        assert "dropping 3 rows from position 0 for request 42" in caplog.text
+
+    @pytest.mark.parametrize("mtp_k,accepted", [(1, 0), (2, 1), (3, 3)])
+    def test_verify_steps_keep_only_accepted_positions(
+        self, mtp_k, accepted, seq_factory
+    ):
+        """Each verify step forwards an anchor plus `mtp_k` drafts; the rows of
+        rejected drafts are trimmed, so routes stay `num_tokens - 1` long."""
+        spec = TestPreemptStripsExactlyThePlaceholders
+        sched = spec()._sched(mtp_k)
+        prompt = [5, 6, 7, 8]
+        seq = seq_factory(prompt)
+        sched.add(seq)
+        sched.schedule()
+        expected = np.arange(4, dtype=np.int16).reshape(4, 1, 1)
+        prefill = spec._deferred_prefill_output()
+        prefill.routed_experts = self._patch((seq.id, 0, expected))
+        sched.postprocess(list(sched.running), prefill)
+
+        real = []
+        for step in range(3):
+            sched.schedule()
+            tokens = [200 + 10 * step + i for i in range(accepted + 1)]
+            real += tokens
+            verify = (100 * (step + 1) + np.arange(mtp_k + 1)).astype(np.int16)
+            verify = verify.reshape(-1, 1, 1)
+            out = spec._verify_output(seq.id, tokens, mtp_k - accepted, mtp_k)
+            out.routed_experts = self._patch((seq.id, seq.routed_expert_rows, verify))
+            sched.postprocess(list(sched.running), out)
+
+            keep = len(prompt) + len(real) - 1
+            expected = np.concatenate([expected, verify])[:keep]
+            assert seq.routed_expert_rows == keep
+            np.testing.assert_array_equal(seq.routed_experts, expected)

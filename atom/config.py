@@ -2493,21 +2493,10 @@ class Config:
 
         if self.enable_return_routed_experts:
             from atom.model_ops.fused_moe.routed_experts_capturer import (
-                check_return_routed_experts,
+                check_return_routed_experts_config,
             )
 
-            check_return_routed_experts(
-                self.decode_context_parallel_size,
-                self.prefill_context_parallel_size,
-                self.pipeline_parallel_size,
-                kv_transfer_config=self.kv_transfer_config,
-                enable_rapidserve=(
-                    self.enable_rapidserve
-                    or self.disagg_is_decode
-                    or "RapidServeModelRunner" in self.runner_qualname
-                ),
-                enable_dp_attention=self.enable_dp_attention,
-            )
+            check_return_routed_experts_config(self)
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens

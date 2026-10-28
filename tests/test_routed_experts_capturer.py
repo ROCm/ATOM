@@ -21,7 +21,6 @@ from atom.model_ops.fused_moe.routed_experts_capturer import (
     check_return_routed_experts,
     maybe_capture_routed_experts,
     prefix_slots,
-    topk_ids_from_triton_routing,
     trim_routed_experts,
 )
 
@@ -74,6 +73,46 @@ def test_dcp_pcp_pp_fail_closed():
         check_return_routed_experts(1, 1, 1, enable_dp_attention=True)
     check_return_routed_experts(1, 1, 1, kv_transfer_config={})
     check_return_routed_experts(1, 1, 1, enable_dp_attention=False)
+
+
+def _r3_config(**overrides):
+    from types import SimpleNamespace
+
+    base = {
+        "enable_return_routed_experts": True,
+        "decode_context_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "kv_transfer_config": {},
+        "enable_rapidserve": False,
+        "disagg_is_decode": False,
+        "runner_qualname": "atom.model_engine.model_runner.ModelRunner",
+        "enable_dp_attention": False,
+        "plugin_config": None,
+    }
+    return SimpleNamespace(**{**base, **overrides})
+
+
+def test_config_check_is_one_resolution_for_every_caller():
+    from types import SimpleNamespace
+
+    from atom.model_ops.fused_moe.routed_experts_capturer import (
+        check_return_routed_experts_config as check,
+    )
+
+    check(_r3_config())
+    check(_r3_config(enable_return_routed_experts=False, pipeline_parallel_size=2))
+    for overrides in (
+        {"disagg_is_decode": True},
+        {"runner_qualname": "x.RapidServeModelRunner"},
+        {"enable_rapidserve": True},
+    ):
+        with pytest.raises(ValueError, match="RapidServe"):
+            check(_r3_config(**overrides))
+    with pytest.raises(ValueError, match="RapidServe"):
+        check(_r3_config(), rapidserve_runner=True)
+    with pytest.raises(ValueError, match="plugin mode"):
+        check(_r3_config(plugin_config=SimpleNamespace(is_plugin_mode=True)))
 
 
 def test_rapidserve_decode_skip_is_rejected():
@@ -252,6 +291,41 @@ def test_moe_outside_the_target_model_never_captures(monkeypatch):
     assert (capturer.buffer == UNCAPTURED).all()
 
 
+def _forward_metadata(monkeypatch, attn_metadata):
+    from types import SimpleNamespace
+
+    import atom.utils.forward_context as fc
+
+    ctx = SimpleNamespace(attn_metadata=attn_metadata)
+    monkeypatch.setattr(fc, "get_forward_context", lambda: ctx)
+
+
+def test_current_slot_mapping_reads_the_builder_metadata(monkeypatch):
+    from types import SimpleNamespace
+
+    slots = torch.tensor([3, 4])
+    _forward_metadata(monkeypatch, SimpleNamespace(slot_mapping=slots))
+    assert cap_mod.current_slot_mapping() is slots
+
+
+@pytest.mark.parametrize("kind", ["none", "empty-dict", "per-layer-dict", "no-slots"])
+def test_current_slot_mapping_refuses_without_one_slot_space(monkeypatch, kind):
+    from types import SimpleNamespace
+
+    attn_metadata = {
+        "none": None,
+        "empty-dict": {},
+        "per-layer-dict": {
+            "full_attn": SimpleNamespace(slot_mapping=torch.tensor([0, 1])),
+            "gdn": SimpleNamespace(slot_mapping=torch.tensor([7, 8])),
+        },
+        "no-slots": object(),
+    }[kind]
+    _forward_metadata(monkeypatch, attn_metadata)
+    with pytest.raises(RuntimeError, match="no single per-token slot_mapping"):
+        cap_mod.current_slot_mapping()
+
+
 def test_prefix_slots_match_gpu_formula():
     table = [4, 9, 2, 7]
     pos = torch.arange(50, dtype=torch.long)
@@ -310,7 +384,9 @@ def test_empty_step_stores_nothing():
         num_slots=8, num_layers=1, top_k=2, device="cpu"
     )
     assert capturer.store_step(torch.tensor([], dtype=torch.long), [], [], []) is None
-    assert capturer.store_step(None, [1], [0], [1]) is None
+    # Outside a forward there are no slots to read: refused, not an empty step.
+    with pytest.raises(RuntimeError, match="no single per-token slot_mapping"):
+        capturer.store_step(None, [1], [0], [1])
 
 
 def test_stored_steps_are_independent():
@@ -351,9 +427,110 @@ def test_async_store_snapshots_slots_before_staging_reuse():
     np.testing.assert_array_equal(pending.patch().rows[:, 0, :], [[7, 8]])
 
 
+def _prefix_batch(block_tables):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        req_ids=[7, 9],
+        block_tables=block_tables,
+        routed_prefix_ranges=[(1, 0, 4)],
+    )
+
+
+def test_cached_prefix_slots_read_the_requests_own_table():
+    req_ids, starts, lens, slots = cap_mod.batch_prefix_slots(
+        _prefix_batch([[0], [5]]), block_size=4
+    )
+    assert req_ids.tolist() == [9] and starts.tolist() == [0] and lens.tolist() == [4]
+    assert slots.tolist() == [20, 21, 22, 23]
+
+
+def test_cached_prefix_slots_refuse_a_dropped_block_table():
+    """`ScheduledBatch` omits an empty table, which shifts every later row onto
+    another request's blocks; the lookup refuses rather than read them."""
+    with pytest.raises(RuntimeError, match="looked up by batch position"):
+        cap_mod.batch_prefix_slots(_prefix_batch([[5]]), block_size=4)
+
+
+def test_reused_slot_keeps_dense_layers_uncaptured():
+    """Layer 1 is dense: no request writes it, so a reused slot reads -1."""
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=3, top_k=2, device=device
+    )
+    slot = torch.tensor([3], device=device)
+    for ids in ([[1, 2]], [[5, 6]]):  # request A, then B on the same slot
+        for layer in (0, 2):
+            capturer.capture(
+                layer, torch.tensor(ids, dtype=torch.int32, device=device), slot
+            )
+    row = capturer.buffer[3].cpu().tolist()
+    assert row == [[5, 6], [UNCAPTURED, UNCAPTURED], [5, 6]]
+
+
+class _Owner:
+    pass
+
+
+def test_second_runner_cannot_take_the_capturer():
+    a, b = _Owner(), _Owner()
+    mine = RoutedExpertsCapturer.init(
+        num_slots=4, num_layers=1, top_k=1, device="cpu", owner=a
+    )
+    with pytest.raises(RuntimeError, match="one capturing runner"):
+        RoutedExpertsCapturer.init(
+            num_slots=4, num_layers=1, top_k=1, device="cpu", owner=b
+        )
+    assert RoutedExpertsCapturer.get() is mine
+    # Another runner's teardown leaves it alone; the owner's drops it.
+    RoutedExpertsCapturer.reset(owner=b)
+    assert RoutedExpertsCapturer.get() is mine
+    RoutedExpertsCapturer.reset(owner=a)
+    assert RoutedExpertsCapturer.get() is None
+
+
+def test_owner_reinit_and_dead_owner_replaced():
+    a = _Owner()
+    first = RoutedExpertsCapturer.init(
+        num_slots=4, num_layers=1, top_k=1, device="cpu", owner=a
+    )
+    # Wake re-allocates for the same runner.
+    again = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=1, device="cpu", owner=a
+    )
+    assert again is not first and RoutedExpertsCapturer.get() is again
+    del a, first
+    import gc
+
+    gc.collect()
+    b = _Owner()
+    assert (
+        RoutedExpertsCapturer.init(
+            num_slots=4, num_layers=1, top_k=1, device="cpu", owner=b
+        )
+        is RoutedExpertsCapturer.get()
+    )
+
+
+def test_capture_buffer_matches_its_budget():
+    """The pool charge and the allocation come from one element type."""
+    block_size, num_blocks, layers, top_k = 16, 3, 5, 4
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=block_size * num_blocks,
+        num_layers=layers,
+        top_k=top_k,
+        device="cpu",
+    )
+    assert capturer.buffer.dtype == cap_mod.CAPTURE_DTYPE
+    assert capturer.buffer.nbytes == num_blocks * capture_bytes_per_kv_block(
+        block_size, layers, top_k
+    ) + capture_pad_row_bytes(layers, top_k)
+
+
 def test_capture_page_bytes_are_budgeted_per_block():
-    assert capture_bytes_per_kv_block(16, 58, 8) == 16 * 58 * 8 * 4
-    assert capture_pad_row_bytes(58, 8) == 58 * 8 * 4
+    item = cap_mod.CAPTURE_DTYPE.itemsize
+    assert capture_bytes_per_kv_block(16, 58, 8) == 16 * 58 * 8 * item
+    assert capture_pad_row_bytes(58, 8) == 58 * 8 * item
     from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
         PAGED_CLASS,
         page_pool,
@@ -409,19 +586,24 @@ def test_lazy_wrapper_fused_moe_is_detected(monkeypatch):
     assert not is_fused_moe_module(nn.Identity())
 
 
-def test_triton_routing_ids_match_packed_histogram():
-    """Reconstruct token-major ids from the same gather/hist Triton consumes."""
+def test_is_fused_moe_module_undecorated_rejects_plain_modules(monkeypatch):
+    import sys
+    import types
 
-    class _Expt:
-        token_offs_raw = torch.tensor([0, 0, 1, 1, 3, 5, 6], dtype=torch.int32)
+    from torch import nn
 
-    class _Routing:
-        expt_data = _Expt()
-        expt_hist = torch.tensor([0, 1, 0, 2, 2, 1], dtype=torch.int32)
+    from atom.model_ops.fused_moe.routed_experts_capturer import is_fused_moe_module
 
-    gather = torch.tensor([0, 2, 4, 1, 5, 3], dtype=torch.int32)
-    ids = topk_ids_from_triton_routing(_Routing(), gather, num_tokens=3, topk=2)
-    assert ids.tolist() == [[1, 4], [3, 5], [3, 4]]
+    class FusedMoE(nn.Module):
+        pass
+
+    fake_moe = types.ModuleType("atom.model_ops.moe")
+    fake_moe.FusedMoE = FusedMoE
+    monkeypatch.setitem(sys.modules, "atom.model_ops.moe", fake_moe)
+
+    assert is_fused_moe_module(FusedMoE())
+    assert not is_fused_moe_module(nn.Identity())
+    assert not is_fused_moe_module(nn.Linear(2, 2))
 
 
 def test_in_place_slot_rewrite_between_forwards():
@@ -472,13 +654,15 @@ def test_apply_patch_gap_fills_uncaptured():
     assert seq.routed_experts[:, 0, 0].tolist() == [0, 0, -1, -1, 5]
 
 
-def test_apply_patch_replaces_suffix():
+def test_apply_patch_overlap_overwrites_and_keeps_high_water():
     seq = Sequence([1, 2, 3], 3)
-    seq.apply_routed_expert_patch(0, np.arange(6, dtype=np.int16).reshape(3, 1, 2))
+    first = np.arange(6, dtype=np.int16).reshape(3, 1, 2)
+    seq.apply_routed_expert_patch(0, first)
     replacement = np.array([[[9, 8]]], dtype=np.int16)
     seq.apply_routed_expert_patch(1, replacement)
-    assert seq.routed_expert_rows == 2
-    np.testing.assert_array_equal(seq.routed_experts[1:], replacement)
+    assert seq.routed_expert_rows == 3
+    np.testing.assert_array_equal(seq.routed_experts[1:2], replacement)
+    np.testing.assert_array_equal(seq.routed_experts[2:], first[2:])
 
 
 def test_truncate_routed_experts_drops_tail():
@@ -487,7 +671,17 @@ def test_truncate_routed_experts_drops_tail():
     seq.truncate_routed_experts(2)
     assert seq.routed_experts.shape[0] == 2
     seq.truncate_routed_experts(0)
-    assert seq.routed_experts is None
+    assert seq.routed_experts.shape == (0, 1, 2)
+
+
+def test_finish_to_zero_rows_keeps_shape():
+    """A one-token prompt that emits nothing still returns [0, layers, top_k]."""
+    seq = Sequence([1], 3)
+    seq.apply_routed_expert_patch(0, np.zeros((1, 2, 2), dtype=np.int16))
+    seq.finish_routed_experts(0)
+    routes = seq.routed_experts
+    assert routes.shape == (0, 2, 2)
+    assert routes.dtype == np.int16
 
 
 def test_apply_patch_deferred_overlap_keeps_prefix():

@@ -51,7 +51,10 @@ from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
-from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+from atom.model_engine.page_unit_checkpoint import (
+    PagedStateCheckpointSpec,
+    checkpoint_page_unit_bytes,
+)
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import (
@@ -81,12 +84,12 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    batch_prefix_slots,
     capture_bytes_per_kv_block,
     capture_pad_row_bytes,
-    check_return_routed_experts,
+    check_return_routed_experts_config,
     current_slot_mapping,
     fused_moe_modules,
-    prefix_slots,
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
@@ -299,11 +302,6 @@ class tokenIDProcessor:
         gpu_logprobs: torch.Tensor | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
-        # Sources are freed on the compute stream once the caller returns; tell
-        # the allocator they are still in use by the copy stream.
-        gpu_tensor.record_stream(self.async_copy_stream)
-        if gpu_logprobs is not None:
-            gpu_logprobs.record_stream(self.async_copy_stream)
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
@@ -766,6 +764,7 @@ class ModelRunner:
     def __init__(self, rank: int, config: Config):
         self.config = config
         self._return_routed_experts = bool(config.enable_return_routed_experts)
+        self._routed_experts_capturer: RoutedExpertsCapturer | None = None
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -1201,7 +1200,8 @@ class ModelRunner:
             del self.model
         if hasattr(self, "drafter"):
             del self.drafter
-        RoutedExpertsCapturer.reset()
+        RoutedExpertsCapturer.reset(owner=self)
+        self._routed_experts_capturer = None
         torch.cuda.empty_cache()
         return True
 
@@ -2024,26 +2024,8 @@ class ModelRunner:
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # None means the backend has not narrowed its image: carry it all.
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
-            # The charged entry can be larger than the bytes a transfer
-            # publishes: MHA alignment padding is not a region, and a draft
-            # pool merged into the same class is ordinary KV after the
-            # checkpoint regions. The backend names the published unit.
-            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
-            published_unit = getattr(
-                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
-            )
-            if callable(published_unit):
-                published = published_unit()
-                if published is not None:
-                    published = int(published)
-                    if published <= 0 or published > page_unit_bytes:
-                        raise RuntimeError(
-                            f"checkpoint PAGE unit is {published} B but the "
-                            f"paged pool entry is {page_unit_bytes} B"
-                        )
-                    page_unit_bytes = published
             checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=page_unit_bytes,
+                page_unit_bytes=checkpoint_page_unit_bytes(self.attn_metadata_builder),
                 slot_bytes=slot_bytes,
                 image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,
@@ -2401,6 +2383,9 @@ class ModelRunner:
                 f"attention metadata; {builder_cls.__name__} does not supply them, "
                 "so routes would never be written"
             )
+        # The exported layer axis is the decoder's, dense layers included, so a
+        # consumer indexes it by decoder layer.
+        num_layers = int(self.hf_text_config.num_hidden_layers)
         layer_ids: list[int] = []
         for ordinal, moe in enumerate(moes):
             prefix = getattr(moe, "prefix", "") or ""
@@ -2409,12 +2394,30 @@ class ModelRunner:
                 idx = int(match.group(1))
             elif getattr(moe, "layer_id", None) is not None:
                 idx = int(moe.layer_id)
-            else:
+            elif len(moes) == num_layers:
+                # Only when every decoder layer is MoE is position its index.
                 idx = ordinal
+            else:
+                raise ValueError(
+                    "enable_return_routed_experts cannot place the FusedMoE "
+                    f"{prefix or ordinal!r} on a decoder layer: its prefix has no "
+                    "'layers.N' and it has no layer_id"
+                )
+            if not 0 <= idx < num_layers:
+                raise ValueError(
+                    f"FusedMoE {prefix!r} resolves to layer {idx}, outside the "
+                    f"model's {num_layers} decoder layers"
+                )
             moe.moe_capture_layer_id = idx
             layer_ids.append(idx)
+        if len(set(layer_ids)) != len(layer_ids):
+            dup = sorted({i for i in layer_ids if layer_ids.count(i) > 1})
+            raise ValueError(
+                f"FusedMoE modules share decoder layer ids {dup}; their routes "
+                "would overwrite each other"
+            )
         self._routed_experts_geo = (
-            max(layer_ids) + 1,
+            num_layers,
             max(int(m.top_k) for m in moes),
         )
         return self._routed_experts_geo
@@ -2425,11 +2428,12 @@ class ModelRunner:
             return
         num_layers, top_k = geo
         num_slots = int(num_kvcache_blocks) * int(self.block_size)
-        RoutedExpertsCapturer.init(
+        self._routed_experts_capturer = RoutedExpertsCapturer.init(
             num_slots=num_slots,
             num_layers=num_layers,
             top_k=top_k,
             device=self.device,
+            owner=self,
         )
 
     def _store_routed_experts_step(
@@ -2448,9 +2452,14 @@ class ModelRunner:
             return
         if getattr(batch, "is_dummy_run", False) or self.rank != 0:
             return
-        capturer = RoutedExpertsCapturer.get()
+        capturer = self._routed_experts_capturer
         if capturer is None:
             return
+        if RoutedExpertsCapturer.get() is not capturer:
+            raise RuntimeError(
+                "enable_return_routed_experts: the MoE layers are capturing "
+                "into another runner's buffer"
+            )
         lens = batch.num_scheduled_tokens
         first = np.cumsum(lens) - lens
         batch.routed_experts_pending = capturer.store_step(
@@ -2464,19 +2473,7 @@ class ModelRunner:
 
     def _routed_prefix_slots(self, batch: ScheduledBatch):
         """Slots of cached prefixes the scheduler has no routes for yet."""
-        ranges = getattr(batch, "routed_prefix_ranges", None)
-        if not ranges:
-            return None
-        req_ids = np.asarray([batch.req_ids[i] for i, _, _ in ranges], np.int64)
-        starts = np.asarray([lo for _, lo, _ in ranges], np.int64)
-        lens = np.asarray([hi - lo for _, lo, hi in ranges], np.int64)
-        slots = np.concatenate(
-            [
-                prefix_slots(batch.block_tables[i], lo, hi, self.block_size)
-                for i, lo, hi in ranges
-            ]
-        )
-        return req_ids, starts, lens, slots
+        return batch_prefix_slots(batch, self.block_size)
 
     def _attach_routed_experts(
         self, batch: ScheduledBatch, output: ScheduledBatchOutput
@@ -3539,7 +3536,10 @@ class ModelRunner:
         # Capture before prepare_sampled_ids(), which advances self.prev_batch.
         prev_batch = self.tokenID_processor.prev_batch
         store_routes_after_recv = None
-        if self._return_routed_experts:
+        store_routes = self._return_routed_experts and not getattr(
+            batch, "is_dummy_run", False
+        )
+        if store_routes:
             slots = current_slot_mapping()
             if deferred:
                 store_routes_after_recv = partial(
@@ -3556,7 +3556,7 @@ class ModelRunner:
             sampled_logprobs,
             after_recv=store_routes_after_recv,
         )
-        if self._return_routed_experts and not deferred:
+        if store_routes and not deferred:
             self._store_routed_experts_step(batch, slot_mapping=slots)
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
@@ -4720,16 +4720,7 @@ class RapidServeModelRunner(ModelRunner):
     def _refuse_routed_experts_capture(self) -> None:
         if not self._return_routed_experts:
             return
-        check_return_routed_experts(
-            getattr(self.config, "decode_context_parallel_size", 1),
-            getattr(self.config, "prefill_context_parallel_size", 1),
-            getattr(self.config, "pipeline_parallel_size", 1),
-            kv_transfer_config=getattr(self.config, "kv_transfer_config", None),
-            enable_rapidserve=True,
-            enable_dp_attention=bool(
-                getattr(self.config, "enable_dp_attention", False)
-            ),
-        )
+        check_return_routed_experts_config(self.config, rapidserve_runner=True)
 
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from

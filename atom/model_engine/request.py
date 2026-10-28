@@ -4,6 +4,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 
 @dataclass
 class RequestOutput:
@@ -15,4 +17,8 @@ class RequestOutput:
     finish_reason: str | None = None
     kv_transfer_params_output: dict[str, Any] | None = None
     num_cached_tokens: int = 0
-    routed_experts: Any | None = None
+    # `enable_return_routed_experts` only, and only on the final output (None
+    # on every streamed one): read-only int16 [seq_len - 1, num_hidden_layers,
+    # top_k], -1 on dense layers. Surfaced through `generate()`'s dict, not
+    # the OpenAI HTTP response.
+    routed_experts: np.ndarray | None = None

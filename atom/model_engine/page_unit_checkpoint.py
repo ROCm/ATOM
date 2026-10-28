@@ -14,6 +14,7 @@ from time import monotonic
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import Pool
 
 _CHANGE_LOG_LIMIT = 4096
 
@@ -88,6 +89,32 @@ class PagedStateCheckpointSpec:
             image_bytes=wire["image_bytes"],  # type: ignore[arg-type]
             layout_id=wire["layout_id"],  # type: ignore[arg-type]
         )
+
+
+def checkpoint_page_unit_bytes(builder: object) -> int:
+    """Bytes of one block that a PAGE-backed state checkpoint moves.
+
+    The plan's PAGE `entry_bytes` is what a block id is charged, and other
+    contributors share that class: a draft pool's KV and the routed-expert
+    capture rows ride the same block ids but are not part of the state
+    image. Only the target builder's own PAGE specs are. Within those the
+    backend may narrow further (MHA alignment padding is not a region).
+    """
+    page_unit_bytes = sum(
+        s.entry_bytes for s in builder.sub_pool_specs() if s.pool is Pool.PAGE
+    )
+    published_unit = getattr(builder, "checkpoint_page_unit_bytes", None)
+    if callable(published_unit):
+        published = published_unit()
+        if published is not None:
+            published = int(published)
+            if published <= 0 or published > page_unit_bytes:
+                raise RuntimeError(
+                    f"checkpoint PAGE unit is {published} B but the "
+                    f"builder's paged entry is {page_unit_bytes} B"
+                )
+            page_unit_bytes = published
+    return int(page_unit_bytes)
 
 
 def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:

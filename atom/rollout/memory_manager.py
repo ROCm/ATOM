@@ -335,7 +335,8 @@ class MemoryManagerMixin:
             RoutedExpertsCapturer,
         )
 
-        RoutedExpertsCapturer.reset()
+        RoutedExpertsCapturer.reset(owner=self)
+        self._routed_experts_capturer = None
         torch.cuda.empty_cache()
         logger.info(f"{self.label}: KV cache released (GPU memory freed)")
 

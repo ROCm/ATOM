@@ -162,18 +162,23 @@ def test_release_kv_cache_resets_routed_experts_capturer(monkeypatch):
     """Sleep must drop the capture singleton or wake under-counts free KV."""
     from atom.model_ops.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
-    RoutedExpertsCapturer.init(num_slots=4, num_layers=2, top_k=2, device="cpu")
-    assert RoutedExpertsCapturer.get() is not None
-    runner = SimpleNamespace(
-        kv_cache=torch.empty(1),
-        config=SimpleNamespace(num_kvcache_blocks=7),
-        model=nn.Sequential(),
-        label="test",
-    )
+    class _Runner:
+        pass
+
+    runner = _Runner()
+    runner.kv_cache = torch.empty(1)
+    runner.config = SimpleNamespace(num_kvcache_blocks=7)
+    runner.model = nn.Sequential()
+    runner.label = "test"
     runner._get_models_with_kv = lambda: [runner.model]
+    runner._routed_experts_capturer = RoutedExpertsCapturer.init(
+        num_slots=4, num_layers=2, top_k=2, device="cpu", owner=runner
+    )
+    assert RoutedExpertsCapturer.get() is not None
     monkeypatch.setattr(memory_manager, "set_kv_cache_data", lambda _value: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
     MemoryManagerMixin._release_kv_cache(runner)
 
     assert RoutedExpertsCapturer.get() is None
+    assert runner._routed_experts_capturer is None

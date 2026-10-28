@@ -673,22 +673,10 @@ class Scheduler:
         )
         if self._return_routed_experts:
             from atom.model_ops.fused_moe.routed_experts_capturer import (
-                check_return_routed_experts,
+                check_return_routed_experts_config,
             )
 
-            check_return_routed_experts(
-                getattr(config, "decode_context_parallel_size", 1),
-                getattr(config, "prefill_context_parallel_size", 1),
-                getattr(config, "pipeline_parallel_size", 1),
-                kv_transfer_config=getattr(config, "kv_transfer_config", None),
-                enable_rapidserve=bool(
-                    getattr(config, "enable_rapidserve", False)
-                    or getattr(config, "disagg_is_decode", False)
-                    or "RapidServeModelRunner"
-                    in str(getattr(config, "runner_qualname", ""))
-                ),
-                enable_dp_attention=bool(getattr(config, "enable_dp_attention", False)),
-            )
+            check_return_routed_experts_config(config)
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
@@ -3916,6 +3904,13 @@ class Scheduler:
         if seq.is_partial_prefill:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1
+        if self._return_routed_experts:
+            # The marker counts rows planned, not delivered. Fall back to what
+            # was delivered, so a range whose patch is lost is asked for again
+            # on resume (read from the cache on a hit, else recomputed).
+            seq.routed_forwarded_end = min(
+                seq.routed_forwarded_end, seq.routed_expert_rows
+            )
         # This free runs no `request_finished`; drop any stall-escaped save
         # tracker now so the connector's save loop cannot later read these
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
@@ -4023,8 +4018,16 @@ class Scheduler:
             zip(patch.req_ids.tolist(), patch.starts.tolist())
         ):
             seq = seq_map.get(req_id)
-            if seq is not None:
-                seq.apply_routed_expert_patch(start, rows[offsets[j] : offsets[j + 1]])
+            if seq is None:
+                logger.warning(
+                    "routed experts: dropping %d rows from position %d for "
+                    "request %s, which is not in the batch it was scheduled in",
+                    offsets[j + 1] - offsets[j],
+                    start,
+                    req_id,
+                )
+                continue
+            seq.apply_routed_expert_patch(start, rows[offsets[j] : offsets[j + 1]])
 
     def postprocess(
         self,
@@ -4164,10 +4167,6 @@ class Scheduler:
             # Update the running status
             idx = fwd_output.get_idx(seq.id)
             if idx is None:
-                continue
-            # Middle-chunk prefill returns req_ids with no sampled tokens so
-            # route patches can merge without advancing generation.
-            if not prev_token_ids:
                 continue
             # An immediate preempt/resume can retain the same request ID in
             # the runner's deferred output. That result belongs to execution

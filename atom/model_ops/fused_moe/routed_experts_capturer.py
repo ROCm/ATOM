@@ -12,6 +12,7 @@ slots to the first step that forwards the request.
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Sequence as AbcSequence
 from typing import Any, NamedTuple
 
@@ -22,6 +23,8 @@ _INSTANCE: RoutedExpertsCapturer | None = None
 
 # Missed captures read as this, never as a valid expert id.
 UNCAPTURED = -1
+# The GPU capture buffer's element type; the KV pool budget is sized from it.
+CAPTURE_DTYPE = torch.int32
 
 
 class RoutedExpertsPatch(NamedTuple):
@@ -64,8 +67,15 @@ def check_return_routed_experts(
     kv_transfer_config: dict | None = None,
     enable_rapidserve: bool = False,
     enable_dp_attention: bool = False,
+    plugin_mode: bool = False,
 ) -> None:
     """Refuse topologies that cannot assemble a full [seq_len-1] route tensor."""
+    if plugin_mode:
+        raise ValueError(
+            "enable_return_routed_experts is not supported in plugin mode: "
+            "capture lives in ATOM's ModelRunner, which a host framework does "
+            "not run"
+        )
     if dcp_size != 1 or pcp_size != 1:
         raise ValueError(
             "enable_return_routed_experts requires decode_context_parallel_size "
@@ -96,6 +106,39 @@ def check_return_routed_experts(
         )
 
 
+def check_return_routed_experts_config(
+    config: Any, *, rapidserve_runner: bool = False
+) -> None:
+    """``check_return_routed_experts`` over an ATOM ``Config``.
+
+    The one place the effective topology is read from a config, for every
+    caller: ``Config`` at construction, the scheduler and the RapidServe
+    runner, which see the config again in their own processes.
+    ``rapidserve_runner`` is the runner's own knowledge that it is one.
+    """
+    if not getattr(config, "enable_return_routed_experts", False):
+        return
+    from atom.plugin import is_plugin_mode
+
+    check_return_routed_experts(
+        getattr(config, "decode_context_parallel_size", 1),
+        getattr(config, "prefill_context_parallel_size", 1),
+        getattr(config, "pipeline_parallel_size", 1),
+        kv_transfer_config=getattr(config, "kv_transfer_config", None),
+        enable_rapidserve=bool(
+            rapidserve_runner
+            or getattr(config, "enable_rapidserve", False)
+            or getattr(config, "disagg_is_decode", False)
+            or "RapidServeModelRunner" in str(getattr(config, "runner_qualname", ""))
+        ),
+        enable_dp_attention=bool(getattr(config, "enable_dp_attention", False)),
+        plugin_mode=bool(
+            getattr(getattr(config, "plugin_config", None), "is_plugin_mode", False)
+            or is_plugin_mode()
+        ),
+    )
+
+
 def is_fused_moe_module(module: Any) -> bool:
     """True for a real FusedMoE, including LazyMoEWrapper instances.
 
@@ -105,8 +148,11 @@ def is_fused_moe_module(module: Any) -> bool:
     """
     from atom.model_ops.moe import FusedMoE
 
+    # An undecorated FusedMoE's base is nn.Module, which every module matches.
     types: tuple[type, ...] = (FusedMoE,) + tuple(
-        b for b in getattr(FusedMoE, "__bases__", ()) if isinstance(b, type)
+        b
+        for b in getattr(FusedMoE, "__bases__", ())
+        if isinstance(b, type) and b is not torch.nn.Module
     )
     return isinstance(module, types)
 
@@ -129,31 +175,64 @@ def prefix_slots(block_table: AbcSequence[int], lo: int, hi: int, block_size: in
     )
 
 
-def current_slot_mapping() -> torch.Tensor | None:
+def batch_prefix_slots(batch: Any, block_size: int):
+    """``(req_ids, starts, lens, slots)`` of a batch's ``routed_prefix_ranges``,
+    or None when it has none. Ranges name requests by batch position."""
+    ranges = getattr(batch, "routed_prefix_ranges", None)
+    if not ranges:
+        return None
+    if len(batch.block_tables) != len(batch.req_ids):
+        # `ScheduledBatch` drops empty tables, so row i would be another
+        # request's blocks and the prefix would read its routes.
+        raise RuntimeError(
+            f"{len(batch.block_tables)} block tables for "
+            f"{len(batch.req_ids)} requests; cached-prefix routes are "
+            "looked up by batch position"
+        )
+    req_ids = np.asarray([batch.req_ids[i] for i, _, _ in ranges], np.int64)
+    starts = np.asarray([lo for _, lo, _ in ranges], np.int64)
+    lens = np.asarray([hi - lo for _, lo, hi in ranges], np.int64)
+    slots = np.concatenate(
+        [
+            prefix_slots(batch.block_tables[i], lo, hi, block_size)
+            for i, lo, hi in ranges
+        ]
+    )
+    return req_ids, starts, lens, slots
+
+
+def current_slot_mapping() -> torch.Tensor:
+    """This forward's per-token KV slots, from the target builder's metadata.
+
+    A per-layer metadata dict (plugin backends) has no single slot space to
+    pick, and a forward without slots would silently drop its routes; both
+    raise instead.
+    """
     from atom.utils.forward_context import get_forward_context
 
-    ctx = get_forward_context()
-    md = getattr(ctx, "attn_metadata", None)
-    if md is None:
-        return None
-    if isinstance(md, dict):
-        for value in md.values():
-            slots = getattr(value, "slot_mapping", None)
-            if isinstance(slots, torch.Tensor):
-                return slots
-        return None
-    slots = getattr(md, "slot_mapping", None)
-    return slots if isinstance(slots, torch.Tensor) else None
+    md = getattr(get_forward_context(), "attn_metadata", None)
+    slots = None if isinstance(md, dict) else getattr(md, "slot_mapping", None)
+    if isinstance(slots, torch.Tensor):
+        return slots
+    raise RuntimeError(
+        "enable_return_routed_experts: this forward's attention metadata "
+        f"({type(md).__name__}) carries no single per-token slot_mapping"
+    )
+
+
+def capture_row_bytes(num_layers: int, top_k: int) -> int:
+    """One token slot's routes in the capture buffer."""
+    return int(num_layers) * int(top_k) * CAPTURE_DTYPE.itemsize
 
 
 def capture_bytes_per_kv_block(block_size: int, num_layers: int, top_k: int) -> int:
-    """PAGE-pool surcharge: int32 routes for every token slot in one KV block."""
-    return int(block_size) * int(num_layers) * int(top_k) * 4
+    """PAGE-pool surcharge: routes for every token slot in one KV block."""
+    return int(block_size) * capture_row_bytes(num_layers, top_k)
 
 
 def capture_pad_row_bytes(num_layers: int, top_k: int) -> int:
     """Sacrificial dummy-slot row charged once, not per KV block."""
-    return int(num_layers) * int(top_k) * 4
+    return capture_row_bytes(num_layers, top_k)
 
 
 def trim_routed_experts(routes: np.ndarray | None, num_tokens: int):
@@ -164,39 +243,6 @@ def trim_routed_experts(routes: np.ndarray | None, num_tokens: int):
     if routes.shape[0] != keep:
         return routes[:keep]
     return routes
-
-
-def _gather_src_indx(gather_indx) -> torch.Tensor:
-    if torch.is_tensor(gather_indx):
-        return gather_indx
-    src = getattr(gather_indx, "src_indx", None)
-    if torch.is_tensor(src):
-        return src
-    raise TypeError(f"unsupported gather_indx type {type(gather_indx)}")
-
-
-def topk_ids_from_triton_routing(
-    routing_data,
-    gather_indx,
-    num_tokens: int,
-    topk: int,
-) -> torch.Tensor:
-    """Logical expert ids ``[num_tokens, topk]`` consumed by Triton fused experts.
-
-    Packed slots are expert-major. ``gather_indx`` maps packed slot ->
-    ``token * topk + k``. Invert the histogram prefix to recover expert ids.
-    """
-    src = _gather_src_indx(gather_indx).to(dtype=torch.long).view(-1)
-    n = int(num_tokens) * int(topk)
-    src = src[:n]
-    packed = torch.arange(n, device=src.device, dtype=torch.long)
-    offs = routing_data.expt_data.token_offs_raw.to(dtype=torch.long)
-    expert_packed = torch.searchsorted(offs[1:], packed, right=True)
-    tokens = torch.div(src, int(topk), rounding_mode="floor")
-    slots = src % int(topk)
-    ids = expert_packed.new_empty((int(num_tokens), int(topk)))
-    ids[tokens, slots] = expert_packed
-    return ids
 
 
 class RoutedExpertsCapturer:
@@ -213,7 +259,6 @@ class RoutedExpertsCapturer:
         num_layers: int,
         top_k: int,
         device: torch.device | str,
-        dtype: torch.dtype = torch.int32,
     ):
         if num_slots <= 0 or num_layers <= 0 or top_k <= 0:
             raise ValueError(
@@ -228,9 +273,17 @@ class RoutedExpertsCapturer:
         self.buffer = torch.full(
             (self.num_slots + 1, self.num_layers, self.top_k),
             UNCAPTURED,
-            dtype=dtype,
+            dtype=CAPTURE_DTYPE,
             device=device,
         )
+        charged = self.num_slots * capture_row_bytes(
+            self.num_layers, self.top_k
+        ) + capture_pad_row_bytes(self.num_layers, self.top_k)
+        if self.buffer.nbytes != charged:
+            raise RuntimeError(
+                f"routed-expert capture buffer is {self.buffer.nbytes} B but the "
+                f"KV pool budget charged {charged} B"
+            )
 
     @classmethod
     def init(
@@ -239,22 +292,48 @@ class RoutedExpertsCapturer:
         num_layers: int,
         top_k: int,
         device: torch.device | str,
-        dtype: torch.dtype = torch.int32,
+        owner: object | None = None,
     ) -> RoutedExpertsCapturer:
+        """Install the process's capturer.
+
+        The MoE hook finds it through this global, so one process holds one.
+        ``owner`` (the runner) is recorded; another live owner's ``init``
+        raises rather than redirecting the first runner's routes.
+        """
         global _INSTANCE
-        _INSTANCE = cls(num_slots, num_layers, top_k, device, dtype=dtype)
-        return _INSTANCE
+        held = _INSTANCE._live_owner() if _INSTANCE is not None else None
+        if held is not None and held is not owner:
+            raise RuntimeError(
+                "enable_return_routed_experts: the routed-expert capturer is "
+                f"held by {type(held).__name__} {id(held):#x}; one process "
+                "supports one capturing runner"
+            )
+        capturer = cls(num_slots, num_layers, top_k, device)
+        capturer._owner = weakref.ref(owner) if owner is not None else None
+        _INSTANCE = capturer
+        return capturer
+
+    _owner: weakref.ref | None = None
+
+    def _live_owner(self) -> object | None:
+        return self._owner() if self._owner is not None else None
 
     @classmethod
     def get(cls) -> RoutedExpertsCapturer | None:
         return _INSTANCE
 
     @classmethod
-    def reset(cls) -> None:
+    def reset(cls, owner: object | None = None) -> None:
         """Drop the process-local GPU/CPU buffers. Sleep KV teardown uses this
         so wake does not size a new pool against a still-live capture tensor.
+
+        With ``owner``, only that owner's capturer is dropped.
         """
         global _INSTANCE
+        if owner is not None and _INSTANCE is not None:
+            held = _INSTANCE._live_owner()
+            if held is not None and held is not owner:
+                return
         _INSTANCE = None
 
     def capture(
@@ -267,7 +346,7 @@ class RoutedExpertsCapturer:
         if layer_id < 0 or layer_id >= self.num_layers:
             return
         slots = slot_mapping if slot_mapping is not None else current_slot_mapping()
-        if slots is None or slots.numel() == 0 or topk_ids.numel() == 0:
+        if slots.numel() == 0 or topk_ids.numel() == 0:
             return
         n = min(int(slots.shape[0]), int(topk_ids.shape[0]))
         k = min(int(topk_ids.shape[-1]), self.top_k)
@@ -302,7 +381,7 @@ class RoutedExpertsCapturer:
         slots = slot_mapping if slot_mapping is not None else current_slot_mapping()
         lens = np.asarray(lens, dtype=np.int64)
         total = int(lens.sum())
-        if slots is None or total == 0:
+        if total == 0:
             return None
         req_ids = np.asarray(req_ids, dtype=np.int64)
         starts = np.asarray(starts, dtype=np.int64)
