@@ -91,12 +91,14 @@ def _import_mega():
 
 
 def _import_mega_recipe() -> SimpleNamespace | None:
-    """aiter's MegaMoERecipe and MegaMoEGeometry, with the kinds a recipe picks;
-    None on an aiter from before them, which takes stage1/stage2 flags instead."""
+    """aiter's MegaMoERecipe, its ExpertComputeConfig and MegaMoEGeometry, with
+    the kinds a recipe picks; None on an aiter from before them, which takes
+    stage1/stage2 flags instead."""
     try:
         from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (  # type: ignore
             CombineKind,
             DispatchKind,
+            ExpertComputeConfig,
             MegaMoEGeometry,
             MegaMoERecipe,
         )
@@ -104,6 +106,7 @@ def _import_mega_recipe() -> SimpleNamespace | None:
         return None
     return SimpleNamespace(
         Recipe=MegaMoERecipe,
+        Compute=ExpertComputeConfig,
         Geometry=MegaMoEGeometry,
         DispatchKind=DispatchKind,
         CombineKind=CombineKind,
@@ -272,6 +275,47 @@ _MEGA_STAGE1_FUSED = (
 _CCO_DEVCOMM_BYTES = 2 << 20
 
 
+def _mega_communicator(
+    all2all_manager: Any,
+    *,
+    ep_size: int,
+    ep_rank: int,
+    ep_src_global_rank: int,
+    per_rank_vmm: int,
+) -> Any:
+    """The cco communicator a MegaMoE allocates its arena on.
+
+    The EP group's all2all manager owns it where it offers one (aiter's
+    MoriV2All2AllManager): it is created once, at the capacity asked for, and
+    destroyed with the process groups -- after close_mega_transports(). It
+    cannot grow, so it serves the first MegaMoE only; a second, differently
+    shaped one gets a communicator of its own, as does any MegaMoE on an aiter
+    whose manager lends none.
+    """
+    borrow = getattr(all2all_manager, "get_or_create_cco_communicator", None)
+    if borrow is not None and not _MEGA_TRANSPORTS:
+        return borrow(per_rank_vmm)
+    if borrow is not None:
+        logger.warning(
+            "[MegaMoEGfx1250] the EP group's cco communicator is sized for the "
+            "first MegaMoE; this differently shaped one gets its own"
+        )
+    return _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
+
+
+def close_mega_transports() -> None:
+    """Close every MegaMoE this process built, newest first.
+
+    Their arenas live on the EP group's cco communicator, which the all2all
+    manager destroys with the process groups, so this has to run first
+    (ModelRunner.exit does). Collective, as building them was.
+    """
+    transports = list(_MEGA_TRANSPORTS.values())
+    _MEGA_TRANSPORTS.clear()
+    for mega in reversed(transports):
+        mega.close()
+
+
 def _mega_recipe(
     api: SimpleNamespace,
     *,
@@ -286,6 +330,14 @@ def _mega_recipe(
     """The MegaMoERecipe this launch asks for: ATOM picks the dispatch, the
     combine and the wires from its environment, the layer supplies the expert
     GEMM. Whether the pairing can run is aiter's to say."""
+    compute = api.Compute(
+        activation=activation,
+        gate_mode=gate_mode,
+        quant_type=quant_type,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        swiglu_limit=swiglu_limit,
+    )
     return api.Recipe(
         dispatch=(
             api.DispatchKind.COMPACT if _MEGA_STAGE1_FUSED else api.DispatchKind.MORI
@@ -298,12 +350,7 @@ def _mega_recipe(
         dispatch_wire=_MEGA_DISPATCH_WIRE,
         # bf16 is always built; a quantized wire is built alongside it.
         combine_wires=("bf16", combine_wire),
-        activation=activation,
-        gate_mode=gate_mode,
-        quant_type=quant_type,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        swiglu_limit=swiglu_limit,
+        compute=compute,
     )
 
 
@@ -346,6 +393,7 @@ def init_mega_transport(
     situ_beta: torch.Tensor | None = None,
     situ_linear_beta: torch.Tensor | None = None,
     combine_wire: str = "bf16",
+    all2all_manager: Any = None,
 ) -> Any:
     """Create (and share) the MegaMoE that runs every MoE layer of this model.
 
@@ -358,6 +406,9 @@ def init_mega_transport(
     to BUILD ($ATOM_MEGA_COMBINE_WIRE). It is a capability, not the choice:
     MegaMoE builds a combine for it and for bf16, and every forward then names
     the one it wants -- bf16 unless it says otherwise. See combine_wire_for_step.
+
+    ``all2all_manager`` is the EP group's; its cco communicator carries the
+    arena where it lends one (see _mega_communicator).
     """
     api = _import_mega_recipe()
     if api is not None:
@@ -384,6 +435,7 @@ def init_mega_transport(
             recipe,
             geometry,
             ep_src_global_rank=ep_src_global_rank,
+            all2all_manager=all2all_manager,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
         )
@@ -435,7 +487,14 @@ def init_mega_transport(
         per_rank_vmm = _cco_per_rank_vmm(
             ep_size, hidden_dim, max_num_inp_token_per_rank, data_type_itemsize
         )
-    comm = _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
+    comm = _mega_communicator(
+        all2all_manager,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        ep_src_global_rank=ep_src_global_rank,
+        # Plus the DevComm created below.
+        per_rank_vmm=per_rank_vmm + _CCO_DEVCOMM_BYTES,
+    )
     mega = MegaMoEGfx1250(
         communicator=comm,
         rank=ep_rank,
@@ -508,6 +567,7 @@ def _init_mega_from_recipe(
     geometry: Any,
     *,
     ep_src_global_rank: int,
+    all2all_manager: Any,
     situ_beta: torch.Tensor | None,
     situ_linear_beta: torch.Tensor | None,
 ) -> Any:
@@ -519,12 +579,16 @@ def _init_mega_from_recipe(
 
     MegaMoEGfx1250 = _import_mega()
     # MegaMoE's arena -- exactly what the constructor allocates -- plus the
-    # DevComm created below. The communicator carries nothing else.
+    # DevComm created below, asked for in full before the communicator exists.
     per_rank_vmm = (
         MegaMoEGfx1250.required_vmm_bytes(recipe, geometry) + _CCO_DEVCOMM_BYTES
     )
-    comm = _init_cco_comm(
-        geometry.world_size, geometry.rank, ep_src_global_rank, per_rank_vmm
+    comm = _mega_communicator(
+        all2all_manager,
+        ep_size=geometry.world_size,
+        ep_rank=geometry.rank,
+        ep_src_global_rank=ep_src_global_rank,
+        per_rank_vmm=per_rank_vmm,
     )
     mega = MegaMoEGfx1250.from_recipe(
         recipe,
@@ -554,12 +618,12 @@ def _init_mega_from_recipe(
         mega.recipe.dispatch_wire,
         mega.recipe.combine.value,
         ",".join(mega.recipe.combine_wires),
-        mega.recipe.activation,
-        mega.recipe.gate_mode,
-        mega.recipe.quant_type,
-        mega.recipe.hidden_pad,
-        mega.recipe.intermediate_pad,
-        mega.recipe.swiglu_limit,
+        mega.recipe.compute.activation,
+        mega.recipe.compute.gate_mode,
+        mega.recipe.compute.quant_type,
+        mega.recipe.compute.hidden_pad,
+        mega.recipe.compute.intermediate_pad,
+        mega.recipe.compute.swiglu_limit,
         # The other half of the wire pair: logged together so a mismatch reads.
         os.environ.get("AITER_FORCE_A8W4", "0"),
         per_rank_vmm / (1 << 30),
@@ -628,6 +692,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         mega_geometry: dict | None = None,
+        all2all_manager: Any = None,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -642,6 +707,8 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # The fused transport's EP geometry; the rest of what MegaMoE fixes at
         # construction only shows up on the layer -- see bind_mega_transport().
         self._mega_geometry = mega_geometry
+        # The EP group's; MegaMoE borrows its cco communicator.
+        self._all2all_manager = all2all_manager
         self.mega: Any = None
         self.is_fused = mega_geometry is not None
 
@@ -682,6 +749,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             situ_beta=getattr(layer, "activation_situ_beta", None),
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
             combine_wire=_MEGA_COMBINE_WIRE,
+            all2all_manager=self._all2all_manager,
         )
 
     @staticmethod
@@ -1030,7 +1098,8 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         }
         # The recipe it was built from, or, on an older aiter, the same names
         # on the instance.
-        source = getattr(mega, "recipe", mega)
+        recipe = getattr(mega, "recipe", None)
+        source = mega if recipe is None else recipe.compute
         built = {name: getattr(source, name) for name in actual}
         differing = {
             name: (value, built[name])
@@ -1080,6 +1149,7 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
                 "num_experts_per_token": moe.experts_per_token,
                 "data_type_itemsize": moe.in_dtype.itemsize,
             },
+            all2all_manager=all2all_manager,
         )
 
     op = init_mori_v2_op(
