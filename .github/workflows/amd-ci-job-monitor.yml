@@ -1,26 +1,53 @@
 name: MiniMax validation diagnostics
 on:
   workflow_dispatch:
+    inputs:
+      reclaim_completed_metric:
+        description: Remove the verified duplicate metric from completed task 10772
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
   inspect:
     runs-on: atomesh-cicd
-    timeout-minutes: 3
+    timeout-minutes: 5
+    env:
+      RECLAIM_COMPLETED_METRIC: ${{ inputs.reclaim_completed_metric }}
     steps:
       - name: Read this task's Slurm states and progress logs
         shell: bash
         run: |
           python3 - <<'PYCODE'
           import collections
+          import hashlib
           import json
           import os
           import re
           import subprocess
           from pathlib import Path
           root = Path('/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG')
-          runs = (40706439005, 40737040374)
+          runs = (40706439005, 40737040374, 40739638741)
           jobs = []
+          if os.environ.get('RECLAIM_COMPLETED_METRIC') == 'true':
+              dirs = list(root.glob('*agentx-chunked-c32-mooncake_store-40706439005-20261028143137'))
+              if len(dirs) != 1:
+                  raise RuntimeError('Expected only the completed ON directory')
+              matches = list(dirs[0].glob('slurm_job-10772/benchmark_results/*/server_metrics_export.json'))
+              if len(matches) != 1:
+                  raise RuntimeError('Expected exactly the backed-up raw metric')
+              metric = matches[0]
+              digest = hashlib.sha256()
+              with metric.open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(16 * 1024 * 1024), b''):
+                      digest.update(chunk)
+              if metric.stat().st_size != 4716797276 or digest.hexdigest() != '631331178b754bdeefae1c70b069721af495dd99f9baced3677293f17c663853':
+                  raise RuntimeError('Backup verification mismatch; keeping original')
+              # Full identical copies are preserved locally and in GitHub
+              # artifact 12830886598, confirmed before this dispatch.
+              metric.unlink()
+              print('RECLAIMED VERIFIED TASK DUPLICATE: 4716797276 bytes; artifact 12830886598 retained', flush=True)
+
           controller = os.environ.get('SPUR_CONTROLLER_ADDR', '')
           controller_args = ['--controller', controller] if controller else []
           print('EXPLICIT CONTROLLER CONFIGURED:', bool(controller), flush=True)
@@ -64,7 +91,7 @@ jobs:
                   print('ROOT FILES:', [(x.name, x.stat().st_size) for x in directory.iterdir() if x.is_file()], flush=True)
                   for job in sorted(directory.glob('slurm_job-*')):
                       jobs.append(job.name.removeprefix('slurm_job-'))
-                      for name in ('decode-rank-0.log', 'prefill-rank-0.log', 'server-rank-0.log', 'eval/decode-rank-0.log', 'eval/prefill-rank-0.log', 'eval/server-rank-0.log'):
+                      for name in ('decode-rank-0.log', 'prefill-rank-0.log', 'server-rank-0.log', 'eval/decode-rank-0.log', 'eval/prefill-rank-0.log', 'eval/server-rank-0.log', '../rank-0/container-eval.log', '../rank-0/container.log'):
                           log = job / 'logs' / name
                           if not log.exists():
                               continue
@@ -79,7 +106,7 @@ jobs:
                                       trace.append(line.rstrip()[:450])
                                   if re.search(r'Capturing|Loading|loaded|Loaded|ready|Traceback|Error:|ERROR|Average toks/fwd|Avg generation|GSM8K', line):
                                       matches.append(line.rstrip()[:450])
-                          print(f'{job.name}/{name}: {log.stat().st_size} bytes', flush=True)
+                          print(f'{job.name}/{name}: {log.stat().st_size} bytes; owner_matches_runner={log.stat().st_uid == os.getuid()}', flush=True)
                           print('\n'.join(matches), flush=True)
                           if trace:
                               print('FIRST ERROR CONTEXT:\n' + '\n'.join(trace), flush=True)
