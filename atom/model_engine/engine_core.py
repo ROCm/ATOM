@@ -206,7 +206,7 @@ class EngineCore:
                     "prefill_token_graphs", wait_out=True
                 ),
             )
-            self.scheduler.dp_cache_admission_callback = lambda event: (
+            self.scheduler.cache_admission.on_admitted = lambda event: (
                 self.output_queue.put_nowait(("CACHE_ADMITTED", event))
             )
             if (
@@ -544,7 +544,7 @@ class EngineCore:
             batch=batch,
         )
 
-        cache_work = self.scheduler.take_cache_work()
+        cache_work = self.scheduler.cache_admission.take_work()
         if cache_work:
             self.output_queue.put_nowait(("CACHE_WORK", cache_work))
 

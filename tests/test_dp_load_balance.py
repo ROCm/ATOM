@@ -49,6 +49,7 @@ def _make_mgr(
 ):
     """Build a bare CoreManager with just the routing state initialized."""
     mgr = CoreManager.__new__(CoreManager)
+    mgr.cache_router = None
     mgr.label = "Engine Core Mgr"
     mgr.local_engine_count = n_ranks
     mgr._dp_lb_strategy = strategy

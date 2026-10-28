@@ -108,6 +108,20 @@ relative to staying with the owner. Explicit rank selection remains authoritativ
 
 ## Admission, copying, and failure
 
+The implementation lives in `atom/model_engine/dp_cache/`. `balance.py` owns
+the cost policy and coordinator `Session`/`Placement` records; `routing.py`
+reconciles placement events with CoreManager's load records through explicit
+load-container, lock, and retry-sender dependencies. `admission.py` uses a
+declared scheduler interface for queues and cleanup. Its preparation and work
+queues are initialized with the component.
+
+`Sequence.dp_cache` is either `None` or a `DPCacheState` from `state.py`. The
+router initializes the migration contract, and the worker scheduler updates
+its own serialized copy with preparation, admission, and work-report state.
+Admission/work events reconcile that copy with the coordinator; it is not a
+shared owner record. Retry creates fresh request state at the previous owner.
+The scheduler and connector continue to own buffer leases and resource release.
+
 The router retains bounded, expiring hints from completed requests. A hint
 records a hash-validated checkpoint boundary on a rank; it predicts residency
 but cannot prove that eviction has not occurred. Tokenizer/hash-cache hits alone

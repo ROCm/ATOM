@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
+from atom.model_engine.dp_cache.state import DPCacheState
 from atom.sampling_params import SamplingParams
 
 
@@ -529,6 +530,7 @@ class Sequence:
         # Optional client session lineage used by CoreManager's cache-aware,
         # token-load-aware DPA router.  These are routing metadata only; they
         # are deliberately kept out of the model-facing request payload.
+        self.dp_cache: DPCacheState | None = None
         self.dp_session_id = dp_session_id
         self.dp_parent_session_id = dp_parent_session_id
 

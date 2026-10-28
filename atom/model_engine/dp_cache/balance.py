@@ -183,6 +183,118 @@ class CacheBalancer:
         weight = prompt / (mean_length * mean_length)
         return [max(0, n) + weight * c for n, c in zip(requests, contexts)]
 
+    def _estimate_waits(self, requests, tokens, pending):
+        cfg = self.config
+        transfers = [0.0] * self.ranks
+        for p in pending:
+            transfers[p.rank] += p.transfer_seconds
+        waits = [
+            max(max(0, t) / cfg.prefill_tokens_per_second, transfers[r])
+            + max(0, n) * cfg.decode_request_seconds
+            for r, (n, t) in enumerate(zip(requests, tokens, strict=True))
+        ]
+        return waits, transfers
+
+    def _pick_lightest(self, waits, decode_scores):
+        cfg = self.config
+        lightest = min(
+            range(self.ranks), key=lambda r: (waits[r], (r - self._cursor) % self.ranks)
+        )
+        if decode_scores is not None:
+            # Inside the existing minimum useful TTFT-gain margin, prefer a
+            # placement that balances both decode batch size and context work.
+            candidates = [
+                r
+                for r in range(self.ranks)
+                if waits[r] - waits[lightest] <= cfg.min_gain_seconds
+            ]
+            lightest = min(
+                candidates,
+                key=lambda r: (
+                    decode_scores[r],
+                    waits[r],
+                    (r - self._cursor) % self.ranks,
+                ),
+            )
+        self._cursor = (self._cursor + 1) % self.ranks
+        return lightest
+
+    def _cached_hits(self, session, chain, now):
+        if session is None:
+            return [0] * self.ranks
+        cfg = self.config
+        return [
+            (
+                h.tokens
+                if (h := session.hints.get(r)) is not None
+                and h.matches(chain, now, cfg.hint_ttl_seconds)
+                else 0
+            )
+            for r in range(self.ranks)
+        ]
+
+    def _best_migration(
+        self,
+        session,
+        rank,
+        prompt,
+        chain,
+        hits,
+        now,
+        *,
+        waits,
+        transfers,
+        decode_scores,
+        pending,
+    ):
+        """Evaluate candidates; leave placement/session ownership unmodified."""
+        cfg = self.config
+        stay = waits[rank] + (prompt - hits[rank]) / cfg.prefill_tokens_per_second
+        candidates = []
+        for target in range(self.ranks):
+            if (
+                target == rank
+                or sum(p.rank == target for p in pending) >= cfg.max_migrations_per_rank
+            ):
+                continue
+            missing = max(0, hits[rank] - hits[target])
+            miss = session.recovery_misses.get((rank, target))
+            if (
+                missing
+                and miss is not None
+                and miss.tokens == hits[rank]
+                and miss.matches(chain, now, cfg.recovery_miss_ttl_seconds)
+            ):
+                self.counters["migration_recovery_miss_avoided"] += 1
+                continue
+            copy_time = (
+                (cfg.transfer_fixed_seconds + missing / cfg.transfer_tokens_per_second)
+                if missing
+                else 0
+            )
+            finish = (
+                max(waits[target], transfers[target] + copy_time)
+                + (prompt - max(hits[rank], hits[target]))
+                / cfg.prefill_tokens_per_second
+            )
+            gain = stay - finish
+            # Compare completion estimates directly: even a lightly
+            # loaded owner can benefit from moving. A zero-gain move
+            # is never useful, including when both margins are zero.
+            if gain > 0 and gain >= max(
+                cfg.min_gain_seconds, stay * cfg.min_gain_ratio
+            ):
+                # Moving prefill off the owner must not increase joint
+                # decode imbalance across the ranks sharing MoE work.
+                if (
+                    decode_scores is not None
+                    and decode_scores[target] > decode_scores[rank]
+                ):
+                    self.counters["migration_decode_balance_rejected"] += 1
+                    continue
+                candidates.append((finish, target, copy_time))
+        return min(candidates) if candidates else None
+
     def place(
         self,
         request_id,
@@ -202,35 +314,9 @@ class CacheBalancer:
             raise ValueError("DP cache load snapshot has the wrong rank count")
         cfg = self.config
         pending = [p for p in self.requests.values() if p.migration]
-        transfers = [0.0] * self.ranks
-        for p in pending:
-            transfers[p.rank] += p.transfer_seconds
-        waits = [
-            max(max(0, t) / cfg.prefill_tokens_per_second, transfers[r])
-            + max(0, n) * cfg.decode_request_seconds
-            for r, (n, t) in enumerate(zip(requests, tokens, strict=True))
-        ]
-        lightest = min(
-            range(self.ranks), key=lambda r: (waits[r], (r - self._cursor) % self.ranks)
-        )
+        waits, transfers = self._estimate_waits(requests, tokens, pending)
         decode_scores = self._decode_placement_scores(prompt, requests)
-        if decode_scores is not None:
-            # Inside the existing minimum useful TTFT-gain margin, prefer a
-            # placement that balances both decode batch size and context work.
-            candidates = [
-                r
-                for r in range(self.ranks)
-                if waits[r] - waits[lightest] <= cfg.min_gain_seconds
-            ]
-            lightest = min(
-                candidates,
-                key=lambda r: (
-                    decode_scores[r],
-                    waits[r],
-                    (r - self._cursor) % self.ranks,
-                ),
-            )
-        self._cursor = (self._cursor + 1) % self.ranks
+        lightest = self._pick_lightest(waits, decode_scores)
         session = self._session(session_id, lightest)
         rank = session.owner if session else lightest
         if explicit_rank is not None:
@@ -244,17 +330,8 @@ class CacheBalancer:
             session_id if session else None,
             self._snapshot(chain, prompt, now),
         )
-        hits = [0] * self.ranks
+        hits = self._cached_hits(session, chain, now)
         if session:
-            hits = [
-                (
-                    h.tokens
-                    if (h := session.hints.get(r)) is not None
-                    and h.matches(chain, now, cfg.hint_ttl_seconds)
-                    else 0
-                )
-                for r in range(self.ranks)
-            ]
             # A concurrent turn must not let an older in-flight migration
             # overwrite the owner's newer routing decision.
             if session.pending is not None:
@@ -268,58 +345,20 @@ class CacheBalancer:
                 and len(pending) < cfg.max_migrations
             )
             if eligible:
-                stay = (
-                    waits[rank] + (prompt - hits[rank]) / cfg.prefill_tokens_per_second
+                candidate = self._best_migration(
+                    session,
+                    rank,
+                    prompt,
+                    chain,
+                    hits,
+                    now,
+                    waits=waits,
+                    transfers=transfers,
+                    decode_scores=decode_scores,
+                    pending=pending,
                 )
-                candidates = []
-                for target in range(self.ranks):
-                    if (
-                        target == rank
-                        or sum(p.rank == target for p in pending)
-                        >= cfg.max_migrations_per_rank
-                    ):
-                        continue
-                    missing = max(0, hits[rank] - hits[target])
-                    miss = session.recovery_misses.get((rank, target))
-                    if (
-                        missing
-                        and miss is not None
-                        and miss.tokens == hits[rank]
-                        and miss.matches(chain, now, cfg.recovery_miss_ttl_seconds)
-                    ):
-                        self.counters["migration_recovery_miss_avoided"] += 1
-                        continue
-                    copy_time = (
-                        (
-                            cfg.transfer_fixed_seconds
-                            + missing / cfg.transfer_tokens_per_second
-                        )
-                        if missing
-                        else 0
-                    )
-                    finish = (
-                        max(waits[target], transfers[target] + copy_time)
-                        + (prompt - max(hits[rank], hits[target]))
-                        / cfg.prefill_tokens_per_second
-                    )
-                    gain = stay - finish
-                    # Compare completion estimates directly: even a lightly
-                    # loaded owner can benefit from moving. A zero-gain move
-                    # is never useful, including when both margins are zero.
-                    if gain > 0 and gain >= max(
-                        cfg.min_gain_seconds, stay * cfg.min_gain_ratio
-                    ):
-                        # Moving prefill off the owner must not increase joint
-                        # decode imbalance across the ranks sharing MoE work.
-                        if (
-                            decode_scores is not None
-                            and decode_scores[target] > decode_scores[rank]
-                        ):
-                            self.counters["migration_decode_balance_rejected"] += 1
-                            continue
-                        candidates.append((finish, target, copy_time))
-                if candidates:
-                    _, target, copy_time = min(candidates)
+                if candidate is not None:
+                    _, target, copy_time = candidate
                     self._generation += 1
                     placement.source = rank
                     placement.rank = target

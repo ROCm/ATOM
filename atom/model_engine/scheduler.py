@@ -40,7 +40,7 @@ from atom.model_engine.block_manager import (
     BlockManager,
     draft_kv_lookahead,
 )
-from atom.model_engine.dp_cache_admission import DPCacheAdmission
+from atom.model_engine.dp_cache.admission import DPCacheAdmission
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     USEFUL_SHRINK_REFERENCE_CHUNKS,
@@ -317,9 +317,9 @@ class ScheduledBatch:
         self.is_final_chunk = is_final_chunk
         self.dp_cache_work_epochs = (
             {
-                seq.id: getattr(seq, "dp_cache_work_epoch", 0)
+                seq.id: seq.dp_cache.work_epoch
                 for seq in seqs.values()
-                if getattr(seq, "dp_cache_balance", False)
+                if seq.dp_cache is not None
             }
             if total_seqs_num_prefill
             else {}
@@ -601,7 +601,7 @@ class ScheduledBatchOutput:
         return self._req_id_to_idx.get(req_id)
 
 
-class Scheduler(DPCacheAdmission):
+class Scheduler:
     """Manages the lifecycle of inference requests through prefill and decode.
 
     The scheduler maintains two primary queues:
@@ -817,6 +817,7 @@ class Scheduler(DPCacheAdmission):
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        self.cache_admission = DPCacheAdmission(self)
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
             bind_block_manager(self.block_manager)
@@ -1265,8 +1266,9 @@ class Scheduler(DPCacheAdmission):
         remaining = seq.num_tokens - start
         if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
             remaining = self.long_prefill_token_threshold + cap_from - start
-        if not getattr(seq, "dp_cache_admission_sent", False):
-            boundary = getattr(seq, "dp_cache_alignment_boundary", 0)
+        state = seq.dp_cache
+        if state is not None and not state.admission_sent:
+            boundary = state.alignment_boundary
             if boundary:
                 remaining = min(remaining, max(0, boundary - start))
         chunk = self._chunked_prefill_size(
@@ -1519,7 +1521,7 @@ class Scheduler(DPCacheAdmission):
     def add(self, seq: Sequence):
         tracing.enqueue(seq)
         self.metrics.enqueue(seq)
-        self._track_cache_migration(seq)
+        self.cache_admission.track(seq)
         self._warn_if_unschedulable(seq)
         self._register_connector_admission(seq)
         self.waiting.append(seq)
@@ -1529,7 +1531,7 @@ class Scheduler(DPCacheAdmission):
         tracing.enqueue_many(seqs)
         for seq in seqs:
             self.metrics.enqueue(seq)
-            self._track_cache_migration(seq)
+            self.cache_admission.track(seq)
             self._warn_if_unschedulable(seq)
             self._register_connector_admission(seq)
         self.waiting.extend(seqs)
@@ -1998,7 +2000,7 @@ class Scheduler(DPCacheAdmission):
 
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
-        self._expire_cache_migrations()
+        self.cache_admission.expire()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._reject_aborted_waiting(self.waiting.popleft())
@@ -2112,10 +2114,10 @@ class Scheduler(DPCacheAdmission):
                 if chunk:
                     self._resume_prefill(seq, start, hit=False)
                     chunk = self._finalize_prefill_chunk(seq, start, chunk)
-                    if not self._cache_alignment_fits(seq, start, chunk):
-                        seq.dp_cache_retry_reason = "alignment_chunk_unavailable"
-                        self.__dict__.get("_dp_cache_preparing", {}).pop(seq.id, None)
-                        self.abort_request(seq.id)
+                    if not self.cache_admission.alignment_fits(seq, start, chunk):
+                        self.cache_admission.reject_running(
+                            seq, "alignment_chunk_unavailable"
+                        )
                         continue
                 if chunk <= 0:
                     break
@@ -2231,7 +2233,7 @@ class Scheduler(DPCacheAdmission):
                 continue
 
             if offload_resume:
-                if not self._admit_cache_placement(seq):
+                if not self.cache_admission.admit(seq):
                     continue
                 # Blocks already held from the pre-park allocate; only re-check
                 # the batch budget. No re-match / re-allocate / re-park.
@@ -2539,7 +2541,7 @@ class Scheduler(DPCacheAdmission):
             # the request is certain to prefill locally. The only path reaching
             # this with an inherited PD hit is a *failed* remote recv, and there
             # the local hit is the truthful number.
-            if not self._admit_cache_placement(seq):
+            if not self.cache_admission.admit(seq):
                 continue
             seq.prefix_cache_hit_tokens = seq.num_cached_tokens
             self._resume_prefill(
@@ -2554,8 +2556,10 @@ class Scheduler(DPCacheAdmission):
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
-            if not self._cache_alignment_fits(seq, seq.num_cached_tokens, chunk):
-                self._reject_cache_migration(seq, "alignment_chunk_unavailable")
+            if not self.cache_admission.alignment_fits(
+                seq, seq.num_cached_tokens, chunk
+            ):
+                self.cache_admission.reject_waiting(seq, "alignment_chunk_unavailable")
                 continue
 
             # Re-assert the atomic-prefill invariant against the *final* chunk.
@@ -2983,7 +2987,7 @@ class Scheduler(DPCacheAdmission):
         return True
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
-        self.__dict__.get("_dp_cache_preparing", {}).pop(seq.id, None)
+        self.cache_admission.forget(seq)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
@@ -3950,7 +3954,7 @@ class Scheduler(DPCacheAdmission):
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
-        self._preempt_cache_work(seq)
+        self.cache_admission.preempt(seq)
         return True
 
     def _advance_prefill_on_schedule(
@@ -4145,7 +4149,7 @@ class Scheduler(DPCacheAdmission):
                 if not now_partial:
                     tracing.prefill_complete(seq)
 
-        self._complete_cache_work(batch, running_by_id)
+        self.cache_admission.complete_work(batch, running_by_id)
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids

@@ -6,12 +6,13 @@ from collections import deque
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
-from atom.model_engine.dp_cache_admission import DPCacheAdmission
-from atom.model_engine.dp_cache_balance import (
+from atom.model_engine.dp_cache.admission import DPCacheAdmission
+from atom.model_engine.dp_cache.balance import (
     CacheBalanceConfig,
     CacheBalancer,
     Placement,
 )
+from atom.model_engine.dp_cache.state import DPCacheState
 
 
 def chain(tokens, *, fork=False):
@@ -341,7 +342,7 @@ class DecodeBalanceTest(unittest.TestCase):
         self.assertEqual(queued.rank, 0)
 
     def test_migration_cannot_trade_prefill_relief_for_worse_decode_balance(self):
-        from atom.model_engine.dp_cache_balance import PrefixHint, Session
+        from atom.model_engine.dp_cache.balance import PrefixHint, Session
 
         self.b.sessions["s"] = Session(
             owner=1, hints={1: PrefixHint(128, 128, -1, 0, 1)}
@@ -380,14 +381,16 @@ class DecodeBalanceTest(unittest.TestCase):
         self.assertGreater(scores[1], 0)
 
 
-class AdmissionHarness(DPCacheAdmission):
+class AdmissionHarness:
     def __init__(self):
         self.waiting = deque()
         self.running = deque()
         self.aborted = []
         self.events = []
         self.rejected = []
-        self.dp_cache_admission_callback = self.events.append
+        self.kv_connector = None
+        self.cache_admission = DPCacheAdmission(self)
+        self.cache_admission.on_admitted = self.events.append
         self.block_manager = NS(replay_start=lambda seq, cached, hit: cached)
 
     def _reject_aborted_waiting(self, seq):
@@ -402,23 +405,20 @@ class AdmissionTest(unittest.TestCase):
         self.s = AdmissionHarness()
         self.seq = NS(
             id=7,
-            dp_cache_balance=True,
-            dp_cache_migration=42,
-            dp_cache_minimum_hit=102400,
-            dp_cache_prepare_timeout=5,
+            dp_cache=DPCacheState(migration_id=42, minimum_hit=102400),
             num_cached_tokens=65536,
             num_tokens=102401,
         )
 
     def test_short_target_prefix_never_reaches_prefill(self):
-        self.assertFalse(self.s._admit_cache_placement(self.seq))
+        self.assertFalse(self.s.cache_admission.admit(self.seq))
         self.assertFalse(self.s.events)
-        self.assertEqual(self.seq.dp_cache_retry_reason, "recoverable_prefix_too_short")
-        self.assertEqual(self.seq.dp_cache_recoverable_hit, 65536)
+        self.assertEqual(self.seq.dp_cache.retry_reason, "recoverable_prefix_too_short")
+        self.assertEqual(self.seq.dp_cache.recoverable_hit, 65536)
 
     def test_completed_work_uses_frozen_offsets_and_preemption_fences_old_batch(self):
         self.seq.num_cached_tokens = 102400
-        self.s._admit_cache_placement(self.seq)
+        self.s.cache_admission.admit(self.seq)
         batch = NS(
             req_ids=[7],
             total_seqs_num_prefill=1,
@@ -427,94 +427,109 @@ class AdmissionTest(unittest.TestCase):
             num_scheduled_tokens=[1024],
             is_final_chunk=[False],
         )
-        self.s._complete_cache_work(batch, {7: self.seq})
-        self.assertEqual(self.s.take_cache_work(), [(7, 42, 1, 35841)])
-        self.s._preempt_cache_work(self.seq)
-        self.s._complete_cache_work(batch, {7: self.seq})
-        self.assertEqual(self.s.take_cache_work(), [(7, 42, 2, 102401)])
+        self.s.cache_admission.complete_work(batch, {7: self.seq})
+        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 1, 35841)])
+        self.s.cache_admission.preempt(self.seq)
+        self.s.cache_admission.complete_work(batch, {7: self.seq})
+        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 2, 102401)])
         batch.dp_cache_work_epochs = {7: 1}
         batch.is_final_chunk = [True]
-        self.s._complete_cache_work(batch, {7: self.seq})
-        self.assertEqual(self.s.take_cache_work(), [(7, 42, 3, 0)])
-        self.assertFalse(self.s.take_cache_work())
+        self.s.cache_admission.complete_work(batch, {7: self.seq})
+        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 3, 0)])
+        self.assertFalse(self.s.cache_admission.take_work())
 
     def test_complete_restore_emits_one_confirmation(self):
         self.seq.num_cached_tokens = 102400
-        self.assertTrue(self.s._admit_cache_placement(self.seq))
-        self.assertTrue(self.s._admit_cache_placement(self.seq))
+        self.assertTrue(self.s.cache_admission.admit(self.seq))
+        self.assertTrue(self.s.cache_admission.admit(self.seq))
         self.assertEqual(self.s.events, [(7, 42, 102400)])
 
     def test_replay_work_is_not_counted_as_reused_state(self):
         self.seq.num_cached_tokens = 102400
         self.s.block_manager.replay_start = lambda *args, **kw: 98304
-        self.assertFalse(self.s._admit_cache_placement(self.seq))
+        self.assertFalse(self.s.cache_admission.admit(self.seq))
 
     def test_timeout_uses_local_clock_and_existing_abort_cleanup(self):
         with patch(
-            "atom.model_engine.dp_cache_admission.time.monotonic", return_value=100
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=100
         ):
-            self.s._track_cache_migration(self.seq)
+            self.s.cache_admission.track(self.seq)
         self.s.waiting.append(self.seq)
         with patch(
-            "atom.model_engine.dp_cache_admission.time.monotonic", return_value=106
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=106
         ):
-            self.s._expire_cache_migrations()
+            self.s.cache_admission.expire()
         self.assertFalse(self.s.waiting)
         self.assertEqual(self.s.rejected, [self.seq])
-        self.assertFalse(self.s._dp_cache_preparing)
+        self.assertFalse(self.s.cache_admission._preparing)
 
     def test_missing_confirmation_channel_fails_closed(self):
         self.seq.num_cached_tokens = 102400
-        self.s.dp_cache_admission_callback = None
-        self.assertFalse(self.s._admit_cache_placement(self.seq))
+        self.s.cache_admission.on_admitted = None
+        self.assertFalse(self.s.cache_admission.admit(self.seq))
 
     def prepare_alignment(self):
         self.seq.num_cached_tokens = 65408
         self.s.kv_connector = NS(pending_prefill_handoff=lambda seq: (65536, 102400))
         with patch(
-            "atom.model_engine.dp_cache_admission.time.monotonic", return_value=100
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=100
         ):
-            self.s._track_cache_migration(self.seq)
-        self.assertTrue(self.s._admit_cache_placement(self.seq))
+            self.s.cache_admission.track(self.seq)
+        self.assertTrue(self.s.cache_admission.admit(self.seq))
         self.assertFalse(self.s.events)
 
     def test_alignment_does_not_commit_until_native_restore(self):
         self.prepare_alignment()
-        self.assertTrue(self.s._cache_alignment_fits(self.seq, 65408, 128))
-        self.assertFalse(self.s._cache_alignment_fits(self.seq, 65408, 256))
+        self.assertTrue(self.s.cache_admission.alignment_fits(self.seq, 65408, 128))
+        self.assertFalse(self.s.cache_admission.alignment_fits(self.seq, 65408, 256))
         self.seq.num_cached_tokens = 102400
-        self.assertTrue(self.s._admit_cache_placement(self.seq))
+        self.assertTrue(self.s.cache_admission.admit(self.seq))
         self.assertEqual(self.s.events, [(7, 42, 102400)])
-        self.assertFalse(self.s._dp_cache_preparing)
+        self.assertFalse(self.s.cache_admission._preparing)
 
     def test_running_alignment_timeout_defers_release_to_postprocess(self):
         self.prepare_alignment()
         self.s.running.append(self.seq)
         with patch(
-            "atom.model_engine.dp_cache_admission.time.monotonic", return_value=106
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=106
         ):
-            self.s._expire_cache_migrations()
+            self.s.cache_admission.expire()
         self.assertEqual(self.s.aborted, [7])
         self.assertFalse(self.s.rejected)
         self.assertFalse(self.s.events)
-        self.assertFalse(self.s._dp_cache_preparing)
+        self.assertFalse(self.s.cache_admission._preparing)
 
     def test_lost_handoff_never_continues_unconfirmed_prefill(self):
         self.prepare_alignment()
         self.s.running.append(self.seq)
         self.s.kv_connector.pending_prefill_handoff = lambda seq: None
         with patch(
-            "atom.model_engine.dp_cache_admission.time.monotonic", return_value=101
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=101
         ):
-            self.s._expire_cache_migrations()
+            self.s.cache_admission.expire()
         self.assertEqual(self.s.aborted, [7])
-        self.assertEqual(self.seq.dp_cache_retry_reason, "alignment_load_unavailable")
+        self.assertEqual(self.seq.dp_cache.retry_reason, "alignment_load_unavailable")
         self.assertFalse(self.s.rejected)
 
     def test_stale_boundary_attribute_is_not_a_load_reservation(self):
         self.seq.offload_handoff_boundary_tokens = 65792
-        self.assertFalse(self.s._admit_cache_placement(self.seq))
+        self.assertFalse(self.s.cache_admission.admit(self.seq))
         self.assertFalse(self.s.events)
+
+    def test_expiry_reads_replaced_scheduler_queues(self):
+        with patch(
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=100
+        ):
+            self.s.cache_admission.track(self.seq)
+        old_waiting = self.s.waiting
+        self.s.waiting = deque([self.seq])
+        with patch(
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=106
+        ):
+            self.s.cache_admission.expire()
+        self.assertFalse(old_waiting)
+        self.assertFalse(self.s.waiting)
+        self.assertEqual(self.s.rejected, [self.seq])
 
 
 if __name__ == "__main__":

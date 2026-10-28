@@ -17,6 +17,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.model_engine.dp_cache.admission import DPCacheAdmission
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
@@ -452,6 +453,7 @@ class TestSchedule:
         )
         sched = Scheduler.__new__(Scheduler)
         sched._rejected = []
+        sched.cache_admission = DPCacheAdmission(sched)
         sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
@@ -580,6 +582,7 @@ class TestSchedule:
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
+        sched.cache_admission = DPCacheAdmission(sched)
         sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
@@ -1188,6 +1191,7 @@ class TestSchedule:
                 req_ids=[seq.id],
                 num_scheduled_tokens=[2],
                 total_seqs_num_prefill=1,
+                dp_cache_work_epochs={},
             ),
         )
         assert seq.num_cached_tokens == 10
@@ -1209,6 +1213,7 @@ class TestSchedule:
                 req_ids=[seq.id],
                 num_scheduled_tokens=[1],
                 total_seqs_num_prefill=0,
+                dp_cache_work_epochs={},
             ),
         )
         assert list(seq.output_tokens) == [999, sched.eos_token_id]

@@ -30,7 +30,7 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
     engine_budget,
 )
-from atom.model_engine.dp_cache_routing import DPCacheRouting
+from atom.model_engine.dp_cache.routing import DPCacheRouter
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
@@ -184,7 +184,7 @@ def _add_frame(seqs: list[Sequence]) -> bytes:
     return pickle.dumps(frame)
 
 
-class CoreManager(DPCacheRouting):
+class CoreManager:
     # Class-level defaults so bare instances built via ``__new__`` (the DP
     # load-balance unit tests) and any subclass that skips ``_init_shared_state``
     # still have working backpressure state. Real instances override
@@ -313,7 +313,7 @@ class CoreManager(DPCacheRouting):
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
         self._lb_lock = Lock()
-        self._init_dp_cache_balance(config)
+        self._init_cache_router(config)
         # --- Backpressure (lazy) DP dispatch --------------------------------
         # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
         # releases them to the lightest rank only up to that in-flight cap. A
@@ -330,7 +330,7 @@ class CoreManager(DPCacheRouting):
         # have no rank hint either, and a seq waiting here is invisible to the
         # scheduler until ``offline_backpressure_batch`` lets it in.
         self._bp_depth = envs.ATOM_DP_DISPATCH_DEPTH
-        if self._bp_depth > 0 and self._cache_balancer is not None:
+        if self._bp_depth > 0 and self.cache_router is not None:
             logger.warning(
                 "%s: ATOM_DP_DISPATCH_DEPTH is inactive with cache_affinity; "
                 "requests use cache-aware placement and admission",
@@ -805,9 +805,11 @@ class CoreManager(DPCacheRouting):
                     elif request_type == EngineCoreRequestType.METRICS:
                         self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.CACHE_ADMITTED:
-                        self._cache_admitted(dp_rank, data)
+                        if self.cache_router is not None:
+                            self.cache_router.admitted(dp_rank, data)
                     elif request_type == EngineCoreRequestType.CACHE_WORK:
-                        self._cache_work(dp_rank, data)
+                        if self.cache_router is not None:
+                            self.cache_router.update_work(dp_rank, data)
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
@@ -829,7 +831,10 @@ class CoreManager(DPCacheRouting):
                         delivered = False
                         completed = []
                         for seq in seqs:
-                            if self._retry_cache_migration(dp_rank, seq):
+                            if (
+                                self.cache_router is not None
+                                and self.cache_router.retry(dp_rank, seq)
+                            ):
                                 continue
                             delivered |= self._deliver_terminal_output(seq)
                             self._release_seq_load(
@@ -1098,7 +1103,7 @@ class CoreManager(DPCacheRouting):
             getattr(self, "_bp_depth", 0) > 0
             and getattr(self, "_bp_offline_batch", False)
             and not self._dp_session_affinity_enabled
-            and getattr(self, "_cache_balancer", None) is None
+            and self.cache_router is None
             and all(h is None for h in hints)
         ):
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
@@ -1423,8 +1428,8 @@ class CoreManager(DPCacheRouting):
         its own session, preventing siblings from dogpiling the root's rank.
         Requests without a session use the selected policy's load estimate.
         """
-        if getattr(self, "_cache_balancer", None) is not None:
-            rank = self._select_cache_rank_locked(seq, explicit_rank)
+        if self.cache_router is not None:
+            rank = self.cache_router.select_locked(seq, explicit_rank)
             self._dp_route_counters.setdefault("cache_affinity_total", 0)
             return self._record_dp_route_locked("cache_affinity_total", rank)
         if explicit_rank is not None:
@@ -1472,7 +1477,9 @@ class CoreManager(DPCacheRouting):
         """Return a consistent, non-mutating snapshot of DP routing state."""
         with self._lb_lock:
             sessions_per_rank = [0] * self._routable_engine_count
-            balancer = getattr(self, "_cache_balancer", None)
+            balancer = (
+                self.cache_router.balancer if self.cache_router is not None else None
+            )
             owners = (
                 (s.owner for s in balancer.sessions.values())
                 if balancer
@@ -1497,7 +1504,7 @@ class CoreManager(DPCacheRouting):
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
-        balancer = getattr(self, "_cache_balancer", None)
+        balancer = self.cache_router.balancer if self.cache_router is not None else None
         if balancer is not None:
             tok_cost = max(0, prompt_tokens - balancer.requests[seq.id].estimated_hit)
         elif self._dp_session_affinity_enabled and session_id:
@@ -1570,7 +1577,8 @@ class CoreManager(DPCacheRouting):
         dp_rank, req_cost, tok_cost = entry
         self._rank_reqs[dp_rank] -= req_cost
         self._rank_tokens[dp_rank] -= tok_cost
-        self._finish_cache_placement_locked(seq_id, succeeded)
+        if self.cache_router is not None:
+            self.cache_router.finish_locked(seq_id, succeeded)
 
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
@@ -1593,6 +1601,21 @@ class CoreManager(DPCacheRouting):
                 return
             self._rank_tokens[dp_rank] -= tok_cost
             self._seq_load[seq_id] = (dp_rank, req_cost, 0)
+
+    def _init_cache_router(self, config: Config) -> None:
+        self.cache_router: DPCacheRouter | None = None
+        if config.dp_load_balance == "cache_affinity":
+            self.cache_router = DPCacheRouter(
+                config,
+                rank_requests=self._rank_reqs,
+                rank_tokens=self._rank_tokens,
+                request_loads=self._seq_load,
+                load_lock=self._lb_lock,
+                send_retry=self._send_cache_retry,
+            )
+
+    def _send_cache_retry(self, rank: int, seq: Sequence) -> None:
+        self._send_control(rank, _add_frame([seq]))
 
     def reset_dp_router(self) -> None:
         """Reset all DP routing state (rotation cursor + in-flight load).
@@ -1617,8 +1640,8 @@ class CoreManager(DPCacheRouting):
                     len(self._seq_load),
                 )
             self._rank_rotation_cursor = 0
-            self._rank_reqs = [0] * self._routable_engine_count
-            self._rank_tokens = [0] * self._routable_engine_count
+            self._rank_reqs[:] = [0] * self._routable_engine_count
+            self._rank_tokens[:] = [0] * self._routable_engine_count
             self._seq_load.clear()
             pending = getattr(self, "_bp_pending", None)
             if pending:
@@ -1631,18 +1654,15 @@ class CoreManager(DPCacheRouting):
                 pending.clear()
             self._dp_session_owners.clear()
             self._dp_session_prompt_tokens.clear()
-            if getattr(self, "_cache_balancer", None) is not None:
-                from atom.model_engine.dp_cache_balance import CacheBalancer
-
-                self._cache_balancer = CacheBalancer(
-                    self._routable_engine_count, self._cache_balancer.config
-                )
-                self._cache_retry_payloads.clear()
+            if self.cache_router is not None:
+                self.cache_router.reset_locked()
             self._bp_dispatch_paused = False
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
-        if cmd == "clear_kv_cache" or cmd in WEIGHT_UPDATE_UTILITY_CMDS:
-            self._invalidate_cache_predictions()
+        if self.cache_router is not None and (
+            cmd == "clear_kv_cache" or cmd in WEIGHT_UPDATE_UTILITY_CMDS
+        ):
+            self.cache_router.invalidate()
         self._refuse_unowned_weight_sync_cmd(cmd, None)
         if dp_rank is None:
             # Send to all DP ranks
@@ -1876,8 +1896,10 @@ class CoreManager(DPCacheRouting):
             )
 
     def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
-        if cmd == "clear_kv_cache" or cmd in WEIGHT_UPDATE_UTILITY_CMDS:
-            self._invalidate_cache_predictions()
+        if self.cache_router is not None and (
+            cmd == "clear_kv_cache" or cmd in WEIGHT_UPDATE_UTILITY_CMDS
+        ):
+            self.cache_router.invalidate()
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)

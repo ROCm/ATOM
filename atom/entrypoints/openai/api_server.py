@@ -417,7 +417,7 @@ def _get_dp_session_affinity_ids(
     balancing.
     """
     cache_balance = (
-        getattr(getattr(engine, "core_mgr", None), "_cache_balancer", None) is not None
+        getattr(getattr(engine, "core_mgr", None), "cache_router", None) is not None
     )
     if not cache_balance and os.environ.get(
         "ATOM_DP_SESSION_AFFINITY", "0"

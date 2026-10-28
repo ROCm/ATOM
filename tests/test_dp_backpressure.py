@@ -36,6 +36,7 @@ class Seq:
 
 def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
     mgr = CoreManager.__new__(CoreManager)
+    mgr.cache_router = None
     mgr.label = "test"
     mgr._dp_lb_strategy = "least_requests"
     mgr._dp_lb_req_equiv = 512
@@ -120,6 +121,7 @@ def test_refill_feeds_fast_rank_more():
 
 def _init_with_strategy(strategy):
     mgr = CoreManager.__new__(CoreManager)
+    mgr.cache_router = None
     mgr._init_shared_state(
         SimpleNamespace(dp_load_balance=strategy, max_num_seqs=1536),
         label="test",

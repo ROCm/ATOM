@@ -28,6 +28,7 @@ from atom.kv_transfer.offload.mp.native_state_worker import (
 )
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.dp_cache.state import DPCacheState
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
@@ -767,12 +768,12 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
 def test_cache_migration_waits_for_joint_native_completion(monkeypatch, succeeded):
     engine, _, _ = engine_scheduler(monkeypatch)
     seq = Sequence(list(range(24)), 4, has_per_req_cache=True)
-    seq.dp_cache_balance = True
-    seq.dp_cache_migration = 1
-    seq.dp_cache_minimum_hit = 16
-    seq.dp_cache_prepare_timeout = 5
+    seq.dp_cache = DPCacheState()
+    seq.dp_cache.migration_id = 1
+    seq.dp_cache.minimum_hit = 16
+    seq.dp_cache.prepare_timeout = 5
     events = []
-    engine.dp_cache_admission_callback = events.append
+    engine.cache_admission.on_admitted = events.append
     engine.add(seq)
     batch, scheduled = engine.schedule()
     assert not scheduled and not events
@@ -793,10 +794,13 @@ def test_cache_migration_waits_for_joint_native_completion(monkeypatch, succeede
     else:
         assert not scheduled and not events
         assert engine.take_rejected() == [seq]
-        assert seq.dp_cache_retry_reason == "recoverable_prefix_too_short"
+        assert seq.dp_cache.retry_reason == "recoverable_prefix_too_short"
 
 
-def test_cache_migration_aligns_local_hit_before_native_copy(monkeypatch):
+@pytest.mark.parametrize("invalid_chunk", [None, 0, 8])
+def test_cache_migration_aligns_local_hit_before_native_copy(
+    monkeypatch, invalid_chunk
+):
     engine, connector, _ = engine_scheduler(monkeypatch, adapter=_ReachAdapter(32))
     bm = engine.block_manager
     warm = Sequence(list(range(12)) + [900] * 4, 4, has_per_req_cache=True)
@@ -805,14 +809,30 @@ def test_cache_migration_aligns_local_hit_before_native_copy(monkeypatch):
     checkpoint(connector, bm.paged_state_checkpoints, warm, 12)
     bm.deallocate(warm)
     seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
-    seq.dp_cache_balance = True
-    seq.dp_cache_migration = 2
-    seq.dp_cache_minimum_hit = 32
-    seq.dp_cache_prepare_timeout = 5
+    seq.dp_cache = DPCacheState()
+    seq.dp_cache.migration_id = 2
+    seq.dp_cache.minimum_hit = 32
+    seq.dp_cache.prepare_timeout = 5
     events = []
-    engine.dp_cache_admission_callback = events.append
+    engine.cache_admission.on_admitted = events.append
+    if invalid_chunk is not None:
+        finalize = engine._finalize_prefill_chunk
+
+        def invalid_alignment(seq, start, chunk):
+            result = finalize(seq, start, chunk)
+            if seq.dp_cache.alignment_boundary:
+                return invalid_chunk
+            return result
+
+        monkeypatch.setattr(engine, "_finalize_prefill_chunk", invalid_alignment)
     engine.add(seq)
     batch, scheduled = engine.schedule()
+    if invalid_chunk is not None:
+        assert not scheduled and not events
+        assert engine.take_rejected() == [seq]
+        assert seq.dp_cache.retry_reason == "alignment_chunk_unavailable"
+        assert seq.id not in engine.cache_admission._preparing
+        return
     assert scheduled[seq.id] is seq
     assert not events
     assert list(batch.num_cached_tokens) == [12]
