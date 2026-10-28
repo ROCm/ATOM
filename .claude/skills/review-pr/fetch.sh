@@ -884,6 +884,15 @@ fi
 "$SKILLS_ROOT/review-pr/triage.py" siblings "$WORK/pr.diff" "$PROJECT_ROOT" \
   | tee "$WORK/siblings.txt"
 
+# FlyDSL buffer/descriptor bounds not tied to the tensor's real extent. D11. Dropped from
+# this script at the initial port (no ATOM path matched aiter's "flydsl" substring test),
+# restored now that triage.py's flydsl_bounds() recognises ATOM's own FlyDSL surface too
+# (atom/mono/, atom/models/{deepseek_v41,minimax_m3}/mono/) and ATOM's `rsrc()` wrapper
+# alongside aiter's create_buffer_resource/make_buffer_tensor/ptr_buffer_resource. D11's
+# citation (PR#2683, e1e8cb034) is a real merged ATOM fix of this exact mechanism.
+"$SKILLS_ROOT/review-pr/triage.py" flydslbounds "$WORK/pr.diff" "$WORK/head" \
+  | tee "$WORK/flydsl_bounds.txt"
+
 # What became of each guard the diff deletes. D4 is red and fires on 69 of 600 open PRs;
 # 14.5% of those add every deleted guard straight back and are not an event at all. The
 # pair is printed rather than filtered on, because the guard that returns in changed form
@@ -979,6 +988,6 @@ echo "WORK=$WORK"
 # produced only when a guard or a signature actually changed, so it is listed as such.
 echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
 test_quality.txt twins.txt ci_coverage.txt perf_claims.txt comment_only.txt \
-guards.txt siblings.txt kernel_tests.txt applies.txt symbols.txt merge_target.txt \
-validation_requirement.json \
+guards.txt siblings.txt flydsl_bounds.txt kernel_tests.txt applies.txt symbols.txt \
+merge_target.txt validation_requirement.json \
 auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"

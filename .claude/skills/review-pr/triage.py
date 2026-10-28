@@ -346,7 +346,22 @@ def render_untested_kernel(new):
     return "\n".join(out)
 
 
-FLYDSL_BUF_CALLS = ("create_buffer_resource", "ptr_buffer_resource", "make_buffer_tensor")
+FLYDSL_BUF_CALLS = ("create_buffer_resource", "ptr_buffer_resource", "make_buffer_tensor",
+                     "rsrc")
+
+# ATOM authors its own FlyDSL kernels under atom/mono/ (and the model-specific trees
+# atom/models/{deepseek_v41,minimax_m3}/mono/) -- none of those paths contain the
+# substring "flydsl", so a path test looking only for that substring (aiter's own
+# convention: aiter/ops/flydsl/, aiter/aot/flydsl/) never looks at ATOM's surface at
+# all. ATOM's buffer-resource wrapper is also named differently: atom/mono/device/
+# ops.py:rsrc(addr, nbytes=None) wraps create_buffer_resource_from_addr, and omitting
+# nbytes is unbounded the same way omitting max_size is upstream (PR#2683, fixed
+# e1e8cb034, atom/models/deepseek_v41/mono/kernels/index_score.py:352 -- see D11).
+ATOM_FLYDSL_PATH = re.compile(r"(^|/)atom/mono/|(^|/)atom/models/[^/]+/mono/")
+
+
+def _is_flydsl_path(path):
+    return "flydsl" in path.lower() or bool(ATOM_FLYDSL_PATH.search(path))
 
 
 def added_line_numbers(diff_text):
@@ -418,12 +433,21 @@ def _buffer_bounded(name, node):
       create_buffer_resource(memref, stride=0, max_size=True, *, num_records_bytes=None)
       make_buffer_tensor(tensor, max_size=True, *, num_records_bytes=None)
       ptr_buffer_resource(ptr, num_records_bytes)   -- a local helper; arg 2 IS the bound
+      rsrc(addr, nbytes=None)   -- ATOM's local helper (atom/mono/device/ops.py); arg 2 /
+                                   kwarg `nbytes` IS the bound, same shape as
+                                   ptr_buffer_resource, just a different kwarg name
     """
     kw = {k.arg: k.value for k in node.keywords}
     if kw.get("num_records_bytes") is not None:
         return True, None
     if name == "ptr_buffer_resource":
         return len(node.args) >= 2, None
+    if name == "rsrc":
+        nb = kw.get("nbytes")
+        if nb is None and len(node.args) >= 2:
+            nb = node.args[1]
+        bounded = not (nb is None or (isinstance(nb, ast.Constant) and nb.value is None))
+        return bounded, None
     ms = kw.get("max_size")
     if ms is None:
         pos = 2 if name == "create_buffer_resource" else 1
@@ -459,11 +483,20 @@ def flydsl_bounds(diff_text, root):
     reads FlyDSL (it knows the `fx.Int64` spelling). This is the descriptor's num_records
     and the hardware voffset: nothing overflows in Python, the read goes out of bounds on
     the GPU. Two mechanisms, two rules -- do not merge them.
+
+    ATOM's own FlyDSL surface (atom/mono/, atom/models/{deepseek_v41,minimax_m3}/mono/)
+    is in scope via `_is_flydsl_path` and `rsrc` is in `FLYDSL_BUF_CALLS` -- see D11 for
+    the landed ATOM instance of this exact mechanism (PR#2683, e1e8cb034). Most of ATOM's
+    ~18 other `rsrc()` call sites (sync.py epoch/fence flags, step_begin.py mailbox slots,
+    ops.py fixed-width tables) are fixed-extent and safe despite omitting `nbytes` -- this
+    forensic reports every unbounded call as a candidate, same as it does for aiter's
+    `max_size`; D11's prose is what tells the reviewer which candidates are ragged /
+    row-addressed (the real defect shape) versus fixed-extent (not a finding).
     """
     added = added_line_numbers(diff_text)
     rows = []
     for path in sorted(added):
-        if not path.endswith(".py") or "flydsl" not in path.lower():
+        if not path.endswith(".py") or not _is_flydsl_path(path):
             continue
         try:
             tree = ast.parse((pathlib.Path(root) / path).read_text(errors="replace"))
@@ -482,10 +515,14 @@ def flydsl_bounds(diff_text, root):
             if name in FLYDSL_BUF_CALLS:
                 bounded, explicit = _buffer_bounded(name, node)
                 if not bounded:
-                    rows.append((path, node.lineno, name, _bound_arg(node),
-                                 "max_size=True -- descriptor is 0xFFFFFFFF" if explicit
-                                 else "max_size omitted, so True -- descriptor is "
-                                      "0xFFFFFFFF and the call does not say so"))
+                    if name == "rsrc":
+                        msg = "nbytes omitted -- unbounded descriptor (0xFFFFFFFF)"
+                    elif explicit:
+                        msg = "max_size=True -- descriptor is 0xFFFFFFFF"
+                    else:
+                        msg = ("max_size omitted, so True -- descriptor is "
+                               "0xFFFFFFFF and the call does not say so")
+                    rows.append((path, node.lineno, name, _bound_arg(node), msg))
             elif name == "make_tensor_descriptor_2d":
                 kws = {k.arg for k in node.keywords}
                 if "oob_outer_bound" in kws and "oob_inner_bound" not in kws:
@@ -636,13 +673,14 @@ def render_aot_pairing(rows):
 def render_flydsl_bounds(rows):
     if not rows:
         return ("FLYDSL BOUNDS: no unbounded buffer resource or descriptor on an added line")
-    out = [(f"FLYDSL BUFFER BOUNDS -- {len(rows)} candidate(s). B8 is the rule; this is its "
-            f"evidence."),
-           "CANDIDATES, NOT VERDICTS. max_size=True is right whenever the bound tensor is",
-           "full-size, and most are: weights and caches (sin_cache, cos_cache, rms_weight,",
-           "block_table, plan) have no ragged dimension. It is a defect only when the bound",
-           "dimension is a runtime extent -- M, token count, num_valid, a per-expert count.",
-           "B8's FP self-check decides which; name the value that overflows before firing."]
+    out = [(f"FLYDSL BUFFER BOUNDS -- {len(rows)} candidate(s). B8 (aiter) / D11 (ATOM) is "
+            f"the rule; this is its evidence."),
+           "CANDIDATES, NOT VERDICTS. max_size=True (or an omitted rsrc nbytes) is right",
+           "whenever the bound tensor is full-size, and most are: weights and caches",
+           "(sin_cache, cos_cache, rms_weight, block_table, plan) have no ragged dimension.",
+           "It is a defect only when the bound dimension is a runtime extent -- M, token",
+           "count, num_valid, a per-expert/per-candidate row. Name the value that overflows",
+           "before firing."]
     for path, line, call, arg, why in rows:
         out.append(f"  {path}:{line}  {call}({arg})  -- {why}")
     return "\n".join(out)
@@ -1231,6 +1269,19 @@ def derive(files, title="", raw_diff=""):
     # online client's callback is never invoked and the SSE stream hangs forever).
     if any(p.startswith("atom/entrypoints/openai/") for p in paths):
         hit("openai-entrypoint", "A1 B6")
+
+    # flydsl-unbounded-descriptor -- pure path trigger. atom/mono/ (plus the model-specific
+    # atom/models/{deepseek_v41,minimax_m3}/mono/ trees) is ATOM's own FlyDSL kernel
+    # surface: five months old, discovered mid-P1, never mined before and -- until
+    # flydsl_bounds()'s path/name gate was broadened to know ATOM's `rsrc()` wrapper and
+    # these directories -- invisible to the forensic too. D11 is anchored on a real merged
+    # fix of exactly this shape (PR#2683, e1e8cb034: an `rsrc()` call with no `nbytes` over
+    # a ragged/row-addressed candidate row). Deliberately narrow: `atom/mono/` paths were
+    # ~1.4% of commits over the trailing six months (16/1181), so this family should land
+    # on roughly that share of a PR sample -- nowhere near the distribution's 35% ceiling.
+    if any(p.startswith("atom/mono/") or re.match(r"atom/models/[^/]+/mono/", p)
+           for p in paths):
+        hit("flydsl-unbounded-descriptor", "D11")
     if (re.search(r"\.item\(\)|\.tolist\(\)", add) or re.search(r'\.to\(\s*["\']cpu["\']\s*\)', add)) \
             and any(p.endswith("model_runner.py") or ("/models/" in p and p.endswith(".py")) for p in paths):
         hit("cpu-gpu-sync", "G2")
@@ -1314,7 +1365,7 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
     "HK3", "HK6", "HK7",
 )}
 
-ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
+ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 C1 C2 D1 D4 D10 D11 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
              "HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float

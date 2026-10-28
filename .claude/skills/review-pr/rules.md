@@ -288,6 +288,43 @@ Real example (ATOM#2305, `atom/kv_transfer/offload/chunked_scheduler.py`): yhl-a
 Real example (ATOM#1316, `atom/distributed/kv_events.py`): yitingw1: sequence numbers wrap into the reserved `REPLAY_DONE` sentinel value. Fixed `918f7dcf`.
 → `🔴 D10: [field] reuses [sentinel] to mean "unset" but also holds real data on [path] — disambiguate with Optional or a distinct sentinel`
 
+**D11 — Unbounded FlyDSL descriptor over a ragged/row-addressed extent** 🔴 *(`flydsl_bounds` scanner-backed — read `flydsl_bounds.txt`, not this prose)*
+
+ATOM authors its own FlyDSL kernels under `atom/mono/` (plus the model-specific trees
+`atom/models/{deepseek_v41,minimax_m3}/mono/`) — a surface discovered mid-project during
+P1 mining, about five months old, never mined before. `atom/mono/device/ops.py` defines
+`rsrc(addr, nbytes=None)`, wrapping `bo.create_buffer_resource_from_addr(addr,
+num_records_bytes=nbytes)`: omitting `nbytes` yields an **unbounded** descriptor
+(`num_records_bytes=None`), the same shape as aiter's `max_size=True` default — D9's
+sibling mechanism for FlyDSL, see its docstring for the aiter-side citations this rule
+is modeled on.
+
+**This is not "every omitted bound."** The mining pass checked roughly eighteen other
+`rsrc()` call sites in `atom/mono/` by hand (epoch/fence flags in `sync.py`, mailbox
+slots in `step_begin.py`, fixed-width tables in `ops.py`) and found them fixed-extent
+and safe by inspection — an unbounded descriptor over a table whose size never varies
+at runtime is not a defect. The rule fires only when the addressed extent is **ragged
+or row-addressed**: a per-token, per-candidate, or per-expert-row structure where a
+computed offset can legitimately land outside one row and nothing bounds it from doing
+so.
+
+Real example (ATOM, fixed `e1e8cb034`, PR#2683, "fix(v41): bound mono candidate
+prefetches without branching"): `atom/models/deepseek_v41/mono/kernels/index_score.py:352`
+— `bo.buffer_load(rsrc(a["icand"]), ip.candidate_offset(t, ident), ...)` could, for a
+FULL or padding row, compute an `ident` landing outside that token's candidate row;
+inside an unbounded descriptor (`rsrc()` called with no `nbytes`), nothing caught it.
+The fix clamps the offset in Python rather than bounding the descriptor — its own
+comment: "clamp the speculative address, not the selected row" — adding `slot =
+imin(imax(ident, 0) // BLOCK_ROWS, TOPK_BLOCKS - 1)`. Either fix shape clears D11: bound
+the descriptor with an explicit `nbytes`, or clamp the computed row offset so it cannot
+leave the row the descriptor covers.
+→ `🔴 D11: rsrc([tensor]) omits nbytes over a ragged/row-addressed extent — [computed offset] can land outside its row with nothing to catch it; bound the descriptor or clamp the offset`
+
+*Gluon is a clean negative, not a rule.* `atom/model_ops/v4_kernels/paged_decode_gluon.py`
+(218 lines, two `@gluon.jit` kernels) landed whole in `5f98bafd1` (PR#2377) as a perf
+change, with zero subsequent commits, zero fix commits, zero review comments. No history
+to mine, no rule to write — noted here so the next pass does not re-mine an empty surface.
+
 ---
 
 ### E — Cross-Repo Sync
