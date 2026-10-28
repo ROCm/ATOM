@@ -1919,6 +1919,22 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+def m3_reuses_index_topk(text_config) -> bool:
+    """Whether any MiniMax-M3 sparse layer reuses the previous layer's top-k.
+
+    The rule of ``models/minimax_m3/model._should_skip_minimax_m3_index_topk``,
+    over all layers: off without ``use_index_cache``; else an explicit
+    ``index_topk_pattern`` decides (any ``"S"`` reuses) and takes precedence
+    over ``index_topk_freq`` (above 1 reuses).
+    """
+    if not getattr(text_config, "use_index_cache", False):
+        return False
+    pattern = getattr(text_config, "index_topk_pattern", None)
+    if pattern is not None:
+        return "S" in pattern
+    return int(getattr(text_config, "index_topk_freq", 1) or 1) > 1
+
+
 def m3_fp4_cache_unsupported_reason(
     gfx: str,
     index_fp4: bool,
@@ -2752,8 +2768,7 @@ class Config:
                     self.tensor_parallel_size,
                     text_cfg.num_attention_heads,
                     text_cfg.num_key_value_heads,
-                    bool(getattr(text_cfg, "use_index_cache", False))
-                    and int(getattr(text_cfg, "index_topk_freq", 1) or 1) > 1,
+                    m3_reuses_index_topk(text_cfg),
                 )
                 if fp4_off is not None:
                     raise ValueError(fp4_off)

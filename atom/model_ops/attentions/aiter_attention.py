@@ -655,16 +655,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ),
         )
 
-    def _bf16_stage(self, name: str, inner: tuple) -> tuple[torch.Tensor, torch.Tensor]:
-        """A step's BF16 rows before FP4/NVFP4 quantization, shared by every
-        sparse layer (each quantizes its rows out before the next layer writes):
+    def _quant_stage(
+        self, name: str, inner: tuple
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """A step's rows, in the model dtype the fused qk-norm/rope/cache writer
+        emits, before FP4/NVFP4 quantization. Shared by every sparse layer (each
+        quantizes its rows out before the next layer writes):
         token-major page-128 ``[rows // 128, *inner]`` with the identity slot
         mapping beside it. Sized for the largest step, a prefill chunk or a full
         decode graph of ``max_num_seqs`` spec-verify rows. One buffer per
         ``name`` -- the K/V stage and the index-key stage."""
-        stages = getattr(self, "_bf16_stages", None)
+        stages = getattr(self, "_quant_stages", None)
         if stages is None:
-            stages = self._bf16_stages = {}
+            stages = self._quant_stages = {}
         if name not in stages:
             config = self.model_runner.config
             spec = config.speculative_config
@@ -680,7 +683,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             stages[name] = (
                 torch.zeros(
                     (rows // self.block_size, *inner),
-                    dtype=torch.bfloat16,
+                    dtype=config.torch_dtype,
                     device=device,
                 ),
                 torch.arange(rows, dtype=torch.int64, device=device),
@@ -770,7 +773,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 (
                     module.impl.index_stage,
                     module.impl.index_stage_slots,
-                ) = self._bf16_stage("index", (self.block_size, spec.dim))
+                ) = self._quant_stage("index", (self.block_size, spec.dim))
             else:
                 module.impl.index_cache = pool.field_view(
                     "index", row, spec.dtype, (-1, self.block_size, spec.dim)
@@ -798,7 +801,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if pool.kv_format == "nvfp4":
             module.k_scale, module.v_scale = pool.scale_views(row)
             module.impl.kv_nvfp4 = True
-            module.impl.kv_stage, module.impl.kv_stage_slots = self._bf16_stage(
+            module.impl.kv_stage, module.impl.kv_stage_slots = self._quant_stage(
                 "kv", (2, self.block_size, geometry.num_kv_heads, geometry.head_dim)
             )
         elif config.kv_cache_dtype == "fp8":

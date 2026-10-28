@@ -11,7 +11,7 @@ an inline-asm build); the pool test pins the byte layout the kernels address.
 import pytest
 import torch
 
-from atom.config import m3_fp4_cache_unsupported_reason
+from atom.config import m3_fp4_cache_unsupported_reason, m3_reuses_index_topk
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
 
@@ -41,6 +41,38 @@ def test_refusal(gfx, index_fp4, kv_nvfp4, tp, reuses_topk, refused):
         assert reason is None
     else:
         assert refused in reason
+
+
+@pytest.mark.parametrize(
+    "fields, reuses",
+    [
+        ({}, False),
+        ({"use_index_cache": False, "index_topk_pattern": ["F", "S"]}, False),
+        ({"use_index_cache": True}, False),
+        ({"use_index_cache": True, "index_topk_freq": 4}, True),
+        # An explicit pattern takes precedence over the frequency, both ways.
+        (
+            {
+                "use_index_cache": True,
+                "index_topk_freq": 1,
+                "index_topk_pattern": ["F", "S"],
+            },
+            True,
+        ),
+        (
+            {
+                "use_index_cache": True,
+                "index_topk_freq": 4,
+                "index_topk_pattern": ["F", "F"],
+            },
+            False,
+        ),
+    ],
+)
+def test_reuses_index_topk_follows_the_model_rule(fields, reuses):
+    from types import SimpleNamespace
+
+    assert m3_reuses_index_topk(SimpleNamespace(**fields)) is reuses
 
 
 def test_nvfp4_pool_fields_and_views():

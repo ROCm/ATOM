@@ -69,42 +69,45 @@ def nvfp4_sparse_attention(
 
 @triton.jit
 def _decode_rows_kernel(
-    seq_ptr, req_ptr, len_ptr, rows, Q: tl.constexpr, BLOCK: tl.constexpr
+    seq_ptr, req_ptr, len_ptr, rows, num_reqs, Q: tl.constexpr, BLOCK: tl.constexpr
 ):
     r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = r < rows
     req = r // Q
-    seq = tl.load(seq_ptr + req, mask=m, other=0).to(tl.int32)
-    tl.store(req_ptr + r, req.to(tl.int32), mask=m)
-    tl.store(len_ptr + r, seq - Q + (r - req * Q) + 1, mask=m)
+    live = m & (req < num_reqs)
+    seq = tl.load(seq_ptr + req, mask=live, other=0).to(tl.int32)
+    length = tl.where(live, tl.maximum(seq - Q + (r - req * Q) + 1, 0), 0)
+    tl.store(req_ptr + r, tl.where(live, req, 0).to(tl.int32), mask=m)
+    tl.store(len_ptr + r, length, mask=m)
 
 
-def decode_rows(seq_lens: torch.Tensor, rows: int):
+def decode_rows(seq_lens: torch.Tensor, rows: int, max_query_len: int):
     """(row_req, row_seq_len) of a uniform spec-verify decode: rows are
-    request-major, ``rows // len(seq_lens)`` query tokens per request, the last
-    at the request's full length. One launch; computed once per layer and
-    shared by the index top-k and the attention.
+    request-major, ``max_query_len`` query tokens per request, the last at the
+    request's full length. Rows past ``len(seq_lens) * max_query_len`` are
+    padding: request 0, length 0, so no kernel reads a block for them. One
+    launch; computed once per layer and shared by the index top-k and the
+    attention.
 
     shortcut: once per layer (60 launches a step), not once per step; moving it
     into the metadata builder's graph buffers would save the rest."""
-    q = rows // seq_lens.shape[0]
     req = torch.empty(rows, dtype=torch.int32, device=seq_lens.device)
     seq = torch.empty(rows, dtype=torch.int32, device=seq_lens.device)
     block = 256
     _decode_rows_kernel[(triton.cdiv(rows, block),)](
-        seq_lens, req, seq, rows, Q=q, BLOCK=block
+        seq_lens, req, seq, rows, seq_lens.shape[0], Q=max_query_len, BLOCK=block
     )
     return req, seq
 
 
 def prefill_rows(cu_seqlens_q: torch.Tensor, prefix_lens: torch.Tensor, rows: int):
     """(row_req, row_seq_len) of prefill query tokens: token i of request b sits
-    at absolute position prefix_lens[b] + i."""
-    tok = torch.arange(rows, device=cu_seqlens_q.device, dtype=torch.int32)
-    req = (torch.searchsorted(cu_seqlens_q[1:].to(torch.int32), tok, right=True)).to(
-        torch.int32
-    )
-    seq = (
-        prefix_lens.to(torch.int32)[req] + (tok - cu_seqlens_q.to(torch.int32)[req]) + 1
-    )
-    return req, seq
+    at absolute position prefix_lens[b] + i. Rows past ``cu_seqlens_q[-1]`` pad a
+    token-graph bucket: request 0, length 0."""
+    cu = cu_seqlens_q.to(torch.int32)
+    tok = torch.arange(rows, device=cu.device, dtype=torch.int32)
+    live = tok < cu[-1]
+    req = torch.where(live, torch.searchsorted(cu[1:], tok, right=True), 0)
+    req = req.to(torch.int32)
+    seq = prefix_lens.to(torch.int32)[req] + (tok - cu[req]) + 1
+    return req, torch.where(live, seq, 0)

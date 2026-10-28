@@ -12,7 +12,7 @@ token against 128 for FP8, quantized per 16 elements as ``scale = e4m3(amax / 6)
 with codes rounded half-to-even, saturating at 6.
 
 The fused qk-norm / rope / cache kernel (aiter ``fused_qknorm_idxrqknorm``) only
-writes BF16 or FP8 index keys. It writes this step's keys BF16 into a token-major
+writes model-dtype or FP8 index keys. It writes this step's keys, in the model dtype, into a token-major
 staging buffer (``index_slot_mapping`` = token number), and
 :func:`index_fp4_store` quantizes them into the paged FP4 planes at the step's
 real slots. The scorers read the planes through the gfx950 hardware e2m1
@@ -49,7 +49,7 @@ def _f32_to_e2m1(x):
 
 @triton.jit
 def _nvfp4_store_kernel(
-    stage_ptr,  # staged BF16 rows of this step's tokens (any page-major layout)
+    stage_ptr,  # staged rows (model dtype) of this step's tokens, any page-major layout
     slot_ptr,  # [tokens] int64 cache slot of token t (-1 = padding)
     payload_ptr,  # [blocks, (heads,) PAGE, D // 2] uint8
     scale_ptr,  # [blocks, (heads,) PAGE, D // 16] uint8
@@ -142,7 +142,7 @@ def _nvfp4_store(
 
 
 def index_fp4_store(
-    stage: torch.Tensor,  # [>= tokens, D] bf16, token-major
+    stage: torch.Tensor,  # [>= tokens, D] model dtype, token-major
     slot_mapping: torch.Tensor,  # [tokens]
     payload: torch.Tensor,  # [blocks, PAGE, D // 2] uint8
     scale: torch.Tensor,  # [blocks, PAGE, D // 16] uint8
@@ -161,7 +161,7 @@ def index_fp4_store(
 
 
 def kv_nvfp4_store(
-    kv_stage: torch.Tensor,  # [stage_pages, 2, PAGE, Hkv, D] bf16, token-major
+    kv_stage: torch.Tensor,  # [stage_pages, 2, PAGE, Hkv, D] model dtype, token-major
     slot_mapping: torch.Tensor,  # [tokens]
     k_payload: torch.Tensor,  # [blocks, Hkv, PAGE, D // 2] uint8
     k_scale: torch.Tensor,  # [blocks, Hkv, PAGE, D // 16] uint8

@@ -1315,13 +1315,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.index_cache: torch.Tensor | None = None
         # `--index-cache-dtype fp4`: index_cache is the FP4 payload plane and
         # index_scale its E4M3 scales; the fused cache write lands the step's
-        # BF16 keys in index_stage (token-major, index_stage_slots = identity)
+        # model-dtype keys in index_stage (token-major, index_stage_slots = identity)
         # and index_fp4_store quantizes them in (minimax_m3/index_fp4.py).
         self.index_scale: torch.Tensor | None = None
         self.index_stage: torch.Tensor | None = None
         self.index_stage_slots: torch.Tensor | None = None
         # ATOM_M3_SPARSE_KV_NVFP4: the bound k/v caches are NVFP4 payload planes
-        # and k/v_scale their E4M3 scales; the fused write lands BF16 K/V in
+        # and k/v_scale their E4M3 scales; the fused write lands model-dtype K/V in
         # kv_stage (token-major) and kv_nvfp4_store quantizes them in.
         self.kv_nvfp4: bool = False
         self._nvfp4_attention_checked = False
@@ -1876,7 +1876,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import decode_rows
 
             # One mapping per layer, read by the fused top-k and the attention.
-            row_req, row_seq = decode_rows(decode_md.seq_lens, q.shape[0])
+            row_req, row_seq = decode_rows(
+                decode_md.seq_lens, q.shape[0], max_query_len
+            )
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")

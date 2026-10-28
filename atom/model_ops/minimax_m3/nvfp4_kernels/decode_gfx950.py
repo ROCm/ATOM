@@ -149,6 +149,8 @@ def _block_table(
     idx_base = idx_ptr + pid_kh * stride_ti_h + pid_b * stride_ti_b
     topk = gl.load(idx_base + off_t, mask=off_t < max_topk, other=-1)
     real_topk = gl.sum((topk >= 0).to(gl.int32), axis=0)
+    # A zero-length row (padding) reads no block: its top-k may be uninitialized.
+    real_topk = gl.where(seq_len > 0, real_topk, 0)
     c_end = gl.minimum(c_start + chunk, real_topk)
     in_chunk = (off_t >= c_start) & (off_t < c_end)
     c_tok = topk * BN

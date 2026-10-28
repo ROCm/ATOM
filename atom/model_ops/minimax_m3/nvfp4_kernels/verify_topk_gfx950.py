@@ -573,7 +573,10 @@ def can_fuse_verify_topk(
             and k_cache.stride(-1) == 1
         )
     return (
-        q.shape[0] // num_draft >= min_reqs
+        # Whole draft groups only: a padded row count leaves a partial group
+        # whose split count the merge would read past.
+        q.shape[0] % num_draft == 0
+        and q.shape[0] // num_draft >= min_reqs
         and q.dtype in (torch.bfloat16, torch.float16)
         and q.shape[-1] == 128
         and num_draft * (q.shape[1] // num_kv_heads) <= 16

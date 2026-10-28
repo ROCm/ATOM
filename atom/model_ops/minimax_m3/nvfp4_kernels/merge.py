@@ -33,8 +33,12 @@ def _merge_topk_attn_out_kernel(
     o = tl.load(o_ptrs, mask=off_d[None, :] < head_dim, other=0.0)
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     lse_max = tl.max(lse, axis=0)
+    # A row with no block in any chunk (a pad request, length 0) has every lse
+    # -inf: shift by 0 instead, so its weights and output are 0, not NaN.
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
     weights = tl.exp(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
+    w_sum = tl.sum(weights, axis=0)
+    weights = weights / tl.where(w_sum > 0, w_sum, 1.0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
     o_out_ptrs = o_ptr + pid_b * stride_o_b + pid_h * stride_o_h + off_d * stride_o_d
     tl.store(o_out_ptrs, o_merged.to(o_ptr.dtype.element_ty), mask=off_d < head_dim)

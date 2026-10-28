@@ -23,7 +23,8 @@ pytest.importorskip("triton", reason="the kernels are triton / gluon")
 def _gfx950() -> bool:
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950")
+    props = torch.cuda.get_device_properties(0)
+    return getattr(props, "gcnArchName", "").startswith("gfx950")
 
 
 pytestmark = pytest.mark.skipif(not _gfx950(), reason="needs a gfx950 GPU")
@@ -112,11 +113,24 @@ def test_decode_rows(bs, q):
     from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import decode_rows
 
     seq = torch.randint(100, 300000, (bs,), device=DEV, dtype=torch.int32)
-    req, seq_len = decode_rows(seq, bs * q)
+    req, seq_len = decode_rows(seq, bs * q, q)
     tok = torch.arange(bs * q, device=DEV)
     want_req = tok // q
     assert torch.equal(req.long(), want_req)
     assert torch.equal(seq_len.long(), (seq[want_req] - q + tok % q + 1).long())
+
+
+def test_decode_rows_padding():
+    """3 requests of 8 rows padded to 32: the live rows keep their mapping (not
+    32 // 3 = 10 rows a request), the pad rows read request 0 at length 0."""
+    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import decode_rows
+
+    seq = torch.tensor([500, 900, 1300], device=DEV, dtype=torch.int32)
+    req, seq_len = decode_rows(seq, 32, 8)
+    tok = torch.arange(24, device=DEV)
+    assert torch.equal(req[:24].long(), tok // 8)
+    assert torch.equal(seq_len[:24].long(), (seq[tok // 8] - 8 + tok % 8 + 1).long())
+    assert req[24:].tolist() == [0] * 8 and seq_len[24:].tolist() == [0] * 8
 
 
 def test_prefill_rows():
@@ -128,6 +142,17 @@ def test_prefill_rows():
     want_req = [b for b, n in enumerate(qlens) for _ in range(n)]
     want_len = [prefix[b] + i + 1 for b, n in enumerate(qlens) for i in range(n)]
     assert req.tolist() == want_req and seq_len.tolist() == want_len
+
+
+def test_prefill_rows_padding():
+    """A prefill padded to a token-graph bucket: rows past cu_seqlens_q[-1]
+    read request 0 at length 0 instead of indexing past the requests."""
+    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_rows
+
+    cu = torch.tensor([0, 3, 4], device=DEV, dtype=torch.int32)
+    req, seq_len = prefill_rows(cu, torch.tensor([10, 0], device=DEV), 8)
+    assert req.tolist() == [0, 0, 0, 1, 0, 0, 0, 0]
+    assert seq_len.tolist() == [11, 12, 13, 1, 0, 0, 0, 0]
 
 
 def _same_sets(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -190,19 +215,24 @@ def test_nvfp4_attention_matches_dequantized_reference():
     )
     bt = torch.stack([torch.randperm(blocks, device=DEV)[:maxb] for _ in range(nreq)])
     bt = bt.to(torch.int32)
-    rows = nreq * q_rows
-    req, row_seq = decode_rows(seq, rows)
+    rows = nreq * q_rows + q_rows  # one padded request: length 0, no blocks
+    req, row_seq = decode_rows(seq, rows, q_rows)
     topk_idx = torch.full((1, rows, topk), -1, device=DEV, dtype=torch.int32)
-    for r in range(rows):
+    for r in range(nreq * q_rows):
         n = int((row_seq[r] + PAGE - 1) // PAGE)
         sel = torch.randperm(n - 1, device=DEV)[: topk - 1]
         sel = torch.cat([sel, torch.tensor([n - 1], device=DEV)])  # the local block
         topk_idx[0, r, : sel.numel()] = sel.to(torch.int32)
+    # A pad row's top-k may be left uninitialized (FP8 index, unfused selector):
+    # a dirty list must still select nothing at length 0.
+    topk_idx[0, nreq * q_rows :, :3] = torch.tensor([0, -1, 0], dtype=torch.int32)
     q = torch.randn(rows, 16, D, device=DEV, dtype=torch.bfloat16)
     args = (q, shape4(kp), shape4(ks), shape4(vp), shape4(vs), topk_idx)
     check_nvfp4_sparse_attention(*args)
     out = nvfp4_sparse_attention(*args, bt, req, row_seq, D**-0.5)
-    for r in range(rows):
+    # Few rows split the top-k into chunks; the empty pad rows merge to 0, not NaN.
+    assert torch.equal(out[nreq * q_rows :], torch.zeros_like(out[nreq * q_rows :]))
+    for r in range(nreq * q_rows):
         blks = topk_idx[0, r][topk_idx[0, r] >= 0].long()
         toks = bt[req[r]].long()[blks][:, None] * PAGE + torch.arange(PAGE, device=DEV)
         logical = blks[:, None] * PAGE + torch.arange(PAGE, device=DEV)
@@ -255,10 +285,37 @@ def test_fused_verify_topk_matches_scorer(bs, ctx):
         local_blocks=1, num_kv_heads=1, sm_scale=D**-0.5, max_query_len=q_rows,
         index_kv_scale=scale,
     )[0]  # fmt: skip
-    req, row_seq = decode_rows(seq, bs * q_rows)
+    req, row_seq = decode_rows(seq, bs * q_rows, q_rows)
     got = fused_verify_topk_idx(
         q, cache, bt, row_seq, ctx, req, q_rows, PAGE, topk, 0, 1, D**-0.5, 1.0
     )
     assert _same_sets(ref, got[0])  # [heads, rows, topk] -> the one index head
-    # The fused kernel's bounds: below 3 requests the separate kernels win.
+    # The fused kernel's bounds: below 3 requests the separate kernels win, and
+    # a padded row count that is not whole draft groups goes unfused.
     assert not can_fuse_verify_topk(q[: 2 * q_rows], cache, q_rows, topk, 1, PAGE, PAGE)
+    padded = torch.cat([q, q[:2]])  # 2 rows past the last whole group
+    assert not can_fuse_verify_topk(padded, cache, q_rows, topk, 1, PAGE, PAGE)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_quant_stage_follows_the_model_dtype(dtype):
+    """The fused writer stores the staged rows in qkv's dtype under "auto", so
+    the staging buffer must be the model's dtype (fp16 models too)."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
+
+    builder = AiterAttentionMetadataBuilder.__new__(AiterAttentionMetadataBuilder)
+    builder.block_size = PAGE
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            max_num_batched_tokens=300,
+            max_num_seqs=64,
+            speculative_config=SimpleNamespace(num_speculative_tokens=7),
+            torch_dtype=dtype,
+        )
+    )
+    stage, slots = builder._quant_stage("index", (PAGE, D))
+    # 64 seqs x 8 verify rows = 512 > 300 tokens: the decode graph sizes it.
+    assert stage.dtype == dtype and stage.shape == (4, PAGE, D)
+    assert torch.equal(slots, torch.arange(512, device=slots.device))
