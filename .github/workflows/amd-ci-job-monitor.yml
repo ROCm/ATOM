@@ -13,58 +13,31 @@ jobs:
         run: |
           python3 - <<'PYCODE'
           import collections
-          import hashlib
           import json
           import os
           import re
           import subprocess
           from pathlib import Path
           root = Path('/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG')
-          runs = (40706439005, 40732976256)
+          runs = (40706439005, 40737040374)
           jobs = []
-          fs = os.statvfs(root)
-          print('TASK LOG FILESYSTEM AVAILABLE BYTES:', fs.f_bavail * fs.f_frsize, flush=True)
-          source_dirs = list(root.glob('*agentx-chunked-c32-mooncake_store-40706439005-20261028143137'))
-          if len(source_dirs) != 1:
-              raise RuntimeError('Expected exactly the completed task directory')
-          completed = source_dirs[0]
-          probe = completed / f'.codex-write-probe-{os.environ["GITHUB_RUN_ID"]}'
-          try:
-              with probe.open('xb') as stream:
-                  stream.write(bytes(1024 * 1024))
-                  stream.flush()
-                  os.fsync(stream.fileno())
-              print('TASK LOG WRITE PROBE: success', flush=True)
-          except OSError as error:
-              print('TASK LOG WRITE PROBE ERRNO:', error.errno, flush=True)
-          finally:
-              probe.unlink(missing_ok=True)
-          metrics = list(completed.glob('slurm_job-10772/benchmark_results/*/server_metrics_export.json'))
-          if len(metrics) == 1:
-              metric = metrics[0]
-              digest = hashlib.sha256()
-              with metric.open('rb') as stream:
-                  for chunk in iter(lambda: stream.read(16 * 1024 * 1024), b''):
-                      digest.update(chunk)
-              matches = metric.stat().st_size == 4716797276 and digest.hexdigest() == '631331178b754bdeefae1c70b069721af495dd99f9baced3677293f17c663853'
-              print('COMPLETED METRIC MATCHES LOCAL AND ARTIFACT BACKUP:', matches, flush=True)
-              print('METRIC OWNER MATCHES DIAGNOSTIC USER:', metric.stat().st_uid == os.getuid(), flush=True)
-
           controller = os.environ.get('SPUR_CONTROLLER_ADDR', '')
           controller_args = ['--controller', controller] if controller else []
           print('EXPLICIT CONTROLLER CONFIGURED:', bool(controller), flush=True)
           runner_root = Path('/share_nfs/ATOMESH_RUNNER')
           task_runners = {run: range(1, 21) for run in runs}
           for run in runs:
-              paths = sorted(root.glob(f'*{run}*'))
+              latest = {}
+              for directory in sorted(root.glob(f'*{run}*')):
+                  if run == 40706439005 and 'agentx-chunked' in directory.name:
+                      continue
+                  latest[directory.name.rsplit(f'-{run}-', 1)[0]] = directory
+              paths = list(latest.values())
               print(f'RUN {run}: {len(paths)} log directories', flush=True)
               for directory in paths:
                   print(directory.name, flush=True)
-                  files = [(p.stat().st_size, str(p.relative_to(directory))) for p in directory.rglob('*') if p.is_file()]
-                  print('TASK DIRECTORY TOTAL BYTES:', sum(size for size, _ in files), flush=True)
-                  print('TASK LARGEST FILES:', sorted(files, reverse=True)[:5], flush=True)
                   cell = directory.name.rsplit(f'-{run}-', 1)[0]
-                  attempt = 2 if run == 40706439005 else 1
+                  attempt = 3 if run == 40706439005 else 1
                   job_name = f'{cell}-{run}-{attempt}'
                   for runner in task_runners[run]:
                       results = runner_root / f'atomesh-runner-{runner:02d}/_work/ATOM/ATOM/atomesh-results'
@@ -91,17 +64,25 @@ jobs:
                   print('ROOT FILES:', [(x.name, x.stat().st_size) for x in directory.iterdir() if x.is_file()], flush=True)
                   for job in sorted(directory.glob('slurm_job-*')):
                       jobs.append(job.name.removeprefix('slurm_job-'))
-                      for name in ('decode-rank-0.log', 'prefill-rank-0.log', 'server-rank-0.log'):
+                      for name in ('decode-rank-0.log', 'prefill-rank-0.log', 'server-rank-0.log', 'eval/decode-rank-0.log', 'eval/prefill-rank-0.log', 'eval/server-rank-0.log'):
                           log = job / 'logs' / name
                           if not log.exists():
                               continue
-                          matches = collections.deque(maxlen=20)
+                          matches = collections.deque(maxlen=12)
+                          trace = []
+                          in_trace = False
                           with log.open(errors='replace') as stream:
                               for line in stream:
+                                  if 'Traceback (most recent call last)' in line and not trace:
+                                      in_trace = True
+                                  if in_trace and len(trace) < 90:
+                                      trace.append(line.rstrip()[:450])
                                   if re.search(r'Capturing|Loading|loaded|Loaded|ready|Traceback|Error:|ERROR|Average toks/fwd|Avg generation|GSM8K', line):
                                       matches.append(line.rstrip()[:450])
                           print(f'{job.name}/{name}: {log.stat().st_size} bytes', flush=True)
                           print('\n'.join(matches), flush=True)
+                          if trace:
+                              print('FIRST ERROR CONTEXT:\n' + '\n'.join(trace), flush=True)
           result = subprocess.run(
               ['sinfo', *controller_args, '--noheader', '--nodes=pit2-p03-g03,pit2-p03-g53', '--format=%N|%T'],
               capture_output=True, text=True, check=False, timeout=20)
@@ -119,3 +100,12 @@ jobs:
                           lines.append(line.strip())
                   print('TASK STATE:', job_id, result.returncode, lines, flush=True)
           PYCODE
+      - name: Recover completed non-PD evaluation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m31-nonpd-baseline-recovered-10816
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/*agg-tp4-dspark7-nvfp4-gsm8k-5shot-c32-accuracy-40732976256-20261028171140/slurm_job-10816/eval_results/
+            /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/*agg-tp4-dspark7-nvfp4-gsm8k-5shot-c32-accuracy-40732976256-20261028171140/slurm_job-10816/logs/eval/server-rank-0.log
