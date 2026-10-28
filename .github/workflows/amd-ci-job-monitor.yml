@@ -10,6 +10,10 @@ on:
         description: Remove hash-verified copies of completed task 10772 raw metric
         type: boolean
         default: false
+      recover_current_artifacts:
+        description: Recover completed DCP ON accuracy and failed c32 task logs
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -19,6 +23,7 @@ jobs:
     env:
       RECLAIM_COMPLETED_METRIC: ${{ inputs.reclaim_completed_metric }}
       RECLAIM_ARTIFACT_COPIES: ${{ inputs.reclaim_artifact_copies }}
+      RECOVER_CURRENT_ARTIFACTS: ${{ inputs.recover_current_artifacts }}
     steps:
       - name: Read this task's Slurm states and progress logs
         shell: bash
@@ -114,6 +119,10 @@ jobs:
                       for line in collections.deque(log.open(errors='replace'), maxlen=15):
                           if re.search(r'(?i)error|cancel|timeout|failed|exit|quota|space', line):
                               print(line.rstrip()[:400], flush=True)
+                  for log in directory.glob('slurm-*.out'):
+                      print('TASK STDOUT TAIL:', log.name, flush=True)
+                      for line in collections.deque(log.open(errors='replace'), maxlen=45):
+                          print(line.rstrip().replace('\x00', '')[:450], flush=True)
                   for result_file in directory.glob('slurm_job-*/benchmark_results/**/profile_export_aiperf.json'):
                       data = json.loads(result_file.read_text())
                       print('BENCHMARK:', {key: data.get(key) for key in ('was_cancelled', 'request_count', 'benchmark_duration', 'error_summary')}, flush=True)
@@ -169,4 +178,35 @@ jobs:
                       if fields and fields[0].split('.')[0] == job_id:
                           lines.append(line.strip())
                   print('TASK STATE:', job_id, result.returncode, lines, flush=True)
+          if os.environ.get('RECOVER_CURRENT_ARTIFACTS') == 'true':
+              recovery = Path(os.environ['RUNNER_TEMP']) / 'm31-task-recovery-10826-10828'
+              for run, job_id, label in [(40739638741, '10826', 'dcp-on'), (40706439005, '10828', 'c32-off')]:
+                  matches = [job for directory in root.glob(f'*{run}*') for job in directory.glob(f'slurm_job-{job_id}')]
+                  if len(matches) != 1:
+                      raise RuntimeError(f'Expected one verified task directory for {job_id}')
+                  job = matches[0]
+                  out = recovery / label / job.name
+                  out.mkdir(parents=True, exist_ok=True)
+                  for subdir in ('eval_results', 'logs', 'rank-0'):
+                      src = job / subdir
+                      if src.is_dir():
+                          for src_file in src.rglob('*'):
+                              if src_file.is_file() and src_file.suffix in ('.log', '.json', '.jsonl'):
+                                  dest = out / src_file.relative_to(job)
+                                  dest.parent.mkdir(parents=True, exist_ok=True)
+                                  shutil.copyfile(src_file, dest)
+                  for pattern in ('cell-metadata.json', 'job-result.json', 'rank-workload-*.json', 'rank-rc-*'):
+                      for src_file in job.glob(pattern):
+                          shutil.copyfile(src_file, out / src_file.name)
+                  for src_file in job.parent.glob(f'slurm-{job_id}.*'):
+                      shutil.copyfile(src_file, out / src_file.name)
+              print('RECOVERED TASK ARTIFACTS READY', flush=True)
           PYCODE
+      - name: Upload recovered task artifacts
+        if: ${{ inputs.recover_current_artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: m31-task-recovery-10826-10828
+          path: ${{ runner.temp }}/m31-task-recovery-10826-10828
+          if-no-files-found: error
+          retention-days: 14
