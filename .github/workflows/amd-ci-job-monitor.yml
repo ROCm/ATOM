@@ -13,12 +13,19 @@ jobs:
         run: |
           python3 - <<'PYCODE'
           import collections
+          import json
+          import os
           import re
           import subprocess
           from pathlib import Path
           root = Path('/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG')
           runs = (40706439005, 40721876344, 40723026923)
           jobs = []
+          controller = os.environ.get('SPUR_CONTROLLER_ADDR', '')
+          controller_args = ['--controller', controller] if controller else []
+          print('EXPLICIT CONTROLLER CONFIGURED:', bool(controller), flush=True)
+          runner_root = Path('/share_nfs/ATOMESH_RUNNER')
+          task_runners = {40706439005: (10,), 40721876344: (8, 9), 40723026923: (3,)}
           for run in runs:
               paths = sorted(root.glob(f'*{run}*'))
               print(f'RUN {run}: {len(paths)} log directories', flush=True)
@@ -26,8 +33,25 @@ jobs:
                   print(directory.name, flush=True)
                   cell = directory.name.rsplit(f'-{run}-', 1)[0]
                   job_name = f'{cell}-{run}-1'
+                  for runner in task_runners[run]:
+                      results = runner_root / f'atomesh-runner-{runner:02d}/_work/ATOM/ATOM/atomesh-results'
+                      recorded_root = results / f'{cell}.log-root'
+                      job_id_file = results / f'{cell}.slurm-job-id'
+                      if recorded_root.is_file() and recorded_root.read_text().strip() == str(directory) and job_id_file.is_file():
+                          job_id = job_id_file.read_text().strip()
+                          if job_id.isdigit():
+                              jobs.append(job_id)
+                              print('VERIFIED TASK JOB ID:', job_id, flush=True)
+                  for log in sorted(directory.glob('slurm-*.err')):
+                      print('TASK SLURM STDERR:', log.name, flush=True)
+                      for line in collections.deque(log.open(errors='replace'), maxlen=15):
+                          if re.search(r'(?i)error|cancel|timeout|failed|exit', line):
+                              print(line.rstrip()[:400], flush=True)
+                  for result_file in directory.glob('slurm_job-*/benchmark_results/**/profile_export_aiperf.json'):
+                      data = json.loads(result_file.read_text())
+                      print('BENCHMARK:', {key: data.get(key) for key in ('was_cancelled', 'request_count', 'benchmark_duration', 'error_summary')}, flush=True)
                   result = subprocess.run(
-                      ['squeue', '--noheader', '--name', job_name,
+                      ['squeue', *controller_args, '--noheader', '--name', job_name,
                        '--format', '%A|%T|%M|%N|%R'],
                       capture_output=True, text=True, check=False, timeout=20)
                   print('TASK QUEUE:', result.stdout.strip(), flush=True)
@@ -46,9 +70,14 @@ jobs:
                           print(f'{job.name}/{name}: {log.stat().st_size} bytes', flush=True)
                           print('\n'.join(matches), flush=True)
           result = subprocess.run(
-              ['sinfo', '--noheader', '--nodes=pit2-p03-g03,pit2-p03-g53', '--format=%N|%T'],
+              ['sinfo', *controller_args, '--noheader', '--nodes=pit2-p03-g03,pit2-p03-g53', '--format=%N|%T'],
               capture_output=True, text=True, check=False, timeout=20)
           print('TARGET NODE AVAILABILITY:', result.stdout.strip(), flush=True)
-          if jobs:
-              subprocess.run(['squeue', '--noheader', '--jobs', ','.join(jobs), '--format', '%A|%T|%M|%N|%R'], check=False, timeout=20)
+          for job_id in sorted(set(jobs)):
+              for command in (
+                  ['squeue', *controller_args, '--noheader', '--jobs', job_id, '--format', '%A|%T|%M|%N|%R'],
+                  ['sacct', *controller_args, '--jobs', job_id, '--noheader', '--format', 'JobID%30,State%30,ExitCode%20'],
+              ):
+                  result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=20)
+                  print('TASK STATE:', job_id, result.returncode, result.stdout.strip(), flush=True)
           PYCODE
