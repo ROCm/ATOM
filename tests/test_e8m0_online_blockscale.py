@@ -107,12 +107,9 @@ def test_rollout_sync_reproduces_the_loaded_e8m0_weight(monkeypatch, output_size
     assert _same_bytes(layer.weight, ref.weight)
     assert _same_bytes(layer.weight_scale, ref.weight_scale)
     assert layer.weight_scale.dtype == dtypes.fp8_e8m0
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    # Only gfx1250's mxfp8_128 GEMM needs N % 128 == 0.
-    padded = output_size % 128 != 0 and get_gfx_runtime() == "gfx1250"
-    assert layer.is_output_padded is padded
-    assert layer.weight.shape[0] == (2176 if padded else output_size)
+    if output_size % 128 != 0:
+        assert layer.is_output_padded
+        assert tuple(layer.weight.shape) == (2176, 256)
 
     if not torch.cuda.is_available():
         return
@@ -127,7 +124,6 @@ def test_rollout_sync_reproduces_the_loaded_e8m0_weight(monkeypatch, output_size
 
 def test_rollout_sync_shards_logical_n_before_padding(monkeypatch):
     monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
-    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: "gfx1250")
     stale = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
     local = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
     other = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
@@ -156,7 +152,6 @@ def test_online_target_decides_the_scale_format(monkeypatch, e8m0):
 
 def test_online_e8m0_weight_is_padded_to_128_rows(monkeypatch):
     monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
-    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: "gfx1250")
     layer = _bf16_layer(monkeypatch, e8m0=True)
 
     layer.is_output_padded = layer._maybe_pad_a8w8_preshuffle_output()
@@ -168,18 +163,12 @@ def test_online_e8m0_weight_is_padded_to_128_rows(monkeypatch):
     assert layer.supports_out() is False
 
 
-@pytest.mark.parametrize(
-    "scale_dtype,gfx", [(torch.float32, "gfx1250"), (dtypes.fp8_e8m0, "gfx950")]
-)
-def test_blockscale_weight_is_padded_only_for_e8m0_on_gfx1250(
-    monkeypatch, scale_dtype, gfx
-):
-    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: gfx)
+def test_fp32_blockscale_weight_is_not_padded():
     module = SimpleNamespace(
         weight=nn.Parameter(
             torch.zeros(2112, 256, dtype=torch.uint8), requires_grad=False
         ),
-        weight_scale=torch.ones(17, 2).to(scale_dtype),
+        weight_scale=torch.ones(17, 2, dtype=torch.float32),
         quant_type=QuantType.per_1x128,
         params_dtype=dtypes.fp8,
     )

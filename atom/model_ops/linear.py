@@ -1383,16 +1383,13 @@ class LinearBase(nn.Module):
         # The other half of the shuffle decision `process_weights_after_loading`
         # takes, so it answers on the same terms `weight_is_stored_preshuffled`
         # does -- by value.
-        # The gfx1250 E8M0 (mxfp8_128) GEMM needs N % 128 == 0; the block scale
-        # already has ceil(N/128) rows, so only the weight is padded.
+        # aiter's E8M0 128x128 GEMMs need N % 128 == 0 (gfx950 reads the block
+        # as N // scale rows); the block scale already has ceil(N/128) rows, so
+        # only the weight is padded.
         is_e8m0_blockscale = (
             self.quant_type.value == QuantType.per_1x128.value
             and self.weight_scale.dtype == dtypes.fp8_e8m0
         )
-        if is_e8m0_blockscale:
-            from aiter.jit.utils.chip_info import get_gfx_runtime
-
-            is_e8m0_blockscale = get_gfx_runtime() == "gfx1250"
         if not is_e8m0_blockscale and not (
             self.quant_type.value == QuantType.per_Token.value
             and self.params_dtype == dtypes.fp8
