@@ -91,6 +91,7 @@ for run in runs:
             row[role + '_log_exists'] = log.is_file()
             if log.is_file():
                 row[role + '_log_bytes'] = log.stat().st_size
+                row[role + '_log_mtime'] = int(log.stat().st_mtime)
                 with log.open('rb') as source:
                     source.seek(max(0, log.stat().st_size - 131072))
                     tail = source.read(131072).decode(errors='replace')
@@ -101,9 +102,19 @@ for run in runs:
                               'Application startup complete'),
                     'out_of_memory': 'out of memory',
                     'hip209': 'no kernel image is available for execution on the device',
+                    'model_loaded': 'Model loading took',
+                    'prefetch_finished': 'Prefetching checkpoint files into page cache finished',
                     'rocm_nvfp4_attention': 'MiniMax M3 sparse attention selected ROCm NVFP4',
                     'mr_failure': 'ibv_reg_mr failed'}.items():
                     row[f'{role}_{name}'] = marker in tail
+        row['runtime_stages'] = {}
+        for role in ('prefill', 'decode'):
+            row['runtime_stages'][role] = {
+                stage: sum((current / 'runtime-evidence' / f'{role}-rank-{rank}' / (stage + '.json')).is_file()
+                           for rank in range(4))
+                for stage in ('before-kv-init', 'after-kv-init', 'before-warmup', 'after-warmup', 'at-failure')}
+        row['store_memory_gate_finished'] = (current / 'store-memory-gate/result.json').is_file()
+        row['smoke_results_exist'] = (current / 'smoke.json').is_file()
         memory_file = current / 'memory-before-download.json'
         if memory_file.is_file():
             memory = json.loads(memory_file.read_text())
@@ -163,6 +174,32 @@ if shutil.which('squeue'):
             result['scheduler'].append(status)
     except subprocess.TimeoutExpired:
         result['scheduler_query_timed_out'] = True
+
+result['accounting'] = []
+for job_id in sorted({str(row['slurm_job_id']) for row in rows}):
+    if not shutil.which('sacct'):
+        break
+    try:
+        query = subprocess.run(['sacct', '-n', '-X', '-P', '-j', job_id,
+            '--format=JobIDRaw,State,ExitCode,NodeList,Elapsed'], capture_output=True, text=True, timeout=15)
+        for line in query.stdout.splitlines():
+            fields = line.strip().split('|')
+            if len(fields) < 5 or fields[0] != job_id:
+                continue
+            entry = {'job_id': int(job_id), 'query_rc': query.returncode}
+            state = fields[1].split()[0].rstrip('+') if fields[1] else ''
+            if state in {'PENDING', 'RUNNING', 'COMPLETING', 'COMPLETED', 'FAILED', 'CANCELLED',
+                         'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'PREEMPTED', 'BOOT_FAIL'}:
+                entry['state'] = state
+            if re.fullmatch(r'\d+:\d+', fields[2]):
+                entry['exit_code'] = fields[2]
+            if re.fullmatch(r'pit2-p03-g[0-9]+', fields[3]):
+                entry['node'] = fields[3]
+            if re.fullmatch(r'[0-9:-]+', fields[4]):
+                entry['elapsed'] = fields[4]
+            result['accounting'].append(entry)
+    except subprocess.TimeoutExpired:
+        result['accounting'].append({'job_id': int(job_id), 'query_timed_out': True})
 
 (out / 'status.json').write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result, indent=2))
