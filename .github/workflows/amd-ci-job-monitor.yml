@@ -19,20 +19,21 @@ jobs:
           import subprocess
           from pathlib import Path
           root = Path('/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG')
-          runs = (40706439005, 40721876344, 40723026923)
+          runs = (40706439005, 40732976256)
           jobs = []
           controller = os.environ.get('SPUR_CONTROLLER_ADDR', '')
           controller_args = ['--controller', controller] if controller else []
           print('EXPLICIT CONTROLLER CONFIGURED:', bool(controller), flush=True)
           runner_root = Path('/share_nfs/ATOMESH_RUNNER')
-          task_runners = {40706439005: (10,), 40721876344: (8, 9), 40723026923: (3,)}
+          task_runners = {run: range(1, 21) for run in runs}
           for run in runs:
               paths = sorted(root.glob(f'*{run}*'))
               print(f'RUN {run}: {len(paths)} log directories', flush=True)
               for directory in paths:
                   print(directory.name, flush=True)
                   cell = directory.name.rsplit(f'-{run}-', 1)[0]
-                  job_name = f'{cell}-{run}-1'
+                  attempt = 2 if run == 40706439005 else 1
+                  job_name = f'{cell}-{run}-{attempt}'
                   for runner in task_runners[run]:
                       results = runner_root / f'atomesh-runner-{runner:02d}/_work/ATOM/ATOM/atomesh-results'
                       recorded_root = results / f'{cell}.log-root'
@@ -75,9 +76,14 @@ jobs:
           print('TARGET NODE AVAILABILITY:', result.stdout.strip(), flush=True)
           for job_id in sorted(set(jobs)):
               for command in (
-                  ['squeue', *controller_args, '--noheader', '--jobs', job_id, '--format', '%A|%T|%M|%N|%R'],
-                  ['sacct', *controller_args, '--jobs', job_id, '--noheader', '--format', 'JobID%30,State%30,ExitCode%20'],
+                  ['squeue', *controller_args, '--noheader', '-j', job_id, '--format', '%A|%T|%M|%N|%R'],
+                  ['sacct', *controller_args, '-j', job_id, '--noheader', '--format', 'JobID%30,State%30,ExitCode%20'],
               ):
                   result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=20)
-                  print('TASK STATE:', job_id, result.returncode, result.stdout.strip(), flush=True)
+                  lines = []
+                  for line in result.stdout.splitlines():
+                      fields = re.split(r'[|\s]+', line.strip())
+                      if fields and fields[0].split('.')[0] == job_id:
+                          lines.append(line.strip())
+                  print('TASK STATE:', job_id, result.returncode, lines, flush=True)
           PYCODE
