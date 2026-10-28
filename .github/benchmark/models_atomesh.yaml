@@ -1240,6 +1240,233 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 512
 
+        # Kimi-K3 P/D on InferenceX's AgentX recipe
+        # (kimik3-fp4-mi355x-atom-agentic-mtp, SemiAnalysisAI/InferenceX#4085 and
+        # #4307), one cell per concurrency on the prefill that measured best
+        # there:
+        #
+        #   CONC 1      TP8EP8 prefill, mono TP8 decode, seven DSpark drafts
+        #   CONC 2, 4   TP8EP8 prefill, TP8 decode, seven drafts
+        #   CONC 16     TP8EP8xDCP8 prefill, TP8xDCP8 decode, four drafts
+        #   CONC 32-88  PP8xTP1 prefill, TP8xDCP8 decode, four drafts
+        #
+        # The decode runs the recipe: the drafter's linears unquantized,
+        # max_num_seqs 2 * CONC (at least 32), ReplaySSM and a 128 GiB per-rank
+        # CPU tier from CONC 16, comm-group reuse from CONC 56. CONC 32 and 88
+        # are not in the recipe and take the neighbouring band. From CONC 48 the
+        # prefill's state cache is the PD recipe's
+        # (recipes/mesh/Agentic-Kimi-K3.md): on-demand KDA checkpoints at
+        # observed shared-prefix targets, and a 128 GiB state cap carved from a
+        # 224 GiB per-rank pool, which leaves paged KV 96 GiB per rank once
+        # state reaches its cap. The recipe's PrefillDelayer settings pace
+        # prefill against decode on one server, which neither P/D server does,
+        # so these cells leave them unset as the TP8 1P1D cells above do.
+        #
+        # Without DP attention an expert-parallel TP8 prefill keeps the tokens
+        # replicated, so there is no all-to-all: each rank owns 112 of the 896
+        # experts at full width and the routed partials take the same
+        # all-reduce as the TP-sharded MoE. It serves prompts faster than PP8
+        # through CONC 16; from CONC 32 one prompt at a time across all eight
+        # GPUs queues the long ones and PP8 wins.
+        #
+        # CONC 1 runs #4307's mono decode. Mono reads the KDA state as fp32, so
+        # both servers allocate it so, and refuses the decode's in_proj,
+        # f_b_proj, o_proj and shared-expert projections quantized. The
+        # prefill's own --online_quant_config, the last on its command line,
+        # keeps the other cells' quantization. Mono stays off elsewhere: at
+        # CONC 2 it lost to the plain TP8 decode.
+        - <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c1-mono
+          display_topology: 1P1D-TP8EP8-TP8-DSPARK7
+          concurrency: [1]
+          prefill:
+            <<: &kimi_k3_tp8ep8_prefill
+              workers: 1
+              tp: 8
+              extra_args: "--enable-expert-parallel"
+            extra_args: >-
+              --enable-expert-parallel
+              --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","layers.*.self_attn.fused_qkv_a_proj","layers.*.self_attn.q_b_proj","layers.*.self_attn.kv_b_proj","layers.*.self_attn.o_proj","layers.*.mlp.gate_up_proj","layers.*.mlp.down_proj","context_proj"]}
+          server:
+            common_args:
+              <<: &kimi_k3_pd_dspark7_args
+                <<: *kimi_k3_agentic_dspark7_args
+                online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","layers.*.self_attn.fused_qkv_a_proj","layers.*.self_attn.q_b_proj","layers.*.self_attn.kv_b_proj","layers.*.self_attn.o_proj","layers.*.mlp.gate_up_proj","layers.*.mlp.down_proj","context_proj"]}'
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","layers.*.self_attn.fused_qkv_a_proj","layers.*.self_attn.q_b_proj","layers.*.self_attn.kv_b_proj","layers.*.self_attn.o_proj","layers.*.mlp.gate_up_proj","layers.*.mlp.down_proj","context_proj","*self_attn.in_proj*","*self_attn.f_b_proj*","*self_attn.o_proj*","*shared_experts.gate_up_proj*","*shared_experts.down_proj*"]}'
+          env:
+            common:
+              <<: &kimi_k3_pd_env
+                AITER_LOG_LEVEL: WARNING
+                ATOM_ENABLE_REPLAYSSM: "0"
+                ATOM_MONO_ENABLE: "0"
+                # While requests wait on remote KV, the decode polls again for
+                # up to 5 ms after each forward, so KV that landed during it is
+                # scheduled the next step. PP engines (the prefill) ignore it.
+                ATOM_KV_POLL_FRESH_WAIT_MS: "5"
+              ATOM_MONO_ENABLE: "1"
+              ATOM_GDN_SSM_DTYPE: fp32
+            prefill: &kimi_k3_pd_prefill_env
+              # Hand decode the prompt ids as base64 int32, not a JSON list
+              # that every hop re-parses (~670K ints at 1M context).
+              ATOM_PD_PROMPT_IDS_B64: "1"
+            decode: &kimi_k3_pd_decode_env
+              # Stream the prefill's first token when the request's KV lands,
+              # not with the first local decode's deferred output.
+              ATOM_PD_EARLY_T0: "1"
+
+        - <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c2
+          display_topology: 1P1D-TP8EP8-TP8-DSPARK7
+          concurrency: [2]
+          prefill: *kimi_k3_tp8ep8_prefill
+          server:
+            common_args: *kimi_k3_pd_dspark7_args
+          env:
+            common: *kimi_k3_pd_env
+            prefill: *kimi_k3_pd_prefill_env
+            decode: *kimi_k3_pd_decode_env
+
+        - <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c4
+          display_topology: 1P1D-TP8EP8-TP8-DSPARK7
+          concurrency: [4]
+          prefill: *kimi_k3_tp8ep8_prefill
+          server:
+            common_args: *kimi_k3_pd_dspark7_args
+          env:
+            common: *kimi_k3_pd_env
+            prefill: *kimi_k3_pd_prefill_env
+            decode: *kimi_k3_pd_decode_env
+
+        - <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8ep8-dcp8-dspark4-agentic-lmcache-1m-c16
+          display_topology: 1P1D-TP8EP8-DCP8-DSPARK4
+          concurrency: [16]
+          prefill:
+            <<: *kimi_k3_tp8ep8_prefill
+            dcp: 8
+          decode: &kimi_k3_dcp8_decode
+            workers: 1
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+          server:
+            common_args: &kimi_k3_pd_dspark4_args
+              <<: *kimi_k3_pd_dspark7_args
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.36
+          env:
+            common: &kimi_k3_pd_replay_env
+              <<: *kimi_k3_pd_env
+              ATOM_ENABLE_REPLAYSSM: "1"
+            prefill:
+              <<: [*kimi_k3_agentic_lmcache128_env, *kimi_k3_pd_prefill_env]
+            decode: *kimi_k3_pd_decode_env
+
+        # The PP8 prefill is eight one-GPU stages. Only the last holds the
+        # drafter, so its stage is cut to nine layers, on AttnRes block
+        # boundaries, to even out the KV block count every stage shares. It runs
+        # eager, since a P/D producer never decodes, and compiles every
+        # M-bucketed prefill GEMM at startup. Its own --online_quant_config, the
+        # last on the command line and so the one that wins, also keeps the
+        # unsharded KDA gate GEMM in bf16; it has no spaces because the launcher
+        # word-splits extra_args.
+        #
+        # Each PP8 stage repacks its KV for the TP8xDCP8 decode on the MLA
+        # staging streams; at high priority a repack does not wait out the
+        # stage's next prefill forward.
+        - &kimi_k3_1p1d_pp8_dcp8
+          <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32
+          topology: 1p1d_pp8_dcp8
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK4
+          concurrency: [32]
+          prefill:
+            workers: 1
+            tp: 1
+            extra_args: >-
+              --pipeline-parallel-size 8
+              --enforce-eager
+              --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","layers.*.self_attn.fused_qkv_a_proj","layers.*.self_attn.q_b_proj","layers.*.self_attn.kv_b_proj","layers.*.self_attn.o_proj","layers.*.mlp.gate_up_proj","layers.*.mlp.down_proj","context_proj"]}
+          decode: *kimi_k3_dcp8_decode
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 64
+          env:
+            common: *kimi_k3_pd_replay_env
+            prefill: &kimi_k3_pp8_lmcache128_prefill_env
+              <<: [*kimi_k3_agentic_lmcache128_env, *kimi_k3_pd_prefill_env]
+              # The launcher exposes `tp` GPUs by default; the eight stages need all eight.
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
+              ATOM_WARMUP_GEMM_M_BUCKETS: "1"
+              ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
+            decode: *kimi_k3_pd_decode_env
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c48
+          concurrency: [48]
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 96
+          env:
+            common: &kimi_k3_pp8_ondemand_env
+              <<: *kimi_k3_pd_replay_env
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+            prefill: &kimi_k3_pp8_state128_prefill_env
+              <<: *kimi_k3_pp8_lmcache128_prefill_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "128"
+            decode: *kimi_k3_pd_decode_env
+
+        - &kimi_k3_1p1d_pp8_dcp8_c56
+          <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c56
+          concurrency: [56]
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 112
+          env:
+            common: &kimi_k3_pp8_reuse_env
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill: *kimi_k3_pp8_state128_prefill_env
+            decode: *kimi_k3_pd_decode_env
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 144
+          run_eval: true
+          eval_concurrency: [72]
+
+        # The prefill saturates at CONC 88, so its PP head keeps 16 batches in
+        # flight instead of one per stage, and each rank saves and loads the
+        # CPU tier on two threads.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 176
+          env:
+            common: *kimi_k3_pp8_reuse_env
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
+              ATOM_PP_MAX_INFLIGHT: "16"
+              OFFLOAD_COPY_WORKERS: "2"
+              OFFLOAD_LOAD_WORKERS: "2"
+            decode: *kimi_k3_pd_decode_env
+
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
