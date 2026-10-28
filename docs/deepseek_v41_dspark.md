@@ -138,38 +138,13 @@ a short-context target-only baseline; `online_sps` adds what serving adds.
 
 **An explicit `calibration_profile`** takes precedence. A profile carries the
 SPS table and **confidence temperatures**, which rescale the drafter's
-per-position survival probabilities; they are fitted against cumulative-survival
-ECE on training blocks and evaluated on held-out request hashes.
+per-position survival probabilities.
 
 Loading a profile validates the config and index-file hashes, model type, TP/DP/
 EP layout, cache types, graph mode and compilation level, GPU name and
 Torch/HIP versions, plus proposal width, batch coverage, positive finite
 temperatures and a non-increasing SPS table. Those hashes identify checkpoint
 metadata, not every weight byte. Recalibrate after a model or runtime change.
-
-### Fitting confidence temperatures
-
-For STS observations, start a **fixed-width** V4.1 server with
-`ATOM_DSPARK_CALIBRATION_DIR=/tmp/dspark-confidence`, then replay the deployment
-workload. Only TP rank zero records numeric confidence, accepted draft length,
-and a hash of the request ID. It pairs an observation with that same request's
-next verification, including zero acceptance. Every eighth step is sampled.
-Collection copies sampled tensors to CPU and synchronizes: do not use this run
-as a performance baseline. Separate directories are required for each process.
-The data contains no prompts or token IDs; request hashes do not identify
-conversation trajectories, so the holdout is not a trajectory-disjoint split.
-
-The SPS measurements are the startup sweep's cache file of the same deployment:
-
-```bash
-python -m atom.benchmarks.fit_dspark \
-  --sps-measurements ~/.cache/atom/dspark_sps/<key>.json \
-  --confidence /tmp/dspark-confidence/confidence.jsonl \
-  --output /tmp/dspark-profile.json
-```
-
-The fitter rejects mismatched deployment identities and insufficient holdout
-coverage. Inspect training and held-out ECE before adopting a profile.
 
 ### Online SPS correction
 

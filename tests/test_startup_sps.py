@@ -25,11 +25,9 @@ def test_table_is_a_monotone_latency_envelope_over_rows():
     assert all(b >= a for a, b in itertools.pairwise(latency))
 
 
-def test_uncovered_rows_extend_along_the_last_slope_only_when_asked():
+def test_uncovered_rows_extend_along_the_last_slope():
     points = [(6, 10.0), (12, 13.0)]
-    with pytest.raises(ValueError, match="cover"):
-        sps_table_from_points(points, 18)
-    latency = [1000 / v for v in sps_table_from_points(points, 18, extrapolate=True)]
+    latency = [1000 / v for v in sps_table_from_points(points, 18)]
     assert latency[18] == pytest.approx(16.0)
 
 

@@ -1060,23 +1060,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # Where DSpark's startup SPS sweep caches its per-deployment measurements
+    # (`atom/spec_decode/startup_sps.py`), keyed by the deployment identity.
+    # Unset: ~/.cache/atom/dspark_sps. Empty: measure on every start.
+    "ATOM_DSPARK_SPS_CACHE_DIR": lambda: os.getenv("ATOM_DSPARK_SPS_CACHE_DIR"),
     # Run the DSpark draft model eager, bypassing torch.compile, while leaving
     # the target compiled. Rollback lever for the draft's compiled path; prefer
     # it over --level 0, which disables compilation for BOTH models. Note that
     # --enforce-eager does NOT disable it: support_torch_compile keys off
     # compilation_config.level only (see atom/utils/decorators.py:485).
     # Default: False (compile the draft).
-    # Offline DSpark STS calibration: when set, rank 0 wraps the runner's
-    # forward/draft/commit to append confidence/acceptance records to this
-    # directory (`atom/benchmarks/dspark_capture.py`). Synchronizes on every
-    # sampled step; never set it on a serving deployment being measured.
-    # Where DSpark's startup SPS sweep caches its per-deployment measurements
-    # (`atom/spec_decode/startup_sps.py`), keyed by the deployment identity.
-    # Unset: ~/.cache/atom/dspark_sps. Empty: measure on every start.
-    "ATOM_DSPARK_SPS_CACHE_DIR": lambda: os.getenv("ATOM_DSPARK_SPS_CACHE_DIR"),
-    "ATOM_DSPARK_CALIBRATION_DIR": lambda: (
-        os.getenv("ATOM_DSPARK_CALIBRATION_DIR") or None
-    ),
     "ATOM_DSPARK_DISABLE_COMPILE": lambda: (
         os.getenv("ATOM_DSPARK_DISABLE_COMPILE", "0") == "1"
     ),

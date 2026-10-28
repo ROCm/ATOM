@@ -35,13 +35,13 @@ _WARMUP = 3
 _ITERS = 15
 
 
-def sps_table_from_points(points, max_rows, *, extrapolate=False):
+def sps_table_from_points(points, max_rows):
     """Dense steps/s per total query rows from measured (rows, ms) points.
 
     Several shapes can share a row count: keep the slower median, then a
     monotone latency envelope before interpolation. Past the largest measured
     row count -- graphs a DP cap never records -- latency continues along the
-    last measured slope when ``extrapolate``; otherwise coverage is required.
+    last measured slope.
     """
     grouped = {}
     for rows, ms in points:
@@ -52,8 +52,6 @@ def sps_table_from_points(points, max_rows, *, extrapolate=False):
     if not grouped:
         raise ValueError("No measured SPS points")
     xs = sorted(grouped)
-    if xs[-1] < max_rows and not extrapolate:
-        raise ValueError("Measured SPS points do not cover the deployment row limit")
     ys = np.maximum.accumulate([max(grouped[x]) for x in xs])
     grid = np.arange(max_rows + 1)
     latency = np.interp(grid, xs, ys)
@@ -236,7 +234,7 @@ def startup_sps_table(runner, qs, max_rows):
             except OSError as e:
                 logger.warning("DSpark SPS cache not written to %s: %s", path, e)
     table = sps_table_from_points(
-        [(r["rows"], r["target_ms"]) for r in records], max_rows, extrapolate=True
+        [(r["rows"], r["target_ms"]) for r in records], max_rows
     )
     if dist.get_rank() == 0:
         logger.info(

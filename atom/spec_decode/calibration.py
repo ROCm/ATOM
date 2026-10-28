@@ -58,8 +58,8 @@ def validate_calibration(profile, identity, *, width, max_batch):
         # they measured, and the cost of a shape depends on both.
         raise ValueError(
             "DSpark calibration predates graph-mode binding (no graph_mode / "
-            "compilation_level in its identity); regenerate it with "
-            "atom.benchmarks.fit_dspark, or drop it to measure at startup"
+            "compilation_level in its identity); drop it to measure the cost "
+            "curve at startup and fit temperatures online"
         )
     # Version-1 profiles could only be produced for plain TP. Retain
     # that compatibility, but never silently reinterpret one as DP or EP.
