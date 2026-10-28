@@ -525,7 +525,9 @@ class GatedDeltaNet(nn.Module):
                     ),
                     # Only when there is somewhere to put them; `h` is large and is
                     # dropped on return otherwise.
-                    keep_intermediate_states=ckpt is not None,
+                    keep_intermediate_states=(
+                        ckpt is not None or gdn_metadata.keep_intermediate_states
+                    ),
                 )
             # Init cache
             ssm_state.index_copy_(

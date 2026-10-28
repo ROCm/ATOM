@@ -209,6 +209,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                     self.dt_bias.detach().to(dtype=dtype), requires_grad=False
                 )
             out = super().forward(mixed_qkv, b, a, core_attn_out, layer_name)
+            self._track_mamba_states(forward_batch, mixed_qkv)
             # Chunked prefill rewrites the checkpoint in place. The ring
             # cursor has to drop the previous tenant's records or the next
             # verify folds them on top of that new state.
@@ -309,6 +310,73 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         )
 
         return core_attn_out
+
+    def _track_mamba_states(self, forward_batch: Any, mixed_qkv: torch.Tensor) -> None:
+        """Fill SGLang's mamba radix cache (extra_buffer) track slots.
+
+        SGLang's HybridLinearAttnBackend owns the prefix cache and computes the
+        track metadata, but the snapshot calls live inside its own GDN kernels,
+        which the plugin replaces. They are made here, after the ATOM forward,
+        through SGLang's helpers so the snapshot semantics stay defined there.
+        Every source is final by now: the conv window is read from the pre-conv
+        input, the SSM state from the chunk kernel's `h` or the runtime slot.
+        """
+        if (
+            forward_batch is None
+            or getattr(forward_batch, "mamba_track_mask", None) is None
+        ):
+            return
+        mode = forward_batch.forward_mode
+        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
+        if attn_backend is None:
+            return
+        linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+        metadata = getattr(linear_backend, "forward_metadata", None)
+        if metadata is None:
+            return
+        layer_cache = linear_backend.req_to_token_pool.mamba2_layer_cache(
+            self.layer_num
+        )
+        conv_states = layer_cache.conv[0]
+        # `h` is in the logical [K, V] layout; FlyDSL decode stores VK.
+        ssm_states = layer_cache.temporal
+        policy = getattr(self, "gdn_flydsl_policy", None)
+        if policy is not None and policy.decode:
+            ssm_states = ssm_states.transpose(-1, -2)
+
+        if mode.is_decode_or_idle():
+            linear_backend._track_mamba_state_decode(
+                forward_batch,
+                conv_states,
+                ssm_states,
+                metadata.mamba_cache_indices,
+                self.layer_num,
+            )
+            return
+        if not mode.is_extend():
+            return
+
+        from atom.model_ops.fla_ops.chunk import pop_last_intermediate_states
+
+        h = pop_last_intermediate_states()
+        if not metadata.has_mamba_track_mask:
+            return
+        track_conv_indices = metadata.track_conv_indices
+        if track_conv_indices is not None and track_conv_indices.numel() > 0:
+            # Only SGLang's GDN backend caches the destination slots; indexing
+            # the pool with a None would broadcast over every slot.
+            dst = getattr(metadata, "conv_states_mask_indices", None)
+            if dst is None:
+                rows = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                dst = metadata.mamba_track_indices[rows]
+            # [rows, state_len, dim] -> the pool's [slot, dim, state_len].
+            conv_states[dst] = mixed_qkv[track_conv_indices].transpose(1, 2)
+        if metadata.track_ssm_h_src.numel() > 0 and h is None:
+            raise RuntimeError(
+                "SGLang mamba radix cache needs the GDN chunk kernel's "
+                "intermediate states, but this prefill kept none."
+            )
+        linear_backend._track_mamba_state_extend(forward_batch, h, ssm_states, metadata)
 
     def _verify_cache_slots(self, forward_batch: Any) -> torch.Tensor | None:
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
@@ -904,6 +972,10 @@ class SGLangGDNForwardContext:
                 non_spec_state_indices_in_i64=idx_i64,
                 flydsl_prefill_metadata=_flydsl_prefill_metadata(
                     query_start_loc, forward_batch
+                ),
+                # SGLangGatedDeltaNet snapshots radix-cache states out of `h`.
+                keep_intermediate_states=bool(
+                    getattr(fm, "has_mamba_track_mask", False)
                 ),
                 **common_kwargs,
             )
