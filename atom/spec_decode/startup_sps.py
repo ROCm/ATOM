@@ -4,7 +4,8 @@
 Right after the decode token graphs are captured -- before the server accepts a
 request -- every (batch, q) graph the step can run is replayed and timed. The
 synthetic metadata is the one capture itself used, so the replays touch only
-what capture already wrote. The per-shape medians are reduced by MAX over TP
+what capture already wrote. The per-shape timings (one warmup, five timed,
+trimmed mean, as DeepInfer) are reduced by MAX over TP
 and DP (the slowest rank sets the step), interpolated into the dense
 `sps_table` the scheduler indexes by total query rows, and cached on disk keyed
 by the deployment identity, so a restart of the same deployment skips the
@@ -19,7 +20,6 @@ import inspect
 import json
 import logging
 import os
-import statistics
 import time
 from pathlib import Path
 
@@ -30,9 +30,12 @@ import torch.distributed as dist
 logger = logging.getLogger("atom")
 
 # Bump when what a cached point means changes.
-_FORMAT = 1
-_WARMUP = 3
-_ITERS = 15
+_FORMAT = 2
+# As DeepInfer's profile_decode_perf: one warmup replay, five timed, and the
+# mean after dropping the fastest and slowest.
+_WARMUP = 1
+_ITERS = 5
+_TRIM = 1
 
 
 def sps_table_from_points(points, max_rows):
@@ -169,17 +172,21 @@ def _measure(runner, shapes):
             for _ in range(_WARMUP):
                 forward()
             torch.cuda.synchronize()
-            times = []
+            # Record every replay's events, then wait once: no host round trip
+            # between replays.
+            events = []
             for _ in range(_ITERS):
                 start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
                 start.record()
                 forward()
                 end.record()
-                end.synchronize()
-                times.append(start.elapsed_time(end))
+                events.append((start, end))
+            torch.cuda.synchronize()
+            times = sorted(start.elapsed_time(end) for start, end in events)
         finally:
             reset_forward_context()
-        ms = _all_max(statistics.median(times))
+        kept = times[_TRIM : len(times) - _TRIM]
+        ms = _all_max(sum(kept) / len(kept))
         result.append({"batch": bs, "q": q, "rows": rows, "target_ms": ms})
     return result
 

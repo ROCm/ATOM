@@ -113,9 +113,10 @@ captured, before the server accepts a request, every captured (batch, q) decode
 graph is replayed and timed, as DeepInfer's startup `profile_decode_perf` does
 (`atom/spec_decode/startup_sps.py`). The replays use the synthetic metadata
 capture itself used, so no request state exists for them to disturb. Each
-shape takes 3 warmup and 15 timed target forwards (including eager regions and
-the LM head); the median is reduced by MAX over TP and DP, since the slowest
-rank sets the step. The points become a conservative monotone latency envelope,
+shape takes one warmup and five timed target forwards (including eager regions
+and the LM head), recorded back to back and read after a single synchronize;
+the mean without the fastest and slowest is reduced by MAX over TP and DP,
+since the slowest rank sets the step. The points become a conservative monotone latency envelope,
 interpolated per row; rows past the largest recorded graph (a DP graph cap)
 extend along the last measured slope. This requires `TR_HYBRID` token graphs.
 The sweep is cached in `ATOM_DSPARK_SPS_CACHE_DIR` (default
