@@ -170,6 +170,7 @@ class TestMultimodalInputs:
         [
             "Qwen3_5ForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
+            "Glm5NextForConditionalGeneration",
         ],
     )
     def test_online_and_offline_image_inputs_match(self, monkeypatch, architecture):
@@ -191,7 +192,12 @@ class TestMultimodalInputs:
 
         class Processor:
             def apply_chat_template(self, messages, **kwargs):
-                return "<|image_pad|> prompt"
+                image_token = (
+                    "<|image|>"
+                    if architecture == "Glm5NextForConditionalGeneration"
+                    else "<|image_pad|>"
+                )
+                return f"{image_token} prompt"
 
             def __call__(self, **kwargs):
                 images = kwargs.get("images")
@@ -859,3 +865,127 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
 
     asyncio.run(drive())
     assert events == ["initialize", "serving", "shutdown"]
+
+
+def _fake_video_reader(monkeypatch, video_specs):
+    """Replace file decoding while exercising ATOM's sampling and metadata path."""
+    import decord
+    import numpy as np
+
+    class Reader:
+        def __init__(self, path, ctx):
+            self.fps, self.frame_count = video_specs[path]
+
+        def get_avg_fps(self):
+            return self.fps
+
+        def __len__(self):
+            return self.frame_count
+
+        def get_batch(self, indices):
+            frame = np.full((2, 2, 3), self.fps, dtype=np.uint8)
+            return SimpleNamespace(asnumpy=lambda: np.stack([frame] * len(indices)))
+
+    monkeypatch.setattr(decord, "VideoReader", Reader)
+
+
+def test_sampled_video_keeps_original_timestamps(monkeypatch):
+    _fake_video_reader(monkeypatch, {"clip.mp4": (24, 96)})
+
+    frames, metadata = api_server._load_video_from_url("clip.mp4")
+
+    assert len(frames) == 8
+    assert metadata.total_num_frames == 96
+    assert metadata.fps == 24
+    assert metadata.frames_indices == [0, 12, 24, 36, 48, 60, 72, 84]
+    assert metadata.timestamps[::2] == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_video_with_unknown_fps_keeps_processor_fallback(monkeypatch):
+    _fake_video_reader(monkeypatch, {"clip.mp4": (0, 4)})
+
+    frames, metadata = api_server._load_video_from_url("clip.mp4")
+
+    assert len(frames) == 4
+    assert metadata.fps is None
+    assert metadata.frames_indices == [0, 1, 2, 3]
+
+
+def test_glm_video_metadata_stays_aligned_through_processor_input(monkeypatch):
+    import torch
+
+    from atom.entrypoints.openai.protocol import ChatMessage
+
+    _fake_video_reader(
+        monkeypatch,
+        {"first.mp4": (24, 96), "second.mp4": (30, 91)},
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_get_engine_config",
+        lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Glm5NextForConditionalGeneration"]
+            )
+        ),
+    )
+    received = {}
+
+    class Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            return "video prompt"
+
+        def __call__(self, **kwargs):
+            received.update(kwargs)
+            return {"input_ids": torch.tensor([[1, 2]])}
+
+    monkeypatch.setattr(api_server, "_get_multimodal_processor", Processor)
+    messages = [
+        ChatMessage(
+            role="user",
+            content=[
+                {"type": "video_url", "video_url": {"url": "first.mp4"}},
+                {"type": "video_url", "video_url": {"url": "second.mp4"}},
+            ],
+        )
+    ]
+
+    token_ids, _ = api_server._prepare_multimodal_inputs(messages, {})
+
+    assert token_ids == [1, 2]
+    assert received["do_sample_frames"] is False
+    assert [video[0].getpixel((0, 0))[0] for video in received["videos"]] == [
+        24,
+        30,
+    ]
+    first, second = received["video_metadata"]
+    assert first.frames_indices == [0, 12, 24, 36, 48, 60, 72, 84]
+    assert second.frames_indices == [0, 15, 30, 45, 60, 75, 90, 90]
+    assert second.timestamps[-2:] == [3.0, 3.0]
+
+
+def test_glm_rejects_mixed_image_and_video_before_decoding(monkeypatch):
+    from atom.entrypoints.openai.protocol import ChatMessage
+
+    monkeypatch.setattr(
+        api_server,
+        "_get_engine_config",
+        lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Glm5NextForConditionalGeneration"]
+            )
+        ),
+    )
+    monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: object())
+    messages = [
+        ChatMessage(
+            role="user",
+            content=[
+                {"type": "image_url", "image_url": {"url": "image.png"}},
+                {"type": "video_url", "video_url": {"url": "clip.mp4"}},
+            ],
+        )
+    ]
+
+    with pytest.raises(ValueError, match="Mixing images and videos"):
+        api_server._prepare_multimodal_inputs(messages, {})

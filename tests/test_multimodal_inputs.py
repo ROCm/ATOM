@@ -274,7 +274,11 @@ def test_kimi_preparation_expands_each_image_and_keeps_interleaving(image_module
 
 @pytest.mark.parametrize(
     "architecture",
-    ["Qwen3_5ForConditionalGeneration", "KimiK3ForConditionalGeneration"],
+    [
+        "Qwen3_5ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "Glm5NextForConditionalGeneration",
+    ],
 )
 def test_separate_images_bind_in_order_across_chat_turns(image_module, architecture):
     seen = {}
@@ -282,7 +286,12 @@ def test_separate_images_bind_in_order_across_chat_turns(image_module, architect
     class Processor:
         def apply_chat_template(self, messages, **kwargs):
             seen["messages"] = messages
-            return "<|image_pad|> first turn <|image_pad|> second turn"
+            marker = (
+                "<|image|>"
+                if architecture == "Glm5NextForConditionalGeneration"
+                else "<|image_pad|>"
+            )
+            return f"{marker} first turn {marker} second turn"
 
         def __call__(self, **kwargs):
             if "messages" in kwargs:
@@ -317,7 +326,16 @@ def test_separate_images_bind_in_order_across_chat_turns(image_module, architect
     assert conversation[1]["content"] is None
 
 
-def test_rendered_qwen_prompt_accepts_media_without_chat_messages(image_module):
+@pytest.mark.parametrize(
+    ("architecture", "marker"),
+    [
+        ("Qwen3_5ForConditionalGeneration", "<|image_pad|>"),
+        ("Glm5NextForConditionalGeneration", "<|image|>"),
+    ],
+)
+def test_rendered_prompt_accepts_media_without_chat_messages(
+    image_module, architecture, marker
+):
     seen = {}
 
     def processor(**kwargs):
@@ -328,9 +346,12 @@ def test_rendered_qwen_prompt_accepts_media_without_chat_messages(image_module):
             "image_grid_thw": np.array([[1, 2, 2]]),
         }
 
-    prompt = "<|vision_start|><|image_pad|><|vision_end|> Describe this image."
+    prompt = f"<|vision_start|>{marker}<|vision_end|> Describe this image."
     tokens, _ = prepare_multimodal_inputs(
-        config(), processor, prompt, {"image": image_module.new("RGB", (2, 2))}
+        config(architecture),
+        processor,
+        prompt,
+        {"image": image_module.new("RGB", (2, 2))},
     )
     assert tokens == [1, 42, 2]
     assert seen["text"] == [prompt]

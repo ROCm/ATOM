@@ -28,6 +28,9 @@ _MULTIMODAL_ARCH_TO_MODEL: dict[str, str] = {
 }
 
 _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
+    "Glm5NextForConditionalGeneration": (
+        "atom.models.glm5_next_image_processing.build_glm5_image_inputs"
+    ),
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.image_processing.build_inputs"
     ),
@@ -36,6 +39,8 @@ _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
         "atom.models.minimax_m3.image_processing.build_minimax_m3_inputs"
     ),
 }
+
+_TEXT_PROMPT_INPUT_BUILDERS = {"Glm5NextForConditionalGeneration"}
 
 # Architectures whose checkpoint ships its own processor rather than one
 # `AutoProcessor` can build. Selected before that fallback, so a model listed
@@ -78,7 +83,11 @@ def get_multimodal_input_builder(
         if architectures
         else None
     )
-    if builder is not None and is_text_prompt:
+    if (
+        builder is not None
+        and is_text_prompt
+        and architectures[0] not in _TEXT_PROMPT_INPUT_BUILDERS
+    ):
         raise ValueError(
             "This model's multimodal processor requires a chat conversation"
         )

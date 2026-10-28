@@ -147,7 +147,7 @@ support_model_arch_dict = {
         "atom.models.minimax_m3.vl.MiniMaxM3SparseForConditionalGenerationVL"
     ),
     "Glm5NextForConditionalGeneration": (
-        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
+        "atom.models.glm5_next.Glm5NextMultimodalModel"
     ),
 }
 # Mono decode by wrapping the loaded model: the installer runs after the drafter

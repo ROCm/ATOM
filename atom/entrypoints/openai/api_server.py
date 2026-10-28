@@ -18,22 +18,30 @@ if __name__ == "__main__":
     initialize_metrics()
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
 import logging
 import os
+import tempfile
 import time
+import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoProcessor, AutoTokenizer
+
+if TYPE_CHECKING:
+    from PIL import Image
+    from transformers.video_utils import VideoMetadata
 
 from atom import SamplingParams
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
@@ -659,6 +667,53 @@ def _has_multimodal_content(messages: list[Any]) -> bool:
     )
 
 
+def _load_video_from_url(
+    url: str,
+) -> tuple[list["Image.Image"], "VideoMetadata"]:
+    """Sample video frames while retaining their original timing metadata."""
+    from decord import VideoReader, cpu
+    from PIL import Image
+    from transformers.video_utils import VideoMetadata
+
+    temporary_path = None
+    if url.startswith("data:"):
+        try:
+            _, encoded = url.split(",", 1)
+            payload = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Invalid base64 data URL for video_url") from exc
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(payload)
+            temporary_path = path = handle.name
+    elif url.startswith(("http://", "https://")):
+        with urllib.request.urlopen(url, timeout=60) as response:
+            payload = response.read()
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(payload)
+            temporary_path = path = handle.name
+    else:
+        path = url.removeprefix("file://")
+    try:
+        reader = VideoReader(path, ctx=cpu(0))
+        fps = float(reader.get_avg_fps())
+        indices = list(range(0, len(reader), max(1, round(fps / 2.0))))[:256]
+        if len(indices) % 2:
+            indices.append(indices[-1])
+        frames = [
+            Image.fromarray(frame).convert("RGB")
+            for frame in reader.get_batch(indices).asnumpy()
+        ]
+        metadata = VideoMetadata(
+            total_num_frames=len(reader),
+            fps=fps if fps > 0 else None,
+            frames_indices=indices,
+        )
+        return frames, metadata
+    finally:
+        if temporary_path is not None:
+            os.unlink(temporary_path)
+
+
 def _get_multimodal_processor():
     global processor
     if processor is None:
@@ -678,6 +733,68 @@ def _get_multimodal_processor():
     return processor
 
 
+def _prepare_glm5_video_inputs(
+    conversation: list[dict[str, Any]],
+    sources: list[Any],
+    processor: Any,
+    chat_template_kwargs: dict[str, Any],
+    tools: Any = None,
+) -> tuple[list[int], dict[str, Any]]:
+    """Bind parsed video markers to sampled frames and matching metadata."""
+    videos: list[list[Image.Image]] = []
+    video_metadata: list[VideoMetadata] = []
+    processor_messages: list[dict[str, Any]] = []
+    for message in conversation:
+        content = message.get("content")
+        if not isinstance(content, list):
+            processor_messages.append({**message, "content": content or ""})
+            continue
+        video_parts = []
+        text_parts = []
+        for part in content:
+            if part["type"] == "video":
+                source_index = len(videos)
+                if source_index >= len(sources) or not isinstance(
+                    sources[source_index], str
+                ):
+                    raise ValueError("video content part must include a URL/path")
+                frames, metadata = _load_video_from_url(sources[source_index])
+                videos.append(frames)
+                video_metadata.append(metadata)
+                video_parts.append({**part, "video": frames})
+            elif part["type"] == "text":
+                text_parts.append(part["text"])
+        if text_parts:
+            video_parts.append({"type": "text", "text": "\n".join(text_parts)})
+        processor_messages.append({**message, "content": video_parts})
+
+    template_kwargs = dict(chat_template_kwargs)
+    template_kwargs.pop("tokenize", None)
+    template_kwargs.pop("add_generation_prompt", None)
+    if tools is not None:
+        template_kwargs["tools"] = tools
+    text = processor.apply_chat_template(
+        processor_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )
+    inputs = processor(
+        text=[text],
+        images=None,
+        videos=videos,
+        video_metadata=video_metadata,
+        do_sample_frames=False,
+        return_tensors="pt",
+    )
+    pixel_values = inputs.get("pixel_values_videos")
+    grid_thw = inputs.get("video_grid_thw")
+    return inputs["input_ids"][0].tolist(), {
+        "pixel_values": pixel_values,
+        "image_grid_thw": grid_thw,
+    }
+
+
 def _prepare_multimodal_inputs(
     messages: list[Any],
     chat_template_kwargs: dict[str, Any],
@@ -689,8 +806,28 @@ def _prepare_multimodal_inputs(
             for message in messages
         ]
     )
+    config = _get_engine_config()
+    architectures = (
+        getattr(getattr(config, "hf_config", None), "architectures", None) or []
+    )
+    if "video" in media and "Glm5NextForConditionalGeneration" in architectures:
+        if "image" in media:
+            raise ValueError(
+                "Mixing images and videos in one request is not supported yet"
+            )
+        if "audio" in media:
+            raise ValueError(
+                "Mixing audio and videos in one request is not supported yet"
+            )
+        return _prepare_glm5_video_inputs(
+            conversation,
+            media["video"],
+            _get_multimodal_processor(),
+            chat_template_kwargs,
+            tools=tools,
+        )
     return prepare_multimodal_inputs(
-        _get_engine_config(),
+        config,
         _get_multimodal_processor(),
         conversation,
         media,
