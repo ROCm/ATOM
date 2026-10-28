@@ -608,11 +608,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
-    # gfx1250 TP4: the decode all-reduce + residual add + Gemma RMSNorm runs
-    # aiter's one-launch Gluon kernel (ROCm/aiter#6923, #6924).
-    "ATOM_USE_GLUON_FUSED_ALLREDUCE_RMSNORM": lambda: (
-        os.getenv("ATOM_USE_GLUON_FUSED_ALLREDUCE_RMSNORM", "0") == "1"
-    ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
     # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
