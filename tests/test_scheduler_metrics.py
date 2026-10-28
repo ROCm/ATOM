@@ -220,12 +220,14 @@ def test_shared_cache_wait_metrics_do_not_retain_sequence():
     scheduler = DecodeScheduler(MockConfig())
     seq = Sequence([1, 2, 3, 4], block_size=4)
     scheduler.add(seq)
-    assert scheduler.allocate_waiting() == [seq]
+    msg = scheduler.build_prefill_batch()
+    assert [c.seq_id for c in msg.chunks] == [seq.id]
     retained = weakref.ref(seq)
 
-    # Release the scheduler's allocation without PrefillDone. Metrics must
+    # Release the scheduler's allocation without a batch result. Metrics must
     # not keep the sequence alive after its actual owner has released it.
-    scheduler.prefill_waiting.pop(seq.id)
+    scheduler.prefill_inflight.pop(seq.id)
+    scheduler._inflight_spans.pop(seq.id)
     scheduler.block_manager.deallocate(seq)
     del seq
     gc.collect()
@@ -233,18 +235,29 @@ def test_shared_cache_wait_metrics_do_not_retain_sequence():
 
 
 def test_shared_cache_wait_preserves_queue_metrics(clock):
+    from atom.model_engine.disagg_types import PrefillBatchDone, PrefillChunkResult
+
     scheduler = DecodeScheduler(MockConfig())
     seq = Sequence([1, 2, 3, 4], block_size=4)
     scheduler.add(seq)
     clock[0] += 2
-    assert scheduler.allocate_waiting() == [seq]
+    msg = scheduler.build_prefill_batch()
+    assert [c.seq_id for c in msg.chunks] == [seq.id]
     handler = EngineUtilityHandler(
         runner_mgr=None, output_queue=Queue(), label="Decode", scheduler=scheduler
     )
     assert handler.collect_metrics()["scheduler_metrics"]["waiting_kv"] == 1
 
     clock[0] += 3
-    scheduler.on_prefill_done(seq.id, 4, 5)
+    scheduler.on_prefill_batch_done(
+        PrefillBatchDone(
+            batch_id=msg.batch_id,
+            results=[
+                PrefillChunkResult(seq_id=seq.id, prefill_pos=4, sampled_token_id=5)
+            ],
+        )
+    )
+    scheduler.drain_prefill_completions()
     scheduled, seqs = scheduler.schedule()
     scheduler.metrics.record_forward(scheduled, seqs)
     snap = histogram_values_by_name(scheduler.metrics)

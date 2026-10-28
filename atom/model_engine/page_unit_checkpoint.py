@@ -1075,12 +1075,14 @@ class PagedStateCheckpointCoordinator:
         the only moment its slot holds the state as of a rung is between the
         chunk that ends there and the one after it -- inside another process,
         on a stream this one cannot order against. So the units are reserved
-        here, at admission, and the op travels in `BlockAssignment` for prefill
-        to execute between its two chunks, where stream order makes it free.
+        here, when the chunk is planned, and the op travels in the batch
+        message for prefill to execute between its two chunks, where stream
+        order makes it free.
 
-        The cost of reserving this early is that the units stay pinned for the
-        whole prefill rather than for one scheduling pass, which is what
-        `_checkpoint_has_room` and `has_available_units` are written against.
+        The cost of reserving this early is that the units stay pinned from the
+        chunk that produces the image until the one that writes it, rather than
+        for one scheduling pass -- which is what `_checkpoint_has_room` and
+        `has_available_units` are written against.
         Accepted deliberately as the first cut.
 
         Returns None when there is nothing to reserve -- the hash is already

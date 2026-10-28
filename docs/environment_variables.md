@@ -32,7 +32,11 @@ zero and keep the master switch enabled. Interval 0 leaves TP scheduling
 unchanged; setting only the master switch does not enable TP coalescing.
 On TP, the interval and coalescer are enabled together.
 This applies to the standard scheduler, including connector-based P/D roles.
-RapidServe's dedicated `PrefillScheduler`/`DecodeScheduler` do not use the delayer.
+RapidServe uses the same delayer, attached to its `DecodeScheduler`: decode
+plans both halves' batches, so one gate covers both. It is consulted in
+`build_prefill_batch`, and a rank already holding an in-flight prefill batch
+reports `prefillable=False` rather than skipping the call — the decision has to
+stay inside the cross-rank reduction or the group desynchronises.
 
 After each executed prefill, the decode interval runs before all coalescing
 bounds. Once it expires, fill, queue age, KV pressure, partial-prefill and stall

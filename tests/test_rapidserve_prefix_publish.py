@@ -1,26 +1,28 @@
 # SPDX-License-Identifier: MIT
 """Who registers a rapidserve request's prompt blocks for reuse.
 
-A block's hash is published only once its KV has actually been computed, so
-publishing is driven from `postprocess`, off the count of tokens the step just
-forwarded. The non-disagg path gets the offset for free by publishing before it
-advances:
+A block's hash is published only once its KV has actually been computed. The
+non-disagg path gets the offset for free by publishing before it advances:
 
     self.block_manager.hash_blocks(seq, chunk)   # base = num_cached_tokens
     seq.num_cached_tokens += chunk
 
-A rapidserve request is prefilled in the other process and learns about it in
-`on_prefill_done`, which advances immediately. By the time `postprocess` runs,
-the default base sits at the END of the prompt and `hash_blocks` computes
-`start >= end` -- it returns having registered nothing. The prompt never enters
-the content index, every later request sharing the prefix misses, and the only
-symptom is a prefix cache hit rate pinned at 0%.
-
-The inter-node P/D path already had this problem and solved it in
-`BlockManager.publish_loaded_prefix` ("the decode consumer has no local prefill
-postprocess to publish these prompt blocks"). Rapidserve needed the same thing,
-through `hash_blocks`' `start_tokens` override -- which exists for pipeline
+A rapidserve request is prefilled in the OTHER process, so there is no local
+forward to hang that off. What makes it work now is that decode PLANS the
+chunk: it records the span at dispatch (`_emit_chunk`) and publishes from the
+recorded start when the batch retires (`_apply_chunk_result`), through
+`hash_blocks`' `start_tokens` override -- which exists for pipeline
 parallelism, for the identical reason: an offset already bumped past the chunk.
+
+The bug this guards is what happens without that offset: the default base sits
+at the END of the prompt, `hash_blocks` computes `start >= end` and registers
+nothing. The prompt never enters the content index, every later request sharing
+the prefix misses, and the only symptom is a prefix cache hit rate pinned at
+0%.
+
+The inter-node P/D path had the same problem and solved it in
+`BlockManager.publish_loaded_prefix` ("the decode consumer has no local prefill
+postprocess to publish these prompt blocks").
 """
 
 from __future__ import annotations
@@ -109,31 +111,51 @@ class TestPublishedRange:
 # ── The offset is captured before it is destroyed ────────────────────────
 
 
-def test_the_offset_is_recorded_before_the_advance():
-    """One statement either side of this ordering is the whole fix. After the
-    advance, `num_cached_tokens` is where prefill has reached and the offset
-    the blocks start at is gone."""
+def test_the_span_is_recorded_at_dispatch():
+    """Decode plans the chunk, so it never has to reconstruct the span.
+
+    `_emit_chunk` runs while `num_cached_tokens` is still the chunk's start,
+    which is exactly the offset the publish needs -- so it is recorded there,
+    before anything advances past it.
+    """
     src = ast.get_source_segment(
-        SCHEDULER.read_text(), _method("DecodeScheduler", "on_prefill_done")
+        SCHEDULER.read_text(), _method("DecodeScheduler", "_emit_chunk")
     )
     assert src is not None
-    record = src.index("seq.pending_hash_start = seq.num_cached_tokens")
-    advance = src.index("seq.num_cached_tokens = prefill_pos")
-    assert record < advance
+    assert "start = seq.num_cached_tokens" in src
+    assert "seq.pending_hash_start = start" in src
+    assert "self._inflight_spans[seq.id] = (start, end, store_hash)" in src
+
+
+def test_the_publish_uses_the_recorded_start_not_the_advanced_offset():
+    """`hash_blocks` reads its base off `num_cached_tokens`, which this method
+    is about to move to the chunk's END. Handing the base in explicitly is the
+    whole fix; without it the call computes `start >= end` and registers
+    nothing."""
+    src = ast.get_source_segment(
+        SCHEDULER.read_text(), _method("DecodeScheduler", "_apply_chunk_result")
+    )
+    assert src is not None
+    publish = src.index("hash_blocks(seq, end - start, start_tokens=start)")
+    advance = src.index("seq.num_cached_tokens = end")
+    assert publish < advance
 
 
 def test_the_receive_thread_does_not_publish():
-    """`on_prefill_done` runs on the PrefillDone receive thread. Publishing
-    there mutates the block pool and the checkpoint coordinator that the engine
-    thread drains in `_flush_state_maintenance` -- so it records, and
-    `postprocess` publishes."""
-    fn = _method("DecodeScheduler", "on_prefill_done")
+    """The socket thread hands the message over and does nothing else.
+
+    Publishing mutates the block pool and the checkpoint coordinator that the
+    engine thread allocates out of in `build_prefill_batch`, so the work
+    belongs on that thread -- which is what `drain_prefill_completions` is.
+    """
+    fn = _method("DecodeScheduler", "on_prefill_batch_done")
     calls = {
         node.func.attr
         for node in ast.walk(fn)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert "hash_blocks" not in calls
+    assert calls <= {"put"}, f"the receive path must only enqueue, got {calls}"
 
 
 # ── postprocess routes on it ─────────────────────────────────────────────
@@ -158,13 +180,13 @@ def test_a_resumed_prefix_counts_as_hashed():
     """
     src = ast.get_source_segment(
         SCHEDULER.read_text(),
-        _method("DecodeScheduler", "_publish_prefill_hashes"),
+        _method("DecodeScheduler", "_apply_chunk_result"),
     )
     assert src is not None
     bump = src.index("seq.num_hashed_tokens = max(seq.num_hashed_tokens, start)")
-    # Before the publish, and outside the `num_new > 0` branch -- the whole
-    # point is the case where nothing is published.
-    assert bump < src.index("num_new = seq.num_cached_tokens - start")
+    # Before the publish -- the whole point is the case where the publish
+    # registers nothing because the request resumed entirely from cache.
+    assert bump < src.index("hash_blocks(seq, end - start")
 
 
 def test_the_recorded_offset_is_consumed_once():

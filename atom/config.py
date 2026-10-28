@@ -2085,14 +2085,15 @@ class Config:
 
     # Intra-GPU prefill/decode disaggregation
     enable_rapidserve: bool = False
-    # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages).
-    # Stays a single address with N decode ranks: many PUSHers to one PULLer is
-    # native ZMQ, and prefill does not care which rank sent an assignment.
+    # ZMQ IPC address: decode PUSH → prefill PULL (PrefillBatchMsg). Per-pair,
+    # because decode rank k plans batches only its own prefill rank may run:
+    # the block IDs inside are meaningful on that GPU and nowhere else.
     disagg_d2p_addrs: list = field(default_factory=list)
-    # The reverse direction is per-rank — prefill must deliver a PrefillDone to
-    # the ONE decode rank that owns the sequence — as is each bootstrap channel,
-    # since decode rank k pairs with prefill rank k on GPU k. Index = decode rank.
-    # ZMQ IPC address: prefill PUSH → decode PULL (PrefillDone messages)
+    # The reverse direction is per-rank too — prefill must deliver a batch
+    # result to the ONE decode rank that planned it — as is each bootstrap
+    # channel, since decode rank k pairs with prefill rank k on GPU k.
+    # Index = decode rank.
+    # ZMQ IPC address: prefill PUSH → decode PULL (PrefillBatchDone)
     disagg_p2d_addrs: list[str] = field(default_factory=list)
     # Bootstrap round 1: prefill PUSH → decode PULL (weight IPC handles)
     disagg_weight_ipc_addrs: list[str] = field(default_factory=list)
@@ -2110,9 +2111,6 @@ class Config:
     disagg_num_decode_ranks: int = 1
     # True for the decode process in disagg mode: skip GPU weight/kvcache allocation.
     disagg_is_decode: bool = False
-    # Name of the shared-memory region used for dynamic CU partitioning.
-    # Both prefill and decode processes open this to exchange batch sizes.
-    disagg_cu_shm_name: str = ""
     # Override max_num_seqs for the prefill process in disagg mode.
     # When None, prefill inherits the base max_num_seqs.
     disagg_prefill_max_num_seqs: int | None = None

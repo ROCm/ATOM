@@ -18,12 +18,11 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
+from atom.model_engine.scheduler import DecodeScheduler, PrefillExecutor, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
     get_exit_sequence,
-    new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
@@ -45,13 +44,13 @@ from atom.utils.gc_utils import (
 
 logger = logging.getLogger("atom")
 
-# How often a prefill engine reports its unapplied BlockAssignment backlog.
+# How often a prefill engine reports its undrained prefill-batch backlog.
 # Per receive thread, so a burst of 128 assignments logs once, not 128 times.
-_ASSIGNMENT_LOG_INTERVAL_S = 5.0
+_PREFILL_BACKLOG_LOG_INTERVAL_S = 5.0
 
 
 def _describe_prefill_queue(seqs: list) -> str:
-    """Summarize one PrefillScheduler queue: partial split, statuses, a sample.
+    """Summarize one PrefillExecutor queue: partial split, statuses, a sample.
 
     Counting a queue says a prompt is stuck; saying WHICH queue holds a
     `is_partial_prefill` sequence says why. `_schedule` builds its candidates
@@ -79,6 +78,7 @@ def _describe_prefill_queue(seqs: list) -> str:
         f" blocks={len(getattr(head, 'block_table', ()) or ())}"
     )
     return f"[n={len(seqs)} partial={partial} status={statuses}{progress}]"
+
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
@@ -1069,20 +1069,22 @@ _SCHED_DIM_KEYS = (
 
 
 class PrefillEngineCore(DPEngineCoreProc):
-    """Disaggregated prefill instance.
+    """Disaggregated prefill instance. Executes; does not schedule.
 
     Responsibilities:
-    - Runs only prefill forward passes (enforce_eager=True, no CUDA graphs).
-    - Receives BlockAssignment messages from DecodeEngineCore over a direct
-      ZMQ PULL socket (disagg_d2p_addr) and populates seq.block_table before
-      calling schedule().
-    - Runs each forward pass on a dedicated CUDA stream (_prefill_stream).
-      Records a CUDA event immediately after each forward; a separate watcher
-      thread polls the events and sends PrefillDone only after the GPU has
-      committed all KV writes — ensuring decode never reads a partial cache.
+    - Receives `PrefillBatchMsg` from DecodeEngineCore over a direct ZMQ PULL
+      socket (disagg_d2p_addr) — decode has already chosen the sequences, the
+      chunk widths and the checkpoint rungs, because it owns the BlockManager
+      and this process owns nothing to decide with.
+    - Runs the forward (enforce_eager=True, no CUDA graphs) on a dedicated CUDA
+      stream. `prefill_forward` is a blocking `wait_out=True` RPC that ends in
+      `stream.synchronize()`, so by the time it returns the whole batch's KV
+      writes have retired — which is what lets a single `PrefillBatchDone`
+      stand for every sequence in it.
     - Imports the KV cache tensor from decode via CUDA IPC at startup so that
       its forward pass writes directly into decode's GPU buffer.
-    - Does NOT sample tokens; completed sequences are discarded here.
+    - Samples the first token and proposes drafts, both of which ride back in
+      the batch result; it keeps no generated tokens of its own.
     """
 
     @property
@@ -1102,41 +1104,13 @@ class PrefillEngineCore(DPEngineCoreProc):
     def _maybe_attach_prefill_delayer(self, config: Config) -> None:
         """No-op: under rapidserve the delayer lives on the DECODE side.
 
-        Delaying prefill means not admitting a sequence yet, and admission is
-        decode's decision — decode owns the BlockManager, so it is the process
-        that would otherwise pin KV blocks for a prefill it has not scheduled.
-        Decode also has the two inputs this side lacks: real KV usage, and a
-        real decode batch to hide the hold behind. See
-        DecodeScheduler.allocate_waiting.
+        There is exactly ONE prefill gate now and it is decode's, because
+        decode is what builds the batch. It also has every input this side
+        lacks: real KV usage, a real decode batch to hide the hold behind, and
+        the queue of requests not yet admitted. See
+        `DecodeScheduler.build_prefill_batch`.
         """
         return
-
-    def _maybe_attach_prefill_group_delayer(self, config: Config) -> None:
-        """Attach `PrefillGroupDelayer` to this rank's `PrefillScheduler`.
-
-        A different gate from the one declined above: not about admission,
-        but about whether THIS SCHEDULER fires a forward this tick for
-        sequences it already holds, so every rank's forward carries at least
-        `min_tokens` instead of firing the moment one sequence lands. Reuses
-        `self.dp_group` -- the same CPU gloo group `_sync_dp_state` already
-        drives every busy_loop tick -- rather than standing up a second one.
-        """
-        if not envs.ATOM_ENABLE_PREFILL_GROUP_DELAYER or self.scheduler is None:
-            return
-        from atom.model_engine.prefill_delayer import PrefillGroupDelayer
-
-        min_tokens = (
-            envs.ATOM_PREFILL_GROUP_DELAYER_MIN_TOKENS or config.max_num_batched_tokens
-        )
-        self.scheduler.set_prefill_group_delayer(
-            PrefillGroupDelayer(
-                dp_size=config.parallel_config.data_parallel_size,
-                cpu_group=getattr(self, "dp_group", None),
-                min_tokens=min_tokens,
-                ttft_max_ticks=envs.ATOM_PREFILL_GROUP_DELAYER_TTFT_MAX_TICKS,
-                stall_ticks=envs.ATOM_PREFILL_GROUP_DELAYER_STALL_TICKS,
-            )
-        )
 
     def __init__(self, config: Config, input_address: str, output_address: str):
 
@@ -1148,26 +1122,19 @@ class PrefillEngineCore(DPEngineCoreProc):
         # handles are valid nowhere else — so each list is narrowed to one entry
         # and the loops below stay single-element fan-outs.
         self._pair_rank = config.disagg_decode_rank
-        # Assignments this process has matched onto a waiting sequence.
-        # Reported by the monitor: a backlog that never converts says the step
-        # that would convert it is not running.
-        self._assignments_applied = 0
+        # Batches this process has resolved onto its own sequences and run.
+        # Reported by the monitor: a queue that never drains says either the
+        # step that would drain it is not running, or a batch names a sequence
+        # whose ADD never arrived.
+        self._batches_applied = 0
         k = self._pair_rank
-        # PULL: BlockAssignment from THIS pair's decode rank only.
+        # PULL: PrefillBatchMsg from THIS pair's decode rank only.
         self._disagg_d2p_addr = config.disagg_d2p_addrs[k]
         self._disagg_p2d_addrs = config.disagg_p2d_addrs[k : k + 1]
         self._disagg_weight_ipc_addrs = config.disagg_weight_ipc_addrs[k : k + 1]
         self._disagg_weight_ack_addrs = config.disagg_weight_ack_addrs[k : k + 1]
         self._disagg_kvcache_ipc_addrs = config.disagg_kvcache_ipc_addrs[k : k + 1]
         self._num_decode_ranks = 1
-
-        # Maps seq_id → BlockAssignment, populated by the receiver thread.
-        self._pending_assignments: dict = {}
-        # seq_id → owning decode rank, learned from each BlockAssignment. The
-        # matching PrefillDone must go back to that rank and nowhere else: block
-        # IDs are per-rank, so delivering it elsewhere would apply them to a
-        # different rank's KV pool.
-        self._seq_target_rank: dict = {}
 
         # ZMQ context for disagg sockets (separate from the main engine sockets).
         self._disagg_ctx = zmq.Context()
@@ -1178,24 +1145,15 @@ class PrefillEngineCore(DPEngineCoreProc):
 
         super().__init__(config, input_address, output_address)
         # Replace the base Scheduler created by EngineCore.__init__ with
-        # PrefillScheduler, which has no BlockManager and only schedules
-        # sequences whose assignment from decode has fully landed -- block
-        # table and, for a per-request-cache model, state slot. The base
-        # Scheduler may have started a KV event publisher with bound sockets;
-        # prefill never publishes, so release it instead of leaking a thread
-        # and an endpoint for the life of the process.
+        # PrefillExecutor, which has no BlockManager and schedules nothing --
+        # it holds this process's sequences and runs the batches decode plans.
+        # The base Scheduler may have started a KV event publisher with bound
+        # sockets; prefill never publishes, so release it instead of leaking a
+        # thread and an endpoint for the life of the process.
         if self.scheduler is not None:
             self.scheduler.shutdown_kv_events()
-        self.scheduler = PrefillScheduler(
-            config, disagg_cu_shm_name=config.disagg_cu_shm_name
-        )
+        self.scheduler = PrefillExecutor(config)
         self.utility_handler.scheduler = self.scheduler
-        # After both self.dp_group (set by DPEngineCoreProc.__init__ inside
-        # super().__init__ above) and self.scheduler exist -- this delayer
-        # reuses that same CPU gloo group, the one the MoE lockstep sync
-        # already uses, rather than standing up a second one.
-        self._maybe_attach_prefill_group_delayer(config)
-
 
     def _post_model_load_hook(self):
         """Round 1 bootstrap: export weights → send to decode → wait for ACK.
@@ -1291,14 +1249,14 @@ class PrefillEngineCore(DPEngineCoreProc):
 
         Called from run_engine() after super().__init__().  The kvcache+weight
         bootstrap was already sent inside _send_ready_signal(), so _init_disagg
-        only needs to set up the per-request BlockAssignment/PrefillDone channel.
+        only needs to set up the PrefillBatchMsg/PrefillBatchDone channel.
         """
         # # --- Create pool of CU-masked CUDA streams for prefill ---
         logger.info("PrefillEngineCore: creating prefill stream pool...")
         self.runner_mgr.call_func("create_prefill_stream_pool", wait_out=True)
         logger.info("PrefillEngineCore: prefill stream pool created")
 
-        # --- Open one PUSH socket per decode rank for PrefillDone ---
+        # --- Open one PUSH socket per decode rank for PrefillBatchDone ---
         # Prefill connects (not binds) so decode's PULL bind is ready first,
         # preventing messages from being dropped before decode connects.
         # Exactly one entry: the decode rank paired with this process.
@@ -1308,53 +1266,54 @@ class PrefillEngineCore(DPEngineCoreProc):
             s.connect(addr)
             self._p2d_socks.append(s)
 
-        # --- Start thread to receive BlockAssignment from decode ---
+        # --- Start thread to receive PrefillBatchMsg from decode ---
         # Prefill binds so decode's PUSH connect finds a ready socket.
-        self._assignment_sock = self._disagg_ctx.socket(zmq.PULL)
-        self._assignment_sock.bind(self._disagg_d2p_addr)
-        self._assignment_thread = threading.Thread(
-            target=self._recv_block_assignments,
+        self._batch_sock = self._disagg_ctx.socket(zmq.PULL)
+        self._batch_sock.bind(self._disagg_d2p_addr)
+        self._batch_thread = threading.Thread(
+            target=self._recv_prefill_batches,
             daemon=True,
-            name="PrefillEngineCore-AssignmentRecv",
+            name="PrefillEngineCore-BatchRecv",
         )
-        self._assignment_thread.start()
-        # Reports on a timer rather than on arrival. Every assignment for a
-        # burst lands within the first second, after which the receive thread
-        # blocks in recv() forever -- so an arrival-triggered report only ever
-        # samples the startup instant, when `waiting` is legitimately 0
-        # (add_request sends decode's ADD before prefill's, so decode can admit
-        # and assign before prefill's copy is even on the wire).
-        self._assignment_monitor_thread = threading.Thread(
-            target=self._monitor_assignment_backlog,
+        self._batch_thread.start()
+        # Reports on a timer rather than on arrival: the receive thread blocks
+        # in recv() between batches, so an arrival-triggered report only ever
+        # samples the instant a batch lands, when a stall is least visible.
+        self._batch_monitor_thread = threading.Thread(
+            target=self._monitor_prefill_backlog,
             daemon=True,
-            name="PrefillEngineCore-AssignmentMonitor",
+            name="PrefillEngineCore-BatchMonitor",
         )
-        self._assignment_monitor_thread.start()
+        self._batch_monitor_thread.start()
 
-    def _monitor_assignment_backlog(self):
-        """Report held-but-unapplied assignments on a timer, forever.
+    def _monitor_prefill_backlog(self):
+        """Report undrained prefill batches on a timer, forever.
 
-        Diagnostic for a prefill that never runs. `_apply_pending_assignments`
-        -- the only consumer of `_pending_assignments` -- is reachable solely
-        from `_process_engine_step`, which `DPEngineCoreProc.busy_loop` skips
-        whenever `_sync_dp_state` reports the whole group idle. An empty
-        `waiting` makes this rank idle, so if the ADD never lands the step is
-        skipped, assignments are never read, and `waiting` stays empty: nothing
-        recovers and nothing is logged. This thread sits outside that gate.
+        Diagnostic for a prefill that never runs. `_process_engine_step` -- the
+        only consumer of the batch queue -- is reachable solely from
+        `DPEngineCoreProc.busy_loop`, which skips it whenever `_sync_dp_state`
+        reports the whole group idle. A batch that arrives but can never be
+        resolved (its sequence's ADD never landed) therefore keeps this rank
+        claiming work while nothing drains it, and nothing else would say so.
+        This thread sits outside that gate.
+
+        It matters more than it used to. Decode keeps ONE batch outstanding, so
+        a batch that cannot be resolved does not hold up one request -- it
+        holds up the whole pair, and decode will not plan another until this
+        one reports back.
 
         Steady state readings, once the burst has settled:
-          backlog>0, waiting=0  -> assignments arrive, the ADD does not
+          backlog>0, waiting=0  -> batches arrive, the ADD does not
           backlog>0, waiting>0  -> both arrived; the stall is downstream
-          backlog=0, waiting>0  -> assignments were applied; stall is in
-                                   schedule() or the worker RPC
+          backlog=0, waiting>0  -> batches were applied; stall is in the
+                                   worker RPC
         """
         while True:
-            time.sleep(_ASSIGNMENT_LOG_INTERVAL_S)
+            time.sleep(_PREFILL_BACKLOG_LOG_INTERVAL_S)
             sched = self.scheduler
             if sched is None:
                 continue
-            with sched._pending_lock:
-                backlog = len(self._pending_assignments)
+            backlog = sched.pending_batch_count
             waiting_q = list(getattr(sched, "waiting", ()))
             running_q = list(getattr(sched, "running", ()))
             waiting = len(waiting_q)
@@ -1372,18 +1331,16 @@ class PrefillEngineCore(DPEngineCoreProc):
             # A dummy forward in flight for longer than one report interval is
             # not slow, it is stuck: this is an empty batch, not real work.
             since = self._dummy_inflight_since
-            stuck_for = (
-                f"{time.monotonic() - since:.1f}s" if since is not None else "-"
-            )
+            stuck_for = f"{time.monotonic() - since:.1f}s" if since is not None else "-"
             logger.info(
-                "PrefillEngineCore[pair %d]: assignment backlog=%d | waiting=%d "
+                "PrefillEngineCore[pair %d]: batch backlog=%d | waiting=%d "
                 "running=%d | applied=%d | adds_received=%d queued=%d | "
                 "dummy_done=%d dummy_inflight=%s | waiting%s running%s",
                 self._pair_rank,
                 backlog,
                 waiting,
                 running,
-                self._assignments_applied,
+                self._batches_applied,
                 self._adds_received,
                 self.input_queue.qsize(),
                 self._dummy_seq,
@@ -1392,84 +1349,62 @@ class PrefillEngineCore(DPEngineCoreProc):
                 _describe_prefill_queue(running_q),
             )
 
-    def _recv_block_assignments(self):
-        """Background thread: pulls BlockAssignment messages from decode."""
-        from atom.model_engine.disagg_types import BlockAssignment, DisaggMsgType
+    def _recv_prefill_batches(self):
+        """Background thread: pulls PrefillBatchMsg messages from decode."""
+        from atom.model_engine.disagg_types import DisaggMsgType
 
-        sock = self._assignment_sock
+        sock = self._batch_sock
         while True:
             try:
                 raw = sock.recv()
             except zmq.error.ContextTerminated:
                 break
             msg_type, payload = pickle.loads(raw)
-            if msg_type == DisaggMsgType.BLOCK_ASSIGNMENT:
-                assignment: BlockAssignment = payload
-                with self.scheduler._pending_lock:
-                    self._pending_assignments[assignment.seq_id] = assignment
-                    self._seq_target_rank[assignment.seq_id] = assignment.target_rank
+            if msg_type == DisaggMsgType.PREFILL_BATCH:
+                # Onto the executor, not a queue of our own: `is_finished()`
+                # reads it, and that is what `_sync_dp_state` all-reduces to
+                # decide whether this rank needs a dummy forward at all.
+                self.scheduler.enqueue_batch(payload)
             elif msg_type == DisaggMsgType.ABORT:
-                seq_id = payload
-                with self.scheduler._pending_lock:
-                    self._pending_assignments.pop(seq_id, None)
-                # Also remove from waiting queue if present.
-                self.scheduler.waiting = type(self.scheduler.waiting)(
-                    s for s in self.scheduler.waiting if s.id != seq_id
-                )
-
-    def _apply_pending_assignments(self):
-        """Copy block assignments received from decode into waiting sequences.
-
-        Must be called at the top of each engine step before schedule().
-        """
-        with self.scheduler._pending_lock:
-            if not self._pending_assignments:
-                return
-            for seq in self.scheduler.waiting:
-                if seq.id in self._pending_assignments:
-                    assignment = self._pending_assignments.pop(seq.id)
-                    self._assignments_applied += 1
-                    seq.block_table = new_block_table(assignment.block_table)
-                    seq.num_cached_tokens = assignment.num_cached_tokens
-                    # The STATE slots decode allocated for this request. This
-                    # forward writes its state into them, and decode continues
-                    # from what it leaves there — the two processes carve the
-                    # same views over one per-request pool, so the index is all
-                    # that has to travel.
-                    seq.state_slots = list(assignment.state_slots)
-                    # Decode's cut and its reserved image. Prefill computes
-                    # neither -- it has no BlockManager -- it only honours them.
-                    seq.prefill_cuts = list(assignment.prefill_cuts)
-                    # Which decode rank sent this. Under the paired topology a
-                    # prefill process only ever serves its own decode rank, so
-                    # this is informational rather than a routing key.
-                    seq.disagg_target_rank = assignment.target_rank
+                # Decode has given up on this request; drop our copy so this
+                # rank can go idle. `drop` takes the executor's own lock -- the
+                # queue it edits is the one `apply_batch` reads.
+                self.scheduler.drop(payload)
 
     def _process_engine_step(self):
-        from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
+        from atom.model_engine.disagg_types import (
+            DisaggMsgType,
+            PrefillBatchDone,
+            PrefillChunkResult,
+        )
 
-        self._apply_pending_assignments()
-        # UNCONDITIONAL, and BEFORE has_requests(): see should_fire_this_tick's
-        # own docstring for why. In short -- has_requests() returns before
-        # schedule() is ever called on a rank with nothing locally ready, so a
-        # gate living inside schedule() would run on a busy rank but not an
-        # idle one, mismatching the collective call count every other rank's
-        # all_reduce expects and hanging the group. busy_loop's _sync_dp_state
-        # already guarantees this method is reached on every prefill rank or
-        # none, each tick -- this call has to sit inside that same guarantee,
-        # not behind a second, narrower one.
-        if not self.scheduler.should_fire_this_tick():
-            return False
-        if not self.scheduler.has_requests():
-            return False
-        result = self.scheduler.schedule()
-        if result is None:
-            return False
-        scheduled_batch, seqs = result
-        if scheduled_batch is None:
+        # Take at most one batch per tick, and leave it queued if it cannot be
+        # resolved yet: a batch may name a sequence whose ADD has not arrived,
+        # because the manager sends decode's copy of a request first and decode
+        # can plan a batch before this process has drained its own input queue.
+        msg = self.scheduler.peek_batch()
+        if msg is None:
+            # Reached only when ANOTHER rank has a batch and this one does not:
+            # `is_finished()` reports the batch queue, so a tick where every
+            # rank is empty is skipped by `busy_loop` before it gets here.
+            # Returning False then earns a `_execute_dummy_batch`, which is
+            # exactly right -- it matches the MoE collective the ranks holding
+            # a batch are about to enter.
             return False
 
-        # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
+        applied = self.scheduler.apply_batch(msg)
+        if applied is None:
+            # Sequences not here yet; retry next tick. The monitor thread is
+            # what makes a batch that never resolves visible.
+            return False
+        # `seqs` alongside the batch, as `schedule()` used to return it:
+        # `ScheduledBatch` consumes the mapping in `__init__` to derive
+        # `req_ids` and the per-seq arrays and keeps none of it, so the reply
+        # loop and the retirement below need their own reference.
+        scheduled_batch, seqs = applied
+        self.scheduler.drop_batch(msg)
+        self._batches_applied += 1
+
         self.scheduler.metrics.record_forward(scheduled_batch, seqs)
         t0 = time.perf_counter()
         sampled_token_ids, draft_token_ids = self.runner_mgr.call_func(
@@ -1477,100 +1412,45 @@ class PrefillEngineCore(DPEngineCoreProc):
         )
         iter_ms = (time.perf_counter() - t0) * 1000
         logger.info(
-            f"prefill iter {iter_ms:.2f}ms | "
+            f"prefill batch {msg.batch_id} {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} | "
             f"tokens={scheduled_batch.total_tokens_num}"
         )
 
-        # Notify decode that prefill is done, including the first generated token
-        # so decode can append it before its first decode step.
-        for i, (seq_id, num_tokens, token_id) in enumerate(
-            zip(
-                scheduled_batch.req_ids,
-                scheduled_batch.num_scheduled_tokens,
-                sampled_token_ids,
-            )
-        ):
-            # A chunked prompt sends one of these per chunk. The partial ones
-            # carry real KV -- decode publishes their hashes, which is how the
-            # blocks the checkpoint covers reach the content index -- but no
-            # token: the request is mid-prompt, so nothing was sampled for it
-            # and decode must not promote it to `running`.
-            # `seqs`, the dict `schedule()` returned alongside the batch --
-            # NOT `scheduled_batch.seqs`, which does not exist: the batch
-            # consumes the mapping in `__init__` to derive `req_ids` and the
-            # per-seq arrays, and keeps none of it.
-            seq = seqs.get(seq_id)
-            if seq is None:
-                # Unreachable: `ScheduledBatch.req_ids` IS `list(seqs.keys())`
-                # (scheduler.py:184) and this is that same mapping. Reported
-                # rather than defaulted, because `prefill_pos` is ABSOLUTE and
-                # the only number available without the seq is 0 -- which
-                # decode would read as "prefill is back at the start of the
-                # prompt" and act on.
-                logger.error(
-                    "%s: seq %s is in the batch but not its own seq mapping; "
-                    "no position to report",
-                    self.label,
-                    seq_id,
+        # ONE reply for the whole batch. `prefill_forward` is synchronous and
+        # ends in `stream.synchronize()`, so every sequence's KV has retired by
+        # the time this is built -- the guarantee is batch-granular, and so is
+        # the message. Decode also cannot dispatch again until it has the whole
+        # batch back, so a per-sequence reply would only be reassembled.
+        results = []
+        for i, chunk in enumerate(msg.chunks):
+            token_id = int(sampled_token_ids[i]) if i < len(sampled_token_ids) else -1
+            results.append(
+                PrefillChunkResult(
+                    seq_id=chunk.seq_id,
+                    prefill_pos=chunk.start + chunk.num_tokens,
+                    sampled_token_id=token_id,
+                    # Empty when no drafter ran here; decode substitutes
+                    # placeholders.
+                    draft_token_ids=(
+                        [int(d) for d in draft_token_ids[i]]
+                        if i < len(draft_token_ids)
+                        else []
+                    ),
+                    is_final=chunk.is_final_chunk,
                 )
-                continue
-            is_final = not seq.is_partial_prefill
-            # After the forward, not at schedule time: the runner reads this as
-            # the chunk's start offset, so advancing it earlier stages nothing.
-            #
-            # Unconditional, and in particular NOT gated on the rung the way
-            # the message below is. A chunk can be short because the rung said
-            # so OR because the token budget did, and only the second kind
-            # exists for a prompt with no rung at all -- gating the advance
-            # left those never advancing, so every pass re-ran the same first
-            # chunk. This is the prefill process's own copy of the sequence;
-            # decode sets its own from `PrefillDone.prefill_pos`, which is
-            # why that field has to be this absolute number rather than a
-            # per-chunk delta.
-            seq.num_cached_tokens += int(num_tokens)
-            # REPORT ONLY WHAT DECODE CAN ACT ON.
-            #
-            # A chunk that ends on a rung produced an image, and the pass that
-            # scattered it has now retired -- that is decode's cue to settle
-            # the record and publish the hashes the chunk filled. A chunk that
-            # merely ran out of budget produced neither: decode would advance
-            # an offset and publish a few blocks it can equally well publish
-            # with the next rung, having kept `pending_hash_start` across the
-            # gap for exactly this.
-            #
-            # The advance above stays UNCONDITIONAL -- see the comment on it.
-            # Only the message is gated; gating the offset deadlocked prefill.
-            if not (is_final or seq.prefill_landed_on_rung):
-                continue
-            done = PrefillDone(
-                seq_id=seq_id,
-                prefill_pos=int(seq.num_cached_tokens),
-                sampled_token_id=int(token_id),
-                # Empty when no drafter ran here; decode substitutes placeholders.
-                draft_token_ids=(
-                    [int(d) for d in draft_token_ids[i]]
-                    if i < len(draft_token_ids)
-                    else []
-                ),
-                is_final=is_final,
             )
-            # One socket: this prefill process serves exactly one decode rank.
-            # Only on the last chunk -- the routing entry is what lets a later
-            # chunk of the same prompt find its decode peer.
-            if is_final:
-                self._seq_target_rank.pop(seq_id, None)
-            self._p2d_socks[0].send(
-                pickle.dumps((DisaggMsgType.PREFILL_DONE, done))
+        # One socket: this prefill process serves exactly one decode rank.
+        self._p2d_socks[0].send(
+            pickle.dumps(
+                (
+                    DisaggMsgType.PREFILL_BATCH_DONE,
+                    PrefillBatchDone(batch_id=msg.batch_id, results=results),
+                )
             )
+        )
 
-        # Remove completed sequences — prefill produces no output tokens.
-        for seq in list(seqs.values()):
-            seq.status = SequenceStatus.FINISHED
-            try:
-                self.scheduler.running.remove(seq)
-            except ValueError:
-                pass
+        self.scheduler.retire_batch(seqs)
         return True
 
     @staticmethod
@@ -1618,11 +1498,11 @@ class DecodeEngineCore(DPEngineCoreProc):
 
     Responsibilities:
     - Owns the BlockManager and the KV cache tensor.
-    - On new request arrival: allocates KV blocks, sends BlockAssignment to
-      prefill, and holds the sequence in prefill_pending until PrefillDone
-      arrives.
-    - PrefillDone signals move the sequence into the decode scheduler's
-      running queue.
+    - Schedules BOTH halves of the pair. Each tick it plans a prefill batch
+      (allocating blocks, sizing chunks, choosing checkpoint rungs) and ships
+      it, then schedules its own decode batch, so the two forwards overlap.
+    - PrefillBatchDone moves finished sequences into the running queue and
+      mid-prompt ones back into the queue the next batch draws from.
     - Exports the kv_cache IPC handle to prefill at startup.
     - Runs normal CUDA-graph-accelerated decode.
     """
@@ -1656,9 +1536,9 @@ class DecodeEngineCore(DPEngineCoreProc):
         # same GPU — the IPC handles are only valid there.
         self._decode_rank = config.disagg_decode_rank
         k = self._decode_rank
-        # PUSH: BlockAssignment to THIS pair's prefill rank only.
+        # PUSH: PrefillBatchMsg to THIS pair's prefill rank only.
         self._disagg_d2p_addr = config.disagg_d2p_addrs[k]
-        self._disagg_p2d_addr = config.disagg_p2d_addrs[k]  # PULL: PrefillDone
+        self._disagg_p2d_addr = config.disagg_p2d_addrs[k]  # PULL: batch done
         self._disagg_weight_ipc_addr = config.disagg_weight_ipc_addrs[k]
         self._disagg_weight_ack_addr = config.disagg_weight_ack_addrs[k]
         self._disagg_kvcache_ipc_addr = config.disagg_kvcache_ipc_addrs[k]
@@ -1744,7 +1624,6 @@ class DecodeEngineCore(DPEngineCoreProc):
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
         self.scheduler = DecodeScheduler(
             config,
-            disagg_cu_shm_name=config.disagg_cu_shm_name,
             state_runtime=self.state_runtime,
         )
         # The block pool exists only now, so the freeze inside
@@ -1757,9 +1636,10 @@ class DecodeEngineCore(DPEngineCoreProc):
         # (decode defers scheduler creation); wire the real one in for MTP stats.
         self.utility_handler.scheduler = self.scheduler
         # Now that the scheduler exists, attach the prefill delayer. It gates
-        # DecodeScheduler.allocate_waiting, so KV blocks are not pinned for a
-        # sequence whose prefill is not ready to run, and every decode rank
-        # admits in the same tick.
+        # DecodeScheduler.build_prefill_batch -- the single prefill gate, now
+        # that decode is what builds the batch -- so KV blocks are not pinned
+        # for a prefill that is not worth running yet, and every decode rank
+        # dispatches in the same tick.
         #
         # Reaches past this class's own override, which exists only to DEFER
         # the attach out of super().__init__(). The base implementation is what
@@ -1810,7 +1690,7 @@ class DecodeEngineCore(DPEngineCoreProc):
 
         Called from run_engine() after __init__().  The kvcache+weight bootstrap
         was already handled in __init__(), so _init_disagg only sets up the
-        per-request BlockAssignment/PrefillDone channel.
+        PrefillBatchMsg/PrefillBatchDone channel.
         """
         # Create pool of CU-masked CUDA streams for decode forward passes.
         self.runner_mgr.call_func("create_decode_stream_pool", wait_out=True)
@@ -1823,17 +1703,24 @@ class DecodeEngineCore(DPEngineCoreProc):
         self._p2d_recv_sock = self._disagg_ctx.socket(zmq.PULL)
         self._p2d_recv_sock.bind(self._disagg_p2d_addr)
 
-        # Start thread to receive PrefillDone from prefill.
+        # Start thread to receive PrefillBatchDone from prefill.
         self._prefill_done_thread = threading.Thread(
-            target=self._recv_prefill_done,
+            target=self._recv_prefill_batch_done,
             daemon=True,
-            name="DecodeEngineCore-PrefillDoneRecv",
+            name="DecodeEngineCore-BatchDoneRecv",
         )
         self._prefill_done_thread.start()
 
-    def _recv_prefill_done(self):
-        """Background thread: receives PrefillDone messages from prefill."""
-        from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
+    def _recv_prefill_batch_done(self):
+        """Background thread: receives PrefillBatchDone messages from prefill.
+
+        Hands the message straight to the scheduler's queue and does nothing
+        else. Applying a completion publishes block hashes and settles
+        checkpoint records, both of which mutate structures the engine thread
+        is simultaneously allocating out of in `build_prefill_batch` -- so the
+        work belongs on that thread, in `drain_prefill_completions`.
+        """
+        from atom.model_engine.disagg_types import DisaggMsgType
 
         sock = self._p2d_recv_sock
         while True:
@@ -1842,21 +1729,13 @@ class DecodeEngineCore(DPEngineCoreProc):
             except zmq.error.ContextTerminated:
                 break
             msg_type, payload = pickle.loads(raw)
-            if msg_type != DisaggMsgType.PREFILL_DONE:
+            if msg_type != DisaggMsgType.PREFILL_BATCH_DONE:
                 continue
-            done: PrefillDone = payload
-            self.scheduler.on_prefill_done(
-                done.seq_id,
-                done.prefill_pos,
-                done.sampled_token_id,
-                done.draft_token_ids,
-                is_final=done.is_final,
-            )
+            self.scheduler.on_prefill_batch_done(payload)
             logger.info(
-                "DecodeEngineCore: seq %s prefill %s (computed to %d)",
-                done.seq_id,
-                "done, moved to running queue" if done.is_final else "rung landed",
-                done.prefill_pos,
+                "DecodeEngineCore: prefill batch %s done (%d chunk(s))",
+                payload.batch_id,
+                len(payload.results),
             )
 
     def _flush_state_maintenance(self):
@@ -1891,31 +1770,34 @@ class DecodeEngineCore(DPEngineCoreProc):
         )
         self.runner_mgr.call_func("flush_state_maintenance", ops, wait_out=True)
 
-    def _send_block_assignment(self, seq: Sequence):
-        """Send BlockAssignment to prefill for a newly allocated sequence."""
-        from atom.model_engine.disagg_types import BlockAssignment, DisaggMsgType
+    def _send_prefill_batch(self, msg) -> None:
+        """Ship one planned batch to this pair's prefill process."""
+        from atom.model_engine.disagg_types import DisaggMsgType
 
-        assignment = BlockAssignment(
-            seq_id=seq.id,
-            block_table=list(seq.block_table),
-            num_cached_tokens=seq.num_cached_tokens,
-            context_len=seq.num_tokens,
-            state_slots=list(seq.state_slots),
-            # Where to stop, and what to write there. Both computed by decode
-            # in `_prepare_prefill_checkpoint`; 0/None when this prompt has no
-            # rung, which is the unchunked path prefill has always taken.
-            prefill_cuts=list(seq.prefill_cuts),
-            target_rank=self._decode_rank,
-        )
-        self._d2p_sock.send(pickle.dumps((DisaggMsgType.BLOCK_ASSIGNMENT, assignment)))
+        self._d2p_sock.send(pickle.dumps((DisaggMsgType.PREFILL_BATCH, msg)))
         logger.info(
-            f"DecodeEngineCore: seq {seq.id} blocks assigned "
-            f"({len(assignment.block_table)} blocks), waiting for prefill"
+            "DecodeEngineCore: prefill batch %s dispatched (%d chunk(s), " "%d tokens)",
+            msg.batch_id,
+            len(msg.chunks),
+            sum(c.num_tokens for c in msg.chunks),
         )
+
+    def _send_prefill_abort(self, seq_id: int) -> None:
+        """Tell prefill to forget a request decode has abandoned.
+
+        Without it prefill keeps the `Sequence` in its queues forever, and
+        `is_finished()` reads off those queues -- so the rank never reports
+        idle and the whole prefill DP group keeps stepping, running a dummy
+        forward per tick for work that no longer exists.
+        """
+        from atom.model_engine.disagg_types import DisaggMsgType
+
+        self._d2p_sock.send(pickle.dumps((DisaggMsgType.ABORT, seq_id)))
 
     def pull_and_process_input_queue(self):
-        """Override: add new sequences to waiting queue, then allocate blocks
-        and send BlockAssignment to prefill for any that fit."""
+        """Override: add new sequences to the waiting queue.
+
+        Scheduling them is `_process_engine_step`'s job, not this one's."""
         exiting = False
         recv_reqs = []
         while not self.input_queue.empty():
@@ -1934,42 +1816,154 @@ class DecodeEngineCore(DPEngineCoreProc):
         # fire_vacuous, starving the process of everything else.
         return exiting
 
+    def _sync_decode_group_state(self) -> tuple[bool, bool]:
+        """One reduction carrying the two facts the whole decode group needs.
+
+        Returns ``(group_busy, any_decode_work)``.
+
+        ``group_busy`` -- ANY rank still holds a prefill batch. While that is
+        true no rank may dispatch, so the pair's prefill ranks all receive
+        their next batch on the same tick and forward together.
+
+        That lockstep is the whole point. The prefill DP group runs one forward
+        per step and its MoE all-to-all spans every rank, so a rank without a
+        batch does not idle -- it runs a dummy and BLOCKS inside the collective
+        until its peers finish their real forwards. The dummy is one sequence
+        of ``mtp_k + 1`` tokens; its cost is the wait, not the compute.
+        Dispatching independently therefore does not overlap anything, it just
+        splits the group: measured on an agentic warmup, only 4.05 of 8 ranks
+        started a real forward per step, 5 occurrences out of 356 had all
+        eight, and prefill ran at 51% occupancy with one ~1.8s dummy per real
+        1.9s chunk.
+
+        Holding a free rank until its peers finish costs nothing it was not
+        already paying at that collective.
+
+        Skipping the delayer while busy also keeps its coalescing episode
+        alive: a busy rank reports ``prefillable=False``, so with every rank
+        busy the delayer short-circuits on ``n_prefillable == 0``, which RESETS
+        ``_hold_ticks`` / ``_stall_count`` rather than holding. Measured on a
+        670k-token warmup: 58% of 5000 decisions were that vacuous reset, and
+        ``ttft_max_ticks`` was consequently never once reached.
+
+        ``any_decode_work`` -- some rank has a decode batch to run, so every
+        rank owes the group a forward, real or dummy. See `has_decode_work()`
+        for why that question is `running` OR `prefill_done`: `_schedule()`
+        promotes before it decides, and asking `running` alone stranded every
+        finished request.
+
+        BOTH are group decisions and both MUST be, because the things they
+        gate are collectives. "Busy" and "has decode work" are per-rank
+        conditions; acting on them locally is how a rank skips a reduction its
+        peers entered, and gloo matches collectives by arrival order rather
+        than by tag -- so the skipper pairs its next `_sync_dp_state` (3 int64)
+        against a peer's 8-int64 delayer reduction and the group wedges.
+
+        MUST itself be called on every decode rank on every tick that reaches
+        `_process_engine_step`, and BEFORE any per-rank early return in it --
+        it is subject to the same rule it exists to enforce.
+
+        Fail-open on a collective error, as `_sync_dp_state` does: no skip, and
+        assume work exists, which leaves every rank on exactly the path it took
+        before this method existed.
+        """
+        busy = self.scheduler.prefill_batch_inflight
+        work = self.scheduler.has_decode_work()
+        if not self._dp_lockstep:
+            return busy, work
+        buf = torch.tensor(
+            [1 if busy else 0, 1 if work else 0], dtype=torch.int64, device="cpu"
+        )
+        try:
+            torch.distributed.all_reduce(
+                buf, op=torch.distributed.ReduceOp.SUM, group=self.dp_group
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "%s: decode-group all_reduce failed (%s); not skipping the "
+                "delayer and assuming decode work exists",
+                self.label,
+                e,
+            )
+            return False, True
+        n_busy, n_work = (int(v) for v in buf.tolist())
+        return n_busy > 0, n_work > 0
+
     def _process_engine_step(self):
-        """Override: handle None from DecodeScheduler when prefill_waiting is
-        non-empty but running is empty (sequences are still being prefilled)."""
-        # Admission first, and BEFORE the early return. allocate_waiting ticks
-        # the prefill delayer, whose cross-DP all_reduce every decode rank must
-        # enter on the same iterations — a rank that returns early hangs the
-        # others. That holds here because busy_loop only reaches this method
-        # when the all-reduced global_has_unfinished (or the previous
-        # iteration's value, engines_running) says some rank has work, so the
-        # entry condition is itself identical on every rank. An idle cluster
-        # reaches neither, which is what stops the spin.
-        # Before `schedule()`, on the engine thread. Two reasons it cannot stay
-        # in `postprocess`: a partial chunk has no decode forward and so never
-        # reaches one, and a checkpoint filed here is drained by the very next
-        # `schedule()` while the slot still holds what the chunk left in it.
-        self.scheduler.publish_landed_prefill_chunks()
-        newly_allocated = self.scheduler.allocate_waiting()
-        if newly_allocated:
-            # Before the assignments go out, not after. Admission is what
-            # queues a checkpoint restore, and the forward that reads the
-            # restored slot is PREFILL's — in the other process, on a stream
-            # this one cannot order against. A ZMQ send is not a stream
-            # barrier, so the copy has to be finished, not merely issued,
-            # before prefill is told the request is ready.
+        """Schedule BOTH halves of the pair: prefill first, then decode.
+
+        Prefill is dispatched before this process runs its own forward, so the
+        two overlap on separate GPU streams -- which is the point of putting
+        them on one device in the first place.
+        """
+        # Completions first: a batch that has retired frees the in-flight slot,
+        # so this tick can plan the next one instead of waiting a tick for it.
+        # On the engine thread, because applying a completion publishes block
+        # hashes and settles checkpoint records against the same block pool
+        # `build_prefill_batch` is about to allocate from.
+        self.scheduler.drain_prefill_completions()
+        if self.scheduler.pending_aborts:
+            with self.scheduler._prefill_lock:
+                aborted = self.scheduler.pending_aborts
+                self.scheduler.pending_aborts = []
+            for seq_id in aborted:
+                self._send_prefill_abort(seq_id)
+        # UNCONDITIONAL, and BEFORE every return below. Both facts it reduces
+        # gate a collective -- the delayer's tick and this step's forward -- so
+        # deciding either locally is how a rank skips a reduction its peers
+        # entered. busy_loop only reaches this method when the all-reduced
+        # global_has_unfinished (or the previous iteration's engines_running)
+        # says some rank has work, so the entry condition is itself identical
+        # on every rank; an idle cluster reaches neither, which is what stops
+        # the spin.
+        group_busy, group_will_forward = self._sync_decode_group_state()
+
+        # `skip_delayer` is the all-reduced answer, never this rank's own: the
+        # delayer's own tick is a cross-DP all_reduce, so the group skips it
+        # together or not at all. It doubles as the dispatch gate -- while ANY
+        # rank is mid-flight nobody plans a batch, so the pair's prefill ranks
+        # receive theirs on the same tick and forward together instead of
+        # splitting the group between real work and blocked dummies.
+        prefill_batch = self.scheduler.build_prefill_batch(skip_delayer=group_busy)
+        if prefill_batch is not None:
+            # Before the batch goes out, not after. Admission is what queues a
+            # checkpoint restore, and the forward that reads the restored slot
+            # is PREFILL's — in the other process, on a stream this one cannot
+            # order against. A ZMQ send is not a stream barrier, so the copy
+            # has to be finished, not merely issued, before prefill is told to
+            # run.
             self._flush_state_maintenance()
-            for seq in newly_allocated:
-                self._send_block_assignment(seq)
-        if not self.scheduler.has_requests():
-            return False
+            self._send_prefill_batch(prefill_batch)
+        # UNCONDITIONAL, whatever the gate said. `schedule()` is not merely a
+        # batch builder: it promotes `prefill_done` into `running`, and it runs
+        # `complete_previous_state_batch()`, "without which the pins taken by
+        # every resume accumulate forever and admission starves". Both of those
+        # are owed on every tick, and the ticks this gate fires on are exactly
+        # the ones where decode has no batch -- i.e. all of them, while a long
+        # prompt is prefilling. The gate decides whether a FORWARD happens, and
+        # nothing else.
         result = self.scheduler.schedule()
-        if result is None:
-            # Sequences exist but are still waiting for PrefillDone — spin.
-            return False
-        scheduled_batch, seqs = result
+        scheduled_batch, seqs = result if result is not None else (None, None)
         if scheduled_batch is None:
-            return False
+            # Nothing to forward on this rank.
+            #
+            # EVERY RANK RUNS EXACTLY ONE FORWARD PER STEP, real or dummy --
+            # that is what keeps the MoE collective inside it matched, and
+            # `busy_loop` supplies the dummy for whoever returns False. So this
+            # rank owes a dummy only if some rank is forwarding; when none is,
+            # the whole group skips together on the same all-reduced value.
+            return not group_will_forward
+        if not group_will_forward:
+            # Unreachable: this rank's own `has_decode_work()` fed the
+            # reduction, so a batch here means the sum was at least one, and
+            # the collective fails open to True. Reported rather than assumed,
+            # because the two disagreeing is a hang -- this rank would forward
+            # into a collective the others skipped.
+            logger.error(
+                "%s: scheduled a decode batch after the group agreed not to "
+                "forward; has_decode_work() and _schedule() disagree",
+                self.label,
+            )
         self.scheduler.metrics.record_forward(scheduled_batch, seqs)
         t0 = time.perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)

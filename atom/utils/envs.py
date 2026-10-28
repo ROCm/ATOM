@@ -422,7 +422,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each was given, with the DP rank and which half produced it.
     #
     # The three schedulers build batches in three different methods
-    # (`Scheduler`, `PrefillScheduler`, `DecodeScheduler`), so without one tag
+    # (`Scheduler`, `PrefillExecutor`, `DecodeScheduler`), so without one tag
     # across all of them a baseline batch and a rapidserve batch cannot be
     # compared -- which is how "rapidserve chunks and baseline does not"
     # survived as long as it did, when both call the same `checkpoint_cut`.
@@ -1090,39 +1090,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A nonzero interval also enables local coalescing on TP without PP.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
-    ),
-    # --- PrefillGroupDelayer (per-rank barrier on PrefillScheduler itself) ---
-    # A different problem from PrefillDelayer above: that one gates when a NEW
-    # request becomes visible to prefill (DecodeScheduler.allocate_waiting);
-    # this one gates whether PREFILL ITSELF runs a forward this tick, for
-    # sequences it already holds a BlockAssignment for. And its release rule is
-    # a per-rank MIN, not PrefillDelayer's cross-rank SUM/average: hold every
-    # prefill rank until EACH ONE individually has min_tokens of ready prefill
-    # queued, release them together, then require the same bar to be cleared
-    # again. Master switch default OFF -- new, and a misconfigured threshold
-    # can genuinely stall a rank nothing is routed to; unlike PrefillDelayer
-    # this is not meant to be on by default.
-    "ATOM_ENABLE_PREFILL_GROUP_DELAYER": lambda: (
-        os.getenv("ATOM_ENABLE_PREFILL_GROUP_DELAYER", "0") == "1"
-    ),
-    # The per-rank token floor. Empty string => None => falls back to
-    # config.max_num_batched_tokens at construction (the literal "16k" in the
-    # common case of a 16384-token budget).
-    "ATOM_PREFILL_GROUP_DELAYER_MIN_TOKENS": lambda: (
-        None
-        if os.getenv("ATOM_PREFILL_GROUP_DELAYER_MIN_TOKENS", "") == ""
-        else int(os.getenv("ATOM_PREFILL_GROUP_DELAYER_MIN_TOKENS"))
-    ),
-    # Give-up bound #1: max consecutive ticks to hold before releasing anyway,
-    # even if some rank has not cleared min_tokens.
-    "ATOM_PREFILL_GROUP_DELAYER_TTFT_MAX_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_GROUP_DELAYER_TTFT_MAX_TICKS", "200")
-    ),
-    # Give-up bound #2: consecutive ticks the aggregate pending-token count may
-    # go without growing before releasing anyway (the burst stalled; waiting
-    # longer would not help).
-    "ATOM_PREFILL_GROUP_DELAYER_STALL_TICKS": lambda: int(
-        os.getenv("ATOM_PREFILL_GROUP_DELAYER_STALL_TICKS", "20")
     ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),

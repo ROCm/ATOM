@@ -372,23 +372,37 @@ class TestScheduleTicksTheWindow:
         all be deleted with its own test still passing."""
         from atom.model_engine.scheduler import DecodeScheduler
 
-        sched = DecodeScheduler(
-            MockConfig(enable_log_stats=True), disagg_cu_shm_name=""
-        )
+        sched = DecodeScheduler(MockConfig(enable_log_stats=True))
         stats = sched.engine_stats
         stats._throughput_last_log_time -= 43.0
         assert sched.schedule() is None  # nothing running: early return
         assert time.monotonic() - stats._throughput_last_log_time < 1.0
 
-    def test_prefill_scheduler_reports_its_prompt_tokens(self, seq_factory):
-        from atom.model_engine.scheduler import PrefillScheduler
+    def test_prefill_executor_reports_its_prompt_tokens(self, seq_factory):
+        """It has no `schedule()` to hang the tick off -- it schedules
+        nothing -- so the tick lives where a batch becomes real."""
+        from atom.model_engine.disagg_types import PrefillBatchMsg, PrefillChunk
+        from atom.model_engine.scheduler import PrefillExecutor
 
-        sched = PrefillScheduler(MockConfig(enable_log_stats=True))
+        sched = PrefillExecutor(MockConfig(enable_log_stats=True))
         seq = seq_factory([10, 20, 30, 40])
-        seq.block_table = [0, 1]
-        seq.num_cached_tokens = 0
         sched.add(seq)
-        sched.schedule()
+        sched.apply_batch(
+            PrefillBatchMsg(
+                batch_id=0,
+                target_rank=0,
+                cu_stream_fraction=None,
+                chunks=[
+                    PrefillChunk(
+                        seq_id=seq.id,
+                        start=0,
+                        num_tokens=4,
+                        is_final_chunk=True,
+                        block_table=[0, 1],
+                    )
+                ],
+            )
+        )
         assert sched.engine_stats.num_prompt_tokens == 4
 
 

@@ -6,7 +6,6 @@ import copy
 import hashlib
 import logging
 import multiprocessing
-import multiprocessing.shared_memory
 import os
 import pickle
 import queue
@@ -2001,8 +2000,8 @@ class DisaggCoreManager(CoreManager):
         # it receives assignments for sequences the other N-1 are holding. Those
         # sequences never prefill (lost) and their ranks idle (slow).
         d2p_addrs = [get_open_zmq_ipc_path() for _ in range(n_pairs)]
-        # Everything prefill sends is per-rank: a PrefillDone must reach the one
-        # owner, and each bootstrap pairs decode rank k with prefill rank k.
+        # Everything prefill sends is per-rank: a batch result must reach the
+        # one owner, and each bootstrap pairs decode rank k with prefill rank k.
         p2d_addrs = [get_open_zmq_ipc_path() for _ in range(n_pairs)]
         # Bootstrap round 1: weight IPC handles (prefill → decode) + ACK (decode → prefill)
         weight_ipc_addrs = [get_open_zmq_ipc_path() for _ in range(n_pairs)]
@@ -2010,26 +2009,11 @@ class DisaggCoreManager(CoreManager):
         # Bootstrap round 2: kvcache handle + num_blocks (prefill → decode)
         kvcache_ipc_addrs = [get_open_zmq_ipc_path() for _ in range(n_pairs)]
 
-        # Shared memory for dynamic CU partitioning: 4 bytes (float32).
-        # DecodeScheduler writes the chosen CU fraction; PrefillScheduler reads it.
-        # 0.0 means no mask (None).
-        # Only created in constrained mode; unconstrained mode runs prefill
-        # and decode on plain separate streams with no CU coordination.
-        # Always created, not only under --disagg-constrained. Decode publishes
-        # its in-flight decode token count here every step and prefill reads it;
-        # CU partitioning is only ONE consumer of that number. The other is the
-        # prefill delayer, whose "is there decode to hide the wait behind?"
-        # signal cannot be answered from prefill's own scheduler — decode runs
-        # in a different process.
-        #
-        # 4 bytes PER PAIR: decode rank k writes at offset 4*k and prefill rank
-        # k reads there. One shared slot would have all N decode ranks
-        # overwriting each other.
-        cu_shm_name = f"atom_cu_split_{os.getpid()}"
-        self._cu_shm = multiprocessing.shared_memory.SharedMemory(
-            name=cu_shm_name, create=True, size=4 * n_pairs
-        )
-        self._cu_shm.buf[: 4 * n_pairs] = b"\x00" * (4 * n_pairs)
+        # No shared-memory channel between the halves. It used to carry
+        # decode's in-flight token count across to prefill, because prefill
+        # sized its own batches and had to guess how much GPU decode wanted.
+        # Decode now plans both batches, so it holds both operands and computes
+        # `cu_stream_fraction` directly, shipping it in the batch message.
 
         # Build per-process configs.
         from atom.utils import get_open_port as _get_open_port
@@ -2067,7 +2051,6 @@ class DisaggCoreManager(CoreManager):
             c.disagg_weight_ipc_addrs = weight_ipc_addrs
             c.disagg_weight_ack_addrs = weight_ack_addrs
             c.disagg_kvcache_ipc_addrs = kvcache_ipc_addrs
-            c.disagg_cu_shm_name = cu_shm_name
             c.disagg_is_decode = is_decode
             c.disagg_decode_rank = k
             c.disagg_num_decode_ranks = n_pairs
@@ -2309,7 +2292,7 @@ class DisaggCoreManager(CoreManager):
         decode_payload = pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
         self._send_request(dp_rank, decode_payload)
         # Prefill discards every sampled token except the first (which it
-        # ships in PrefillDone), so cap max_tokens at 1: the forward then
+        # ships in the batch result), so cap max_tokens at 1: the forward then
         # terminates after one generate step and num_scheduled_tokens
         # reflects only the prompt.
         prefill_seqs = []
@@ -2325,10 +2308,3 @@ class DisaggCoreManager(CoreManager):
 
     def close(self):
         super().close()
-        # Clean up dynamic CU partitioning shared memory (if created).
-        if getattr(self, "_cu_shm", None) is not None:
-            try:
-                self._cu_shm.close()
-                self._cu_shm.unlink()
-            except Exception:
-                pass

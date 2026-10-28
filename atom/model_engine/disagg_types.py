@@ -45,81 +45,103 @@ class DisaggMsgType(enum.Enum):
     (which uses 0x00–0x07).
     """
 
-    BLOCK_ASSIGNMENT = b"\xa0"  # decode → prefill: assign KV blocks for a new seq
-    PREFILL_DONE = b"\xa1"  # prefill → decode: prefill forward pass complete
+    PREFILL_BATCH = b"\xa0"  # decode → prefill: one batch to execute, as planned
+    PREFILL_BATCH_DONE = b"\xa1"  # prefill → decode: that batch's forward retired
     ABORT = b"\xa2"  # decode → prefill: cancel a pending sequence
 
 
 @dataclass
-class BlockAssignment:
-    """Sent from DecodeEngineCore to PrefillEngineCore when a new request arrives.
+class PrefillChunk:
+    """One sequence's share of a prefill batch decode has planned.
 
-    Decode allocates KV blocks via its BlockManager and notifies prefill so
-    prefill can write the prompt's K/V values into the correct physical blocks.
+    Decode owns the BlockManager, so it is the only half that can allocate,
+    find a prefix-cache hit, walk the checkpoint ladder or measure KV pressure.
+    It therefore decides EVERYTHING about this chunk -- which sequence, which
+    span, which rung -- and prefill only executes it. That is the inversion
+    this type encodes: it used to ship an *assignment* (blocks, and a
+    speculative ladder of rungs prefill would choose from) because prefill did
+    its own scheduling; it now ships a *decision*.
+
+    Carries no token ids. The prefill process already holds the whole
+    `Sequence`, prompt included, from the ADD that `DisaggCoreManager`
+    fans out to both members of a pair -- so repeating the prompt here would
+    re-send, per chunk, bytes the other side already has.
     """
 
     seq_id: int
-    block_table: list  # list[int] — physical block IDs owned by decode
-    num_cached_tokens: int  # prefix-cache hits; prefill skips these blocks
-    context_len: int  # total token count (prompt length)
-    # Which decode rank owns this sequence's KV. Under DP decode each rank has
-    # its own BlockManager and KV pool, so the block IDs above are meaningful
-    # only on THIS rank — prefill must route the matching PrefillDone back to it
-    # and must write the KV from the prefill TP rank sharing its GPU. Always 0
-    # for symmetric rapidserve (single decode rank).
-    target_rank: int = 0
+    # ABSOLUTE offset this chunk begins at: the `num_cached_tokens` prefill
+    # must adopt before the forward. Absolute rather than a delta because
+    # decode is the only owner of the offset now -- a delta would make
+    # prefill's local copy authoritative again, which is the thing being
+    # removed.
+    start: int
+    num_tokens: int  # chunk width; `start + num_tokens` is where it ends
+    # Whether this chunk finishes the prompt. Drives `is_partial_prefill` on
+    # the prefill side and `ScheduledBatch.is_final_chunk`, which is what makes
+    # `produces_output()` answer correctly for a middle chunk.
+    is_final_chunk: bool
+    # Physical block IDs owned by decode. Sent on a sequence's FIRST chunk only
+    # and None afterwards, meaning "unchanged": decode allocates the whole
+    # prompt at admission, so the table is stable for the rest of its life, and
+    # re-sending it per chunk is most of a long prompt's message cost.
+    block_table: list | None = None
     # Per-request STATE slot indices, in `Sequence.state_slots` order (index 0
-    # is the committed slot; the rest are speculative rollback slots).
-    #
-    # Same shape of problem the paged-SWA table used to solve, and its direct
-    # replacement: the PREFILL forward is what writes this request's
-    # compressor/recurrent state, but only decode owns `StateSlotPool` — so
-    # decode allocates and ships the indices here. What changed with #1771 is
-    # only what a slot holds: the sliding window became a ring inside the STATE
-    # entry rather than a parallel table of blocks, so one index per slot
-    # replaces a table positionally aligned with `block_table`.
-    #
-    # An index means the same bytes in both processes only because they share
-    # one per-request pool over CUDA IPC (`shares_per_req_cache`). Empty list
-    # for a model with no per-request state.
+    # is the committed slot; the rest are speculative rollback slots). Decode
+    # allocates them; prefill writes this request's compressor/recurrent state
+    # into them. An index means the same bytes in both processes only because
+    # they share one per-request pool over CUDA IPC (`shares_per_req_cache`).
+    # Empty for a model with no per-request state.
     state_slots: list = field(default_factory=list)
-    # Ascending `(cut, CheckpointStoreOp)` pairs: every rung of the checkpoint
-    # ladder this prompt crosses, and the image reserved at each. Empty for a
-    # prompt with no rung, which is prefill's "run it on the budget alone".
+    # The ONE `CheckpointStoreOp` whose image this chunk's forward produces, or
+    # None. A checkpoint holds the state as of a forward's LAST token, so an op
+    # is only real if the forward ends exactly at its rung -- which is why
+    # decode shortens the chunk to that rung before filling this in
+    # (`_finalize_prefill_chunk` -> `checkpoint_cut`).
     #
-    # `cut` is where a forward must END. A checkpoint is filed under a block
-    # hash, so it sits on a hash-block boundary, and it holds the state as of a
-    # forward's last token -- so only a forward ending exactly there makes the
-    # image real. The ordinary scheduler gets this by shortening the chunk
-    # (`_finalize_prefill_chunk` -> `checkpoint_cut`); prefill has no
-    # BlockManager and can compute neither the rung nor the units, so decode
-    # computes both and sends them.
-    #
-    # A LIST because `checkpoint_cut` answers with the rightmost rung inside
-    # the window it is given: one question about a whole prompt returns one
-    # checkpoint near its end, where the ordinary scheduler asks once per chunk
-    # and walks the ladder. Decode steps the same budget-sized window here.
-    #
-    # The third instance of this pair's one contract: decode allocates
-    # (`block_table`, `state_slots`, these units), prefill writes.
-    prefill_cuts: list = field(default_factory=list)
+    # Singular, where the old `BlockAssignment.prefill_cuts` was a whole ladder:
+    # that list existed so a BlockManager-less prefill could pick a rung for
+    # itself. Decode picks it now, so it ships the one it chose.
+    store_op: object | None = None
+    # The token at `start + num_tokens`, for drafters that need the next token
+    # to propose from; -1 when there is none or the drafter does not want one.
+    # Decode holds the token ids, so it reads this rather than prefill.
+    next_token_id: int = -1
 
 
 @dataclass
-class PrefillDone:
-    """Sent from PrefillEngineCore to DecodeEngineCore after the forward pass.
+class PrefillBatchMsg:
+    """Sent from DecodeEngineCore to PrefillEngineCore: run exactly this.
 
-    Decode uses this signal to move the sequence from its prefill-pending
-    holding area into the active decode scheduler queue.
+    The unit of work is a BATCH, not a request. Decode schedules prefill the
+    same way it schedules itself -- pick the sequences, size the chunks against
+    one token budget -- and a batch is what that decision produces.
     """
 
+    batch_id: int
+    # Which decode rank planned this. Under DP decode each rank has its own
+    # BlockManager and KV pool, so the block IDs inside are meaningful only on
+    # that rank, and its paired prefill rank is the only one that may run them.
+    target_rank: int
+    # Fraction of CUs the prefill forward may use, or None for no mask. Decode
+    # computes it because decode is now the only half that knows both operands
+    # (its own batch's tokens and the prefill tokens it just planned) -- which
+    # is what retired the shared-memory channel that used to carry its decode
+    # token count across to prefill.
+    cu_stream_fraction: float | None
+    chunks: list  # list[PrefillChunk]
+
+
+@dataclass
+class PrefillChunkResult:
+    """What one chunk of a batch produced."""
+
     seq_id: int
-    # ABSOLUTE prompt position prefill has computed to, not this chunk's size.
-    # Prefill reports only the chunks that land on a checkpoint rung (plus the
-    # final one), so a delta would silently lose every suppressed chunk and
-    # leave decode's offset behind prefill's forever. An absolute position is
-    # also self-correcting: a message decode somehow misses costs it nothing
-    # once the next one arrives.
+    # Absolute position prefill computed to. Decode already knows this -- it
+    # planned the span -- so this is a CROSS-CHECK, not the source of truth:
+    # decode asserts it against the chunk it dispatched. It was authoritative
+    # while prefill owned the offset and reported only the chunks that landed
+    # on a rung; now that every dispatched chunk is acknowledged, a mismatch
+    # means the two sides have diverged and is worth failing on.
     prefill_pos: int
     sampled_token_id: int  # first generated token sampled from prefill logits
     # Speculative drafts for the token(s) AFTER sampled_token_id, proposed by
@@ -131,3 +153,19 @@ class PrefillDone:
     # -- decode publishes its hashes -- but the request is not decodable yet,
     # so it must not be promoted to `running` and carries no sampled token.
     is_final: bool = True
+
+
+@dataclass
+class PrefillBatchDone:
+    """Sent from PrefillEngineCore to DecodeEngineCore once a batch retires.
+
+    ONE message per batch, not one per sequence, because that is the real
+    granularity of the GPU guarantee: `prefill_forward` ends in a blocking
+    `stream.synchronize()` and is called with `wait_out=True`, so every
+    sequence in the batch has its KV committed at the same instant. Decode also
+    needs the whole batch retired before it may dispatch the next one, so a
+    per-sequence message would only ever be reassembled into this.
+    """
+
+    batch_id: int
+    results: list  # list[PrefillChunkResult]

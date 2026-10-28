@@ -412,9 +412,9 @@ class Sequence:
         # cannot forget a field; see `OffloadJointRecord`.
         self.offload_joint = OffloadJointRecord()
         # Rapidserve: the decode rank owning this sequence's KV pool.
-        # Set from BlockAssignment.target_rank in the prefill process; the block
-        # table above indexes THAT rank's pool, so only the prefill TP rank on
-        # the same GPU may write it. 0 everywhere else.
+        # Set from the batch message's target_rank in the prefill process; the
+        # block table above indexes THAT rank's pool, so only the prefill TP
+        # rank on the same GPU may write it. 0 everywhere else.
         self.disagg_target_rank = 0
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
@@ -443,47 +443,46 @@ class Sequence:
         # which works because the non-disagg path publishes the chunk BEFORE
         # advancing (scheduler.py, `hash_blocks(seq, chunk)` then
         # `num_cached_tokens += chunk`). A rapidserve request is prefilled in
-        # another process and learns about it in `on_prefill_done`, on the
-        # PrefillDone receive thread, which advances immediately — publishing
-        # there would mutate the block pool and the checkpoint coordinator off
-        # the engine loop, racing `_flush_state_maintenance`. So the offset is
-        # recorded here and the publish happens on the engine thread, in
-        # `postprocess`, through `hash_blocks`' documented `start_tokens`
-        # override — the same override pipeline parallelism uses for the same
-        # reason, an offset already bumped past the chunk being published.
+        # another process, so there is no local forward to hang the publish
+        # off. Decode records the offset when it PLANS the chunk
+        # (`_emit_chunk`), while `num_cached_tokens` is still the chunk's
+        # start, and publishes from it when the batch retires
+        # (`_apply_chunk_result`) — on the engine thread, because publishing
+        # mutates the block pool and the checkpoint coordinator that the same
+        # thread allocates out of. `Scheduler.postprocess` reads this field too,
+        # for the head-less inter-node path. Both go through `hash_blocks`'
+        # documented `start_tokens` override — the same override pipeline
+        # parallelism uses for the same reason, an offset already bumped past
+        # the chunk being published.
         #
         # Left unset, the one-shot publish computes `start >= end` and
         # registers nothing: the prompt blocks never enter the content index,
         # and every later request that shares the prefix misses. Visible only
         # as a prefix cache hit rate pinned at 0%.
         self.pending_hash_start = -1
-        # Rapidserve: where prefill must end a forward, and what to write
-        # there. Both are decode's to compute -- the BlockManager that knows
-        # the rung and owns the PAGE units is decode's -- and prefill's to
-        # carry out, which is the same split `block_table` and `state_slots`
-        # already follow. 0 / None means "run the prompt in one forward",
-        # which is every non-rapidserve request and any prompt with no rung.
-        # Ascending `(cut, store_op)` pairs: every rung of the ladder this
-        # prompt crosses, and the image reserved at each. A LIST and not one
-        # pair because `checkpoint_cut` collapses the grid to a single
-        # candidate -- the rightmost rung within the `end` it is handed -- so
-        # asking it once for the whole prompt yields one checkpoint near the
-        # end, where the ordinary scheduler asks once per chunk and walks the
-        # whole ladder. One resume point against fourteen is the difference
-        # between a 59% and a 66% hit rate on agentic traffic.
-        self.prefill_cuts: list = []
-        # Hashes every reserved image is filed under, positionally aligned with
-        # `prefill_cuts`, so decode can map a reported chunk boundary back to
-        # the image that boundary produced. The records are deliberately left
-        # unarmed until a chunk proves the scatter ran, or `complete_inflight`
-        # would publish bytes nobody had written.
-        self.prefill_store_hashes: list = []
-        # Did the chunk just scheduled for this seq end exactly on a rung?
-        # `is_partial_prefill` cannot answer it: a chunk is partial whether the
-        # rung stopped it or the token budget did, and only the first kind is
-        # worth a PrefillDone -- the second produces no image for decode to
-        # settle and nothing it has to act on before the next one.
-        self.prefill_landed_on_rung: bool = False
+        # Rapidserve: the ONE checkpoint image owed to this sequence's next
+        # prefill chunk, and the hash it is filed under. Both are decode's to
+        # compute -- the BlockManager that knows the rung and owns the PAGE
+        # units is decode's -- and prefill's to carry out, which is the same
+        # split `block_table` and `state_slots` already follow.
+        #
+        # They span two chunks by construction, which is why they live on the
+        # Sequence rather than on one chunk's record. An image holds the state
+        # as of a forward's LAST token, so the chunk ENDING on a rung is what
+        # produces it, and the scatter can only run once that forward has
+        # retired -- i.e. at the head of the chunk STARTING there, where
+        # `build()` drains state maintenance. Reserved when the first chunk is
+        # planned, carried here, attached to the second, settled when the
+        # second retires.
+        #
+        # None / 0 means "nothing owed", which is every non-rapidserve request,
+        # any prompt with no rung, and the final chunk of every prompt -- a
+        # rung at the prompt's end has no pass after it to scatter from, so it
+        # is deliberately never reserved. Decode files that boundary itself out
+        # of the slot prefill leaves behind, exactly as the non-disagg path
+        # does.
+        self.pending_checkpoint_op = None
+        self.pending_checkpoint_hash: int = 0
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
         # One entry per completion token, so the same reason `token_ids` is an
         # array applies: a list would box a PyFloat per token and hand the
@@ -570,69 +569,6 @@ class Sequence:
         self.last_block_num_tokens = (
             self._num_tokens - (self.num_blocks - 1) * self.block_size
         )
-
-    def prefill_cut_within(self, limit: int) -> int:
-        """Furthest rung in `(num_cached_tokens, limit]`, or 0 for none.
-
-        FURTHEST, not nearest: the chunk being sized runs as far as its budget
-        allows and lands on the last rung inside it, which is what
-        `Scheduler._finalize_prefill_chunk` does on the non-disagg path
-        (`checkpoint_cut` collapses the grid to its rightmost member before
-        choosing). Taking the nearest instead would halve every chunk the
-        moment the ladder is spaced at the checkpoint interval rather than at a
-        whole batch, for no extra resume point that survives: a rung the
-        forward runs over holds no state anyone can restore.
-
-        The lower bound is STRICT, which is the half of this that used to be
-        wrong. `prefill_cuts` runs on two clocks: `take_prefill_store_op` has
-        to hold a rung one pass past the chunk that reached it, because the
-        image is scattered by the NEXT forward. Cutting runs a pass earlier --
-        once a chunk has landed on R, the question is already where to stop
-        after R. Reading the list head served the first clock and answered the
-        second with R, the position the sequence is standing on, so
-        `num_cached_tokens < cut` was false, nothing cut, and the chunk ran the
-        full budget over the top of the rung after R. Observed on a
-        37211-token prompt with rungs [16384, 32768, 37120]: the last chunk ran
-        32768 -> 37211 straight past the prompt-end anchor, which is the rung a
-        later turn of the same conversation resumes from.
-
-        The scan is over a ladder a handful of entries long that shrinks as it
-        is consumed, and it runs once per scheduled chunk.
-        """
-        best = 0
-        for cut, _ in self.prefill_cuts:
-            if self.num_cached_tokens < cut <= limit:
-                best = cut
-        return best
-
-    def take_prefill_store_op(self):
-        """The checkpoint image to write, once this prompt is past a rung.
-
-        Gated on `num_cached_tokens`, so it is handed out by the pass that
-        schedules the chunk AFTER the cut -- never the one that produces the
-        state. `build()` runs maintenance before its forward, so an op taken
-        one pass early would scatter a slot the forward has not filled yet.
-
-        A rung BEHIND the current position is dropped rather than returned.
-        Since a chunk runs to the furthest rung that fits, it routinely passes
-        over nearer ones, and the slot at the end of that chunk holds the state
-        as of its END -- scattering a skipped rung's op would file that state
-        under a hash meaning somewhere else entirely, and a later request
-        resuming from it would restore a position it never asked for. Decode
-        is what releases the units (`on_prefill_done` unindexes every rung a
-        reported chunk ran over); this end only declines to write.
-        """
-        while self.prefill_cuts:
-            cut, op = self.prefill_cuts[0]
-            if self.num_cached_tokens < cut:
-                # Not reached yet -- keep holding it.
-                return None
-            self.prefill_cuts.pop(0)
-            if cut == self.num_cached_tokens:
-                # The pass after the chunk that ended here: the slot holds
-                # exactly this rung's state.
-                return op
-        return None
 
     @property
     def state_slot(self) -> int:

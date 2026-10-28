@@ -72,17 +72,17 @@ class TestReservationIsNotPublishable:
             CHECKPOINT, "PagedStateCheckpointCoordinator", "settle_prefill_store"
         )
 
-    def test_arming_happens_per_reported_chunk(self):
-        """`PrefillDone` is sent only after the forward's event retires and the
-        scatter was enqueued ahead of it, so by then the bytes are real.
+    def test_arming_happens_per_completed_chunk(self):
+        """A batch result is sent only after `prefill_forward` has returned,
+        and that call ends in `stream.synchronize()` with the scatter enqueued
+        ahead of the forward -- so by then the bytes are real.
 
         Per chunk, not per prompt: the image a chunk proves is the rung at its
-        START, scattered at the head of the pass that produced it. Settling the
-        whole ladder on the final chunk instead armed rungs no forward had ever
-        ended on -- see `test_a_rung_run_over_is_released_not_settled`."""
-        src = _src(SCHEDULER, "DecodeScheduler", "_settle_reported_chunk")
-        assert "cp.settle_prefill_store(h)" in src
-        assert "if cut == start:" in src
+        START, scattered at the head of the pass that produced it. Settling
+        anything a forward had not ended on published resume points over
+        unwritten units, which is the bug this ordering exists for."""
+        src = _src(SCHEDULER, "DecodeScheduler", "_apply_chunk_result")
+        assert "cp.settle_prefill_store(store_hash)" in src
 
     def test_the_ordinary_path_still_arms_immediately(self):
         """Every other caller issues its own scatter in the batch it drains
@@ -158,22 +158,214 @@ class TestRungHash:
 # ── The op rides the chunk AFTER the rung ────────────────────────────────
 
 
-def test_the_store_is_taken_before_the_offset_advances():
-    """`take_prefill_store_op` gates on `num_cached_tokens`, so whichever pass
-    reads it decides which chunk carries the scatter. Taken after the advance
-    it would attach to the chunk that produces the state, and `build()` runs
-    maintenance BEFORE its forward -- scattering a slot not yet filled."""
-    src = _src(SCHEDULER, "PrefillScheduler", "_schedule")
-    assert "take_prefill_store_op()" in src
-    assert "seq.num_cached_tokens +=" not in src, (
-        "the offset must advance after the forward (the runner reads it as the "
-        "chunk's start), not in _schedule"
+def _decode(**cfg):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import DecodeScheduler
+
+    return DecodeScheduler(MockConfig(**cfg))
+
+
+def _executor(**cfg):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import PrefillExecutor
+
+    return PrefillExecutor(MockConfig(**cfg))
+
+
+def _seq(ntok, block_size=4):
+    from atom.model_engine.sequence import Sequence
+    from atom.sampling_params import SamplingParams
+
+    return Sequence(list(range(ntok)), block_size, sampling_params=SamplingParams())
+
+
+def _complete(sched, msg, *, sampled=7):
+    """Round-trip one dispatched batch back through the completion path."""
+    from atom.model_engine.disagg_types import PrefillBatchDone, PrefillChunkResult
+
+    sched.on_prefill_batch_done(
+        PrefillBatchDone(
+            batch_id=msg.batch_id,
+            results=[
+                PrefillChunkResult(
+                    seq_id=c.seq_id,
+                    prefill_pos=c.start + c.num_tokens,
+                    sampled_token_id=sampled,
+                    is_final=c.is_final_chunk,
+                )
+                for c in msg.chunks
+            ],
+        )
     )
+    sched.drain_prefill_completions()
 
 
-def test_the_offset_advances_after_the_forward():
-    src = _src(CORE, "PrefillEngineCore", "_process_engine_step")
-    assert "seq.num_cached_tokens += int(num_tokens)" in src
+class TestTheOpRidesTheChunkAfterTheRung:
+    """A checkpoint holds the state as of a forward's LAST token.
+
+    So the chunk ENDING on a rung is what produces the image, and the scatter
+    can only run once that forward has retired -- at the head of the chunk
+    STARTING there, where `build()` drains state maintenance. Decode reserves
+    when it plans the first chunk, carries the op on the Sequence, and attaches
+    it to the second.
+
+    This is the same two-clock problem the deleted `take_prefill_store_op`
+    solved, with one difference that removes a whole class of bug: decode now
+    reserves only the rung a chunk actually lands on, so there is no ladder of
+    speculative rungs to run over, skip, or release.
+    """
+
+    def test_the_op_is_taken_from_the_sequence_and_cleared(self):
+        src = _src(SCHEDULER, "DecodeScheduler", "_emit_chunk")
+        take = src.index("store_op = seq.pending_checkpoint_op")
+        clear = src.index("seq.pending_checkpoint_op = None")
+        assert take < clear, "the carried op must be taken before it is cleared"
+
+    def test_the_next_rung_is_reserved_after_the_op_is_taken(self):
+        """Reserving first would overwrite the op this chunk is owed with the
+        one the NEXT chunk is owed, and the image for this rung would never be
+        scattered."""
+        src = _src(SCHEDULER, "DecodeScheduler", "_emit_chunk")
+        take = src.index("store_op = seq.pending_checkpoint_op")
+        reserve = src.index("self._reserve_chunk_checkpoint(seq, end)")
+        assert take < reserve
+
+    def test_a_rung_at_the_prompt_end_is_never_reserved(self):
+        """An image is scattered by the pass AFTER the chunk that ends on its
+        rung, and a chunk ending at the prompt has no pass after it: the
+        sequence leaves this scheduler.
+
+        Nothing is lost by refusing it -- decode files that boundary itself out
+        of the slot prefill leaves behind, which is exactly how the non-disagg
+        path keeps a prompt-end image. Reserving it as well would be a second
+        reservation for one hash, written by nobody.
+        """
+        src = _src(SCHEDULER, "DecodeScheduler", "_emit_chunk")
+        assert "if not is_final:" in src
+        guard = src.index("if not is_final:")
+        reserve = src.index("self._reserve_chunk_checkpoint(seq, end)")
+        assert guard < reserve
+
+    def test_the_op_travels_on_the_chunk_it_scatters(self):
+        src = _src(SCHEDULER, "DecodeScheduler", "_emit_chunk")
+        assert "store_op=store_op," in src
+
+    def test_the_executor_hands_it_to_state_maintenance(self):
+        """`build()` drains these BEFORE the forward, which is the whole reason
+        the op is attached to the chunk after the one that produced the
+        state."""
+        src = _src(SCHEDULER, "PrefillExecutor", "apply_batch")
+        assert "stores.append(chunk.store_op)" in src
+        assert "StateMaintenanceOps(checkpoint_stores=tuple(stores))" in src
+
+    def test_the_old_speculative_ladder_is_gone(self):
+        """`prefill_cuts` shipped every rung a prompt crossed so a
+        BlockManager-less prefill could pick one. Decode picks it now, from the
+        chunk it just sized, so the ladder has no reason to exist -- and a
+        field nothing fills is a trap for the next reader."""
+        from atom.model_engine.disagg_types import PrefillChunk
+        from atom.model_engine.sequence import Sequence
+
+        seq = _seq(8)
+        for gone in (
+            "prefill_cuts",
+            "prefill_store_hashes",
+            "prefill_landed_on_rung",
+        ):
+            assert not hasattr(seq, gone), gone
+        for gone in ("prefill_cut_within", "take_prefill_store_op"):
+            assert not hasattr(Sequence, gone), gone
+        assert "prefill_cuts" not in PrefillChunk.__dataclass_fields__
+
+
+class TestTheRungComesFromTheSharedHelper:
+    """Decode calls `_finalize_prefill_chunk`, the same helper the non-disagg
+    scheduler uses.
+
+    That is the point of moving prefill scheduling here: the half that sizes
+    the chunk is now the half holding the BlockManager, so it can ask where the
+    rung is instead of being told. One implementation of the cut rule, not two
+    that drift.
+    """
+
+    def test_decode_uses_the_baseline_helper(self):
+        src = _src(SCHEDULER, "DecodeScheduler", "_plan_prefill_chunk")
+        assert "self._finalize_prefill_chunk(seq, start, chunk)" in src
+
+    def test_the_budget_is_applied_before_the_rung(self):
+        """Taken the other way round, a rung further out than one batch allows
+        produces a chunk nothing can schedule, and the caller's `break` parks
+        it at the head of the queue forever: a 226k prompt against a 16k budget
+        asks for its 221184-token rung, never fits, and every request behind it
+        stops too."""
+        src = _src(SCHEDULER, "DecodeScheduler", "_plan_prefill_chunk")
+        budget = src.index("self._prefill_chunk_for_budget(")
+        rung = src.index("self._finalize_prefill_chunk(")
+        assert budget < rung
+
+    def test_a_rung_off_the_hash_grid_is_refused(self):
+        """A checkpoint is filed under a block hash, so a cut that is not on a
+        hash-block boundary has nothing to file under. A chunk stopped by the
+        budget alone generally lands off the grid, and that is the common
+        case."""
+        src = _src(SCHEDULER, "DecodeScheduler", "_reserve_chunk_checkpoint")
+        assert "if cut % bm.hash_block_size:" in src
+
+    def test_a_disabled_coordinator_reserves_nothing(self):
+        """`is None` is not the same question as "is this doing anything". The
+        coordinator is constructed whenever the model has a checkpoint spec and
+        carries `enabled = enable_prefix_caching and num_state_slots > 0`, so
+        with prefix caching off it exists, answers every call and stores
+        nothing -- and reserving against it pins units no one can resume
+        from."""
+        src = _src(SCHEDULER, "DecodeScheduler", "_reserve_chunk_checkpoint")
+        assert "if cp is None or not cp.enabled:" in src
+
+
+class TestTheImageIsSettledOnlyWhenItsForwardRetired:
+    """`PrefillBatchDone` is the evidence, and the only evidence.
+
+    `prefill_forward` is synchronous and ends in `stream.synchronize()`, so a
+    batch result means every scatter it carried has landed. Settling earlier
+    would arm a record for `complete_inflight` and publish a resume point over
+    units nobody had written.
+    """
+
+    def test_the_settle_is_driven_by_the_recorded_hash(self):
+        src = _src(SCHEDULER, "DecodeScheduler", "_apply_chunk_result")
+        assert "start, end, store_hash = self._inflight_spans[result.seq_id]" in src
+        assert "cp.settle_prefill_store(store_hash)" in src
+
+    def test_nothing_is_settled_for_a_chunk_that_carried_no_image(self):
+        src = _src(SCHEDULER, "DecodeScheduler", "_apply_chunk_result")
+        guard = src.index("if store_hash:")
+        settle = src.index("cp.settle_prefill_store(store_hash)")
+        assert guard < settle
+
+    def test_an_abandoned_reservation_is_released(self):
+        """A reservation is made one chunk ahead of the chunk that writes it,
+        so a sequence that dies in between leaves units pinned under a hash
+        nobody will ever publish."""
+        src = _src(SCHEDULER, "DecodeScheduler", "_release_pending_checkpoint")
+        assert "cp.unindex(seq.pending_checkpoint_hash)" in src
+        assert "seq.pending_checkpoint_op = None" in src
+
+    def test_the_release_runs_on_every_path_that_drops_a_request(self):
+        """Abort while queued, abort on landing, and preemption. A preempted
+        sequence is re-prefilled from scratch, so the chunk its reservation was
+        waiting for is never going to run."""
+        for method in (
+            "build_prefill_batch",
+            "_apply_chunk_result",
+            "preempt",
+        ):
+            src = _src(SCHEDULER, "DecodeScheduler", method)
+            assert "_release_pending_checkpoint(seq)" in src, method
+
+
+# ── The batch round trip ────────────────────────────────────────────────
 
 
 def test_the_scheduled_batch_is_not_asked_for_its_seqs():
@@ -200,7 +392,7 @@ def test_the_scheduled_batch_is_not_asked_for_its_seqs():
     ]
     assert not bad, (
         f"engine_core.py:{bad} reads scheduled_batch.seqs, which does not "
-        "exist; the mapping schedule() returns alongside the batch is the "
+        "exist; the mapping apply_batch() returns alongside the batch is the "
         "one to use"
     )
 
@@ -226,542 +418,170 @@ def _scheduled_batch_attrs() -> set[str]:
     }
 
 
-class TestTakeGuard:
-    @staticmethod
-    def _seq(cached, cuts):
-        from atom.model_engine.sequence import Sequence
-        from atom.sampling_params import SamplingParams
-
-        seq = Sequence([1, 2, 3, 4], 4, sampling_params=SamplingParams())
-        seq.num_cached_tokens = cached
-        seq.prefill_cuts = list(cuts)
-        return seq
-
-    def test_withheld_before_the_rung(self):
-        """The chunk that ends AT the rung must not carry it."""
-        seq = self._seq(cached=0, cuts=[(1024, "A")])
-        assert seq.take_prefill_store_op() is None
-
-    def test_handed_out_once_past_it(self):
-        seq = self._seq(cached=1024, cuts=[(1024, "A")])
-        assert seq.take_prefill_store_op() == "A"
-
-    def test_handed_out_only_once(self):
-        seq = self._seq(cached=1024, cuts=[(1024, "A")])
-        assert seq.take_prefill_store_op() == "A"
-        assert seq.take_prefill_store_op() is None
-
-    def test_an_unchunked_prompt_carries_nothing(self):
-        """An empty ladder is every non-rapidserve request and any prompt with
-        no rung; it must not read as 'past it'."""
-        seq = self._seq(cached=0, cuts=[])
-        assert seq.take_prefill_store_op() is None
-        assert seq.prefill_cut_within(1 << 30) == 0
-
-    def test_the_ladder_is_consumed_in_order(self):
-        """Each rung is handed out by the pass after the chunk that ends on it,
-        which is what makes a prompt crossing many rungs checkpoint at all of
-        them instead of one. The cut position tracks the same ladder a pass
-        ahead -- see `test_the_cut_skips_a_rung_already_reached`."""
-        seq = self._seq(cached=0, cuts=[(1024, "A"), (2048, "B"), (3072, "C")])
-        assert seq.prefill_cut_within(1024) == 1024
-        assert seq.take_prefill_store_op() is None
-
-        seq.num_cached_tokens = 1024
-        assert seq.take_prefill_store_op() == "A"
-        assert seq.prefill_cut_within(2048) == 2048, "the next rung is next"
-        assert seq.take_prefill_store_op() is None
-
-        seq.num_cached_tokens = 2048
-        assert seq.take_prefill_store_op() == "B"
-        seq.num_cached_tokens = 3072
-        assert seq.take_prefill_store_op() == "C"
-        assert seq.prefill_cut_within(1 << 30) == 0, "ladder exhausted"
-
-    def test_a_rung_run_over_is_dropped_not_scattered(self):
-        """A chunk takes the furthest rung it can reach, so nearer ones are
-        passed over -- and the slot at the end of that chunk holds the state as
-        of its END. Scattering a skipped rung's op would file that state under
-        a hash meaning somewhere else, and a later request resuming from it
-        would restore a position it never asked for. Decode releases the units
-        (`on_prefill_done` unindexes them); this end only declines to write."""
-        seq = self._seq(cached=4096, cuts=[(1024, "A"), (2048, "B")])
-        assert seq.take_prefill_store_op() is None
-        assert seq.prefill_cuts == [], "both dropped, neither written"
-
-    def test_the_rung_landed_on_is_still_handed_out(self):
-        """Dropping what is behind must not drop what is exactly here."""
-        seq = self._seq(cached=2048, cuts=[(1024, "A"), (2048, "B"), (3072, "C")])
-        assert seq.take_prefill_store_op() == "B", "A skipped, B landed on"
-        assert seq.prefill_cuts == [(3072, "C")]
-
-    def test_the_cut_skips_a_rung_already_reached(self):
-        """Standing ON R, the next question is "where after R", not "R".
-
-        The two uses of `prefill_cuts` run one pass apart.
-        `take_prefill_store_op` has to hold R for the pass after the chunk that
-        reached it, because that is the forward which scatters R's image. The
-        cut cannot wait: the chunk being sized right now starts at R. Answering
-        it with R made `num_cached_tokens < cut` false, so nothing cut and the
-        chunk took the whole budget.
-        """
-        seq = self._seq(cached=1024, cuts=[(1024, "A"), (2048, "B")])
-        assert seq.prefill_cut_within(4096) == 2048
-        # The hold is still a hold -- A has not been handed out yet.
-        assert seq.prefill_cuts[0] == (1024, "A")
-        assert seq.take_prefill_store_op() == "A"
-
-    def test_the_cut_takes_the_furthest_rung_that_fits(self):
-        """Baseline parity: `_finalize_prefill_chunk` lets `checkpoint_cut`
-        collapse the grid to its rightmost member inside the chunk it was
-        already going to run. Taking the nearest instead would shorten every
-        chunk to the ladder's spacing and buy nothing -- the rungs in between
-        are run over either way."""
-        seq = self._seq(cached=0, cuts=[(8192, "A"), (16384, "B"), (24576, "C")])
-        assert seq.prefill_cut_within(16384) == 16384, "a full 16384 budget"
-        assert seq.prefill_cut_within(20000) == 16384, "no rung past 16384 fits"
-        assert seq.prefill_cut_within(8192) == 8192, "half a budget still lands"
-        assert seq.prefill_cut_within(4096) == 0, "nothing reachable -> no cut"
-
-    def test_the_cut_rule_this_replay_models_is_still_the_scheduler_s(self):
-        """Pin the lines the replay below stands in for, so it cannot drift
-        into testing a rule the scheduler stopped using."""
-        src = _src(SCHEDULER, "PrefillScheduler", "_schedule")
-        assert "reach = seq.num_cached_tokens + num_new_tokens" in src
-        assert "cut = seq.prefill_cut_within(reach)" in src
-        assert "if cut and cut < reach:" in src
-        assert "seq.prefill_landed_on_rung = bool(cut) and (" in src
-
-    def _replay(self, seq, prompt, budget):
-        """Drive one prompt through the scheduler's cut rule and the hold.
-
-        Returns `(chunks, reported, scattered)` -- every chunk's size, the end
-        offset of the chunks prefill would send a PrefillDone for, and the ops
-        it actually wrote.
-        """
-        chunks, reported, scattered = [], [], []
-        while seq.num_cached_tokens < prompt:
-            start = seq.num_cached_tokens
-            chunk = min(prompt - start, budget)
-            cut = seq.prefill_cut_within(start + chunk)
-            if cut and cut < start + chunk:
-                chunk = cut - start
-            on_rung = bool(cut) and cut == start + chunk
-            # The scheduler takes the op BEFORE the engine advances the offset,
-            # which is what makes the hold one pass long.
-            op = seq.take_prefill_store_op()
-            if op is not None:
-                scattered.append(op)
-            seq.num_cached_tokens = start + chunk
-            chunks.append(chunk)
-            if on_rung or seq.num_cached_tokens >= prompt:
-                reported.append(seq.num_cached_tokens)
-        return chunks, reported, scattered
-
-    def test_the_prompt_end_anchor_is_not_sailed_past(self):
-        """The whole ladder has to be landed on, not just the rungs that happen
-        to fall a budget apart.
-
-        Observed before the fix, on prompt 37211 with rungs
-        [16384, 32768, 37120]: chunks came out 4891 / 16384 / 4443. The middle
-        one hit 32768 by arithmetic luck -- a full budget from 16384 -- and the
-        last ran from 32768 clean over the prompt-end anchor at 37120, which is
-        the rung a later turn of the same conversation resumes from. Each
-        chunk's successor started exactly on a rung, which is the one state
-        that used to read its cut as the position it was already at.
-        """
-        seq = self._seq(cached=11493, cuts=[(16384, "A"), (32768, "B"), (37120, "C")])
-        seq.num_tokens = 37211
-        chunks, reported, scattered = self._replay(seq, 37211, 16384)
-
-        assert chunks == [4891, 16384, 4352, 91]
-        for rung in (16384, 32768, 37120):
-            assert rung in reported, f"no forward ended on rung {rung}"
-        assert scattered == ["A", "B", "C"], "every rung's image was written"
-
-    def test_an_interval_ladder_does_not_halve_every_chunk(self):
-        """The whole point of pairing the finer ladder with the furthest-rung
-        cut: at 8192 spacing and a 16384 budget, a chunk takes a full budget
-        whenever a rung lands there. Taking the NEAREST rung instead would make
-        every chunk 8192, for rungs that are run over either way.
-
-        The ladder stops short of the prompt end: `_prepare_prefill_checkpoint`
-        refuses a rung at `end`, which nothing could scatter.
-        """
-        seq = self._seq(cached=0, cuts=[(8192, "A"), (16384, "B"), (24576, "C")])
-        seq.num_tokens = 32768
-        chunks, reported, scattered = self._replay(seq, 32768, 16384)
-
-        # 0 -> 16384 is a whole budget, skipping 8192. From there the furthest
-        # rung that fits is 24576, so the tail splits -- the finer ladder buys
-        # a resume point at 24576 that the 16384-spaced one had no candidate
-        # for, and pays one extra forward for it.
-        assert chunks == [16384, 8192, 8192]
-        assert reported == [16384, 24576, 32768]
-        # A was run over by chunk 1 and dropped by the pass after it; B and C
-        # are rungs a forward ended on, so both images were written.
-        assert scattered == ["B", "C"]
-
-    def test_a_chunk_reaching_no_rung_is_not_reported(self):
-        """A leftover-budget crumb writes real KV but produces no image, so
-        there is nothing for decode to settle -- and `pending_hash_start`
-        already spans the gap, so its blocks are published with the next
-        rung's message."""
-        seq = self._seq(cached=0, cuts=[(8192, "A")])
-        seq.num_tokens = 8192
-        chunks, reported, _ = self._replay(seq, 8192, 85)
-        assert chunks[0] == 85
-        assert reported == [8192], "only the rung, not the crumbs before it"
-
-
-# ── Two fates for a rung, decided by one chunk's boundaries ──────────────
-
-
-class TestSettleReportedChunk:
-    """`_settle_reported_chunk` is the only thing that arms a record or gives
-    its units back, so every rung's fate is decided here.
-
-    Driven unbound against a stub coordinator: the method reads nothing off
-    `self` but `block_manager.paged_state_checkpoints`, and building a real
-    `DecodeScheduler` would drag in a block pool and a KV cache for a rule that
-    is four lines of arithmetic.
-    """
-
-    class _Coordinator:
-        def __init__(self):
-            self.settled, self.released = [], []
-
-        def settle_prefill_store(self, h):
-            self.settled.append(h)
-
-        def unindex(self, h):
-            self.released.append(h)
-
-    @staticmethod
-    def _call(seq, start, end, cp):
-        from types import SimpleNamespace
-
-        from atom.model_engine.scheduler import DecodeScheduler
-
-        stub = SimpleNamespace(
-            block_manager=SimpleNamespace(paged_state_checkpoints=cp)
-        )
-        DecodeScheduler._settle_reported_chunk(stub, seq, start, end)
-
-    @staticmethod
-    def _seq(cuts, hashes):
-        from atom.model_engine.sequence import Sequence
-        from atom.sampling_params import SamplingParams
-
-        seq = Sequence([1, 2, 3, 4], 4, sampling_params=SamplingParams())
-        seq.prefill_cuts = [(c, f"op{c}") for c in cuts]
-        seq.prefill_store_hashes = list(hashes)
-        return seq
-
-    def test_the_rung_at_the_start_is_settled(self):
-        """Its image was scattered at the head of the pass that produced this
-        chunk, and PrefillDone waits for that pass's event -- so the bytes are
-        on the device by the time this runs. That is the per-hash evidence
-        `mark_inflight` asks for."""
-        cp = self._Coordinator()
-        seq = self._seq([8192, 16384], ["hA", "hB"])
-        self._call(seq, start=8192, end=16384, cp=cp)
-        assert cp.settled == ["hA"]
-        assert cp.released == []
-
-    def test_a_rung_run_over_has_its_units_released(self):
-        """Nothing will ever be written there -- the slot holds the state as of
-        `end`. Holding the reservation for the rest of the prefill buys nothing
-        and the pool is the scarce thing."""
-        cp = self._Coordinator()
-        seq = self._seq([8192, 16384, 24576], ["hA", "hB", "hC"])
-        self._call(seq, start=0, end=24576, cp=cp)
-        assert cp.settled == [], "0 is not a rung on this ladder"
-        assert cp.released == ["hA", "hB"], "both run over; 24576 is the end"
-
-    def test_the_rung_at_the_end_is_left_alone(self):
-        """It is the next chunk's start, and that chunk's message settles it.
-        Settling it now would publish before its scatter has even been issued
-        -- the exact thing the unarmed reservation exists to prevent."""
-        cp = self._Coordinator()
-        seq = self._seq([8192, 16384], ["hA", "hB"])
-        self._call(seq, start=0, end=16384, cp=cp)
-        assert cp.settled == []
-        assert cp.released == ["hA"]
-        assert "hB" not in cp.released
-
-    def test_a_prompt_with_no_ladder_touches_nothing(self):
-        cp = self._Coordinator()
-        seq = self._seq([], [])
-        self._call(seq, start=0, end=16384, cp=cp)
-        assert cp.settled == [] and cp.released == []
-
-    def test_no_coordinator_is_not_an_error(self):
-        """Every prompt takes this path; a model without per-request state has
-        no coordinator at all."""
-        seq = self._seq([8192], ["hA"])
-        self._call(seq, start=0, end=16384, cp=None)
-
-
-# ── The ladder, not just its last rung ───────────────────────────────────
-
-
-class TestLadderWalk:
-    """Why the walk is per chunk and not per prompt.
-
-    `checkpoint_cut` answers with the RIGHTMOST rung inside the window it is
-    handed (`rung = min(end, limit)` floored to the interval, then
-    `min(rung, demand, anchor)`). Ask it once about a whole prompt and a 226k
-    prompt yields one checkpoint at 221184; the ordinary scheduler asks once
-    per chunk and walks the whole ladder. One resume point against fourteen
-    measured as 59% against 66% on agentic traffic.
-    """
-
-    def test_the_walk_steps_one_checkpoint_interval(self):
-        """The window width IS the ladder's spacing.
-
-        `checkpoint_cut` answers with the rightmost grid point inside the
-        window, so a window of `max_num_batched_tokens` produced a rung every
-        16384 while the interval was 8192 -- half the resume points the grid
-        defines. Stepping the interval enumerates all of them.
-        """
-        src = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        assert "interval = bm.state_checkpoint_interval_tokens" in src
-        assert "min(pos + step, end)" in src
-        assert "while pos < end:" in src
-
-    def test_the_walk_falls_back_when_the_grid_is_off(self):
-        """`interval <= 0` places no grid rung at all (-1 keeps checkpoints
-        without a grid, 0 disables them). Only a demand or the prompt-end
-        anchor can cut then, and neither cares how wide the window is -- so
-        step a batch rather than walking the prompt a token at a time."""
-        src = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        assert (
-            "step = interval if interval > 0 else max(1, self.max_num_batched_tokens)"
-            in src
-        )
-
-    def test_every_rung_gets_its_own_reservation(self):
-        src = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        assert "seq.prefill_cuts.append((cut, op))" in src
-
-    def test_an_unreservable_rung_does_not_stall_the_walk(self):
-        """`pos` advances past a rung whether or not it was reserved. Left
-        where it was, the same window would answer with the same rung forever
-        and admission would hang."""
-        src = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        advance = src.index("pos = cut")
-        assert src.index("if op is None:", advance) > advance, (
-            "pos must advance before the unreserved-rung continue"
-        )
-
-    def test_a_window_with_no_rung_still_advances(self):
-        src = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        assert "pos = window" in src
-
-    def test_the_ladder_is_not_capped(self):
-        """Every rung becomes a cut, as on the non-disagg path.
-
-        The ladder used to be trimmed to `MAX_PREFILL_CHECKPOINTS` keeping the
-        tail, because rapidserve reserves the WHOLE ladder at admission (prefill
-        has no BlockManager and `BLOCK_ASSIGNMENT` is the only decode->prefill
-        message), so each reservation pinned units for the entire prefill.
-        Baseline has no such cap -- it reserves one image at a time, per chunk --
-        so the two produced different cut positions on any prompt crossing more
-        than eight rungs. Parity won that trade.
-        """
-        src = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        assert "MAX_PREFILL_CHECKPOINTS" not in src
-        assert "prefill_cuts[dropped:]" not in src, (
-            "the trim is what made the ladder diverge from baseline's"
-        )
-
-    def test_unreservable_rungs_are_reported(self):
-        """With no cap, a full state pool is the only thing left that can still
-        shorten this ladder below baseline's -- and it does so silently:
-        `reserve_prefill_checkpoint` returns `(0, None)`, the rung is skipped,
-        and the prompt is never cut there. Counted and logged so a parity gap
-        is visible instead of inferred."""
-        src = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        assert "unreserved += 1" in src
-        assert "unreserved" in src and "logger.warning" in src
-
-    def test_a_rung_at_the_prompt_end_is_not_reserved(self):
-        """Prefill cannot write it, and decode already does.
-
-        An image is scattered by the pass AFTER the chunk ending on its rung,
-        and a rung at the prompt's last token has no such pass -- that chunk is
-        the prompt's last and the sequence leaves this scheduler.
-
-        Nothing is lost by refusing it. `Scheduler.hash_blocks` ends every
-        chunk with `checkpointers_at(pos)`; at the prompt end
-        `next_forward_tokens` defaults to the remainder (0) and the PAGE
-        coordinator's `successor_room` is 0.0, so decode files the boundary
-        from `_publish_prefill_hashes` and scatters it out of the slot prefill
-        left behind -- the same way the non-disagg path keeps a prompt-end
-        image. Reserving it here too would be a second reservation for one
-        hash, written by nobody.
-
-        `checkpoint_cut` admits `p == end` and the walk's `end` is the prompt,
-        so this fires whenever the last rung and the prompt end coincide: a
-        32768-token prompt with an 8192 interval lands on it exactly.
-        """
-        src = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        guard = src.index("if cut >= end:")
-        assert guard < src.index("bm.reserve_prefill_checkpoint(seq, cut)"), (
-            "the rung has to be refused BEFORE it reserves units, or they stay "
-            "pinned for a whole prefill against an image nothing will write"
-        )
-
-    def test_the_prompt_end_is_still_reachable_through_the_ordinary_path(self):
-        """The guard above is only safe because this is true: decode's own
-        publish runs the same `checkpointers_at` call baseline does, with the
-        defaults that admit a zero-remainder position."""
-        src = _src(SCHEDULER, "DecodeScheduler", "_publish_prefill_hashes")
-        assert "self.block_manager.hash_blocks(seq, num_new, start_tokens=start)" in src
-        hb = _src(BLOCK_MANAGER, "BlockManager", "hash_blocks")
-        assert (
-            "kept = self.checkpointers_at(seq, pos, next_forward_tokens, aimed)" in hb
-        )
-        ca = _src(BLOCK_MANAGER, "BlockManager", "checkpointers_at")
-        assert "next_forward_tokens = seq.num_prompt_tokens - pos" in ca
-        assert "next_forward_tokens >= c.successor_room" in ca
-
-    def test_a_rung_run_over_is_released_not_settled(self):
-        """The other half of the furthest-rung cut.
-
-        A chunk takes the last rung it can reach, so nearer ones are passed
-        over routinely. Prefill declines to scatter them
-        (`take_prefill_store_op` drops what is behind), but only decode can
-        give the units back -- and settling them instead, which the wholesale
-        loop this replaced did, publishes a resume point over bytes nobody
-        wrote.
-        """
-        src = _src(SCHEDULER, "DecodeScheduler", "_settle_reported_chunk")
-        assert "elif start < cut < end:" in src
-        assert "cp.unindex(h)" in src
-        # And the wholesale settle is gone, not merely supplemented.
-        done = _src(SCHEDULER, "DecodeScheduler", "on_prefill_done")
-        assert "for h in seq.prefill_store_hashes:" not in done
-
-    def test_the_settle_pairs_cuts_with_hashes_positionally(self):
-        """`prefill_cuts` and `prefill_store_hashes` are appended together in
-        `_prepare_prefill_checkpoint`; a `zip` is only correct while that
-        holds."""
-        walk = _src(SCHEDULER, "DecodeScheduler", "_prepare_prefill_checkpoint")
-        append_cut = walk.index("seq.prefill_cuts.append((cut, op))")
-        append_hash = walk.index("seq.prefill_store_hashes.append(h)")
-        assert append_cut < append_hash
-        src = _src(SCHEDULER, "DecodeScheduler", "_settle_reported_chunk")
-        assert "zip(seq.prefill_cuts, seq.prefill_store_hashes)" in src
-
-
-# ── A prompt bigger than the budget must still run ───────────────────────
-
-
-class TestBudgetBound:
-    """The deadlock this scheduler shipped with, and the one the cut added.
-
-    `PrefillScheduler` had no chunked prefill: it took the whole remaining
-    prompt and `break`-ed when that exceeded `max_num_batched_tokens`. A prompt
-    longer than the budget could therefore only be queued, never run, and it
-    parked at the head of the queue with every request behind it. Measured on
-    an agentic workload: 46 requests of up to 226k tokens against a 16384
-    budget, two forwards total, then nothing.
-
-    Applying the rung before the budget made it worse in one direction -- a
-    rung 221184 tokens out asks for a chunk no batch can hold even when the
-    prompt itself would have fit.
+class TestChunkedPrefillRoundTrip:
+    """Decode plans every chunk and learns of each one landing.
+
+    The old split let prefill chunk on its own and report only the chunks that
+    reached a rung; decode now dispatches each chunk and waits for it, so the
+    offsets on both sides advance in lockstep by construction.
     """
 
     @staticmethod
-    def _order() -> tuple[int, int]:
-        """Source offsets of the budget clamp and the cut, in `_schedule`."""
-        src = _src(SCHEDULER, "PrefillScheduler", "_schedule")
-        return src.index("num_new_tokens = budget"), src.index(
-            "num_new_tokens = cut - seq.num_cached_tokens"
+    def _pair(prompt=40, budget=16):
+        cfg = {
+            "max_num_batched_tokens": budget,
+            "enable_chunked_prefill": True,
+        }
+        decode, executor = _decode(**cfg), _executor(**cfg)
+        seq = _seq(prompt)
+        twin = _seq(prompt)
+        twin.id = seq.id
+        decode.waiting.append(seq)
+        executor.add(twin)
+        return decode, executor, seq
+
+    def test_a_long_prompt_is_chunked_until_it_finishes(self):
+        decode, executor, seq = self._pair(prompt=40, budget=16)
+        spans = []
+        while True:
+            msg = decode.build_prefill_batch()
+            if msg is None:
+                break
+            chunk = msg.chunks[0]
+            spans.append((chunk.start, chunk.num_tokens, chunk.is_final_chunk))
+            seqs = executor.apply_batch(msg)[1]
+            executor.retire_batch(seqs)
+            _complete(decode, msg)
+        assert spans == [(0, 16, False), (16, 16, False), (32, 8, True)]
+        assert seq.num_cached_tokens == 40
+
+    def test_the_block_table_is_sent_once(self):
+        """Decode allocates the whole prompt at admission, so the table is
+        stable for the rest of the sequence's life. Re-sending it per chunk is
+        most of a long prompt's message cost."""
+        decode, executor, _ = self._pair()
+        sent = []
+        while True:
+            msg = decode.build_prefill_batch()
+            if msg is None:
+                break
+            sent.append(msg.chunks[0].block_table is not None)
+            seqs = executor.apply_batch(msg)[1]
+            executor.retire_batch(seqs)
+            _complete(decode, msg)
+        assert sent[0] is True
+        assert not any(sent[1:]), "only the first chunk carries the table"
+
+    def test_a_mid_prompt_request_waits_in_its_own_queue(self):
+        """Not in `running`, which is the DECODE queue: a partial prefill there
+        would be picked up by the decode batch builder."""
+        decode, executor, seq = self._pair()
+        msg = decode.build_prefill_batch()
+        executor.retire_batch(executor.apply_batch(msg)[1])
+        _complete(decode, msg)
+        assert [s.id for s in decode.prefill_partial] == [seq.id]
+        assert not decode.running
+        assert not decode.prefill_done
+
+    def test_partials_are_drawn_from_before_new_requests(self):
+        """A prompt already holding blocks should finish before another is let
+        in to hold more -- the baseline scheduler's phase order."""
+        src = _src(SCHEDULER, "DecodeScheduler", "build_prefill_batch")
+        assert src.index("while self.prefill_partial:") < src.index(
+            "while self.waiting:"
         )
 
-    def test_the_budget_is_applied_before_the_rung(self):
-        """Order is the fix. The rung is chosen from what this pass can
-        afford, never the other way round."""
-        budget_at, cut_at = self._order()
-        assert budget_at < cut_at
+    def test_the_executor_keeps_a_mid_prompt_sequence_but_reports_idle(self):
+        """It must still HOLD the sequence -- the next chunk names it, and the
+        prompt tokens live only here -- while reporting that it has nothing to
+        run.
 
-    def test_a_chunk_never_exceeds_the_remaining_budget(self):
-        src = _src(SCHEDULER, "PrefillScheduler", "_schedule")
-        assert "budget = self.max_num_batched_tokens - num_batched_tokens" in src
-        assert "if num_new_tokens > budget:" in src
-
-    def test_an_oversized_prompt_is_partial_rather_than_refused(self):
-        """It must leave `waiting` only when finished; a budget-clipped chunk
-        is as partial as a rung-clipped one."""
-        src = _src(SCHEDULER, "PrefillScheduler", "_schedule")
-        clip = src.index("num_new_tokens = budget")
-        assert "partial = True" in src[clip : clip + 120]
-
-    def test_the_offset_advances_even_for_an_unreported_chunk(self):
-        """Gated on the cut, a budget-clipped chunk of a prompt with no rung
-        never advanced -- so every pass re-ran the same first chunk and the
-        request never finished.
-
-        The rung now gates the MESSAGE instead, which puts the same trap one
-        line further down: a chunk prefill stays silent about still has to move
-        prefill's own offset, or a sequence living on leftover-budget crumbs
-        never reaches a rung to be silent about.
+        The two answers deliberately differ. A rank waiting on decode's next
+        chunk is idle, and saying otherwise costs a dummy forward on every tick
+        of the wait. Nothing is lost by going quiet: the batch queue is filled
+        by the socket thread, so the next `_sync_dp_state` picks the work back
+        up whether or not this rank was stepping.
         """
-        src = _src(CORE, "PrefillEngineCore", "_process_engine_step")
-        advance = src.index("seq.num_cached_tokens += int(num_tokens)")
-        gate = src.index("if not (is_final or seq.prefill_landed_on_rung):")
-        assert advance < gate
+        decode, executor = self._pair()[:2]
+        msg = decode.build_prefill_batch()
+        executor.retire_batch(executor.apply_batch(msg)[1])
+        assert executor.has_requests(), "the next chunk names this sequence"
+        assert executor.is_finished(), "but there is nothing to run right now"
+
+    def test_the_executor_releases_a_finished_sequence(self):
+        decode, executor = self._pair(prompt=8, budget=16)[:2]
+        msg = decode.build_prefill_batch()
+        executor.retire_batch(executor.apply_batch(msg)[1])
+        assert executor.is_finished(), "decode keeps it for the rest of its life"
+
+    def test_a_batch_naming_an_unknown_sequence_is_retried_not_dropped(self):
+        """The manager sends decode's ADD first, so decode can plan a batch
+        before this process has drained its own input queue."""
+        decode = self._pair()[0]
+        msg = decode.build_prefill_batch()
+        empty = _executor(max_num_batched_tokens=16, enable_chunked_prefill=True)
+        assert empty.apply_batch(msg) is None
 
 
-# ── A partial chunk is KV without a token ────────────────────────────────
+class TestOneBatchInFlight:
+    def test_a_second_build_is_refused_while_one_is_outstanding(self):
+        decode = _decode()
+        decode.waiting.append(_seq(8))
+        decode.waiting.append(_seq(8))
+        assert decode.build_prefill_batch() is not None
+        assert decode.build_prefill_batch() is None
 
+    def test_the_slot_frees_when_the_batch_lands(self):
+        decode = _decode()
+        decode.waiting.append(_seq(8))
+        msg = decode.build_prefill_batch()
+        assert decode.prefill_batch_inflight is True
+        _complete(decode, msg)
+        assert decode.prefill_batch_inflight is False
+        assert not decode.prefill_inflight
+        assert not decode._inflight_spans
 
-def test_a_partial_chunk_stays_in_waiting():
-    """It has more prompt to run, and the next pass has to find it again."""
-    src = _src(SCHEDULER, "PrefillScheduler", "_schedule")
-    assert "if not partial:" in src
-    assert "self.waiting.remove(seq)" in src
+    def test_a_dispatched_chunk_with_no_result_is_not_lost(self):
+        """It would otherwise be dropped when the in-flight map is cleared:
+        never decoded, never freed, and invisible except as a request that
+        stops."""
+        from atom.model_engine.disagg_types import PrefillBatchDone
 
+        decode = _decode()
+        seq = _seq(8)
+        decode.waiting.append(seq)
+        msg = decode.build_prefill_batch()
+        free_before = decode.block_manager.kv.num_free
 
-def test_a_partial_chunk_does_not_promote_to_running():
-    """Real KV, no sampled token: promoting it would have decode try to decode
-    a request that is still mid-prompt."""
-    src = _src(SCHEDULER, "DecodeScheduler", "on_prefill_done")
-    assert "if not is_final:" in src
-    prem = src.index("if not is_final:")
-    assert prem < src.index("self.prefill_waiting.pop")
+        decode.on_prefill_batch_done(
+            PrefillBatchDone(batch_id=msg.batch_id, results=[])
+        )
+        decode.drain_prefill_completions()
 
+        assert not decode.prefill_done
+        assert not decode.prefill_partial
+        assert decode.block_manager.kv.num_free > free_before, "blocks leaked"
 
-def test_a_partial_chunk_keeps_its_routing_entry():
-    """`_seq_target_rank` is how a later chunk of the same prompt finds its
-    decode peer; dropping it on chunk 1 orphans chunk 2."""
-    src = _src(CORE, "PrefillEngineCore", "_process_engine_step")
-    drop = src.index("self._seq_target_rank.pop(seq_id, None)")
-    assert "if is_final:" in src[:drop]
+    def test_a_result_for_the_wrong_batch_is_refused(self):
+        """Only one batch is ever outstanding, so this cannot happen without
+        the two sides having diverged about what was sent."""
+        from atom.model_engine.disagg_types import (
+            PrefillBatchDone,
+            PrefillChunkResult,
+        )
 
-
-# ── Publishing moved off the postprocess path ────────────────────────────
-
-
-def test_chunks_publish_before_schedule():
-    """Two reasons, both fatal otherwise: a partial chunk never reaches
-    `postprocess` (decode runs no forward for it), and a checkpoint filed there
-    would be drained a forward later, against a slot that has moved."""
-    src = _src(CORE, "DecodeEngineCore", "_process_engine_step")
-    pub = src.index("publish_landed_prefill_chunks()")
-    assert pub < src.index("self.scheduler.schedule()")
-
-
-def test_the_publish_uses_the_recorded_offset():
-    src = _src(SCHEDULER, "DecodeScheduler", "_publish_prefill_hashes")
-    assert "start_tokens=start" in src
-
-
-@pytest.mark.parametrize("queue", ["prefill_partial"])
-def test_landed_chunks_have_their_own_queue(queue):
-    """Separate from `prefill_done`, which means 'decodable now'."""
-    src = _src(SCHEDULER, "DecodeScheduler", "__init__")
-    assert queue in src
+        decode = _decode()
+        seq = _seq(8)
+        decode.waiting.append(seq)
+        decode.build_prefill_batch()
+        decode.on_prefill_batch_done(
+            PrefillBatchDone(
+                batch_id=999,
+                results=[
+                    PrefillChunkResult(seq_id=seq.id, prefill_pos=8, sampled_token_id=1)
+                ],
+            )
+        )
+        decode.drain_prefill_completions()
+        assert decode.prefill_batch_inflight is True, "the real batch is still out"
+        assert not decode.prefill_done

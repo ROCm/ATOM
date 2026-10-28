@@ -5640,7 +5640,7 @@ class RapidServeModelRunner(ModelRunner):
             )
         # What makes this span two processes is the HOST, not the device: this
         # call returns only once the copies have run, the engine sends the
-        # BlockAssignment only after it returns, and prefill launches only after
+        # prefill batch only after it returns, and prefill launches only after
         # it receives. CUDA IPC shares memory, not stream order, so without a
         # wait somewhere in that chain prefill's forward and this gather are two
         # unordered queues and prefill can read the slot before it is filled --
@@ -5861,7 +5861,7 @@ class RapidServeModelRunner(ModelRunner):
         Writes KV for all prompt tokens, samples the first generated token for
         each sequence, then synchronizes before returning so decode's default
         stream sees all KV writes.  Returns a list of sampled token IDs (one
-        per sequence, in batch order) — these are included in PrefillDone so
+        per sequence, in batch order) — these ride back in the batch result so
         the decode process can append them before the first decode step,
         matching the num_tokens state that non-disagg postprocess would produce.
 
@@ -5938,14 +5938,12 @@ class RapidServeModelRunner(ModelRunner):
             if logits is None:
                 sampled = None
                 # One entry per scheduled seq, NOT an empty list. The engine
-                # builds its `PrefillDone` messages by zipping `req_ids` with
-                # these, so an empty list truncates the zip to nothing, no
-                # message is sent for the chunk, and decode never advances
-                # `num_cached_tokens` for it -- the prompt stalls mid-way with
-                # no error. A middle chunk still owes decode that message: it
+                # builds its batch result by zipping the batch's chunks with
+                # these, so a short list leaves a chunk reporting a sampled
+                # token of -1. A middle chunk still owes decode that entry: it
                 # carries real KV and the hashes to publish. The VALUE is
-                # ignored, since `on_prefill_done` returns on `is_final=False`
-                # before reading `sampled_token_id`.
+                # ignored, since a non-final chunk never reads
+                # `sampled_token_id`.
                 sampled_cpu = [0] * int(batch.total_seqs_num)
             else:
                 logits = logits[: batch.total_seqs_num]
@@ -5980,7 +5978,7 @@ class RapidServeModelRunner(ModelRunner):
                 # to `_log_draft_tokens` -- the drafts reaching decode's first
                 # decode step were made here, not by `propose_draft_token_ids`.
                 # Logged next to the sampled token so the pair can be matched
-                # against what `on_prefill_done` reports receiving.
+                # against what decode reports receiving.
                 for _i, _sid in enumerate(list(batch.req_ids)[: len(sampled_cpu)]):
                     logger.info(
                         "[draft-prefill] seq=%s sampled=%s drafts=%s",

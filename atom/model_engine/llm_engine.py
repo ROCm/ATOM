@@ -528,8 +528,8 @@ class LLMEngine:
 
         # Queue depths cannot be summed across a P/D pair: one in-flight
         # request sits in the prefill rank's `running` and the decode rank's
-        # `prefill_waiting` at once. The decode side's four queues already
-        # span the whole lifetime, so it alone is the full picture. Falls back
+        # `prefill_inflight` at once. The decode side's queues already span the
+        # whole lifetime, so it alone is the full picture. Falls back
         # to every rank when no decode rank reported — non-P/D, or before the
         # decode engine's first push, where nothing is duplicated yet.
         queue_stats = [s for s in rank_stats if s.get("role") == "decode"] or rank_stats

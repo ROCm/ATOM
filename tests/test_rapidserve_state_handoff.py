@@ -52,8 +52,9 @@ def test_the_base_backend_does_not_share():
 
     Read statically, for the reason `test_kv_pool_contract` gives: this module
     imports aiter, and the regression would land on CI, which has none."""
-    fn = _method(ATTENTIONS / "backends.py", "AttentionMetadataBuilder",
-                 "shares_per_req_cache")
+    fn = _method(
+        ATTENTIONS / "backends.py", "AttentionMetadataBuilder", "shares_per_req_cache"
+    )
     returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
     assert len(returns) == 1
     assert returns[0].value.value is False
@@ -105,9 +106,9 @@ def test_deepseek_v4_shares_and_checks_the_size():
     cls = next(
         c
         for c in ast.walk(tree)
-        if isinstance(c, ast.ClassDef) and "shares_per_req_cache" in {
-            f.name for f in c.body if isinstance(f, ast.FunctionDef)
-        }
+        if isinstance(c, ast.ClassDef)
+        and "shares_per_req_cache"
+        in {f.name for f in c.body if isinstance(f, ast.FunctionDef)}
     )
     alloc = next(
         f
@@ -125,9 +126,7 @@ def test_deepseek_v4_shares_and_checks_the_size():
 # ── Neither the export nor the guard may bypass the capability ───────────
 
 
-@pytest.mark.parametrize(
-    "method", ["_shared_pool_names", "_bind_kv_cache_to_modules"]
-)
+@pytest.mark.parametrize("method", ["_shared_pool_names", "_bind_kv_cache_to_modules"])
 def test_the_runner_keeps_both_halves_of_the_handoff(method):
     """Export and bind are one contract read from two sides; a tree with only
     one of them is how the merge left this file."""
@@ -164,10 +163,10 @@ def test_the_checkpoint_guard_asks_the_capability():
 # ── The slot indices reach prefill ───────────────────────────────────────
 
 
-def test_block_assignment_carries_state_slots_not_the_old_swa_table():
-    from atom.model_engine.disagg_types import BlockAssignment
+def test_prefill_chunk_carries_state_slots_not_the_old_swa_table():
+    from atom.model_engine.disagg_types import PrefillChunk
 
-    names = {f.name for f in __import__("dataclasses").fields(BlockAssignment)}
+    names = {f.name for f in __import__("dataclasses").fields(PrefillChunk)}
     assert "state_slots" in names
     assert "swa_block_table" not in names, (
         "the paged-SWA table went away with #1771; a field nothing fills is a "
@@ -175,36 +174,44 @@ def test_block_assignment_carries_state_slots_not_the_old_swa_table():
     )
 
 
-def test_the_assignment_round_trip_uses_the_same_field():
-    """Send and apply are in one file and drifted apart once already."""
-    text = CORE.read_text()
-    send = ast.get_source_segment(
-        text, _method(CORE, "DecodeEngineCore", "_send_block_assignment")
+def test_the_slot_round_trip_uses_the_same_field():
+    """Plan and apply are in two files and drifted apart once already.
+
+    The slots travel on EVERY chunk, not just the first, unlike the block
+    table: a chunk is the unit prefill adopts state from, and making one of
+    the two fields conditional is how they would drift again.
+    """
+    sched = pathlib.Path(__file__).resolve().parent.parent / (
+        "atom/model_engine/scheduler.py"
+    )
+    text = sched.read_text()
+    emit = ast.get_source_segment(
+        text, _method(sched, "DecodeScheduler", "_emit_chunk")
     )
     apply_ = ast.get_source_segment(
-        text, _method(CORE, "PrefillEngineCore", "_apply_pending_assignments")
+        text, _method(sched, "PrefillExecutor", "apply_batch")
     )
-    assert send is not None and apply_ is not None
-    assert "state_slots=list(seq.state_slots)" in send
-    assert "seq.state_slots = list(assignment.state_slots)" in apply_
+    assert emit is not None and apply_ is not None
+    assert "state_slots=list(seq.state_slots)" in emit
+    assert "seq.state_slots = list(chunk.state_slots)" in apply_
 
 
 # ── A restore must land before prefill is told to go ─────────────────────
 
 
-def test_restores_are_flushed_before_the_assignment_is_sent():
+def test_restores_are_flushed_before_the_batch_is_sent():
     """Admission queues the restore; the forward that reads the restored slot
     is prefill's, on a stream this process cannot order against. A ZMQ send is
     not a stream barrier, so the copy has to be finished -- not merely issued --
-    before the assignment goes out."""
+    before the batch goes out."""
     src = ast.get_source_segment(
         CORE.read_text(),
         _method(CORE, "DecodeEngineCore", "_process_engine_step"),
     )
     assert src is not None
     flush = src.index("_flush_state_maintenance()")
-    send = src.index("_send_block_assignment(seq)")
-    assert flush < send, "the flush must precede the sends, not follow them"
+    send = src.index("_send_prefill_batch(prefill_batch)")
+    assert flush < send, "the flush must precede the send, not follow it"
 
 
 def test_the_flush_waits_for_the_copies():

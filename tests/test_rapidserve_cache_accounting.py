@@ -54,29 +54,50 @@ def _calls(fn: ast.FunctionDef) -> set[str]:
 
 
 def test_decode_admission_accounts_the_reuse_it_found():
-    """`allocate_waiting` is the only place a rapidserve request is admitted,
-    and `block_manager.allocate` there is the only place its hit count is
-    computed. If the accounting is not in that method it happens nowhere."""
+    """`build_prefill_batch` is the only place a rapidserve request is
+    admitted, and `block_manager.allocate` there is the only place its hit
+    count is computed. If the accounting is not in that method it happens
+    nowhere."""
     assert "_record_cache_reuse" in _calls(
-        _method("DecodeScheduler", "allocate_waiting")
+        _method("DecodeScheduler", "build_prefill_batch")
     )
 
 
 def test_it_is_charged_only_on_a_successful_allocation():
     """Counted after a refusal, a request that was never admitted enters the
     window as zero reuse and drags the windowed rate toward 0%. The call has to
-    sit under the `allocate` that filled the fields it reads, above the
-    `popleft` every exit path shares."""
+    sit under the `allocate` that filled the fields it reads, above the point
+    the request is actually admitted.
+
+    Anchored on `admitted.append`, not on a `popleft`: the method now has two
+    of those, one dropping an aborted head and one admitting, and only the
+    second is the event being charged for.
+    """
     src = ast.get_source_segment(
-        SCHEDULER.read_text(), _method("DecodeScheduler", "allocate_waiting")
+        SCHEDULER.read_text(), _method("DecodeScheduler", "build_prefill_batch")
     )
     assert src is not None
     record = src.index("self._record_cache_reuse(seq)")
-    popleft = src.index("self.waiting.popleft()")
-    assert record < popleft, (
-        "_record_cache_reuse must precede the popleft, inside the branch where "
-        "block_manager.allocate() succeeded"
+    admit = src.index("admitted.append(seq)")
+    assert record < admit, (
+        "_record_cache_reuse must precede the admission, inside the branch "
+        "where block_manager.allocate() succeeded"
     )
+
+
+def test_it_is_not_charged_for_a_prompt_that_got_no_tokens():
+    """A prompt can allocate and still be refused a chunk -- the batch is
+    already full. Charged there, a request that never ran enters the window as
+    zero reuse, which is the same distortion as charging a failed allocation.
+    So the accounting sits below the chunk decision, not just below `allocate`.
+    """
+    src = ast.get_source_segment(
+        SCHEDULER.read_text(), _method("DecodeScheduler", "build_prefill_batch")
+    )
+    assert src is not None
+    plan = src.index("chunk = self._plan_prefill_chunk(seq, num_batched_tokens)")
+    record = src.index("self._record_cache_reuse(seq)")
+    assert plan < record
 
 
 def test_the_fields_it_reads_are_filled_by_the_allocate_above_it():
@@ -85,7 +106,7 @@ def test_the_fields_it_reads_are_filled_by_the_allocate_above_it():
     `block_manager.allocate`, so accounting before it reads the previous
     request's numbers."""
     src = ast.get_source_segment(
-        SCHEDULER.read_text(), _method("DecodeScheduler", "allocate_waiting")
+        SCHEDULER.read_text(), _method("DecodeScheduler", "build_prefill_batch")
     )
     assert src is not None
     assert src.index("self.block_manager.allocate(") < src.index(
@@ -100,11 +121,11 @@ def test_the_hit_count_reaches_allocate():
     `num_cached_tokens = 0`, and no request reuses anything however full the
     cache is. The ordinary path passes it; this one has to as well."""
     src = ast.get_source_segment(
-        SCHEDULER.read_text(), _method("DecodeScheduler", "allocate_waiting")
+        SCHEDULER.read_text(), _method("DecodeScheduler", "build_prefill_batch")
     )
     assert src is not None
     assert "self.block_manager.allocate(seq, num_cached_blocks)" in src, (
-        "DecodeScheduler.allocate_waiting must forward can_allocate's hit "
+        "DecodeScheduler.build_prefill_batch must forward can_allocate's hit "
         "count to allocate, not just test its sign"
     )
 
@@ -135,13 +156,13 @@ def test_both_allocate_callers_pass_the_hit_count():
 
 def test_the_prefill_side_does_not_double_count():
     """It could not do the lookup, and must not claim the result. Both halves
-    matter: `PrefillScheduler` has no BlockManager to read a hit off, and the
+    matter: `PrefillExecutor` has no BlockManager to read a hit off, and the
     aggregator already folds the pair's counts together."""
     tree = ast.parse(SCHEDULER.read_text(), filename=str(SCHEDULER))
     cls = next(
         c
         for c in ast.walk(tree)
-        if isinstance(c, ast.ClassDef) and c.name == "PrefillScheduler"
+        if isinstance(c, ast.ClassDef) and c.name == "PrefillExecutor"
     )
     assert "_record_cache_reuse" not in _calls(cls), (
         "the rapidserve prefill process must not account cache reuse; its "
@@ -156,7 +177,7 @@ def test_prefill_still_declares_itself_the_prefill_role():
     cls = next(
         c
         for c in ast.walk(ast.parse(src))
-        if isinstance(c, ast.ClassDef) and c.name == "PrefillScheduler"
+        if isinstance(c, ast.ClassDef) and c.name == "PrefillExecutor"
     )
     roles = [
         n.value.value

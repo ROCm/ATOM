@@ -16,17 +16,40 @@ from conftest import MockConfig
 
 
 @pytest.fixture
-def prefill_scheduler_unconstrained():
-    from atom.model_engine.scheduler import PrefillScheduler
+def prefill_executor_unconstrained():
+    from atom.model_engine.scheduler import PrefillExecutor
 
-    return PrefillScheduler(MockConfig(), disagg_cu_shm_name="")
+    return PrefillExecutor(MockConfig())
 
 
 @pytest.fixture
 def decode_scheduler_unconstrained():
     from atom.model_engine.scheduler import DecodeScheduler
 
-    return DecodeScheduler(MockConfig(), disagg_cu_shm_name="")
+    return DecodeScheduler(MockConfig())
+
+
+def _batch_msg(chunks, cu_stream_fraction=None):
+    from atom.model_engine.disagg_types import PrefillBatchMsg
+
+    return PrefillBatchMsg(
+        batch_id=0,
+        target_rank=0,
+        cu_stream_fraction=cu_stream_fraction,
+        chunks=chunks,
+    )
+
+
+def _chunk(seq, start, num_tokens, is_final, block_table=None):
+    from atom.model_engine.disagg_types import PrefillChunk
+
+    return PrefillChunk(
+        seq_id=seq.id,
+        start=start,
+        num_tokens=num_tokens,
+        is_final_chunk=is_final,
+        block_table=block_table,
+    )
 
 
 @pytest.fixture
@@ -43,12 +66,19 @@ def seq_factory():
 # ── Unconstrained: no shm handle attached ────────────────────────────────
 
 
-def test_prefill_scheduler_skips_shm_when_name_empty(prefill_scheduler_unconstrained):
-    assert prefill_scheduler_unconstrained._cu_shm is None
+def test_no_scheduler_opens_a_shared_memory_channel(
+    prefill_executor_unconstrained, decode_scheduler_unconstrained
+):
+    """The CU shm is gone, on both sides.
 
-
-def test_decode_scheduler_skips_shm_when_name_empty(decode_scheduler_unconstrained):
-    assert decode_scheduler_unconstrained._cu_shm is None
+    It existed to carry decode's in-flight token count across to prefill,
+    because prefill sized its own batches and had to guess how much GPU decode
+    wanted. Decode plans both batches now, so it holds both operands and the
+    fraction travels inside the batch message.
+    """
+    for sched in (prefill_executor_unconstrained, decode_scheduler_unconstrained):
+        assert not hasattr(sched, "_cu_shm")
+        assert not hasattr(sched, "_cu_shm_offset")
 
 
 def test_decode_handoff_builds_full_mtp_window(seq_factory):
@@ -59,18 +89,29 @@ def test_decode_handoff_builds_full_mtp_window(seq_factory):
         def use_dspark():
             return True
 
+    from atom.model_engine.disagg_types import PrefillBatchDone, PrefillChunkResult
     from atom.model_engine.scheduler import DecodeScheduler
 
-    scheduler = DecodeScheduler(
-        MockConfig(speculative_config=SpecConfig()), disagg_cu_shm_name=""
-    )
+    scheduler = DecodeScheduler(MockConfig(speculative_config=SpecConfig()))
     prompt = [11, 22, 33, 44, 55]
     t0 = 14
     seq = seq_factory(prompt)
     scheduler.block_manager.allocate(seq)
-    scheduler.prefill_waiting[seq.id] = seq
+    scheduler.prefill_inflight[seq.id] = seq
+    scheduler._inflight_batch_id = 0
+    scheduler._inflight_spans[seq.id] = (0, len(prompt), 0)
 
-    scheduler.on_prefill_done(seq.id, len(prompt), t0)
+    scheduler.on_prefill_batch_done(
+        PrefillBatchDone(
+            batch_id=0,
+            results=[
+                PrefillChunkResult(
+                    seq_id=seq.id, prefill_pos=len(prompt), sampled_token_id=t0
+                )
+            ],
+        )
+    )
+    scheduler.drain_prefill_completions()
 
     assert seq.is_first_decode is True
     assert list(seq.token_ids[-4:]) == [t0, 2, 2, 2]
@@ -85,18 +126,23 @@ def test_decode_handoff_builds_full_mtp_window(seq_factory):
 
 
 def test_unconstrained_prefill_batch_has_none_cu_fraction(
-    prefill_scheduler_unconstrained, seq_factory
+    prefill_executor_unconstrained, seq_factory
 ):
-    """Without shm, PrefillScheduler must produce batches keyed by the
-    plain (None) stream — never a fractional CU mask."""
-    seq = seq_factory([10, 20, 30, 40])
-    seq.block_table = [0, 1]
-    seq.num_cached_tokens = 0
-    prefill_scheduler_unconstrained.add(seq)
+    """The executor forwards the fraction decode chose, unchanged.
 
-    batch, _ = prefill_scheduler_unconstrained.schedule()
+    Unconstrained, decode sends None and the batch must be keyed by the plain
+    stream — a fractional mask here would index a stream pool that was never
+    built (KeyError on the first forward).
+    """
+    seq = seq_factory([10, 20, 30, 40])
+    prefill_executor_unconstrained.add(seq)
+
+    batch, seqs = prefill_executor_unconstrained.apply_batch(
+        _batch_msg([_chunk(seq, 0, 4, True, block_table=[0, 1])])
+    )
     assert batch is not None
     assert batch.cu_stream_fraction is None
+    assert list(seqs) == [seq.id]
 
 
 # ── Asymmetric rapidserve: reserved KV dump index ────────────────────────
@@ -368,23 +414,388 @@ class TestDecodeLockstep:
         obj = object.__new__(ec.DecodeEngineCore)
         assert obj._dp_lockstep is False
 
+    def test_an_idle_decode_group_skips_the_dummy_forward(self):
+        """Decode must keep ticking to drive prefill, but `busy_loop` reads
+        "the step ran nothing" as "issue a dummy forward". While every request
+        is mid-prefill that is a real forward per tick, on the same GPU as the
+        prefill chunk it competes with, matching a collective nobody entered.
+
+        Measured on a 670k-token agentic warmup: decode sat at `Running: 0`
+        for 15 minutes while prefill ran at ~60% occupancy.
+        """
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        obj = object.__new__(ec.DecodeEngineCore)
+        obj.dp_group = None  # dp=1: answer locally, no collective
+        obj.scheduler = type(
+            "S",
+            (),
+            {
+                "prefill_batch_inflight": False,
+                "has_decode_work": lambda self: False,
+                "schedule": lambda self: None,
+                "has_requests": lambda self: True,
+                "build_prefill_batch": lambda self, **kw: None,
+                "drain_prefill_completions": lambda self: None,
+                "pending_aborts": [],
+            },
+        )()
+        assert obj._sync_decode_group_state()[1] is False
+        assert obj._process_engine_step() is True, (
+            "a tick that drove prefill but had nothing to decode must not be "
+            "reported as 'ran nothing'"
+        )
+
+    def test_a_rank_with_decode_work_still_forwards(self):
+        """The gate must not swallow real work: the proxy is `running`, and a
+        non-empty queue falls through to `schedule()` exactly as before."""
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        obj = object.__new__(ec.DecodeEngineCore)
+        obj.dp_group = None
+        obj.scheduler = type(
+            "S",
+            (),
+            {
+                "prefill_batch_inflight": False,
+                "has_decode_work": lambda self: True,
+            },
+        )()
+        assert obj._sync_decode_group_state() == (False, True)
+
+    def test_the_gate_runs_before_every_per_rank_return(self):
+        """gloo matches collectives by ARRIVAL ORDER, not by tag.
+
+        A rank that skipped this reduction while its peers entered it would
+        pair its next `_sync_dp_state` (3 int64) against their 1-int64
+        reduction here, and the group wedges. Placed behind `has_requests()`,
+        a burst whose ADDs reached the decode ranks a tick apart hung the whole
+        replica after a single dispatched batch -- 7 ranks stuck inside a dummy
+        forward with `dummy_inflight=4.0s` and nothing else in any log.
+
+        Checked on the AST, not the source text: the comments here name the
+        very constructs being ordered, so a substring search matches prose and
+        passes whatever the code does.
+        """
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        gate = min(
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "_sync_decode_group_state"
+        )
+        first_return = min(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Return))
+        assert gate < first_return, (
+            "a per-rank early return before the cross-DP reduction lets ranks "
+            "disagree about how many collectives they have entered"
+        )
+        per_rank = min(
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("has_requests", "schedule")
+        )
+        assert gate < per_rank
+
+    def test_skipping_the_forward_is_a_group_decision(self):
+        """`busy_loop` hands a dummy forward to whoever returns False, so every
+        rank runs exactly one forward per step -- real or dummy -- and that is
+        what keeps the MoE collective inside it matched.
+
+        So on the no-batch path the answer must come from the all-reduced value
+        and nothing else. One rank dummying while the others skip is the same
+        hang from the other side.
+        """
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        guards = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Return)
+            and isinstance(n.value, ast.UnaryOp)
+            and isinstance(n.value.op, ast.Not)
+            and isinstance(n.value.operand, ast.Name)
+            and n.value.operand.id == "group_will_forward"
+        ]
+        assert len(guards) == 1, (
+            "the no-batch path must return exactly `not group_will_forward` -- "
+            "a local condition there desynchronises the dummy"
+        )
+
+    def test_schedule_is_never_skipped_by_the_gate(self):
+        """`schedule()` is not just a batch builder.
+
+        It promotes `prefill_done` into `running`, and it runs
+        `complete_previous_state_batch()` -- "without which the pins taken by
+        every resume accumulate forever and admission starves". The ticks this
+        gate fires on are exactly the ones where decode has no batch, which
+        during a long prefill is all of them, so a gate that skipped
+        `schedule()` would starve the state pool for the whole prompt.
+        """
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        sched = min(
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "schedule"
+        )
+        first_return = min(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Return))
+        assert sched < first_return, (
+            "no return may precede schedule(): it must run on every path, "
+            "whatever the gate decided"
+        )
+
+    def test_a_rank_with_no_requests_still_dummies_when_peers_forward(self):
+        """Returning True there would leave the peers' MoE collective short."""
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        obj = object.__new__(ec.DecodeEngineCore)
+        obj.dp_group = None
+        obj.scheduler = type(
+            "S",
+            (),
+            {
+                "prefill_batch_inflight": False,
+                "has_decode_work": lambda self: True,  # group forwards
+                "schedule": lambda self: None,
+                "has_requests": lambda self: False,
+                "build_prefill_batch": lambda self, **kw: None,
+                "drain_prefill_completions": lambda self: None,
+                "pending_aborts": [],
+            },
+        )()
+        assert obj._process_engine_step() is False, "must earn a dummy forward"
+
+    def test_the_gate_agrees_with_what_schedule_actually_does(self):
+        """The predicate and `_schedule()` must never disagree.
+
+        The gate decides whether `_schedule()` is called AT ALL, so a predicate
+        that says "no work" when `_schedule()` would have produced a batch is a
+        livelock, not a missed optimisation -- nothing else promotes
+        `prefill_done` into `running`.
+
+        Checked behaviourally against the real scheduler over every queue state
+        that matters, rather than by reading either implementation: that is the
+        only form of this test that would have caught `bool(running)`.
+        """
+        from conftest import MockConfig
+
+        from atom.model_engine.scheduler import DecodeScheduler
+        from atom.model_engine.sequence import Sequence
+        from atom.sampling_params import SamplingParams
+
+        def seq():
+            return Sequence([1, 2, 3, 4], 4, sampling_params=SamplingParams())
+
+        for name, place in (
+            ("empty", lambda s: None),
+            ("running", lambda s: s.running.append(seq())),
+            ("prefill_done", lambda s: s.prefill_done.append(seq())),
+        ):
+            sched = DecodeScheduler(MockConfig())
+            place(sched)
+            for q in (sched.running, sched.prefill_done):
+                for sq in q:
+                    sched.block_manager.allocate(sq)
+            claimed = sched.has_decode_work()
+            produced = sched.schedule() is not None
+            assert claimed == produced, (
+                f"queue state {name!r}: has_decode_work()={claimed} but "
+                f"schedule() produced a batch={produced}"
+            )
+
+    def test_a_finished_prefill_is_not_stranded(self):
+        """The exact livelock: prefill drains, every request lands in
+        `prefill_done`, and the gate -- reading `running` -- reports no work,
+        so `_schedule()` is never called and nothing ever promotes them.
+
+        Observed as 16 requests per rank reported `Running`, 0 tokens/s, zero
+        decode forwards for the whole run, and the delayer firing `vacuous`
+        41000 times because the prefill side was empty too.
+        """
+        from conftest import MockConfig
+
+        from atom.model_engine.scheduler import DecodeScheduler
+        from atom.model_engine.sequence import Sequence
+        from atom.sampling_params import SamplingParams
+
+        sched = DecodeScheduler(MockConfig())
+        sq = Sequence([1, 2, 3, 4], 4, sampling_params=SamplingParams())
+        sched.block_manager.allocate(sq)
+        sched.prefill_done.append(sq)
+
+        assert not sched.running, "the request has not been promoted yet"
+        assert (
+            sched.has_decode_work()
+        ), "a request whose prefill just finished is decodable this tick"
+
+    def test_the_delayer_skip_is_group_wide_never_local(self):
+        """ "Busy" is PER-RANK -- decode ranks finish their prefills at
+        different times -- and the delayer's own tick is a cross-DP all_reduce.
+        A rank that skipped it on its own `prefill_batch_inflight` would
+        desynchronise the group: gloo matches by arrival order, so it would
+        pair its next `_sync_dp_state` against a peer's delayer reduction.
+
+        So the engine must pass the ALL-REDUCED answer down, and the scheduler
+        must take the skip only from that argument.
+        """
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+        sched_mod = pytest.importorskip("atom.model_engine.scheduler")
+
+        step = inspect.getsource(ec.DecodeEngineCore._process_engine_step)
+        assert "skip_delayer=group_busy" in step, (
+            "the skip must come from the reduction, not from the scheduler's "
+            "own in-flight flag"
+        )
+
+        build = ast.parse(
+            inspect.getsource(sched_mod.DecodeScheduler.build_prefill_batch).lstrip()
+        ).body[0]
+        guards = [
+            n
+            for n in build.body
+            if isinstance(n, ast.If)
+            and isinstance(n.test, ast.Name)
+            and n.test.id == "skip_delayer"
+        ]
+        assert len(guards) == 1, "exactly one guard, reading the argument"
+        # ...and it must sit above the delayer tick it is skipping.
+        delayer = min(
+            n.lineno
+            for n in ast.walk(build)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "should_allow_prefill"
+        )
+        assert guards[0].lineno < delayer
+
+    def test_one_busy_peer_holds_the_whole_group(self):
+        """Dispatch is gated on NO rank being mid-flight, not on all of them
+        being so.
+
+        The pair's prefill ranks run one forward per step and its MoE
+        all-to-all spans every rank, so a rank handed a batch early does not
+        get a head start -- its peers simply block inside the collective in a
+        dummy until it is done. Letting each rank dispatch the moment it frees
+        up split the group: 4.05 of 8 ranks doing real work per step, 51%
+        prefill occupancy, one ~1.8s blocked dummy per real 1.9s chunk.
+        """
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._sync_decode_group_state).lstrip()
+        ).body[0]
+        ret = max(
+            (n for n in ast.walk(fn) if isinstance(n, ast.Return)),
+            key=lambda n: n.lineno,
+        )
+        busy_expr = ast.unparse(ret.value.elts[0])
+        assert busy_expr == "n_busy > 0", (
+            f"dispatch must hold while ANY rank is busy, got {busy_expr!r} -- "
+            "a threshold of dp_size lets ranks dispatch independently and "
+            "splits the prefill group between real work and blocked dummies"
+        )
+
+    def test_a_busy_rank_alone_does_not_skip_the_delayer(self):
+        """Only the group's answer may skip it. A locally busy rank whose
+        peers are free still has to tick the delayer -- that is where the
+        `n_prefillable < dp_size` alignment gate holds the free ranks until
+        this one catches up.
+        """
+        from conftest import MockConfig
+
+        from atom.model_engine.scheduler import DecodeScheduler
+
+        sched = DecodeScheduler(MockConfig())
+        sched._inflight_batch_id = 7  # locally busy
+        assert sched.prefill_batch_inflight is True
+
+        calls = []
+
+        class _Delayer:
+            is_local = True
+
+            def should_allow_prefill(self, **kw):
+                calls.append(kw)
+                return True
+
+        sched.prefill_delayer = _Delayer()
+        assert sched.build_prefill_batch(skip_delayer=False) is None
+        assert len(calls) == 1, "a busy rank still ticks the delayer"
+        assert calls[0]["prefillable"] is False
+
+        calls.clear()
+        assert sched.build_prefill_batch(skip_delayer=True) is None
+        assert calls == [], "the group said skip, so the tick is skipped"
+
+    def test_the_gate_fails_open(self):
+        """A peer dying must not wedge the step; the guarded DP-state barrier
+        drives shutdown, as it does for `_sync_dp_state`."""
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        src = inspect.getsource(ec.DecodeEngineCore._sync_decode_group_state)
+        assert "except RuntimeError" in src
+        assert "return False, True" in src, (
+            "the error path must not skip the delayer and must assume decode "
+            "work exists -- i.e. leave every rank on the path it took before "
+            "this method existed"
+        )
+
     def test_step_reports_whether_it_ran(self):
         """The loop uses this to decide when a dummy batch is needed."""
         ec = pytest.importorskip("atom.model_engine.engine_core")
 
         obj = object.__new__(ec.DecodeEngineCore)
-        # Both run before the early return: `publish_landed_prefill_chunks`
-        # registers the hashes of chunks that landed since the last pass, and
-        # `allocate_waiting` ticks the delayer's collective. A rank that skips
-        # either is out of step with the others, so the stub has to provide
-        # them even when there is nothing to admit.
+        # All three run before the early return:
+        # `drain_prefill_completions` applies batches that retired since the
+        # last pass, and `build_prefill_batch` ticks the delayer's collective.
+        # A rank that skips either is out of step with the others, so the stub
+        # has to provide them even when there is nothing to dispatch.
+        obj.dp_group = None
         obj.scheduler = type(
             "S",
             (),
             {
+                # A peer has decode work, so the group forwards and this rank
+                # owes it a dummy.
+                "prefill_batch_inflight": False,
+                "has_decode_work": lambda self: True,
+                "schedule": lambda self: None,
                 "has_requests": lambda self: False,
-                "allocate_waiting": lambda self: [],
-                "publish_landed_prefill_chunks": lambda self: None,
+                "build_prefill_batch": lambda self, **kw: None,
+                "drain_prefill_completions": lambda self: None,
+                "pending_aborts": [],
             },
         )()
         assert obj._process_engine_step() is False
@@ -406,9 +817,7 @@ class TestDecodeLockstep:
 # would all-reduce over a group that was never formed.
 
 
-def _rapidserve_runner(
-    *, rank, decode, dp_rank_local=0, tp=8, device=None, pcp=1
-):
+def _rapidserve_runner(*, rank, decode, dp_rank_local=0, tp=8, device=None, pcp=1):
     """A RapidServeModelRunner with only the attributes the pairing logic reads.
 
     `tp` is THIS process's TP size — 8 for symmetric rapidserve (one process
@@ -472,10 +881,6 @@ class TestDisaggPairRank:
         assert self._pair_rank(1, 1, 2 * 2) == 5
 
 
-
-
-
-
 class TestDisaggIndexSplit:
     """The GPU index and the handle-paths index are different things.
 
@@ -534,9 +939,7 @@ class TestDisaggPairingGuard:
 
     def test_paired_correct_pairing_passes(self):
         for k in range(8):
-            self._assert(
-                _rapidserve_runner(rank=0, decode=True, dp_rank_local=k, tp=1)
-            )
+            self._assert(_rapidserve_runner(rank=0, decode=True, dp_rank_local=k, tp=1))
 
     def test_collapse_onto_gpu0_is_caught(self):
         """Forgetting data_parallel_rank_local puts every process on cuda:0."""
@@ -743,8 +1146,6 @@ class TestKvDimShipping:
             return 1
 
         assert derive(128, 8) == derive(128, 8)
-
-
 
 
 # ── Paired rapidserve: process layout and request routing ────────────────
@@ -1191,63 +1592,54 @@ class TestPerPairChannels:
         assert "config.disagg_d2p_addrs[k]" in dec
 
 
+class TestCuFractionTravelsInTheBatch:
+    """Decode computes the CU split and ships it; there is no side channel.
 
-
-class TestDecodeTokensChannel:
-    """Decode publishes its in-flight token count for prefill, always.
-
-    It used to exist only under --disagg-constrained, where CU partitioning
-    consumed it. The prefill delayer needs the same number for its "is there
-    decode to hide the wait behind?" gate, and prefill cannot answer that from
-    its own scheduler — decode is a different process.
+    It used to go through 4 bytes of shared memory per pair, because prefill
+    sized its own batches and needed decode's in-flight token count to pick a
+    fraction. Decode plans both batches now, so it holds both operands at the
+    moment it needs them and the answer rides in the message.
     """
 
-    @staticmethod
-    def _offset(decode_rank):
-        return 4 * decode_rank
+    def test_message_carries_the_fraction(self):
+        from atom.model_engine.disagg_types import PrefillBatchMsg
 
-    def test_each_pair_gets_its_own_slot(self):
-        assert [self._offset(k) for k in range(4)] == [0, 4, 8, 12]
+        assert "cu_stream_fraction" in PrefillBatchMsg.__dataclass_fields__
 
-    def test_slots_do_not_overlap(self):
-        offs = [self._offset(k) for k in range(8)]
-        assert len(set(offs)) == 8
-        assert max(offs) + 4 == 4 * 8  # the size the manager allocates
-
-    def test_both_schedulers_derive_the_same_offset(self):
-        import ast
+    def test_no_scheduler_mentions_shared_memory(self):
         import inspect
 
         sched = pytest.importorskip("atom.model_engine.scheduler")
 
-        for cls in (sched.PrefillScheduler, sched.DecodeScheduler):
+        for cls in (sched.PrefillExecutor, sched.DecodeScheduler):
             src = inspect.getsource(cls)
-            assert "self._cu_shm_offset = 4 * getattr(config" in src, cls.__name__
-            ast.parse(src.lstrip())
+            assert "shared_memory" not in src, cls.__name__
+            assert "_cu_shm" not in src, cls.__name__
 
-    def test_cu_masking_is_gated_on_the_flag_not_the_shm(self):
-        """The shm now exists regardless, so `_cu_shm is not None` no longer
-        means 'constrained mode'."""
+    def test_manager_allocates_no_shm(self):
+        import inspect
+
+        mgr = pytest.importorskip("atom.model_engine.engine_core_mgr")
+
+        src = inspect.getsource(mgr.DisaggCoreManager)
+        assert "SharedMemory" not in src
+        assert "cu_shm" not in src
+
+    def test_config_has_no_shm_field(self):
+        cfg = pytest.importorskip("atom.config")
+
+        assert not hasattr(cfg.Config, "disagg_cu_shm_name")
+
+    def test_masking_still_gated_on_the_constrained_flag(self):
+        """Emitting a fraction when the pool holds only the full-CU stream is
+        a KeyError on the first forward, so the gate has to survive."""
         import inspect
 
         sched = pytest.importorskip("atom.model_engine.scheduler")
 
-        src = inspect.getsource(sched.PrefillScheduler)
-        assert "self._cu_masking = bool(" in src
-        assert "if self._cu_masking and self._cu_shm is not None:" in src
-
-    def test_prefill_reads_decode_tokens_through_a_named_accessor(self):
-        sched = pytest.importorskip("atom.model_engine.scheduler")
-
-        assert hasattr(sched.PrefillScheduler, "decode_tokens")
-
-    def test_decode_tokens_is_zero_without_the_shm(self):
-        sched = pytest.importorskip("atom.model_engine.scheduler")
-
-        obj = object.__new__(sched.PrefillScheduler)
-        obj._cu_shm = None
-        obj._cu_shm_offset = 0
-        assert obj.decode_tokens() == 0
+        src = inspect.getsource(sched.DecodeScheduler)
+        assert 'self._cu_masking = bool(getattr(config, "disagg_constrained"' in src
+        assert "if self._cu_masking:" in src
 
 
 class TestPrefillDelayerObservability:
@@ -1322,32 +1714,47 @@ class TestPrefillDelayerObservability:
 
 
 class TestDelayerLivesOnDecode:
-    """Admission is decode's decision, so the delayer belongs there.
+    """There is ONE prefill gate and it is decode's, because decode builds
+    the batch.
 
-    Two things follow from decode owning the BlockManager:
-      - delaying admission delays the KV allocation, so blocks are not pinned
-        for a sequence whose prefill has not been scheduled;
-      - the alignment that matters is across DECODE ranks. One rank admitting
-        alone leaves it the only one with prefill_waiting, and its paired
-        prefill rank runs while the other prefill ranks issue dummy forwards.
+    Three things follow from decode owning the BlockManager:
+      - holding the gate holds the KV allocation, so blocks are not pinned for
+        a prefill that is not worth running yet;
+      - the alignment that matters is across DECODE ranks, since each one
+        dispatches to its own paired prefill rank;
+      - decode has the inputs prefill never had: real KV usage, and a real
+        decode batch to hide the hold behind.
     """
 
-    def test_decode_gates_admission_on_the_delayer(self):
+    def test_decode_gates_the_batch_build_on_the_delayer(self):
         import inspect
 
         sched = pytest.importorskip("atom.model_engine.scheduler")
 
-        src = inspect.getsource(sched.DecodeScheduler.allocate_waiting)
+        src = inspect.getsource(sched.DecodeScheduler.build_prefill_batch)
         assert "should_allow_prefill" in src
-        assert "return []" in src, "a HOLD must allocate nothing"
+        assert "return None" in src, "a HOLD must dispatch nothing"
 
-    def test_prefill_no_longer_gates(self):
-        import inspect
-
+    def test_prefill_side_has_no_scheduling_at_all(self):
+        """The executor chooses nothing: no delayer, no gate, no schedule()."""
         sched = pytest.importorskip("atom.model_engine.scheduler")
 
-        src = inspect.getsource(sched.PrefillScheduler.schedule)
-        assert "should_allow_prefill" not in src
+        for name in (
+            "schedule",
+            "_schedule",
+            "should_fire_this_tick",
+            "set_prefill_group_delayer",
+            "decode_tokens",
+        ):
+            assert not hasattr(sched.PrefillExecutor, name), name
+
+    def test_the_second_delayer_is_gone(self):
+        """`PrefillGroupDelayer` was a per-rank barrier on prefill's own
+        forward. Decode sizes the batch now, so the floor it enforced is just
+        how the batch is built."""
+        pd = pytest.importorskip("atom.model_engine.prefill_delayer")
+
+        assert not hasattr(pd, "PrefillGroupDelayer")
 
     def test_prefill_engine_declines_the_delayer(self):
         ec = pytest.importorskip("atom.model_engine.engine_core")
@@ -1358,15 +1765,36 @@ class TestDelayerLivesOnDecode:
         )
 
     def test_decode_uses_real_kv_usage_and_decode_batch(self):
-        """The inputs prefill could not supply: prefill passed kv_usage=0.0,
-        which disables the KV-high/KV-low release bounds entirely."""
+        """The inputs prefill could not supply: it passed kv_usage=0.0, which
+        disables the KV-high/KV-low release bounds entirely."""
         import inspect
 
         sched = pytest.importorskip("atom.model_engine.scheduler")
 
-        src = inspect.getsource(sched.DecodeScheduler.allocate_waiting)
+        src = inspect.getsource(sched.DecodeScheduler.build_prefill_batch)
         assert "kv_usage=self._kv_usage()" in src
-        assert "len(self.running) - self._partial_prefill_count" in src
+        assert "running_decode_batch=len(self.running)" in src
+
+    def test_an_inflight_batch_is_reported_not_skipped(self):
+        """A busy rank must still enter the reduction.
+
+        "One batch in flight" is a PER-RANK condition and decode ranks finish
+        at different times, so returning before `should_allow_prefill` would
+        split the all_reduce call count and hang the group. Reporting
+        `prefillable=False` instead puts the condition inside the reduction,
+        where the existing alignment gate re-synchronises dispatch -- which is
+        also the only thing keeping the paired PREFILL ranks in step, since the
+        two sides share no collective.
+        """
+        import inspect
+
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+
+        src = inspect.getsource(sched.DecodeScheduler.build_prefill_batch)
+        gate = src.index("should_allow_prefill")
+        bail = src.index("if busy or not allow:")
+        assert gate < bail, "the delayer must be consulted before bailing out"
+        assert "prefillable = (not busy)" in src
 
     def test_decode_reuses_the_scheduler_delayer_helpers(self):
         """Not interchangeable with the obvious one-liners.
@@ -1381,7 +1809,7 @@ class TestDelayerLivesOnDecode:
 
         sched = pytest.importorskip("atom.model_engine.scheduler")
 
-        src = inspect.getsource(sched.DecodeScheduler.allocate_waiting)
+        src = inspect.getsource(sched.DecodeScheduler.build_prefill_batch)
         for helper in (
             "_waiting_new_token_count()",
             "_can_admit_head_prefill()",
@@ -1392,29 +1820,80 @@ class TestDelayerLivesOnDecode:
     def test_both_call_sites_build_the_same_inputs(self):
         """Decode's call and the base scheduler's must not drift apart.
 
-        Compared by INPUT SOURCE, not by exact kwarg spelling. The base call
-        site moved from `schedule` to `_schedule` and #2238 grew two branches
-        the rapidserve decode path does not have -- a decode-protection window
-        (`protects_decode`, which forces kv_usage=0.0) and local prefill
-        coalescing -- so it now reaches these helpers through locals rather
-        than inline keyword arguments. That is a real behavioural gap for
-        rapidserve, tracked separately; what this test still pins is that
-        neither side stops consulting one of the four inputs altogether.
+        Compared by INPUT SOURCE, not by exact kwarg spelling: the base site
+        reaches these helpers through locals because of branches rapidserve
+        does not have. What this pins is that neither side stops consulting one
+        of the inputs altogether.
         """
         import inspect
 
         sched = pytest.importorskip("atom.model_engine.scheduler")
 
-        decode = inspect.getsource(sched.DecodeScheduler.allocate_waiting)
+        decode = inspect.getsource(sched.DecodeScheduler.build_prefill_batch)
         base = inspect.getsource(sched.Scheduler._schedule)
         for source in (
             "self._can_admit_head_prefill()",
             "self._kv_usage()",
-            "self._partial_prefill_count > 0",
             "self._oldest_waiting_prefill_age_ms()",
         ):
             assert source in decode, f"decode dropped {source}"
             assert source in base, f"base dropped {source}"
+
+    def test_partial_terms_are_real_on_this_side_now(self):
+        """Chunked prefill is decode's, so a mid-prompt request is one of ours
+        and its remainder belongs in the aggregate. The old admission-time call
+        passed structural zeros here."""
+        import inspect
+
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+
+        src = inspect.getsource(sched.DecodeScheduler.build_prefill_batch)
+        assert "self._partial_prefill_remaining_tokens()" in src
+        assert "has_partial=bool(self.prefill_partial)" in src
+
+    def test_the_partial_term_reads_this_side_s_queue(self):
+        """The base helper walks `running` for `is_partial_prefill`, and a
+        rapidserve partial is never there -- `running` is the DECODE queue and
+        a mid-prompt request is not decodable. Inherited unchanged it returns 0
+        always, silently dropping the partial term out of the delayer's
+        aggregate so a rank chewing through a long chunked prompt looks idle to
+        its peers."""
+        import inspect
+
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+
+        src = inspect.getsource(sched.DecodeScheduler._partial_prefill_remaining_tokens)
+        assert "for seq in self.prefill_partial:" in src
+
+    def test_the_partial_term_counts_real_remainders(self):
+        from conftest import MockConfig
+
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+
+        obj = sched.DecodeScheduler(MockConfig(max_num_batched_tokens=4096))
+        assert obj._partial_prefill_remaining_tokens() == 0
+
+        from atom.model_engine.sequence import Sequence
+        from atom.sampling_params import SamplingParams
+
+        seq = Sequence(list(range(40)), 4, sampling_params=SamplingParams())
+        seq.num_cached_tokens = 16
+        obj.prefill_partial.append(seq)
+        assert obj._partial_prefill_remaining_tokens() == 24
+
+    def test_execution_feedback_fires_on_completion_not_dispatch(self):
+        """`notify_prefill_executed` arms post-prefill decode protection. A
+        dispatch is not an execution -- the forward happens in another
+        process -- so the true analogue of the baseline's call site is the
+        batch result arriving."""
+        import inspect
+
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+
+        drain = inspect.getsource(sched.DecodeScheduler.drain_prefill_completions)
+        build = inspect.getsource(sched.DecodeScheduler.build_prefill_batch)
+        assert "notify_prefill_executed()" in drain
+        assert "notify_prefill_executed" not in build
 
     def test_decode_attaches_after_its_scheduler_exists(self):
         """DecodeScheduler is built only after the kvcache import, so the
@@ -1429,88 +1908,15 @@ class TestDelayerLivesOnDecode:
         assert attach > build
 
 
+class TestUnconstrainedEmitsOnlyTheNoneStream:
+    """The pool's sole key in unconstrained mode is None, so that is the only
+    fraction either side may put on a batch.
 
-
-class TestCuMaskingIsIndependentOfTheShm:
-    """Publishing the decode token count and masking CUs are separate concerns.
-
-    The shm now exists in BOTH modes so the count is always available. Decode
-    used to infer "constrained mode" from `self._cu_shm is not None`, so once
-    the shm became unconditional it emitted cu_stream_fraction=0.5 while
-    ModelRunner had built only the full-CU stream (the pool is gated on
-    disagg_constrained, model_runner.py:4711) — KeyError: 0.5 on the first
-    decode forward.
+    Emitting 0.5 against a pool built without the fractional entries is a
+    KeyError on the first forward, which is how this was found.
     """
 
-    @staticmethod
-    def _shm(nbytes=4):
-        import multiprocessing.shared_memory
-        import os
-
-        shm = multiprocessing.shared_memory.SharedMemory(
-            name=f"atom_test_cu_{os.getpid()}_{nbytes}", create=True, size=nbytes
-        )
-        shm.buf[:nbytes] = b"\x00" * nbytes
-        return shm
-
-    @staticmethod
-    def _build(cls, cfg, shm_name):
-        """Construct, or skip on the pre-existing full-suite import pollution.
-
-        Scheduler.__init__ does a lazy `from atom.utils.forward_context import
-        get_kvconnector` (scheduler.py:599) that fails once the suite has run —
-        inside __init__, so pytest.importorskip on the module cannot catch it.
-        """
-        try:
-            return cls(cfg, disagg_cu_shm_name=shm_name)
-        except ImportError as exc:
-            pytest.skip(f"polluted sys.modules: {exc}")
-
-    def test_masking_off_when_unconstrained_even_with_shm(self):
-        from atom.model_engine.scheduler import DecodeScheduler
-
-        shm = self._shm()
-        try:
-            sched = self._build(
-                DecodeScheduler, MockConfig(disagg_constrained=False), shm.name
-            )
-            assert sched._cu_shm is not None, "the count must still be published"
-            assert sched._cu_masking is False
-            assert sched.cu_fraction is None
-        finally:
-            shm.close()
-            shm.unlink()
-
-    def test_masking_on_when_constrained(self):
-        from atom.model_engine.scheduler import DecodeScheduler
-
-        shm = self._shm(8)
-        try:
-            sched = self._build(
-                DecodeScheduler, MockConfig(disagg_constrained=True), shm.name
-            )
-            assert sched._cu_masking is True
-        finally:
-            shm.close()
-            shm.unlink()
-
-    def test_prefill_side_agrees(self):
-        from atom.model_engine.scheduler import PrefillScheduler
-
-        shm = self._shm()
-        try:
-            sched = self._build(
-                PrefillScheduler, MockConfig(disagg_constrained=False), shm.name
-            )
-            assert sched._cu_shm is not None
-            assert sched._cu_masking is False
-        finally:
-            shm.close()
-            shm.unlink()
-
     def test_only_none_key_is_emitted_when_unconstrained(self):
-        """The pool's sole key in unconstrained mode is None, so that is the
-        only fraction either scheduler may put on a batch."""
         import inspect
 
         mr_src = inspect.getsource(
@@ -1519,6 +1925,13 @@ class TestCuMaskingIsIndependentOfTheShm:
         # the fractional entries are gated; the None entry is unconditional
         assert 'if getattr(self.config, "disagg_constrained", False):' in mr_src
         assert "self._decode_streams[None] = torch.cuda.Stream()" in mr_src
+
+    def test_decode_leaves_the_fraction_none_when_unconstrained(self):
+        from atom.model_engine.scheduler import DecodeScheduler
+
+        sched = DecodeScheduler(MockConfig(disagg_constrained=False))
+        assert sched._cu_masking is False
+        assert sched.cu_fraction is None
 
 
 class TestDelayerDoesNotSpinWhenIdle:
@@ -1538,7 +1951,7 @@ class TestDelayerDoesNotSpinWhenIdle:
         ec = pytest.importorskip("atom.model_engine.engine_core")
 
         src = inspect.getsource(ec.DecodeEngineCore.pull_and_process_input_queue)
-        assert "allocate_waiting" not in src
+        assert "build_prefill_batch" not in src
 
     def test_admission_is_in_the_work_gated_step(self):
         import inspect
@@ -1546,16 +1959,32 @@ class TestDelayerDoesNotSpinWhenIdle:
         ec = pytest.importorskip("atom.model_engine.engine_core")
 
         src = inspect.getsource(ec.DecodeEngineCore._process_engine_step)
-        assert "allocate_waiting" in src
+        assert "build_prefill_batch" in src
 
-    def test_admission_precedes_the_early_return(self):
-        """Every rank must reach the collective on the same iterations."""
+    def test_admission_precedes_every_early_return(self):
+        """Every rank must reach the delayer's collective on the same
+        iterations, so nothing may return before the batch build that ticks it.
+
+        Checked on the AST: the comments around this code name the very
+        constructs being ordered, so a substring search matches prose.
+        """
+        import ast
         import inspect
 
         ec = pytest.importorskip("atom.model_engine.engine_core")
 
-        src = inspect.getsource(ec.DecodeEngineCore._process_engine_step)
-        assert src.index("allocate_waiting") < src.index("has_requests()")
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        build = min(
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "build_prefill_batch"
+        )
+        first_return = min(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Return))
+        assert build < first_return
 
     def test_busy_loop_gates_the_step_on_an_all_reduced_flag(self):
         """What makes the entry condition identical on every rank."""
@@ -1685,9 +2114,9 @@ class TestHashRoutingIdsGather:
             for bypass in (False, True):
                 for has_mori in (False, True):
                     all2all = ep and has_mori and not bypass
-                    assert self._need(
-                        True, ep, bypass=bypass, has_mori=has_mori
-                    ) is (not all2all)
+                    assert self._need(True, ep, bypass=bypass, has_mori=has_mori) is (
+                        not all2all
+                    )
 
 
 class TestAll2AllBackendSelection:
@@ -1837,9 +2266,7 @@ class TestAll2AllKwargFiltering:
             M()._make_all2all_kwargs(**got)
 
     def test_real_backends_differ_exactly_by_gpu_per_node(self):
-        a2a = pytest.importorskip(
-            "aiter.dist.device_communicators.all2all"
-        )
+        a2a = pytest.importorskip("aiter.dist.device_communicators.all2all")
         import inspect
 
         mori = set(
@@ -1947,18 +2374,17 @@ class TestDecodeMoEAll2AllInit:
         assert layer.quant_method.init_calls == 1
 
 
-
 # ── engine-status line: the two P/D processes must be distinguishable ─────
 
 
 def test_pd_schedulers_label_their_engine_lines(
-    prefill_scheduler_unconstrained, decode_scheduler_unconstrained
+    prefill_executor_unconstrained, decode_scheduler_unconstrained
 ):
     """Both P/D processes run as engine index 0 and usually log to the same
     place, so the line carries a label; the aggregated engine keeps none."""
     from atom.model_engine.scheduler import Scheduler
 
-    assert prefill_scheduler_unconstrained.engine_stats.label == "Prefill "
+    assert prefill_executor_unconstrained.engine_stats.label == "Prefill "
     assert decode_scheduler_unconstrained.engine_stats.label == "Decode "
     assert Scheduler(MockConfig()).engine_stats.label == ""
 
@@ -1966,19 +2392,21 @@ def test_pd_schedulers_label_their_engine_lines(
 def test_decode_request_counts_fold_in_the_pd_queues(
     decode_scheduler_unconstrained, seq_factory
 ):
-    """`allocate_waiting()` drains `waiting` almost at once, so a decode
-    engine at full load parks its requests in `prefill_waiting` /
-    `prefill_done`. Counting only the base pair reports an idle engine."""
+    """A decode engine at full load parks its requests in `prefill_inflight`
+    / `prefill_partial` / `prefill_done`. Counting only the base pair reports
+    an idle engine."""
     sched = decode_scheduler_unconstrained
     assert sched.get_request_counts() == (0, 0)
 
-    parked = seq_factory([1, 2, 3, 4])
+    inflight = seq_factory([1, 2, 3, 4])
+    partial = seq_factory([9, 10, 11, 12])
     ready = seq_factory([5, 6, 7, 8])
-    sched.prefill_waiting[parked.id] = parked
+    sched.prefill_inflight[inflight.id] = inflight
+    sched.prefill_partial.append(partial)
     sched.prefill_done.append(ready)
 
     running, waiting = sched.get_request_counts()
-    assert waiting == 1, "prefill_waiting must count as waiting"
+    assert waiting == 2, "prefill_inflight and prefill_partial count as waiting"
     assert running == 1, "prefill_done must count as running"
 
 
@@ -1991,7 +2419,7 @@ def test_decode_metrics_and_status_line_agree(
     log says it is at full load."""
     sched = decode_scheduler_unconstrained
     for i in range(3):
-        sched.prefill_waiting[i] = seq_factory([1, 2, 3, 4])
+        sched.prefill_inflight[i] = seq_factory([1, 2, 3, 4])
     sched.prefill_done.append(seq_factory([5, 6, 7, 8]))
 
     running, waiting = sched.get_request_counts()
@@ -2002,17 +2430,17 @@ def test_decode_metrics_and_status_line_agree(
     assert sched.has_unfinished_requests() is True
 
 
-def test_metrics_work_on_the_prefill_scheduler():
-    """`PrefillEngineCore` swaps in a `PrefillScheduler` and rewires the
+def test_metrics_work_on_the_prefill_executor():
+    """`PrefillEngineCore` swaps in a `PrefillExecutor` and rewires the
     utility handler to it, so `collect_metrics` has to survive a scheduler
     that is not a `Scheduler` subclass and owns no BlockManager — it used to
     raise AttributeError on `block_manager.kv` inside the busy loop."""
     import queue
 
     from atom.model_engine.engine_utility import EngineUtilityHandler
-    from atom.model_engine.scheduler import PrefillScheduler
+    from atom.model_engine.scheduler import PrefillExecutor
 
-    sched = PrefillScheduler(MockConfig(enable_log_stats=True))
+    sched = PrefillExecutor(MockConfig(enable_log_stats=True))
     handler = EngineUtilityHandler(
         runner_mgr=None,
         output_queue=queue.Queue(),
@@ -2040,14 +2468,14 @@ def test_idle_heartbeat_is_available_on_every_scheduler(caplog):
 
     from atom.model_engine.scheduler import (
         DecodeScheduler,
-        PrefillScheduler,
+        PrefillExecutor,
         Scheduler,
     )
 
     cfg = MockConfig(enable_log_stats=True)
     for sched in (
-        PrefillScheduler(cfg, disagg_cu_shm_name=""),
-        DecodeScheduler(cfg, disagg_cu_shm_name=""),
+        PrefillExecutor(cfg),
+        DecodeScheduler(cfg),
         Scheduler(cfg),
     ):
         stats = sched.engine_stats
@@ -2083,7 +2511,7 @@ def test_decode_schedule_records_throughput_when_log_stats_on(seq_factory):
     default (log stats ON) on both the empty and the scheduled path."""
     from atom.model_engine.scheduler import DecodeScheduler
 
-    sched = DecodeScheduler(MockConfig(enable_log_stats=True), disagg_cu_shm_name="")
+    sched = DecodeScheduler(MockConfig(enable_log_stats=True))
     assert sched.engine_stats.throughput_enabled is True
 
     # Empty path: `running` is empty, so schedule() takes the early return.
@@ -2143,7 +2571,7 @@ def test_snapshots_carry_their_pd_role():
     from atom.model_engine.engine_utility import EngineUtilityHandler
     from atom.model_engine.scheduler import (
         DecodeScheduler,
-        PrefillScheduler,
+        PrefillExecutor,
         Scheduler,
     )
 
@@ -2156,15 +2584,15 @@ def test_snapshots_carry_their_pd_role():
         )
         return handler.collect_metrics()["role"]
 
-    assert role_of(PrefillScheduler(MockConfig())) == "prefill"
-    assert role_of(DecodeScheduler(MockConfig(), disagg_cu_shm_name="")) == "decode"
+    assert role_of(PrefillExecutor(MockConfig())) == "prefill"
+    assert role_of(DecodeScheduler(MockConfig())) == "decode"
     # The aggregated (non-P/D) engine is neither half of a pair.
     assert role_of(Scheduler(MockConfig())) == ""
 
 
 def test_pd_queue_depths_are_not_double_counted():
     """One in-flight request is held by both P/D ranks at the same instant —
-    the prefill rank's `running` and the decode rank's `prefill_waiting`. The
+    the prefill rank's `running` and the decode rank's `prefill_inflight`. The
     decode side's queues already span the whole lifetime, so summing the pair
     reports more requests than exist."""
     metrics = _aggregate(

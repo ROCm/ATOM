@@ -838,9 +838,14 @@ class EngineUtilityHandler:
                     seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
                     for seq in self.scheduler.waiting
                 )
-                # Shared-cache disaggregation has a separate prefill queue,
-                # whereas connector-based PD parks requests in `waiting`.
-                external = parked + len(getattr(self.scheduler, "prefill_waiting", ()))
+                # Shared-cache disaggregation has separate prefill queues --
+                # dispatched and mid-prompt -- whereas connector-based PD parks
+                # requests in `waiting`.
+                external = (
+                    parked
+                    + len(getattr(self.scheduler, "prefill_inflight", ()))
+                    + len(getattr(self.scheduler, "prefill_partial", ()))
+                )
                 result["scheduler_metrics"] = {
                     "running": running,
                     "waiting": max(0, waiting - external),

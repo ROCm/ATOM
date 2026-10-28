@@ -22,7 +22,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
-import struct
+import queue
 import threading
 import time
 from collections import deque
@@ -43,6 +43,7 @@ from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
     SequenceType,
+    new_block_table,
     new_token_ids,
     resumes_offload_prefill,
 )
@@ -103,7 +104,7 @@ def _prompt_tokens_of(result) -> int:
     """Prompt tokens in whatever a `_schedule()` returned.
 
     The three schedulers disagree on the empty shape — bare `None` from
-    `Scheduler` and `DecodeScheduler`, `(None, {})` from `PrefillScheduler` —
+    `Scheduler` and `DecodeScheduler` —
     so normalize here rather than at each caller. `total_tokens_num_prefill`
     is 0 on a decode batch, which is what the throughput window wants: its
     generation side is counted in `postprocess`, from tokens actually
@@ -114,13 +115,13 @@ def _prompt_tokens_of(result) -> int:
 
 
 def _optimal_cu_fraction(
-    decode_batch: int, prefill_waiting_tokens: int
+    decode_batch: int, prefill_pending_tokens: int
 ) -> float | None:
     """Return the prefill CU fraction for the current workload, or None for no mask.
 
     Called by the DecodeScheduler, which has visibility into both the decode
-    batch size and the total tokens queued in prefill_waiting.  The chosen
-    fraction is written to shared memory so the PrefillScheduler can read it.
+    batch size and the prefill tokens still owed.  The chosen fraction travels
+    to prefill inside the batch message decode plans.
 
     Lookup table derived from empirical benchmarking across CU splits
     (30/50/60/70/80% prefill) on DeepSeek-R1 tp=8.  Prefill latency
@@ -130,8 +131,8 @@ def _optimal_cu_fraction(
     Returns None when CU masking provides no benefit (no pending prefill,
     tiny prefill).
     """
-    assert prefill_waiting_tokens >= 0
-    if prefill_waiting_tokens == 0: # or decode_batch < 64:
+    assert prefill_pending_tokens >= 0
+    if prefill_pending_tokens == 0:  # or decode_batch < 64:
         return None
     else:
         return 0.5
@@ -505,7 +506,7 @@ class ScheduledBatchOutput:
 def _sched_role(config) -> str:
     """Which scheduler produced a batch: single / prefill / decode.
 
-    Module-level, NOT a method: `PrefillScheduler` does not inherit from
+    Module-level, NOT a method: `PrefillExecutor` does not inherit from
     `Scheduler` (it has no BlockManager and shares none of its scheduling), so
     a helper defined on `Scheduler` and called from all three is an
     `AttributeError` on exactly one of them -- found the hard way.
@@ -656,7 +657,7 @@ class Scheduler:
         self.delay_factor = config.scheduler_delay_factor
 
         # Speculative decoding. A P/D producer is excluded for the same reason
-        # `PrefillScheduler` is: it prefills, samples T0 and hands the request
+        # `PrefillExecutor` is: it prefills, samples T0 and hands the request
         # off, so it never proposes. That holds for every producer, so this
         # does not follow the runner's deferred-output decision, which
         # additionally asks whether the model keeps recurrent state.
@@ -2987,14 +2988,14 @@ class Scheduler:
         Three callers, one per way a request can first be charged for its
         prompt: `_schedule_prefill_seq` for an ordinary engine,
         `_schedule_first_decode_after_remote_kv` for a Mooncake/MORI-IO decode,
-        and `DecodeScheduler.allocate_waiting` for a rapidserve one.
+        and `DecodeScheduler.build_prefill_batch` for a rapidserve one.
 
         The last is decode's because it is decode's BlockManager that does the
-        lookup: rapidserve's prefill process runs a `PrefillScheduler` with no
-        BlockManager at all, and is handed the hit count in
-        `BlockAssignment.num_cached_tokens` rather than finding it. Accounting
+        lookup: rapidserve's prefill process runs a `PrefillExecutor` with no
+        BlockManager at all, and is handed the span to run rather than
+        discovering anything about it. Accounting
         it there as well would double-count, which is the same reason
-        `PrefillScheduler` carries `_METRICS_ROLE = "prefill"` and the
+        `PrefillExecutor` carries `_METRICS_ROLE = "prefill"` and the
         aggregator drops its counts.
         """
         if self.engine_stats.cache_enabled:
@@ -3593,7 +3594,7 @@ class Scheduler:
                 if batch is None:
                     if seq.pending_hash_start >= 0:
                         # Rapidserve: prefill ran in the other process and
-                        # `on_prefill_done` already advanced
+                        # the batch completion already advanced
                         # `num_cached_tokens` past what it computed, so the
                         # default offset points at the END of the prompt and
                         # the range collapses. Publish the range prefill
@@ -4436,19 +4437,24 @@ class Scheduler:
         return passed_delay
 
 
-class PrefillScheduler:
-    """Scheduler for the disaggregated prefill process.
+class PrefillExecutor:
+    """Holds the prefill process's sequences and runs the batches decode sends.
 
-    Key differences from the base Scheduler:
-    - No BlockManager: KV blocks AND per-request state slots are pre-assigned
-      by DecodeEngineCore and written into seq.block_table / seq.state_slots
-      before schedule() is called.
-    - schedule() only runs sequences whose assignment has fully landed -- both
-      halves, since a model with a per-request cache cannot run without its
-      slot. Sequences still waiting for a BlockAssignment message stay in
-      waiting.
-    - postprocess() is a no-op: prefill produces no sampled tokens.
-    - Decode scheduling is never performed.
+    Not a scheduler, and deliberately named so: it chooses nothing. Decode owns
+    the `BlockManager`, so decode decides which sequences prefill runs, how
+    wide each chunk is and which checkpoint rung it lands on, and ships that
+    decision as a `PrefillBatchMsg`. This class resolves the sequence ids,
+    applies the spans and turns them into a `ScheduledBatch`.
+
+    What it still owns is everything that is local to this process by nature:
+    the `Sequence` objects themselves -- which arrive from the ADD that
+    `DisaggCoreManager` fans out to both members of a pair, prompt tokens
+    included, and are why a batch message carries no token ids -- plus this
+    rank's metrics and throughput window.
+
+    `block_manager` is None here and stays None: this process allocates
+    nothing. `postprocess` is a no-op; prefill's sampled token goes back to
+    decode in the batch result instead.
     """
 
     # Every request here is also held by the decode side, whose queues span
@@ -4457,11 +4463,11 @@ class PrefillScheduler:
     # `Scheduler`.
     _METRICS_ROLE = "prefill"
 
-    def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
+    def __init__(self, config: Config):
         # Kept whole, as `Scheduler` does. This class otherwise picks out
         # individual fields, so helpers shared with the other schedulers had
-        # nothing to read -- and `PrefillScheduler` does NOT inherit from
-        # `Scheduler`, so it gets none of its attributes for free.
+        # nothing to read -- and it does NOT inherit from `Scheduler`, so it
+        # gets none of its attributes for free.
         self.config = config
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -4499,104 +4505,78 @@ class PrefillScheduler:
         self.total_generation_tokens = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
-
-        # Shared memory carrying decode's in-flight token count, published by
-        # the paired DecodeScheduler every step.
-        # Layout: 4 bytes per pair; this pair reads at offset 4*decode_rank.
-        # Published regardless of --disagg-constrained so the number is always
-        # available; CU partitioning is its consumer here.
-        self._cu_shm = None
-        self._cu_shm_offset = 4 * getattr(config, "disagg_decode_rank", 0)
-        # Whether to actually mask CUs. The shm now exists either way, so this
-        # can no longer be inferred from `self._cu_shm is not None`.
-        self._cu_masking = bool(getattr(config, "disagg_constrained", False))
-        if disagg_cu_shm_name:
-            import multiprocessing.shared_memory
-
-            self._cu_shm = multiprocessing.shared_memory.SharedMemory(
-                name=disagg_cu_shm_name, create=False
-            )
-            logger.info("initialized shared memory")
+        # Guards `waiting` / `running` against the socket thread, which removes
+        # aborted sequences from them.
         self._pending_lock = threading.Lock()
-        # Set post-construction by `PrefillEngineCore._maybe_attach_prefill_
-        # group_delayer`, once `self.dp_group` exists -- see
-        # `set_prefill_group_delayer`. A different gate from `PrefillDelayer`:
-        # that one lives on `DecodeScheduler` and holds back NEW admission;
-        # this one holds back THIS scheduler's own forward on sequences it
-        # already has.
-        self.prefill_group_delayer = None
+        # Batches decode has sent and this process has not run yet, oldest
+        # first. Filled by the socket thread, drained by the engine thread.
+        # Decode keeps one batch outstanding, so this holds at most one in
+        # steady state; it is a queue rather than a slot so a batch whose
+        # sequences have not arrived yet can be retried without blocking the
+        # socket thread.
+        self._pending_batches: deque = deque()
+        self._batch_lock = threading.Lock()
 
-    def set_prefill_group_delayer(self, delayer) -> None:
-        self.prefill_group_delayer = delayer
+    def enqueue_batch(self, msg) -> None:
+        """Accept a batch from decode. Socket thread."""
+        with self._batch_lock:
+            self._pending_batches.append(msg)
 
-    @staticmethod
-    def _is_ready(seq: Sequence) -> bool:
-        """Has this seq's BlockAssignment fully landed?
+    def peek_batch(self):
+        """The batch to run next, or None. Engine thread."""
+        with self._batch_lock:
+            return self._pending_batches[0] if self._pending_batches else None
 
-        BOTH halves, not just the block table. A `BlockAssignment` carries
-        `block_table` AND `state_slots`, and a model with a per-request cache
-        is unrunnable without the second: the batch's `state_slot_out` is
-        built from `[seq for seq in seqs.values() if seq.has_per_req_cache and
-        seq.state_slot >= 0]`, so a sequence admitted with blocks but no slot
-        silently drops out of that table while still occupying a row of the
-        grid. The draft block then indexes past the table's end -- "a Python
-        slice past the end truncates rather than raising, so the kernels got
-        a slot table shorter than their own grid and read past it" -- which
-        surfaces as a GPU memory access fault with no Python frame, not as an
-        error anyone can read.
+    def drop_batch(self, msg) -> None:
+        """Retire a batch that has been run. Engine thread."""
+        with self._batch_lock:
+            if self._pending_batches and self._pending_batches[0] is msg:
+                self._pending_batches.popleft()
 
-        One source of truth for `_schedule()`'s own admission filter and
-        `should_fire_this_tick()`'s pending-token scan, so the two can never
-        quietly disagree about what "ready" means.
-        """
-        return bool(seq.block_table) and (
-            not getattr(seq, "has_per_req_cache", False) or seq.state_slot >= 0
-        )
-
-    def should_fire_this_tick(self) -> bool:
-        """Gate for `PrefillGroupDelayer`: may this rank run a forward now?
-
-        MUST be called every tick `PrefillEngineCore._process_engine_step`
-        reaches, BEFORE the `has_requests()` short-circuit below it -- that
-        short-circuit returns before `schedule()` is ever called on a rank
-        with nothing locally ready, so a gate living inside `_schedule()`
-        would run on a busy rank but not an idle one, mismatching the
-        collective call count and hanging the group. `busy_loop`'s own
-        `_sync_dp_state` guarantees `_process_engine_step` is reached on every
-        prefill rank or none, each tick -- that is the invariant this relies
-        on, not anything local to this method.
-
-        True when no delayer is attached, so attaching one is the only way
-        this method's existence changes anything for an engine that never
-        opts in.
-        """
-        if self.prefill_group_delayer is None:
-            return True
-        pending = 0
-        any_ready = False
-        with self._pending_lock:
-            for seq in self.waiting:
-                if self._is_ready(seq):
-                    any_ready = True
-                    pending += seq.num_tokens - seq.num_cached_tokens
-        return self.prefill_group_delayer.should_allow_prefill(any_ready, pending)
-
-    def decode_tokens(self) -> int:
-        """Decode's in-flight token count on the paired rank, or 0."""
-        if self._cu_shm is None:
-            return 0
-        return struct.unpack_from("I", self._cu_shm.buf, self._cu_shm_offset)[0]
+    @property
+    def pending_batch_count(self) -> int:
+        return len(self._pending_batches)
 
     def is_finished(self) -> bool:
-        return not self.waiting and not self.running
+        """Is there anything for this rank to RUN?
+
+        A batch, and only a batch. Holding a `Sequence` is not work here: this
+        process schedules nothing, so a sequence decode has not yet sent a
+        chunk for is something to wait on, not something to do.
+
+        That distinction is the difference between an idle rank and a busy one,
+        and it is expensive to get wrong. `DPEngineCoreProc.busy_loop` answers
+        "unfinished but `_process_engine_step` ran nothing" with
+        `_execute_dummy_batch()`, to keep the MoE collective matched with ranks
+        that did run something. Reporting the queues here made every rank claim
+        work for the whole life of a long prompt, so each one burned a dummy
+        forward on every tick it spent waiting for decode's next chunk --
+        measured at 4.7 dummy forwards per real chunk on a 670k-token prompt,
+        about 40% of prefill's GPU time.
+
+        Reading the batch queue instead lets `_sync_dp_state` all-reduce the
+        truth: when every rank is waiting on decode, the group skips the step
+        entirely and no dummy runs. It is safe precisely because the loop folds
+        this into `local_unfinished` BEFORE that all_reduce, so every rank sees
+        the same answer. And it cannot wedge: the socket thread fills the queue
+        independently of the step, so the next tick's all_reduce picks the work
+        back up.
+        """
+        return not self._pending_batches
 
     def has_requests(self) -> bool:
+        """Does this rank still hold sequences? NOT the same as having work.
+
+        Used for reporting; `is_finished()` is the work gate. The two answer
+        different questions and deliberately disagree while a chunked prompt
+        waits between chunks.
+        """
         return bool(self.waiting) or bool(self.running)
 
     def publish_kv_events(self) -> None:
         # No-op: disagg prefill has no BlockManager — the decode process owns the
         # KV blocks and emits KV events. Defined so EngineCore.busy_loop teardown
-        # (which calls this on every scheduler) works for PrefillScheduler.
+        # (which calls this on every scheduler) works for this class too.
         pass
 
     def shutdown_kv_events(self) -> None:
@@ -4605,195 +4585,133 @@ class PrefillScheduler:
 
     def add(self, seq: Sequence):
         self.metrics.enqueue(seq)
-        self.waiting.append(seq)
+        with self._pending_lock:
+            self.waiting.append(seq)
 
     def extend(self, seqs: list):
         for seq in seqs:
             self.metrics.enqueue(seq)
-        self.waiting.extend(seqs)
-
-    def schedule(self):
-        """Run a scheduling pass and close the throughput window.
-
-        Override `_schedule`, not this — see `Scheduler.schedule` for why the
-        tick lives at the one entry point instead of at each early return.
-        """
-        result = self._schedule()
-        self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
-        return result
-
-    def _schedule(self):
-        """Schedule only sequences whose block assignment has fully landed.
-
-        Sequences that do not yet have one remain in the waiting queue and are
-        reconsidered on the next call. "Fully" means both halves: an empty
-        `block_table`, or a missing state slot on a model that keeps a
-        per-request cache, each leave the sequence unrunnable.
-
-        Returns (ScheduledBatch, dict[seq_id, Sequence]) or (None, {}) when
-        no sequence is ready.
-        """
-        scheduled_seqs = {}
-        num_scheduled_tokens = []
-        # Per-seq finality, which this scheduler did not report. Left unset,
-        # `ScheduledBatch.is_final_chunk` stays None and `produces_output()`
-        # answers True unconditionally ("if self.is_final_chunk is None:
-        # return True") -- so a batch of nothing but middle chunks claimed to
-        # produce output, and the draft pass ran for sequences that are
-        # mid-prompt. The non-disagg scheduler computes the same thing at its
-        # prefill batch, which is why that path can take the `align_only`
-        # branch and this one never could.
-        is_final_chunk: list[bool] = []
-        num_batched_tokens = 0
-        num_seqs = 0
-        # Images for chunks that already landed on their rung, carried by the
-        # batch that runs next. `build()` drains these before the forward
-        # ("Run state maintenance on the compute stream before the forward"),
-        # so on one stream the order is: chunk ending at the rung, scatter,
-        # chunk after it. No event and no sync -- the copy simply sits between
-        # the forward that produced the state and the one that overwrites it.
-        stores: list = []
-
         with self._pending_lock:
-            # Collect ready sequences (have received BlockAssignment from
-            # decode) -- see `_is_ready` for what "ready" requires and why.
-            ready = [s for s in self.waiting if self._is_ready(s)]
+            self.waiting.extend(seqs)
 
-            for seq in ready:
-                if num_seqs >= self.max_num_seqs:
-                    break
-                # The budget FIRST, then the rung inside it -- the order
-                # `Scheduler._finalize_prefill_chunk` uses, and it is not
-                # cosmetic. Taken the other way round, a rung further out than
-                # one batch allows produces a chunk nothing can schedule, and
-                # the `break` below parks it at the head of the queue forever:
-                # a 226k prompt against a 16k budget asks for its 221184-token
-                # rung, never fits, and every request behind it stops too.
-                #
-                # The budget chunks ONLY what cannot run whole: a prompt that
-                # fits a full batch waits for one, a prompt longer than the
-                # budget entire is cut. So middle chunks come from two places
-                # now -- an over-budget prompt, and the checkpoint rung (gated
-                # on prefix caching via `_prepare_prefill_checkpoint`). With
-                # prefix caching off and every prompt under the budget, a
-                # prefill batch is whole prompts and `produces_output()` is
-                # never false.
-                budget = self.max_num_batched_tokens - num_batched_tokens
-                if budget <= 0:
-                    break
-                num_new_tokens = seq.num_tokens - seq.num_cached_tokens
-                partial = False
-                # WHOLE SEQUENCES WHERE POSSIBLE, chunked where it is not.
-                #
-                # A prompt that fits a full batch but not what is left of this
-                # one WAITS rather than being truncated: budget-chunking is
-                # what manufactured middle chunks, and a middle chunk is a
-                # forward with no output rows that every draft path then has to
-                # special-case.
-                #
-                # But a prompt longer than `max_num_batched_tokens` ENTIRE can
-                # never fit any batch, and chunking is the only way it runs at
-                # all. Refusing it is not an option -- an agentic workload
-                # routinely sends prompts far past the budget (observed: a
-                # 226264-token request against a 16384 budget), and skipping
-                # them silently starves exactly the requests the benchmark is
-                # about. So the cut comes back for that case only.
-                if num_new_tokens > budget:
-                    if num_new_tokens > self.max_num_batched_tokens:
-                        # Unrunnable whole at ANY batch size: chunk it, which is
-                        # what this scheduler did for everything before. Take
-                        # the remaining budget rather than the full one -- a
-                        # later pass continues from `num_cached_tokens`.
-                        num_new_tokens = budget
-                        partial = True
-                    else:
-                        # Fits a full batch, just not what is left of this one.
-                        break
-                # Land on the FURTHEST rung this chunk can reach, which is what
-                # `Scheduler._finalize_prefill_chunk` does on the non-disagg
-                # path. A checkpoint holds the state as of a forward's LAST
-                # token, so a rung is only real if a forward ends exactly
-                # there; stopping at the nearest one instead would shorten
-                # every chunk to the ladder's spacing and buy nothing, because
-                # the rungs in between are run over either way. A rung past
-                # what this pass can afford is not this chunk's to land on --
-                # a later pass, starting further in, reaches it.
-                reach = seq.num_cached_tokens + num_new_tokens
-                cut = seq.prefill_cut_within(reach)
-                if cut and cut < reach:
-                    num_new_tokens = cut - seq.num_cached_tokens
-                    partial = True
-                if num_new_tokens <= 0:
-                    break
-                # Whether THIS chunk ends on a rung, which is what decides if
-                # the peer reports it (`PrefillEngineCore._process_engine_step`
-                # gates PrefillDone on it) and therefore whether decode has an
-                # image to settle. Recorded after the clamp above, so it
-                # describes the chunk actually being scheduled.
-                seq.prefill_landed_on_rung = bool(cut) and (
-                    cut == seq.num_cached_tokens + num_new_tokens
-                )
-                # A partial chunk leaves the request in `waiting`: it is not
-                # running anything after this forward, and the next pass has to
-                # find it again to run the remainder. Only the final chunk
-                # promotes.
-                if not partial:
+    def drop(self, seq_id: int) -> bool:
+        """Forget a sequence decode has abandoned. Socket thread.
+
+        Without this an aborted request's `Sequence` stays in `waiting`
+        forever, and `is_finished()` reads off those queues -- so the rank
+        never reports idle, `_sync_dp_state` keeps the whole prefill group
+        stepping, and every tick runs a dummy forward for work that no longer
+        exists.
+        """
+        with self._pending_lock:
+            for q in (self.waiting, self.running):
+                for seq in q:
+                    if seq.id == seq_id:
+                        q.remove(seq)
+                        return True
+        return False
+
+    def apply_batch(self, msg):
+        """Turn one `PrefillBatchMsg` into `(ScheduledBatch, seqs)`, or None.
+
+        The pair, not just the batch: `ScheduledBatch.__init__` consumes the
+        mapping to derive `req_ids` and the per-seq arrays and keeps none of
+        it, so the caller needs its own reference to reply and to retire.
+
+        None means "not yet" and is never an error: a batch can name a
+        sequence whose ADD has not arrived, because the manager sends decode's
+        copy of a request first and decode may plan a batch before this
+        process has drained its own. The caller retries on the next tick, and
+        `_monitor_prefill_backlog` is what makes a batch that never resolves
+        visible -- with one batch in flight per pair, a stuck one stalls the
+        pair rather than just one request.
+        """
+        with self._pending_lock:
+            by_id = {seq.id: seq for seq in self.waiting}
+            by_id.update({seq.id: seq for seq in self.running})
+            missing = [c.seq_id for c in msg.chunks if c.seq_id not in by_id]
+            if missing:
+                return None
+
+            scheduled_seqs: dict[int, Sequence] = {}
+            num_scheduled_tokens: list[int] = []
+            num_cached_tokens: list[int] = []
+            is_final_chunk: list[bool] = []
+            next_token_ids: list[int] = []
+            stores: list = []
+            for chunk in msg.chunks:
+                seq = by_id[chunk.seq_id]
+                # Decode owns these; this process only adopts them. The block
+                # table arrives once, on a sequence's first chunk, and is
+                # unchanged afterwards -- decode allocates the whole prompt at
+                # admission.
+                if chunk.block_table is not None:
+                    seq.block_table = new_block_table(chunk.block_table)
+                seq.state_slots = list(chunk.state_slots)
+                seq.num_cached_tokens = chunk.start
+                seq.type = SequenceType.PREFILL
+                seq.status = SequenceStatus.RUNNING
+                seq.is_partial_prefill = not chunk.is_final_chunk
+                scheduled_seqs[seq.id] = seq
+                num_scheduled_tokens.append(chunk.num_tokens)
+                num_cached_tokens.append(chunk.start)
+                is_final_chunk.append(chunk.is_final_chunk)
+                next_token_ids.append(chunk.next_token_id)
+                if chunk.store_op is not None:
+                    # Scattered by `build()` BEFORE this forward, which is the
+                    # whole reason decode attaches an image to the chunk AFTER
+                    # the one that produced it: on one stream the order is
+                    # chunk ending at the rung, scatter, chunk after it.
+                    stores.append(chunk.store_op)
+
+            for seq in scheduled_seqs.values():
+                if seq in self.waiting:
                     self.waiting.remove(seq)
                     self.running.append(seq)
-                seq.status = SequenceStatus.RUNNING
-                seq.type = SequenceType.PREFILL
-                seq.is_partial_prefill = partial
-                scheduled_seqs[seq.id] = seq
-                num_scheduled_tokens.append(num_new_tokens)
-                # Positionally aligned with `num_scheduled_tokens`, appended in
-                # the same place, so the two cannot describe different batches.
-                is_final_chunk.append(not partial)
-                num_batched_tokens += num_new_tokens
-                num_seqs += 1
-                # Read BEFORE the advance below, which is what decides whether
-                # this seq is past its rung. Taken after it, the op would
-                # attach to the very chunk that produces the state and the
-                # scatter would run before the forward that fills the slot.
-                op = seq.take_prefill_store_op()
-                if op is not None:
-                    stores.append(op)
-                # NOT advanced here. The runner derives a chunk's start
-                # offset from `num_cached_tokens` and this batch does not
-                # carry a pre-advance copy, so moving it now stages zero
-                # tokens. The prefill engine advances it after the forward,
-                # beside the PrefillDone it sends for the same chunk.
 
-        if not scheduled_seqs:
-            return None, {}
-
-        # Read the decode tokens from decode process via shared memory.
-
-        cu_fraction = None
-
-        if self._cu_masking and self._cu_shm is not None:
-            cu_fraction = _optimal_cu_fraction(
-                self.decode_tokens(), num_batched_tokens
-            )
-
+        num_batched_tokens = sum(num_scheduled_tokens)
         _log_sched_batch(self.config, "prefill", scheduled_seqs, num_scheduled_tokens)
-        return (
-            ScheduledBatch(
-                seqs=scheduled_seqs,
-                num_scheduled_tokens=num_scheduled_tokens,
-                total_tokens_num=num_batched_tokens,
-                total_tokens_num_prefill=num_batched_tokens,
-                total_seqs_num=num_seqs,
-                total_seqs_num_prefill=num_seqs,
-                is_final_chunk=is_final_chunk,
-                cu_stream_fraction=cu_fraction,
-                state_maintenance_ops=(
-                    StateMaintenanceOps(checkpoint_stores=tuple(stores))
-                    if stores
-                    else None
-                ),
+        # The throughput window's only input on this side. `Scheduler.schedule`
+        # ticks it at its single entry point; this class has no `schedule`, so
+        # the tick lives at the one place a batch becomes real.
+        self._record_throughput(num_prompt_tokens=num_batched_tokens)
+        batch = ScheduledBatch(
+            seqs=scheduled_seqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_tokens_num=num_batched_tokens,
+            total_tokens_num_prefill=num_batched_tokens,
+            total_seqs_num=len(scheduled_seqs),
+            total_seqs_num_prefill=len(scheduled_seqs),
+            num_cached_tokens=num_cached_tokens,
+            # Per-seq finality, without which `ScheduledBatch.is_final_chunk`
+            # stays None and `produces_output()` answers True unconditionally --
+            # so a batch of nothing but middle chunks would claim to produce
+            # output and the draft pass would run for sequences mid-prompt.
+            is_final_chunk=is_final_chunk,
+            next_token_ids=next_token_ids,
+            cu_stream_fraction=msg.cu_stream_fraction,
+            state_maintenance_ops=(
+                StateMaintenanceOps(checkpoint_stores=tuple(stores)) if stores else None
             ),
-            scheduled_seqs,
         )
+        return batch, scheduled_seqs
+
+    def retire_batch(self, scheduled_seqs: dict) -> None:
+        """Release what a finished batch leaves behind.
+
+        A sequence whose final chunk just ran is done here -- decode keeps it
+        for the rest of its life. One mid-prompt goes back to `waiting` so the
+        next batch naming it resolves, and so `is_finished()` keeps this rank
+        live while decode still owes it chunks.
+        """
+        with self._pending_lock:
+            for seq in scheduled_seqs.values():
+                if seq in self.running:
+                    self.running.remove(seq)
+                if seq.is_partial_prefill:
+                    self.waiting.append(seq)
+                else:
+                    seq.status = SequenceStatus.FINISHED
 
     def _record_throughput(
         self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
@@ -4845,19 +4763,29 @@ class PrefillScheduler:
 
 
 class DecodeScheduler(Scheduler):
-    """Scheduler for the disaggregated decode process.
+    """The scheduler for a rapidserve pair -- BOTH halves of it.
 
-    Manages 3 queues:
-    - waiting:         new requests pending block allocation
-    - prefill_waiting: blocks allocated, BlockAssignment sent, awaiting PrefillDone
-    - running:         ongoing decode sequences
+    Decode owns the `BlockManager`, and every question prefill scheduling has
+    to answer is a question only a `BlockManager` can answer: which blocks,
+    which prefix-cache hit, which checkpoint rung, how much KV pressure. So
+    this class schedules prefill too, exactly the way the baseline `Scheduler`
+    does, and ships the resulting batch to the prefill process to execute.
+    Prefill does no scheduling at all.
 
-    Block allocation is separated from scheduling: allocate_waiting() is called
-    by DecodeEngineCore after draining the input queue, and returns newly
-    allocated sequences so the engine can send BlockAssignment to prefill.
+    Queues, in the order a request moves through them:
 
-    on_prefill_done() promotes sequences directly from prefill_waiting to
-    running.  schedule() only schedules the running queue as decode batches.
+    - waiting:          new requests, no blocks yet
+    - prefill_inflight: the batch decode dispatched, awaiting PrefillBatchDone
+    - prefill_partial:  a chunk landed, prompt not finished -- drawn from FIRST
+                        by the next batch build
+    - prefill_done:     final chunk landed, decodable, awaiting promotion
+    - running:          decoding
+
+    Per tick `DecodeEngineCore` calls `drain_prefill_completions()` then
+    `build_prefill_batch()` (which ticks the cross-DP prefill delayer and must
+    therefore run on every rank every tick), sends whatever batch comes back,
+    and only then schedules its own decode batch -- so prefill's forward
+    overlaps decode's on the other stream.
     """
 
     _ENGINE_LABEL = "Decode "
@@ -4866,32 +4794,42 @@ class DecodeScheduler(Scheduler):
     def abort_request(self, req_id: int) -> bool:
         # RapidServe does not drain the standard scheduler's rejection queue.
         # Preserve its mark-only cancellation path.
+        #
+        # `prefill_inflight` is deliberately NOT scanned: its batch is already
+        # on prefill's GPU, and marking a sequence aborted mid-flight would
+        # have `drain_prefill_completions` drop a result whose checkpoint
+        # reservation and hash span still need settling. It is aborted when it
+        # lands, by which point it is in one of the queues below.
         with self._prefill_lock:
-            for seq in (*self.running, *self.waiting):
+            for seq in (*self.running, *self.waiting, *self.prefill_partial):
                 if seq.id == req_id:
                     seq.status = SequenceStatus.ABORTED
+                    # Prefill holds its own copy of every request and reads
+                    # `is_finished()` off the queues holding them, so a copy
+                    # left behind keeps that rank live forever. The engine
+                    # drains this and tells it to drop the sequence.
+                    self.pending_aborts.append(req_id)
                     return True
         return False
 
     def get_request_counts(self) -> tuple[int, int]:
-        """Fold in the two queues this scheduler adds.
+        """Fold in the three queues this scheduler adds.
 
-        `allocate_waiting()` drains `waiting` almost immediately, so a request
-        spends most of its life in `prefill_waiting` (blocks assigned, awaiting
-        PrefillDone) and lands in `prefill_done` before `schedule()` promotes
-        it. Counting only the base pair reports `Running: 0, Waiting: 0` on an
-        engine holding a full load of in-flight requests — on the status line
-        and, because `/metrics` reads this same method, on the dashboard too.
+        A request spends most of its life between `prefill_inflight` and
+        `prefill_partial`, and lands in `prefill_done` before `schedule()`
+        promotes it. Counting only the base pair reports `Running: 0,
+        Waiting: 0` on an engine holding a full load of in-flight requests --
+        on the status line and, because `/metrics` reads this same method, on
+        the dashboard too.
         """
         return (
             len(self.running) + len(self.prefill_done),
-            len(self.waiting) + len(self.prefill_waiting),
+            len(self.waiting) + len(self.prefill_inflight) + len(self.prefill_partial),
         )
 
     def __init__(
         self,
         config: Config,
-        disagg_cu_shm_name: str = "",
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
@@ -4899,38 +4837,102 @@ class DecodeScheduler(Scheduler):
             config,
             state_runtime=state_runtime,
         )
-        # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
-        self.prefill_waiting: dict[int, Sequence] = {}
+        # seq_id → Sequence; this batch is on the wire or on prefill's GPU.
+        # Empty whenever no batch is in flight, which is what makes
+        # `prefill_batch_inflight` below a one-line question.
+        self.prefill_inflight: dict[int, Sequence] = {}
         self.prefill_done: deque[Sequence] = deque()
-        # Chunks that landed but left the request mid-prompt. Separate from
-        # `prefill_done`, which means "decodable now": these are only waiting
-        # to have their hashes published, and the request stays in
-        # `prefill_waiting` until its final chunk arrives.
+        # Chunks that landed and left the request mid-prompt. These are not
+        # decodable and not in flight: they are the first thing the NEXT batch
+        # build draws from, mirroring the baseline scheduler's "resume partials
+        # before admitting new" phase order.
         self.prefill_partial: deque[Sequence] = deque()
-        # Shared memory for dynamic CU partitioning.
-        self._cu_shm = None
-        # 4 bytes per pair; this rank publishes at offset 4*decode_rank so the
-        # N decode ranks do not overwrite each other's counts.
-        self._cu_shm_offset = 4 * getattr(config, "disagg_decode_rank", 0)
-        # Whether to pick a fractional CU stream. Separate from the shm, which
-        # now exists in BOTH modes: publishing the decode token count and
-        # masking CUs are different concerns, and conflating them made decode
-        # emit cu_stream_fraction=0.5 while ModelRunner had built only the
-        # full-CU stream (model_runner.py:4711 gates the pool on this flag) —
-        # KeyError: 0.5 on the first decode forward.
+        # Completed batches handed over by `_recv_prefill_batch_done`. A plain
+        # queue, because that thread's only job is now to hand the message to
+        # the engine thread: everything the completion implies -- publishing
+        # hashes, settling checkpoint records, promoting to `running` -- mutates
+        # the block pool and the checkpoint coordinator, which the engine thread
+        # is simultaneously allocating out of. Doing that work on the receive
+        # thread raced it, and the old code could only route around the race by
+        # deferring the publish alone.
+        self.prefill_completions: queue.Queue = queue.Queue()
+        # Monotonic batch id. Only ever one batch outstanding, so this is for
+        # correlating logs and for asserting that a completion answers the
+        # batch actually dispatched -- not for reordering.
+        self._next_prefill_batch_id = 0
+        self._inflight_batch_id: int | None = None
+        # seq_id → (start, end, store_hash) for the batch in flight, recorded at
+        # dispatch. Decode plans the span, so it does not have to reconstruct it
+        # from what prefill reports back: the publish offset, the checkpoint to
+        # settle and the cross-check are all read from here.
+        self._inflight_spans: dict[int, tuple] = {}
+        # Whether to pick a fractional CU stream for the prefill forward.
+        # Decode computes the fraction itself now -- it is the only half that
+        # knows both operands -- so there is no shared-memory hand-off left.
         self._cu_masking = bool(getattr(config, "disagg_constrained", False))
-        if disagg_cu_shm_name:
-            import multiprocessing.shared_memory
 
-            self._cu_shm = multiprocessing.shared_memory.SharedMemory(
-                name=disagg_cu_shm_name, create=False
-            )
-            struct.pack_into("I", self._cu_shm.buf, self._cu_shm_offset, 0)
-
-        # Protects prefill_waiting and running: on_prefill_done is called
-        # from the _recv_prefill_done background thread.
+        # Request ids decode has abandoned and prefill has not been told
+        # about. Drained by the engine, which owns the socket.
+        self.pending_aborts: list[int] = []
+        # Protects the prefill queues against `abort_request`, which the
+        # utility handler can call from the input thread.
         self._prefill_lock = threading.Lock()
         self.cu_fraction: float | None = None
+
+    def has_decode_work(self) -> bool:
+        """Would `_schedule()` produce a decode batch?
+
+        BOTH queues, because `_schedule()` PROMOTES before it decides: it
+        drains `prefill_done` into `running` and only then asks whether
+        `running` is empty. So a request whose prefill has just finished is
+        decodable this tick even though it is not in `running` yet.
+
+        Reading `running` alone stranded every one of them. The engine's
+        group-wide forward gate asks this question to decide whether to call
+        `_schedule()` at all, so a predicate that misses `prefill_done` skips
+        the only code that would have moved them -- a livelock that drains the
+        prefill side, fills this queue, then generates nothing: the status line
+        still reports those requests as `Running` (it counts both queues) and
+        the delayer fires `vacuous` forever because there is no prefill left
+        either.
+
+        Kept here, beside the queues, so it cannot drift from the method it
+        predicts.
+        """
+        return bool(self.running) or bool(self.prefill_done)
+
+    def _partial_prefill_remaining_tokens(self) -> int:
+        """Prompt still owed by mid-prefill requests, from THIS side's queue.
+
+        Overridden because the base walks `self.running` for
+        `seq.is_partial_prefill`, and a rapidserve partial is never in
+        `running` -- that is the decode queue, and a mid-prompt request is not
+        decodable. Inherited unchanged it returns 0 always, which silently
+        drops the partial term out of the delayer's aggregate and makes a rank
+        with a long chunked prompt look idle to its peers.
+
+        Saturates at the batch budget, as the base does: the delayer compares
+        the total against one batch's worth and summing a whole queue of long
+        prompts past that only wastes the walk.
+        """
+        total = 0
+        for seq in self.prefill_partial:
+            total += max(0, seq.num_tokens - seq.num_cached_tokens)
+            if total >= self.max_num_batched_tokens:
+                return self.max_num_batched_tokens
+        return total
+
+    @property
+    def prefill_batch_inflight(self) -> bool:
+        """Is a prefill batch on the wire or on prefill's GPU right now?
+
+        One batch at a time: decode plans the next only once the last has
+        retired. That bound is what keeps decode in charge -- an unbounded
+        pipeline would pin KV blocks for work the delayer has not yet decided
+        to admit -- and it is also what lets a chunk's span, its checkpoint and
+        its publish offset live in a single `_inflight_spans` entry.
+        """
+        return self._inflight_batch_id is not None
 
     def is_finished(self) -> bool:
         # Kept explicit rather than derived from get_request_counts: unlike the
@@ -4939,7 +4941,8 @@ class DecodeScheduler(Scheduler):
         # *and* in get_request_counts.
         return (
             not self.waiting
-            and not self.prefill_waiting
+            and not self.prefill_inflight
+            and not self.prefill_partial
             and not self.running
             and not self.prefill_done
         )
@@ -4950,528 +4953,566 @@ class DecodeScheduler(Scheduler):
         # through this method and need no override of their own.
         return sum(self.get_request_counts())
 
-    def allocate_waiting(self) -> list[Sequence]:
-        """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.
+    def build_prefill_batch(self, *, skip_delayer: bool = False):
+        """Plan this tick's prefill batch, or None. Ticks the prefill delayer.
 
-        Returns newly allocated sequences so DecodeEngineCore can send a
-        BlockAssignment message to the prefill process for each one.
-        Called from the main busy_loop thread only.
+        The rapidserve counterpart of the baseline scheduler's prefill phases
+        (`Scheduler._schedule`): resume partials first, then admit new
+        requests, sizing both against one token budget. The only difference is
+        where the batch goes -- the prefill process, over ZMQ, instead of this
+        process's own forward -- so the helpers are the baseline's, called in
+        the baseline's order.
 
-        Gated by the prefill delayer, which lives HERE rather than on the
-        prefill side for two reasons the prefill process cannot satisfy:
+        MUST be called every tick on every decode rank, BEFORE any early
+        return. It runs a cross-DP `all_reduce` through the delayer, and a rank
+        that skips it hangs the ranks that did not.
 
-        - Blocks are the thing being delayed. Allocating on arrival pins KV for
-          a sequence whose prefill has not been scheduled yet; holding the
-          admission holds the blocks too.
-        - The alignment that matters is across DECODE ranks. One rank admitting
-          while the others do not leaves it alone in `prefill_waiting`, and its
-          paired prefill rank prefills alone while the other prefill ranks issue
-          dummy forwards to keep the MoE collective matched.
-
-        Decode also has the inputs prefill lacked: a real `kv_usage` from its
-        own BlockManager, and a real decode batch from `running`.
-
-        MUST be called every tick on every decode rank — it runs a cross-DP
-        all_reduce, and a rank that skips it hangs the ranks that did not.
+        Returns a `PrefillBatchMsg` for `DecodeEngineCore` to send, or None.
+        The scheduler does no IO of its own, matching how the rest of this
+        class hands work back to the engine.
         """
+        from atom.model_engine.disagg_types import PrefillBatchMsg
+
+        # `skip_delayer` is the caller's ALL-REDUCED "some rank is still
+        # mid-flight", not this rank's own view. It gates DISPATCH as well as
+        # the delayer tick, and both for the same reason: the pair's prefill
+        # ranks run one forward per step with an MoE all-to-all spanning all of
+        # them, so a rank without a batch does not idle -- it runs a dummy and
+        # blocks inside that collective until its peers' real forwards finish.
+        # Dispatching as soon as THIS rank frees up therefore buys nothing and
+        # splits the group: measured at 4.05 of 8 ranks doing real work per
+        # step, 51% prefill occupancy, one ~1.8s blocked dummy per real chunk.
+        # Waiting for the group costs a free rank nothing it was not already
+        # paying at that collective.
+        #
+        # Skipping the delayer is also safe only because the flag is
+        # group-wide -- its tick is itself a cross-DP all_reduce, so a rank
+        # that skipped on its own `prefill_batch_inflight` would desynchronise
+        # everyone -- and it spares the coalescing episode: a busy rank reports
+        # `prefillable=False`, so the delayer short-circuits on
+        # `n_prefillable == 0`, which RESETS `_hold_ticks` / `_stall_count`
+        # rather than holding.
+        if skip_delayer:
+            return None
+
+        # Reached only when every rank is free, so the delayer is deciding for
+        # a group that can act on its answer together.
+        busy = self.prefill_batch_inflight
         if self.prefill_delayer is not None:
-            # Same inputs the non-disagg path builds in Scheduler.schedule():
-            # these helpers are not interchangeable with the obvious one-liners.
-            # `_waiting_new_token_count` skips sequences this rank could not
-            # actually admit (unschedulable, awaiting remote KV, oversized with
-            # chunking off) — counting them inflates the cross-rank aggregate
-            # and trips the fill target before a real batch has accumulated.
-            # `_can_admit_head_prefill` is likewise stricter than a non-empty
-            # queue: under a concurrent burst every rank has a full queue, so
-            # `bool(self.waiting)` is always True everywhere and the delayer
-            # never engages.
+            # Same inputs the non-disagg path builds in Scheduler.schedule();
+            # these helpers are not interchangeable with the obvious
+            # one-liners. `_waiting_new_token_count` skips sequences this rank
+            # could not actually admit -- counting them inflates the cross-rank
+            # aggregate and trips the fill target before a real batch has
+            # accumulated. `_can_admit_head_prefill` is likewise stricter than
+            # a non-empty queue: under a concurrent burst every rank has a full
+            # queue, so `bool(self.waiting)` is always True everywhere and the
+            # delayer never engages.
             #
-            # The partial terms are 0 here — chunked prefill runs in the prefill
-            # process, so decode never holds a mid-prefill sequence — but they
-            # are kept so this call and Scheduler.schedule()'s cannot drift.
+            # The partial terms are REAL here, unlike the admission-time call
+            # this replaced: chunked prefill is decode's now, so a mid-prompt
+            # request is one of ours and its remainder belongs in the aggregate.
             pending_tokens = min(
                 self._waiting_new_token_count()
                 + self._partial_prefill_remaining_tokens(),
                 self.max_num_batched_tokens,
             )
+            prefillable = (not busy) and (
+                bool(self.prefill_partial) or self._can_admit_head_prefill()
+            )
             allow = self.prefill_delayer.should_allow_prefill(
-                prefillable=self._can_admit_head_prefill(),
-                pending_tokens=pending_tokens,
-                running_decode_batch=max(
-                    0, len(self.running) - self._partial_prefill_count
-                ),
+                prefillable=prefillable,
+                pending_tokens=0 if busy else pending_tokens,
+                running_decode_batch=len(self.running),
                 kv_usage=self._kv_usage(),
-                has_partial=self._partial_prefill_count > 0,
+                has_partial=bool(self.prefill_partial),
                 oldest_waiting_age_ms=self._oldest_waiting_prefill_age_ms(),
             )
-            if not allow:
-                return []
+            if busy or not allow:
+                return None
+        elif busy:
+            return None
 
-        newly_allocated = []
+        chunks: list = []
+        num_batched_tokens = 0
+        num_seqs = 0
+        # Reset per build, exactly as `Scheduler._schedule` does: the cost
+        # limit bounds one batch and a stale one silently shrinks the next.
+        self._tick_cost_limit = math.inf
+        self._tick_cost = 0.0
+
+        # --- Phase 1: resume partials, before admitting anything new ---
+        #
+        # Same order as the baseline, and for the same reason: a prompt already
+        # holding blocks should finish before another is let in to hold more.
+        resumed: list[Sequence] = []
+        while self.prefill_partial:
+            if num_seqs >= self.max_num_seqs:
+                break
+            seq = self.prefill_partial[0]
+            if seq.status == SequenceStatus.ABORTED:
+                self.prefill_partial.popleft()
+                self._release_pending_checkpoint(seq)
+                self.block_manager.deallocate(seq)
+                continue
+            chunk = self._plan_prefill_chunk(seq, num_batched_tokens)
+            if chunk <= 0:
+                break
+            self.prefill_partial.popleft()
+            resumed.append(seq)
+            chunks.append(self._emit_chunk(seq, chunk, first=False))
+            num_batched_tokens += chunk
+            num_seqs += 1
+
+        # --- Phase 2: admit new requests ---
+        admitted: list[Sequence] = []
         while self.waiting:
+            if num_seqs >= self.max_num_seqs:
+                break
+            if num_batched_tokens >= self.max_num_batched_tokens:
+                break
             seq = self.waiting[0]
+            if seq.status == SequenceStatus.ABORTED:
+                self.waiting.popleft()
+                continue
             with self._prefill_lock:
-                # The hit count, not just its sign. `allocate` defaults it to 0
+                # The hit COUNT, not just its sign. `allocate` defaults it to 0
                 # -- "0 if caller didn't call it" -- so dropping it here told
                 # `allocate` every block was fresh: it claimed the whole prompt,
                 # recorded `num_cached_tokens = 0`, and no request ever reused
-                # anything however full the cache was. The ordinary path passes
-                # it (`allocate(seq, num_cached_blocks)`); this one must too.
+                # anything however full the cache was.
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks < 0:
-                    logger.warning("Cannot allocate prefill")
                     break
                 if not self.block_manager.allocate(seq, num_cached_blocks):
-                    # Disown could not be backed (finding #2); leave the seq at
-                    # the front of waiting to retry once the pool has room.
+                    # Disown could not be backed; leave the seq at the front of
+                    # waiting to retry once the pool has room.
                     self.block_manager.deallocate(seq)
                     break
-                # This used to also materialize the paged-SWA window here, so
-                # prefill — which has no BlockManager of its own — had real
-                # sliding-window slots to write into. #1771 removed the paged
-                # SWA pool: the window is a ring inside the per-request STATE
-                # entry now, addressed by `seq.state_slots` rather than by a
-                # parallel block table. Nothing to pre-fill: `allocate` above
-                # took the slots, and `BlockAssignment.state_slots` carries
-                # their indices to the prefill process, which writes this
-                # request's state into them.
+                chunk = self._plan_prefill_chunk(seq, num_batched_tokens)
+                if chunk <= 0:
+                    # Nothing of this prompt fits the remaining budget. Hand
+                    # the blocks back rather than holding them for a batch that
+                    # is already full -- the next build re-admits from scratch.
+                    self.block_manager.deallocate(seq)
+                    break
+                # After the chunk is known, so a prompt that allocated but
+                # could not be given a single token is not charged: counted
+                # there, a request that was never admitted enters the window as
+                # zero reuse and drags the windowed rate toward 0%. Still
+                # inside the lock and under the `allocate` that filled every
+                # field it reads.
                 #
-                # Inside the success path and inside the lock, because every
-                # field it reads is one `allocate` just set. After `popleft`
-                # would also count the refusals above as zero-reuse
-                # admissions, which never happened and which drag the windowed
-                # rate down.
+                # Decode's, and only decode's: the prefill process has no
+                # BlockManager and is handed the span rather than finding it,
+                # so accounting it there too would double-count.
                 self._record_cache_reuse(seq)
-                # After `_record_cache_reuse`, which reads the admission as it
-                # stands; reserving units does not change the hit, but the two
-                # are read together in the funnel and the order should say so.
-                #
-                # Both halves here, under the same lock as the allocation:
-                # `checkpoint_cut` and `reserve_store` are decode's to compute
-                # (prefill has no BlockManager), and prefill can only act on
-                # them if they travel with the assignment.
-                self._prepare_prefill_checkpoint(seq)
-            # Would this prompt need a REPLAY -- a forward starting below the
-            # point it resumed at, to rebuild what it reads there? Decode is the
-            # only half that can answer: `replay_start` is a BlockManager method
-            # and prefill has none. Nothing here acts on the answer, and
-            # `BlockAssignment` carries no replay field, so a prompt that needs
-            # one is prefilled from `num_cached_tokens` with the rows below it
-            # never recomputed. Reported rather than assumed: the non-disagg
-            # path covers two cases -- a prefix hit under a `replay` state
-            # transfer, and `min_final_prefill_rows` of decoder bounded replay
-            # on the chunk finishing the prompt -- and whether either arises
-            # under rapidserve is a question for the log, not for inference.
-            try:
-                _rs = self.block_manager.replay_start(
-                    seq, seq.num_cached_tokens, hit=seq.num_cached_tokens > 0
-                )
-                if _rs < seq.num_cached_tokens:
-                    logger.warning(
-                        "[replay] role=%s seq=%s WOULD BE REQUIRED but rapidserve "
-                        "does not replay: resume=%d, forward should start at %d "
-                        "(%d rows), prompt=%d",
-                        _sched_role(self.config),
-                        seq.id,
-                        seq.num_cached_tokens,
-                        _rs,
-                        seq.num_cached_tokens - _rs,
-                        seq.num_prompt_tokens,
-                    )
-            except Exception:
-                # A probe must not block admission.
-                logger.warning("[replay] probe failed", exc_info=True)
             self.waiting.popleft()
+            admitted.append(seq)
+            chunks.append(self._emit_chunk(seq, chunk, first=True))
+            num_batched_tokens += chunk
+            num_seqs += 1
 
-            # Shared-cache prefill writes into this allocation; there is no
-            # KV transfer to time or retain a separate metrics reference for.
-            self.prefill_waiting[seq.id] = seq
-            newly_allocated.append(seq)
-        return newly_allocated
+        if not chunks:
+            return None
 
-    def publish_landed_prefill_chunks(self) -> None:
-        """Register the hashes of every prefill chunk that has landed.
+        # Would any of these prompts need a REPLAY -- a forward starting below
+        # the point it resumed at, to rebuild what it reads there? Reported
+        # rather than assumed: rapidserve does not replay, and a prompt that
+        # needs one is prefilled from `num_cached_tokens` with the rows below
+        # it never recomputed.
+        for seq in admitted:
+            self._warn_if_replay_needed(seq)
 
-        Called by the engine before `schedule()`, which is the whole point of
-        it being here rather than in `postprocess`:
+        batch_id = self._next_prefill_batch_id
+        self._next_prefill_batch_id += 1
+        self._inflight_batch_id = batch_id
+        for seq in (*resumed, *admitted):
+            self.prefill_inflight[seq.id] = seq
 
-        - a PARTIAL chunk never reaches `postprocess` at all. Its request is
-          still in `prefill_waiting`, so decode runs no forward for it and the
-          one-shot publish there is unreachable. Without this the blocks a
-          checkpoint covers are never indexed and the checkpoint is useless.
-        - a checkpoint filed here is drained by the `schedule()` immediately
-          after, while the slot still holds what the chunk left in it. Filed
-          from `postprocess` it would be drained a forward later, against a
-          slot that has moved -- an image one step ahead of the hash it is
-          stored under, which nothing downstream can detect.
+        # Decode computes the CU split because decode is the only half that
+        # knows both operands: the prefill tokens it has just planned, and its
+        # own decode batch, which it is about to schedule. That is what retired
+        # the shared-memory channel this used to read across from.
+        cu_fraction = None
+        if self._cu_masking:
+            cu_fraction = _optimal_cu_fraction(
+                sum(seq.num_tokens for seq in self.running), num_batched_tokens
+            )
 
-        `PrefillDone` is a GPU-completion signal (the prefill engine records an
-        event after each forward and sends only once it has retired), so the
-        KV these hashes describe is real by the time this runs.
-        """
-        pending, self.prefill_partial = self.prefill_partial, deque()
-        for seq in pending:
-            self._publish_prefill_hashes(seq)
-
-    def _publish_prefill_hashes(self, seq: Sequence) -> None:
-        """Hash the blocks one landed chunk filled, from its own start offset.
-
-        `hash_blocks` reads its base off `num_cached_tokens`, which
-        `on_prefill_done` has already advanced past this chunk -- so the offset
-        has to be handed in explicitly. Same `start_tokens` override pipeline
-        parallelism uses, for the same reason.
-        """
-        start = seq.pending_hash_start
-        # Counted per seq, so a seq draining twice is visible as a second line
-        # rather than as an extra publish nobody can place.
-        seq.publish_drains = getattr(seq, "publish_drains", 0) + 1
-        logger.info(
-            "[prefix-drain] seq %s: drain#%d start=%d cached=%d hashed=%d "
-            "blocks=%d",
-            seq.id,
-            seq.publish_drains,
-            start,
-            seq.num_cached_tokens,
-            seq.num_hashed_tokens,
-            len(seq.block_table),
+        _log_sched_batch(
+            self.config,
+            "prefill",
+            {c.seq_id: self.prefill_inflight[c.seq_id] for c in chunks},
+            [c.num_tokens for c in chunks],
         )
-        if start < 0 or not seq.block_table:
-            return
-        # The prefix below `start` is already in the index -- being found there
-        # is what the hit WAS -- so it is hashed whether or not this call
-        # publishes anything. `hash_blocks` advances the watermark only on the
-        # path that publishes, and a request resuming entirely from cache takes
-        # the other one: it would leave `num_hashed_tokens` at 0, and
-        # `hash_decode_blocks` reads that as "nothing has ever been hashed" and
-        # re-hashes the whole prompt on the first decode step. Idempotent, but
-        # an O(prompt) pass per cache hit and a watermark that is simply wrong.
-        seq.num_hashed_tokens = max(seq.num_hashed_tokens, start)
-        num_new = seq.num_cached_tokens - start
-        if num_new > 0:
-            self.block_manager.hash_blocks(seq, num_new, start_tokens=start)
-        seq.pending_hash_start = -1
+        return PrefillBatchMsg(
+            batch_id=batch_id,
+            target_rank=getattr(self.config, "disagg_decode_rank", 0),
+            cu_stream_fraction=cu_fraction,
+            chunks=chunks,
+        )
 
-    def _prepare_prefill_checkpoint(self, seq: Sequence) -> None:
-        """Walk this prompt's ladder, reserving an image at every rung.
+    def _plan_prefill_chunk(self, seq: Sequence, num_batched_tokens: int) -> int:
+        """How many tokens of `seq` this batch should forward, or 0.
 
-        Per chunk, not per prompt. `checkpoint_cut` collapses the grid to one
-        candidate -- the rightmost rung within the `end` it is handed -- so
-        asking once for the whole prompt yields a single checkpoint near its
-        end. The ordinary scheduler asks once per chunk
-        (`_finalize_prefill_chunk`) and so walks the whole ladder; this mirrors
-        that by stepping the same budget-sized window decode knows prefill will
-        use.
-
-        Both halves are decode's to compute and prefill's to carry out: prefill
-        has no BlockManager, so it can neither find a rung nor own the units.
-
-        Failure is always "fewer checkpoints", never an error. A prompt with no
-        rung, a pool with no room, a model with no per-request state all leave
-        the list shorter, and prefill chunks on the budget alone.
+        The baseline's three stacked clamps, in the baseline's order, through
+        the baseline's helpers -- budget first, rung inside it. The order is
+        not cosmetic: taken the other way round, a rung further out than one
+        batch allows produces a chunk nothing can schedule, and the caller's
+        `break` parks it at the head of the queue forever. A 226k prompt
+        against a 16k budget asks for its 221184-token rung, never fits, and
+        every request behind it stops too.
         """
-        seq.prefill_cuts = []
-        seq.prefill_store_hashes = []
+        start = seq.num_cached_tokens
+        num_new_tokens = self._new_prefill_tokens(seq, start)
+        if num_new_tokens <= 0:
+            return 0
+        room = self._prefill_room(num_batched_tokens, start)
+        chunk = self._prefill_chunk_for_budget(num_new_tokens, room, num_batched_tokens)
+        if not chunk:
+            return 0
+        # Shorten to the furthest checkpoint rung this chunk can reach. Same
+        # call the non-disagg path makes, now that the half computing the chunk
+        # is the half holding the BlockManager -- which is the whole reason the
+        # speculative `prefill_cuts` ladder this replaced had to exist.
+        chunk = self._finalize_prefill_chunk(seq, start, chunk)
+        if chunk <= 0:
+            return 0
+        self._tick_cost += self._chunk_cost(start, chunk)
+        return chunk
+
+    def _emit_chunk(self, seq: Sequence, chunk: int, *, first: bool):
+        """Turn a planned chunk into a wire record, and book its consequences.
+
+        Everything decode must remember about a dispatched chunk is recorded
+        here, at the one point where the span is known for certain:
+
+        - the span itself, so the completion does not have to reconstruct it;
+        - the checkpoint image this chunk SCATTERS (reserved when the previous
+          chunk was planned) and the one it PRODUCES (reserved now, carried on
+          the Sequence, attached to the next chunk);
+        - `pending_hash_start`, the offset the hashes will be published from.
+        """
+        from atom.model_engine.disagg_types import PrefillChunk
+
+        start = seq.num_cached_tokens
+        end = start + chunk
+        is_final = end >= seq.num_tokens
+
+        # The image owed to THIS chunk: produced by the chunk that ended at
+        # `start`, scattered at the head of this one. `build()` drains state
+        # maintenance before the forward, so on one stream the order is: chunk
+        # ending at the rung, scatter, chunk after it. No event and no sync.
+        store_op = seq.pending_checkpoint_op
+        store_hash = seq.pending_checkpoint_hash
+        seq.pending_checkpoint_op = None
+        seq.pending_checkpoint_hash = 0
+
+        # The image this chunk PRODUCES, for the next one to scatter. Never on
+        # the final chunk: a rung at the prompt's end has no pass after it, and
+        # decode files that boundary itself from the slot prefill leaves behind.
+        if not is_final:
+            self._reserve_chunk_checkpoint(seq, end)
+
+        # Recorded BEFORE the dispatch advances anything, because it is the
+        # offset the publish needs and `num_cached_tokens` is about to move
+        # past it. The non-disagg path gets this for free by publishing before
+        # it advances; here the forward happens in another process, so the
+        # offset has to be carried.
+        seq.pending_hash_start = start
+        self._inflight_spans[seq.id] = (start, end, store_hash)
+
+        seq.type = SequenceType.PREFILL
+        seq.status = SequenceStatus.RUNNING
+        next_token_id = -1
+        if self.drafter_needs_next_token and not is_final:
+            next_token_id = int(seq.token_ids[end])
+        return PrefillChunk(
+            seq_id=seq.id,
+            start=start,
+            num_tokens=chunk,
+            is_final_chunk=is_final,
+            block_table=list(seq.block_table) if first else None,
+            state_slots=list(seq.state_slots),
+            store_op=store_op,
+            next_token_id=next_token_id,
+        )
+
+    def _reserve_chunk_checkpoint(self, seq: Sequence, cut: int) -> None:
+        """Reserve the image the chunk ending at `cut` produces, if any.
+
+        One rung, for one chunk -- where this used to walk the prompt's whole
+        ladder at admission and ship every rung speculatively. That ladder
+        existed only because the half sizing the chunk (prefill) could not ask
+        a BlockManager anything; now that decode sizes it, the rung is simply
+        wherever `_finalize_prefill_chunk` just stopped the chunk, and it is
+        known to be real rather than guessed at.
+
+        Failure is always "one fewer checkpoint", never an error: no
+        coordinator, a disabled one, a chain too short or a pool with no room
+        all leave nothing pending and the next chunk simply scatters nothing.
+        """
         bm = self.block_manager
         cp = bm.paged_state_checkpoints
-        # `is None` is not the same question as "is this doing anything".
-        # The coordinator is CONSTRUCTED whenever the model has a checkpoint
-        # spec and carries `enabled = enable_prefix_caching and
-        # num_state_slots > 0`, so without prefix caching it exists, answers
-        # every call, and stores nothing. Walking the ladder against it
-        # reserved rungs no one would ever resume from and chopped every long
-        # prompt into middle chunks for free -- cost with the benefit switched
-        # off. A rung only pays for itself when a later request can hit the
-        # image it pins.
+        # `is None` is not the same question as "is this doing anything". The
+        # coordinator is CONSTRUCTED whenever the model has a checkpoint spec
+        # and carries `enabled = enable_prefix_caching and num_state_slots > 0`,
+        # so without prefix caching it exists, answers every call, and stores
+        # nothing -- reserving against it would pin units no one can ever
+        # resume from.
         if cp is None or not cp.enabled:
             return
-        # ONE RUNG PER INTERVAL, not one per batch.
-        #
-        # `checkpoint_cut` answers with the RIGHTMOST grid point inside the
-        # window it is handed (`rung = min(end, limit)` floored to the
-        # interval), so the window width IS the ladder's spacing. Stepping a
-        # whole `max_num_batched_tokens` therefore produced a rung every 16384
-        # while the interval was 8192 -- half the resume points the grid
-        # defines, and up to a full batch of travel for a sequence knocked off
-        # the grid by a leftover-budget chunk before it could rejoin.
-        #
-        # `interval <= 0` is the grid switched off (-1 keeps checkpoints but
-        # places no grid rung, 0 disables them entirely; see
-        # `BlockManager.__init__`). Only a demand or the prompt-end anchor can
-        # produce a cut then, and neither cares how wide the window is, so fall
-        # back to the budget rather than walking the prompt a token at a time.
-        interval = bm.state_checkpoint_interval_tokens
-        step = interval if interval > 0 else max(1, self.max_num_batched_tokens)
-        unreserved = 0
-        pos = seq.num_cached_tokens
-        end = seq.num_prompt_tokens
-        while pos < end:
-            window = min(pos + step, end)
-            cut = bm.checkpoint_cut(seq, pos, window)
-            if not cut:
-                # No rung in this window; step a whole one and ask again.
-                #
-                # This walk is NOT the chunking prefill does -- prefill hands
-                # out what is LEFT of the budget, so a packed batch gives a
-                # sequence less, and a chunk spans several of these windows at
-                # once. It does not have to match: the walk is a partition of
-                # the prompt into windows at most `step` wide and
-                # `checkpoint_cut` searches each whole window, so every rung
-                # the grid defines is enumerated exactly once however the real
-                # chunks fall. The cuts are absolute positions, and
-                # `prefill_cut_within` picks whichever of them a given chunk
-                # can reach.
-                pos = window
-                continue
-            if cut >= end:
-                # A rung AT the prompt's last token can never be written.
-                #
-                # An image is scattered by the pass AFTER the chunk that ends
-                # on its rung (`take_prefill_store_op` holds it exactly that
-                # long, because the forward producing the state must retire
-                # first). A rung at `end` has no pass after it -- the chunk
-                # ending there is the prompt's last, and the sequence leaves
-                # this scheduler.
-                #
-                # Nothing is lost by refusing it. This position is the one
-                # `Scheduler.hash_blocks` reaches on its own: it ends every
-                # chunk with `checkpointers_at(pos)`, `next_forward_tokens`
-                # defaults to the prompt's remainder (0 here), and the PAGE
-                # coordinator's `successor_room` is 0.0 -- so DECODE files the
-                # boundary from `_publish_prefill_hashes` and scatters it out
-                # of the slot prefill left behind, which is exactly how the
-                # non-disagg path keeps a prompt-end image. Reserving it in
-                # the ladder as well would be a second reservation for one
-                # hash, written by nobody.
-                #
-                # Reachable whenever the last rung and the prompt end coincide:
-                # `checkpoint_cut` admits `p == end`, and the walk's `end` is
-                # the prompt. A 32768-token prompt against a 16384 budget hits
-                # it on the nose.
-                break
-            h, op = bm.reserve_prefill_checkpoint(seq, cut)
-            # `pos` advances past the rung either way: a rung that could not be
-            # reserved is still a rung, and re-asking this window would return
-            # it again forever.
-            pos = cut
-            if op is None:
-                # Counted, not just skipped. With the cap gone this is the ONLY
-                # thing that can still make the rapidserve ladder shorter than
-                # baseline's, and it is invisible otherwise: `reserve_store`
-                # returns `(0, None)` when the pool has no room, the rung is
-                # dropped, and the prompt is simply never cut there. Baseline
-                # cannot hit this -- it reserves one image at a time, as each
-                # chunk lands, so it is never asking for the whole ladder at
-                # once.
-                unreserved += 1
-                continue
-            seq.prefill_cuts.append((cut, op))
-            seq.prefill_store_hashes.append(h)
-        if unreserved:
+        if cut % bm.hash_block_size:
+            # A checkpoint is filed under a block hash, so a rung off the hash
+            # grid has nothing to file it under. `_finalize_prefill_chunk`
+            # lands on the grid when it cuts; a chunk stopped by the budget
+            # alone generally does not, and that is the common case.
+            return
+        h, op = bm.reserve_prefill_checkpoint(seq, cut)
+        if op is None:
+            # The pool had no room. The rung is dropped and this prompt simply
+            # is not resumable there -- visible as a shorter ladder than the
+            # non-disagg path's, so say so.
             logger.warning(
-                "[prefill-cut] seq %s: %d rung(s) could not reserve an image "
-                "(state pool full) and will NOT be cut -- this prompt's ladder "
-                "is shorter than the non-disagg path's by that many",
+                "[prefill-cut] seq %s: rung %d could not reserve an image "
+                "(state pool full) and will not be written",
                 seq.id,
-                unreserved,
+                cut,
             )
-        if seq.prefill_cuts:
-            logger.info(
-                "[prefill-cut] seq %s: %d rung(s) %s prompt=%d cached=%d",
-                seq.id,
-                len(seq.prefill_cuts),
-                [c for c, _ in seq.prefill_cuts],
-                seq.num_prompt_tokens,
-                seq.num_cached_tokens,
-            )
+            return
+        seq.pending_checkpoint_op = op
+        seq.pending_checkpoint_hash = h
+        logger.info(
+            "[prefill-cut] seq %s: rung %d reserved prompt=%d cached=%d",
+            seq.id,
+            cut,
+            seq.num_prompt_tokens,
+            seq.num_cached_tokens,
+        )
 
-    def _settle_reported_chunk(self, seq: Sequence, start: int, end: int) -> None:
-        """Resolve the ladder against one chunk prefill has reported.
+    def _release_pending_checkpoint(self, seq: Sequence) -> None:
+        """Hand back an image whose scatter is never going to run.
 
-        Two fates, decided by where the chunk's own boundaries fall:
-
-        - the rung AT `start` produced an image, and it is on the device now.
-          `build()` drains state maintenance before its forward, so the scatter
-          for that rung ran at the head of the very pass that produced this
-          chunk, and PrefillDone is sent only once that pass's event retires.
-          Settling arms the record for the next `complete_inflight`. This is
-          the per-hash evidence `PageUnitStore.mark_inflight` is written to
-          demand -- it used to be approximated by settling the WHOLE ladder on
-          the final chunk, which armed records for rungs no forward had ever
-          ended on and published resume points over unwritten units.
-
-        - a rung strictly INSIDE `(start, end)` was run over. A chunk takes the
-          furthest rung it can reach, so this is the normal case, not an error:
-          the slot holds the state as of `end`, nothing will ever be written at
-          that position, and holding its units for the rest of the prefill buys
-          nothing. `unindex` drops the reservation and releases them.
-
-        Idempotent per rung: `settle_prefill_store` refuses a record already
-        armed and `unindex` a hash already gone, so a sequence reported twice
-        for the same span costs a dict lookup.
+        A reservation is made one chunk ahead of the chunk that writes it, so a
+        sequence that dies in between -- aborted, preempted, refused a chunk --
+        leaves units pinned under a hash nobody will ever publish.
         """
+        if seq.pending_checkpoint_op is None:
+            return
         cp = self.block_manager.paged_state_checkpoints
-        if cp is None or not seq.prefill_store_hashes:
-            return
-        for (cut, _op), h in zip(seq.prefill_cuts, seq.prefill_store_hashes):
-            if cut == start:
-                cp.settle_prefill_store(h)
-            elif start < cut < end:
-                cp.unindex(h)
+        if cp is not None:
+            cp.unindex(seq.pending_checkpoint_hash)
+        seq.pending_checkpoint_op = None
+        seq.pending_checkpoint_hash = 0
 
-    def on_prefill_done(
-        self,
-        seq_id: int,
-        prefill_pos: int,
-        sampled_token_id: int,
-        draft_token_ids: list | None = None,
-        is_final: bool = True,
-    ) -> None:
-        """Promote a sequence from prefill_waiting directly to running.
+    def _warn_if_replay_needed(self, seq: Sequence) -> None:
+        """Report a prompt rapidserve is about to prefill without replaying.
 
-        Called from the _recv_prefill_done background thread.
-        sampled_token_id is the first generated token sampled by the prefill
-        process; it is appended here so that context_lens and slot_mapping
-        match the non-disagg postprocess state before the first decode step.
-
-        `prefill_pos` is the ABSOLUTE position prefill has computed to, not
-        this chunk's size: prefill reports only the chunks that land on a rung
-        (plus the final one), so a delta would lose every suppressed chunk.
+        Decode is the only half that can answer this -- `replay_start` is a
+        BlockManager method. Nothing acts on the answer and `PrefillChunk`
+        carries no replay field, so a prompt that needs one is prefilled from
+        `num_cached_tokens` with the rows below it never recomputed. Reported
+        rather than assumed: the non-disagg path covers two cases, and whether
+        either arises here is a question for the log, not for inference.
         """
-
-        from atom.utils import envs as _envs
-
-        if _envs.ATOM_LOG_DRAFT_TOKENS:
-            # The RECEIVING end of the handoff. `rejected_prev=6` on every
-            # sequence's first logged decode step is a verdict on these, and
-            # nothing else prints them: they are appended here by the
-            # scheduler, not produced by `propose_draft_token_ids`. An empty
-            # list here means the placeholder fallback below is what decode
-            # actually verified, whatever prefill proposed.
-            logger.info(
-                "[draft-handoff] seq=%s is_final=%s sampled=%s drafts=%s",
-                seq_id,
-                is_final,
-                sampled_token_id,
-                list(draft_token_ids) if draft_token_ids else "(empty)",
+        try:
+            rs = self.block_manager.replay_start(
+                seq, seq.num_cached_tokens, hit=seq.num_cached_tokens > 0
             )
-        if not is_final:
-            # A chunk that landed on a rung: real KV, an image, no token. Its
-            # hashes are published (the engine does that before `schedule()`),
-            # but the request cannot decode yet, so it stays in
-            # `prefill_waiting` and nothing is promoted.
-            #
-            # `pending_hash_start` is set once and survives until a publish
-            # resets it, which is what lets prefill stay silent about the
-            # chunks between two rungs: the span this eventually hashes covers
-            # them too.
-            seq = self.prefill_waiting.get(seq_id)
-            if seq is not None:
-                if seq.pending_hash_start < 0:
-                    seq.pending_hash_start = seq.num_cached_tokens
-                self._settle_reported_chunk(seq, seq.num_cached_tokens, prefill_pos)
-                seq.num_cached_tokens = prefill_pos
-                self.prefill_partial.append(seq)
+        except Exception:
+            # A probe must not affect scheduling.
+            logger.warning("[replay] probe failed", exc_info=True)
             return
-        seq = self.prefill_waiting.pop(seq_id, None)
-        if seq is not None:
-            # The final chunk gets NO special case. Its pass scattered the rung
-            # at its start exactly like every other, so the one rule below
-            # covers it -- and any rung between that start and the prompt's end
-            # was run over and has to be released, which the wholesale settle
-            # this replaced instead ARMED, publishing resume points whose units
-            # were never written.
-            self._settle_reported_chunk(seq, seq.num_cached_tokens, prefill_pos)
-            # Also published on the engine thread, before the next schedule():
-            # the final chunk's blocks need hashing too, and a checkpoint filed
-            # there is drained while the slot still holds what it left.
+        if rs < seq.num_cached_tokens:
+            logger.warning(
+                "[replay] role=%s seq=%s WOULD BE REQUIRED but rapidserve "
+                "does not replay: resume=%d, forward should start at %d "
+                "(%d rows), prompt=%d",
+                _sched_role(self.config),
+                seq.id,
+                seq.num_cached_tokens,
+                rs,
+                seq.num_cached_tokens - rs,
+                seq.num_prompt_tokens,
+            )
+
+    def on_prefill_batch_done(self, done) -> None:
+        """Hand a completed batch to the engine thread. Called from the socket.
+
+        Deliberately does nothing else. Everything a completion implies --
+        publishing block hashes, settling checkpoint records, promoting to
+        `running` -- mutates the block pool and the checkpoint coordinator that
+        the engine thread allocates out of in `build_prefill_batch`. Doing that
+        work here raced it; the previous version could only route around the
+        race by deferring the publish alone and left the rest unlocked.
+        """
+        self.prefill_completions.put(done)
+
+    def drain_prefill_completions(self) -> None:
+        """Apply every batch that has retired. Engine thread, before scheduling.
+
+        `PrefillBatchDone` is a GPU-completion signal: the prefill process
+        calls `prefill_forward` synchronously and that call ends in a blocking
+        `stream.synchronize()`, so the KV and the state images this settles are
+        real by the time the message exists. The guarantee is batch-granular,
+        which is why the message is too.
+        """
+        while True:
+            try:
+                done = self.prefill_completions.get_nowait()
+            except queue.Empty:
+                break
+            if done.batch_id != self._inflight_batch_id:
+                # Only one batch is ever outstanding, so this cannot happen
+                # without the two sides having diverged about what was sent.
+                logger.error(
+                    "Decode: PrefillBatchDone for batch %s but %s is in "
+                    "flight; dropping",
+                    done.batch_id,
+                    self._inflight_batch_id,
+                )
+                continue
+            for result in done.results:
+                self._apply_chunk_result(result)
+            # A chunk dispatched but not reported back would otherwise be
+            # dropped here without reaching any queue: never decoded, never
+            # freed, and invisible except as a request that stops. Prefill
+            # answers every chunk, so this is a contract check -- but it is the
+            # one place the loss could happen silently.
+            unanswered = set(self.prefill_inflight) - {r.seq_id for r in done.results}
+            for seq_id in unanswered:
+                seq = self.prefill_inflight[seq_id]
+                logger.error(
+                    "Decode: batch %s returned no result for seq %s; releasing "
+                    "its blocks rather than leaking them",
+                    done.batch_id,
+                    seq_id,
+                )
+                self._release_pending_checkpoint(seq)
+                self.block_manager.deallocate(seq)
+            self._inflight_batch_id = None
+            self.prefill_inflight.clear()
+            self._inflight_spans.clear()
+            # Arm post-prefill decode protection only now. A delayer FIRE
+            # merely grants a dispatch; this is the point at which a prefill
+            # forward has actually completed, which is what the baseline's
+            # own call site means by it.
+            if self.prefill_delayer is not None:
+                self.prefill_delayer.notify_prefill_executed()
+
+    def _apply_chunk_result(self, result) -> None:
+        """Settle one chunk: its checkpoint, its hashes, and where it goes next."""
+        seq = self.prefill_inflight.get(result.seq_id)
+        if seq is None:
+            logger.error("Decode: PrefillChunkResult for unknown seq %s", result.seq_id)
+            return
+        start, end, store_hash = self._inflight_spans[result.seq_id]
+        if result.prefill_pos != end:
+            # Decode planned the span, so this is a cross-check on a contract
+            # both sides are meant to be holding, not a position to adopt.
+            logger.error(
+                "Decode: seq %s reported prefill_pos=%d but the dispatched "
+                "chunk ends at %d; the two sides have diverged",
+                result.seq_id,
+                result.prefill_pos,
+                end,
+            )
+
+        # The image this chunk scattered is on the device now, so the record
+        # may be armed for the next `complete_inflight`. Per-chunk evidence,
+        # which is what `PageUnitStore.mark_inflight` is written to demand.
+        if store_hash:
+            cp = self.block_manager.paged_state_checkpoints
+            if cp is not None:
+                cp.settle_prefill_store(store_hash)
+
+        # Publish the blocks this chunk filled, from its own start offset.
+        # `hash_blocks` reads its base off `num_cached_tokens`, which is about
+        # to move past this chunk -- so the offset is handed in explicitly,
+        # through the same `start_tokens` override pipeline parallelism uses
+        # for the identical reason.
+        if seq.block_table and end > start:
+            # The prefix below `start` is already in the index -- being found
+            # there is what the hit WAS -- so it counts as hashed whether or
+            # not this call publishes anything. `hash_blocks` advances the
+            # watermark only on the path that publishes, and a request resuming
+            # entirely from cache takes the other one: left at 0,
+            # `hash_decode_blocks` reads that as "nothing has ever been hashed"
+            # and re-hashes the whole prompt on the first decode step.
+            seq.num_hashed_tokens = max(seq.num_hashed_tokens, start)
+            self.block_manager.hash_blocks(seq, end - start, start_tokens=start)
+        seq.pending_hash_start = -1
+        seq.num_cached_tokens = end
+
+        if seq.status == SequenceStatus.ABORTED:
+            self._release_pending_checkpoint(seq)
+            self.block_manager.deallocate(seq)
+            return
+
+        if not result.is_final:
+            # Real KV, possibly an image, but no token: the request is not
+            # decodable yet. It goes back in the queue the next batch build
+            # draws from first.
+            seq.is_partial_prefill = True
             self.prefill_partial.append(seq)
-            # `prefill_pos` is prefill's ABSOLUTE position, in the same frame
-            # this seq already counts in: prefill started from the
-            # `num_cached_tokens` decode put in the BlockAssignment, so a
-            # prefix-cache hit is inside the number rather than clobbered by
-            # it. Assignment, not `+=` -- the delta this used to add no longer
-            # exists on the wire, because prefill stays silent about chunks
-            # that reach no rung.
+            return
+
+        seq.is_partial_prefill = False
+        seq.append_token(result.sampled_token_id)
+        seq.is_first_decode = True
+        # T0 lives in seq.token_ids (so the first decode forward reads it as
+        # input), but no postprocess ever sees it in a fwd_output: with
+        # deferred output this seq has idx=None on its first decode step and
+        # `continue`s before any stream output is built, so T0 would never be
+        # emitted and every completion would silently lose its first token.
+        # Mark it for injection so the first postprocess that does carry a
+        # token for this seq prepends T0 to new_tokens.
+        seq._injected_t0 = result.sampled_token_id
+        if self.mtp_k > 0:
+            # schedule() always asks for mtp_k+1 query tokens, and the per-seq
+            # count CANNOT be shrunk for plain MTP: the q-shrink offset
+            # correction (model_runner.py) and the defensive index clamp
+            # (drafter.py) are both gated on the DSpark drafter, so
+            # EagleProposer would scatter an out-of-range anchor index and
+            # fault the GPU. So the seq must always arrive with mtp_k drafts.
             #
-            # Recorded BEFORE the advance, because it is the offset the advance
-            # is about to destroy: the blocks prefill just filled run from here
-            # to `num_cached_tokens`, and `hash_blocks` would otherwise start
-            # looking at the end of them. Not published here — this runs on the
-            # PrefillDone receive thread, and the publish mutates the block pool
-            # and the checkpoint coordinator that the engine thread is draining.
-            # `postprocess` does it; see `Sequence.pending_hash_start`.
-            if seq.pending_hash_start < 0:
-                seq.pending_hash_start = seq.num_cached_tokens
-            seq.num_cached_tokens = prefill_pos
-            seq.append_token(sampled_token_id)
-            seq.is_first_decode = True
-            # T0 lives in seq.token_ids (so the first decode forward reads it as
-            # input), but no postprocess ever sees it in a fwd_output: with
-            # deferred output this seq has idx=None on its first decode step and
-            # `continue`s before any stream output is built, so T0 would never be
-            # emitted and every completion would silently lose its first token.
-            # Mark it for injection so the first postprocess that does carry a
-            # token for this seq prepends T0 to new_tokens — the same hook the
-            # inter-node P/D path uses at _schedule_first_decode_after_remote_kv.
-            seq._injected_t0 = sampled_token_id
-            if self.mtp_k > 0:
-                # schedule() always asks for mtp_k+1 query tokens, and the
-                # per-seq count CANNOT be shrunk for plain MTP: the q-shrink
-                # offset correction (model_runner.py) and the defensive index
-                # clamp (drafter.py) are both gated on the DSpark drafter, so
-                # EagleProposer would scatter an out-of-range anchor index and
-                # fault the GPU. So the seq must always arrive with mtp_k
-                # drafts appended.
-                #
-                # Prefer the real drafts the prefill process proposed. Every
-                # drafter proposes there now, DSpark included, so an empty list
-                # means spec is off on that side — not a flavor we decline.
-                #
-                # The fallback stays because it must: rejection sampling makes
-                # draft *quality* irrelevant to correctness — a draft is emitted
-                # only if it matches what the target would have sampled — so
-                # placeholders are simply rejected, at the cost of one
-                # unspeculated step. That cost is what proposing in prefill
-                # removes, and it was measurable: with the fallback in play,
-                # `rejected_prev == mtp_k` on the first decode step of every
-                # sequence.
-                drafts = [int(d) for d in (draft_token_ids or [])][: self.mtp_k]
-                if len(drafts) < self.mtp_k:
-                    drafts += [self.eos_token_id] * (self.mtp_k - len(drafts))
-                for d in drafts:
-                    seq.append_token(int(d))
-                seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
-                # Declare those trailing slots as placeholders, which the
-                # inter-node P/D path has always done at the same point
-                # (`_schedule_first_decode_after_remote_kv`) and this one never
-                # did. `num_placeholder_tokens` is "the only width that
-                # describes what is actually there": at 0, the `mtp_k` drafts
-                # just appended count as REAL tokens in `seq.num_tokens`, and
-                # `num_tokens` is what the batch turns into `context_lens`. So
-                # the first decode step is told its context is `mtp_k` tokens
-                # longer than the KV that exists, and every query position --
-                # including position 0, whose logits produce the emitted token
-                # -- attends past the end of the prompt.
-                #
-                # That is why the drafter made this visible while nothing else
-                # did: without it the step is q=1, `num_tokens` is right by
-                # accident, and the output is correct. With it the step is
-                # `mtp_k + 1` wide and the count is wrong by exactly `mtp_k`.
-                #
-                # Width is `mtp_k`, not `len(drafts)`: the padding above is
-                # `eos_token_id`, so a short draft list still occupies the full
-                # window and counting only the real ones leaves that EOS behind
-                # as context. T0 is excluded -- it is a real generated token.
-                seq.num_placeholder_tokens = self.mtp_k
-            seq.first_token_time = time.time()
-            self.prefill_done.append(seq)
+            # Prefer the real drafts the prefill process proposed. The fallback
+            # stays because it must: rejection sampling makes draft *quality*
+            # irrelevant to correctness, so placeholders are simply rejected,
+            # at the cost of one unspeculated step.
+            drafts = [int(d) for d in (result.draft_token_ids or [])][: self.mtp_k]
+            if len(drafts) < self.mtp_k:
+                drafts += [self.eos_token_id] * (self.mtp_k - len(drafts))
+            for d in drafts:
+                seq.append_token(int(d))
+            seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
+            # Declare those trailing slots as placeholders.
+            # `num_placeholder_tokens` is "the only width that describes what is
+            # actually there": at 0, the `mtp_k` drafts just appended count as
+            # REAL tokens in `seq.num_tokens`, and `num_tokens` is what the
+            # batch turns into `context_lens`. So the first decode step is told
+            # its context is `mtp_k` tokens longer than the KV that exists, and
+            # every query position -- including position 0, whose logits produce
+            # the emitted token -- attends past the end of the prompt.
+            #
+            # Width is `mtp_k`, not `len(drafts)`: the padding above is
+            # `eos_token_id`, so a short draft list still occupies the full
+            # window and counting only the real ones leaves that EOS behind as
+            # context. T0 is excluded -- it is a real generated token.
+            seq.num_placeholder_tokens = self.mtp_k
+        seq.first_token_time = time.time()
+        self.prefill_done.append(seq)
 
     def preempt(self, seq: Sequence) -> bool:
-        """Drop any pending T0 injection when a preemption actually lands.
+        """Drop what a preemption invalidates: a pending T0, a pending image.
 
         A preempted sequence is re-prefilled from scratch and will emit its
         first token through the normal path. Carrying `_injected_t0` across the
-        preempt/resume boundary would prepend T0 to the output a second time.
+        preempt/resume boundary would prepend T0 to the output a second time,
+        and carrying a checkpoint reservation would pin units under a hash for
+        a chunk that is never going to run.
+
         Overridden here rather than in Scheduler.preempt so the disagg fix
         cannot affect the non-disagg path.
 
@@ -5482,13 +5523,16 @@ class DecodeScheduler(Scheduler):
         if not super().preempt(seq):
             return False
         seq._injected_t0 = None
+        self._release_pending_checkpoint(seq)
         return True
 
     def _schedule(self):
         """Schedule decode-only batches.
 
-        Sequences are promoted directly from prefill_waiting to running by
-        on_prefill_done(); this method only schedules the running queue.
+        Prefill is scheduled by `build_prefill_batch`, which the engine calls
+        just before this and which dispatches to the other process -- so this
+        method only ever sees the `running` queue, and a mid-prompt sequence
+        never reaches it (it waits in `prefill_partial` instead).
 
         Overrides the base `_schedule`, so the inherited `schedule()` still
         closes the throughput window on every one of the returns below.
@@ -5518,8 +5562,6 @@ class DecodeScheduler(Scheduler):
 
         if not self.running:
             self.cu_fraction = None
-            if self._cu_shm is not None:
-                struct.pack_into("I", self._cu_shm.buf, self._cu_shm_offset, 0)
             return None
 
         scheduled_seqs: dict[int, Sequence] = {}
@@ -5529,9 +5571,6 @@ class DecodeScheduler(Scheduler):
         with self._prefill_lock:
             while self.running and len(scheduled_seqs) < self.max_num_seqs:
                 seq = self.running.popleft()
-                # logger.warning("decode state: waiting=%d prefill_waiting=%d prefill_done=%d running=%d free_blocks=%d",
-                #     len(self.waiting), len(self.prefill_waiting), len(self.prefill_done),
-                #     len(self.running), self.block_manager.kv.num_free)
                 while not self.block_manager.can_append(seq, self.mtp_k + 1):
                     logger.warning("Cannot allocate")
                     if self.running:
@@ -5550,24 +5589,22 @@ class DecodeScheduler(Scheduler):
 
         if not scheduled_seqs:
             self.cu_fraction = None
-            if self._cu_shm is not None:
-                struct.pack_into("I", self._cu_shm.buf, self._cu_shm_offset, 0)
             return None
 
         self.running.extendleft(reversed(scheduled_seqs.values()))
 
         total_tokens_num_decode = sum(num_scheduled_tokens)
 
-        # Dynamic CU partitioning: decode decides the fraction based on its
-        # batch size and the total tokens queued for prefill, then writes the
-        # decode tokens to shared memory for PrefillScheduler to read.
-
-        if self._cu_shm is not None:
-            struct.pack_into(
-                "I", self._cu_shm.buf, self._cu_shm_offset, total_tokens_num_decode
-            )
+        # Dynamic CU partitioning for DECODE's own stream. The prefill side's
+        # fraction is computed in `build_prefill_batch` and travels with the
+        # batch -- decode is the only half that knows both operands, which is
+        # what retired the shared-memory channel that used to carry its token
+        # count across to prefill.
         if self._cu_masking and prefill_finished:
-            pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
+            pwait = sum(
+                seq.num_tokens - seq.num_cached_tokens
+                for seq in (*self.prefill_inflight.values(), *self.prefill_partial)
+            )
             self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
         _log_sched_batch(self.config, "decode", scheduled_seqs, num_scheduled_tokens)
