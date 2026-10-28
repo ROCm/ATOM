@@ -650,10 +650,9 @@ class DSparkProposer(Drafter):
         attn_metadata = forward_context.attn_metadata
         context.is_draft = True
 
-        # Drafter-owned aux: our own forward-hook capture buffers, row-aligned to
-        # the target hidden states.
-        aux_hidden_states = self.aux_for(target_hidden_states)
-        if aux_hidden_states is None:
+        # Drafter-owned aux: our own forward-hook capture buffers. Checked, not
+        # read: `aux_for` would all_gather them again under a PCP prefill.
+        if not self._captures_aux:
             raise RuntimeError(
                 "DSpark requires target auxiliary hidden states from "
                 "dspark_target_layer_ids; none were captured."
