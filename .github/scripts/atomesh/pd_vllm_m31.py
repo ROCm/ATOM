@@ -352,7 +352,7 @@ def main():
                          'dbo-decode-token-threshold': 32768})
         cmd = ['vllm', 'serve', model_path, *flags(args)]
         recorded_env = {k: env[k] for k in sorted(env)
-                        if k in ('GLIBC_TUNABLES', 'PYTHONPATH', 'ATOMESH_VLLM_ROLE',
+                        if k in ('LD_PRELOAD', 'LD_LIBRARY_PATH', 'GLIBC_TUNABLES', 'PYTHONPATH', 'ATOMESH_VLLM_ROLE',
                                  'ATOMESH_VLLM_MEMORY_DIR', 'ATOMESH_VLLM_STORE_CONFIG_PATH')
                         or k.startswith(('VLLM_', 'MC_', 'MOONCAKE_', 'NCCL_',
                                          'HIP_VISIBLE', 'DEBUG_HIP'))}

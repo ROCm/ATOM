@@ -150,3 +150,11 @@ core-COMGR preload controls. It records hashes/inodes of both COMGR copies.
 No connector, Store or model is initialized. This follows smoke 40724865295:
 the failing zeroing HSACO is byte-identical to the successful minimal probe,
 but the two processes loaded COMGR from different SDK directories.
+
+The next smoke sets `LD_PRELOAD` to the image's
+`_rocm_sdk_core/lib/libamd_comgr.so.3` before starting vLLM services. The core
+and devel COMGR paths are hardlinks to identical bytes. In no-model run
+40727829376, importing Mooncake before Torch aborted during Triton compilation;
+preloading COMGR made both import orders pass all four native/minimal checks.
+This is a loader-order workaround candidate; the full model smoke must verify
+whether it also fixes its HIP 209. It does not replace any image package.
