@@ -675,7 +675,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # T=16, K=1024) -- plus a dense [max_num_seqs, V] fp32 score scratch
     # (320 MiB at 512, V=163840; the verify reuses it to spread a rejecting
     # request's q over the vocab), all allocated before the KV cache is sized.
-    # The two ops' per-step scratch is allocated once alongside them.
+    # The two ops' per-step scratch is allocated once alongside them: about
+    # 28 MiB for the draft and 191 MiB for the verify at 512, T=16, V=163840.
+    # 160 MiB of the verify's, max_num_seqs * T * V / 8 bytes, holds the run
+    # maxima that let a top-k of at most 256 read its logits once; it is
+    # reserved whether or not traffic uses top-k. The startup log line
+    # "Lossless speculative sampling armed" itemizes all of these.
     #
     # Only a draft model that declares `supports_lossless_draft` honours it;
     # any other flavor silently keeps the greedy pair. Mutually exclusive with

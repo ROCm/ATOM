@@ -16,6 +16,7 @@ from atom.model_ops.dspark_markov_sample import (
 )
 from atom.model_ops.rejection_sampler import (
     RatioDraftQ,
+    ratio_count_scratch_bytes,
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
@@ -292,22 +293,27 @@ class DSparkProposer(Drafter):
         )
         self.model.bind_draft_sampling(self.draft_sampling)
         if self.runner.rank == 0:
+
+            def mib(*scratches):
+                return (
+                    sum(s.f32.numel() * 4 + s.i32.numel() * 4 for s in scratches)
+                    / 2**20
+                )
+
             logger.info(
                 "Lossless speculative sampling armed: draft q store %d slots x "
                 "[%d, top %d of %d] (%.1f MiB) + %.1f MiB draft scores + %.1f "
-                "MiB scratch",
+                "MiB draft scratch + %.1f MiB verify scratch (%.1f MiB of it "
+                "the counted top-k's run maxima)",
                 q_slots,
                 t,
                 q_width,
                 vocab,
                 self._q_store.nbytes() / 2**20,
                 self._s_scratch.numel() * 4 / 2**20,
-                sum(
-                    buf.numel() * 4
-                    for scratch in (self._draft_scratch, self._verify_scratch)
-                    for buf in (scratch.f32, scratch.i32)
-                )
-                / 2**20,
+                mib(self._draft_scratch),
+                mib(self._verify_scratch),
+                ratio_count_scratch_bytes(max_bs * t, vocab) / 2**20,
             )
 
     def stage_draft_sampling_host(
