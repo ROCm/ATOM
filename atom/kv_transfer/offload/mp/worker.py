@@ -375,11 +375,6 @@ class LMCacheMPConnector(KVConnectorBase):
         return self._start_load_kv_inner(metadata)
 
     def _start_load_kv_inner(self, metadata: Any) -> None:
-        self._release_ipc_resources()
-        # Raised before anything else in the step: the drain thread's useful
-        # window is the model forward that follows, where the step thread is in
-        # C with the GIL released. By `get_finished` the results are settled.
-        self._drain_wake.set()
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
         if self._adapter is None or self.chunk_size is None:
@@ -393,6 +388,14 @@ class LMCacheMPConnector(KVConnectorBase):
         ]
         if not requests:
             return
+        # Only on a step with transfers: an idle step has nothing to wake the
+        # drain thread for (`get_finished` wakes it while transfers are
+        # pending), and what is owned waits for the next one.
+        self._release_ipc_resources()
+        # Raised before the submits: the drain thread's useful window is the
+        # model forward that follows, where the step thread is in C with the
+        # GIL released. By `get_finished` the results are settled.
+        self._drain_wake.set()
         event = self._record_step_event()
         self._owned_events.append(event)
         for req in requests:
@@ -429,12 +432,14 @@ class LMCacheMPConnector(KVConnectorBase):
         if not owned or (owned < _OWNED_IPC_CAP and not _stream_idle()):
             return
         # Futures first: each retains its step event, which is unshared only
-        # once they are gone.
-        for resources in (self._owned_futures, self._owned_events):
-            with self._lock:
-                unshared = _take_unshared(resources)
-            # The destroys run here, outside the lock.
-            del unshared
+        # once they are gone. The drain thread adds futures under `_lock`; the
+        # events are this thread's alone, so their scan holds no lock the drain
+        # thread waits on. The destroys run outside the lock.
+        with self._lock:
+            unshared = _take_unshared(self._owned_futures)
+        del unshared
+        unshared = _take_unshared(self._owned_events)
+        del unshared
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:

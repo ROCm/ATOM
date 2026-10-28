@@ -26,7 +26,10 @@ import torch
 # Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
 # never reuse one another's objects even when the HF model config is identical.
-PAGE_LAYOUT_VERSION = 3
+# Version 4 hashes `sliding_window` and `candidate_block_size`, a canonical
+# `head_dim`, and the speculative config without per-process fields. That moves
+# every model's digest, so objects stored under version 3 are unreachable.
+PAGE_LAYOUT_VERSION = 4
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",

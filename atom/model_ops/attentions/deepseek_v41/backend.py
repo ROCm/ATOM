@@ -63,19 +63,6 @@ def _compress_plan_buffer_names(ratio):
     }
 
 
-def _staging_advances(staged) -> bool:
-    """Whether this step's Engram staging will advance the cursor itself.
-
-    `EngramStaging._advance_cursor` does it on the way past, and stands down on
-    a step carrying candidate cursors -- a verify step's cursor is the accepted
-    prefix's, which only the sampler knows. The advance has to happen exactly
-    once, down one path or the other.
-    """
-    if staged is None:
-        return False
-    return staged.candidates is None
-
-
 def build_v41_pool_geometry(
     hf_config,
     block_size: int,
@@ -1353,13 +1340,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # the forward advances it, after its snapshot).
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
-        elif (
-            not metadata.dummy and not step.tentative and not _staging_advances(staged)
-        ):
-            # Testing `staged is None` instead left a step whose staging stood
-            # down advancing nothing: the request stays one behind its own
-            # position ("needs state at 828, found 818" under
-            # FULL_AND_PIECEWISE at 64 concurrent requests).
+        elif staged is None and not metadata.dummy and not step.tentative:
             cache.advance_cursor(step, histories)
         if on_device and step.tentative:
             cache.pending.staged_on_device = True

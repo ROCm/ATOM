@@ -52,6 +52,7 @@ from atom.plugin.vllm.paged_state_checkpoint import (
     install,
     register_state_checkpoint_adapter,
     register_state_checkpoint_layers,
+    state_checkpoints_on,
 )
 from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
     SchedulerStateCheckpoints,
@@ -262,9 +263,21 @@ def v41_state_checkpoints_requested() -> bool:
     one switch are two answers waiting to disagree, and the disagreement is a
     platform that admits prefix caching for a pool with no checkpoint groups.
     """
-    import os
+    from atom.utils import envs
 
-    return os.environ.get("ATOM_V41_STATE_CHECKPOINTS") in ("1", "true", "True")
+    return envs.ATOM_V41_STATE_CHECKPOINTS
+
+
+def v41_state_checkpoints_active(vllm_config) -> bool:
+    """Whether checkpoints restore V4.1's STATE this run.
+
+    The one predicate the platform gate and the model's runtime check share.
+    Both halves: the switch registers the checkpoint layers, and
+    `state_checkpoints_on` (any V4.1 run with prefix caching) is what uses them.
+    """
+    return v41_state_checkpoints_requested() and bool(
+        state_checkpoints_on(register_v41_state_checkpoint_adapter(), vllm_config)
+    )
 
 
 def register_deepseek_v41_state_checkpoint_layers(vllm_config) -> list[str]:
@@ -347,6 +360,9 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
     state_checkpoint_drafters = "no drafter, or speculative method 'dspark'"
     # Under speculation a hit leaves two tokens (`V41BoundaryPlanner`).
     speculative_prefill_tail = 2
+    # Without checkpoints `deepseek_v41_state_reserve_patch` withholds the STATE
+    # tail and auto-fits the length, as it did before this adapter existed.
+    sizes_pool_without_checkpoints = False
 
     @property
     def proxy_layer_name(self) -> str:

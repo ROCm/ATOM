@@ -1018,7 +1018,13 @@ def snapshot_v41_batch(common_attn_metadata):
             # The accessor is an ATOM patch over another engine's internals;
             # absent is the caller's ordinary "fall back" case.
             req_ids = None
-        host_table = getattr(input_batch, "block_table", None)
+        # Not V2's view: it copies the pool-wide table, and the trimmed copy
+        # below reads only the columns this step needs.
+        host_table = (
+            None
+            if getattr(input_batch, "copies_whole_table", False)
+            else getattr(input_batch, "block_table", None)
+        )
         if host_table is not None:
             try:
                 block_table_np = host_table[0].block_table.np
@@ -2111,10 +2117,12 @@ def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None
     if not state_checkpoints_on(adapter, vllm_config):
         return
     worker = current_state_checkpoint_worker(adapter)
-    if worker is None:
+    copies = getattr(getattr(worker, "copier", None), "_copies", None)
+    if worker is None or getattr(copies, "cache", None) is not cache:
+        # First bind, or a rebind: the copier copies against the arena it was
+        # built on, so a new cache needs a new worker.
         worker = _v41_build_state_checkpoint_worker(vllm_config, adapter, num_slots)
-    # On every bind, not only the first: a rebind builds a new cache, and a
-    # cache without a restore refuses every cross-request hit.
+    # On every bind: a cache without a restore refuses every cross-request hit.
     cache.checkpoint_restore = _v41_checkpoint_restore(adapter, worker)
 
 

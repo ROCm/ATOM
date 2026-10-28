@@ -201,8 +201,8 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
     if original is None:
         logger.warning(
             "ATOM DeepSeek-V4.1: vLLM has no Scheduler._reserve_prefill_lookahead; "
-            "skipping this patch. V4.1 offload needs it -- that model will "
-            "refuse at startup rather than run uncapped."
+            "skipping this patch. V4.1 state checkpoints need it and refuse to "
+            "start without it (`v41_scheduler_patches_missing`)."
         )
         return
     if getattr(original, "_atom_v41_prefill_aligned", False):
@@ -272,8 +272,8 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
     if original is None:
         logger.warning(
             "ATOM DeepSeek-V4.1: vLLM has no Scheduler._get_local_prefix_cache_hit; "
-            "skipping this patch. V4.1 offload needs it -- that model will "
-            "refuse at startup rather than run uncapped."
+            "skipping this patch. V4.1 state checkpoints need it and refuse to "
+            "start without it (`v41_scheduler_patches_missing`)."
         )
         return
     if getattr(original, "_atom_v41_hit_cap_patched", False):
@@ -282,8 +282,12 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
     from atom.plugin.vllm.v41_speculative import _is_v41_speculating
 
     @functools.wraps(original)
-    def _wrapped(self, request):
-        blocks, num_local, boundary, divergent = original(self, request)
+    def _wrapped(self, request, *args, **kwargs):
+        # Forwarded as given: vLLM 0.33 adds `max_cache_hit_length`, and this
+        # wraps the method for every plugin model.
+        blocks, num_local, boundary, divergent = original(
+            self, request, *args, **kwargs
+        )
         if num_local <= 0:
             return blocks, num_local, boundary, divergent
         planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
@@ -384,3 +388,19 @@ def select_scheduler_cls(scheduler_config) -> str | None:
         name,
     )
     return f"atom.plugin.vllm.scheduler.{name}"
+
+
+def v41_scheduler_patches_missing() -> list[str]:
+    """The vLLM `Scheduler` methods V4.1's state checkpoints need but lack ATOM's
+    patch: a renamed method leaves local hits uncapped and prefill chunks off
+    the checkpoint grid, which is a stale-state failure at serving time."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    return [
+        name
+        for name, marker in (
+            ("_get_local_prefix_cache_hit", "_atom_v41_hit_cap_patched"),
+            ("_reserve_prefill_lookahead", "_atom_v41_prefill_aligned"),
+        )
+        if not getattr(getattr(Scheduler, name, None), marker, False)
+    ]

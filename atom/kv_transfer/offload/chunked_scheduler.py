@@ -100,6 +100,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._load_specs: dict[str, LoadSpec] = {}
         # req_id -> Sequence (queued to recv this step)
         self._reqs_need_recv: dict[str, object] = {}
+        # Loads this step's `build_connector_meta` declined at dispatch. A
+        # frontend that parked the request on its load reads them to release it
+        # now (`_decline_load`); reset every build.
+        self.declined_loads: set[str] = set()
         # req_id -> HBM chunk frontier for an emitted load. If the load fails,
         # lower the save frontier to this value so recomputed chunks can be
         # stored again.
@@ -768,8 +772,24 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             recurrent_state=recurrent,
         )
 
-    def _drop_unridable_finished_save(self, sid: str, seq) -> None:
-        """Retire a finished request's save that cannot carry its state.
+    def _decline_load(self, sid, seq, reason, hbm, lmc, need, chunk) -> None:
+        """Skip a load at dispatch, and name it in `declined_loads`.
+
+        A frontend that parked the request on this load before dispatch (the
+        vLLM plugin) releases it this step instead of waiting it out.
+        """
+        self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+        self._clear_pending_load(sid)
+        self.declined_loads.add(sid)
+
+    def _unbuilt_save_is_final(self) -> bool:
+        """Whether a save `_build_save_request` declined stays unbuildable once
+        its request has finished. Here only a missing recurrent ride declines
+        one, and a finished request commits no further block to ride on."""
+        return True
+
+    def _retire_finished_save(self, sid: str, seq) -> None:
+        """Retire a finished request's save that can never be emitted.
 
         Gives back the suffix leased at teardown, except blocks an earlier
         operation of this request may still read; `_release_operation_lease`
@@ -899,6 +919,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         _perf_t0 = time.perf_counter()
         meta = LMCacheOffloadMetadata()
+        self.declined_loads = set()
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))
@@ -925,15 +946,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 seq, ls
             )
             if not should_load:
-                self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
-                self._clear_pending_load(sid)
+                self._decline_load(sid, seq, reason, hbm, lmc, need, chunk)
                 continue
             # This is the one place a retrieve is handed to the worker, so it
             # is where the load's lookup pin has to be live -- a spec derived
             # from a remembered hit has none yet.
             if not self._ensure_lookup_pin(seq, sid, ls):
-                self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
-                self._clear_pending_load(sid)
+                self._decline_load(sid, seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 continue
             transfer_end = (
                 lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
@@ -949,10 +968,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     # ever completes. The prefix is recomputed instead, which
                     # is a performance loss where the alternative is a wrong
                     # answer.
-                    self._mark_load_skip(
-                        seq, "no_recurrent_state", hbm, lmc, need, chunk
+                    self._decline_load(
+                        sid, seq, "no_recurrent_state", hbm, lmc, need, chunk
                     )
-                    self._clear_pending_load(sid)
                     continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
             # The scheduler needs the physical load floor to publish the
@@ -1067,6 +1085,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self.total_unbacked_saves += 1
                 if late_acquired:
                     self._block_manager.free_leased_blocks(late_acquired)
+                if getattr(seq, "_offload_finished", False):
+                    # A finished request gets no blocks back, so this would
+                    # repeat every step with the tracker holding its lease.
+                    self._retire_finished_save(sid, seq)
                 logger.warning(
                     "Offload save of seq %s covers [%d, %d) but its block table "
                     "holds %d blocks; skipping (total unbacked_saves=%d)",
@@ -1088,11 +1110,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if request is None:
                 if late_acquired:
                     self._block_manager.free_leased_blocks(late_acquired)
-                if getattr(seq, "_offload_finished", False):
-                    # Nothing will make a finished request's save ridable
-                    # again, and a tracker left behind would hold its lease
-                    # forever.
-                    self._drop_unridable_finished_save(sid, seq)
+                if (
+                    getattr(seq, "_offload_finished", False)
+                    and self._unbuilt_save_is_final()
+                ):
+                    # A tracker left behind would hold its lease forever.
+                    self._retire_finished_save(sid, seq)
                 continue
             self._track_save_statistics(save_operation, aligned - saved)
             meta.add_request(request)
@@ -1216,7 +1239,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_lease_at.setdefault(lease_key, time.monotonic())
             self.total_leased_source_blocks += len(added)
 
-    def has_active_save_leases(self) -> bool:
+    def has_active_save_leases(self, max_age_s: float | None = None) -> bool:
         """Whether any block lease is still held for a save in flight.
 
         These blocks are protected by a refcount rather than by vLLM holding
@@ -1224,9 +1247,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         connector reports them to vLLM as pending frees: they are precisely
         "blocks a pending transfer will release", which is what lets the
         scheduler wait a step instead of preempting a running request to make
-        room.
+        room. ``max_age_s`` counts only leases taken that recently: an older
+        one is a save that is not about to land.
         """
-        return bool(self._save_lease_blocks)
+        if max_age_s is None:
+            return bool(self._save_lease_blocks)
+        oldest = time.monotonic() - max_age_s
+        return any(
+            self._save_lease_at.get(lease_key, oldest) > oldest
+            for lease_key in self._save_lease_blocks
+        )
 
     def take_source_safe_releases(self) -> list[frozenset]:
         """Drain block-ID sets whose lease became source-safe since the last poll."""

@@ -382,17 +382,11 @@ def _v41_state_checkpoints_own_state(config) -> bool:
         from vllm.config import get_current_vllm_config_or_none
 
         from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
-            register_v41_state_checkpoint_adapter,
+            v41_state_checkpoints_active,
         )
-        from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
 
         vllm_config = get_current_vllm_config_or_none()
-        return bool(
-            vllm_config is not None
-            and state_checkpoints_on(
-                register_v41_state_checkpoint_adapter(), vllm_config
-            )
-        )
+        return vllm_config is not None and v41_state_checkpoints_active(vllm_config)
     except Exception:  # noqa: BLE001 - absence means checkpoints are off
         return False
 

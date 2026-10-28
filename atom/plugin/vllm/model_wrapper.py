@@ -373,6 +373,16 @@ def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
 
     if not v41_state_checkpoints_requested():
         return
+    from atom.plugin.vllm.scheduler import v41_scheduler_patches_missing
+
+    missing = v41_scheduler_patches_missing()
+    if missing:
+        raise ValueError(
+            "DeepSeek-V4.1 state checkpoints (ATOM_V41_STATE_CHECKPOINTS) need "
+            f"ATOM's patch on vLLM's Scheduler.{', Scheduler.'.join(missing)}, "
+            "which this vLLM does not carry; unpatched, local hits are not capped "
+            "to a checkpoint and prefill chunks do not end on one"
+        )
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     if getattr(vllm_config, "speculative_config", None) is not None and getattr(
         scheduler_config, "async_scheduling", False

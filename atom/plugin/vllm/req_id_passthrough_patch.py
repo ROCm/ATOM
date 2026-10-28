@@ -93,12 +93,16 @@ class _V2InputBatchView:
     cache it for the rest of that step. Readers of every other attribute get
     the real batch.
 
-    The copy is a sync. It happens only when something actually asks for an
-    checkpoint unit id -- that is, on a step the scheduler planned a store or a
-    restore for, not on every step.
+    The copy is a sync of the whole pool-wide table. It happens only when
+    something asks for a checkpoint unit id -- a step the scheduler planned a
+    store or a restore for. `snapshot_v41_batch`, which reads every step,
+    takes its own trimmed copy instead (`copies_whole_table`).
     """
 
     __slots__ = ("_batch", "_cache", "_computed", "_tables")
+
+    #: Reading `block_table` copies every column of every row, not the step's.
+    copies_whole_table = True
 
     def __init__(self, batch, tables):
         self._batch = batch
@@ -151,16 +155,13 @@ class _V2InputBatchView:
         view = self._cache.get(group_id)
         if view is None:
             table = self._tables[group_id]
-            # Rows are request-state slots, not batch positions: the table is
-            # handed over as the runner keeps it, and the callers address it
-            # in that same space (their rows index `state_slots_committed`).
+            # Rows are already batch rows: `gather_block_tables` builds the
+            # table in batch order, the same order the callers index.
             #
-            # Gathering it into batch order with `idx_mapping_np` looks right
-            # -- vLLM documents that array as `batch_idx -> req_state_idx` --
-            # and is measured wrong: with it, a concurrent restore asked for
-            # (row 4, col 2) while the blocks sat at (row 6, col 2), and the
-            # mechanism refused every such hit with null unit ids. Without it
-            # that refusal does not occur at all.
+            # Gathering it again with `idx_mapping_np` permutes it twice, which
+            # is what was measured: a concurrent restore asked for (row 4,
+            # col 2) while the blocks sat at (row 6, col 2), and the mechanism
+            # refused every such hit with null unit ids.
             view = _BlockTableGroupView(_HostMirror(table.cpu().numpy()))
             self._cache[group_id] = view
         return view

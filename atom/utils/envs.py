@@ -439,6 +439,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS": lambda: (
         int(v) if (v := os.getenv("ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS")) else None
     ),
+    # vLLM plugin, DeepSeek-V4.1: register the PAGE-backed state-checkpoint
+    # layers that prefix caching and AtomLMCacheOffloadConnector restore STATE
+    # from. Off: V4.1 refuses both.
+    "ATOM_V41_STATE_CHECKPOINTS": lambda: (
+        os.getenv("ATOM_V41_STATE_CHECKPOINTS", "0").lower() in ("1", "true")
+    ),
     # vLLM plugin, state checkpoints: after every schedule, check that no
     # request holds more than two blocks per state checkpoint group (diagnostic).
     "ATOM_STATE_CHECKPOINT_CHECK_BLOCKS": lambda: (

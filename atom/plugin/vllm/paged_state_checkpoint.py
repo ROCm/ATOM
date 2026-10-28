@@ -69,6 +69,10 @@ class PagedStateCheckpointAdapter:
     backend_cls: type | None = None
     #: The drafters ``drafter_state_in_checkpoint`` accepts, for the refusal message.
     state_checkpoint_drafters: str = ""
+    #: Whether `_kv_cache_configs_hook` sizes the pool with checkpoints off. A
+    #: family that withholds its STATE tail elsewhere then sets it False, so
+    #: the tail is withheld once.
+    sizes_pool_without_checkpoints: bool = True
 
     @property
     def proxy_layer_name(self) -> str:
@@ -406,6 +410,8 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
 
     bs = adapter.block_size
     pc = state_checkpoints_on(adapter, vllm_config)
+    if not pc and not adapter.sizes_pool_without_checkpoints:
+        return original(vllm_config, kv_cache_specs, available_memory)
     if pc:
         adapter.check_state_checkpoints_supported(vllm_config)
         spec = getattr(vllm_config, "speculative_config", None)

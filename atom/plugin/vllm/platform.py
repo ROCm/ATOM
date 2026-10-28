@@ -234,16 +234,10 @@ def _v41_state_checkpoints_configured(vllm_config) -> bool:
     """
     try:
         from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
-            register_v41_state_checkpoint_adapter,
-            v41_state_checkpoints_requested,
+            v41_state_checkpoints_active,
         )
-        from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
 
-        # Both: `state_checkpoints_on` holds for any V4.1 run with prefix
-        # caching, but the layers exist only when the switch registers them.
-        return v41_state_checkpoints_requested() and bool(
-            state_checkpoints_on(register_v41_state_checkpoint_adapter(), vllm_config)
-        )
+        return v41_state_checkpoints_active(vllm_config)
     except Exception:  # noqa: BLE001 - absence means the mechanism is off
         return False
 

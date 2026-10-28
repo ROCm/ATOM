@@ -157,7 +157,7 @@ def test_an_unridable_finished_save_retires_and_frees_its_lease():
     s._save_operation_blocks = {"op1": {0: 10}, "op2": {0: 11}}
     s._pending_source_safe_releases = []
     s.total_source_safe_released_blocks = 0
-    s._drop_unridable_finished_save("r0", seq)
+    s._retire_finished_save("r0", seq)
     assert "r0" not in s._save_tracker
     assert s._pending_source_safe_releases == [frozenset({11, 12})]
     assert s._save_lease_blocks == {id(seq): {10}}
@@ -227,11 +227,12 @@ def test_an_unresolved_ride_does_not_release_the_request_itself():
     assert c._abandoned_loads == set()
 
 
-def _promising_connector(parked):
+def _promising_connector(parked, declined=()):
     c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
     c._promised_loads = {"7": [0, 32, 64, parked]}
     c._config = SimpleNamespace(kv_cache_block_size=16)
     c._seqs = {"7": SimpleNamespace(block_table=list(range(100, 116)))}
+    c._scheduler = SimpleNamespace(declined_loads=set(declined))
     return c
 
 
@@ -244,6 +245,13 @@ def test_an_undispatched_promise_is_withdrawn_only_if_vllm_parked_it(parked):
         out.extend(c._check_promised_loads(SimpleNamespace(requests=[])))
     assert out == ([("7", [102, 103, 104, 105])] if parked else [])
     assert c._promised_loads == {}
+
+
+def test_a_load_declined_at_dispatch_is_withdrawn_that_step():
+    """No later step dispatches it, so the parked request is released now."""
+    c = _promising_connector(True, declined={"7"})
+    out = c._check_promised_loads(SimpleNamespace(requests=[]))
+    assert out == [("7", [102, 103, 104, 105])] and c._promised_loads == {}
 
 
 def _lookup_connector(*, pending, detachable):
@@ -526,6 +534,9 @@ def test_checkpoints_refuse_async_speculative_scheduling(monkeypatch):
     stub.v41_state_checkpoints_requested = lambda: True
     stub.register_deepseek_v41_state_checkpoint_layers = Mock()
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    patches = types.ModuleType("atom.plugin.vllm.scheduler")
+    patches.v41_scheduler_patches_missing = list
+    monkeypatch.setitem(sys.modules, patches.__name__, patches)
     register = _from_source(
         "atom/plugin/vllm/model_wrapper.py", "_maybe_register_v41_state_checkpoints", {}
     )
@@ -542,3 +553,60 @@ def test_checkpoints_refuse_async_speculative_scheduling(monkeypatch):
         )
     )
     stub.register_deepseek_v41_state_checkpoint_layers.assert_called_once()
+
+    # A vLLM whose Scheduler lacks a patched method is refused, not run uncapped.
+    patches.v41_scheduler_patches_missing = lambda: ["_reserve_prefill_lookahead"]
+    with pytest.raises(ValueError, match="_reserve_prefill_lookahead"):
+        register(
+            SimpleNamespace(
+                **vars(spec), scheduler_config=SimpleNamespace(async_scheduling=False)
+            )
+        )
+
+
+def test_the_hit_cap_forwards_vllms_newer_arguments(monkeypatch):
+    """vLLM 0.33 calls `_get_local_prefix_cache_hit(request, max_cache_hit_length)`."""
+    import sys
+    import types
+
+    from atom.plugin.vllm import scheduler as patches
+
+    seen = []
+
+    class Scheduler:
+        def _get_local_prefix_cache_hit(self, request, max_cache_hit_length=None):
+            seen.append(max_cache_hit_length)
+            return [], 0, None, False
+
+    module = types.ModuleType("vllm.v1.core.sched.scheduler")
+    module.Scheduler = Scheduler
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    patches.apply_vllm_v41_local_hit_cap_patch()
+    assert Scheduler()._get_local_prefix_cache_hit(object(), 1024) == (
+        [],
+        0,
+        None,
+        False,
+    )
+    assert seen == [1024]
+    assert patches.v41_scheduler_patches_missing() == ["_reserve_prefill_lookahead"]
+
+
+def test_the_pool_hook_leaves_v41_without_checkpoints_to_the_reserve_patch(
+    monkeypatch,
+):
+    """Both withholding the STATE tail would charge the pool for it twice."""
+    from atom.plugin.vllm import paged_state_checkpoint as psc
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        register_v41_state_checkpoint_adapter,
+    )
+
+    adapter = register_v41_state_checkpoint_adapter()
+    assert adapter.sizes_pool_without_checkpoints is False
+    monkeypatch.setattr(psc, "adapter_for_config", lambda _config: adapter)
+    monkeypatch.setattr(psc, "state_checkpoints_on", lambda _adapter, _config: False)
+    configs = [object()]
+    out = psc._kv_cache_configs_hook(
+        lambda *_args: configs, object(), {adapter.proxy_layer_name: object()}, [0]
+    )
+    assert out is configs

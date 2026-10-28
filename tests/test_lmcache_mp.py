@@ -2395,12 +2395,45 @@ def test_preemption_fence_covers_queued_transfers_and_fails_stop(monkeypatch):
         _pending_loads={},
         _submitting_owner={"save:7:1": "7"},
         _drain_wake=threading.Event(),
+        _drain_thread=SimpleNamespace(is_alive=lambda: True),
+        _drain_error=None,
     )
     fence = mp_worker_adapter.MPOffloadWorkerAdapter(inner)
     fence.wait_for_requests(["8"])  # someone else's transfer: no wait
     with pytest.raises(RuntimeError, match="preemption fence timed out"):
         fence.wait_for_requests(["7"])
     assert inner._drain_wake.is_set()
+
+
+def test_the_preemption_fence_names_what_waiting_cannot_clear(monkeypatch):
+    """A dead drain, its error, or an unprovable submit: raised at once."""
+    import threading
+
+    from atom.kv_transfer.offload.mp.transfer import _UnprovableSubmission
+    from atom.plugin.vllm.kv_transfer import mp_worker_adapter
+
+    monkeypatch.setattr(mp_worker_adapter, "_FENCE_TIMEOUT_S", 3600.0)
+    inner = SimpleNamespace(
+        _lock=threading.Lock(),
+        _pending_saves={},
+        _pending_loads={},
+        _submitting_owner={"save:7:1": "7"},
+        _drain_wake=threading.Event(),
+        _drain_thread=None,
+        _drain_error=None,
+    )
+    fence = mp_worker_adapter.MPOffloadWorkerAdapter(inner)
+    with pytest.raises(RuntimeError, match="no drain thread"):
+        fence.wait_for_requests(["7"])
+    inner._drain_error = ConnectionError("server went away")
+    with pytest.raises(RuntimeError, match="drain failed"):
+        fence.wait_for_requests(["7"])
+    inner._drain_error, inner._submitting_owner = None, {}
+    inner._pending_saves = {
+        "save:7:1": SimpleNamespace(completion="7", future=_UnprovableSubmission())
+    }
+    with pytest.raises(RuntimeError, match="submit raised"):
+        fence.wait_for_requests(["7"])
 
 
 def test_get_finished_wakes_the_drain_while_transfers_are_pending(
@@ -2513,10 +2546,66 @@ def test_ipc_resources_are_destroyed_on_the_step_thread(
     idle[0] = True
     for req_id in range(4, 9):
         step(_load_step(req_id))
-    step(LMCacheOffloadMetadata())
+    step(_load_step(9))  # the release runs on a step with transfers
     assert all(destroyed.values())
     # The adapter still holds the last future and the two newest exports.
     assert {f"future{i}" for i in (1, 4, 5, 6, 7)} <= destroyed.keys()
     assert {f"event{i}" for i in (1, 2, 4, 5, 6)} <= destroyed.keys()
     assert not {"future8", "event7", "event8"} & destroyed.keys()
     worker.close()
+
+
+def test_only_recent_save_leases_count_as_blocks_about_to_return():
+    """A lease past the horizon is a stuck save, which must not stop preemption."""
+    import time
+
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+
+    s = ChunkedOffloadSchedulerBase.__new__(ChunkedOffloadSchedulerBase)
+    s._save_lease_blocks = {1: {10}}
+    s._save_lease_at = {1: time.monotonic() - 60.0}
+    assert s.has_active_save_leases()
+    assert not s.has_active_save_leases(max_age_s=10.0)
+    s._save_lease_blocks[2] = {11}
+    s._save_lease_at[2] = time.monotonic()
+    assert s.has_active_save_leases(max_age_s=10.0)
+
+
+def test_a_declined_save_retires_only_where_the_decline_is_permanent():
+    """NativeState declines while its pin budget is full: that clears."""
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+    from atom.kv_transfer.offload.mp.native_state_scheduler import (
+        NativeStateLMCacheMPConnectorScheduler,
+    )
+
+    assert ChunkedOffloadSchedulerBase._unbuilt_save_is_final(None)
+    assert not NativeStateLMCacheMPConnectorScheduler._unbuilt_save_is_final(None)
+
+
+def test_a_failed_load_reports_only_the_blocks_it_writes():
+    """The HBM prefix below the load may be shared with a running request."""
+    from atom.plugin.vllm.kv_transfer import mp_worker_adapter
+
+    inner = SimpleNamespace(block_size=4, start_load_kv=lambda metadata: None)
+    adapter = mp_worker_adapter.MPOffloadWorkerAdapter(inner)
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=7,
+            token_ids=list(range(16)),
+            block_ids=[100, 101, 102, 103],
+            load_spec=LoadSpec(8, 14, can_load=True),
+        )
+    )
+    adapter.start_load_kv(metadata)
+    assert adapter._load_blocks == {"7": {102, 103}}
+
+
+def test_the_v41_checkpoint_switch_parses_like_other_switches(monkeypatch):
+    from atom.utils import envs
+
+    for value, on in (("TRUE", True), ("1", True), ("true", True), ("0", False)):
+        monkeypatch.setenv("ATOM_V41_STATE_CHECKPOINTS", value)
+        assert envs.ATOM_V41_STATE_CHECKPOINTS is on
+    monkeypatch.delenv("ATOM_V41_STATE_CHECKPOINTS")
+    assert envs.ATOM_V41_STATE_CHECKPOINTS is False

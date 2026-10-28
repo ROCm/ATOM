@@ -40,7 +40,10 @@ from typing import Any
 
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-from atom.kv_transfer.offload.mp.transfer import _terminal_future_result
+from atom.kv_transfer.offload.mp.transfer import (
+    _terminal_future_result,
+    _UnprovableSubmission,
+)
 
 # How long the preemption fence waits for one transfer before it gives up and
 # lets the step proceed. The MP worker already enforces its own, much longer,
@@ -86,13 +89,30 @@ class MPOffloadWorkerAdapter:
     # -- the two hooks --------------------------------------------------
 
     def start_load_kv(self, metadata: Any) -> None:
-        """Record each load's destination blocks, then dispatch the step."""
+        """Record each load's destination blocks, then dispatch the step.
+
+        Only the blocks the load writes, from its HBM frontier to its end:
+        those below are valid and may be shared with a running request, which
+        vLLM's invalid-block handling would fail or recompute as well.
+        """
         if isinstance(metadata, LMCacheOffloadMetadata):
+            block_size = int(getattr(self._inner, "block_size", 0) or 0)
             for req in metadata.requests:
-                if req.load_spec is not None:
-                    self._load_blocks[str(req.req_id)] = {
-                        int(block_id) for block_id in req.block_ids
-                    }
+                spec = req.load_spec
+                if spec is None:
+                    continue
+                blocks = list(req.block_ids)
+                if block_size > 0:
+                    end = (
+                        spec.lmcache_cached_tokens
+                        if spec.transfer_end_tokens is None
+                        else spec.transfer_end_tokens
+                    )
+                    blocks = blocks[
+                        int(spec.hbm_cached_tokens)
+                        // block_size : -(-int(end) // block_size)
+                    ]
+                self._load_blocks[str(req.req_id)] = {int(b) for b in blocks}
         self._inner.start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -154,6 +174,32 @@ class MPOffloadWorkerAdapter:
             ]
             if not outstanding:
                 return
+            # Causes that waiting cannot clear, named now rather than as a
+            # timeout: the server may still write these blocks either way.
+            error = getattr(inner, "_drain_error", None)
+            if error is not None:
+                raise RuntimeError(
+                    "ATOM LMCache MP: preemption fence found the transfer drain "
+                    f"failed with {len(outstanding)} transfer(s) in flight for "
+                    f"{sorted(wanted)}"
+                ) from error
+            unprovable = [
+                operation_id
+                for operation_id, future in pending
+                if isinstance(future, _UnprovableSubmission)
+            ]
+            if unprovable:
+                raise RuntimeError(
+                    "ATOM LMCache MP: preemption fence cannot release "
+                    f"{sorted(wanted)}: submit raised for {unprovable}, so the "
+                    "server may have the request and still write its blocks"
+                )
+            drain = getattr(inner, "_drain_thread", None)
+            if submitting and (drain is None or not drain.is_alive()):
+                raise RuntimeError(
+                    "ATOM LMCache MP: preemption fence found no drain thread to "
+                    f"submit {submitting} for {sorted(wanted)}"
+                )
             if submitting:
                 wake = getattr(inner, "_drain_wake", None)
                 if wake is not None:

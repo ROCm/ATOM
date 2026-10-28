@@ -2186,11 +2186,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self._kda_planner is not None and self._kda_planner.has_pending_work():
             return True
         scheduler = self._scheduler
+        # Only recent leases. Waiting stalls the running loop for the step,
+        # and a save past this horizon is stuck rather than landing (MP has no
+        # stale-lease reclaim; its transfer deadline fail-stops later). The
+        # leased blocks are not the ones a preemption frees, so preempting
+        # instead is safe.
         return bool(
             scheduler is not None
             and getattr(scheduler, "has_active_save_leases", None) is not None
-            and scheduler.has_active_save_leases()
+            and scheduler.has_active_save_leases(max_age_s=self._PENDING_FREE_HORIZON_S)
         )
+
+    # How long a save lease counts as blocks about to come back.
+    _PENDING_FREE_HORIZON_S = 10.0
 
     # Steps a promised load may go undispatched before it is called out. Loads
     # are emitted on the step after the promise, so anything past a handful of
@@ -2223,6 +2231,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if not self._promised_loads:
             return []
+        # Declined at dispatch this step: no later step will dispatch them.
+        declined = getattr(self._scheduler, "declined_loads", None) or set()
         for meta in getattr(inner, "requests", ()) or ():
             if (
                 getattr(meta, "load_operation", None) is None
@@ -2231,6 +2241,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             self._promised_loads.pop(str(getattr(meta, "req_id", meta)), None)
         withdrawn: list[tuple[str, list[int]]] = []
+        expired: list[str] = []
         for req_id in list(self._promised_loads):
             state = self._promised_loads[req_id]
             if not state[3]:
@@ -2245,17 +2256,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # steps, four ranks reporting it, and the engine down.
                 self._promised_loads.pop(req_id)
                 continue
-            state[0] += 1
-            if state[0] <= self._PROMISE_GRACE_STEPS:
-                continue
+            if req_id not in declined:
+                state[0] += 1
+                if state[0] <= self._PROMISE_GRACE_STEPS:
+                    continue
+                expired.append(req_id)
             _, start, need, _parked = self._promised_loads.pop(req_id)
             withdrawn.append((req_id, self._promised_block_ids(req_id, start, need)))
-        if withdrawn:
+        if expired:
             logger.error(
                 "ATOM LMCache offload: promised a load for %s but none was "
                 "dispatched within %d steps; withdrawing the promise so the "
                 "request leaves WAITING_FOR_REMOTE_KVS and recomputes",
-                sorted(r for r, _ in withdrawn),
+                sorted(expired),
                 self._PROMISE_GRACE_STEPS,
             )
         return withdrawn
