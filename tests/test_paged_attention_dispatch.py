@@ -295,10 +295,23 @@ class _Layer:
     through once already.
     """
 
-    def __init__(self, sliding_window=-1, num_heads=16, num_kv_heads=1, **flags):
+    def __init__(
+        self,
+        sliding_window=-1,
+        num_heads=16,
+        num_kv_heads=1,
+        head_dim=128,
+        kv_cache_dtype="fp8",
+        sinks=None,
+        **flags,
+    ):
         self.sliding_window = sliding_window
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        # Read only past the gluon envelope, by the FlyDSL static gate.
+        self.head_dim = head_dim
+        self.kv_cache_dtype = kv_cache_dtype
+        self.sinks = sinks
         self.use_triton_attn = flags.get("use_triton_attn", False)
         self.use_flash_layout = flags.get("use_flash_layout", False)
         for name in (
@@ -310,11 +323,26 @@ class _Layer:
             setattr(self, name, name)
 
 
-def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **kw):
+def _route(
+    monkeypatch,
+    max_qlen,
+    block_size=128,
+    unified=False,
+    force=False,
+    flydsl=False,
+    flydsl_arch=True,
+    **kw,
+):
     from atom.model_ops import attention_mha as mha
+    from atom.model_ops import base_attention as ba
 
     monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", unified)
     monkeypatch.setattr(mha.envs, "ATOM_FORCE_ATTN_TRITON", force)
+    # Pinned, not inherited: the container sets ATOM_PA_FLYDSL=1, and the two
+    # capability probes below need a GPU / the aiter API, not this test.
+    monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", flydsl)
+    monkeypatch.setattr(ba, "_flydsl_arch_supported", lambda: flydsl_arch)
+    monkeypatch.setattr(ba, "_flydsl_explicit_plan_api", lambda: True)
     monkeypatch.setattr(
         mha,
         "get_current_atom_config",
@@ -399,6 +427,115 @@ class TestDecodeRouting:
             _route(monkeypatch, 4, block_size=256, unified=True)
             == "paged_attention_persistent_asm"
         )
+
+
+class TestFlyDSLPastGluonRouting:
+    """Past the gluon envelope a FlyDSL-served layer stays on the paged path.
+
+    Qwen3.5 TP4 MTP-5: 8 q heads / 1 kv head per rank, head_dim 256, fp8 KV,
+    qlen 6 -> 48 rows. FlyDSL takes any query length; unified cannot carry the
+    per-token KV scales and raises at capture.
+    """
+
+    QWEN35 = dict(num_heads=8, num_kv_heads=1, head_dim=256, use_triton_attn=True)
+
+    @pytest.mark.parametrize("max_qlen", [5, 6, 8])
+    def test_qwen35_mtp5_takes_paged_with_flydsl(self, monkeypatch, max_qlen):
+        assert (
+            _route(monkeypatch, max_qlen, block_size=16, flydsl=True, **self.QWEN35)
+            == "paged_attention_triton"
+        )
+
+    @pytest.mark.parametrize("max_qlen", [1, 2, 4])
+    def test_within_gluon_unchanged_by_flydsl(self, monkeypatch, max_qlen):
+        """MTP-3 (qlen 4) and the draft steps (qlen 1) route identically."""
+        for kw in (self.QWEN35, {}):
+            assert _route(
+                monkeypatch, max_qlen, block_size=16, flydsl=True, **kw
+            ) == _route(monkeypatch, max_qlen, block_size=16, flydsl=False, **kw)
+
+    def test_flydsl_off_still_unified(self, monkeypatch):
+        assert (
+            _route(monkeypatch, 6, block_size=16, flydsl=False, **self.QWEN35)
+            == "paged_attention_unified"
+        )
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            dict(block_size=256),
+            dict(block_size=1024),
+            dict(kv_cache_dtype="bf16"),
+            dict(sinks=object()),
+            dict(sliding_window=128),
+            dict(head_dim=192),
+            dict(use_flash_layout=True),
+            dict(flydsl_arch=False),
+        ],
+    )
+    def test_non_flydsl_configs_still_unified(self, monkeypatch, override):
+        kw = {**self.QWEN35, "block_size": 16, "flydsl": True, **override}
+        assert _route(monkeypatch, 6, **kw) == "paged_attention_unified"
+
+    def test_unified_env_still_wins(self, monkeypatch):
+        assert (
+            _route(
+                monkeypatch, 6, block_size=16, flydsl=True, unified=True, **self.QWEN35
+            )
+            == "paged_attention_unified"
+        )
+
+    def test_no_gluon_gpu_keeps_unified_first(self, monkeypatch):
+        """Without gluon (gfx1250) paged_attention_unified already hands FlyDSL
+        its calls per call; the static shortcut must not bypass that."""
+        from atom.model_ops import attention_mha as mha
+
+        monkeypatch.setattr(mha, "pa_decode_gluon_supports_arch", lambda: False)
+        assert (
+            _route(monkeypatch, 6, block_size=16, flydsl=True, **self.QWEN35)
+            == "paged_attention_unified"
+        )
+
+    def test_past_gluon_with_flydsl_skips_asm(self, monkeypatch):
+        """qlen 5 x group 3 = 15 is inside ASM's group bound; it must still
+        go to the FlyDSL-capable runner, never run_pa_fwd_asm at qlen 5."""
+        assert (
+            _route(
+                monkeypatch, 5, block_size=16, flydsl=True, num_heads=3, num_kv_heads=1
+            )
+            == "paged_attention_triton"
+        )
+
+    def test_run_pa_decode_refuses_gluon_past_envelope(self, monkeypatch):
+        """require_flydsl: a call FlyDSL rejects raises, never reaches gluon."""
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **k: None)
+        q = torch.empty(12, 8, 256)
+        with pytest.raises(NotImplementedError, match="gluon envelope"):
+            ba.run_pa_decode(
+                output=q,
+                q=q,
+                k_cache=None,
+                v_cache=None,
+                context_lens=torch.empty(2, dtype=torch.int32),
+                block_tables=None,
+                softmax_scale=1.0,
+                max_seqlen_q=6,
+                max_context_partition_num=1,
+                context_partition_size=256,
+                compute_type=None,
+                q_scale=None,
+                k_scale=None,
+                v_scale=None,
+                exp_sums=None,
+                max_logits=None,
+                temporary_output=None,
+                require_flydsl=True,
+            )
 
 
 class _FakePlan:

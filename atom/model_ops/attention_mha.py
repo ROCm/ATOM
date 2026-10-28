@@ -19,6 +19,7 @@ from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     dense_decode_splits,
     flydsl_decode_seqs,
+    flydsl_decode_static_ok,
     gluon_decode_over_limit,
     run_pa_decode,
     run_pa_fwd_asm,
@@ -701,7 +702,9 @@ class PagedAttentionImpl(nn.Module):
         """Decode through ``run_pa_decode``: gluon, or opted-in FlyDSL.
 
         Callers must have cleared ``gluon_decode_over_limit`` in
-        ``_dispatch_decode`` or, on a GPU without gluon, established through
+        ``_dispatch_decode``, or established there through
+        ``flydsl_decode_static_ok`` that FlyDSL serves this layer past that
+        limit, or, on a GPU without gluon, established through
         ``_flydsl_takes_decode`` that FlyDSL accepts the call.
         """
 
@@ -755,6 +758,10 @@ class PagedAttentionImpl(nn.Module):
             # max_context_length: the block-table bound is the same in graph
             # and eager, so both pick the same kernel specialization.
             work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
+            # Past the gluon envelope only FlyDSL may run it; see _dispatch_decode.
+            require_flydsl=gluon_decode_over_limit(
+                attn_metadata.max_seqlen_q, num_q_heads_total, num_kv_heads
+            ),
         )
 
         return o
@@ -1107,6 +1114,23 @@ class PagedAttentionImpl(nn.Module):
         over_gluon = not pa_decode_gluon_supports_arch() or gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
+        # FlyDSL takes any query length, so a layer it will serve stays on the
+        # paged path past the gluon envelope (Qwen3.5 MTP-5: qlen 6, group 8).
+        # Only evaluated when the limit is actually hit, so every within-limit
+        # route -- including MTP-3 -- is decided exactly as before. A GPU
+        # without gluon already reaches FlyDSL through paged_attention_unified.
+        flydsl_past_gluon = False
+        if over_gluon and pa_decode_gluon_supports_arch() and not self.use_flash_layout:
+            flydsl_past_gluon = flydsl_decode_static_ok(
+                head_dim=self.head_dim,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                kv_cache_dtype=self.kv_cache_dtype,
+                block_size=get_current_atom_config().kv_cache_block_size,
+                sliding_window=self.sliding_window,
+                has_sinks=self.sinks is not None,
+            )
+            over_gluon = not flydsl_past_gluon
         over_asm = (
             max_qlen * (self.num_heads // self.num_kv_heads)
             > PA_ASM_MAX_QUERY_GROUP_SIZE
@@ -1138,7 +1162,10 @@ class PagedAttentionImpl(nn.Module):
 
         if wants_unified:
             return self.paged_attention_unified
-        if self.use_triton_attn:
+        # Straight to the FlyDSL-capable runner, not through the ASM arm: the
+        # ASM envelope is a group bound only and this query length is past
+        # anything ASM was ever routed here with.
+        if self.use_triton_attn or flydsl_past_gluon:
             return self.paged_attention_triton
 
         # use_pa_decode_bf16_asm() requires ATOM_USE_UNIFIED_ATTN, which the
