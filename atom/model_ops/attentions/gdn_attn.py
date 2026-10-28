@@ -1964,6 +1964,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             )
 
         attn_metadata.gdn_metadata = gdn_metadata
+        self._attach_prefix_split(batch, attn_metadata)
         return attn_metadata, positions
 
     # Small per-step index tables staged through pinned memory and sent up
@@ -2066,6 +2067,39 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             if gpu is None:
                 return  # the kernels compute their own (with the sync)
             prepare_chunk_indices.prime(gpu.view(total, 2), query_start_loc, chunk_size)
+
+    def _attach_prefix_split(self, batch: ScheduledBatch, attn_metadata) -> None:
+        """The split-KV layout for this step's prefix-cached prefill
+        (`attentions.prefix_split`), built on the host and staged up; None when
+        the step does not qualify or the switch is off."""
+        attn_metadata.prefix_split = None
+        if not attn_metadata.has_cached or not envs.ATOM_PREFIX_SPLIT_ATTN:
+            return
+        from types import SimpleNamespace
+
+        from atom.model_ops.attentions import prefix_split
+
+        n = batch.total_seqs_num_prefill
+        plan = prefix_split.build_plan(
+            batch.num_scheduled_tokens[:n], batch.context_lens[:n]
+        )
+        if plan is None:
+            return
+        runner = self.model_runner
+        cap_cu = runner.max_bs * (prefix_split.MAX_FULL_SLICES + 1) + 1
+        cap_rows = prefix_split.MAX_PARTIAL_ROWS + runner.max_num_batched_tokens
+        staged = {}
+        for name, cap in (
+            ("cu_q_a", cap_cu), ("cu_k_a", cap_cu), ("cu_q_b", cap_cu), ("cu_k_b", cap_cu),
+            ("q_rep", cap_rows), ("merge_rows", cap_rows),
+        ):
+            t = self._stage_upload(f"psplit_{name}", plan[name], cap, torch.int32)
+            if t is None:
+                return
+            staged[name] = t
+        attn_metadata.prefix_split = SimpleNamespace(
+            n_full=plan["n_full"], max_q=plan["max_q"], max_k_a=plan["max_k_a"], **staged
+        )
 
     def _upload_prefill_mirrors(
         self, scheduled_bs, running_bs, scheduled_tokens, has_cached, cached_lens

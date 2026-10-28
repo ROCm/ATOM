@@ -844,6 +844,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
+    # Prefix-cached prefill attention split along the context into varlen
+    # sequences of one FMHA launch, plus a causal launch over the new tokens
+    # and a merge (atom/model_ops/attentions/prefix_split.py). 0 keeps the
+    # single launch, which walks the whole context from a handful of
+    # workgroups.
+    "ATOM_PREFIX_SPLIT_ATTN": lambda: os.getenv("ATOM_PREFIX_SPLIT_ATTN", "1") == "1",
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1",
