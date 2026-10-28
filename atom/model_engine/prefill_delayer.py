@@ -103,7 +103,7 @@ fires smaller — that is a request-routing problem, out of scope here.
 
 Cross-DP comms
 --------------
-Single ``all_reduce(SUM)`` over an 11-int64 cpu buffer (gloo-safe). Booleans are
+Single ``all_reduce(SUM)`` over a 12-int64 cpu buffer (gloo-safe). Booleans are
 encoded as 0/1 and read back as ``sum > 0`` (logical OR). All timing is
 tick-based (``hold_ticks``), which is deterministic across ranks — no per-rank
 wall-clock, so ranks never diverge on a timeout boundary. The cost gate's step
@@ -130,7 +130,7 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "tru
 _STEP_EMA_WEIGHT = 0.2
 # The reduce buffer: these fixed slots, each rank's prefill cost, then the cost
 # gate's `_Gate` (`PrefillDelayer.__init__`).
-_FIXED_SLOTS = 11
+_FIXED_SLOTS = 12
 
 
 class _Gate(NamedTuple):
@@ -273,6 +273,7 @@ class PrefillDelayer:
         "_last_arrival_s",
         "_last_call_s",
         "_prefill_executed_since_last_decision",
+        "_prefill_only_since_last_decision",
         "_prefill_ps_per_cost",
         "_prev_pending",
         "_prev_prefillable",
@@ -406,6 +407,10 @@ class PrefillDelayer:
         #                                head cannot be admitted)
         #   slot 10 = unreachable flag  (SUM → n_unreachable; no prefill and no
         #                                decode completion within the hold)
+        #   slot 11 = prefill_only flag (SUM>0 → that forward decoded nothing:
+        #                                the step the decode-protection
+        #                                interval answers; a mixed step decoded
+        #                                beside its prefill and arms none)
         # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
         #   slot `_FIXED_SLOTS` + r = rank r's prefill chunk cost (one-hot, SUM
         #                → every rank's cost), read back as rank_prefill_costs
@@ -472,6 +477,7 @@ class PrefillDelayer:
         self._first = True
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
+        self._prefill_only_since_last_decision = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
         # is counted separately so the log shows WHICH reason released prefill —
@@ -530,7 +536,7 @@ class PrefillDelayer:
             and (
                 self._decode_interval_remaining > 0
                 or (
-                    self._prefill_executed_since_last_decision
+                    self._prefill_only_since_last_decision
                     and self.prefill_decode_interval > 0
                 )
             )
@@ -638,6 +644,7 @@ class PrefillDelayer:
         self._reduce_buf[8] = int(arrived_requests)
         self._reduce_buf[9] = 1 if blocked else 0
         self._reduce_buf[10] = 1 if unreachable else 0
+        self._reduce_buf[11] = 1 if self._prefill_only_since_last_decision else 0
         if self._cost_slots:
             self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
             self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
@@ -721,6 +728,7 @@ class PrefillDelayer:
             g_arrived,
             n_blocked,
             n_unreachable,
+            prefill_only_n,
         ) = reduced[:_FIXED_SLOTS]
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
@@ -730,6 +738,7 @@ class PrefillDelayer:
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
         self._prefill_executed_since_last_decision = False
+        self._prefill_only_since_last_decision = False
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
         any_partial = partial_n > 0
@@ -739,7 +748,9 @@ class PrefillDelayer:
         # countdown on every rank. Delayer FIRE is only permission to try:
         # allocation, remote-KV handling, or queue changes may still produce a
         # decode/empty batch, which must not start a decode-protection window.
-        if prefill_ran_n > 0:
+        # Nor does a mixed step: it decoded beside its prefill. The cost gate
+        # above still times it as the prefill step it is.
+        if prefill_only_n > 0:
             self._decode_interval_remaining = self.prefill_decode_interval
 
         # First call fires unconditionally (one-time warmup seed).
@@ -994,15 +1005,19 @@ class PrefillDelayer:
         self._stat_adapt_hold_ticks += 1
         return self._hold(g_pending)
 
-    def notify_prefill_executed(self, tokens: int = 0) -> None:
+    def notify_prefill_executed(self, tokens: int = 0, *, decoded: bool = False) -> None:
         """Report a completed local prefill forward.
 
-        The next lockstep decision folds this flag into the existing SUM
+        The next lockstep decision folds both flags into the existing SUM
         reduction, so every DP rank arms the interval together without adding
-        a second collective to the scheduler hot path.
+        a second collective to the scheduler hot path. Every prefill forward is
+        timed as one (the cost gate); only one that decoded nothing arms the
+        decode-protection interval.
         """
         self._prefill_executed_since_last_decision = True
         self._adapt_last_tokens += int(tokens)
+        if not decoded:
+            self._prefill_only_since_last_decision = True
 
     def notify_idle(self) -> None:
         """Report a tick the DP group spent with no work, which schedules
