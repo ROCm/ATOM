@@ -20,19 +20,20 @@ The scripts are in [`mlperf_endpoints_qwen35/`](mlperf_endpoints_qwen35/). Relat
 |---|---|
 | Hardware | 4 gfx1250 GPUs (GPUs 0-3) |
 | Image | `rocm/fw-bringup-mlperf:gfx1250-atom-20261026-dsv41-qwen-e15-08` or later |
-| ATOM / aiter | `alizaidy/gfx1250-qwen-support` of both |
+| ATOM / aiter | `alizaidy/gfx1250-qwen-support` of both, checked out over the image's (validated: ATOM b4f41cdd, aiter 0f95c0f4); see [Setup](#setup) |
 | FlyDSL | 0.4.0 (`/opt/flydsl-0.4.0`, put first on `PYTHONPATH` by `serve_ep.sh`) |
 | Model | `/data/Qwen3.5-35B-A3B-MXFP4` |
 | Client | MLCommons endpoints at `/app/mlcommons-endpoints` (with its venv) |
 | Dataset | `mlperf_agentic_inference_dataset`, 613 trajectories, 20,297 assistant turns |
 
 Concurrency: **1-2048, a power of two or three times one** (1, 2, 3, 4, 6, 8, 12, 16, 24, ..., 768,
-1024, 1536, 2048). `run_ep.sh` picks the server from it:
+1024, 1536, 2048). Every point runs MTP with 3 draft tokens (`SPEC=0` turns it off); `run_ep.sh`
+picks the server from the concurrency:
 
 | Concurrency | Server |
 |---|---|
-| 1-16 | TP4, MTP with 3 draft tokens, custom all-reduce |
-| 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity), no MTP |
+| 1-16 | TP4, custom all-reduce |
+| 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
 `--level 0`, 16k-token prefill chunks, decode graphs captured at every size up to `max-num-seqs`.
@@ -40,6 +41,18 @@ Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-
 affinity's imbalance), **at most 512**: see [Known issues](#known-issues). DP keeps one copy of the
 KV cache per request instead of TP4's duplicated heads, about twice the capacity (TP4 BF16 holds
 ~34M tokens).
+
+## Setup
+
+The image's own ATOM predates the MTP draft fixes on the branch (see Known issues), so check out
+the branch in both repositories and let aiter rebuild its JIT modules (the image's prebuilt ones
+do not match the branch's sources: the server then fails with a `topk_softmax` argument error):
+
+```bash
+cd /app/ATOM  && git fetch https://github.com/ROCm/ATOM.git  alizaidy/gfx1250-qwen-support && git checkout -f FETCH_HEAD
+cd /app/aiter && git fetch https://github.com/ROCm/aiter.git alizaidy/gfx1250-qwen-support && git checkout -f FETCH_HEAD
+mkdir -p /tmp/aiter_jit_old && mv /app/aiter/aiter/jit/*.so /tmp/aiter_jit_old/   # rebuilt on first use (~6 min)
+```
 
 ## Run
 
@@ -63,21 +76,66 @@ should be 0).
 Knobs: `CAP_MIN` (default 30), `STOP_FIRST` (1: stop issuing at the first trajectory completion
 once all have started), `TRAJ_X` (trajectories = max(613, `TRAJ_X` x c), default 4: the client
 repeats trajectories with a fresh salt, so the 30-minute cap and not an exhausted pool ends every
-point), `TURN_TIMEOUT` (default 900 s on 30-minute points: bounds the drain), `MODE` / `SPEC`
+point), `TURN_TIMEOUT` (default 14400 s, the benchmark's own: the drain after the cap lasts until the
+in-flight turns finish, up to ~50 min at c2048; 900 bounds it but at high concurrency fails long turns and
+their trajectories: 22% of turns at c2048), `MODE` / `SPEC`
 (override the table above), `SEQ_CAP` (512). A full compliant run is `CAP_MIN=600 STOP_FIRST=0`.
+`ATOM_PREFILL_DECODE_INTERVAL` in the environment overrides the DP points' default of 8 (0 is the
+scheduling before it; see [Prefill / decode interval](#prefill--decode-interval)).
 
 ## Results
 
-30-minute points, image `gfx1250-atom-20261026-dsv41-qwen-e15-08`:
+30-minute points on image `gfx1250-atom-20261026-dsv41-qwen-e15-08`; "tip" = the validated branch
+tips (ATOM b4f41cdd, aiter 0f95c0f4), "image" = the image's own ATOM / aiter:
 
-| c | Server | Turns (failed) | TPS | Interactivity (tok/s) | TTFT median | TPOT median | Outputs |
-|---|---|---|---|---|---|---|---|
-| 16 | TP4 + MTP3 | 6,390 (0) | 1,457 | 140.2 | 0.45 s | 5.2 ms | clean |
-| 4096 | DP4 + EP4, 512 / engine | 59,302 (1,873) | 6,779 | n/a | 63 s | 289 ms | clean |
+| c | Stack | Server | Turns (failed) | TPS | Interactivity (tok/s) | TTFT median | TPOT median | Outputs |
+|---|---|---|---|---|---|---|---|---|
+| 16 | image | TP4 + MTP3 | 6,390 (0) | 1,457 | 140.2 | 0.45 s | 5.2 ms | clean |
+| 2048 | tip | DP4 + EP4 + MTP3, 512 / engine | 50,234 (0) | 6,465 | 3.53 | 0.93 s | 313 ms | clean |
+| 4096 | image | DP4 + EP4, 512 / engine, no MTP, 900 s turn timeout | 59,302 (1,873) | 6,779 | n/a | 63 s | 289 ms | clean |
 
-MTP accepted 2.99 tokens a forward at c16 on the real data. The c4096 point is above the range:
-2,048 conversations run and the rest queue (hence the TTFT and the turns that hit the 900 s
-timeout); it shows the cap, not the hardware.
+MTP accepted 2.99 tokens a forward at c16 and 2.58 at c2048 on the real data. The c4096 point is
+above the range: 2,048 conversations run and the rest queue (hence the TTFT and the turns that hit
+the then 900 s turn timeout); it shows the cap, not the hardware. These points predate the
+[prefill / decode interval](#prefill--decode-interval) (they ran with 0). Interactivity is the
+report's "E2E average interactivity": output tokens over turn latency, TTFT included.
+
+## Prefill / decode interval
+
+The four DP engines step in lockstep: every layer's MoE dispatch waits for all of them, so a step
+lasts as long as the busiest engine, and an engine runs either a prefill or a decode in a step. Once
+the KV cache fills (c2048: past 90% by minute 7) the prefill delayer's KV-pressure rule releases
+prefill on every step, so engines prefill and decode in the same step and every decode waits for the
+prefill beside it. In steady state at c2048 (interval 0) 46% of the steps were mixed and none was
+all-decode: an engine decoded on 15% of its steps, each stretched to ~145 ms against ~55 ms for an
+aligned decode step of the same size (~500 sequences an engine, graphed), and run eagerly (a captured
+decode graph replays only when every engine decodes).
+
+`serve_ep.sh` sets `ATOM_PREFILL_DECODE_INTERVAL=8` on DP points: after any engine prefills, every
+engine runs 8 decode-only passes before new prefill is admitted. Steps then alternate between one
+prefill on all engines, with the turns that arrived meanwhile batched into bigger chunks, and decode
+steps that replay graphs. DeepSeek-R1's DP4 + EP4 + MTP endpoints script and MLPerf configs set 32 for
+the same reason. c2048 with issuing capped at 15 minutes (minutes 10-15 are inside the KV-saturated
+regime; these are not 30-minute points), mori's dispatch geometry tuned for this shape (worth ~0.5%
+of the prefill time, not upstream):
+
+| Interval | Mixed steps | Out tok/s, min 10-15 | Turns (failed) | TPS | TPOT median | 1000 / TPOT | E2E interactivity | NATL median | TTFT median |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 (22-minute point, untuned mori) | 46% | 5,622 | 43,009 (0) | 7,339 | 257 ms | 3.9 | 4.02 | 4.7 | 0.91 s |
+| 4 | 0 | 9,273 | 45,975 (0) | 11,330 | 65 ms | 15.3 | 6.60 | 7.6 | 13.5 s |
+| 8 | 0 | 10,217 | 46,237 (0) | 10,824 | 36 ms | 28.1 | 6.70 | 7.6 | 23.0 s |
+
+Mixed steps are counted over a 10-15 s profiler window (minute 20 for interval 0, minute 12 for the
+others); outputs were clean on every run. With the interval, prompt throughput nearly doubles
+(75-91k against 33-47k tok/s at minutes 6-15: aligned, full chunks) and decode is fast enough that
+prefill becomes the bottleneck: ~300 conversations an engine wait for prefill, which is the TTFT.
+The interval trades TTFT against TPOT: against 8, interval 4 cuts the TTFT by ~40% and nearly doubles
+the TPOT. Which
+side to favour depends on the interactivity definition: the report's E2E interactivity and the
+client's experimental per-trajectory NATL include TTFT, 1000 / TPOT does not (the client reports
+1 / mean TPOT as the official per-user TPS on non-agentic benchmarks and computes no official agentic
+steady state yet). TP points do not set the interval: one engine has nothing to skew against, and a
+nonzero interval there also turns on the delayer's prefill coalescing, untested here.
 
 ## Run length
 
@@ -105,11 +163,11 @@ points with points. `ep_drift.py <events.jsonl>` profiles a run in 5-minute bins
    fixed.
 2. DP4 + EP4 without the cap once hit a GPU memory fault on one rank a minute in and hung the
    others (`HSA_STATUS_ERROR_MEMORY_FAULT`); not seen with the cap.
-3. With the 2026-10-26 heads of `alizaidy/gfx1250-qwen-support` (ATOM 3fd8f4a8, aiter 2fcdd108,
-   the fused MoE routing integration) on the 20261026 image, TP4 serving (MTP3, 8k prompts, c16)
-   faults in `moe_route_psum_fused` within minutes, with or without mono; DP4 + EP4 at c2048
-   passed the server checks. The image's own ATOM / aiter (c0883e9d9 / e64eb08eb) do not fault.
-   After switching aiter branches, delete the image's prebuilt `aiter/jit/*.so` so they rebuild:
-   the prebuilt `topk_softmax` does not take the new routing argument.
-4. GSM8K with prefix caching on is not yet checked on this image (the image's own Qwen3.5 scripts
+3. MTP above c16 needs the branch. On the image's own ATOM (c0883e9d9, before the branch's draft
+   block-table / KV-lookahead / GDN draft-metadata / ReplaySSM fixes), DP4 + EP4 + MTP3 returned
+   ~0.2% token salad at 512 an engine and hung on a 2,048-request burst at 256 an engine; on the
+   validated tips the same probe is all correct (1,024 and 2 x 2,048 at once).
+4. An earlier branch head (ATOM 3fd8f4a8, aiter 2fcdd108) faulted in `moe_route_psum_fused` on TP4
+   serving (MTP3, 8k prompts, c16); the validated tips do not (c16 8k/1k: TPOT 1.98 ms, no faults).
+5. GSM8K with prefix caching on is not yet checked on this image (the image's own Qwen3.5 scripts
    serve without prefix caching for accuracy at TP>1). The prefix-cache check above is the gate here.

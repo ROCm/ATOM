@@ -44,6 +44,11 @@ case $MODE in
       export ATOM_MORI_V2=1 MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 ATOM_DP_LM_HEAD_MODE=allgather
       export MORI_AMD_SMI_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamd_smi.so.27
       export ATOM_DP_SESSION_AFFINITY=1 AITER_CUSTOM_AR_MAX_SIZE=0
+      # after any rank prefills, every rank runs 8 decode-only passes before new prefill: without it, once
+      # the KV cache fills the prefill delayer releases prefill every step, ranks prefill and decode in the
+      # same lockstep step and each decode waits for the prefill beside it (see the recipe's "Prefill /
+      # decode interval"). An ATOM_PREFILL_DECODE_INTERVAL in the environment wins; 0 is the old scheduling.
+      export ATOM_PREFILL_DECODE_INTERVAL=${ATOM_PREFILL_DECODE_INTERVAL:-8}
       ARGS+=(--enable-dp-attention --enable-expert-parallel --max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}") ;;
   *) echo "unknown mode $MODE"; exit 1 ;;
 esac

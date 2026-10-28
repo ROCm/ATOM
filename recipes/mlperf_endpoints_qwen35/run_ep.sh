@@ -4,9 +4,11 @@
 # container.  usage: run_ep.sh <concurrency>
 #
 # Concurrency: 1-2048, a power of two or three times one (1 2 3 4 6 8 12 16 24 ... 768 1024
-# 1536 2048). c <= 16: TP4 + MTP3; above: DP4 attention + EP4 MoE (MODE=tp|dp, SPEC=<n> override).
+# 1536 2048). MTP with 3 draft tokens on every point; c <= 16: TP4, above: DP4 attention + EP4 MoE
+# (MODE=tp|dp, SPEC=<n> override; SPEC=0: no MTP).
 # 30-minute points (defaults): CAP_MIN=30, STOP_FIRST=1, TRAJ_X=4 (trajectories = max(613, 4 c):
-# the cap, not an exhausted pool, ends every point), TURN_TIMEOUT=900 (bounded drain).
+# the cap, not an exhausted pool, ends every point), TURN_TIMEOUT=14400 (the benchmark's own; the drain
+# after the cap lasts until the in-flight turns finish).
 # Full compliant run: CAP_MIN=600 STOP_FIRST=0. SMOKE_ONLY=1 stops after the server checks.
 C=$1
 R=${R:-/work/qwen35_ep}; RUNS=${RUNS:-$R/runs}; D=$RUNS/c$C; ST=$RUNS/status.txt; mkdir -p $D
@@ -19,7 +21,7 @@ valid() { local m=$1; [ "$m" -ge 1 ] && [ "$m" -le 2048 ] || return 1
   while [ $((m % 2)) -eq 0 ]; do m=$((m / 2)); done; [ $m -eq 1 ] || [ $m -eq 3 ]; }
 [[ "$C" =~ ^[0-9]+$ ]] && valid "$C" || { echo "usage: run_ep.sh <c>, c in 1-2048, 2^k or 3*2^k (got '$C')"; exit 2; }
 MODE=${MODE:-$([ "$C" -le 16 ] && echo tp || echo dp)}
-export SPEC=${SPEC:-$([ "$MODE" = tp ] && echo 3 || echo 0)}
+export SPEC=${SPEC:-3}
 # sequences an engine: every concurrent trajectory, with 25% slack under DP for the session-affinity
 # imbalance, at most SEQ_CAP=512. On the 2026-10-26 gfx1250 images an engine decoding more than 512
 # sequences returns partly garbage (see the recipe's Known issues); concurrency above that queues.
@@ -60,7 +62,7 @@ cmp -s $D/prefix_1.txt $D/prefix_2.txt && echo "PREFIX_OK" >> $ST || { echo "PRE
 
 $VENV/bin/python $S/mkcfg.py $BASE $DATASET $MODEL $C $D/report $D/client.yaml > /dev/null || { echo "CFG_FAIL c=$C" >> $ST; exit 1; }
 echo "BENCH c=$C $(date -u +%FT%TZ)" >> $ST
-DRAIN=${TURN_TIMEOUT:-$([ "${STOP_FIRST:-1}" = 1 ] && echo 900 || echo 14400)}
+DRAIN=${TURN_TIMEOUT:-14400}
 (cd $EP && timeout $(( ${CAP_MIN:-30} * 60 + DRAIN + 900 )) $VENV/bin/inference-endpoint benchmark from-config --config $D/client.yaml --mode perf > $D/client.log 2>&1); rc=$?
 curl -s -m 10 localhost:8000/metrics > $D/server_metrics.txt 2>/dev/null
 kill -0 $SPID 2>/dev/null || echo "SERVER_DIED during c=$C rc=$rc" >> $ST

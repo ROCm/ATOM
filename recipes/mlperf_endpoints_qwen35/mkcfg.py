@@ -32,14 +32,11 @@ ai = perf["agentic_inference"]
 ai["num_trajectories_to_issue"] = max(
     613, int(os.environ.get("TRAJ_X", "4")) * int(conc)
 )
-# TURN_TIMEOUT (s): a turn still unanswered after it fails and its trajectory ends. Proxy points
-# (STOP_FIRST=1) default to 900, which bounds the drain after the cap at high concurrency; full runs
-# keep the benchmark's 14400
-ai["turn_timeout_s"] = float(
-    os.environ.get(
-        "TURN_TIMEOUT", "900" if os.environ.get("STOP_FIRST", "1") == "1" else "14400"
-    )
-)
+# TURN_TIMEOUT (s): a turn still unanswered after it fails, and with it the rest of its trajectory.
+# Default: the benchmark's own 14400, as the DSv4.1 30-minute points use. A short one bounds the
+# drain after the cap but kills long turns at high concurrency (c2048 at 900 s: 22% of turns failed,
+# at a 377 ms TPOT a 2,400-token turn already takes 15 min).
+ai["turn_timeout_s"] = float(os.environ.get("TURN_TIMEOUT", "14400"))
 ai["enable_salt"] = True
 ai["inject_tool_delay"] = True
 # STOP_FIRST=0 / CAP_MIN=600: every trajectory to its end, the compliant 10-hour cap
