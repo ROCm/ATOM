@@ -19,18 +19,18 @@ jobs:
           root = Path('/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG')
           runs = (40706439005, 40721876344, 40723026923)
           jobs = []
-          for cmd in (
-              ['squeue', '--noheader', '--format', '%A|%T|%M|%P|%j|%N|%R'],
-              ['sinfo', '--nodes=pit2-p03-g03,pit2-p03-g53', '--long'],
-              ['scontrol', 'show', 'node', 'pit2-p03-g53'],
-          ):
-              print('READ ONLY:', cmd, flush=True)
-              subprocess.run(cmd, check=False, timeout=20)
           for run in runs:
               paths = sorted(root.glob(f'*{run}*'))
               print(f'RUN {run}: {len(paths)} log directories', flush=True)
               for directory in paths:
                   print(directory.name, flush=True)
+                  cell = directory.name.rsplit(f'-{run}-', 1)[0]
+                  job_name = f'{cell}-{run}-1'
+                  result = subprocess.run(
+                      ['squeue', '--noheader', '--name', job_name,
+                       '--format', '%A|%T|%M|%N|%R'],
+                      capture_output=True, text=True, check=False, timeout=20)
+                  print('TASK QUEUE:', result.stdout.strip(), flush=True)
                   print('ROOT FILES:', [(x.name, x.stat().st_size) for x in directory.iterdir() if x.is_file()], flush=True)
                   for job in sorted(directory.glob('slurm_job-*')):
                       jobs.append(job.name.removeprefix('slurm_job-'))
@@ -45,6 +45,10 @@ jobs:
                                       matches.append(line.rstrip()[:450])
                           print(f'{job.name}/{name}: {log.stat().st_size} bytes', flush=True)
                           print('\n'.join(matches), flush=True)
+          result = subprocess.run(
+              ['sinfo', '--noheader', '--nodes=pit2-p03-g03,pit2-p03-g53', '--format=%N|%T'],
+              capture_output=True, text=True, check=False, timeout=20)
+          print('TARGET NODE AVAILABILITY:', result.stdout.strip(), flush=True)
           if jobs:
               subprocess.run(['squeue', '--noheader', '--jobs', ','.join(jobs), '--format', '%A|%T|%M|%N|%R'], check=False, timeout=20)
           PYCODE
