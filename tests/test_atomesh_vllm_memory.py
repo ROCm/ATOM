@@ -312,6 +312,7 @@ class PostLoadPreparationTest(unittest.TestCase):
                     'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill',
                     'HIP_VISIBLE_DEVICES': '0,1,2,3', 'ROCR_VISIBLE_DEVICES': ''}), \
                  patch.object(Path, 'exists', return_value=True), \
+                 patch.object(worker_module, 'probe'), \
                  patch.object(worker_module, 'prepare_after_load', side_effect=lambda *args, **kw: events.append('prepare')):
                 self.assertIs(worker.initialize_from_config(kv_config), kv_config)
                 self.assertEqual(events, ['prepare', 'store-init'])
