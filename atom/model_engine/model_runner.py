@@ -47,8 +47,8 @@ from atom.distributed.ulysses_sp import (
     sp_gather_tokens,
     sp_graph_capture,
     sp_is_enabled,
+    sp_local_len,
     sp_local_slice,
-    sp_pad_len,
     sp_split_tokens,
 )
 from atom.kv_transfer.disaggregation import (
@@ -1446,7 +1446,7 @@ class ModelRunner:
         if sp_is_enabled():
             # Each graph captures a fixed address for this rank's token shard.
             self.forward_vars["sp_input_ids"] = torch.empty(
-                sp_pad_len(self.max_num_batched_tokens) // get_sp_world_size(),
+                sp_local_len(self.max_num_batched_tokens),
                 dtype=self.tokenID_processor.input_ids.gpu.dtype,
                 device=self.device,
             )
@@ -1659,15 +1659,9 @@ class ModelRunner:
             self.h2d_owner.fail()
             raise
 
-    def sp_local_tokens(self, num_tokens: int) -> int:
-        """Rows of the model input this rank owns for a step of `num_tokens`."""
-        if not sp_is_enabled():
-            return num_tokens
-        return sp_pad_len(num_tokens) // get_sp_world_size()
-
     def sp_graph_input_ids(self, num_tokens: int) -> torch.Tensor:
         """Stage this rank's padded token shard at the graph's fixed address."""
-        local = self.sp_local_tokens(num_tokens)
+        local = sp_local_len(num_tokens)
         buf = self.forward_vars["sp_input_ids"][:local]
         src = self.forward_vars["input_ids"].gpu[:num_tokens]
         shard = src[sp_local_slice(num_tokens)]
@@ -3254,7 +3248,7 @@ class ModelRunner:
                     self.sp_graph_input_ids(running_tokens)
                 logits = self.req_graph.replay(key=graph_key)
                 if sp_is_enabled():
-                    local = self.sp_local_tokens(running_tokens)
+                    local = sp_local_len(running_tokens)
                     hidden_states = sp_gather_tokens(
                         self.forward_vars["outputs"][:local], running_tokens
                     )[:scheduled_tokens]
@@ -3938,6 +3932,12 @@ class ModelRunner:
         # Config owns the declared ladder; the runner only narrows it to what
         # this deployment can actually schedule (see the bound below).
         self.capture_sizes = self.config.capture_sizes
+        if tr_hybrid and sp_is_enabled():
+            # A token graph's bucket is its local rows (`sp_local_len`), and SP
+            # pads a batch to a multiple of its width: keep the ladder on that
+            # multiple so each recorded bucket is one batch size.
+            sp = get_sp_world_size()
+            self.capture_sizes = list({-(-bs // sp) * sp for bs in self.capture_sizes})
         self.capture_sizes.sort(reverse=True)
 
         # Drop any capture size the scheduler could never produce. `schedule_decode`
@@ -4106,7 +4106,8 @@ class ModelRunner:
                     # The bucket's rows, which every DP rank records alike.
                     running_tokens = bs * max_q_len
                     if tr_hybrid and (
-                        running_tokens in TokenGraph.captured_sizes("decode")
+                        sp_local_len(running_tokens)
+                        in TokenGraph.captured_sizes("decode")
                         or self._skip_token_bucket(running_tokens)
                     ):
                         continue
@@ -4165,7 +4166,7 @@ class ModelRunner:
                     # Ulysses runs the model on this rank's token chunk while
                     # positions stay whole, so the graph is captured at the
                     # local width and writes that many output rows.
-                    local_tokens = self.sp_local_tokens(running_tokens)
+                    local_tokens = sp_local_len(running_tokens)
                     model_ids = (
                         self.sp_graph_input_ids(running_tokens)
                         if sp_is_enabled()
