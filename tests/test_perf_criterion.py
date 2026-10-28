@@ -85,3 +85,64 @@ def test_group_families_splits_on_isl_osl():
     """Same model at a different shape is a different family, not a level."""
     fams = group_families([_level(32, -1.0), {**_level(32, -1.0), "isl": 1024}])
     assert len(fams) == 2
+
+
+def test_an_interior_level_outside_its_neighbours_is_reported():
+    """c=64 -8.6%, c=128 -0.3%, c=256 -7.8% medians to -7.8% and reads as a
+    clean two-sided drop; the actual signal is that the middle level behaves
+    nothing like the ones around it. The median cannot express that shape, so
+    it is reported separately rather than summarised away."""
+    verdict = judge_family(
+        [
+            _level(64, -8.6, 9.0, 9.0),
+            _level(128, -0.3, 0.1, 0.1),
+            _level(256, -7.8, 8.0, 8.0),
+        ]
+    )
+    assert verdict["nonmonotonic"] is not None
+    flag = verdict["nonmonotonic"][0]
+    assert flag["conc"] == 128
+    assert flag["neighbours"] == [64, 256]
+
+
+def test_two_levels_cannot_be_nonmonotonic():
+    """The shape needs an interior level; a pair has none."""
+    verdict = judge_family([_level(32, -8.0, 9.0, 9.0), _level(128, -0.2, 0.1, 0.1)])
+    assert verdict["nonmonotonic"] is None
+
+
+def test_a_level_within_the_margin_of_its_neighbours_is_not_flagged():
+    """NONMONOTONIC_MARGIN_PCT is 3.0; 2.0 outside must not flag."""
+    verdict = judge_family(
+        [
+            _level(32, -8.0, 9.0, 9.0),
+            _level(64, -6.0, 7.0, 7.0),
+            _level(128, -8.0, 9.0, 9.0),
+        ]
+    )
+    assert verdict["nonmonotonic"] is None
+
+
+def test_a_none_throughput_level_does_not_crash_and_is_not_clean():
+    """perf_judge's own judging filter omits this check, so a None tput there
+    reaches statistics.median and raises. The library filters it out."""
+    verdict = judge_family([_level(32, None, 9.0, 9.0), _level(128, -8.0, 9.0, 9.0)])
+    assert verdict["status"] == "insufficient"
+
+
+def test_a_dropped_level_is_counted_and_the_rest_still_judge():
+    """Three judging levels, one with no throughput delta: that level is
+
+    dropped from the verdict rather than silently shrinking the family's
+    evidence, and the family still judges on the remaining two.
+    """
+    verdict = judge_family(
+        [
+            _level(32, -0.5, 0.2, 0.3),
+            _level(64, None, 0.1, 0.2),
+            _level(128, 0.4, -0.3, -0.1),
+        ]
+    )
+    assert verdict["n_dropped"] == 1
+    assert verdict["n_judging"] == 2
+    assert verdict["status"] == "clean"

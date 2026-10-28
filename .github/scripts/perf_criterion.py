@@ -28,7 +28,13 @@ FAMILY_MIN_CONFIGS = 2  # judging levels needed before a family is judged at all
 FAMILY_MIN_DOWN = 2  # of those, how many must be down
 FAMILY_MEDIAN_PCT = -3.0  # family median throughput delta that trips the gate
 DOWN_EPS_PCT = -2.0  # a level counts as "down" past this
+# Shared between the TPOT and TTFT mirror checks: TTFT is the other way
+# capacity is lost -- requests queue instead of slowing down, and it moves
+# much harder than TPOT when it moves at all (+300-700% against a 30%
+# throughput drop in the measured case) -- so the bar is the same ratio for
+# both: it is cleared by a wide margin or not at all.
 MIRROR_RATIO = 0.6  # |median latency delta / median tput delta| confirming it
+NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
 
 FAMILY_FIELDS = ("backend", "model", "isl", "osl")
 
@@ -64,6 +70,42 @@ def _mirrors(levels, field, median_tput):
     return median > 0 and abs(median / median_tput) >= MIRROR_RATIO
 
 
+def nonmonotonic(judging):
+    """Interior levels sitting well outside their immediate neighbours.
+
+    A median cannot express this shape at all: c=64 -8.6%, c=128 -0.3%,
+    c=256 -7.8% medians to -7.8% and reads as a clean two-sided drop, while the
+    actual signal is that one level behaves nothing like the ones around it --
+    often a kernel-selection fork. Worth surfacing verbatim rather than
+    summarising away.
+
+    Needs only the levels, no history, which is why it belongs here rather than
+    in either caller: both lines have the levels.
+
+    Returns a list of flags, or None when there is nothing to report.
+    """
+    if len(judging) < 3:
+        return None
+    outliers = []
+    for i in range(1, len(judging) - 1):
+        value = judging[i]["tput_pct"]
+        lo = min(judging[i - 1]["tput_pct"], judging[i + 1]["tput_pct"])
+        hi = max(judging[i - 1]["tput_pct"], judging[i + 1]["tput_pct"])
+        if value > hi + NONMONOTONIC_MARGIN_PCT or value < lo - NONMONOTONIC_MARGIN_PCT:
+            outliers.append(
+                {
+                    "conc": judging[i]["conc"],
+                    "pct": value,
+                    "neighbours": [judging[i - 1]["conc"], judging[i + 1]["conc"]],
+                    "neighbour_pcts": [
+                        judging[i - 1]["tput_pct"],
+                        judging[i + 1]["tput_pct"],
+                    ],
+                }
+            )
+    return outliers or None
+
+
 def judge_family(levels):
     """Judge one family from its concurrency levels.
 
@@ -71,14 +113,15 @@ def judge_family(levels):
     is never ``clean``: a family that could not be judged says so, because the
     one thing this must never do is read as a pass.
     """
+    at_conc = [level for level in levels if level["conc"] >= JUDGE_MIN_CONC]
     judging = sorted(
-        (
-            level
-            for level in levels
-            if level["conc"] >= JUDGE_MIN_CONC and level.get("tput_pct") is not None
-        ),
+        (level for level in at_conc if level.get("tput_pct") is not None),
         key=lambda level: level["conc"],
     )
+    # A level at judging concurrency with no throughput delta is evidence lost,
+    # not evidence absent -- counted so a caller can keep "clean" from reading
+    # as a pass on a family that quietly judged on fewer levels than it has.
+    n_dropped = len(at_conc) - len(judging)
     median_tput = _median_or_none([level["tput_pct"] for level in judging])
     verdict = {
         "status": "insufficient",
@@ -92,9 +135,11 @@ def judge_family(levels):
         ),
         "n_down": sum(1 for level in judging if level["tput_pct"] <= DOWN_EPS_PCT),
         "n_judging": len(judging),
+        "n_dropped": n_dropped,
         "mirror": False,
         "mirror_via": None,
         "judging_concs": [level["conc"] for level in judging],
+        "nonmonotonic": nonmonotonic(judging),
     }
 
     if len(judging) < FAMILY_MIN_CONFIGS:

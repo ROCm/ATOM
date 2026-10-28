@@ -333,7 +333,7 @@ def judge_linkage(deltas):
     few nights of live data can be compared against the criterion that ships
     before the gate moves, rather than after.
     """
-    triggered, insufficient = [], []
+    triggered, insufficient, dropped = [], [], []
     for (backend, model, isl, osl), levels in group_families(deltas).items():
         verdict = judge_family(levels)
         row = {
@@ -348,12 +348,21 @@ def judge_linkage(deltas):
             "n_judging": verdict["n_judging"],
             "mirror_via": verdict["mirror_via"],
             "judging_concs": verdict["judging_concs"],
+            # Levels at or above JUDGE_MIN_CONC that carried no usable
+            # throughput delta and were dropped from the judging set. Reported
+            # because a family judged on less evidence than it appears to have
+            # must say so: without this a three-level family silently becomes a
+            # two-level one and can read clean on two thirds of the evidence.
+            "n_dropped": verdict["n_dropped"],
         }
         if verdict["status"] == "triggered":
             triggered.append(row)
         elif verdict["status"] == "insufficient":
             insufficient.append({**row, "reason": verdict["reason"]})
+        elif verdict["n_dropped"]:
+            dropped.append(row)
     return {
+        "dropped": dropped,
         "count": len(triggered),
         "triggered": triggered,
         "insufficient": insufficient,
@@ -403,6 +412,15 @@ def main():
                 f"**{linkage['count']}** famil{'y' if linkage['count'] == 1 else 'ies'} "
                 f"would alert, against {regression_count} configuration(s) above.\n"
             )
+            # A family that lost a level is judged on less evidence than the
+            # table above shows, so it is named rather than folded into the
+            # count. The count alone would read as full coverage.
+            for row in linkage["dropped"]:
+                print(
+                    f">   {row['model']} {row['isl']}/{row['osl']}: "
+                    f"{row['n_dropped']} level(s) dropped for a missing "
+                    f"throughput delta, judged on {row['n_judging']}.\n"
+                )
         else:
             print("\n> No baseline results found for regression comparison\n")
 
