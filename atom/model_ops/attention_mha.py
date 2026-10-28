@@ -1447,8 +1447,15 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         index_q = None
         if not self.skip_index_topk:
+            # e4m3 (cast as is) for the MXFP4 index's fp8-q scorer
             index_q = torch.empty(
-                (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
+                (num_tokens, self.index_q_size),
+                dtype=(
+                    torch.float8_e4m3fn
+                    if self.index_mxfp4 and envs.ATOM_M3_INDEX_Q_FP8
+                    else qkv.dtype
+                ),
+                device=qkv.device,
             )
         aiter.fused_qknorm_idxrqknorm(
             qkv,
