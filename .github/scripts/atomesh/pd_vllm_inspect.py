@@ -176,28 +176,26 @@ if shutil.which('squeue'):
         result['scheduler_query_timed_out'] = True
 
 result['accounting'] = []
+helper = Path(__file__).resolve().parents[1] / 'slurm_submit_helpers.sh'
 for job_id in sorted({str(row['slurm_job_id']) for row in rows}):
-    if not shutil.which('sacct'):
+    if not shutil.which('scontrol'):
         break
     try:
-        query = subprocess.run(['sacct', '-n', '-X', '-P', '-j', job_id,
-            '--format=JobIDRaw,State,ExitCode,NodeList,Elapsed'], capture_output=True, text=True, timeout=15)
+        # Use the same tested controller/accounting fallback as real submissions.
+        # Spur rejects native sacct -X/-P; the shared helper selects its syntax.
+        query = subprocess.run(['bash', '-c',
+            'source "$1"; detect_slurm_backend; query_slurm_result "$2"',
+            'inspect-slurm', str(helper), job_id], capture_output=True, text=True, timeout=45)
+        entry = {'job_id': int(job_id), 'query_rc': query.returncode}
         for line in query.stdout.splitlines():
-            fields = line.strip().split('|')
-            if len(fields) < 5 or fields[0] != job_id:
-                continue
-            entry = {'job_id': int(job_id), 'query_rc': query.returncode}
-            state = fields[1].split()[0].rstrip('+') if fields[1] else ''
-            if state in {'PENDING', 'RUNNING', 'COMPLETING', 'COMPLETED', 'FAILED', 'CANCELLED',
-                         'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'PREEMPTED', 'BOOT_FAIL'}:
-                entry['state'] = state
-            if re.fullmatch(r'\d+:\d+', fields[2]):
-                entry['exit_code'] = fields[2]
-            if re.fullmatch(r'pit2-p03-g[0-9]+', fields[3]):
-                entry['node'] = fields[3]
-            if re.fullmatch(r'[0-9:-]+', fields[4]):
-                entry['elapsed'] = fields[4]
-            result['accounting'].append(entry)
+            match = re.fullmatch(r'([A-Z_]+)\+?\|(\d+:\d+)?', line.strip())
+            if match and match[1] in {'PENDING', 'RUNNING', 'COMPLETING', 'COMPLETE', 'COMPLETED',
+                    'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'PREEMPTED',
+                    'BOOT_FAIL', 'SUSPENDED', 'CONFIGURING', 'REQUEUED', 'DEADLINE'}:
+                entry['state'] = match[1]
+                if match[2]:
+                    entry['exit_code'] = match[2]
+        result['accounting'].append(entry)
     except subprocess.TimeoutExpired:
         result['accounting'].append({'job_id': int(job_id), 'query_timed_out': True})
 
