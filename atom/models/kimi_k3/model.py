@@ -218,6 +218,18 @@ def _effective_layer_quant(
     return cfg.quant_type, cfg.quant_dtype
 
 
+def _is_e8m0_blockscale(
+    quant_config: QuantizationConfig | None, quant_type: QuantType
+) -> bool:
+    """Whether a per_1x128 consumer runs E8M0 block scales (same test as
+    LinearBase). FP32-scale fused producers stand down for it."""
+    return (
+        quant_config is not None
+        and quant_type.value == QuantType.per_1x128.value
+        and quant_config.blockscale_e8m0_scale
+    )
+
+
 class SituAndMul(nn.Module):
     def __init__(
         self,
@@ -879,7 +891,10 @@ class KimiFullAttention(nn.Module):
         qknorm_type, qknorm_dtype = _effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
-        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
+        self.fuse_qknorm_quant = qknorm_dtype in (
+            dtypes.fp8,
+            dtypes.fp4x2,
+        ) and not _is_e8m0_blockscale(quant_config, qknorm_type)
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
@@ -897,9 +912,10 @@ class KimiFullAttention(nn.Module):
         # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
         # (ptpc_fp8) or per-1x128 block.
         o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
-        self.fuse_sigmoid_mul_quant = o_dtype == dtypes.fp8 and o_type in (
-            QuantType.per_Token,
-            QuantType.per_1x128,
+        self.fuse_sigmoid_mul_quant = (
+            o_dtype == dtypes.fp8
+            and o_type in (QuantType.per_Token, QuantType.per_1x128)
+            and not _is_e8m0_blockscale(quant_config, o_type)
         )
         # .value, like qknorm_quant_type_value above: comparing the pybind11
         # QuantType inside forward() graph-breaks Dynamo.
@@ -1151,12 +1167,14 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
+        # rmsnorm_gated fuses only per-token FP8; otherwise o_proj quantizes itself.
         o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        o_norm_fuses_quant = o_type == QuantType.per_Token and o_dtype == dtypes.fp8
         self.o_norm = KimiRMSNormGated(
             self.head_dim,
             eps=config.rms_norm_eps,
-            quant_type=o_type,
-            quant_dtype=o_dtype,
+            quant_type=o_type if o_norm_fuses_quant else None,
+            quant_dtype=o_dtype if o_norm_fuses_quant else None,
             weight_dtype=control_dtype,
         )
         self.o_proj = RowParallelLinear(
