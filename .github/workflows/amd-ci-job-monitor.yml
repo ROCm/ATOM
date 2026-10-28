@@ -48,6 +48,17 @@ jobs:
               metric.unlink()
               print('RECLAIMED VERIFIED TASK DUPLICATE: 4716797276 bytes; artifact 12830886598 retained', flush=True)
 
+          import shutil
+          usage = os.statvfs(root)
+          print('TASK LOG FILESYSTEM:', {'available_bytes': usage.f_bavail * usage.f_frsize, 'available_inodes': usage.f_favail}, flush=True)
+          if shutil.which('quota'):
+              result = subprocess.run(['quota', '-s'], capture_output=True, text=True, timeout=15)
+              print('CURRENT RUNNER USER QUOTA:', result.returncode, result.stdout[:2000], result.stderr[:500], flush=True)
+          else:
+              print('CURRENT RUNNER USER QUOTA: quota command unavailable', flush=True)
+          result = subprocess.run(['stat', '-f', '-c', '%T', str(root)], capture_output=True, text=True, timeout=15)
+          print('TASK LOG FILESYSTEM TYPE:', result.stdout.strip(), flush=True)
+
           controller = os.environ.get('SPUR_CONTROLLER_ADDR', '')
           controller_args = ['--controller', controller] if controller else []
           print('EXPLICIT CONTROLLER CONFIGURED:', bool(controller), flush=True)
