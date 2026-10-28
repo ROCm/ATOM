@@ -764,33 +764,6 @@ def fused_ar_gemma_per_group_supported() -> bool:
     return "gemma_norm" in inspect.signature(method).parameters
 
 
-_GLUON_AR_MAX_BYTES = 2 << 20  # decode sizes; prefill keeps aiter's fused all-reduce
-_gluon_ar = None  # TP CPU group, inboxes and call counters of aiter's Gluon all-reduce
-
-
-def _gluon_fused_allreduce_gemma_rmsnorm_fake(
-    x: Tensor, residual: Tensor, weight: Tensor, eps: float
-) -> tuple[Tensor, Tensor]:
-    return torch.empty_like(x), torch.empty_like(x)
-
-
-@torch_compile_guard(gen_fake=_gluon_fused_allreduce_gemma_rmsnorm_fake)
-def gluon_fused_allreduce_gemma_rmsnorm(
-    x: Tensor, residual: Tensor, weight: Tensor, eps: float
-) -> tuple[Tensor, Tensor]:
-    """Gemma RMSNorm of residual + all-reduce(x), and residual + all-reduce(x),
-    with aiter's one-launch Gluon kernel (ROCm/aiter#6924)."""
-    from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
-        all_reduce_rmsnorm_quant,
-    )
-
-    if x.numel() * x.element_size() > _GLUON_AR_MAX_BYTES:
-        return tensor_model_parallel_fused_allreduce_rmsnorm(
-            x, residual, weight, eps, gemma_norm=True
-        )
-    return all_reduce_rmsnorm_quant(x, residual, weight, eps, True, False, *_gluon_ar)
-
-
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -832,14 +805,6 @@ class GemmaRMSNorm(nn.Module):
                 "an aiter whose fused AR + RMSNorm + per-group quant takes "
                 "gemma_norm; this one would silently normalize with x * w"
             )
-        if self.fused_allreduce and envs.ATOM_USE_GLUON_FUSED_ALLREDUCE_RMSNORM:
-            global _gluon_ar
-            if _gluon_ar is None:  # once; every rank builds the norms in the same order
-                from aiter.dist.parallel_state import get_tp_group
-                from aiter.ops.triton.comms.all_reduce import all_reduce_init
-
-                group = get_tp_group().cpu_group
-                _gluon_ar = (group, *all_reduce_init(group, _GLUON_AR_MAX_BYTES))
 
     @staticmethod
     def forward_static(
@@ -976,10 +941,6 @@ class GemmaRMSNorm(nn.Module):
             out_fp8, res_out, out_scale = outs[:3]
             out_bf16 = outs[3] if self.write_bf16 else None
             return out_fp8, out_scale, out_bf16, res_out
-        if _gluon_ar is not None:
-            return gluon_fused_allreduce_gemma_rmsnorm(
-                x.contiguous(), residual, self.weight, self.variance_epsilon
-            )
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             x.contiguous(),
             residual,
