@@ -60,6 +60,13 @@ class TestPreprocessSingle:
         with pytest.raises(ValueError, match="preprocess_fanout"):
             proc.preprocess("hello", SamplingParams(n=3, temperature=0.8))
 
+    def test_sequence_parallel_rejects_multimodal_request(self):
+        # Refused per request: the runner cannot merge embeddings across SP shards.
+        proc = _make_processor()
+        proc.config.sequence_parallel_size = 4
+        with pytest.raises(ValueError, match="Ulysses SP"):
+            proc.preprocess("hello", SamplingParams(n=1), multimodal_data={"image": 1})
+
 
 class TestPreprocessFanout:
     def test_n_one_returns_list_of_one(self):

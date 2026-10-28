@@ -323,6 +323,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
     # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel.
     "ATOM_QSA_FLYDSL_ATTN": lambda: os.getenv("ATOM_QSA_FLYDSL_ATTN", "0") == "1",
+    # AITER MegaMoeTP (ROCm/aiter#6514) for Ulysses SP MoE layers. Layers it
+    # cannot serve keep the native MoE.
+    "ATOM_SP_MOE_MEGA": lambda: os.getenv("ATOM_SP_MOE_MEGA", "1") == "1",
+    "ATOM_SP_MOE_MEGA_COMM_DTYPE": lambda: os.getenv(
+        "ATOM_SP_MOE_MEGA_COMM_DTYPE", "fp8"
+    ),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
@@ -605,6 +611,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # Experimental TP QKV + replicated o_proj layout for models that opt in.
+    "ATOM_TP_REPLICATED_O_PROJ": lambda: (
+        os.getenv("ATOM_TP_REPLICATED_O_PROJ", "0") == "1"
+    ),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
