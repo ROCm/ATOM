@@ -15,7 +15,6 @@ from rtp_llm.ops import DataType, HybridAttentionType
 from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
 from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
-from atom.plugin.rtpllm.models import qwen4_exp as qwen4_exp_model
 from atom.plugin.rtpllm.models import qwen4_exp_mtp_hooks
 from atom.plugin.rtpllm.models.qwen3_5 import _ATOMQwen35MoeRuntime
 from atom.plugin.rtpllm.models.qwen4_exp import (
@@ -824,11 +823,6 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path, monkeypatch):
     config.init_precision_config(None, None)
     assert config.compute_dtype == torch.bfloat16
     config.attn_config.tokens_per_block = 64
-    monkeypatch.setattr(
-        qwen4_exp_model,
-        "_rtp_compute_ops_module",
-        lambda: SimpleNamespace(supports_plugin_cache_block_copy=True),
-    )
     kv_cache_config = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
     ATOMQwen4Exp._apply_kv_cache_config(config, kv_cache_config)
     qsa_bytes = (64 + 16) * 128 * 2
@@ -836,36 +830,6 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path, monkeypatch):
     assert config.auxiliary_paged_cache_bytes_per_block == qsa_bytes + ple_bytes
     assert kv_cache_config.reuse_cache is True
     assert config.atom_qwen4_exp_prefix_cache_enabled is True
-
-    monkeypatch.setattr(
-        qwen4_exp_model,
-        "_rtp_compute_ops_module",
-        lambda: SimpleNamespace(supports_plugin_cache_block_copy=False),
-    )
-    legacy = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
-    ATOMQwen4Exp._apply_kv_cache_config(config, legacy)
-    assert legacy.reuse_cache is False
-    assert config.atom_qwen4_exp_prefix_cache_enabled is False
-    monkeypatch.setattr(
-        qwen4_exp_model,
-        "_rtp_compute_ops_module",
-        lambda: SimpleNamespace(supports_plugin_cache_block_copy=lambda: True),
-    )
-    callable_capability = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
-    ATOMQwen4Exp._apply_kv_cache_config(config, callable_capability)
-    assert callable_capability.reuse_cache is False
-    assert config.atom_qwen4_exp_prefix_cache_enabled is False
-
-    monkeypatch.setattr(qwen4_exp_model, "_rtp_compute_ops_module", lambda: None)
-    missing_extension = SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
-    ATOMQwen4Exp._apply_kv_cache_config(config, missing_extension)
-    assert missing_extension.reuse_cache is False
-
-    monkeypatch.setattr(
-        qwen4_exp_model,
-        "_rtp_compute_ops_module",
-        lambda: SimpleNamespace(supports_plugin_cache_block_copy=True),
-    )
 
     disabled = SimpleNamespace(seq_size_per_block=64, reuse_cache=False)
     ATOMQwen4Exp._apply_kv_cache_config(config, disabled)

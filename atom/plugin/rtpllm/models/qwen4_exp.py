@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import inspect
 import json
 import logging
@@ -23,15 +22,6 @@ from atom.plugin.rtpllm.models.qwen3_5 import (
 )
 
 logger = logging.getLogger("atom.plugin.rtpllm.models")
-
-
-def _rtp_compute_ops_module():
-    # Older RTP builds may omit this extension. Keep model registration
-    # available and disable prefix reuse when the capability is absent.
-    try:
-        return importlib.import_module("librtp_compute_ops.rtp_llm_ops")
-    except ImportError:
-        return None
 
 
 class _Qwen4ExpAttnPyObj(_ATOMAttnPyObj):
@@ -708,20 +698,8 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             kv_cache_config, "multi_task_prompt_str", None
         ):
             raise ValueError("Qwen4Exp RTP plugin does not support cached task prompts")
-        # Older RTP binaries do not call copy_plugin_cache_blocks during a
-        # tagged block relocation. Reuse would then read stale QSA/PLE state.
-        capability = getattr(
-            _rtp_compute_ops_module(), "supports_plugin_cache_block_copy", False
-        )
-        # pybind exports a bool attribute. A bound function is always truthy
-        # and must not accidentally enable reuse on an incompatible RTP build.
-        supported = isinstance(capability, (bool, int)) and bool(capability)
-        if kv_cache_config.reuse_cache and not supported:
-            logger.warning(
-                "Disabling Qwen4Exp prefix cache: RTP lacks the compiled "
-                "plugin cache block-copy callback"
-            )
-            kv_cache_config.reuse_cache = False
+        # RTP's plugin block-copy callback must accompany reuse_cache so QSA/PLE
+        # side pools follow copy-on-write relocations.
         model_config.atom_qwen4_exp_prefix_cache_enabled = bool(
             kv_cache_config.reuse_cache
         )
