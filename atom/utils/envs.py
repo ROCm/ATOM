@@ -127,6 +127,41 @@ def _finite_float_env(name: str, default: float, *, allow_zero: bool) -> float:
     return value
 
 
+def _unit_fraction_list_env(name: str, default: str) -> list[float]:
+    """Comma-separated fractions, each strictly inside (0, 1).
+
+    The bounds are not fussiness. `_cu_mask_for_fraction` clamps the split to
+    `[1, total - 1]` CUs, so 0.0 and 1.0 do not mean "no mask" and "all of it"
+    -- they silently become "one CU" and "all but one", which is a pathological
+    partition that looks like a working one. Rejecting them at parse time turns
+    a typo into a startup error instead of a mystery slowdown.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        raw = default
+    out: list[float] = []
+    for piece in raw.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            value = float(piece)
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} must be comma-separated numbers, got {piece!r}"
+            ) from exc
+        if not math.isfinite(value) or not 0.0 < value < 1.0:
+            raise ValueError(
+                f"{name} entries must be strictly between 0 and 1, got {value}"
+            )
+        out.append(value)
+    if not out:
+        raise ValueError(f"{name} must name at least one fraction")
+    # Sorted and deduplicated so the pool's key order is stable across ranks
+    # and a repeated value does not build the same masked stream twice.
+    return sorted(set(out))
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # Forward metadata transport: direct or packed. Both keep source checks.
     # Single-member groups and strided bindings retain direct copies.
@@ -1090,6 +1125,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A nonzero interval also enables local coalescing on TP without PP.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
+    ),
+    # --- RapidServe CU masking (--disagg-constrained only) ---
+    # Which CU splits to build masked stream pairs for. The two halves take
+    # COMPLEMENTARY masks off one fraction -- prefill gets CUs [0, split) and
+    # decode [split, total) -- so a stream pair has to exist for every fraction
+    # the scheduler can choose, and the scheduler must never choose one outside
+    # this set.
+    #
+    # Comma-separated, each strictly inside (0, 1): 0.0 and 1.0 clamp to "one
+    # CU" and "all but one" rather than meaning "no mask", which is a
+    # pathological split that looks like a working one.
+    #
+    # One pair per value, built once at startup, so a long list costs stream
+    # objects rather than per-step work. Default "0.5" matches the single
+    # hardcoded split this replaced.
+    "ATOM_CU_POOL_FRACTIONS": lambda: _unit_fraction_list_env(
+        "ATOM_CU_POOL_FRACTIONS", "0.5"
     ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),

@@ -10,7 +10,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -1309,8 +1309,14 @@ class ModelRunner:
         if self.rank == 0:
             logger.info(*args)
 
-    def dummy_execution(self):
+    def dummy_execution(self, cu_stream_fraction: float | None = None):
         """Execute dummy decode batch for DP synchronization.
+
+        `cu_stream_fraction` must be whatever the ranks running REAL work this
+        step are using. The dummy exists to match their collective, and a
+        CU-masked stream and an unmasked one are not the same place to meet:
+        eight prefill ranks entering one MoE all-to-all with five on CUs
+        [0,128) and three on [0,256) hung for six minutes.
 
         Two mechanisms lean on the fabricated id being -1: this pass flushes
         the previous real step's tokens (`prepare_sampled_ids` reports the
@@ -1350,6 +1356,7 @@ class ModelRunner:
             is_dummy_run=True,
             num_spec_step=mtp_k,
             scheduled_spec_decode_tokens=spec_tokens,
+            cu_stream_fraction=cu_stream_fraction,
         )
 
         self.forward(dummy_batch)
@@ -5131,7 +5138,9 @@ class RapidServeModelRunner(ModelRunner):
         # GPU; postprocess (sampling + async CPU copy) stays on the default
         # stream. The stream pool is created by DecodeEngineCore via
         # create_decode_stream_pool().
-        stream = self._decode_streams[batch.cu_stream_fraction]
+        stream = self._cu_stream(
+            self._decode_streams, batch.cu_stream_fraction, "decode"
+        )
         self._done_event.record()
         stream.wait_event(self._done_event)
         with torch.cuda.stream(stream):
@@ -5940,22 +5949,54 @@ class RapidServeModelRunner(ModelRunner):
         )
         return words
 
-    # CU fractions for which we pre-create masked streams.
-    _CU_POOL_FRACTIONS: ClassVar[list[float]] = [0.5]
+    @property
+    def _cu_pool_fractions(self) -> list[float]:
+        """CU splits to pre-create masked stream pairs for.
+
+        Read from the environment rather than hardcoded, because the two halves
+        take COMPLEMENTARY masks off one fraction and tuning the split is the
+        whole point of turning masking on. The scheduler must only ever choose
+        a value in here -- `_cu_stream` is what catches it when that slips.
+        """
+        return list(envs.ATOM_CU_POOL_FRACTIONS)
+
+    @staticmethod
+    def _cu_stream(pool: dict, fraction, side: str):
+        """The stream for `fraction`, or the full-CU one if it is not pooled.
+
+        A bare `pool[fraction]` here is a KeyError on the first forward, after
+        model load and graph capture -- an expensive way to find out that a
+        fraction reached the batch that no stream was built for. The decision
+        path should make that impossible; this is what turns "should" into a
+        log line instead of a dead engine.
+        """
+        stream = pool.get(fraction)
+        if stream is not None:
+            return stream
+        if fraction is not None:
+            logger.error(
+                "%s stream pool has no entry for cu_stream_fraction=%s "
+                "(pooled: %s); falling back to full CUs, so this forward is "
+                "NOT masked and overlaps the other half",
+                side,
+                fraction,
+                sorted(f for f in pool if f is not None),
+            )
+        return pool[None]
 
     def create_prefill_stream_pool(self) -> bool:
         """Create a pool of CUDA streams for disaggregated prefill.
 
         Called once by PrefillEngineCore._init_disagg() after IPC import.
         In constrained mode, pre-creates one CU-masked stream per fraction
-        in _CU_POOL_FRACTIONS plus a full-CU fallback (None key);
+        in ATOM_CU_POOL_FRACTIONS plus a full-CU fallback (None key);
         prefill_forward() selects the stream dynamically each iteration via
         _optimal_cu_fraction().  In unconstrained mode, only the plain
         full-CU stream (None key) is created.
         """
         self._prefill_streams = {}
         if getattr(self.config, "disagg_constrained", False):
-            for f in self._CU_POOL_FRACTIONS:
+            for f in self._cu_pool_fractions:
                 mask = self._cu_mask_for_fraction(f, upper=False)
                 self._prefill_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
@@ -5976,7 +6017,7 @@ class RapidServeModelRunner(ModelRunner):
         """
         self._decode_streams = {}
         if getattr(self.config, "disagg_constrained", False):
-            for f in self._CU_POOL_FRACTIONS:
+            for f in self._cu_pool_fractions:
                 mask = self._cu_mask_for_fraction(f, upper=True)
                 self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
@@ -6007,7 +6048,9 @@ class RapidServeModelRunner(ModelRunner):
         """
         prefill_streams = getattr(self, "_prefill_streams", None)
         if prefill_streams is not None:
-            stream = self._prefill_streams[batch.cu_stream_fraction]
+            stream = self._cu_stream(
+                self._prefill_streams, batch.cu_stream_fraction, "prefill"
+            )
         else:
             stream = torch.cuda.current_stream()
         with torch.cuda.stream(stream):

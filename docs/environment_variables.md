@@ -551,3 +551,25 @@ Set on the decode side; the prefill side follows what each write request offers 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_PD_MLA_LANDING** | bool | 1 | Decode (`kv_consumer`, plain `mooncake` connector, DCP > 1, a plain MLA model) only. Allocate a GPU landing pool per rank and give prefill stages partitions of it. A stage writes a rank's MLA rows packed in rank order into a landing slot with one RDMA descriptor per slot (instead of one per destination page); the decode rank scatters the slot into its paged KV cache on a side stream and returns the slot. A request completes only after its slots are scattered. Destination bytes are identical to the staged path. The pool is 256 MiB of 8 MiB slots per decode rank; it and the scatter's segment table (about 12 MiB at block size 1, less for larger blocks) are held back from the KV cache budget. Only a non-DCP MLA prefill with `ATOM_PD_MLA_STAGING=1` lands, so set 0 where none does (for example symmetric DCP P/D) to give the pool back to the KV cache. Partitions go first come, first served: a prefill stage endpoint gets `32 // its PP size` slots on first contact and keeps them while the decode runs, so with several prefill instances per decode rank a later one may get fewer slots, or none and keep the staged path. A stage that reports it cannot land returns its partition at its first write-done and is not offered slots again. A prefill sends a transfer needing fewer than 2 slots, or the rest of one after waiting 10 ms for a free slot, through the staged per-page path. 0 keeps the staged per-page writes. |
+
+## RapidServe CU masking
+
+Only read under `--enable-rapidserve --disagg-constrained`. Without
+`--disagg-constrained` both halves run on the plain full-CU stream and none of
+this applies.
+
+The two halves of a pair take **complementary** masks off a single fraction:
+prefill gets CUs `[0, split)` and decode `[split, total)`, where
+`split = round(total * fraction)`. Both must therefore use the same fraction —
+if they disagree the masks overlap and decode runs on prefill's CUs as well,
+which costs a mask and removes none of the contention it exists to remove.
+
+The fraction is chosen once per dispatched prefill batch, from values reduced
+across every decode rank (`DecodeEngineCore._sync_decode_group_state`), and
+held until that batch retires. So all ranks agree, and decode's own forwards
+stay on the complementary half for as long as the prefill it is sharing the
+device with is running.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_CU_POOL_FRACTIONS** | float list | 0.5 | Comma-separated CU splits to pre-create masked stream pairs for, e.g. `0.3,0.5,0.7`. One pair is built per value at startup, so a longer list costs stream objects rather than per-step work; values are sorted and deduplicated. Each must be strictly between 0 and 1 — `0.0` and `1.0` clamp to "one CU" and "all but one" rather than meaning "no mask", so they are rejected at parse time. The scheduler may only pick a fraction that is in this set; one that is not falls back to the full-CU stream with an error logged, rather than failing the first forward. |

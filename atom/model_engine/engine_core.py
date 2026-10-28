@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
+from typing import NamedTuple
 
 import torch
 import zmq
@@ -18,7 +19,12 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.scheduler import DecodeScheduler, PrefillExecutor, Scheduler
+from atom.model_engine.scheduler import (
+    DecodeScheduler,
+    PrefillExecutor,
+    Scheduler,
+    _optimal_cu_fraction,
+)
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -43,6 +49,21 @@ from atom.utils.gc_utils import (
 )
 
 logger = logging.getLogger("atom")
+
+
+class DecodeGroupState(NamedTuple):
+    """What one cross-DP reduction tells every decode rank each tick.
+
+    A NamedTuple rather than a 4-tuple: two flags and two counts read
+    positionally at the call site is the kind of thing that gets mis-indexed
+    silently, and every field here gates either a collective or the CU mask.
+    """
+
+    busy: bool  # ANY rank holds a prefill batch -> nobody dispatches
+    will_forward: bool  # ANY rank has a decode batch -> everyone forwards
+    max_decode_tokens: int  # largest rank's decode tokens, for the CU split
+    max_prefill_pending: int  # largest rank's owed prefill, for the CU split
+
 
 # How often a prefill engine reports its undrained prefill-batch backlog.
 # Per receive thread, so a burst of 128 assignments logs once, not 128 times.
@@ -979,7 +1000,19 @@ class DPEngineCoreProc(EngineCore):
             self.scheduler.shutdown_kv_events()
 
     def _execute_dummy_batch(self):
-        return self.runner_mgr.call_func("dummy_execution", wait_out=True)
+        return self.runner_mgr.call_func(
+            "dummy_execution", self._dummy_cu_fraction(), wait_out=True
+        )
+
+    def _dummy_cu_fraction(self) -> float | None:
+        """CU split the dummy must run on, to meet its peers where they are.
+
+        None here, and for every engine that does not mask. RapidServe
+        overrides: its dummy shares one MoE all-to-all with ranks running real,
+        possibly masked, forwards, and a masked stream is not the same place to
+        meet as an unmasked one.
+        """
+        return None
 
     def _sync_dp_state(
         self,
@@ -1127,6 +1160,9 @@ class PrefillEngineCore(DPEngineCoreProc):
         # step that would drain it is not running, or a batch names a sequence
         # whose ADD never arrived.
         self._batches_applied = 0
+        # CU split every prefill rank runs on this step, real batch or dummy.
+        # See `_sync_prefill_cu_fraction`.
+        self._group_cu_fraction: float | None = None
         k = self._pair_rank
         # PULL: PrefillBatchMsg from THIS pair's decode rank only.
         self._disagg_d2p_addr = config.disagg_d2p_addrs[k]
@@ -1371,6 +1407,56 @@ class PrefillEngineCore(DPEngineCoreProc):
                 # queue it edits is the one `apply_batch` reads.
                 self.scheduler.drop(payload)
 
+    def _sync_prefill_cu_fraction(self, mine: float | None) -> float | None:
+        """The CU split EVERY prefill rank runs this step on, real or dummy.
+
+        The prefill ranks share one MoE all-to-all per step, so they must all
+        enter it on the same stream. A fraction reaches this process inside a
+        `PrefillBatchMsg`, and a rank with no batch has no message -- so a rank
+        that has drained its queue would dummy on full CUs while its peers ran
+        masked. Eight ranks, five on CUs [0,128) and three on [0,256): the
+        group hung for six minutes with `dummy_inflight=356s` on exactly the
+        three that had run out of work.
+
+        MAX over the group, so a single rank with a masked batch pulls
+        everyone onto that mask. Encoded as thousandths because the buffer is
+        integral; 0 means no mask.
+
+        MUST be called on every prefill rank on every tick that reaches
+        `_process_engine_step`, BEFORE any per-rank early return -- the same
+        rule the decode group's reduction follows, and for the same reason:
+        gloo matches collectives by arrival order, so a rank that skips this
+        pairs its next `_sync_dp_state` against a peer's reduction here.
+
+        Fail-open to no mask: an unmasked group is slower than a masked one,
+        never wedged.
+        """
+        if not self._dp_lockstep:
+            return mine
+        buf = torch.tensor(
+            [0 if mine is None else round(mine * 1000)],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        try:
+            torch.distributed.all_reduce(
+                buf, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "%s: prefill CU-fraction all_reduce failed (%s); running "
+                "unmasked this step",
+                self.label,
+                e,
+            )
+            return None
+        thousandths = int(buf.item())
+        return thousandths / 1000 if thousandths else None
+
+    def _dummy_cu_fraction(self) -> float | None:
+        """What the ranks running real work this step agreed on."""
+        return self._group_cu_fraction
+
     def _process_engine_step(self):
         from atom.model_engine.disagg_types import (
             DisaggMsgType,
@@ -1383,6 +1469,13 @@ class PrefillEngineCore(DPEngineCoreProc):
         # because the manager sends decode's copy of a request first and decode
         # can plan a batch before this process has drained its own input queue.
         msg = self.scheduler.peek_batch()
+        # UNCONDITIONAL, and BEFORE the returns below: a cross-DP collective on
+        # the same gloo group as `_sync_dp_state`, which matches by arrival
+        # order rather than by tag. It is also what a dummy needs -- the
+        # branch right under this one -- so it could not sit any lower anyway.
+        self._group_cu_fraction = self._sync_prefill_cu_fraction(
+            msg.cu_stream_fraction if msg is not None else None
+        )
         if msg is None:
             # Reached only when ANOTHER rank has a batch and this one does not:
             # `is_finished()` reports the batch queue, so a tick where every
@@ -1402,6 +1495,10 @@ class PrefillEngineCore(DPEngineCoreProc):
         # `req_ids` and the per-seq arrays and keeps none of it, so the reply
         # loop and the retirement below need their own reference.
         scheduled_batch, seqs = applied
+        # The group's answer, not this batch's own. They agree whenever every
+        # rank dispatched; when they do not, a peer's dummy is pinned to this
+        # mask and this forward must be too.
+        scheduled_batch.cu_stream_fraction = self._group_cu_fraction
         self.scheduler.drop_batch(msg)
         self._batches_applied += 1
 
@@ -1535,6 +1632,9 @@ class DecodeEngineCore(DPEngineCoreProc):
         # rank k lives on GPU k and bootstraps against the prefill TP rank on the
         # same GPU — the IPC handles are only valid there.
         self._decode_rank = config.disagg_decode_rank
+        # CU split the next dispatched batch will carry; see
+        # `_process_engine_step`.
+        self._next_cu_fraction: float | None = None
         k = self._decode_rank
         # PUSH: PrefillBatchMsg to THIS pair's prefill rank only.
         self._disagg_d2p_addr = config.disagg_d2p_addrs[k]
@@ -1816,10 +1916,14 @@ class DecodeEngineCore(DPEngineCoreProc):
         # fire_vacuous, starving the process of everything else.
         return exiting
 
-    def _sync_decode_group_state(self) -> tuple[bool, bool]:
-        """One reduction carrying the two facts the whole decode group needs.
+    def _sync_decode_group_state(self) -> DecodeGroupState:
+        """One reduction carrying everything the whole decode group must agree on.
 
-        Returns ``(group_busy, any_decode_work)``.
+        Reduced with MAX, not SUM. The two flags are 0/1 "any" predicates, for
+        which `SUM > 0` and `MAX > 0` are identical, and the two counts want
+        the largest rank's value rather than a total -- so one op serves all
+        four and the group still needs only one collective per tick.
+        `_sync_dp_state` already reduces this group with `ReduceOp.MAX`.
 
         ``group_busy`` -- ANY rank still holds a prefill batch. While that is
         true no rank may dispatch, so the pair's prefill ranks all receive
@@ -1863,31 +1967,43 @@ class DecodeEngineCore(DPEngineCoreProc):
         `_process_engine_step`, and BEFORE any per-rank early return in it --
         it is subject to the same rule it exists to enforce.
 
-        Fail-open on a collective error, as `_sync_dp_state` does: no skip, and
-        assume work exists, which leaves every rank on exactly the path it took
-        before this method existed.
+        `max_decode_tokens` and `max_prefill_pending` are the CU split's two
+        operands. They are reduced rather than read locally because the two
+        halves of a pair take COMPLEMENTARY masks off one fraction -- prefill
+        CUs `[0, split)`, decode `[split, total)` -- so every rank has to reach
+        the same number or the masks overlap and decode runs on prefill's CUs.
+        Deriving the split from reduced values alone is what makes that
+        agreement structural rather than hoped for.
+
+        Fail-open on a collective error, as `_sync_dp_state` does: no skip,
+        assume work exists, and no mask. That leaves every rank on exactly the
+        path it took before this method existed.
         """
         busy = self.scheduler.prefill_batch_inflight
         work = self.scheduler.has_decode_work()
+        decode_tokens = self.scheduler.decode_tokens_estimate()
+        prefill_pending = self.scheduler.prefill_pending_estimate()
         if not self._dp_lockstep:
-            return busy, work
+            return DecodeGroupState(busy, work, decode_tokens, prefill_pending)
         buf = torch.tensor(
-            [1 if busy else 0, 1 if work else 0], dtype=torch.int64, device="cpu"
+            [1 if busy else 0, 1 if work else 0, decode_tokens, prefill_pending],
+            dtype=torch.int64,
+            device="cpu",
         )
         try:
             torch.distributed.all_reduce(
-                buf, op=torch.distributed.ReduceOp.SUM, group=self.dp_group
+                buf, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
         except RuntimeError as e:
             logger.warning(
                 "%s: decode-group all_reduce failed (%s); not skipping the "
-                "delayer and assuming decode work exists",
+                "delayer, assuming decode work exists, and masking no CUs",
                 self.label,
                 e,
             )
-            return False, True
-        n_busy, n_work = (int(v) for v in buf.tolist())
-        return n_busy > 0, n_work > 0
+            return DecodeGroupState(False, True, 0, 0)
+        any_busy, any_work, max_decode, max_prefill = (int(v) for v in buf.tolist())
+        return DecodeGroupState(any_busy > 0, any_work > 0, max_decode, max_prefill)
 
     def _process_engine_step(self):
         """Schedule BOTH halves of the pair: prefill first, then decode.
@@ -1916,7 +2032,47 @@ class DecodeEngineCore(DPEngineCoreProc):
         # says some rank has work, so the entry condition is itself identical
         # on every rank; an idle cluster reaches neither, which is what stops
         # the spin.
-        group_busy, group_will_forward = self._sync_decode_group_state()
+        group = self._sync_decode_group_state()
+        group_busy, group_will_forward = group.busy, group.will_forward
+
+        # ONE CU split for the whole pair, offered to the batch about to be
+        # planned. `build_prefill_batch` ADOPTS it only if it actually
+        # dispatches, and clears the mask otherwise -- the fraction is a
+        # property of a running prefill, not of a backlog. Keyed on pending
+        # work instead, a delayer hold left decode on half the CUs with the
+        # other half idle.
+        #
+        # From REDUCED values only, so every rank that does dispatch reaches
+        # the same answer without a second collective. A rank that dispatches
+        # nothing does not mask: masking is a per-GPU partition between the two
+        # halves of one pair, and that pair's prefill half is running a dummy,
+        # so its decode may as well have the whole device.
+        #
+        # Not recomputed while a batch is in flight: `build_prefill_batch`
+        # returns early on `skip_delayer` and leaves the fraction that batch
+        # was dispatched under in place.
+        # Chosen on a free tick and remembered, so the batch dispatched under
+        # it and every decode forward that overlaps it use one number.
+        if not group_busy:
+            self._next_cu_fraction = (
+                _optimal_cu_fraction(group.max_decode_tokens, group.max_prefill_pending)
+                if self.scheduler.cu_masking
+                else None
+            )
+        # Decode masks exactly while a prefill batch is in flight SOMEWHERE,
+        # which is reduced and therefore identical on every decode rank. The
+        # decode ranks share an MoE all-to-all of their own, so a rank that
+        # masked while a peer did not would wedge it exactly as the prefill
+        # ranks did.
+        #
+        # `group_busy` rather than "did I dispatch": a rank whose own queue has
+        # drained still has peers prefilling, and its decode must leave them
+        # the lower half. And on the tick that dispatches, `group_busy` is
+        # still False -- the batch has not left yet -- so decode runs unmasked
+        # for one step and then joins, which is when prefill actually starts.
+        self.scheduler.set_cu_fraction(
+            self._next_cu_fraction if group_busy else None
+        )
 
         # `skip_delayer` is the all-reduced answer, never this rank's own: the
         # delayer's own tick is a cross-DP all_reduce, so the group skips it
@@ -1924,7 +2080,9 @@ class DecodeEngineCore(DPEngineCoreProc):
         # rank is mid-flight nobody plans a batch, so the pair's prefill ranks
         # receive theirs on the same tick and forward together instead of
         # splitting the group between real work and blocked dummies.
-        prefill_batch = self.scheduler.build_prefill_batch(skip_delayer=group_busy)
+        prefill_batch = self.scheduler.build_prefill_batch(
+            skip_delayer=group_busy, cu_fraction=self._next_cu_fraction
+        )
         if prefill_batch is not None:
             # Before the batch goes out, not after. Admission is what queues a
             # checkpoint restore, and the forward that reads the restored slot

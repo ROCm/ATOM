@@ -119,23 +119,41 @@ def _optimal_cu_fraction(
 ) -> float | None:
     """Return the prefill CU fraction for the current workload, or None for no mask.
 
-    Called by the DecodeScheduler, which has visibility into both the decode
-    batch size and the prefill tokens still owed.  The chosen fraction travels
-    to prefill inside the batch message decode plans.
+    Called once per dispatched prefill batch from
+    `DecodeEngineCore._process_engine_step`, with both operands reduced across
+    the decode group so every rank reaches the same answer.
+
+    Masking only ever pays when BOTH halves have work. The split is
+    complementary -- prefill gets CUs `[0, split)` and decode `[split, total)`
+    -- so whichever side has nothing to run is holding CUs the other side
+    could have used:
+
+    - no prefill pending: decode would be masked against an idle half;
+    - no decode batch: prefill would be, which is the expensive direction.
+      An agentic warmup runs for many minutes with `Running: 0` on every
+      decode rank because every request is still mid-prefill. Masking there
+      halves prefill throughput for the whole phase, and prefill is the only
+      thing happening.
 
     Lookup table derived from empirical benchmarking across CU splits
     (30/50/60/70/80% prefill) on DeepSeek-R1 tp=8.  Prefill latency
     dominates in nearly all cases; decode tolerates CU reduction well
     at typical batch sizes.
 
-    Returns None when CU masking provides no benefit (no pending prefill,
-    tiny prefill).
+    `decode_batch` is a token count, not a request count -- `mtp_k + 1` per
+    scheduled sequence, matching what `_schedule` reports. Zero is the only
+    value treated specially here; a floor below which masking stops being
+    worth it (the original note guessed 64) is a tuning question, and wants
+    the measurement that `ATOM_CU_POOL_FRACTIONS` exists to let you take.
+
+    Any value returned must be in `ATOM_CU_POOL_FRACTIONS`, or no masked
+    stream was built for it.
     """
     assert prefill_pending_tokens >= 0
-    if prefill_pending_tokens == 0:  # or decode_batch < 64:
+    assert decode_batch >= 0
+    if prefill_pending_tokens == 0 or decode_batch == 0:
         return None
-    else:
-        return 0.5
+    return 0.5
 
 
 class ScheduledBatch:
@@ -4866,10 +4884,8 @@ class DecodeScheduler(Scheduler):
         # from what prefill reports back: the publish offset, the checkpoint to
         # settle and the cross-check are all read from here.
         self._inflight_spans: dict[int, tuple] = {}
-        # Whether to pick a fractional CU stream for the prefill forward.
-        # Decode computes the fraction itself now -- it is the only half that
-        # knows both operands -- so there is no shared-memory hand-off left.
-        self._cu_masking = bool(getattr(config, "disagg_constrained", False))
+        # Whether to mask CUs at all (`--disagg-constrained`).
+        self.cu_masking = bool(getattr(config, "disagg_constrained", False))
 
         # Request ids decode has abandoned and prefill has not been told
         # about. Drained by the engine, which owns the socket.
@@ -4877,7 +4893,55 @@ class DecodeScheduler(Scheduler):
         # Protects the prefill queues against `abort_request`, which the
         # utility handler can call from the input thread.
         self._prefill_lock = threading.Lock()
+        # The CU split BOTH halves of this pair are using right now, or None
+        # for no mask. Set by the engine once per dispatched prefill batch and
+        # then left alone -- see `set_cu_fraction`.
         self.cu_fraction: float | None = None
+
+    def set_cu_fraction(self, fraction: float | None) -> None:
+        """Adopt the group's CU split for the batch about to be dispatched.
+
+        One setter, called from one place, because the two halves take
+        COMPLEMENTARY masks off this one number -- prefill gets CUs
+        `[0, split)` and decode `[split, total)`. If they disagree the masks
+        overlap and decode runs on prefill's CUs too, which is worse than not
+        masking: it is the contention masking exists to remove, plus the cost
+        of a mask.
+
+        It used to be computed twice from different operands -- once for the
+        dispatched batch and once, `prefill_finished`-gated, for decode's own
+        -- so decode's half could flip mid-flight or go stale, and nothing
+        reduced either across ranks.
+        """
+        self.cu_fraction = fraction
+
+    def decode_tokens_estimate(self) -> int:
+        """Decode tokens this rank would run, ahead of actually scheduling.
+
+        Must match what `_schedule` goes on to produce, which is one entry of
+        `mtp_k + 1` per scheduled sequence, capped by `max_num_seqs`. It feeds
+        the cross-rank reduction that picks the CU split, and that reduction
+        happens before the batch exists.
+
+        BOTH queues, for the same reason `has_decode_work` reads both:
+        `_schedule` drains `prefill_done` into `running` and only then decides,
+        so a request whose prefill just finished is in this tick's batch. This
+        is read before that promotion, so counting `running` alone reports zero
+        decode tokens on exactly the tick a request becomes decodable -- and
+        zero is the value that turns masking off.
+
+        NOT the running sequences' context length, which is what the old
+        call site passed: ~186k tokens per request on agentic traffic against
+        a true decode-token count of `mtp_k + 1`. Four orders of magnitude out.
+        """
+        ready = len(self.running) + len(self.prefill_done)
+        return min(ready, self.max_num_seqs) * (self.mtp_k + 1)
+
+    def prefill_pending_estimate(self) -> int:
+        """Prefill tokens this rank still owes, across both of its queues."""
+        return (
+            self._waiting_new_token_count() + self._partial_prefill_remaining_tokens()
+        )
 
     def has_decode_work(self) -> bool:
         """Would `_schedule()` produce a decode batch?
@@ -4953,7 +5017,9 @@ class DecodeScheduler(Scheduler):
         # through this method and need no override of their own.
         return sum(self.get_request_counts())
 
-    def build_prefill_batch(self, *, skip_delayer: bool = False):
+    def build_prefill_batch(
+        self, *, skip_delayer: bool = False, cu_fraction: float | None = None
+    ):
         """Plan this tick's prefill batch, or None. Ticks the prefill delayer.
 
         The rapidserve counterpart of the baseline scheduler's prefill phases
@@ -4970,6 +5036,12 @@ class DecodeScheduler(Scheduler):
         Returns a `PrefillBatchMsg` for `DecodeEngineCore` to send, or None.
         The scheduler does no IO of its own, matching how the rest of this
         class hands work back to the engine.
+
+        `cu_fraction` is stamped on the message and nothing else. What THIS
+        process's decode forwards run on is the engine's to decide and is
+        keyed on the group being busy, not on whether this rank dispatched --
+        the decode ranks share a collective of their own, so a rank that
+        masked while a peer did not would wedge it.
         """
         from atom.model_engine.disagg_types import PrefillBatchMsg
 
@@ -4993,6 +5065,8 @@ class DecodeScheduler(Scheduler):
         # `n_prefillable == 0`, which RESETS `_hold_ticks` / `_stall_count`
         # rather than holding.
         if skip_delayer:
+            # A batch is already in flight somewhere, so the fraction it was
+            # dispatched under still stands. Leave it alone.
             return None
 
         # Reached only when every rank is free, so the delayer is deciding for
@@ -5130,16 +5204,6 @@ class DecodeScheduler(Scheduler):
         for seq in (*resumed, *admitted):
             self.prefill_inflight[seq.id] = seq
 
-        # Decode computes the CU split because decode is the only half that
-        # knows both operands: the prefill tokens it has just planned, and its
-        # own decode batch, which it is about to schedule. That is what retired
-        # the shared-memory channel this used to read across from.
-        cu_fraction = None
-        if self._cu_masking:
-            cu_fraction = _optimal_cu_fraction(
-                sum(seq.num_tokens for seq in self.running), num_batched_tokens
-            )
-
         _log_sched_batch(
             self.config,
             "prefill",
@@ -5149,6 +5213,16 @@ class DecodeScheduler(Scheduler):
         return PrefillBatchMsg(
             batch_id=batch_id,
             target_rank=getattr(self.config, "disagg_decode_rank", 0),
+            # The fraction the GROUP agreed on before this batch was planned,
+            # not one computed here. Both halves take complementary masks off
+            # it -- prefill [0, split), decode [split, total) -- so decode's
+            # own batches must use the same number for as long as this one is
+            # in flight, and every rank must have reached the same number. See
+            # `DecodeEngineCore._process_engine_step`.
+            #
+            # The ARGUMENT, not `self.cu_fraction`: that one is what this
+            # process's decode forwards are using right now, which on the tick
+            # that dispatches is still "no mask" -- the batch has not left yet.
             cu_stream_fraction=cu_fraction,
             chunks=chunks,
         )
@@ -5544,7 +5618,6 @@ class DecodeScheduler(Scheduler):
         # pins taken by every resume accumulate forever and admission starves.
         self.block_manager.complete_previous_state_batch()
 
-        prefill_finished = False
         while self.prefill_done:
             seq = self.prefill_done.popleft()
             seq.status = SequenceStatus.RUNNING
@@ -5558,10 +5631,8 @@ class DecodeScheduler(Scheduler):
             # slot_mapping in the same state as non-disagg before the first decode
             # step.
             self.running.append(seq)
-            prefill_finished = True
 
         if not self.running:
-            self.cu_fraction = None
             return None
 
         scheduled_seqs: dict[int, Sequence] = {}
@@ -5588,24 +5659,11 @@ class DecodeScheduler(Scheduler):
                     num_scheduled_tokens.append(num_new_tokens)
 
         if not scheduled_seqs:
-            self.cu_fraction = None
             return None
 
         self.running.extendleft(reversed(scheduled_seqs.values()))
 
         total_tokens_num_decode = sum(num_scheduled_tokens)
-
-        # Dynamic CU partitioning for DECODE's own stream. The prefill side's
-        # fraction is computed in `build_prefill_batch` and travels with the
-        # batch -- decode is the only half that knows both operands, which is
-        # what retired the shared-memory channel that used to carry its token
-        # count across to prefill.
-        if self._cu_masking and prefill_finished:
-            pwait = sum(
-                seq.num_tokens - seq.num_cached_tokens
-                for seq in (*self.prefill_inflight.values(), *self.prefill_partial)
-            )
-            self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
         _log_sched_batch(self.config, "decode", scheduled_seqs, num_scheduled_tokens)
         decode_batch = ScheduledBatch(

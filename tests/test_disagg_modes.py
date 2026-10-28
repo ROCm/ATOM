@@ -432,6 +432,10 @@ class TestDecodeLockstep:
             (),
             {
                 "prefill_batch_inflight": False,
+                "cu_masking": False,
+                "set_cu_fraction": lambda self, f: None,
+                "decode_tokens_estimate": lambda self: 0,
+                "prefill_pending_estimate": lambda self: 0,
                 "has_decode_work": lambda self: False,
                 "schedule": lambda self: None,
                 "has_requests": lambda self: True,
@@ -440,7 +444,7 @@ class TestDecodeLockstep:
                 "pending_aborts": [],
             },
         )()
-        assert obj._sync_decode_group_state()[1] is False
+        assert obj._sync_decode_group_state().will_forward is False
         assert obj._process_engine_step() is True, (
             "a tick that drove prefill but had nothing to decode must not be "
             "reported as 'ran nothing'"
@@ -458,10 +462,15 @@ class TestDecodeLockstep:
             (),
             {
                 "prefill_batch_inflight": False,
+                "cu_masking": False,
+                "set_cu_fraction": lambda self, f: None,
+                "decode_tokens_estimate": lambda self: 0,
+                "prefill_pending_estimate": lambda self: 0,
                 "has_decode_work": lambda self: True,
             },
         )()
-        assert obj._sync_decode_group_state() == (False, True)
+        state = obj._sync_decode_group_state()
+        assert (state.busy, state.will_forward) == (False, True)
 
     def test_the_gate_runs_before_every_per_rank_return(self):
         """gloo matches collectives by ARRIVAL ORDER, not by tag.
@@ -579,6 +588,10 @@ class TestDecodeLockstep:
             (),
             {
                 "prefill_batch_inflight": False,
+                "cu_masking": False,
+                "set_cu_fraction": lambda self, f: None,
+                "decode_tokens_estimate": lambda self: 0,
+                "prefill_pending_estimate": lambda self: 0,
                 "has_decode_work": lambda self: True,  # group forwards
                 "schedule": lambda self: None,
                 "has_requests": lambda self: False,
@@ -718,11 +731,25 @@ class TestDecodeLockstep:
             (n for n in ast.walk(fn) if isinstance(n, ast.Return)),
             key=lambda n: n.lineno,
         )
-        busy_expr = ast.unparse(ret.value.elts[0])
-        assert busy_expr == "n_busy > 0", (
-            f"dispatch must hold while ANY rank is busy, got {busy_expr!r} -- "
-            "a threshold of dp_size lets ranks dispatch independently and "
-            "splits the prefill group between real work and blocked dummies"
+        # `DecodeGroupState(busy, ...)` -- the first construction argument is
+        # the busy predicate, whatever the container around it.
+        value = ret.value
+        args = value.args if isinstance(value, ast.Call) else value.elts
+        busy = args[0]
+        # Shape, not spelling: `<reduced busy slot> > 0`. Pinning the exact
+        # text breaks on a variable rename and says nothing about meaning;
+        # what matters is that it is a comparison against ZERO -- "any rank" --
+        # and not against a group size, which would let a rank dispatch as soon
+        # as it alone was free.
+        assert isinstance(busy, ast.Compare), ast.unparse(busy)
+        assert len(busy.ops) == 1 and isinstance(busy.ops[0], ast.Gt), (
+            f"dispatch must hold while ANY rank is busy, got {ast.unparse(busy)!r}"
+        )
+        bound = busy.comparators[0]
+        assert isinstance(bound, ast.Constant) and bound.value == 0, (
+            f"compared against {ast.unparse(bound)!r}, not 0 -- a threshold of "
+            "dp_size lets ranks dispatch independently and splits the prefill "
+            "group between real work and blocked dummies"
         )
 
     def test_a_busy_rank_alone_does_not_skip_the_delayer(self):
@@ -766,10 +793,10 @@ class TestDecodeLockstep:
 
         src = inspect.getsource(ec.DecodeEngineCore._sync_decode_group_state)
         assert "except RuntimeError" in src
-        assert "return False, True" in src, (
-            "the error path must not skip the delayer and must assume decode "
-            "work exists -- i.e. leave every rank on the path it took before "
-            "this method existed"
+        assert "DecodeGroupState(False, True, 0, 0)" in src, (
+            "the error path must not skip the delayer, must assume decode work "
+            "exists, and must mask no CUs -- i.e. leave every rank on the path "
+            "it took before this method existed"
         )
 
     def test_step_reports_whether_it_ran(self):
@@ -790,6 +817,10 @@ class TestDecodeLockstep:
                 # A peer has decode work, so the group forwards and this rank
                 # owes it a dummy.
                 "prefill_batch_inflight": False,
+                "cu_masking": False,
+                "set_cu_fraction": lambda self, f: None,
+                "decode_tokens_estimate": lambda self: 0,
+                "prefill_pending_estimate": lambda self: 0,
                 "has_decode_work": lambda self: True,
                 "schedule": lambda self: None,
                 "has_requests": lambda self: False,
@@ -1638,8 +1669,15 @@ class TestCuFractionTravelsInTheBatch:
         sched = pytest.importorskip("atom.model_engine.scheduler")
 
         src = inspect.getsource(sched.DecodeScheduler)
-        assert 'self._cu_masking = bool(getattr(config, "disagg_constrained"' in src
-        assert "if self._cu_masking:" in src
+        assert 'self.cu_masking = bool(getattr(config, "disagg_constrained"' in src
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        step = inspect.getsource(ec.DecodeEngineCore._process_engine_step)
+        assert "if self.scheduler.cu_masking" in step, (
+            "emitting a fraction with no masked streams built is a KeyError on "
+            "the first forward"
+        )
 
 
 class TestPrefillDelayerObservability:
@@ -1944,6 +1982,566 @@ class TestNoExtraKvReserveUnderRapidServe:
             ), gb
 
 
+class TestOneGroupWideCuSplit:
+    """One CU fraction, chosen at dispatch, held until the batch retires.
+
+    The halves take COMPLEMENTARY masks off this one number -- prefill gets
+    CUs `[0, split)` and decode `[split, total)` -- so a disagreement is not a
+    missed optimisation: the masks overlap, decode runs on prefill's CUs, and
+    the result is the contention masking exists to remove plus the cost of a
+    mask.
+
+    It used to be computed twice from different operands, once for the
+    dispatched batch and once (gated on `prefill_finished`) for decode's own,
+    neither reduced across ranks.
+    """
+
+    def test_the_reduction_uses_max_and_carries_four_slots(self):
+        """MAX, not SUM. The two flags are 0/1 "any" predicates, for which
+        `SUM > 0` and `MAX > 0` agree, and the two counts want the largest
+        rank's value -- so one op serves all four and the group still needs
+        only one collective per tick."""
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._sync_decode_group_state).lstrip()
+        ).body[0]
+        reduce_calls = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "all_reduce"
+        ]
+        assert len(reduce_calls) == 1, "one collective per tick, not two"
+        op = next(k for k in reduce_calls[0].keywords if k.arg == "op")
+        assert ast.unparse(op.value).endswith("MAX"), ast.unparse(op.value)
+
+        assert len(ec.DecodeGroupState._fields) == 4
+        assert ec.DecodeGroupState._fields == (
+            "busy",
+            "will_forward",
+            "max_decode_tokens",
+            "max_prefill_pending",
+        )
+
+    def test_the_split_is_decided_only_from_reduced_values(self):
+        """Every operand must come off the reduction. A local one and the
+        ranks disagree, which is the overlap this exists to prevent."""
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        call = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "_optimal_cu_fraction"
+        )
+        for arg in call.args:
+            text = ast.unparse(arg)
+            assert text.startswith("group."), (
+                f"{text!r} is not a reduced value; every rank must reach the "
+                "same fraction or the two halves' masks overlap"
+            )
+
+    def test_the_split_is_not_recomputed_while_a_batch_is_in_flight(self):
+        """The candidate is chosen on a free tick and remembered, so the batch
+        dispatched under it and every decode forward that overlaps it use one
+        number. Recomputing mid-flight lets them drift apart."""
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        guards = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.If)
+            and isinstance(n.test, ast.UnaryOp)
+            and isinstance(n.test.op, ast.Not)
+            and isinstance(n.test.operand, ast.Name)
+            and n.test.operand.id == "group_busy"
+            and any(
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Name)
+                and c.func.id == "_optimal_cu_fraction"
+                for c in ast.walk(n)
+            )
+        ]
+        assert len(guards) == 1, (
+            "the candidate must be chosen under `if not group_busy`, i.e. only "
+            "on a tick with no batch already running under another fraction"
+        )
+
+    def test_decodes_mask_follows_the_group_not_this_rank(self):
+        """Uniformity is a correctness requirement, not a preference.
+
+        The decode ranks share an MoE all-to-all, so a rank that masked while
+        a peer did not would wedge it -- exactly as the prefill ranks did when
+        three that had drained their queues dummied on full CUs while five ran
+        masked batches, and the group hung for six minutes.
+
+        `group_busy` is reduced, so every rank gets the same answer. "Did I
+        dispatch" is not.
+        """
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        call = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "set_cu_fraction"
+        )
+        arg = ast.unparse(call.args[0])
+        assert "group_busy" in arg, (
+            f"decode's mask is keyed on {arg!r}; it must come off the reduced "
+            "group state so every rank agrees"
+        )
+        assert "prefill_batch" not in arg, "a local dispatch outcome diverges"
+
+
+    def test_there_is_exactly_one_decision_site(self):
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+        import inspect
+
+        in_scheduler = inspect.getsource(sched.DecodeScheduler).count(
+            "_optimal_cu_fraction("
+        )
+        assert in_scheduler == 0, (
+            "the scheduler must not compute its own fraction; it reads the "
+            "one the group agreed on"
+        )
+        in_engine = inspect.getsource(ec.DecodeEngineCore).count(
+            "_optimal_cu_fraction("
+        )
+        assert in_engine == 1
+
+    def test_build_only_stamps_the_message(self):
+        """The scheduler stamps; the engine decides what this process runs on.
+        Two owners is how the two drifted apart in the first place."""
+        import ast
+        import inspect
+
+        from conftest import MockConfig
+
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+
+        fn = ast.parse(
+            inspect.getsource(sched.DecodeScheduler.build_prefill_batch).lstrip()
+        ).body[0]
+        assert not [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "set_cu_fraction"
+        ], "build_prefill_batch must not install a fraction"
+
+        from atom.model_engine.sequence import Sequence
+        from atom.sampling_params import SamplingParams
+
+        obj = sched.DecodeScheduler(MockConfig(disagg_constrained=True))
+        obj.waiting.append(
+            Sequence([1, 2, 3, 4], 4, sampling_params=SamplingParams())
+        )
+        msg = obj.build_prefill_batch(cu_fraction=0.5)
+        assert msg.cu_stream_fraction == 0.5
+
+    def test_nothing_in_flight_means_no_mask(self):
+        """A delayer hold dispatches nothing, so there is no prefill on the
+        other half for decode to make room for. Keyed on pending work instead,
+        decode sat on half the device for the whole hold."""
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.DecodeEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        call = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "set_cu_fraction"
+        )
+        expr = call.args[0]
+        assert isinstance(expr, ast.IfExp), ast.unparse(expr)
+        assert isinstance(expr.orelse, ast.Constant) and expr.orelse.value is None, (
+            "with no batch in flight the mask must come off"
+        )
+
+
+
+
+
+
+    def test_decode_does_not_clear_the_fraction_on_its_own(self):
+        """`_schedule`'s early returns used to null it, which would drop the
+        mask while a prefill was still running on the complementary half."""
+        import ast
+        import inspect
+
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+
+        fn = ast.parse(
+            inspect.getsource(sched.DecodeScheduler._schedule).lstrip()
+        ).body[0]
+        writes = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Attribute) and t.attr == "cu_fraction"
+                for t in n.targets
+            )
+        ]
+        assert not writes, "only set_cu_fraction may write the fraction"
+
+
+class TestEveryPrefillRankMeetsOnTheSameStream:
+    """The prefill ranks share one MoE all-to-all per step, so they must all
+    enter it on the same stream.
+
+    The fraction reaches this process inside a `PrefillBatchMsg`, and a rank
+    with no batch has no message -- so a rank that had drained its queue
+    dummied on full CUs while its peers ran masked. Observed on 8 ranks:
+    batch 198 dispatched by 5 of them, ranks 4/5/7 with `running=0 waiting=0`,
+    and `dummy_inflight=356.4s` on exactly those three.
+    """
+
+    def test_the_reduction_precedes_every_early_return(self):
+        """Same rule as the decode group's: gloo matches collectives by
+        arrival order, so a rank that skips this pairs its next
+        `_sync_dp_state` against a peer's reduction here."""
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.PrefillEngineCore._process_engine_step).lstrip()
+        ).body[0]
+        sync = min(
+            n.lineno
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "_sync_prefill_cu_fraction"
+        )
+        first_return = min(
+            n.lineno for n in ast.walk(fn) if isinstance(n, ast.Return)
+        )
+        assert sync < first_return
+
+    def test_it_reduces_with_max(self):
+        """One rank with a masked batch must pull everyone onto that mask."""
+        import ast
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        fn = ast.parse(
+            inspect.getsource(ec.PrefillEngineCore._sync_prefill_cu_fraction).lstrip()
+        ).body[0]
+        call = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "all_reduce"
+        )
+        op = next(k for k in call.keywords if k.arg == "op")
+        assert ast.unparse(op.value).endswith("MAX")
+
+    def test_it_round_trips_a_fraction_without_a_group(self):
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        obj = object.__new__(ec.PrefillEngineCore)
+        obj.dp_group = None
+        assert obj._sync_prefill_cu_fraction(0.5) == 0.5
+        assert obj._sync_prefill_cu_fraction(None) is None
+
+    def test_it_fails_open_to_no_mask(self, caplog, monkeypatch):
+        """An unmasked group is slower than a masked one, never wedged.
+
+        The raise is the RuntimeError gloo actually produces -- the same one
+        `_sync_dp_state` catches -- not whatever a bare stub happens to throw.
+        """
+        import logging
+
+        import torch
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        def _boom(*a, **kw):
+            raise RuntimeError("peer down")
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", _boom)
+
+        obj = object.__new__(ec.PrefillEngineCore)
+        obj.dp_group = object()
+        obj.label = "PrefillEngineCore"
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            got = obj._sync_prefill_cu_fraction(0.5)
+        assert got is None
+        assert "running unmasked" in caplog.text
+
+    def test_the_dummy_runs_on_the_groups_fraction(self):
+        """The dummy exists to match its peers' collective; a masked stream
+        and an unmasked one are not the same place to meet."""
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        obj = object.__new__(ec.PrefillEngineCore)
+        obj._group_cu_fraction = 0.5
+        assert obj._dummy_cu_fraction() == 0.5
+
+    def test_the_base_engine_masks_nothing(self):
+        """Every engine that does not partition CUs keeps the plain stream."""
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        obj = object.__new__(ec.DPEngineCoreProc)
+        assert obj._dummy_cu_fraction() is None
+
+    def test_the_dummy_batch_carries_it(self):
+        """`dummy_execution` built the batch with no fraction at all, so even
+        a uniformly masked group would have met a dummy on full CUs."""
+        import ast
+        import inspect
+
+        mr = pytest.importorskip("atom.model_engine.model_runner")
+
+        fn = ast.parse(
+            inspect.getsource(mr.ModelRunner.dummy_execution).lstrip()
+        ).body[0]
+        assert "cu_stream_fraction" in {a.arg for a in fn.args.args}
+        call = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "ScheduledBatch"
+        )
+        assert any(k.arg == "cu_stream_fraction" for k in call.keywords)
+
+    def test_a_real_batch_is_overridden_with_the_group_fraction(self):
+        """A rank whose own batch says 0.5 and whose peers all say None has to
+        run unmasked, or it is alone on half the device inside their
+        collective."""
+        import inspect
+
+        ec = pytest.importorskip("atom.model_engine.engine_core")
+
+        src = inspect.getsource(ec.PrefillEngineCore._process_engine_step)
+        assert "scheduled_batch.cu_stream_fraction = self._group_cu_fraction" in src
+
+
+class TestMaskingNeedsBothSides:
+    """The split is complementary, so whichever side is idle is holding CUs
+    the other could use. Masking only pays when both halves have work."""
+
+    @staticmethod
+    def _f(decode, prefill):
+        sched = pytest.importorskip("atom.model_engine.scheduler")
+
+        return sched._optimal_cu_fraction(decode, prefill)
+
+    def test_no_decode_means_no_mask(self):
+        """The expensive direction, and the common one.
+
+        An agentic warmup runs for many minutes with `Running: 0` on every
+        decode rank -- every request is still mid-prefill. Masking there halves
+        prefill throughput for the whole phase, and prefill is the only thing
+        happening.
+        """
+        assert self._f(0, 8) is None
+        assert self._f(0, 16384) is None
+
+    def test_no_prefill_means_no_mask(self):
+        assert self._f(7, 0) is None
+
+    def test_neither_means_no_mask(self):
+        assert self._f(0, 0) is None
+
+    def test_both_sides_busy_masks(self):
+        assert self._f(7, 8) == 0.5
+
+    def test_whatever_it_returns_is_buildable(self):
+        """A fraction with no masked stream behind it falls back to full CUs
+        with an error -- correct, but it means the mask silently did nothing."""
+        envs = pytest.importorskip("atom.utils.envs")
+
+        for decode, prefill in ((7, 8), (12, 16384), (1, 1)):
+            f = self._f(decode, prefill)
+            assert f is None or f in envs.ATOM_CU_POOL_FRACTIONS
+
+    def test_an_idle_decode_rank_dispatches_prefill_unmasked(self):
+        """End to end, not just the table: no decode anywhere, so the batch
+        goes out on full CUs."""
+        from conftest import MockConfig
+
+        from atom.model_engine.scheduler import (
+            DecodeScheduler,
+            _optimal_cu_fraction,
+        )
+        from atom.model_engine.sequence import Sequence
+        from atom.sampling_params import SamplingParams
+
+        sched = DecodeScheduler(MockConfig(disagg_constrained=True))
+        sched.waiting.append(
+            Sequence(list(range(8)), 4, sampling_params=SamplingParams())
+        )
+        assert sched.decode_tokens_estimate() == 0
+
+        msg = sched.build_prefill_batch(
+            cu_fraction=_optimal_cu_fraction(
+                sched.decode_tokens_estimate(), sched.prefill_pending_estimate()
+            )
+        )
+        assert msg is not None
+        assert msg.cu_stream_fraction is None, (
+            "prefill is masked to half the device with nothing to decode on "
+            "the other half"
+        )
+
+
+class TestDecodeTokenOperand:
+    """The operand the split is chosen from has to be decode TOKENS."""
+
+    @staticmethod
+    def _sched(mtp):
+        from conftest import MockConfig
+
+        from atom.model_engine.scheduler import DecodeScheduler
+
+        class _Spec:
+            num_speculative_tokens = mtp
+
+            @staticmethod
+            def use_dspark():
+                return True
+
+        return DecodeScheduler(
+            MockConfig(speculative_config=_Spec() if mtp else None)
+        )
+
+    @pytest.mark.parametrize("mtp", [0, 3])
+    def test_the_estimate_matches_what_schedule_produces(self, mtp):
+        """It is read before the batch exists, so it is an estimate -- but it
+        must be the same number `_schedule` goes on to report, or the split is
+        chosen from a quantity nothing else uses."""
+        from atom.model_engine.sequence import Sequence
+        from atom.sampling_params import SamplingParams
+
+        sched = self._sched(mtp)
+        for _ in range(3):
+            sq = Sequence([1, 2, 3, 4], 4, sampling_params=SamplingParams())
+            sched.block_manager.allocate(sq)
+            sched.prefill_done.append(sq)
+
+        # Before `schedule()`, which is when the engine actually reads it --
+        # measuring after lets the promotion hide a queue the estimate misses.
+        estimate = sched.decode_tokens_estimate()
+        batch, _ = sched.schedule()
+        assert estimate == batch.total_tokens_num_decode
+
+    def test_it_is_not_the_running_context_length(self):
+        """What the old call site passed. On agentic traffic that is ~186k
+        tokens per request against a true decode count of `mtp_k + 1` -- four
+        orders of magnitude out, invisible only because the lookup table does
+        not read this operand yet."""
+        from atom.model_engine.sequence import Sequence
+        from atom.sampling_params import SamplingParams
+
+        sched = self._sched(0)
+        sq = Sequence(list(range(4096)), 4, sampling_params=SamplingParams())
+        sched.running.append(sq)
+        assert sched.decode_tokens_estimate() == 1
+        assert sched.decode_tokens_estimate() != sq.num_tokens
+
+
+class TestCuPoolFractions:
+    def test_default_is_the_single_split_it_replaced(self):
+        envs = pytest.importorskip("atom.utils.envs")
+
+        assert envs.ATOM_CU_POOL_FRACTIONS == [0.5]
+
+    @pytest.mark.parametrize("bad", ["0", "1.0", "-0.5", "abc", "0.5,2"])
+    def test_values_outside_the_open_unit_interval_are_refused(
+        self, bad, monkeypatch
+    ):
+        """`_cu_mask_for_fraction` clamps the split to [1, total-1] CUs, so 0.0
+        and 1.0 do not mean "no mask" -- they silently become "one CU" and
+        "all but one", a pathological partition that looks like a working
+        one."""
+        import importlib
+
+        envs = pytest.importorskip("atom.utils.envs")
+
+        monkeypatch.setenv("ATOM_CU_POOL_FRACTIONS", bad)
+        with pytest.raises(ValueError):
+            importlib.reload(envs).ATOM_CU_POOL_FRACTIONS
+
+    def test_values_are_sorted_and_deduplicated(self, monkeypatch):
+        """The pool's key order has to be stable across ranks, and a repeated
+        value must not build the same masked stream twice."""
+        import importlib
+
+        envs = pytest.importorskip("atom.utils.envs")
+
+        monkeypatch.setenv("ATOM_CU_POOL_FRACTIONS", "0.7, 0.3,0.5,0.3")
+        assert importlib.reload(envs).ATOM_CU_POOL_FRACTIONS == [0.3, 0.5, 0.7]
+
+    def test_an_unpooled_fraction_degrades_instead_of_raising(self, caplog):
+        """A bare dict index here is a KeyError on the first forward, after
+        model load and graph capture. The decision path should make it
+        impossible; this turns "should" into a log line."""
+        import logging
+
+        mr = pytest.importorskip("atom.model_engine.model_runner")
+
+        sentinel = object()
+        pool = {None: sentinel}
+        with caplog.at_level(logging.ERROR, logger="atom"):
+            got = mr.RapidServeModelRunner._cu_stream(pool, 0.25, "prefill")
+        assert got is sentinel
+        assert "no entry for cu_stream_fraction" in caplog.text
+
+    def test_a_pooled_fraction_is_returned_without_complaint(self, caplog):
+        import logging
+
+        mr = pytest.importorskip("atom.model_engine.model_runner")
+
+        masked, plain = object(), object()
+        with caplog.at_level(logging.ERROR, logger="atom"):
+            got = mr.RapidServeModelRunner._cu_stream(
+                {None: plain, 0.5: masked}, 0.5, "decode"
+            )
+        assert got is masked
+        assert caplog.text == ""
+
+
 class TestUnconstrainedEmitsOnlyTheNoneStream:
     """The pool's sole key in unconstrained mode is None, so that is the only
     fraction either side may put on a batch.
@@ -1966,7 +2564,7 @@ class TestUnconstrainedEmitsOnlyTheNoneStream:
         from atom.model_engine.scheduler import DecodeScheduler
 
         sched = DecodeScheduler(MockConfig(disagg_constrained=False))
-        assert sched._cu_masking is False
+        assert sched.cu_masking is False
         assert sched.cu_fraction is None
 
 
