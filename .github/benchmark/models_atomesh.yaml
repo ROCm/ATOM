@@ -1467,6 +1467,24 @@ models:
               OFFLOAD_LOAD_WORKERS: "2"
             decode: *kimi_k3_pd_decode_env
 
+        # Test only: the C88 cell with the M-bucket GEMM warmup off.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-nogemmwarm
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 176
+          env:
+            common: *kimi_k3_pp8_reuse_env
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
+              ATOM_PP_MAX_INFLIGHT: "16"
+              OFFLOAD_COPY_WORKERS: "2"
+              OFFLOAD_LOAD_WORKERS: "2"
+              ATOM_WARMUP_GEMM_M_BUCKETS: "0"
+            decode: *kimi_k3_pd_decode_env
+
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
