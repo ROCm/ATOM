@@ -1429,22 +1429,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
             return q, k, v, k_cache, v_cache, k_scale, v_scale
 
-        # MXFP4 KV: the kernel hands back the main q as e4m3 (cast as is, no
-        # per-tensor scale) and writes no bf16 copy of it.
-        q_fp8 = None
-        if self.kv_mxfp4:
-            q_fp8 = torch.empty(
-                (num_tokens, self.num_heads * self.head_dim),
-                dtype=torch.float8_e4m3fn,
-                device=qkv.device,
-            )
-            q_out = None
-        else:
-            q_out = torch.empty(
-                (num_tokens, self.num_heads * self.head_dim),
-                dtype=qkv.dtype,
-                device=qkv.device,
-            )
+        # MXFP4 KV: an e4m3 q_out makes the kernel write the main q as e4m3 (cast
+        # as is, scale 1.0) and no bf16 copy of it, nor write it back into qkv.
+        q_out = torch.empty(
+            (num_tokens, self.num_heads * self.head_dim),
+            dtype=torch.float8_e4m3fn if self.kv_mxfp4 else qkv.dtype,
+            device=qkv.device,
+        )
         index_q = None
         if not self.skip_index_topk:
             # e4m3 (cast as is) for the MXFP4 index's fp8-q scorer
@@ -1484,7 +1475,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             v_scale=fused_v_scale,
             asm_layout=not (self.kv_nvfp4 or self.kv_mxfp4),
             skip_index_branch=self.skip_index_topk,
-            q_fp8_out=q_fp8,
         )
         if self.kv_nvfp4:
             from atom.model_ops.minimax_m3.index_fp4 import kv_nvfp4_store
@@ -1502,7 +1492,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.index_scale,
             )
 
-        q = (q_fp8 if self.kv_mxfp4 else q_out).view(-1, self.num_heads, self.head_dim)
+        q = q_out.view(-1, self.num_heads, self.head_dim)
         self._out_dtype = qkv.dtype
         if index_q is None:
             # top-k-reusing layer: no indexer query, as the Triton branch above
