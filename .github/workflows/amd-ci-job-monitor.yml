@@ -78,7 +78,7 @@ jobs:
                   for log in sorted(directory.glob('slurm-*.err')):
                       print('TASK SLURM STDERR:', log.name, flush=True)
                       for line in collections.deque(log.open(errors='replace'), maxlen=15):
-                          if re.search(r'(?i)error|cancel|timeout|failed|exit', line):
+                          if re.search(r'(?i)error|cancel|timeout|failed|exit|quota|space', line):
                               print(line.rstrip()[:400], flush=True)
                   for result_file in directory.glob('slurm_job-*/benchmark_results/**/profile_export_aiperf.json'):
                       data = json.loads(result_file.read_text())
@@ -113,7 +113,7 @@ jobs:
                                       in_trace = True
                                   if in_trace and len(trace) < 90:
                                       trace.append(line.rstrip()[:450])
-                                  if re.search(r'Capturing|Loading|loaded|Loaded|ready|Traceback|Error:|ERROR|Average toks/fwd|Avg generation|GSM8K', line):
+                                  if re.search(r'Capturing|Loading|loaded|Loaded|ready|Traceback|Error:|ERROR|Average toks/fwd|Avg generation|GSM8K|quota|No space', line):
                                       matches.append(line.rstrip()[:450])
                           print(f'{job.name}/{name}: {log.stat().st_size} bytes; owner_matches_runner={log.stat().st_uid == os.getuid()}', flush=True)
                           print('\n'.join(matches), flush=True)
