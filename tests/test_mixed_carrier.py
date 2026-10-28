@@ -149,3 +149,49 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(monkeypatch)
     )
     assert positions.numel() == p_tokens + n_d
     assert merged.args[2:6] == (n_p, n_d, p_tokens, n_d)
+
+
+def test_mixed_prefill_banks_exist_before_the_first_mixed_step():
+    """The banks are built up front, one per `forward_vars` ring slot, and a
+    lookup never builds one: allocating on the first mixed step would take
+    memory the KV cache was already sized against."""
+    from atom.model_ops.attentions.backends import CommonAttentionBuilder
+
+    get_bank = CommonAttentionBuilder._get_mixed_prefill_bank
+    build_banks = CommonAttentionBuilder.build_mixed_prefill_banks
+    ring = [{"mtp_k": 0}, {"mtp_k": 1}]
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(_fv_ring=ring, _fv_idx=1, h2d_groups=None)
+    )
+    with pytest.raises(RuntimeError, match="build_mixed_prefill_banks"):
+        get_bank(builder)
+
+    build_banks(builder)
+    variables, owner, groups = get_bank(builder)
+    assert variables == ring[1] and variables is not ring[1]
+    assert owner is None and groups is None
+    builder.model_runner._fv_idx = 0
+    assert get_bank(builder)[0] == ring[0]
+
+
+def test_runner_builds_the_banks_before_warmup():
+    """Before `_maybe_warmup`, whose memory profile sizes the KV cache."""
+    runner_src = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "atom/model_engine/model_runner.py"
+    ).read_text(encoding="utf-8")
+    init = next(
+        n
+        for n in ast.walk(ast.parse(runner_src))
+        if isinstance(n, ast.ClassDef) and n.name == "ModelRunner"
+    )
+    body = ast.unparse(
+        next(
+            n
+            for n in init.body
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        )
+    )
+    built = body.index("build_mixed_prefill_banks()")
+    assert body.index("_init_h2d_publication()") < built
+    assert built < body.index("_maybe_warmup()")

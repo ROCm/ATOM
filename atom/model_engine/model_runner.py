@@ -1019,6 +1019,9 @@ class ModelRunner:
             )
         self._init_forward_vars_ring()
         self._init_h2d_publication()
+        if config.enable_mixed_prefill_decode:
+            # Before warmup's memory profile, so the KV budget counts them.
+            self.attn_metadata_builder.build_mixed_prefill_banks()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
