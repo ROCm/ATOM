@@ -22,7 +22,7 @@ kimi_k3 = importlib.import_module("atom.models.kimi_k3")
 def test_e8m0_scale_is_the_fp32_scale_rounded_up_to_a_power_of_two():
     w = torch.randn(300, 520) * 0.02  # neither dim a multiple of 128
     _, s32 = quantize(w, dtypes.fp8)
-    q, se = quantize(w, dtypes.fp8, e8m0_scale=True)
+    q, se = quantize(w, dtypes.fp8, scale_dtype=dtypes.fp8_e8m0)
 
     assert se.dtype == dtypes.fp8_e8m0 and tuple(se.shape) == (3, 5)
     ratio = se.float() / s32
@@ -31,7 +31,10 @@ def test_e8m0_scale_is_the_fp32_scale_rounded_up_to_a_power_of_two():
 
     exact = torch.zeros(128, 128)
     exact[0, 0] = torch.finfo(dtypes.fp8).max * 2.0**-7
-    assert quantize(exact, dtypes.fp8, e8m0_scale=True)[1].float().item() == 2.0**-7
+    assert (
+        quantize(exact, dtypes.fp8, scale_dtype=dtypes.fp8_e8m0)[1].float().item()
+        == 2.0**-7
+    )
 
 
 def _bf16_layer(monkeypatch, e8m0, output_size=2112, source=None, *, load=False):
@@ -144,6 +147,7 @@ def test_online_target_decides_the_scale_format(monkeypatch, e8m0):
     assert layer.quant_type == QuantType.per_1x128
     assert layer.weight_scale.dtype == (dtypes.fp8_e8m0 if e8m0 else torch.float32)
     assert layer.blockscale_e8m0_scale is e8m0
+    assert layer.scale_dtype == layer.weight_scale.dtype
 
 
 def test_online_e8m0_weight_is_padded_to_128_rows(monkeypatch):
@@ -159,15 +163,20 @@ def test_online_e8m0_weight_is_padded_to_128_rows(monkeypatch):
     assert layer.supports_out() is False
 
 
-def test_checkpoint_native_e8m0_weight_is_not_padded():
+@pytest.mark.parametrize(
+    "scale_dtype,gfx", [(torch.float32, "gfx1250"), (dtypes.fp8_e8m0, "gfx950")]
+)
+def test_blockscale_weight_is_padded_only_for_e8m0_on_gfx1250(
+    monkeypatch, scale_dtype, gfx
+):
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: gfx)
     module = SimpleNamespace(
         weight=nn.Parameter(
             torch.zeros(2112, 256, dtype=torch.uint8), requires_grad=False
         ),
-        weight_scale=None,
+        weight_scale=torch.ones(17, 2).to(scale_dtype),
         quant_type=QuantType.per_1x128,
         params_dtype=dtypes.fp8,
-        online_e8m0_blockscale=False,
     )
     assert linear_mod.LinearBase._maybe_pad_a8w8_preshuffle_output(module) is False
 

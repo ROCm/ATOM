@@ -772,15 +772,17 @@ class WeightUpdaterMixin:
     def _logical_weight_shape(
         module: torch.nn.Module, param: torch.nn.Parameter
     ) -> tuple:
-        """Parameter shape without the online-E8M0 output-row pad.
+        """Parameter shape without the E8M0 per_1x128 output-row pad.
 
         Other layouts, including per-token FP8 padding, keep ``param.shape``:
         their scale rows are padded too, and zero-filling before quantize would
         not reproduce that scale.
         """
+        from aiter import dtypes
+
         shape = tuple(param.shape)
         if (
-            not getattr(module, "online_e8m0_blockscale", False)
+            module.weight_scale.dtype != dtypes.fp8_e8m0
             or not getattr(module, "is_output_padded", False)
             or len(shape) != 2
         ):
@@ -809,7 +811,7 @@ class WeightUpdaterMixin:
 
         tensor_gpu = tensor.to(device=self.device, dtype=torch.float32)
 
-        # Online E8M0 per_1x128 stores N padded up to a multiple of 128. The
+        # E8M0 per_1x128 stores N padded up to a multiple of 128. The
         # training weight is the logical, unpadded shape, so shard and compare
         # against that and restore the pad rows before the shape check below.
         logical_shape = self._logical_weight_shape(module, param)
@@ -844,7 +846,7 @@ class WeightUpdaterMixin:
             # produced a 1x128-along-K scale (N, K//128) and sliced it into the
             # (N//128, K//128) buffer, which is inconsistent with the blockscale
             # GEMM and collapses generation after the first weight update.
-            # ``e8m0_scale`` has to be decided here too. Casting an FP32 scale
+            # ``scale_dtype`` has to be decided here too. Casting an FP32 scale
             # to E8M0 afterwards does not round it up to a power of two, and
             # the weight would have been quantized against the unrounded scale.
             from atom.quantization.quark.utils import (
@@ -854,7 +856,7 @@ class WeightUpdaterMixin:
             q_weight, scale = quantize_weight_to_fp8_128x128_blockscale(
                 tensor_gpu,
                 fp8_dtype,
-                e8m0_scale=bool(getattr(module, "online_e8m0_blockscale", False)),
+                scale_dtype=module.weight_scale.dtype,
             )
             # The scale writes ride on the weight's fence: `_await_readers_of`
             # synchronizes the device, so the reader that held the weight held

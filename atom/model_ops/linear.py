@@ -568,6 +568,24 @@ def _a8w8_preshuffle_output_padding(output_size: int) -> int:
     return 0 if remainder == 0 else 128 - remainder
 
 
+def _quant_scale_dtype(quant_type: QuantType, quant_config) -> torch.dtype | None:
+    """Scale dtype a quant scheme stores, for the weight and the activation alike.
+
+    MX (per_1x32) scales are E8M0 by the format; 128x128 blocks are E8M0 when
+    QuantizationConfig.blockscale_e8m0_scale says so; other schemes are FP32.
+    """
+    if quant_type.value == QuantType.No.value:
+        return None
+    if quant_type.value == QuantType.per_1x32.value:
+        return dtypes.fp8_e8m0
+    if (
+        quant_type.value == QuantType.per_1x128.value
+        and quant_config.blockscale_e8m0_scale
+    ):
+        return dtypes.fp8_e8m0
+    return dtypes.fp32
+
+
 def weight_is_stored_preshuffled(
     quant_type: QuantType,
     params_dtype: torch.dtype,
@@ -754,14 +772,8 @@ class LinearBase(nn.Module):
             self.register_parameter("bias", None)
         self.quant_type = quant_type
         self.params_dtype = params_dtype
-        # E8M0 rather than FP32 128x128 block scales, for the weight and the
-        # activation quantized for it alike (QuantizationConfig decides).
-        self.blockscale_e8m0_scale = (
-            quant_type.value == QuantType.per_1x128.value
-            and quant_config.blockscale_e8m0_scale
-        )
+        self.scale_dtype = _quant_scale_dtype(quant_type, quant_config)
         self.native_a8_group_rows = None
-        self.online_e8m0_blockscale = False  # set by online_quantize_weight
         source_block = layer_quant_config.weight_block_size
         native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
             (1, 32),
@@ -858,14 +870,11 @@ class LinearBase(nn.Module):
                     )
                 )
             elif quant_type == QuantType.per_1x128:
-                scale_dtype = (
-                    dtypes.fp8_e8m0 if self.blockscale_e8m0_scale else dtypes.fp32
-                )
                 self.weight_scale = atom_parameter(
                     torch.empty(
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
-                        dtype=scale_dtype,
+                        dtype=self.scale_dtype,
                         device=param_device,
                     )
                 )
@@ -1101,10 +1110,7 @@ class LinearBase(nn.Module):
         weight = self.weight.data
         weight_scale = getattr(self, "weight_scale", None)
         # __init__ decided this from the checkpoint scheme; follow the online target.
-        online_e8m0_scale = (
-            online_quant_type.value == QuantType.per_1x128.value
-            and self.quant_config.blockscale_e8m0_scale
-        )
+        online_scale_dtype = _quant_scale_dtype(online_quant_type, self.quant_config)
         if (
             self.tp_size > 1
             and self.tp_dim is not None
@@ -1196,7 +1202,7 @@ class LinearBase(nn.Module):
                 weight,
                 online_quant_type,
                 online_quant_dtype,
-                blockscale_e8m0_scale=online_e8m0_scale,
+                scale_dtype=online_scale_dtype,
             )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
@@ -1214,8 +1220,7 @@ class LinearBase(nn.Module):
         # Update quant state
         self.quant_type = online_quant_type
         self.params_dtype = online_quant_dtype
-        self.blockscale_e8m0_scale = online_e8m0_scale
-        self.online_e8m0_blockscale = online_e8m0_scale
+        self.scale_dtype = online_scale_dtype
         self.layer_quant_config = online_layer_quant_config
         self._stream_online_quant = False
         self.quant_func = get_hip_quant(online_quant_type)
@@ -1382,8 +1387,12 @@ class LinearBase(nn.Module):
         # already has ceil(N/128) rows, so only the weight is padded.
         is_e8m0_blockscale = (
             self.quant_type.value == QuantType.per_1x128.value
-            and self.online_e8m0_blockscale
+            and self.weight_scale.dtype == dtypes.fp8_e8m0
         )
+        if is_e8m0_blockscale:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            is_e8m0_blockscale = get_gfx_runtime() == "gfx1250"
         if not is_e8m0_blockscale and not (
             self.quant_type.value == QuantType.per_Token.value
             and self.params_dtype == dtypes.fp8
@@ -1439,6 +1448,14 @@ class LinearBase(nn.Module):
         w_dtype = self.params_dtype
         o_dtype = otype
         return f"{self.prefix}[M={m},N={n},K={k},a={a_dtype},w={w_dtype},o={o_dtype}]"
+
+    @property
+    def blockscale_e8m0_scale(self) -> bool:
+        """Whether this layer runs 128x128 block scales in E8M0."""
+        return (
+            self.quant_type.value == QuantType.per_1x128.value
+            and self.scale_dtype == dtypes.fp8_e8m0
+        )
 
     def supports_out(self) -> bool:
         """Whether `forward(out=...)` is wired for this Linear: the unquantised
