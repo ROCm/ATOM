@@ -1992,7 +1992,7 @@ class DeepseekV4Attention(nn.Module):
         return at once: main Compressor -> alt_stream (CSA + HCA), Indexer
         Compressor -> indexer_stream (CSA only). Launched ahead of the Q/KV
         projections, which they then overlap; `_sparse_attention` joins them.
-        A PCP prefill first gathers both projections in one collective.
+        A PCP prefill first gathers their projections in one collective.
 
         A dummy run skips them: warmup runs before allocate_kv_cache, so their
         caches are unbound."""

@@ -339,6 +339,28 @@ def test_grouped_gather_restores_every_tensor_in_one_collective(monkeypatch, ws)
         assert torch.equal(pu.pcp_allgather_rerange(shards[rank][2], ws), fulls[2])
 
 
+def test_grouped_gather_takes_one_tensor_at_a_time_where_aiter_has_no_kernel(
+    monkeypatch,
+):
+    """At 6 ranks aiter's custom all-reduce is on but its all-gatherv kernel is
+    not (2, 4 and 8 only) and would throw: gather each tensor on its own."""
+    ws, n = 6, 12
+    fulls = [torch.arange(n, dtype=torch.int64), torch.randn(n, 3)]
+    shards = [[pu.pcp_round_robin_split(t, ws, r) for t in fulls] for r in range(ws)]
+    gathers = []
+
+    class Group:
+        def all_gather(self, x, dim=0):
+            i = next(i for i, t in enumerate(shards[0]) if t.dtype == x.dtype)
+            gathers.append(i)
+            return torch.cat([s[i] for s in shards])
+
+    monkeypatch.setattr(pu, "get_pcp_group", lambda: Group())
+    got = pu.pcp_allgather_rerange_many(shards[0], ws)
+    assert gathers == [0, 1]
+    assert all(torch.equal(g, f) for g, f in zip(got, fulls))
+
+
 def test_needs_id_sync_is_one_predicate_for_both_groups():
     """PCP and TP gate their id broadcast on the same question."""
     mr = pytest.importorskip("atom.model_engine.model_runner")
@@ -470,7 +492,7 @@ def test_dspark_split_context_kv_projects_each_rank_s_own_rows(monkeypatch):
     run(0, lambda ts, w: gathered)
     for layer, rows in zip(layers, gathered):
         ((written, pos),) = layer.written
-        assert torch.equal(written, rows[:n]) and pos is positions
+        assert torch.equal(written, rows[:n]) and torch.equal(pos[:n], positions[:n])
 
     # Either half of the gate alone keeps the aux path: a draft that cannot
     # project by rows, or a target forward that did not split.

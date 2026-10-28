@@ -148,6 +148,13 @@ def pcp_allgather_rerange_many(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return list(inputs)
+    assert all(t.shape[0] == inputs[0].shape[0] for t in inputs), [
+        t.shape[0] for t in inputs
+    ]
+    # aiter's custom all-gatherv kernel exists for 2, 4 and 8 ranks only, while
+    # its custom all-reduce (which `all_gatherv` tries first) also runs at 6.
+    if pcp_size not in (2, 4, 8):
+        return [pcp_allgather_rerange(t, pcp_size) for t in inputs]
     sent = [
         t.contiguous().view(torch.uint8) if t.element_size() == 1 else t.contiguous()
         for t in inputs
