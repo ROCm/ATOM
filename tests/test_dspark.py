@@ -107,6 +107,33 @@ def test_semi_autoregressive_bias_changes_argmax():
     assert int(combined.argmax(-1)) == 2
 
 
+def test_the_sampled_block_chains_positions_through_the_shared_head():
+    """`DSparkMarkovHead.sample_block_q`, the one sampled loop every flavor
+    shares: position k draws from x_{k-1} into its own column, at store
+    position k, with the noise counter strided by the buffers' max batch."""
+    max_bs, bs, steps, V = 4, 3, 3, 10
+    head = DSparkMarkovHead(vocab_size=V, rank=2)
+    sampling = types.SimpleNamespace(
+        s_scratch=torch.empty(max_bs, V),
+        q_row_base=torch.zeros(max_bs, dtype=torch.int32),
+    )
+    calls = []
+
+    def sample_next_q(prev, base, out, bound, rows, position, noise_offset):
+        calls.append((bound, rows, position, noise_offset))
+        assert torch.equal(base, base_logits[:, position])
+        out.copy_(prev + 1)
+
+    head.sample_next_q = sample_next_q
+    base_logits = torch.randn(bs, steps, V)
+    anchors = torch.tensor([0, 3, 5])
+    drafts = head.sample_block_q(base_logits, anchors, sampling)
+    assert torch.equal(drafts, anchors[:, None] + torch.arange(1, steps + 1))
+    assert calls == [(sampling, bs, k, k * max_bs * V) for k in range(steps)]
+    with pytest.raises(AssertionError, match="score scratch"):
+        head.sample_block_q(torch.randn(bs, steps, V + 1), anchors, sampling)
+
+
 def _real_hf_config_override():
     """Load the real SpeculativeConfig.hf_config_override despite conftest stubs.
 

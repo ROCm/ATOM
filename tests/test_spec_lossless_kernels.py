@@ -558,9 +558,10 @@ def test_unsupported_weights_raise_rather_than_drafting_off_the_global_rng():
 
 
 def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
-    """K3's sampled block: position k drafts from x_{k-1} into row base + k,
-    with the per-row inputs sliced to the running batch and the noise counter
-    strided by the buffers' max batch, exactly as calling the op directly."""
+    """K3's sampled block, the head's shared `sample_block_q`: position k
+    drafts from x_{k-1} into row base + k, with the per-row inputs sliced to
+    the running batch and the noise counter strided by the buffers' max batch,
+    exactly as calling the op directly."""
     from types import SimpleNamespace
 
     from atom.models.dspark_draft import DraftSampling
@@ -587,7 +588,7 @@ def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
         scratch=dspark_markov_sample_scratch(max_bs, vocab, DEV),
     )
     model = SimpleNamespace(markov_head=head, draft_sampling=sampling)
-    drafts = KimiK3DSpark._sample_block_lossless(model, base, anchors)
+    drafts = KimiK3DSpark._sample_block(model, base, anchors)
 
     store = empty_store(3 * steps, width)
     prev = anchors

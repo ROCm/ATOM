@@ -514,8 +514,8 @@ class KimiK3DSpark(DSparkDraftModel):
     ``packed_modules_mapping``.
     """
 
-    # This flavor's markov head implements `sample_next_q` and `_sample_block`
-    # below branches on the binding, so `DSparkProposer` may arm lossless
+    # `_sample_block` below branches on the binding and draws through the
+    # head's `sample_block_q`, so `DSparkProposer` may arm lossless
     # speculative sampling here.
     supports_lossless_draft = True
 
@@ -715,7 +715,9 @@ class KimiK3DSpark(DSparkDraftModel):
         # loop: the block head is captured, so whichever side is taken at warmup
         # is the one every replay runs.
         if self.draft_sampling is not None:
-            return self._sample_block_lossless(base_logits, anchor_ids)
+            return self.markov_head.sample_block_q(
+                base_logits, anchor_ids, self.draft_sampling
+            )
         bs, T, _ = base_logits.shape
         out_ids = anchor_ids.new_empty(bs, T + 1)
         out_ids[:, 0] = anchor_ids
@@ -724,44 +726,5 @@ class KimiK3DSpark(DSparkDraftModel):
             # The column is the op's destination, so no id is written twice.
             self.markov_head.sample_next(
                 out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
-            )
-        return out_ids[:, 1:]
-
-    def _sample_block_lossless(
-        self,
-        base_logits: torch.Tensor,  # [B, T, V]
-        anchor_ids: torch.Tensor,  # [B]
-    ) -> torch.Tensor:
-        """The sampled twin of `_sample_block`:
-
-            logits_k <- U_k + B(x_{k-1}, .)
-            q_k      <- top of softmax(logits_k / T) -- stored at q_store[base + k]
-            x_k      <- q_k                          -- drawn, not argmaxed
-
-        Each row writes its q straight into the persistent row block its
-        request owns, ``draft_sampling.q_row_base`` naming the block; the
-        accept kernel reads it back from there a step later.
-        """
-        sampling = self.draft_sampling
-        bs, num_draft, vocab = base_logits.shape
-        assert sampling.s_scratch.shape[1] == vocab, (
-            f"the score scratch is {sampling.s_scratch.shape[1]} wide but the "
-            f"block scores {vocab} ids"
-        )
-        # The noise counter stride is the buffer's max batch, not this step's,
-        # so the uniform a (position, row, id) draws does not move with the
-        # batch, and no two positions of one block share a counter.
-        position_stride = sampling.q_row_base.shape[0] * vocab
-        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
-        out_ids[:, 0] = anchor_ids
-        for k in range(num_draft):
-            self.markov_head.sample_next_q(
-                out_ids[:, k],
-                base_logits[:, k],
-                out_ids[:, k + 1],
-                sampling,
-                bs,
-                k,
-                k * position_stride,
             )
         return out_ids[:, 1:]

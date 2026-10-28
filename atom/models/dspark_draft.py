@@ -214,6 +214,47 @@ class DSparkMarkovHead(nn.Module):
             sampling.scratch.i32,
         )
 
+    def sample_block_q(
+        self,
+        base_logits: torch.Tensor,  # [B, T, V]
+        anchor_ids: torch.Tensor,  # [B]
+        sampling: "DraftSampling",
+    ) -> torch.Tensor:
+        """The sampled block, left to right, through ``sample_next_q``:
+
+            logits_k <- U_k + B(x_{k-1}, .)
+            q_k      <- top of softmax(logits_k / T) -- stored at q_store[base + k]
+            x_k      <- q_k                          -- drawn, not argmaxed
+
+        Each row writes its q straight into the persistent row block its
+        request owns, ``sampling.q_row_base`` naming the block; the accept
+        kernel reads it back from there a step later. Returns the drafts
+        ``[B, T]``. One loop for every flavor that drafts losslessly, so the
+        noise counters cannot differ between them.
+        """
+        bs, num_draft, vocab = base_logits.shape
+        assert sampling.s_scratch.shape[1] == vocab, (
+            f"the score scratch is {sampling.s_scratch.shape[1]} wide but the "
+            f"block scores {vocab} ids"
+        )
+        # The noise counter stride is the buffer's max batch, not this step's,
+        # so the uniform a (position, row, id) draws does not move with the
+        # batch, and no two positions of one block share a counter.
+        position_stride = sampling.q_row_base.shape[0] * vocab
+        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(num_draft):
+            self.sample_next_q(
+                out_ids[:, k],
+                base_logits[:, k],
+                out_ids[:, k + 1],
+                sampling,
+                bs,
+                k,
+                k * position_stride,
+            )
+        return out_ids[:, 1:]
+
 
 class DSparkConfidenceHead(nn.Module):
     """Per-position survival-probability estimator.
@@ -278,16 +319,16 @@ class DSparkDraftModel(nn.Module):
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
 
-    #: Does this flavor's ``_sample_block`` branch on ``draft_sampling`` and
-    #: draw from, and publish, a real q? An explicit class flag
-    #: rather than a ``hasattr(head, "sample_next_q")`` probe:
-    #: ``DSparkMarkovHead`` is a name carried by two independent classes, so a
-    #: duck-typed probe would arm the other flavor the day its head grew one.
+    #: Does this flavor's block sampler branch on ``draft_sampling`` and draw
+    #: from, and publish, a real q (``DSparkMarkovHead.sample_block_q``)? An
+    #: explicit class flag rather than a probe of the head: every flavor shares
+    #: ``DSparkMarkovHead``, so it has ``sample_block_q`` whether or not the
+    #: flavor's own sampling loop calls it.
     supports_lossless_draft = False
 
     #: Set by ``bind_draft_sampling`` when lossless speculative sampling is on;
-    #: None keeps the greedy block sampler. A class default because every
-    #: flavor's ``_sample_block`` reads it.
+    #: None keeps the greedy block sampler. A class default, so a flavor that
+    #: does not support lossless drafts reads None.
     draft_sampling: "DraftSampling | None" = None
 
     def bind_draft_sampling(self, sampling: "DraftSampling | None") -> None:
