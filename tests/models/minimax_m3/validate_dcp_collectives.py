@@ -151,6 +151,47 @@ def main():
             gathered[:, h * 128 : (h + 1) * 128], torch.full_like(local, h + 1.0)
         )
     torch.testing.assert_close(projection.local_output(gathered), local)
+    graphs = []
+
+    def backend(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    # Fullgraph rejects a Python communicator graph break. Dynamic row counts
+    # exercise the fake output shape without recompiling for every batch size.
+    compiled = torch.compile(
+        lambda x: projection.gather(x[:, 128:256], 128),
+        backend=backend,
+        fullgraph=True,
+        dynamic=True,
+    )
+    for rows in (8, 12):
+        x = torch.full((rows, 384), rank + 2.0, device="cuda", dtype=torch.bfloat16)
+        result = compiled(x)
+        expected = torch.cat(
+            [
+                torch.full((rows, 128), h + 2.0, device="cuda", dtype=torch.bfloat16)
+                for h in range(4)
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(result, expected)
+    assert len(graphs) == 1, (
+        f"DCP projection split or recompiled into {len(graphs)} graphs"
+    )
+    with ps.graph_capture() as context:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=context.stream):
+            captured = compiled(x)
+    x.add_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected + 1)
+    if rank == 0:
+        print(
+            "DCP projection fullgraph dynamic tracing and graph replay passed",
+            flush=True,
+        )
 
     for fmt, page in (("fp8", 16), ("nvfp4", 128)):
         check_format(fmt, page, rank, group)

@@ -251,7 +251,8 @@ def check(rank):
                 running_tokens=8,
             ),
         )
-        actual = layer(pos, x)
+        compiled_layer = torch.compile(layer, backend="eager", fullgraph=True)
+        actual = compiled_layer(pos, x)
         torch.testing.assert_close(
             actual.float(), reference(x, pos), atol=0.005, rtol=0.02
         )

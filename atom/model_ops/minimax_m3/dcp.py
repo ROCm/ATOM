@@ -9,6 +9,26 @@ from atom.model_ops.attention_mha import PagedAttentionImpl, SparseMHAPagedAtten
 from atom.model_ops.dcp_ops import dcp_all_gather_query_heads
 from atom.model_ops.minimax_m3.dcp_attention import attention, index_topk
 from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import decode_rows, prefill_rows
+from atom.utils.custom_register import direct_register_custom_op
+
+
+def _gather_projection(x: torch.Tensor, head_dim: int, world: int) -> torch.Tensor:
+    """Keep communicator setup and backend selection outside Dynamo tracing."""
+    return dcp_all_gather_query_heads(
+        get_dcp_group(), x.contiguous().view(x.shape[0], -1, head_dim)
+    ).flatten(1)
+
+
+def _gather_projection_fake(x: torch.Tensor, head_dim: int, world: int) -> torch.Tensor:
+    return x.new_empty((x.shape[0], x.shape[1] * world))
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_dcp_gather_projection",
+    op_func=_gather_projection,
+    mutates_args=[],
+    fake_impl=_gather_projection_fake,
+)
 
 
 class M3DCPProjection:
@@ -41,9 +61,7 @@ class M3DCPProjection:
     def gather(self, x, dim):
         if self.world == 1:
             return x
-        return dcp_all_gather_query_heads(
-            self.group, x.contiguous().view(x.shape[0], -1, dim)
-        ).flatten(1)
+        return torch.ops.aiter.minimax_m3_dcp_gather_projection(x, dim, self.world)
 
     def local_output(self, x):
         if self.world == 1:

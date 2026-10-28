@@ -29,7 +29,8 @@ currently restricted to S=128.
 ## Compute
 
 TP projection shards gather Q/K/V and index Q in head order; index K is already
-replicated. Fused norm/RoPE writes only owned slots. Each rank scores its owned
+replicated. Projection gathers are registered custom operators with symbolic
+fake output shapes, keeping communicator initialization outside Dynamo tracing. Fused norm/RoPE writes only owned slots. Each rank scores its owned
 index blocks, exchanges scores in global block order, and uses the native packed
 top-k selector, including its init/local priorities and tie-breaking.
 
@@ -72,11 +73,13 @@ each rank receives approximately one quarter, subject to block tails.
   reference, real 64-query-head geometry, independent K/V scales, empty shards,
   causal block boundaries, global top-k and graph replay.
 - `tests/models/minimax_m3/validate_dcp_collectives.py`: four-GPU AITER projection
-  gathers, global top-k, FP32 merge and full attention graph replay.
+  gathers, global top-k, FP32 merge and full attention graph replay. Projection
+  gathers also require one full Dynamo graph across dynamic batch sizes.
 - `tests/models/minimax_m3/validate_dcp_module.py`: the real sparse layer on
   four GPUs, including projection and fused writers, compared with dense
   PyTorch attention over unsharded quantized KV. Checks byte equality and q=8
-  whole-layer graph replay with changed inputs (short contexts, all blocks selected).
+  fullgraph Dynamo tracing and whole-layer graph replay with changed inputs
+  (short contexts, all blocks selected).
   Also checks the real DSpark layer: context writes, noncausal block attention,
   the page-rounded 4096-token window, output reduction and full graph replay.
 - CI accuracy cases: `minimax-m31-flash-mxfp4-1p1d-pp4-dcp4-dspark7-nvfp4-gsm8k-5shot-c32`
