@@ -97,6 +97,21 @@ def _calls(src, name):
         i = k
 
 
+def ctor_missing_kwarg(src, classnames, kwarg):
+    """Names of `classnames` constructor calls in `src` whose paren-balanced argument
+    text does not mention `kwarg`.
+
+    Reuses `_calls`'s paren-balancing (a plain `[^)]*` regex stops at the first close
+    paren, which a multi-line constructor call with nested parens -- e.g. a
+    `quant_config=quant_config` kwarg right before the real close -- breaks silently)."""
+    out = []
+    for name in classnames:
+        for args in _calls(src, name):
+            if not re.search(r"\b" + kwarg + r"\s*=", args):
+                out.append(name)
+    return out
+
+
 def triton_families(add):
     """Triton-specific families. Kept separate from the generic derivation because the
     generic one was tuned on the whole corpus and barely discriminates here: over the 195
@@ -1328,6 +1343,38 @@ def derive(files, title="", raw_diff=""):
     if new_kernel_files or new_dispatch_envvar:
         hit("production-kernel-belongs-in-aiter", "E4")
 
+    # parallel-linear-missing-prefix -- B7, anchored on ATOM#755 (954a66f8c): a
+    # ColumnParallelLinear built with no prefix= queries get_layer_quant_config("") and
+    # silently falls through to the global quant spec instead of the checkpoint's own
+    # exclude-layer config. Scoped to atom/models/ and atom/model_ops/ (model-construction
+    # code) so this does not fire on the LinearBase/ColumnParallelLinear class definitions
+    # themselves, which legitimately have no caller-side prefix= to omit.
+    PARALLEL_LINEAR_CLASSES = ("ColumnParallelLinear", "RowParallelLinear",
+                               "ReplicatedLinear", "MergedColumnParallelLinear",
+                               "QKVParallelLinear")
+    if any(p.startswith(("atom/models/", "atom/model_ops/")) for p in paths) \
+            and ctor_missing_kwarg(add, PARALLEL_LINEAR_CLASSES, "prefix"):
+        hit("parallel-linear-missing-prefix", "B7")
+
+    # stateful-prefix-cache -- I1, pure path trigger. Anchored on issue #1417 / fix PR
+    # #1423 (081045f6a) / follow-up PR #1573: DeepSeek-V4's SWA ring lived outside the
+    # content-addressed paged cache, so a cross-request prefix-cache hit replayed the
+    # compressed KV correctly but read stale per-request SWA state. The files below are
+    # today's locus of that invariant post-fix (atom/model_engine/{state_cache,state_pool,
+    # state_runtime,page_unit_checkpoint,block_manager}.py, the GDN and DSv4 attention
+    # backends, and the plugin bridges both #1423 and its #1573 follow-up had to touch) --
+    # a PR touching any of them is exactly the set this rule needs asked about, regardless
+    # of what its added lines look like.
+    STATEFUL_CACHE_PATHS = (
+        "atom/model_engine/state_cache.py", "atom/model_engine/state_pool.py",
+        "atom/model_engine/state_runtime.py", "atom/model_engine/page_unit_checkpoint.py",
+        "atom/model_engine/block_manager.py", "atom/model_ops/attentions/gdn_attn.py",
+        "atom/model_ops/attentions/deepseek_v4_attn.py",
+        "atom/plugin/sglang/deepseek_v4_bridge.py", "atom/plugin/vllm/deepseek_v4_bridge.py",
+    )
+    if any(p in STATEFUL_CACHE_PATHS for p in paths):
+        hit("stateful-prefix-cache", "I1")
+
     # Triton family (T1 T3 T6 T8), ported from aiter's own review-pr skill. Gated so it
     # only looks at Triton PRs: either the diff adds a `@triton.jit`-decorated kernel, or it
     # touches one of the directories that hold ATOM's Triton kernels today. v4_kernels and
@@ -1352,8 +1399,8 @@ def derive(files, title="", raw_diff=""):
 # The failure is invisible from inside a review -- the ledger only ever sees rules that
 # were derived -- so `triage.py mapping` is what surfaces it.
 #
-# These 19 ids are rules.md bodies with no corresponding family in derive(): the P0 minimal
-# deriver emits only ALL_RULES's 32 ids, and these are the rest. Carried over verbatim from
+# These 12 ids are rules.md bodies with no corresponding family in derive(): the P0 minimal
+# deriver emits only ALL_RULES's 36 ids, and these are the rest. Carried over verbatim from
 # the pre-pipeline SKILL.md prose, same as every rule here -- they are not dead weight, they
 # are P1's raw material for regrowing ATOM's own rule-family axis from real review history.
 # Do not trim rules.md to make this list shrink; the gap is the thing to see, not to hide.
@@ -1365,8 +1412,8 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
     "HK3", "HK6", "HK7",
 )}
 
-ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 C1 C2 D1 D4 D10 D11 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
-             "HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8")
+ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 B7 C1 C2 D1 D4 D10 D11 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
+             "I1 HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert
