@@ -81,3 +81,60 @@ def schedule_bucket_prefix_lengths_tensor(
     ell.scatter_add_(0, request, admitted.long())
     # During startup/no coverage, retain the complete verification layout.
     return torch.where(valid.any(), ell, torch.full_like(ell, gamma))
+
+
+class BucketPolicy:
+    """`bucket_global`: verification lengths priced by the graph each layout
+    actually replays, and the guard that keeps the reserved width when the
+    floors of today's bonus tokens erase the predicted saving."""
+
+    def __init__(self, ragged_graph_sizes: str):
+        self.ragged_graph_sizes = ragged_graph_sizes
+        self._lookup = None
+        self._signature = None
+
+    def ell(self, confidence, sps_table, sts_temperatures):
+        """Per-request verify lengths [bs]; the full width while no decode
+        graph is recorded or a graph is being captured."""
+        from atom.spec_decode.dspark_scheduler import resolve_q_buckets
+        from atom.utils.region_graph import TokenGraph
+
+        bs, width = confidence.shape
+        sizes = TokenGraph.captured_sizes("decode")
+        if not sizes or torch.cuda.is_current_stream_capturing():
+            return torch.full((bs,), width, dtype=torch.long, device=confidence.device)
+        qs = resolve_q_buckets(self.ragged_graph_sizes, width + 1)
+        signature = (sizes, tuple(qs), sps_table.numel())
+        if signature != self._signature:
+            self._lookup = torch.tensor(
+                graph_row_indices(sizes, qs, sps_table.numel() - 1),
+                dtype=torch.long,
+                device="cpu",
+            ).to(device=confidence.device)
+            self._signature = signature
+        return schedule_bucket_prefix_lengths_tensor(
+            confidence.detach(),
+            sps_table,
+            self._lookup,
+            qs,
+            sts_temperatures=sts_temperatures,
+        )
+
+
+def keeps_reserved_width(ragged_rows: int, q: int, full_rows: int, full_q: int) -> bool:
+    """Whether a single-rank step keeps its reserved tokens instead of the
+    ragged layout.
+
+    N-2 decisions meet today's bonus floors here; if those floors erase the
+    predicted graph saving, the reserved tokens stay. This only restores the
+    existing rectangular path; no current draft confidence or speculative token
+    value is consulted. Keep them only when shrinking cannot help: it would
+    leave a recorded graph for an eager step, or land on a graph no smaller. An
+    uncovered full width (e.g. past a DP graph cap) does not veto a covered
+    ragged layout.
+    """
+    from atom.utils.region_graph import TokenGraph
+
+    short = TokenGraph.bucket(ragged_rows, "decode", multiple_of=q)
+    full = TokenGraph.bucket(full_rows, "decode", multiple_of=full_q)
+    return full is not None and (short is None or short >= full)

@@ -74,7 +74,7 @@ def test_a_forward_without_a_usable_verdict_still_counts(prev):
 def test_timing_brackets_the_forward():
     events = []
     runtime = NS(
-        begin=lambda batch, mode: events.append("begin") or "t",
+        begin=lambda batch, mode, dp_state: events.append(("begin", dp_state)) or "t",
         target_done=lambda t: events.append(("target", t)),
         finish=lambda t: events.append(("end", t)),
     )
@@ -82,8 +82,13 @@ def test_timing_brackets_the_forward():
     ctl.forward_begin(NS(), NS())
     ctl.target_done()
     ctl.forward_end()
-    assert events == ["begin", ("target", "t"), ("end", "t")]
+    assert events == [("begin", None), ("target", "t"), ("end", "t")]
     assert ctl._timing is None
+    # Under DP the timer reads the group state the plan settled this step.
+    events.clear()
+    ctl.verify.dp = NS(state="group")
+    ctl.forward_begin(NS(), NS())
+    assert events == [("begin", "group")]
 
 
 def _plan_batch():
@@ -143,3 +148,29 @@ def test_a_declined_plan_leaves_the_batch_alone():
     sync = NS(scheduled_tokens_per_dp_rank=np.array([8]), max_seqlen_q_across_dp=None)
     assert plan.apply(np.zeros((1, 1)), sync) is None
     assert batch.total_tokens_num == 8
+
+
+def test_the_reserved_width_guard_is_single_rank_bucket_global_only(monkeypatch):
+    from atom.utils.region_graph import TokenGraph
+
+    graphs = [12, 24, 36]
+    monkeypatch.setattr(
+        TokenGraph,
+        "bucket",
+        staticmethod(
+            lambda rows, kind, multiple_of: next(
+                (g for g in graphs if g >= rows and g % multiple_of == 0), None
+            )
+        ),
+    )
+    ctl = _controller(bucket=object())
+    ctl.runner = NS(config=NS(parallel_config=NS(data_parallel_size=1)))
+    assert ctl.keeps_reserved_width(10, 2, 12, 6)  # same graph: keep
+    assert not ctl.keeps_reserved_width(10, 2, 30, 6)  # 12 < 36: shrink
+    assert ctl.keeps_reserved_width(40, 2, 30, 6)  # ragged uncovered: keep
+    assert not ctl.keeps_reserved_width(10, 2, 40, 6)  # full uncovered: shrink
+    ctl.runner.config.parallel_config.data_parallel_size = 2
+    assert not ctl.keeps_reserved_width(10, 2, 12, 6)
+    ctl.runner.config.parallel_config.data_parallel_size = 1
+    ctl.verify.bucket = None
+    assert not ctl.keeps_reserved_width(10, 2, 12, 6)

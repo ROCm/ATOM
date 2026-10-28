@@ -64,7 +64,6 @@ class Timing:
 
 class DSparkRuntime:
     def __init__(self, runner, *, comm=None, event_factory=None):
-        validate_online_runtime(runner.config)
         self.runner = runner
         cfg = runner.config.dspark
         # Bound to the measured curve by VerifyScheduler.bind_sps: from the
@@ -78,7 +77,7 @@ class DSparkRuntime:
 
             comm = DSparkComm()
         self.comm = comm
-        self.dp_state = None
+        # The joint DP planner, for its counters in the published snapshot.
         self.dp_planner = None
         self.event_factory = event_factory or (
             lambda: torch.cuda.Event(enable_timing=True)
@@ -99,11 +98,12 @@ class DSparkRuntime:
         )
         self.table_cache.clear()
 
-    def begin(self, batch, forward_mode):
-        # Under DP the planner publishes a group-wide decode predicate and a
-        # request-set generation before shape agreement. Dummy ranks take part
-        # in both timing and publication; mixed P/D steps take part in neither.
-        dp = self.dp_state
+    def begin(self, batch, forward_mode, dp_state=None):
+        # Under DP the planner settles a group-wide decode predicate and a
+        # request-set generation (`dp_state`) at shape agreement. Dummy ranks
+        # take part in both timing and publication; mixed P/D steps take part
+        # in neither.
+        dp = dp_state
         if self.model is None:
             return None  # warmup and capture run before the curve exists
         if self.comm.dp_size > 1 and (dp is None or not dp.pure_decode):

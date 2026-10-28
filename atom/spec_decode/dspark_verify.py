@@ -37,6 +37,12 @@ class VerifyScheduler:
     it only SIZES the next verify, and a short one is re-drafted next step.
     """
 
+    # Online parts, set by `build_online_parts`; None when off.
+    runtime = None
+    sts = None
+    dp = None
+    bucket = None
+
     def __init__(self, runner):
         # runner: provides the shared async D2H stream (tokenID_processor).
         self.runner = runner
@@ -51,42 +57,13 @@ class VerifyScheduler:
             self.sps_table, self.sts_temperatures = load_calibration(
                 runner.config, runner.device
             )
-        # One set of TP/DP CPU groups for every DSpark collective below.
-        from atom.spec_decode.dspark_comm import DSparkComm
+        # The optional online parts (`build_online_parts`); bucket_global's
+        # graph-priced policy.
+        from atom.spec_decode.dspark_controller import build_online_parts
 
-        comm = DSparkComm()
-        self.runtime = None
-        self._bucket_lookup = None
-        self._bucket_signature = None
-        if getattr(runner.config.dspark, "bucket_global", False):
-            from atom.spec_decode.dspark_runtime import validate_online_runtime
-
-            validate_online_runtime(runner.config)
-        if getattr(runner.config.dspark, "online_sps", False):
-            from atom.spec_decode.dspark_runtime import DSparkRuntime
-
-            self.runtime = DSparkRuntime(runner, comm=comm)
-        self.dp = None
-        if runner.config.parallel_config.data_parallel_size > 1 and (
-            runner.config.dspark.online_sps or runner.config.dspark.bucket_global
-        ):
-            from atom.spec_decode.dspark_dp import DPVerifyPlanner
-
-            self.dp = DPVerifyPlanner(self, comm=comm)
+        build_online_parts(self, runner)
         if self.sps_table is not None:
             self.bind_sps(self.sps_table)
-        # No calibration profile supplies temperatures: fit them online.
-        self.sts = None
-        if (
-            self.sts_temperatures is None
-            and getattr(runner.config.dspark, "confidence_schedule", False)
-            and getattr(runner.config.dspark, "online_sts", True)
-        ):
-            from atom.spec_decode.online_sts import OnlineSTS
-
-            self.sts = OnlineSTS(
-                self, runner.config.speculative_config.num_speculative_tokens, comm=comm
-            )
         self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
         # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.
@@ -131,19 +108,16 @@ class VerifyScheduler:
         from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths_tensor
 
         bs, L = confidence.shape
-        sts = getattr(self, "sts", None)
-        if sts is not None:
-            sts.capture(confidence)
-        dp = getattr(self, "dp", None)
-        if dp is not None:
+        if self.sts is not None:
+            self.sts.capture(confidence)
+        if self.dp is not None:
             # The DP planner also consumes this confidence at N+2, jointly with
             # every peer's frontier. The local budget below stays the fallback
             # for every step the joint plan does not improve on.
-            dp.capture(confidence)
+            self.dp.capture(confidence)
         sps_table = self.sps_table
-        runtime = getattr(self, "runtime", None)
-        if runtime is not None and sps_table is not None:
-            measured_table = runtime.table(sps_table, bs)
+        if self.runtime is not None and sps_table is not None:
+            measured_table = self.runtime.table(sps_table, bs)
             if not self.runner.config.dspark.online_sps_observe_only:
                 sps_table = measured_table
         if sps_table is None:
@@ -162,33 +136,8 @@ class VerifyScheduler:
             sps_table = torch.linspace(
                 1.0, 0.1, steps=dp * bs * (L + 1) + 1, device=confidence.device
             )
-        if getattr(self.runner.config.dspark, "bucket_global", False):
-            from atom.spec_decode.dspark_bucket import (
-                graph_row_indices,
-                schedule_bucket_prefix_lengths_tensor,
-            )
-            from atom.spec_decode.dspark_scheduler import resolve_q_buckets
-            from atom.utils.region_graph import TokenGraph
-
-            sizes = TokenGraph.captured_sizes("decode")
-            if not sizes or torch.cuda.is_current_stream_capturing():
-                return torch.full((bs,), L, dtype=torch.long, device=confidence.device)
-            qs = resolve_q_buckets(self.runner.config.dspark.ragged_graph_sizes, L + 1)
-            signature = (sizes, tuple(qs), sps_table.numel())
-            if signature != self._bucket_signature:
-                self._bucket_lookup = torch.tensor(
-                    graph_row_indices(sizes, qs, sps_table.numel() - 1),
-                    dtype=torch.long,
-                    device="cpu",
-                ).to(device=confidence.device)
-                self._bucket_signature = signature
-            return schedule_bucket_prefix_lengths_tensor(
-                confidence.detach(),
-                sps_table,
-                self._bucket_lookup,
-                qs,
-                sts_temperatures=self.sts_temperatures,
-            )
+        if self.bucket is not None:
+            return self.bucket.ell(confidence, sps_table, self.sts_temperatures)
         return schedule_prefix_lengths_tensor(
             confidence.detach(),
             sps_table,
@@ -249,12 +198,10 @@ class VerifyScheduler:
         The copy is queued here; ``_resolve_ell`` adopts it once it is
         ``_ELL_GENERATION`` steps old.
         """
-        sts = getattr(self, "sts", None)
-        if sts is not None:
-            sts.record(req_ids)
-        dp = getattr(self, "dp", None)
-        if dp is not None:
-            dp.record(req_ids)
+        if self.sts is not None:
+            self.sts.record(req_ids)
+        if self.dp is not None:
+            self.dp.record(req_ids)
         ell = self._last_ell
         if ell is None:
             self._ell_pending.clear()
@@ -340,9 +287,8 @@ class VerifyScheduler:
         # Direct assignment (e.g. reset to {}) drops the in-flight copies too.
         self._ell_map = value
         self._ell_pending.clear()
-        dp = getattr(self, "dp", None)
-        if dp is not None:
-            dp.invalidate()
+        if self.dp is not None:
+            self.dp.invalidate()
 
     def ell_nonblocking(self) -> dict:
         """Non-blocking read for the SAME-step postprocess path (carried back to

@@ -2532,32 +2532,10 @@ class ModelRunner:
             if not self._tr_hybrid_active():
                 return  # stay rectangular
 
-            if (
-                self.config.dspark.bucket_global
-                and self.config.parallel_config.data_parallel_size == 1
+            if self.dspark is not None and self.dspark.keeps_reserved_width(
+                int(new_len.sum()), q_eff, int(old_nst[:scheduled_bs].sum()), full_q
             ):
-                from atom.utils.region_graph import TokenGraph
-
-                short_graph = TokenGraph.bucket(
-                    int(new_len.sum()), "decode", multiple_of=q_eff
-                )
-                full_graph = TokenGraph.bucket(
-                    int(old_nst[:scheduled_bs].sum()), "decode", multiple_of=full_q
-                )
-                # N-2 decisions meet today's bonus floors here. If those floors
-                # erase the predicted graph saving, keep the reserved tokens.
-                # This only restores the existing rectangular path; no current
-                # draft confidence or speculative token value is consulted.
-                # Keep the reserved tokens only when shrinking cannot help: it
-                # would leave a recorded graph for an eager step, or land on a
-                # graph no smaller. An uncovered full width (e.g. past a DP
-                # graph cap) does not veto a covered ragged layout.
-                if (short_graph is None and full_graph is not None) or (
-                    short_graph is not None
-                    and full_graph is not None
-                    and short_graph >= full_graph
-                ):
-                    return
+                return
 
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
         # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft

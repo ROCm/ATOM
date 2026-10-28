@@ -10,11 +10,55 @@ capture; nothing in the runner reaches into those components directly.
     forward        -> forward_begin / target_done / forward_end
     postprocess    -> observe_verdict / observe_no_verdict
     capture        -> bind_startup_sps(max_q_len)
+
+`build_online_parts` is where those components are validated and created.
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+
+def build_online_parts(verify, runner) -> None:
+    """Validate the online configuration once and attach the enabled parts to
+    `verify`: the online SPS timer, the joint DP planner, the online STS
+    collector and the graph-priced bucket policy. Every collective among them
+    shares one `DSparkComm`."""
+    config = runner.config
+    dspark = config.dspark
+    online = dspark.online_sps or dspark.bucket_global
+    if online:
+        from atom.spec_decode.dspark_runtime import validate_online_runtime
+
+        validate_online_runtime(config)
+    from atom.spec_decode.dspark_comm import DSparkComm
+
+    comm = DSparkComm()
+    if dspark.online_sps:
+        from atom.spec_decode.dspark_runtime import DSparkRuntime
+
+        verify.runtime = DSparkRuntime(runner, comm=comm)
+    if online and config.parallel_config.data_parallel_size > 1:
+        from atom.spec_decode.dspark_dp import DPVerifyPlanner
+
+        verify.dp = DPVerifyPlanner(verify, comm=comm)
+        if verify.runtime is not None:
+            verify.runtime.dp_planner = verify.dp
+    # No calibration profile supplies temperatures: fit them online.
+    if (
+        verify.sts_temperatures is None
+        and dspark.confidence_schedule
+        and dspark.online_sts
+    ):
+        from atom.spec_decode.online_sts import OnlineSTS
+
+        verify.sts = OnlineSTS(
+            verify, config.speculative_config.num_speculative_tokens, comm=comm
+        )
+    if dspark.bucket_global:
+        from atom.spec_decode.dspark_bucket import BucketPolicy
+
+        verify.bucket = BucketPolicy(dspark.ragged_graph_sizes)
 
 
 class DPPlan:
@@ -94,8 +138,16 @@ class DSparkController:
 
     # -- forward ------------------------------------------------------------
     def forward_begin(self, batch, forward_mode) -> None:
+        """`prepare_model` settled the planner's group state for this step
+        (`DPPlan.apply`), so the timer reads the step it is timing."""
         runtime = self.verify.runtime
-        self._timing = None if runtime is None else runtime.begin(batch, forward_mode)
+        if runtime is None:
+            self._timing = None
+            return
+        planner = self.verify.dp
+        self._timing = runtime.begin(
+            batch, forward_mode, None if planner is None else planner.state
+        )
 
     def target_done(self) -> None:
         if self.verify.runtime is not None:
@@ -107,6 +159,20 @@ class DSparkController:
         if self.verify.runtime is not None:
             self.verify.runtime.finish(self._timing)
         self._timing = None
+
+    # -- ragged layout ------------------------------------------------------
+    def keeps_reserved_width(self, ragged_rows, q, full_rows, full_q) -> bool:
+        """`bucket_global` on a single rank: keep the reserved tokens when the
+        ragged layout would not replay a smaller graph (`keeps_reserved_width`
+        in `dspark_bucket`). Under DP the joint plan settles the shape."""
+        if (
+            self.verify.bucket is None
+            or self.runner.config.parallel_config.data_parallel_size != 1
+        ):
+            return False
+        from atom.spec_decode.dspark_bucket import keeps_reserved_width
+
+        return keeps_reserved_width(ragged_rows, q, full_rows, full_q)
 
     # -- postprocess --------------------------------------------------------
     def observe_verdict(self, prev_batch, prev_bonus_num) -> bool:

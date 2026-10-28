@@ -331,9 +331,6 @@ class DPVerifyPlanner:
             not headers[:, 0].any() and bool(headers[:, 1].sum()),
         )
         runtime = self.scheduler.runtime
-        if runtime is not None:
-            runtime.dp_state = self.state
-            runtime.dp_planner = self
         if not self.state.pure_decode or not headers[:, 3].all() or not self._captured:
             return None
         model = runtime.model if runtime is not None and not self.observe_only else None
