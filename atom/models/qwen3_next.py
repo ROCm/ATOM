@@ -37,7 +37,11 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
-from atom.model_ops.triton_mrope import try_fused_qk_norm_mrope, try_mrope_qk_fused
+from atom.model_ops.triton_mrope import (
+    gfx1250_fused_qk_norm_mrope_cache_applies,
+    try_fused_qk_norm_mrope,
+    try_mrope_qk_fused,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -47,7 +51,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.plugin.prepare import is_vllm
+from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
@@ -386,8 +390,18 @@ class Qwen3NextAttention(nn.Module):
 
         from atom.model_ops.base_attention import Attention
 
+        # The attention runs the Q/K norm, the RoPE and the KV cache write. On
+        # gfx1250, ATOM's own attention does this for Qwen3.5 by default, in one
+        # aiter kernel (try_fused_qk_norm_mrope_cache). Plugin mode keeps the
+        # separate kernels (not validated there).
+        self.fuse_qk_norm_rope_cache = ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION or (
+            not is_plugin_mode()
+            and gfx1250_fused_qk_norm_mrope_cache_applies(
+                self.rotary_emb, self.head_dim, atom_config.kv_cache_dtype
+            )
+        )
         fusion_kwargs = {}
-        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if self.fuse_qk_norm_rope_cache:
             fusion_kwargs = {
                 "rotary_emb": self.rotary_emb,
                 "q_norm": self.q_norm,
@@ -433,7 +447,7 @@ class Qwen3NextAttention(nn.Module):
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
-        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if self.fuse_qk_norm_rope_cache:
             # Pass the packed [q, k, v] tensor (gate excluded) for smuggling
             # through vLLM's typed custom op which requires Tensor args.
             # qkv_packed = qkv[:, self.q_size :] if self.attn_output_gate else qkv
