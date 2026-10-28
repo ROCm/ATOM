@@ -157,6 +157,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if callable(callback):
             callback(req_ids)
 
+    def release_deferred_events(self) -> None:
+        """Forward safe-point reclamation when the backend owns IPC events."""
+        callback = getattr(self._impl, "release_deferred_events", None)
+        if callable(callback):
+            callback()
+
     def close(self) -> None:
         """Join the impl's save/load executors at worker teardown.
 
