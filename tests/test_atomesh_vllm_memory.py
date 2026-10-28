@@ -20,7 +20,7 @@ import pd_vllm_memory as memory
 def marker(root, job='42', token='token-42', node='pit2-p03-g12'):
     memory.write_json(root / memory.MARKER, {
         'schema': 1, 'job_id': job, 'run_token': token, 'node': node,
-        'reason': 'thp_shortfall', 'phase': 'smoke', 'retry_rc': 86,
+        'reason': 'rdma_registration_enomem', 'phase': 'smoke', 'retry_rc': 86,
     })
     (root / 'rank-rc-0').write_text('86\n')
 
@@ -83,32 +83,136 @@ class MemoryRecoveryTest(unittest.TestCase):
                 self.assertEqual(memory.recover_host(root, '42', 'token-42', 'pit2-p03-g12'), 86)
                 self.assertEqual(run.call_count, 1)
 
-    def test_thp_shortfall_is_fatal_and_records_allocation_marker(self):
+    def test_only_actual_registration_enomem_records_retry_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            phase = root / 'smoke'
-            phase.mkdir()
+            with patch.dict(os.environ, {'RUN_DIR': str(root), 'ATOMESH_ALLOCATION_RUN_DIR': str(root),
+                    'SLURM_JOB_ID': '42', 'ATOMESH_RUN_TOKEN': 'token-42',
+                    'ATOMESH_ALLOCATED_NODE': 'pit2-p03-g12'}):
+                for reason in ('thp_shortfall', 'thp_timeout', 'numa_unavailable', 'memory_budget'):
+                    with self.assertRaises(ValueError):
+                        memory.memory_failure(reason, root / 'smoke')
+                self.assertFalse((root / memory.MARKER).exists())
+                with self.assertRaises(memory.StoreMemoryUnavailable):
+                    memory.memory_failure('rdma_registration_enomem', root / 'smoke')
+                self.assertEqual(memory.valid_marker(root, '42', 'token-42')['reason'],
+                                 'rdma_registration_enomem')
+
+
+class THPPreparationTest(unittest.TestCase):
+    def test_partial_timeout_helper_failure_and_bad_results_continue_to_next_node(self):
+        for mode in ('partial', 'timeout', 'nonzero', 'missing', 'malformed'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                probes = []
+                def run(cmd, **kwargs):
+                    if 'probe' not in cmd:
+                        return subprocess.CompletedProcess(cmd, 0)
+                    node = int(cmd[2])
+                    probes.append(node)
+                    output = Path(cmd[cmd.index('--output') + 1])
+                    if node == 0:
+                        if mode == 'timeout':
+                            raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+                        if mode == 'nonzero':
+                            return subprocess.CompletedProcess(cmd, -9)
+                        if mode == 'missing':
+                            return subprocess.CompletedProcess(cmd, 0)
+                        if mode == 'malformed':
+                            output.write_text('[]')
+                            return subprocess.CompletedProcess(cmd, 0)
+                    memory.write_json(output, {'requested_bytes': memory.GIB,
+                        'huge_bytes': memory.GIB // 2 if node == 0 else memory.GIB})
+                    return subprocess.CompletedProcess(cmd, 0)
+                with patch.object(memory, 'cpu_numa_nodes', return_value=[0, 1]), \
+                     patch('numa_memory_budget.node_meminfo', return_value={
+                         'MemFree': 128 * memory.GIB, 'Active(file)': 0, 'Inactive(file)': 0}), \
+                     patch.object(memory.subprocess, 'run', side_effect=run), \
+                     patch.object(memory, 'memory_failure') as failure:
+                    state = memory.prepare({'global_segment_size': memory.GIB // 4}, '/snapshot', root)
+                self.assertEqual(probes, [0, 1])
+                self.assertEqual(state['status'], 'completed_with_warnings')
+                self.assertEqual(state['nodes'][1]['status'], 'completed')
+                expected = {'partial': 'thp_shortfall', 'timeout': 'thp_timeout',
+                            'nonzero': 'probe_failed', 'missing': 'probe_result_unavailable',
+                            'malformed': 'probe_result_unavailable'}[mode]
+                self.assertEqual(state['nodes'][0]['status'], expected)
+                if mode == 'partial':
+                    self.assertEqual(state['nodes'][0]['huge_bytes'], memory.GIB // 2)
+                else:
+                    self.assertIsNone(state['nodes'][0]['huge_bytes'])
+                self.assertEqual(json.loads((root / 'memory-preparation.json').read_text()), state)
+                failure.assert_not_called()
+                self.assertFalse((root / memory.MARKER).exists())
+
+    def test_successful_ci_budget_uses_global_segments_and_reclaimable_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+            def info(sysfs, node):
+                events.append(('meminfo', node))
+                return {'MemFree': (300 if node == 0 else 44) * memory.GIB,
+                        'Active(file)': 10 * memory.GIB, 'Inactive(file)': 10 * memory.GIB}
             def run(cmd, **kwargs):
                 if 'probe' in cmd:
+                    events.append(('probe', int(cmd[2]), cmd[cmd.index('--gib') + 1]))
+                    size = int(cmd[cmd.index('--gib') + 1]) * memory.GIB
                     memory.write_json(Path(cmd[cmd.index('--output') + 1]),
-                                      {'requested_bytes': memory.GIB, 'huge_bytes': memory.GIB // 2})
+                                      {'requested_bytes': size, 'huge_bytes': size})
+                else:
+                    events.append('evict')
                 return subprocess.CompletedProcess(cmd, 0)
-            with patch.dict(os.environ, {'RUN_DIR': str(phase), 'ATOMESH_ALLOCATION_RUN_DIR': str(root),
-                     'SLURM_JOB_ID': '42', 'ATOMESH_RUN_TOKEN': 'token-42',
-                     'ATOMESH_ALLOCATED_NODE': 'pit2-p03-g12'}), \
-                 patch.object(memory, 'plan_pins', return_value={0: 1}), \
-                 patch('numa_memory_budget.check_budget', return_value=0), \
+            with patch.object(memory, 'cpu_numa_nodes', return_value=[0, 1]), \
+                 patch('numa_memory_budget.node_meminfo', side_effect=info), \
                  patch.object(memory.subprocess, 'run', side_effect=run):
-                with self.assertRaises(memory.StoreMemoryUnavailable):
-                    memory.prepare({}, '/models/snapshot', phase)
-            self.assertEqual(memory.valid_marker(root, '42', 'token-42')['reason'], 'thp_shortfall')
-            self.assertEqual(json.loads((phase / 'memory-preparation.json').read_text())['status'], 'thp_shortfall')
+                state = memory.prepare({'global_segment_size': 128 * memory.GIB,
+                                        'local_buffer_size': 4 * memory.GIB}, '/snapshot', tmp)
+            self.assertEqual(events, ['evict', ('meminfo', 0), ('probe', 0, '256'), ('meminfo', 1)])
+            self.assertEqual(state['nodes'][0]['desired_bytes'], 512 * memory.GIB)
+            self.assertEqual(state['nodes'][1]['status'], 'skipped_low_memory')
+            self.assertEqual(state['status'], 'completed_with_warnings')
 
+    def test_cache_eviction_failure_and_timeout_still_attempt_thp(self):
+        for mode in ('nonzero', 'timeout'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                probes = []
+                def run(cmd, **kwargs):
+                    if 'probe' in cmd:
+                        probes.append(cmd)
+                        memory.write_json(Path(cmd[cmd.index('--output') + 1]),
+                                          {'huge_bytes': memory.GIB})
+                        return subprocess.CompletedProcess(cmd, 0)
+                    if mode == 'timeout':
+                        raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+                    return subprocess.CompletedProcess(cmd, 1)
+                with patch.object(memory, 'cpu_numa_nodes', return_value=[0]), \
+                     patch('numa_memory_budget.node_meminfo', return_value={
+                         'MemFree': 128 * memory.GIB, 'Active(file)': 0, 'Inactive(file)': 0}), \
+                     patch.object(memory.subprocess, 'run', side_effect=run):
+                    state = memory.prepare({'global_segment_size': memory.GIB // 8}, '/snapshot', tmp)
+                self.assertEqual(len(probes), 1)
+                self.assertEqual(state['nodes'][0]['status'], 'completed')
+                self.assertEqual(state['status'], 'completed_with_warnings')
+
+    def test_unavailable_numa_information_does_not_gate_store(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(memory, 'cpu_numa_nodes', side_effect=OSError('unavailable')), \
+             patch.object(memory.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            state = memory.prepare({'global_segment_size': memory.GIB}, '/snapshot', tmp)
+            self.assertEqual(state['status'], 'completed_with_warnings')
+            self.assertEqual(state['nodes'], [])
+
+    def test_probe_shortfall_exits_zero_and_preserves_measured_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'probe.json'
+            with patch.object(sys, 'argv', ['pd_vllm_memory.py', 'probe', '--gib', '1', '--output', str(output)]), \
+                 patch('compact_huge_pages.fault_huge_pages', return_value=(memory.GIB, memory.GIB // 2, 0.1)):
+                self.assertEqual(memory.main(), 0)
+            self.assertEqual(json.loads(output.read_text())['huge_bytes'], memory.GIB // 2)
 
 
 class PostLoadPreparationTest(unittest.TestCase):
     def test_both_roles_arrive_before_one_preparation_and_all_continue(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare') as prepare:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare', return_value={'status': 'completed'}) as prepare:
             root = Path(tmp)
             participants = [(role, rank) for role in ('prefill', 'decode') for rank in range(4)]
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -126,8 +230,36 @@ class PostLoadPreparationTest(unittest.TestCase):
                     future.result(timeout=6)
             prepare.assert_called_once_with({}, '/snapshot', root)
             result = json.loads((root / 'store-memory-gate/result.json').read_text())
-            self.assertEqual(result['status'], 'prepared')
+            self.assertEqual(result['status'], 'completed')
             self.assertEqual(len(result['workers']), 8)
+
+    def test_all_workers_attempt_store_after_partial_thp_and_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registrations = []
+            def run(cmd, **kwargs):
+                if 'probe' in cmd:
+                    if cmd[2] == '1':
+                        raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
+                    memory.write_json(Path(cmd[cmd.index('--output') + 1]), {'huge_bytes': memory.GIB // 2})
+                return subprocess.CompletedProcess(cmd, 0)
+            def worker(role, rank):
+                memory.prepare_after_load({'global_segment_size': memory.GIB // 4}, '/snapshot', root, role, rank, 5)
+                registrations.append((role, rank))
+            with patch.object(memory, 'cpu_numa_nodes', return_value=[0, 1]), \
+                 patch('numa_memory_budget.node_meminfo', return_value={
+                     'MemFree': 128 * memory.GIB, 'Active(file)': 0, 'Inactive(file)': 0}), \
+                 patch.object(memory.subprocess, 'run', side_effect=run) as command:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = [pool.submit(worker, r, i) for r in ('prefill', 'decode') for i in range(4)]
+                    for future in futures:
+                        future.result(timeout=6)
+            self.assertEqual(command.call_count, 3)  # One eviction, two probes, once for all ranks.
+            self.assertEqual(len(registrations), 8)
+            result = json.loads((root / 'store-memory-gate/result.json').read_text())
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['preparation_status'], 'completed_with_warnings')
+            self.assertFalse((root / memory.MARKER).exists())
 
     def test_missing_worker_times_out_without_cleaning(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare') as prepare:
@@ -135,25 +267,25 @@ class PostLoadPreparationTest(unittest.TestCase):
                 memory.prepare_after_load({}, '/snapshot', tmp, 'prefill', 0, timeout=0)
             prepare.assert_not_called()
 
-    def test_thp_failure_releases_all_peers_and_preserves_retry_marker(self):
+    def test_unexpected_preparation_error_releases_all_peers_as_failed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             phase = root / 'smoke'
             with patch.dict(os.environ, {'RUN_DIR': str(phase), 'ATOMESH_ALLOCATION_RUN_DIR': str(root),
                     'SLURM_JOB_ID': '42', 'ATOMESH_RUN_TOKEN': 'token-42',
                     'ATOMESH_ALLOCATED_NODE': 'pit2-p03-g12'}), \
-                 patch.object(memory, 'prepare', side_effect=lambda *args: memory.memory_failure('thp_timeout', phase)) as prepare:
+                 patch.object(memory, 'prepare', side_effect=RuntimeError('unexpected preparation error')) as prepare:
                 with ThreadPoolExecutor(max_workers=8) as pool:
                     futures = [pool.submit(memory.prepare_after_load, {}, '/snapshot', phase, r, i, 5)
                                for r in ('prefill', 'decode') for i in range(4)]
                     for future in futures:
-                        with self.assertRaisesRegex(RuntimeError, 'thp_timeout'):
+                        with self.assertRaisesRegex(RuntimeError, 'unexpected preparation error'):
                             future.result(timeout=6)
                 prepare.assert_called_once()
-            self.assertEqual(memory.valid_marker(root, '42', 'token-42')['phase'], 'smoke')
+            self.assertFalse((root / memory.MARKER).exists())
             self.assertEqual(json.loads((phase / 'store-memory-gate/result.json').read_text())['status'], 'failed')
 
-    def test_worker_only_initializes_store_after_preparation_succeeds(self):
+    def test_worker_prepares_before_store_and_propagates_unexpected_errors(self):
         events = []
         class NativeWorker:
             def initialize_from_config(self, config):
@@ -178,8 +310,8 @@ class PostLoadPreparationTest(unittest.TestCase):
             events.clear()
             with patch.dict(os.environ, {'MOONCAKE_CONFIG_PATH': str(config),
                     'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill'}), \
-                 patch.object(worker_module, 'prepare_after_load', side_effect=memory.StoreMemoryUnavailable('shortfall')):
-                with self.assertRaises(memory.StoreMemoryUnavailable):
+                 patch.object(worker_module, 'prepare_after_load', side_effect=RuntimeError('unexpected preparation error')):
+                with self.assertRaisesRegex(RuntimeError, 'unexpected preparation error'):
                     worker.initialize_from_config('kv-config')
                 self.assertEqual(events, [])
 

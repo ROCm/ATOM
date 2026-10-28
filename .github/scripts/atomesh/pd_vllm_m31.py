@@ -24,7 +24,7 @@ CONFIG = HERE.parents[1] / "benchmark/vllm_m31"
 PROCESSES: list[tuple[str, subprocess.Popen, Path]] = []
 # Explicit script path also supports CPU unit-test imports via importlib.
 sys.path.insert(0, str(HERE))
-from pd_vllm_memory import StoreMemoryUnavailable, memory_failure, valid_marker
+from pd_vllm_memory import StoreMemoryUnavailable, memory_failure
 
 
 
@@ -259,7 +259,8 @@ def main():
     mem = dict(line.split(":", 1) for line in Path('/proc/meminfo').read_text().splitlines())
     available = int(mem['MemAvailable'].split()[0]) * 1024
     if available <= (1024 + 32 + 256) * 1024**3:
-        memory_failure('memory_budget', out)
+        print(f'[store-memory][WARN] MemAvailable={available / 1024**3:.1f} GiB; '
+              'continuing to actual Store registration', flush=True)
     # Reuse the cluster cache, while the model revision remains explicit.
     # Bound download memory; Xet's concurrent shard reconstruction was killed
     # with rc=137 during the first run, before Store or engines were started.
@@ -340,12 +341,6 @@ def main():
         for url in urls.values():
             wait_http(url + '/health', int(os.environ.get('WAIT_SERVER_TIMEOUT', 7200)))
     except RuntimeError:
-        # Worker-side THP failures preserve the same allocation retry contract.
-        root = Path(os.environ.get('ATOMESH_ALLOCATION_RUN_DIR', os.environ['RUN_DIR']))
-        marker = valid_marker(root, os.environ.get('SLURM_JOB_ID', ''),
-                              os.environ.get('ATOMESH_RUN_TOKEN', ''))
-        if marker and marker['phase'] == out.name:
-            memory_failure(marker['reason'], out)
         # Only Store registration ENOMEM during startup qualifies for memory
         # recovery; ordinary model, transport and correctness failures stay fatal.
         for path in (logs / 'prefill.log', logs / 'decode.log'):

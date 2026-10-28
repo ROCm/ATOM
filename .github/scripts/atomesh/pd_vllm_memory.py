@@ -17,8 +17,7 @@ import time
 HERE = Path(__file__).resolve().parent
 GIB = 1 << 30
 RETRY_RC = 86
-REASONS = {'thp_shortfall', 'thp_timeout', 'numa_unavailable', 'memory_budget',
-           'rdma_registration_enomem'}
+REASONS = {'rdma_registration_enomem'}
 MARKER = 'vllm-memory-retry.json'
 
 
@@ -61,76 +60,110 @@ def valid_marker(root, job_id, token):
     return data
 
 
-def plan_pins(store, sysfs=Path('/sys')):
-    # Native Mooncake splits every global segment over selected NIC NUMA nodes.
-    # Private malloc buffers are not bound per rank: reserve all eight on each
-    # possible GPU/NIC NUMA node, rather than assuming balanced CPU scheduling.
-    from numa_memory_budget import gpu_numa_nodes
-    nic_nodes = {max(0, int((nic / 'device/numa_node').read_text()))
-                 for nic in (sysfs / 'class/infiniband').iterdir()}
-    if not nic_nodes:
-        raise ValueError('No RDMA NUMA nodes')
-    global_bytes = store['global_segment_size'] * 8
-    planned = {node: global_bytes / len(nic_nodes) / GIB for node in nic_nodes}
-    for node in nic_nodes | set(gpu_numa_nodes(sysfs, list(range(8)))):
-        planned[node] = planned.get(node, 0) + 8 * store['local_buffer_size'] / GIB
-    return planned
+def cpu_numa_nodes(sysfs=Path('/sys')):
+    return [int(path.name.removeprefix('node'))
+            for path in sorted((sysfs / 'devices/system/node').glob('node[0-9]*'))
+            if (path / 'cpulist').read_text().strip()]
 
 
 def prepare(store, model_path, out, timeout=600):
-    """PR #2750: evict model file cache, then fault/free each NUMA node's THP."""
-    from numa_memory_budget import check_budget
+    """Successful CI 40376309047: best-effort THP, then try native Store setup.
+
+    Preparation does not reserve pages or prove that MR registration will work.
+    Only the actual Store registration result can trigger memory recovery.
+    """
+    from numa_memory_budget import node_meminfo
     out = Path(out)
     logs = out / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
-    state = {'status': 'running', 'nodes': [],
+    state = {'status': 'running', 'nodes': [], 'warnings': [], 'reserve_gib': 64,
              'stage': 'after_model_load_before_store_init', 'started_at': time.time()}
     summary = out / 'memory-preparation.json'
-    try:
-        planned = plan_pins(store)
-    except (OSError, ValueError, SystemExit):
-        memory_failure('numa_unavailable', out)
-    state['planned_gib'] = planned
+    segments = store['global_segment_size'] * 8
+    if segments <= 0:
+        raise ValueError('Expected positive Store global_segment_size')
+
+    def warn(reason, **details):
+        state['warnings'].append({'reason': reason, **details})
+        print(f'[store-memory][WARN] {reason}: {details}; continuing toward Store registration', flush=True)
+
     write_json(summary, state)
-    if check_budget(planned, 128, Path('/sys')):
-        state['status'] = 'memory_budget'
-        write_json(summary, state)
-        memory_failure('memory_budget', out)
     print('[store-memory] dropping clean model page cache before NUMA THP preparation', flush=True)
     try:
         # Exact snapshot only. This helper uses fadvise and never deletes files.
-        subprocess.run([sys.executable, str(HERE / 'drop_page_cache.py'), str(model_path)],
-                       check=True, timeout=120)
+        result = subprocess.run([sys.executable, str(HERE / 'drop_page_cache.py'), str(model_path)],
+                                check=False, timeout=120)
+        if result.returncode:
+            warn('cache_eviction_failed', rc=result.returncode)
     except subprocess.TimeoutExpired:
-        print('[store-memory] model cache eviction timed out; checking THP anyway', flush=True)
-    for node, gib in sorted(planned.items()):
+        warn('cache_eviction_timeout', timeout_seconds=120)
+    try:
+        nodes = cpu_numa_nodes()
+    except OSError as exc:
+        nodes = []
+        warn('numa_unavailable', error=str(exc))
+    if not nodes:
+        warn('no_cpu_numa_nodes')
+    for node in nodes:
+        row = {'node': node, 'desired_bytes': int(segments / len(nodes))}
+        state['nodes'].append(row)
+        try:
+            info = node_meminfo(Path('/sys'), node)
+            reclaimable = info['MemFree'] + info['Active(file)'] + info['Inactive(file)']
+        except (OSError, ValueError, KeyError, SystemExit) as exc:
+            row['status'] = 'numa_memory_unavailable'
+            warn(row['status'], node=node, error=str(exc))
+            write_json(summary, state)
+            continue
+        # Match the successful worker: global segments only, capped by current
+        # free + reclaimable file pages with 64 GiB left on this NUMA node.
+        gib = min(segments / len(nodes), reclaimable - 64 * GIB) / GIB
+        row['reclaimable_bytes'] = reclaimable
+        row['target_gib'] = max(0, gib)
+        if gib * GIB < row['desired_bytes']:
+            warn('thp_target_capped', node=node, target_gib=max(0, gib))
+        if gib < 1:
+            row['status'] = 'skipped_low_memory'
+            write_json(summary, state)
+            continue
         result_path = out / f'thp-node-{node}.json'
-        print(f'[store-memory] NUMA {node}: need {gib:g} GiB THP', flush=True)
+        # Integer GiB rounding matches the successful CI's helper invocation.
+        row['requested_bytes'] = int(f'{gib:.0f}') * GIB
+        print(f'[store-memory] NUMA {node}: compacting {gib:.0f} of {row["desired_bytes"] / GIB:g} GiB', flush=True)
+        began = time.monotonic()
         try:
             with (logs / f'thp-node-{node}.log').open('w') as log:
                 result = subprocess.run([
                     sys.executable, str(HERE / 'numa_exec.py'), str(node),
                     sys.executable, str(HERE / 'pd_vllm_memory.py'), 'probe',
-                    '--gib', str(gib), '--output', str(result_path)],
+                    '--gib', f'{gib:.0f}', '--output', str(result_path)],
                     stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+            row['rc'] = result.returncode
+            row['status'] = 'probe_failed' if result.returncode else 'completed'
         except subprocess.TimeoutExpired:
-            state['status'] = 'thp_timeout'
-            write_json(summary, state)
-            memory_failure('thp_timeout', out)
+            row.update(status='thp_timeout', rc=None, timeout_seconds=timeout)
+        row['elapsed_seconds'] = time.monotonic() - began
         try:
-            row = json.loads(result_path.read_text())
-        except (OSError, ValueError):
-            row = {'requested_bytes': int(gib * GIB), 'huge_bytes': 0}
-        state['nodes'].append({'node': node, 'rc': result.returncode, **row})
-        if result.returncode or row.get('huge_bytes', 0) < int(gib * GIB):
-            state['status'] = 'thp_shortfall'
-            write_json(summary, state)
-            memory_failure('thp_shortfall', out)
+            measured = json.loads(result_path.read_text())
+            huge = measured['huge_bytes']
+            if not isinstance(huge, int) or huge < 0:
+                raise ValueError('Invalid huge_bytes')
+            row['huge_bytes'] = huge
+        except (OSError, ValueError, KeyError, TypeError):
+            row['huge_bytes'] = None
+            if row['status'] == 'completed':
+                row['status'] = 'probe_result_unavailable'
+        if row['status'] == 'completed' and row['huge_bytes'] < row['requested_bytes']:
+            row['status'] = 'thp_shortfall'
+        if row['status'] != 'completed':
+            warn(row['status'], node=node, rc=row['rc'], huge_bytes=row['huge_bytes'],
+                 requested_bytes=row['requested_bytes'])
         write_json(summary, state)
-    state['status'] = 'prepared'
+    state['status'] = 'completed_with_warnings' if state['warnings'] else 'completed'
     state['finished_at'] = time.time()
     write_json(summary, state)
-    print('[store-memory] full per-NUMA THP budget prepared and freed for Store', flush=True)
+    print(f'[store-memory] best-effort THP preparation {state["status"]}; attempting Store registration', flush=True)
+    return state
 
 
 def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
@@ -160,7 +193,7 @@ def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
         while True:
             if terminal.exists():
                 result = json.loads(terminal.read_text())
-                if result['status'] != 'prepared':
+                if result['status'] != 'completed':
                     raise RuntimeError(f"Store memory preparation failed: {result.get('error')}")
                 print(f'[store-memory] {participant}: preparation complete; initializing Store', flush=True)
                 return
@@ -178,12 +211,13 @@ def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
                             continue
                         print('[store-memory] all eight workers loaded; preparing once before Store initialization', flush=True)
                         try:
-                            prepare(store, model_path, out)
+                            preparation = prepare(store, model_path, out)
                         except Exception as exc:
                             write_json(terminal, {'status': 'failed', 'coordinator': participant,
                                                   'error': str(exc), 'finished_at': time.time()})
                             raise
-                        write_json(terminal, {'status': 'prepared', 'coordinator': participant,
+                        write_json(terminal, {'status': 'completed', 'coordinator': participant,
+                                              'preparation_status': preparation['status'],
                                               'workers': [p.stem for p in expected],
                                               'finished_at': time.time()})
                     finally:
@@ -275,7 +309,9 @@ def main():
         from compact_huge_pages import fault_huge_pages
         size, huge, elapsed = fault_huge_pages(args.gib)
         write_json(args.output, {'requested_bytes': size, 'huge_bytes': huge, 'elapsed_seconds': elapsed})
-        return 0 if huge >= size else RETRY_RC
+        tag = '[WARN] ' if huge < size else ''
+        print(f'[store-memory] {tag}{huge / GIB:g} of {size / GIB:g} GiB came as THP in {elapsed:g} s', flush=True)
+        return 0
     if args.command == 'clean-host':
         return 0 if clean_host() else RETRY_RC
     if args.command == 'recover-host':

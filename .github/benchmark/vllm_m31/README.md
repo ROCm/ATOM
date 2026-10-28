@@ -46,27 +46,32 @@ SIGKILL exits there; explicitly pinned nodes bypass the automatic exclusion.
 The read-only inspection case emits schema-filtered status for its configured
 Actions ID, never raw logs or arbitrary file content.
 
-Memory recovery follows PR #2750 (`e73246e80ec`): evict only the pinned model
-snapshot's clean file cache with `drop_page_cache.py`, check NUMA budgets with
-128 GiB reserved per node, then use `numa_exec.py` + `compact_huge_pages.py` to
-fault/free the Store budget as THP. Private buffers are conservatively budgeted
-on each GPU/NIC NUMA node because worker malloc placement is not guaranteed;
-this only affects preparation, not the configured Store or buffer capacity. The native launcher checks the actual
-`AnonHugePages` bytes; insufficient THP or a 600-second per-node preparation
-timeout stops startup. Native Store uses the PR's glibc THP hint and 64 GiB MR
-cap. The earlier malloc perturbation, sequential P/D startup and separate
-native Store PUT/GET preflight in `57888067b` were reverted.
-
-Memory preparation now follows the timing of successful CI `40376309047`
-(commit `fc9bf7aa215f33067a8b0728279d076c0da5a313`): the custom
+Memory preparation follows successful CI `40376309047` (commit
+`fc9bf7aa215f33067a8b0728279d076c0da5a313`). The custom
 `pd_vllm_worker.StoreMemoryWorker` waits until all eight P/D workers reach
 `initialize_from_config`, after model loading/profiling and before native
 connector initialization. A file lock elects one worker to evict the pinned
-snapshot's page cache and prepare NUMA THP; all workers wait for success before
-initializing Store. There is no preparation or periodic cache eviction during
-model loading. A failed preparation publishes a terminal result for waiting
-workers and preserves the allocation-specific exit-86 recovery marker.
-`store-memory-gate/` records each worker's arrival and the preparation result.
+snapshot's clean page cache (including its draft subdirectory) and fault/free
+THP with `numa_exec.py` + `compact_huge_pages.py`. There is no preparation or
+periodic cache eviction during model loading.
+
+Preparation is best effort: split the eight global Store segments equally over
+NUMA nodes with CPUs, cap each node's target at `MemFree + Active(file) +
+Inactive(file) - 64 GiB`, and skip targets below 1 GiB. This matches the
+successful CI's sizing rule; private buffers are not added to the preparation
+target. THP shortfall, a nonzero helper exit, missing measurements or a
+600-second per-node timeout only warn, then proceed to the remaining nodes and
+native Store registration. Available-memory estimates also only warn. Actual
+Store registration determines success; preparation never emits exit 86.
+Native Store retains the glibc THP hint and 64 GiB MR cap. The earlier malloc
+perturbation, sequential P/D startup and separate native Store PUT/GET preflight
+in `57888067b` were reverted.
+
+`store-memory-gate/` records each worker's arrival and completion of the single
+preparation attempt. Its `status=completed` allows every worker to initialize
+Store even when `preparation_status=completed_with_warnings`. This does not
+claim successful Store registration. Unexpected preparation errors still
+publish a terminal failure for waiting workers; missing workers still time out.
 
 The common environment explicitly sets `MC_MAX_CONCURRENT_REG_MR=1`,
 `NCCL_DMABUF_ENABLE=0`, `MC_GID_INDEX=1`, `MC_IB_TC=104`, and
@@ -81,7 +86,8 @@ A smoke-only dispatch uses suite `mooncake_store` and case
 `smoke/` and `suite-status.json`, then exits without the C32/C48/C64 measurements.
 The workflow's separate `suite=smoke` is an RDMA test, not this model smoke.
 
-On the `atomesh-cicd` Spur runner, a memory-specific exit (86) first stops and
+On the `atomesh-cicd` Spur runner, actual Store registration ENOMEM produces
+a memory-specific exit (86), which first stops and
 removes this allocation's container. A job/token/node-validated recovery helper
 uses existing host write permissions or noninteractive `sudo -n` to sync, drop
 host page cache and compact memory. It never elevates container capabilities.
@@ -93,7 +99,8 @@ resubmissions, configurable with `ATOMESH_VLLM_MEMORY_RETRIES`). Explicitly pinn
 nodes are not silently widened. Generic model and correctness failures do not
 trigger this retry path. A host cleanup timeout is fatal, not resubmitted.
 
-`memory-preparation.json` and `thp-node-*.json` record measured hugepage bytes;
+`memory-preparation.json` records targets, per-node outcomes and warnings;
+`thp-node-*.json` records measured hugepage bytes when the probe finishes;
 `vllm-memory-retry.json` binds the reason to the exact allocation;
 `host-memory-recovery.json` records whether cleanup succeeded or lacked permission.
 The model image, revisions, 1 TiB pool, per-rank 4 GiB buffer, prefix caches,
