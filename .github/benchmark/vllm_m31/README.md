@@ -143,3 +143,10 @@ saves host kernel/amdgpu version, HIP API versions, loaded GPU libraries,
 Triton target/cache location, and compiled IR/HSACO before binary loading.
 A missing command is recorded as unavailable. Run on the failed node with
 `atomesh_single_node=pit2-p03-g12`, case `m31-vllm-triton-probe`, dashboard off.
+
+The current no-model probe matrix compares a fresh-cache baseline, explicit
+core/devel COMGR preloads, and Mooncake-before/after-Torch imports, including
+core-COMGR preload controls. It records hashes/inodes of both COMGR copies.
+No connector, Store or model is initialized. This follows smoke 40724865295:
+the failing zeroing HSACO is byte-identical to the successful minimal probe,
+but the two processes loaded COMGR from different SDK directories.

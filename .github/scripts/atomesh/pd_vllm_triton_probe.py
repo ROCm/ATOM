@@ -104,17 +104,43 @@ def save_kernel(compiled, out):
     dump(out / 'sha256.json', hashes)
 
 
+def library_fingerprints():
+    files = set(mapped_gpu_libraries())
+    for sdk in ('_rocm_sdk_core', '_rocm_sdk_devel'):
+        files.add(f'/usr/local/lib/python3.12/dist-packages/{sdk}/lib/libamd_comgr.so.3')
+    rows = []
+    for filename in sorted(files):
+        p = Path(filename)
+        if not p.is_file():
+            continue
+        stat = p.stat()
+        digest = hashlib.sha256()
+        with p.open('rb') as stream:
+            for block in iter(lambda: stream.read(4 << 20), b''):
+                digest.update(block)
+        rows.append({'path': filename, 'resolved': str(p.resolve()), 'size': stat.st_size,
+                     'device': stat.st_dev, 'inode': stat.st_ino, 'sha256': digest.hexdigest()})
+    return rows
+
+
 def run_worker(out):
     global torch, triton, tl
     out.mkdir(parents=True, exist_ok=True)
     rows = []
     try:
+        if os.environ.get('ATOMESH_PROBE_MC_IMPORT') == 'before':
+            import mooncake.store
+            import mooncake.engine
         import torch
+        if os.environ.get('ATOMESH_PROBE_MC_IMPORT') == 'after':
+            import mooncake.store
+            import mooncake.engine
         import triton
         import triton.language as tl
         torch.cuda.set_device(0)
         env = environment(torch, triton)
         dump(out / 'environment.json', env)
+        dump(out / 'library-fingerprints.json', library_fingerprints())
         assert '8d0f05a0c' in env['versions']['vllm'], env['versions']
         assert 'MI355' in env['device_name'], env['device_name']
         assert env['triton_target']['arch'].split(':')[0] == 'gfx950', env['triton_target']
@@ -219,34 +245,48 @@ def run_suite(out):
     base.update(plan['common_env'])
     base.update(VLLM_PLUGINS='', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
     rows = []
-    for cache in ('default', 'fresh'):
-        for role in ('prefill', 'decode'):
-            dest = out / (cache + '-' + role)
-            dest.mkdir(exist_ok=True)
-            env = role_env(base, role, '127.0.0.1', plan[role]['env'])
-            # No Store, no communication group, no model creation in this probe.
-            if cache == 'fresh':
-                env['TRITON_CACHE_DIR'] = str(Path(os.environ['XDG_CACHE_HOME']) / 'triton-probe' / dest.name)
-                if Path(env['TRITON_CACHE_DIR']).exists():
-                    raise RuntimeError('Fresh probe cache already exists; use a new allocation')
-            row = {'case': dest.name, 'status': 'running'}
-            rows.append(row)
-            dump(out / 'summary.json', rows)
-            with (dest / 'worker.log').open('w') as log:
-                try:
-                    result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
-                        '--worker', '--out', str(dest)], env=env, stdout=log,
-                        stderr=subprocess.STDOUT, timeout=180, cwd='/tmp')
-                    row['returncode'] = result.returncode
-                    result_file = dest / 'results.json'
-                    results = json.loads(result_file.read_text()) if result_file.exists() else []
-                    row['kernels'] = results
-                    row['status'] = ('success' if result.returncode == 0 and len(results) == 4
-                        and all(r['status'] == 'success' for r in results) else 'failed')
-                except subprocess.TimeoutExpired:
-                    row.update(status='failed', error='worker_timeout_180s')
-            dump(out / 'summary.json', rows)
-            print('[triton-probe]', json.dumps(row), flush=True)
+    cases = [(cache + '-' + role, role, cache == 'fresh', {})
+             for cache in ('default', 'fresh') for role in ('prefill', 'decode')]
+    if os.environ.get('ATOMESH_ENV_ATOMESH_TRITON_PROBE_MATRIX') == 'library_order':
+        base = dict(base)
+        sdk = '/usr/local/lib/python3.12/dist-packages/'
+        cases = [
+            ('fresh-decode', 'decode', True, {}),
+            ('core-comgr', 'decode', True, {'LD_PRELOAD': sdk + '_rocm_sdk_core/lib/libamd_comgr.so.3'}),
+            ('devel-comgr', 'decode', True, {'LD_PRELOAD': sdk + '_rocm_sdk_devel/lib/libamd_comgr.so.3'}),
+            ('mooncake-before-torch', 'decode', True, {'ATOMESH_PROBE_MC_IMPORT': 'before'}),
+            ('mooncake-after-torch', 'decode', True, {'ATOMESH_PROBE_MC_IMPORT': 'after'}),
+            ('core-comgr-mooncake-before', 'decode', True, {'LD_PRELOAD': sdk + '_rocm_sdk_core/lib/libamd_comgr.so.3', 'ATOMESH_PROBE_MC_IMPORT': 'before'}),
+            ('core-comgr-mooncake-after', 'decode', True, {'LD_PRELOAD': sdk + '_rocm_sdk_core/lib/libamd_comgr.so.3', 'ATOMESH_PROBE_MC_IMPORT': 'after'}),
+        ]
+    for name, role, fresh, overrides in cases:
+        dest = out / name
+        dest.mkdir(exist_ok=True)
+        env = role_env(base, role, '127.0.0.1', plan[role]['env'])
+        env.update(overrides)
+        # No Store, no communication group, no model creation in this probe.
+        if fresh:
+            env['TRITON_CACHE_DIR'] = str(Path(os.environ['XDG_CACHE_HOME']) / 'triton-probe' / dest.name)
+            if Path(env['TRITON_CACHE_DIR']).exists():
+                raise RuntimeError('Fresh probe cache already exists; use a new allocation')
+        row = {'case': dest.name, 'status': 'running'}
+        rows.append(row)
+        dump(out / 'summary.json', rows)
+        with (dest / 'worker.log').open('w') as log:
+            try:
+                result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                    '--worker', '--out', str(dest)], env=env, stdout=log,
+                    stderr=subprocess.STDOUT, timeout=180, cwd='/tmp')
+                row['returncode'] = result.returncode
+                result_file = dest / 'results.json'
+                results = json.loads(result_file.read_text()) if result_file.exists() else []
+                row['kernels'] = results
+                row['status'] = ('success' if result.returncode == 0 and len(results) == 4
+                    and all(r['status'] == 'success' for r in results) else 'failed')
+            except subprocess.TimeoutExpired:
+                row.update(status='failed', error='worker_timeout_180s')
+        dump(out / 'summary.json', rows)
+        print('[triton-probe]', json.dumps(row), flush=True)
     return 0 if all(r['status'] == 'success' for r in rows) else 1
 
 
