@@ -17,6 +17,7 @@ from torch import nn
 
 from atom.config import DCPConfig
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.model_engine.block_manager import draft_kv_lookahead
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
@@ -531,11 +532,20 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self.row_ids = torch.arange(
             self.max_bs + 1, device=self.device, dtype=torch.int32
         )
-        self.max_num_blocks_per_seq = (
-            config.max_model_len + self.block_size - 1
-        ) // self.block_size
-        # Width of every `block_tables` buffer, and of anything gathered from one.
-        self.block_table_cols = self.max_num_blocks_per_seq // self.block_ratio
+        # Deferred speculative output can leave two draft windows and a bonus
+        # token pending when the committed sequence reaches max_model_len.
+        # Reserve internal page-table capacity without changing the API limit.
+        speculative = config.speculative_config
+        drafts = speculative.num_speculative_tokens if speculative else 0
+        pending = 2 * drafts + 1 if speculative else 0
+        # The allocator also reserves pages for the draft's mid-step KV writes.
+        table_tokens = config.max_model_len + pending + draft_kv_lookahead(drafts)
+        # Round in scheduler pages first: a partial page still needs an entry,
+        # and its expanded backend table needs every constituent subpage.
+        self.block_table_cols = (
+            table_tokens + model_runner.block_size - 1
+        ) // model_runner.block_size
+        self.max_num_blocks_per_seq = self.block_table_cols * self.block_ratio
         # Per-rank attention head count. eagle.propose's mid-step path reads
         # this to gate the `do_attn_metadata_update` branch. Subclasses that
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
