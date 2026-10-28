@@ -602,6 +602,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         for s in os.getenv("ATOM_DECODER_GRAPH_SIZES", "1,2,3,4,8,16").split(",")
         if s.strip()
     ),
+    "ATOM_DSV41_ROW_SHARDED_MHC": lambda: _flag_env("ATOM_DSV41_ROW_SHARDED_MHC"),
+    "ATOM_DSV41_PREFILL_TAIL_MODE": lambda: os.environ.get(
+        "ATOM_DSV41_PREFILL_TAIL_MODE", "off"
+    ),
+    "ATOM_DSV41_PREFILL_TAIL_TRANSPORT": lambda: os.environ.get(
+        "ATOM_DSV41_PREFILL_TAIL_TRANSPORT", "packet"
+    ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's

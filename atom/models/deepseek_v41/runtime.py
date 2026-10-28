@@ -2,6 +2,7 @@
 """ModelRunner interface over the V4.1 multimodal backbone."""
 
 import logging
+import os
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -28,11 +29,14 @@ from .config import validate_tbo_parallelism
 from .decoder_graph import DecoderGraph
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
+from .owner_service_contract import owner_prefill_enabled
 
 logger = logging.getLogger("atom")
 
 
-def _fake_layer_output(hidden, layer_name, hidden_fp8=None, hidden_scale=None):
+def _fake_layer_output(
+    hidden, layer_name, hidden_fp8=None, hidden_scale=None, row_sharded=False
+):
     return torch.empty_like(hidden)
 
 
@@ -90,6 +94,7 @@ def v41_attention(
     layer_name: str,
     hidden_fp8: torch.Tensor | None = None,
     hidden_scale: torch.Tensor | None = None,
+    row_sharded: bool = False,
 ) -> torch.Tensor:
     context = get_forward_context()
     metadata = context.attn_metadata
@@ -106,6 +111,8 @@ def v41_attention(
     # A bounded replay's layer 39 outputs some rows of `hidden`
     # (`metadata.queries`); it runs outside the compiled graphs.
     options = {} if hidden_fp8 is None else {"hidden_fp8": hidden_fp8}
+    if row_sharded:
+        options["row_sharded"] = True
     return layer.attn(
         hidden,
         hidden_scale,
@@ -128,20 +135,126 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
         return residual.clone()
     layer, _ = context.no_compile_layers[layer_name]
     embeddings = metadata.engram_embeddings.get(layer.engram.layer_id)
-    return Block.engram_forward(layer, residual, embeddings, metadata.image_mask)
+    image_mask = metadata.image_mask
+    if residual.shape[-3] != metadata.step.width:
+        from aiter.dist.parallel_state import get_tp_group
+
+        count = residual.shape[-3]
+        start = get_tp_group().rank_in_group * count
+        valid = min(count, max(0, metadata.step.width - start))
+        embeddings = embeddings.narrow(-2, start, valid)
+        shape = list(embeddings.shape)
+        shape[-2] = count - valid
+        embeddings = torch.cat((embeddings, embeddings.new_zeros(shape)), dim=-2)
+        if image_mask is not None:
+            image_mask = image_mask.narrow(-1, start, valid)
+            shape = list(image_mask.shape)
+            shape[-1] = count - valid
+            image_mask = torch.cat((image_mask, image_mask.new_ones(shape)), dim=-1)
+    return Block.engram_forward(layer, residual, embeddings, image_mask)
+
+
+def _fake_moe(hidden, layer_name, row_sharded):
+    return (
+        hidden.new_empty(((hidden.shape[0] + 3) // 4, hidden.shape[1]))
+        if row_sharded
+        else torch.empty_like(hidden)
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_fake_moe)
+def v41_owned_moe(
+    hidden: torch.Tensor, layer_name: str, row_sharded: bool
+) -> torch.Tensor:
+    layer, _ = get_forward_context().no_compile_layers[layer_name]
+    if not row_sharded:
+        return layer.ffn(hidden)
+    from atom.model_ops.deepseek_v41.row_sharded_mhc import v41_mhc_reduce_scatter
+
+    moe = layer.ffn
+    shared = moe.shared_experts(hidden) if moe.shared_experts is not None else None
+    routed = moe.experts(hidden, moe.router_logits(hidden))
+    return v41_mhc_reduce_scatter(routed if shared is None else routed + shared)
+
+
+def _fake_prequantized_moe(hidden, layer_name, original_rows):
+    return torch.empty_like(hidden)
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_fake_prequantized_moe)
+def v41_owned_prequantized_moe(
+    hidden: torch.Tensor, layer_name: str, original_rows: int
+) -> torch.Tensor:
+    from atom.model_ops.deepseek_v41.row_sharded_mhc import gather_norm
+
+    from .prefill_ffn import prequantized_owned_ffn, supported
+
+    context = get_forward_context()
+    layer, _ = context.no_compile_layers[layer_name]
+    if supported(layer.ffn, hidden, original_rows, context.attn_metadata):
+        return prequantized_owned_ffn(layer.ffn, hidden, original_rows)
+    return v41_owned_moe(gather_norm(hidden, original_rows), layer_name, True)
 
 
 class RuntimeBlock(Block):
     """Serving uses the same guarded ops in eager and compiled execution."""
 
-    def attention_forward(self, normed, cache, step, rope):
+    def attention_forward(self, normed, cache, step, rope, *, row_sharded=False):
+        options = {"row_sharded": True} if row_sharded else {}
         if isinstance(normed, tuple):
             hidden, hidden_fp8, hidden_scale = normed
-            return v41_attention(hidden, self.layer_name, hidden_fp8, hidden_scale)
-        return v41_attention(normed, self.layer_name)
+            return v41_attention(
+                hidden, self.layer_name, hidden_fp8, hidden_scale, **options
+            )
+        return v41_attention(normed, self.layer_name, **options)
 
     def engram_forward(self, residual, embeddings, image_mask):
         return v41_engram(residual, self.layer_name)
+
+    def ffn_forward(
+        self,
+        output,
+        residual,
+        pre,
+        post,
+        comb,
+        *,
+        row_sharded=False,
+        original_rows=None,
+    ):
+        if not row_sharded or not getattr(self, "prequantized_prefill_ffn", False):
+            return super().ffn_forward(
+                output,
+                residual,
+                pre,
+                post,
+                comb,
+                row_sharded=row_sharded,
+                original_rows=original_rows,
+            )
+        # prepare_ffn's flag controls only its final norm gather. Keep exactly
+        # the native mHC seam, then consume the owner norm behind one boundary.
+        normed, residual, pre, post, comb = self.prepare_ffn(
+            output, residual, pre, post, comb, row_sharded=False
+        )
+        flat = normed.reshape(-1, normed.shape[-1])
+        output = v41_owned_prequantized_moe(flat, self.layer_name, original_rows)
+        return self.finish_ffn(
+            output.view_as(normed),
+            residual,
+            pre,
+            post,
+            comb,
+            row_sharded=True,
+            original_rows=original_rows,
+        )
+
+    def expert_forward(self, normed, *, row_sharded):
+        if getattr(self, "row_sharded_mhc", False):
+            flat = normed.reshape(-1, normed.shape[-1])
+            result = v41_owned_moe(flat, self.layer_name, row_sharded)
+            return result.view(*normed.shape[:-2], result.shape[0], normed.shape[-1])
+        return self.ffn(normed)
 
 
 class _Stage(nn.Module):
@@ -157,11 +270,25 @@ class _Stage(nn.Module):
         self.__dict__["owner"] = owner
         self.first, self.last = first, last
 
-    def run(self, state):
+    def run(self, state, *, row_sharded=False, restore_rows=True):
         m = self.owner
         for i in range(self.first, self.last):
-            state = m.layers[i](state, None, None, m._rope(i), None, image_mask=None)
-        return state
+            layer = m.layers[i]
+            if row_sharded and getattr(layer, "row_sharded_mhc", False):
+                state = layer(
+                    state,
+                    None,
+                    None,
+                    m._rope(i),
+                    None,
+                    image_mask=None,
+                    row_sharded=True,
+                )
+            else:
+                state = layer(state, None, None, m._rope(i), None, image_mask=None)
+        from atom.model_ops.deepseek_v41.row_sharded_mhc import replicate
+
+        return replicate(state) if restore_rows else state
 
 
 # Per phase, all three stages: a decode forward computes no `kv` for the
@@ -206,6 +333,28 @@ class _EarlyLayers(_Stage):
         hidden = (m.embed(input_ids) if inputs_embeds is None else inputs_embeds)[None]
         m.begin_forward(hidden, None)
         state = self.run(SinglePassHCState.from_embeddings(hidden, m.config.hc_mult))
+        return _rows_first(state.fields())
+
+
+@support_torch_compile(dynamic_arg_dims={"input_ids": 0, "inputs_embeds": 0})
+class _EarlyOwnedLayers(_Stage):
+    """Large, ragged prefill graph with a static row-ownership contract."""
+
+    def __init__(self, *, retain_mode="off", **kwargs):
+        super().__init__(**kwargs)
+        self.retain_mode = retain_mode
+
+    def forward(self, input_ids, inputs_embeds=None):
+        m = self.owner
+        hidden = (m.embed(input_ids) if inputs_embeds is None else inputs_embeds)[None]
+        m.begin_forward(hidden, None)
+        state = self.run(
+            SinglePassHCState.from_embeddings(hidden, m.config.hc_mult),
+            row_sharded=True,
+            restore_rows=self.retain_mode == "off",
+        )
+        if self.retain_mode == "settled":
+            state = state.settle()
         return _rows_first(state.fields())
 
 
@@ -259,6 +408,93 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             max_length=config.max_model_len,
             online_quant_config=config.online_quant_config,
         )
+        from atom.utils import envs
+
+        self.use_row_sharded_mhc = envs.ATOM_DSV41_ROW_SHARDED_MHC
+        owner_service = os.environ.get("DSV41_OWNER_SERVING") == "1"
+        retained_prefill = os.environ.get("DSV41_OWNER_ACCEPTED_PREFILL") == "1"
+        self.owner_ep4_contract = None
+        fixed_placement = os.environ.get("ATOM_DSV41_EP_PROFILED_PLACEMENT", "0") == "1"
+        if fixed_placement and not (
+            self.use_row_sharded_mhc and config.enable_expert_parallel
+        ):
+            raise ValueError("Fixed placement requires the EP4 owner deployment")
+        if self.use_row_sharded_mhc and config.enable_expert_parallel:
+            from .owner_ep import validate_owner_ep4
+
+            if not owner_prefill_enabled(
+                config,
+                owner_service=owner_service,
+                retained_prefill=retained_prefill,
+                ep4_verified=True,
+            ):
+                raise ValueError(
+                    "EP4 row-sharded prefill requires the DSpark5 owner deployment"
+                )
+            if fixed_placement:
+                from .owner_placement import install_owner_placement
+
+                install_owner_placement(self, config)
+            self.owner_ep4_contract = validate_owner_ep4(self, config)
+        self.owner_service_prefill = owner_prefill_enabled(
+            config,
+            owner_service=owner_service,
+            retained_prefill=retained_prefill,
+            ep4_verified=self.owner_ep4_contract is not None,
+        )
+        self.prefill_tail_mode = envs.ATOM_DSV41_PREFILL_TAIL_MODE
+        self.prefill_tail_transport = envs.ATOM_DSV41_PREFILL_TAIL_TRANSPORT
+        if self.prefill_tail_mode not in ("off", "settled", "delayed"):
+            raise ValueError("Invalid prefill owner-tail mode")
+        if self.prefill_tail_transport not in ("packet", "fields"):
+            raise ValueError("Invalid prefill owner-tail transport")
+        if self.prefill_tail_mode != "off" and not self.use_row_sharded_mhc:
+            raise ValueError("Prefill owner-tail requires row-sharded mHC")
+        if self.use_row_sharded_mhc:
+            if (
+                config.tensor_parallel_size != 4
+                or config.parallel_config.data_parallel_size != 1
+                or config.enable_dp_attention
+                or envs.ATOM_DSV41_SIDE_STREAMS
+                or config.enable_tbo
+                or config.prefill_context_parallel_size != 1
+                or config.decode_context_parallel_size != 1
+                or config.index_cache_dtype != "fp4"
+                or config.kv_cache_dtype != "bf16"
+                or (config.enable_expert_parallel and self.owner_ep4_contract is None)
+                or (
+                    config.speculative_config is not None
+                    and not self.owner_service_prefill
+                )
+                or not getattr(config, "enable_decoder_swa_bounded_replay", False)
+            ):
+                raise ValueError(
+                    "row-sharded prefill requires TP4 or verified native EP4, BF16 KV, FP4 index and bounded replay; speculation requires the explicit DSpark5 owner deployment"
+                )
+            split = late_layer_start(config.hf_config) - 1
+            for i in range(2, split):
+                layer = self.layers[i]
+                if layer.ffn.is_hash_layer or layer.ffn._use_comm_fused_dispatch:
+                    raise ValueError(
+                        "row-sharded prefill requires non-hash native routed experts"
+                    )
+                layer.row_sharded_mhc = True
+                layer.prequantized_prefill_ffn = (
+                    os.environ.get("ATOM_DSV41_PREFILL_QUANTIZED_FFN", "0") == "1"
+                )
+                layer.ffn.prefill_local_router = (
+                    os.environ.get("ATOM_DSV41_PREFILL_LOCAL_ROUTER", "0") == "1"
+                )
+                layer.ffn.prefill_route_packet = (
+                    self.owner_ep4_contract is not None
+                    and os.environ.get("ATOM_DSV41_PREFILL_ROUTE_PACKET", "0") == "1"
+                )
+            logger.info(
+                "row-sharded mHC/index: encoder layers 2..%s, TP4, M>=4096; tail mode %s, transport %s",
+                split - 1,
+                self.prefill_tail_mode,
+                self.prefill_tail_transport,
+            )
         for i, layer in enumerate(self.layers):
             atom_config.compilation_config.static_forward_context[layer.layer_name] = (
                 layer,
@@ -291,6 +527,19 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self.early = _EarlyLayers(
             atom_config=config, owner=self, last=self.decoder_start
         )
+        if self.use_row_sharded_mhc:
+            with set_model_tag("backbone_early_owned"):
+                self.early_owned = _EarlyOwnedLayers(
+                    atom_config=config, owner=self, last=self.decoder_start
+                )
+            if self.prefill_tail_mode != "off":
+                with set_model_tag("backbone_early_owned_retained"):
+                    self.early_owned_retained = _EarlyOwnedLayers(
+                        atom_config=config,
+                        owner=self,
+                        last=self.decoder_start,
+                        retain_mode=self.prefill_tail_mode,
+                    )
         # Its own compile-cache tag: two graphs of one model must not share one.
         with set_model_tag("backbone_late"):
             self.late = _LateLayers(
@@ -355,8 +604,26 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         """Tensor-only serving entry; guarded ops read the live forward context."""
         if not self.replay:
             return self.backbone(input_ids, positions, inputs_embeds)
-        state = SinglePassHCState(*_batched(self.early(input_ids, inputs_embeds)))
+        early = self.early
         forward, running_tokens = get_forward_context(), input_ids.numel()
+        metadata = forward.attn_metadata
+        retained = False
+        if self.use_row_sharded_mhc and getattr(metadata, "image_mask", None) is None:
+            from atom.model_ops.deepseek_v41.row_sharded_mhc import eligible
+
+            if eligible(running_tokens, 4):
+                early = self.early_owned
+                # Resolve ownership before begin_forward and all state writes.
+                retained = self.prefill_tail_mode != "off" and replayable(
+                    forward, running_tokens
+                )
+                if retained:
+                    early = self.early_owned_retained
+        state = SinglePassHCState(
+            *_batched(early(input_ids, inputs_embeds)),
+            row_sharded=retained,
+            original_rows=running_tokens if retained else None,
+        )
         if replayable(forward, running_tokens):
             step = forward.attn_metadata.step
             step.replay = step.decoder
@@ -397,15 +664,36 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         metadata = forward.attn_metadata
         step, cache = metadata.step, metadata.cache
         layer, rope = self.layers[self.decoder_start], self._rope(self.decoder_start)
-        normed, *seam = layer.prepare_attention(state, None, None)
+        owned = state.row_sharded
+        if owned:
+            normed, *seam = layer.prepare_attention(state, None, None, row_sharded=True)
+        else:
+            normed, *seam = layer.prepare_attention(state, None, None)
         del state
         # A fused-quant `normed` carries its BF16 rows first.
         hidden = normed[0] if isinstance(normed, tuple) else normed
-        layer.attn._compress_batch(hidden, cache, step, rope)
+        if owned:
+            layer.attn._compress_batch(hidden, cache, step, rope, row_sharded=True)
+        else:
+            layer.attn._compress_batch(hidden, cache, step, rope)
         full = hidden.new_zeros(running_tokens, self.config.hidden_size)
         if decoder_runs(forward):
             carry_selections(step, plan, self.decoder_specs)
-            last = self.decoder.run(forward, plan, normed, seam)
+            options = {}
+            if owned:
+                from atom.model_ops.deepseek_v41.owner_tail import gather_owner_tail
+
+                def gather_tail(*fields, out=None):
+                    return gather_owner_tail(
+                        plan.tail_rows_host,
+                        *fields,
+                        original_rows=running_tokens,
+                        transport=self.prefill_tail_transport,
+                        out=out,
+                    )
+
+                options["gather_tail"] = gather_tail
+            last = self.decoder.run(forward, plan, normed, seam, **options)
             if plan.tail.requests:
                 self._move_aux_rows(plan.tail_rows[: plan.filled])
                 full[plan.last_rows] = last[: plan.last_rows.numel()]

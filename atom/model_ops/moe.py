@@ -5502,8 +5502,104 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def supports_prequantized_input(self) -> bool:
+        """Native W4A8 group32 scales for TP4 or fixed V4.1 EP4 experts."""
+        method = self.quant_method
+        native_tp = self.tp_size == 4 and self.ep_size == 1
+        native_ep = (
+            type(method) is Mxfp4MoEMethod
+            and self.tp_size == 1
+            and self.ep_size == 4
+            and self.ep_rank == get_tp_group().rank_in_group
+            and get_tp_group().world_size == 4
+            and self.global_num_experts == 384
+            and self.local_num_experts == 96
+            and self.hidden_size == 5120
+            and method.intermediate_size == 2304
+            and self.expert_map is not None
+            and self.expert_mask is not None
+            and not self.moe_parallel_config.use_all2all_kernels
+        )
+        return (
+            type(method) is Mxfp4MoEMethod
+            and method.quant_type == QuantType.per_1x32
+            and method.fp8_activations
+            and not method.static_input_scales
+            and not method.use_triton
+            and not method.use_triton_ep
+            and method.fused_experts is None
+            and (native_tp or native_ep)
+            and self.dp_size == 1
+            and self.moe_parallel_config.dp_logical_ratio == 1
+            and not self.reduce_results
+            and self._comm_fused_moe is None
+            and self.balance_router_logits is None
+            and not self.expert_layout.uses_dispatch_remap
+            and self.num_fused_shared_experts == 0
+        )
+
+    def _validate_preselected_routes(self, hidden_states, router_logits, selected):
+        """Consume caller-owned logical routes through native expert remapping.
+
+        This narrow EP4 path avoids mutable routing callbacks on the module.
+        Each eager call or graph owns the selected tensors and their lifetime.
+        """
+        method = self.quant_method
+        if not (
+            router_logits is None
+            and type(method) is Mxfp4MoEMethod
+            and self.supports_prequantized_input()
+            and (self.tp_size, self.ep_size, self.dp_size) == (1, 4, 1)
+            and self.moe_parallel_config.dp_logical_ratio == 1
+            and not self.moe_parallel_config.use_all2all_kernels
+            and not self.moe_parallel_config.pcp_merge
+            and not method.use_triton
+            and not method.use_triton_ep
+            and self.num_fused_shared_experts == 0
+            and self.top_k == 6
+            and self.renormalize
+        ):
+            raise ValueError("Preselected routes require native EP4 W4A8 experts")
+        weights, ids = selected
+        if not (
+            weights.shape == ids.shape == (hidden_states.shape[0], self.top_k)
+            and weights.dtype == torch.float32
+            and ids.dtype == torch.int32
+            and weights.device == ids.device == hidden_states.device
+            and weights.is_contiguous()
+            and ids.is_contiguous()
+        ):
+            raise ValueError("Expected contiguous FP32 weights and int32 logical ids")
+
+        return weights, ids
+
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None,
+        *,
+        x_scale: torch.Tensor | None = None,
+        preselected_routes: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):
         assert self.quant_method is not None
+        if x_scale is not None:
+            if not self.supports_prequantized_input():
+                raise ValueError("Prequantized input requires native TP4 or EP4 W4A8")
+            if not (
+                hidden_states.dtype == dtypes.fp8
+                and x_scale.dtype == dtypes.fp8_e8m0
+                and x_scale.shape
+                == (hidden_states.shape[0], hidden_states.shape[1] // 32)
+                and x_scale.device == hidden_states.device
+            ):
+                raise ValueError(
+                    "Expected FP8 values and row-major group32 E8M0 scales"
+                )
+        selected = None
+        if preselected_routes is not None:
+            selected = self._validate_preselected_routes(
+                hidden_states, router_logits, preselected_routes
+            )
 
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
@@ -5511,8 +5607,10 @@ class FusedMoE(torch.nn.Module):
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
-        topk_weights, topk_ids = self.quant_method.select_experts(
-            self, hidden_states, router_logits
+        topk_weights, topk_ids = (
+            self.quant_method.select_experts(self, hidden_states, router_logits)
+            if selected is None
+            else selected
         )
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
         local_rows = hidden_states.shape[0]
@@ -5525,7 +5623,11 @@ class FusedMoE(torch.nn.Module):
         # The stand-in copies make the rows the logical group's, as a gather
         # would.
         final_hidden_states = self._run_experts(
-            hidden_states, topk_weights, topk_ids, gathered=dp_repeat > 1
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            x_scale=x_scale,
+            gathered=dp_repeat > 1,
         )
 
         if dp_repeat > 1:

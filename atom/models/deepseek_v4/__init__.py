@@ -2755,6 +2755,8 @@ class Expert(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         weights: torch.Tensor | None = None,  # [num_tokens, 1]  optional gate
+        *,
+        x_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
 
         dtype = x.dtype
@@ -2762,7 +2764,14 @@ class Expert(nn.Module):
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
-        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        combined = (
+            self.gate_up_proj(x)
+            if x_scale is None
+            else self.gate_up_proj(x, x_scale=x_scale)
+        )  # [num_tokens, 2*inter_dim_per_tp]
+        if x_scale is not None:
+            # FP8 input does not change the native activation/output dtype.
+            dtype = combined.dtype
         if self.use_fused_clamp_act_mul:
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,

@@ -155,3 +155,62 @@ def test_a_decoder_reading_the_encoders_selection_never_records(monkeypatch):
     carried = (SimpleNamespace(layer_id=20, topk_owner=19, candidate_source=None),)
     out, log, _ = _run(monkeypatch, mode="record_req", specs=carried)
     assert out == "decoded" and log == []
+
+
+def test_owner_transport_updates_native_graph_inputs_on_every_replay(monkeypatch):
+    """Changing owner rows must reach recorded addresses in all quant planes."""
+
+    def unexpected_native_gather(*args, **kwargs):
+        raise AssertionError("owner inputs must not be gathered a second time")
+
+    monkeypatch.setattr(decoder_graph, "gather_rows", unexpected_native_gather)
+    graph = DecoderGraph(SimpleNamespace(decoder_specs=(), parallel_config=None))
+    graph.graph = _Graph({(2, True)})
+    graph.graph.recorded_inputs = (
+        torch.zeros(4, 8, dtype=torch.bfloat16),
+        torch.zeros(4, 8, dtype=torch.float8_e4m3fn),
+        torch.zeros(4, 4, dtype=torch.uint8),
+        torch.zeros(4, 2, dtype=torch.float32),
+    )
+    pointers = tuple(t.data_ptr() for t in graph.graph.recorded_inputs)
+    step = SimpleNamespace(indptrs={}, tiles={}, selected={}, candidates={})
+    forward = SimpleNamespace(
+        tr_graph=None,
+        context=SimpleNamespace(forward_mode=SimpleNamespace(req_graphs=True)),
+        dp_metadata=None,
+        attn_metadata=SimpleNamespace(step=step),
+    )
+    plan = SimpleNamespace(
+        tail=SimpleNamespace(width=4, requests=_FINISHING), last=torch.zeros(2)
+    )
+    selected = torch.tensor([1, 0, 1, 1])  # includes native bucket padding
+    for value in (2, 7):
+        hidden = torch.full((1, 2, 8), value, dtype=torch.bfloat16)
+        quant = hidden.to(torch.float8_e4m3fn)
+        scale = torch.full((1, 2, 4), 127 + value, dtype=torch.uint8)
+        seam = torch.full((1, 2, 2), -value, dtype=torch.float32)
+
+        def owner_gather(*fields, out):
+            for source, target in zip(fields, out, strict=True):
+                # Byte transport also covers e8m0, without floating conversion.
+                target.view(torch.uint8).copy_(
+                    source.view(torch.uint8).index_select(1, selected)
+                )
+            return out
+
+        result = graph.run(
+            forward,
+            plan,
+            (hidden, quant, scale.view(torch.float8_e8m0fnu)),
+            [seam],
+            gather_tail=owner_gather,
+        )
+        assert result == "replayed"
+        assert tuple(t.data_ptr() for t in graph.graph.recorded_inputs) == pointers
+        for source, target in zip(
+            (hidden, quant, scale, seam), graph.graph.recorded_inputs, strict=True
+        ):
+            assert torch.equal(
+                target.view(torch.uint8),
+                source.view(torch.uint8).index_select(1, selected)[0],
+            )

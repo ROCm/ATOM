@@ -222,6 +222,10 @@ class ReplayPlan:
     filled_gpu: torch.Tensor
     finishing_gpu: torch.Tensor
 
+    # Exact host counterpart of tail_rows, including repeated padding rows.
+    # Owner transport uses the same layout as the native request graph.
+    tail_rows_host: np.ndarray | None = None
+
     def queries(self) -> QueryRows:
         """Layer 39's queries. Built where they are read, so a recording reads
         them through the tail's addresses."""

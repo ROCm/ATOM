@@ -818,6 +818,11 @@ class ModelRunner:
 
         self._build_and_load_model(model_class)
 
+        if getattr(self.model, "use_row_sharded_mhc", False):
+            from atom.model_ops.deepseek_v41.owner_attention import bind_model
+
+            bind_model(self.model)
+
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
         from atom.utils.debug_helper import (

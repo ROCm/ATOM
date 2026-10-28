@@ -96,7 +96,7 @@ class Indexer(nn.Module):
     def weights_scale(self):
         return self.head_dim**-0.5 * self.heads**-0.5
 
-    def project(self, hidden, qr, qr_scale, cache, step, rope):
+    def project(self, hidden, qr, qr_scale, cache, step, rope, *, row_sharded=False):
         """Everything `score` needs that the index plane does not hold: the
         index query and the head weights.
 
@@ -111,15 +111,29 @@ class Indexer(nn.Module):
         that is neither before this nor after the plane is read.
         """
         positions = cache.rope_positions(step)
+        if row_sharded:
+            group = get_tp_group()
+            count = hidden.shape[-2]
+            start = group.rank_in_group * count
+            valid = min(count, max(0, step.width - start))
+
+            def take(value, dim):
+                part = value.narrow(dim, min(start, step.width), valid)
+                shape = list(value.shape)
+                shape[dim] = count - valid
+                return torch.cat((part, value.new_zeros(shape)), dim=dim)
+
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
         weights = self.weights_proj(hidden)[0]
+        if row_sharded:
+            positions = take(positions, -1)
         if cache.geometry.index_fp4:
             return quantize_query_fp4(query[0], rope, positions), weights
         return rope(query, positions)[0], weights
 
-    def score(self, query, weights, cache, step):
+    def score(self, query, weights, cache, step, *, row_sharded=False):
         """This layer's top-k rows, out of the paged plane, into `step`.
 
         Every query row carries its own bound and its own tile list, so a
@@ -129,6 +143,10 @@ class Indexer(nn.Module):
         First reader of the index plane, into which a boundary crossed in this
         same forward writes a row that `visible` already counts.
         """
+        if row_sharded:
+            from atom.model_ops.deepseek_v41.row_sharded_mhc import score_owned_rows
+
+            return score_owned_rows(self, query, weights, cache, step)
         if cache.geometry.index_fp4:
             # `project` quantized the query; the scorer scales the weights
             self.score_quantized(
@@ -296,7 +314,7 @@ class Attention(nn.Module):
             else None
         )
 
-    def _compress_batch(self, hidden, cache, step, rope):
+    def _compress_batch(self, hidden, cache, step, rope, *, row_sharded=False):
         """Every compression boundary in the batch, in one call.
 
         The cache owns where the main latent lands; what comes back is the
@@ -314,6 +332,12 @@ class Attention(nn.Module):
             return
         owner = self.spec.kv_owner
         values, scores = self.compressor.project(hidden)
+        if row_sharded:
+            from atom.model_ops.deepseek_v41.row_sharded_mhc import gather_norm
+
+            values = gather_norm(values, step.width)
+            if scores is not None:
+                scores = gather_norm(scores, step.width)
         latent = cache.compress(owner, self.compressor, values, scores, step, rope)
         if latent is not None:
             self.indexer.write_keys(latent, cache, step, rope)
@@ -354,7 +378,7 @@ class Attention(nn.Module):
         )
         return self.wo_b(y.view(*output.shape[:-2], -1))
 
-    def _fork_compress(self, hidden, cache, step, rope):
+    def _fork_compress(self, hidden, cache, step, rope, *, row_sharded=False):
         """The compressor, issued before the projections, beside them.
 
         It reads the hidden row and its own arena state, so the top of the
@@ -365,14 +389,20 @@ class Attention(nn.Module):
 
         Reports whether it forked, which is all `_fork_select` needs to know.
         """
-        self._compress(hidden, cache, step, rope)
+        if row_sharded:
+            self._compress(hidden, cache, step, rope, row_sharded=True)
+        else:
+            self._compress(hidden, cache, step, rope)
         return forks(self.compress_stream)
 
     @eager_region(stream=lambda self: self.compress_stream, live=_live_step)
-    def _compress(self, hidden, cache, step, rope):
+    def _compress(self, hidden, cache, step, rope, *, row_sharded=False):
         """`_compress_batch` as a TR-graph break: its launches are sized by
         the boundaries the batch crosses, not by its token count."""
-        self._compress_batch(hidden, cache, step, rope)
+        if row_sharded:
+            self._compress_batch(hidden, cache, step, rope, row_sharded=True)
+        else:
+            self._compress_batch(hidden, cache, step, rope)
 
     def _fork_select(self, hidden, qr, qr_scale, cache, step, rope, *, compressed):
         """The scorer, and the compressor's join, wherever those two run.
@@ -400,10 +430,31 @@ class Attention(nn.Module):
         self.indexer.score(*projected, cache, step)
 
     def forward(
-        self, hidden, hidden_scale, cache, step, rope, queries=None, *, hidden_fp8=None
+        self,
+        hidden,
+        hidden_scale,
+        cache,
+        step,
+        rope,
+        queries=None,
+        *,
+        hidden_fp8=None,
+        row_sharded=False,
     ):
         """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
         layer is asked outputs for; KV is still every row's."""
+        if row_sharded:
+            from atom.model_ops.deepseek_v41.owner_attention import forward
+
+            return forward(
+                self,
+                hidden,
+                cache,
+                step,
+                rope,
+                hidden_fp8=hidden_fp8,
+                hidden_scale=hidden_scale,
+            )
         compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(
             hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
