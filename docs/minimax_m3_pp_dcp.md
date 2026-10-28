@@ -73,5 +73,20 @@ each rank receives approximately one quarter, subject to block tails.
   and its `gsm8k-5shot-chunked-c32` counterpart. They retain the PP4 integration's
   full 1319-question, five-shot, real-acceptance GSM8K gate (0.94).
 
+- `test_real_nvfp4_rope_writer_keeps_queries_for_unowned_tokens` exercises the
+  real AITER fused norm/RoPE and NVFP4/FP4 writers with alternating unowned slots.
+- Non-P/D accuracy baseline:
+  `minimax-m31-flash-mxfp4-agg-tp4-dspark7-nvfp4-gsm8k-5shot-c32` uses the same
+  model, KV formats, five-shot prompt, real DSpark K7 and TP4 without a connector.
+- C56 performance cases:
+  `minimax-m31-flash-mxfp4-1p1d-pp4-dcp4-dspark7-nvfp4-mcstore-agentx-c56`
+  and its `agentx-chunked-c56` counterpart retain AgentX 1.0.12, the one-hour
+  measurement window, 1 TiB Store and synthetic AL 4.04 performance recipe.
+  Run these after real-acceptance accuracy passes. Use the profiling phase's
+  `atom:pd_kv_transfer_seconds` sum/count deltas for the request-weighted mean;
+  this includes dispatch, handshake and notification until all workers finish.
+  Report warmup separately, and do not substitute TTFT or an unweighted average
+  of the report's rolling means for the transfer wait.
+
 GPU kernel/collective tests alone do not establish model-level accuracy or the
 issue #314 C56 transfer-wait target. Those results must be collected separately.
