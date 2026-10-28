@@ -1057,6 +1057,36 @@ def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
     return worker
 
 
+def test_completed_device_event_survives_adapter_future_pruning():
+    import gc
+
+    from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
+
+    destroyed = []
+
+    class Event:
+        def __del__(self):
+            destroyed.append(True)
+
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._event_reclaimer = IPCEventReclaimer()
+    future = _WorkerFuture()
+    future.ready = True
+    future.event_ = Event()
+    worker._pending_loads["load:test"] = transfer._PendingLoad(
+        completion="test", future=future
+    )
+    assert worker.get_finished().finished_loading == {"test"}
+    # LMCache may retain a finished future until the next submission; its
+    # destruction there must enqueue the IPC event, not synchronize the GPU.
+    del future
+    gc.collect()
+    assert destroyed == []
+    worker._event_reclaimer.release()
+    assert destroyed == [True]
+
+
 def test_close_unregisters_the_worker_once(monkeypatch):
     """`ModelRunner.exit` closes the connector before the KV pool is freed.
 
