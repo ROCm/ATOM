@@ -6,6 +6,7 @@ from pathlib import Path
 from vllm.v1.worker.gpu_worker import Worker
 
 from pd_vllm_memory import prepare_after_load, write_json
+from pd_vllm_diagnostics import record_runtime, record_failure
 
 
 def mooncake_hca(local_rank, environ=os.environ):
@@ -18,6 +19,21 @@ def mooncake_hca(local_rank, environ=os.environ):
 
 
 class StoreMemoryWorker(Worker):
+    def _diagnostic_dir(self):
+        return (Path(os.environ['ATOMESH_VLLM_MEMORY_DIR']) / 'runtime-evidence'
+                / f"{os.environ['ATOMESH_VLLM_ROLE']}-rank-{self.local_rank}")
+
+    def compile_or_warm_up_model(self):
+        evidence = self._diagnostic_dir()
+        record_runtime(evidence, 'before-warmup')
+        try:
+            result = super().compile_or_warm_up_model()
+        except Exception as exc:
+            record_failure(evidence, exc)
+            raise
+        record_runtime(evidence, 'after-warmup')
+        return result
+
     def initialize_from_config(self, kv_cache_config):
         if self.parallel_config.tensor_parallel_size != 4:
             raise ValueError('Store memory preparation requires TP4 for both roles')
@@ -47,4 +63,12 @@ class StoreMemoryWorker(Worker):
             out, role, self.local_rank,
             timeout=int(os.environ.get('VLLM_ENGINE_READY_TIMEOUT_S', '7200')),
         )
-        return super().initialize_from_config(kv_cache_config)
+        evidence = self._diagnostic_dir()
+        record_runtime(evidence, 'before-kv-init')
+        try:
+            result = super().initialize_from_config(kv_cache_config)
+        except Exception as exc:
+            record_failure(evidence, exc)
+            raise
+        record_runtime(evidence, 'after-kv-init')
+        return result
