@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """SwiGLU-OAI activation used by MiniMax-M3.
 
@@ -12,9 +12,34 @@ with optional clamping.  ATOM only supports this path on AMD GPU, so the
 implementation is Triton-only.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
+
+
+@functools.cache
+def _device_arch(device_index: int) -> str:
+    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
+
+
+def _launch_config(num_rows: int, n_inter: int, arch: str) -> tuple[int, int]:
+    # gfx1250 benefits from fewer, wider programs at MiniMax-M3's I=3072.
+    # One or two warps also improve occupancy for the bandwidth-bound prefill
+    # shapes; decode retains the higher-warp launch needed by its few programs.
+    if arch == "gfx1250" and n_inter >= 2048:
+        if num_rows < 64:
+            return 256, 4
+        if num_rows < 256:
+            return 512, 2
+        if num_rows < 512:
+            # Avoid a heavily masked third 1024-wide tile (for example I=2560).
+            return (1024, 4) if n_inter % 1024 == 0 else (512, 4)
+        if num_rows < 16384:
+            return 1024, 2
+        return 512, 1
+    return (512 if n_inter >= 2048 else 256), 4
 
 
 @triton.jit
@@ -84,7 +109,12 @@ def swiglu_oai_split(
         device=gate_up.device,
     )
 
-    block_i = 512 if n_inter >= 2048 else 256
+    device_index = gate_up.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    block_i, num_warps = _launch_config(
+        x2.shape[0], n_inter, _device_arch(device_index)
+    )
     grid = (x2.shape[0], triton.cdiv(n_inter, block_i))
     _swiglu_oai_kernel[grid](
         x2,
@@ -99,6 +129,6 @@ def swiglu_oai_split(
         0.0 if limit is None else float(limit),
         has_limit=limit is not None,
         block_i=block_i,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return out.reshape(*orig_shape[:-1], n_inter)
