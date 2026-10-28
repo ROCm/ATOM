@@ -170,3 +170,39 @@ def test_chunked_dcp_prefix_counts_source_blocks_and_waits_for_handoff(
                         ]
                     local += 1
         assert torch.equal(actual, expected), (role, cached, rank, interleave)
+
+
+@pytest.mark.parametrize("source_pages", [0, 3, 16389])
+@pytest.mark.parametrize("rank", [0, 3])
+def test_whole_page_batches_preserve_noncontiguous_ids_and_padding(source_pages, rank):
+    import numpy as np
+
+    from atom.kv_transfer.disaggregation.mha_token_transfer import dcp_page_descriptors
+    from atom.kv_transfer.disaggregation.sharded_transfer import build_dcp_shard_plan
+
+    src = np.arange(source_pages, dtype=np.int64)[::-1] * 3 + 7
+    pages = (source_pages + 3) // 4
+    dst = np.arange(pages, dtype=np.int64)[::-1] * 5 + 11
+    plan = build_dcp_shard_plan(
+        src,
+        block_size=128,
+        dcp_size=4,
+        dcp_rank=rank,
+        interleave_size=128,
+        dst_pages=pages,
+    )
+    unit = 4 * 128 * 64
+    batches = list(
+        dcp_page_descriptors(plan, dst, 100000, 200000, unit, ((4, 128, 64), (1,)))
+    )
+    expected_source = src[rank::4]
+    if not expected_source.size:
+        assert not batches
+        return
+    addresses = [np.concatenate([batch[i] for batch in batches]) for i in range(3)]
+    np.testing.assert_array_equal(addresses[0], 100000 + expected_source * unit)
+    np.testing.assert_array_equal(
+        addresses[1], 200000 + dst[: len(expected_source)] * unit
+    )
+    np.testing.assert_array_equal(addresses[2], np.full(len(expected_source), unit))
+    assert all(len(batch[0]) <= 4096 for batch in batches)

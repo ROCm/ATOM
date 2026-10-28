@@ -44,7 +44,7 @@ def _token_bytes(shape, axes):
 
 
 def dcp_page_descriptors(plan, dst_block_ids, src_base, dst_base, unit_bytes, layout):
-    """Yield byte descriptors bounded to one destination PAGE at a time.
+    """Yield batches of byte descriptors, each bounded to one destination PAGE.
 
     Both endpoint layouts must already be checked identical. Missing source
     blocks leave destination padding untouched. No descriptor crosses a PAGE,
@@ -56,11 +56,28 @@ def dcp_page_descriptors(plan, dst_block_ids, src_base, dst_base, unit_bytes, la
     shape, axes = canonical_token_layout(layout, plan.block_size, unit_bytes)
     if len(dst_block_ids) != plan.dst_pages:
         raise ValueError("DCP destination block count disagrees with shard plan")
-    if any(int(b) < 0 for b in dst_block_ids):
+    dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
+    if (dst_ids < 0).any():
         raise ValueError("DCP destination block ids must be nonnegative")
-    offsets = (
-        None if plan.interleave_size == plan.block_size else _token_bytes(shape, axes)
-    )
+    if plan.interleave_size == plan.block_size:
+        # One run is one complete PAGE. Vectorize the address arithmetic and
+        # list conversion, while retaining a separate descriptor for each PAGE.
+        # Bounded batches avoid per-page Python/NumPy calls across every layer
+        # and consumer rank without growing scratch with the context length.
+        for start in range(0, plan.dst_pages, 4096):
+            stop = min(start + 4096, plan.dst_pages)
+            keep = plan.valid[start:stop]
+            source = plan.src_block_id_per_run[start:stop][keep]
+            if (source < 0).any():
+                raise ValueError("DCP source block ids must be nonnegative")
+            if source.size:
+                yield (
+                    src_base + source * unit_bytes,
+                    dst_base + dst_ids[start:stop][keep] * unit_bytes,
+                    np.full(source.size, unit_bytes, dtype=np.int64),
+                )
+        return
+    offsets = _token_bytes(shape, axes)
     n = plan.block_size // plan.interleave_size
     for page, dst_id in enumerate(dst_block_ids):
         start, stop = page * n, (page + 1) * n
@@ -70,13 +87,6 @@ def dcp_page_descriptors(plan, dst_block_ids, src_base, dst_base, unit_bytes, la
         src_ids = plan.src_block_id_per_run[keep]
         if (src_ids < 0).any():
             raise ValueError("DCP source block ids must be nonnegative")
-        if offsets is None:
-            yield (
-                src_base + src_ids * unit_bytes,
-                np.array([dst_base + int(dst_id) * unit_bytes], dtype=np.int64),
-                np.array([unit_bytes], dtype=np.int64),
-            )
-            continue
         within = np.arange(plan.interleave_size, dtype=np.int64)
         src = (
             src_ids[:, None, None] * unit_bytes

@@ -21,7 +21,8 @@ layer/field identities; only the stage holding the draft sends draft planes.
 
 Both endpoints must declare identical all-head layouts. The complete stage is
 validated before writing. Descriptors never cross a source or destination PAGE,
-so PAGE-aligned memory-region boundaries remain valid. S=128 copies whole pages;
+so PAGE-aligned memory-region boundaries remain valid. S=128 batches whole-page
+address calculations (up to 4096 separate descriptors per batch);
 the transfer planner also supports S=1/16 through byte runs, but M3 compute is
 currently restricted to S=128.
 
