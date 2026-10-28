@@ -118,4 +118,5 @@ def load_calibration(config, device):
     )
     return (
         torch.tensor(profile["sps_table"], dtype=torch.float32, device=device),
-        torch.tensor(profile["sts_temperatures"], dtype=torch.float32, 
+        torch.tensor(profile["sts_temperatures"], dtype=torch.float32, device=device),
+    )

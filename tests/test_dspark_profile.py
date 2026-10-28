@@ -162,4 +162,5 @@ def test_identity_resolves_a_hub_id_to_its_local_snapshot(tmp_path, monkeypatch)
     identity = deployment_identity(config, 0)
     assert set(identity["model_files"]) == {
         "config.json",
-        "model.safetensors.index
+        "model.safetensors.index.json",
+    }
