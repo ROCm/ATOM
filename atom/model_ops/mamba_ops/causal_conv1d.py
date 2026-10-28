@@ -43,7 +43,9 @@ def _causal_conv1d_metadata_kernel(
         num_chunks = ((hi - lo + BLOCK_M - 1) // BLOCK_M).to(tl.int32)
         for c0 in range(0, num_chunks, BLOCK):
             c = c0 + tl.arange(0, BLOCK)
-            mask = c < num_chunks
+            # A short `num_programs` truncates the map instead of writing past
+            # it; causal_conv1d_fn then rebuilds it from x.
+            mask = (c < num_chunks) & (start + c < num_programs)
             tl.store(batch_ptr + start + c, tl.zeros_like(c) + seq, mask=mask)
             tl.store(token_chunk_offset_ptr + start + c, c, mask=mask)
     else:
@@ -183,7 +185,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     is_k_block = (idx_feats >= k_start_dim) & (idx_feats < v_start_dim)
     is_v_block = idx_feats >= v_start_dim
 
-    if idx_seq == pad_slot_id:
+    # The program map pads with a negative id whatever `pad_slot_id` is;
+    # `pad_slot_id` only marks cache slots.
+    if idx_seq < 0:
         return
 
     sequence_start_index = tl.load(query_start_loc_ptr + idx_seq)
