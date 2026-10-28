@@ -881,9 +881,7 @@ class SGLangGDNForwardContext:
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    query_start_loc.diff().cpu().numpy(), query_start_loc.device
-                )
+                compute_causal_conv1d_metadata(query_start_loc, seq_sum)
             )
             # GatedDeltaNet's prefill reads these once-per-step fields (#2534)
             # instead of casting per layer. The native builder fills them; a
