@@ -383,7 +383,7 @@ class Drafter(abc.ABC):
 
     def lossless_verify_inputs(self, bs: int):
         """``(draft_probs, q_row_base, ratio_scratch)`` for the ratio accept
-        rule (``draft_probs`` a `rejection_sampler.RatioDraftQ`), or all None
+        rule (``draft_probs`` a `sparse_q_store.RatioDraftQ`), or all None
         for exact match."""
         return None, None, None
 

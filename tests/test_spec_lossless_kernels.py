@@ -29,7 +29,6 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.dspark_markov_sample import (
-    SparseQStore,
     dspark_markov_argmax,
     dspark_markov_sample,
     dspark_markov_sample_reference,
@@ -40,29 +39,31 @@ from atom.model_ops.rejection_sampler import (
     _RATIO_ACCEPT_KEY,
     _RATIO_BLOCK_V,
     _RATIO_RESIDUAL_KEY,
-    RatioDraftQ,
     _draft_token,
     _finish_request,
     _ratio_accept_kernel,
     _ratio_densify_clear_kernel,
     _ratio_densify_scatter_kernel,
-    _ratio_filter_count_kernel,
-    _ratio_filter_cut_kernel,
-    _ratio_filter_floor_kernel,
-    _ratio_filter_pass_kernel,
     _ratio_residual_pick_kernel,
     _ratio_residual_race_kernel,
     _ratio_scratch_shapes,
     _ratio_stats_kernel,
     _ratio_target_p,
-    _request_of_row,
     ratio_verify_scratch,
     rejection_sample,
     warmup_ratio_verify,
 )
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.model_ops.sampling_filter import (
+    _ratio_filter_count_kernel,
+    _ratio_filter_cut_kernel,
+    _ratio_filter_floor_kernel,
+    _ratio_filter_pass_kernel,
+    _request_of_row,
+)
 from atom.model_ops.sampling_scratch import take
 from atom.model_ops.softmax_tiles import softmax_combine_kernel
+from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
 
 DEV = "cuda"
 ANCHOR = 0
@@ -1719,6 +1720,7 @@ def test_a_counted_top_k_keeps_what_the_descent_keeps(monkeypatch, dtype):
     top_p that is off (1.0, scalar or per request) changes nothing, the
     +inf row included: it gets its top-k floor whatever its batch passes."""
     import atom.model_ops.rejection_sampler as rs
+    import atom.model_ops.sampling_filter as sf
 
     for vocab in (163840, 3 * _RATIO_BLOCK_V + 123):
         rows = 40
@@ -1746,7 +1748,8 @@ def test_a_counted_top_k_keeps_what_the_descent_keeps(monkeypatch, dtype):
         for ks in (top_ks, 1, 20, 50, 256):
             counted = filtered_p(logits, temps, ks)
             with monkeypatch.context() as m:
-                m.setattr(rs, "_FILTER_COUNT_MAX_K", 0)
+                for module in (rs, sf):
+                    m.setattr(module, "_FILTER_COUNT_MAX_K", 0)
                 descended = filtered_p(logits, temps, ks)
             assert torch.equal(counted[0], descended[0]), (vocab, ks)
             torch.testing.assert_close(

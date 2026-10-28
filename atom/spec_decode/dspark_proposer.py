@@ -10,17 +10,16 @@ from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.distributed.pcp_utils import get_pcp_world_size
 from atom.kv_transfer.disaggregation import kv_config_has_producer
 from atom.model_ops.dspark_markov_sample import (
-    SparseQStore,
     dspark_markov_sample_scratch,
     dspark_markov_sample_unsupported,
 )
 from atom.model_ops.rejection_sampler import (
-    RatioDraftQ,
     ratio_count_scratch_bytes,
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
 from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
+from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.draft_q_slots import DraftQSlots, DraftQStaging

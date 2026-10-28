@@ -34,7 +34,7 @@ def tile_max_sumexp(x, mask):
 
 
 # The ratio verify launches this eagerly at whatever batch arrives, so the row
-# count is not specialized on, as `rejection_sampler._BATCH_COUNTS` explains.
+# count is not specialized on, as `sampling_filter._BATCH_COUNTS` explains.
 @triton.jit(do_not_specialize=["num_rows"])
 def softmax_combine_kernel(
     part_max_ptr,  # [num_tiles, num_rows] fp32

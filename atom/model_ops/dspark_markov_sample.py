@@ -48,8 +48,6 @@ data-dependent *address* inside stage 1's W1 gather, never a data-dependent
 shape. See ``docs/environment_variables.md``.
 """
 
-from typing import NamedTuple
-
 import torch
 import triton
 import triton.language as tl
@@ -551,11 +549,9 @@ def dspark_markov_argmax_tp(
 # `ATOM_SPEC_LOSSLESS_Q_TOPK` for the trade, and
 # `atom/model_ops/rejection_sampler.py` for the consumer.
 #
-# The store (`SparseQStore`), per draft row R = q_row_base[b] + position:
-#   ids   [R, :n]  distinct vocab ids (ascending, as compaction emits them);
-#   probs [R, :n]  their q, > 0 and summing to 1 in one fixed-order reduction;
-#   meta  [R]      (n, xslot): how many are stored, and the slot of the token
-#                  the draft emitted. Slots >= n are never read.
+# The store (`sparse_q_store.SparseQStore`) holds, per draft row
+# R = q_row_base[b] + position, the stored ids in ascending order (as
+# compaction emits them), their q and the slot of the token the draft emitted.
 # A row that drafts a deterministic token (greedy, a non-finite or otherwise
 # degenerate row) stores the delta on it: n = 1, ids[0] = x, probs[0] = 1.
 # A negative base writes nothing -- pad rows, a dummy forward, an align-only
@@ -622,26 +618,6 @@ _Q_LEVELS_PER_NAT = 8.0
 _Q_MAX_GAP = 19.0
 # Stored entries one finalize iteration covers.
 _Q_FINAL_BLOCK = 1024
-
-
-class SparseQStore(NamedTuple):
-    """The persistent draft q, ``rows`` draft rows of up to ``width`` entries;
-    see the module notes for the contract."""
-
-    ids: torch.Tensor  # [rows, width] int32
-    probs: torch.Tensor  # [rows, width] fp32
-    meta: torch.Tensor  # [rows, 2] int32: (n, xslot)
-
-    @classmethod
-    def allocate(cls, rows: int, width: int, device) -> "SparseQStore":
-        return cls(
-            torch.empty((rows, width), dtype=torch.int32, device=device),
-            torch.empty((rows, width), dtype=torch.float32, device=device),
-            torch.empty((rows, 2), dtype=torch.int32, device=device),
-        )
-
-    def nbytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self)
 
 
 @triton.jit

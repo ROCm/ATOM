@@ -6,9 +6,9 @@ import torch
 
 pytest.importorskip("aiter", reason="the sampler and rejection sampler are AITER ops")
 
-from atom.model_ops.dspark_markov_sample import SparseQStore
-from atom.model_ops.rejection_sampler import RatioDraftQ, rejection_sample
+from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import Sampler
+from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
 
 ANCHOR = 7  # never a target below: a draft read from an anchor's slot is rejected
 
