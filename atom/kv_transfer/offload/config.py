@@ -27,6 +27,8 @@ import torch
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
 # never reuse one another's objects even when the HF model config is identical.
 PAGE_LAYOUT_VERSION = 3
+# Bump when M3 PAGE field/layer publication order or byte interpretation changes.
+M3_PAGE_MODE = "m3-page-regions-v2"
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
@@ -348,7 +350,8 @@ def build_page_namespace(
         "model": base_model_name,
         "page_mode": {
             "hybrid": "dsv4-page-regions",
-            "m3": "m3-page-regions",
+            # v2 orders M3 target regions by field/global layer across KV pools.
+            "m3": M3_PAGE_MODE,
         }.get(select_offload_layout(config), "dense-opaque-block"),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),

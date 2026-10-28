@@ -121,7 +121,10 @@ def _m3_builder(layer_nums, sparse, heads, config=None, kv_dtype=torch.float8_e4
     model = SimpleNamespace(config=config)
     model.configure_kv_transfer_tensors = MethodType(_configure_model, model)
     builder.model_runner = SimpleNamespace(
-        block_size=BLOCK, model=model, attn_metadata_builder=builder
+        block_size=BLOCK,
+        model=model,
+        attn_metadata_builder=builder,
+        config=SimpleNamespace(index_cache_dtype="fp8"),
     )
     return builder
 
