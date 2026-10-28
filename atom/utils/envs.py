@@ -698,6 +698,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serial one at verify windows >= ~12 tokens (measured on gfx950), so
     # "auto" keeps practical MTP windows on the serial route.
     "ATOM_REPLAYSSM_ROUTE": lambda: os.getenv("ATOM_REPLAYSSM_ROUTE", "auto").lower(),
+    # Set to 1 to compute the Qwen3-Next / Qwen3.5 GDN gate (g, beta) inside
+    # the ReplaySSM serial kernel instead of a separate `fused_gdn_gating`
+    # launch, on pure spec-verify and pure decode batches. Bit-identical
+    # output; saves one launch per GDN layer. Default 0 (opt-in).
+    "ATOM_GDN_REPLAYSSM_FUSED_GATING": lambda: (
+        os.getenv("ATOM_GDN_REPLAYSSM_FUSED_GATING", "0") == "1"
+    ),
     # "fp32" | "fp16" | "bf16".  Storage dtype of the KDA temporal state pool,
     # whose per-token traffic dominates KDA decode; the recurrence itself
     # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
