@@ -4534,21 +4534,32 @@ class ModelRunner:
         if verify_scheduler.calibration_profile is not None:
             return  # Explicit offline measurements must not be overwritten.
         dspark = self.config.dspark
+        from atom.utils.region_graph import TokenGraph
+
+        # A measured curve is mandatory where nothing else is admitted: V4.1
+        # takes no synthetic stub, and online SPS / the graph-aware budget
+        # correct a measured baseline.
+        required = (
+            dspark.online_sps
+            or dspark.bucket_global
+            or self.config.hf_config.model_type == "deepseek_v41_text"
+        )
         if (
             dspark.ragged
             and drafter.uses_confidence_schedule
             and (
-                dspark.online_sps
-                or dspark.bucket_global
-                or self.config.hf_config.model_type == "deepseek_v41_text"
+                required
+                or (
+                    TokenGraph.captured_sizes("decode") and not dspark.disable_sps_calib
+                )
             )
         ):
-            # A measured curve is required here (V4.1 admits no stub; online
-            # SPS corrects a measured baseline). Ragged verification runs on
-            # decode token graphs: time those now, before the first request,
-            # as DeepInfer's startup profile does. Capture already ran these
+            # Every model with ragged confidence scheduling and recorded decode
+            # token graphs: time those now, before the first request, as
+            # DeepInfer's startup profile does. Capture already ran these
             # graphs on the same synthetic metadata, so no request state exists
-            # yet for the replays to disturb.
+            # yet for the replays to disturb. Without token graphs (and where
+            # a stub is admitted) the synthetic table below remains.
             from atom.spec_decode.startup_sps import startup_sps_table
 
             verify_scheduler.bind_sps(

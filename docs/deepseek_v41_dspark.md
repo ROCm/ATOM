@@ -108,7 +108,8 @@ ragged=True)`. No V4 SPS curve or synthetic cost stub is admitted for V4.1: the
 scheduler needs a measured **SPS table**, mapping total query rows to
 target-forward throughput. It comes from one of two places.
 
-**Measured at startup (default).** Right after the decode token graphs are
+**Measured at startup (default, for every model with ragged confidence
+scheduling and recorded decode token graphs).** Right after the decode token graphs are
 captured, before the server accepts a request, every captured (batch, q) decode
 graph is replayed and timed, as DeepInfer's startup `profile_decode_perf` does
 (`atom/spec_decode/startup_sps.py`). The replays use the synthetic metadata
