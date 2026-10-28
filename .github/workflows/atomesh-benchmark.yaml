@@ -72,7 +72,8 @@ on:
             ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,
             ds-v4-1p1d-tp8-mtp3,ds-v4-1p1d-dpa-tp8-mtp1,
             ds-v4-2p1d-tp8,ds-v4-2p1d-dpa-tp8,
-            ds-v4-2p1d-tp8-mtp3,ds-v4-2p1d-dpa-tp8-mtp1
+            ds-v4-2p1d-tp8-mtp3,ds-v4-2p1d-dpa-tp8-mtp1,
+            ds-v4-1p1d-tp8-moriio-gsm8k,ds-v4-2p1d-tp8-moriio-gsm8k
 
           DeepSeek-V4-Pro-0813 (weekly):
             ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c1,
