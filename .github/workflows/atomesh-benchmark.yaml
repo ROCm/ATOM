@@ -89,8 +89,9 @@ on:
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48,
             glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c36,
             glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c40,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c32,
             glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c48,
-            glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c56
+            glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c56,
 
           GLM mooncake_store (suite=mooncake_store; pit2-p03 (TW MI355X) nodes only):
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c48,
@@ -283,6 +284,7 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           import urllib.parse
           import urllib.request
           from datetime import datetime, timedelta, timezone
@@ -312,7 +314,13 @@ jobs:
 
           def latest_nightly_for(day) -> str | None:
               prefix = f"nightly_{day:%Y%m%d}"
-              tags = docker_tags(prefix)
+              # Unsuffixed latest/nightly tags are the default ROCm line.
+              # ROCm 10 and manual builds have suffixes and must be requested
+              # explicitly; publication order must not switch runtime lines.
+              tags = [
+                  tag for tag in docker_tags(prefix)
+                  if re.fullmatch(r"nightly_[0-9]{12}", str(tag.get("name", "")))
+              ]
               if not tags:
                   return None
               tags.sort(

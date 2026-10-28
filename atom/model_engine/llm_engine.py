@@ -158,6 +158,19 @@ class LLMEngine:
                     "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
                     "prefill uses request-boundary balanced grouping."
                 )
+            # TBO stripes positions per request group, the draft prefill split
+            # the batch as one sequence: their shards disagree. Keyed on config,
+            # so runs that would never reach TBO are refused too.
+            if config.enable_tbo and config.speculative_config is not None:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) with speculative "
+                    "decoding is not supported under TBO: TBO's PCP prefill "
+                    "splits per request group, which the draft model's global "
+                    "round-robin query split does not match. Drop --enable-tbo, "
+                    "or run without a draft model. Note -tp > 1 already "
+                    "disables TBO under PCP (see above), so this only affects "
+                    "-tp 1 (e.g. -tp 1 -pcp 8)."
+                )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
@@ -301,7 +314,10 @@ class LLMEngine:
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()
 
-        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        # Backpressure admission is offline-only. The flag covers this add,
+        # not the collect loop; refills of the pool do not consult it.
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -321,11 +337,12 @@ class LLMEngine:
     ) -> list[dict]:
         """Generate completions for multimodal inputs (token IDs + vision data)."""
         self.core_mgr.reset_dp_router()
-        self.add_request(
-            token_ids_list,
-            sampling_params,
-            multimodal_data_list=multimodal_data_list,
-        )
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(
+                token_ids_list,
+                sampling_params,
+                multimodal_data_list=multimodal_data_list,
+            )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
