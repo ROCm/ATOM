@@ -14,7 +14,11 @@ from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample_scratch,
     dspark_markov_sample_unsupported,
 )
-from atom.model_ops.rejection_sampler import RatioDraftQ, ratio_verify_scratch
+from atom.model_ops.rejection_sampler import (
+    RatioDraftQ,
+    ratio_verify_scratch,
+    warmup_ratio_verify,
+)
 from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
@@ -362,6 +366,19 @@ class DSparkProposer(Drafter):
         return (
             RatioDraftQ(self._q_store, self._s_scratch),
             self._verify_row_base_buf.gpu[:bs],
+            self._verify_scratch,
+        )
+
+    def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:
+        """Compile the ratio verify at the widths serving gives it: the store's,
+        the vocab's and ``mtp_k`` drafts (`warmup_ratio_verify`)."""
+        if self.draft_sampling is None:
+            return
+        warmup_ratio_verify(
+            self.mtp_k,
+            self._s_scratch.shape[1],
+            self._q_store.ids.shape[1],
+            logits_dtype,
             self._verify_scratch,
         )
 

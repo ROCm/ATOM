@@ -43,6 +43,9 @@ from atom.model_ops.rejection_sampler import (
     RatioDraftQ,
     _draft_token,
     _finish_request,
+    _ratio_accept_kernel,
+    _ratio_densify_clear_kernel,
+    _ratio_densify_scatter_kernel,
     _ratio_filter_count_kernel,
     _ratio_filter_cut_kernel,
     _ratio_filter_floor_kernel,
@@ -55,6 +58,7 @@ from atom.model_ops.rejection_sampler import (
     _request_of_row,
     ratio_verify_scratch,
     rejection_sample,
+    warmup_ratio_verify,
 )
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.model_ops.sampling_scratch import take
@@ -934,6 +938,90 @@ def test_the_preallocated_scratch_verifies_exactly_what_allocation_does(dtype, f
             ratio_scratch=scratch,
         )
         assert torch.equal(plain[0], reused[0]) and torch.equal(plain[1], reused[1])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
+    dtype,
+):
+    """No warmup or capture forward verifies, so `warmup_ratio_verify` is what
+    keeps the first sampled steps from compiling mid-serve: after it, a
+    serving-shaped verify in each filter form `prepare_sample` hands over, at
+    another batch, store contents and row bases, compiles nothing."""
+    kernels = (
+        _ratio_stats_kernel,
+        softmax_combine_kernel,
+        _ratio_filter_count_kernel,
+        _ratio_filter_pass_kernel,
+        _ratio_filter_floor_kernel,
+        _ratio_filter_cut_kernel,
+        _ratio_accept_kernel,
+        _ratio_densify_clear_kernel,
+        _ratio_densify_scatter_kernel,
+        _ratio_residual_race_kernel,
+        _ratio_residual_pick_kernel,
+    )
+    max_bs, batch_n, width, q_width, vocab = 16, 5, 4, 8, 3000
+    scratch = ratio_verify_scratch(max_bs, width, vocab, DEV)
+    caches = [k.device_caches[torch.cuda.current_device()][0] for k in kernels]
+    saved = [dict(cache) for cache in caches]
+    for cache in caches:
+        cache.clear()
+    try:
+        warmup_ratio_verify(width, vocab, q_width, dtype, scratch)
+        torch.cuda.synchronize()
+        warmed = [len(cache) for cache in caches]
+        assert all(warmed), [k.fn.__name__ for k, n in zip(kernels, warmed) if not n]
+
+        torch.manual_seed(53)
+        rows = batch_n * width
+        q_rows = torch.softmax(torch.randn(rows, vocab, device=DEV), -1)
+        drafts = torch.multinomial(q_rows, 1).view(-1).to(torch.int32)
+        # Sliced out of the per-row buffers, as `prepare_sample` hands them.
+        top_ks = torch.randint(1, 300, (max_bs,), device=DEV, dtype=torch.int32)
+        top_ps = torch.rand(max_bs, device=DEV) * 0.9 + 0.05
+        forms = (
+            (None, None),
+            (20, None),
+            (300, None),
+            (None, 0.8),
+            (top_ks[:batch_n], None),
+            (None, top_ps[:batch_n]),
+            (top_ks[:batch_n], 0.8),
+            (top_ks[:batch_n], top_ps[:batch_n]),
+        )
+        store = SparseQStore.allocate(max_bs * width, q_width, DEV)
+        for t in store:
+            t.zero_()
+        for top_ks_form, top_ps_form in forms:
+            # A step's target rows are gathered out of its whole logits.
+            logits = torch.randn(rows + batch_n, vocab, device=DEV).to(dtype)
+            args = verify_batch(
+                drafts,
+                width,
+                logits[:rows],
+                torch.ones(max_bs, device=DEV)[:batch_n],
+                row_base=torch.arange(batch_n, device=DEV, dtype=torch.int32) * width,
+            )
+            rejection_sample(
+                **args,
+                draft_probs=RatioDraftQ(store, stale(max_bs, vocab)),
+                ratio_step=3,
+                top_ks=top_ks_form,
+                top_ps=top_ps_form,
+                ratio_scratch=scratch,
+            )
+        torch.cuda.synchronize()
+        grew = [
+            k.fn.__name__
+            for k, cache, n in zip(kernels, caches, warmed)
+            if len(cache) != n
+        ]
+        assert not grew, f"compiled while serving: {grew}"
+    finally:
+        for cache, entries in zip(caches, saved):
+            cache.clear()
+            cache.update(entries)
 
 
 def test_the_same_key_gives_the_same_verdict():

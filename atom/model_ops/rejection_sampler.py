@@ -1798,6 +1798,76 @@ def _ratio_sample(
     )
 
 
+def warmup_ratio_verify(
+    num_spec_steps: int,
+    vocab_size: int,
+    q_width: int,
+    logits_dtype: torch.dtype,
+    scratch: SamplingScratch,
+) -> None:
+    """Compile every ratio verify variant serving can launch, before it does.
+
+    The verify runs eagerly and only on a step that scores drafts, which no
+    warmup or capture forward is (`ModelRunner._verifies_drafts`). On an empty
+    Triton cache each variant would otherwise compile inside the first serving
+    step that needs it, seconds per rank, with DP peers waiting in the
+    collective. So this verifies a one-request dummy batch once per filter
+    form. It matches a serving batch in everything Triton specializes on: the
+    logits' dtype and width, the index dtypes, ``num_spec_steps``, the store's
+    width and ``scratch``'s alignment (batch counts are not specialized on,
+    `_BATCH_COUNTS`).
+
+    It touches no state: the coins use step 0 of the keys rather than a
+    `RejectionSampler`'s counter, the store and dense rows are its own and
+    never read (the row base is -1), and ``scratch`` holds nothing across a
+    verify. It has no collective and takes no input from the device, so every
+    rank runs it alike.
+    """
+    device = scratch.f32.device
+    num_tokens = num_spec_steps
+
+    def ints(values, dtype=torch.int32):
+        return torch.tensor(values, dtype=dtype, device=device)
+
+    def per_row_p():
+        return torch.full((1,), 0.9, dtype=torch.float32, device=device)
+
+    k_counted = _FILTER_COUNT_MAX_K
+    k_descended = _FILTER_COUNT_MAX_K + 1
+    # The (top_ks, top_ps) forms `ModelRunner.prepare_sample` hands over: none,
+    # a scalar top-k (counted or descended), a scalar top-p, and a per-row k,
+    # p or both. Never a scalar k beside a top-p: `Sampler` keeps top-k ties
+    # with the flag on, so that k arrives per row, beside either kind of p.
+    forms = (
+        (None, None),
+        (k_counted, None),
+        (k_descended, None),
+        (None, 0.9),
+        (ints([k_counted]), None),
+        (None, per_row_p()),
+        (ints([k_counted]), 0.9),
+        (ints([k_counted]), per_row_p()),
+    )
+    store = SparseQStore.allocate(num_tokens, q_width, device)
+    dense = torch.empty((1, vocab_size), dtype=torch.float32, device=device)
+    for top_ks, top_ps in forms:
+        rejection_sample(
+            ints([0] * (num_tokens + 2)),
+            torch.arange(num_tokens, dtype=torch.int64, device=device),
+            num_spec_steps,
+            ints([num_tokens]),
+            RatioDraftQ(store, dense),
+            torch.zeros((num_tokens, vocab_size), dtype=logits_dtype, device=device),
+            ints([0]),
+            ints([num_tokens], torch.int64),
+            temperatures=torch.ones(1, dtype=torch.float32, device=device),
+            top_ks=top_ks,
+            top_ps=top_ps,
+            draft_probs_row_base=ints([-1]),
+            ratio_scratch=scratch,
+        )
+
+
 def acceptance_length_to_rates(length: float, n: int) -> list[float]:
     """Mean acceptance length -> per-position *unconditional* acceptance rates.
 

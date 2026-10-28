@@ -387,6 +387,11 @@ class Drafter(abc.ABC):
         for exact match."""
         return None, None, None
 
+    def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:
+        """Compile the ratio verify before serving; see
+        `rejection_sampler.warmup_ratio_verify`."""
+        return
+
     @property
     def draft_kv_duplicates_propose(self) -> bool:
         """Is `compute_draft_kv` the pass propose's first draft step redoes?

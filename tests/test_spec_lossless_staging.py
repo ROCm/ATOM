@@ -259,6 +259,30 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     assert prop._draft_scratch.f32.numel() and prop._verify_scratch.f32.numel()
 
 
+@pytest.mark.parametrize("lossless", [True, False], ids=["armed", "not-armed"])
+def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch, lossless):
+    """The ratio verify compiles per store width, draft count, vocab and
+    logits dtype, so the warmup must use the ones serving will; unarmed there
+    is nothing to compile."""
+    prop = proposer(monkeypatch, lossless=lossless)
+    calls = []
+    monkeypatch.setattr(
+        dspark_proposer, "warmup_ratio_verify", lambda *args: calls.append(args)
+    )
+    prop.warmup_lossless_verify(torch.bfloat16)
+    if not lossless:
+        assert calls == []
+        return
+    ((steps, vocab, width, dtype, scratch),) = calls
+    assert (steps, vocab, width, dtype) == (
+        T,
+        VOCAB,
+        prop._q_store.ids.shape[1],
+        torch.bfloat16,
+    )
+    assert scratch is prop._verify_scratch
+
+
 # ---- staging ----------------------------------------------------------------
 
 

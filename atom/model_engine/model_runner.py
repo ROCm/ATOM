@@ -947,6 +947,11 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
+        if getattr(self, "drafter", None) is not None:
+            # No warmup or capture forward verifies, so the ratio verify is
+            # compiled here, before the memory profile. Its logits are the LM
+            # head's, which keeps the hidden states' dtype.
+            self.drafter.warmup_lossless_verify(config.torch_dtype)
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
