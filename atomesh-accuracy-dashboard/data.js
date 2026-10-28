@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793122295990,
+  "lastUpdate": 1793210795225,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4490,6 +4490,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8984,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40539094122 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610271459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1592 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Pleaplusone",
+            "username": "ganyi1996ppo",
+            "email": "ygan@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "646da00fe322d28cb7971082d2a8af6905c57cd8",
+          "message": "[GDN][Perf] Build causal_conv1d program map on GPU with Triton (#2773)\n\n* [GDN][Perf] Build causal_conv1d program map on GPU with Triton\n\ncompute_causal_conv1d_metadata copied query_start_loc to the host, built\nthe (sequence, chunk) map with numpy and a per-chunk Python loop, then\ncopied it back, which also forced a device sync every prefill step. A\nTriton kernel now writes the map on the device.\n\nThe conv grid no longer needs the exact chunk count: callers pass a host\ntoken count and the grid is cdiv(num_tokens, BLOCK_M) + num_seqs, with\nsurplus programs reading PAD_SLOT_ID and exiting. causal_conv1d_fn\nrebuilds the map from x.shape[1] when that bound is short, so an\nunder-reporting caller cannot drop chunks, and its metadata=None path\nuses the same kernel instead of the host loop.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* [GDN] Bound conv1d map stores and exit padded programs on any negative id\n\nA num_tokens bound short of the real chunk count let the map kernel write\npast its rows before causal_conv1d_fn rebuilt the map; stores are now\nmasked by num_programs. Surplus conv programs carry -1, which the conv\nkernel compared against the configurable pad_slot_id; it now exits on\nany negative sequence id, leaving pad_slot_id to cache slots.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* [GDN] Test that a sufficient conv1d map is reused, not rebuilt\n\nThe exact variant built its map for T tokens while x has T + 5 columns,\nso the launcher rebuilt it and the reuse path went untested. It now\nbuilds for x.shape[1] and fails if causal_conv1d_fn rebuilds.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>\nCo-authored-by: gbyu-amd <Guanbao.Yu@amd.com>",
+          "timestamp": "2026-10-28T14:42:09Z",
+          "url": "https://github.com/ROCm/ATOM/commit/646da00fe322d28cb7971082d2a8af6905c57cd8"
+        },
+        "date": 1793210789729,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.953,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40724005038 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610281502 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8946,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40724005038 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610281502 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1569 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
