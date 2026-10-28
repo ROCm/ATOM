@@ -12,6 +12,7 @@ if not torch.cuda.is_available():
     pytest.skip("requires GPU", allow_module_level=True)
 
 from atom.model_ops.engram.device.gate import (
+    _engram_apply_gates_kernel,
     engram_post_wkv,
     engram_post_wkv_reference,
     engram_post_wkv_tp,
@@ -130,6 +131,60 @@ def test_capture_replay_reads_changed_inputs(monkeypatch):
         graph.replay()
         expected = engram_post_wkv_reference(h, kv, w, mask)
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("dim", [38, 5120])
+def test_apply_gates_reuses_binary_across_token_counts_and_graph(tp, dim):
+    local_hc, value_start = 4 // tp, dim // tp
+    # Include M=1, aligned/unaligned M and the observed prefill JIT triggers.
+    counts = [1, 6, 7, 16, 129, 192]
+    if dim == 38:
+        counts += [768, 12237, 16260]
+    compiled = None
+    for m in counts:
+        h = torch.randn(m, 4, dim, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(m, (local_hc + 1) * dim, device="cuda", dtype=h.dtype)
+        gates = torch.rand(tp, m, local_hc, device="cuda")
+        output = torch.empty_like(h)
+
+        def launch(h=h, kv=kv, gates=gates, output=output, m=m):
+            return _engram_apply_gates_kernel[((h.numel() + 1023) // 1024,)](
+                h,
+                kv,
+                gates,
+                output,
+                m,
+                HC=4,
+                DIM=dim,
+                LOCAL_HC=local_hc,
+                BLOCK=1024,
+                VALUE_START=value_start,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
+
+        def check(h=h, kv=kv, gates=gates, output=output, m=m):
+            gate = gates.permute(1, 0, 2).reshape(m, 4)
+            value = torch.roll(kv[:, local_hc * dim :], value_start, -1)
+            expected = (h.float() + gate[..., None] * value.float()[:, None]).to(
+                h.dtype
+            )
+            assert torch.equal(output, expected)
+
+        kernel = launch()
+        if compiled is None:
+            compiled = kernel
+        assert kernel is compiled
+        check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert launch() is compiled
+    for _ in range(2):
+        h.add_(0.25)
+        gates.mul_(0.75)
+        graph.replay()
+        check()
 
 
 @pytest.mark.parametrize("tp", [2, 4])
@@ -255,3 +310,13 @@ def test_empty_and_invalid_local_projection():
             group,
             torch.ones(1, device="cuda", dtype=torch.bool),
         )
+
+
+def test_tp8_rejected_by_sharded_gate_entry_points():
+    group = SimpleNamespace(world_size=8, rank_in_group=0)
+    h = torch.empty(1, 8, 64, device="cuda")
+    weight = torch.ones(8, 64, device="cuda")
+    with pytest.raises(ValueError, match="TP2 or TP4"):
+        engram_post_wkv_tp(h, torch.empty(1, 128, device="cuda"), weight, group)
+    with pytest.raises(ValueError, match="TP2 or TP4"):
+        engram_post_wkv(h, torch.empty(1, 9 * 64, device="cuda"), weight, kv_tp_size=8)

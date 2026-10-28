@@ -129,7 +129,9 @@ def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20, *, kv_tp_siz
         raise ValueError("Engram gate weight does not match residual branches")
     if token_mask is not None and token_mask.shape != hidden.shape[:-2]:
         raise ValueError("Engram token mask must match residual tokens")
-    if kv_tp_size < 1 or (hc * dim) % kv_tp_size or dim % kv_tp_size:
+    if kv_tp_size not in (1, 2, 4):
+        raise ValueError("Engram KV sharding supports TP2 or TP4")
+    if (hc * dim) % kv_tp_size or dim % kv_tp_size:
         raise ValueError("Engram KV TP size must divide key rows and value width")
     supported = _can_fuse(hidden, kv, weight, token_mask)
     if not supported:
@@ -165,13 +167,14 @@ def engram_post_wkv(hidden, kv, weight, token_mask=None, eps=1e-20, *, kv_tp_siz
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _engram_apply_gates_kernel(
     hidden,
     kv,
     gates,
     output,
-    M: tl.constexpr,
+    # Prefill chunk lengths vary; keep the gathered-gate stride runtime.
+    M,
     HC: tl.constexpr,
     DIM: tl.constexpr,
     LOCAL_HC: tl.constexpr,
@@ -197,163 +200,14 @@ def _engram_apply_gates_kernel(
     tl.store(output + off, h + gate * v, live)
 
 
-@triton.jit
-def _engram_key_stats_kernel(
-    hidden,
-    kv,
-    weight,
-    stats,
-    DIM: tl.constexpr,
-    KEY_DIM: tl.constexpr,
-    RANK: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    token = tl.program_id(0).to(tl.int64)
-    col = tl.arange(0, BLOCK)
-    live = col < KEY_DIM
-    hcol = (RANK % 2) * KEY_DIM + col
-    branch: tl.constexpr = RANK // 2
-    h = tl.load(hidden + (token * 4 + branch) * DIM + hcol, live, 0).to(tl.float32)
-    k = tl.load(kv + token * (KEY_DIM + DIM) + col, live, 0).to(tl.float32)
-    w = tl.load(weight + branch * DIM + hcol, live, 0).to(tl.float32)
-    tl.store(stats + token * 3, tl.sum(h * h, 0))
-    tl.store(stats + token * 3 + 1, tl.sum(k * k, 0))
-    tl.store(stats + token * 3 + 2, tl.sum((h * w) * k, 0))
-
-
-@triton.jit
-def _engram_apply_stats_kernel(
-    hidden,
-    kv,
-    stats,
-    token_mask,
-    output,
-    eps,
-    M: tl.constexpr,
-    DIM: tl.constexpr,
-    KEY_DIM: tl.constexpr,
-    VALUE_START: tl.constexpr,
-    HAS_MASK: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    token, branch = row // 4, row % 4
-    off = branch * 2 * M * 3 + token * 3
-    sh = tl.load(stats + off) + tl.load(stats + off + M * 3)
-    sk = tl.load(stats + off + 1) + tl.load(stats + off + M * 3 + 1)
-    dot = tl.load(stats + off + 2) + tl.load(stats + off + M * 3 + 2)
-    rstd = tl.rsqrt(sh / DIM + eps) * tl.rsqrt(sk / DIM + eps)
-    dot = dot * rstd * (DIM**-0.5)
-    magnitude = tl.sqrt(tl.maximum(tl.abs(dot), 1e-6))
-    signed = (magnitude.to(tl.uint32, bitcast=True) & 0x7FFFFFFF) | (
-        dot.to(tl.uint32, bitcast=True) & 0x80000000
-    )
-    gate = tl.sigmoid(signed.to(tl.float32, bitcast=True))
-    if HAS_MASK:
-        gate = tl.where(tl.load(token_mask + token), gate, 0.0)
-    col = tl.arange(0, BLOCK)
-    live = col < DIM
-    value_col = (col + DIM - VALUE_START) % DIM
-    h = tl.load(hidden + row * DIM + col, live, 0).to(tl.float32)
-    v = tl.load(kv + token * (KEY_DIM + DIM) + KEY_DIM + value_col, live, 0).to(
-        tl.float32
-    )
-    tl.store(output + row * DIM + col, h + gate * v, live)
-
-
-def _engram_post_wkv_split_key(
-    hidden, kv, weight, group, token_mask, eps, *, value_start
-):
-    """TP8: merge two half-Key statistics before normalization and sigmoid."""
-    dim = hidden.shape[-1]
-    key_dim = dim // 2
-    m = hidden.numel() // (4 * dim)
-    if dim % 2 or kv.shape != (*hidden.shape[:-2], key_dim + dim):
-        raise ValueError("Engram TP8 requires one half Key and complete V per rank")
-    if weight.shape != (4, dim):
-        raise ValueError("Engram gate weight does not match residual branches")
-    if token_mask is not None and token_mask.shape != hidden.shape[:-2]:
-        raise ValueError("Engram token mask must match residual tokens")
-    if not 0 <= value_start < dim:
-        raise ValueError("Engram value start must be inside the value width")
-    if not m:
-        return hidden.clone()
-    rank = group.rank_in_group
-    fused = _can_fuse(hidden, kv, weight, token_mask)
-    if fused:
-        local = torch.empty((m, 3), device=hidden.device, dtype=torch.float32)
-        _engram_key_stats_kernel[(m,)](
-            hidden,
-            kv,
-            weight,
-            local,
-            DIM=dim,
-            KEY_DIM=key_dim,
-            RANK=rank,
-            BLOCK=triton.next_power_of_2(key_dim),
-            num_warps=8,
-            enable_fp_fusion=False,
-        )
-    else:
-        start = rank % 2 * key_dim
-        h = hidden[..., rank // 2, start : start + key_dim].float()
-        k = kv[..., :key_dim].float()
-        w = weight[rank // 2, start : start + key_dim]
-        local = (
-            torch.stack(
-                (h.square().sum(-1), k.square().sum(-1), ((h * w) * k).sum(-1)), -1
-            )
-            .reshape(m, 3)
-            .contiguous()
-        )
-    comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
-    stats = group.all_gather(
-        local,
-        dim=0,
-        use_custom=local.is_cuda and comm is not None and not comm.disabled,
-    )
-    if fused:
-        output = torch.empty_like(hidden)
-        _engram_apply_stats_kernel[(m * 4,)](
-            hidden,
-            kv,
-            stats,
-            token_mask,
-            output,
-            eps,
-            M=m,
-            DIM=dim,
-            KEY_DIM=key_dim,
-            VALUE_START=value_start,
-            HAS_MASK=token_mask is not None,
-            BLOCK=triton.next_power_of_2(dim),
-            num_warps=8,
-            enable_fp_fusion=False,
-        )
-        return output
-    stats = stats.reshape(4, 2, m, 3).sum(1).permute(1, 0, 2)
-    sh, sk, dot = stats.unbind(-1)
-    dot = dot * (torch.rsqrt(sh / dim + eps) * torch.rsqrt(sk / dim + eps)) * dim**-0.5
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
-    gate = gate.reshape(*hidden.shape[:-2], 4)
-    if token_mask is not None:
-        gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
-    value = torch.roll(kv[..., key_dim:], value_start, -1)
-    return (hidden.float() + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
-        hidden.dtype
-    )
-
-
 def engram_post_wkv_tp(
     hidden, kv, weight, group, token_mask=None, eps=1e-20, *, value_start=0
 ):
-    """Local Keys + complete V; gather FP32 gates, or TP8 half-Key statistics."""
+    """TP2/TP4: local complete Keys + full V; gather FP32 gates."""
     hc, dim = hidden.shape[-2:]
     tp, rank = group.world_size, group.rank_in_group
-    if tp == 8 and hc == 4:
-        return _engram_post_wkv_split_key(
-            hidden, kv, weight, group, token_mask, eps, value_start=value_start
-        )
+    if tp not in (2, 4):
+        raise ValueError("Engram WKV sharding supports TP2 or TP4")
     if hc % tp:
         raise ValueError("Engram branches must divide evenly across TP ranks")
     local_hc = hc // tp

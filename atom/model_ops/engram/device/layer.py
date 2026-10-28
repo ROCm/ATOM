@@ -33,12 +33,12 @@ class _EngramWKV(ReplicatedLinear):
             enable_tp
             and self.native_a8_group_rows == 32
             and self.weight.dtype == torch.float8_e4m3fn
-            and self.tp_size in (2, 4, 8)
-            and (hc_mult % self.tp_size == 0 or (self.tp_size == 8 and hc_mult == 4))
+            and self.tp_size in (2, 4)
+            and hc_mult % self.tp_size == 0
             and (hc_mult * hidden_size) % (32 * self.tp_size) == 0
             and hidden_size % 32 == 0
         ):
-            self.local_hc = max(1, hc_mult // self.tp_size)
+            self.local_hc = hc_mult // self.tp_size
             self.local_key_rows = hc_mult * hidden_size // self.tp_size
             self.output_size = self.local_key_rows + hidden_size
             self.output_partition_sizes = [self.output_size]
@@ -55,8 +55,8 @@ class _EngramWKV(ReplicatedLinear):
     def use_kv_gather(self, x: torch.Tensor) -> bool:
         return self.kv_gather_rows > 0 and 0 < x.numel() // self.input_size <= 12
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.use_kv_gather(x):
+    def forward(self, x: torch.Tensor, *, full_value: bool = False) -> torch.Tensor:
+        if full_value or not self.use_kv_gather(x):
             return super().forward(x)
         from atom.model_ops.blockscale import native_quant_linear
 
@@ -182,14 +182,16 @@ class EngramOp(nn.Module):
         m = embeddings.numel() // self.engram_hidden_size
         use_fused = (
             self.fused_post is not None
-            and 12 < m <= 128
+            and 6 < m <= 128
             and hidden_states.dtype == embeddings.dtype == torch.bfloat16
             and hidden_states.is_contiguous()
             and embeddings.is_contiguous()
             and (token_mask is None or token_mask.is_contiguous())
         )
         if use_fused:
-            kv = self.wkv(embeddings)
+            # Fusion needs complete V even where the unfused route still
+            # prefers the KV prefix (M=7..12).
+            kv = self.wkv(embeddings, full_value=True)
             return self.fused_post(
                 hidden_states,
                 kv,

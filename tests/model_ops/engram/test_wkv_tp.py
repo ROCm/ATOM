@@ -208,6 +208,14 @@ def test_small_projection_uses_prefix_of_the_only_weight(monkeypatch, tp_group, 
         )
         assert_bytes(prefix, shuffle_weight(expected, (16, 16)))
 
+        # The fused post also runs below the unfused cutoff and requires
+        # complete V from the same stored weight, rather than its KV prefix.
+        projection.reset_mock()
+        op.wkv(x, full_value=True)
+        projection.assert_called_once()
+        assert projection.call_args.args[1] is stored
+        assert projection.call_args.args[2] is op.wkv.weight_scale
+
 
 @pytest.mark.parametrize("name", ["weight", "weight_scale"])
 @pytest.mark.parametrize("bad_shape", ["local", "transpose", "flatten", "short"])
@@ -318,6 +326,8 @@ def test_dispatches_local_projection_without_forward_context(
         (2, 4, 128, 32, False),
         (4, 4, 128, 32, False),
         (8, 4, 128, 32, False),
+        (8, 4, 256, 32, True),
+        (8, 8, 256, 32, True),
     ],
     ids=[
         "tp1",
@@ -329,6 +339,8 @@ def test_dispatches_local_projection_without_forward_context(
         "tp2-disabled",
         "tp4-disabled",
         "tp8-disabled",
+        "tp8-fallback",
+        "tp8-complete-keys-fallback",
     ],
 )
 def test_unsupported_configs_keep_full_loading_and_gate(
@@ -351,6 +363,7 @@ def test_unsupported_configs_keep_full_loading_and_gate(
         op.load_checkpoint_weights(weight, torch.ones(hc, dim), torch.ones(hc, dim))
         torch.testing.assert_close(op.wkv.weight, weight)
     op.process_weights_after_loading()
+    assert op.fused_post is None
     hidden, embeddings = torch.randn(2, 3, hc, dim), torch.randn(2, 3, 96)
     kv = torch.randn(2, 3, (hc + 1) * dim)
     monkeypatch.setattr(op.wkv, "forward", Mock(return_value=kv))
@@ -377,7 +390,7 @@ def gpu_checkpoint():
 
 
 @pytest.mark.parametrize("m", [1, 12, 13, 16, 32, 256])
-@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("tp", [2, 4])
 def test_loaded_native_projection_matches_gathered_keys_and_value(
     monkeypatch, tp_group, gpu_checkpoint, m, tp
 ):
@@ -432,43 +445,34 @@ def test_loaded_native_projection_matches_gathered_keys_and_value(
             assert mismatch.float().mean() < 1e-3
 
 
-def test_tp8_half_key_weight_and_small_prefix_share_storage(monkeypatch, tp_group):
-    from aiter.ops.shuffle import shuffle_weight
-
-    tp_group.world_size = 8
-    monkeypatch.setattr(linear, "weight_is_stored_preshuffled", lambda *a, **k: True)
-    for rank in range(8):
-        tp_group.rank_in_group = rank
-        op = make_op(dim=256)
-        weight, scales = checkpoint(op)
-        op.load_checkpoint_weights(
-            weight, torch.ones(4, 256), torch.ones(4, 256), scales
+@pytest.mark.parametrize("m", [6, 7, 128, 129])
+def test_tp8_fallback_matches_complete_wkv(monkeypatch, tp_group, gpu_checkpoint, m):
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1")
+    tp_group.world_size, tp_group.rank_in_group = 8, 7
+    weight, scales = gpu_checkpoint
+    with torch.device("cuda"):
+        gate_weight = torch.ones(4, 5120)
+        baseline = make_op(dim=5120, width=6144, enable_tp=False)
+        fallback = make_op(dim=5120, width=6144, enable_tp=True)
+        for op in (baseline, fallback):
+            op.load_checkpoint_weights(weight, gate_weight, gate_weight, scales)
+            assert op.wkv.weight.shape == (25600, 6144)
+            assert op.fused_post is None
+        monkeypatch.setattr(layer, "get_tp_group", Mock(side_effect=AssertionError))
+        monkeypatch.setattr(
+            layer, "engram_post_wkv_tp", Mock(side_effect=AssertionError)
         )
-        assert op.wkv.local_key_rows == 128
-        assert op.wkv.weight.shape == (384, 96)
-        assert op.wkv.weight.untyped_storage().nbytes() == 384 * 96
-        expected = torch.cat(
-            (
-                weight[rank * 128 : (rank + 1) * 128],
-                torch.roll(weight[1024:], -rank * 32, 0),
-            )
-        )
-        assert_bytes(op.wkv.weight, shuffle_weight(expected, (16, 16)))
-        assert_bytes(op.wkv.weight_scale[:4], scales[rank * 4 : (rank + 1) * 4])
-        assert_bytes(op.wkv.weight_scale[4:], torch.roll(scales[32:], -rank, 0))
-        prefix = op.wkv.weight[:160]
-        assert (
-            prefix.untyped_storage().data_ptr()
-            == op.wkv.weight.untyped_storage().data_ptr()
-        )
-        assert_bytes(prefix, shuffle_weight(expected[:160], (16, 16)))
-        assert set(dict(op.wkv.named_parameters())) == {"weight", "weight_scale"}
+        h = torch.randn(m, 4, 5120, dtype=torch.bfloat16)
+        x = torch.randn(m, 6144, dtype=torch.bfloat16)
+        mask = torch.arange(m) % 3 != 0
+        assert torch.equal(fallback(h, x, mask), baseline(h, x, mask))
 
 
-@pytest.mark.parametrize("tp", [2, 4, 8])
-@pytest.mark.parametrize("m", [0, 1, 12, 13, 128, 129])
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("m", [0, 1, 6, 7, 12, 13, 128, 129])
+@pytest.mark.parametrize("fuse_available", [False, True])
 def test_flydsl_dispatch_preserves_kv_prefix_and_large_m_fallback(
-    monkeypatch, tp_group, tp, m
+    monkeypatch, tp_group, tp, m, fuse_available
 ):
     tp_group.world_size, tp_group.rank_in_group = tp, tp - 1
     op = make_op(dim=5120)
@@ -476,7 +480,8 @@ def test_flydsl_dispatch_preserves_kv_prefix_and_large_m_fallback(
     h = torch.randn(m, 4, 5120, dtype=torch.bfloat16)
     x = torch.randn(m, 96, dtype=torch.bfloat16)
     mask = torch.ones(m, dtype=torch.bool)
-    tiny = 0 < m <= 12
+    use_fused = fuse_available and 6 < m <= 128
+    tiny = not use_fused and 0 < m <= 12
     kv = torch.empty(
         m, 25600 // tp if tiny else 20480 // tp + 5120, dtype=torch.bfloat16
     )
@@ -484,15 +489,15 @@ def test_flydsl_dispatch_preserves_kv_prefix_and_large_m_fallback(
     monkeypatch.setattr(op.wkv, "forward", projection)
     output = torch.empty_like(h)
     fused = Mock(return_value=output)
-    op.fused_post = fused
+    op.fused_post = fused if fuse_available else None
     composed = Mock(return_value=output)
     monkeypatch.setattr(layer, "engram_post_wkv_tp", composed)
     full_gate = Mock(return_value=output)
     monkeypatch.setattr(layer, "engram_post_wkv", full_gate)
     tp_group.all_gather = Mock(return_value=torch.empty(m, 25600, dtype=torch.bfloat16))
     assert op(h, x, mask) is output
-    projection.assert_called_once_with(x)
-    if 12 < m <= 128:
+    projection.assert_called_once_with(x, **({"full_value": True} if use_fused else {}))
+    if use_fused:
         fused.assert_called_once_with(
             h, kv, op.gate_weight, mask, value_start=op.wkv.value_start, eps=op.norm_eps
         )
