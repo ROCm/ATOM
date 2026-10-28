@@ -107,9 +107,12 @@ def test_rollout_sync_reproduces_the_loaded_e8m0_weight(monkeypatch, output_size
     assert _same_bytes(layer.weight, ref.weight)
     assert _same_bytes(layer.weight_scale, ref.weight_scale)
     assert layer.weight_scale.dtype == dtypes.fp8_e8m0
-    if output_size % 128 != 0:
-        assert layer.is_output_padded
-        assert tuple(layer.weight.shape) == (2176, 256)
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    # Only gfx1250's mxfp8_128 GEMM needs N % 128 == 0.
+    padded = output_size % 128 != 0 and get_gfx_runtime() == "gfx1250"
+    assert layer.is_output_padded is padded
+    assert layer.weight.shape[0] == (2176 if padded else output_size)
 
     if not torch.cuda.is_available():
         return
@@ -124,6 +127,7 @@ def test_rollout_sync_reproduces_the_loaded_e8m0_weight(monkeypatch, output_size
 
 def test_rollout_sync_shards_logical_n_before_padding(monkeypatch):
     monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: "gfx1250")
     stale = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
     local = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
     other = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
@@ -152,6 +156,7 @@ def test_online_target_decides_the_scale_format(monkeypatch, e8m0):
 
 def test_online_e8m0_weight_is_padded_to_128_rows(monkeypatch):
     monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: "gfx1250")
     layer = _bf16_layer(monkeypatch, e8m0=True)
 
     layer.is_output_padded = layer._maybe_pad_a8w8_preshuffle_output()
