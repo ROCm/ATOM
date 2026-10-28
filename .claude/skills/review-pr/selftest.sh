@@ -245,5 +245,37 @@ if [ "$lr_rc" -ne 0 ] && [ "$lbad" -eq 0 ]; then
   echo "  ❌ lost_review_test.py did not run — ${why:-exit $lr_rc}"; bad=$((bad + 1))
 fi
 
+echo "[applies.txt recheck]"
+# run_one.sh re-checks `git apply` on the merge-target worktree (checked out at the real BASE_SHA)
+# because fetch.sh's own check ran against PROJECT_ROOT's current checkout instead. That recheck
+# must not clobber a richer diagnosis fetch.sh already wrote -- PR#2705 lost fetch.sh's
+# double-application explanation to the generic "needs a rebase" text this way once already.
+applies_recheck() {  # <git-apply exit code> <applies.txt fetch.sh already wrote> -> final applies.txt
+  local W; W=$(mktemp -d)
+  mkdir -p "$W/merge-target"
+  echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" > "$W/merge_target.txt"
+  printf '%s\n' "$2" > "$W/applies.txt"
+  { echo 'set -uo pipefail'
+    echo 'say() { :; }'
+    printf 'W=%s\n' "$W"
+    printf 'git() { return %s; }\n' "$1"
+    sed -n '/^if \[ -d "\$W\/merge-target" \]; then/,/^fi$/p' "$S/run_one.sh"
+    echo 'cat "$W/applies.txt"'
+  } | bash 2>/dev/null
+  rm -rf "$W"
+}
+double_app_msg="STALE: no longer applies to merge target abc -- but this PR was ALREADY
+  MERGED via xyz, and abc is downstream of that merge commit. This
+  is not drift needing a rebase -- it is double-application: ..."
+t "recheck STALE keeps fetch.sh's double-application diagnosis" \
+  "$(applies_recheck 1 "$double_app_msg" | grep -c 'double-application')" "1"
+t "recheck STALE does not also write the generic rebase text over a double-application one" \
+  "$(applies_recheck 1 "$double_app_msg" | grep -c 'needs a rebase,')" "0"
+t "recheck STALE still writes the generic text when fetch.sh's own verdict was generic" \
+  "$(applies_recheck 1 'STALE: no longer applies to merge target abc -- the PR needs a rebase,' \
+     | grep -c 'needs a rebase,')" "1"
+t "recheck APPLIES overwrites with the rechecked-tree message regardless" \
+  "$(applies_recheck 0 "$double_app_msg" | grep -c 'rechecked on the merge-target worktree')" "1"
+
 echo "=== $ok green / $bad red ==="
 [ "$bad" -eq 0 ]

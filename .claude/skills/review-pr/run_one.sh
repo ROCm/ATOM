@@ -115,6 +115,15 @@ if [ -d "$W/merge-target" ]; then
   BASE=$(grep -oE '[0-9a-f]{40}' "$W/merge_target.txt" 2>/dev/null | head -1)
   if git -C "$W/merge-target" -c core.fileMode=false apply --check "$W/pr.diff" 2>"$W/.err2"; then
     echo "APPLIES: the diff still applies to merge target $BASE (rechecked on the merge-target worktree)" > "$W/applies.txt"
+  elif grep -q 'double-application' "$W/applies.txt" 2>/dev/null; then
+    # fetch.sh already diagnosed this as double-application: the PR is already merged and
+    # BASE_SHA is downstream of the PR's own merge commit, so re-applying the diff conflicts
+    # by construction -- not drift. That is a fact about commit ancestry (merge commit vs.
+    # BASE_SHA), not about which working tree `git apply --check` ran against, so it still
+    # holds when the recheck (on the correct merge-target tree) also comes back STALE. This
+    # recheck exists to correct WHICH TREE was tested, not to discard a correct, more
+    # specific diagnosis for the generic "needs a rebase" one.
+    say "applies.txt: recheck on merge-target agrees (STALE) -- keeping fetch.sh's double-application diagnosis"
   else
     { echo "STALE: no longer applies to merge target $BASE -- the PR needs a rebase,"
       echo "  and any CI result on it describes a tree that has moved"
