@@ -5,7 +5,6 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -13,6 +12,35 @@ import triton.language as tl
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 PAD_SLOT_ID = -1
+BLOCK_M = 8
+
+
+def device_conv1d_indices(
+    query_start_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Sequence id and chunk offset for each conv program, on the same device.
+
+    Built with tensor ops so the host never copies the per-sequence lengths
+    back or uploads the expanded tables. The third value is the table length,
+    which is the kernel grid.
+    """
+    nums = -(-query_start_loc.diff() // BLOCK_M)
+    n_seqs = int(nums.shape[0])
+    if n_seqs == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=query_start_loc.device)
+        return empty, empty, 0
+    seq_ids = torch.repeat_interleave(
+        torch.arange(n_seqs, device=nums.device, dtype=torch.int32),
+        nums,
+    )
+    num_chunks = int(seq_ids.shape[0])
+    if num_chunks == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=query_start_loc.device)
+        return empty, empty, 0
+    starts = torch.cumsum(nums, 0) - nums
+    positions = torch.arange(num_chunks, device=nums.device, dtype=torch.int32)
+    offsets = (positions - starts[seq_ids]).to(torch.int32)
+    return seq_ids.contiguous(), offsets.contiguous(), num_chunks
 
 
 @triton.jit()
@@ -594,26 +622,19 @@ def causal_conv1d_fn(
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    args = None
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
     if metadata is not None:
         nums_dict = metadata.nums_dict
-        args = nums_dict
         batch_ptr = metadata.batch_ptr
         token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
+        num_chunks = int(nums_dict[BLOCK_M]["tot"])
     else:
-        seqlens = query_start_loc.diff().to("cpu")
-        args = seqlens
-        MAX_NUM_PROGRAMS = 1024
-
-        batch_ptr = torch.full(
-            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-        )  # tracking which seq-idx the Triton program is handling
-        token_chunk_offset_ptr = torch.full(
-            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-        )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
+        nums_dict = None
+        batch_ptr, token_chunk_offset_ptr, num_chunks = device_conv1d_indices(
+            query_start_loc
+        )
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
@@ -641,7 +662,6 @@ def causal_conv1d_fn(
     key_dim_stride = key.stride(1)
     value_dim_stride = value.stride(1)
 
-    BLOCK_M = 8
     if conv_states is not None:
         # extensions to support vLLM:
         # 1. conv_states is used to replaced initial_states
@@ -686,71 +706,9 @@ def causal_conv1d_fn(
         else:
             block_size_to_align = BLOCK_M
 
-    if metadata is None:
-
-        def num_program(META, seqlens):
-            tot = 0
-
-            mlist = []
-            offsetlist = []  # type: ignore
-
-            nums = -(-seqlens // META["BLOCK_M"])
-
-            tot = nums.sum().item()
-            mlist = np.repeat(np.arange(len(nums)), nums)
-            for idx, num in enumerate(nums):
-                offsetlist.extend(
-                    range(num)
-                )  # chunk-idx if a sequence is split into multiple chunks
-
-            if META["batch_ptr"].nelement() < len(mlist):
-                newlen = len(mlist) + 1
-                META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-                META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-
-            if META["batch_ptr"].nelement() >= len(mlist):
-                META["batch_ptr"][0 : len(mlist)].copy_(
-                    torch.from_numpy(np.array(mlist))
-                )
-                META["token_chunk_offset_ptr"][0 : len(mlist)].copy_(
-                    torch.from_numpy(np.array(offsetlist))
-                )
-
-            META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
-            META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
-                META["x_ptr"].device
-            )
-            return tot
-
-    else:
-
-        def num_program(META, nums_dict):
-            tot = nums_dict[META["BLOCK_M"]]["tot"]
-
-            mlist = nums_dict[META["BLOCK_M"]]["mlist"]
-            mlist_len = nums_dict[META["BLOCK_M"]]["mlist_len"]
-
-            offsetlist = nums_dict[META["BLOCK_M"]]["offsetlist"]
-
-            if nums_dict[META["BLOCK_M"]]["batch_ptr"] is not None:
-                META["batch_ptr"] = nums_dict[META["BLOCK_M"]]["batch_ptr"]
-                META["token_chunk_offset_ptr"] = nums_dict[META["BLOCK_M"]][
-                    "token_chunk_offset_ptr"
-                ]
-            else:
-                if META["batch_ptr"].nelement() < mlist_len:
-                    newlen = mlist_len + 1
-                    META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-                    META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-
-                if META["batch_ptr"].nelement() >= mlist_len:
-                    META["batch_ptr"][0:mlist_len].copy_(mlist)
-                    META["token_chunk_offset_ptr"][0:mlist_len].copy_(offsetlist)
-            return tot
-
     def grid(META):
         return (
-            num_program(META, args),
+            num_chunks,
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
