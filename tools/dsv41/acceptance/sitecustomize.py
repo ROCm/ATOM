@@ -54,11 +54,13 @@ def install():
     if ep:
         SERVER_COMMAND.append("--enable-expert-parallel")
     if server:
+        from step12_draft_kv_preload import install as draft_kv_preload
         from step12_owner_ep_service_audit import install as ep_audit
         from step12_placement_service_audit import install as placement_audit
 
         ep_audit()
         placement_audit()
+        draft_kv_preload()
     else:
         from step12_ep_client_environment import install_client_environment
 
