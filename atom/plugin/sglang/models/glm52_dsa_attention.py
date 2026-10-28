@@ -116,7 +116,7 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
         del kwargs
         forward_batch = self._get_forward_batch()
 
-        from sglang.srt.layers.communicator import get_attn_tp_context
+        from atom.plugin.sglang.sglang_compat import get_attn_tp_context
 
         attn_tp_context = get_attn_tp_context()
         with attn_tp_context.maybe_input_scattered(forward_batch):

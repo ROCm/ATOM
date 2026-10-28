@@ -16,7 +16,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig as SGLangQuantizationConfig,
@@ -37,6 +36,7 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     plugin_runtime_scope,
 )
+from atom.plugin.sglang.sglang_compat import get_pp_group
 
 try:
     from atom.models.qwen4_exp import (

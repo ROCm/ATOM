@@ -12,7 +12,6 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 
 import torch
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -31,6 +30,7 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     plugin_runtime_scope,
 )
+from atom.plugin.sglang.sglang_compat import get_pp_group
 
 logger = logging.getLogger("atom.plugin.sglang.models")
 

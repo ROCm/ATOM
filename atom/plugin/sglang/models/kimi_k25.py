@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.kimi_k25 import (
+    KimiK25ForConditionalGeneration as _SglangKimiK25ForConditionalGeneration,
+)
+from sglang.srt.utils import LazyValue
 from torch import nn
 
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
@@ -11,14 +19,7 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     plugin_runtime_scope,
 )
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.kimi_k25 import (
-    KimiK25ForConditionalGeneration as _SglangKimiK25ForConditionalGeneration,
-)
-from sglang.srt.utils import LazyValue
+from atom.plugin.sglang.sglang_compat import get_pp_group
 
 _KIMI_K25_PACKED_MODULES_MAPPING = {
     "q_a_proj": ("fused_qkv_a_proj", 0),

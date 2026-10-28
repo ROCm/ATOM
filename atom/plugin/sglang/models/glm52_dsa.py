@@ -237,7 +237,7 @@ def setup_glm52_dsa_for_sglang(model: Any) -> None:
     except ImportError:
         from sglang.srt.configs.model_config import is_deepseek_nsa as is_deepseek_dsa
 
-    from sglang.srt.layers.communicator import get_attn_tp_context
+    from atom.plugin.sglang.sglang_compat import get_attn_tp_context
 
     config = model.config
     get_attn_tp_context().init_context(config.q_lora_rank, is_deepseek_dsa(config))

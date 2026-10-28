@@ -1039,14 +1039,14 @@ def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
         return
 
     try:
+        import sglang.srt.speculative.eagle_worker_v2 as eagle_worker_module
         from sglang.srt.distributed import get_tp_group
         from sglang.srt.distributed.parallel_state import get_attn_tp_group
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-        from sglang.srt.speculative import eagle_worker_v2 as eagle_worker_module
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         if not hasattr(EagleVerifyInput, "sample"):
-            from sglang.srt.speculative import eagle_utils
+            import sglang.srt.speculative.eagle_utils as eagle_utils  # noqa: PLR0402
     except Exception as exc:
         logger.debug(
             "Skipping optional EAGLE3 TP verify broadcast patch: %s",
