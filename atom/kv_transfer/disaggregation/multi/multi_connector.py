@@ -351,6 +351,12 @@ class MultiConnector(KVConnectorBase):
             blocks.extend(c.get_finished_recv_blocks())
         return blocks
 
+    def release_deferred_events(self) -> None:
+        for connector in self._connectors:
+            release = getattr(connector, "release_deferred_events", None)
+            if release is not None:
+                release()
+
     def close(self) -> None:
         """Tear down every sub-connector at worker teardown.
 
