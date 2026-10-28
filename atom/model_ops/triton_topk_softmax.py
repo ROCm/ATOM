@@ -69,12 +69,15 @@ def _topk_softmax_kernel(
 def triton_topk_softmax_supported(
     gating_output: torch.Tensor, topk: int, renormalize: bool, num_shared_experts: int
 ) -> bool:
+    """The shapes AITER's fused `topkGatingSoftmax` handles (power-of-two
+    expert counts up to 512). Past 512 AITER takes `moeSoftmax` + `moeTopK`,
+    which round the weights differently."""
     num_experts = gating_output.shape[-1] - num_shared_experts
     return (
         renormalize
         and gating_output.dim() == 2
         and gating_output.stride(-1) == 1
-        and 32 <= num_experts <= 1024
+        and 32 <= num_experts <= 512
         and num_experts & (num_experts - 1) == 0
         and 0 < topk <= 32
         and num_shared_experts in (0, 1, 2, 4, 8)

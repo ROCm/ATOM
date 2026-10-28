@@ -63,11 +63,93 @@ def test_matches_aiter_bit_for_bit(shared, rows, scale, ties):
     assert torch.equal(w_new, w_ref)
 
 
+def _aiter_and_triton(logits, k, shared):
+    """Both kernels on the fused-shared layout, from the same poisoned
+    buffers: ((w_aiter, ids_aiter), (w_triton, ids_triton))."""
+    rows = logits.shape[0]
+    w_ref = torch.full((rows, k + shared), -1.0, device="cuda")
+    ids_ref = torch.full((rows, k + shared), 12345, dtype=torch.int32, device="cuda")
+    w_new, ids_new = w_ref.clone(), ids_ref.clone()
+    scratch = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+    aiter.topk_softmax(
+        w_ref, ids_ref[:, :k], scratch, logits, True, shared,
+        "sigmoid" if shared else "",
+    )  # fmt: skip
+    triton_topk_softmax(w_new, ids_new[:, :k], logits, shared)
+    return (w_ref, ids_ref), (w_new, ids_new)
+
+
+# Every shape `triton_topk_softmax_supported` accepts, so a shape where AITER
+# takes another code path (as 1024 experts does) cannot be accepted unseen.
+SUPPORTED_EXPERTS = (32, 64, 128, 256, 512)
+SUPPORTED_TOPK = (1, 8, 10, 32)
+SUPPORTED_SHARED = (0, 1, 2, 4, 8)
+
+
+@pytest.mark.parametrize("shared", SUPPORTED_SHARED)
+@pytest.mark.parametrize("k", SUPPORTED_TOPK)
+@pytest.mark.parametrize("experts", SUPPORTED_EXPERTS)
+def test_every_supported_shape_matches_aiter(experts, k, shared):
+    torch.manual_seed(experts + 3 * k + shared)
+    width = experts + shared
+    logits = torch.cat(
+        [
+            _logits(24, width, 2.0, False),
+            _logits(24, width, 0.05, True),
+            _logits(16, width, 8.0, False),
+        ]
+    )
+    assert triton_topk_softmax_supported(logits, k, True, shared)
+    (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, k, shared)
+    assert torch.equal(ids_new, ids_ref)
+    assert torch.equal(_bits(w_new), _bits(w_ref))
+
+
 def test_unsupported_shapes_fall_back():
     logits = torch.zeros(4, 513, dtype=torch.bfloat16, device="cuda")
     assert not triton_topk_softmax_supported(logits, TOPK, False, 1)
     assert not triton_topk_softmax_supported(logits, TOPK, True, 0)  # 513 experts
     assert not triton_topk_softmax_supported(logits[:, ::2], TOPK, True, 0)
+    # AITER's fused kernel stops at 512 experts; 1024 takes its
+    # softmax-then-top-k path, which rounds the weights differently.
+    wide = torch.zeros(4, 1024 + 1, dtype=torch.bfloat16, device="cuda")
+    assert not triton_topk_softmax_supported(wide, TOPK, True, 1)
+    assert not triton_topk_softmax_supported(wide[:, :1024], TOPK, True, 0)
+    assert not triton_topk_softmax_supported(logits[:, :16], 1, True, 0)
+    assert not triton_topk_softmax_supported(logits[:, :512], 33, True, 0)
+    assert not triton_topk_softmax_supported(logits[:, :515], TOPK, True, 3)
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+def test_1024_experts_route_through_aiter(shared, monkeypatch):
+    """Past AITER's fused kernel, eager and captured passes both run AITER."""
+    from atom.model_ops import topK
+
+    def no_triton(*args, **kwargs):
+        raise AssertionError("1024 experts must not take the Triton kernel")
+
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    monkeypatch.setattr(topK, "triton_topk_softmax", no_triton)
+    rows, experts, k = 64, 1024, TOPK
+    torch.manual_seed(5 + shared)
+    logits = _logits(rows, experts + shared, 2.0, False)
+    if shared:
+        meta_w, meta_ids = _outputs(rows, shared)
+        monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
+
+    def route():
+        return topK.rocm_aiter_topk_softmax_impl(
+            logits, k, True, shared, experts, "sigmoid" if shared else None
+        )
+
+    w_eager, ids_eager = (t.clone() for t in route())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w_graph, ids_graph = route()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(ids_graph[:, :k], ids_eager[:, :k])
+    assert torch.equal(_bits(w_graph), _bits(w_eager))
 
 
 # num_valid_rows (ROCm/aiter#6916): rows at or past the device count are
