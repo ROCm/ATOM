@@ -13,6 +13,7 @@ jobs:
         run: |
           python3 - <<'PYCODE'
           import collections
+          import hashlib
           import json
           import os
           import re
@@ -23,6 +24,32 @@ jobs:
           jobs = []
           fs = os.statvfs(root)
           print('TASK LOG FILESYSTEM AVAILABLE BYTES:', fs.f_bavail * fs.f_frsize, flush=True)
+          source_dirs = list(root.glob('*agentx-chunked-c32-mooncake_store-40706439005-20261028143137'))
+          if len(source_dirs) != 1:
+              raise RuntimeError('Expected exactly the completed task directory')
+          completed = source_dirs[0]
+          probe = completed / f'.codex-write-probe-{os.environ["GITHUB_RUN_ID"]}'
+          try:
+              with probe.open('xb') as stream:
+                  stream.write(bytes(1024 * 1024))
+                  stream.flush()
+                  os.fsync(stream.fileno())
+              print('TASK LOG WRITE PROBE: success', flush=True)
+          except OSError as error:
+              print('TASK LOG WRITE PROBE ERRNO:', error.errno, flush=True)
+          finally:
+              probe.unlink(missing_ok=True)
+          metrics = list(completed.glob('slurm_job-10772/benchmark_results/*/server_metrics_export.json'))
+          if len(metrics) == 1:
+              metric = metrics[0]
+              digest = hashlib.sha256()
+              with metric.open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(16 * 1024 * 1024), b''):
+                      digest.update(chunk)
+              matches = metric.stat().st_size == 4716797276 and digest.hexdigest() == '631331178b754bdeefae1c70b069721af495dd99f9baced3677293f17c663853'
+              print('COMPLETED METRIC MATCHES LOCAL AND ARTIFACT BACKUP:', matches, flush=True)
+              print('METRIC OWNER MATCHES DIAGNOSTIC USER:', metric.stat().st_uid == os.getuid(), flush=True)
+
           controller = os.environ.get('SPUR_CONTROLLER_ADDR', '')
           controller_args = ['--controller', controller] if controller else []
           print('EXPLICIT CONTROLLER CONFIGURED:', bool(controller), flush=True)
