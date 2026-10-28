@@ -163,6 +163,36 @@ jobs:
             lm_eval_num_fewshot: 5
             accuracy_test_threshold: 0.94
             runner: spur-runner-mi355x-8gpu
+          - display_name: "DeepSeek-V4.1-Flash DSpark TP4"
+            model_name: "DeepSeek-V4.1-Flash-DSpark"
+            model_path: "deepseek-ai/DeepSeek-V4.1-Flash"
+            # `--kv-cache-dtype auto`: the V4.1 runtime takes auto/bfloat16/
+            # nvfp4 and refuses fp8, which is what the harness would otherwise
+            # supply. `--no-enable-prefix-caching` comes from the harness and
+            # is also required here: a block-table hit restores the compressed
+            # pages but not the per-request CSA2 state read alongside them.
+            # DSpark is fixed at 5 draft tokens by the model's own config gate,
+            # and the draft is the target checkpoint's `mtp.*` stages, so there
+            # is no separate draft_model_path.
+            extra_args: "--tensor-parallel-size 4 --tokenizer-mode deepseek_v4 --kv-cache-dtype auto --gpu-memory-utilization 0.9 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 64 --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"kv_cache_dtype\":\"fp8_ds_mla\"}'"
+            env_vars: |
+              VLLM_USE_BREAKABLE_CUDAGRAPH=1
+              ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1
+            lm_eval_num_fewshot: 20
+            accuracy_test_threshold: 0.91
+            # The gate that actually guards the draft. Verification is lossless,
+            # so accuracy stays put when the draft head breaks; measured 0.4729
+            # overall on this recipe, against 0.008 when the target's LM head
+            # was not shared into the draft and 0.02 when the aux hidden states
+            # were the wrong quantity. 0.35 sits well clear of both.
+            mtp_accept_threshold: 0.35
+            # Per position, which the overall rate alone cannot see: a draft
+            # that still lands its first token and nothing after it keeps a
+            # respectable overall number. Measured 0.7785/0.6243/0.4299/
+            # 0.3214/0.2102 and 0.7898/0.6411/0.4248/0.3063/0.1906 over two
+            # runs; these floors sit near 70% of that.
+            mtp_per_pos_threshold: "0.55,0.40,0.25,0.18,0.10"
+            runner: spur-runner-mi355x-8gpu
           - display_name: "Qwen3.5-397B-A17B-MXFP4 TP4"
             model_name: "Qwen3.5-397B-A17B-MXFP4"
             model_path: "amd/Qwen3.5-397B-A17B-MXFP4"
@@ -211,6 +241,8 @@ jobs:
           MATRIX_ENV_VARS: ${{ matrix.env_vars }}
           MATRIX_LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           MATRIX_ACCURACY_TEST_THRESHOLD: ${{ matrix.accuracy_test_threshold }}
+          MATRIX_MTP_ACCEPT_THRESHOLD: ${{ matrix.mtp_accept_threshold }}
+          MATRIX_MTP_PER_POS_THRESHOLD: ${{ matrix.mtp_per_pos_threshold }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           SKIP_DOCKER_LOGIN: ${{ github.event.pull_request.head.repo.fork && '1' || '0' }}

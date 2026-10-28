@@ -12,7 +12,11 @@ from unittest import mock
 
 import pytest
 
-from atom.model_engine.prefill_delayer import PrefillDelayer
+from atom.model_engine.prefill_delayer import (
+    _FIXED_SLOTS,
+    PrefillDelayer,
+    _Gate,
+)
 
 MAX_BATCHED = 16384
 
@@ -70,6 +74,7 @@ def call(
     has_partial=False,
     oldest_waiting_age_ms=0.0,
     reduce=_noop_all_reduce,
+    **kw,
 ):
     with mock.patch("torch.distributed.all_reduce", reduce):
         return d.should_allow_prefill(
@@ -79,7 +84,8 @@ def call(
             kv_usage=kv_usage,
             has_partial=has_partial,
             oldest_waiting_age_ms=oldest_waiting_age_ms,
-        )
+            **kw,
+        ).allow
 
 
 def skip_first(d):
@@ -269,6 +275,163 @@ class TestAlignmentGate:
         assert call(d, pending_tokens=MAX_BATCHED, reduce=mixed) is False  # hold 2
         assert call(d, pending_tokens=MAX_BATCHED, reduce=mixed) is True  # ttft
         assert d._stat_fire_ttft == 1
+
+    def test_mixed_released_by_stall(self):
+        # One rank's lone request, the other decoding: nothing more arrives, so
+        # the gate gives up after stall_ticks instead of waiting out ttft.
+        d = make_delayer(dp_size=2, ttft_max_ticks=1000, stall_ticks=2)
+        skip_first(d)
+        mixed = _add_rank({2: 64})
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # grew
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 1
+        assert call(d, pending_tokens=500, reduce=mixed) is True  # stall 2
+        assert d._stat_fire_stall == 1
+
+    def test_mixed_holds_while_growing(self):
+        d = make_delayer(dp_size=2, ttft_max_ticks=1000, stall_ticks=2)
+        skip_first(d)
+        mixed = _add_rank({2: 64})
+        for pending in (500, 1000, 1500, 2000):
+            assert call(d, pending_tokens=pending, reduce=mixed) is False
+        assert d._stat_fire_stall == 0
+
+
+class _Rank0Group:
+    def rank(self):
+        return 0
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+# dp_size=2 with costs and the cost gate: after the fixed slots the two
+# ranks' chunk costs, then the gate's waiting / decode µs / prefill ps / timed
+# ranks / arrivals per 1000 s on ranks without prefill
+WAITING, DECODE_US, PREFILL_PS, TIMED, ARRIVALS = range(
+    _FIXED_SLOTS + 2, _FIXED_SLOTS + 2 + len(_Gate._fields)
+)
+# The sibling decodes 1 seq with no prefill; it timed a 10 ms decode step and
+# 100 ps a cost unit. Firing stalls 2 decodes for 3e8 x 100 ps = 30 ms: 60 ms
+# of decode stall.
+TIMED_SIBLING = {2: 1, DECODE_US: 10_000, PREFILL_PS: 100, TIMED: 1}
+
+
+def lone_request(d, reduce):
+    # this rank: one waiting request of cost 3e8, one decode; the sibling has
+    # no prefill
+    return call(
+        d,
+        pending_tokens=500,
+        running_decode_batch=1,
+        prefill_cost=3e8,
+        waiting_requests=1,
+        reduce=reduce,
+    )
+
+
+def make_gated(**kw):
+    return make_delayer(
+        dp_size=2,
+        cpu_group=_Rank0Group(),
+        ttft_max_ticks=1000,
+        stall_ticks=1000,
+        exchange_prefill_costs=True,
+        cost_gate=True,
+        **kw,
+    )
+
+
+class TestCostGate:
+    def test_releases_at_once_when_no_work_is_coming(self):
+        # 1 arrival / 100 s on the sibling: a held tick's expected saving is
+        # 60 ms x 1e-8 / µs, far below the waiting request it delays
+        d = make_gated()
+        skip_first(d)
+        mixed = _add_rank({**TIMED_SIBLING, ARRIVALS: 10})
+        assert lone_request(d, mixed) is True
+        assert d._stat_fire_cost == 1
+
+    def test_holds_while_work_is_coming_until_the_wait_costs_the_stall(self):
+        # 100 arrivals / s: holding is expected to pay (60 ms x 1e-4 / µs = 6
+        # > 1 request); the request pays 10 ms a held tick, so the 7th tick
+        # (60 ms already paid) releases.
+        d = make_gated()
+        skip_first(d)
+        mixed = _add_rank({**TIMED_SIBLING, ARRIVALS: 100_000})
+        for _ in range(6):
+            assert lone_request(d, mixed) is False
+        assert lone_request(d, mixed) is True
+        assert d._stat_fire_cost == 1
+
+    def test_untimed_holds_for_the_stall_bound(self):
+        d = make_gated()
+        skip_first(d)
+        mixed = _add_rank({2: 1})
+        for _ in range(20):
+            assert lone_request(d, mixed) is False
+        assert d._stat_fire_cost == 0
+
+    def test_arrival_rate_decays_while_nothing_comes(self):
+        clock = _Clock()
+        d = make_gated(clock=clock)
+        skip_first(d)
+        for _ in range(3):
+            clock.now += 0.5
+            call(d, prefillable=False, arrived_requests=1)
+        assert d._arrival_rate(clock.now) == pytest.approx(2.0)
+        clock.now += 4.0
+        assert d._arrival_rate(clock.now) == pytest.approx(0.25)
+        # a rank without prefill reports its rate (per 1000 s)
+        call(d, prefillable=False)
+        assert d._reduce_buf[ARRIVALS] == 250
+
+    def test_an_idle_spell_is_not_timed_as_a_decode_step(self):
+        """The DP group idle schedules nothing, so the next decision follows
+        no step: 100 s of nothing must not average into a decode step."""
+        clock = _Clock()
+        d = make_gated(clock=clock)
+        skip_first(d)
+        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1})
+        for _ in range(3):
+            clock.now += 0.010
+            call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
+        d.notify_idle()
+        clock.now += 100.0
+        call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
+        assert d._decode_tick_us == pytest.approx(10_000)
+
+    def test_times_decode_and_prefill_steps(self):
+        clock = _Clock()
+        d = make_gated(clock=clock)
+        skip_first(d)
+        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1})
+        # decode steps of 10 ms (no prefill ran)
+        for _ in range(3):
+            clock.now += 0.010
+            call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
+        assert d._decode_tick_us == pytest.approx(10_000)
+        # both ranks full: fill fires a 2e8-cost prefill that runs 20 ms
+        clock.now += 0.010
+        assert (
+            call(
+                d,
+                pending_tokens=MAX_BATCHED,
+                running_decode_batch=1,
+                prefill_cost=2e8,
+                reduce=sibling,
+            )
+            is True
+        )
+        d.notify_prefill_executed()
+        clock.now += 0.020
+        call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
+        assert d._prefill_ps_per_cost == pytest.approx(0.020e12 / 2e8)
+        assert d._decode_tick_us == pytest.approx(10_000)
 
 
 class TestParamClamps:

@@ -167,6 +167,7 @@ def test_fp4_rows_by_sequence_select_what_rows_alone_do(monkeypatch, band, lengt
     decode step's few rows, or a prefill's more than one M tile holds), an
     empty padding request and padding rows; ``band`` cuts the rows into bands
     that split requests."""
+    from atom.model_ops import sparse_indexer_chunk as chunk
     from atom.model_ops.deepseek_v41 import paged_scoring as scoring
     from atom.model_ops.deepseek_v41 import score_workspace as ws
     from atom.model_ops.deepseek_v41.unit_table import unit_table
@@ -175,6 +176,7 @@ def test_fp4_rows_by_sequence_select_what_rows_alone_do(monkeypatch, band, lengt
     if band is not None:
         # Forced where `logits_rows` looks it up, not on the scorer.
         monkeypatch.setattr(ws, "plane_rows", lambda width: band)
+        monkeypatch.setattr(chunk, "plane_rows", lambda width: band)
     torch.manual_seed(3)
     pages, per_page = 8, 128
     _, _, units = _pool(pages, per_page)

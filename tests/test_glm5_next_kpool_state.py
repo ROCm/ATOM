@@ -2,9 +2,9 @@
 
 """GLM-5.3 k-pool state contracts (CPU plus ROCm-only kernel cases)."""
 
-import importlib
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -15,7 +15,12 @@ GLM5 = pytest.importorskip(
     reason="the GLM-5.3 model imports the AITER runtime",
     exc_type=ImportError,
 )
+from atom.model_ops.attentions.aiter_mla import decode_row_ends
 from atom.model_ops.glm5_next import indexer as KPOOL_INDEXER
+from atom.model_ops.glm5_next import speculative as SPEC
+from atom.model_ops.glm5_next.geometry import pool_plane_width
+from atom.model_ops.indexer import fp8_rows
+from atom.model_ops.indexer import score as shared
 
 
 def _config_for_normalize(**overrides):
@@ -96,7 +101,7 @@ def test_dummy_custom_op_result_is_fresh_fp32_like_its_fake(monkeypatch):
         topk_tokens=4,
         index_kpool=4,
         head_dim=4,
-        max_model_len=16,
+        mtp=False,
         topk_out_width=128,
         scale_fmt="ue8m0",
         stable_topk=False,
@@ -287,13 +292,6 @@ def test_cached_chunk_reads_the_tail_from_its_history_ring_rows(monkeypatch):
 
 def _run_speculative_verify(monkeypatch, positions, max_model_len):
     """Verify one request's rows at `positions`, recording what the ops get."""
-    from atom.model_ops.glm5_next import speculative as SPEC
-
-    # The op imports these at call time; patch the defining modules. A dotted
-    # string would resolve `pa_mqa_logits` to the package's re-exported name.
-    aiter_cache = importlib.import_module("aiter.ops.cache")
-    aiter_topk = importlib.import_module("aiter.ops.topk")
-    aiter_logits = importlib.import_module("aiter.ops.triton.attention.pa_mqa_logits")
     seen = {}
     monkeypatch.setattr(
         SPEC,
@@ -309,9 +307,7 @@ def _run_speculative_verify(monkeypatch, positions, max_model_len):
         lambda _bt, pool_ids, _req_idx, _rows: pool_ids,
     )
     monkeypatch.setattr(SPEC, "update_speculative_kpool_history", lambda *_a: None)
-    monkeypatch.setattr(
-        aiter_cache, "indexer_k_quant_and_cache", lambda *_a, **_k: None
-    )
+    monkeypatch.setattr(SPEC, "indexer_k_quant_and_cache", lambda *_a, **_k: None)
 
     def paged_logits(_q, _kv, _w, logits, lens, _bt, max_pools, **_kwargs):
         seen["logits_width"] = logits.shape[1]
@@ -321,8 +317,8 @@ def _run_speculative_verify(monkeypatch, positions, max_model_len):
     def top_k(_logits, _next_n, lens, *_args, **_kwargs):
         seen["topk_lens"] = lens.tolist()
 
-    monkeypatch.setattr(aiter_logits, "deepgemm_fp8_paged_mqa_logits", paged_logits)
-    monkeypatch.setattr(aiter_topk, "top_k_per_row_decode", top_k)
+    monkeypatch.setattr(shared, "deepgemm_fp8_paged_mqa_logits", paged_logits)
+    monkeypatch.setattr(shared, "top_k_per_row_decode", top_k)
     monkeypatch.setattr(
         SPEC.kpool, "expand_pools_and_append_tail", lambda *_a, **_k: None
     )
@@ -333,12 +329,21 @@ def _run_speculative_verify(monkeypatch, positions, max_model_len):
     monkeypatch.setattr(SPEC, "map_token_indices_to_slots", map_to_slots)
 
     rows = len(positions)
+    # A verify step's pooled row bounds, as the MLA builder publishes them.
+    ends = decode_row_ends(np.asarray(positions), 4, max_model_len)
+    width = pool_plane_width(max_model_len, 4)
     SPEC.run_speculative_kpool_indexer(
         SimpleNamespace(
             cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32),
             max_seqlen_k=0,
             block_tables=torch.zeros((1, 4), dtype=torch.int32),
             sparse_kv_indptr=torch.zeros(rows + 1, dtype=torch.int32),
+        ),
+        fp8_rows(
+            torch.from_numpy(ends.astype(np.int32)),
+            width,
+            None,
+            torch.zeros((rows, 4), dtype=torch.int32),
         ),
         kv_cache=torch.zeros((16, 1, 132), dtype=torch.uint8),
         queries=torch.zeros((rows, 2, 128)),
@@ -355,7 +360,6 @@ def _run_speculative_verify(monkeypatch, positions, max_model_len):
         topk_tokens=2048,
         output_width=2176,
         block_size=16,
-        max_model_len=max_model_len,
         scale_fmt="ue8m0",
         stable_topk=False,
     )
@@ -366,7 +370,7 @@ def test_speculative_verify_selects_below_index_topk_and_at_capture(monkeypatch)
     """MLA verify always reads sparse_kv_indices, so the indexer must write them.
 
     `max_seqlen_k == 0` is what CUDAGraph capture metadata carries; skipping on
-    it would record the skip into every replay. The scoring scratch is sized
+    it would record the skip into every replay. The scoring plane is sized
     from the model limit for the same reason.
     """
     seen = _run_speculative_verify(monkeypatch, [5, 6], max_model_len=8192)
@@ -378,7 +382,8 @@ def test_speculative_verify_selects_below_index_topk_and_at_capture(monkeypatch)
 def test_speculative_verify_scores_no_pool_past_the_model_limit(monkeypatch):
     """A 15-token request under a 16-token limit verifies 5 drafts at 15..19.
 
-    Row 19 spans pools 0..4, one more than the 4 columns the scratch holds.
+    Row 19 spans pools 0..4, one more than the 4 columns the plane holds: the
+    builder caps every row's bound at the plane.
     """
     seen = _run_speculative_verify(
         monkeypatch, [14, 15, 16, 17, 18, 19], max_model_len=16

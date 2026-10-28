@@ -556,22 +556,6 @@ class DSparkProposer(Drafter):
             return self.runner.block_size * self.dcp_world_size
         return self.runner.block_size
 
-    def _draft_layer_num(self) -> int:
-        """The draft's first layer number, whichever attention it carries.
-
-        Both flavors register an `Attention` and expose `layer_num` on it; only
-        the attribute holding it differs (`mla_attn` vs `attn`).
-        """
-        attn = self.model.layers[0].self_attn
-        holder = getattr(attn, "mla_attn", None) or getattr(attn, "attn", None)
-        if holder is None:
-            raise AttributeError(
-                "draft layer 0 exposes neither `mla_attn` nor `attn`; the "
-                "proposer reads `layer_num` off one of them to find the "
-                "draft's rows in the KV cache data"
-            )
-        return holder.layer_num
-
     def _bound_draft_k_cache(self, forward_context) -> "torch.Tensor | None":
         """The draft's own paged K cache, or None while the pool is unallocated.
 
@@ -582,7 +566,7 @@ class DSparkProposer(Drafter):
         fully bound. Gating on the flag would let the second one through
         describing whatever the previous real step left behind.
         """
-        layer_num = self._draft_layer_num()
+        layer_num = self.model.first_attention_layer_num
         cache_data = forward_context.kv_cache_data or {}
         entry = cache_data.get(f"layer_{layer_num}")
         bound = getattr(entry, "k_cache", None) if entry is not None else None
@@ -616,7 +600,7 @@ class DSparkProposer(Drafter):
             # for `final` so the caller does not cache a warmup-time guess.
             return from_config, False
         if bound.dtype != from_config:
-            layer_num = self._draft_layer_num()
+            layer_num = self.model.first_attention_layer_num
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
@@ -952,6 +936,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and `num_draft` config, so
             # every rank reaches this height on its own.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
         label = self.block.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
@@ -1292,6 +1277,20 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
+        if not self.model.block_attention_is_mla:
+            # A draft that attends its block another way (MiniMax-M3.1's per-row
+            # MHA decode) builds what it reads itself; there is no MLA decode
+            # to plan.
+            self.model.prepare_paged_block(
+                attn_metadata,
+                block_tables,
+                block_positions,
+                slots,
+                ctx_lens,
+                block_table_state(self.runner.forward_vars["block_tables"]).lengths,
+                scheduled_bs,
+            )
+            return
 
         if self._draft_reads_non_causal_gqa:
             # A GQA draft reads through mha_v3, which plans nothing: it takes
@@ -1433,6 +1432,7 @@ class DSparkProposer(Drafter):
             # `running_bs` is `decide`'s reduction and T is config, so every
             # rank reaches this height on its own, none has to discover it.
             running_tokens_are_unified=True,
+            scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
 
         # ---- 3. Block pass + Markov sampling ---------------------------------

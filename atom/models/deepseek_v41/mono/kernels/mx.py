@@ -10,13 +10,18 @@ must use the one its original kernel does:
 - ``code_round`` (aiter Triton ``_mxfp8_quant_op``, the q_lora norm): amax's
   exponent after adding 0x200000 to its bits, minus 8.
 
-Every E8M0 code is a biased exponent (``atom.mono.device.mx.pow2`` its scale);
-the E4M3 range and packing are ``atom.mono.device``'s.
+Every rule floors a group's amax at ``AMAX_FLOOR``, the original path's one
+floor. Every E8M0 code is a biased exponent (``atom.mono.device.mx.pow2`` its
+scale); the E4M3 range and packing are ``atom.mono.device``'s.
 """
 
 import flydsl.expr as fx
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T
+
+from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR as _FLOOR
+
+AMAX_FLOOR = _FLOOR.value
 
 # (bits(amax) + ROUND_BIAS) & EXP_MASK rounds amax to a power of two
 ROUND_BIAS = 0x200000

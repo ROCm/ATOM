@@ -12,7 +12,7 @@ controls ATOM's runtime behaviour.
 | `Config` | Master dataclass — model path, memory, TP size, scheduler limits, KV cache, profiler, and references to all sub-configs |
 | `CompilationConfig` | Compilation level (0-3), CUDA graph capture sizes, piecewise splitting ops, inductor settings |
 | `CompilationLevel` | Integer constants for the four compilation levels |
-| `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (none / piecewise / full / hybrid) |
+| `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (`NONE` / `TR_HYBRID` token graphs / `FULL` / `FULL_AND_TR_HYBRID`) |
 | `QuantizationConfig` | Layer-wise quantization orchestrator: global config, per-layer overrides, exclude lists, layer name remapping |
 | `LayerQuantConfig` | Per-layer quantization spec (frozen dataclass): quant type, dtype, dynamic flag, method |
 | `ParallelConfig` | Data-parallel size, rank, master IP/port |
@@ -45,12 +45,16 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
 | `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
+| `enable_dynamic_chunking` | `bool` | `False` | Size pipeline-parallel prefill chunks from a calibrated equal-latency model. Needs `pipeline_parallel_size > 1` and chunked prefill, and does not apply to RapidServe or a P/D decode instance (`kv_role: kv_consumer`); otherwise the flag is turned off with a warning and chunking stays fixed |
+| `dynamic_chunking_smooth_factor` | `float \| None` | `None` | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). `None` takes `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR`, read only when the feature is on. Must be in `[0, 1]` when the feature is on |
+| `dynamic_chunking_min_chunk_size` | `int` | `4096` | Floor for a solved chunk. Must be positive when the feature is on |
 | `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state, Kimi-K3 KDA): tokens between rungs of the checkpoint ladder. The sign carries three policies — `>0` a rung every N tokens (must be a multiple of the prefix-cache hash block size), `0` checkpointing off entirely, `-1` ladder off while the prompt-end anchor and the demand rung still place. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `state_checkpoint_demand` | `bool` | `True` | Whether a prefix hit refused for want of a checkpoint may place a rung of its own. Off leaves the prompt-end anchor as the only placement. Overridden by `ATOM_STATE_CHECKPOINT_DEMAND` |
 | `enable_decoder_swa_bounded_replay` | `bool` | `True` | DeepSeek-V4.1 only: prefill runs the decoder (layers 20..39) only on the rows the next forward reads, its windows truncated there (the V4.1 report's SWA Bounded Replay). Faster prefill, not numerically equivalent to a full prefill. See [DeepSeek-V4.1 runtime](deepseek_v41_runtime.md#decoder-swa-bounded-replay) |
 | `enable_encoder_swa_bounded_replay` | `bool` | `True` | DeepSeek-V4.1 only: a prefix hit resumes without a state checkpoint, rebuilding the sliding-window state from the hash block below the hit; no state checkpoint is kept. See [DeepSeek-V4.1 runtime](deepseek_v41_runtime.md#encoder-swa-bounded-replay) |
 | `min_final_prefill_rows` | `int` | `0` | Set by the model, not a flag: the fewest rows the forward finishing a prompt runs; one resuming closer to the end starts earlier, on the hash-block grid (`BlockManager.replay_start`). DeepSeek-V4.1 with decoder bounded replay: `sliding_window` |
 | `replay_history_tokens` | `int` | `0` | Set by the model, not a flag: the tokens before a forward that starts below where its prefill resumed which the backend reads (`Replay.history_ids`). DeepSeek-V4.1: its Engram n-gram lookback, `engram_max_ngram_size - 1` |
+| `state_replay_tokens` | `int` | `0` | Set by the model, not a flag: how far below a prefix hit with no state checkpoint behind it a prefill starts to rebuild that state exactly (`BlockManager.replay_start`); 0 takes no such hit. DeepSeek-V4 under `ATOM_DSV4_STATE_REPLAY`: the window receptive field `W + (L-1)(W-1)`, 7,748 on V4-Pro and 7,875 with MTP or DSpark |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
@@ -88,7 +92,7 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `NO_COMPILATION` | `0` | No compilation — pure eager execution |
 | `DYNAMO_AS_IS` | `1` | Use torch.compile / TorchDynamo as-is |
 | `DYNAMO_ONCE` | `2` | TorchDynamo with a single compilation pass |
-| `PIECEWISE` | `3` | Piecewise compilation with CUDA graph capture (recommended for production) |
+| `PIECEWISE` | `3` | Piecewise compilation: the graph is split at `splitting_ops` and each piece compiled by Inductor (recommended for production; CUDA graphs are chosen separately by `CUDAGraphMode`) |
 
 ### `CompilationConfig` fields
 
@@ -101,9 +105,9 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
-| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `PIECEWISE` automatically at level 3 |
+| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `TR_HYBRID` automatically at level 3 |
 | `splitting_ops` | `Optional[list[str]]` | `None` | Ops that split the graph into sub-graphs for piecewise compilation; auto-populated at level 3 with `["aiter.unified_attention_with_output", "aiter.mla_attention"]` |
-| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; only effective in PIECEWISE mode |
+| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; effective at level 3 whenever `cudagraph_mode` is not `NONE` |
 | `compile_sizes` | `Optional[list[Union[int, str]]]` | `None` | Sizes to compile for inductor; accepts integers and the string `"cudagraph_capture_sizes"` |
 | `inductor_compile_config` | `dict` | `{}` | Additional configuration passed to the inductor backend |
 
@@ -112,16 +116,16 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | Mode | Value | Description |
 |---|---|---|
 | `NONE` | `0` | No CUDA graph capture |
-| `PIECEWISE` | `1` | Piecewise CUDA graphs — attention ops stay outside the graph for flexibility (default at level 3) |
+| `TR_HYBRID` | `1` | Token graphs and request graphs mixed: a token graph per token bucket, breaking only where a launch depends on host data (default at level 3) |
 | `FULL` | `2` | Full CUDA graph capture for all batches; best for small models / short prompts |
 | `FULL_DECODE_ONLY` | `(FULL, NONE)` | Full CUDA graphs for decode batches only; mixed prefill-decode runs without graphs (useful in P/D setups) |
-| `FULL_AND_PIECEWISE` | `(FULL, PIECEWISE)` | Full graphs for decode, piecewise for prefill/mixed — most performant mode for most models |
+| `FULL_AND_TR_HYBRID` | `(FULL, TR_HYBRID)` | Recorded as `TR_HYBRID` by the native runner: decode replays token graphs too, no full decode graph |
 
 Helper methods on `CUDAGraphMode`:
 
 - `decode_mode()` — returns the mode used for pure decode batches.
 - `mixed_mode()` — returns the mode used for mixed prefill-decode batches.
-- `requires_piecewise_compilation()` — whether the mode needs piecewise compilation.
+- `uses_tr_hybrid()` — whether the mode records token graphs.
 - `has_full_cudagraphs()` — whether the mode includes full CUDA graph capture.
 - `separate_routine()` — whether decode and mixed batches use different routines.
 
@@ -415,6 +419,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_DP_SIZE` | `int` | `1` | Total number of data-parallel groups |
 | `ATOM_DP_MASTER_IP` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 | `ATOM_DP_MASTER_PORT` | `int` | `29500` | Port of the data-parallel master |
+| `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR` | `float` | `0.75` | Default for `dynamic_chunking_smooth_factor`: `0` keeps the initial chunk, `1` uses the equal-latency chunk |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | `bool` | `False` | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models |
 | `ATOM_USE_TRITON_GEMM` | `bool` | `False` | Use Triton-based GEMM kernels instead of default backends |
@@ -450,14 +455,14 @@ Do you need torch.compile but no graph splitting?
   v
 Production inference on ROCm/HIP GPU?
   |-- Yes --> Level 3 (PIECEWISE) [default in EngineArgs]
-              - Auto-sets CUDAGraphMode.PIECEWISE
+              - Auto-sets CUDAGraphMode.TR_HYBRID
               - Auto-populates splitting_ops for attention ops
               - Pair with --cudagraph-capture-sizes for your batch profile
   |
   v
 Need maximum decode throughput?
-  |-- Yes --> Level 3 + set cudagraph_mode to FULL_AND_PIECEWISE
-              (full graphs for decode, piecewise for prefill)
+  |-- Yes --> set cudagraph_mode to FULL
+              (a whole-forward request graph per decode bucket)
 ```
 
 **Rules of thumb:**

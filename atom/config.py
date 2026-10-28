@@ -12,7 +12,6 @@ from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
@@ -90,20 +89,13 @@ class KVCacheConfig:
 
 
 class CUDAGraphMode(enum.Enum):
-    """Constants for the cudagraph mode in CompilationConfig.
-    Meanwhile, the subset enum `NONE`, `PIECEWISE` and `FULL` are also
-    treated as concrete runtime mode for cudagraph runtime dispatching.
-    """
+    """Constants for the cudagraph mode in CompilationConfig."""
 
     NONE = 0
-    PIECEWISE = 1
+    TR_HYBRID = 1
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
-    FULL_AND_PIECEWISE = (FULL, PIECEWISE)
-    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
-    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
-    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
-    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
+    FULL_AND_TR_HYBRID = (FULL, TR_HYBRID)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
@@ -111,15 +103,10 @@ class CUDAGraphMode(enum.Enum):
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
 
-    def is_attn_ffn_piecewise(self) -> bool:
-        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
-        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
-        return self is CUDAGraphMode.AF_PIECEWISE
-
-    def requires_piecewise_compilation(self) -> bool:
+    def uses_tr_hybrid(self) -> bool:
         return (
-            self.decode_mode() == CUDAGraphMode.PIECEWISE
-            or self.mixed_mode() == CUDAGraphMode.PIECEWISE
+            self.decode_mode() == CUDAGraphMode.TR_HYBRID
+            or self.mixed_mode() == CUDAGraphMode.TR_HYBRID
         )
 
     def max_cudagraph_mode(self) -> "CUDAGraphMode":
@@ -179,41 +166,32 @@ class CompilationConfig:
     The mode of the cudagraph:
 
     - NONE, no cudagraph capture.
-    - PIECEWISE. (v1 default)
+    - TR_HYBRID. (default at level 3)
     - FULL.
     - FULL_DECODE_ONLY.
-    - FULL_AND_PIECEWISE.
-    - AF_PIECEWISE.
+    - FULL_AND_TR_HYBRID.
 
-    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
-    core is ALSO captured into its own cudagraph with zero-copy public buffers
-    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
-    attention gap between the dense pieces. Falls back to plain PIECEWISE
-    behavior for models that don't implement the attention-core capture.
-
-    PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
-    incompatiable ops (i.e. some attention ops) outside the cudagraph
-    for general flexibility.
-    This is the default mode.
+    TR_HYBRID mode mixes token graphs and request graphs: the compiled forward
+    is recorded as a `TokenGraph` per token bucket, breaking only at the split
+    ops whose launches depend on host data (`eager_region`), which run between
+    its segments -- eagerly, or as a `ReqGraph` where the request bucket fixes
+    their launches.
 
     FULL mode: Capture full cudagraph for all batches. Can be good for small
     models or workloads with small prompts; not supported by many backends.
-    Generally for performance FULL_AND_PIECEWISE is better.
 
     FULL_DECODE_ONLY mode: Capture full cudagraph for decode batches only.
     Mixed prefill-decode batches are run without cudagraphs. Can be good for
     decode instances in a P/D setup where prefill is not as important so we
     can save some memory.
 
-    FULL_AND_PIECEWISE mode: Capture full cudagraph for decode batches and
-    piecewise cudagraph for prefill and mixed prefill-decode batches.
-    This is like the most performant mode for most models.
+    FULL_AND_TR_HYBRID mode: the native runner records it as TR_HYBRID --
+    decode replays token graphs too, not a full graph (`_tr_hybrid_active`).
 
-    Currently, the cudagraph mode is only used for the v1 engine.
     Note that the cudagraph logic is generally orthogonal to the
-    compilation logic. While piecewise cudagraphs require piecewise
-    compilation (level=PIECEWISE and non-empty splitting_ops), full
-    cudagraphs are supported with and without compilation.
+    compilation logic: full cudagraphs and token graphs are recorded with and
+    without compilation; piecewise compilation (level=PIECEWISE and non-empty
+    splitting_ops) only decides where the compiled pieces split.
 
     Warning: This flag is new and subject to change in addition
     more modes may be added.
@@ -233,7 +211,8 @@ class CompilationConfig:
     are always used, it can set this to False. Otherwise, it should
     set this to True, and the compiler will copy the input to an
     internally managed buffer. Default is False.
-    Note that this flag is only effective when cudagraph_mode is PIECEWISE.
+    Note that this flag is only effective at level 3, whenever cudagraph_mode
+    is not NONE (`VllmBackend`).
     """
 
     inductor_compile_config: dict = field(default_factory=dict)
@@ -351,7 +330,8 @@ class QuantizationConfig:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time.
+        # models at load time. For IQ2R only the non-IQ2R layers qualify;
+        # should_skip_online_quant keeps the IQ2R experts as they are.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
@@ -365,6 +345,7 @@ class QuantizationConfig:
             "quark",
             "modelopt",
             "compressed-tensors",
+            "iq2r",
         ]:
             self.online_quant = True
             if self.quant_method == "compressed-tensors":
@@ -969,6 +950,13 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    if isinstance(text_config, dict):
+        # The remote MiniMaxM3VLConfig bundled with some exports (MiniMax-M3.1)
+        # coerces text_config in a way transformers 5 undoes, leaving the raw
+        # dict. The text block has no model_type, so keep every field as a
+        # plain PretrainedConfig attr.
+        text_config = PretrainedConfig.from_dict(text_config)
+        hf_config.text_config = text_config
     if text_config is not None and text_config is not hf_config:
         # Some exports (Quark NVFP4) carry the layer layout on the VL root; it
         # replaces the text config's own, then is checked like any other.
@@ -1096,17 +1084,6 @@ class ParallelConfig:
         )
         return dp_group
 
-    @staticmethod
-    def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
-        tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
-        # dp rank 0: has_unfinished_seqs=True
-        # dp rank 1: has_unfinished_seqs=False
-        # aggregated: has_unfinished_seqs=True
-        # so this is an OR operation, i.e. MAX in integers
-        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
-        aggregated_has_unfinished = bool(tensor.item())
-        return aggregated_has_unfinished
-
     def compute_hash(self):
         """
         Provide a hash that uniquely identifies all the configs
@@ -1194,6 +1171,47 @@ def _resolve_sequential_drafter_max_spec(
     return _SERIAL_MTP_DEFAULT_MAX_SPEC
 
 
+# Standalone DSpark draft architectures: their own checkpoint, normalized by
+# `_normalize_draft_dspark_config`. Inline drafts (V4-Pro-DSpark) are not
+# listed; they ship inside the target checkpoint and are told by
+# `dspark_block_size`.
+_STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset(
+    {"K3DSparkModel", "DSparkMiniMaxDraftModel"}
+)
+# Where the standalone drafts name each field ATOM reads, in lookup order:
+# Kimi-K3's top-level names, then MiniMax-M3.1's `dspark_*` names and its DFlash
+# geometry under `dflash_config`. A dotted alias reads into that sub-config.
+_STANDALONE_DSPARK_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "dspark_target_layer_ids": (
+        "target_layer_ids",
+        "dspark_target_layer_ids",
+        "dflash_config.target_layer_ids",
+    ),
+    "dspark_noise_token_id": (
+        "mask_token_id",
+        "dspark_noise_token_id",
+        "dflash_config.mask_token_id",
+    ),
+    "dspark_markov_rank": ("markov_rank", "dspark_markov_rank"),
+}
+
+
+def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
+    """The value of the first alias of `field` the draft config sets, or None."""
+    for alias in _STANDALONE_DSPARK_FIELD_ALIASES[field]:
+        value = hf_config
+        for part in alias.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = getattr(value, part, None)
+            if value is None:
+                break
+        if value is not None:
+            return value
+    return None
+
+
 def _normalize_draft_dspark_config(
     hf_config: PretrainedConfig, *, dflash: bool = False
 ) -> None:
@@ -1204,49 +1222,42 @@ def _normalize_draft_dspark_config(
 
     - INLINE (e.g. V4-Pro-DSpark) ships inside the target checkpoint and already
       uses the ``dspark_*`` names the rest of ATOM reads. It never comes here.
-    - STANDALONE drafts are their OWN checkpoint (``architectures:
-      ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
-      their DSpark fields at the config top level: ``target_layer_ids``,
-      ``mask_token_id``, ``markov_rank``, and optionally a training block width.
-    - STANDALONE, SpecForge-trained (DFlash) drafts are also their own
-      checkpoint, but nest the same two fields under ``dflash_config`` and put
-      the trained block width at the top level as ``block_size``. SpecForge
-      builds these on a plain ``Qwen3Config``, so the backbone is GQA rather
+    - STANDALONE drafts are their OWN checkpoint (an architecture in
+      ``_STANDALONE_DSPARK_ARCHS``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``)
+      and name their DSpark fields as ``_STANDALONE_DSPARK_FIELD_ALIASES``
+      lists: ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
+    - SpecForge-trained (DFlash) drafts are standalone too, but nest the first
+      two under ``dflash_config`` (an alias above) and record the trained block
+      width as ``block_size``, which only ``dflash=True`` promotes. SpecForge
+      builds them on a plain ``Qwen3Config``, so the backbone is GQA rather
       than MLA -- which this function does not care about, but the log line
       below does.
-
-    Both standalone shapes are read here; ``dflash_config`` is the fallback so
-    a checkpoint carrying both stays on its top-level values.
     """
-    dflash_config = getattr(hf_config, "dflash_config", None) or {}
-
-    target_layer_ids = getattr(
-        hf_config, "target_layer_ids", None
-    ) or dflash_config.get("target_layer_ids")
+    target_layer_ids = _standalone_dspark_field(hf_config, "dspark_target_layer_ids")
     if not target_layer_ids:
         raise ValueError(
             "Standalone DSpark draft config is missing `target_layer_ids` (the "
-            "target decoder layers whose hidden states the draft consumes), at "
-            "the top level and under `dflash_config`. Without it the draft has "
-            "no context input."
+            "target decoder layers whose hidden states the draft consumes). "
+            "Without it the draft has no context input."
         )
     # 0-based target decoder-layer indices, matching ATOM's `layers[i]` aux-tap
     # convention: the reference indexes `hidden_states[layer_id + 1]`, i.e. the
     # OUTPUT of layer `layer_id`, which is the layer this convention taps.
     hf_config.dspark_target_layer_ids = [int(i) for i in target_layer_ids]
 
-    mask_token_id = getattr(hf_config, "mask_token_id", None)
+    mask_token_id = _standalone_dspark_field(hf_config, "dspark_noise_token_id")
     if mask_token_id is None:
         mask_token_id = dflash_config.get("mask_token_id")
     if mask_token_id is None:
         raise ValueError(
             "Standalone DSpark draft config is missing `mask_token_id` (the "
-            "noise token the draft block is seeded with), at the top level and "
-            "under `dflash_config`."
+            "noise token the draft block is seeded with)."
         )
     hf_config.dspark_noise_token_id = int(mask_token_id)
 
-    hf_config.dspark_markov_rank = int(getattr(hf_config, "markov_rank", 0) or 0)
+    hf_config.dspark_markov_rank = int(
+        _standalone_dspark_field(hf_config, "dspark_markov_rank") or 0
+    )
     # Synthesized marker, not a checkpoint field: the flavor discriminator the
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
@@ -1268,6 +1279,7 @@ def _normalize_draft_dspark_config(
     # `dflash` is the caller's assertion that this checkpoint's `block_size` is
     # the SpecForge-trained verify width; nothing else promotes one.
     if dflash:
+        dflash_config = getattr(hf_config, "dflash_config", None) or {}
         block_size = dflash_config.get("block_size") or getattr(
             hf_config, "block_size", None
         )
@@ -1405,8 +1417,8 @@ class SpeculativeConfig:
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
         :func:`_normalize_draft_dspark_config`, which runs from
-        :meth:`hf_config_override` when the draft's ``architectures`` is
-        ``["K3DSparkModel"]``, so it is set for exactly the configs that went
+        :meth:`hf_config_override` when the draft's architecture is in
+        ``_STANDALONE_DSPARK_ARCHS``, so it is set for exactly the configs that went
         through that normalization.
         """
         cfg = self.draft_model_hf_config
@@ -1475,7 +1487,15 @@ class SpeculativeConfig:
             )
         # For multimodal models, extract text_config
         if hasattr(self.draft_model_hf_config, "text_config"):
-            self.draft_model_hf_config = self.draft_model_hf_config.text_config
+            root = self.draft_model_hf_config
+            self.draft_model_hf_config = root.text_config
+            # A multimodal draft (MiniMax-M3.1 DSpark) records its quantization
+            # on the root only; the text config is what the draft reads.
+            root_qc = getattr(root, "quantization_config", None)
+            if root_qc and not getattr(
+                self.draft_model_hf_config, "quantization_config", None
+            ):
+                self.draft_model_hf_config.quantization_config = root_qc
         self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
@@ -1503,11 +1523,11 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        # SpecForge DFlash drafts, before the suffix test below: they are
-        # standalone DSpark checkpoints too, but their arch is `DSparkDraftModel`
-        # -- which ends in "DraftModel", not "DSparkModel", so the suffix test
-        # misses them -- and SpecForge stamps that same string on every DFlash
-        # draft regardless of target. So key on the nested `dflash_config` the
+        # SpecForge DFlash drafts, before the standalone-arch test below: they
+        # are standalone DSpark checkpoints too, but their arch is
+        # `DSparkDraftModel` -- not in `_STANDALONE_DSPARK_ARCHS` -- and
+        # SpecForge stamps that same string on every DFlash draft regardless of
+        # target. So key on the nested `dflash_config` the
         # backbone actually needs, and rename to an arch that identifies the
         # model. The rename also resolves a collision: `DSparkDraftModel` is
         # already the name of ATOM's draft base class in
@@ -1517,7 +1537,7 @@ class SpeculativeConfig:
             hf_config.architectures = ["K3DFlashModel"]
             _normalize_draft_dspark_config(hf_config, dflash=True)
             return
-        if arch.endswith("DSparkModel"):
+        if arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)
             return
         if arch == "LlamaForCausalLMEagle3":
@@ -2021,6 +2041,11 @@ class Config:
     # The tokens before a replaying forward a backend reads (`Replay.history_ids`).
     # Set by the model: V4.1's Engram n-gram lookback.
     replay_history_tokens: int = 0
+    # How far below a prefix hit with no state checkpoint behind it a prefill
+    # starts to rebuild that state exactly (`BlockManager.replay_start`), 0 =
+    # such a hit is not taken. Set by the model, not a flag: DeepSeek-V4's
+    # window receptive field under ATOM_DSV4_STATE_REPLAY (`deepseek_v4_replay`).
+    state_replay_tokens: int = 0
     # DeepSeek-V4.1 encoder SWA bounded replay: a prefix hit keeps no state
     # checkpoint and rebuilds it by recomputing the window rows below the hit
     # (`--encoder-swa-bounded-replay`). On by default;
@@ -2073,6 +2098,13 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    # None reads ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR once the feature is on; see
+    # `_resolve_dynamic_chunking`.
+    dynamic_chunking_smooth_factor: float | None = None
+    # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
+    # rebuild, so the floor is what bounds that amplification.
+    dynamic_chunking_min_chunk_size: int = 4096
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2410,8 +2442,7 @@ class Config:
             )
             if qrep_off is not None:
                 logger.warning(
-                    "dcp_config.enable_query_replication disabled: %s not "
-                    "supported.",
+                    "dcp_config.enable_query_replication disabled: %s not supported.",
                     qrep_off,
                 )
                 self.dcp_config.enable_query_replication = False
@@ -2509,14 +2540,14 @@ class Config:
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
         ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
             self.compilation_config.set_splitting_ops_for_v1()
-            # Default to PIECEWISE, except V4.1 whose Engram stream fork/join
+            # Default to TR_HYBRID, except V4.1 whose Engram stream fork/join
             # currently requires a FULL graph. Explicit choices are preserved.
             # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
                 self.compilation_config.cudagraph_mode = (
                     CUDAGraphMode.FULL
                     if self.hf_config.model_type == "deepseek_v41_text"
-                    else CUDAGraphMode.PIECEWISE
+                    else CUDAGraphMode.TR_HYBRID
                 )
             self.compilation_config.init_with_cudagraph_sizes()
 
@@ -2554,6 +2585,7 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_dynamic_chunking()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2758,6 +2790,55 @@ class Config:
 
             validate_runtime_config(self)
 
+        if is_deepseek_v4:
+            from atom.model_ops.attentions.deepseek_v4_replay import (
+                state_replay_tokens,
+            )
+
+            self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_dynamic_chunking(self) -> None:
+        """Validate dynamic chunking, or turn it off where it cannot size a chunk.
+
+        Everything here, the env read included, runs only when the feature is
+        on: a stale ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
+        must not stop a server that never asked for dynamic chunking.
+        """
+        if not self.enable_dynamic_chunking:
+            return
+        if self.dynamic_chunking_smooth_factor is None:
+            try:
+                self.dynamic_chunking_smooth_factor = (
+                    envs.ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR must be a number: {exc}"
+                ) from None
+        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+            raise ValueError(
+                "dynamic_chunking_smooth_factor must be in [0, 1], got "
+                f"{self.dynamic_chunking_smooth_factor}"
+            )
+        if self.dynamic_chunking_min_chunk_size <= 0:
+            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+        if self.pipeline_parallel_size <= 1:
+            reason = "pipeline_parallel_size is 1"
+        elif not self.enable_chunked_prefill:
+            reason = "chunked prefill is off"
+        elif self.enable_rapidserve:
+            reason = "the RapidServe prefill scheduler never chunks"
+        elif (self.kv_transfer_config or {}).get("kv_role") == "kv_consumer":
+            reason = "a P/D decode instance does not run the prefills it would size"
+        else:
+            return
+        # Same degrade-to-fixed path as a failed profile or a rejected fit.
+        # Raising would make the flag a hard failure in a shared launch script.
+        logger.warning(
+            "Dynamic chunking disabled because %s; chunking stays fixed", reason
+        )
+        self.enable_dynamic_chunking = False
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -2845,6 +2926,24 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 decides whether the MoE calls
+        # shared_experts() and how many experts it routes over (129 / top-5 vs
+        # 128 / top-4), so it changes the compiled graph the same way.
+        factors.append(bool(envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4))
+        # The sparse-attention indexer bakes max_model_len and max_num_seqs into
+        # the graph as constants, so a cache built for a smaller max_model_len
+        # faults on the first decode past the old width.
+        factors.append(self.max_model_len)
+        factors.append(self.max_num_seqs)
+        # The drafter graph bakes its draft width in as a constant (DSpark traces
+        # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
+        # would otherwise load the other width's artifact: draft 6 over a draft 3
+        # cache hands MoE half the rows it expects. Acceptance-length knobs only
+        # steer sampling and stay out.
+        spec = self.speculative_config
+        factors.append(
+            None if spec is None else (spec.method, spec.num_speculative_tokens)
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

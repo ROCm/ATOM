@@ -7,35 +7,42 @@ import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import nn
 
-from atom.model_ops.attentions.token_layout.gather import gather_rows
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.utils.backends import set_model_tag
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import eager_region, token_graph
 
 from .bounded_replay import (
-    build_replay_plan,
     carry_selections,
     decoder_replay_unsupported,
+    decoder_runs,
+    decoder_stages,
     late_layer_start,
     replayable,
-    rows_of,
+    run_decoder_stages,
+    tail_width,
 )
 from .config import validate_tbo_parallelism
+from .decoder_graph import DecoderGraph
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
 
 logger = logging.getLogger("atom")
 
 
-def _fake_layer_output(hidden, layer_name):
+def _fake_layer_output(hidden, layer_name, hidden_fp8=None, hidden_scale=None):
     return torch.empty_like(hidden)
 
 
 # The boundary ops carry a dependency on hidden so the compiler retains and
 # orders the stream fork/join with the model's tensor work.
+# Each is a TR-graph break (`eager_region`) inside the op, not around a caller:
+# a compiled stage calls the op directly, so a break declared outside it would
+# be traced away and the Engram fork recorded into a segment it never joins.
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
+@eager_region()
 def v41_begin_forward(hidden: torch.Tensor) -> None:
     """Read live request state on every execution, including graph capture."""
     context = get_forward_context()
@@ -43,17 +50,34 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
     metadata.step.begin_forward()
     if not metadata.step.requests:
         return
+    # Checked before the staged path returns, so it covers both. What the
+    # width governs is how every later index into this batch is computed, so a
+    # mismatch is not confined to staging: skipping the check for the plugin
+    # left its main path to discover the same disagreement as a reshape error
+    # inside a layer, or not at all, with padding rows read as real ones.
     if hidden.shape[-2] != metadata.step.width:
         raise ValueError("Token rows disagree with the width this step declared")
+    if getattr(metadata, "staged_outside_forward", False):
+        # The plugin staged this step in the metadata builder, where no graph
+        # can capture it. Re-staging here would advance the cursor and reset
+        # the slots a second time.
+        return
     if isinstance(metadata.engram_embeddings, EngramStagedRows):
         metadata.engram_embeddings.stage()
 
 
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
+@eager_region()
 def v41_end_forward(hidden: torch.Tensor) -> None:
+    """Closes what `v41_begin_forward` opened."""
     metadata = get_forward_context().attn_metadata
     if not metadata.step.requests:
         hidden.zero_()
+        return
+    if getattr(metadata, "staged_outside_forward", False):
+        # Staged and joined by the metadata builder, before this forward. Its
+        # fork was opened and closed out there; waiting on it from in here
+        # would be a captured stream waiting on uncaptured work.
         return
     rows = metadata.engram_embeddings
     if isinstance(rows, EngramStagedRows):
@@ -61,22 +85,42 @@ def v41_end_forward(hidden: torch.Tensor) -> None:
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_fake_layer_output)
-def v41_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
+def v41_attention(
+    hidden: torch.Tensor,
+    layer_name: str,
+    hidden_fp8: torch.Tensor | None = None,
+    hidden_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
     context = get_forward_context()
     metadata = context.attn_metadata
     if not metadata.step.requests:
-        return torch.zeros_like(hidden)
+        # one output row per query where a layer is asked for some
+        # (`metadata.queries`): a tail of padding's layer 39
+        rows = (
+            hidden.shape[-2] if metadata.queries is None else len(metadata.queries.rows)
+        )
+        return hidden.new_zeros(*hidden.shape[:-2], rows, hidden.shape[-1])
     layer, rope = context.no_compile_layers[layer_name]
     # `hidden` arrives normed: the mHC seam (`pre_delayed`) applies the norm
     # before this boundary, so only the attention body runs here.
     # A bounded replay's layer 39 outputs some rows of `hidden`
     # (`metadata.queries`); it runs outside the compiled graphs.
+    options = {} if hidden_fp8 is None else {"hidden_fp8": hidden_fp8}
     return layer.attn(
-        hidden, None, metadata.cache, metadata.step, rope, metadata.queries
+        hidden,
+        hidden_scale,
+        metadata.cache,
+        metadata.step,
+        rope,
+        metadata.queries,
+        **options,
     )
 
 
+# A TR-graph break: the lookup it consumes is staged beside the forward, and a
+# recorded segment cannot wait on that stream's events.
 @torch_compile_guard(mutates_args=[], gen_fake=_fake_layer_output)
+@eager_region()
 def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
     context = get_forward_context()
     metadata = context.attn_metadata
@@ -91,6 +135,9 @@ class RuntimeBlock(Block):
     """Serving uses the same guarded ops in eager and compiled execution."""
 
     def attention_forward(self, normed, cache, step, rope):
+        if isinstance(normed, tuple):
+            hidden, hidden_fp8, hidden_scale = normed
+            return v41_attention(hidden, self.layer_name, hidden_fp8, hidden_scale)
         return v41_attention(normed, self.layer_name)
 
     def engram_forward(self, residual, embeddings, image_mask):
@@ -117,6 +164,9 @@ class _Stage(nn.Module):
         return state
 
 
+# Per phase, all three stages: a decode forward computes no `kv` for the
+# attention region (`_attend`), which a prefill step reads.
+@token_graph(per_phase=True)
 @support_torch_compile(
     dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0}
 )
@@ -144,6 +194,7 @@ def _batched(tensors):
     return tuple(None if t is None else t[None] for t in tensors)
 
 
+@token_graph(per_phase=True)
 @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "inputs_embeds": 0})
 class _EarlyLayers(_Stage):
     """Under bounded replay: embedding, the Engram fork and the layers before
@@ -158,6 +209,7 @@ class _EarlyLayers(_Stage):
         return _rows_first(state.fields())
 
 
+@token_graph(per_phase=True)
 @support_torch_compile(
     dynamic_arg_dims={
         "residual": 0,
@@ -229,6 +281,13 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self.replay = True
         self.decoder_start, self.last_layer = split - 1, layers - 1
         self.decoder_specs = self.topology[self.decoder_start : layers]
+        self.parallel_config = config.parallel_config
+        # What sizes a tail (`bounded_replay.tail_width`), for a rank that runs
+        # beside one without laying it out.
+        self.window, self.tail_capacity = (
+            hf.sliding_window,
+            config.max_num_batched_tokens,
+        )
         self.early = _EarlyLayers(
             atom_config=config, owner=self, last=self.decoder_start
         )
@@ -237,17 +296,21 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             self.late = _LateLayers(
                 atom_config=config, owner=self, first=split, last=self.last_layer
             )
+        self.decoder = DecoderGraph(self)
         logger.info(
             "Decoder SWA bounded replay: a prefill finishing its prompt runs "
             "the decoder (layers %d..%d) on its last window rows only and layer "
             "%d's query on its last row; one that does not stops at layer %d's "
-            "compression",
+            "compression (under DP attention it joins a peer's decoder "
+            "collectives on a tail of padding)",
             self.decoder_start,
             self.last_layer,
             self.last_layer,
             self.decoder_start,
         )
 
+    # TR-graph breaks through their ops: both decide on the live step whether
+    # there is anything to stage or join.
     def begin_forward(self, hidden, engram_embeddings):
         v41_begin_forward(hidden)
 
@@ -293,38 +356,59 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         if not self.replay:
             return self.backbone(input_ids, positions, inputs_embeds)
         state = SinglePassHCState(*_batched(self.early(input_ids, inputs_embeds)))
-        if replayable(get_forward_context(), input_ids.numel()):
-            return self._replayed(state, input_ids.numel())
-        state = self._late_layers(self._layer(self.decoder_start, state))
-        hidden = self._layer(self.last_layer, state).collapse()
+        forward, running_tokens = get_forward_context(), input_ids.numel()
+        if replayable(forward, running_tokens):
+            step = forward.attn_metadata.step
+            step.replay = step.decoder
+            return self._replayed(state, running_tokens, step.decoder)
+        # Every row through every layer; beside replaying DP peers, under the
+        # tail's stages they run (`decoder_stages`).
+        running_bs = forward.context.running_bs
+        stages = decoder_stages(
+            forward,
+            self.parallel_config,
+            tail_width(running_bs, self.window, self.tail_capacity),
+            running_bs,
+            replaying=False,
+        )
+        hidden = run_decoder_stages(
+            forward,
+            stages,
+            lambda: self._layer(self.decoder_start, state),
+            self._late_layers,
+            lambda late: self._layer(self.last_layer, late),
+        ).collapse()
         self.end_forward(hidden, None)
         return hidden.squeeze(0)
 
-    def _replayed(self, state, num_tokens):
+    def _replayed(self, state, running_tokens, plan):
         """The forward's rows cut as `bounded_replay` lays them out: layer 20
         compresses every row; the requests that finish their prompts run the
-        decoder on their tails, layer 39's query on their last row, which alone
-        comes out. Every other row is zero: only each request's last row is
-        read (the LM head's), and a chunk that holds none has its logits
-        discarded."""
-        metadata = get_forward_context().attn_metadata
+        decoder on their tails (`DecoderGraph`), layer 39's query on their last
+        row, which alone comes out. Every other row is zero: only each
+        request's last row is read (the LM head's), and a chunk that holds
+        none has its logits discarded. A rank finishing no prompt runs the
+        decoder on its tail of padding while a DP peer runs it
+        (`decoder_runs`): attention sees no request and writes no cache, so
+        the rows only feed the collectives. V4.1 rejects EPLB
+        (`validate_runtime_config`), so their routing reaches no expert-load
+        statistics."""
+        forward = get_forward_context()
+        metadata = forward.attn_metadata
         step, cache = metadata.step, metadata.cache
-        plan = step.replay = build_replay_plan(step, cache.geometry.window_size)
         layer, rope = self.layers[self.decoder_start], self._rope(self.decoder_start)
         normed, *seam = layer.prepare_attention(state, None, None)
         del state
-        layer.attn._compress_batch(normed, cache, step, rope)
-        full = normed.new_zeros(num_tokens, self.config.hidden_size)
-        if plan.tail is not None:
+        # A fused-quant `normed` carries its BF16 rows first.
+        hidden = normed[0] if isinstance(normed, tuple) else normed
+        layer.attn._compress_batch(hidden, cache, step, rope)
+        full = hidden.new_zeros(running_tokens, self.config.hidden_size)
+        if decoder_runs(forward):
             carry_selections(step, plan, self.decoder_specs)
-            normed, *seam = gather_rows(plan.tail_rows, normed, *seam, dim=1)
-            with rows_of(metadata, plan.tail, rows=plan.tail_rows):
-                output = layer.attention_forward(normed, None, None, rope)
-                tail = self._late_layers(layer.ffn_forward(output, *seam))
-                with rows_of(metadata, plan.tail, plan.q39, plan.q39.rows):
-                    last = self._layer(self.last_layer, tail, plan.q39)
-            self._move_aux_rows(plan.tail_rows)
-            full[plan.last_rows] = last.collapse().squeeze(0)
+            last = self.decoder.run(forward, plan, normed, seam)
+            if plan.tail.requests:
+                self._move_aux_rows(plan.tail_rows[: plan.filled])
+                full[plan.last_rows] = last[: plan.last_rows.numel()]
         self.end_forward(full, None)
         return full
 

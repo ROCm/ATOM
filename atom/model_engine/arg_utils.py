@@ -146,6 +146,11 @@ class EngineArgs:
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
+    # feature is on (see Config._resolve_dynamic_chunking).
+    dynamic_chunking_smooth_factor: float | None = None
+    dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -335,12 +340,12 @@ class EngineArgs:
             "--cudagraph-mode",
             type=str,
             default="FULL",
-            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE", "AF_PIECEWISE"],
+            choices=["NONE", "TR_HYBRID", "FULL", "FULL_AND_TR_HYBRID"],
             help="CUDA graph runtime mode. FULL = manual whole-forward capture "
-            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
-            "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
-            "the attention core is also captured into its own cudagraph with "
-            "zero-copy buffers (DeepSeek-V4 DSpark).",
+            "(default, existing behavior). TR_HYBRID = a token graph per token "
+            "bucket, breaking only where a launch depends on host data, which "
+            "runs eagerly or as a request graph; recorded at any --level. "
+            "FULL_AND_TR_HYBRID is recorded as TR_HYBRID.",
         )
         parser.add_argument(
             "--load_dummy",
@@ -593,6 +598,37 @@ class EngineArgs:
             "line's prefix cache hit rate (default: 1000, matching vLLM). "
             "Must be > 0. Only the status line is windowed; /metrics and "
             "[Cache Stats] stay cumulative.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            help=(
+                "Equalize the runtime of a PP prefill request's chunks to shorten "
+                "pipeline fill/drain. Requires --pipeline-parallel-size > 1. Helps "
+                "single-stream long prefill and costs throughput once several "
+                "requests prefill at once, so it is meant for latency-bound "
+                "deployments; see docs/dynamic_chunking_guide.md."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-smooth-factor",
+            type=float,
+            default=None,
+            help=(
+                "Interpolation between the initial chunk size (0) and the "
+                "equal-latency prediction (1). Defaults to "
+                "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR or 0.75, read only when "
+                "--enable-dynamic-chunking is set."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-min-chunk-size",
+            type=int,
+            default=4096,
+            help=(
+                "Floor for solved chunk sizes. Every extra chunk rebuilds the "
+                "cached prefix again, so this bounds how much work shrinking adds."
+            ),
         )
         parser.add_argument(
             "--max-num-seqs",

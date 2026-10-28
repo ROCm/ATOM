@@ -11,7 +11,6 @@ CPU tier for that state: same paged-KV path, one extra leg.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from atom.kv_transfer.disaggregation.types import (
@@ -37,6 +36,7 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     _JointPark,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+from atom.model_engine.state_offload import state_tier_cpu_bytes
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -238,9 +238,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             world_size=world,
             worker_id=rank,
             layout_id=layout_id,
-            max_cache_bytes=int(
-                float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30)
-            ),
+            max_cache_bytes=state_tier_cpu_bytes(),
         )
         # Share the allocator, but cap state retention separately so old
         # checkpoints cannot consume nearly the whole paged-KV CPU pool.

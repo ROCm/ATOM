@@ -940,6 +940,11 @@ class KimiK3DFlash(DSparkDraftModel):
 
     # -- DSparkDraftModel contract ----------------------------------------
 
+    @property
+    def first_attention_layer_num(self) -> int:
+        """GQA layers register their `Attention` as `attn`, not `mla_attn`."""
+        return self.layers[0].self_attn.attn.layer_num
+
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
         return self.hidden_norm(_linear_out(self.fc(aux_concat)))
 

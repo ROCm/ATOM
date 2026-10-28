@@ -183,7 +183,12 @@ class StateByteCodec:
         # and shrinking the CPU pool one entry per failure. `get` guards its own
         # reference with `finally` for the same reason.
         try:
-            self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
+            segments = getattr(self._backend, "page_unit_segments", None)
+            if callable(segments):
+                ptrs, sizes = segments(unit_ids)
+                self._staged.pack_segments(ptrs, sizes, obj)
+            else:
+                self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
             # Source first: `pack` has synchronized the stream that reads the
             # units, so nothing on the device touches them from here.
             if on_source_released is not None:

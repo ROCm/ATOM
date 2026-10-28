@@ -29,6 +29,9 @@ from typing import Optional, Union
 import torch
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import MixtralConfig
+
 from atom.config import Config, QuantizationConfig
 
 # from atom.model_ops.attention import Attention
@@ -44,8 +47,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import MixtralConfig
+from atom.utils.region_graph import token_graph
 
 
 class MixtralMoE(nn.Module):
@@ -257,6 +259,7 @@ class MixtralDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@token_graph
 @support_torch_compile
 class MixtralModel(nn.Module):
 

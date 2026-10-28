@@ -7,6 +7,9 @@ from pathlib import Path
 
 
 def write_json(path, payload):
+    # A job that dies before the workers create the run directory still has a
+    # scheduler outcome to record; crashing here would replace it with rc=1.
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
     temporary.replace(path)

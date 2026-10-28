@@ -157,6 +157,45 @@ class GatedDeltaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    def _spec_conv1d_update(
+        self,
+        mixed_qkv_spec,
+        conv_state,
+        conv_weights,
+        gdn_metadata,
+        num_accepted_tokens,
+        use_replayssm,
+    ):
+        """Update speculative convolution state using the native cache layout."""
+        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
+        return causal_conv1d_update(
+            mixed_qkv_spec,
+            conv_state,
+            conv_weights,
+            self.num_k_heads * self.head_k_dim // self.tp_size,
+            self.num_v_heads * self.head_v_dim // self.tp_size,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=spec_state_indices_tensor[:, 0][
+                : gdn_metadata.num_spec_decodes
+            ],
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=gdn_metadata.spec_query_start_loc,
+            # The verify window, which sizes the conv rollback window
+            # (state_len = kernel_width-1 + max_query_len-1) and hence the
+            # kernel's NP2_STATELEN tile. It used to be inferred from the
+            # slot table's last dim, which only coincided with the window
+            # because that table carried one column per draft; state that
+            # dependency explicitly so a narrower table cannot silently
+            # truncate the conv state.
+            max_query_len=(
+                gdn_metadata.replayssm_max_query_len
+                if use_replayssm
+                else spec_state_indices_tensor.size(-1)
+            ),
+            validate_data=False,
+        )
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -243,32 +282,13 @@ class GatedDeltaNet(nn.Module):
 
         # # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            query_spec, key_spec, value_spec = causal_conv1d_update(
+            query_spec, key_spec, value_spec = self._spec_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
                 conv_weights,
-                self.num_k_heads * self.head_k_dim // self.tp_size,
-                self.num_v_heads * self.head_v_dim // self.tp_size,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][
-                    : gdn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                # The verify window, which sizes the conv rollback window
-                # (state_len = kernel_width-1 + max_query_len-1) and hence the
-                # kernel's NP2_STATELEN tile. It used to be inferred from the
-                # slot table's last dim, which only coincided with the window
-                # because that table carried one column per draft; state that
-                # dependency explicitly so a narrower table cannot silently
-                # truncate the conv state.
-                max_query_len=(
-                    gdn_metadata.replayssm_max_query_len
-                    if use_replayssm
-                    else spec_state_indices_tensor.size(-1)
-                ),
-                validate_data=False,
+                gdn_metadata,
+                num_accepted_tokens,
+                use_replayssm,
             )
             num_tokens_spec = query_spec.shape[0]
             query_spec = query_spec.view(1, num_tokens_spec, -1, self.head_k_dim)
@@ -384,6 +404,12 @@ class GatedDeltaNet(nn.Module):
                 # rejected drafts of the previous step are undone simply by
                 # `write_pos` never having advanced past them.
                 nsd = gdn_metadata.num_spec_decodes
+                # Pure spec-decode batch: the spec tokens are exactly the
+                # first num_actual_tokens rows, so write straight into the
+                # result and skip the merge copy below.
+                spec_only = (
+                    gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0
+                )
                 core_attn_out_spec = replayssm_gated_delta_rule(
                     q=query_spec,
                     k=key_spec,
@@ -401,6 +427,7 @@ class GatedDeltaNet(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
+                    o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
                 )
                 last_recurrent_state = None
             else:
@@ -417,6 +444,7 @@ class GatedDeltaNet(nn.Module):
                             : gdn_metadata.num_spec_decodes + 1
                         ],
                         ssm_state_indices=spec_state_indices_tensor,
+                        ssm_state_indices_in=gdn_metadata.spec_state_indices_in_tensor,
                         num_accepted_tokens=num_accepted_tokens,
                         use_qk_l2norm_in_kernel=True,
                     )
@@ -533,25 +561,32 @@ class GatedDeltaNet(nn.Module):
                 )
 
                 h = flydsl_h if use_flydsl_prefill else pop_last_intermediate_states()
-                if h is not None:
-                    # One launch for both halves. `conv_state` is
-                    # [slot, conv_dim, state_len] by here (see the transpose
-                    # above) and shares `slots` with the SSM half, so the two
-                    # always describe the same token position.
-                    write_state_checkpoints(
-                        h,
-                        ssm_state,
-                        mixed_qkv_non_spec,
-                        conv_state,
-                        ckpt["rows"],
-                        ckpt["slots"],
-                        ckpt["offs"],
-                        ckpt["is_end"],
-                        ckpt["runtime"],
-                        gdn_metadata.ssm_chunk_offsets,
-                        non_spec_query_start_loc,
-                        CHUNK_SIZE,
+                # Raise rather than skip: the scheduler publishes every target
+                # after this forward, written or not.
+                if h is None:
+                    raise RuntimeError(
+                        "GDN state checkpoints reserved but the prefill kernel "
+                        "kept no intermediate states to copy them from"
                     )
+                # One launch for both halves. `conv_state` is
+                # [slot, conv_dim, state_len] by here (see the transpose
+                # above) and shares `slots` with the SSM half, so the two
+                # always describe the same token position.
+                write_state_checkpoints(
+                    h,
+                    ssm_state,
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    ckpt["rows"],
+                    ckpt["slots"],
+                    ckpt["offs"],
+                    ckpt["is_end"],
+                    ckpt["runtime"],
+                    gdn_metadata.ssm_chunk_offsets,
+                    non_spec_query_start_loc,
+                    CHUNK_SIZE,
+                    gdn_metadata.ssm_conv_state_len,
+                )
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes
             core_attn_out_non_spec = replayssm_gated_delta_rule(
@@ -645,7 +680,8 @@ class GatedDeltaNet(nn.Module):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if core_attn_out_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
