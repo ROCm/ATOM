@@ -726,6 +726,30 @@ def test_a_residual_without_mass_falls_back_to_p():
     torch.testing.assert_close(freq, p, rtol=0, atol=0.01)
 
 
+def test_a_row_without_a_finite_z_emits_its_argmax_not_id_0():
+    """One +inf logit, or one NaN logit, makes Z NaN and every p 0: the
+    draft is rejected, the residual and the fallback race have no positive
+    key, and the emitted id must be the row's raw argmax (the +inf id, or the
+    finite max beside the NaN), never id 0, which carries no mass."""
+    n = 64
+    hot = _RATIO_BLOCK_V + 7
+    torch.manual_seed(37)
+    logits = torch.randn(2, VOCAB, device=DEV)
+    logits[:, 0] = -30.0
+    logits[0, hot] = float("inf")
+    logits[1, hot] = 10.0
+    logits[1, 20] = float("nan")
+    q = sparse(VOCAB, {3: 0.5, 11: 0.5})
+    drafts = draw(q, 2 * n)
+    out, (accepted, _, _) = rejection_sample(
+        **verify_batch(drafts, 1, logits.repeat(n, 1), torch.ones(2 * n, device=DEV)),
+        draft_probs=draft_q(q, drafts),
+        ratio_step=9,
+    )
+    assert (accepted == 0).all()
+    assert (out[:, 0] == hot).all()
+
+
 def test_a_request_without_q_rejects_and_draws_from_p():
     torch.manual_seed(23)
     n = 30000

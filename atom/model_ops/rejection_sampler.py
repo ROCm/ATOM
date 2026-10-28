@@ -1340,7 +1340,10 @@ def _ratio_residual_pick_kernel(
             temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
             row_max = tl.load(row_max_ptr + row)
             inv_z = tl.load(row_inv_z_ptr + row)
-            pbest = -1.0
+            # From 0, not -1: a zero key (no mass anywhere, or inv_z 0 after
+            # a NaN Z) never wins, so the sentinel survives into the
+            # row_argmax fallback below rather than emitting id 0.
+            pbest = 0.0
             token = 2147483647
             for v_start in range(0, vocab_size, BLOCK_V):
                 v = v_start + tl.arange(0, BLOCK_V)
