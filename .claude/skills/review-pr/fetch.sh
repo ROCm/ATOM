@@ -41,7 +41,7 @@ REPO_URL="https://github.com/$REPO"
 
 # Full metadata
 gh pr view "$PR" --repo "$REPO" \
-  --json title,body,number,labels,files,author,reviews,comments,baseRefName,baseRefOid,headRefOid \
+  --json title,body,number,labels,files,author,reviews,comments,baseRefName,baseRefOid,headRefOid,state,mergedAt,mergeCommit \
   > "$WORK/pr_meta.json"
 
 # Diff. Unchecked, this wrote an empty file and the run continued: `gh` reports a diff
@@ -892,11 +892,42 @@ fi
 "$SKILLS_ROOT/review-pr/triage.py" guards "$WORK/pr.diff" \
   | tee "$WORK/guards.txt"
 
+# If this PR is already merged, $BASE_SHA (the base branch's CURRENT tip) is routinely
+# downstream of the PR's own merge commit -- main kept moving after the merge landed, same
+# as any other commit. Unguarded, that makes `apply --check` fail for a reason that has
+# nothing to do with staleness and everything to do with asking the wrong question: a
+# merged PR's diff is BY DEFINITION already in $BASE_SHA's history, so "no longer applies"
+# reads as "needs a rebase" when the true state is "already shipped; there is nothing to
+# rebase". Confirmed on ATOM#2705: merged via e3a00a9281, base tip ebd5f84f3a is downstream
+# of that merge commit, and `apply --check` fails -- not from drift, from double-applying.
+MERGE_SHA=$(python3 -c \
+  'import json,sys; m=json.load(open(sys.argv[1])).get("mergeCommit") or {}; \
+   print(m.get("oid") or "")' "$WORK/pr_meta.json")
+DOWNSTREAM_OF_PR=""
+if [ -n "$MERGE_SHA" ]; then
+  git -C "$PROJECT_ROOT" cat-file -e "${MERGE_SHA}^{commit}" 2>/dev/null \
+    || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$MERGE_SHA" 2>/dev/null || true
+  if git -C "$PROJECT_ROOT" merge-base --is-ancestor "$MERGE_SHA" "$BASE_SHA" 2>/dev/null; then
+    DOWNSTREAM_OF_PR=1
+  fi
+fi
+
 # Whether the diff still applies to the branch it targets. Free, and nothing else asks:
 # aiter#2478 is five months old, both hunks conflict, and the review found that only by
 # thinking to run this. symbols.txt reporting resolved imports reads as "no drift".
 if git -C "$PROJECT_ROOT" -c core.fileMode=false apply --check "$WORK/pr.diff" 2>"$WORK/.err"; then
   echo "APPLIES: the diff still applies to $BASE_SHA" | tee "$WORK/applies.txt"
+elif [ -n "$DOWNSTREAM_OF_PR" ]; then
+  { echo "STALE: no longer applies to merge target $BASE_SHA -- but this PR was ALREADY"
+    echo "  MERGED via $MERGE_SHA, and $BASE_SHA is downstream of that merge commit. This"
+    echo "  is not drift needing a rebase -- it is double-application: the diff's own"
+    echo "  changes are already part of $BASE_SHA's history, so re-applying them conflicts"
+    echo "  by construction. merge-target/ below is checked out at $BASE_SHA, which is"
+    echo "  AFTER this PR's own merge, not the PR's actual base -- do not use it to judge"
+    echo "  what this PR changed."
+    echo "  Recovery: read the pre-PR state directly from the merge commit's first parent:"
+    echo "    git -C $PROJECT_ROOT show ${MERGE_SHA}^:<path>"
+    sed 's/^/  /' "$WORK/.err"; } | tee "$WORK/applies.txt"
 else
   { echo "STALE: no longer applies to merge target $BASE_SHA -- the PR needs a rebase,"
     echo "  and any CI result on it describes a tree that has moved"
