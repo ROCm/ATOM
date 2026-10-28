@@ -451,6 +451,37 @@ def sigmoid_mul_fp8_group_quant(
     )
 
 
+def _sigmoid_mul_fake(attn_output: Tensor, gate: Tensor) -> Tensor:
+    return torch.empty_like(attn_output)
+
+
+# A custom op so AITER's wrapper runs its shape checks and mask choice at call
+# time: traced, they fix the token count to the one seen while compiling.
+@torch_compile_guard(gen_fake=_sigmoid_mul_fake, mutates_args=[])
+def sigmoid_mul(attn_output: Tensor, gate: Tensor) -> Tensor:
+    """Out-of-place sigmoid(gate) * attn_output, computed in FP32 and rounded
+    once by AITER's fused gate where its layout and dtype allow."""
+    if (
+        attn_output.is_cuda
+        and gate.device == attn_output.device
+        and attn_output.dtype == gate.dtype
+        and attn_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and attn_output.shape == gate.shape
+        and (
+            (attn_output.is_contiguous() and gate.is_contiguous())
+            or all(
+                t.ndim == 2 and t.stride(1) == 1 and t.stride(0) >= t.shape[1]
+                for t in (attn_output, gate)
+            )
+        )
+    ):
+        # AITER defaults to in-place output. Keep the out-of-place contract,
+        # including when attn_output and gate share storage.
+        out = torch.empty_like(attn_output)
+        return fused_sigmoid_mul(attn_output, gate, out=out)
+    return attn_output * torch.sigmoid(gate)
+
+
 def fused_sigmoid_mul_maybe_quant(
     attn_output: Tensor,
     gate: Tensor,
@@ -481,25 +512,7 @@ def fused_sigmoid_mul_maybe_quant(
     comparing the pybind11 type inside a traced ``forward``.
     """
     if not quant:
-        if (
-            attn_output.is_cuda
-            and gate.device == attn_output.device
-            and attn_output.dtype == gate.dtype
-            and attn_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
-            and attn_output.shape == gate.shape
-            and (
-                (attn_output.is_contiguous() and gate.is_contiguous())
-                or all(
-                    t.ndim == 2 and t.stride(1) == 1 and t.stride(0) >= t.shape[1]
-                    for t in (attn_output, gate)
-                )
-            )
-        ):
-            # AITER defaults to in-place output. Keep this helper's original
-            # out-of-place contract, including when x and gate share storage.
-            out = torch.empty_like(attn_output)
-            return fused_sigmoid_mul(attn_output, gate, out=out), None
-        return attn_output * torch.sigmoid(gate), None
+        return sigmoid_mul(attn_output, gate), None
     if quant_type_value == QuantType.per_Token.value:
         return fused_sigmoid_mul_fp8_quant(attn_output, gate, per_token=True)
     if quant_type_value == QuantType.per_1x128.value:
