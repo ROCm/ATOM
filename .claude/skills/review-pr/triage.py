@@ -2407,6 +2407,35 @@ def _fold_punct(text):
 
 HASH_LEDGER = ".artifact_hashes"
 LATE_MARK = re.compile(r"--\s*late finding:", re.IGNORECASE)
+# Design spec 6.6: a card that says nothing about validation reads as clearance. `N/A`
+# ("nothing to validate") and `NOT RUN` ("should have been validated and wasn't") are
+# different facts and must not be merged into one word -- so this checks for the line's
+# presence AND that whichever word is used carries its own reason, not just the other.
+VALIDATION_LINE = re.compile(r"^\s*Validation\s*\(deterministic\)\s*:\s*(.*)$",
+                             re.IGNORECASE)
+VALIDATION_REASON = re.compile(r"(?:--|—|:)\s*\S")
+
+
+def _check_validation_line(card_text):
+    """Returns a list of (kind, text, why) problems, same shape as audit_card's."""
+    for line in (card_text or "").splitlines():
+        m = VALIDATION_LINE.match(line.strip())
+        if m:
+            body = m.group(1).strip()
+            if not body:
+                return [("EMPTY-VALIDATION", line.strip()[:70],
+                         "no verdict after the colon -- state PASS/NEEDS_WORK/BLOCK/"
+                         "INCONCLUSIVE, N/A, or NOT RUN")]
+            if re.match(r"(N/A|NOT RUN)\b", body, re.IGNORECASE) \
+                    and not VALIDATION_REASON.search(body):
+                return [("UNREASONED-VALIDATION", body[:70],
+                         "N/A and NOT RUN both need a reason after `--` -- e.g. `N/A -- "
+                         "no runtime surface changed` or `NOT RUN -- <why>`")]
+            return []
+    return [("MISSING-VALIDATION", "Validation (deterministic)",
+             "every card needs this line in every state -- silence on it reads as "
+             "clearance. Write `N/A -- <reason>` when nothing needed validating, or "
+             "`NOT RUN -- <reason>` when it did and could not run")]
 
 
 def record_artifact_hash(path):
@@ -2587,6 +2616,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                           "arrived late is reported with `-- late finding:` and recorded in "
                           "late_findings.txt; it is not written back into an artifact that "
                           "had already gone green")))
+    problems.extend(_check_validation_line(card_text))
     return findings, problems
 
 
