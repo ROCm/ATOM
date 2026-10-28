@@ -14,6 +14,8 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -87,9 +89,27 @@ def verify_attention_configuration(plan, logs, out):
 def start(name, cmd, env, logs):
     log = logs / f"{name}.log"
     print(f"[{name}] {shlex.join(map(str, cmd))}", flush=True)
-    with log.open("w") as stream:
-        proc = subprocess.Popen(cmd, env=env, stdout=stream, stderr=subprocess.STDOUT,
-                                start_new_session=True, cwd="/tmp")
+    # A pipe gives the many engine workers one log writer. Retain a local copy
+    # so an interrupted/shared-filesystem write cannot hide the first exception.
+    local = Path(tempfile.mkdtemp(prefix=f'atomesh-{name}-')) / log.name
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            start_new_session=True, cwd="/tmp")
+
+    def collect():
+        with local.open('wb', buffering=0) as backup, log.open('wb', buffering=0) as shared:
+            while chunk := proc.stdout.read1(65536):
+                backup.write(chunk)
+                try:
+                    shared.write(chunk)
+                except OSError as exc:
+                    print(f'[logs] {name} shared log write failed: {exc}; local={local}', flush=True)
+                if any(marker in chunk for marker in (b'ERROR', b'Fatal Python', b'Traceback', b'Error:')):
+                    print(f'[{name}-diagnostic] ' + chunk.decode(errors='replace'), flush=True)
+        proc.stdout.close()
+
+    proc._atomesh_log_thread = threading.Thread(target=collect, daemon=True)
+    proc._atomesh_local_log = local
+    proc._atomesh_log_thread.start()
     PROCESSES.append((name, proc, log))
     return proc
 
@@ -134,7 +154,7 @@ def wait_http(url, timeout):
 
 def cleanup():
     # First stop all clients/engines, then wait before stopping the Store master.
-    for name, proc, _ in reversed(PROCESSES):
+    for name, proc, log in reversed(PROCESSES):
         if proc.poll() is None:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
@@ -144,6 +164,14 @@ def cleanup():
                 proc.wait(timeout=10)
             except ProcessLookupError:
                 pass
+        collector = getattr(proc, '_atomesh_log_thread', None)
+        if collector is not None:
+            collector.join(timeout=10)
+            if not collector.is_alive():
+                try:
+                    shutil.copyfile(proc._atomesh_local_log, log)
+                except OSError as exc:
+                    print(f'[logs] {name} final copy failed: {exc}', flush=True)
 
 
 def on_signal(signum, frame):

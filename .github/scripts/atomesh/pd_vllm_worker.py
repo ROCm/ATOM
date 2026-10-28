@@ -23,6 +23,24 @@ class StoreMemoryWorker(Worker):
         return (Path(os.environ['ATOMESH_VLLM_MEMORY_DIR']) / 'runtime-evidence'
                 / f"{os.environ['ATOMESH_VLLM_ROLE']}-rank-{self.local_rank}")
 
+    def init_device(self):
+        try:
+            result = super().init_device()
+        except Exception as exc:
+            record_failure(self._diagnostic_dir(), exc)
+            raise
+        record_runtime(self._diagnostic_dir(), 'after-device-init')
+        return result
+
+    def load_model(self, *, load_dummy_weights=False):
+        try:
+            result = super().load_model(load_dummy_weights=load_dummy_weights)
+        except Exception as exc:
+            record_failure(self._diagnostic_dir(), exc)
+            raise
+        record_runtime(self._diagnostic_dir(), 'after-model-load')
+        return result
+
     def compile_or_warm_up_model(self):
         evidence = self._diagnostic_dir()
         record_runtime(evidence, 'before-warmup')
