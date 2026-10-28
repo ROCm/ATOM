@@ -2697,6 +2697,13 @@ class ModelRunner:
             graph_shapes=self._producer_graph_shapes(),
             tbo_decode_graphs=self.tbo_decode_graphs,
         )
+        connector = get_kvconnector()
+        release_events = getattr(connector, "release_deferred_events", None)
+        if release_events is not None:
+            # All DP peers have submitted the previous forward before the
+            # metadata rendezvous above. HIP IPC event destruction can wait
+            # for that work; it must not run before peers reach this point.
+            release_events()
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
         self._eplb_any_rank_has_prefill = forward_mode.sync.any_rank_has_prefill
