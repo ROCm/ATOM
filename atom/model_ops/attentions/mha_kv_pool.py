@@ -122,9 +122,12 @@ class MhaKvPool:
         # "nvfp4": per (token, kv head) a D/2-byte e2m1 payload and D/16 E4M3
         # block scales, token-major (minimax_m3/sparse_attn_nvfp4.py), instead
         # of SHUFFLE values plus one fp32 scale per token.
+        # "mxfp4": per (page, kv head) one 8704 B field holding e2m1 data and
+        # e8m0 scales (minimax_m3/kv_mxfp4.py); K and V a field each, no scale
+        # planes.
         self.kv_format = kv_format
         self.x = shuffle_pack(kv_dtype)
-        if kv_format == "nvfp4":
+        if kv_format in ("nvfp4", "mxfp4"):
             self.x = 1
         elif head_dim % self.x or block_size % self.x:
             raise ValueError(
@@ -140,7 +143,22 @@ class MhaKvPool:
         # 256 B field alignment by the same factor -- 9% of the pool at 8
         # blocks an entry, almost all of it padding on the 64 B scale planes.
         entry_tokens = block_size * blocks_per_entry
-        if kv_format == "nvfp4":
+        if kv_format == "mxfp4":
+            from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, PAGE_TOKENS
+
+            if block_size != PAGE_TOKENS or head_dim != 128 or blocks_per_entry != 1:
+                raise ValueError(
+                    "an MXFP4 KV page is 128 tokens of head_dim 128, one block "
+                    f"an entry; got block_size {block_size}, head_dim "
+                    f"{head_dim}, {blocks_per_entry} blocks an entry"
+                )
+            per_entry = num_kv_heads * PAGE_BYTES
+            self.cache_fields = [
+                EntryField("k", layers, (per_entry,), torch.uint8),
+                EntryField("v", layers, (per_entry,), torch.uint8),
+            ]
+            self.scale_fields = []
+        elif kv_format == "nvfp4":
             payload = num_kv_heads * entry_tokens * (head_dim // 2)
             scales = num_kv_heads * entry_tokens * (head_dim // 16)
             self.cache_fields = [
@@ -284,6 +302,14 @@ class MhaKvPool:
         collapsing V's outer half to one.
         """
         x, nh, hd, bs = self.x, self.num_kv_heads, self.head_dim, self.block_size
+        if self.kv_format == "mxfp4":
+            from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES
+
+            shape = (-1, nh, PAGE_BYTES)
+            return (
+                self.field_view("k", layer, torch.uint8, shape),
+                self.field_view("v", layer, torch.uint8, shape),
+            )
         if self.kv_format == "nvfp4":
             shape = (-1, nh, bs, hd // 2)
             return (
