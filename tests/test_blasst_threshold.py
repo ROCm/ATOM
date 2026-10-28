@@ -26,7 +26,7 @@ def _clean_blasst_env(monkeypatch):
 
 def _blasst():
     """Return the module fresh; envs.__getattr__ re-reads os.environ per access."""
-    import atom.utils.blasst as blasst
+    from atom.utils import blasst
 
     return blasst
 
