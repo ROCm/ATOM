@@ -129,12 +129,7 @@ from atom.utils.forward_context import (
     pass_scheduled_tokens_gpu,
 )
 from atom.utils.region_graph import token_graph
-from atom.utils.tbo.ubatching import (
-    tbo_active,
-    tbo_mark_used_on_compute,
-    tbo_switch_to_compute_sync,
-    tbo_yield_and_switch_from_compute_to_comm,
-)
+from atom.utils.tbo.ubatching import tbo_active, tbo_on_comm
 
 logger = logging.getLogger(__name__)
 
@@ -2034,14 +2029,7 @@ class DeepseekV4Attention(nn.Module):
         state slots are already full-sequence. Mirrors SGLang's
         compute_kv_score: gather after the projection, before the pooling."""
         projected = [c.wkv_gate(x) for c in compressors]
-        tbo = tbo_active()
-        if tbo:
-            tbo_yield_and_switch_from_compute_to_comm()
-        gathered = pcp_allgather_rerange_many(projected, get_pcp_world_size())
-        if tbo:
-            tbo_switch_to_compute_sync()
-            tbo_mark_used_on_compute(*gathered)
-        return gathered
+        return tbo_on_comm(pcp_allgather_rerange_many, projected, get_pcp_world_size())
 
     def _compressor_streams(self):
         """Each compressor this layer runs and the side stream it runs on:
@@ -2534,25 +2522,17 @@ class DeepseekV4Attention(nn.Module):
             pcp_on = _pcp_active()
             if pcp_on:
                 pcp_ws = get_pcp_world_size()
-                _tbo_attn = tbo_active()
-                if _tbo_attn:
-                    tbo_yield_and_switch_from_compute_to_comm()
                 if self.kv_fp8:
-                    k_packed_full, k_rope_full, positions_full = (
-                        pcp_allgather_rerange_many(
-                            [qkn.k_packed, qkn.k_rope, positions], pcp_ws
-                        )
+                    k_packed_full, k_rope_full, positions_full = tbo_on_comm(
+                        pcp_allgather_rerange_many,
+                        [qkn.k_packed, qkn.k_rope, positions],
+                        pcp_ws,
                     )
                     kv_full = None
                 else:
                     k_packed_full = k_rope_full = None
-                    kv_full, positions_full = pcp_allgather_rerange_many(
-                        [qkn.kv, positions], pcp_ws
-                    )
-                if _tbo_attn:
-                    tbo_switch_to_compute_sync()
-                    tbo_mark_used_on_compute(
-                        k_packed_full, k_rope_full, kv_full, positions_full
+                    kv_full, positions_full = tbo_on_comm(
+                        pcp_allgather_rerange_many, [qkn.kv, positions], pcp_ws
                     )
             else:
                 k_packed_full, k_rope_full = qkn.k_packed, qkn.k_rope

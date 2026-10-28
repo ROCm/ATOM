@@ -600,16 +600,30 @@ def tbo_switch_to_compute_sync():
     _get_current_tbo_context().switch_to_compute_sync()
 
 
-def tbo_mark_used_on_compute(*tensors: torch.Tensor | None):
-    """After `tbo_switch_to_compute_sync`: mark `tensors`, allocated on the comm
-    stream, as in use on the compute stream that reads them. Freed without it,
-    their memory goes back to the comm stream at once, and the comm stream
-    waits only on its own ubatch's compute: the other ubatch's next collective
-    can overwrite them before this ubatch's kernels have read them."""
-    stream = torch.cuda.current_stream()
+def tbo_mark_used_on_compute(*tensors):
+    """Mark `tensors`, allocated on this ubatch's comm stream, as in use on its
+    compute stream, which reads them. Freed without it, their memory goes back
+    to the comm stream at once, and the comm stream waits only on its own
+    ubatch's compute: the other ubatch's next collective can overwrite them
+    before this ubatch's kernels have read them. Skips anything not a tensor."""
+    stream = _get_current_tbo_context().compute_stream
     for t in tensors:
-        if t is not None:
+        if isinstance(t, torch.Tensor):
             t.record_stream(stream)
+
+
+def tbo_on_comm(fn: Callable, *args):
+    """`fn(*args)` as a comm phase: under TBO, yield to the other ubatch, run it
+    on the comm stream, switch back to compute, and hold what it returns (a
+    tensor, or a list / tuple of them) for the compute stream. Outside TBO,
+    just `fn(*args)`."""
+    if not tbo_active():
+        return fn(*args)
+    tbo_yield_and_switch_from_compute_to_comm()
+    out = fn(*args)
+    tbo_switch_to_compute_sync()
+    tbo_mark_used_on_compute(*(out if isinstance(out, (list, tuple)) else (out,)))
+    return out
 
 
 def tbo_yield_and_switch_from_comm_to_compute():

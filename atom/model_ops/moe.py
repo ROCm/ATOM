@@ -112,7 +112,7 @@ from atom.utils.forward_context import get_forward_context, pass_scheduled_token
 from atom.utils.tbo.ubatching import (
     tbo_active,
     tbo_enabled,
-    tbo_mark_used_on_compute,
+    tbo_on_comm,
     tbo_switch_to_compute_sync,
     tbo_yield_and_switch_from_compute_to_comm,
 )
@@ -5367,20 +5367,17 @@ class FusedMoE(torch.nn.Module):
                 topk_ids,
                 x_scale,
             )
-            tbo = tbo_active()
-            if tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
             # One grouped collective, rank-major: every PCP shard is one height.
             pcp_group = get_pcp_group()
             heights = [hidden_states.shape[0]] * pcp_group.world_size
-            hidden_states, topk_weights, topk_ids, *scale = gather_rows(
-                lambda ts: all_gatherv(ts, heights, pcp_group), rows
-            )
+
+            def gather():
+                out = gather_rows(lambda ts: all_gatherv(ts, heights, pcp_group), rows)
+                reassign_gathered_shared_ids(self, out[2])
+                return out
+
+            hidden_states, topk_weights, topk_ids, *scale = tbo_on_comm(gather)
             x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
-            if tbo:
-                tbo_switch_to_compute_sync()
-                tbo_mark_used_on_compute(hidden_states, topk_weights, topk_ids, x_scale)
         gathered = gathered or split
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
@@ -5401,12 +5398,7 @@ class FusedMoE(torch.nn.Module):
             ),
         )
         if split:
-            if tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-            output = pcp_reduce_scatter(output)
-            if tbo:
-                tbo_switch_to_compute_sync()
-                tbo_mark_used_on_compute(output)
+            output = tbo_on_comm(pcp_reduce_scatter, output)
         elif pcp:
             output = pcp_all_reduce(output)
         return output
