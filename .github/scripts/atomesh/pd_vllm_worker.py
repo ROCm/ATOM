@@ -7,6 +7,7 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from pd_vllm_memory import prepare_after_load, write_json
 from pd_vllm_diagnostics import record_runtime, record_failure
+from pd_vllm_stage_probe import probe
 
 
 def mooncake_hca(local_rank, environ=os.environ):
@@ -30,6 +31,7 @@ class StoreMemoryWorker(Worker):
             record_failure(self._diagnostic_dir(), exc)
             raise
         record_runtime(self._diagnostic_dir(), 'after-device-init')
+        probe(self._diagnostic_dir(), 'after-device-init', 1)
         return result
 
     def load_model(self, *, load_dummy_weights=False):
@@ -39,16 +41,31 @@ class StoreMemoryWorker(Worker):
             record_failure(self._diagnostic_dir(), exc)
             raise
         record_runtime(self._diagnostic_dir(), 'after-model-load')
+        probe(self._diagnostic_dir(), 'after-model-load', 2)
+        return result
+
+    def determine_available_memory(self):
+        result = super().determine_available_memory()
+        probe(self._diagnostic_dir(), 'after-memory-profile', 3)
         return result
 
     def compile_or_warm_up_model(self):
         evidence = self._diagnostic_dir()
         record_runtime(evidence, 'before-warmup')
+        import vllm.v1.worker.gpu_worker as worker_module
+        original_warmup = worker_module.kernel_warmup
+        def observed_kernel_warmup(worker):
+            result = original_warmup(worker)
+            probe(evidence, 'after-aiter-warmup', 5)
+            return result
+        worker_module.kernel_warmup = observed_kernel_warmup
         try:
             result = super().compile_or_warm_up_model()
         except Exception as exc:
             record_failure(evidence, exc)
             raise
+        finally:
+            worker_module.kernel_warmup = original_warmup
         record_runtime(evidence, 'after-warmup')
         return result
 
@@ -89,4 +106,5 @@ class StoreMemoryWorker(Worker):
             record_failure(evidence, exc)
             raise
         record_runtime(evidence, 'after-kv-init')
+        probe(evidence, 'after-kv-init', 4)
         return result

@@ -113,6 +113,8 @@ for run in runs:
                        for role in ('prefill', 'decode', 'proxy', 'mooncake-master')]
             sources += [current / 'runtime-evidence' / f'{role}-rank-{rank}' / 'failure.txt'
                         for role in ('prefill', 'decode') for rank in range(4)]
+            sources += list((current / 'runtime-evidence').glob('*/*/result.json'))
+            sources += list((current / 'runtime-evidence').glob('*/*-hip-load.json'))
             for source in sources:
                 if not source.is_file() or not source.resolve().is_relative_to(job.resolve()):
                     continue
@@ -203,7 +205,7 @@ for job_id in sorted({str(row['slurm_job_id']) for row in rows}):
         entry = {'job_id': int(job_id), 'query_rc': query.returncode,
                  'reported_status': query.stdout.strip()[:200], 'query_error': query.stderr.strip()[-500:]}
         for line in query.stdout.splitlines():
-            match = re.fullmatch(r'([A-Z_]+)\+?\|(\d+:\d+)?', line.strip())
+            match = re.fullmatch(r'([A-Z_]+)\+?\|(-?\d+:\d+)?', line.strip())
             if match and match[1] in {'PENDING', 'RUNNING', 'COMPLETING', 'COMPLETE', 'COMPLETED',
                     'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'PREEMPTED',
                     'BOOT_FAIL', 'SUSPENDED', 'CONFIGURING', 'REQUEUED', 'DEADLINE'}:

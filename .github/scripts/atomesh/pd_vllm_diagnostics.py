@@ -45,6 +45,9 @@ def record_failure(out, error):
                 if compiled is not None and id(compiled) not in saved and isinstance(getattr(compiled, 'asm', None), dict):
                     name = str(getattr(getattr(compiled, 'metadata', None), 'name', 'compiled_kernel'))
                     save_kernel(compiled, out / name)
+                    from pd_vllm_stage_probe import direct_hip_load
+                    (out / (name + '-hip-load.json')).write_text(json.dumps(
+                        direct_hip_load(compiled.asm['hsaco'], name), indent=2) + '\n')
                     saved.add(id(compiled))
             tb = tb.tb_next
         record_runtime(out, 'at-failure')
