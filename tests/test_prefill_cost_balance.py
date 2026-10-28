@@ -55,6 +55,7 @@ def _sched(
     max_tokens=64,
     dp_size=8,
     prefix_caching=False,
+    mixed=False,
 ):
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", str(weight))
     monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_SLACK", str(slack))
@@ -67,6 +68,7 @@ def _sched(
             max_model_len=256,
             max_num_batched_tokens=max_tokens,
             enable_prefix_caching=prefix_caching,
+            enable_mixed_prefill_decode=mixed,
             enable_dp_attention=dp_attention,
             parallel_config=SimpleNamespace(data_parallel_size=dp_size),
         )
@@ -108,6 +110,21 @@ def test_off_with_a_single_dp_rank(monkeypatch, seq_factory):
     assert not sched.cost_balance
     assert _prefill_tokens(sched) == 64
     assert delayer.reported == [0.0]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_estimate_prices_the_chunk_the_prefill_budget_allows(
+    monkeypatch, seq_factory, mixed
+):
+    """Under mixed batching the running decodes keep their rows
+    (`_prefill_budget`), so the estimate prices the chunk that is left, not
+    one the batch budget would allow and admission then could not take."""
+    sched = _sched(monkeypatch, mixed=mixed)
+    sched.running.extend(SimpleNamespace(is_partial_prefill=False) for _ in range(6))
+    sched.add(seq_factory(list(range(100, 164))))
+    chunk = 64 - 6 if mixed else 64  # one row per decode (no drafts)
+    assert sched._estimate_prefill_chunk_cost() == sched._chunk_cost(0, chunk)
+    assert sched._prefill_budget() == chunk
 
 
 def test_per_tick_probes_keep_the_head_walk(monkeypatch, seq_factory):

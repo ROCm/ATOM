@@ -545,7 +545,8 @@ class EngineCore:
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
                 self.scheduler.prefill_delayer.notify_prefill_executed(
-                    scheduled_batch.total_tokens_num_prefill
+                    scheduled_batch.total_tokens_num_prefill,
+                    decoded=scheduled_batch.total_seqs_num_decode > 0,
                 )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
