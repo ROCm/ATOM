@@ -203,3 +203,37 @@ Example with tuning:
   "num_worker_threads": 8
 }'
 ```
+
+## UALoE connector (scale-up fabric)
+
+`"kv_connector": "ualoe"` moves KV over the scale-up fabric (AMD Helios UALoE,
+or xGMI within one node) instead of a NIC. Like MoRI-IO's default mode it
+pulls: the decode rank maps the prefill rank's KV pool and copies the
+request's blocks out of it with one kernel.
+
+- The prefill rank allocates its paged KV pool with HIP VMM and exports it
+  (`fabric` handles on ROCm >= 7.14, else `posix_fd` within one host). The
+  pool is built from chunks below 4 GiB: ROCm 7.2's dma-buf export/import
+  maps the wrong memory once one allocation reaches 2**32 bytes.
+- Per request, decode rank *i* claims the source blocks from prefill rank *i*
+  (`READ_BEGIN`, which also returns the pool's layout the first time), copies
+  them on a side stream, and releases them (`READ_END`).
+
+Scope: equal TP on both sides (any DP), no PP / DCP / chunked transfer, and
+paged KV only (models with slot, SWA ring or staging regions, e.g.
+DeepSeek-V4, are refused). Both ranks must share a fabric domain or a host;
+there is no RDMA fallback.
+
+```bash
+--kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"ualoe","handshake_port":6301}'
+--kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"ualoe"}'
+```
+
+| Key | Side | Default | Meaning |
+|-----|------|---------|---------|
+| `handshake_port` | P | `6301` | base of the per-rank side-channel ports |
+| `ualoe_handle` | P | `auto` | `fabric`, `posix_fd`, or `auto` (fabric when the runtime exports one) |
+| `ualoe_domain` | both | `$ATOM_UALOE_FABRIC_DOMAIN` | fabric domain (rack / virtual pod); a pool from another named domain is refused |
+| `ualoe_send_timeout_s` | P | `120` | release blocks no decode claimed within this |
+| `ualoe_read_timeout_s` | D | `30` | fail a read whose claim got no reply |
+| `ualoe_peer_idle_s` | D | `600` | unmap a prefill pool unused this long |

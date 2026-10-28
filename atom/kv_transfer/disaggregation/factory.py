@@ -27,7 +27,7 @@ logger = logging.getLogger("atom")
 _DEFAULT_BACKEND = "moriio"
 
 # Backends with a remote peer. The rest of the registry is local storage.
-PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake"})
+PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake", "ualoe"})
 
 
 def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
@@ -313,6 +313,24 @@ class KVConnectorFactory:
         return total
 
     @classmethod
+    def allocate_kv_pool(cls, config: Any, nbytes: int, device: Any) -> Any:
+        """The paged KV pool from the first connector that allocates it, else None.
+
+        A transport that lets a peer map this rank's KV cache needs the pool
+        in memory it can export (`KVConnectorBase.allocate_kv_pool`); None
+        leaves the model runner to allocate it.
+        """
+
+        for name, leaf_config in cls.leaf_connectors(config) or ():
+            entry = cls._registry[name]
+            mod = importlib.import_module(entry["worker_module"])
+            klass = getattr(mod, entry["worker_class"])
+            pool = klass.allocate_kv_pool(leaf_config, nbytes, device)
+            if pool is not None:
+                return pool
+        return None
+
+    @classmethod
     def create_connector(
         cls, config: Any, role: str = "worker"
     ) -> KVConnectorBase | KVConnectorSchedulerBase:
@@ -372,6 +390,16 @@ KVConnectorFactory.register(
     worker_class="MooncakeConnector",
     scheduler_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
     scheduler_class="MooncakeConnectorScheduler",
+)
+
+# The decode rank maps the prefill rank's KV pool and copies it over the
+# scale-up fabric (Helios UALoE; xGMI within one node). Plain paged KV only.
+KVConnectorFactory.register(
+    "ualoe",
+    worker_module="atom.kv_transfer.disaggregation.ualoe.ualoe_connector",
+    worker_class="UALoEConnector",
+    scheduler_module="atom.kv_transfer.disaggregation.ualoe.ualoe_connector",
+    scheduler_class="UALoEConnectorScheduler",
 )
 
 # Composite backend: fans out to several sub-connectors listed under

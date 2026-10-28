@@ -607,6 +607,12 @@ See `atom/utils/envs.py` for the full list of lazy-evaluated environment variabl
 See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
 rank configuration, deployment requirements, and registration lifetime.
 
+## UALoE P/D
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_UALOE_FABRIC_DOMAIN** | str | "" | The `ualoe` connector's scale-up fabric domain (rack / virtual pod) for this rank; `kv_transfer_config["ualoe_domain"]` overrides it. A decode rank refuses to map a prefill KV pool from another named domain instead of trying. Empty: always try the map. |
+
 ## Mooncake PD MLA staging
 
 | Variable | Type | Default | Description |
