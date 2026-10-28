@@ -238,7 +238,11 @@ def rocm_aiter_topk_softmax_impl(
         and torch.cuda.is_current_stream_capturing()
         and fused_shared_experts_scoring_func in ("", "sigmoid")
         and triton_topk_softmax_supported(
-            gating_output, topk, renormalize, fused_shared_experts_for_kernel
+            topk_weights,
+            topk_ids,
+            gating_output,
+            renormalize,
+            fused_shared_experts_for_kernel,
         )
     ):
         triton_topk_softmax(

@@ -36,13 +36,22 @@ def _logits(rows, width, scale, ties):
     return x.to(torch.bfloat16)
 
 
+def _supported(logits, k, renormalize, shared):
+    """`triton_topk_softmax_supported` for fresh outputs in the fused-shared
+    layout: [rows, k + shared] buffers, the routed ids through a [:, :k] view."""
+    rows = logits.shape[0]
+    w = torch.empty(rows, k + shared, device="cuda")
+    ids = torch.empty(rows, k + shared, dtype=torch.int32, device="cuda")
+    return triton_topk_softmax_supported(w, ids[:, :k], logits, renormalize, shared)
+
+
 @pytest.mark.parametrize("shared", [0, 1])
 @pytest.mark.parametrize("rows", [1, 4, 33, 1024])
 @pytest.mark.parametrize("scale,ties", [(2.0, False), (0.05, True), (8.0, False)])
 def test_matches_aiter_bit_for_bit(shared, rows, scale, ties):
     torch.manual_seed(rows * 7 + shared)
     logits = _logits(rows, EXPERTS + shared, scale, ties)
-    assert triton_topk_softmax_supported(logits, TOPK, True, shared)
+    assert _supported(logits, TOPK, True, shared)
 
     # The fused-shared layout: one [rows, k + shared] buffer per output, the
     # kernels write the routed columns through a [:, :k] view.
@@ -99,7 +108,7 @@ def test_every_supported_shape_matches_aiter(experts, k, shared):
             _logits(16, width, 8.0, False),
         ]
     )
-    assert triton_topk_softmax_supported(logits, k, True, shared)
+    assert _supported(logits, k, True, shared)
     (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, k, shared)
     assert torch.equal(ids_new, ids_ref)
     assert torch.equal(_bits(w_new), _bits(w_ref))
@@ -156,17 +165,33 @@ def test_nan_logits_are_never_picked(experts, shared):
 
 def test_unsupported_shapes_fall_back():
     logits = torch.zeros(4, 513, dtype=torch.bfloat16, device="cuda")
-    assert not triton_topk_softmax_supported(logits, TOPK, False, 1)
-    assert not triton_topk_softmax_supported(logits, TOPK, True, 0)  # 513 experts
-    assert not triton_topk_softmax_supported(logits[:, ::2], TOPK, True, 0)
+    assert not _supported(logits, TOPK, False, 1)
+    assert not _supported(logits, TOPK, True, 0)  # 513 experts
+    assert not _supported(logits[:, ::2], TOPK, True, 0)
     # AITER's fused kernel stops at 512 experts; 1024 takes its
     # softmax-then-top-k path, which rounds the weights differently.
     wide = torch.zeros(4, 1024 + 1, dtype=torch.bfloat16, device="cuda")
-    assert not triton_topk_softmax_supported(wide, TOPK, True, 1)
-    assert not triton_topk_softmax_supported(wide[:, :1024], TOPK, True, 0)
-    assert not triton_topk_softmax_supported(logits[:, :16], 1, True, 0)
-    assert not triton_topk_softmax_supported(logits[:, :512], 33, True, 0)
-    assert not triton_topk_softmax_supported(logits[:, :515], TOPK, True, 3)
+    assert not _supported(wide, TOPK, True, 1)
+    assert not _supported(wide[:, :1024], TOPK, True, 0)
+    assert not _supported(logits[:, :16], 1, True, 0)
+    assert not _supported(logits[:, :512], 33, True, 0)
+    assert not _supported(wide[:, :515], TOPK, True, 3)
+
+
+def test_outputs_need_a_unit_last_stride():
+    """AITER honours any output stride; the Triton kernel stores along a unit
+    one, so it does not take other layouts and its launcher refuses them."""
+    rows, shared = 8, 1
+    logits = _logits(rows, EXPERTS + shared, 2.0, False)
+    w = torch.empty(rows, TOPK + shared, device="cuda")
+    ids = torch.empty(rows, TOPK + shared, dtype=torch.int32, device="cuda")
+    w_t = torch.empty(TOPK + shared, rows, device="cuda").t()
+    ids_t = torch.empty(TOPK + shared, rows, dtype=torch.int32, device="cuda").t()
+    assert triton_topk_softmax_supported(w, ids[:, :TOPK], logits, True, shared)
+    for out_w, out_ids in ((w_t, ids[:, :TOPK]), (w, ids_t[:, :TOPK])):
+        assert not triton_topk_softmax_supported(out_w, out_ids, logits, True, shared)
+        with pytest.raises(AssertionError, match="unit last stride"):
+            triton_topk_softmax(out_w, out_ids, logits, shared)
 
 
 @pytest.mark.parametrize("shared", [0, 1])
