@@ -20,10 +20,8 @@ if not torch.cuda.is_available():
 
 aiter = pytest.importorskip("aiter")
 
-from atom.model_ops.triton_topk_softmax import (
-    triton_topk_softmax,
-    triton_topk_softmax_supported,
-)
+from atom.model_ops.topk_softmax_dispatch import triton_topk_softmax_supported
+from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 
 EXPERTS, TOPK = 512, 10
 

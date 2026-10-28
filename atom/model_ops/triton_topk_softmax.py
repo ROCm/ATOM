@@ -76,32 +76,6 @@ def _topk_softmax_kernel(
         tl.store(w_ptr + row * stride_w + K + sh, 1.0 / (1.0 + libdevice.exp(-lg)))
 
 
-def triton_topk_softmax_supported(
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    gating_output: torch.Tensor,
-    renormalize: bool,
-    num_shared_experts: int,
-) -> bool:
-    """Whether `triton_topk_softmax` takes this launch: the shapes AITER's
-    fused `topkGatingSoftmax` handles (power-of-two expert counts up to 512;
-    past 512 AITER takes `moeSoftmax` + `moeTopK`, which round the weights
-    differently), with a unit last stride on the logits and both outputs."""
-    num_experts = gating_output.shape[-1] - num_shared_experts
-    topk = topk_ids.shape[-1]
-    return (
-        renormalize
-        and gating_output.dim() == topk_weights.dim() == topk_ids.dim() == 2
-        and gating_output.stride(-1) == 1
-        and topk_weights.stride(-1) == 1
-        and topk_ids.stride(-1) == 1
-        and 32 <= num_experts <= 512
-        and num_experts & (num_experts - 1) == 0
-        and 0 < topk <= 32
-        and num_shared_experts in (0, 1, 2, 4, 8)
-    )
-
-
 def triton_topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

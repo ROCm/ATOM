@@ -8,10 +8,8 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
-from atom.model_ops.triton_topk_softmax import (
-    triton_topk_softmax,
-    triton_topk_softmax_supported,
-)
+from atom.model_ops.topk_softmax_dispatch import use_triton_topk_softmax
+from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
@@ -231,21 +229,14 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
-    # Inside a graph only: the Triton launch costs more host time than the
-    # HIP one, which matters for eager (host-bound) prefill.
-    use_triton = (
-        envs.ATOM_TRITON_TOPK_SOFTMAX
-        and torch.cuda.is_current_stream_capturing()
-        and fused_shared_experts_scoring_func in ("", "sigmoid")
-        and triton_topk_softmax_supported(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-            fused_shared_experts_for_kernel,
-        )
-    )
-    if use_triton:
+    if use_triton_topk_softmax(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        fused_shared_experts_for_kernel,
+        fused_shared_experts_scoring_func,
+    ):
         triton_topk_softmax(
             topk_weights,
             topk_ids,
