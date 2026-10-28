@@ -2152,7 +2152,7 @@ models:
             exclude_nodes: pit2-p03-g09,pit2-p03-g23
             time_limit: "00:20:00"
           concurrency: [1]
-          env: {common: {ATOMESH_VLLM_MODE: triton_probe, ATOMESH_TRITON_PROBE_MATRIX: library_order}}
+          env: {common: {ATOMESH_VLLM_MODE: triton_probe, ATOMESH_TRITON_PROBE_MATRIX: engine_lifecycle}}
 
         - <<: *m31_vllm_pd
           name: m31-vllm-inspect-triton

@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -146,6 +147,26 @@ def run_worker(out):
         assert env['triton_target']['arch'].split(':')[0] == 'gfx950', env['triton_target']
         print('[environment]', json.dumps(env), flush=True)
 
+        engine_mode = os.environ.get('ATOMESH_PROBE_ENGINE')
+        if engine_mode:
+            from mooncake.engine import TransferEngine
+            engine = TransferEngine()
+            ip = socket.gethostbyname(socket.gethostname())
+            rc = engine.initialize(ip, 'P2PHANDSHAKE', 'rdma', '')
+            setup = {'mode': engine_mode, 'initialize_rc': rc,
+                     'MC_TE_FILTERS': os.environ.get('MC_TE_FILTERS'),
+                     'MC_DISABLE_HIP': os.environ.get('MC_DISABLE_HIP'),
+                     'device_after_init': torch.cuda.current_device()}
+            dump(out / 'engine-setup.json', setup)
+            assert rc == 0, setup
+            if engine_mode == 'register':
+                registered = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device='cuda')
+                rc = engine.batch_register_memory([registered.data_ptr()], [registered.numel()])
+                setup.update(register_rc=rc, device_after_register=torch.cuda.current_device())
+                dump(out / 'engine-setup.json', setup)
+                assert rc == 0, setup
+            print('[engine-setup]', json.dumps(setup), flush=True)
+
         @triton.jit
         def write_kernel(output, N: tl.constexpr, BLOCK: tl.constexpr):
             offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -260,12 +281,19 @@ def run_suite(out):
             ('core-comgr-mooncake-before', 'decode', True, {'LD_PRELOAD': sdk + '_rocm_sdk_core/lib/libamd_comgr.so.3', 'ATOMESH_PROBE_MC_IMPORT': 'before'}),
             ('core-comgr-mooncake-after', 'decode', True, {'LD_PRELOAD': sdk + '_rocm_sdk_core/lib/libamd_comgr.so.3', 'ATOMESH_PROBE_MC_IMPORT': 'after'}),
         ]
+    if os.environ.get('ATOMESH_ENV_ATOMESH_TRITON_PROBE_MATRIX') == 'engine_lifecycle':
+        cases = [
+            ('engine-control', 'decode', True, {'ATOMESH_PROBE_MC_IMPORT': 'after'}),
+            ('engine-init', 'decode', True, {'ATOMESH_PROBE_ENGINE': 'init', 'MC_TE_FILTERS': 'rdma4'}),
+            ('engine-register', 'decode', True, {'ATOMESH_PROBE_ENGINE': 'register', 'MC_TE_FILTERS': 'rdma4'}),
+            ('engine-rdma-only', 'decode', True, {'ATOMESH_PROBE_ENGINE': 'register', 'MC_TE_FILTERS': 'rdma4', 'MC_DISABLE_HIP': '1'}),
+        ]
     for name, role, fresh, overrides in cases:
         dest = out / name
         dest.mkdir(exist_ok=True)
         env = role_env(base, role, '127.0.0.1', plan[role]['env'])
         env.update(overrides)
-        # No Store, no communication group, no model creation in this probe.
+        # No Store, distributed group, or model; lifecycle matrix adds Transfer only.
         if fresh:
             env['TRITON_CACHE_DIR'] = str(Path(os.environ['XDG_CACHE_HOME']) / 'triton-probe' / dest.name)
             if Path(env['TRITON_CACHE_DIR']).exists():

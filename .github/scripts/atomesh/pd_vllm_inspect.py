@@ -200,7 +200,8 @@ for job_id in sorted({str(row['slurm_job_id']) for row in rows}):
         query = subprocess.run(['bash', '-c',
             'source "$1"; detect_slurm_backend; query_slurm_result "$2"',
             'inspect-slurm', str(helper), job_id], capture_output=True, text=True, timeout=45)
-        entry = {'job_id': int(job_id), 'query_rc': query.returncode}
+        entry = {'job_id': int(job_id), 'query_rc': query.returncode,
+                 'reported_status': query.stdout.strip()[:200], 'query_error': query.stderr.strip()[-500:]}
         for line in query.stdout.splitlines():
             match = re.fullmatch(r'([A-Z_]+)\+?\|(\d+:\d+)?', line.strip())
             if match and match[1] in {'PENDING', 'RUNNING', 'COMPLETING', 'COMPLETE', 'COMPLETED',
