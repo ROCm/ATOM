@@ -13,7 +13,7 @@ Enable prefix caching, frontend prefix hashes, and the `lmcache_mp` offload
 connector. The MP server must be running before model startup. V4.1 uses the
 native PAGE/STATE connector, BF16 KV, DP attention, and
 `--no-encoder-swa-bounded-replay` to retain the checkpoint images required by
-that connector. Apply the same replay setting to both benchmark arms.
+that connector.
 PP and PD-only workers
 are not supported by this placement policy.
 
@@ -31,12 +31,6 @@ remain ordered on its own thread. It does not add model workers or split one
 transfer across two threads. For other deployments, size the pool for the
 distinct GPU clients connected to that server; it is not necessarily the
 global DP size. CPU handler workers are configured independently.
-
-The opt-in benchmark helper `.github/scripts/start_benchmark_lmcache.py`
-defaults to two GPU workers for the DP2 preset. Set
-`ATOM_BENCHMARK_LMCACHE_GPU_WORKERS=1` to reproduce the previous configuration,
-or another positive count for a different client topology. This helper setting
-does not reconfigure an externally managed LMCache server.
 
 The OpenAI endpoint accepts `X-Dynamo-Session-ID`, falling back to
 `X-Correlation-ID`. Selecting this policy enables session extraction without
@@ -208,87 +202,8 @@ alongside them: fewer fallbacks alone are not evidence of a faster workload.
 `migration_decode_balance_rejected` counts otherwise profitable migration
 candidates rejected by the joint request-count/context balance constraint.
 
-### Measured scope
+## Validation scope
 
-The latest incremental comparison against `c4de6c6` tested completed-work
-accounting, separate restore backlog, exact-prefix recovery-miss evidence and
-the joint count/context balance constraint described above. Both arms used
-common worker/dependency recovery fixes, V4.1-Flash, MI355X, attention DP2 /
-MoE TP2, DSpark5, memory 0.9, AgentX SA393/seed42 and c128. They ran simultaneously
-on separate GPU pairs with a common warmup barrier and 900 s of arrivals.
-
-| Metric | Control | Work accounting + joint balance | Change |
-| --- | ---: | ---: | ---: |
-| Output tokens/s/GPU | 1091.23 | 1136.58 | +4.16% |
-| Total tokens/s/GPU, including cached input | 135063.23 | 139129.66 | +3.01% |
-| Mean inter-token latency | 49.58 ms | 45.71 ms | -7.81% |
-| P90 inter-token latency | 76.44 ms | 70.54 ms | -7.71% |
-| Mean TTFT | 2.266 s | 2.405 s | +6.12% |
-| P90 TTFT | 4.032 s | 4.618 s | +14.54% |
-| P99 TTFT | 9.492 s | 9.292 s | -2.10% |
-
-This is a throughput/latency tradeoff: the constraint can retain requests at
-their owner to protect decode balance. It is not a TTFT improvement across
-percentiles. Sampled mean in-flight request-count spread fell from 8.90 to
-5.21; actual scheduled prefill tokens were essentially unchanged (14.952M /
-14.943M). A preceding work-accounting revision without the joint constraint
-reduced output throughput by 2.31%; fixing prefill accounting alone did not
-establish a net gain.
-
-Both clients exited 0, with 2569/2600 successful profiling requests and 1/0
-profiling errors; the treatment had one warmup error. Among 2506 matched
-successful requests, output-length distributions were identical and mean
-inter-token latency decreased 7.58%. Completed workload mixes differed, and
-one run does not establish statistical significance or isolate each change.
-See the [benchmark evidence and dependency overlay](../.github/benchmark/dp_cache_balance_ab.md#incremental-routing-comparison-2026-10-27-utc)
-for denominator, failure accounting and reproduction limits.
-
-#### Earlier policy comparisons
-
-A single same-configuration AgentX A/B on V4.1-Flash, two MI355X GPUs,
-attention DP2 / MoE TP2, 128 concurrent session slots and 900 s profiling
-arrivals compared `least_requests` with the original `cache_affinity` policy.
-Both arms already enabled unified prefix hashing and LMCache MP PAGE/STATE;
-both used the same image, source, GPU pair, seed, warmup and real DSpark5.
-
-| Metric | `least_requests` | Original `cache_affinity` |
-| --- | ---: | ---: |
-| P90 TTFT | 7.668 s | 5.324 s |
-| P99 TTFT | 23.559 s | 12.012 s |
-| Output tokens/s/GPU | 908.43 | 941.53 |
-| P90 inter-token latency | 84.24 ms | 86.49 ms |
-
-This is evidence for the combined routing/recovery policy on this workload,
-not an isolated measurement of migration, LMCache versus no LMCache, or a
-comparison with unmodified main. The original measured policy had overload
-gates that were subsequently replaced by the net-gain comparison described
-above. Later runs observed lower TTFT, but their different GPU pairs and host
-load prevent treating all of that reduction as an isolated policy effect.
-
-Measured transfers were within one host. Cross-host deployment and global
-replica eviction still need validation. The policy moves later requests in a
-session; it does not live-migrate an active decode.
-
-A later short-recovery reconsideration experiment was removed after a parallel
-900 s AgentX comparison on `792d6d6`. Both arms used cache affinity; the control
-disabled only reconsideration. On V4.1-Flash, MI355X, attention DP2 / MoE TP2,
-c128 and separate LMCache MP servers, the experiment reduced migration fallback
-events from 179/578 to 42/554, but output tokens/s/GPU fell from 1089.50 to
-1054.61 (-3.20%), total tokens/s/GPU fell 1.89%, and P90 inter-token latency
-increased from 72.352 to 78.254 ms (+8.16%). The current code retains the
-control's prior-owner fallback behavior.
-
-Throughput uses successful profiling tokens divided by first request start to
-last request end (929.675 / 928.065 s including completed drain requests), then
-by two GPUs; total includes cached input. Counter samples bracket the 900 s
-arrival window within 1.76 s before start and 0.35 s after end. This is one
-run on different GPU pairs sharing a host, with 3/1 error records and 23/34
-cancelled credits at the finite-window end, not a significance claim.
-
-The 2484 shared successful requests had matching output-length distributions,
-but mean input minus reported cached input increased from 5727.17 to 6005.50
-tokens (+4.86%) with reconsideration. It also added a source probe, with 27/165
-timeouts. A cache snapshot taken before rejection cleanup is not a reservation
-for a later resubmission. Future reconsideration must account for actual
-retained PAGE/STATE and demonstrate net throughput and latency benefit before
-replacing fallback.
+GPU validation covers same-host DP2 placement and prefix recovery. Cross-host
+deployment and global replica eviction still need validation. The policy moves
+later requests in a session; it does not live-migrate an active decode.

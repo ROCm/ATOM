@@ -237,10 +237,6 @@ jobs:
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
           echo "Docker: ${DOCKER_IMAGE}"
 
-      - name: Start optional LMCache MP service
-        timeout-minutes: 5
-        run: docker exec atom-benchmark python3 .github/scripts/start_benchmark_lmcache.py
-
       - name: Run benchmark
         timeout-minutes: ${{ inputs.bench_kind == 'aiperf_agentic' && 180 || 80 }}
         env:
@@ -288,31 +284,6 @@ jobs:
         if: always()
         run: |
           docker exec atom-benchmark cat /tmp/atom_client.log 2>/dev/null || true
-
-      - name: Collect LMCache and DP routing diagnostics
-        if: always()
-        run: |
-          docker exec -e RESULT_FILENAME atom-benchmark bash -lc '
-            if [[ "${ATOM_BENCHMARK_LMCACHE_MP:-0}" != 1 ]]; then exit 0; fi
-            destination="/workspace/benchmark-cache/$RESULT_FILENAME"
-            mkdir -p "$destination"
-            cp /tmp/atom_lmcache_mp.log "$destination/" 2>/dev/null || true
-            curl --noproxy "*" -fsS --max-time 5 \
-              "http://127.0.0.1:${ATOM_BENCHMARK_LMCACHE_HTTP_PORT:-24851}/status" \
-              > "$destination/lmcache-status.json" || true
-            curl --noproxy "*" -fsS --max-time 5 \
-              "http://127.0.0.1:${ATOM_SERVER_PORT:-8000}/debug/dp_router_stats" \
-              > "$destination/dp-router-final.json" || true
-          ' || true
-
-      - name: Upload cache diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: atom-cache-diagnostics-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
-          path: benchmark-cache/${{ env.RESULT_FILENAME }}/
-          if-no-files-found: ignore
-          retention-days: 15
 
       - name: Inject GPU metadata into benchmark result
         run: |
