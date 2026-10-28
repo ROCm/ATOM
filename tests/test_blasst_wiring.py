@@ -61,18 +61,87 @@ def unified_attention_calls():
 
 
 def _kwargs(call):
-    return {k.arg for k in call.keywords}
+    """Literal keyword names on a call, plus ``**name`` unpacks as ``**name``."""
+    names = set()
+    for k in call.keywords:
+        names.add(k.arg if k.arg is not None else "**" + ast.unparse(k.value))
+    return names
+
+
+def _forwards_blasst(call):
+    """True if the call forwards the threshold, directly or via ``**blasst_kwargs``.
+
+    The threshold is forwarded conditionally (see
+    ``test_prefill_forwards_the_threshold_only_when_enabled``), so at the call
+    site it appears as ``**blasst_kwargs`` rather than a literal keyword. Accept
+    either form so the guard survives a refactor back to an unconditional pass.
+    """
+    kw = _kwargs(call)
+    return "block_skip_threshold" in kw or "**blasst_kwargs" in kw
+
+
+def _prefill_func(tree):
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef) and fn.name == PREFILL:
+            return fn
+    return None
 
 
 class TestPrefillIsWired:
     def test_prefill_passes_the_threshold(self, unified_attention_calls):
-        assert PREFILL in unified_attention_calls, f"{PREFILL} no longer calls unified_attention"
+        assert (
+            PREFILL in unified_attention_calls
+        ), f"{PREFILL} no longer calls unified_attention"
         for call in unified_attention_calls[PREFILL]:
-            assert "block_skip_threshold" in _kwargs(call), (
-                f"{PREFILL} calls unified_attention without block_skip_threshold. "
-                "BLASST is now dead code: resolve_threshold still returns a value "
-                "and nothing consumes it."
+            assert _forwards_blasst(call), (
+                f"{PREFILL} calls unified_attention without forwarding "
+                "block_skip_threshold. BLASST is now dead code: resolve_threshold "
+                "still returns a value and nothing consumes it."
             )
+
+    def test_prefill_forwards_the_threshold_only_when_enabled(self):
+        """The keyword must be omitted when skipping is off.
+
+        block_skip_threshold is from ROCm/aiter#5868, which is unmerged, so stock
+        upstream AITER -- the default Docker dependency -- does not accept it.
+        Passing it unconditionally raises TypeError on the first prefill of every
+        ATOM_USE_UNIFIED_ATTN=1 deployment, including ones that never enabled
+        BLASST. So the forwarding has to sit behind a ``threshold > 0`` guard; a
+        literal ``block_skip_threshold=`` keyword straight on the call is the
+        regression this test exists to catch.
+        """
+        tree = ast.parse(ATTENTION_MHA.read_text())
+        fn = _prefill_func(tree)
+        assert fn is not None, f"{PREFILL} no longer calls unified_attention"
+
+        # It is not passed as an unconditional literal keyword on the call.
+        for call in (
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "unified_attention"
+        ):
+            assert "block_skip_threshold" not in {k.arg for k in call.keywords}, (
+                f"{PREFILL} passes block_skip_threshold as an unconditional keyword. "
+                "Against stock AITER (aiter#5868 unmerged) this raises TypeError for "
+                "every unified-attn deployment. Forward it behind a threshold>0 guard."
+            )
+
+        # There is a guard comparing the threshold against zero.
+        guards = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.If)
+            and any(
+                isinstance(c, ast.Name) and c.id == "block_skip_threshold"
+                for c in ast.walk(n.test)
+            )
+            and any(isinstance(c, ast.Compare) for c in ast.walk(n.test))
+        ]
+        assert guards, (
+            f"{PREFILL} forwards block_skip_threshold but nothing guards it against "
+            "0.0. The disabled path must omit the keyword, not pass 0.0."
+        )
 
     def test_threshold_comes_from_the_attended_kv_length(self):
         """resolve_threshold must be fed the KV length, not a constant.
@@ -109,9 +178,9 @@ class TestDecodeIsNotWired:
             "would otherwise pass over an empty list."
         )
         for call in unified_attention_calls[DECODE]:
-            assert "block_skip_threshold" not in _kwargs(call), (
-                f"{DECODE} now passes block_skip_threshold. BLASST is prefill-only."
-            )
+            assert not _forwards_blasst(
+                call
+            ), f"{DECODE} now forwards block_skip_threshold. BLASST is prefill-only."
 
     def test_exactly_one_call_site_is_wired(self, unified_attention_calls):
         """A new call site that forwards the threshold is a deliberate decision,
@@ -119,8 +188,8 @@ class TestDecodeIsNotWired:
         wired = sorted(
             name
             for name, calls in unified_attention_calls.items()
-            if any("block_skip_threshold" in _kwargs(c) for c in calls)
+            if any(_forwards_blasst(c) for c in calls)
         )
-        assert wired == [PREFILL], (
-            f"expected only {PREFILL} to pass block_skip_threshold, found {wired}"
-        )
+        assert wired == [
+            PREFILL
+        ], f"expected only {PREFILL} to forward block_skip_threshold, found {wired}"

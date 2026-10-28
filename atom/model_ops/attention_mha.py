@@ -938,10 +938,19 @@ class PagedAttentionImpl(nn.Module):
 
         # BLASST block skipping, keyed off the KV length being attended over,
         # which is what the calibrated fit is defined against. 0.0 unless
-        # configured, and the kernel treats 0.0 as "run dense", so this is exact
-        # dense attention by default. The kernel additionally force-disables
-        # skipping for all-decode and sliding-window batches.
+        # configured, and the kernel treats 0.0 as "run dense".
+        #
+        # Forward the keyword ONLY when skipping is enabled. block_skip_threshold
+        # is a new argument from ROCm/aiter#5868, which is unmerged, so the stock
+        # upstream AITER signature -- including the default Docker dependency --
+        # does not accept it. Passing it unconditionally would raise TypeError on
+        # the first prefill of every ATOM_USE_UNIFIED_ATTN=1 deployment, even one
+        # that never enabled BLASST. The opt-in dependency stays scoped to the
+        # opt-in users.
         block_skip_threshold = blasst.resolve_threshold(attn_metadata.max_seqlen_k)
+        blasst_kwargs = {}
+        if block_skip_threshold > 0.0:
+            blasst_kwargs["block_skip_threshold"] = block_skip_threshold
 
         unified_attention(
             q,
@@ -965,7 +974,7 @@ class PagedAttentionImpl(nn.Module):
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
-            block_skip_threshold=block_skip_threshold,
+            **blasst_kwargs,
         )
 
         return o
