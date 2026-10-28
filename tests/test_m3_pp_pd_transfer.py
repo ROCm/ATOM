@@ -23,7 +23,11 @@ from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
 from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
 
-aiter_attention = pytest.importorskip("atom.model_ops.attentions.aiter_attention")
+# `exc_type`: collected after a test that stubs `sys.modules["aiter"]`, the
+# import reaches the stub and fails on a symbol rather than on the module.
+aiter_attention = pytest.importorskip(
+    "atom.model_ops.attentions.aiter_attention", exc_type=ImportError
+)
 
 BLOCK, HEAD_DIM = 128, 128
 CONFIG = SimpleNamespace(
@@ -316,7 +320,9 @@ def test_every_stage_maps_into_the_full_consumer_layout(heads, kv_dtype, draft, 
 
 
 def test_page16_runs_are_how_the_sparse_writer_lays_heads_out():
-    sparse_attn = pytest.importorskip("atom.model_ops.minimax_m3.sparse_attn")
+    sparse_attn = pytest.importorskip(
+        "atom.model_ops.minimax_m3.sparse_attn", exc_type=ImportError
+    )
     builder = _m3_builder([15], [True], heads=4)
     pool = next(iter(builder.kv_pools.values()))
     views = sparse_attn.to_page16_shuffle(*pool.kv_views(0), *pool.scale_views(0))
