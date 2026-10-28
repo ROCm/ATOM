@@ -32,7 +32,7 @@
     "tool-call-parser": "minimax_m3",
     "enable-auto-tool-choice": true,
     "block-size": 128,
-    "kv-cache-dtype": "nvfp4",
+    "kv-cache-dtype": "bfloat16",
     "moe-backend": "aiter",
     "disable-hybrid-kv-cache-manager": true,
     "max-model-len": 1048576,
@@ -65,7 +65,7 @@
     "method": "dspark",
     "num_speculative_tokens": 3,
     "attention_backend": "TRITON_ATTN",
-    "kv_cache_dtype": "fp8",
+    "kv_cache_dtype": "bfloat16",
     "draft_sample_method": "probabilistic",
     "rejection_sample_method": "synthetic",
     "synthetic_acceptance_length": 2.88
@@ -74,7 +74,7 @@
     "port": 8100,
     "enable-prefix-caching": true,
     "attention-config": {
-      "indexer_kv_dtype": "nvfp4"
+      "indexer_kv_dtype": "bf16"
     },
     "enable-dbo": true,
     "dbo-prefill-token-threshold": 16384,
@@ -89,7 +89,7 @@
     "port": 8200,
     "enable-prefix-caching": true,
     "attention-config": {
-      "indexer_kv_dtype": "nvfp4",
+      "indexer_kv_dtype": "bf16",
       "indexer_decode_cp": true
     },
     "enable-dbo": false,
@@ -158,7 +158,7 @@
     ]
   },
   "unverified": [
-    "MiniMax M3.1 + NVFP4 + DSpark + DBO requires GPU smoke with the fixed image.",
+    "Uniform BF16 main/indexer/draft KV is a diagnostic configuration; verify needs_kv_cache_zeroing=false on all workers before interpreting smoke results.",
     "Validate one HCA per process in the allocated node logs.",
     "Smoke uses block rejection; synthetic acceptance remains performance-only.",
     "Validate P Store reload after GPU cache reset and PD output against independent D computation.",
@@ -176,6 +176,15 @@
       "purpose": "Only for diagnosing Store overhead or correctness; not the main AgentX performance configuration.",
       "mooncake_store": false,
       "cpu_offload": false
+    },
+    "uniform_bf16_kv": {
+      "active": true,
+      "purpose": "Diagnose HIP 209 in KV-block zeroing by using native uniform-precision cache specs; no zeroing predicate override.",
+      "baseline_commit": "57760f17a70dd1c54488ddf5f0fad23b912fb089",
+      "baseline_main_kv_dtype": "nvfp4",
+      "baseline_indexer_kv_dtype": "nvfp4",
+      "baseline_draft_kv_dtype": "fp8",
+      "note": "BF16 increases KV memory per token and changes MiniMax attention/indexer backend selection. Run smoke only; results are not directly comparable to the NVFP4 performance baseline."
     }
   },
   "alignment_reference": {

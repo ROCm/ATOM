@@ -5,6 +5,18 @@ Manual `atomesh-benchmark.yaml` dispatch on `atomesh-cicd`, suite
 `m31-vllm-1p1d-tp4-mcstore-smoke` first; only after success run
 `m31-vllm-1p1d-tp4-mcstore-c32`, `-c48`, and `-c64`.
 
+Current diagnostic: main and DSpark draft KV use `bfloat16`, and the indexer
+uses `bf16`, so all device attention caches have the same storage dtype and
+`KVQuantMode.NONE`. The draft's Triton backend does not support NVFP4; using
+FP8 everywhere would still leave different main/indexer cache specs. This
+configuration lets vLLM's native mixed-precision predicate disable block
+zeroing without overriding its correctness guard. Each worker records the
+actual predicates in `<role>-rank-<rank>-kv-precision.json` before KV setup;
+expect `has_mixed_precision_kv_cache=false` and `needs_kv_cache_zeroing=false`.
+Run smoke only while diagnosing HIP 209. BF16 increases KV memory per token
+and selects different attention/indexer paths; it is not a performance
+comparison with the NVFP4 baseline at commit `57760f17a`.
+
 The image digest and model revision in `experiment.json` come from
 https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39929767608/attempts/1.
 Those MI355X results used aggregated TP4. This experiment tests the same

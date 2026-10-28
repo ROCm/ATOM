@@ -302,6 +302,9 @@ class PostLoadPreparationTest(unittest.TestCase):
         worker.local_rank = 0
         worker.parallel_config = SimpleNamespace(tensor_parallel_size=4)
         worker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model='/snapshot'))
+        kv_config = SimpleNamespace(has_mamba_layers=False,
+                                    has_mixed_precision_kv_cache=False,
+                                    needs_kv_cache_zeroing=False)
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / 'store.json'
             config.write_text('{}')
@@ -310,8 +313,10 @@ class PostLoadPreparationTest(unittest.TestCase):
                     'HIP_VISIBLE_DEVICES': '0,1,2,3', 'ROCR_VISIBLE_DEVICES': ''}), \
                  patch.object(Path, 'exists', return_value=True), \
                  patch.object(worker_module, 'prepare_after_load', side_effect=lambda *args, **kw: events.append('prepare')):
-                self.assertEqual(worker.initialize_from_config('kv-config'), 'kv-config')
+                self.assertIs(worker.initialize_from_config(kv_config), kv_config)
                 self.assertEqual(events, ['prepare', 'store-init'])
+                precision = json.loads((Path(tmp) / 'prefill-rank-0-kv-precision.json').read_text())
+                self.assertFalse(precision['needs_kv_cache_zeroing'])
             events.clear()
             with patch.dict(os.environ, {'ATOMESH_VLLM_STORE_CONFIG_PATH': str(config),
                     'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill',
@@ -319,7 +324,7 @@ class PostLoadPreparationTest(unittest.TestCase):
                  patch.object(Path, 'exists', return_value=True), \
                  patch.object(worker_module, 'prepare_after_load', side_effect=RuntimeError('unexpected preparation error')):
                 with self.assertRaisesRegex(RuntimeError, 'unexpected preparation error'):
-                    worker.initialize_from_config('kv-config')
+                    worker.initialize_from_config(kv_config)
                 self.assertEqual(events, [])
 
     def test_worker_uses_physical_gpu_rail_for_both_tp_groups(self):

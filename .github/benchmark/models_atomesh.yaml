@@ -2097,7 +2097,7 @@ models:
     server:
       common_args:
         trust_remote_code: true
-        kv_cache_dtype: nvfp4
+        kv_cache_dtype: bfloat16
         block_size: 128
         gpu_memory_utilization: 0.9
         max_model_len: 1048576

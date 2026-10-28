@@ -23,6 +23,14 @@ class StoreMemoryWorker(Worker):
             raise ValueError('Store memory preparation requires TP4 for both roles')
         role = os.environ['ATOMESH_VLLM_ROLE']
         out = Path(os.environ['ATOMESH_VLLM_MEMORY_DIR'])
+        precision = {
+            'role': role, 'local_rank': self.local_rank,
+            'has_mamba_layers': kv_cache_config.has_mamba_layers,
+            'has_mixed_precision_kv_cache': kv_cache_config.has_mixed_precision_kv_cache,
+            'needs_kv_cache_zeroing': kv_cache_config.needs_kv_cache_zeroing,
+        }
+        write_json(out / f'{role}-rank-{self.local_rank}-kv-precision.json', precision)
+        print(f'[kv-precision] {json.dumps(precision)}', flush=True)
         hca = mooncake_hca(self.local_rank)
         if not (Path('/sys/class/infiniband') / hca).exists():
             raise RuntimeError(f'Missing physical GPU RDMA rail: {hca}')
