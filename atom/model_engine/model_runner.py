@@ -2140,6 +2140,36 @@ class ModelRunner:
             )
         return pool
 
+    def _get_kv_transfer_tensors(self, num_blocks):
+        """The backend's PAGE regions as the model names them, then the draft's.
+
+        A model may annotate the regions (`configure_kv_transfer_tensors`)
+        before the draft pool is merged, so an explicit consumer map can
+        declare its full consumer count first.
+        """
+        builder = self.attn_metadata_builder
+        transfer_tensors = builder.get_kv_transfer_tensors()
+        if transfer_tensors is None:
+            return None
+        configure = getattr(self.model, "configure_kv_transfer_tensors", None)
+        if configure is not None:
+            configure(transfer_tensors, builder)
+        # The tier is built inside `register_kv_caches` and needs
+        # `state_entry_views` to name the bytes it packs. The caller is the
+        # only place the builder and the connector are both in scope.
+        transfer_tensors.state_backend = builder
+        if hasattr(self, "draft_kv_builder"):
+            transfer_tensors.merge_pages(
+                self.draft_kv_builder.get_kv_transfer_tensors()
+            )
+        # After the draft's regions are in, and here because this is the
+        # only place holding both the complete region list and the
+        # scheduler's block count. The builders cannot answer this: each
+        # counts in its own page, and the transfer protocol addresses
+        # ``req.block_ids``, which are the scheduler's.
+        transfer_tensors.set_block_count(num_blocks)
+        return transfer_tensors
+
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
@@ -2222,23 +2252,7 @@ class ModelRunner:
                 if kv_cache_tensor is not None:
                     kv_cache_data[f"layer_{module.layer_num}"] = kv_cache_tensor
 
-        transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
-        if transfer_tensors is not None:
-            # The tier is built inside `register_kv_caches` and needs
-            # `state_entry_views` to name the bytes it packs. This is the only
-            # place the builder and the connector are both in scope.
-            transfer_tensors.state_backend = self.attn_metadata_builder
-        if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
-            transfer_tensors.merge_pages(
-                self.draft_kv_builder.get_kv_transfer_tensors()
-            )
-        if transfer_tensors is not None:
-            # After the draft's regions are in, and here because this is the
-            # only place holding both the complete region list and the
-            # scheduler's block count. The builders cannot answer this: each
-            # counts in its own page, and the transfer protocol addresses
-            # ``req.block_ids``, which are the scheduler's.
-            transfer_tensors.set_block_count(num_kvcache_blocks)
+        transfer_tensors = self._get_kv_transfer_tensors(num_kvcache_blocks)
         # The same count reaches the codecs, which likewise index by scheduler
         # block: MLA's cache is allocated in page-size-1 rows, so its own count
         # is block_ratio times larger and would make a codec treat one token as

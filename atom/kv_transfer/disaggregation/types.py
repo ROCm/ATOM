@@ -221,6 +221,9 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
+    # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
+    # `heads` KV heads one after another. None: not per head (replicated).
+    head_major_runs: tuple[int, int] | None = None
 
 
 @dataclass
@@ -304,6 +307,10 @@ class KVTransferTensors:
     # those are ordinary PAGE KV, never part of the state image. None means
     # every region. Appended for positional compatibility.
     paged_state_region_count: int | None = None
+    # Full consumer region count for this contributor, including other PP
+    # stages. Appended draft regions start here, not after this stage's pages.
+    # Required when merging a contributor with explicit consumer indices.
+    block_region_consumer_count: int | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is
@@ -333,6 +340,25 @@ class KVTransferTensors:
         """
         if not other.pages:
             return
+        if (
+            self.block_region_consumer_indices is not None
+            or other.block_region_consumer_indices is not None
+        ):
+            indices, offset = [], 0
+            for contributor in (self, other):
+                local = contributor.block_region_consumer_indices
+                count = contributor.block_region_consumer_count
+                if local is None:
+                    local = range(len(contributor.pages))
+                    count = len(contributor.pages)
+                elif count is None:
+                    raise ValueError(
+                        "Merging mapped PAGE regions needs their full consumer count"
+                    )
+                indices.extend(offset + i for i in local)
+                offset += count
+            self.block_region_consumer_indices = indices
+            self.block_region_consumer_count = offset
         self.pages.extend(other.pages)
         self.tp_replication_factor = math.gcd(
             self.tp_replication_factor, other.tp_replication_factor
