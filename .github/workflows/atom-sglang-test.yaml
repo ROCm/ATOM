@@ -193,6 +193,7 @@ jobs:
               SGLANG_DSV4_REASONING_EFFORT=max
               SGLANG_USE_AITER=1
               SGLANG_DSV4_FP4_EXPERTS=true
+              AITER_DISABLE_COMM_FUSED_MOE=1
               SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
               TORCHINDUCTOR_COMPILE_THREADS=128
               ATOM_USE_TRITON_MOE=0
