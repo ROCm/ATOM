@@ -100,12 +100,3 @@ jobs:
                           lines.append(line.strip())
                   print('TASK STATE:', job_id, result.returncode, lines, flush=True)
           PYCODE
-      - name: Recover completed non-PD evaluation evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: m31-nonpd-baseline-recovered-10816
-          retention-days: 3
-          if-no-files-found: warn
-          path: |
-            /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/*agg-tp4-dspark7-nvfp4-gsm8k-5shot-c32-accuracy-40732976256-20261028171140/slurm_job-10816/eval_results/
-            /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/*agg-tp4-dspark7-nvfp4-gsm8k-5shot-c32-accuracy-40732976256-20261028171140/slurm_job-10816/logs/eval/server-rank-0.log
