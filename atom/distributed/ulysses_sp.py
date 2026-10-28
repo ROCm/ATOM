@@ -8,7 +8,7 @@ sequence metadata. Dense weights are replicated; MoE weights remain sharded.
 SP uses AITER's PCP rank dimension and runs with ``-tp 1 -sp W``.
 """
 
-from functools import partial
+from functools import cache, partial
 
 import torch
 
@@ -188,14 +188,83 @@ def ulysses_gather_heads(x: torch.Tensor, group=None) -> torch.Tensor:
     return _swap_heads(x, s_local, width, group=explicit_group)
 
 
+@cache
+def _head_exchange_kernel():
+    """AITER's four-rank head exchange, or None if this AITER lacks it."""
+    try:
+        import aiter.ops.sp_head_exchange as ops
+    except ModuleNotFoundError as exc:
+        if exc.name != "aiter.ops.sp_head_exchange":
+            raise
+        return None
+    return getattr(ops, "sp_head_exchange", None)
+
+
+def head_exchange_communicator(x, *, group=None):
+    """Select the four-rank prefill exchange; decode uses the regular gather."""
+    if (
+        not x.is_cuda
+        or not envs.ATOM_USE_CUSTOM_ALL_GATHER
+        or x.ndim != 2
+        or x.shape[0] < 8192
+        or x.shape[0] % 4
+        or x.shape[1] * x.element_size() % 16
+        or x.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or _head_exchange_kernel() is None
+    ):
+        return None
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+
+    from atom.plugin.prepare import is_plugin_mode
+
+    if is_plugin_mode():
+        return None
+    if group is None:
+        if get_sp_world_size() != 4 or get_tensor_model_parallel_world_size() != 1:
+            return None
+        group = get_sp_group()
+    elif group.world_size != 4 or get_sp_world_size() != 1:
+        return None
+    ca = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
+    if ca is None or ca.disabled or getattr(ca, "_pool", None) is None:
+        return None
+    if not ca.should_custom_ag(x):
+        return None
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return ca if get_gfx_runtime() == "gfx950" else None
+
+
+def exchange_heads(x, ca, *, registered=False):
+    """Read just this rank's token slice from each peer and concatenate heads.
+
+    The output is already in the o-projection's row layout. All operations use
+    the communicator's current stream. Registered scratch must be produced
+    immediately before this call; end_sync protects its reuse.
+    """
+    out = torch.empty((x.shape[0] // 4, x.shape[1] * 4), device=x.device, dtype=x.dtype)
+    pool = ca._pool["input"]
+    graph_registered = (
+        ca._IS_CAPTURING
+        and torch.cuda.is_current_stream_capturing()
+        and ca.enable_register_for_capturing
+    )
+    _head_exchange_kernel()(
+        ca._ptr,
+        x,
+        out,
+        pool.data_ptr,
+        pool.max_size,
+        not (registered or graph_registered),
+        80,
+    )
+    return out
+
+
 def _swap_heads(x, s_local, width, group=None):
     """``[w*s_local, width] -> [s_local, w*width]`` by all-to-all."""
     if x.is_cuda:
-        from atom.distributed.sp_head_exchange import (
-            exchange_heads,
-            head_exchange_communicator,
-        )
-
         ca = head_exchange_communicator(x, group=group)
         if ca is not None:
             return exchange_heads(x, ca)

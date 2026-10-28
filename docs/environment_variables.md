@@ -27,7 +27,6 @@ decoder layer; layers or deployments it cannot serve keep the native MoE and log
 needs AITER with the big-M path ([ROCm/aiter#6514](https://github.com/ROCm/aiter/pull/6514))
 and MORI built with `BUILD_CCO_SDMA=ON`. Each launch covers
 `min(ceil(max_num_batched_tokens / N), 8192)` local rows; small batches keep the native MoE.
-`ATOM_SP_MOE_MEGA_COMM_DTYPE` selects the token transport, `fp8` (default) or `bf16`.
 
 ## Experimental TP replicated o-projection
 
