@@ -249,6 +249,7 @@ def run_suite(out):
              for cache in ('default', 'fresh') for role in ('prefill', 'decode')]
     if os.environ.get('ATOMESH_ENV_ATOMESH_TRITON_PROBE_MATRIX') == 'library_order':
         base = dict(base)
+        base.pop('LD_PRELOAD', None)  # The matrix controls load order independently of the model recipe.
         sdk = '/usr/local/lib/python3.12/dist-packages/'
         cases = [
             ('fresh-decode', 'decode', True, {}),
