@@ -163,10 +163,11 @@ jobs:
         id: rl
         run: echo "dir=${GITHUB_WORKSPACE}/.claude/skills/review-pr" >> "$GITHUB_OUTPUT"
 
-      # P0 has no bot token: skip the reaction entirely rather than send a request with an
-      # empty Authorization header. The `secrets` context is not reliably available in a
-      # step-level `if`, so the secret is bound to the step's own env and that is what gets
-      # tested. P0.5 adds the secret and this step goes live with no further workflow edit.
+      # P0.5: ATOM_BOT_TOKEN is now a configured repo secret, so this condition passes and
+      # the reaction goes live. The condition itself stays -- it is the step's closure
+      # against an empty Authorization header if the secret is ever removed again, not a
+      # P0-only guard. The `secrets` context is not reliably available in a step-level
+      # `if`, so the secret is bound to the step's own env and that is what gets tested.
       - name: Claim 👀 (as rocm-atom-bot)
         env:
           ATOM_BOT_TOKEN: ${{ secrets.ATOM_BOT_TOKEN }}
@@ -181,13 +182,15 @@ jobs:
         id: review
         run: bash "${{ steps.rl.outputs.dir }}/run_one.sh" "$PR" "$GITHUB_REPOSITORY"
 
-      # P0 has no bot token: _publish.py is dry-run by default, so the card is
-      # rendered and logged but not posted. P0.5 adds --post together with the
-      # ATOM_BOT_TOKEN secret. The review itself never uses the token -- the
-      # agent runs --dangerously-skip-permissions over untrusted PR content.
-      - name: Render the review card (dry-run until P0.5)
+      # P0.5: ATOM_BOT_TOKEN is live, so _publish.py is invoked with --post and actually
+      # posts the card as rocm-atom-bot. It posts over its own token directly (never
+      # GITHUB_TOKEN), which is why this job still needs no issues/pull-requests write
+      # permission -- see check_prompts.py's check_publish_needs_post_flag. The review
+      # step itself never uses the token -- the agent runs --dangerously-skip-permissions
+      # over untrusted PR content.
+      - name: Render and post the review card (as rocm-atom-bot)
         if: success()
-        run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR"
+        run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post
 
       - name: Report a failed review to the owner (as rocm-atom-bot)
         id: notify

@@ -14,13 +14,18 @@ finding, seven gates verify each step actually happened (not just claimed), and
 a structured, human-readable review with a one-line summary, tagged findings, and a
 verdict.
 
-**P0 posts nothing.** There is no PR comment, no claim reaction, no GitHub write of any
-kind. `_publish.py --post` exists in the codebase but is not wired into the workflow's
-review step, and the repo secret it would need (`ATOM_BOT_TOKEN`) has no bot account
-behind it yet — `rocm-atom-bot` does not exist. Wiring that up is **P0.5**, and it needs
-you to mint the bot account first (see §5).
+**P0 posted nothing; P0.5 (now live) posts.** P0 shipped with no PR comment, no claim
+reaction, no GitHub write of any kind: `_publish.py --post` existed in the codebase but
+was not wired into the workflow's review step, and the repo secret it would need
+(`ATOM_BOT_TOKEN`) had no bot account behind it — `rocm-atom-bot` did not exist yet.
 
-Until P0.5, the dry-run workflow renders the card and logs it; nothing lands on the PR.
+P0.5 wired that up: `rocm-atom-bot` is registered, `ATOM_BOT_TOKEN` is a configured repo
+secret, the claim-👀 step's condition now passes naturally (it was already written to
+test the secret, not to assume its absence), and `_publish.py` is invoked with `--post`.
+The bot posts as itself, over its own token — it is not a collaborator on ROCm/ATOM
+(`push: false`), but a `public_repo`-scoped PAT is sufficient on a public repo to comment
+and react, so the workflow still grants the job no `issues:`/`pull-requests:` write and
+never falls back to `GITHUB_TOKEN`. The review chain itself (§1 below) is unchanged.
 
 ## 2. The acceptance run
 
@@ -130,8 +135,9 @@ an agent session cannot do either:
   that section — the unit `svc.sh` writes on its own survives a reboot but not a crash.
 
 Once both are done, `bash .claude/skills/review-pr/preflight.sh` should show all green
-except the `ATOM_BOT_TOKEN` warning (expected until P0.5 mints a bot account) and the
-persistence check should now pass instead of showing the current, correct-for-today red.
+(the `ATOM_BOT_TOKEN` warning now clears too, since P0.5 minted the bot account and the
+secret is configured) and the persistence check should now pass instead of showing the
+current, correct-for-today red.
 
 ## 6. What's deliberately left undone
 
@@ -144,8 +150,6 @@ persistence check should now pass instead of showing the current, correct-for-to
   cannot reach. Not fixed here — fixing it means a local `git diff` against a fetched
   merge-base instead of the GitHub API diff, which is a different, larger change to
   `fetch.sh`'s fetch path and is out of scope for this pass.
-- **P0.5 — publishing**: wire up the claim reaction (👀), `_publish.py --post`, and real
-  PR comments. Needs the `rocm-atom-bot` account and its PAT in `ATOM_BOT_TOKEN`.
 - **P1 — ATOM family axis and rule rewrite**: replace the P0 placeholder rule deriver
   with ATOM's real family axis, and rewrite `rules.md`'s rule content from roughly the
   last six months of ATOM's own review comments across all channels.
