@@ -75,6 +75,9 @@ class KVConnectorBase(ABC):
         """
         ...
 
+    def publish_prefill_chunks(self, batch: Any) -> None:
+        """Publish completed prefill chunks; no-op without chunked P/D transfer."""
+
     def get_finished_recv_blocks(self) -> list[int]:
         """Return block IDs from recently completed receives for GPU memory fence.
 
@@ -112,6 +115,18 @@ class KVConnectorSchedulerBase(ABC):
     def update_state_after_alloc(self, seq: Any) -> None:
         """Update internal state after the scheduler allocates blocks."""
         ...
+
+    def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        """Preserve completions unless the backend consumes chunked P/D metadata."""
+        return output
+
+    def admission_ready(self, seq: Any) -> bool:
+        """Whether the scheduler may allocate this request and start prefill."""
+        return True
+
+    def abort_send(self, seq: Any) -> None:
+        """Retire an unsent abort; streaming senders must wait for reader drain."""
+        self.send_finished(seq.id)
 
     @abstractmethod
     def request_finished(self, seq: Any) -> None:

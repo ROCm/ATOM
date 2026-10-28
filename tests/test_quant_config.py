@@ -683,6 +683,37 @@ class TestQuarkParser:
         assert spec.quant_dtype == FP4X2
         assert result.exclude_layers == ["lm_head"]
 
+    def test_per_block_1x32_fp8_is_mxfp8(self):
+        # MiniMax-M3.1 Quark MXFP4: MXFP4 global, MXFP8 attention as per_block [1, 32].
+        def spec(block_size):
+            weight = {"qscheme": "per_block", "dtype": "fp8_e4m3"}
+            if block_size is not None:
+                weight["block_size"] = block_size
+            return {"weight": weight, "input_tensors": {"is_dynamic": True}}
+
+        result = QuarkParser().parse(
+            {
+                "quant_method": "quark",
+                "global_quant_config": {
+                    "weight": {"qscheme": "per_group", "dtype": "fp4"},
+                    "input_tensors": {"is_dynamic": True},
+                },
+                "layer_quant_config": {
+                    "model.layers.0.self_attn.q_proj": spec([1, 32]),
+                    "model.layers.0.self_attn.o_proj": spec([128, 128]),
+                    "model.layers.0.mlp.down_proj": spec(None),
+                },
+            }
+        )
+        types = {p: s.quant_type for p, s in result.layer_pattern_specs}
+        assert types["model.layers.0.self_attn.q_proj"] == QuantType.per_1x32
+        assert types["model.layers.0.self_attn.o_proj"] == QuantType.per_1x128
+        assert types["model.layers.0.mlp.down_proj"] == QuantType.per_1x128
+        assert all(s.quant_dtype == FP8 for _, s in result.layer_pattern_specs)
+        blocks = {p: s.weight_block_size for p, s in result.layer_pattern_specs}
+        assert blocks["model.layers.0.self_attn.q_proj"] == (1, 32)
+        assert blocks["model.layers.0.self_attn.o_proj"] is None
+
 
 # =========================================================================
 # Tests — QuarkOnlineParser

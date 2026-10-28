@@ -153,7 +153,9 @@ def test_engram_provider_maps_independent_shards_and_only_gathers_rows(tmp_path)
         )
         assert torch.equal(actual[0], expected)
         assert table._tensor.device.type == "cpu" and table.dtype == torch.float8_e4m3fn
-        assert len(reader._handles) == 2
+        # Engram tables map their shards directly (a shared read-only mapping
+        # for the UVA lookup), not through safe_open handles.
+        assert not reader._handles
         with pytest.raises(ValueError, match="owned by host"):
             reader.read(build_weight_manifest(specs)[0])
 

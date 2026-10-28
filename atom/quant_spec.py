@@ -222,6 +222,26 @@ def should_stream_online_quant(
     )
 
 
+def fuses_mxfp8_shared_into_mxfp4(
+    shared: LayerQuantConfig, routed: LayerQuantConfig
+) -> bool:
+    """Whether an MXFP8 shared expert is fused into MXFP4 routed experts.
+
+    Opt-in through ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 (the Quark MXFP4 export of
+    MiniMax-M3.1): FusedMoE re-quantizes the shared expert to MXFP4 at load,
+    which costs it accuracy.
+    """
+    from atom.utils import envs
+
+    return (
+        envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4
+        and shared.quant_type == QuantType.per_1x32
+        and shared.quant_dtype == d_dtypes.get("fp8")
+        and routed.quant_type == QuantType.per_1x32
+        and routed.quant_dtype == d_dtypes.get("fp4x2")
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Structured parsed config
 # ──────────────────────────────────────────────────────────────────────
@@ -418,8 +438,20 @@ def _build_quark_layer_spec(layer_dict: dict) -> LayerQuantConfig:
     weight = layer_dict.get("weight", {}) or {}
     input_tensors = layer_dict.get("input_tensors")
     weight, quant_dtype_override = _quark_weight_spec(weight, input_tensors)
+    quant_type = _parse_quant_type(weight.get("qscheme"))
+    # Quark spells MXFP8 (one E8M0 scale per 1x32 block) as per_block with
+    # block_size [1, 32]; a bare per_block is the 128x128 FP8 layout. The
+    # source block is what routes the linear to its native group-32 FP8 GEMM,
+    # as GenericParser's weight_block_size does for the original checkpoint.
+    weight_block_size = None
+    if weight.get("qscheme") == "per_block" and list(
+        weight.get("block_size") or []
+    ) == [1, 32]:
+        quant_type = QuantType.per_1x32
+        weight_block_size = (1, 32)
     return LayerQuantConfig(
-        quant_type=_parse_quant_type(weight.get("qscheme")),
+        quant_type=quant_type,
+        weight_block_size=weight_block_size,
         quant_dtype=(
             quant_dtype_override
             if quant_dtype_override is not None

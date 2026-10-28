@@ -59,11 +59,8 @@ from atom.config import (
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
-    pcp_all_reduce,
-    pcp_allgather_rankmajor,
     pcp_allgather_rerange,
     pcp_pad_len,
-    pcp_reduce_scatter,
     pcp_round_robin_split,
 )
 from atom.model_loader.loader import WeightsMapper
@@ -104,6 +101,7 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
+from atom.model_ops.topK import topk_meta_rows
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
@@ -124,7 +122,11 @@ from atom.model_ops.v4_kernels import (
 from atom.utils import envs, mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
-from atom.utils.forward_context import AttnState, get_forward_context
+from atom.utils.forward_context import (
+    AttnState,
+    get_forward_context,
+    pass_scheduled_tokens_gpu,
+)
 from atom.utils.region_graph import token_graph
 from atom.utils.tbo.ubatching import (
     tbo_active,
@@ -2910,12 +2912,9 @@ class MoE(nn.Module):
         # Keep comm-fused token-bucket dispatch dynamic under torch.compile.
         self._use_comm_fused_dispatch = self.experts._comm_fused_moe is not None
         # Register self in static_forward_context so the custom op dispatcher
-        # can look us up by `layer_name` (= self.prefix). Needed by
-        # maybe_dual_stream_forward (dual-stream) AND moe_pcp_merge_forward
-        # — the latter requires registration regardless of
-        # dual-stream, so register whenever either consumer is active.
-        _pcp_merge_on = get_pcp_world_size() > 1 and bool(envs.ATOM_PCP_MOE_MERGE)
-        if self._use_dual_stream or self._use_comm_fused_dispatch or _pcp_merge_on:
+        # can look us up by `layer_name` (= self.prefix): maybe_dual_stream_forward
+        # (dual-stream) and the comm-fused token-bucket dispatch.
+        if self._use_dual_stream or self._use_comm_fused_dispatch:
             get_current_atom_config().compilation_config.static_forward_context[
                 prefix
             ] = self
@@ -2943,6 +2942,8 @@ class MoE(nn.Module):
             ids.shape[0] == num_tokens
         ), f"input_ids length {ids.shape[0]} does not match gating_output num_tokens {num_tokens}"
         tid2eid = self.gate.tid2eid
+        # Rows at or past the pass's real row count route to -1.
+        num_valid_rows = pass_scheduled_tokens_gpu(num_tokens)
 
         # Fused-shared expert: the custom_routing_function path bypasses
         # select_experts' shared-expert append, so the shared expert (slot
@@ -2952,24 +2953,18 @@ class MoE(nn.Module):
         # return the full [N, topk + n_shared] view.
         num_fused_shared = getattr(self.experts, "num_fused_shared_experts", 0)
         if num_fused_shared > 0:
-            import atom.model_ops.topK as _topK_mod
-
-            assert _topK_mod.aiter_topK_meta_data is not None, (
-                "AITER topK meta data is not initialized. "
-                "init_aiter_topK_meta_data must run before hash-layer routing."
-            )
-            total_topk_weights, total_topk_ids = _topK_mod.aiter_topK_meta_data
-            assert total_topk_weights.shape[0] >= num_tokens
+            total_topk_weights, total_topk_ids = topk_meta_rows(num_tokens)
             hash_topk_triton(
                 ids,
                 gating_output,
                 tid2eid,
                 renormalize,
                 self.routed_scaling_factor,
-                total_topk_ids[:num_tokens, :topk],
-                total_topk_weights[:num_tokens, :topk],
+                total_topk_ids[:, :topk],
+                total_topk_weights[:, :topk],
+                num_valid_rows,
             )
-            return total_topk_weights[:num_tokens], total_topk_ids[:num_tokens]
+            return total_topk_weights, total_topk_ids
 
         topk_ids = torch.empty(
             (num_tokens, topk), dtype=torch.int32, device=gating_output.device
@@ -2985,6 +2980,7 @@ class MoE(nn.Module):
             self.routed_scaling_factor,
             topk_ids,
             topk_weights,
+            num_valid_rows,
         )
         return topk_weights, topk_ids
 
@@ -3013,26 +3009,6 @@ class MoE(nn.Module):
             stage2_stream=stage2_stream,
         )
 
-    @staticmethod
-    def _gather_ids_for_dp(ids: torch.Tensor, ctx) -> torch.Tensor:
-        """All-gather input_ids across DP ranks to match gathered hidden_states."""
-        from aiter.dist.parallel_state import get_dp_group
-
-        ids_2d = ids.unsqueeze(-1)
-        dp_eager_mode = (
-            not ctx.context.running_tokens_are_unified
-        ) and ctx.dp_metadata is not None
-        if dp_eager_mode:
-            from atom.model_ops.moe import all_gatherv
-
-            sizes = ctx.dp_metadata.get_sizes_across_dp()
-            ids_2d = all_gatherv(ids_2d, sizes, get_dp_group())
-        else:
-            from atom.model_ops.moe import all_gather_with_padding
-
-            ids_2d, _ = all_gather_with_padding(ids_2d, use_cag=False)
-        return ids_2d.flatten()
-
     @mark_trace
     def combine_outputs(
         self,
@@ -3044,18 +3020,9 @@ class MoE(nn.Module):
         all-reduce across TP ranks.
         """
         if shared is not None:
-            # PCP with ATOM_PCP_MOE_MERGE=1 (non-fused shared only): the shared expert
-            # is NOT pcp-sharded (its MergedColumn/RowParallelLinear bind to the
-            # 4-card tp group, so every pcp rank holds the same shared weights
-            # and computes the same full shared output — pcp-redundant). After
-            # this combine the result rides through Block.forward's pcp
-            # reduce_scatter, which SUMS the pcp partners. Without correction the
-            # shared part would be summed pcp_size times (doubled for pcp=2). So
-            # pre-scale shared by 1/pcp_size: the reduce_scatter then RESTORES it
-            # to 1x instead of multiplying. routed is genuinely pcp-sharded
-            # (partial sum) so it must NOT be scaled — only shared.
-            if _moe_pcp_merge_active() or _moe_pcp_merge_decode_active():
-                shared = shared * (1.0 / get_pcp_world_size())
+            # Both on this rank's rows: the routed experts' PCP reduction
+            # (ATOM_PCP_MOE_MERGE) happens inside FusedMoE, and the shared
+            # expert, sharded by TP alone, never takes part in it.
             routed = routed + shared
         if self.tp_size > 1:
             # ATOM AR layer decides internally (via _tbo_aware_tp_reduce) whether
@@ -3195,9 +3162,6 @@ class Block(nn.Module):
             indexer_stream=indexer_stream,
         )
         self.ffn = MoE(layer_id, args, prefix=f"{prefix}.ffn", alt_stream=alt_stream)
-        self._moe_merge_enabled = get_pcp_world_size() > 1 and bool(
-            envs.ATOM_PCP_MOE_MERGE
-        )
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
@@ -3511,12 +3475,9 @@ class Block(nn.Module):
             self.norm_eps,
         )
         x = hc_state.x_prev
-        if self._moe_merge_enabled:
-            x = torch.ops.aiter.moe_pcp_merge_forward(x, self.ffn.prefix)
-        else:
-            x = self.ffn(
-                x
-            )  # [num_tokens, dim]  (input_ids from forward_context for hash MoE)
+        x = self.ffn(
+            x
+        )  # [num_tokens, dim]  (input_ids from forward_context for hash MoE)
         hc_state.x_prev = x
         return hc_state
 
@@ -3595,74 +3556,6 @@ class ParallelHead(ParallelLMHead):
         return self.get_logits(norm(x))  # [bs, vocab]
 
 
-def _run_moe(moe: "MoE", x: torch.Tensor) -> torch.Tensor:
-    """Replicate MoE.forward's dual/single dispatch (we are already inside an
-    opaque op, so call the underlying methods directly rather than re-entering
-    the maybe_dual_stream_forward custom op)."""
-    threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
-    num_tokens = x.shape[0]
-    if moe._use_dual_stream and 0 < num_tokens <= threshold:
-        return moe.dual_stream_moe_forward(x)
-    return moe.single_stream_moe_forward(x)
-
-
-def moe_pcp_merge_forward(
-    hidden_states: torch.Tensor,  # [n_local, dim]
-    layer_name: str,
-) -> torch.Tensor:  # [n_local, dim]  (shape-preserving)
-    moe = get_current_atom_config().compilation_config.static_forward_context[
-        layer_name
-    ]
-    # Gate is read EAGERLY here (op is opaque to Dynamo), so it is NEVER baked —
-    # keeping is_dummy_run in the gate is correct and NECESSARY: it keeps this op
-    # consistent with the out-of-graph split gate `_pcp_active()` (also has
-    # is_dummy). At warmup (is_dummy=True) neither splits nor merges, so x stays
-    # full and the hash-MoE input_ids (also un-split at warmup) match. Removing
-    # is_dummy here would merge a never-split warmup batch -> input_ids/hidden
-    # length mismatch -> crash. (The in-graph gate needed is_dummy *removed* to
-    # bake True into code0; the opaque op does NOT — opacity is the fix.)
-    do_prefill = _moe_pcp_merge_active()
-    do_decode = _moe_pcp_merge_decode_active()
-    ws = get_pcp_world_size()
-    x = hidden_states
-    if do_prefill:
-        _tbo = tbo_active()
-        # allgather: when TBO is active, yield to the partner ubatch so its
-        # compute overlaps this collective on the comm stream (P2 overlap).
-        if _tbo:
-            tbo_yield_and_switch_from_compute_to_comm()
-        x = pcp_allgather_rankmajor(x, ws)  # [1/W,dim] -> [full,dim]
-        if _tbo:
-            tbo_switch_to_compute_sync()
-    x = _run_moe(moe, x)
-    if do_prefill:
-        # reduce_scatter: same yield pattern.
-        if _tbo:
-            tbo_yield_and_switch_from_compute_to_comm()
-        x = pcp_reduce_scatter(x, ws)  # [full,dim] -> [1/W,dim]
-        if _tbo:
-            tbo_switch_to_compute_sync()
-    elif do_decode:
-        x = pcp_all_reduce(x)  # sum pcp half (decode tokens are pcp-redundant)
-    return x
-
-
-def _moe_pcp_merge_forward_fake(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="moe_pcp_merge_forward",
-    op_func=moe_pcp_merge_forward,
-    mutates_args=(),
-    fake_impl=_moe_pcp_merge_forward_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
-
-
 def _pcp_active() -> bool:
     """Whether to apply PCP round-robin-split in this forward.
 
@@ -3674,37 +3567,6 @@ def _pcp_active() -> bool:
         return False
     fc = get_forward_context()
     return fc.context.is_prefill and not fc.context.is_dummy_run
-
-
-def _moe_pcp_merge_active() -> bool:
-    """Whether PCP applies `attn with PCP -> all-gather hidden -> full before MoE,
-     slice back` after in this forward.
-
-    True only when this is a real PCP prefill (`_pcp_active`) AND the
-    `ATOM_PCP_MOE_MERGE` env is set. Mode A returns False: MoE runs on the
-    1/W shard with no extra comm.
-    """
-    if not _pcp_active():
-        return False
-    return bool(envs.ATOM_PCP_MOE_MERGE)
-
-
-def _moe_pcp_merge_decode_active() -> bool:
-    """moe_pcp_merge DECODE path: MoE weights are sharded W*tp ways (pcp folded
-    into tp at build time), but decode does NOT stripe-split tokens — every pcp
-    rank holds the same full batch. So decode skips gather/reduce_scatter and
-    instead does one pcp all_reduce after MoE to sum the pcp-half of the
-    intermediate that combine_outputs' tp all_reduce misses.
-
-    True only when pcp>1, ATOM_PCP_MOE_MERGE set, and this is a real DECODE forward
-    (not prefill — that's `_moe_pcp_merge_active` — and not dummy/warmup).
-    """
-    if get_pcp_world_size() <= 1:
-        return False
-    if not bool(envs.ATOM_PCP_MOE_MERGE):
-        return False
-    fc = get_forward_context()
-    return (not fc.context.is_prefill) and (not fc.context.is_dummy_run)
 
 
 @support_torch_compile
@@ -3929,19 +3791,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         # default [max_num_batched_tokens, hidden_size]. forward returns
         # the un-reduced mHC residual stack [N, hc, dim].
         self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
-        # Hash routing must see one token id for every MoE row. DPA gathers MoE
-        # rows when EP is disabled *and* when EP uses the collective fallback;
-        # only the mori all-to-all path keeps routing on rank-local rows.
-        uses_routed_all2all = any(
-            isinstance(module, MoE)
-            and module.experts.moe_parallel_config.use_all2all_kernels
-            for module in self.model.modules()
-        )
-        self._need_ids_gather = (
-            config.enable_dp_attention
-            and not uses_routed_all2all
-            and self.args.n_hash_layers > 0
-        )
 
     @property
     def disable_fused_shared_loading(self) -> bool:
@@ -3982,74 +3831,22 @@ class DeepseekV4ForCausalLM(nn.Module):
         # runs entirely on 1/W; the final hidden is all-gathered + un-padded
         # after self.model(...) returns.
         use_pcp = _pcp_active()
-        # NOTE: moe_merge here is the OUT-OF-GRAPH gate, used only for the
-        # input_ids gather below (round-robin split + hash-MoE id alignment).
-        # The MoE merge collectives gate themselves separately inside the opaque
-        # moe_pcp_merge_forward custom op (called from Block.forward).
-        moe_merge = _moe_pcp_merge_active()
-        # PCP with ATOM_PCP_MOE_MERGE=1 (default) is incompatible with DP-attention
-        # id-gathering for now: both rewrite ctx.context.input_ids with different
-        # (full-PCP vs DP-gathered) token sets, and stacking them is unverified.
-        # Disallow until needed.
-        assert not (moe_merge and self._need_ids_gather), (
-            "PCP with ATOM_PCP_MOE_MERGE=1 (default) is not supported "
-            "together with DP-attention input-id gathering yet."
-        )
-        full_padded_ids = None
-        if use_pcp:
+        # FusedMoE gathers its routed rows across the PCP group itself; the
+        # MoE routes these local rows first, hash layers by these local ids.
+        ctx.context.pcp_split = use_pcp
+        if use_pcp and not tbo_active():
+            # (PCP+TBO splits upstream in run_model: input_ids is already this
+            # ubatch's 1/(2*pcp) tokens.)
             pcp_size = get_pcp_world_size()
-            if tbo_active():
-                # PCP+TBO prefill: the split was done upstream in run_model;
-                # input_ids is already 1/(2*pcp) tokens. full_padded_ids was
-                # precomputed there and stored in ctx.context.input_ids (carried
-                # into this ubatch context by _make_ubatch_context). Nothing to do.
-                pass
-            else:
-                n_global = input_ids.shape[0]
-                pad = pcp_pad_len(n_global, pcp_size) - n_global
-                if pad > 0:
-                    input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
-                    positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
-                input_ids = pcp_round_robin_split(input_ids, pcp_size)
-                positions = pcp_round_robin_split(positions, pcp_size)
-                # each Block rank-major all-gathers hidden before MoE
-                # (pcp_allgather_rankmajor = plain all_gather(dim=0), RANK-MAJOR
-                # order: [rank0's stripe | rank1's stripe | ...]). The hash MoE
-                # indexes input_ids per hidden row, so the ids must be gathered in
-                # the SAME rank-major order. pcp_allgather_rankmajor is int-safe
-                # (plain all_gather), so reuse it for the ids too.
-                if moe_merge:
-                    full_padded_ids = pcp_allgather_rankmajor(input_ids, pcp_size)
+            n_global = input_ids.shape[0]
+            pad = pcp_pad_len(n_global, pcp_size) - n_global
+            if pad > 0:
+                input_ids = torch.cat([input_ids, input_ids.new_zeros(pad)], dim=0)
+                positions = torch.cat([positions, positions.new_zeros(pad)], dim=0)
+            input_ids = pcp_round_robin_split(input_ids, pcp_size)
+            positions = pcp_round_robin_split(positions, pcp_size)
 
-        if self._need_ids_gather:
-            # DP-attention collective fallback hash routing: input_ids is local
-            # but the MoE gate sees DP-gathered gating_output, so gather ids to
-            # match. This covers TP-style MoE and EP with mori disabled. Run
-            # the gather INLINE on the compute stream. Running this all-gather on
-            # a side stream coordinated it with a DIFFERENT stream/sync than the
-            # MoE hidden/router DP gather under TBO → mismatched DP layouts →
-            # wrong V4 hash routing (GSM8K 0.95→0.87). NOTE: do NOT wrap this in
-            # the TBO ping-pong
-            # (tbo_yield_and_switch_*) — injecting an extra yield at forward top
-            # desyncs the ping-pong ring and collapses accuracy to ~0.54
-            # (measured). The ids tensor is [N,1] int (tiny vs hidden [N,7168]),
-            # so inline costs ~nothing in overlap.
-            ctx.context.input_ids = MoE._gather_ids_for_dp(input_ids.flatten(), ctx)
-        elif moe_merge:
-            if full_padded_ids is not None:
-                # Normal PCP path: set ids from the just-computed all-gather.
-                ctx.context.input_ids = full_padded_ids
-            else:
-                # PCP+TBO path: input_ids is the per-ubatch slice of local ids
-                # (set by _make_ubatch_context from run_model's local ids).
-                # Allgather across PCP ranks to get padded_total//2 ids,
-                # matching what moe_pcp_merge_forward allgathers for hidden states.
-                # Both PCP ranks call this at the same TBO ubatch phase → synchronized.
-                ctx.context.input_ids = pcp_allgather_rankmajor(
-                    input_ids.flatten(), pcp_size
-                )
-        else:
-            ctx.context.input_ids = input_ids
+        ctx.context.input_ids = input_ids
         h = self.model(input_ids, positions)
 
         # ----- PCP: all-gather shards, restore original order, drop pad -----

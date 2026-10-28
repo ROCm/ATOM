@@ -351,3 +351,133 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
         assert output["prompt_token_ids"] == PROMPT_IDS
     else:
         assert "prompt_token_ids" not in output
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(
+    monkeypatch, enabled, multi
+):
+    sub = {
+        "kv_connector": "mooncake",
+        "kv_role": "kv_producer",
+        "enable_chunked_transfer": enabled,
+        "handshake_port": 6401,
+    }
+    config = SimpleNamespace(
+        kv_transfer_config=(
+            {"kv_connector": "multi", "connectors": [sub]} if multi else sub
+        ),
+        tensor_parallel_size=4,
+        pipeline_parallel_size=3,
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        kv_cache_block_size=64,
+        decode_context_parallel_size=2,
+    )
+    monkeypatch.setattr(api_server, "engine", SimpleNamespace(config=config))
+    monkeypatch.setattr("atom.utils.network.get_ip", lambda: "127.0.0.1")
+    info = asyncio.run(api_server.kv_transfer_info())
+    assert info["kv_role"] == "kv_producer"
+    assert info["handshake_port"] == 6401
+    assert ("chunked_transfer" in info) is enabled
+    if enabled:
+        assert info["chunked_transfer"] == {
+            "remote_host": "127.0.0.1",
+            "remote_handshake_port": 6401,
+            "remote_pp_size": 3,
+            "block_size": 64,
+            "dcp_size": 2,
+        }
+
+
+class TestChunkedAdmissionTopology:
+    @pytest.mark.parametrize(
+        "endpoint", ["chat/completions", "completions", "messages", "responses"]
+    )
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "p_tp,d_tp,d_pp", [(2, 1, 1), (3, 4, 1), (1, 1, 2), (0, 1, 1)]
+    )
+    def test_incompatible_pair_is_http_400_before_enqueue(
+        self, monkeypatch, server, endpoint, stream, p_tp, d_tp, d_pp
+    ):
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    tensor_parallel_size=d_tp,
+                    pipeline_parallel_size=d_pp,
+                )
+            ),
+        )
+
+        async def unexpected_enqueue(*_args, **_kwargs):
+            pytest.fail("incompatible D request must be rejected before enqueue")
+
+        monkeypatch.setattr(api_server, "setup_streaming_request", unexpected_enqueue)
+        body = {
+            "model": "m",
+            "max_tokens": 2,
+            "stream": stream,
+            "kv_transfer_params": {
+                "chunked_transfer": True,
+                "do_remote_prefill": True,
+                "transfer_id": "rejected-pair",
+                "remote_tp_size": p_tp,
+            },
+        }
+        if endpoint == "completions":
+            body["prompt"] = "hi"
+        elif endpoint == "responses":
+            body.pop("max_tokens")
+            body["input"] = "hi"
+        else:
+            body["messages"] = [{"role": "user", "content": "hi"}]
+
+        async def post():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=api_server.app),
+                base_url="http://d",
+            ) as client:
+                return await client.post(f"/v1/{endpoint}", json=body)
+
+        response = asyncio.run(asyncio.wait_for(post(), 5))
+        assert response.status_code == 400, response.text
+        assert "Chunked P/D requires" in response.text
+        assert not server.generate and not server.templates
+
+    @pytest.mark.parametrize("p_tp,d_tp", [(1, 1), (1, 4), (2, 4), (4, 4)])
+    def test_supported_receive_keeps_admission_path(self, monkeypatch, p_tp, d_tp):
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    tensor_parallel_size=d_tp,
+                    pipeline_parallel_size=1,
+                )
+            ),
+        )
+        api_server._validate_chunked_receive(
+            {
+                "chunked_transfer": True,
+                "do_remote_prefill": True,
+                "remote_tp_size": p_tp,
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            None,
+            {},
+            {"do_remote_prefill": True},
+            {"chunked_transfer": True, "do_remote_decode": True},
+        ],
+    )
+    def test_legacy_offload_and_producer_do_not_require_decode_topology(
+        self, monkeypatch, params
+    ):
+        monkeypatch.setattr(api_server, "engine", None)
+        api_server._validate_chunked_receive(params)

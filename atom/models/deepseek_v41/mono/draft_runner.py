@@ -84,6 +84,7 @@ class DraftMonoRunner(V41MonoDecodeRunner):
                 tp=self.tp,
                 timeline=self.timeline,
                 diag_off=self.diag_off,
+                kv_fp8=self.kv_fp8,
             )
             for i in range(len(self.model.mtp))
         ]

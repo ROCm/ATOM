@@ -37,7 +37,9 @@ def _install_forward_context_stubs():
 
     config = atom.config
     config_attr = getattr(config, "get_current_atom_config", None)
-    config.get_current_atom_config = lambda: SimpleNamespace(kv_cache_block_size=16)
+    config.get_current_atom_config = lambda: SimpleNamespace(
+        kv_cache_block_size=16, parallel_config=None
+    )
 
     attention_gdn = stub(
         "atom.model_ops.attention_gdn",
@@ -76,6 +78,9 @@ def _install_forward_context_stubs():
         types.ModuleType("atom.utils.forward_context"),
     )
     utils_forward_context.running_tokens_from_bs = running_tokens_from_bs
+    utils_forward_context.DPMetadata = SimpleNamespace(
+        gather_running_tokens=lambda *args: None
+    )
     utils_forward_context.AttentionMetaData = _KwargsObject
     utils_forward_context.Context = _KwargsObject
     utils_forward_context._forward_kv_cache_context = SimpleNamespace(kv_cache_data={})
@@ -226,6 +231,9 @@ def test_qwen35_prefill_reads_prefix_state_and_writes_last_chunk_block():
     assert md.non_spec_state_indices_in_tensor.tolist() == [10, 20]
     assert md.non_spec_state_indices_tensor.tolist() == [12, 20]
     assert md.has_initial_state.tolist() == [True, False]
+    assert md.non_spec_state_indices_i64.tolist() == [12, 20]
+    assert md.non_spec_state_indices_in_i64.tolist() == [10, 20]
+    assert md.no_initial_state.tolist() == [False, True]
 
 
 def test_qwen35_decode_mixed_boundary_reads_previous_and_writes_current_block():
@@ -360,16 +368,26 @@ def test_recover_physical_block_table_accepts_expanded_kernel_layout():
     assert recovered.cpu().tolist() == [[56]]
 
 
-def test_recover_physical_block_table_keeps_compact_physical_layout():
+def test_recover_physical_block_table_discards_incomplete_reserved_columns():
     compact = torch.tensor([[7, 8, 9]], dtype=torch.int32)
 
+    # Only a complete ratio-sized group describes one physical page.
+    with pytest.raises(ValueError, match="no complete physical page"):
+        RTPForwardContext._recover_physical_block_table_from_kernel(
+            compact,
+            seq_size_per_block=1024,
+            kernel_seq_size_per_block=16,
+        )
+
+
+def test_recover_physical_block_table_trims_mtp_reserved_columns():
+    kernel = torch.tensor([[28, 29, 30, 31, 32, 33, 34, 35, 999]], dtype=torch.int32)
     recovered = RTPForwardContext._recover_physical_block_table_from_kernel(
-        compact,
-        seq_size_per_block=1024,
+        kernel,
+        seq_size_per_block=64,
         kernel_seq_size_per_block=16,
     )
-
-    assert recovered.cpu().tolist() == [[7, 8, 9]]
+    assert recovered.tolist() == [[7, 8]]
 
 
 def test_plugin_attention_metadata_keeps_indexer_block_table_expanded():
@@ -649,7 +667,7 @@ def test_bind_temporarily_attaches_mla_layer_cache(monkeypatch):
     )
     monkeypatch.setattr(
         "atom.plugin.rtpllm.utils.forward_context.get_current_atom_config",
-        lambda: SimpleNamespace(kv_cache_block_size=99),
+        lambda: SimpleNamespace(kv_cache_block_size=99, parallel_config=None),
     )
 
     with RTPForwardContext.bind(
@@ -750,7 +768,7 @@ def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
     )
     monkeypatch.setattr(
         "atom.plugin.rtpllm.utils.forward_context.get_current_atom_config",
-        lambda: SimpleNamespace(kv_cache_block_size=16),
+        lambda: SimpleNamespace(kv_cache_block_size=16, parallel_config=None),
     )
 
     with RTPForwardContext.bind(
