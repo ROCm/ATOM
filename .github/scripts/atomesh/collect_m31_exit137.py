@@ -22,7 +22,7 @@ containers_by_node = {}
 jobs = {"10598"} if RUN_ID == "40526449275" else set()
 used = 0
 for run in sorted(ROOT.glob(f"minimax-m3.1-flash-*-{RUN_ID}-*")):
-    for pattern in ("slurm-*.out", "slurm-*.err", "slurm_job-*/*.json", "slurm_job-*/rank-rc-*", "slurm_job-*/rank-*/*.log", "slurm_job-*/logs/*.log", "slurm_job-*/benchmark_results/*/aiperf.log", "slurm_job-*/benchmark_results/*/profile_export_aiperf.json"):
+    for pattern in ("slurm-*.out", "slurm-*.err", "slurm_job-*/*.json", "slurm_job-*/rank-rc-*", "slurm_job-*/rank-*/*.log", "slurm_job-*/logs/*.log", "slurm_job-*/benchmark_results/*/aiperf.log", "slurm_job-*/benchmark_results/*/logs/aiperf.log", "slurm_job-*/benchmark_results/*/profile_export_aiperf.json"):
         for src in sorted(run.glob(pattern)):
             if not src.is_file() or not src.resolve().is_relative_to(ROOT.resolve()):
                 continue
