@@ -5131,3 +5131,60 @@ def test_an_exact_prepared_case_still_returns_its_rows_untouched(monkeypatch):
     d = GC.last_decision()
     assert (d.m_real, d.bucket_m) == (16, 16)
     GC._SITES.clear()
+
+
+# ======= exact after padded on the SAME bucket: no tensor of the padded case may leak ====================
+def _exact_inputs(bucket):
+    import torch as _t
+
+    bucket.positions = _T((64,), _t.int64)
+    bucket.slot_mapping = _T((64,), _t.int64)
+    bucket.x = _T((16, 6144), _t.float8_e4m3fn)
+    bucket.x_scale = _T((16, 1), _t.float32)
+    bucket.cos_sin = None
+
+
+@pytest.mark.parametrize("mode", ["qkv_dense", "qkv_indexer", "qkv_indexer_reuse"])
+def test_an_exact_call_after_a_padded_one_runs_on_its_own_tensors(monkeypatch, mode):
+    GC, _site, plan, padded, bucket = _padded_adapter_case(monkeypatch, mode, 52)
+    _exact_inputs(bucket)
+    comm = SimpleNamespace(rank=0)
+    GC.qkv_proj_all2all_norm_rope_cache(
+        padded, comm
+    )  # pad-M: the site is now the padded case's
+    GC.qkv_proj_all2all_norm_rope_cache(bucket, comm)  # then the bucket's own, exact
+    padded_run, exact_run = plan.runs
+    # sanity: the padded call used the padded case's tensors
+    assert padded_run["meta"]["q_norm_w"] is padded.q_norm.weight
+    # the exact call must use the BUCKET case's: q-side norm, k-side norm, rope, weight, scales, caches
+    m = exact_run["meta"]
+    assert m["q_norm_w"] is bucket.q_norm.weight  # affects q only
+    assert m["k_norm_w"] is bucket.k_norm.weight
+    assert (
+        m["cos_cache"] is bucket.rotary.cos_cache
+        and m["sin_cache"] is bucket.rotary.sin_cache
+    )
+    assert (
+        exact_run["w"] is bucket.weight and exact_run["w_scale"] is bucket.weight_scale
+    )
+    for name in ("k_cache", "v_cache", "k_scale", "v_scale"):
+        assert m[name] is bucket.caches[name], name
+    if mode == "qkv_indexer":
+        assert m["index_cache"] is bucket.caches["index_cache"]
+        assert m["index_q_norm_w"] is bucket.index_q_norm.weight
+        assert m["index_k_norm_w"] is bucket.index_k_norm.weight
+    # and a padded call after the exact one gets ITS tensors again
+    GC.qkv_proj_all2all_norm_rope_cache(padded, comm)
+    assert plan.runs[-1]["meta"]["q_norm_w"] is padded.q_norm.weight
+    assert plan.runs[-1]["w"] is padded.weight
+    GC._SITES.clear()
+
+
+def test_adoption_is_per_call_for_a_prepared_cases_own_site_too(monkeypatch):
+    GC, site, _plan, case, bucket = _padded_adapter_case(monkeypatch, "qkv_dense", 52)
+    GC._site_for(case, None)
+    assert site.linear.weight is case.weight  # served by the bucket's site
+    GC._site_for(bucket, None)
+    assert site.linear.weight is bucket.weight  # the exact case takes its tensors back
+    assert site.attn.impl.q_norm is bucket.q_norm
+    GC._SITES.clear()

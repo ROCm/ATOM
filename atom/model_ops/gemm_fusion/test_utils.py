@@ -990,6 +990,11 @@ def _site_for(case, comm):
             )
         )
         ent = _SITES[key] = (site, holder, attn)
+    # EVERY call runs on its own case's layer tensors, exact or padded: a bucket's site is shared by
+    # the cases served through it (pad-M), and a padded call re-points it at ITS tensors, so an exact
+    # call that follows must not inherit them (q came back wrong with k / v exact: the q-side norm /
+    # weights of the previous case). The engine has one layer per site; the harness has many cases.
+    _adopt_case_tensors(ent[0], ent[2], case, mode)
     ent[1].case = case
     return ent
 
