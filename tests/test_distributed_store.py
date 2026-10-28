@@ -183,6 +183,7 @@ def _model_runner_worker(pc, layout, global_rank):
     config = SimpleNamespace(
         parallel_config=pc,
         tensor_parallel_size=tp,
+        sequence_parallel_size=1,
         tp_world_size=tp,
         pipeline_parallel_size=pp,
         prefill_context_parallel_size=pcp,

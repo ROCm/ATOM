@@ -156,6 +156,62 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
     assert captured["scale"] == 2.0
 
 
+@pytest.mark.parametrize("eplb_enabled", [False, True])
+@pytest.mark.parametrize("fuse_shared", [False, True])
+def test_sigmoid_dispatch_scales_routed_weights_once(
+    monkeypatch, eplb_enabled, fuse_shared
+):
+    layer = _dispatch_layer()
+    layer.num_fused_shared_experts = int(fuse_shared)
+    layer.expert_layout = MoEExpertLayout.make(
+        num_routed=8,
+        num_fused_shared_experts=layer.num_fused_shared_experts,
+        num_configured_redundant=0,
+        ep_size=2,
+        use_all2all=True,
+        eplb_enabled=eplb_enabled,
+    )
+    layer.scoring_func = "sigmoid"
+    layer.to_dispatch_space = lambda weights, ids: FusedMoE.to_dispatch_space(
+        layer, weights, ids
+    )
+
+    def cpu_topk(weights, ids, logits, bias, renormalize, scale, **kwargs):
+        assert kwargs["score_func"] == "sigmoid"
+        scores, indices = logits.float().sigmoid().topk(ids.shape[1], dim=-1)
+        if renormalize:
+            scores = scores / scores.sum(dim=-1, keepdim=True)
+        weights.copy_(scores * scale)
+        ids.copy_(indices)
+
+    monkeypatch.setattr(moe_module, "topk_gating", cpu_topk)
+    monkeypatch.setattr(moe_module, "eplb_map_and_record_fused", lambda _, ids, g: ids)
+    monkeypatch.setattr(dispatch_module, "_HAS_TRITON", False)
+    monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
+    monkeypatch.setattr(
+        moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
+    )
+    logits = torch.tensor([[2.0, -2.0, -2.0, -2.0, 1.0, -2.0, -2.0, -2.0]])
+
+    method = object()
+    weights, ids = Mxfp4MoEMethod.select_experts(
+        method, layer, torch.empty(1, 4), logits
+    )
+    weights, ids = Mxfp4MoEMethod.place_experts(method, layer, weights, ids)
+
+    # A separate shared MLP leaves scaling to the model. Fused shared experts
+    # require scaled routed weights even though routing receives no shared cols.
+    expected_scale = layer.routed_scaling_factor if fuse_shared else 1.0
+    torch.testing.assert_close(
+        weights[:, :2].sum(dim=-1), torch.tensor([expected_scale])
+    )
+    if fuse_shared:
+        assert weights[:, 2].tolist() == [1.0]
+        assert ids.tolist() == ([[0, 4, 8]] if eplb_enabled else [[0, 5, 9]])
+    else:
+        assert ids.tolist() == [[0, 4]]
+
+
 def _parallel_config(
     *, dp_size: int, use_ep: bool, backend: str = "auto"
 ) -> FusedMoEParallelConfig:
@@ -266,3 +322,37 @@ def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
     )
 
     assert is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)
+
+
+@pytest.mark.parametrize("backend", ["none", "rccl", "mori"])
+@pytest.mark.parametrize("sp_size", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float4_e2m1fn_x2])
+def test_sp_shared_mlp_fallback_matches_loader_decision(
+    monkeypatch, backend, sp_size, dtype
+):
+    spec = SimpleNamespace(quant_dtype=dtype, quant_type=None, is_dynamic=False)
+    quant = SimpleNamespace(
+        quant_dtype=dtype,
+        exclude_layers=[],
+        global_quant_config=spec,
+        get_layer_quant_config=lambda *args, **kwargs: spec,
+    )
+    config = atom_config_double(
+        quant_config=quant,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        sequence_parallel_size=sp_size,
+        enable_expert_parallel=True,
+        moe_all2all_backend=backend,
+    )
+    monkeypatch.setattr(topK_module, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
+    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
+    expected = not (sp_size > 1 and backend != "none" and dtype == torch.bfloat16)
+    # Module construction and checkpoint loading must choose the same layout.
+    assert is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None) == expected
+    assert (
+        is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            quant, shared_expert_prefix="shared", routed_expert_prefix="experts"
+        )
+        == expected
+    )
