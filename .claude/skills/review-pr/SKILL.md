@@ -137,10 +137,18 @@ for what to look for, not as a citation of what will appear on the card.
 ## Step 4 — Backbone File Risk Assessment
 
 **Write one line per backbone file this diff touches into `$WORK/core_files.txt`
-— Step 8 gates on it.** Format: `<path> TIER1|TIER2|TIER3 COVERED|GAP|N/A -- <reason>`.
-This step was prose only, so a review that skipped it was textually identical to
-one that performed it. Touching no Tier 1/2 file: write one `NONE -- <reason>`
-line naming the Tier 3 files touched instead.
+— Step 8 gates on it. Write a line for a backbone file only — never for a file this diff
+touches that Q1–Q4 below rules is not backbone.** Format: `<path> TIER1|TIER2|TIER3
+COVERED|GAP|N/A -- <reason>`; the `N/A` there answers "do findings for THIS tier apply",
+not "is this file backbone" — a non-backbone file does not get a line of its own in any
+form, `N/A` included. This step was prose only, so a review that skipped it was textually
+identical to one that performed it.
+- **This diff touches a backbone file** (Tier 1, 2, or Tier-3-by-Q4): write that file's
+  line(s) and stop — every other file the diff also touches (a test, a doc, a non-backbone
+  helper) gets no line, because it answered no to every one of Q1–Q4.
+- **No file in the diff is Tier 1/2/3-by-Q4** (e.g. the diff is only a new test file):
+  write exactly one `NONE -- <reason>` line naming what was touched instead — do not
+  describe each non-backbone file on its own line even to say it is not backbone.
 
 **What makes an ATOM file "backbone"?** Apply these questions to any file in the diff.
 
