@@ -911,8 +911,14 @@ class Scheduler:
         self._local_prefill_coalescing = delayer is not None and delayer.is_local
         self._inflight_prefix_wait = {}
 
-    def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
-        """Bounded wait for a hybrid producer's planned prompt-end checkpoint."""
+    def _wait_for_inflight_prefix(
+        self, seq: Sequence, cached_tokens: int, *, peek: bool = False
+    ) -> bool:
+        """Bounded wait for a hybrid producer's planned prompt-end checkpoint.
+
+        `peek=True` answers without starting the wait's deadline: the fill
+        probe asks what admission would do, it does not decide it.
+        """
         bm = self.block_manager
         delayer = self.prefill_delayer
         if (
@@ -959,9 +965,10 @@ class Scheduler:
                 np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
                 np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
             ):
-                self._inflight_prefix_wait.setdefault(
-                    seq.id, self._schedule_tick + delayer.ttft_max_ticks
-                )
+                if not peek:
+                    self._inflight_prefix_wait.setdefault(
+                        seq.id, self._schedule_tick + delayer.ttft_max_ticks
+                    )
                 return True
         return False
 
@@ -1017,6 +1024,11 @@ class Scheduler:
         # reported a few thousand rows of fill where admission packs the
         # whole budget. The prefix walk is memoised across ticks.
         slots = self.max_num_seqs - len(self.running)
+        # What the seqs counted so far take from the pool: admission allocates
+        # them one after another, so each later seq fits only in what the
+        # earlier ones leave (Phase 2 stops at the first refusal).
+        reserved_blocks = 0
+        reserved_state_slots = 0
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
@@ -1027,7 +1039,14 @@ class Scheduler:
                 )
             else:
                 # The exact probe's answer; the walk is memoised across ticks.
-                cached_blocks = self.block_manager.can_allocate_memoized(seq)
+                demand: list[int] = []
+                cached_blocks = self.block_manager.can_allocate_memoized(
+                    seq,
+                    reserved_blocks=reserved_blocks,
+                    reserved_state_slots=reserved_state_slots,
+                    demand=demand,
+                    observe=False,
+                )
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
                 if slots <= self._num_parked_remote_kv:
@@ -1037,6 +1056,24 @@ class Scheduler:
                     prefillable = True
                     break
                 resume = cached_blocks * self.block_manager.hash_block_size
+                # Seqs admission passes over rather than prefills this pass
+                # (`prefix_waiters`): a pending tier lookup it cannot detach, or
+                # a hybrid producer's prompt-end checkpoint still in flight.
+                if (
+                    self.kv_connector is not None
+                    and self._offload_lookup_pending(seq)
+                    and not (
+                        self._lookup_detach_enabled(seq)
+                        and self._can_detach_tier_lookup(seq, (cached_blocks, []))
+                    )
+                ):
+                    continue
+                if self._local_prefill_coalescing and self._wait_for_inflight_prefix(
+                    seq,
+                    max(resume, seq.offload_joint.kv_prefix_tokens),
+                    peek=True,
+                ):
+                    continue
                 cached = self.block_manager.replay_start(seq, resume, hit=True)
             remaining = (
                 seq.num_tokens - cached
@@ -1061,6 +1098,11 @@ class Scheduler:
             prefillable = True
             pending += chunk
             slots -= 1
+            if not offload_resume:
+                # An offload resume already holds its blocks (pre-park allocate).
+                reserved_blocks += demand[0] if demand else 0
+                if seq.has_per_req_cache:
+                    reserved_state_slots += self.block_manager.state_slots_per_req
             if pending >= budget:
                 return True, budget
             if slots == 0:

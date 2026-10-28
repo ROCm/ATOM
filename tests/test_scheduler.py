@@ -3370,3 +3370,95 @@ def test_cancel_without_sampled_output_releases_state_and_pages(partial):
     assert scheduler.total_finished_requests == 1
     scheduler.kv_connector.request_finished.assert_called_once_with(seq)
     scheduler.kv_connector.send_finished.assert_called_once_with(seq.id)
+
+
+class TestLocalPrefillProbeMatchesAdmission:
+    """The probe's scan must count what admission will prefill this pass and
+    nothing else (review of #2708): under pool pressure each later seq fits only
+    in what the earlier counted seqs leave, the seqs admission parks in
+    `prefix_waiters` are not fill, and probing must not touch admission state."""
+
+    @staticmethod
+    def _sched(num_blocks):
+        return Scheduler(
+            MockConfig(
+                enable_prefix_caching=True,
+                enable_chunked_prefill=True,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=num_blocks,
+                max_num_seqs=8,
+                max_num_batched_tokens=32,
+                max_model_len=128,
+            )
+        )
+
+    @staticmethod
+    def _run_to_finish(sched, seed):
+        sched.add(seed)
+        while not seed.is_finished:
+            batch, _ = sched.schedule()
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[seed.id],
+                    token_ids=[(999,)],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                batch=batch,
+            )
+
+    def _two_hits_waiting(self, seq_factory, num_blocks):
+        """Two 36-token prefixes cached and freed, then two 40-token prompts
+        hitting them (4 uncached rows each), both waiting."""
+        sched = self._sched(num_blocks)
+        p1, p2 = list(range(1, 37)), list(range(1001, 1037))
+        sp = SamplingParams(max_tokens=1)
+        self._run_to_finish(
+            sched, seq_factory(p1 + [500, 501, 502, 503], sampling_params=sp)
+        )
+        self._run_to_finish(
+            sched, seq_factory(p2 + [510, 511, 512, 513], sampling_params=sp)
+        )
+        assert not sched.running
+        a = seq_factory(p1 + [600, 601, 602, 603])
+        b = seq_factory(p2 + [700, 701, 702, 703])
+        sched.add(a)
+        sched.add(b)
+        return sched, a, b
+
+    @pytest.mark.parametrize("num_blocks", [17, 18, 19, 20, 21])
+    def test_probe_equals_admission_under_pool_pressure(self, seq_factory, num_blocks):
+        # The reviewer's repro: without reserving the earlier seqs' blocks the
+        # probe reported 16/12/8 rows where admission prefilled 12/8/4.
+        sched, _, _ = self._two_hits_waiting(seq_factory, num_blocks)
+        _, probed = sched._local_prefill_pending_work()
+        batch, _ = sched.schedule()
+        admitted = batch.total_tokens_num_prefill if batch is not None else 0
+        assert probed == admitted
+
+    def test_probe_skips_prefix_waiters_without_starting_their_wait(
+        self, seq_factory, monkeypatch
+    ):
+        sched, a, b = self._two_hits_waiting(seq_factory, 40)
+        sched._local_prefill_coalescing = True
+        calls = []
+
+        def waits(seq, cached_tokens, *, peek=False):
+            calls.append((seq.id, peek))
+            return seq is a  # admission would park `a` behind a producer
+
+        monkeypatch.setattr(sched, "_wait_for_inflight_prefix", waits)
+        _, probed = sched._local_prefill_pending_work()
+        assert probed == 4  # only `b`'s uncached rows
+        assert calls and all(peek for _, peek in calls)
+        assert sched._inflight_prefix_wait == {}
+
+    def test_probe_leaves_hit_instrumentation_alone(self, seq_factory):
+        sched, a, b = self._two_hits_waiting(seq_factory, 40)
+        for seq in (a, b):
+            seq.num_compressed_hit_blocks = -7
+        sched._local_prefill_pending_work()
+        assert a.num_compressed_hit_blocks == -7
+        assert b.num_compressed_hit_blocks == -7
