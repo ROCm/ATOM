@@ -21,6 +21,8 @@ jobs:
           root = Path('/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG')
           runs = (40706439005, 40732976256)
           jobs = []
+          fs = os.statvfs(root)
+          print('TASK LOG FILESYSTEM AVAILABLE BYTES:', fs.f_bavail * fs.f_frsize, flush=True)
           controller = os.environ.get('SPUR_CONTROLLER_ADDR', '')
           controller_args = ['--controller', controller] if controller else []
           print('EXPLICIT CONTROLLER CONFIGURED:', bool(controller), flush=True)
@@ -31,6 +33,9 @@ jobs:
               print(f'RUN {run}: {len(paths)} log directories', flush=True)
               for directory in paths:
                   print(directory.name, flush=True)
+                  files = [(p.stat().st_size, str(p.relative_to(directory))) for p in directory.rglob('*') if p.is_file()]
+                  print('TASK DIRECTORY TOTAL BYTES:', sum(size for size, _ in files), flush=True)
+                  print('TASK LARGEST FILES:', sorted(files, reverse=True)[:5], flush=True)
                   cell = directory.name.rsplit(f'-{run}-', 1)[0]
                   attempt = 2 if run == 40706439005 else 1
                   job_name = f'{cell}-{run}-{attempt}'
