@@ -2155,6 +2155,15 @@ models:
           env: {common: {ATOMESH_VLLM_MODE: triton_probe}}
 
         - <<: *m31_vllm_pd
+          name: m31-vllm-inspect-triton
+          concurrency: [1]
+          env:
+            common:
+              ATOMESH_VLLM_MODE: inspect
+              ATOMESH_INSPECT_RUN_ID: "40718511511"
+              ATOMESH_INSPECT_CASE: triton-probe
+
+        - <<: *m31_vllm_pd
           name: m31-vllm-inspect-smoke
           concurrency: [1]
           env:

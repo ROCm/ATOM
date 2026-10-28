@@ -19,9 +19,11 @@ out = Path(os.environ['RESULT_DIR']) / 'inspection'
 out.mkdir(parents=True, exist_ok=True)
 # Exact task namespace and Actions ID; only its timestamp suffix is variable.
 case = os.environ.get('ATOMESH_ENV_ATOMESH_INSPECT_CASE', 'smoke')
-if case not in {'smoke', 'validated-sweep'}:
+if case not in {'smoke', 'validated-sweep', 'triton-probe'}:
     raise ValueError('Unknown native experiment case')
 prefix = f'minimax-m3.1-flash-vllm-m31-vllm-1p1d-tp4-mcstore-{case}-mooncake_store-{run_id}-'
+if case == 'triton-probe':
+    prefix = f'minimax-m3.1-flash-vllm-m31-vllm-triton-probe-mooncake_store-{run_id}-'
 runs = [p for p in root.glob(prefix + '*')
         if p.parent.resolve() == root and p.name[len(prefix):].isdecimal()]
 rows = []
@@ -50,6 +52,30 @@ for run in runs:
                'suite_phases': phases,
                'image_preflight_complete': (current / 'image-hardware.json').is_file(),
                'model_snapshot_resolved': (current / 'resolved-experiment.json').is_file()}
+        if case == 'triton-probe':
+            row['triton_cases'] = []
+            summary = job / 'triton-probe/summary.json'
+            if summary.is_file():
+                try:
+                    cases = json.loads(summary.read_text())
+                except json.JSONDecodeError:
+                    cases = []
+                for probe in cases:
+                    if probe.get('case') not in {'default-prefill', 'default-decode',
+                                                  'fresh-prefill', 'fresh-decode'}:
+                        continue
+                    if probe.get('status') not in {'running', 'success', 'failed'}:
+                        continue
+                    entry = {'case': probe['case'], 'status': probe['status']}
+                    result = job / 'triton-probe' / probe['case'] / 'results.json'
+                    if result.is_file():
+                        try:
+                            kernels = json.loads(result.read_text())
+                        except json.JSONDecodeError:
+                            kernels = []
+                        entry['completed_kernels'] = sum(k.get('status') == 'success' for k in kernels)
+                        entry['failed_kernels'] = sum(k.get('status') == 'failed' for k in kernels)
+                    row['triton_cases'].append(entry)
         for role in ('prefill', 'decode', 'proxy', 'mooncake-master'):
             log = current / 'logs' / f'{role}.log'
             row[role + '_log_exists'] = log.is_file()
