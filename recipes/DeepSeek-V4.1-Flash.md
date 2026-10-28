@@ -1,5 +1,10 @@
 # DeepSeek-V4.1-Flash
 
+For the consolidated R13 C256 owner/EP4 configuration, use the [fusedmoe recipe](DeepSeek-V4.1-FusedMoE.md). Its environment and evidence scope supersede the older owner-service experiment recipes.
+
+For a measured high-concurrency deployment using two TP2 replicas on four
+MI355X GPUs, see the [replica recipe](DeepSeek-V4.1-Flash-Replicas.md).
+
 The native text backbone and the paged ModelRunner/Scheduler lifecycle are
 usable. The KV cache is FP8 (`--kv_cache_dtype fp8`, MXFP8 rows attended by
 AITER's `mla_sparse_prefill_v41`); on the BF16 or FP4 pool the original V4
@@ -29,7 +34,7 @@ fixed acceptance length 3.51. For MI455X, see [gfx1250 (MI455X)](#gfx1250-mi455x
 | FP8 (default) or FP4 (`--index_cache_dtype fp4`) index plane, paged scorer, whole-forward target graph | Complete; a decode step is the draft's replay plus the target's, and prefill scores in the plane too |
 | DSpark speculation and accepted-prefix state commit | Fixed-width lifecycle supported at level 0; [quality and throughput acceptance remain incomplete](../docs/deepseek_v41_dspark.md#current-limitations) |
 | Candidate-only indexing, Engram residency and fusion | Partial: Engram UVA/overlap and fusions exist. Visibility-sized scratch, candidate-only Reindex and HBM residency remain |
-| Fused decode (mono) for DSpark verify steps of up to 12 rows and their draft backbone | On by default (`ATOM_MONO_ENABLE`) but currently refused: its MoE kernel still runs MXFP4 activations; see [Fused decode](#fused-decode-mono) |
+| Fused decode (mono), target padded rows ≤48 and draft ≤8 requests | Native TP deployment and step guards apply; R13 owner EP4 refuses the legacy Mono wrappers. See [current architecture and capability table](../docs/dsv41_fusedmoe_architecture.md). |
 | Decoder SWA bounded replay (the decoder on each prompt's last window rows) | On by default (`--no-decoder-swa-bounded-replay`); see [the runtime guide](../docs/deepseek_v41_runtime.md#decoder-swa-bounded-replay) |
 | Encoder SWA bounded replay (no state checkpoints; a hit rebuilds one PAGE) | On by default (`--no-encoder-swa-bounded-replay`); see [the runtime guide](../docs/deepseek_v41_runtime.md#encoder-swa-bounded-replay) |
 | P/D disaggregation (Mooncake) | 1P1D TP2+TP2 validated with DSpark (gsm8k and AgentX c32); MoRI-IO not yet admitted. See [the PD guide](pd_disaggregation_guide.md#deepseek-v41-flash) |
@@ -165,7 +170,7 @@ and top-k at any context length, the sparse decode attention, the output
 projections and their all-reduce, the FFN seam) and then K2b (the MoE and its
 all-reduce) in one launch. Each step width has its own kernel build. The
 compressor and Engram stay on the original modules. The DSpark draft's block
-backbone of up to two requests (its three window-only stages, 5 rows each)
+backbone of up to eight requests (its three window-only stages, 5 rows each)
 runs on the same kernels, after a prefill as after a decode; its LM head and Markov sampler are unchanged. It is on by
 default; `ATOM_MONO_ENABLE=0` turns it off. The deployment it serves and the
 conditions it checks before taking over are listed under `ATOM_MONO_ENABLE` in
@@ -173,10 +178,12 @@ the [environment variable guide](../docs/environment_variables.md); any other
 deployment, and every other target step (prefill, more rows), keeps the
 original path.
 
-The routed experts now take MXFP8 activations on interleaved gate/up rows
-(the checkpoint reference's precision; MXFP4 activations cost ~1.4pp of
-GSM8K at TP4). K2b still reads separated rows with MXFP4 activations, so
-mono refuses every layer until K2b follows, and decode runs the original path.
+Current K2b consumes MXFP8 activations with interleaved gate/up weights. The
+current limits are target padded rows ≤48 and draft ≤8 requests; the actual
+`mono/config.py` and `mono/dispatch.py` are authoritative. R13 attention TP4
+with expert EP4 is refused by the existing Mono deployment contract. The
+measurements below describe the older 2026-09-29/30 implementation, not a
+current R13 Mono ablation or precision acceptance.
 
 Against the original path on the same inputs (`ATOM_MONO_CHECK=1` with
 `--enforce-eager`), every target layer's outputs and the indexer's selection
