@@ -55,6 +55,7 @@ from atom.distributed.pcp_utils import (
     get_pcp_rank,
     get_pcp_world_size,
     pcp_is_enabled,
+    pcp_local_indptr,
     pcp_owned_rows_by_request,
     pcp_pad_dense,
     pcp_pad_indptr,
@@ -388,6 +389,9 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     (same `kv` shared by all 3 ratios; one builder pass)."""
     kv_indptr_extend: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
+    paged_prefill_indptr_cpu: dict[str, np.ndarray] | None = None
+    """Host copies of the four `kv_indptr_*` above, keyed by field name. PCP
+    reindexes from these, so it never reads the GPU copies back."""
 
 
 class DeepseekV4Backend(AttentionBackend):
@@ -2868,10 +2872,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # on its own pcp pad). Either way the divisor is pcp_size.
         padded_total = pcp_pad_len(total_tokens, pcp_size)
         n_pad = padded_total - total_tokens
-        # This rank's round-robin queries, generated on the GPU.
+        # This rank's round-robin queries, on the GPU and on the host.
         owned_q = torch.arange(get_pcp_rank(), padded_total, pcp_size, device=device)
+        owned_cpu = np.arange(get_pcp_rank(), padded_total, pcp_size)
 
         # --- ragged per-query buffers: pad indptr to padded_total, then 1/W ---
+        indptr_cpu = attn_metadata.paged_prefill_indptr_cpu
+        local_indptr_cpu = {}
         for ind_attr, idx_attr in (
             ("kv_indptr_prefix_swa", "kv_indices_prefix_swa"),
             ("kv_indptr_prefix_csa", "kv_indices_prefix_csa"),
@@ -2883,9 +2890,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if indptr is None or indices is None:
                 continue
             indptr = pcp_pad_indptr(indptr, n_pad)  # dummy queries: 0-length KV
-            new_indptr, new_indices = pcp_reindex_ragged(indptr, indices, owned_q)
+            local_cpu = pcp_local_indptr(indptr_cpu[ind_attr], owned_cpu)
+            new_indptr, new_indices = pcp_reindex_ragged(
+                indptr, indices, owned_q, local_cpu
+            )
             setattr(attn_metadata, ind_attr, new_indptr)
             setattr(attn_metadata, idx_attr, new_indices)
+            local_indptr_cpu[ind_attr] = local_cpu
+        attn_metadata.paged_prefill_indptr_cpu = local_indptr_cpu
 
         # --- dense per-token fields: pad then round-robin-slice to 1/W ---
         if attn_metadata.skip_prefix_len_csa is not None:
@@ -3184,6 +3196,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # ---- per-token DSV4 fields sliced by the GLOBAL token range [gts,gte) ----
         owned = torch.arange(gts, gte, device=device)
+        owned_cpu = np.arange(gts, gte)
+        ub.paged_prefill_indptr_cpu = {}
         for ind_attr, idx_attr in (
             ("kv_indptr_prefix_swa", "kv_indices_prefix_swa"),
             ("kv_indptr_prefix_csa", "kv_indices_prefix_csa"),
@@ -3194,7 +3208,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             indices = getattr(src, idx_attr, None)
             if indptr is None or indices is None:
                 continue
-            ni, nx = pcp_reindex_ragged(indptr, indices, owned)
+            local_cpu = pcp_local_indptr(
+                src.paged_prefill_indptr_cpu[ind_attr], owned_cpu
+            )
+            ni, nx = pcp_reindex_ragged(indptr, indices, owned, local_cpu)
+            ub.paged_prefill_indptr_cpu[ind_attr] = local_cpu
             # kv_indices_extend are ROW offsets into the per-fwd kv_full tensor.
             # In the full metadata they index the WHOLE sequence's kv_full [0,T);
             # for this group kv_full only holds the group's tokens (global order
@@ -3856,6 +3874,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indptr_prefix_csa = csa_indptr
         attn_metadata.kv_indices_prefix_hca = hca_indices[:hca_total]
         attn_metadata.kv_indptr_prefix_hca = hca_indptr
+        attn_metadata.paged_prefill_indptr_cpu = {
+            "kv_indptr_extend": ext_indptr_np,
+            "kv_indptr_prefix_swa": swa_indptr_np,
+            "kv_indptr_prefix_csa": csa_indptr_np,
+            "kv_indptr_prefix_hca": hca_indptr_np,
+        }
         attn_metadata.skip_prefix_len_csa = skip_csa_gpu
         attn_metadata.envelope_rows = envelope_rows
 

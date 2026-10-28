@@ -12,11 +12,13 @@ Groups:
   * draft prefill split  --- `_pcp_split_draft_inputs`
   * row ownership        --- `pcp_round_robin_split` vs `pcp_round_robin_query_indices`
   * metadata padding     --- `pcp_pad_dense` vs `pcp_pad_indptr`
-  * ragged reindex       --- `pcp_reindex_ragged`
+  * ragged reindex       --- `pcp_reindex_ragged`, `pcp_local_indptr`
+  * grouped gather       --- `pcp_allgather_rerange_many`
 """
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from import_guard import skip_if_dependency_missing
 
@@ -147,6 +149,18 @@ def test_ownership_partitions_every_row_exactly_once(monkeypatch):
     assert sorted(seen) == list(range(n_global))
 
 
+@pytest.mark.parametrize("rows_per_rank", [1, 2])
+def test_split_shards_have_unit_strides(rows_per_rank):
+    """A one-row shard counts as contiguous at any stride, but aiter's
+    cached-positions RoPE checks `positions.view(1, n).stride(1) == 1` itself
+    and aborts: a 2-token chunk under PCP8 leaves every rank one row."""
+    n = rows_per_rank * WS
+    pos = pu.pcp_round_robin_split(torch.arange(n), WS, 1)
+    hid = pu.pcp_round_robin_split(torch.zeros(n, HID), WS, 1)
+    assert pos.stride() == (1,) and pos.view(1, -1).stride(1) == 1
+    assert hid.stride() == (HID, 1)
+
+
 def test_pad_len_rounds_up_to_a_pcp_multiple():
     assert pu.pcp_pad_len(10, 4) == 12
     assert pu.pcp_pad_len(12, 4) == 12  # already aligned, no growth
@@ -204,12 +218,17 @@ def _ragged(lens):
     return indptr, indices
 
 
+def _reindex(kv_indptr, kv_indices, owned):
+    local = pu.pcp_local_indptr(kv_indptr.numpy(), owned.numpy())
+    return pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned, local)
+
+
 @pytest.mark.parametrize("lens", [[2, 3, 1, 4, 0, 2], [1, 1, 1, 1], [0, 0, 5, 0]])
 @pytest.mark.parametrize("rank,ws", [(0, 2), (1, 2), (2, 3)])
 def test_reindex_ragged_preserves_each_owned_segment(lens, rank, ws):
     kv_indptr, kv_indices = _ragged(lens)
     owned = pu.pcp_round_robin_query_indices(len(lens), ws, rank)
-    ip_local, idx_local = pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned)
+    ip_local, idx_local = _reindex(kv_indptr, kv_indices, owned)
 
     assert ip_local.shape[0] == owned.shape[0] + 1
     assert int(ip_local[0]) == 0
@@ -223,9 +242,99 @@ def test_reindex_ragged_handles_an_all_empty_shard():
     # every owned query has a zero-length segment -> the `total == 0` fast path
     kv_indptr, kv_indices = _ragged([0, 3, 0, 4])
     owned = torch.tensor([0, 2], dtype=torch.long)  # both empty
-    ip_local, idx_local = pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned)
+    ip_local, idx_local = _reindex(kv_indptr, kv_indices, owned)
     assert ip_local.tolist() == [0, 0, 0]
     assert idx_local.numel() == 0
+
+
+def test_reindex_ragged_reads_nothing_back_from_the_device(monkeypatch):
+    """The output is sized from the host indptr. A readback here would block
+    the host until the GPU drains, for every ragged field of every prefill."""
+    kv_indptr, kv_indices = _ragged([2, 3, 1, 4, 0, 2])
+    owned = torch.tensor([1, 3, 5], dtype=torch.long)
+    local = pu.pcp_local_indptr(kv_indptr.numpy(), owned.numpy())
+
+    def readback(*args, **kwargs):
+        raise AssertionError("read a device value back")
+
+    for name in ("item", "tolist", "__int__"):
+        monkeypatch.setattr(torch.Tensor, name, readback)
+    ip_local, idx_local = pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned, local)
+    monkeypatch.undo()
+    assert ip_local.tolist() == [0, 3, 7, 9]
+    assert idx_local.tolist() == [102, 103, 104, 106, 107, 108, 109, 110, 111]
+
+
+@pytest.mark.parametrize("ws", [2, 3, 8])
+def test_local_indptr_sums_exactly_the_owned_segments(ws):
+    """Strided (a rank's share, padding queries past the end keep nothing) and
+    contiguous (a TBO request group) ownership alike."""
+    rng = np.random.default_rng(ws)
+    for _ in range(25):
+        lens = rng.integers(0, 6, size=int(rng.integers(1, 30)))
+        indptr = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+        padded = pu.pcp_pad_len(len(lens), ws)
+        lo, hi = sorted(int(v) for v in rng.integers(0, len(lens) + 1, size=2))
+        ownerships = [np.arange(r, padded, ws) for r in range(ws)]
+        for owned in ownerships + [np.arange(lo, hi)]:
+            want = np.cumsum([0] + [lens[q] if q < len(lens) else 0 for q in owned])
+            assert pu.pcp_local_indptr(indptr, owned).tolist() == want.tolist()
+
+
+def _bytes(t):
+    return t.contiguous().view(torch.uint8)
+
+
+class _FakePcpGroup:
+    """One process standing in for every PCP rank: a gather returns, per
+    tensor, the rank-major concatenation of what each rank would pass in
+    (`shards[rank][i]`), and is recorded. Like aiter's PyNCCL fallback, it
+    takes only the dtypes NCCL has."""
+
+    def __init__(self, shards, rank):
+        self.shards, self.rank, self.calls = shards, rank, []
+        self.device_communicator = self
+
+    def all_gatherv(self, inputs, dim=0, sizes=None):
+        from aiter.dist.device_communicators.pynccl_wrapper import ncclDataTypeEnum
+
+        assert dim == 0 and sizes is None
+        self.calls.append(len(inputs))
+        for i, t in enumerate(inputs):
+            ncclDataTypeEnum.from_torch(t.dtype)
+            assert torch.equal(_bytes(t), _bytes(self.shards[self.rank][i]))
+        return [
+            torch.cat([s[i].view(t.dtype) for s in self.shards])
+            for i, t in enumerate(inputs)
+        ]
+
+    def all_gather(self, x, dim=0):
+        (out,) = self.all_gatherv([x], dim)
+        return out
+
+
+@pytest.mark.parametrize("ws", [2, 4, 8])
+def test_grouped_gather_restores_every_tensor_in_one_collective(monkeypatch, ws):
+    """The extend K (fp8 bytes + bf16 RoPE tail) and its positions travel in
+    one collective, and each comes back in global token order."""
+    n = 5 * ws
+    fulls = [
+        torch.randint(0, 255, (n, 1, 8), dtype=torch.uint8).view(torch.float8_e4m3fn),
+        torch.randn(n, 1, 4).to(torch.bfloat16),
+        torch.arange(n, dtype=torch.int64) + 100,
+    ]
+    shards = [[pu.pcp_round_robin_split(t, ws, r) for t in fulls] for r in range(ws)]
+    for rank in range(ws):
+        group = _FakePcpGroup(shards, rank)
+        monkeypatch.setattr(pu, "get_pcp_group", lambda g=group: g)
+        got = pu.pcp_allgather_rerange_many(shards[rank], ws)
+        assert group.calls == [len(fulls)]
+        for g, f in zip(got, fulls):
+            assert g.dtype == f.dtype and torch.equal(_bytes(g), _bytes(f))
+        # The single-tensor gather restores the same order.
+        group = _FakePcpGroup([[s[2]] for s in shards], rank)
+        monkeypatch.setattr(pu, "get_pcp_group", lambda g=group: g)
+        assert torch.equal(pu.pcp_allgather_rerange(shards[rank][2], ws), fulls[2])
 
 
 def test_needs_id_sync_is_one_predicate_for_both_groups():
