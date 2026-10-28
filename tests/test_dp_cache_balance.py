@@ -11,6 +11,8 @@ from atom.model_engine.dp_cache_balance import (
     CacheBalanceConfig,
     CacheBalancer,
     Placement,
+    PrefixHint,
+    Session,
 )
 
 
@@ -308,6 +310,10 @@ class BalanceTest(unittest.TestCase):
             {"max_sessions": 1.1},
             {"prepare_timeout_seconds": 0},
             {"min_gain_ratio": 1},
+            {"decode_balance_tolerance_ratio": 1},
+            {"decode_balance_tolerance_ratio": -0.01},
+            {"decode_balance_tolerance_ratio": True},
+            {"decode_balance_tolerance_ratio": float("nan")},
             {"prefill_tokens_per_second": float("nan")},
             {"typo": 1},
         ):
@@ -378,6 +384,94 @@ class DecodeBalanceTest(unittest.TestCase):
         scores = self.b._decode_placement_scores(1000, [0, 3])
         self.assertEqual(scores[0], 0)
         self.assertGreater(scores[1], 0)
+
+
+class DecodeToleranceTest(unittest.TestCase):
+    def make_balancer(self, *, counts=(64, 63), contexts=(6400000, 6450000), **cfg):
+        balancer = CacheBalancer(
+            2, CacheBalanceConfig.parse({"checkpoint_tokens": 128, **cfg})
+        )
+        for rank, (count, context) in enumerate(zip(counts, contexts)):
+            for index in range(count):
+                length = context // count + (index < context % count)
+                balancer.requests[rank, index] = Placement(rank, length, None, None)
+        balancer.sessions["s"] = Session(
+            owner=0, hints={0: PrefixHint(262144, 128, -1, 2047, 1)}
+        )
+        return balancer
+
+    def place(self, balancer, *, counts=(64, 63), tokens=(1000000, 0)):
+        return balancer.place(
+            "move", "s", 262145, chain(262145), counts, tokens, 2, can_migrate=True
+        )
+
+    def test_small_context_increase_can_relieve_prefill_without_growing_peak_batch(
+        self,
+    ):
+        balancer = self.make_balancer()
+        scores = balancer._decode_placement_scores(262145, [64, 63])
+        self.assertGreater(scores[1], scores[0])
+        placement = self.place(balancer)
+        self.assertEqual((placement.source, placement.rank), (0, 1))
+        self.assertTrue(placement.migration)
+        self.assertEqual(balancer.counters["migration_decode_balance_tolerated"], 1)
+        # The tolerance changes placement only; residency must still be ACKed.
+        self.assertEqual(balancer.sessions["s"].owner, 0)
+        self.assertFalse(balancer.admitted("move", 1, placement.migration, 131072, 3))
+        self.assertEqual(balancer.sessions["s"].owner, 0)
+        self.assertTrue(balancer.admitted("move", 1, placement.migration, 262144, 4))
+        self.assertEqual(balancer.sessions["s"].owner, 1)
+
+    def test_zero_tolerance_restores_strict_guard(self):
+        balancer = self.make_balancer(decode_balance_tolerance_ratio=0)
+        self.assertEqual(self.place(balancer).rank, 0)
+        self.assertEqual(balancer.counters["migration_decode_balance_rejected"], 1)
+        self.assertEqual(balancer.counters["migration_decode_balance_tolerated"], 0)
+
+    def test_context_limit_cannot_be_paid_for_by_lower_batch_size(self):
+        balancer = self.make_balancer(contexts=(6400000, 6500000))
+        self.assertEqual(self.place(balancer).rank, 0)
+        self.assertEqual(balancer.counters["migration_decode_balance_rejected"], 1)
+
+    def test_batch_limit_cannot_be_paid_for_by_balanced_context(self):
+        balancer = self.make_balancer(counts=(63, 64), contexts=(6400000, 6400000))
+        self.assertEqual(self.place(balancer, counts=(63, 64)).rank, 0)
+        self.assertEqual(balancer.counters["migration_decode_balance_rejected"], 1)
+
+    def test_tolerance_does_not_bypass_time_gain_or_cooldown(self):
+        for config in ({"min_gain_seconds": 100}, {"min_gain_ratio": 0.999}):
+            with self.subTest(config=config):
+                balancer = self.make_balancer(**config)
+                self.assertEqual(self.place(balancer).rank, 0)
+                self.assertEqual(
+                    balancer.counters["migration_decode_balance_tolerated"], 0
+                )
+        balancer = self.make_balancer()
+        balancer.sessions["s"].last_migration = 1
+        self.assertEqual(self.place(balancer).rank, 0)
+        self.assertEqual(balancer.counters["migration_decode_balance_tolerated"], 0)
+
+    def test_failed_tolerated_migration_preserves_existing_fallback(self):
+        balancer = self.make_balancer()
+        placement = self.place(balancer)
+        generation = placement.migration
+        self.assertTrue(generation)
+        self.assertEqual(balancer.retry("move", 1, generation, 3), 0)
+        self.assertFalse(balancer.admitted("move", 1, generation, 262144, 4))
+        self.assertEqual(balancer.sessions["s"].owner, 0)
+
+    def test_tolerance_boundary_and_unrelated_busy_rank(self):
+        balancer = self.make_balancer()
+        self.assertTrue(
+            balancer._within_decode_tolerance(0, 1, 1, [99, 100], [1000, 1000])
+        )
+        self.assertFalse(
+            balancer._within_decode_tolerance(0, 1, 1, [98, 99], [1000, 1000])
+        )
+        balancer = CacheBalancer(3, CacheBalanceConfig())
+        self.assertFalse(
+            balancer._within_decode_tolerance(0, 1, 1, [1, 2, 1000], [10, 20, 10000])
+        )
 
 
 class AdmissionHarness(DPCacheAdmission):

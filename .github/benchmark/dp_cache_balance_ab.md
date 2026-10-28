@@ -27,11 +27,53 @@ must include the LMCache MP CLI with native PAGE/STATE object-group support.
 
 The opt-in helper starts LMCache inside each benchmark container before ATOM
 and waits for its engine health check. Container teardown also stops LMCache.
+It passes `--max-gpu-workers 2` so the two DP GPU clients can use separate
+STORE/RETRIEVE handler threads. Override
+`ATOM_BENCHMARK_LMCACHE_GPU_WORKERS` with a positive integer to change that
+count; CPU handler workers retain LMCache's default. This uses the dependency's
+existing affinity pool and requires no LMCache source patch.
 The usual benchmark bundles contain TTFT, ITL, token throughput and errors;
 `atom-cache-diagnostics-*` adds the LMCache log/status and final DP router
 counters. These final counters include warmup and are not profiling-only
 deltas. The two cells may run on different dedicated CI hosts, so host effects
 remain a limitation of a single A/B run.
+
+## GPU handler workers and guard audit (2026-10-28 UTC)
+
+A separate simultaneous 900-second run compared one versus two LMCache GPU
+handler workers, with the strict decode guard unchanged. Both used attention
+DP2 / MoE TP2, c128, fixed AL=3.51 with synthetic acceptance, memory 0.95,
+main-compatible graph/replay settings, SA393/seed42 and the same source/runtime.
+These settings differ from the earlier real-acceptance comparison below.
+
+| Metric | 1 GPU worker | 2 GPU workers | Change |
+| --- | ---: | ---: | ---: |
+| Output tokens/s/GPU | 1521.44 | 1522.01 | +0.04% |
+| Total tokens/s/GPU | 177569.78 | 180238.44 | +1.50% |
+| Mean TTFT | 1190.09 ms | 1113.24 ms | -6.46% |
+| P99 TTFT | 9398.56 ms | 6322.01 ms | -32.73% |
+| Mean ITL | 26.47 ms | 26.74 ms | +1.05% |
+
+Throughput uses successful profiling-record tokens over the request span,
+929.485/928.646 seconds, divided by two GPUs. Total includes cached input.
+Both clients exited zero; successful profiling requests were 3347/3434, with
+0/1 exported errors (one connection reset in the two-worker arm). Among3316
+matched successful requests, mean TTFT improved4.71% and mean ITL increased1.80%.
+This single run shows a TTFT benefit, not a measured decode-throughput gain.
+
+All numeric decision-audit events were collected. The two-worker arm rejected
+516 formal-window migration candidates:334 had a target no lighter in either
+request count or initial-prompt-context proxy,122 traded more requests for less
+context, and60 traded fewer requests for more context. Of the516,198 had a joint
+score gap of at most5%;34 would increase neither peak load proxy by more than1%.
+These subsets overlap the preceding categories. The34 had predicted TTFT gain
+median0.392s and mean0.577s; those are uncalibrated predictions, not measured
+savings. The earlier498 rejected candidates had no individual audit records.
+
+The new1% per-dimension tolerance targets this narrow subset. Setting
+`decode_balance_tolerance_ratio=0` restores the strict guard used for both arms
+in this table. The tolerance's performance has not yet been measured. It changes
+ATOM placement only; LMCache transfer code and prefix-recovery checks are unchanged.
 
 ## Incremental routing comparison (2026-10-27 UTC)
 
