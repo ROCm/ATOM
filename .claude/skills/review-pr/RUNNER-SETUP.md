@@ -1,6 +1,6 @@
 # Runner setup — atom-review-bot
 
-The `@rocm-atom-bot review` workflow (`.github/workflows/atom-review-bot.yml`) runs on a
+The `atom-bot review` workflow (`.github/workflows/atom-review-bot.yml`) runs on a
 self-hosted runner labeled `atom-bot-24`, on host `srdc-24`. This is what that runner must
 provide. Verify the box with `bash .claude/skills/review-pr/preflight.sh` — it checks every item
 below and prints a fix hint for each red. This doc explains how to make those checks pass.
@@ -38,7 +38,7 @@ logged in directly (SSH or console), not from inside this or any other agent con
 
 The reason this matters more than it looks: a runner process started by hand inside a container
 dies the moment that container stops or is rebuilt, and nothing reports it. GitHub does not see
-a crashed runner as a failure — it sees no runner, so the next `@rocm-atom-bot review` job just
+a crashed runner as a failure — it sees no runner, so the next `atom-bot review` job just
 sits in `queued` forever. That state fails nothing, notifies nobody, and looks from the PR like
 "review still in progress," not "broken." aiter's own box lost its runner to a plain reboot this
 same way and sat silently offline for days before anyone noticed. A systemd unit on the host,
@@ -175,7 +175,7 @@ cd /mnt/raid0/zufa/atom-bot-work && bash .claude/skills/review-pr/preflight.sh; 
 ```
 
 All green except one expected warning (no `ATOM_BOT_TOKEN` yet — see section 4) means
-`@rocm-atom-bot review` can run end to end. `preflight.sh` also runs `selftest.sh`, which holds
+`atom-bot review` can run end to end. `preflight.sh` also runs `selftest.sh`, which holds
 `run_one.sh` to its guards (timeout routes to `flow` rather than paging the model owner, an
 attempt that cannot fit the run budget is refused, a refuter timeout still publishes the card
 only by admitting it) — run it directly to see which guard broke if it's red:

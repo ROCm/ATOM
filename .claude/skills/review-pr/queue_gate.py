@@ -114,7 +114,7 @@ def message(verdict, ahead, eta, owner):
             "wedged; both need the same thing, a look at the box.\n\n"
             "This request was **not queued**, because a job queued behind a stopped runner is "
             "cancelled after 24 h without a word.\n\n"
-            "@%s — please check the runner, then re-comment `@rocm-atom-bot review`.\n\n"
+            "@%s — please check the runner, then re-comment `atom-bot review`.\n\n"
             "<sub>See `.claude/skills/review-pr/RUNNER-SETUP.md` section 5.</sub>"
             % (ahead, _hours(eta), owner))
     if verdict == "too-deep":
@@ -123,7 +123,7 @@ def message(verdict, ahead, eta, owner):
             "(roughly %s of work ahead).\n\n"
             "This request was **not queued**: a job that waits more than 24 h is cancelled "
             "silently, so saying no now is better than losing it later.\n\n"
-            "Re-comment `@rocm-atom-bot review` once the queue is shorter."
+            "Re-comment `atom-bot review` once the queue is shorter."
             % (ahead, _hours(eta)))
     return ("**rocm-atom-bot** — queued behind %d review(s); expect to start in about %s. "
             "The box reviews one PR at a time." % (ahead, _hours(eta)))

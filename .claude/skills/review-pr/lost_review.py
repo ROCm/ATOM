@@ -43,7 +43,7 @@ def body(result, owner, run_url):
         "\u2014 a runner that lost contact mid-review and a card that could not be published "
         "both end up here. Nothing is wrong with this PR, and nothing on it was changed.\n\n"
         "@%s \u2014 the run below has the cause.%s\n\n"
-        "<sub>Re-comment `@rocm-atom-bot review` to try again.</sub>"
+        "<sub>Re-comment `atom-bot review` to try again.</sub>"
         % (result, owner, ("\n\nRun: " + run_url) if run_url else ""))
 
 

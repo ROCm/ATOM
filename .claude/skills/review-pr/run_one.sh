@@ -4,7 +4,7 @@
 # triage.py). Pure GLM on the box (claude-glm), no claude-mix. Publishing is a separate step
 # (_publish.py); this script does not publish.
 #
-# This is the backend of the @rocm-atom-bot review workflow, and can also be run by hand.
+# This is the backend of the atom-bot review workflow, and can also be run by hand.
 #
 # ⚠️ Must run in a plain terminal / the runner, NOT inside an auto-mode Claude session — the
 #    auto-mode classifier blocks a headless sub-agent launched with

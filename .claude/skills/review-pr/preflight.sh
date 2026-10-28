@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runner preflight self-check: run once after the runner is installed to confirm the
-# environment a PR review needs is present. All green = @rocm-atom-bot review runs end to end
+# environment a PR review needs is present. All green = atom-bot review runs end to end
 # on trigger. Fix any red per its hint. Read-only, changes nothing.
 #   bash .claude/skills/review-pr/preflight.sh
 # Run it as the same user the runner runs as (claude-glm config is per-user).
@@ -90,5 +90,5 @@ else
 fi
 
 echo "=== $ok green / $bad red ==="
-[ "$bad" -eq 0 ] && echo "runner ready: @rocm-atom-bot review can run end to end." || echo "fix the red items before triggering."
+[ "$bad" -eq 0 ] && echo "runner ready: atom-bot review can run end to end." || echo "fix the red items before triggering."
 exit "$bad"

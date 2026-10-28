@@ -138,7 +138,7 @@ def stuck_body(mins, owner):
         "process is probably not running on the box — see "
         "`.claude/skills/review-pr/RUNNER-SETUP.md` section 5.\n\n"
         "@%s — please check the runner.\n\n"
-        "<sub>A queued job expires after 24 h. Re-comment `@rocm-atom-bot review` once it is "
+        "<sub>A queued job expires after 24 h. Re-comment `atom-bot review` once it is "
         "back.</sub>" % (mins, owner))
 
 

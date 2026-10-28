@@ -1,14 +1,21 @@
-# atom-review-bot — on-demand PR review triggered by an `@rocm-atom-bot review` comment.
+# atom-review-bot — on-demand PR review triggered by an `atom-bot review` comment.
 # Native issue_comment trigger, no polling and no local daemon.
 #
 # Install at ROCm/ATOM as .github/workflows/atom-review-bot.yml and merge to the default
 # branch (issue_comment workflows only run from the definition on the default branch).
 #
 # Trigger (an authorized ATOM reviewer comments on a PR):
-#   @rocm-atom-bot review   reviews the PR. Comment again after pushing fixes for a fresh pass —
+#   atom-bot review   reviews the PR. Comment again after pushing fixes for a fresh pass —
 #                       a new head SHA is reviewed, repeats on the same SHA are deduped, so this
 #                       one command covers both the first pass and repeat passes.
-# Commands inside quote (`>`) lines do not trigger; non-allowlisted commenters are ignored.
+#                   No `@` — the bot's account is `rocm-atom-bot`, and GitHub notifies on an
+#                   `@handle` regardless of what we document, so the documented form is written
+#                   to not carry one. Writing `@rocm-atom-bot review` out of habit still works
+#                   (the bare phrase is a substring of it) and still notifies that account —
+#                   that is GitHub's doing, not this workflow's, the moment the comment is sent.
+# Commands inside quote (`>`) lines do not trigger, and the bare phrase must open the line (after
+# trimming leading whitespace) so it cannot fire from inside ordinary prose, a quoted log or a
+# code block; non-allowlisted commenters are ignored.
 #
 # Two jobs so an unauthorized comment never touches the self-hosted box:
 #   gate    (ubuntu-latest, free): quote-aware trigger + allowlist check, reading
@@ -42,7 +49,7 @@ jobs:
     if: >
       github.event.issue.pull_request &&
       github.event.comment.user.login != 'rocm-atom-bot' &&
-      contains(github.event.comment.body, '@rocm-atom-bot review')
+      contains(github.event.comment.body, 'atom-bot review')
     runs-on: ubuntu-latest
     # A few API calls and, on the rare stalled-queue path, one 60s pause. Without this the
     # default is six hours, which is a long time to hold a runner because an API call hung.
@@ -65,11 +72,16 @@ jobs:
           script: |
             const body = context.payload.comment.body || '';
             const who = (context.payload.comment.user.login || '').toLowerCase();
-            // real trigger: line-based, skip quote (>) lines
+            // real trigger: line-based, skip quote (>) lines. The bare phrase must open the
+            // (trimmed) line -- unlike an @-mention it can otherwise appear mid-sentence, in a
+            // quoted log, or inside a code block, none of which is a review request.
+            // An optional leading @ (and rocm- prefix) is still accepted, so habit still works:
+            // '@rocm-atom-bot review' and '@atom-bot review' both contain 'atom-bot review'.
             let trig = false;
             for (const raw of body.split('\n')) {
-              if (raw.replace(/^\s+/, '').startsWith('>')) continue;
-              if (/@rocm-atom-bot\s+review\b/i.test(raw)) { trig = true; break; }
+              const line = raw.replace(/^\s+/, '');
+              if (line.startsWith('>')) continue;
+              if (/^@?(?:rocm-)?atom-bot\s+review\b/i.test(line)) { trig = true; break; }
             }
             // allowlist: the repo var wins, else authorized.txt from the default branch
             let allow = new Set();

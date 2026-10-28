@@ -83,7 +83,7 @@ def main():
             f"framework (@{owner_for('atom')}); if the box, GPU, disk or network is unhealthy "
             f"it may be the machine (@{owner_for('machine')}).</sub>"
         )
-    body += "\n\nRe-comment `@rocm-atom-bot review` once it is resolved."
+    body += "\n\nRe-comment `atom-bot review` once it is resolved."
 
     tok = os.environ.get("ATOM_BOT_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
