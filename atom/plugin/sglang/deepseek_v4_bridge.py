@@ -514,6 +514,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # keep both False while still exposing the ABI.
         self._unified_kv = False
         self._unified_kv_fp8 = False
+        # 0.5.22 chooses the SWA allocator from this flag. ATOM keeps the
+        # paged SWA bookkeeping path, so the flag stays on.
+        self.needs_paged_swa_allocator = True
         self.unified_kv_pool = None
         self.c4_kv_pool = None
         self.c128_kv_pool = None

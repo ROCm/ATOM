@@ -737,6 +737,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             prefix_lens=forward_batch.extend_prefix_lens,
             encoder_lens=forward_batch.encoder_lens,
             spec_info=None,
+            plan=getattr(forward_batch, "kv_loc_plan", None),
         )
         max_q_len = self._max_len(
             forward_batch.extend_seq_lens_cpu,
@@ -883,6 +884,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             forward_batch.extend_seq_lens.max().item(),
             forward_batch.seq_lens.max().item(),
             spec_info=None,
+            plan=getattr(forward_batch, "kv_loc_plan", None),
         )
 
         max_q_len = self.mla_indices_updater_prefill.max_q_len
@@ -962,6 +964,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             forward_batch.extend_prefix_lens,
             encoder_lens=forward_batch.encoder_lens,
             spec_info=None,
+            plan=getattr(forward_batch, "kv_loc_plan", None),
         )
         self.forward_metadata = ForwardMetadata(
             self.indices_updater_prefill.kv_indptr,
