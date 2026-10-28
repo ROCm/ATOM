@@ -149,3 +149,9 @@ R3每次独立服务的总墙钟约748秒，其中正式生成约301秒，约447
 | 16315 | 2.841735005 | 2.827955484 | 1.004873× | 13.78 μs |
 
 两对均正向；owner相对L2分别为0.000245–0.000325与0.000196–0.000267，与Native自重复同量级。`quant_pool/REVIEW.json`保存逐rank与原始记录。该实现仍是严格部署下的验证代码，直接依赖communicator私有pool，尚无所有生产调用者的显式借用合同或整网验收，因此**不晋级生产**，也不继承上一版GSM结果。下一架构边界应将norm→量化→通信暂存的owner、stream和最后读者统一，而不是把私有pool指针散布到各层；大GEMM及原生同步保持原样。本轮不再重复整网验收这个仅单层微收益的原型。
+
+## 7. 下一轮详细方案
+
+[大 prefill 输入融合：从原生 Mega-MHC 直达专家消费布局](dsv41_prefill_input_fusion_plan.md) 已给出下一轮设计。首版使用 AITER 现有 external input registration，将 Q/scale 写入专用 arena；随后复用 Mega-MHC 的 BF16 norm＋MXFP8 输出能力，删除独立量化对 norm 的重读。保留 BF16 router、完整 M 的原生 shared/G1/G2 与本轮输出融合。
+
+外部注册路线、FFN fused producer、mutation/graph ABI 和整网增益均尚未实现或验收。新方案明确精确指针注册、communicator 生命周期、同 stream 复用、20.625 MiB/rank 的发送容量，以及包含 producer 的完整计时窗；也说明修改 traced producer 后，当前只切换 eager 出口的单次加载脚本需要怎样扩展。本文已有数字不变，不能据此为新设计计入收益。

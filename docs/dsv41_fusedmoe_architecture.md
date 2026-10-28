@@ -2,13 +2,13 @@
 
 本方案的目标是减少真实消费者之间的重复计算、HBM 往返和跨卡传输，并把依赖交接留在设备端。融合边界由数据所有权、数值语义和可调度性决定。不能用合并文件、少几个 launch、单个 GEMM 更快或换专家布局代替完整链路目标。
 
-本轮先收敛 R13 性能候选、运行入口和代码分支，再实施清理。下文的大并发融合是架构方案，尚未实现；不会因该方案修改已测算术、同步或调度参数。
+R13/C5 性能候选、运行入口和分支已收敛到锁定主线；大 M 的 shared add＋ragged padding 输出融合也已完成整网与 GSM8K 验收。后续输入链、块完成发布和更深归约融合仍是设计，不能与已实现部分混算收益。下一轮的具体接口、缓冲生命周期、搬运账本和验证顺序见 [大 prefill 输入融合方案](dsv41_prefill_input_fusion_plan.md)。
 
 ## 1. 基线与证据边界
 
 当前交付基于本轮开始时锁定的 `origin/main = ebd5f84f3`，将运行实现、统一入口、部署与架构文档整理成线性主题提交。旧 merge 和开发分支已经退出当前分支历史；22 个旧 worktree、10 个本地分支的源码与修改保存在项目验证目录的 `WORKTREE_ARCHIVE.json` 及对应 Git 归档引用中。
 
-rebase 后的 **C5** 已完成 ABBA（保留同一新主线的 C4 A1，修复后运行 B1/B2/A2）：主线 **5741.094198**、候选 **7603.533722** 输出 tok/s，**1.324404976×**；平均 TPOT **42.541209→31.636498 ms**。两对 **1.315218× / 1.333702×**，候选 B2/B1 为 **1.012029851**，主线 A2/A1 为 **0.998004086**。受测提交 `fc4da1513`；四臂各 593 warm / 2560 formal，输入 18,859,319、输出 2,357,150 token，正式新增 JIT/图捕获为零，完整图键保留。主线 Spec0、候选 DSpark5，这是完整服务组合收益；本轮没有新的 GSM8K 整网精度验收。
+rebase 后的 **C5** 已完成 ABBA（保留同一新主线的 C4 A1，修复后运行 B1/B2/A2）：主线 **5741.094198**、候选 **7603.533722** 输出 tok/s，**1.324404976×**；平均 TPOT **42.541209→31.636498 ms**。两对 **1.315218× / 1.333702×**，候选 B2/B1 为 **1.012029851**，主线 A2/A1 为 **0.998004086**。受测提交 `fc4da1513`；四臂各 593 warm / 2560 formal，输入 18,859,319、输出 2,357,150 token，正式新增 JIT/图捕获为零，完整图键保留。主线 Spec0、候选 DSpark5，这是完整服务组合收益；C5 当时未做新的 GSM8K。后续输出版的全量 GSM8K 已完成，配置与证据见第 6 节及 [实测记录](dsv41_wide_output_findings.md)。
 
 | 臂 | 输出 tok/s | 平均 TPOT ms | P99 TPOT ms | 实际 C256 q |
 |---|---:|---:|---:|---:|
@@ -71,7 +71,7 @@ Token-owner变体只把部分结果发给真正的owner；K1可接下一层的�
 
 小M的独立算子很短，启动、归约和阶段交接占比容易变大；按token或少量被选专家的任务表可在固定驻留CTA中运行。现有公共执行模型为MI355X的256 CTA、512线程、每CU一个CTA，设备端等待以所有生产者可驻留为前提。合并K2还复用两个阶段的LDS空间，且保留阶段间barrier。
 
-当前服务使用 FULL graph，多个原生 kernel 的 host launch 开销已经被压缩。因此后续不能按少了几个 launch 估算收益；应在相同 graph 模式下比较 HBM 物化、跨卡字节、设备调度、producer 等待和同步的完整净费用。
+当前服务配置包含 FULL decoder graph，已捕获路径的 host launch 开销被压缩；这不代表所有大 prefill 算子都在图内。后续单次加载实验已确认受测的大 prefill FFN 出口是 eager seam。因此应按实际 eager/capture/replay 分别比较 HBM 物化、跨卡字节、设备调度与同步，不能仅按配置名或少了几个 launch 估算收益。
 
 源码说明M>48时，部分TP形状的shared任务超过现有CTA分配，K1/K2出现寄存器压力/溢出风险。这是结构约束。把MAX_ROWS改到768，或简单复制若干小M Mono再拼输出，会破坏权重复用、sort/padding效率和进度保证。
 
@@ -140,7 +140,7 @@ flowchart LR
 
 | 边 | 当前R13行为 | 拟消除的重复 | 必须保留的消费者/语义 |
 |---|---|---|---|
-| norm→FFN输入 | owner-local BF16；一次FP8 value/scale，再AG | 独立quant output再pack/unpack；无意义的BF16重建 | router仍需要原BF16；shared/routed的scale格式和舍入 |
+| norm→FFN输入 | owner-local BF16；独立一次FP8 value/scale量化；eager custom AG有copy-in | 独立量化重读norm、Q/scale到注册发送区的重复复制 | router仍需要原BF16；shared/routed的scale格式和舍入；graph是否已有registered输入需单独确认 |
 | route→expert | 本地top6 ID/weight小包AG | 全M logits传输、重复top-k、重复sort/布局转换 | global ID、tie规则、有效owner行、sentinel/mask |
 | G1→G2 | 原生FP8中间量化/排序消费 | 写通用中间布局后再转成G2布局 | FP4权重/FP8 activation、原scale规则与K累加 |
 | G2/shared→RS | 原生本地专家输出、shared相加、RS | 独立完整combine tensor、重复清零/复制及整层末尾等待 | 每行所有本地expert贡献、shared就绪、原数值顺序 |
@@ -181,6 +181,10 @@ R13中H=5120：完整BF16行10240B，FP8 values5120B；scale字节由真实block
 
 ### B. 输入段：owner norm/quant/route → 完整expert tile就绪
 
+下一轮先做 [大 prefill 输入融合方案](dsv41_prefill_input_fusion_plan.md) 中的可闭合边界：runner 绑定专用已注册 Q/scale arena，先由独立量化直写，再接原生 Mega-MHC 的融合量化。BF16 norm 保留给 router，两次原生 AG 生成完整 M 的 shared/routed 消费布局。注册按精确指针且仅在加载期完成，生命周期绑定 communicator；首版一个串行 slot，不直接借用私有 pool。
+
+已有私有 pool 原型只在真实单层 eager FFN 获得 M7835/16315 的1.002444/1.004873×，尚未生产接入。专用外部注册、FFN fused producer 和整网收益均待验收；包含 Mega-MHC 的完整计时窗是晋级依据。以下 tile-ready/arrival-order 组织属于更后续设计，不是首版同时实施的前提。
+
 全步只做一次route/sort/padding。按expert保留GEMM的权重复用，把完整K输入和对应scale都已到达的原生M tile标记为ready；G1可以完成并退休该任务后，再执行下一任务。
 
 不要回到旧K-band假设：G1拿不齐K就不能退休，一CTA/CU下等待会阻断后续波次。也不要把M16384切成许多小M并分别sort/GEMM，旧实测分析已表明padding会膨胀。新增arrival-order plan、worklist和epoch维护必须计入完整FFN。
@@ -208,7 +212,7 @@ buffer由graph/runner持有，容量由immutable plan确定。保留地址、sha
 | 4 整网接入 | 同一LayerPlan接入真实early/late层与owner状态 | 小并发/尾段/填充/补请求/结束请求、KV与回滚、full-key warm、正式zero-cold |
 | 5 任务与服务验收 | 固定checkpoint/协议GSM8K；fresh主线/候选对照；清理前后对照 | 任务门槛、适用L2及真实路由证据；吞吐/TPOT/尾延迟各自报告 |
 
-先选输出段还是输入段的最终实施顺序，以第1阶段的可消除完整费用和ABI可行性为准；当前建议先闭合输出段，因为它能让结果直接服务下一层，避免再只优化小输入packet。若完整FFN不收益、GEMM退化吃掉重叠、producer不能前进、数值/状态不合格或接口需要复制一整条forward，停止该候选并保留R13，不用参数扫描或更多独立小包凑倍率。
+上表记录总体递进顺序。输出布局融合已完成完整单层、整网和GSM验收；IPC逐包方案已停止，下一阶段转入第6节B的norm→quant→专用注册arena，具体实施与停止条件以 [新输入方案](dsv41_prefill_input_fusion_plan.md) 为准。若完整链不收益、GEMM退化吃掉节省、producer不能前进、数值/状态不合格或接口需要复制一整条forward，停止该候选并保留当前已验收生产路径，不用参数扫描或更多独立小包凑倍率。
 
 不以2×作未经证据支持的预测。先保住实测1.3×，再用完整周期净节省制定下一阶段目标。小并发Mono应先在合法TP配置中做真实开关对照，保持同输入/状态和proposal预算；targetEP4＋draftTP4是独立部署设计，不能直接改全局config来恢复草稿Mono。
 
