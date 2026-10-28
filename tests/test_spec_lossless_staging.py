@@ -62,7 +62,7 @@ def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, **config):
         max_num_seqs=MAX_BS, pipeline_parallel_size=pp, **config
     )
     prop.device = torch.device("cpu")
-    prop.runner = SimpleNamespace(rank=1)
+    prop.runner = SimpleNamespace(rank=1, forward_step=0)
     prop.metadata_buffers = {}
     prop.mtp_k = T
     prop.model = FakeDraftModel() if model is None else model
@@ -99,7 +99,9 @@ def batch(
 
 
 def stage(prop, b, *, verifiable=True):
+    """One forward's staging, as `ModelRunner.forward` would number it."""
     g = group(prop)
+    prop.runner.forward_step += 1
     prop.stage_draft_sampling_host(
         b, len(b.req_ids), g, drafts_verifiable=verifiable, verifies=verifiable
     )
@@ -276,6 +278,18 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
 
 
 # ---- staging ----------------------------------------------------------------
+
+
+def test_a_propose_drafts_only_through_its_own_forwards_staging(monkeypatch):
+    """A middle chunk stages and returns before proposing; a later forward
+    whose propose skipped staging must not draft through those row bases."""
+    prop = proposer(monkeypatch)
+    stage(prop, batch(["a"]))
+    prop._consume_staging()
+    stage(prop, batch(["m"]), verifiable=False)
+    prop.runner.forward_step += 1
+    with pytest.raises(AssertionError, match="fresh stage_draft_sampling_host"):
+        prop._consume_staging()
 
 
 def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):

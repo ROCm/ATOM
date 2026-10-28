@@ -326,7 +326,11 @@ class DSparkProposer(Drafter):
         if self.draft_sampling is None:
             return
         rows = self._staging.stage(
-            batch, bs, drafts_verifiable=drafts_verifiable, verifies=verifies
+            batch,
+            bs,
+            drafts_verifiable=drafts_verifiable,
+            verifies=verifies,
+            step=self.runner.forward_step,
         )
         counts, index = group.counts, group.indices
         for name, key in (
@@ -344,7 +348,7 @@ class DSparkProposer(Drafter):
         """Claim this step's staging for the propose about to run, or refuse."""
         if self.draft_sampling is None:
             return
-        self._staging.consume()
+        self._staging.consume(self.runner.forward_step)
 
     @property
     def keeps_top_k_ties(self) -> bool:

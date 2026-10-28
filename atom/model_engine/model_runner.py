@@ -1500,6 +1500,7 @@ class ModelRunner:
         """
         pp_size = self.config.pipeline_parallel_size
         self._fv_idx = 0
+        self.forward_step = 0
         self._stage_h2d_done = None
         if pp_size <= 1:
             self._fv_ring = [self.forward_vars]
@@ -1602,8 +1603,14 @@ class ModelRunner:
         """Rotate to the next in-flight slot before any buffer is written.
 
         Dummy forwards use the same staging buffers as real forwards, so they
-        participate in the ring too. No-op when the ring has a single slot.
+        participate in the ring too. The rotation is a no-op when the ring has a
+        single slot.
+
+        Called once at the start of every forward, so it also numbers them:
+        ``forward_step`` lets a consumer of host staging (the lossless draft's
+        `DraftQStaging`) check that what it reads was staged by this forward.
         """
+        self.forward_step += 1
         if len(self._fv_ring) == 1:
             return
         self._fv_idx = (self._fv_idx + 1) % len(self._fv_ring)

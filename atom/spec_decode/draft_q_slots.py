@@ -206,11 +206,13 @@ class DraftQStaging:
         self._step = 0
         # Leading destination rows that may still name a slot.
         self._dest_hi = 0
-        # Generations of `stage` and of the proposes consuming it.
-        self._staged = 0
-        self._consumed = 0
+        # The forwards that last staged and last consumed a staging.
+        self._staged = None
+        self._consumed = None
 
-    def stage(self, batch, bs: int, *, drafts_verifiable: bool, verifies: bool):
+    def stage(
+        self, batch, bs: int, *, drafts_verifiable: bool, verifies: bool, step: int
+    ):
         """Stage one step and return ``{buffer: rows to publish or None}``.
 
         ``drafts_verifiable``: this step's propose emits drafts a later verify
@@ -221,12 +223,15 @@ class DraftQStaging:
         ``verifies``: this forward's verify scores drafts and so may read q
         (`ModelRunner._verifies_drafts`). False for a prefill, align-only or
         dummy forward: no lookup is made, so none is counted.
+
+        ``step``: the forward this staging is for (`ModelRunner.forward_step`),
+        which `consume` checks.
         """
         # The Philox key. A plain SPMD counter, so every TP rank reaches the
         # same number without exchanging it.
         self._seed[0] = self._step
         self._step = (self._step + 1) & 0x7FFFFFFF
-        self._staged += 1
+        self._staged = step
         req_ids = batch.req_ids[:bs]
         # Verify bases before claims: a claim may hand a slot to a new request,
         # and a request's verify must still read the slot its drafts came from.
@@ -280,17 +285,22 @@ class DraftQStaging:
         self._top_p[:bs] = batch.top_ps[:bs]
         return counts
 
-    def consume(self) -> None:
-        """Claim the latest staging for the propose about to run, or refuse.
+    def consume(self, step: int) -> None:
+        """Claim forward ``step``'s staging for the propose about to run, or
+        refuse.
 
-        A propose that skipped `stage` would draft through the previous step's
-        destination rows, into slots other requests may own by now.
+        A propose whose forward skipped `stage` would draft through an earlier
+        forward's destination rows, into slots other requests may own by now.
+        That earlier forward need not have proposed (a middle chunk stages and
+        returns first), so what is checked is that this very forward staged,
+        and only once consumed.
         """
-        assert self._staged != self._consumed, (
-            "propose without a fresh stage_draft_sampling_host: the q row bases "
-            "are the previous step's"
+        assert self._staged == step and self._consumed != step, (
+            f"propose in forward {step} without a fresh "
+            f"stage_draft_sampling_host (last staged {self._staged}, last "
+            f"consumed {self._consumed}): the q row bases are another forward's"
         )
-        self._consumed = self._staged
+        self._consumed = step
 
     def clear_destinations(self) -> None:
         """Point every host-side destination row at no q row."""
