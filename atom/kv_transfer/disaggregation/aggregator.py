@@ -30,6 +30,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveCompletionId,
     SaveOperationId,
+    StateTouchId,
 )
 
 logger = logging.getLogger("atom")
@@ -155,10 +156,13 @@ class KVOutputAggregator:
             terminal_tombstone_limit,
             lambda key: isinstance(key, LoadOperationId),
         )
+        # A state touch has a fresh round in every identity, so it is never
+        # reported twice; tombstoning touches (one per voted hash per 0.5 s)
+        # would only push the store / source tombstones out of the ring.
         self._connector_completions = _TPCompletionGroup[ConnectorCompletionKey](
             world_size,
             terminal_tombstone_limit,
-            lambda _key: True,
+            lambda key: not isinstance(key[1], StateTouchId),
         )
 
     @property

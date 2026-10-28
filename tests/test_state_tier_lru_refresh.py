@@ -371,12 +371,47 @@ class TestNeedsVerify:
         monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "2")
         idx = _index(7)
         clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        # A held request re-probes every pass and its touch is re-sent every
+        # interval; verdicts never come back. Re-sends must not extend the hold.
+        held_for, step = 0.0, 0.05
+        while idx.needs_verify(7):
+            assert held_for <= 2 + 1e-6, "the hold outlived OFFLOAD_LOOKUP_DEFER_S"
+            assert idx.could_serve(7)
+            idx.take_touches()
+            clock[0] += step
+            held_for += step
+        assert held_for >= 2
+        assert idx.touches_sent > 1, "the touch was re-sent while held"
+        assert idx.verify_holds_expired == 1
+        assert idx.stats()["verify_holds_expired"] == 1
+        assert not idx.needs_verify(7), "later admissions are not held again"
+        assert idx.verify_holds_expired == 1
+
+    def test_evidence_after_an_expired_hold_rearms_it(self, clock, monkeypatch):
+        monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "2")
+        idx = _index(7)
+        clock[0] += so._TIER_VERIFIED_FOR_S + 1
         assert idx.needs_verify(7)
-        idx.take_touches()
-        clock[0] += 1.5
-        assert idx.needs_verify(7)
-        clock[0] += 1.0
+        clock[0] += 3
         assert not idx.needs_verify(7)
+        idx.apply_touch_verdict(7, True)
+        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        assert idx.needs_verify(7), "a fresh hold, timed from now"
+        clock[0] += 1
+        assert idx.needs_verify(7)
+
+    def test_a_verdict_ends_the_hold_timer(self, clock, monkeypatch):
+        monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "2")
+        idx = _index(7)
+        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        assert idx.needs_verify(7)
+        clock[0] += 1.5
+        idx.apply_touch_verdict(7, True)
+        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        assert idx.needs_verify(7)
+        clock[0] += 1.5
+        assert idx.needs_verify(7), "the earlier 1.5 s does not count"
+        assert idx.verify_holds_expired == 0
 
     def test_a_zero_defer_never_holds(self, clock, monkeypatch):
         monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "0")

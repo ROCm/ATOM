@@ -118,6 +118,13 @@ class StateOffloadIndex:
         # the image was resident.
         self._touch_sent_at: dict[int, float] = {}
         self._verified_at: dict[int, float] = {}
+        # hash -> monotonic of the first admission held for its verdict; the
+        # `defer_s` bound runs from here, so re-sent touches cannot extend it.
+        # Cleared by any evidence (verdict, store, load) or by dropping `h`.
+        self._hold_started_at: dict[int, float] = {}
+        # Hashes whose hold ran out: admissions over them go ahead unheld
+        # until evidence arrives.
+        self._hold_expired: set[int] = set()
         self.touches_sent = 0
         # Touches that found the image gone: LMCache evicted it and the index
         # learned of it before any request parked on it.
@@ -125,6 +132,9 @@ class StateOffloadIndex:
         # Admissions held back a pass because the image they would load had
         # not been confirmed recently (`needs_verify`).
         self.loads_deferred_for_verify = 0
+        # Holds released because no verdict came back within `defer_s`. Any
+        # non-zero value means touch verdicts are being lost.
+        self.verify_holds_expired = 0
 
     # ------------------------------- stores -------------------------------- #
     def note_stored(self, h: int) -> None:
@@ -140,7 +150,7 @@ class StateOffloadIndex:
         # re-stored prefix is treated as freshly used, then trim the cold end.
         self._hash_lru.pop(h, None)
         self._hash_lru[h] = None
-        self._verified_at[h] = monotonic()
+        self._mark_verified(h)
         while len(self._hash_lru) > self._hash_cap:
             old, _ = self._hash_lru.popitem(last=False)
             self.hashes.discard(old)
@@ -157,6 +167,15 @@ class StateOffloadIndex:
         self._touch_wanted.discard(h)
         self._touch_sent_at.pop(h, None)
         self._verified_at.pop(h, None)
+        self._end_hold(h)
+
+    def _mark_verified(self, h: int) -> None:
+        self._verified_at[h] = monotonic()
+        self._end_hold(h)
+
+    def _end_hold(self, h: int) -> None:
+        self._hold_started_at.pop(h, None)
+        self._hold_expired.discard(h)
 
     def could_serve(self, h: int) -> bool:
         """Whether a load for `h` could be offered at all: this tier can load
@@ -219,7 +238,7 @@ class StateOffloadIndex:
             self.touch_misses += 1
             self.forget(h)
             return
-        self._verified_at[h] = monotonic()
+        self._mark_verified(h)
         # The touch made it LMCache's youngest image; keep the cap's order.
         self._hash_lru.move_to_end(h)
 
@@ -229,6 +248,8 @@ class StateOffloadIndex:
         self.refresh_hits = False
         self._touch_wanted.clear()
         self._touch_sent_at.clear()
+        self._hold_started_at.clear()
+        self._hold_expired.clear()
 
     def needs_verify(self, h: int) -> bool:
         """Whether an admission about to load `h` should wait a pass for a
@@ -239,9 +260,14 @@ class StateOffloadIndex:
         the verdict is normally in: resident lets the load go ahead, gone has
         already dropped `h`, so the admission picks a lower boundary (an HBM
         checkpoint, an older CPU image, or a plain prefill) instead of parking
-        and recomputing everything after the miss. A verdict that has not come
-        back within `defer_s` of its touch stops holding the admission, which
-        then proceeds as it did before touches existed.
+        and recomputing everything after the miss.
+
+        The hold is bounded by `defer_s` from the first time `h` was held, not
+        from its latest touch: a held request re-probes every pass and its
+        touch is re-sent every `_TIER_TOUCH_INTERVAL_S`, so a bound measured
+        from the send would never run out if verdicts stopped arriving. Once
+        it runs out, admissions over `h` proceed as they did before touches
+        existed until any evidence about `h` arrives.
         """
         if not self.refresh_hits or h not in self.hashes:
             return False
@@ -252,12 +278,24 @@ class StateOffloadIndex:
         verified = self._verified_at.get(h)
         if verified is not None and now - verified <= _TIER_VERIFIED_FOR_S:
             return False
-        sent = self._touch_sent_at.get(h)
-        if sent is None or (verified is not None and verified >= sent):
-            # No touch outstanding: ask for one; it leaves this pass.
-            self._touch_wanted.add(h)
-            return True
-        return now - sent <= defer_s
+        if h in self._hold_expired:
+            return False
+        started = self._hold_started_at.setdefault(h, now)
+        if now - started > defer_s:
+            self._hold_expired.add(h)
+            self.verify_holds_expired += 1
+            if self.verify_holds_expired == 1:
+                logger.warning(
+                    "state offload: no touch verdict for a CPU state image "
+                    "within OFFLOAD_LOOKUP_DEFER_S=%.1fs; admitting without it. "
+                    "Touch verdicts are being lost (counted as "
+                    "state_offload_verify_holds_expired).",
+                    defer_s,
+                )
+            return False
+        # Ask for a touch; `take_touches` throttles the resend.
+        self._touch_wanted.add(h)
+        return True
 
     # -------------------------------- loads -------------------------------- #
     def request_load(self, req_id, h: int) -> bool:
@@ -300,7 +338,7 @@ class StateOffloadIndex:
             # order so the cap trims what the codec will trim.
             if h in self._hash_lru:
                 self._hash_lru.move_to_end(h)
-                self._verified_at[h] = monotonic()
+                self._mark_verified(h)
 
     def fail_load(self, req_id) -> None:
         """No bytes came back. Retract the claim as well as counting it.
@@ -358,6 +396,7 @@ class StateOffloadIndex:
             "touches_sent": self.touches_sent,
             "touch_misses": self.touch_misses,
             "loads_deferred_for_verify": self.loads_deferred_for_verify,
+            "verify_holds_expired": self.verify_holds_expired,
         }
 
 
