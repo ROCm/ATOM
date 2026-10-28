@@ -548,7 +548,7 @@ class RTPForwardContext:
                     "RTP prefill requires attention_inputs.prefix_lengths for GDN metadata."
                 )
             has_initial_state = prefix_lengths > 0
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+            batch_ptr, token_chunk_offset_ptr, num_chunks = (
                 compute_causal_conv1d_metadata(query_start_loc)
             )
             return GDNAttentionMetadata(
@@ -568,9 +568,9 @@ class RTPForwardContext:
                 spec_token_indx=None,
                 non_spec_token_indx=None,
                 num_accepted_tokens=None,
-                nums_dict=nums_dict,
                 batch_ptr=batch_ptr,
                 token_chunk_offset_ptr=token_chunk_offset_ptr,
+                num_chunks=num_chunks,
             )
 
         input_lengths = RTPForwardContext._non_empty_int32(
@@ -599,9 +599,9 @@ class RTPForwardContext:
             spec_token_indx=None,
             non_spec_token_indx=None,
             num_accepted_tokens=None,
-            nums_dict=None,
             batch_ptr=None,
             token_chunk_offset_ptr=None,
+            num_chunks=None,
         )
 
     @staticmethod

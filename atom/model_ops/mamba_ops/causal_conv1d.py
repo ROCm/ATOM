@@ -5,7 +5,6 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -13,6 +12,37 @@ import triton.language as tl
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 PAD_SLOT_ID = -1
+# One program covers this many tokens of one sequence.
+BLOCK_M = 8
+
+
+def device_conv1d_indices(
+    query_start_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Sequence id and chunk offset for each conv program, on the same device.
+
+    Built with tensor ops so the host never copies the per-sequence lengths
+    back or uploads the expanded tables. `num_chunks` is the table length.
+    """
+    nums = -(-query_start_loc.diff() // BLOCK_M)
+    n_seqs = int(nums.shape[0])
+    if n_seqs == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=query_start_loc.device)
+        return empty, empty, 0
+    seq_ids = torch.repeat_interleave(
+        torch.arange(n_seqs, device=nums.device, dtype=torch.int32),
+        nums,
+    )
+    num_chunks = int(seq_ids.shape[0])
+    if num_chunks == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=query_start_loc.device)
+        return empty, empty, 0
+    starts = torch.cumsum(nums, 0) - nums
+    positions = torch.arange(num_chunks, device=nums.device, dtype=torch.int32)
+    offsets = (positions - starts[seq_ids]).to(torch.int32)
+    # Own the storage. repeat_interleave's output can otherwise alias a
+    # caching-allocator block the next kernel reuses.
+    return seq_ids.contiguous().clone(), offsets.contiguous().clone(), num_chunks
 
 
 @triton.jit()
@@ -594,26 +624,30 @@ def causal_conv1d_fn(
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    args = None
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
+    # vLLM still passes host-built tables. Prefer those. Otherwise build the
+    # index tables on device; the metadata object keeps them alive across layers.
+    batch_ptr = None
+    token_chunk_offset_ptr = None
+    num_chunks = None
     if metadata is not None:
-        nums_dict = metadata.nums_dict
-        args = nums_dict
-        batch_ptr = metadata.batch_ptr
-        token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
-    else:
-        seqlens = query_start_loc.diff().to("cpu")
-        args = seqlens
-        MAX_NUM_PROGRAMS = 1024
-
-        batch_ptr = torch.full(
-            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-        )  # tracking which seq-idx the Triton program is handling
-        token_chunk_offset_ptr = torch.full(
-            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=x.device
-        )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
+        batch_ptr = getattr(metadata, "batch_ptr", None)
+        token_chunk_offset_ptr = getattr(metadata, "token_chunk_offset_ptr", None)
+        num_chunks = getattr(metadata, "num_chunks", None)
+        if num_chunks is None:
+            nums_dict = getattr(metadata, "nums_dict", None)
+            if isinstance(nums_dict, dict):
+                entry = nums_dict.get(BLOCK_M)
+                if isinstance(entry, dict) and entry.get("tot") is not None:
+                    num_chunks = int(entry["tot"])
+    if batch_ptr is None or token_chunk_offset_ptr is None:
+        batch_ptr, token_chunk_offset_ptr, built = device_conv1d_indices(
+            query_start_loc
+        )
+        if num_chunks is None:
+            num_chunks = built
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
@@ -641,7 +675,6 @@ def causal_conv1d_fn(
     key_dim_stride = key.stride(1)
     value_dim_stride = value.stride(1)
 
-    BLOCK_M = 8
     if conv_states is not None:
         # extensions to support vLLM:
         # 1. conv_states is used to replaced initial_states
@@ -686,133 +719,76 @@ def causal_conv1d_fn(
         else:
             block_size_to_align = BLOCK_M
 
-    if metadata is None:
-
-        def num_program(META, seqlens):
-            tot = 0
-
-            mlist = []
-            offsetlist = []  # type: ignore
-
-            nums = -(-seqlens // META["BLOCK_M"])
-
-            tot = nums.sum().item()
-            mlist = np.repeat(np.arange(len(nums)), nums)
-            for idx, num in enumerate(nums):
-                offsetlist.extend(
-                    range(num)
-                )  # chunk-idx if a sequence is split into multiple chunks
-
-            if META["batch_ptr"].nelement() < len(mlist):
-                newlen = len(mlist) + 1
-                META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-                META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-
-            if META["batch_ptr"].nelement() >= len(mlist):
-                META["batch_ptr"][0 : len(mlist)].copy_(
-                    torch.from_numpy(np.array(mlist))
-                )
-                META["token_chunk_offset_ptr"][0 : len(mlist)].copy_(
-                    torch.from_numpy(np.array(offsetlist))
-                )
-
-            META["batch_ptr"] = META["batch_ptr"].to(META["x_ptr"].device)
-            META["token_chunk_offset_ptr"] = META["token_chunk_offset_ptr"].to(
-                META["x_ptr"].device
-            )
-            return tot
-
-    else:
-
-        def num_program(META, nums_dict):
-            tot = nums_dict[META["BLOCK_M"]]["tot"]
-
-            mlist = nums_dict[META["BLOCK_M"]]["mlist"]
-            mlist_len = nums_dict[META["BLOCK_M"]]["mlist_len"]
-
-            offsetlist = nums_dict[META["BLOCK_M"]]["offsetlist"]
-
-            if nums_dict[META["BLOCK_M"]]["batch_ptr"] is not None:
-                META["batch_ptr"] = nums_dict[META["BLOCK_M"]]["batch_ptr"]
-                META["token_chunk_offset_ptr"] = nums_dict[META["BLOCK_M"]][
-                    "token_chunk_offset_ptr"
-                ]
-            else:
-                if META["batch_ptr"].nelement() < mlist_len:
-                    newlen = mlist_len + 1
-                    META["batch_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-                    META["token_chunk_offset_ptr"].resize_(newlen).fill_(PAD_SLOT_ID)
-
-                if META["batch_ptr"].nelement() >= mlist_len:
-                    META["batch_ptr"][0:mlist_len].copy_(mlist)
-                    META["token_chunk_offset_ptr"][0:mlist_len].copy_(offsetlist)
-            return tot
+    if num_chunks is None:
+        num_chunks = int(batch_ptr.shape[0])
+    num_chunks = int(num_chunks)
+    if not batch_ptr.is_contiguous():
+        batch_ptr = batch_ptr.contiguous()
+    if not token_chunk_offset_ptr.is_contiguous():
+        token_chunk_offset_ptr = token_chunk_offset_ptr.contiguous()
 
     def grid(META):
         return (
-            num_program(META, args),
+            num_chunks,
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-    if batch_ptr.device != x.device:
-        batch_ptr = batch_ptr.to(x.device)
-        token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
-
-    _causal_conv1d_fwd_kernel[grid](
-        # Pointers to matrices
-        x,
-        weight,
-        bias,
-        conv_states,
-        cache_indices,
-        cache_indices if cache_indices_in is None else cache_indices_in,
-        has_initial_state,
-        query_start_loc,
-        batch_ptr,
-        token_chunk_offset_ptr,
-        block_idx_first_scheduled_token,
-        block_idx_last_scheduled_token,
-        initial_state_idx,
-        num_computed_tokens,
-        query,
-        key,
-        value,
-        # Matrix dimensions
-        dim,
-        k_dim_size,
-        v_dim_size,
-        cu_seqlen,
-        num_cache_lines,
-        # stride
-        stride_x_dim,
-        stride_x_token,
-        stride_w_dim,
-        stride_w_width,
-        stride_istate_seq,
-        stride_istate_dim,
-        stride_istate_token,
-        stride_cache_indices,
-        query_dim_stride,
-        query_token_stride,
-        key_dim_stride,
-        key_token_stride,
-        value_dim_stride,
-        value_token_stride,
-        block_size_to_align // BLOCK_M,
-        # others
-        pad_slot_id,
-        # META
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        NP2_STATELEN=np2_statelen,
-        # launch_cooperative_grid=True
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=256,
-        num_stages=2,
-    )
+    if num_chunks > 0:
+        _causal_conv1d_fwd_kernel[grid](
+            # Pointers to matrices
+            x,
+            weight,
+            bias,
+            conv_states,
+            cache_indices,
+            cache_indices if cache_indices_in is None else cache_indices_in,
+            has_initial_state,
+            query_start_loc,
+            batch_ptr,
+            token_chunk_offset_ptr,
+            block_idx_first_scheduled_token,
+            block_idx_last_scheduled_token,
+            initial_state_idx,
+            num_computed_tokens,
+            query,
+            key,
+            value,
+            # Matrix dimensions
+            dim,
+            k_dim_size,
+            v_dim_size,
+            cu_seqlen,
+            num_cache_lines,
+            # stride
+            stride_x_dim,
+            stride_x_token,
+            stride_w_dim,
+            stride_w_width,
+            stride_istate_seq,
+            stride_istate_dim,
+            stride_istate_token,
+            stride_cache_indices,
+            query_dim_stride,
+            query_token_stride,
+            key_dim_stride,
+            key_token_stride,
+            value_dim_stride,
+            value_token_stride,
+            block_size_to_align // BLOCK_M,
+            # others
+            pad_slot_id,
+            # META
+            HAS_BIAS=bias is not None,
+            KERNEL_WIDTH=width,
+            SILU_ACTIVATION=activation in ["silu", "swish"],
+            IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
+            USE_PAD_SLOT=pad_slot_id is not None,
+            NP2_STATELEN=np2_statelen,
+            # launch_cooperative_grid=True
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=256,
+            num_stages=2,
+        )
     return query, key, value
 
 

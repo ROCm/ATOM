@@ -522,9 +522,9 @@ class SGLangGDNForwardContext:
                 num_decode_tokens=bs,
                 num_actual_tokens=bs,
                 has_initial_state=None,
-                nums_dict=None,
                 batch_ptr=None,
                 token_chunk_offset_ptr=None,
+                num_chunks=None,
                 **common_kwargs,
             )
 
@@ -534,7 +534,7 @@ class SGLangGDNForwardContext:
             seq_sum = int(query_start_loc[-1].item())
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+            batch_ptr, token_chunk_offset_ptr, num_chunks = (
                 compute_causal_conv1d_metadata(query_start_loc)
             )
             return GDNAttentionMetadata(
@@ -544,9 +544,9 @@ class SGLangGDNForwardContext:
                 num_decode_tokens=0,
                 num_actual_tokens=seq_sum,
                 has_initial_state=has_initial_state,
-                nums_dict=nums_dict,
                 batch_ptr=batch_ptr,
                 token_chunk_offset_ptr=token_chunk_offset_ptr,
+                num_chunks=num_chunks,
                 **common_kwargs,
             )
 

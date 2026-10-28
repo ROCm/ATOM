@@ -527,10 +527,9 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
-    # The following attributes are for triton implementation of causal_conv1d
-    nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    num_chunks: int | None = None
 
 
 @dataclass
