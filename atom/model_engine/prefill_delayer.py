@@ -31,8 +31,8 @@ bounds do not impose a hard end-to-end TTFT limit.
 It is NOT about mixing prefill+decode in one forward. It DOES preserve cross-DP
 phase alignment: it only releases when every rank is prefill-ready (so all ranks
 enter prefill together and the MoE collective stays aligned), except when a
-must-fire bound forces release regardless, or the cost gate measures that
-waiting longer no longer pays off. A flat queue alone never releases an
+must-fire bound forces release regardless, or the opt-in cost gate measures
+that waiting longer no longer pays off. A flat queue alone never releases an
 unaligned group: pending-token probes are capped, so a flat sum does not mean
 that decoding peers have stopped receiving work.
 
