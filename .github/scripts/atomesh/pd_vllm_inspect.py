@@ -90,6 +90,9 @@ for run in runs:
             log = current / 'logs' / f'{role}.log'
             row[role + '_log_exists'] = log.is_file()
             if log.is_file():
+                row[role + '_log_uid'] = log.stat().st_uid
+                row[role + '_log_gid'] = log.stat().st_gid
+            if log.is_file():
                 row[role + '_log_bytes'] = log.stat().st_size
                 row[role + '_log_mtime'] = int(log.stat().st_mtime)
                 with log.open('rb') as source:
@@ -182,12 +185,21 @@ for run in runs:
         rows.append(row)
 result = {'kind': 'experiment_status_only', 'actions_run_id': int(run_id), 'jobs': rows}
 result['filesystem'] = {}
+result['identity'] = {'uid': os.getuid(), 'gid': os.getgid(), 'groups': os.getgroups()}
 for name, path in (('shared_logs', root), ('inspection_output', out)):
     stat = os.statvfs(path)
     result['filesystem'][name] = {'available_bytes': stat.f_bavail * stat.f_frsize,
                                  'total_bytes': stat.f_blocks * stat.f_frsize,
-                                 'available_inodes': stat.f_favail}
+                                 'available_inodes': stat.f_favail,
+                                 'owner_uid': path.stat().st_uid, 'owner_gid': path.stat().st_gid}
 
+if shutil.which('quota'):
+    try:
+        quota = subprocess.run(['quota', '-s'], capture_output=True, text=True, timeout=15)
+        result['current_user_quota'] = {'rc': quota.returncode, 'stdout': quota.stdout[:4000],
+                                        'stderr': quota.stderr[:1000]}
+    except subprocess.TimeoutExpired:
+        result['current_user_quota'] = {'timed_out': True}
 if shutil.which('squeue'):
     try:
         queue = subprocess.run(['squeue', '--name', prefix[:-1] + '-1', '--noheader',
