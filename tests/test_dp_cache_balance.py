@@ -468,6 +468,35 @@ class AdmissionTest(unittest.TestCase):
         self.s.cache_admission.on_admitted = None
         self.assertFalse(self.s.cache_admission.admit(self.seq))
 
+    def test_expiry_forgets_abandoned_preparation_without_reclaiming_resources(self):
+        self.s.cache_admission.track(self.seq)
+        # A terminal path has removed the request from both scheduler queues.
+        # Its connector can still retain a DMA lease independently of admission.
+        lease_owner = {self.seq.id: self.seq}
+        self.s.cache_admission.expire()
+        self.assertFalse(self.s.cache_admission._preparing)
+        self.assertIs(lease_owner[self.seq.id], self.seq)
+        self.assertFalse(self.s.aborted)
+        self.assertFalse(self.s.rejected)
+        self.assertFalse(self.s.events)
+
+    def test_expiry_keeps_live_waiting_and_running_preparations(self):
+        self.prepare_alignment()
+        self.s.running.append(self.seq)
+        waiting = NS(id=8, dp_cache=DPCacheState(migration_id=43))
+        with patch(
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=100
+        ):
+            self.s.cache_admission.track(waiting)
+        self.s.waiting.append(waiting)
+        with patch(
+            "atom.model_engine.dp_cache.admission.time.monotonic", return_value=101
+        ):
+            self.s.cache_admission.expire()
+        self.assertEqual(self.s.cache_admission._preparing, {7: self.seq, 8: waiting})
+        self.assertFalse(self.s.aborted)
+        self.assertFalse(self.s.rejected)
+
     def prepare_alignment(self):
         self.seq.num_cached_tokens = 65408
         self.s.kv_connector = NS(pending_prefill_handoff=lambda seq: (65536, 102400))

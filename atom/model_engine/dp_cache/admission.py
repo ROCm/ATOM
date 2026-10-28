@@ -118,8 +118,15 @@ class DPCacheAdmission:
     def expire(self) -> None:
         if not self._preparing:
             return
+        queued = {id(seq) for seq in self._host.waiting}
+        queued.update(id(seq) for seq in self._host.running)
         now = time.monotonic()
         for seq in list(self._preparing.values()):
+            if id(seq) not in queued:
+                # Terminal scheduler paths own resource reclamation. Drop only
+                # our reference; an in-flight transfer may still own its lease.
+                self.forget(seq)
+                continue
             state = seq.dp_cache
             assert state is not None
             expired = now >= state.prepare_deadline

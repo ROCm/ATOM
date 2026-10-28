@@ -35,6 +35,7 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     here; the fan-out and correlation logic is what is under test.
     """
     mgr = object.__new__(cls)
+    mgr.cache_router = None
     mgr.label = "test-mgr"
     mgr.control_sockets = [_Socket() for _ in range(engine_count)]
     mgr._rpc_router = RpcResponseRouter()

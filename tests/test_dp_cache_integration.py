@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Real manager wire format and scheduler admission, with CPU cache pools."""
 
+import gc
 import pickle
+import weakref
 from types import SimpleNamespace as NS
 
 import pytest
@@ -271,6 +273,59 @@ def test_real_prefill_retires_work_only_after_forward_and_rebases_after_preempt(
     assert work[-1][3] == 65 - int(new_batch.num_cached_tokens[0]) - int(
         new_batch.num_scheduled_tokens[0]
     )
+
+
+def test_permanent_rejection_releases_migrated_prompt_without_another_step():
+    scheduler = Scheduler(MockConfig(max_model_len=16))
+    refs = []
+    for _ in range(8):
+        seq = Sequence(list(range(17)), scheduler.block_manager.block_size)
+        seq.dp_cache = DPCacheState(migration_id=7)
+        refs.append(weakref.ref(seq))
+        scheduler.add(seq)
+        scheduler.schedule()
+        assert scheduler.take_rejected() == [seq]
+        assert seq.leave_reason.startswith("unschedulable:")
+        assert not scheduler.cache_admission._preparing
+    del seq
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
+def test_cancelled_alignment_releases_tracking_only_with_terminal_cleanup(monkeypatch):
+    scheduler = Scheduler(
+        MockConfig(
+            kv_cache_block_size=4,
+            num_kvcache_blocks=128,
+            max_model_len=256,
+            max_num_batched_tokens=16,
+            enable_chunked_prefill=True,
+        )
+    )
+    seq = Sequence(list(range(65)), 4)
+    seq.dp_cache = DPCacheState(migration_id=7, minimum_hit=48)
+    scheduler.cache_admission.on_admitted = lambda event: pytest.fail(
+        "alignment must not commit admission"
+    )
+    monkeypatch.setattr(
+        scheduler.cache_admission, "_prefill_handoff", lambda seq: (32, 48)
+    )
+    scheduler.add(seq)
+    batch, active = scheduler.schedule()
+    assert batch.req_ids == [seq.id]
+    empty = ScheduledBatchOutput([], [], None, None, None, is_deferred_out=True)
+    assert scheduler.postprocess(list(active.values()), empty, batch=batch) == []
+    assert seq.is_partial_prefill
+    batch, active = scheduler.schedule()
+    assert batch.req_ids == [seq.id]
+    assert seq.id in scheduler.cache_admission._preparing
+    assert scheduler.abort_request(seq.id)
+    # Cancellation cannot free buffers before the scheduled forward completes.
+    assert seq.block_table
+    assert scheduler.postprocess(list(active.values()), empty, batch=batch) == [seq]
+    assert not scheduler.cache_admission._preparing
+    assert not scheduler.running
+    assert not seq.block_table
 
 
 def test_failed_retry_send_uses_normal_terminal_cleanup(monkeypatch):

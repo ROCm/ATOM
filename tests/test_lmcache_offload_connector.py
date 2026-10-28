@@ -88,6 +88,7 @@ from atom.kv_transfer.offload.metadata import (
     SlotSaveSpec,
 )
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.dp_cache.admission import DPCacheAdmission
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
 from atom.sampling_params import SamplingParams
@@ -3710,6 +3711,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host.cache_admission = DPCacheAdmission(host)
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3777,6 +3779,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host.cache_admission = DPCacheAdmission(host)
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3851,6 +3854,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host.cache_admission = DPCacheAdmission(host)
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(

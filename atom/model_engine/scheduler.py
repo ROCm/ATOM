@@ -2173,6 +2173,7 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
+                self.cache_admission.forget(seq)
                 self._inflight_prefix_wait.pop(seq.id, None)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
@@ -4591,6 +4592,7 @@ class Scheduler:
         return finished_seqs
 
     def _mark_finished(self, seq, reason, num_tokens):
+        self.cache_admission.forget(seq)
         tracing.finish(seq, reason=reason, num_tokens=num_tokens)
         # Set the reason before the connector decides whether to claim the
         # source blocks. This runs exactly once, including early cancellation
