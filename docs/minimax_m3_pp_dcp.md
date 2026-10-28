@@ -103,3 +103,33 @@ each rank receives approximately one quarter, subject to block tails.
 
 GPU kernel/collective tests alone do not establish model-level accuracy or the
 issue #314 C56 transfer-wait target. Those results must be collected separately.
+
+## Model validation status (2026-10-28)
+
+The production model code at `b1efc3fd6` was evaluated on MI355X with
+`rocm/atom-dev:nightly_202610261558`, all 1,319 GSM8K questions, five-shot prompts,
+c32, and real DSpark K7 acceptance. The accuracy gate uses flexible exact match
+with a threshold of 0.94. Per-question document, prompt, and target hashes match
+the non-P/D baseline in both DCP modes.
+
+| Deployment | Flexible exact match | Strict exact match | DSpark acceptance | Validation state |
+| --- | ---: | ---: | ---: | --- |
+| Non-P/D TP4 | 94.4655% | 93.4799% | 49.4133% | Completed successfully |
+| PP4 → DCP4, chunk OFF | 95.5269% | 94.3139% | 50.5119% | Completed successfully |
+| PP4 → DCP4, chunk ON | 95.1478% | 93.6315% | Pending complete counters | Full evaluation recovered from failed CI |
+
+The baseline is [run 40737040374](https://github.com/ROCm/ATOM/actions/runs/40737040374)
+(Slurm 10821). The DCP results are from
+[run 40739638741, attempt 1](https://github.com/ROCm/ATOM/actions/runs/40739638741/attempts/1)
+(Slurm 10825 and 10826). OFF acceptance uses the last cumulative report,
+229,829 accepted / 455,000 drafted tokens, or 4.54 tokens per forward. The
+baseline report is 255,961 / 518,000, or 4.46 tokens per forward.
+
+Shared log writes reported `Disk quota exceeded`. The OFF container log
+preserved the full evaluation and cumulative counters. ON's recovered samples
+are complete and exceed the accuracy gate, but its log stops before evaluation
+finishes; its intermediate acceptance must not be treated as the final rate.
+The ON retry (attempt 2, Slurm 10832) was externally cancelled on 2026-10-28.
+A successful ON CI completion with complete acceptance counters remains pending.
+C56 performance has not yet been measured, so the issue's mean P→D wait target
+below one second remains unverified.
