@@ -230,12 +230,16 @@ for line in diff_path.read_text(errors="replace").splitlines():
 
 def is_candidate_target(path):
     name = pathlib.PurePosixPath(path).name
-    # op_benchmarks/ holds bench_*.py perf harnesses. They are excluded because they are
-    # not correctness targets; the validator's perf stage times the correctness target it
-    # already selected, so it does not need one of these either.
+    # ATOM's test tree is flat under tests/ (tests/test_*.py, tests/plugin/test_*.py, ...),
+    # not aiter's op_tests/ -- carrying over aiter's prefix verbatim meant `candidates` was
+    # always empty on this tree, regardless of what the PR added, and every runtime-changing
+    # PR fell through to "ships no test target" even when it added one (ATOM#2705: this
+    # PR adds tests/plugin/test_minimax_m3_mono_refusal.py and validation_requirement.json
+    # still claimed no test target existed). tests/benchmarks/ holds perf harnesses, excluded
+    # for the same reason aiter excludes op_benchmarks/: not a correctness target.
     return (
-        path.startswith("op_tests/")
-        and "/op_benchmarks/" not in f"/{path}"
+        path.startswith("tests/")
+        and "/benchmarks/" not in f"/{path}"
         and name.startswith("test_")
         and name.endswith(".py")
     )
