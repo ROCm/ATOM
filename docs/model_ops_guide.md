@@ -507,6 +507,8 @@ Every rank must reach the same verdict. Each rule gets there its own way:
 - **Synthetic**: a per-device `torch.Generator` re-seeded from a step counter each step.
 - **Relaxed** and greedy rows draw nothing.
 
+Only the tokens are broadcast; every rank computes its own verdict, so all of the above also needs the target logits to be bitwise equal across TP ranks. If they differ, each rank's accepted count can differ while the emitted tokens follow rank 0, and `next_token_locs`, the KDA state commit and the KV release diverge silently. This holds for main's exact-match path (a greedy row's argmax is computed on every rank) as much as for the ratio verify. **Minimum aiter**: a build that includes ROCm/aiter#6954. From aiter `2039d2b96c` (2026-09-13) until that PR, the custom all-reduce's LL/LL128 paths summed ranks in a rank-dependent order, and ranks' logits could differ by about one bf16 ulp.
+
 ## Fused kernel chains
 
 ATOM uses fused kernels to reduce memory traffic by combining multiple operations into a single kernel launch.

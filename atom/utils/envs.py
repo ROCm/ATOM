@@ -633,6 +633,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # regression is suspected -- the fastest way to rule this kernel in or out,
     # since the two paths are not bit-identical by construction. Read once when
     # the Markov head is built, so it must be set before the server starts.
+    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3's draft takes the
+    # lossless sampled block for every row, greedy rows included, whatever
+    # this says: "0" no longer selects the reference there. Turn that flag
+    # off too to compare against the reference.
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
@@ -691,6 +695,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # p_f); those warn and keep the greedy pair (`Sampler` still keeps top-k
     # tie groups whole there, as above). Read at drafter and `Sampler`
     # construction, so it must be set before the server starts.
+    #
+    # Under TP every rank computes its own verdict, so the target logits must
+    # be bitwise equal across ranks, as for the exact-match path: use an aiter
+    # build with ROCm/aiter#6954. From aiter 2039d2b96c (2026-09-13) until
+    # then, the custom all-reduce summed ranks in a rank-dependent order
+    # (docs/model_ops_guide.md, `RejectionSampler`).
     "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
         os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
     ),
