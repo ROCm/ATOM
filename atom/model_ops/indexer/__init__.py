@@ -7,22 +7,29 @@ A model owns its query projection, how it writes index keys, and what it does
 with the selection; the attention builder publishes the step's rows once,
 cut to the logits plane it owns (`IndexRows.workspace`). Scoring and top-k --
 split across DCP or TP ranks, each rank's share of the rows and their
-all-gather -- are here."""
+all-gather -- are here.
 
-from .query import fold_query_scale, quantize_query, quantize_query_rows
-from .rows import (
-    NATURAL,
-    PRESHUFFLE,
-    ConcatKeys,
-    Fp4LaunchStorages,
-    IndexCache,
-    IndexRows,
-    RowSplit,
-    concat_rows,
-    fp4_rows,
-    fp8_rows,
-)
-from .score import score_topk
+The names below are loaded on first use, so importing a submodule that needs
+no kernels (``schedule``) does not import AITER."""
+
+import importlib
+
+_EXPORTS = {
+    "NATURAL": ".rows",
+    "PRESHUFFLE": ".rows",
+    "ConcatKeys": ".rows",
+    "Fp4LaunchStorages": ".rows",
+    "IndexCache": ".rows",
+    "IndexRows": ".rows",
+    "RowSplit": ".rows",
+    "concat_rows": ".rows",
+    "fp4_rows": ".rows",
+    "fp8_rows": ".rows",
+    "fold_query_scale": ".query",
+    "quantize_query": ".query",
+    "quantize_query_rows": ".query",
+    "score_topk": ".score",
+}
 
 __all__ = [
     "NATURAL",
@@ -40,3 +47,12 @@ __all__ = [
     "quantize_query_rows",
     "score_topk",
 ]
+
+
+def __getattr__(name: str):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module, __name__), name)
+    globals()[name] = value
+    return value
