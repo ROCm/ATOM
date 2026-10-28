@@ -63,6 +63,27 @@ def role_env(common, role, ip, overrides=None):
     return env
 
 
+def verify_attention_configuration(plan, logs, out):
+    """Accept the requested cache dtypes and the actual native attention path."""
+    expected = ('nvfp4', 'nvfp4', 'nvfp4', 'fp8')
+    actual = (plan['common_args']['kv-cache-dtype'],
+              plan['prefill']['attention-config']['indexer_kv_dtype'],
+              plan['decode']['attention-config']['indexer_kv_dtype'],
+              plan['speculative_config']['kv_cache_dtype'])
+    evidence = {'cache_dtypes': dict(zip(('main', 'prefill_indexer', 'decode_indexer', 'draft'), actual)),
+                'roles': {}, 'status': 'failed'}
+    marker = 'MiniMax M3 sparse attention selected ROCm NVFP4'
+    for role in ('prefill', 'decode'):
+        with (logs / f'{role}.log').open(errors='replace') as stream:
+            selected = [line.strip() for line in stream if marker in line]
+        evidence['roles'][role] = {'rocm_nvfp4': bool(selected), 'evidence': selected}
+    ok = actual == expected and all(x['rocm_nvfp4'] for x in evidence['roles'].values())
+    evidence['status'] = 'success' if ok else 'failed'
+    dump(out / 'attention-verification.json', evidence)
+    if not ok:
+        raise RuntimeError('Required NVFP4/NVFP4/FP8 cache or ROCm NVFP4 attention path was not verified')
+
+
 def start(name, cmd, env, logs):
     log = logs / f"{name}.log"
     print(f"[{name}] {shlex.join(map(str, cmd))}", flush=True)
@@ -350,6 +371,7 @@ def main():
                     and 'Initialize MooncakeDistributedStore failed' in text):
                 memory_failure('rdma_registration_enomem', out)
         raise
+    verify_attention_configuration(plan, logs, out)
     proxy_url = f'http://{ip}:{ports["proxy"]}'
     start('proxy', [sys.executable, str(HERE / 'pd_vllm_proxy.py'),
           '--host', '0.0.0.0', '--port', str(ports['proxy']), '--prefill', urls['prefill'],

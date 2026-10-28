@@ -93,6 +93,19 @@ class NativeExperimentTest(unittest.TestCase):
         ])
         self.assertEqual(runner.store_load_bytes(metrics), 384)
 
+    def test_attention_gate_requires_observed_rocm_path_in_both_roles(self):
+        plan = json.loads((runner.CONFIG / 'experiment.json').read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / 'prefill.log').write_text('MiniMax M3 sparse attention selected ROCm NVFP4 (topk_blocks=16)')
+            (out / 'decode.log').write_text('MiniMax M3 sparse attention selected Triton BF16')
+            with self.assertRaisesRegex(RuntimeError, 'was not verified'):
+                runner.verify_attention_configuration(plan, out, out)
+            self.assertEqual(json.loads((out / 'attention-verification.json').read_text())['status'], 'failed')
+            (out / 'decode.log').write_text('MiniMax M3 sparse attention selected ROCm NVFP4 (topk_blocks=16)')
+            runner.verify_attention_configuration(plan, out, out)
+            self.assertEqual(json.loads((out / 'attention-verification.json').read_text())['status'], 'success')
+
     def test_decode_disables_dbo_explicitly(self):
         args = runner.flags({'enable-prefix-caching': True, 'enable-dbo': False,
                              'kv-transfer-config': {'kv_role': 'kv_consumer'}})
