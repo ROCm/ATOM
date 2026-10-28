@@ -1887,6 +1887,44 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+def _check_m3_mxfp4(
+    arches,
+    index_cache_dtype,
+    kv_mxfp4: bool,
+    kv_nvfp4: bool,
+    block_size: int,
+    plugin_mode: bool,
+    index_q_fp8: bool = False,
+) -> None:
+    """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
+    than in the first forward (``ATOM_M3_SPARSE_KV_MXFP4``, ``--index-cache-dtype
+    mxfp4``). On M3 ``--index-cache-dtype fp4`` is NVFP4: the two formats are
+    different pools and different kernels, so they do not mix."""
+    index_mxfp4 = index_cache_dtype == "mxfp4"
+    if index_q_fp8 and not index_mxfp4:
+        raise ValueError("ATOM_M3_INDEX_Q_FP8 needs --index-cache-dtype mxfp4")
+    if not (kv_mxfp4 or index_mxfp4):
+        return
+    if not any("MiniMaxM3" in str(a) for a in arches):
+        raise ValueError("MXFP4 KV / index caches are MiniMax-M3 only")
+    if plugin_mode:
+        raise ValueError(
+            "MXFP4 KV / index caches do not run under the vLLM/SGLang bridges"
+        )
+    if kv_mxfp4 and kv_nvfp4:
+        raise ValueError(
+            "ATOM_M3_SPARSE_KV_MXFP4 and ATOM_M3_SPARSE_KV_NVFP4 are exclusive"
+        )
+    if (kv_mxfp4 and index_cache_dtype == "fp4") or (kv_nvfp4 and index_mxfp4):
+        raise ValueError("the MXFP4 and NVFP4 formats do not mix between KV and index")
+    if block_size != 128:
+        raise ValueError(f"MXFP4 pages are 128 tokens; --block-size is {block_size}")
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx950":
+        raise ValueError(f"MXFP4 KV / index caches need gfx950, got {get_gfx()}")
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -2631,6 +2669,10 @@ class Config:
                 indexer_cp_off = (
                     "--index-cache-dtype fp4 is not supported by the CP scorer"
                 )
+            if indexer_cp_off is None and (
+                self.index_cache_dtype == "mxfp4" or envs.ATOM_M3_SPARSE_KV_MXFP4
+            ):
+                indexer_cp_off = "the MXFP4 caches are not wired to the CP scorer"
             if indexer_cp_off is not None:
                 logger.warning(
                     "dcp_config.indexer_dcp_only disabled: %s.", indexer_cp_off
@@ -2672,6 +2714,16 @@ class Config:
                 self.index_cache_dtype = "fp8"
             else:
                 self.index_cache_dtype = self.kv_cache_dtype
+
+        _check_m3_mxfp4(
+            arches,
+            self.index_cache_dtype,
+            envs.ATOM_M3_SPARSE_KV_MXFP4,
+            envs.ATOM_M3_SPARSE_KV_NVFP4,
+            self.kv_cache_block_size,
+            is_plugin_mode(),
+            envs.ATOM_M3_INDEX_Q_FP8,
+        )
 
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a
