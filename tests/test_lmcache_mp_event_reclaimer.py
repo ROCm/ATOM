@@ -111,3 +111,20 @@ def test_unprovable_submission_keeps_its_ready_event():
     original = reclaimer.acquire_ready_event(object)
     reclaimer.track_ready_event(original, owner)
     assert reclaimer.acquire_ready_event(object) is not original
+
+
+def test_pre_submit_rejection_keeps_other_event_owners():
+    class Future:
+        ready = False
+
+        def query(self):
+            return self.ready
+
+    reclaimer = IPCEventReclaimer()
+    owner = Future()
+    event = reclaimer.acquire_ready_event(object)
+    reclaimer.track_ready_event(event, owner)
+    reclaimer.track_ready_event(event, None)
+    assert reclaimer.acquire_ready_event(object) is not event
+    owner.ready = True
+    assert reclaimer.acquire_ready_event(object) is event
