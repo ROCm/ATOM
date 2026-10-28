@@ -284,9 +284,6 @@ class MoRIIOConnector(KVConnectorBase):
         metadata list layout:
         ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
         ``self.num_k_chunks`` marks the K/V boundary.
-
-        An empty cache with transfer regions is registered by
-        ``_register_regions``, one pseudo-layer per region.
         """
         self.kv_caches = kv_caches
         if not kv_caches:
@@ -437,14 +434,6 @@ class MoRIIOConnector(KVConnectorBase):
 
         self.block_len = self.kv_cache_block_size
         self.num_blocks = int(num_blocks or tt.num_blocks)
-        n_page = sum(v[0] == _REGION_PAGE for v in self._region_layers.values())
-        n_slot = sum(v[0] == _REGION_SLOT for v in self._region_layers.values())
-        logger.info(
-            "[moriio-layout] %d PAGE + %d SLOT regions, %d blocks",
-            n_page,
-            n_slot,
-            self.num_blocks,
-        )
         metadata = MoRIIOAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
@@ -483,7 +472,6 @@ class MoRIIOConnector(KVConnectorBase):
 
     @staticmethod
     def _region_unit(layout: list[int], index: int, label: str) -> int:
-        """Forward unit of ``index`` in a region, bounds-checked."""
         num_units, reverse = layout[2], layout[3]
         if not 0 <= index < num_units:
             raise ValueError(f"{label}: unit {index} outside 0..{num_units - 1}")
@@ -1260,7 +1248,6 @@ class MoRIIOConnector(KVConnectorBase):
         src: list[int],
         dst: list[int],
     ) -> list[dict[tuple[int, int], tuple[list[int], list[int], list[int]]]]:
-        """PAGE pairs the blocks. SLOT pairs producer slot to consumer slot."""
         label = f"transfer {request['transfer_id']}"
         remote_layout = self.remote_moriio_metadata[engine_id].region_layout
         src_slot = int(request.get("src_slot", -1))
