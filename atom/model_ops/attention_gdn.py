@@ -12,6 +12,7 @@ from atom.model_ops.fla_ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
     gdn_decode_update_lossy_fast,
+    gdn_fused_decode,
 )
 from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import (
@@ -138,6 +139,11 @@ class GatedDeltaNet(nn.Module):
         # Opt-in is only eligibility. The standalone cache builder resolves the
         # policy once with ReplaySSM, architecture and the actual state tensor.
         self.gdn_flydsl_policy = None
+        # Set by models whose attention op applies the gated RMSNorm (forward
+        # then returns norm(core) * silu(z)); the fused decode is resolved at
+        # cache binding, with the state layout it needs.
+        self.gated_norm = None
+        self.gdn_fused_decode = False
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
@@ -203,7 +209,9 @@ class GatedDeltaNet(nn.Module):
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
         layer_name: str,
+        z: torch.Tensor | None = None,
     ):
+        """``z`` (with ``gated_norm`` set) makes the result norm(core) * silu(z)."""
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 
         fwd_ctx: ForwardContext = get_forward_context()
@@ -253,6 +261,31 @@ class GatedDeltaNet(nn.Module):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+
+        # Decode-only batch: one fused kernel writes norm(core) * silu(z) into
+        # the output. Decode never forks a state, so read and write slots match.
+        if (
+            z is not None
+            and self.gdn_fused_decode
+            and spec_sequence_masks is None
+            and gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes > 0
+            and non_spec_state_indices_tensor is not None
+            and gdn_fused_decode.decode(
+                self,
+                mixed_qkv,
+                b,
+                a,
+                z[:num_actual_tokens],
+                conv_state,
+                ssm_state,
+                non_spec_state_indices_tensor[:num_actual_tokens],
+                core_attn_out[:num_actual_tokens],
+            )
+        ):
+            if num_actual_tokens < core_attn_out.shape[0]:
+                core_attn_out[num_actual_tokens:].zero_()
+            return core_attn_out
 
         if spec_sequence_masks is not None:
             if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:
@@ -684,6 +717,13 @@ class GatedDeltaNet(nn.Module):
                 core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+        if z is not None:
+            gdn_fused_decode.gated_rmsnorm_(
+                core_attn_out[:num_actual_tokens],
+                z[:num_actual_tokens],
+                self.gated_norm,
+            )
 
         # Zero padding tail for CUDA graph replay safety
         if num_actual_tokens < core_attn_out.shape[0]:

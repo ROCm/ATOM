@@ -676,6 +676,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
+    # Native ATOM Qwen3.5 GDN decode as one AITER kernel on gfx1250; "0" keeps
+    # the separate conv/gating/recurrence/norm kernels.
+    "ATOM_GDN_FUSED_DECODE": lambda: (
+        os.getenv("ATOM_GDN_FUSED_DECODE", "1").lower() == "1"
+    ),
     # --- ReplaySSM (linear-attention state) ---
     # Cache the SSM *inputs* (k, u, g) instead of one full recurrent state per
     # speculative token.  The state pool stops scaling with the MTP window --
