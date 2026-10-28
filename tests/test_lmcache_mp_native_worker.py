@@ -24,6 +24,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload.chunked_scheduler import DENSE_PAGE_SOURCE_SAFE_CHANNEL
 from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
     NativeStateTransfer,
@@ -33,6 +34,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _model_namespace,
     _tp_replication_factor,
 )
+from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
 )
@@ -600,6 +602,104 @@ def test_restore_is_fenced_against_the_compute_stream_both_ways(worker, cuda):
 
     worker.start_load_kv(object())
     assert cuda.compute.waited_events == [event]
+
+
+@pytest.mark.parametrize("loading", [False, True])
+@pytest.mark.parametrize("images", [False, True])
+@pytest.mark.parametrize("unprovable", [False, True])
+def test_overlapping_native_batches_keep_their_ready_fences(
+    monkeypatch, loading, images, unprovable
+):
+    worker = _make_worker(images=images)
+    worker._event_reclaimer = IPCEventReclaimer()
+    worker._max_pending_saves = 4
+    transfers = []
+
+    class ReadyEvent:
+        records = 0
+
+        def record(self, _stream):
+            self.records += 1
+
+    monkeypatch.setattr(torch.cuda, "Event", lambda **_kw: ReadyEvent())
+    monkeypatch.setattr(torch.cuda, "current_stream", object)
+
+    def submit(_request_id, _spec, event):
+        future = Future()
+        transfers.append((event, future))
+        if unprovable and len(transfers) == 1:
+            raise ConnectionError("server may already be using the ready fence")
+        return future
+
+    worker._adapter.submit_store_request = submit
+    worker._adapter.submit_retrieve_request = submit
+
+    def batch(generation):
+        req = request(loading=loading, generation=generation)
+        if not images:
+            req = replace(
+                req,
+                native_state=NativeStateTransfer((), 16, 998, None, kv_only=True),
+            )
+        metadata = LMCacheOffloadMetadata()
+        metadata.add_request(req)
+        worker.start_load_kv(metadata)
+
+    batch(1)
+    batch(2)
+    first, first_future = transfers[0]
+    second, _ = transfers[1]
+    assert first is not second
+    assert first.records == second.records == 1
+
+    first_future.ready = True
+    batch(3)
+    third, _ = transfers[2]
+    if unprovable:
+        assert third is not first and third is not second
+        assert first.records == 1
+    else:
+        assert third is first
+        assert first.records == 2
+    assert second.records == 1
+
+
+@pytest.mark.parametrize("loading", [False, True])
+def test_native_completion_event_reclamation_waits_for_a_safe_point(worker, loading):
+    import gc
+
+    destroyed = []
+
+    class CompletionEvent:
+        def __del__(self):
+            destroyed.append(True)
+
+    worker._event_reclaimer = IPCEventReclaimer()
+    future = worker.future
+    future.ready = True
+    future.event_ = CompletionEvent()
+    if loading:
+        worker._submit_load(request(loading=True), object())
+        worker._begin_restore = lambda pending: False
+        worker.get_finished()
+        worker.get_finished()  # No descriptor: must not register cleanup twice.
+
+        def restore(pending):
+            pending.restore_event = SimpleNamespace(query=lambda: True)
+            pending.restore_succeeded = True
+            return True
+
+        worker._begin_restore = restore
+    else:
+        worker._submit_save(request(), object())
+    worker.get_finished()
+    worker.future = None
+    del future
+    gc.collect()
+    assert destroyed == []
+    assert len(worker._event_reclaimer._retired) == 1
+    worker._event_reclaimer.release()
+    assert destroyed == [True]
 
 
 def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
