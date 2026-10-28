@@ -41,23 +41,29 @@ class DraftQSlots:
     the ones that cost a step: an expired request that came back and found the
     sentinel. ``verifies`` counts the lookups that found their rows, so
     ``live_expiries / (verifies + live_expiries)`` is the fraction of lookups
-    that lost their q. Expired ids are remembered for the last
-    ``_EXPIRED_MEMORY * num_slots`` expiries only; a request that waits out
-    more than that is missed, so under extreme churn the count is a lower
-    bound. A preempted request that expired while waiting counts too, though
-    its first step back recomputes the prompt and has no drafts to lose.
+    that lost their q. Only lookups a verify reads count: `DraftQStaging`
+    asks for none on a step that verifies nothing (prefill, align-only), so a
+    preempted request re-prefilled in chunks adds nothing until its first
+    verify, which reads the slot its final chunk claimed. Expired ids are
+    remembered for the last ``_EXPIRED_MEMORY * num_slots`` expiries only; a
+    request that waits out more than that is missed, so under extreme churn
+    the count is a lower bound.
+
+    ``log``: whether this instance reports the counters. Every TP rank keeps
+    the same map, so only the first rank of each DP group says so.
     """
 
     # How many expired ids `live_expiries` remembers, per slot.
     _EXPIRED_MEMORY = 16
 
-    def __init__(self, num_slots: int, rows_per_slot: int):
+    def __init__(self, num_slots: int, rows_per_slot: int, *, log: bool = True):
         if num_slots <= 0 or rows_per_slot <= 0:
             raise ValueError(
                 f"need positive slots and rows, got {num_slots} x {rows_per_slot}"
             )
         self.num_slots = num_slots
         self.rows_per_slot = rows_per_slot
+        self._log = log
         # A plain dict is insertion-ordered; `claim_bases` re-inserts, so the
         # first key is always the least recently drafted request.
         self._slot_of: dict = {}
@@ -79,8 +85,9 @@ class DraftQSlots:
     def verify_bases(self, req_ids, out) -> None:
         """Write each request's first q row into ``out``, or -1 if it has none.
 
-        Must run before `claim_bases` for the same batch, which may hand the
-        slot of a request outside the batch to a new one. Both run on the host
+        Only for a step whose verify reads them: every call is counted. Must
+        run before `claim_bases` for the same batch, which may hand the slot
+        of a request outside the batch to a new one. Both run on the host
         before the forward; the verify's read is ordered before the propose
         that rewrites a slot because both run on the one compute stream.
         """
@@ -100,14 +107,15 @@ class DraftQSlots:
         if lookups >= self._next_lookup_log:
             # Powers of two again: a handful of lines over a long run.
             self._next_lookup_log *= 2
-            logger.info(
-                "draft q slots: %d of %d lookups lost their q to an expiry "
-                "(%d expiries in all, %d slots)",
-                self.live_expiries,
-                lookups,
-                self.evictions,
-                self.num_slots,
-            )
+            if self._log:
+                logger.info(
+                    "draft q slots: %d of %d lookups lost their q to an expiry "
+                    "(%d expiries in all, %d slots)",
+                    self.live_expiries,
+                    lookups,
+                    self.evictions,
+                    self.num_slots,
+                )
 
     def claim_bases(self, req_ids, out, skip=None) -> None:
         """Give every request a slot to draft into and write its first row.
@@ -146,12 +154,13 @@ class DraftQSlots:
         if self.evictions >= self._next_eviction_log:
             # Powers of two: visible from the first one on, quiet under churn.
             self._next_eviction_log *= 2
-            logger.info(
-                "draft q slots: %d expiries so far (%d slots); an expired "
-                "request that is still running rejects its next first draft",
-                self.evictions,
-                self.num_slots,
-            )
+            if self._log:
+                logger.info(
+                    "draft q slots: %d expiries so far (%d slots); an expired "
+                    "request that is still running rejects its next first draft",
+                    self.evictions,
+                    self.num_slots,
+                )
         victim = next(iter(self._slot_of))
         self._expired[victim] = True
         if len(self._expired) > self._EXPIRED_MEMORY * self.num_slots:
@@ -201,13 +210,17 @@ class DraftQStaging:
         self._staged = 0
         self._consumed = 0
 
-    def stage(self, batch, bs: int, *, drafts_verifiable: bool):
+    def stage(self, batch, bs: int, *, drafts_verifiable: bool, verifies: bool):
         """Stage one step and return ``{buffer: rows to publish or None}``.
 
         ``drafts_verifiable``: this step's propose emits drafts a later verify
         may read. False for a dummy forward and an align-only middle chunk:
         those claim no slot and write no q, so their ids (warmup's 0..n-1, the
         DP dummy's -1) never enter the slot map.
+
+        ``verifies``: this forward's verify scores drafts and so may read q
+        (`ModelRunner._verifies_drafts`). False for a prefill, align-only or
+        dummy forward: no lookup is made, so none is counted.
         """
         # The Philox key. A plain SPMD counter, so every TP rank reaches the
         # same number without exchanging it.
@@ -217,10 +230,10 @@ class DraftQStaging:
         req_ids = batch.req_ids[:bs]
         # Verify bases before claims: a claim may hand a slot to a new request,
         # and a request's verify must still read the slot its drafts came from.
-        if batch.is_dummy_run:
-            self._verify[:bs] = -1
-        else:
+        if verifies and not batch.is_dummy_run:
             self.slots.verify_bases(req_ids, self._verify)
+        else:
+            self._verify[:bs] = -1
         # Every row the block runs must name a destination, the pad rows up to
         # `running_bs` included, and a pad row left holding a larger previous
         # batch's base would write its q into a live request's slot. So clear

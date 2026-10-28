@@ -2720,6 +2720,10 @@ class ModelRunner:
                 # dropped, so they must not claim q slots or write q.
                 drafts_verifiable=not batch.is_dummy_run
                 and not self._is_pure_middle_chunk(batch),
+                # Only a forward that scores drafts looks its q up.
+                verifies=self._verifies_drafts(
+                    batch, batch.total_tokens_num_prefill > 0
+                ),
             )
         if publication_group is None:
             group.publish(counts)

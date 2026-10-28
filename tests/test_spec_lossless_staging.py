@@ -100,7 +100,9 @@ def batch(
 
 def stage(prop, b, *, verifiable=True):
     g = group(prop)
-    prop.stage_draft_sampling_host(b, len(b.req_ids), g, drafts_verifiable=verifiable)
+    prop.stage_draft_sampling_host(
+        b, len(b.req_ids), g, drafts_verifiable=verifiable, verifies=verifiable
+    )
     return {name: g.counts[g.indices[name]] for name in LOSSLESS}
 
 
@@ -176,7 +178,9 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
     assert prop.lossless_verify_inputs(2) == (None, None, None)
     # Staging is a no-op rather than an error.
-    prop.stage_draft_sampling_host(batch(["a"]), 1, None, drafts_verifiable=True)
+    prop.stage_draft_sampling_host(
+        batch(["a"]), 1, None, drafts_verifiable=True, verifies=True
+    )
 
 
 @pytest.mark.parametrize(

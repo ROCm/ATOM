@@ -149,6 +149,21 @@ def test_the_expired_id_memory_is_bounded():
     assert slots.live_expiries == 1
 
 
+@pytest.mark.parametrize("log", [True, False])
+def test_only_the_logging_rank_reports_the_counters(caplog, log):
+    """Every TP rank keeps the same map; one of them says so."""
+    slots = DraftQSlots(1, T, log=log)
+    with caplog.at_level("INFO", logger="atom"):
+        for i in range(4):
+            bases(slots, [f"r{i}"], claim=False)
+            bases(slots, [f"r{i}"], claim=True)
+        for _ in range(1024):
+            bases(slots, ["r3"], claim=False)
+    assert slots.evictions == 3 and slots.verifies == 1024
+    assert ("expiries so far" in caplog.text) is log
+    assert ("lookups lost their q" in caplog.text) is log
+
+
 def test_sizes_must_be_positive():
     with pytest.raises(ValueError):
         DraftQSlots(0, T)

@@ -374,7 +374,7 @@ class Drafter(abc.ABC):
     # the hooks unconditionally and gets None back.
 
     def stage_draft_sampling_host(
-        self, batch, bs: int, group, *, drafts_verifiable: bool
+        self, batch, bs: int, group, *, drafts_verifiable: bool, verifies: bool
     ) -> None:
         """Stage the draft sampler's per-step inputs into pinned host buffers
         and claim their counts in `prepare_sample`'s own `sampling` H2D

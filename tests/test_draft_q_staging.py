@@ -59,8 +59,8 @@ def batch(
     )
 
 
-def stage(st, b, *, verifiable=True):
-    return st.stage(b, len(b.req_ids), drafts_verifiable=verifiable)
+def stage(st, b, *, verifiable=True, verifies=True):
+    return st.stage(b, len(b.req_ids), drafts_verifiable=verifiable, verifies=verifies)
 
 
 def test_a_verify_finds_the_rows_its_drafts_were_written_to():
@@ -79,7 +79,7 @@ def test_a_dummy_forward_claims_nothing_and_verifies_nothing():
     """Warmup and DP dummies carry ids 0..n-1 and -1; none may enter the map,
     or a real request 0 would later verify against a dummy's q."""
     st, a = staging()
-    stage(st, batch([0, 1, -1], dummy=True), verifiable=False)
+    stage(st, batch([0, 1, -1], dummy=True), verifiable=False, verifies=False)
     assert a.dest_row_base[:3].tolist() == [-1, -1, -1]
     assert a.verify_row_base[:3].tolist() == [-1, -1, -1]
     assert len(st.slots) == 0
@@ -91,12 +91,31 @@ def test_an_align_only_propose_writes_no_q_and_keeps_other_slots():
     st, a = staging()
     stage(st, batch(["d"]))
     d = a.dest_row_base[0]
-    rows = stage(st, batch(["m1", "m2"]), verifiable=False)
+    rows = stage(st, batch(["m1", "m2"]), verifiable=False, verifies=False)
     assert a.dest_row_base[:2].tolist() == [-1, -1]
     assert rows["dest_row_base"] == 2
     assert "m1" not in st.slots and "m2" not in st.slots
     stage(st, batch(["d"]))
     assert a.verify_row_base[0] == d
+
+
+def test_only_a_step_that_verifies_looks_q_up_or_counts():
+    """A prefill-only or align-only step reads no q, so it looks nothing up:
+    a request re-prefilled in chunks after its slot expired neither counts
+    as a lost q nor as a verify, and its first verify reads the slot its
+    final chunk claimed."""
+    st, a = staging(slots=1)
+    stage(st, batch(["a"]))
+    stage(st, batch(["b"]))  # a expires
+    stage(st, batch(["a"]), verifiable=False, verifies=False)  # middle chunk
+    assert a.verify_row_base[0] == -1
+    stage(st, batch(["a"], final_chunk=[True]), verifies=False)
+    assert a.verify_row_base[0] == -1
+    assert (st.slots.verifies, st.slots.live_expiries) == (0, 0)
+    claimed = a.dest_row_base[0]
+    stage(st, batch(["a"]))
+    assert a.verify_row_base[0] == claimed
+    assert (st.slots.verifies, st.slots.live_expiries) == (1, 0)
 
 
 def test_a_greedy_request_claims_no_slot_and_writes_no_q():

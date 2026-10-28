@@ -270,7 +270,7 @@ class DSparkProposer(Drafter):
         self._draft_row_base_buf = buffers["draft_q_row_base"]
         self._verify_row_base_buf = buffers["verify_q_row_base"]
         self._staging = DraftQStaging(
-            DraftQSlots(q_slots, t),
+            DraftQSlots(q_slots, t, log=self.runner.rank == 0),
             temperatures=self._draft_temps_buf.np,
             greedy_mask=self._draft_greedy_buf.np,
             top_k=self._draft_top_k_buf.np,
@@ -312,7 +312,7 @@ class DSparkProposer(Drafter):
             )
 
     def stage_draft_sampling_host(
-        self, batch, bs: int, group, *, drafts_verifiable: bool
+        self, batch, bs: int, group, *, drafts_verifiable: bool, verifies: bool
     ) -> None:
         """Stage this step's draft sampling inputs and both q row bases.
 
@@ -320,12 +320,14 @@ class DSparkProposer(Drafter):
         preparation window, so every member rides that function's `sampling`
         H2D. The block head is captured and bakes these buffers' addresses;
         only their contents change, and only here. What goes in each row is
-        `DraftQStaging.stage`'s policy (see there for ``drafts_verifiable``);
-        this method only publishes it.
+        `DraftQStaging.stage`'s policy (see there for ``drafts_verifiable``
+        and ``verifies``); this method only publishes it.
         """
         if self.draft_sampling is None:
             return
-        rows = self._staging.stage(batch, bs, drafts_verifiable=drafts_verifiable)
+        rows = self._staging.stage(
+            batch, bs, drafts_verifiable=drafts_verifiable, verifies=verifies
+        )
         counts, index = group.counts, group.indices
         for name, key in (
             ("draft_sample_seed", "seed"),
