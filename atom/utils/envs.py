@@ -408,6 +408,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
+    # Qwen3-Next / Qwen3.5: one Triton launch each for the MoE shared-expert
+    # combine `routed + sigmoid(gate) * shared` and the attention output gate
+    # `o * sigmoid(gate)`, instead of three and two eager kernels. Keeps the
+    # BF16 rounding of every intermediate, so the outputs match the unfused ops.
+    "ATOM_FUSED_SIGMOID_GATE": lambda: (
+        os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
+    ),
     # With that fusion on, batches above this token count run the Gemma q/k
     # norm, RoPE and cache write as separate kernels: the one-kernel version
     # loses at prefill sizes while saving launches at decode sizes (crossover
