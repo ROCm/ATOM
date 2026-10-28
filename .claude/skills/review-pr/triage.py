@@ -1197,9 +1197,40 @@ def derive(files, title="", raw_diff=""):
         hit("sentinel-value", "D10")
     if re.search(r"\bself\.\w*(awaiting|pending|in_?flight|finished_\w*|retained|deferred|_cache)\w*\s*(\.add\(|\.append\(|\.setdefault\(|\[[^\]]+\]\s*=)", add, re.I):
         hit("unbounded-tracking-set", "F2")
-    if (any("kv_transfer" in p or "disaggregation" in p or "mooncake" in p for p in paths)
-            and re.search(r"self\.\w*(size|rank|dtype|layout)\s*=", add)):
-        hit("pd-handshake", "A4")
+    # kv-transfer -- pure path trigger, deliberately NOT content-gated. Measured gap
+    # (P1, 2026-10-23): atom/kv_transfer/offload (224 commits) and atom/kv_transfer/
+    # disaggregation (147 commits) since 2026-04-27 had zero family routing to them
+    # at all; A4/D10/F2 already carry citations anchored in exactly these two
+    # directories (D10: ATOM#2305, atom/kv_transfer/offload/chunked_scheduler.py;
+    # F2: ATOM#2146, atom/kv_transfer/offload/_offload_common.py +
+    # chunked_scheduler.py; A4: ATOM#2000 + the ATOM#2315 revert, both
+    # atom/kv_transfer/disaggregation) but were only reachable if the diff happened
+    # to also match a sentinel comparison or a tracking-dict mutation -- the path
+    # itself routed nowhere. A PR anywhere under these two directories should be
+    # asked about all three regardless of what its diff lines look like.
+    if any("atom/kv_transfer/offload" in p or "atom/kv_transfer/disaggregation" in p
+           or "mooncake" in p for p in paths):
+        hit("kv-transfer", "A4 D10 F2")
+
+    # mesh-routing -- pure path trigger. atom/mesh/src (288 commits since 2026-04-27)
+    # had no family at all. A5 is anchored on two independent PRs in this exact
+    # directory (#2351, #1886), both the same shape: per-request routing state
+    # (a load-tracking guard, a sticky DP-affinity rank) applied on the
+    # non-streaming branch but silently skipped on the streaming branch of the
+    # same dispatch function.
+    if any(p.startswith("atom/mesh/src/") for p in paths):
+        hit("mesh-routing", "A5")
+
+    # openai-entrypoint -- pure path trigger. atom/entrypoints/openai (170 commits
+    # since 2026-04-27) had no family at all. Routes to two existing rules with
+    # citations already in this directory: A1 (ATOM#1803 -- the same "include
+    # content=''" fix had to be repeated across three sibling SSE chunk-builder
+    # call sites: stream_chat_response, stream_chat_response_fanout, and the
+    # standalone router) and B6 (ATOM#2041 -- a rejected request is routed through
+    # the ADD dispatch branch, which never touches _seq_id_to_callback, so the
+    # online client's callback is never invoked and the SSE stream hangs forever).
+    if any(p.startswith("atom/entrypoints/openai/") for p in paths):
+        hit("openai-entrypoint", "A1 B6")
     if (re.search(r"\.item\(\)|\.tolist\(\)", add) or re.search(r'\.to\(\s*["\']cpu["\']\s*\)', add)) \
             and any(p.endswith("model_runner.py") or ("/models/" in p and p.endswith(".py")) for p in paths):
         hit("cpu-gpu-sync", "G2")
@@ -1283,7 +1314,7 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
     "P1", "P2", "P3", "P4", "P5", "HK3", "HK6", "HK7",
 )}
 
-ALL_RULES = ("A1 A2 A3 A4 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
+ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 C1 C2 D1 D4 D10 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
              "HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
