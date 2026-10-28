@@ -60,33 +60,45 @@ def mark_notified():
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: _notify.py <pr>"); return 2
+        print("usage: _notify.py <pr>")
+        return 2
     pr = sys.argv[1]
     path = os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), ".atom-review-status")
     if not os.path.exists(path):
         return 0  # the review succeeded -> nothing to report
-    cls, _, msg = open(path, encoding="utf-8").read().strip().partition("\t")
+    with open(path, encoding="utf-8") as fh:
+        raw = fh.read()
+    cls, _, msg = raw.strip().partition("\t")
     if cls not in OWNERS:
         cls = "flow"  # an unknown tag routes to the bot owner rather than nobody
     owner = owner_for(cls)
     domain = OWNERS[cls][1]
-    body = (f"⚠️ **rocm-atom-bot** — this review could not complete: a problem with **{domain}**, "
-            f"not with this PR.\n\n> {msg}\n\n@{owner} — please take a look.")
+    body = (
+        f"⚠️ **rocm-atom-bot** — this review could not complete: a problem with **{domain}**, "
+        f"not with this PR.\n\n> {msg}\n\n@{owner} — please take a look."
+    )
     if cls == "glm":
-        body += (f"\n\n<sub>Triage: if GLM serves but its output is malformed it may be the ATOM "
-                 f"framework (@{owner_for('atom')}); if the box, GPU, disk or network is unhealthy "
-                 f"it may be the machine (@{owner_for('machine')}).</sub>")
+        body += (
+            f"\n\n<sub>Triage: if GLM serves but its output is malformed it may be the ATOM "
+            f"framework (@{owner_for('atom')}); if the box, GPU, disk or network is unhealthy "
+            f"it may be the machine (@{owner_for('machine')}).</sub>"
+        )
     body += "\n\nRe-comment `@rocm-atom-bot review` once it is resolved."
 
     tok = os.environ.get("ATOM_BOT_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not tok or not repo:
-        print("no ATOM_BOT_TOKEN / GITHUB_REPOSITORY -- would post:\n" + body); return 0
+        print("no ATOM_BOT_TOKEN / GITHUB_REPOSITORY -- would post:\n" + body)
+        return 0
     req = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/issues/{pr}/comments",
         data=json.dumps({"body": body}).encode(),
-        headers={"Authorization": f"token {tok}", "Accept": "application/vnd.github+json"},
-        method="POST")
+        headers={
+            "Authorization": f"token {tok}",
+            "Accept": "application/vnd.github+json",
+        },
+        method="POST",
+    )
     try:
         urllib.request.urlopen(req, timeout=15)
         mark_notified()
