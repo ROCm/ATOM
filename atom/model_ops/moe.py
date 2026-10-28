@@ -2089,31 +2089,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         shared column widened in where the legacy layout fuses one. A HERD
         step instead returns the raw (unbiased, unnormalised) scores of the
         Top-(K+1) candidates: fused_moe drops one per row, renormalises and
-        applies the routed scale. Its rows past the real count keep real
-        routes, as aiter's HERD routing takes no -1 ids."""
+        applies the routed scale. Rows past the real count route to -1 and
+        are skipped by aiter's HERD route/quant kernels."""
         if self._flydsl_herd_step(layer, router_logits):
             num_tokens = router_logits.shape[0]
             _log_flydsl_herd_batch(num_tokens, layer.top_k)
-            topk_ids = torch.empty(
-                (num_tokens, layer.top_k + 1),
-                dtype=torch.int32,
-                device=router_logits.device,
+            return FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=layer.top_k + 1,
+                use_grouped_topk=False,
+                renormalize=False,
+                scoring_func=layer.scoring_func,
+                e_score_correction_bias=layer.e_score_correction_bias,
+                routed_scaling_factor=1.0,
+                num_fused_shared_experts=0,
+                fused_shared_experts_scoring_func=None,
+                custom_routing_function=None,
             )
-            topk_weights = torch.empty(
-                (num_tokens, layer.top_k + 1),
-                dtype=torch.float32,
-                device=router_logits.device,
-            )
-            topk_gating(
-                topk_weights,
-                topk_ids,
-                router_logits,
-                layer.e_score_correction_bias,
-                False,
-                1.0,
-                score_func=layer.scoring_func,
-            )
-            return topk_weights, topk_ids
         layout = layer.expert_layout
         return _select_logical(
             layer,
@@ -2501,9 +2494,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=apply_router_weight_on_input,
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
-                # aiter's HERD routing takes no pad-row count: the candidates
-                # route every row (see select_experts).
-                num_local_tokens=None if herd_topk else scheduled_tokens_gpu,
+                # AITER uses the same device-side count for ordinary and HERD
+                # routing. HERD candidate rows past this count are -1 and its
+                # route/quant kernels leave them out of the grouped MoE.
+                num_local_tokens=scheduled_tokens_gpu,
                 **moe_extra_args,
             )
         return self.fused_experts(
