@@ -4,7 +4,7 @@ This test configuration adapts [recipe PR #2747](https://github.com/ROCm/ATOM/pu
 at `7742552f26e6fe1545202a6cb78f4839ec0563cb` to one prefill TP4 worker and one
 decode TP4 worker on eight MI355X GPUs. It uses the recipe's high-concurrency
 NVFP4 band. The published recipe measures an aggregated TP4 server through C48;
-C64 here extends its `max-num-seqs = 2 * concurrency` rule.
+C64 and C88 here extend its `max-num-seqs = 2 * concurrency` rule.
 
 The configuration is in `.github/benchmark/models_atomesh.yaml` under
 `MiniMax-M3.1-Flash-Quark-MXFP4`.
@@ -60,6 +60,42 @@ published throughput/GPU divides by four; its results are not measurements of
 this P/D setup. The trace case's intentionally stopped load is not a full
 3600-second performance result.
 
+## C32 chunked-transfer comparison
+
+Rebase onto a `main` containing [#2425](https://github.com/ROCm/ATOM/pull/2425)
+(`8a9253daa`) before using the chunked case. Both the ATOM workers and the
+ATOMesh router must include that protocol. With `atom_source=mounted`, this
+workflow builds the router from the checked-out branch as well.
+
+Select these two cases explicitly under `suite=mooncake_store`:
+
+- Baseline: `minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32`
+- Chunked: `minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32`
+
+The second case only adds `"enable_chunked_transfer":true` to prefill's
+Mooncake P/D connector configuration. C32, TP4/TP4, NVFP4/FP4 index, draft FP8,
+DSpark K7/AL4.04, 1 TiB Store, capture sizes, and the 32768-token prefill batch
+budget remain identical. Each case runs 3600 seconds of formal profiling with
+no torch trace. Run both on the same branch revision, image and node. The
+launcher retains `agentx-harness==1.0.12` and `agentx_recipe_defaults: true` so
+the rebase's upstream AgentX installer does not change this workload's CLI.
+
+Chunked transfer sends newly completed pages after each prefill forward's GPU
+completion event; it includes target KV, scales, index and draft regions. Decode
+reserves destinations early, skips its cached prefix, and waits for all required
+KV plus the final first-token/draft handoff before generating. It does not
+pipeline Store-to-prefill loading or permit decode to read an incomplete prefix.
+A prefill that completes in one compute chunk has limited opportunity for
+compute/transfer overlap. Keep the batch budget fixed in this first comparison;
+a later smaller-budget experiment needs its own matched off/on baseline.
+
+Compare client/route-level TTFT, request/output throughput, cache hit rates,
+errors and memory pressure. Local decode queue, TTFT and KV-wait metrics start
+earlier with parallel P/D dispatch and may now include prefill work, so their
+raw off/on differences do not measure transfer savings. Earlier reservation
+also holds decode KV for longer. If tracing a later experiment, inspect the gap
+between the last prefill forward and decode KV readiness separately.
+
 ## Runtime dependencies brought into the test branch
 
 These were open PRs when the recipe was inspected on 2026-10-27:
@@ -89,7 +125,8 @@ are selected without an explicit image override.
 - `suite=profile`: the C32 30-second trace case.
 - `suite=mooncake_store`: C32/C48/C64/C88, each with 3600 seconds of formal
   profiling after warmup and without torch tracing. Each case starts its own
-  P/D service. The workflow runs these cases in order.
+  P/D service. Use `case_names` to select the sweep or the C32 off/on pair;
+  selecting the entire suite also includes the chunked C32 case.
 - `suite=accuracy`: the C32 GSM8K 5-shot case, without synthetic acceptance.
 
 Case names now contain `dspark7-nvfp4`; the previous `dspark3` case names no

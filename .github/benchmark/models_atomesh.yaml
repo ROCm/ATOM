@@ -1656,6 +1656,17 @@ models:
             wait_router_timeout: 600
           run_eval: false
 
+        # Same C32 recipe and prefill budget; isolate incremental P->D transfer.
+        - <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32
+          env:
+            common: *m31_flash_mcstore_common_env
+            prefill:
+              <<: *m31_flash_mcstore_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_mcstore_decode_env
+
         - <<: *m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c48
           concurrency: [48]
