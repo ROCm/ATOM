@@ -1133,11 +1133,31 @@ class TestSchedule:
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
         seq.num_cached_tokens = 8
-        # The pre-handoff partial-prefill postprocess already appended the
-        # deferred-output placeholder before the request was parked.
-        seq.append_token(sched.eos_token_id)
         sched.running = deque([seq])
 
+        # Parking discarded the previous partial chunk's deferred output. The
+        # resumed suffix prefill produces its first token one step later.
+        sched.postprocess(
+            [seq],
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=[],
+                num_bonus=[],
+                draft_token_ids=None,
+                is_deferred_out=True,
+            ),
+            batch=SimpleNamespace(
+                req_ids=[seq.id],
+                num_scheduled_tokens=[2],
+                total_seqs_num_prefill=1,
+            ),
+        )
+        assert seq.num_cached_tokens == 10
+        assert list(seq.output_tokens) == [sched.eos_token_id]
+
+        # The next decode batch carries the resumed prefill's real output.
+        seq.type = SequenceType.DECODE
         sched.postprocess(
             [seq],
             ScheduledBatchOutput(
@@ -1150,12 +1170,10 @@ class TestSchedule:
             ),
             batch=SimpleNamespace(
                 req_ids=[seq.id],
-                num_scheduled_tokens=[2],
-                total_seqs_num_prefill=1,
+                num_scheduled_tokens=[1],
+                total_seqs_num_prefill=0,
             ),
         )
-
-        assert seq.num_cached_tokens == 10
         assert list(seq.output_tokens) == [999, sched.eos_token_id]
 
 
