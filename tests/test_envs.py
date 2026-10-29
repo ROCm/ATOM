@@ -45,6 +45,8 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_DSV41_ROPE_HEAD_BLOCK",
+    "ATOM_INDEXER_LOGITS_SPLITKV",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -397,3 +399,28 @@ def test_otel_version_environment(monkeypatch):
     assert _get_envs().ATOM_TRACE_VERSION == "unknown"
     monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
     assert _get_envs().ATOM_TRACE_VERSION == "build-test"
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, False), ("0", False), ("1", True), ("true", True)]
+)
+def test_dsv41_rope_head_block(value, expected, monkeypatch):
+    if value is not None:
+        monkeypatch.setenv("ATOM_DSV41_ROPE_HEAD_BLOCK", value)
+    assert _get_envs().ATOM_DSV41_ROPE_HEAD_BLOCK is expected
+
+
+@pytest.mark.parametrize("value,expected", [(None, 0), ("0", 0), ("2", 2), ("4", 4)])
+def test_indexer_logits_splitkv(value, expected, monkeypatch, caplog):
+    if value is not None:
+        monkeypatch.setenv("ATOM_INDEXER_LOGITS_SPLITKV", value)
+    assert _get_envs().ATOM_INDEXER_LOGITS_SPLITKV == expected
+    assert not caplog.records
+
+
+def test_indexer_logits_splitkv_negative_warns_and_defaults(monkeypatch, caplog):
+    monkeypatch.setenv("ATOM_INDEXER_LOGITS_SPLITKV", "-1")
+    assert _get_envs().ATOM_INDEXER_LOGITS_SPLITKV == 0
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "ATOM_INDEXER_LOGITS_SPLITKV" in caplog.records[0].getMessage()
