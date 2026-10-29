@@ -166,6 +166,7 @@ class PrefillDelayer:
         "_stat_fire_nodecode",
         "_stat_fire_partial",
         "_stat_fire_queue_ms",
+        "_stat_fire_quorum",
         "_stat_fire_stall",
         "_stat_fire_ttft",
         "_stat_fire_vacuous",
@@ -175,6 +176,7 @@ class PrefillDelayer:
         "cpu_group",
         "dp_size",
         "kv_high_watermark",
+        "last_fire_aligned",
         "max_num_batched_tokens",
         "max_queue_ms",
         "partial_max_ticks",
@@ -331,7 +333,11 @@ class PrefillDelayer:
         self._stat_fire_partial = 0
         self._stat_fire_nodecode = 0
         self._stat_fire_queue_ms = 0
+        self._stat_fire_quorum = 0
         self._stat_fire_vacuous = 0
+        # True only for this tick's full-group align. The scheduler's
+        # one-sequence cap reads it; a quorum or escape release leaves it false.
+        self.last_fire_aligned = False
         self._stat_hold = 0
         self._stat_hold_decode_interval = 0
         self._stat_log_every = int(
@@ -518,6 +524,7 @@ class PrefillDelayer:
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
         self._prefill_executed_since_last_decision = False
+        self.last_fire_aligned = False
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
         any_partial = partial_n > 0
@@ -559,18 +566,19 @@ class PrefillDelayer:
             self._maybe_log()
             return True
 
-        # Sync mode: the group stays in CUDA-graph decode until every rank
-        # can prefill on this tick, then releases immediately. Waiting for
-        # target_fill is wrong here — one prompt never fills max_num_batched
-        # tokens, so the coalescer used to hold until a must-fire bound and
-        # then release unaligned anyway. Escapes are the cases where holding
-        # cannot preserve graphs: nobody is decoding, KV cannot take another
-        # wait, or a request/partial has already waited out its bound.
-        # kv_low and stall are not escapes; both trip in normal steady state
-        # and would put the peers back on eager decode.
+        # Sync mode. With prefill token graphs a lone prefill already makes
+        # idle ranks run a dummy prefill, so this is not what keeps peers off
+        # an eager decode. It holds a wave until enough ranks can prefill
+        # together, instead of turning every arrival into a group prefill tick.
+        # Full alignment is the only release that caps admission at one
+        # sequence. A 3/4 quorum releases when one rank has no work, so that
+        # rank cannot hold the group for ttft_max_ticks. Escapes still release
+        # a short wave (KV, queue age, partial, no decode, TTFT).
         if self.sync_prefill and self.dp_size > 1:
             if n_prefillable >= self.dp_size:
                 return self._fire("align", g_pending)
+            if n_prefillable >= max(1, (self.dp_size * 3 + 3) // 4):
+                return self._fire("quorum", g_pending)
             if g_running_dec == 0:
                 return self._fire("nodecode", g_pending)
             if any_kv_high:
@@ -690,6 +698,9 @@ class PrefillDelayer:
         # reason ∈ {align, quorum, fill, stall, cost, ttft, kv, partial,
         # nodecode, queue_ms, vacuous}; each maps to a dedicated
         # _stat_fire_<reason> slot so the log shows what released.
+        # last_fire_aligned is the scheduler's one-sequence cap, not the
+        # lockstep idle gate.
+        self.last_fire_aligned = reason == "align"
         attr = f"_stat_fire_{reason}"
         setattr(self, attr, getattr(self, attr) + 1)
         self._fired_cost = max(self.rank_prefill_costs, default=0.0)
@@ -749,6 +760,7 @@ class PrefillDelayer:
             + self._stat_fire_partial
             + self._stat_fire_nodecode
             + self._stat_fire_queue_ms
+            + self._stat_fire_quorum
             + self._stat_fire_vacuous
             + self._stat_hold
         )
@@ -766,6 +778,7 @@ class PrefillDelayer:
                 f"fire_partial={self._stat_fire_partial} "
                 f"fire_nodecode={self._stat_fire_nodecode} "
                 f"fire_queue_ms={self._stat_fire_queue_ms} "
+                f"fire_quorum={self._stat_fire_quorum} "
                 f"fire_vacuous={self._stat_fire_vacuous} "
                 f"hold_decode_interval={self._stat_hold_decode_interval} "
                 f"hold={self._stat_hold} "
