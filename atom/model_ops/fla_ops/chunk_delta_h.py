@@ -19,6 +19,10 @@ from .utils import use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
 
+# (heads, key / value heads and dims, chunk, dtypes) whose slot-indexed in-place
+# launch is tuned in this process (`chunk_gated_delta_rule_fwd_h`)
+_SLOT_VARIANT_TUNED: set = set()
+
 
 @triton.heuristics(
     {
@@ -386,11 +390,13 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     plan=None,
+    state_slots=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """With ``plan`` (`varlen_plan.VarlenPlan`) ``initial_state`` is the
     state pool: the kernel reads each sequence's initial state from its slot
     and writes the final state back to its slot in place, so the returned
-    final state is None."""
+    final state is None. ``state_slots`` = (read slots, write slots, has
+    initial state), one entry a sequence, does the same for an exact grid."""
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size
@@ -414,9 +420,12 @@ def chunk_gated_delta_rule_fwd_h(
                 len(chunk_indices),
                 prepare_chunk_offsets(cu_seqlens, BT),
             )
+        if state_slots is not None:
+            h0_idx, ht_idx, h0_flag = state_slots
+    in_place = plan is not None or state_slots is not None
     assert K <= 256, "current kernel does not support head dimension larger than 256."
     h = k.new_empty(B, NT, H, K, V)
-    if plan is not None:
+    if in_place:
         final_state = initial_state if output_final_state else None
     else:
         final_state = (
@@ -428,27 +437,40 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
-        k=k,
-        v=u,
-        w=w,
-        v_new=v_new,
-        g=g,
-        gk=gk,
-        h=h,
-        h0=initial_state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_offsets=chunk_offsets,
-        n_ptr=n_ptr,
-        h0_idx=h0_idx,
-        ht_idx=ht_idx,
-        h0_flag=h0_flag,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-    )
-    return h, v_new, (None if plan is not None else final_state)
+    def launch(h0, ht, h0_idx, ht_idx):
+        chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+            k=k,
+            v=u,
+            w=w,
+            v_new=v_new,
+            g=g,
+            gk=gk,
+            h=h,
+            h0=h0,
+            ht=ht,
+            cu_seqlens=cu_seqlens,
+            chunk_offsets=chunk_offsets,
+            n_ptr=n_ptr,
+            h0_idx=h0_idx,
+            ht_idx=ht_idx,
+            h0_flag=h0_flag,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+        )
+
+    tune_key = (H, Hg, K, V, BT, k.dtype, initial_state.dtype if in_place else None)
+    if state_slots is not None and tune_key not in _SLOT_VARIANT_TUNED:
+        # The autotuner times every config on the launch's own arguments, and
+        # this launch updates the pool in place: each trial would start from
+        # the state the previous one left. Tune once a process on a scratch
+        # copy of this step's slots; the launch below reuses the config.
+        scratch = initial_state.index_select(0, h0_idx)
+        rows = torch.arange(N, device=scratch.device, dtype=h0_idx.dtype)
+        launch(scratch, scratch if output_final_state else None, rows, rows)
+        _SLOT_VARIANT_TUNED.add(tune_key)
+    launch(initial_state, final_state, h0_idx, ht_idx)
+    return h, v_new, (None if in_place else final_state)

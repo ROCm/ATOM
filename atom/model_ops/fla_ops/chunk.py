@@ -44,6 +44,7 @@ def chunk_gated_delta_rule_fwd(
     o: torch.Tensor | None = None,
     keep_intermediate_states: bool = False,
     plan=None,
+    state_slots=None,
 ):
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
@@ -108,6 +109,7 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         plan=plan,
+        state_slots=state_slots,
     )
     o = chunk_fwd_o(
         q=q,
@@ -181,6 +183,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         o: torch.Tensor | None = None,
         keep_intermediate_states: bool = False,
         plan=None,
+        state_slots=None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -202,6 +205,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             o=o,
             keep_intermediate_states=keep_intermediate_states,
             plan=plan,
+            state_slots=state_slots,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -235,6 +239,7 @@ def chunk_gated_delta_rule(
     o: torch.Tensor | None = None,
     keep_intermediate_states: bool = False,
     plan=None,
+    state_slots=None,
 ):
     r"""
     Args:
@@ -350,6 +355,7 @@ def chunk_gated_delta_rule(
             )
         if (
             plan is None
+            and state_slots is None
             and initial_state is not None
             and initial_state.shape[0] != len(cu_seqlens) - 1
         ):
@@ -390,6 +396,7 @@ def chunk_gated_delta_rule(
         o,
         keep_intermediate_states,
         plan,
+        state_slots,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
