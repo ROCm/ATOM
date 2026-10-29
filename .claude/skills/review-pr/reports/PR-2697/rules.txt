@@ -1,0 +1,4 @@
+  files=7  types=3  rules=5/36
+    [tier1-every-request ] STEP4 A2 D4
+    [cudagraph-capture   ] D1 D4
+    [scattered-diff      ] HK2

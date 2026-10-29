@@ -1,0 +1,2 @@
+  files=7  types=1  rules=1/36
+    [scattered-diff      ] HK2

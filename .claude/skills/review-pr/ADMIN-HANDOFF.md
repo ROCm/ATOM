@@ -78,6 +78,18 @@ Neither blocks a first run.
 
 ---
 
+## 3b. The trigger allowlist takes effect only after merge
+
+`authorized.txt` lists the 58 logins that may say `atom-bot review` -- everyone who
+authored or reviewed one of the last 300 merged ROCm/ATOM PRs, bots excluded. The gate
+reads it **from the default branch**, so while this work is still a PR branch the file is
+invisible to the gate and every trigger is refused (the parser fails closed on a missing
+file). Two ways through, pick one:
+
+- merge the PR first, then the file is live as written; or
+- set the `ATOM_REVIEW_AUTHORIZED` repo variable to a comma-separated list for the trial
+  period, which overrides the file entirely.
+
 ## 4. Check one thing that could silently block every comment
 
 `rocm-atom-bot` is **not** a member of the `ROCm` org. If the repo or the org has

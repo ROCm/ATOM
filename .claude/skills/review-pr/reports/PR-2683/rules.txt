@@ -1,0 +1,3 @@
+  files=3  types=2  rules=4/36
+    [tier2-shared-op     ] A1 A2 B6
+    [flydsl-unbounded-descriptor] D11

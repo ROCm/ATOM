@@ -1,0 +1,9 @@
+======== SEVEN GATES (/tmp/review-pr-v9ISPF) ========
+  ✅ answers      ANSWERS COMPLETE: 6/6
+  ✅ diagnostic   DIAGNOSTIC COMPLETE: 6/6
+  ✅ corefiles    CORE FILES ASSESSED: 2/2 backbone files (0 tier-1), 0 gap(s)
+  ✅ ledger       LEDGER COMPLETE: 4/4 rules adjudicated with evidence
+  ✅ card         CARD NAILED DOWN: 2 findings, each traced to an adjudication and anchored in a changed file; every FIRE accounted for
+  ✅ refutations  REFUTATIONS COMPLETE: 2 attempted, 2 survived, 0 killed before reaching the card
+  ✅ independent  INDEPENDENTLY REFUTED: 2 judged, 2 defended, 0 killed by a reader who had not seen the reasoning
+======== 7 green / 0 red ========

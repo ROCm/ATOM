@@ -1,0 +1,10 @@
+## ATOM PR #2683 — fix(v41): bound mono candidate prefetches without branching
+
+**Bounds the speculative candidate-table prefetch in DeepSeek-V4.1's mono K2a selection helper to the current token's row via a new shared clamped pure function, so FULL layers' history-row IDs can no longer read past the allocation — all without adding branches around the load.**
+
+Review: ✅ LGTM
+Validation (advisory): tests/test_deepseek_v41_mono_selected_rows.py run against the PR head's index_plan.py in a CPU-only sandbox — 28/28 cases passed — one run, this box, unverified.
+
+📝 The device-side evidence — the 48 candidate-load exec-mask branches each ending in `s_waitcnt vmcnt(0)` that the branched variant lowered to and the clamp removes, the 10.2/11.9 µs selection-stage parity table, and the 21 GPU helper cases behind the unmapped guard — is author-reported with no shipped reproducer: the `harness/p31_score.py` the kernels cite is not in the tree, and the only shipped coverage, tests/test_deepseek_v41_mono_selected_rows.py, checks the host-side address math, so the branch-free parity claim cannot be re-run from this repo if it gates future mono work. **Reviewer should ask** the author to publish the A/B benchmark and helper-case script. [verified]
+
+📝 `rsrc(a["icand"])` in index_score.py:343 still builds the candidate-table descriptor with no explicit extent (`rsrc(addr, nbytes=None)` in atom/mono/device/ops.py), so the clamp inside candidate_offset (index_plan.py) is the only structural bound keeping the speculative load inside token t's row — a future caller passing a wider ident domain would silently re-open the out-of-bounds read this PR fixed. **Reviewer should ask** for a follow-up that also passes the buffer's byte extent to rsrc so the descriptor itself carries the bound. [verified]
