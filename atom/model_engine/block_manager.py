@@ -816,15 +816,23 @@ class BlockManager:
         the connector loads the KV past the HBM hit first (`replay_kv_load`).
         Records on `seq` whether the hit it returns replays (`replay_start`).
         """
+        hit, seq.replays_hit, seq.replay_kv_load = self._replay_decision(
+            seq, compressed_hit, hit, int(seq.offload_joint.kv_prefix_tokens or 0)
+        )
+        return hit
+
+    def _replay_decision(
+        self, seq: Sequence, compressed_hit: int, hit: int, tier_hit: int
+    ) -> tuple[int, bool, bool]:
+        """`_replay_hit` for an LMCache hit of `tier_hit` tokens, writing
+        nothing: `(hit, replays_hit, replay_kv_load)`."""
         hbs = self.hash_block_size
-        seq.replays_hit = seq.replay_kv_load = False
         if not self.state_replay_tokens or not seq.has_per_req_cache:
-            return hit
+            return hit, False, False
         # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
         # LMCache figure counts unless it clears that above where it starts.
         min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
         resume = hit * hbs
-        tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
         if tier_hit - resume >= min_load:
             resume = tier_hit
         in_hbm = compressed_hit * hbs
@@ -833,10 +841,8 @@ class BlockManager:
         if tier_kv - in_hbm >= min_load:
             end = tier_kv
         if end - resume <= self.state_replay_tokens:
-            return hit
-        seq.replays_hit = True
-        seq.replay_kv_load = end > in_hbm
-        return compressed_hit
+            return hit, False, False
+        return compressed_hit, True, end > in_hbm
 
     def fall_back_to_hbm_replay(self, seq: Sequence) -> None:
         """A replay's KV-only load will not run: replay below the HBM hit.
@@ -979,15 +985,19 @@ class BlockManager:
 
         A read-only probe for a connector shaping the hit it reports: the
         admission recomputes the boundary from the hit the connector settled
-        on. Measured against the gated HBM hit; a replay can only raise that
-        hit, so this never misses a boundary the admission would find.
+        on. Measured against the hit admission holds, the gated HBM hit as
+        `_replay_hit` widens it for this lookup, so the two agree. The walk is
+        `can_allocate_memoized`'s: a request waiting at the backpressure gate
+        re-asks this every pass without walking its prompt again.
         """
         if not self.enable_prefix_caching:
             return 0
-        walk = self._walk_prefix(seq)
-        hbm = self._gated_hit(seq, len(walk.hashes), walk.hashes)
+        walk = (self._memoised_walk if self.walk_memo else self._walk_prefix)(seq)
+        compressed = len(walk.hashes)
+        gated = self._gated_hit(seq, compressed, walk.hashes)
+        hit, _, _ = self._replay_decision(seq, compressed, gated, kv_prefix_tokens)
         return self._joint_kv_boundary(
-            seq, hbm, walk.hashes, kv_prefix_tokens=kv_prefix_tokens
+            seq, hit, walk.hashes, kv_prefix_tokens=kv_prefix_tokens
         ).boundary_tokens
 
     def _joint_kv_boundary(

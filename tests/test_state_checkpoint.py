@@ -1627,6 +1627,56 @@ class TestPagedCopyCheckpoint:
         assert seq.offload_joint.boundary_tokens == 0
         assert bm.joint_boundaries == 0 and not bm.joint_skips
 
+    def test_the_joint_probe_measures_the_hit_a_replay_widens(self):
+        """HBM holds the KV to block 8 and a rung at 4, the tier the rung at 11.
+        A bounded replay has admission hold the whole HBM hit, 8, rather than
+        the rung; the probe asks the same hit, so it names the boundary the
+        admission then commits."""
+        tokens = list(range(48))
+        bm = self._joint_bm(chunk=4 * BLOCK)
+        first, h = self._prompt_with_a_rung_at(bm, 11, tokens)
+        low = bm._chain_to(first, [], 4)[3]
+        bm.paged_state_checkpoints.checkpoint(first, 4, low)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        victim = first.block_table[8]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h)
+        self._with_tier(bm, h)
+        bm.state_replay_tokens = BLOCK
+        self._reset_joint_counters(bm)
+
+        seq = stateful_seq(tokens)
+        probed = bm.joint_boundary_tokens(seq, len(tokens))
+        assert not seq.replays_hit  # a probe writes nothing
+        seq.offload_joint.kv_prefix_tokens = len(tokens)
+        assert bm.can_allocate(seq) == 8
+        assert seq.replays_hit
+        assert probed == seq.offload_joint.boundary_tokens == 11 * BLOCK
+
+    def test_a_waiting_request_probes_without_walking_its_prompt_again(
+        self, monkeypatch
+    ):
+        """The probe runs on every scheduling pass a request waits; the walk
+        behind it is the memoised one, re-done only once the index moved."""
+        tokens = list(range(48))
+        bm = self._joint_bm(chunk=4 * BLOCK)
+        first, h = self._prompt_with_a_rung_at(bm, 11, tokens)
+        victim = first.block_table[0]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h)
+        self._with_tier(bm, h)
+        bm.walk_memo = True
+        walks = []
+        walk = bm._walk_prefix
+        monkeypatch.setattr(bm, "_walk_prefix", lambda s: walks.append(s) or walk(s))
+        seq = stateful_seq(tokens)
+        for _ in range(3):
+            assert bm.joint_boundary_tokens(seq, len(tokens)) == 11 * BLOCK
+        assert len(walks) == 1
+
     def test_an_unaligned_hbm_hit_still_reaches_the_rung_above_it(self):
         """A hit that is not a multiple of the KV chunk used to refuse the
         whole CPU prefix (`hbm_off_chunk_grid`). The shared claim stops at
