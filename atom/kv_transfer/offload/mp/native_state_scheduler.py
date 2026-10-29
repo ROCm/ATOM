@@ -235,6 +235,36 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._remember_tier_hit(seq, sid, 0)
         return 0
 
+    def _record_prepared_hit(self, seq: Any, hit: int) -> None:
+        if not self._page_only:
+            super()._record_prepared_hit(seq, hit)
+            return
+        # Preserve the existing bounded-replay contract: the pin backs PAGE,
+        # never a STATE image. Ordinary allocation later chooses and arms the
+        # PAGE-only load; its forward reconstructs STATE below this reach.
+        sid = str(seq.id)
+        self._kv_reach[sid] = (seq, hit)
+        seq._mp_page_reach = hit
+        self._lookup_results[sid] = (seq, 0)
+        self._remember_tier_hit(seq, sid, 0)
+        # No dispatch-time lookup release while the shadow owns this pin.
+        # update_state_after_alloc / request_finished retain normal ownership.
+
+    def _prepared_hit(self, seq: Any) -> int:
+        return (
+            self._kv_only_reach(seq) if self._page_only else super()._prepared_hit(seq)
+        )
+
+    def lookup_recovery_upper_bound(self, seq: Any) -> int | None:
+        hit = super().lookup_recovery_upper_bound(seq)
+        if hit is None or not self._page_only:
+            return hit
+        # PAGE-only lookup deliberately reports zero joint STATE hit. Its
+        # separate PAGE reach may still support replay, so zero is not a miss.
+        return max(
+            hit, self._kv_only_reach(seq), int(getattr(seq, "_mp_page_reach", 0))
+        )
+
     def _kv_only_reach(self, seq: Any) -> int:
         """This request's KV-only reach in tokens, or 0 if unknown."""
         entry = self._kv_reach.get(str(seq.id))

@@ -625,6 +625,36 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return c.adjust_prefill_chunk_after_alloc(seq, chunk)
         return chunk
 
+    def _recovery_prepare_provider(self):
+        providers = [c for c in self._connectors if getattr(c, "is_offload", False)]
+        return providers[0] if len(providers) == 1 else None
+
+    def recovery_prepare_ttl(self) -> float:
+        callback = getattr(
+            self._recovery_prepare_provider(), "recovery_prepare_ttl", None
+        )
+        return callback() if callable(callback) else 0.0
+
+    def prepare_recovery(self, seq: Any) -> int | None:
+        return self._recovery_prepare_provider().prepare_recovery(seq)
+
+    def recovery_prepared(self, seq: Any, boundary: int) -> bool:
+        return self._recovery_prepare_provider().recovery_prepared(seq, boundary)
+
+    def cancel_recovery(self, seq: Any) -> None:
+        self._recovery_prepare_provider().cancel_recovery(seq)
+
+    def lookup_recovery_upper_bound(self, seq: Any) -> int | None:
+        """Only rule out recovery when every possible provider has answered."""
+        bounds = []
+        for connector in self._connectors:
+            callback = getattr(connector, "lookup_recovery_upper_bound", None)
+            bound = callback(seq) if callable(callback) else None
+            if bound is None:
+                return None
+            bounds.append(bound)
+        return max(bounds) if bounds else None
+
     def pending_prefill_handoff(self, seq: Any) -> tuple[int, int] | None:
         """The load owner's alignment boundary and recoverable prefix, if any."""
         callback = getattr(self._load_owner(seq), "pending_prefill_handoff", None)

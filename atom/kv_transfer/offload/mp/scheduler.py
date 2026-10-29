@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 
@@ -103,6 +104,73 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         load_spec.transfer_end_tokens = num_prompt
         self._hit_save_floors[sid] = num_prompt
         return matched
+
+    def recovery_prepare_ttl(self) -> float:
+        # This is the operator-confirmed LOWER BOUND of --l1-read-ttl-seconds
+        # on every reachable server. Never assume the upstream default.
+        ttl = float(
+            _extra_config(self._config).get("lmcache.mp.prepare_read_ttl_seconds", 0)
+        )
+        if not self._do_load or not self._lookup_client.supports_async():
+            return 0.0
+        return max(0.0, ttl / 2) if math.isfinite(ttl) else 0.0
+
+    def prepare_recovery(self, seq: Any) -> int | None:
+        """Nonblocking lookup holding PAGE (and native image-group) read locks.
+
+        Returns a *loadable* boundary, not the raw optimistic lookup upper
+        bound. The entry is never added to the runnable scheduler queue here.
+        """
+        sid = str(seq.id)
+        self._begin_load_lifecycle(seq)
+        pending = self._lookup_results.get(sid)
+        if pending is not None and pending[0] is seq:
+            return self._prepared_hit(seq)
+        client = self._lookup_client
+        if not seq.dp_cache.preparation_lookup_started:
+            if not client.submit(self._lookup_token_ids(seq), sid):
+                return None
+            seq.dp_cache.preparation_lookup_started = True
+        client.poll(sid)
+        hit = client.take_ready_lookup(sid)
+        if hit is None:
+            return None
+        self._record_prepared_hit(seq, hit)
+        return self._prepared_hit(seq)
+
+    def _record_prepared_hit(self, seq: Any, hit: int) -> None:
+        sid = str(seq.id)
+        self._lookup_results[sid] = (seq, hit)
+        if sid not in self._lookup_in_step:
+            self._lookup_in_step.append(sid)
+        self._remember_tier_hit(seq, sid, hit)
+        self._answer_from_tier_hit(seq, sid, hit)
+
+    def _prepared_hit(self, seq: Any) -> int:
+        spec = self._load_specs.get(str(seq.id))
+        return int(spec.lmcache_cached_tokens) if spec is not None else 0
+
+    def recovery_prepared(self, seq: Any, boundary: int) -> bool:
+        pending = self._lookup_results.get(str(seq.id))
+        return bool(
+            pending is not None
+            and pending[0] is seq
+            and self._prepared_hit(seq) >= boundary
+            and (self._lookup_client.hit_tokens(str(seq.id)) or 0) >= boundary
+        )
+
+    def cancel_recovery(self, seq: Any) -> None:
+        # No destination/DMA exists until commit. Existing cancellation owns
+        # asynchronous orphans and the metadata dispatch that releases pins.
+        self.request_finished(seq)
+
+    def lookup_recovery_upper_bound(self, seq: Any) -> int | None:
+        """Read the last actual answer, including memo hits, without another RPC.
+
+        None means unknown/timeout, not a cache miss. This optimistic ceiling
+        is only for early rejection; it proves neither a pin nor residency.
+        """
+        return self._last_tier_hit(seq, str(seq.id))
 
     def _new_load_operation(self, seq: Any) -> LoadOperationId:
         operation = super()._new_load_operation(seq)

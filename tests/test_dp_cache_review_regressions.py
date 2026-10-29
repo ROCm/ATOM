@@ -76,7 +76,7 @@ def test_review_migration_must_not_increase_post_placement_imbalance():
         17920,
         chain(17920),
         [1, 3],
-        [0, 1000000],
+        [0, balancer.cost(0, 1000000)],
         2,
         can_migrate=True,
     )
@@ -108,7 +108,7 @@ def test_multi_alignment_uses_load_winner_and_never_a_losing_tier(winner_has_han
         assert not seq.dp_cache.admission_sent
         assert not host.rejected and not host.events
     else:
-        assert seq.dp_cache.retry_reason == "recoverable_prefix_too_short"
+        assert seq.dp_cache.retry_reason == "lookup_unavailable"
     multi.cancel_pending_load(seq)
     assert multi.pending_prefill_handoff(seq) is None
 
@@ -233,7 +233,7 @@ def test_last_cancelled_partial_prefill_finishes_after_one_safe_dummy(kind):
 def test_preempted_work_is_reported_with_no_running_sequences(monkeypatch, path):
     scheduler = Scheduler(MockConfig())
     seq = Sequence(list(range(65)), scheduler.block_manager.block_size)
-    seq.dp_cache = DPCacheState(admission_sent=True, last_work=0)
+    seq.dp_cache = DPCacheState(admission_sent=True, last_work=(0, 0))
     assert scheduler.preempt(seq)
     assert not scheduler.running and list(scheduler.waiting) == [seq]
     # The next schedule is held by remote recovery; no forward/postprocess follows.
@@ -244,5 +244,5 @@ def test_preempted_work_is_reported_with_no_running_sequences(monkeypatch, path)
         assert not core._process_engine_step()
     else:
         core._execute_dummy_batch()
-    assert core.output_queue.get_nowait() == ("CACHE_WORK", [(seq.id, 0, 1, 65)])
+    assert core.output_queue.get_nowait() == ("CACHE_WORK", [(seq.id, 0, 1, 65, 0)])
     assert scheduler.cache_admission.take_work() == []

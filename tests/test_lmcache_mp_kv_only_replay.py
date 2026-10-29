@@ -32,6 +32,7 @@ from atom.kv_transfer.offload.mp.native_state_worker import (
 )
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.dp_cache.state import DPCacheState
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
@@ -217,6 +218,7 @@ def test_without_images_the_server_hit_is_the_kv_only_reach(monkeypatch):
     # No image ends the PAGE KV, so nothing is matched as a state-carrying hit.
     assert _look_up(scheduler, seq) == (0, False)
     assert seq.offload_joint.kv_only_tokens == 4 * CHUNK
+    assert scheduler.lookup_recovery_upper_bound(seq) == 4 * CHUNK
     # One lookup, with no option a stock server would not know.
     [key] = adapter._client.keys
     assert key.request_id == SESSION
@@ -231,6 +233,56 @@ def test_with_images_the_server_hit_carries_one(monkeypatch):
     seq = _seq()
     assert _look_up(scheduler, seq) == (2 * CHUNK, True)
     assert seq.offload_joint.kv_only_tokens == 0
+
+
+def test_prepared_page_pin_survives_idle_dispatch_and_commits_to_replay(monkeypatch):
+    scheduler, checkpoints, adapter, _ = _scheduler(monkeypatch, chunks=4)
+    scheduler._config.kv_transfer_config["kv_connector_extra_config"][
+        "lmcache.mp.prepare_read_ttl_seconds"
+    ] = 10
+    assert scheduler.recovery_prepare_ttl() == 5
+    seq = _seq()
+    seq.state_slots = []
+    seq.block_table = []
+    seq.dp_cache = DPCacheState(preparation_id=1, preparation_role="target")
+    free = checkpoints.store.pool.num_free
+    assert scheduler.prepare_recovery(seq) == 32
+    assert scheduler._last_tier_hit(seq, str(seq.id)) == 0
+    assert not scheduler._load_specs and not scheduler._native_loads
+    assert not scheduler.build_connector_meta().requests
+    assert scheduler.recovery_prepared(seq, 32)
+    assert scheduler.prepare_recovery(seq) == 32
+    assert len(adapter._client.keys) == 1 and not adapter.freed
+    assert checkpoints.store.pool.num_free == free
+    # Commit rejoins the existing PAGE-only allocation/restore path.
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    assert seq.offload_joint.kv_only_tokens == 32
+    seq.state_slots = [5]
+    seq.block_table = list(range(10))
+    seq.num_cached_tokens = 8
+    seq.replays_hit = seq.replay_kv_load = True
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    assert request.native_state.kv_only
+    assert request.native_state.unit_ids == ()
+    assert request.native_state.destination_slot is None
+    assert request.native_state.boundary_tokens == 32
+    assert _freed(adapter) == [(0, 8)]
+    assert scheduler.load_finished(seq._load_operation)
+    assert checkpoints.store.pool.num_free == free
+
+
+def test_cancel_prepared_page_pin_never_advertises_a_state_image(monkeypatch):
+    scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=4)
+    seq = _seq()
+    seq.dp_cache = DPCacheState(preparation_id=1, preparation_role="target")
+    assert scheduler.prepare_recovery(seq) == 32
+    assert not scheduler.recovery_prepared(seq, 40)
+    scheduler.cancel_recovery(seq)
+    assert not scheduler.recovery_prepared(seq, 32)
+    assert _freed(adapter) == [(0, 32)]
+    assert not scheduler._native_loads
 
 
 def test_a_kv_only_load_reads_page_alone_and_restores_nothing(monkeypatch):
@@ -294,6 +346,7 @@ def test_the_reach_stays_locked_until_admission_weighs_it(monkeypatch):
     seq.num_cached_tokens = CHUNK
     assert _look_up(scheduler, seq) == (0, False)
     assert seq.offload_joint.kv_only_tokens == 4 * CHUNK
+    assert scheduler.lookup_recovery_upper_bound(seq) == 4 * CHUNK
     assert adapter.freed == []
     scheduler.update_state_after_alloc(seq)
     assert _freed(adapter) == [(0, 32)]

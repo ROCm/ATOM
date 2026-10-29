@@ -4,7 +4,8 @@
 from dataclasses import dataclass
 
 CacheAdmissionEvent = tuple[object, int, int]
-CacheWorkEvent = tuple[object, int, int, int]
+# request, migration, revision, remaining tokens, completed prefix
+CacheWorkEvent = tuple[object, int, int, int, int]
 
 
 @dataclass(slots=True)
@@ -16,6 +17,9 @@ class DPCacheState:
     """
 
     # Routing contract. Zero migration_id means no prepared migration.
+    preparation_lookup_started: bool = False
+    preparation_id: int = 0
+    preparation_role: str = ""
     migration_id: int = 0
     minimum_hit: int = 0
     prepare_timeout: float = 5.0
@@ -29,6 +33,6 @@ class DPCacheState:
 
     # Scheduler work reporting. Revisions order events at the coordinator;
     # epochs fence forwards issued before a local preemption.
-    last_work: int | None = None
+    last_work: tuple[int, int] | None = None
     work_revision: int = 0
     work_epoch: int = 0

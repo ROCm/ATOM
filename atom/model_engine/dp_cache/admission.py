@@ -44,14 +44,15 @@ class DPCacheAdmission:
         self._work: dict[object, CacheWorkEvent] = {}
         self._preparing: dict[object, Sequence] = {}
 
-    def _queue_work(self, seq: Sequence, remaining: int) -> None:
+    def _queue_work(self, seq: Sequence, remaining: int, prefix: int) -> None:
         state = seq.dp_cache
         if state is None or not state.admission_sent:
             return
         remaining = max(0, int(remaining))
-        if state.last_work == remaining:
+        prefix = max(0, int(prefix))
+        if state.last_work == (remaining, prefix):
             return
-        state.last_work = remaining
+        state.last_work = (remaining, prefix)
         state.work_revision += 1
         # Coalesce once per engine step, including preemption and re-admission.
         # No synchronous lookup or per-token decode reporting.
@@ -60,6 +61,7 @@ class DPCacheAdmission:
             state.migration_id,
             state.work_revision,
             remaining,
+            prefix,
         )
 
     def take_work(self) -> list[CacheWorkEvent]:
@@ -70,7 +72,7 @@ class DPCacheAdmission:
     def preempt(self, seq: Sequence) -> None:
         if seq.dp_cache is not None:
             seq.dp_cache.work_epoch += 1
-            self._queue_work(seq, seq.num_tokens)
+            self._queue_work(seq, seq.num_tokens, 0)
 
     def complete_work(
         self, batch: ScheduledBatch | None, seq_by_id: dict[object, Sequence]
@@ -89,11 +91,15 @@ class DPCacheAdmission:
                 continue
             end = int(batch.num_cached_tokens[i]) + int(batch.num_scheduled_tokens[i])
             remaining = 0 if batch.is_final_chunk[i] else seq.num_tokens - end
-            self._queue_work(seq, remaining)
+            self._queue_work(seq, remaining, end)
 
     def track(self, seq: Sequence) -> None:
         state = seq.dp_cache
-        if state is None or not state.migration_id:
+        if (
+            state is None
+            or not state.migration_id
+            or state.preparation_role == "source"
+        ):
             return
         state.prepare_deadline = time.monotonic() + state.prepare_timeout
         self._preparing[seq.id] = seq
@@ -164,6 +170,30 @@ class DPCacheAdmission:
             or start < start + chunk <= state.alignment_boundary
         )
 
+    def reject_short_lookup(self, seq: Sequence, upper_bound: int) -> bool:
+        """Reject a known-short migration before allocating or loading its KV.
+
+        The bound includes HBM, the tier's STATE/PAGE reach and any alignment
+        handoff. It can rule out admission, but cannot establish residency:
+        feasible requests still pass the existing post-load admission gate.
+        """
+        state = seq.dp_cache
+        if state is None or not state.migration_id or state.admission_sent:
+            return False
+        callback = getattr(self._host.kv_connector, "lookup_recovery_upper_bound", None)
+        tier_bound = callback(seq) if callable(callback) else None
+        if tier_bound is None:
+            return False
+        upper_bound = max(upper_bound, tier_bound)
+        handoff = self._prefill_handoff(seq)
+        if handoff is not None:
+            upper_bound = max(upper_bound, handoff[1])
+        if upper_bound >= state.minimum_hit:
+            return False
+        state.recoverable_hit = max(0, int(upper_bound))
+        self.reject_waiting(seq, "lookup_prefix_too_short")
+        return True
+
     def admit(self, seq: Sequence) -> bool:
         state = seq.dp_cache
         if state is None:
@@ -175,7 +205,7 @@ class DPCacheAdmission:
             self._host.block_manager.replay_start(seq, seq.num_cached_tokens, hit=True),
         )
         if state.admission_sent:
-            self._queue_work(seq, seq.num_tokens - cached)
+            self._queue_work(seq, seq.num_tokens - cached, cached)
             return True
         if cached < state.minimum_hit:
             handoff = self._prefill_handoff(seq)
@@ -192,7 +222,15 @@ class DPCacheAdmission:
                 return True
             # Negative routing evidence, captured before cleanup; not a lease.
             state.recoverable_hit = max(0, int(cached))
-            self.reject_waiting(seq, "recoverable_prefix_too_short")
+            callback = getattr(
+                self._host.kv_connector, "lookup_recovery_upper_bound", None
+            )
+            reason = (
+                "lookup_unavailable"
+                if callable(callback) and callback(seq) is None
+                else "recoverable_prefix_too_short"
+            )
+            self.reject_waiting(seq, reason)
             return False
         if self.on_admitted is None:
             if state.migration_id:

@@ -11,6 +11,8 @@ from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 from atom.model_engine.dp_cache.balance import CacheBalanceConfig, CacheBalancer
+from atom.model_engine.dp_cache.preparation import PrepareMessage
+from atom.model_engine.dp_cache.prepared_routing import PreparedRouting
 from atom.model_engine.dp_cache.state import (
     CacheAdmissionEvent,
     CacheWorkEvent,
@@ -41,12 +43,14 @@ class DPCacheRouter:
         request_loads: dict[object, tuple[int, int, int]],
         load_lock: AbstractContextManager,
         send_retry: Callable[[int, Sequence], None],
+        send_prepare: Callable[[int, PrepareMessage], None] | None = None,
     ):
         self._rank_reqs = rank_requests
         self._rank_tokens = rank_tokens
         self._seq_load = request_loads
         self._lb_lock = load_lock
         self._send_retry = send_retry
+        self.preparation = PreparedRouting(self, send_prepare)
         self._retry_payloads: dict[object, tuple[Sequence, object]] = {}
         if not config.enable_prefix_caching:
             raise ValueError("cache_affinity requires prefix caching")
@@ -70,23 +74,33 @@ class DPCacheRouter:
                 "cache_affinity requires lmcache_mp and a shared cache tier; "
                 "V4.1 must use the native PAGE/STATE connector"
             )
-        hf = getattr(config, "hf_config", None)
-        hf = getattr(hf, "text_config", hf)
-        if getattr(hf, "model_type", None) == "deepseek_v41" and getattr(
-            config, "enable_encoder_swa_bounded_replay", True
-        ):
-            raise ValueError(
-                "V4.1 cache_affinity requires --no-encoder-swa-bounded-replay "
-                "to retain native PAGE/STATE checkpoints for lmcache_mp"
-            )
         values = json.loads(envs.ATOM_DP_CACHE_BALANCE_CONFIG)
         if isinstance(values, dict):
+            values.setdefault(
+                "prefill_reference_tokens",
+                getattr(config, "max_num_batched_tokens", 16384),
+            )
             values.setdefault(
                 "checkpoint_tokens",
                 getattr(config, "state_checkpoint_interval_tokens", 8192),
             )
         options = CacheBalanceConfig.parse(values)
         self.balancer = CacheBalancer(len(self._rank_reqs), options)
+
+    def prefill_work_locked(self) -> list[float]:
+        """Rebuild work from the same token charges released on finish/abort.
+
+        Prefixes are predicted at dispatch and corrected by admission/chunk
+        completion. No extra cumulative counters can drift across retries.
+        """
+        work = [0.0] * len(self._rank_reqs)
+        for sid, (rank, _, remaining) in self._seq_load.items():
+            if remaining <= 0:
+                continue
+            placement = self.balancer.requests.get(sid)
+            prefix = placement.work_prefix if placement is not None else 0
+            work[rank] += self.balancer.cost(prefix, remaining)
+        return work
 
     def select_locked(self, seq: Sequence, hint: int | None) -> int:
         balancer = self.balancer
@@ -97,7 +111,7 @@ class DPCacheRouter:
             seq.num_prompt_tokens,
             chain,
             self._rank_reqs,
-            self._rank_tokens,
+            self.prefill_work_locked(),
             time.monotonic(),
             explicit_rank=hint,
             can_migrate=True,
@@ -111,7 +125,12 @@ class DPCacheRouter:
             # The frontend Sequence is never modified by the target process.
             # ADD detaches its hash chain, so retain that separately for retry.
             self._retry_payloads[seq.id] = (seq, chain)
+        self.preparation.begin(seq, chain, placement)
         return placement.rank
+
+    def prepared(self, rank: int, event: PrepareMessage) -> None:
+        with self._lb_lock:
+            self.preparation.event(rank, event)
 
     def admitted(self, rank: int, event: CacheAdmissionEvent) -> None:
         balancer = self.balancer
@@ -185,7 +204,7 @@ class DPCacheRouter:
     def update_work(self, rank: int, events: Iterable[CacheWorkEvent]) -> None:
         balancer = self.balancer
         with self._lb_lock:
-            for sid, migration, revision, remaining in events:
+            for sid, migration, revision, remaining, prefix in events:
                 load = self._seq_load.get(sid)
                 placement = balancer.requests.get(sid)
                 if (
@@ -198,19 +217,26 @@ class DPCacheRouter:
                 ):
                     continue
                 placement.work_revision = revision
+                placement.work_prefix = max(0, int(prefix))
                 remaining = max(0, int(remaining))
                 self._rank_tokens[rank] += remaining - load[2]
                 self._seq_load[sid] = (rank, load[1], remaining)
                 balancer.counters["prefill_work_updates"] += 1
 
     def finish_locked(self, sid: object, succeeded: bool) -> None:
+        self.preparation.forget(sid)
         self.balancer.finish(sid, time.monotonic(), succeeded=succeeded)
         self._retry_payloads.pop(sid, None)
 
     def invalidate(self) -> None:
         with self._lb_lock:
             self.balancer.invalidate()
+            self.preparation.invalidate()
 
     def reset_locked(self) -> None:
+        for sid in list(self.preparation.attempts):
+            self.preparation.forget(sid)
+        generation = self.balancer._generation
         self.balancer = CacheBalancer(len(self._rank_reqs), self.balancer.config)
+        self.balancer._generation = generation
         self._retry_payloads.clear()

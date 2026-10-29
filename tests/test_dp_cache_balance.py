@@ -53,7 +53,10 @@ class BalanceTest(unittest.TestCase):
             prompt,
             chain(prompt, fork=fork),
             [0] * 4,
-            loads or [0] * 4,
+            [
+                v * self.b.work_per_second / self.b.config.prefill_tokens_per_second
+                for v in (loads or [0] * 4)
+            ],
             now,
             explicit_rank=hint,
             can_migrate=enabled,
@@ -119,6 +122,44 @@ class BalanceTest(unittest.TestCase):
         # Target 2 has 10 ms of GPU work, hidden by its new restore.
         second = self.place("m2", "second", now=3, loads=[1000000, 0, 328, 1000000])
         self.assertEqual((first.rank, second.rank), (1, 2))
+
+    def test_unavailable_lookup_does_not_record_negative_evidence(self):
+        self.seed()
+        placement = self.migrate()
+        assert (
+            self.b.retry(
+                "move",
+                1,
+                placement.migration,
+                4,
+                reason="lookup_unavailable",
+                recoverable_hit=0,
+            )
+            == 0
+        )
+        assert not self.b.sessions["s"].recovery_misses
+        assert self.b.counters["migration_fallback_lookup_unavailable"] == 1
+
+    def test_early_short_lookup_keeps_existing_miss_suppression(self):
+        self.seed()
+        placement = self.migrate()
+        self.assertEqual(
+            self.b.retry(
+                "move",
+                1,
+                placement.migration,
+                4,
+                reason="lookup_prefix_too_short",
+                recoverable_hit=65536,
+            ),
+            0,
+        )
+        self.assertEqual(self.b.counters["migration_fallback_before_allocation"], 1)
+        self.assertEqual(
+            self.b.counters["migration_fallback_recoverable_prefix_too_short"], 1
+        )
+        self.b.finish("move", 5)
+        self.assertEqual(self.migrate("second", now=40).migration, 0)
 
     def test_short_recovery_blocks_only_same_promise_until_expiry(self):
         self.seed()
@@ -338,7 +379,9 @@ class DecodeBalanceTest(unittest.TestCase):
         self.assertEqual(long.rank, 1)
         self.b.requests.pop("long")
         # An obvious prefill queue still takes precedence over the tie-break.
-        queued = self.b.place("queued", None, 1000, chain(1000), [1, 3], [0, 100000], 1)
+        queued = self.b.place(
+            "queued", None, 1000, chain(1000), [1, 3], [0, self.b.cost(0, 100000)], 1
+        )
         self.assertEqual(queued.rank, 0)
 
     def test_migration_cannot_trade_prefill_relief_for_worse_decode_balance(self):
@@ -350,7 +393,14 @@ class DecodeBalanceTest(unittest.TestCase):
         # The post-placement mean makes even this shorter request too costly
         # for rank 0's context load, despite its smaller request count.
         refused = self.b.place(
-            "short", "s", 129, chain(129), [1, 3], [0, 100000], 2, can_migrate=True
+            "short",
+            "s",
+            129,
+            chain(129),
+            [1, 3],
+            [0, self.b.cost(0, 100000)],
+            2,
+            can_migrate=True,
         )
         self.assertEqual((refused.rank, refused.migration), (1, 0))
         self.b.finish("short", 3)
@@ -360,7 +410,14 @@ class DecodeBalanceTest(unittest.TestCase):
         # With this long request, rank 0's larger context is the worse choice:
         # migrating from 0 to 1 is permitted, while the reverse is refused.
         allowed = self.b.place(
-            "long", "s", 1025, chain(1025), [1, 3], [100000, 0], 5, can_migrate=True
+            "long",
+            "s",
+            1025,
+            chain(1025),
+            [1, 3],
+            [self.b.cost(0, 100000), 0],
+            5,
+            can_migrate=True,
         )
         self.assertEqual(allowed.rank, 1)
         self.b.finish("long", 6)
@@ -368,7 +425,14 @@ class DecodeBalanceTest(unittest.TestCase):
         self.b.sessions["s"].hints = {1: PrefixHint(896, 128, -1, 6, 7)}
         self.b.sessions["s"].last_migration = float("-inf")
         refused = self.b.place(
-            "refused", "s", 1025, chain(1025), [1, 3], [0, 100000], 8, can_migrate=True
+            "refused",
+            "s",
+            1025,
+            chain(1025),
+            [1, 3],
+            [0, self.b.cost(0, 100000)],
+            8,
+            can_migrate=True,
         )
         self.assertEqual(refused.rank, 1)
         self.assertEqual(refused.migration, 0)
@@ -416,6 +480,36 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(self.seq.dp_cache.retry_reason, "recoverable_prefix_too_short")
         self.assertEqual(self.seq.dp_cache.recoverable_hit, 65536)
 
+    def test_short_lookup_rejects_without_claiming_residency(self):
+        self.s.kv_connector = NS(lookup_recovery_upper_bound=lambda seq: 65536)
+        self.assertTrue(self.s.cache_admission.reject_short_lookup(self.seq, 65536))
+        self.assertEqual(self.s.rejected, [self.seq])
+        self.assertEqual(self.seq.dp_cache.retry_reason, "lookup_prefix_too_short")
+        self.assertEqual(self.seq.dp_cache.recoverable_hit, 65536)
+        self.assertFalse(self.s.events)
+
+    def test_feasible_lookup_still_requires_real_admission(self):
+        self.s.kv_connector = NS(lookup_recovery_upper_bound=lambda seq: 102400)
+        self.assertFalse(self.s.cache_admission.reject_short_lookup(self.seq, 102400))
+        self.assertFalse(self.seq.dp_cache.admission_sent)
+        self.assertFalse(self.s.cache_admission.admit(self.seq))
+
+    def test_short_lookup_keeps_alignment_that_can_reach_the_promise(self):
+        self.s.kv_connector = NS(
+            pending_prefill_handoff=lambda seq: (81920, 102400),
+            lookup_recovery_upper_bound=lambda seq: 65536,
+        )
+        self.assertFalse(self.s.cache_admission.reject_short_lookup(self.seq, 65536))
+        self.assertFalse(self.s.rejected)
+
+    def test_early_rejection_does_not_apply_after_admission_or_to_owner(self):
+        self.seq.dp_cache.admission_sent = True
+        self.assertFalse(self.s.cache_admission.reject_short_lookup(self.seq, 0))
+        self.seq.dp_cache.admission_sent = False
+        self.seq.dp_cache.migration_id = 0
+        self.assertFalse(self.s.cache_admission.reject_short_lookup(self.seq, 0))
+        self.assertFalse(self.s.rejected)
+
     def test_completed_work_uses_frozen_offsets_and_preemption_fences_old_batch(self):
         self.seq.num_cached_tokens = 102400
         self.s.cache_admission.admit(self.seq)
@@ -428,15 +522,27 @@ class AdmissionTest(unittest.TestCase):
             is_final_chunk=[False],
         )
         self.s.cache_admission.complete_work(batch, {7: self.seq})
-        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 1, 35841)])
+        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 1, 35841, 66560)])
         self.s.cache_admission.preempt(self.seq)
         self.s.cache_admission.complete_work(batch, {7: self.seq})
-        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 2, 102401)])
+        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 2, 102401, 0)])
         batch.dp_cache_work_epochs = {7: 1}
         batch.is_final_chunk = [True]
         self.s.cache_admission.complete_work(batch, {7: self.seq})
-        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 3, 0)])
+        self.assertEqual(self.s.cache_admission.take_work(), [(7, 42, 3, 0, 66560)])
         self.assertFalse(self.s.cache_admission.take_work())
+
+    def test_sufficient_hbm_is_not_rejected_by_short_tier_answer(self):
+        self.s.kv_connector = NS(lookup_recovery_upper_bound=lambda seq: 0)
+        assert not self.s.cache_admission.reject_short_lookup(self.seq, 102400)
+        assert not self.s.rejected
+
+    def test_unknown_lookup_does_not_poison_recovery_miss_cache(self):
+        self.s.kv_connector = NS(lookup_recovery_upper_bound=lambda seq: None)
+        assert not self.s.cache_admission.reject_short_lookup(self.seq, 0)
+        assert not self.s.rejected
+        assert not self.s.cache_admission.admit(self.seq)
+        assert self.seq.dp_cache.retry_reason == "lookup_unavailable"
 
     def test_complete_restore_emits_one_confirmation(self):
         self.seq.num_cached_tokens = 102400

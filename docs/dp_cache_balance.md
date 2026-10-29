@@ -7,13 +7,110 @@ there and let the existing LMCache MP connector
 recover its prefix. The target must acknowledge a usable prefix before the
 router commits the new owner. This policy is opt-in.
 
+## Shared prefill cost and progress
+
+Routing and chunk scheduling both use `prefill_cost(c, q, w) = q * (w + c + q/2)`:
+`q` is the work still to compute, `c` is the completed prefix, and `w` comes
+from `ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT`. Equal token counts after different
+prefix lengths therefore need not have equal routing cost. Costs add across
+chunks: completed work plus remaining work equals the original estimate.
+
+The router sums costs per request, rather than squaring the rank's combined
+queue length. At dispatch it uses prefix hints; admission replaces them with
+the actual forward start. Only a completed prefill batch reports its remaining
+tokens and prefix, using frozen batch offsets. Revisions reject stale reports;
+preemption resets the prefix and charges recomputation, including generated
+context. Finish/cancellation releases the same token records from which work
+is derived. No per-token decode progress messages are added.
+
+`prefill_tokens_per_second` remains a heuristic rate, now explicitly anchored
+to a cold chunk of `prefill_reference_tokens` (default: the configured maximum
+batched-token budget). The conversion is
+`work_per_second = rate * (w + reference_tokens/2)`. Queue and candidate costs
+use this same conversion; transfer estimates remain in seconds. This is not
+V4.1 sparse-attention calibration, nor does it change the scheduler's current
+`min(max, mean * (1 + slack))` target or minimum-token floor.
+
+The router statistics expose `queued_prefill_work_per_rank` separately from
+`queued_prefill_tokens_per_rank`, plus the assumed rate and token weight under
+`cache_balance`. Work units are predictions, not GPU elapsed time.
+
+## Rejecting an impossible restore early
+
+Before target KV allocation and transfer submission, admission compares the
+promised prefix with an optimistic bound from local HBM, a known LMCache
+lookup answer, PAGE-only coverage, and any alignment handoff. A confirmed short
+bound returns the request to its owner through the existing cleanup path and
+increments `migration_fallback_before_allocation`. Lookup/memo reads add no
+new RPC. Unknown answers, timeouts, or a composite connector with an unknown
+provider do not establish a cache miss. An unavailable lookup at final admission
+uses `lookup_unavailable`, which does not populate the negative cache.
+
+A sufficient bound does not acknowledge residency: the existing final
+PAGE/STATE completion and admission checks still decide whether migration can
+commit. Failed DMA and its buffer/lease lifetime rules remain unchanged.
+
+## Optional prepare / commit protocol
+
+Set `"prepare_migrations": true` in `ATOM_DP_CACHE_BALANCE_CONFIG` to enable
+source-owned preparation. It defaults to false while this protocol is being
+validated. All coordinator and engine processes must use the same version.
+
+1. The request stays runnable on its source. Once that scheduler confirms it
+   is queued, the coordinator sends a non-runnable shadow to the target.
+2. The target asynchronously looks up and pins the recoverable prefix, without
+   allocating destination KV or submitting a retrieve. With bounded replay it
+   pins PAGE alone; STATE is reconstructed by the existing replay path. With
+   image-based recovery it pins the grouped PAGE+STATE prefix. Its
+   HBM probe helps estimate transfer cost. In this first implementation the
+   **entire promised prefix must be pinned in the tier**: HBM alone is not a
+   credential, so eviction of an unpinned HBM hint cannot break the promise.
+3. READY reports both the pinned transport boundary and the actual forward
+   start, computed by the scheduler's `replay_start` rule. Routing charges the
+   suffix from this earlier start, including STATE reconstruction, while
+   transfer cost covers the PAGE range. The coordinator rechecks current source/target work and the decode
+   guard. It asks the source to relinquish the request only if still useful.
+   The source scheduler serializes release with allocation: if allocation won,
+   it keeps the request and the target preparation is cancelled. No extra
+   permission round trip is added to the source's execution path.
+4. Only SOURCE_RELEASED permits COMMIT, after a second cost check. The target
+   validates its generation, local deadline and held lookup before moving the
+   same shadow Sequence into normal admission. Final native transfer/admission
+   still gates actual execution. A cancelled or expired uncommitted shadow is
+   never runnable. Once committed, ordinary DMA-safe cleanup owns its resources.
+
+Configure `lmcache.mp.prepare_read_ttl_seconds` in the connector extra config
+as a confirmed **lower bound** of `--l1-read-ttl-seconds` across all reachable
+LMCache servers. Do not assume the installed LMCache default. The target uses
+at most half that bound and at most `prepare_timeout_seconds`, measured on its
+own clock from before lookup submission. Missing/zero TTL, a synchronous-only
+adapter or an unsupported composite provider keeps execution
+on the source. A multi connector supports preparation only with one offload
+provider. PAGE-only and image-based recovery retain their existing separate
+namespaces and read-lock contracts; no LMCache package patch is added by this
+protocol. Preparation never changes the model's replay mode.
+
+Generation numbers fence stale messages and survive router resets. Target
+expiry during source release waits for the source's acknowledgment before any
+requeue. The ordered control channel is required: a missing release ACK or an
+ambiguous commit send must never be interpreted as permission to execute at the
+other rank. Worker/connection loss uses the existing request failure/abort path;
+this is not a durable distributed exactly-once protocol across process crashes.
+
+Counters `migration_prepare_started`, `migration_prepare_source_won`,
+`migration_prepare_gain_disappeared`, `migration_prepare_short`,
+`migration_prepare_failed`, and `migration_prepare_committed` separate prepare
+outcomes from actual migration dispatch. CPU state-machine and connector tests
+do not establish an end-to-end throughput benefit; matched GPU measurement is
+still required.
+
 ## Configuration
 
 Enable prefix caching, frontend prefix hashes, and the `lmcache_mp` offload
 connector. The MP server must be running before model startup. V4.1 uses the
-native PAGE/STATE connector, BF16 KV, DP attention, and
-`--no-encoder-swa-bounded-replay` to retain the checkpoint images required by
-that connector.
+native connector, BF16 KV and DP attention. Keep the serving recipe's bounded
+replay setting: preparation supports PAGE-only recovery with STATE rebuilt
+by replay and does not require `--no-encoder-swa-bounded-replay`.
 PP and PD-only workers
 are not supported by this placement policy.
 

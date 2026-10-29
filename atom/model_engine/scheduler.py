@@ -41,6 +41,7 @@ from atom.model_engine.block_manager import (
     draft_kv_lookahead,
 )
 from atom.model_engine.dp_cache.admission import DPCacheAdmission
+from atom.model_engine.dp_cache.preparation import CachePreparation
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     USEFUL_SHRINK_REFERENCE_CHUNKS,
@@ -50,6 +51,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
+from atom.model_engine.prefill_cost import prefill_cost
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
@@ -818,6 +820,7 @@ class Scheduler:
 
         self.kv_connector = get_kvconnector("scheduler", config)
         self.cache_admission = DPCacheAdmission(self)
+        self.cache_preparation = CachePreparation(self)
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
             bind_block_manager(self.block_manager)
@@ -1146,7 +1149,7 @@ class Scheduler:
     def _chunk_cost(self, start: int, chunk: int) -> float:
         """Estimated prefill cost of `chunk` new tokens after `start` cached
         ones: a per-token term plus the context each new token attends."""
-        return chunk * (self._balance_token_weight + start + chunk / 2)
+        return prefill_cost(start, chunk, self._balance_token_weight)
 
     def _prefill_room(self, batched_tokens: int, start: int) -> int:
         """New tokens a seq whose chunk starts at `start` may still add this
@@ -1525,6 +1528,7 @@ class Scheduler:
         self._warn_if_unschedulable(seq)
         self._register_connector_admission(seq)
         self.waiting.append(seq)
+        self.cache_preparation.register_source(seq)
         self._arrived_requests += 1
 
     def extend(self, seqs: list[Sequence]):
@@ -1535,6 +1539,8 @@ class Scheduler:
             self._warn_if_unschedulable(seq)
             self._register_connector_admission(seq)
         self.waiting.extend(seqs)
+        for seq in seqs:
+            self.cache_preparation.register_source(seq)
         self._arrived_requests += len(seqs)
 
     def _register_connector_admission(self, seq: Sequence) -> None:
@@ -2350,6 +2356,15 @@ class Scheduler:
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
+            if not lookup_detachable and self.cache_admission.reject_short_lookup(
+                seq,
+                max(
+                    num_cached_blocks * self.block_manager.hash_block_size,
+                    seq.num_cached_tokens,
+                    *self._tier_hit(seq),
+                ),
+            ):
+                continue
             if (
                 seq.replay_kv_load
                 and not needs_remote_load
@@ -2415,6 +2430,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 self.waiting.appendleft(seq)
                 break
+            self.cache_preparation.source_started(seq)
             self._allocate_prefill_draft_lookahead(seq)
 
             # Detached before the alloc notification, which reads the save

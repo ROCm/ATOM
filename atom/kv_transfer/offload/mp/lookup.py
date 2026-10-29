@@ -131,6 +131,15 @@ class _MPLookupClient:
         self._async_tokens[lookup_id] = token_ids
         return True
 
+    def take_ready_lookup(self, lookup_id: str) -> int | None:
+        """Consume only an answered asynchronous lookup, retaining its read locks."""
+        if lookup_id not in self._async_hits:
+            return None
+        hit = self._async_hits.pop(lookup_id)
+        tokens = self._async_tokens.pop(lookup_id)
+        self._lookups[lookup_id] = _LookupState(token_ids=tokens, hit=hit)
+        return hit
+
     def supports_async(self) -> bool:
         """Whether `submit` can send a lookup without waiting for it."""
         return self._async_supported

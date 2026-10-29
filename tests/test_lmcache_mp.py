@@ -880,6 +880,7 @@ def test_mp_lookup_timeout_is_not_recorded_as_a_tier_miss(monkeypatch):
     assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
     # Remembered as "did not answer", never as a hit of 0.
     assert scheduler._tier_hit_memo["7"][1] is None
+    assert scheduler.lookup_recovery_upper_bound(seq) is None
 
     assert scheduler.get_num_new_matched_tokens(seq) == (4, True)
     assert [request_id for request_id, _tokens in adapter.submissions] == [
@@ -2046,3 +2047,18 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
+
+
+@pytest.mark.parametrize("hit", [0, 4, 8])
+def test_recovery_bound_uses_real_answer_and_memo_without_rpc(monkeypatch, hit):
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4, hit=hit)
+    seq = _hit_seq()
+    assert scheduler.lookup_recovery_upper_bound(seq) is None
+    scheduler.get_num_new_matched_tokens(seq)
+    calls = len(lookup._adapter.submissions)
+    assert scheduler.lookup_recovery_upper_bound(seq) == hit
+    scheduler.get_num_new_matched_tokens(seq)
+    assert scheduler.lookup_recovery_upper_bound(seq) == hit
+    assert len(lookup._adapter.submissions) == calls
+    # A reused request ID must not read the previous Sequence's answer.
+    assert scheduler.lookup_recovery_upper_bound(_hit_seq()) is None

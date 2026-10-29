@@ -16,6 +16,7 @@ from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.dp_cache.preparation import PrepareMessage
 from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
@@ -208,6 +209,9 @@ class EngineCore:
                 prefill_token_graphs=self.runner_mgr.call_func(
                     "prefill_token_graphs", wait_out=True
                 ),
+            )
+            self.scheduler.cache_preparation.emit = lambda event: (
+                self.output_queue.put_nowait(("CACHE_PREPARE", event))
             )
             self.scheduler.cache_admission.on_admitted = lambda event: (
                 self.output_queue.put_nowait(("CACHE_ADMITTED", event))
@@ -450,6 +454,7 @@ class EngineCore:
                 # Teardown runs even on exceptions so the sender thread/socket
                 # don't leak. Isolate the final publish so a publisher hiccup
                 # cannot skip shutdown_kv_events().
+                self.scheduler.cache_preparation.close()
                 self._drain_kv_work_at_exit()
                 try:
                     self.scheduler.publish_kv_events()
@@ -763,6 +768,12 @@ class EngineCore:
         recv_reqs = []
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
+            if isinstance(seqs, PrepareMessage):
+                if recv_reqs:
+                    self.scheduler.extend(recv_reqs)
+                    recv_reqs = []
+                self.scheduler.cache_preparation.handle(seqs)
+                continue
             if isinstance(seqs, EngineCoreAbortRequest):
                 # Preserve input-IO order through admission. Fallback ADD and
                 # abort share the control socket; draining a separate utility
@@ -780,6 +791,9 @@ class EngineCore:
         if len(recv_reqs) > 0:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
+        preparation = getattr(self.scheduler, "cache_preparation", None)
+        if preparation is not None:
+            preparation.advance()
         return False
 
     def process_input_sockets(self, input_address: str, control_address: str):
@@ -839,6 +853,8 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
+                    elif request_type == EngineCoreRequestType.CACHE_PREPARE:
+                        self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
@@ -889,6 +905,12 @@ class EngineCore:
                 if isinstance(item, tuple) and item[0] == "CACHE_ADMITTED":
                     socket.send(
                         pickle.dumps((EngineCoreRequestType.CACHE_ADMITTED, item[1]))
+                    )
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "CACHE_PREPARE":
+                    socket.send(
+                        pickle.dumps((EngineCoreRequestType.CACHE_PREPARE, item[1]))
                     )
                     continue
 
@@ -1020,6 +1042,7 @@ class DPEngineCoreProc(EngineCore):
             try:
                 # Isolate the final publish so a publisher hiccup cannot skip
                 # shutdown_kv_events() (which closes the sender thread/socket).
+                self.scheduler.cache_preparation.close()
                 self._drain_kv_work_at_exit()
                 try:
                     self.scheduler.publish_kv_events()

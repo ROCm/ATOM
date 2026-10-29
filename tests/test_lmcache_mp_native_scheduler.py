@@ -794,7 +794,8 @@ def test_cache_migration_waits_for_joint_native_completion(monkeypatch, succeede
     else:
         assert not scheduled and not events
         assert engine.take_rejected() == [seq]
-        assert seq.dp_cache.retry_reason == "recoverable_prefix_too_short"
+        # Failed DMA is not evidence of a missing shared prefix.
+        assert seq.dp_cache.retry_reason == "lookup_unavailable"
 
 
 @pytest.mark.parametrize("invalid_chunk", [None, 0, 8])

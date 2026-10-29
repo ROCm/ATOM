@@ -69,21 +69,23 @@ def manager(monkeypatch, *, legacy_session_affinity=False):
     mgr.cache_router.admitted(0, (seq.id, 0, 0))
     mgr._release_seq_load(seq.id, succeeded=True)
     mgr._rank_tokens[0] = 1000000
+    mgr._seq_load["background"] = (0, 0, 1000000)
     return mgr
 
 
-def test_v41_requires_native_checkpoints_before_model_startup():
+def test_v41_cache_affinity_preserves_bounded_replay(monkeypatch):
+    monkeypatch.setenv("ATOM_DP_CACHE_BALANCE_CONFIG", '{"prepare_migrations": true}')
     mgr = _make_mgr(2, strategy="cache_affinity")
-    with pytest.raises(ValueError, match="no-encoder-swa-bounded-replay"):
-        mgr._init_cache_router(
-            NS(
-                dp_load_balance="cache_affinity",
-                enable_prefix_caching=True,
-                kv_transfer_config={"kv_connector": "lmcache_mp"},
-                hf_config=NS(model_type="deepseek_v41"),
-                enable_encoder_swa_bounded_replay=True,
-            )
-        )
+    config = NS(
+        dp_load_balance="cache_affinity",
+        enable_prefix_caching=True,
+        kv_transfer_config={"kv_connector": "lmcache_mp"},
+        hf_config=NS(model_type="deepseek_v41"),
+        enable_encoder_swa_bounded_replay=True,
+    )
+    mgr._init_cache_router(config)
+    assert config.enable_encoder_swa_bounded_replay
+    assert mgr.cache_router.balancer.config.prepare_migrations
 
 
 def test_offline_depth_cannot_bypass_cache_placement(monkeypatch):
@@ -169,26 +171,26 @@ def test_work_updates_are_absolute_ordered_and_fenced_by_dispatch(monkeypatch):
     seq = request()
     _route(mgr, [seq])
     generation = seq.dp_cache.migration_id
-    mgr.cache_router.update_work(1, [(seq.id, generation, 1, 12)])  # not admitted
+    mgr.cache_router.update_work(1, [(seq.id, generation, 1, 12, 0)])  # not admitted
     assert mgr._seq_load[seq.id][2] != 12
     mgr.cache_router.admitted(1, (seq.id, generation, seq.dp_cache.minimum_hit))
-    mgr.cache_router.update_work(1, [(seq.id, generation, 1, 128)])
+    mgr.cache_router.update_work(1, [(seq.id, generation, 1, 128, 0)])
     assert mgr._rank_tokens[1] == 128
-    mgr.cache_router.update_work(1, [(seq.id, generation, 1, 256)])  # duplicate
-    mgr.cache_router.update_work(0, [(seq.id, generation, 2, 256)])  # wrong engine
-    mgr.cache_router.update_work(1, [(seq.id, generation + 1, 2, 256)])
+    mgr.cache_router.update_work(1, [(seq.id, generation, 1, 256, 0)])  # duplicate
+    mgr.cache_router.update_work(0, [(seq.id, generation, 2, 256, 0)])  # wrong engine
+    mgr.cache_router.update_work(1, [(seq.id, generation + 1, 2, 256, 0)])
     assert mgr._rank_tokens[1] == 128
     # Preemption may legitimately increase work, including generated context.
     mgr.cache_router.update_work(
-        1, [(seq.id, generation, 2, seq.num_prompt_tokens + 100)]
+        1, [(seq.id, generation, 2, seq.num_prompt_tokens + 100, 0)]
     )
     assert mgr._rank_tokens[1] == seq.num_prompt_tokens + 100
     mgr.cache_router.update_work(
-        1, [(seq.id, generation, 1, 128)]
+        1, [(seq.id, generation, 1, 128, 0)]
     )  # stale pre-preemption
     assert mgr._rank_tokens[1] == seq.num_prompt_tokens + 100
     mgr._release_seq_load(seq.id)
-    mgr.cache_router.update_work(1, [(seq.id, generation, 3, 128)])  # cancelled
+    mgr.cache_router.update_work(1, [(seq.id, generation, 3, 128, 0)])  # cancelled
     assert mgr._rank_tokens == [1000000, 0]
 
 
@@ -203,7 +205,7 @@ def test_fallback_rejects_late_target_progress(monkeypatch):
     mgr.cache_router.retry(1, target)
     mgr.cache_router.admitted(0, (seq.id, 0, 65536))
     before = list(mgr._rank_tokens)
-    mgr.cache_router.update_work(1, [(seq.id, target.dp_cache.migration_id, 1, 0)])
+    mgr.cache_router.update_work(1, [(seq.id, target.dp_cache.migration_id, 1, 0, 0)])
     assert mgr._rank_tokens == before
 
 
@@ -230,10 +232,11 @@ def test_reset_keeps_router_and_manager_on_the_same_load_records(monkeypatch):
     router.admitted(0, (warm.id, 0, 0))
     mgr._release_seq_load(warm.id, succeeded=True)
     mgr._rank_tokens[0] = 1000000
+    mgr._seq_load["background"] = (0, 0, 1000000)
     seq = request()
     assert _route(mgr, [seq]) == [1]
     router.admitted(1, (seq.id, seq.dp_cache.migration_id, seq.dp_cache.minimum_hit))
-    router.update_work(1, [(seq.id, seq.dp_cache.migration_id, 1, 128)])
+    router.update_work(1, [(seq.id, seq.dp_cache.migration_id, 1, 128, 0)])
     assert mgr._rank_tokens[1] == 128
     mgr._release_seq_load(seq.id, succeeded=True)
     assert mgr._rank_reqs == [0, 0]
@@ -260,10 +263,12 @@ def test_real_prefill_retires_work_only_after_forward_and_rebases_after_preempt(
     empty = ScheduledBatchOutput([], [], None, None, None, is_deferred_out=True)
     sched.postprocess(list(active.values()), empty, batch=batch)
     remaining = seq.num_prompt_tokens - int(batch.num_scheduled_tokens[0])
-    assert sched.cache_admission.take_work() == [(seq.id, 0, 1, remaining)]
+    assert sched.cache_admission.take_work() == [
+        (seq.id, 0, 1, remaining, 65 - remaining)
+    ]
     sched.running.remove(seq)
     assert sched.preempt(seq)
-    assert sched.cache_admission.take_work() == [(seq.id, 0, 2, 65)]
+    assert sched.cache_admission.take_work() == [(seq.id, 0, 2, 65, 0)]
     sched.cache_admission.complete_work(batch, {seq.id: seq})
     assert sched.cache_admission.take_work() == []
     new_batch, active = sched.schedule()
@@ -349,7 +354,7 @@ def test_failed_retry_send_uses_normal_terminal_cleanup(monkeypatch):
 
 
 @pytest.mark.parametrize("resident,accepted", [(64 * 1024, False), (100 * 1024, True)])
-def test_real_scheduler_gates_before_first_forward(resident, accepted):
+def test_real_scheduler_gates_before_first_forward(resident, accepted, monkeypatch):
     scheduler = Scheduler(
         MockConfig(
             kv_cache_block_size=BLOCK,
@@ -384,6 +389,52 @@ def test_real_scheduler_gates_before_first_forward(resident, accepted):
         assert rejected == [seq]
         assert not events
         assert bm.kv.num_used == baseline_used
+
+
+def test_short_tier_lookup_returns_to_owner_before_allocating_or_loading(monkeypatch):
+    scheduler = Scheduler(
+        MockConfig(
+            kv_cache_block_size=4,
+            num_kvcache_blocks=128,
+            max_model_len=256,
+            max_num_batched_tokens=16,
+            enable_chunked_prefill=True,
+        )
+    )
+    seq = Sequence(list(range(65)), 4)
+    seq.dp_cache = DPCacheState(migration_id=7, minimum_hit=48)
+    scheduler.cache_admission.on_admitted = lambda event: pytest.fail(
+        "short lookup admitted"
+    )
+
+    def short_match(seq, *, skip):
+        assert not skip
+        scheduler.kv_connector = NS(
+            lookup_recovery_upper_bound=lambda seq: 32,
+            build_connector_meta=lambda: None,
+        )
+        seq.offload_joint.kv_prefix_tokens = 32
+        return True
+
+    monkeypatch.setattr(scheduler, "_query_connector_prefill_match", short_match)
+    monkeypatch.setattr(
+        scheduler.block_manager,
+        "allocate",
+        lambda *args: pytest.fail("useless target KV allocation"),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_notify_connector_after_prefill_alloc",
+        lambda *args: pytest.fail("useless target load preparation"),
+    )
+    scheduler.add(seq)
+    batch, _ = scheduler.schedule()
+    assert batch is None or seq.id not in batch.req_ids
+    assert scheduler.take_rejected() == [seq]
+    assert seq.dp_cache.retry_reason == "lookup_prefix_too_short"
+    assert seq.dp_cache.recoverable_hit == 32
+    assert not seq.block_table
+    assert not scheduler.cache_admission._preparing
 
 
 def test_multinode_mp_routes_registration_to_host_local_server():
@@ -437,3 +488,62 @@ def test_dp_dummy_forward_reaps_cancelled_alignment_without_more_prefill():
     )
     DPEngineCoreProc._execute_dummy_batch(core)
     assert calls == ["forward_finished", ((), "dummy-output", None)]
+
+
+@pytest.mark.parametrize("weight", [0, 360000])
+def test_router_and_scheduler_share_prefix_cost_and_completed_work(monkeypatch, weight):
+    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", str(weight))
+    mgr = manager(monkeypatch)
+    seq = request()
+    _route(mgr, [seq])
+    router = mgr.cache_router
+    placement = router.balancer.requests[seq.id]
+    prefix = placement.minimum_hit
+    remaining = seq.num_prompt_tokens - prefix
+    sched = Scheduler(MockConfig())
+    assert router.prefill_work_locked()[1] == sched._chunk_cost(prefix, remaining)
+    generation = seq.dp_cache.migration_id
+    router.admitted(1, (seq.id, generation, prefix))
+    chunk = 128
+    router.update_work(1, [(seq.id, generation, 1, remaining - chunk, prefix + chunk)])
+    assert router.prefill_work_locked()[1] == sched._chunk_cost(
+        prefix + chunk, remaining - chunk
+    )
+    assert sched._chunk_cost(prefix, remaining) == (
+        sched._chunk_cost(prefix, chunk) + router.prefill_work_locked()[1]
+    )
+    # Preemption includes generated context, but restarts computation at zero.
+    router.update_work(1, [(seq.id, generation, 2, seq.num_tokens + 100, 0)])
+    assert router.prefill_work_locked()[1] == sched._chunk_cost(0, seq.num_tokens + 100)
+    router.update_work(1, [(seq.id, generation, 1, 1, 0)])
+    assert placement.work_prefix == 0
+    mgr._mark_seq_prefill_complete(seq.id)
+    assert router.prefill_work_locked()[1] == 0
+    mgr._release_seq_load(seq.id)
+    assert router.prefill_work_locked()[1] == 0
+
+
+def test_equal_token_queues_route_away_from_longer_completed_prefix(monkeypatch):
+    mgr = manager(monkeypatch)
+    mgr.reset_dp_router()
+    first, second = request(rank=0), request(rank=1)
+    _route(mgr, [first, second])
+    for rank, seq, prefix in [(0, first, 100000), (1, second, 0)]:
+        mgr.cache_router.admitted(rank, (seq.id, 0, 0))
+        mgr.cache_router.update_work(rank, [(seq.id, 0, 1, 16384, prefix)])
+    assert mgr._rank_tokens == [16384, 16384]
+    fresh = Sequence(TOKENS, BLOCK)
+    ship_prompt_hash_chain(fresh, BLOCK)
+    assert _route(mgr, [fresh]) == [1]
+
+
+def test_cache_admission_corrects_predicted_work_prefix(monkeypatch):
+    mgr = manager(monkeypatch)
+    seq = request(rank=0)
+    _route(mgr, [seq])
+    router = mgr.cache_router
+    placement = router.balancer.requests[seq.id]
+    assert placement.work_prefix > 0
+    router.admitted(0, (seq.id, 0, 0))
+    assert placement.work_prefix == 0
+    assert mgr._seq_load[seq.id][2] == seq.num_prompt_tokens

@@ -45,3 +45,4 @@ class EngineCoreRequestType(enum.Enum):
     CACHE_ADMITTED = b"\x0a"
     # Coalesced remaining GPU prefill work, after completion or preemption.
     CACHE_WORK = b"\x0b"
+    CACHE_PREPARE = b"\x0c"

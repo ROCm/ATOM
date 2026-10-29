@@ -807,6 +807,9 @@ class CoreManager:
                     elif request_type == EngineCoreRequestType.CACHE_ADMITTED:
                         if self.cache_router is not None:
                             self.cache_router.admitted(dp_rank, data)
+                    elif request_type == EngineCoreRequestType.CACHE_PREPARE:
+                        if self.cache_router is not None:
+                            self.cache_router.prepared(dp_rank, data)
                     elif request_type == EngineCoreRequestType.CACHE_WORK:
                         if self.cache_router is not None:
                             self.cache_router.update_work(dp_rank, data)
@@ -1494,6 +1497,11 @@ class CoreManager:
                 "requests_per_rank": list(self._rank_routed_total),
                 "inflight_requests_per_rank": list(self._rank_reqs),
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
+                "queued_prefill_work_per_rank": (
+                    self.cache_router.prefill_work_locked()
+                    if self.cache_router is not None
+                    else None
+                ),
                 "session_count_per_rank": sessions_per_rank,
                 "cache_balance": balancer.statistics() if balancer else {},
             }
@@ -1612,7 +1620,13 @@ class CoreManager:
                 request_loads=self._seq_load,
                 load_lock=self._lb_lock,
                 send_retry=self._send_cache_retry,
+                send_prepare=self._send_cache_prepare,
             )
+
+    def _send_cache_prepare(self, rank, message):
+        self._send_control(
+            rank, pickle.dumps((EngineCoreRequestType.CACHE_PREPARE, message))
+        )
 
     def _send_cache_retry(self, rank: int, seq: Sequence) -> None:
         self._send_control(rank, _add_frame([seq]))

@@ -12,12 +12,19 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, fields
 from math import isfinite
 
+from atom.model_engine.prefill_cost import prefill_cost
+from atom.utils import envs
+
 
 @dataclass(frozen=True)
 class CacheBalanceConfig:
     # Initial estimates, not a V4.1 calibration. Operators can replace them
     # with rates measured on their model and parallel configuration.
+    prepare_migrations: bool = False
     prefill_tokens_per_second: float = 32768.0
+    # The rate above describes a cold chunk of this size. This only sets the
+    # work-to-seconds scale; it is not a measured sparse-attention calibration.
+    prefill_reference_tokens: int = 16384
     transfer_tokens_per_second: float = 2000000.0
     transfer_fixed_seconds: float = 0.01
     decode_request_seconds: float = 0.002
@@ -45,6 +52,10 @@ class CacheBalanceConfig:
         result = cls(**values)
         for f in fields(cls):
             value = getattr(result, f.name)
+            if f.name == "prepare_migrations":
+                if type(value) is not bool:
+                    raise ValueError("prepare_migrations must be boolean")
+                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{f.name} must be numeric")  # noqa: TRY004
             if not isfinite(value) or value < 0:
@@ -53,6 +64,7 @@ class CacheBalanceConfig:
                 f.name
                 in {
                     "prefill_tokens_per_second",
+                    "prefill_reference_tokens",
                     "transfer_tokens_per_second",
                     "prepare_timeout_seconds",
                     "hint_ttl_seconds",
@@ -64,9 +76,10 @@ class CacheBalanceConfig:
                 and value <= 0
             ):
                 raise ValueError(f"{f.name} must be positive")
-            if (f.name.startswith("max_") or f.name == "checkpoint_tokens") and type(
-                value
-            ) is not int:
+            if (
+                f.name.startswith("max_")
+                or f.name in {"checkpoint_tokens", "prefill_reference_tokens"}
+            ) and type(value) is not int:
                 raise ValueError(f"{f.name} must be an integer")
         if result.min_gain_ratio >= 1:
             raise ValueError("min_gain_ratio must be less than one")
@@ -122,17 +135,31 @@ class Placement:
     transfer_seconds: float = 0.0
     work_migration: int = 0
     work_revision: int = 0
+    work_prefix: int = 0
+    prepare_target: int | None = None
+
+    @property
+    def destination(self):
+        return self.rank if self.prepare_target is None else self.prepare_target
 
 
 class CacheBalancer:
     def __init__(self, ranks: int, config: CacheBalanceConfig):
         self.ranks = ranks
         self.config = config
+        self.token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
+        self.work_per_second = config.prefill_tokens_per_second * (
+            self.cost(0, config.prefill_reference_tokens)
+            / config.prefill_reference_tokens
+        )
         self.sessions: OrderedDict[str, Session] = OrderedDict()
         self.requests: dict[object, Placement] = {}
         self.counters = Counter()
         self._generation = 0
         self._cursor = 0
+
+    def cost(self, prefix: int, tokens: int) -> float:
+        return prefill_cost(prefix, tokens, self.token_weight)
 
     def _snapshot(self, chain, prompt, now):
         if chain is None or chain.num_prompt_tokens != prompt:
@@ -185,15 +212,16 @@ class CacheBalancer:
         weight = prompt / (mean_length * mean_length)
         return [max(0, n) + weight * c for n, c in zip(requests, contexts)]
 
-    def _estimate_waits(self, requests, tokens, pending):
+    def _estimate_waits(self, requests, work, pending):
         cfg = self.config
         transfers = [0.0] * self.ranks
         for p in pending:
-            transfers[p.rank] += p.transfer_seconds
+            if p.prepare_target is None:
+                transfers[p.rank] += p.transfer_seconds
         waits = [
-            max(max(0, t) / cfg.prefill_tokens_per_second, transfers[r])
+            max(max(0, w) / self.work_per_second, transfers[r])
             + max(0, n) * cfg.decode_request_seconds
-            for r, (n, t) in enumerate(zip(requests, tokens, strict=True))
+            for r, (n, w) in enumerate(zip(requests, work, strict=True))
         ]
         return waits, transfers
 
@@ -248,18 +276,27 @@ class CacheBalancer:
         transfers,
         decode_scores,
         pending,
+        only_target=None,
+        target_prefix=None,
+        transfer_boundary=None,
     ):
         """Evaluate candidates; leave placement/session ownership unmodified."""
         cfg = self.config
-        stay = waits[rank] + (prompt - hits[rank]) / cfg.prefill_tokens_per_second
+        stay = (
+            waits[rank]
+            + self.cost(hits[rank], prompt - hits[rank]) / self.work_per_second
+        )
         candidates = []
         for target in range(self.ranks):
             if (
                 target == rank
-                or sum(p.rank == target for p in pending) >= cfg.max_migrations_per_rank
+                or (only_target is not None and target != only_target)
+                or sum(p.destination == target for p in pending)
+                >= cfg.max_migrations_per_rank
             ):
                 continue
-            missing = max(0, hits[rank] - hits[target])
+            restore_end = hits[rank] if transfer_boundary is None else transfer_boundary
+            missing = max(0, restore_end - hits[target])
             miss = session.recovery_misses.get((rank, target))
             if (
                 missing
@@ -274,10 +311,18 @@ class CacheBalancer:
                 if missing
                 else 0
             )
+            prefix = (
+                max(hits[rank], hits[target])
+                if target_prefix is None
+                else target_prefix
+            )
             finish = (
                 max(waits[target], transfers[target] + copy_time)
-                + (prompt - max(hits[rank], hits[target]))
-                / cfg.prefill_tokens_per_second
+                + self.cost(
+                    prefix,
+                    prompt - prefix,
+                )
+                / self.work_per_second
             )
             gain = stay - finish
             # Compare completion estimates directly: even a lightly
@@ -304,7 +349,7 @@ class CacheBalancer:
         prompt,
         chain,
         requests,
-        tokens,
+        work,
         now,
         *,
         explicit_rank=None,
@@ -312,11 +357,11 @@ class CacheBalancer:
     ):
         if request_id in self.requests:
             raise ValueError("request already has a DP cache placement")
-        if len(requests) != self.ranks or len(tokens) != self.ranks:
+        if len(requests) != self.ranks or len(work) != self.ranks:
             raise ValueError("DP cache load snapshot has the wrong rank count")
         cfg = self.config
         pending = [p for p in self.requests.values() if p.migration]
-        waits, transfers = self._estimate_waits(requests, tokens, pending)
+        waits, transfers = self._estimate_waits(requests, work, pending)
         decode_scores = self._decode_placement_scores(prompt, requests)
         lightest = self._pick_lightest(waits, decode_scores)
         session = self._session(session_id, lightest)
@@ -375,6 +420,7 @@ class CacheBalancer:
         # Charge the same GPU work that won the cost comparison. Outstanding
         # restore work has its own queue above; it is not free or GPU prefill.
         placement.estimated_hit = max(hits[placement.rank], placement.minimum_hit)
+        placement.work_prefix = placement.estimated_hit
         self.requests[request_id] = placement
         return placement
 
@@ -389,6 +435,7 @@ class CacheBalancer:
         if placement.admitted or hit < placement.minimum_hit:
             return False
         placement.admitted = True
+        placement.work_prefix = hit
         placement.work_migration = migration
         placement.transfer_seconds = 0.0
         self.counters["admitted"] += 1
@@ -421,6 +468,9 @@ class CacheBalancer:
             return None
         source = placement.source
         session = self.sessions.get(placement.session_id)
+        if reason == "lookup_prefix_too_short":
+            self.counters["migration_fallback_before_allocation"] += 1
+            reason = "recoverable_prefix_too_short"
         if (
             session is not None
             and reason == "recoverable_prefix_too_short"
@@ -442,6 +492,7 @@ class CacheBalancer:
         placement.transfer_seconds = 0.0
         # A failed destination is no proof of residency at the source either.
         placement.estimated_hit = 0
+        placement.work_prefix = 0
         self.counters["migration_fallback"] += 1
         # Fixed categories keep metrics bounded and identify which preparation
         # stage needs attention without per-request tracing on the hot path.
@@ -451,6 +502,7 @@ class CacheBalancer:
             "alignment_load_unavailable",
             "alignment_chunk_unavailable",
             "admission_callback_unavailable",
+            "lookup_unavailable",
         }:
             reason = "other"
         self.counters["migration_fallback_" + reason] += 1
@@ -486,7 +538,8 @@ class CacheBalancer:
     def statistics(self):
         transfers = [0.0] * self.ranks
         for placement in self.requests.values():
-            transfers[placement.rank] += placement.transfer_seconds
+            if placement.prepare_target is None:
+                transfers[placement.rank] += placement.transfer_seconds
         return {
             **self.counters,
             "sessions": len(self.sessions),
@@ -494,4 +547,6 @@ class CacheBalancer:
                 bool(p.migration) for p in self.requests.values()
             ),
             "pending_restore_seconds_per_rank": transfers,
+            "prefill_work_per_second": self.work_per_second,
+            "prefill_token_weight": self.token_weight,
         }

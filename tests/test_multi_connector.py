@@ -1059,3 +1059,20 @@ def test_waits_for_transfer_report_needs_every_deferring_sub():
     assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
     assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
     assert not multi(sub(False, True)).waits_for_transfer_report(seq)
+
+
+@pytest.mark.parametrize(
+    "bounds,expected", [([0, 32], 32), ([None, 32], None), ([0, 0], 0)]
+)
+def test_recovery_upper_bound_requires_all_providers(bounds, expected):
+    subs = [FakeSchedSub() for _ in bounds]
+    for sub, bound in zip(subs, bounds, strict=True):
+        sub.lookup_recovery_upper_bound = lambda seq, b=bound: b
+    assert _sched(subs).lookup_recovery_upper_bound(SimpleNamespace(id=7)) == expected
+
+
+def test_recovery_upper_bound_unknown_when_a_provider_lacks_the_hook():
+    assert (
+        _sched([FakeSchedSub()]).lookup_recovery_upper_bound(SimpleNamespace(id=7))
+        is None
+    )
