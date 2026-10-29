@@ -691,8 +691,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         ``operation`` names the transfer that will carry the snapshot, and is
         what the hook keys a save's source pin by. A load passes ``None``: its
-        destination blocks belong to the parked request, which vLLM holds for
-        longer than the transfer, so there is nothing to pin.
+        destination blocks belong to the parked request, which its frontend
+        holds for longer than the transfer, so there is nothing to pin.
         """
         hook = self._recurrent_state_hook
         return None if hook is None else hook(seq, int(end), operation=operation)
@@ -732,10 +732,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         The MP backend also reaches this from `_enforce_transfer_deadlines`,
         but that path hangs off `process_completions`, which only ATOM's native
-        engine calls -- the vLLM plugin connector drives the scheduler from
-        `build_connector_meta` instead. A reconciliation installed on the
-        native path alone never runs under the plugin, and the pins leak the
-        whole pool away exactly as if it had never been installed.
+        engine calls. A frontend that drives the scheduler from
+        `build_connector_meta` instead never reaches it, and the pins would
+        leak the whole pool away exactly as if nothing were installed.
         """
         self._retire_recurrent_rides(self._live_transfers())
 
@@ -787,8 +786,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def _decline_load(self, sid, seq, reason, hbm, lmc, need, chunk) -> None:
         """Skip a load at dispatch, and name it in `declined_loads`.
 
-        A frontend that parked the request on this load before dispatch (the
-        vLLM plugin) releases it this step instead of waiting it out.
+        A frontend that parked the request on this load before dispatch
+        releases it this step instead of waiting it out.
         """
         self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
         self._clear_pending_load(sid)
@@ -1255,9 +1254,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def has_active_save_leases(self, max_age_s: float | None = None) -> bool:
         """Whether any block lease is still held for a save in flight.
 
-        These blocks are protected by a refcount rather than by vLLM holding
-        the request, so nothing about the request's state says they exist. The
-        connector reports them to vLLM as pending frees: they are precisely
+        These blocks are protected by a refcount rather than by the frontend
+        holding the request, so nothing about the request's state says they
+        exist. A frontend can report them as pending frees: they are precisely
         "blocks a pending transfer will release", which is what lets the
         scheduler wait a step instead of preempting a running request to make
         room. ``max_age_s`` counts only leases taken that recently: an older

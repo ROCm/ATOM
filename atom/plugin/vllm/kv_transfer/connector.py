@@ -491,6 +491,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
                 self._worker = DenseOffloadConnector(self._config)
+                # vLLM 0.31 refuses a flat block set for a model with more than
+                # one KV cache group, so failures also go out by request.
+                self._worker.track_load_error_reqs()
         else:
             if self._offload_backend == "mp":
                 # The shell in `offload/mp/connector.py` is bypassed on purpose:

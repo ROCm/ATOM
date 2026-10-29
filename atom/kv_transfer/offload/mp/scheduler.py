@@ -203,7 +203,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     abandons_saves = False
 
     def enforce_transfer_deadlines(self) -> None:
-        # The vLLM plugin never calls `process_completions`; this is its hook.
+        # For a frontend that never calls `process_completions`.
         self._enforce_transfer_deadlines()
 
     def _enforce_transfer_deadlines(self) -> None:

@@ -290,69 +290,15 @@ def _stable_config_value(value: Any) -> Any:
     )
 
 
-# A `ParallelConfig` describes where *this* process sits, not what the bytes
-# look like, so it must not reach the namespace digest.
-_PAGE_PLACEMENT_FIELDS = frozenset({"target_parallel_config", "draft_parallel_config"})
-
-# Speculative-decoding behaviour each process decides for itself. Like the
-# placement fields above these say nothing about what the PAGE bytes look
-# like, and hashing them splits the namespace in two.
-#
-# Measured on DeepSeek-V4.1-Flash with DSpark on the `mp` backend: the four
-# workers hashed `disable_eagle_block_drop: false` and the scheduler hashed
-# `true`, so the workers registered their layout under
-# `atom-page-v3-290a23f2...` while every lookup asked for
-# `atom-page-v3-dbdf5a1c...`. The tier logged `Stored 2560 tokens` for the
-# saves and `No GPU context found for model ... during lookup` for the reads,
-# and the arm ran at a flat zero hit rate with no error on the engine side --
-# the third time this module has been bitten by a per-process field reaching
-# the digest (see `_PAGE_PLACEMENT_FIELDS` and `_canonical_head_dim`).
-_PAGE_SPECULATIVE_BEHAVIOUR_FIELDS = frozenset({"disable_eagle_block_drop"})
-
-# The model and load configs nested in a speculative config: each process fills
-# them in (`hf_config` included) on its own, as `_canonical_head_dim` documents
-# for the target's, so hashing them can split the namespace the same way. The
-# bytes are already named without them: the target by the HF fields hashed
-# above, the draft by the speculative config's own `model`, `method` and
-# `num_speculative_tokens`.
-_PAGE_SPECULATIVE_NESTED_FIELDS = frozenset(
-    {"target_model_config", "draft_model_config", "draft_load_config"}
-)
-
-
-def _stable_speculative_config(value: Any) -> Any:
-    """The speculative config with everything per-process removed.
-
-    The parallel configs carry this process' own coordinates -- `rank`,
-    `data_parallel_rank`, `node_rank` -- so hashing them gives every TP rank a
-    different PAGE namespace. Under `tp_rank_collapse` that is silent data
-    loss: the one writing rank publishes its bytes under its own name, the
-    other ranks look their own names up, and the tier answers every one of
-    those lookups with a miss and no error anywhere (the failure mode
-    `_canonical_head_dim` documents, reached by a different field). Placement
-    is not a property of the bytes; the parallelism that is -- TP and DCP width
-    -- `build_page_namespace` hashes explicitly.
-    """
-
-    stable = _stable_config_value(value)
-    if isinstance(stable, dict):
-        dropped = (
-            _PAGE_PLACEMENT_FIELDS
-            | _PAGE_SPECULATIVE_BEHAVIOUR_FIELDS
-            | _PAGE_SPECULATIVE_NESTED_FIELDS
-        )
-        return {key: item for key, item in stable.items() if key not in dropped}
-    return stable
-
-
 def _canonical_head_dim(hf: object) -> int | None:
     """Return the attention head dim every process agrees on.
 
     ``head_dim`` is not a stable property of the checkpoint: for MLA models it
     is absent from ``config.json`` and each process fills it in on its own.
-    vLLM's scheduler process keeps transformers' computed default
+    A scheduler process can keep transformers' computed default
     (``hidden_size // num_attention_heads``, 74 for Kimi K3) while the workers
-    end up with the MLA head dim (``qk_nope + qk_rope``, 192).  Hashing the
+    that build the model end up with the MLA head dim (``qk_nope + qk_rope``,
+    192), as `Config.__post_init__` notes for ATOM's own.  Hashing the
     attribute therefore splits the PAGE namespace in two: the workers publish
     their layout under one name, every lookup asks for the other, and the tier
     answers every lookup with a miss and no error.  Derive it from the fields
@@ -496,9 +442,10 @@ def build_page_namespace(
         # The config-time snapshot when there is one; see `Config.__post_init__`.
         "hf_geometry": getattr(config, "offload_page_hf_geometry", None)
         or _stable_hf_geometry(hf),
-        "speculative_config": _stable_speculative_config(
-            getattr(config, "speculative_config", None)
-        ),
+        # A frontend's own stable form when it supplies one, as for the HF
+        # geometry above: only it knows which of its fields are per-process.
+        "speculative_config": getattr(config, "offload_speculative_config", None)
+        or _stable_config_value(getattr(config, "speculative_config", None)),
     }
     canonical = json.dumps(
         document,

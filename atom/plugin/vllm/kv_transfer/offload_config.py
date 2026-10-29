@@ -83,6 +83,54 @@ class _HFConfigView:
         )
 
 
+# vLLM `SpeculativeConfig` fields that describe this process rather than the
+# cached bytes, so hashing them into the PAGE namespace splits it in two.
+#
+# `target_parallel_config` / `draft_parallel_config` carry this process' own
+# `rank`, `data_parallel_rank` and `node_rank`: every TP rank would get its own
+# namespace, which under `tp_rank_collapse` is silent data loss -- the one
+# writing rank publishes under its name and every other rank misses on its own.
+# The parallelism that does shape the bytes, TP and DCP width,
+# `build_page_namespace` hashes explicitly.
+#
+# `disable_eagle_block_drop` is decided per process. Measured on
+# DeepSeek-V4.1-Flash with DSpark on the `mp` backend: the four workers hashed
+# `false` and the scheduler `true`, so the workers registered their layout
+# under `atom-page-v3-290a23f2...` while every lookup asked for
+# `atom-page-v3-dbdf5a1c...`; the tier logged `Stored 2560 tokens` for the saves
+# and `No GPU context found for model ... during lookup` for the reads, at a
+# flat zero hit rate with no error on the engine side.
+#
+# `target_model_config` / `draft_model_config` / `draft_load_config` are filled
+# in by each process (`hf_config` included). The bytes are named without them:
+# the target by the HF fields the namespace hashes, the draft by the
+# speculative config's own `model`, `method` and `num_speculative_tokens`.
+_PER_PROCESS_SPECULATIVE_FIELDS = frozenset(
+    {
+        "target_parallel_config",
+        "draft_parallel_config",
+        "disable_eagle_block_drop",
+        "target_model_config",
+        "draft_model_config",
+        "draft_load_config",
+    }
+)
+
+
+def _stable_speculative_config(value: Any) -> Any:
+    """vLLM's speculative config as the PAGE namespace hashes it."""
+    from atom.kv_transfer.offload.config import _stable_config_value
+
+    stable = _stable_config_value(value)
+    if isinstance(stable, dict):
+        return {
+            key: item
+            for key, item in stable.items()
+            if key not in _PER_PROCESS_SPECULATIVE_FIELDS
+        }
+    return stable
+
+
 class OffloadConfigShim:
     """The ATOM-offload-shaped view of a vLLM config.
 
@@ -173,6 +221,11 @@ class OffloadConfigShim:
         # model_tag.
         self.model = str(getattr(model_config, "model", "") or "atom-model")
         self.model_tag = self.model
+
+    @property
+    def offload_speculative_config(self) -> Any:
+        """What `build_page_namespace` hashes for `speculative_config`."""
+        return _stable_speculative_config(self.speculative_config)
 
     def __repr__(self) -> str:
         return (

@@ -76,8 +76,8 @@ def build_v41_pool_geometry(
     The single authority for it. The pool is declared twice -- once by the
     scheduler that sizes it and once by whoever hands the runtime its backing
     store -- and the two only describe the same bytes if they derive the shape
-    the same way. The vLLM plugin sizes a proxy KV pool from here and the
-    native builder below builds its cache from here, so a change to the
+    the same way. A frontend that sizes its own pool sizes it from here and
+    the native builder below builds its cache from here, so a change to the
     topology reaches both or neither.
 
     ``kv_dtype`` is the main pool's format (native's ``kv_cache_dtype``: bf16,

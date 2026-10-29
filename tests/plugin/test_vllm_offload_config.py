@@ -113,3 +113,32 @@ def test_outer_only_fields_still_resolve():
 def test_flat_config_is_unaffected():
     cfg = build_offload_config(_vllm_config())
     assert cfg.hf_config.num_hidden_layers == 60
+
+
+def test_per_process_speculative_fields_stay_out_of_the_page_namespace():
+    """vLLM fills these in per process; hashed, they split one deployment's
+    PAGE namespace between its scheduler and its workers."""
+    from atom.kv_transfer.offload import config as offcfg
+
+    def namespace(rank, drop):
+        vllm_config = _vllm_config()
+        vllm_config.speculative_config = NS(
+            method="dspark",
+            model="/d",
+            num_speculative_tokens=3,
+            disable_eagle_block_drop=drop,
+            target_parallel_config=NS(rank=rank),
+            draft_parallel_config=NS(rank=rank),
+            target_model_config=NS(filled=rank),
+            draft_model_config=NS(filled=rank),
+            draft_load_config=NS(filled=rank),
+        )
+        cfg = build_offload_config(vllm_config)
+        assert cfg.offload_speculative_config == {
+            "method": "dspark",
+            "model": "/d",
+            "num_speculative_tokens": 3,
+        }
+        return offcfg.build_page_namespace(cfg, NS(chunk_size=256), 4)
+
+    assert namespace(0, False) == namespace(3, True)

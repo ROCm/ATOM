@@ -227,11 +227,11 @@ class RecurrentPageGroup:
 
     A hybrid model's recurrent layers are block-major like PAGE KV -- one
     snapshot row per block-table position -- but they live in a *different*
-    block id space (vLLM allocates mamba blocks separately) and only the block
-    holding the last state of a chunk is meaningful. Published apart from
+    block id space (recurrent blocks are allocated separately) and only the
+    block holding the last state of a chunk is meaningful. Published apart from
     ``pages`` for exactly those two reasons: a block id cannot be resolved
     without knowing which space it counts in, and a transport that copied every
-    position would copy the null block vLLM parks in the skipped ones.
+    position would copy the null block parked in the skipped ones.
     """
 
     pages: tuple[PageRegion, ...]

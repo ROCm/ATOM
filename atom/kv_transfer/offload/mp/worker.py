@@ -478,7 +478,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
         A recurrent snapshot exists only at a chunk boundary, so an operation
         spanning ``n`` chunks carries ``n - 1`` null ids and the boundary block
-        last. The null id is ``0``, vLLM's null block, which is what LMCache's
+        last. The null id is ``0``, the null block, which is what LMCache's
         `all_null_chunk_masks` tests for -- it asks whether any id in the chunk
         is truthy, so a sentinel of ``-1`` would read as a real block and the
         empty chunks would be committed as content-hashed garbage. It is not

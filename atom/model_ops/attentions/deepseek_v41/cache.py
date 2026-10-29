@@ -440,7 +440,8 @@ class PagedAttentionCache:
 
         The point between a slot being assigned and its cursor being judged,
         so `_report_stale_state` checks whatever a restore produced. Native
-        ATOM restores nothing here; the vLLM plugin's cache overrides it.
+        ATOM restores nothing here; a frontend that checkpoints state
+        overrides it.
         """
         return cursors
 
