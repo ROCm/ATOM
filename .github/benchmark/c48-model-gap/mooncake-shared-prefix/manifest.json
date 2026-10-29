@@ -1,0 +1,8 @@
+{
+  "source_sha": "ce0528892e7ab79030f8355483ba2a2bd786ffe7",
+  "source_path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
+  "sha256": {
+    "worker.py": "dae33150acc1332622c63641a864415d95ccaf719250555ffdbeea7cd8719b9f"
+  },
+  "validation": "6 CPU adapter tests; 4 failures/2 passes before fix; no GPU validation yet"
+}

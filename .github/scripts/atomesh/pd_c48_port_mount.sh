@@ -21,6 +21,14 @@ c48_append_port_mount() {
     c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
     [[ "${c48_fix_digest%% *}" == "397e20f11593dfa652d7338a848945db0ab90c4f5424c9b129068278518c5646" ]] || return 2
     docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+    if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-JUNCTION-MC ]]; then
+      c48_fix_source="$1/.github/benchmark/c48-model-gap/mooncake-shared-prefix/worker.py"
+      c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py"
+      [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
+      c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
+      [[ "${c48_fix_digest%% *}" == "dae33150acc1332622c63641a864415d95ccaf719250555ffdbeea7cd8719b9f" ]] || return 2
+      docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+    fi
   fi
   local c48_kda_dir=online-quant-fix c48_kda_sha=8318855c6eede76b8072bc7ba744523a331c6ebe2bd3d145b6e6e3c1722518ed
   if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-INPAD || "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-INPAD-* ]]; then

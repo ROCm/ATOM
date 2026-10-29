@@ -54,6 +54,24 @@ def mounts(case, root=REPO):
 
 
 class PortMountTest(unittest.TestCase):
+    def test_shared_prefix_store_overlay_is_scoped_and_pinned(self):
+        base = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72"
+        rc, normal = mounts(base + "-MC")
+        self.assertEqual(rc, 0)
+        rc, junction = mounts(base + "-JUNCTION-MC")
+        self.assertEqual(rc, 0)
+        extra = [entry for entry in junction if "/mooncake/store/worker.py," in entry]
+        self.assertEqual(len(extra), 1)
+        self.assertIn("/mooncake-shared-prefix/worker.py,", extra[0])
+        self.assertEqual(normal, [entry for entry in junction if entry not in extra])
+        with tempfile.TemporaryDirectory() as temp:
+            gap = Path(temp) / ".github/benchmark/c48-model-gap"
+            shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
+            with (gap / "mooncake-shared-prefix/worker.py").open("a") as handle:
+                handle.write("\n")
+            self.assertEqual(mounts(base + "-JUNCTION-MC", temp)[0], 2)
+            self.assertEqual(mounts(base + "-MC", temp)[0], 0)
+
     def test_pp_aux_overlay_is_selected_only_for_pp(self):
         base = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C32"
         rc, normal = mounts(base + "-MC")
@@ -135,8 +153,8 @@ class PortMountTest(unittest.TestCase):
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-"
         for path in sorted((REPO / ".github/benchmark/c48-model-gap").glob(prefix + "*-MC.json")):
             case = path.stem
-            if "-PP8-" in case:
-                continue  # PP also replaces the model's auxiliary-state transport.
+            if "-PP8-" in case or "-JUNCTION-" in case:
+                continue  # Additional overlays have dedicated scope/pinning tests.
             rc, mc = mounts(case)
             self.assertEqual(rc, 0)
             self.assertTrue(mc[1].endswith("/kv_connector/v1/multi_connector.py,readonly"))

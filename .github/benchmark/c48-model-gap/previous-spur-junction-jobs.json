@@ -1,0 +1,9 @@
+{
+  "purpose": "Refuse a checkpoint retry while its cancelled predecessor remains in the scheduler",
+  "jobs": [
+    {"job_id": "7788", "run_id": "38296153235"},
+    {"job_id": "8540", "run_id": "38740874930"},
+    {"job_id": "8541", "run_id": "38740903706"},
+    {"job_id": "11041", "run_id": "40908096424", "actions_conclusion": "cancelled", "cleanup_verified": false}
+  ]
+}

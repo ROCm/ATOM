@@ -253,6 +253,12 @@ class ManifestWorker(Worker):
                 "speculative": inspect_speculative(spec,
                     int(os.environ["C48_DIAG_DRAFT_TOKENS"]),
                     float(os.environ["C48_DIAG_AL"]) if os.environ["C48_DIAG_AL"] else None)}
+        if os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1":
+            import hashlib
+            from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import worker as store_worker
+            digest = hashlib.sha256(Path(store_worker.__file__).read_bytes()).hexdigest()
+            assert digest == "dae33150acc1332622c63641a864415d95ccaf719250555ffdbeea7cd8719b9f", "Unexpected checkpoint Store worker"
+            data["mooncake_boundary_store"] = {"module_path": store_worker.__file__, "module_sha256": digest}
         if os.environ.get("AITER_MLA_USE_OPUS") == "1":
             import hashlib
             import importlib
