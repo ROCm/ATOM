@@ -50,4 +50,4 @@ jobs:
         run: bash .claude/skills/review-pr/selftest.sh
 
       - name: Unit tests
-        run: python3 -m pytest .claude/skills/review-pr/tests/ -v
+        run: python3 -m pytest .claude/skills/review-pr/*_test.py .claude/skills/validate-atom-pr/tests/ -v

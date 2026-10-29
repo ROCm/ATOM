@@ -16,7 +16,7 @@ this on a PR branch -- watchdog_test.py drives it instead, against a fake API an
 Usage (from the workflow): python3 .claude/skills/review-pr/watchdog.py
 Reads STUCK_MINUTES, PR, GH_TOKEN, ATOM_BOT_TOKEN, OWNER_OVERRIDE, and the GITHUB_* that
 Actions sets for every step. OWNER_OVERRIDE is read but nothing in the workflow sets it --
-ATOM's injection of it was removed along with the repo-variable override channel (owners.txt
+ATOM's injection of it was removed along with the repo-variable override channel (_notify.py's OWNERS
 is now the only map) -- so this always falls back to the hardcoded owner below.
 """
 

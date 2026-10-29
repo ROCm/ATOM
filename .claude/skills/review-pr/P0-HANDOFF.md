@@ -102,9 +102,9 @@ finding that reached the card without being attacked, etc.).
 - **First red**: re-run the worker. Most reds are the model not following the output
   format that particular time, not a real defect in the pipeline.
 - **Same gate red three times running**: that is not bad luck, that is the gate — or
-  `SKILL.md`'s instruction to the worker — being wrong. Treat it as a code fix: find the
-  corresponding task in the plan (`docs/superpowers/plans/2026-10-23-atom-review-bot-p0.md`)
-  and fix the instruction or the gate's check.
+  `SKILL.md`'s instruction to the worker — being wrong. Treat it as a code fix: the gate's
+  check lives in `triage.py`, the instruction it enforces in `SKILL.md`, and one of the two
+  is wrong. Fix that, not the symptom.
 - **Never relax a gate to make it pass.** A gate exists to catch a specific way the
   model can cheat the review; loosening it to clear a red defeats the one thing gates
   are for.

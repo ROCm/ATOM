@@ -196,9 +196,9 @@ jobs:
         id: notify
         # Runs even when the review step failed. run_one.sh writes .atom-review-status as
         # "<class>\t<message>"; _notify.py maps the class to its owner and posts one comment
-        # @-mentioning them, reading the class->owner map from owners.txt (next to _notify.py,
-        # so ownership changes without touching code), never the PR author. check_prompts.py
-        # fails if run_one emits a class owners.txt does not know -- so they cannot drift.
+        # @-mentioning them, reading the class->owner map from _notify.py's OWNERS table
+        # (the single source of truth, as in aiter's), never the PR author. check_prompts.py
+        # fails if run_one emits a class that table does not know -- so they cannot drift.
         if: always()
         env:
           ATOM_BOT_TOKEN: ${{ secrets.ATOM_BOT_TOKEN }}

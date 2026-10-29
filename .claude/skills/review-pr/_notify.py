@@ -4,37 +4,28 @@ the failure with `fail <class> ...`) and the workflow (which reports it) cannot 
 check_prompts.py asserts every class run_one.sh can emit is known here.
 
 Called by the workflow's notify step as `python3 _notify.py <pr>`. Reads `.atom-review-status`
-(written by run_one.sh as "<class>\t<message>"). Owners come from owners.txt, next to this file,
-so ownership changes without touching code.
+(written by run_one.sh as "<class>\t<message>"). The class -> owner map is the table below --
+the single source of truth, as in aiter's copy of this file; check_prompts.py asserts every
+class run_one.sh can emit is known here, and that the standalone notifiers agree with it.
 """
 
 import json
 import os
-import pathlib
 import sys
 import urllib.request
 
-HERE = pathlib.Path(__file__).resolve().parent
-
-
-def _owners():
-    """Read owners.txt: '<class> <login> <description>' per line, '#' comments.
-
-    The map is in version control, not in repo variables: changing who gets
-    paged should be an auditable commit, not an invisible settings edit.
-    """
-    out = {}
-    for line in (HERE / "owners.txt").read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        parts = s.split(None, 2)
-        if len(parts) >= 2:
-            out[parts[0]] = (parts[1], parts[2] if len(parts) > 2 else "")
-    return out
-
-
-OWNERS = _owners()
+# class -> (login, what is wrong). Hardcoded, not read from a file: aiter keeps the same
+# map inline in its own _notify.py, and a second file that only this module reads buys
+# nothing over a literal while adding a way for the two to drift. Changing who gets paged
+# stays an auditable commit either way. There is deliberately no repo-variable override:
+# an invisible settings edit is not an audit trail.
+OWNERS = {
+    "flow": ("zufayu", "the review pipeline itself (bot logic / prompts)"),
+    "env": ("zufayu", "the runner environment (gh, token, git, disk)"),
+    "glm": ("yhl-amd", "the model backend serving the review agent"),
+    "atom": ("valarLip", "the ATOM serving framework"),
+    "machine": ("gyohuangxin", "the machine (GPU, disk, network, OS)"),
+}
 
 
 def owner_for(cls):

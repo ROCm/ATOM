@@ -126,15 +126,15 @@ def check_budget_fits():
 
 def check_owner_fallbacks():
     """watchdog.py, lost_review.py and queue_gate.py each hardcode their own fallback owner
-    rather than reading owners.txt: they exist to speak precisely when the review job (and
+    rather than reading _notify.py's table: they exist to speak precisely when the review job (and
     _notify.py with it) never ran at all, so they cannot depend on anything that only works
-    inside that job. That duplication is deliberate, but it drifts from owners.txt in silence
-    if nobody checks it: the next owner updates owners.txt and still never hears that the
+    inside that job. That duplication is deliberate, but it drifts from that table in silence
+    if nobody checks it: the next owner updates OWNERS and still never hears that the
     runner is down, or that a review vanished.
 
-    Since Task 5 moved the map into owners.txt, there is no longer a repo-variable override
+    There is no repo-variable override channel
     channel for these three scripts' fallback -- Task 7 removed the workflow's OWNER_OVERRIDE
-    injection along with it, so this only compares each hardcoded login against owners.txt."""
+    for the map, so this only compares each hardcoded login against OWNERS."""
     miss = _missing(HERE / "_notify.py", HERE / "watchdog.py",
                      HERE / "lost_review.py", HERE / "queue_gate.py")
     if miss:
@@ -159,11 +159,11 @@ def check_owner_fallbacks():
             bad += 1
             continue
         if m.group(1) != default:
-            print(f"\u274c {filename} pages '{m.group(1)}', but owners.txt's {cls} class is "
+            print(f"\u274c {filename} pages '{m.group(1)}', but OWNERS' {cls} class is "
                   f"'{default}'")
             bad += 1
             continue
-        print(f"\u2705 {filename} matches owners.txt's {cls} class: {default}")
+        print(f"\u2705 {filename} matches OWNERS' {cls} class: {default}")
     return 1 if bad else 0
 
 

@@ -19,7 +19,7 @@ Usage (from the gate job): python3 .claude/skills/review-pr/queue_gate.py
 Reads AUTHORIZED, PR, GH_TOKEN, ATOM_BOT_TOKEN, OWNER_OVERRIDE, the tuning below, and the
 GITHUB_* that Actions sets for every step. Writes `ok` to GITHUB_OUTPUT. OWNER_OVERRIDE is read
 but nothing in the workflow sets it -- ATOM's injection of it was removed along with the
-repo-variable override channel (owners.txt is now the only map) -- so this always falls back
+repo-variable override channel (_notify.py's OWNERS is the only map) -- so this always falls back
 to the hardcoded owner below.
 """
 

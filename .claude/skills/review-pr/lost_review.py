@@ -15,7 +15,7 @@ one that started and then disappeared.
 What lands here is "the job said nothing and the cause is in the log" -- a triage job, not
 necessarily a box problem -- so aiter's workflow pages the FLOW owner here, not the runner
 owner it pages from the watchdog. ATOM's workflow injection for OWNER_OVERRIDE was removed along
-with the repo-variable channel (owners.txt is now the only map), so this script's fallback is
+with the repo-variable channel (_notify.py's OWNERS is the only map), so this script's fallback is
 the only owner that is ever paged here; nothing currently populates OWNER_OVERRIDE for any of
 the three scripts that read it.
 

@@ -283,8 +283,7 @@ Expected output: `ROCm/ATOM` (or `zufayu/ATOM` while registered against the fork
 ## 4. Bot identity
 
 `rocm-atom-bot` was registered on 2026-10-29 (`public_repo` scope, `pull` on the repo — enough
-to comment on a public repo, though **not yet exercised against `ROCm/ATOM`**; see
-`ADMIN-HANDOFF.md` §4 for the interaction-limit check that could silently block it).
+to comment on a public repo, though **not yet exercised against `ROCm/ATOM`**; an org or repo interaction limit would reject every comment it posts).
 Set the repo secret `ATOM_BOT_TOKEN` to that account's PAT. The workflow binds it as a step env var at five
 places (gate's queue step, the watchdog job, review's claim step, review's notify step, and the
 report job) — including steps that run inside the review job. The one step that is never given
