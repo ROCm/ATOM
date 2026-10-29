@@ -108,6 +108,9 @@ class TestEnvsDefaults:
     def test_sampler_split_softmax_default_disabled(self):
         assert _get_envs().ATOM_SAMPLER_SPLIT_SOFTMAX is False
 
+    def test_gluon_gemm_ar_default_enabled(self):
+        assert _get_envs().ATOM_ENABLE_GLUON_GEMM_AR is True
+
     def test_model_sensitive_rmsnorm_default_disabled(self):
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False
 

@@ -23,7 +23,12 @@ from atom.model_ops import module_dispatch_ops  # noqa: F401
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import DualRMSNorm, GemmaRMSNorm, RMSNormGated
+from atom.model_ops.layernorm import (
+    DualRMSNorm,
+    GemmaRMSNorm,
+    RMSNormGated,
+    gluon_gemm_allreduce_gemma_rmsnorm,
+)
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
 from atom.model_ops.linear import (
     BAParallelLinear,
@@ -413,6 +418,8 @@ class Qwen3NextAttention(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
+        # Set by the decoder layer: it runs o_proj in one kernel with its next norm.
+        self.skip_out_proj = False
         if is_vllm():
             # print("hf_config: ", atom_config.plugin_config.vllm_config.model_config.hf_config, flush=True)
             model_config = atom_config.plugin_config.vllm_config.model_config
@@ -557,9 +564,9 @@ class Qwen3NextAttention(nn.Module):
             output = self.o_proj(attn_output, x_scale=attn_scale)
         elif self.attn_output_gate:
             attn_output = output_gate_mul(attn_output, gate, ATOM_FUSED_SIGMOID_GATE)
-            output = self.o_proj(attn_output)
+            output = attn_output if self.skip_out_proj else self.o_proj(attn_output)
         else:
-            output = self.o_proj(attn_output)
+            output = attn_output if self.skip_out_proj else self.o_proj(attn_output)
 
         return output
 
@@ -804,6 +811,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
 
 class Qwen3NextDecoderLayer(nn.Module):
+    # Set by Qwen3_5DecoderLayer: the attention skips its last projection, and
+    # forward runs it with post_attention_layernorm in one aiter kernel.
+    fuse_gemm_ar = False
+
     def __init__(
         self,
         atom_config,
@@ -962,7 +973,22 @@ class Qwen3NextDecoderLayer(nn.Module):
                 )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.fuse_gemm_ar:
+            if self.layer_type == "linear_attention":
+                proj = self.linear_attn.out_proj
+            else:
+                proj = self.self_attn.o_proj
+            hidden_states, residual = gluon_gemm_allreduce_gemma_rmsnorm(
+                hidden_states.contiguous(),
+                proj.weight,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
 
         hidden_states = self.mlp(hidden_states)
 
