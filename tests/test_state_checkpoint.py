@@ -3192,12 +3192,33 @@ class TestPromptEndAnchor:
             seq = stateful_seq(tokens)
             bm.allocate(seq, bm.can_allocate(seq))
             anchor = seq.checkpoint_end_pos
-            assert anchor == ref.checkpoint_end_pos // grid * grid, n
+            floored = ref.checkpoint_end_pos // grid * grid
+            assert anchor == (floored or ref.checkpoint_end_pos), n
             cuts = set(forward_on_the_ladder(bm, seq))
             keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
             assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
             if anchor:
                 assert anchor in keeps, n
+
+    def test_a_prompt_short_of_the_tier_grid_keeps_its_hash_block_anchor(self):
+        """A grid coarser than the prompt's anchor floors it to 0. Recording
+        nothing would drop the HBM resume point the next turn uses (the tier
+        never had it), so the hash-block anchor stays."""
+        n = 40
+        tokens = list(range(1000 * n, 1000 * n + n))
+        plain = make_block_manager(demand_config())
+        ref = stateful_seq(tokens)
+        plain.can_allocate(ref)
+        assert ref.checkpoint_end_pos > 0
+
+        bm = make_block_manager(demand_config())
+        bm.align_checkpoint_anchor(
+            (ref.checkpoint_end_pos // BLOCK + 1) * BLOCK  # just past the anchor
+        )
+        seq = stateful_seq(tokens)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert seq.checkpoint_end_pos == ref.checkpoint_end_pos
+        assert bm.checkpointers_at(seq, seq.checkpoint_end_pos)
 
     def test_an_anchor_grid_off_the_hash_grid_is_refused(self):
         bm = make_block_manager(demand_config())

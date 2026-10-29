@@ -2487,6 +2487,11 @@ class BlockManager:
         every continuation (see `_record_checkpoint_end`), and the 8192 ladder
         is too coarse to stand in for it. On the grid it costs HBM less than
         one grid of reuse.
+
+        Set by the LMCache MP native-state scheduler, so it applies to every
+        GDN model on that tier (Qwen3-Next and Qwen3.5 as well as Qwen3.8). A
+        prompt too short to reach the grid keeps its hash-block anchor, which
+        only HBM serves, exactly as without a grid.
         """
         tokens = int(tokens)
         if tokens <= 0 or tokens % self.hash_block_size:
@@ -2718,8 +2723,12 @@ class BlockManager:
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
         # Floored after the cap, which is a hash-block position: a tier grid
         # (`align_checkpoint_anchor`) need not contain it. Moving left keeps
-        # both tests above.
-        end -= end % self.checkpoint_anchor_grid
+        # both tests above. A prompt with no grid position left keeps the
+        # hash-block anchor instead: the tier never stores it, but the next
+        # turn still resumes from it in HBM, as it did before the grid.
+        aligned = end - end % self.checkpoint_anchor_grid
+        if aligned > 0:
+            end = aligned
         if end > 0:
             seq.checkpoint_end_pos = end
 
