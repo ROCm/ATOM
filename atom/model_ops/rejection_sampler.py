@@ -21,7 +21,12 @@ from atom.model_ops.sampling_filter import (
     row_filters,
 )
 from atom.model_ops.sampling_scratch import SamplingScratch, take
-from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
+from atom.model_ops.softmax_tiles import (
+    argmax_lowest_id,
+    race_key,
+    softmax_combine_kernel,
+    tile_max_sumexp,
+)
 from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
@@ -491,6 +496,33 @@ def _ratio_densify_scatter_kernel(
             )
 
 
+@triton.jit
+def _target_p_tile(
+    logits_ptr,
+    row,
+    logits_row_stride,
+    offs,
+    vmask,
+    temp,
+    row_max,
+    inv_z,
+    row_floor_ptr,
+    FILTER: tl.constexpr,
+):
+    """``p_f`` on one V tile of ``row``: the tempered softmax from the row's
+    max and 1/Z, 0 on masked lanes and, under ``FILTER``, below the row's
+    floor. The residual race and its p fallback both race this p."""
+    x = tl.load(
+        logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
+        mask=vmask,
+        other=float("-inf"),
+    ).to(tl.float32)
+    p = tl.where(vmask, tl.exp(x / temp - row_max) * inv_z, 0.0)
+    if FILTER:
+        p = tl.where(x >= tl.load(row_floor_ptr + row), p, 0.0)
+    return p
+
+
 @triton.jit(do_not_specialize=["batch_size", "residual_seed"])
 def _ratio_residual_race_kernel(
     residual_row_ptr,  # [batch_size] int32, the rejecting row, or -1
@@ -521,15 +553,18 @@ def _ratio_residual_race_kernel(
         temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
         offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
         vmask = offs < vocab_size
-        x = tl.load(
-            logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
-            mask=vmask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        p = tl.exp(x / temp - tl.load(row_max_ptr + row)) * tl.load(row_inv_z_ptr + row)
-        p = tl.where(vmask, p, 0.0)
-        if FILTER:
-            p = tl.where(x >= tl.load(row_floor_ptr + row), p, 0.0)
+        p = _target_p_tile(
+            logits_ptr,
+            row,
+            logits_row_stride,
+            offs,
+            vmask,
+            temp,
+            tl.load(row_max_ptr + row),
+            tl.load(row_inv_z_ptr + row),
+            row_floor_ptr,
+            FILTER,
+        )
         q = tl.load(
             dense_ptr + req_idx.to(tl.int64) * vocab_size + offs,
             mask=vmask & has_q,
@@ -539,18 +574,13 @@ def _ratio_residual_race_kernel(
         # so the residual falls back toward p rather than inheriting garbage.
         q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
         residual = tl.maximum(p - q, 0.0)
-        u = tl.rand(residual_seed, row.to(tl.int64) * vocab_size + offs)
-        # u in [0, 1): E = -log(u) is in (0, inf], so a key is finite and a
-        # zero-mass id keys exactly 0.
-        e = -tl.log(u)
-        key = tl.where(vmask, residual / e, -1.0)
-        best = tl.max(key, axis=0)
+        key = race_key(
+            residual, residual_seed, row.to(tl.int64) * vocab_size, offs, vmask
+        )
+        best, best_id = argmax_lowest_id(key, offs, vmask, 2147483647)
         part = tile * batch_size + req_idx
         tl.store(part_key_ptr + part, best)
-        tl.store(
-            part_idx_ptr + part,
-            tl.min(tl.where((key == best) & vmask, offs, 2147483647), axis=0),
-        )
+        tl.store(part_idx_ptr + part, best_id)
 
 
 @triton.jit(do_not_specialize=["batch_size", "num_spec_steps", "residual_seed"])
@@ -600,8 +630,7 @@ def _ratio_residual_pick_kernel(
         idxs = tl.load(
             part_idx_ptr + offs * batch_size + req_idx, mask=tmask, other=2147483647
         )
-        best = tl.max(keys, axis=0)
-        token = tl.min(tl.where((keys == best) & tmask, idxs, 2147483647), axis=0)
+        best, token = argmax_lowest_id(keys, idxs, tmask, 2147483647)
         if best <= 0.0:
             temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
             row_max = tl.load(row_max_ptr + row)
@@ -614,21 +643,27 @@ def _ratio_residual_pick_kernel(
             for v_start in range(0, vocab_size, BLOCK_V):
                 v = v_start + tl.arange(0, BLOCK_V)
                 vmask = v < vocab_size
-                x = tl.load(
-                    logits_ptr + row.to(tl.int64) * logits_row_stride + v,
-                    mask=vmask,
-                    other=float("-inf"),
-                ).to(tl.float32)
-                p = tl.where(vmask, tl.exp(x / temp - row_max) * inv_z, 0.0)
-                if FILTER:
-                    p = tl.where(x >= tl.load(row_floor_ptr + row), p, 0.0)
-                u = tl.rand(residual_seed, row.to(tl.int64) * vocab_size + v)
-                key = tl.where(vmask, p / -tl.log(u), -1.0)
-                tile_best = tl.max(key, axis=0)
-                tile_idx = tl.min(
-                    tl.where((key == tile_best) & vmask, v, 2147483647), axis=0
+                p = _target_p_tile(
+                    logits_ptr,
+                    row,
+                    logits_row_stride,
+                    v,
+                    vmask,
+                    temp,
+                    row_max,
+                    inv_z,
+                    row_floor_ptr,
+                    FILTER,
                 )
-                # Strictly better only: an equal key keeps the lower id.
+                # The race kernel's key and tile reduction at the same Philox
+                # counters, with p_f in place of the residual.
+                key = race_key(
+                    p, residual_seed, row.to(tl.int64) * vocab_size, v, vmask
+                )
+                tile_best, tile_idx = argmax_lowest_id(key, v, vmask, 2147483647)
+                # Strictly better only: an equal key keeps the lower id. (Not
+                # finalize's tie merge: a 0 key must not displace the
+                # sentinel, which the row_argmax fallback below relies on.)
                 token = tl.where(tile_best > pbest, tile_idx, token)
                 pbest = tl.maximum(pbest, tile_best)
         # Every comparison above is false on NaN. The max has no id either on

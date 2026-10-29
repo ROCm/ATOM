@@ -9,6 +9,12 @@ The probability-ratio verify (`rejection_sampler`) builds the target's p this
 way. The sampled DSpark draft (`dspark_markov_sample`) takes only the row max
 (and the raw argmax) from the combine: its q is normalized over the entries it
 stores, not by a full-vocab 1/Z, so it skips the sum (``WITH_INV_Z=False``).
+
+Both also draw by the same exponential race: `race_key` keys every id on its
+mass over Exp(1) noise from Philox, and `argmax_lowest_id` takes the winner,
+the lowest id on a tie. The verify's residual race, its p fallback and the
+draft's draw over its stored q all go through these two, so they are one
+sampler by construction and cannot drift apart bit by bit.
 """
 
 import triton
@@ -31,6 +37,40 @@ def tile_max_sumexp(x, mask):
     else:
         expd = tl.where(mask, tl.exp(x - shift[:, None]), 0.0)
     return tile_max, tl.sum(expd, axis=-1)
+
+
+@triton.jit
+def race_key(mass, seed, noise_base, ids, mask):
+    """Each id's exponential-race key, ``mass / E`` with ``E = -log(u)`` and
+    ``u`` Philox's uniform at counter ``noise_base + ids``; -1 on masked lanes.
+
+    The argmax of these keys is a draw from ``mass`` (normalized or not): the
+    exponential race, or Gumbel-max. ``-log(u)`` rather than ``-log(1 - u)``:
+    tl.rand is [0, 1), so E is in (0, inf] and every key is finite, and an id
+    with zero mass (or u == 0) keys exactly 0, which never beats a positive key.
+    One counter per (stream, row, vocab id): the caller folds the row (and any
+    position) into ``noise_base`` as int64, so every rank, and every kernel
+    racing the same row, draws the same uniform for an id.
+    """
+    return tl.where(mask, mass / -tl.log(tl.rand(seed, noise_base + ids)), -1.0)
+
+
+@triton.jit
+def argmax_lowest_id(key, ids, mask, sentinel):
+    """``(max, lowest id holding it)`` of a ``[BLOCK]`` or ``[ROWS, BLOCK]``
+    tile along its last axis, over the lanes ``mask`` keeps.
+
+    The tie rule ``torch.argmax`` and ``topk_select(..., tie="low")`` make. A
+    tile no lane of which equals its max (masked out throughout, or all NaN,
+    since NaN equals nothing) answers ``sentinel``; callers pick one past
+    every real id and map it back into range themselves.
+    """
+    best = tl.max(key, axis=-1)
+    if len(key.shape) == 1:
+        hit = key == best
+    else:
+        hit = key == best[:, None]
+    return best, tl.min(tl.where(hit & mask, ids, sentinel), axis=-1)
 
 
 # The ratio verify launches this eagerly at whatever batch arrives, so the row

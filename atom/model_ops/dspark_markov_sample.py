@@ -54,7 +54,11 @@ import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.model_ops.sampling_scratch import SamplingScratch, take
-from atom.model_ops.softmax_tiles import softmax_combine_kernel
+from atom.model_ops.softmax_tiles import (
+    argmax_lowest_id,
+    race_key,
+    softmax_combine_kernel,
+)
 
 # Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
@@ -154,13 +158,11 @@ def _dspark_markov_argmax_stage1(
         other=0.0,
     )
     vals = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
-    tile_max = tl.max(vals, axis=1)
-    # `& v_mask` also covers the all--inf row: without it a padded lane, which
+    # `v_mask` also covers the all--inf row: without it a padded lane, which
     # is -inf too, could win the id.
-    cand = tl.where(
-        (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
+    tile_max, tile_idx = argmax_lowest_id(
+        vals, offs_v[None, :], v_mask[None, :], vocab_size
     )
-    tile_idx = tl.min(cand, axis=1)
     # Global id; a padded lane's sentinel stays `vocab_size`, which stage 2
     # recognizes before adding the offset back in.
     tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
@@ -690,12 +692,8 @@ def _dspark_markov_sample_stage1(
     logits = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
     # The greedy op's own (max, lowest id), taken before the division: a
     # near-zero temperature can round distinct logits onto one value.
-    raw_max = tl.max(logits, axis=1)
-    raw_idx = tl.min(
-        tl.where(
-            (logits == raw_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
-        ),
-        axis=1,
+    raw_max, raw_idx = argmax_lowest_id(
+        logits, offs_v[None, :], v_mask[None, :], vocab_size
     )
     tl.store(part_amax_val_ptr + tile * num_rows + offs_row, raw_max, mask=row_mask)
     tl.store(part_amax_idx_ptr + tile * num_rows + offs_row, raw_idx, mask=row_mask)
@@ -959,12 +957,10 @@ def _dspark_q_finalize(
         probs = tl.load(q_probs_ptr + base + slots, mask=mask, other=0.0) * inv_total
         tl.store(q_probs_ptr + base + slots, probs, mask=mask)
         ids = tl.load(q_ids_ptr + base + slots, mask=mask, other=0)
-        # `-log(u)` rather than `-log(1 - u)`: tl.rand is [0, 1), so E is in
-        # (0, inf] and the key is always finite (u == 0 gives key 0, which
-        # simply loses the race).
-        key = tl.where(mask, probs / -tl.log(tl.rand(seed, noise_base + ids)), -1.0)
-        chunk_best = tl.max(key, axis=0)
-        chunk_id = tl.min(tl.where(mask & (key == chunk_best), ids, 2147483647), axis=0)
+        # The verify's race and tie rule (`softmax_tiles`). Stored ids are in
+        # slot order, not id order, so chunks merge on the id below.
+        key = race_key(probs, seed, noise_base, ids, mask)
+        chunk_best, chunk_id = argmax_lowest_id(key, ids, mask, 2147483647)
         chunk_slot = tl.min(
             tl.where(mask & (ids == chunk_id), slots, 2147483647), axis=0
         )
