@@ -28,8 +28,13 @@ layouts: `m3` for MiniMax-M3 PAGE regions
 tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`, and Qwen3.8's
 `qwen4_exp`; a subclass of the K3 tier over a PAGE image, held in the MHA pool
 for Qwen3-Next/3.5 and in the QSA arena -- K, V, raw and compressed index
-keys, plus `rope_positions` with image input -- for Qwen3.8, whose image also
-carries the PLE conv/n-gram windows), `hybrid` when `hf_config.compress_ratios` is
+keys, `k_scale`/`v_scale` and `index_compressed_scale` when those caches are
+quantized, `*_draft` copies of them for an MTP draft kept in BF16 under a
+quantized target (`ATOM_QSA_DRAFT_KV_BF16`), plus `rope_positions` with image
+input -- for Qwen3.8, whose image also carries the PLE conv/n-gram windows;
+until ROCm/ATOM#2655, Qwen3.8 refuses `lmcache_offload` with a quantized QSA
+KV or index cache at startup and only `lmcache_mp` stores those fields),
+`hybrid` when `hf_config.compress_ratios` is
 present (DSV4 PAGE+SLOT), and `dense` otherwise.
 `kv_transfer_config.offload_layout` can override compatible choices without
 giving scheduler and worker different connector names. MiniMax-M3 cannot be

@@ -87,8 +87,14 @@ and draft share the embedding and output head.
 - Only native MTP speculation is supported. Pipeline parallelism, context
   parallelism, DP attention, and TBO are not supported.
 - Text LMCache offload is the `qwen` layout: QSA pages (K, V, raw index,
-  compressed index) plus a PAGE checkpoint of the GDN state and the PLE
-  conv/n-gram windows. PAGE checkpoints are used only when an offload
+  compressed index; `k_scale`/`v_scale` and `index_compressed_scale` when
+  those caches are quantized; `*_draft` copies for an MTP draft kept in BF16
+  under a quantized target, `ATOM_QSA_DRAFT_KV_BF16`) plus a PAGE checkpoint
+  of the GDN state and the PLE conv/n-gram windows. Until ROCm/ATOM#2655,
+  `lmcache_offload` is refused at startup with an FP8/FP4 KV or index cache
+  (an unset `--index-cache-dtype` follows the KV cache): use
+  `--kv-cache-dtype bf16 --index-cache-dtype bf16`, or `lmcache_mp`, which
+  stores every field. PAGE checkpoints are used only when an offload
   connector (`lmcache_offload` or `lmcache_mp`) is configured; a server
   without one keeps fork-slot checkpoints. Pipeline parallelism and
   RapidServe stay on fork slots and still reject offload. P/D
