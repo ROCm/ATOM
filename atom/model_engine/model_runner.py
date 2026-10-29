@@ -94,12 +94,15 @@ from atom.utils import (
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
+    batch_info_len,
     get_forward_context,
     get_kvconnector,
+    register_batch_info_routes,
     request_bucket,
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
+    stage_batch_info,
 )
 from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.h2d import h2d_producer
@@ -264,10 +267,17 @@ class tokenIDProcessor:
         # [scheduled requests, scheduled tokens, scheduled draft tokens]: each
         # pass's real row count (its `Context.scheduled_tokens_gpu` is the
         # entry). Not `cu_seqlens_q[-1]`: a token-graph bucket was recorded at
-        # its own request count.
+        # its own request count. ATOM_MOE_PRECOMPUTED_NVR appends each times
+        # the MoE top-k (`stage_batch_info`).
+        text_config = getattr(runner, "hf_text_config", None)
+        moe_topk = int(getattr(text_config, "num_experts_per_tok", 0) or 0)
         self.batch_info = CpuGpuBuffer(
-            3, dtype=torch.int32, device=device, publication_group="input_ids"
+            batch_info_len(moe_topk),
+            dtype=torch.int32,
+            device=device,
+            publication_group="input_ids",
         )
+        register_batch_info_routes(self.batch_info.gpu, moe_topk)
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
         # The drafter's `draft_tokens_per_seq`, set once it is loaded.
@@ -505,7 +515,7 @@ class tokenIDProcessor:
             return self.input_ids.copy_to_gpu(count)
         group.counts[group.indices["input_ids"]] = count
         group.counts[group.indices["decode_src"]] = None
-        group.counts[group.indices["batch_info"]] = 3
+        group.counts[group.indices["batch_info"]] = len(self.batch_info.np)
         group.publish(group.counts)
         return self.input_ids.gpu[:count]
 
@@ -527,10 +537,9 @@ class tokenIDProcessor:
         `num_rejected`) reads the status.
         """
         bs = batch.total_seqs_num
-        self.batch_info.np[:] = (
-            bs,
-            batch.total_tokens_num,
-            bs * self.draft_tokens_per_seq,
+        stage_batch_info(
+            self.batch_info.np,
+            (bs, batch.total_tokens_num, bs * self.draft_tokens_per_seq),
         )
         input_ids, locs = self._stage_input_ids(batch, max_seqlen_q, publication_group)
         # The speculative status queue is filled in postprocess but drained here, so a
@@ -674,7 +683,7 @@ class tokenIDProcessor:
         counts = group.counts
         counts[group.indices["input_ids"]] = total_tokens_decode
         counts[group.indices["decode_src"]] = bs
-        counts[group.indices["batch_info"]] = 3
+        counts[group.indices["batch_info"]] = len(self.batch_info.np)
         group.publish(counts)
         # How wide the forward reads: a replayed decode graph takes a fixed
         # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
@@ -4491,7 +4500,9 @@ class ModelRunner:
             # bounds. The draft slot stays 0, as the capture never looks up
             # the drafter.
             batch_info = self.forward_vars["batch_info"]
-            batch_info.np[:] = (context.scheduled_bs, context.scheduled_tokens, 0)
+            stage_batch_info(
+                batch_info.np, (context.scheduled_bs, context.scheduled_tokens, 0)
+            )
             batch_info.copy_to_gpu()
             context.scheduled_tokens_gpu = batch_info.gpu[1:2]
             self.h2d_owner.finish()
@@ -4571,7 +4582,7 @@ class ModelRunner:
             cu.np[: bs + 1] = np.arange(0, B + 1, max_q_len, dtype=np.int32)
             cu.copy_to_gpu(bs + 1)
             batch_info = self.forward_vars["batch_info"]
-            batch_info.np[:] = (bs, B, 0)
+            stage_batch_info(batch_info.np, (bs, B, 0))
             batch_info.copy_to_gpu()
             # Warm replay, then timed replays (median for robustness to jitter).
             replay()

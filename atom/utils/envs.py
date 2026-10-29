@@ -257,6 +257,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TP_TOKEN_SYNC_ALLGATHER": lambda: (
         os.getenv("ATOM_TP_TOKEN_SYNC_ALLGATHER", "0") == "1"
     ),
+    # Stage each `batch_info` count times the MoE top-k with the counts (one
+    # host-to-device copy), and hand it to aiter's fused_moe as
+    # `num_valid_routes`: the gfx1250 grouped TP path then skips the
+    # `num_local_tokens * topk` multiply it launches in every MoE layer. Needs
+    # an aiter whose fused_moe takes `num_valid_routes`; off, nothing passes it.
+    "ATOM_MOE_PRECOMPUTED_NVR": lambda: (
+        os.getenv("ATOM_MOE_PRECOMPUTED_NVR", "0") == "1"
+    ),
     # Broadcast EAGLE3 verification predictions and acceptance decisions from
     # TP rank 0 so every tensor-parallel rank advances with identical results.
     # SGLang lacks this broadcast path; the ATOM plugin adds it to match native

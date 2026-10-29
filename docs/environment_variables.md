@@ -299,6 +299,14 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_RELAXED_MTP** | bool | 0 (false) | Accept a draft token when it lands in the target's top 10 within 0.6 of the top logit, instead of requiring the argmax. Intended for quantized MTP heads, whose drafts are right about the region and wrong about the exact winner often enough that strict acceptance throws away usable tokens. Read once at `rejection_sampler` import, so it must be set before the server starts. |
 
+### Qwen3.5 TP decode step
+
+All default off.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MOE_PRECOMPUTED_NVR** | bool | 0 (false) | Stage each `batch_info` count times the MoE top-k next to the counts (same host-to-device copy) and pass it to aiter's `fused_moe` as `num_valid_routes`, so the gfx1250 grouped TP path does not launch the `num_local_tokens * topk` multiply in every MoE layer. Needs an aiter whose `fused_moe` takes `num_valid_routes`; with the flag off ATOM never passes it. |
+
 ## Engram (DeepSeek-V4.1)
 
 The n-gram tables are per-layer and large enough that where they live, and

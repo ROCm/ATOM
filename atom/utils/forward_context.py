@@ -960,6 +960,69 @@ def pass_scheduled_tokens_gpu(rows: int) -> torch.Tensor | None:
     return context.scheduled_tokens_gpu
 
 
+# `forward_vars["batch_info"]`'s per-pass counts: [requests, tokens, draft
+# tokens]. With ATOM_MOE_PRECOMPUTED_NVR on a MoE model the buffer carries each
+# of them times the MoE top-k as well, three entries on, written on the host by
+# `stage_batch_info` next to the counts and uploaded by the same host-to-device
+# copy. A replay so reads its own step's routes, staged before it like the
+# counts; nothing in a recorded forward writes them.
+BATCH_INFO_COUNTS = 3
+_batch_info_route_topk = 0
+_batch_info_route_gpus: list[torch.Tensor] = []
+
+
+def batch_info_len(moe_topk: int) -> int:
+    """Entries of a `batch_info` buffer for a model routing `moe_topk` experts a
+    token (0: no MoE): its counts, and their routes too when they are staged."""
+    from atom.utils import envs
+
+    if envs.ATOM_MOE_PRECOMPUTED_NVR and moe_topk > 0:
+        return 2 * BATCH_INFO_COUNTS
+    return BATCH_INFO_COUNTS
+
+
+def register_batch_info_routes(batch_info_gpu: torch.Tensor, moe_topk: int) -> None:
+    """Make `pass_scheduled_routes_gpu` resolve this `batch_info`'s counts to
+    their routes; a buffer of `batch_info_len(moe_topk)` entries."""
+    global _batch_info_route_topk
+    if batch_info_gpu.numel() != 2 * BATCH_INFO_COUNTS:
+        return
+    _batch_info_route_topk = moe_topk
+    _batch_info_route_gpus.append(batch_info_gpu)
+
+
+def stage_batch_info(batch_info_np: np.ndarray, counts) -> None:
+    """Write a step's `batch_info` counts on the host, and their routes where
+    the buffer carries them."""
+    batch_info_np[:BATCH_INFO_COUNTS] = counts
+    if batch_info_np.size > BATCH_INFO_COUNTS:
+        batch_info_np[BATCH_INFO_COUNTS:] = (
+            batch_info_np[:BATCH_INFO_COUNTS] * _batch_info_route_topk
+        )
+
+
+def pass_scheduled_routes_gpu(
+    scheduled_tokens_gpu: torch.Tensor | None, topk: int
+) -> torch.Tensor | None:
+    """`scheduled_tokens_gpu * topk` with no launch: the routes entry staged
+    beside a `batch_info` count (ATOM_MOE_PRECOMPUTED_NVR). None -- the caller
+    multiplies -- for any count that is no `batch_info` entry (a micro-batch's
+    clamped share) or another top-k than the one staged."""
+    if (
+        scheduled_tokens_gpu is None
+        or topk != _batch_info_route_topk
+        or scheduled_tokens_gpu.numel() != 1
+    ):
+        return None
+    base = scheduled_tokens_gpu._base
+    if base is None or not any(base is gpu for gpu in _batch_info_route_gpus):
+        return None
+    offset = scheduled_tokens_gpu.storage_offset() - base.storage_offset()
+    if not 0 <= offset < BATCH_INFO_COUNTS:
+        return None
+    return base[offset + BATCH_INFO_COUNTS : offset + BATCH_INFO_COUNTS + 1]
+
+
 @contextmanager
 def side_stream(stream: torch.cuda.Stream | None):
     """Issue the block beside the main stream instead of on it.
