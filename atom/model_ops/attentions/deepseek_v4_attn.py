@@ -164,6 +164,14 @@ def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
     return KVConnectorFactory.topology_uses_pd_staging(kv_transfer_config)
 
 
+def _is_pd_consumer(kv_transfer_config: dict | None) -> bool:
+    """A P/D decode instance; a load-only offload node sets the same role."""
+    from atom.kv_transfer.disaggregation.factory import resolve_pd_backend
+
+    cfg = kv_transfer_config or {}
+    return resolve_pd_backend(cfg) is not None and cfg.get("kv_role") == "kv_consumer"
+
+
 def _validate_fp4_indexer_transfer(kv_transfer_config: dict) -> None:
     """FP4 PAGE pools require a connector that consumes transfer regions."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -2232,6 +2240,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             tbo=bool(config.enable_tbo),
             pcp=get_pcp_world_size(),
             dcp=int(config.decode_context_parallel_size),
+            kv_consumer=_is_pd_consumer(config.kv_transfer_config),
         )
         if world > 1:
             self._warm_split_gather(world)

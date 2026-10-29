@@ -1243,19 +1243,38 @@ def test_split_logits_do_not_wrap_in_int32(v4_builder_cls, monkeypatch):
     assert builder._prefill_row_split(1 << 14, rows, n_committed) is not None
 
 
+_MOONCAKE = {"kv_connector": "mooncake"}
+
+
 @pytest.mark.parametrize(
-    "enabled, tbo, world",
-    [("1", False, 8), ("1", True, 1), ("0", False, 1)],
-    ids=["splits", "prefill_tbo", "flag_off"],
+    "enabled, tbo, kv, world",
+    [
+        ("1", False, {}, 8),
+        ("1", False, {**_MOONCAKE, "kv_role": "kv_producer"}, 8),
+        ("1", False, {"kv_connector": "lmcache_offload", "kv_role": "kv_consumer"}, 8),
+        ("1", True, {}, 1),
+        ("1", False, {**_MOONCAKE, "kv_role": "kv_consumer"}, 1),
+        ("0", False, {}, 1),
+    ],
+    ids=[
+        "splits",
+        "pd_prefill",
+        "offload_load_only",
+        "prefill_tbo",
+        "pd_decode",
+        "flag_off",
+    ],
 )
 def test_a_run_that_splits_warms_the_split_s_gather(
-    v4_builder_cls, monkeypatch, enabled, tbo, world
+    v4_builder_cls, monkeypatch, enabled, tbo, kv, world
 ):
-    """With the flag on, plain TP8 splits; the flag off keeps the rows whole,
-    and so, for now, does prefill TBO, whose ubatches' rows do not take the
-    split yet. A run that splits gathers once at startup, on the TP group and
-    from this rank's own slot as the split does, so what RCCL allocates on its
-    first all-gather is inside the memory profile; one that does not never
+    """With the flag on, plain TP8 splits, a P/D prefill instance and a
+    load-only offload node included; the flag off keeps the rows whole, and
+    so, for now, does prefill TBO, whose ubatches' rows do not take the split
+    yet, and so does a P/D decode instance, which only recomputes prefills.
+    A run that splits gathers once at startup, on the TP group and from this
+    rank's own slot as the split does, so what RCCL allocates on its first
+    all-gather is inside the memory profile; one that does not never
     gathers."""
     module = v4_builder_cls._indexer_qsplit_world_size.__globals__
     monkeypatch.setitem(module, "get_tensor_model_parallel_world_size", lambda: 8)
@@ -1282,6 +1301,7 @@ def test_a_run_that_splits_warms_the_split_s_gather(
         enable_tbo=tbo,
         enable_tbo_decode=False,
         decode_context_parallel_size=1,
+        kv_transfer_config=kv,
     )
     assert builder._indexer_qsplit_world_size(config) == world
     if world == 1:

@@ -167,6 +167,7 @@ def indexer_qsplit_world(
     tbo: bool,
     pcp: int,
     dcp: int,
+    kv_consumer: bool,
 ) -> int:
     """TP width the DeepSeek-V4 prefill indexer splits its query rows over
     (`RowSplit` with `group="tp"`); 1 means no split.
@@ -176,9 +177,11 @@ def indexer_qsplit_world(
     attention, PCP and DCP each break; a prefill TBO's ubatch rows do not
     take it yet. Simulated TP (`--fake-eplb` on fewer devices) reports a
     width the device group does not have. gfx1250 OPUS scores through its own
-    plans and plugin bridges build their own rows. Within this width a
-    prefill step still splits only from `ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS`
-    index logits (the V4 builder's `_prefill_row_split`).
+    plans and plugin bridges build their own rows. A P/D decode instance
+    (`kv_consumer`) prefills only to recompute, too rarely to pay for the
+    split's startup gather. Within this width a prefill step still splits
+    only from `ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS` index logits (the V4
+    builder's `_prefill_row_split`).
     """
     if (
         not enabled
@@ -190,6 +193,7 @@ def indexer_qsplit_world(
         or tbo
         or pcp > 1
         or dcp > 1
+        or kv_consumer
     ):
         return 1
     return tp

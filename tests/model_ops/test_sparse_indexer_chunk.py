@@ -201,6 +201,7 @@ _GATE = {
     "tbo": False,
     "pcp": 1,
     "dcp": 1,
+    "kv_consumer": False,
 }
 
 
@@ -230,6 +231,12 @@ def test_qsplit_not_yet_under_tbo_plugins_or_gfx1250_opus(override):
     rows, a plugin bridge's and gfx1250 OPUS's plans do not take the split
     yet."""
     assert indexer_qsplit_world(8, **{**_GATE, **override}) == 1
+
+
+def test_qsplit_off_on_a_pd_decode_instance():
+    """A trade-off: a decode instance only recomputes prefills, so it keeps
+    them whole rather than pay for the split's startup gather."""
+    assert indexer_qsplit_world(8, **{**_GATE, "kv_consumer": True}) == 1
 
 
 def test_qsplit_off_with_the_flag():
