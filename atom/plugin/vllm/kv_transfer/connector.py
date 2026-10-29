@@ -2204,8 +2204,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # scheduler pumps lookups and ends sessions from a step as well.
         if self._v41_planner is not None and self._v41_planner.has_ride_pins():
             return True
-        scheduler = getattr(self, "_scheduler", None)
-        if scheduler is not None and scheduler.has_pending_work():
+        pending = getattr(getattr(self, "_scheduler", None), "has_pending_work", None)
+        if pending is not None and pending():
             return True
         return bool(self._deferred_frees or self._releases_in_flight)
 

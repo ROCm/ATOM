@@ -62,6 +62,7 @@ def _adapter(monkeypatch, calls, *, min_load):
     adapter._scheduler = scheduler
     adapter._seqs = SeqViewRegistry()
     adapter._promised_loads = {}
+    adapter._detach_after_alloc, adapter._finished_withdrawals = {}, []
     adapter._requests = {}
     adapter._kda_planner = None
     adapter._v41_planner = None

@@ -72,6 +72,7 @@ def _adapter(monkeypatch, dcp=1, *, block_size=BLOCK, chunk_size=CHUNK):
     adapter._v41_planner = None
     adapter._state_load_failure_reports = {}
     adapter._promised_loads = {}
+    adapter._detach_after_alloc, adapter._finished_withdrawals = {}, []
     adapter._deferred_frees = set()
     adapter._deferred_free_at = {}
     adapter._next_save_reconcile_at = 0.0
