@@ -1,10 +1,14 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from test_gdn_draft_kv_slots import builder
 
-from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+from atom.model_ops.attentions.gdn_attn import (
+    GDNAttentionMetadataBuilder,
+    mtp_decode_kv_indptr,
+)
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
 
@@ -89,3 +93,28 @@ def test_next_draft_step_refreshes_page_count_without_rejecting_twice(monkeypatc
     result = b.prepare_mtp_decode(3, 1, 65, torch.zeros(4, dtype=torch.int32))
     assert var["kv_indptr"].gpu.tolist() == [0, 3, 5, 10, 10]
     assert result["slot_mapping"].tolist() == [702 * 16, 905 * 16, 45 * 16, -1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("rows,num_real", [(1, 1), (4, 3), (33, 30), (256, 256)])
+@pytest.mark.parametrize("reject", [False, True])
+def test_fused_kv_indptr_matches_the_eager_rebuild(rows, num_real, reject):
+    """ATOM_MTP_FUSED_KV_INDPTR: the one-launch rebuild writes what the eager
+    sub / div / cumsum chain does, pad rows included."""
+    g = torch.Generator(device="cuda").manual_seed(rows + num_real)
+    ctx = torch.randint(5, 5000, (rows,), dtype=torch.int32, device="cuda", generator=g)
+    num_reject = (
+        torch.randint(0, 5, (rows,), dtype=torch.int32, device="cuda", generator=g)
+        if reject
+        else None
+    )
+    ref_ctx = ctx.clone()
+    if num_reject is not None:
+        ref_ctx[:num_real] -= num_reject[:num_real]
+    counts = torch.div(ref_ctx + 15, 16, rounding_mode="floor")
+    counts[num_real:] = 0
+    ref_indptr = torch.cat([counts.new_zeros(1), counts.cumsum(0, dtype=torch.int32)])
+    indptr = torch.full((rows + 1,), -1, dtype=torch.int32, device="cuda")
+    mtp_decode_kv_indptr(ctx, num_reject, indptr, num_real, 16)
+    assert torch.equal(ctx, ref_ctx)
+    assert torch.equal(indptr, ref_indptr)

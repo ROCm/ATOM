@@ -604,6 +604,11 @@ class Drafter(abc.ABC):
             "lm_head.weight",
             "lm_head",
         )
+        # A draft that derives tables of its own from the now-final embed /
+        # lm_head (e.g. replicating them) does it here, after the sharing above.
+        post_share = getattr(self.model, "post_share_with_target", None)
+        if post_share is not None:
+            post_share(target_base)
 
     def _publish_draft_shape(
         self,

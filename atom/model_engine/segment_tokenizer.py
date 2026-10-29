@@ -121,10 +121,10 @@ class SegmentTokenizer:
     """``encode(prompt)`` equal to ``tokenizer.encode(prompt)``, reusing
     earlier prompts' ids (module docstring)."""
 
-    def __init__(self, tokenizer, budget_bytes: int):
+    def __init__(self, tokenizer, budget_bytes: int, per_segment_normalizer=False):
         self._tokenizer = tokenizer
         self._split = AddedTokenSplitter(tokenizer)
-        self.enabled = self._split.segments_exact()
+        self.enabled = self._split.segments_exact(per_segment_normalizer)
         if not self.enabled:
             logger.info("segment tokenizer: off (added tokens are not plain splits)")
         self._prefix_ok = self._split.prefix_cuts_stable()
@@ -139,9 +139,10 @@ class SegmentTokenizer:
         self._stats = [0, 0, 0.0, 0, 0]
 
     @classmethod
-    def maybe_create(cls, tokenizer, budget_bytes: int):
+    def maybe_create(cls, tokenizer, budget_bytes: int, per_segment_normalizer=False):
         """A cache for `tokenizer`, or None: turned off, not a fast (Rust)
-        tokenizer, or splitting would not be exact."""
+        tokenizer, or splitting would not be exact
+        (`AddedTokenSplitter.segments_exact`)."""
         if budget_bytes <= 0:
             return None
         try:
@@ -151,7 +152,7 @@ class SegmentTokenizer:
         if not isinstance(getattr(tokenizer, "_tokenizer", None), Tokenizer):
             return None
         try:
-            seg = cls(tokenizer, budget_bytes)
+            seg = cls(tokenizer, budget_bytes, per_segment_normalizer)
         except Exception:
             logger.warning("segment tokenizer: off", exc_info=True)
             return None

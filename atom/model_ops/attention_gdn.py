@@ -585,14 +585,10 @@ class GatedDeltaNet(nn.Module):
                     has_initial_state=has_initial_state,
                 )
             else:
-                # Slots and mask come per step from the metadata builder, so
-                # this is one gather and one masked fill per layer.
-                initial_state = ssm_state.index_select(
-                    0, gdn_metadata.non_spec_state_indices_in_i64
-                )
-                initial_state.masked_fill_(
-                    gdn_metadata.no_initial_state.view(-1, 1, 1, 1), 0
-                )
+                # The recurrence reads each sequence's initial state from its
+                # slot of the pool (zero for a cold one) and writes the final
+                # state back to its write slot, as the planned path does: no
+                # gather, zero fill, fp32 -> pool-dtype cast or scatter.
                 # With no spec tokens the non-spec rows are rows [0, T) of the
                 # op's output, so let the kernel write there instead of into a
                 # fresh `o` that step 3 would copy over (a 64 MiB memcpy per
@@ -604,7 +600,7 @@ class GatedDeltaNet(nn.Module):
                     v=value_non_spec,
                     g=g_non_spec,
                     beta=beta_non_spec,
-                    initial_state=initial_state,
+                    initial_state=ssm_state,
                     output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
@@ -617,6 +613,11 @@ class GatedDeltaNet(nn.Module):
                     # Only when there is somewhere to put them; `h` is large and is
                     # dropped on return otherwise.
                     keep_intermediate_states=ckpt is not None,
+                    state_slots=(
+                        gdn_metadata.non_spec_state_indices_in_i64,
+                        gdn_metadata.non_spec_state_indices_i64,
+                        has_initial_state,
+                    ),
                 )
             # Init cache (the planned path wrote its final states in place)
             if last_recurrent_state is not None:

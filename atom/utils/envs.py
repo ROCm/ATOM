@@ -244,6 +244,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_PREFILL_COMPILE_ONLY": lambda: (
         os.getenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "0") == "1"
     ),
+    # MTP verify under TP: sample the verify rows and the bonus rows in one
+    # sampler call with one TP broadcast, instead of two calls, a broadcast of
+    # the verify draws and a second one of the accepted tokens.
+    "ATOM_SPEC_FUSED_VERIFY_SAMPLE": lambda: (
+        os.getenv("ATOM_SPEC_FUSED_VERIFY_SAMPLE", "0") == "1"
+    ),
+    # Sync sampled token ids across TP ranks with aiter's custom all-gather
+    # (rank 0's slice of it) instead of an RCCL broadcast. Bit-exact: the
+    # gather is a memcpy. Falls back to the broadcast where the custom gather
+    # is unavailable (ATOM_USE_CUSTOM_ALL_GATHER=0, no ca_comm, oversize).
+    "ATOM_TP_TOKEN_SYNC_ALLGATHER": lambda: (
+        os.getenv("ATOM_TP_TOKEN_SYNC_ALLGATHER", "0") == "1"
+    ),
+    # Stage each `batch_info` count times the MoE top-k with the counts (one
+    # host-to-device copy), and hand it to aiter's fused_moe as
+    # `num_valid_routes`: the gfx1250 grouped TP path then skips the
+    # `num_local_tokens * topk` multiply it launches in every MoE layer. Needs
+    # an aiter whose fused_moe takes `num_valid_routes`; off, nothing passes it.
+    "ATOM_MOE_PRECOMPUTED_NVR": lambda: (
+        os.getenv("ATOM_MOE_PRECOMPUTED_NVR", "0") == "1"
+    ),
     # Broadcast EAGLE3 verification predictions and acceptance decisions from
     # TP rank 0 so every tensor-parallel rank advances with identical results.
     # SGLang lacks this broadcast path; the ATOM plugin adds it to match native
@@ -394,6 +415,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
+    ),
+    # Qwen3-Next / Qwen3.5: one Triton launch each for the MoE shared-expert
+    # combine `routed + sigmoid(gate) * shared` and the attention output gate
+    # `o * sigmoid(gate)`, instead of three and two eager kernels. Keeps the
+    # BF16 rounding of every intermediate, so the outputs match the unfused ops.
+    "ATOM_FUSED_SIGMOID_GATE": lambda: (
+        os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
     ),
     # With that fusion on, batches above this token count run the Gemma q/k
     # norm, RoPE and cache write as separate kernels: the one-kernel version
@@ -785,6 +813,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_TOKENIZE_CACHE_BLOCK_HASHES", "1"
     )
     == "1",
+    # Also run the tokenizer cache for a tokenizer whose normalizer is not the
+    # identity (Qwen's NFC) when none of its added tokens is normalized: the
+    # backend normalizes each piece between added tokens on its own then, so
+    # encoding a piece alone stays exact (`AddedTokenSplitter.segments_exact`).
+    # Off: such tokenizers re-encode every prompt in full.
+    "ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER": lambda: os.getenv(
+        "ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER", "0"
+    )
+    == "1",
     # Warm the page cache with a background sequential reader instead of
     # leaving it to demand faults through the mmap. Measured on a local NVMe:
     # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
@@ -960,8 +997,50 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DRAFT_STEP0_CUDAGRAPH": lambda: (
         os.getenv("ATOM_DRAFT_STEP0_CUDAGRAPH", "1").lower() == "1"
     ),
+    # --- Qwen3.5 MTP draft path (all default OFF) ---
+    # Qwen3.5 MTP: the fc (2H -> H, bf16) replicated on every TP rank instead of
+    # column-parallel + all-gather. Drops an RCCL all-gather and its reorder copy
+    # per draft pass for 12 MB of weight per rank; the GEMM is bitwise the same.
+    # A prefill chunk over 1024 tokens keeps this rank's rows and the gather.
+    "ATOM_MTP_REPLICATED_FC": lambda: _flag_env("ATOM_MTP_REPLICATED_FC", "0"),
+    # Full vocab embedding on every rank for the MTP draft only (the target keeps
+    # its sharded one): a local lookup instead of masked-embedding + all-reduce,
+    # bit-identical (x + 0 + 0 + 0). +(tp-1)/tp of the table (~0.76 GB) per rank.
+    "ATOM_QWEN35_MTP_REPLICATED_EMBED": lambda: (
+        os.getenv("ATOM_QWEN35_MTP_REPLICATED_EMBED", "0").lower() in ("1", "true")
+    ),
+    # Qwen3.5 MTP: pre_fc_norm_embedding and pre_fc_norm_hidden in one launch of
+    # the two-input Gemma norm, written straight into the fc input -- no
+    # torch.cat. Same kernel and math as the two norms, so bitwise the same.
+    "ATOM_MTP_DUAL_PRE_FC_NORM": lambda: _flag_env("ATOM_MTP_DUAL_PRE_FC_NORM", "0"),
+    # TP greedy argmax head: exchange the per-rank (max, index) packs through an
+    # all-reduce of a zero-padded byte image (exact: one nonzero term a value)
+    # instead of the custom all-gather, and pick the winner in one kernel. Three
+    # launches instead of six; token-identical.
+    "ATOM_ARGMAX_HEAD_AR_GATHER": lambda: _flag_env("ATOM_ARGMAX_HEAD_AR_GATHER", "0"),
+    # GDN-hybrid MTP: each draft step's context_lens fix-up and kv_indptr rebuild
+    # (GDNAttentionMetadataBuilder.prepare_mtp_decode) in one Triton launch
+    # instead of up to seven eager ones. Integer math, so the same result.
+    "ATOM_MTP_FUSED_KV_INDPTR": lambda: _flag_env("ATOM_MTP_FUSED_KV_INDPTR", "0"),
+    # Debug: all-gather each step's draft ids over TP after propose and log any
+    # rank disagreement. Syncs the host every decode step -- validation only.
+    "ATOM_MTP_DRAFT_RANK_CHECK": lambda: (
+        os.getenv("ATOM_MTP_DRAFT_RANK_CHECK", "0").lower() in ("1", "true")
+    ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
+    # Qwen3-Next / Qwen3.5: run the unfused shared expert beside the routed
+    # experts on a side stream (up to ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD tokens).
+    "ATOM_QWEN_SHARED_EXPERT_STREAM": lambda: (
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_STREAM", "1").lower() in ("1", "true")
+    ),
+    # Run the engine-core and worker loops under a frame that holds one large
+    # CPython data-stack chunk (atom/utils/deep_stack.py): on CPython 3.11 / 3.12
+    # a hot path straddling the end of a 16 KiB frame chunk maps and unmaps a
+    # chunk on every call across it, each munmap a TLB shootdown.
+    "ATOM_DEEP_FRAME_STACK": lambda: (
+        os.getenv("ATOM_DEEP_FRAME_STACK", "1").lower() in ("1", "true")
+    ),
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
@@ -993,6 +1072,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
+    ),
+    # --- Sampling ---
+    # Top-k / top-p sampling: compute softmax(logits / temperature) over the
+    # vocab with a split-row Triton kernel (atom/model_ops/split_softmax.py)
+    # instead of the eager division and torch's one-block-a-row softmax.
+    "ATOM_SAMPLER_SPLIT_SOFTMAX": lambda: (
+        os.getenv("ATOM_SAMPLER_SPLIT_SOFTMAX", "0") == "1"
     ),
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.

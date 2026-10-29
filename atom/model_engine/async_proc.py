@@ -54,6 +54,7 @@ from atom.utils import (
     shutdown_all_processes,
     worker_process_name,
 )
+from atom.utils.deep_stack import run_on_deep_stack
 from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
 
@@ -223,7 +224,7 @@ class AsyncIOProc:
         runner_class = resolve_obj_by_qualname(runner_qualname)
         self.runners: list[object] = []
         self.runners = [runner_class(rank, *args, **kwargs)]
-        self.busy_loop()
+        run_on_deep_stack(self.busy_loop)
 
     def exit(self):
         if not getattr(self, "still_running", True):

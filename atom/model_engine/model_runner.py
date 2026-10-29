@@ -41,6 +41,7 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
+from atom.distributed.token_sync import broadcast_from_rank0
 from atom.kv_transfer.disaggregation import (
     KVConnectorFactory,
     KVConnectorOutput,
@@ -93,12 +94,15 @@ from atom.utils import (
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
+    batch_info_len,
     get_forward_context,
     get_kvconnector,
+    register_batch_info_routes,
     request_bucket,
     reset_forward_context,
     set_forward_context,
     set_kv_cache_data,
+    stage_batch_info,
 )
 from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.h2d import h2d_producer
@@ -263,10 +267,17 @@ class tokenIDProcessor:
         # [scheduled requests, scheduled tokens, scheduled draft tokens]: each
         # pass's real row count (its `Context.scheduled_tokens_gpu` is the
         # entry). Not `cu_seqlens_q[-1]`: a token-graph bucket was recorded at
-        # its own request count.
+        # its own request count. ATOM_MOE_PRECOMPUTED_NVR appends each times
+        # the MoE top-k (`stage_batch_info`).
+        text_config = getattr(runner, "hf_text_config", None)
+        moe_topk = int(getattr(text_config, "num_experts_per_tok", 0) or 0)
         self.batch_info = CpuGpuBuffer(
-            3, dtype=torch.int32, device=device, publication_group="input_ids"
+            batch_info_len(moe_topk),
+            dtype=torch.int32,
+            device=device,
+            publication_group="input_ids",
         )
+        register_batch_info_routes(self.batch_info.gpu, moe_topk)
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
         # The drafter's `draft_tokens_per_seq`, set once it is loaded.
@@ -504,7 +515,7 @@ class tokenIDProcessor:
             return self.input_ids.copy_to_gpu(count)
         group.counts[group.indices["input_ids"]] = count
         group.counts[group.indices["decode_src"]] = None
-        group.counts[group.indices["batch_info"]] = 3
+        group.counts[group.indices["batch_info"]] = len(self.batch_info.np)
         group.publish(group.counts)
         return self.input_ids.gpu[:count]
 
@@ -526,10 +537,9 @@ class tokenIDProcessor:
         `num_rejected`) reads the status.
         """
         bs = batch.total_seqs_num
-        self.batch_info.np[:] = (
-            bs,
-            batch.total_tokens_num,
-            bs * self.draft_tokens_per_seq,
+        stage_batch_info(
+            self.batch_info.np,
+            (bs, batch.total_tokens_num, bs * self.draft_tokens_per_seq),
         )
         input_ids, locs = self._stage_input_ids(batch, max_seqlen_q, publication_group)
         # The speculative status queue is filled in postprocess but drained here, so a
@@ -673,7 +683,7 @@ class tokenIDProcessor:
         counts = group.counts
         counts[group.indices["input_ids"]] = total_tokens_decode
         counts[group.indices["decode_src"]] = bs
-        counts[group.indices["batch_info"]] = 3
+        counts[group.indices["batch_info"]] = len(self.batch_info.np)
         group.publish(counts)
         # How wide the forward reads: a replayed decode graph takes a fixed
         # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
@@ -3334,6 +3344,56 @@ class ModelRunner:
             commit_pp_send_work(self._pp_pending_send)
         return True
 
+    def _sample_verify_and_bonus(
+        self,
+        logits: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`Sampler.sample_verification_tokens` over the verify rows and the
+        bonus draw over each request's last row, as one sampler call and one TP
+        broadcast (ATOM_SPEC_FUSED_VERIFY_SAMPLE). Same rows and per-row
+        filters as the two calls, independent noise per row as both had."""
+        rows = target_logits_indices.numel()
+        device = logits.device
+        per_row = torch.cat(
+            [
+                torch.searchsorted(
+                    cu_num_draft_tokens,
+                    torch.arange(rows, device=device, dtype=cu_num_draft_tokens.dtype),
+                    right=True,
+                ),
+                torch.arange(
+                    bonus_logits_indices.numel(),
+                    device=device,
+                    dtype=cu_num_draft_tokens.dtype,
+                ),
+            ]
+        )
+
+        def expand(values):
+            if not isinstance(values, torch.Tensor) or values.numel() == 1:
+                return values
+            return values[per_row]
+
+        tokens = self.sampler(
+            torch.index_select(
+                logits, 0, torch.cat([target_logits_indices, bonus_logits_indices])
+            ),
+            temperatures[per_row],
+            expand(top_ks),
+            expand(top_ps),
+            all_greedy=False,
+            needs_independent_noise=True,
+        )
+        if get_tp_group().world_size > 1:
+            tokens = broadcast_from_rank0(tokens, get_tp_group())
+        return tokens[:rows], tokens[rows:]
+
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3349,6 +3409,8 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # Set when the sampled tokens are already identical on every TP rank.
+        tokens_tp_synced = False
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3391,6 +3453,26 @@ class ModelRunner:
                     logits.ids, 0, target_logits_indices
                 )
                 target_logits = None
+            elif (
+                envs.ATOM_SPEC_FUSED_VERIFY_SAMPLE
+                and not all_greedy
+                and target_logits_indices.numel()
+            ):
+                # One sampler pass over the verify rows and the bonus rows, and
+                # one TP broadcast of both: the rejection below is then a
+                # deterministic function of rank-consistent inputs, so its
+                # tokens need no second broadcast.
+                target_logits = None
+                target_token_ids, bonus_token_ids = self._sample_verify_and_bonus(
+                    logits,
+                    target_logits_indices,
+                    bonus_logits_indices,
+                    spec_decode_metadata.cu_num_draft_tokens,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                )
+                tokens_tp_synced = True
             else:
                 bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
                 target_logits = torch.index_select(logits, 0, target_logits_indices)
@@ -3404,8 +3486,8 @@ class ModelRunner:
                         top_ps,
                     )
                     if target_token_ids.numel() and get_tp_group().world_size > 1:
-                        target_token_ids = get_tp_group().broadcast(
-                            target_token_ids, src=0
+                        target_token_ids = broadcast_from_rank0(
+                            target_token_ids, get_tp_group()
                         )
                 bonus_token_ids = self.sampler(
                     logits=bonus_logits,
@@ -3435,10 +3517,12 @@ class ModelRunner:
             spec_counts = verdict[:2]
 
         # Drafter input must agree across TP ranks.
-        if get_tp_group().world_size > 1 and (
-            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        if (
+            get_tp_group().world_size > 1
+            and not tokens_tp_synced
+            and (self.tokenID_processor.is_deferred_out or hasattr(self, "drafter"))
         ):
-            sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            sampled_tokens = broadcast_from_rank0(sampled_tokens, get_tp_group())
 
         # Compute logprobs if any sequence requested them
         need_logprobs = any(batch.return_logprobs)
@@ -4416,7 +4500,9 @@ class ModelRunner:
             # bounds. The draft slot stays 0, as the capture never looks up
             # the drafter.
             batch_info = self.forward_vars["batch_info"]
-            batch_info.np[:] = (context.scheduled_bs, context.scheduled_tokens, 0)
+            stage_batch_info(
+                batch_info.np, (context.scheduled_bs, context.scheduled_tokens, 0)
+            )
             batch_info.copy_to_gpu()
             context.scheduled_tokens_gpu = batch_info.gpu[1:2]
             self.h2d_owner.finish()
@@ -4496,7 +4582,7 @@ class ModelRunner:
             cu.np[: bs + 1] = np.arange(0, B + 1, max_q_len, dtype=np.int32)
             cu.copy_to_gpu(bs + 1)
             batch_info = self.forward_vars["batch_info"]
-            batch_info.np[:] = (bs, B, 0)
+            stage_batch_info(batch_info.np, (bs, B, 0))
             batch_info.copy_to_gpu()
             # Warm replay, then timed replays (median for robustness to jitter).
             replay()

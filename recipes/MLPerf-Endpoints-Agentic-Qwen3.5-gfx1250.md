@@ -27,12 +27,12 @@ The scripts are in [`mlperf_endpoints_qwen35/`](mlperf_endpoints_qwen35/). Relat
 | Dataset | `mlperf_agentic_inference_dataset`, 613 trajectories, 20,297 assistant turns |
 
 Concurrency: **1-2048, a power of two or three times one** (1, 2, 3, 4, 6, 8, 12, 16, 24, ..., 768,
-1024, 1536, 2048). Every point runs MTP, with 4 draft tokens at TP4 and 3 under DP (`SPEC=<n>` overrides,
-`SPEC=0` turns it off); `run_ep.sh` picks the server from the concurrency:
+1024, 1536, 2048). Every point runs MTP, with 4 draft tokens on TP points and 3 on DP (`SPEC=<n>`
+overrides, `SPEC=0` turns it off); `run_ep.sh` picks the server from the concurrency:
 
 | Concurrency | Server |
 |---|---|
-| 1-16 | TP4, custom all-reduce, MTP4, [TP4 decode settings](#tp4-c16-2026-10-28) |
+| 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p, MoE routes staged once per forward, MTP draft with replicated fc / embedding, one-launch pre-fc norms, all-reduce argmax exchange and one-launch GDN kv-indptr, split-row sampler softmax |
 | 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
@@ -88,6 +88,10 @@ their trajectories: 22% of turns at c2048), `MODE` / `SPEC`
 `ATOM_PREFILL_DECODE_INTERVAL` in the environment overrides the DP points' default of 8 (0 is the
 scheduling before it; see [Prefill / decode interval](#prefill--decode-interval)).
 
+Traces: `TRACE_AT_MIN=5 TRACE_S=10 TRACE_STOP=1 bash run_ep.sh 16` takes a 10 s torch-profiler window of
+every rank 5 minutes into the benchmark (`$RUNS/c16/trace/rank_<r>/`) and then ends the point, so a
+traced point takes about 10 minutes.
+
 ## Results
 
 30-minute points on image `gfx1250-atom-20261026-dsv41-qwen-e15-08`; "tip" = the validated branch
@@ -121,18 +125,22 @@ On image `gfx1250-atom-20261028-qwen35`, 30 minutes each, both clean:
 
 The second point ran ATOM 38d645db (#2740) + #2798 (merged) + #2801 + #2803 with aiter
 alizaidy/gfx1250-qwen-support be1cab9d + ROCm/aiter#7113. It used the Gluon fused all-reduce + RMSNorm for
-decode, which #2766 now enables by default, and these settings, all of which `serve_ep.sh` now sets for TP:
+decode, which #2766 now enables by default, and these settings, which `serve_ep.sh` sets for TP:
 
 | Setting | What it does | Measured (TP4 c16 traces, decode step at equal batch) |
 |---|---|---|
-| `HSA_NO_SCRATCH_RECLAIM=1` | keeps scratch allocated: the eager sampling and token-broadcast kernels use scratch, and with reclaim the GPU stalled ~120-230 us before each of them (4 a step) | -0.66 to -0.76 ms (-10%), GPU idle 1.61 -> 1.03 ms a step |
 | MTP4 (`SPEC=4`) | one more draft token | 3.46 tokens a forward against ~3.00 for MTP3 on the same traffic, step +12%: ~+3% per sequence |
 | `ATOM_SPEC_FUSED_VERIFY_SAMPLE=1` (#2801) | one sampler pass and one TP broadcast for the verify and bonus rows | ~-0.15 to -0.21 ms (-2 to -3%) |
 | `ATOM_SAMPLER_SPLIT_SOFTMAX=1` (#2803) | the sampler's softmax over the 248k vocab split across 61 programs a row | ~-85 us of GPU time a step |
 | `AITER_TOPK_FIRST_SMALL_K_TOPP=1` (aiter#7113) | register-resident top-p for k <= 64 (the client's top_k is 20) | ~-3 us a step once scratch reclaim is off |
-| `ATOM_PREFILL_DECODE_INTERVAL=16`, `ATOM_PREFILL_DELAYER_STALL_TICKS=2`, `ATOM_TOKEN_GRAPH_SIZES=256,...,4096` | the scheduling both points ran with | |
 
-The flags from unmerged PRs do nothing on a tree without them. With MTP4 the verify attention (unified
+That point also ran `HSA_NO_SCRATCH_RECLAIM=1` and the scheduling `ATOM_PREFILL_DECODE_INTERVAL=16`,
+`ATOM_PREFILL_DELAYER_STALL_TICKS=2`, `ATOM_TOKEN_GRAPH_SIZES=256,...,4096`; the recipe sets neither.
+Against the tip with #2803 (10-minute TP4 c16 points, 2026-10-29): scratch reclaim off measured no gain
+(TPOT 1.55 -> 1.58 ms), since aiter#7113 and the all-gather token sync removed the kernels that used
+scratch; the scheduling cut TPOT 8% but raised the TTFT median 46 -> 183 ms, TPS 2,529 -> 2,385.
+
+With MTP4 the verify attention (unified
 attention 3D at 5 query tokens) picks a quarter of MTP3's KV segments a sequence and takes 65 against
 40 us a launch: a config for that shape would make MTP4 a clearer gain.
 
