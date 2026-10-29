@@ -37,7 +37,12 @@ def inspect_model(model):
 def inspect_speculative(spec, expected_drafts, expected_al):
     rates = spec.synthetic_acceptance_rates
     resolved_al = 1 + sum(rates) if rates is not None else None
-    if (spec.rejection_sample_method != "synthetic" or rates is None
+    if expected_al is None:
+        if (spec.rejection_sample_method != "standard" or rates is not None
+                or spec.synthetic_acceptance_length is not None
+                or spec.num_speculative_tokens != expected_drafts):
+            raise ValueError("C48 eval requires natural rejection sampling")
+    elif (spec.rejection_sample_method != "synthetic" or rates is None
             or spec.num_speculative_tokens != expected_drafts
             or len(rates) != expected_drafts
             or not math.isclose(resolved_al, expected_al, rel_tol=0, abs_tol=1e-9)):
@@ -247,7 +252,17 @@ class ManifestWorker(Worker):
                 "profiler_config": asdict(self.vllm_config.profiler_config),
                 "speculative": inspect_speculative(spec,
                     int(os.environ["C48_DIAG_DRAFT_TOKENS"]),
-                    float(os.environ["C48_DIAG_AL"]))}
+                    float(os.environ["C48_DIAG_AL"]) if os.environ["C48_DIAG_AL"] else None)}
+        if os.environ.get("AITER_MLA_USE_OPUS") == "1":
+            import hashlib
+            import importlib
+            aiter = importlib.import_module("aiter")
+            mla = importlib.import_module("aiter.mla")
+            source = Path(mla.__file__).read_bytes()
+            assert callable(getattr(aiter, "opus_mla_decode_fp8_fwd", None)), "AITER lacks FP8 MLA OPUS"
+            assert b"AITER_MLA_USE_OPUS" in source, "AITER MLA dispatcher lacks the OPUS switch"
+            data["aiter_mla_opus"] = {"operator_available": True, "module_path": mla.__file__,
+                                      "module_sha256": hashlib.sha256(source).hexdigest()}
         out = Path(os.environ["C48_DIAG_DIR"])
         out.mkdir(parents=True, exist_ok=True)
         (out / f'{data["role"]}-rank-{self.rank}.json').write_text(json.dumps(data, indent=2) + "\n")
@@ -255,4 +270,11 @@ class ManifestWorker(Worker):
         assert bool(counts["target"]) == (os.environ["C48_DIAG_PTPC"] == "1"), counts
         expect = json.loads(os.environ.get("C48_EXPECT_QUANT", "{}"))
         got = {k: sum(item["quant_method"].endswith("." + k) for item in target) for k in expect}
+        if expect and self.parallel_config.pipeline_parallel_size > 1:
+            import torch
+            from vllm.distributed.parallel_state import get_pp_group
+            # The expected coverage names the whole target, split across PP stages.
+            coverage = torch.tensor(list(got.values()), dtype=torch.int64, device="cpu")
+            torch.distributed.all_reduce(coverage, group=get_pp_group().cpu_group)
+            got = dict(zip(got, coverage.tolist()))
         assert got == expect, f"C48 quantization coverage mismatch: got={got} expected={expect}"

@@ -19,9 +19,15 @@ def draft_path(model: str) -> Path:
 
 def render(config: dict, role: str, model: str, host: str, proxy: str,
            port: int, discovery: int, trace_dir: str | None = None,
-           lmcache_port: int | None = None) -> tuple[list[str], dict[str, str]]:
+           lmcache_port: int | None = None,
+           phase: str = "combined") -> tuple[list[str], dict[str, str]]:
     args = copy.deepcopy(config["roles"][role]["args"])
     args["speculative-config"]["model"] = str(draft_path(model))
+    if phase == "eval":
+        spec = args["speculative-config"]
+        spec["rejection_sample_method"] = "standard"
+        spec.pop("synthetic_acceptance_length", None)
+        spec.pop("synthetic_acceptance_rates", None)
     transfer = args["kv-transfer-config"]
     connectors = transfer.get("kv_connector_extra_config", {}).get("connectors", [transfer])
     for connector in connectors:
@@ -56,7 +62,7 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
     env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
     env["C48_DIAG_ROLE"] = role
     env["C48_DIAG_PTPC"] = str(int("quantization-config" in args))
-    env["C48_DIAG_AL"] = str(args["speculative-config"]["synthetic_acceptance_length"])
+    env["C48_DIAG_AL"] = str(args["speculative-config"].get("synthetic_acceptance_length", ""))
     env["C48_DIAG_DRAFT_TOKENS"] = str(args["speculative-config"]["num_speculative_tokens"])
     return argv, env
 
@@ -78,7 +84,7 @@ def main() -> None:
     argv, additions = render(config, options.role, options.model, options.host,
                              options.proxy, options.port, options.discovery,
                              str(options.output.parent.parent / "traces" / options.role),
-                             options.lmcache_port)
+                             options.lmcache_port, os.environ.get("ATOMESH_EXECUTION_PHASE", "combined"))
     additions["C48_DIAG_DIR"] = str(options.output.parent / "model-manifests")
     record = {"config": str(options.config), "config_sha256": hashlib.sha256(options.config.read_bytes()).hexdigest(),
               "role": options.role, "argv": argv, "environment_overrides": additions,

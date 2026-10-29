@@ -18,6 +18,32 @@ def transfer(argv):
 
 
 class LaunchTest(unittest.TestCase):
+    def test_eval_removes_synthetic_acceptance_without_changing_benchmark(self):
+        config = json.loads((GAP / "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C32-PP8-MC.json").read_text())
+        before = json.dumps(config)
+        for role in ("prefill", "decode"):
+            argv, env = render(config, role, *ADDR, phase="eval")
+            spec = json.loads(argv[argv.index("--speculative-config") + 1])
+            self.assertEqual(spec["rejection_sample_method"], "standard")
+            self.assertNotIn("synthetic_acceptance_length", spec)
+            self.assertNotIn("synthetic_acceptance_rates", spec)
+            self.assertEqual(env["C48_DIAG_AL"], "")
+            argv, env = render(config, role, *ADDR, phase="benchmark")
+            spec = json.loads(argv[argv.index("--speculative-config") + 1])
+            self.assertEqual(spec["rejection_sample_method"], "synthetic")
+            self.assertEqual(spec["synthetic_acceptance_length"], 3.36)
+        self.assertEqual(json.dumps(config), before)
+
+    def test_eval_manifest_rejects_forced_acceptance(self):
+        sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
+        from pd_c48_worker import inspect_speculative
+        spec = types.SimpleNamespace(rejection_sample_method="standard", num_speculative_tokens=4,
+                                     synthetic_acceptance_rates=None, synthetic_acceptance_length=None)
+        self.assertEqual(inspect_speculative(spec, 4, None)["rejection_sample_method"], "standard")
+        spec.rejection_sample_method = "synthetic"
+        with self.assertRaises(ValueError):
+            inspect_speculative(spec, 4, None)
+
     def test_lmcache_port_fills_prefill_connector(self):
         config = json.loads((GAP / "V-QD-LMC.json").read_text())
         argv, _ = render(config, "prefill", *ADDR, lmcache_port=6655)
@@ -32,7 +58,8 @@ class LaunchTest(unittest.TestCase):
         sources = {"DG5-PNT-SWB-C48-MC": "DG5-PNT", "DG5-PNT-SWB-C56-MC": "DG5-PNT-SWB-C56-CPU26",
                    "DG5-PNT-SWB-C88-MC": "DG5-PNT-SWB-C88-CPU26"}
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-"
-        cases = sorted(GAP.glob(prefix + "*-MC.json"))
+        cases = sorted(p for p in GAP.glob(prefix + "*-MC.json")
+                       if "-PP8-" not in p.stem and "-OPUS-" not in p.stem)
         self.assertEqual(len(cases), 8)
         for path in cases:
             suffix = path.stem.removeprefix(prefix)
@@ -72,6 +99,22 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(mooncake_hca(3, {}), "rdma3")
         self.assertEqual(mooncake_hca(1, {"HIP_VISIBLE_DEVICES": "4,5,6,7"}), "rdma5")
         self.assertEqual(mooncake_hca(0, {"ROCR_VISIBLE_DEVICES": "6", "HIP_VISIBLE_DEVICES": "0"}), "rdma6")
+
+    def test_pp_and_opus_candidates_preserve_unrelated_recipe_settings(self):
+        prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
+        for concurrency, variant in ((32, "PP8"), (72, "OPUS"), (88, "OPUS")):
+            base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
+            candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
+            candidate["name"] = base["name"]
+            if variant == "PP8":
+                args = candidate["roles"]["prefill"]["args"]
+                self.assertEqual(args.pop("pipeline-parallel-size"), 8)
+                for key in ("tensor-parallel-size", "decode-context-parallel-size"):
+                    self.assertEqual(args[key], 1)
+                    args[key] = base["roles"]["prefill"]["args"][key]
+            else:
+                self.assertEqual(candidate["roles"]["decode"]["env"].pop("AITER_MLA_USE_OPUS"), "1")
+            self.assertEqual(candidate, base)
 
     def test_nic_limits_degrades_without_verbs(self):
         sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))

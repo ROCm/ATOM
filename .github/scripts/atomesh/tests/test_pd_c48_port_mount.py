@@ -54,6 +54,17 @@ def mounts(case, root=REPO):
 
 
 class PortMountTest(unittest.TestCase):
+    def test_pp_aux_overlay_is_selected_only_for_pp(self):
+        base = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C32"
+        rc, normal = mounts(base + "-MC")
+        self.assertEqual(rc, 0)
+        rc, pp = mounts(base + "-PP8-MC")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(normal), len(pp))
+        self.assertEqual(normal[:-1], pp[:-1])
+        self.assertIn("/latent-down-mxfp4/linear.py,", normal[-1])
+        self.assertIn("/pp-aux-hidden/linear.py,", pp[-1])
+
     def test_manager_overlay_only_for_cpuref(self):
         rc, base = mounts("V-QD")
         self.assertEqual((rc, len(base)), (0, 3))
@@ -121,6 +132,8 @@ class PortMountTest(unittest.TestCase):
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-"
         for path in sorted((REPO / ".github/benchmark/c48-model-gap").glob(prefix + "*-MC.json")):
             case = path.stem
+            if "-PP8-" in case:
+                continue  # PP also replaces the model's auxiliary-state transport.
             rc, mc = mounts(case)
             self.assertEqual(rc, 0)
             self.assertTrue(mc[1].endswith("/kv_connector/v1/multi_connector.py,readonly"))

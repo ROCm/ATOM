@@ -73,10 +73,16 @@ c48_append_port_mount() {
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
   [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == V-QD-CPUREF[23]-FP8ATTN-FQ[23]-PQ-LDFP4* ]] || return 0
   # Inert unless the role's online config selects routed_expert_down_proj (Prefill only).
-  c48_fix_source="$1/.github/benchmark/c48-model-gap/latent-down-mxfp4/linear.py"
+  c48_fix_dir=latent-down-mxfp4
+  c48_fix_sha=aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-PP8-MC ]]; then
+    c48_fix_dir=pp-aux-hidden
+    c48_fix_sha=05f18e8d4c279c310da5567d889752d1bbb35d1a5f44b94b9c2b6f68556b9151
+  fi
+  c48_fix_source="$1/.github/benchmark/c48-model-gap/${c48_fix_dir}/linear.py"
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/linear.py"
   [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
-  [[ "${c48_fix_digest%% *}" == "aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa" ]] || return 2
+  [[ "${c48_fix_digest%% *}" == "${c48_fix_sha}" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
 }
