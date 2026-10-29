@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from atom.utils import compilation_counter
+from atom.utils import compilation_counter, compiler_inferface
 from atom.utils.compiler_inferface import (
     InductorStandaloneAdaptor,
     _save_standalone_compiled_graph,
@@ -79,8 +79,14 @@ def test_standalone_cpu_artifact_roundtrip_with_tuple_input(tmp_path, monkeypatc
     This compiles a real CPU kernel, saves it, and uses ATOM's real loader.
     """
     standalone = pytest.importorskip("torch._inductor.standalone_compile")
-    if not hasattr(standalone, "CacheCompiledArtifact"):
-        pytest.skip("Torch does not provide CacheCompiledArtifact")
+    # The adaptation must key on the artifact kind: torch < 2.10 has the same
+    # flat reload under another class name.
+    monkeypatch.setattr(
+        compiler_inferface,
+        "is_torch_equal_or_newer",
+        lambda v, _newer=compiler_inferface.is_torch_equal_or_newer: v != "2.10"
+        and _newer(v),
+    )
 
     class Nested(torch.nn.Module):
         def forward(self, pair, n, residual):
@@ -109,8 +115,8 @@ def test_standalone_cpu_artifact_roundtrip_with_tuple_input(tmp_path, monkeypatc
             dynamic_shapes="from_example_inputs",
             options={"config_patches": {"compile_threads": 1, "fx_graph_cache": True}},
         )
-    if not isinstance(fresh, standalone.CacheCompiledArtifact):
-        pytest.skip("Torch selected a different standalone artifact format")
+    if isinstance(fresh, getattr(standalone, "AOTCompiledArtifact", ())):
+        pytest.skip("Torch selected the AOT standalone artifact format")
     path = str(tmp_path / "artifact")
     handle = _save_standalone_compiled_graph(fresh, path, "roundtrip")
     assert handle is not None, "The CPU probe must produce a serializable artifact"

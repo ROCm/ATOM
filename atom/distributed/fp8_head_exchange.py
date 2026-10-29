@@ -14,6 +14,7 @@ from aiter import dtypes
 
 from atom.config import get_current_atom_config
 from atom.distributed.ulysses_sp import (
+    HEAD_EXCHANGE_MIN_LOCAL_ROWS,
     _all_gather_tokens,
     exchange_heads,
     get_sp_group,
@@ -56,7 +57,7 @@ def local_token_fp8_supported(*, tp_replicated_o_proj: bool = False) -> bool:
 def _head_amax_kernel(
     X, AMAX, WIDTH: tl.constexpr, STRIDE: tl.constexpr, BLOCK: tl.constexpr
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, BLOCK)
     x = tl.load(X + row * STRIDE + col, col < WIDTH, other=0).to(tl.float32)
     # max(abs(BF16)) is itself exactly representable as BF16. No scale or
@@ -78,7 +79,7 @@ def _quantize_global_amax_kernel(
     RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, BLOCK)
     amax = tl.full((), 0, tl.float32)
     for peer in tl.static_range(WORLD):
@@ -161,7 +162,7 @@ def gather_heads_fp8(x: torch.Tensor, group=None) -> tuple[torch.Tensor, torch.T
     # Piecewise compilation reuses the initially traced graph at other token
     # counts. Keep this runtime choice inside the opaque attention op so decode
     # cannot inherit the prefill branch or change the op's tuple schema.
-    if x.shape[0] // world < 2048:
+    if x.shape[0] // world < HEAD_EXCHANGE_MIN_LOCAL_ROWS:
         from aiter.ops.quant import per_token_quant_hip
 
         return per_token_quant_hip(
@@ -204,6 +205,10 @@ def _attention_fp8_fake(
     )
 
 
+# Not an eager_region: TR_HYBRID records it inline in the decode token graphs,
+# which is valid only while a token bucket is one (bs, q=1) request bucket
+# (Config refuses spec decoding; ModelRunner._record_prefill_graphs refuses
+# prefill token graphs).
 @mark_spliting_op(is_custom=True, gen_fake=_attention_fp8_fake, mutates_args=[])
 def sp_attention_fp8(
     q: torch.Tensor,

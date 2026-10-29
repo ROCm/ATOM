@@ -14,7 +14,10 @@ import pytest
 
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
-from atom.model_engine.model_runner import max_schedulable_decode_bs
+from atom.model_engine.model_runner import (
+    max_schedulable_decode_bs,
+    sp_token_graph_ladder,
+)
 
 
 class TestMaxSchedulableDecodeBs:
@@ -62,3 +65,15 @@ class TestMaxSchedulableDecodeBs:
                         max_schedulable_decode_bs(max_num_seqs, budget, full_q_len)
                         == admitted
                     )
+
+
+@pytest.mark.parametrize("sp", [2, 4, 8])
+@pytest.mark.parametrize("max_bs", [1, 2, 6, 12, 250, 512])
+def test_sp_token_graph_ladder_covers_every_schedulable_batch(sp, max_bs):
+    # Rounding to SP multiples used to run past `max_bs` and get filtered out,
+    # leaving the top batch sizes eager (or no ladder at all).
+    ladder = sp_token_graph_ladder(
+        list(range(1, 9)) + list(range(16, 513, 16)), sp, max_bs
+    )
+    assert max(ladder) == max_bs
+    assert len({-(-r // sp) for r in ladder}) == len(ladder)

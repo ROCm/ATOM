@@ -47,16 +47,20 @@ def runtime(monkeypatch):
     return SimpleNamespace(comm=comm, group=group, kernel=kernel)
 
 
+# Columns of a 4-row BF16 tensor at the size threshold.
+_MIN_COLS = quick_rs.QUICK_RS_MIN_BYTES // 8
+
+
 @pytest.mark.parametrize(
     "shape,contiguous,selected",
     [
-        ((4, 3 * 1024**2 - 8), True, False),  # Just below 24 MiB.
-        ((4, 3 * 1024**2), True, True),
+        ((4, _MIN_COLS - 8), True, False),  # Just below the threshold.
+        ((4, _MIN_COLS), True, True),
         ((4, 8 * 1024**2), True, True),  # The communicator's maximum.
         ((4, 8 * 1024**2 + 8), True, False),
-        ((4, 3 * 1024**2 + 1), True, False),  # Shard is not 16-byte aligned.
+        ((4, _MIN_COLS + 1), True, False),  # Shard is not 16-byte aligned.
         ((3, 4 * 1024**2), True, False),  # Rows do not split across 4 ranks.
-        ((4, 3 * 1024**2), False, False),
+        ((4, _MIN_COLS), False, False),
     ],
 )
 def test_only_supported_shards_use_the_int4_kernel(

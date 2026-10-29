@@ -18,9 +18,14 @@ def _pack_fields_kernel(
     SPEC: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # Tensor offsets can pass 2**31 on long prefills: keep the block's base in
+    # int64 and the per-element index math in int32, relative to that base.
     peer = tl.program_id(1)
-    flat = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    row, col = flat // WIDTH, flat % WIDTH
+    first = tl.program_id(0).to(tl.int64) * BLOCK
+    first_row = first // WIDTH
+    local = (first % WIDTH).to(tl.int32) + tl.arange(0, BLOCK)
+    row, col = local // WIDTH, local % WIDTH
+    rows_left = (TOKENS - first_row).to(tl.int32)
     source_col = tl.full((BLOCK,), 0, tl.int32)
     start = 0
     for field in tl.static_range(len(SPEC)):
@@ -33,8 +38,10 @@ def _pack_fields_kernel(
             (col >= start) & (col < start + size), base + col - start, source_col
         )
         start += size
-    value = tl.load(source + row * STRIDE + source_col, row < TOKENS, other=0)
-    tl.store(output + peer * TOKENS * WIDTH + flat, value, row < TOKENS)
+    source += first_row * STRIDE
+    value = tl.load(source + row * STRIDE + source_col, row < rows_left, other=0)
+    output += peer.to(tl.int64) * TOKENS * WIDTH + first
+    tl.store(output + tl.arange(0, BLOCK), value, row < rows_left)
 
 
 def pack_fields(source: torch.Tensor, spec: tuple, world: int) -> torch.Tensor:

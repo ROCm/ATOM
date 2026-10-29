@@ -20,6 +20,11 @@ except ModuleNotFoundError as exc:
 # Resolve optional AITER support before dispatch; execution failures propagate.
 _qr_reduce_scatter = getattr(_qrs_ops, "qr_reduce_scatter", None)
 
+# MiniMax-M3 SP4 on gfx950: INT4 beat the BF16 custom reduce-scatter by 19% at
+# 24 MiB but only 2% at 6 MiB, too little for another lossy step. Decode stays
+# below it on the exact reduce-scatter.
+QUICK_RS_MIN_BYTES = 24 << 20
+
 
 def try_quick_reduce_scatter(x: torch.Tensor, group) -> torch.Tensor | None:
     """Return this rank's sum shard, or None for the normal RS fallback.
@@ -40,8 +45,11 @@ def try_quick_reduce_scatter(x: torch.Tensor, group) -> torch.Tensor | None:
     if x.dtype not in (torch.float16, torch.bfloat16) or not x.is_cuda:
         return None
     size = x.numel() * x.element_size()
-    # Below 24 MiB, keep the normal reduce-scatter used by decode.
-    if size < 24 * 1024**2 or size > comm.qr_max_size or size % (16 * comm.world_size):
+    if (
+        size < QUICK_RS_MIN_BYTES
+        or size > comm.qr_max_size
+        or size % (16 * comm.world_size)
+    ):
         return None
     from aiter.jit.utils.chip_info import get_gfx_runtime
 

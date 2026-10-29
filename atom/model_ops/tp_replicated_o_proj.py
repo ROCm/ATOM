@@ -53,6 +53,7 @@ def _attention_fake(
     )
 
 
+# Recorded inline in token graphs, like sp_attention_fp8.
 @mark_spliting_op(is_custom=True, gen_fake=_attention_fake, mutates_args=[])
 def replicated_o_proj_attention(
     q: torch.Tensor,
