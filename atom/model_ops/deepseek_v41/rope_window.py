@@ -26,6 +26,14 @@ from atom.model_ops.blockscale_kernels.quantization import (
     ceil_pow2_code,
 )
 from atom.model_ops.v4_kernels.pool_index import window_row
+from atom.utils import envs
+
+# `ATOM_DSV41_ROPE_HEAD_BLOCK`: a token's query heads rotated by one program
+# rather than one each. The per-head programs each move one 64-element tail,
+# so a launch of hundreds of tokens is nearly all program scheduling; on
+# MI455X the whole launch at 576 tokens took 13.1 us one program a head and
+# 2.5 us one a token, with the same bytes out.
+_HEAD_BLOCK = envs.ATOM_DSV41_ROPE_HEAD_BLOCK
 
 # A token's query heads rotated by one program rather than one each. The
 # per-head programs each move one 64-element tail, so a launch of hundreds of
