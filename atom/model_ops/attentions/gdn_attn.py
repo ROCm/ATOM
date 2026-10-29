@@ -1723,6 +1723,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         """
         return list(self.kv_pools.values())
 
+    def release_kv_pools(self) -> None:
+        # `_page_unit_regions` is keyed on the pool objects, and the regions
+        # cached under them name this allocation's addresses.
+        self._page_unit_region_cache = None
+        super().release_kv_pools()
+
     def _published_page_unit_bytes(self) -> int:
         """Bytes one block publishes, from the declaration (before allocation)."""
         from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
@@ -1744,19 +1750,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         pools = self._page_unit_pools()
-        key = tuple(
-            (
-                tensor.data_ptr(),
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                tensor.element_size(),
-            )
-            for pool in pools
-            for _, tensor in pool.region_tensors()
-        )
+        # Keyed on the pool objects: a pool's regions do not move while it is
+        # allocated, and walking ~120 region tensors per call cost more than
+        # the step's copy bookkeeping. An MHA pool keeps its identity across
+        # a release and the next allocation, so `release_kv_pools` drops this.
         cached = getattr(self, "_page_unit_region_cache", None)
-        if cached is not None and cached[0] == key:
+        if (
+            cached is not None
+            and len(cached[0]) == len(pools)
+            and all(a is b for a, b in zip(cached[0], pools))
+        ):
             return cached[1]
+        key = tuple(pools)
         regions = mha_page_unit_regions(pools)
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec

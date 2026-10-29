@@ -385,6 +385,34 @@ def test_qsa_regions_are_built_once_per_allocation(monkeypatch):
         cls._page_unit_pools(builder)
 
 
+def test_page_unit_regions_are_cached_per_pool_until_release(monkeypatch):
+    """Called several times a step: the key is the pool objects, not a walk
+    over every region tensor, and a release drops it before the addresses
+    change."""
+    from atom.model_ops.attentions.pool_layout import mha_page_unit_geometry
+
+    builder, cls = _paged_builder()
+    first = cls._page_unit_regions(builder)
+    real = mha_page_unit_geometry.mha_page_unit_regions
+    walks = []
+
+    def counted(pools):
+        walks.append(len(pools))
+        return real(pools)
+
+    monkeypatch.setattr(mha_page_unit_geometry, "mha_page_unit_regions", counted)
+    for _ in range(3):
+        assert cls._page_unit_regions(builder) is first
+    assert walks == []
+
+    cls.release_kv_pools(builder)
+    assert builder._page_unit_region_cache is None
+    cls.allocate_kv_cache_tensors(builder, blocks=3, buf=None)
+    bases, _ = cls._page_unit_regions(builder)
+    assert walks == [1]
+    assert bases.tolist() == [base for base, _ in builder.qsa_arena.region_layout()]
+
+
 def test_page_unit_segments_take_the_untrimmed_path_before_the_spec():
     """The store thread can ask before the runtime exists: same safe path as
     `page_unit_views`, not an AttributeError."""
