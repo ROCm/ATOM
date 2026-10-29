@@ -37,6 +37,16 @@ logger = logging.getLogger("atom")
 _REPLICATED_FC_MAX_TOKENS = 1024
 
 
+def _dual_norm_inputs_ok(a: torch.Tensor, b: torch.Tensor) -> bool:
+    # What the two-input norm takes: 2-D rows of one dtype, last dim contiguous.
+    return (
+        a.dim() == b.dim() == 2
+        and a.shape == b.shape
+        and a.dtype == b.dtype
+        and a.stride(-1) == b.stride(-1) == 1
+    )
+
+
 # @support_torch_compile
 class Qwen3_5MultiTokenPredictor(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
@@ -73,6 +83,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc",
         )
+        self.dual_pre_fc_norm = envs.ATOM_MTP_DUAL_PRE_FC_NORM
 
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
@@ -116,6 +127,33 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         shard = self.fc.weight[tp.rank_in_group * rows :][:rows]
         return tp.all_gather(tgemm.mm(x, shard, None, otype=x.dtype))
 
+    def _pre_fc_norms(
+        self, inputs_embeds: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """cat([pre_fc_norm_embedding(e), pre_fc_norm_hidden(h)], -1) in one
+        launch: the two-input mode of the kernel GemmaRMSNorm runs, each norm
+        storing into its half of the fc input."""
+        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+
+        hidden = hidden_states.shape[-1]
+        out = torch.empty(
+            (hidden_states.shape[0], 2 * hidden),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        fused_qk_rmsnorm_group_quant(
+            q=inputs_embeds,
+            q_weight=self.pre_fc_norm_embedding.weight.data,
+            q_epsilon=self.pre_fc_norm_embedding.variance_epsilon,
+            q_out_unquantized=out[:, :hidden],
+            k=hidden_states,
+            k_weight=self.pre_fc_norm_hidden.weight.data,
+            k_epsilon=self.pre_fc_norm_hidden.variance_epsilon,
+            k_out=out[:, hidden:],
+            gemma_norm=True,
+        )
+        return out
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -129,9 +167,12 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-        hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        if self.dual_pre_fc_norm and _dual_norm_inputs_ok(inputs_embeds, hidden_states):
+            hidden_states = self._pre_fc_norms(inputs_embeds, hidden_states)
+        else:
+            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
         hidden_states = self._fc(hidden_states)
         residual = None
 

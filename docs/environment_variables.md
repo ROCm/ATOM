@@ -308,6 +308,7 @@ All default off.
 | **ATOM_MOE_PRECOMPUTED_NVR** | bool | 0 (false) | Stage each `batch_info` count times the MoE top-k next to the counts (same host-to-device copy) and pass it to aiter's `fused_moe` as `num_valid_routes`, so the gfx1250 grouped TP path does not launch the `num_local_tokens * topk` multiply in every MoE layer. Needs an aiter whose `fused_moe` takes `num_valid_routes`; with the flag off ATOM never passes it. |
 | **ATOM_MTP_REPLICATED_FC** | bool | 0 (false) | Qwen3.5 MTP at TP>1: hold the whole `mtp.fc` (2H -> H) on every rank instead of column-parallel + all-gather. Its input is the same on every rank, so is its output; the GEMM is bitwise the same. A prefill chunk over 1024 tokens still runs this rank's rows and the all-gather. |
 | **ATOM_QWEN35_MTP_REPLICATED_EMBED** | bool | 0 (false) | Qwen3.5 MTP at TP>1: the full vocab embedding on every rank for the draft only (the target keeps its shard), gathered from the shards once the draft shares the target's embedding: a local lookup instead of the masked lookup + all-reduce, bit-identical. About 0.76 GB more per rank. |
+| **ATOM_MTP_DUAL_PRE_FC_NORM** | bool | 0 (false) | Qwen3.5 MTP: `pre_fc_norm_embedding` and `pre_fc_norm_hidden` in one launch of the two-input Gemma RMSNorm, each written into its half of the fc input, instead of two launches and a `torch.cat`. Bitwise the same. |
 
 ## Engram (DeepSeek-V4.1)
 

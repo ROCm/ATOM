@@ -1009,6 +1009,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QWEN35_MTP_REPLICATED_EMBED": lambda: (
         os.getenv("ATOM_QWEN35_MTP_REPLICATED_EMBED", "0").lower() in ("1", "true")
     ),
+    # Qwen3.5 MTP: pre_fc_norm_embedding and pre_fc_norm_hidden in one launch of
+    # the two-input Gemma norm, written straight into the fc input -- no
+    # torch.cat. Same kernel and math as the two norms, so bitwise the same.
+    "ATOM_MTP_DUAL_PRE_FC_NORM": lambda: _flag_env("ATOM_MTP_DUAL_PRE_FC_NORM", "0"),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(

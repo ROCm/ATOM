@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""Qwen3.5 MTP draft TP options: the replicated fc (ATOM_MTP_REPLICATED_FC) and
-embedding (ATOM_QWEN35_MTP_REPLICATED_EMBED).
+"""Qwen3.5 MTP draft options: the replicated fc (ATOM_MTP_REPLICATED_FC) and
+embedding (ATOM_QWEN35_MTP_REPLICATED_EMBED), and both pre-fc norms in one
+launch (ATOM_MTP_DUAL_PRE_FC_NORM).
 
-The tests run against a fake 4-rank TP group (all_gather returns what the
+The TP tests run against a fake 4-rank TP group (all_gather returns what the
 ranks' shards concatenate to), so they check the wiring and the bit-exactness
 claims without a process group.
 """
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -176,3 +178,41 @@ def test_flag_defaults_are_off(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
         assert not getattr(envs, name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("rows", [1, 5, 40])
+def test_dual_pre_fc_norm_is_the_two_norms_and_cat(rows):
+    """ATOM_MTP_DUAL_PRE_FC_NORM: one launch, bitwise the separate norms' cat."""
+    from atom.model_ops.layernorm import GemmaRMSNorm
+
+    hidden = 2048
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    pred = object.__new__(mtp.Qwen3_5MultiTokenPredictor)
+    nn.Module.__init__(pred)
+    pred.pre_fc_norm_embedding = GemmaRMSNorm(hidden, eps=1e-6).cuda()
+    pred.pre_fc_norm_hidden = GemmaRMSNorm(hidden, eps=1e-5).cuda()
+    for norm in (pred.pre_fc_norm_embedding, pred.pre_fc_norm_hidden):
+        norm.weight.data = torch.randn(hidden, device="cuda", generator=g).bfloat16()
+    e = torch.randn(rows, hidden, device="cuda", generator=g).bfloat16()
+    h = torch.randn(rows, hidden, device="cuda", generator=g).bfloat16()
+    assert mtp._dual_norm_inputs_ok(e, h)
+    ref = torch.cat(
+        [
+            pred.pre_fc_norm_embedding.forward_cuda(e),
+            pred.pre_fc_norm_hidden.forward_cuda(h),
+        ],
+        dim=-1,
+    )
+    out = pred._pre_fc_norms(e, h)
+    assert out.shape == (rows, 2 * hidden) and out.is_contiguous()
+    assert torch.equal(out, ref)
+
+
+def test_dual_pre_fc_norm_inputs():
+    e = torch.zeros(3, HIDDEN, dtype=torch.bfloat16)
+    assert mtp._dual_norm_inputs_ok(e, e.clone())
+    assert not mtp._dual_norm_inputs_ok(e, e.float())
+    assert not mtp._dual_norm_inputs_ok(e, e[:2])
+    assert not mtp._dual_norm_inputs_ok(e, e.view(3, 1, HIDDEN))
+    assert not mtp._dual_norm_inputs_ok(e, torch.zeros(HIDDEN, 3).bfloat16().t())
