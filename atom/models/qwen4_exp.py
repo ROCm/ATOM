@@ -432,6 +432,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             num_routing_experts=ex.global_num_experts,
             num_fused_shared_experts=ex.num_fused_shared_experts,
             routed_scaling_factor=ex.routed_scaling_factor,
+            triton_max_rows=ex.triton_topk_softmax_max_rows,
         )
         return moe_decode_single_token(hidden_states, topk_ids, topk_weights, *weights)
 

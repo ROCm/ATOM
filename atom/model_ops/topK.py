@@ -8,7 +8,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
-from atom.model_ops.topk_softmax_dispatch import use_triton_topk_softmax
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
@@ -211,7 +210,11 @@ def rocm_aiter_topk_softmax_impl(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
+    triton_max_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """`triton_max_rows`: the layer's `triton_topk_softmax_rows` for these
+    arguments; launches of up to that many rows run `triton_topk_softmax`,
+    the rest (all of them when None) AITER's `topk_softmax`."""
     from aiter import topk_softmax
 
     token = gating_output.shape[0]
@@ -229,14 +232,7 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
-    if use_triton_topk_softmax(
-        topk_weights,
-        topk_ids,
-        gating_output,
-        renormalize,
-        fused_shared_experts_for_kernel,
-        fused_shared_experts_scoring_func,
-    ):
+    if triton_max_rows is not None and token <= triton_max_rows:
         triton_topk_softmax(
             topk_weights,
             topk_ids,
@@ -447,6 +443,7 @@ def rocm_aiter_topk_softmax(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
+    triton_max_rows: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
     return rocm_aiter_topk_softmax_impl(
         gating_output,
@@ -456,6 +453,7 @@ def rocm_aiter_topk_softmax(
         num_routing_experts,
         fused_shared_experts_scoring_func,
         num_valid_rows,
+        triton_max_rows,
     )
 
 

@@ -273,7 +273,7 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 
 | Routing Function | Kernel | Used For |
 |---|---|---|
-| `rocm_aiter_topk_softmax` | Triton `triton_topk_softmax` for the launches `use_triton_topk_softmax` accepts (renormalized, 32-512 experts, up to 20 rows per CU, eager and captured alike); `aiter.topk_softmax` otherwise or with `ATOM_TRITON_TOPK_SOFTMAX=0` | Softmax top-k (Mixtral, Qwen3 MoE, Qwen3.8-Flash-Next) |
+| `rocm_aiter_topk_softmax` | Triton `triton_topk_softmax` for layers `triton_topk_softmax_rows` accepts when they are built (renormalized, 32-512 experts), in launches of up to 20 rows per CU, eager and captured alike; `aiter.topk_softmax` otherwise or with `ATOM_TRITON_TOPK_SOFTMAX=0` | Softmax top-k (Mixtral, Qwen3 MoE, Qwen3.8-Flash-Next) |
 | `rocm_aiter_grouped_topk` | `aiter.grouped_topk` | Grouped top-k (DeepSeek) |
 | `rocm_aiter_biased_grouped_topk` | `aiter.biased_grouped_topk` | Biased grouped top-k (DeepSeek V3) |
 
@@ -538,7 +538,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `rotary_embedding.py` | `RotaryEmbedding`, `get_rope` |
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
 | `triton_topk_softmax.py` | `triton_topk_softmax` -- renormalized softmax top-k, one Triton program per token, bit-identical to AITER's fused `topk_softmax` |
-| `topk_softmax_dispatch.py` | `triton_topk_softmax_supported`, `triton_topk_softmax_max_rows`, `use_triton_topk_softmax` -- which kernel `rocm_aiter_topk_softmax` runs (no Triton / AITER import at module level, so the GPU-less CI tests it) |
+| `topk_softmax_dispatch.py` | `triton_topk_softmax_supported`, `triton_topk_softmax_max_rows`, `triton_topk_softmax_rows` -- which kernel `rocm_aiter_topk_softmax` runs, decided once per MoE layer (`FusedMoE.triton_topk_softmax_max_rows`) (no Triton / AITER import at module level, so the GPU-less CI tests it) |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
 | `base_config.py` | `QuantizeMethodBase` abstract class |

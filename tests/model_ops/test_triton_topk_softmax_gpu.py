@@ -5,7 +5,8 @@
 
 `rocm_aiter_topk_softmax_impl` runs it, eager and captured alike, for the
 shapes it supports up to `triton_topk_softmax_max_rows()` rows, and AITER
-for longer launches, the other shapes or with `ATOM_TRITON_TOPK_SOFTMAX=0`.
+for longer launches, the other shapes or with `ATOM_TRITON_TOPK_SOFTMAX=0`
+-- as the layer decided when it was built (`triton_topk_softmax_rows`).
 Any difference -- an expert id, the order of tied experts, or the last bit
 of a weight -- would route a token differently in a long prefill than in a
 short pass, or make that switch change outputs, hence bit-exactness rather
@@ -23,11 +24,14 @@ if not torch.cuda.is_available():
 
 aiter = pytest.importorskip("aiter")
 
+from atom.model_ops import topk_softmax_dispatch
 from atom.model_ops.topk_softmax_dispatch import (
     triton_topk_softmax_max_rows,
+    triton_topk_softmax_rows,
     triton_topk_softmax_supported,
 )
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
+from atom.utils import envs
 
 EXPERTS, TOPK = 512, 10
 
@@ -41,12 +45,20 @@ def _logits(rows, width, scale, ties):
 
 
 def _supported(logits, k, renormalize, shared):
-    """`triton_topk_softmax_supported` for fresh outputs in the fused-shared
-    layout: [rows, k + shared] buffers, the routed ids through a [:, :k] view."""
-    rows = logits.shape[0]
-    w = torch.empty(rows, k + shared, device="cuda")
-    ids = torch.empty(rows, k + shared, dtype=torch.int32, device="cuda")
-    return triton_topk_softmax_supported(w, ids[:, :k], logits, renormalize, shared)
+    """`triton_topk_softmax_supported` for a routing of these logits, the
+    last `shared` of them sigmoid-scored shared experts."""
+    experts = logits.shape[1] - shared
+    return triton_topk_softmax_supported(
+        experts, k, renormalize, shared, "sigmoid" if shared else ""
+    )
+
+
+def _layer_rows(experts, k, shared):
+    """What a layer routing `experts` / top-`k` with `shared` sigmoid-scored
+    fused shared experts decides when it is built."""
+    return triton_topk_softmax_rows(
+        experts, k, True, shared, "sigmoid" if shared else None
+    )
 
 
 @pytest.mark.parametrize("shared", [0, 1])
@@ -171,7 +183,6 @@ def test_unsupported_shapes_fall_back():
     logits = torch.zeros(4, 513, dtype=torch.bfloat16, device="cuda")
     assert not _supported(logits, TOPK, False, 1)
     assert not _supported(logits, TOPK, True, 0)  # 513 experts
-    assert not _supported(logits[:, ::2], TOPK, True, 0)
     # AITER's fused kernel stops at 512 experts; 1024 takes its
     # softmax-then-top-k path, which rounds the weights differently.
     wide = torch.zeros(4, 1024 + 1, dtype=torch.bfloat16, device="cuda")
@@ -182,20 +193,25 @@ def test_unsupported_shapes_fall_back():
     assert not _supported(wide[:, :515], TOPK, True, 3)
 
 
-def test_outputs_need_a_unit_last_stride():
-    """AITER honours any output stride; the Triton kernel stores along a unit
-    one, so it does not take other layouts and its launcher refuses them."""
+def test_launcher_needs_a_unit_last_stride():
+    """The Triton kernel loads and stores along a unit last stride. The impl's
+    outputs always have one (fresh buffers, or column views of the shared
+    `aiter_topK_meta_data` rows), as do router logits (a gate's output, or a
+    column slice of it); the launcher refuses anything else."""
     rows, shared = 8, 1
     logits = _logits(rows, EXPERTS + shared, 2.0, False)
     w = torch.empty(rows, TOPK + shared, device="cuda")
     ids = torch.empty(rows, TOPK + shared, dtype=torch.int32, device="cuda")
     w_t = torch.empty(TOPK + shared, rows, device="cuda").t()
     ids_t = torch.empty(TOPK + shared, rows, dtype=torch.int32, device="cuda").t()
-    assert triton_topk_softmax_supported(w, ids[:, :TOPK], logits, True, shared)
-    for out_w, out_ids in ((w_t, ids[:, :TOPK]), (w, ids_t[:, :TOPK])):
-        assert not triton_topk_softmax_supported(out_w, out_ids, logits, True, shared)
+    wide = _logits(rows, 2 * (EXPERTS + shared), 2.0, False)
+    for out_w, out_ids, gating in (
+        (w_t, ids[:, :TOPK], logits),
+        (w, ids_t[:, :TOPK], logits),
+        (w, ids[:, :TOPK], wide[:, ::2]),
+    ):
         with pytest.raises(AssertionError, match="unit last stride"):
-            triton_topk_softmax(out_w, out_ids, logits, shared)
+            triton_topk_softmax(out_w, out_ids, gating, shared)
 
 
 @pytest.mark.parametrize("shared", [0, 1])
@@ -214,11 +230,14 @@ def test_1024_experts_route_through_aiter(shared, monkeypatch):
     if shared:
         meta_w, meta_ids = _outputs(rows, shared)
         monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
+    max_rows = _layer_rows(experts, k, shared)
+    assert max_rows is None
 
     def route():
         return topK.rocm_aiter_topk_softmax_impl(
-            logits, k, True, shared, experts, "sigmoid" if shared else None
-        )
+            logits, k, True, shared, experts, "sigmoid" if shared else None,
+            triton_max_rows=max_rows,
+        )  # fmt: skip
 
     w_eager, ids_eager = (t.clone() for t in route())
     graph = torch.cuda.CUDAGraph()
@@ -359,11 +378,13 @@ def test_impl_passes_num_valid_rows_to_both_paths(shared, switch, kernel, monkey
         meta_w, meta_ids = _outputs(max_rows, shared)
         monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
     num_valid_rows = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    max_rows = _layer_rows(EXPERTS, TOPK, shared)
 
     def route():
         w, ids = topK.rocm_aiter_topk_softmax_impl(
             logits, TOPK, True, shared, EXPERTS,
             "sigmoid" if shared else None, num_valid_rows=num_valid_rows,
+            triton_max_rows=max_rows,
         )  # fmt: skip
         return w[:rows], ids[:rows]
 
@@ -414,6 +435,7 @@ def test_select_experts_counts_the_pass_rows(
     if shared:
         meta_w, meta_ids = _outputs(max_rows, shared)
         monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
+    triton_max_rows = _layer_rows(EXPERTS, TOPK, shared)
 
     def route():
         return FusedMoE.select_experts(
@@ -425,6 +447,7 @@ def test_select_experts_counts_the_pass_rows(
             num_routing_experts=EXPERTS,
             num_fused_shared_experts=shared,
             fused_shared_experts_scoring_func="sigmoid" if shared else None,
+            triton_max_rows=triton_max_rows,
         )
 
     route()  # eager: compiles the Triton kernel, when on, outside the capture
@@ -506,10 +529,13 @@ def test_impl_matches_aiter_on_both_sides_of_the_row_cutoff(
         monkeypatch.setattr(topK, "aiter_topK_meta_data", outputs())
     used = _record_kernels(monkeypatch, topK)
 
+    max_rows = _layer_rows(experts, k, shared)
+    assert max_rows == cutoff
+
     def route():
         return topK.rocm_aiter_topk_softmax_impl(
             logits, k, True, shared, experts, scoring_func or None,
-            num_valid_rows=num_valid_rows,
+            num_valid_rows=num_valid_rows, triton_max_rows=max_rows,
         )  # fmt: skip
 
     w_eager, ids_eager = (t.clone() for t in route())
@@ -525,3 +551,66 @@ def test_impl_matches_aiter_on_both_sides_of_the_row_cutoff(
         assert torch.equal(_bits(w), _bits(w_ref))
     if num_valid_rows is not None:
         assert bool((ids_ref[rows * 2 // 3 :, :k] == -1).all())
+
+
+@SWITCH
+def test_launches_only_compare_the_row_count(switch, kernel, monkeypatch):
+    """Launches, direct or through `FusedMoE.select_experts`, read neither the
+    switch nor the CU count and run no shape check: the layer decided once,
+    when it was built, and flipping the switch afterwards does not move it."""
+    from atom.model_ops import moe, topK
+    from atom.model_ops.moe import FusedMoE
+
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", switch)
+    shared, rows = 1, 64
+    max_rows = _layer_rows(EXPERTS, TOPK, shared)
+    assert (max_rows is not None) == (kernel == "triton")
+
+    calls = []
+    get_env = envs.__getattr__
+
+    def counting_getattr(name):
+        if name == "ATOM_TRITON_TOPK_SOFTMAX":
+            calls.append(name)
+        return get_env(name)
+
+    monkeypatch.setattr(envs, "__getattr__", counting_getattr)
+    for module, name in (
+        (topk_softmax_dispatch, "_cu_num"),
+        (topk_softmax_dispatch, "triton_topk_softmax_max_rows"),
+        (topk_softmax_dispatch, "triton_topk_softmax_supported"),
+        (topk_softmax_dispatch, "triton_topk_softmax_rows"),
+        (moe, "triton_topk_softmax_rows"),
+    ):
+        fn = getattr(module, name)
+
+        def counted(*args, _fn=fn, _name=name, **kwargs):
+            calls.append(_name)
+            return _fn(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, counted)
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "0" if switch == "1" else "1")
+    used = _record_kernels(monkeypatch, topK)
+    monkeypatch.setattr(topK, "aiter_topK_meta_data", _outputs(rows, shared))
+    torch.manual_seed(41)
+    logits = _logits(rows, EXPERTS + shared, 2.0, False)
+
+    for _ in range(3):
+        topK.rocm_aiter_topk_softmax_impl(
+            logits, TOPK, True, shared, EXPERTS, "sigmoid", triton_max_rows=max_rows
+        )
+        FusedMoE.select_experts(
+            hidden_states=None,
+            router_logits=logits,
+            top_k=TOPK,
+            use_grouped_topk=False,
+            renormalize=True,
+            num_routing_experts=EXPERTS,
+            num_fused_shared_experts=shared,
+            fused_shared_experts_scoring_func="sigmoid",
+            mask_pad_rows=False,
+            triton_max_rows=max_rows,
+        )
+    torch.cuda.synchronize()
+    assert used == [kernel] * 6
+    assert calls == []
