@@ -207,13 +207,6 @@ def _device_host(table, mode, monkeypatch, tmp_path, start=0, end=None):
     end = table.shape[0] if end is None else end
     if mode == "hbm":
         monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
-    elif mode == "register":
-        pin_rows = host_memory.pin_rows
-        monkeypatch.setattr(
-            host_memory,
-            "pin_rows",
-            lambda sources, copy=None: pin_rows(sources, copy=False),
-        )
     host = _host(start, end, table.dtype, "cuda")
     _load(table, host, start, end, _checkpoint_shards(table, tmp_path))
     bases = host.shard_bases(NUM_SHARDS).cuda()
@@ -222,7 +215,7 @@ def _device_host(table, mode, monkeypatch, tmp_path, start=0, end=None):
 
 
 @_gpu
-@pytest.mark.parametrize("mode", ["copy", "register", "hbm"])
+@pytest.mark.parametrize("mode", ["copy", "hbm"])
 def test_uva_lookup_matches_hbm_embedding_bitwise(monkeypatch, tmp_path, mode):
     ple = _ops()
     table = _table()
@@ -237,11 +230,10 @@ def test_uva_lookup_matches_hbm_embedding_bitwise(monkeypatch, tmp_path, mode):
 
 
 @_gpu
-@pytest.mark.parametrize("mode", ["copy", "register"])
-def test_fp8_uva_lookup_matches_fp8_embedding_bitwise(monkeypatch, tmp_path, mode):
+def test_fp8_uva_lookup_matches_fp8_embedding_bitwise(monkeypatch, tmp_path):
     ple = _ops()
     table = _table(torch.float8_e4m3fn)
-    host, bases = _device_host(table, mode, monkeypatch, tmp_path)
+    host, bases = _device_host(table, "copy", monkeypatch, tmp_path)
     scale = torch.tensor([0.1875], device="cuda")
     ids = _probe_ids(TABLE_ROWS, 4096).cuda()
     got = ple.sharded_table_lookup(

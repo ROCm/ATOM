@@ -21,9 +21,14 @@ logger = logging.getLogger("atom")
 
 @functools.cache
 def _hip_device_pointer():
+    # The runtime `host_memory` page-locks with: another one does not know
+    # its allocations.
+    hip = host_memory._hip_runtime()
+    if hip is None:
+        return None
     try:
-        fn = ctypes.CDLL("libamdhip64.so").hipHostGetDevicePointer
-    except OSError:
+        fn = hip.hipHostGetDevicePointer
+    except AttributeError:
         return None
     fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
     return fn
@@ -59,6 +64,10 @@ class PleHostTable:
     that mapping fail (`hipErrorInvalidValue`, or a GPU memory fault). The
     registered pages would also be private copies (the mapping is
     `MAP_PRIVATE`), so registering would not share them across processes.
+    And the kernel reads a shard from one base address, while in-place
+    registrations of adjacent, unaligned shards share their boundary pages
+    (`host_memory._PageRuns`): a shard then spans device ranges that are
+    mapped apart.
 
     One shard that cannot be page-locked moves the table to `device` -- the
     rows already pinned are copied over -- and the addresses point there
