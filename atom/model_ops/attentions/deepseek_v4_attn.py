@@ -94,6 +94,7 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
 )
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     CSA_INDEXER_SCALE,
+    FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
     MAIN_KV_NOPE,
     fp4_indexer_block_fields,
@@ -117,6 +118,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.indexer import (
+    MFMA,
     NATURAL,
     PRESHUFFLE,
     ConcatKeys,
@@ -529,10 +531,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         # FP4 indexer cache (the native single-node default except on gfx942).
         # When enabled, the CSA Indexer KV is
-        # stored as packed FP4 E2M1 + per-group(32) e8m0 scale. gfx950 keeps
-        # the `pa_mqa_logits_fp4` preshuffle; gfx1250 uses OPUS natural rows.
-        # Both are written by `fused_compress_attn(quant_mode="fp4")`. The
-        # scoring path is selected from the same architecture layout policy.
+        # stored as packed FP4 E2M1 + per-group(32) e8m0 scale. The writer and
+        # scorer use the same architecture/backend layout policy.
         # Explicit fp8 keeps the existing FP8 (+fp32 scale) path byte-identical.
         # `--index_cache_dtype` remains an explicit override. This is the
         # authoritative decision re-asserted onto every Indexer in
@@ -545,24 +545,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
         self.indexer_layout = (
-            fp4_indexer_layout_for_arch(get_gfx()) if self._indexer_fp4 else "fp8"
+            fp4_indexer_layout_for_arch(get_gfx(), backend=envs.ATOM_V4_UNIFIED_MQA)
+            if self._indexer_fp4
+            else "fp8"
         )
-        if self.indexer_layout == FP4_GFX1250_NATURAL:
-            if self.max_bs > 2048:
-                raise ValueError(
-                    f"gfx1250 OPUS FP4 MQA supports batch <= 2048, got max_bs={self.max_bs}"
-                )
+        if self.indexer_layout in (FP4_GFX950_OPUS, FP4_GFX1250_NATURAL):
             from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
-                pa_mqa_logits_mxfp4_block_table_width,
+                mqa_logits_mxfp4_config,
             )
 
-            # Size for every compiled gfx1250 kernel instance. The qlen=1 and
-            # qlen=4 variants currently share a 64-token KV tile, but the AITER
-            # helper is the ABI authority if a future instance changes it.
-            opus_cols = pa_mqa_logits_mxfp4_block_table_width(
-                self.max_model_len_idx,
-                kv_block_size=self.csa_rows_per_block,
-            )
+            # The config owns the scorer's table-width requirement.
+            opus_cols = mqa_logits_mxfp4_config(
+                self.device,
+                heads=self.index_n_heads,
+                page_size=self.csa_rows_per_block,
+                max_rows=self.max_bs,
+                max_seqs=self.max_bs,
+                max_qlen=1,
+                max_seq_len=self.max_model_len_idx,
+            ).block_table_width
             if opus_cols > self.block_table_cols:
                 self.block_table_cols = opus_cols
                 # CommonAttentionBuilder allocated this buffer before the
@@ -1842,7 +1843,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     )
                 # Indexer-inner cache is always fp8 (independent of
                 # kv_cache_dtype); it has no separate rope pool.
-                module.quant_mode = "fp4" if self._indexer_fp4 else "per_row_fp8"
+                module.quant_mode = (
+                    "fp4_gfx950_opus"
+                    if self.indexer_layout == FP4_GFX950_OPUS
+                    else "fp4" if self._indexer_fp4 else "per_row_fp8"
+                )
                 module.kv_cache_rope = None
             elif ratio in (CSA_RATIO, HCA_RATIO):
                 table = (
@@ -2171,9 +2176,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.csa_rows_per_block,
             layout=(
-                NATURAL if self.indexer_layout == FP4_GFX1250_NATURAL else PRESHUFFLE
+                NATURAL
+                if self.indexer_layout == FP4_GFX1250_NATURAL
+                else MFMA if self.indexer_layout == FP4_GFX950_OPUS else PRESHUFFLE
             ),
-            row_to_batch=attn_metadata.batch_id_per_q_token[: row_ends.shape[0]],
             storage=storage,
         )
 

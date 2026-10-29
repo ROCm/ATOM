@@ -24,7 +24,7 @@ import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits, flydsl_pa_mqa_logits_fp4
-from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4
+from aiter.ops.opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -33,7 +33,7 @@ from atom.distributed.dcp_utils import get_dcp_group
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
-from .rows import NATURAL, IndexCache, IndexRows
+from .rows import MFMA, NATURAL, IndexCache, IndexRows
 
 # gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
 # included); it reads the same packed preshuffled pages as the Triton kernel
@@ -264,21 +264,19 @@ def _fp4_band_logits(
     """FP4 band `band`'s logits into `scores`, launched as the step planned it
     (`IndexRows.fp4_bands`): a token graph's break. `offsets`: packed rows."""
     launch = rows.fp4_bands[band]
-    if cache.layout == NATURAL:
+    if cache.layout in (NATURAL, MFMA):
         if weights.dtype != torch.bfloat16:
             raise TypeError(f"OPUS FP4 MQA reads BF16 weights, got {weights.dtype}")
-        pa_mqa_logits_mxfp4(
+        mqa_logits_mxfp4(
             values.squeeze(1),
             scales.squeeze(1),
             cache.values,
             cache.scales,
-            launch["block_tables"],
             weights,
-            launch["plan"],
-            rows.width,
             weight_scale=weight_scale,
-            kv_block_size=cache.rows_per_block,
             out=scores,
+            out_offsets=offsets,
+            **launch,
         )
         return scores
     flydsl_pa_mqa_logits_fp4(

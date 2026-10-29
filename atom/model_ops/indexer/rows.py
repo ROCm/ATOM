@@ -9,8 +9,8 @@ from typing import Any, NamedTuple
 
 import torch
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
-    pa_mqa_logits_mxfp4_plan,
-    pa_mqa_logits_mxfp4_plan_buffers,
+    mqa_logits_mxfp4_config,
+    mqa_logits_mxfp4_schedule,
 )
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
@@ -23,6 +23,8 @@ from atom.model_ops.sparse_indexer_chunk import (
 PRESHUFFLE = "preshuffle"
 # gfx1250: FP4 rows in natural order, scored by the OPUS kernels.
 NATURAL = "natural"
+# gfx950 OPUS: MFMA-permuted scales, distinct from FlyDSL's preshuffle.
+MFMA = "mfma"
 
 
 class IndexCache(NamedTuple):
@@ -109,14 +111,14 @@ class IndexRows(NamedTuple):
 class Fp4LaunchStorage:
     """Fixed homes for a recorded decode's per-step FP4 launch arguments: a
     captured graph replays the addresses it recorded, so each band's query
-    starts and OPUS plan are rewritten in place every step rather than
+    starts and OPUS schedule are rewritten in place every step rather than
     allocated afresh (`fp4_rows`). One per set of rows live at once -- a TBO
     ubatch has its own."""
 
     def __init__(self, device, rows: int, sequences: int):
         self.device, self.rows, self.sequences = device, rows, sequences
         self._starts: dict[int, torch.Tensor] = {}
-        self._plans: dict[tuple[int, str], Any] = {}
+        self._schedules: dict[tuple[int, Any], Any] = {}
 
     def starts(self, band: int) -> torch.Tensor:
         """Band `band`'s query starts, `[sequences + 1]`."""
@@ -126,15 +128,12 @@ class Fp4LaunchStorage:
             )
         return self._starts[band]
 
-    def plan_buffers(self, band: int, max_qlen: int):
-        """Band `band`'s OPUS plan, the variant a sequence of `max_qlen` rows
-        launches."""
-        variant = "qlen1_kv64" if max_qlen == 1 else "qlen4_kv64"
-        if (band, variant) not in self._plans:
-            self._plans[band, variant] = pa_mqa_logits_mxfp4_plan_buffers(
-                self.device, self.rows, self.sequences, variant=variant
-            )
-        return self._plans[band, variant]
+    def schedule_buffers(self, band: int, cfg):
+        """One band's buffers for this config; never shared between ubatches."""
+        key = (band, cfg)
+        if key not in self._schedules:
+            self._schedules[key] = cfg.schedule_buffers()
+        return self._schedules[key]
 
 
 class Fp4LaunchStorages(dict):
@@ -209,7 +208,6 @@ def fp4_rows(
     heads: int,
     page_size: int,
     layout: str = PRESHUFFLE,
-    row_to_batch: torch.Tensor | None = None,
     row_tables: torch.Tensor | None = None,
     row_starts: torch.Tensor | None = None,
     bands: tuple[tuple[int, int], ...] | None = None,
@@ -218,8 +216,8 @@ def fp4_rows(
     storage: Fp4LaunchStorage | None = None,
 ) -> IndexRows:
     """FP4 rows, a sequence's together (`sequences`), each band's launch
-    planned here, once: the row-group plan (preshuffle) or the OPUS plan
-    (natural, which also takes each row's sequence, `row_to_batch`).
+    prepared here, once: the row-group plan (preshuffle) or the OPUS config
+    (natural/MFMA), with a shared schedule for V4 decode.
     `page_size` is the cache's index rows a block. Without `sequences` each
     row is a sequence of its own on its own `row_tables` row, a band's
     starting at `row_starts` (`[rows + 1]`, 0 .. rows). Rows a graph records
@@ -247,19 +245,45 @@ def fp4_rows(
                 out=None if storage is None else storage.starts(index),
             )
         )
-        if layout == NATURAL:
-            plan = pa_mqa_logits_mxfp4_plan(
-                band.query_start_loc,
-                ends,
-                buffers=(
-                    None
-                    if storage is None
-                    else storage.plan_buffers(index, band.max_qlen)
-                ),
-                total_q=end - first,
-                row_to_batch=row_to_batch[first:end],
+        if layout in (NATURAL, MFMA):
+            cfg = mqa_logits_mxfp4_config(
+                row_ends.device,
+                heads=heads,
+                page_size=page_size,
+                pages_per_block=band.pages_per_block,
+                max_rows=end - first,
+                max_seqs=band.query_start_loc.numel() - 1,
+                max_qlen=band.max_qlen,
+                max_seq_len=width,
             )
-            launches.append({"block_tables": band.block_tables, "plan": plan})
+            # V4 amortizes one decode schedule across its indexer layers.
+            # Prefill and V4.1 use the config-selected schedule-free mode.
+            schedule = None
+            if heads == 64 and band.max_qlen <= 8:
+                schedule = mqa_logits_mxfp4_schedule(
+                    cfg,
+                    band.query_start_loc,
+                    ends,
+                    buffers=(
+                        None
+                        if storage is None
+                        else storage.schedule_buffers(index, cfg)
+                    ),
+                )
+            table = band.block_tables
+            if table.shape[1] < cfg.block_table_width:
+                table = torch.nn.functional.pad(
+                    table, (0, cfg.block_table_width - table.shape[1])
+                )
+            launches.append(
+                {
+                    "cfg": cfg,
+                    "schedule": schedule,
+                    "block_tables": table,
+                    "query_start_loc": band.query_start_loc,
+                    "row_ends": ends,
+                }
+            )
         else:
             launches.append(
                 band.kernel_args(

@@ -16,7 +16,7 @@ from aiter.ops.quant import dynamic_per_token_scaled_quant
 
 from atom.model_ops.v4_kernels import scale_indexer_weights
 
-from .rows import NATURAL, PRESHUFFLE
+from .rows import MFMA, NATURAL, PRESHUFFLE
 
 
 def quantize_query(
@@ -54,15 +54,21 @@ def quantize_query(
         )
         return values, scales.view(rows, heads, 1)
     values = torch.empty(rows, heads, dim // 2, dtype=torch.uint8, device=query.device)
-    if layout == NATURAL:
+    if layout == MFMA:
+        if heads != 64 or dim != 128:
+            raise ValueError("gfx950 OPUS queries require heads=64, dim=128")
+        scales = torch.empty(rows, 2, 32, 4, dtype=torch.uint8, device=query.device)
+    elif layout == NATURAL:
         scales = torch.empty(
             rows, heads, dim // 32, dtype=torch.uint8, device=query.device
         )
-    else:
+    elif layout == PRESHUFFLE:
         scales = torch.empty(
             rows, dim // 128, 4, 16, -(-(heads // 16) // 4) * 4,
             dtype=torch.uint8, device=query.device,
         )  # fmt: skip
+    else:
+        raise ValueError(f"unknown FP4 query layout {layout!r}")
     rope_rotate_activation(
         values.view(dtypes.fp4x2),
         query,
@@ -72,7 +78,7 @@ def quantize_query(
         rope_dim,
         out_scale=scales,
         group_size=32,
-        shuffle_scale=layout != NATURAL,
+        scale_layout={NATURAL: "none", MFMA: "opus", PRESHUFFLE: "flydsl"}[layout],
         do_rotate_act=False,
         round_rope=round_rope,
     )

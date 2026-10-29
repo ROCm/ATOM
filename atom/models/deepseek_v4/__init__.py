@@ -73,6 +73,7 @@ from atom.model_loader.weight_utils import local_model_dir
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
     fp4_indexer_layout_for_arch,
 )
@@ -81,6 +82,7 @@ from atom.model_ops.communication_op import (
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.indexer import (
+    MFMA,
     NATURAL,
     PRESHUFFLE,
     IndexCache,
@@ -1453,18 +1455,25 @@ class Indexer(nn.Module):
         self._indexer_fp4 = fp4_indexer_enabled(
             get_current_atom_config().index_cache_dtype
         )
-        self.quant_mode = "fp4" if self._indexer_fp4 else "per_row_fp8"
         # `quant_mode` says how values are quantized; `indexer_layout` says how
         # those values are physically stored and therefore which scorer ABI
-        # consumes them. Both gfx950 and gfx1250 use quant_mode="fp4", but their
-        # preshuffled/natural layouts are intentionally incompatible.
+        # consumes them. Query scales and cache writes must select it together.
         self.indexer_layout = (
-            fp4_indexer_layout_for_arch(get_gfx_runtime())
+            fp4_indexer_layout_for_arch(
+                get_gfx_runtime(), backend=envs.ATOM_V4_UNIFIED_MQA
+            )
             if self._indexer_fp4
             else "fp8"
         )
         self._layout = (
-            NATURAL if self.indexer_layout == FP4_GFX1250_NATURAL else PRESHUFFLE
+            NATURAL
+            if self.indexer_layout == FP4_GFX1250_NATURAL
+            else MFMA if self.indexer_layout == FP4_GFX950_OPUS else PRESHUFFLE
+        )
+        self.quant_mode = (
+            "fp4_gfx950_opus"
+            if self._layout == MFMA
+            else "fp4" if self._indexer_fp4 else "fp8_per_row"
         )
         self.compressor = Compressor(
             args,
@@ -1654,6 +1663,8 @@ class Indexer(nn.Module):
             return IndexCache(
                 self.kv_cache, self.kv_scale, self.kv_cache.size(1), NATURAL
             )
+        if self._layout == MFMA:
+            return IndexCache(self.kv_cache, self.kv_scale, self.kv_cache.size(2), MFMA)
         # The row-group readers' packed-dword scale contract (N_PHYS == 1)
         # holds at 64 rows a block only: fail loudly on any other.
         assert self.kv_cache.size(3) == 64, (

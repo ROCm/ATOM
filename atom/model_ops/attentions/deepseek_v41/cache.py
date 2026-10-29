@@ -3,6 +3,7 @@
 
 import numpy as np
 import torch
+from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     gather_prefix_rows,
@@ -19,7 +20,10 @@ from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
-from atom.model_ops.deepseek_v41.index_plane import IndexUnits
+from atom.model_ops.deepseek_v41.index_plane import (
+    IndexUnits,
+    fp4_index_layout_for_arch,
+)
 from atom.model_ops.deepseek_v41.index_write import (
     write_index_rows,
     write_index_rows_fp4,
@@ -115,7 +119,12 @@ class PagedAttentionCache:
                 *(
                     plane.view(-1, geometry.index_block_rows, plane.shape[-1])
                     for plane in planes
-                )
+                ),
+                layout=(
+                    fp4_index_layout_for_arch(get_gfx())
+                    if geometry.index_fp4
+                    else "fp8"
+                ),
             )
             for owner, planes in self.index_planes.items()
         }

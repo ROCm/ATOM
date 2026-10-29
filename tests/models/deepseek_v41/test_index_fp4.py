@@ -62,8 +62,11 @@ def _write(keys, table, per_page, ratio, rows, units, norm, rope, batch=0):
     return torch.where(plan[:, 1] >= 0, slots, -1)
 
 
+@pytest.mark.parametrize("layout", ["preshuffle", "natural"])
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_fp4_writer_stores_the_quantized_key_in_the_rowgroup_layout(monkeypatch, ratio):
+def test_fp4_writer_stores_the_quantized_key_in_the_selected_layout(
+    monkeypatch, ratio, layout
+):
     """Bytes equal to the model's own key chain (RMSNorm, RoPE, `quantize_fp4`)
     packed by the scorer's `pack_kv_cache` at the slot the plan and PAGE table
     give; a sentinel row writes nothing."""
@@ -77,6 +80,7 @@ def test_fp4_writer_stores_the_quantized_key_in_the_rowgroup_layout(monkeypatch,
     pages, per_page = 4, 64
     norm, rope = _norm(monkeypatch), _rope()
     values, scales, units = _pool(pages, per_page)
+    units = units._replace(layout=layout)
     table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")
     rows = pages * per_page
     keys = (3 * torch.randn(rows, DIM, device="cuda")).bfloat16()
@@ -90,7 +94,11 @@ def test_fp4_writer_stores_the_quantized_key_in_the_rowgroup_layout(monkeypatch,
     natural_s = torch.zeros(rows, DIM // 32, dtype=torch.uint8, device="cuda")
     natural_v[slots[live]] = ref_v.view(torch.uint8)[live]
     natural_s[slots[live]] = ref_s.view(torch.uint8)[live]
-    packed_v, packed_s = pack_kv_cache(natural_v, natural_s, PAGE)
+    packed_v, packed_s = (
+        (natural_v, natural_s)
+        if layout == "natural"
+        else pack_kv_cache(natural_v, natural_s, PAGE)
+    )
     assert torch.equal(values.flatten(), packed_v.flatten())
     assert torch.equal(scales.flatten(), packed_s.flatten())
 

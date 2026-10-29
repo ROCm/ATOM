@@ -24,6 +24,8 @@ from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
 from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
 
+from .index_plane import FP4_FLYDSL, FP4_OPUS
+
 MFMA_N = 16
 """Columns one shuffled group interleaves: the MFMA B operand's width.
 
@@ -166,6 +168,7 @@ def _write_index_fp4_kernel(
     HEAD_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     PAGE: tl.constexpr,
+    NATURAL: tl.constexpr,
 ):
     """One program per plan row, as `_write_index_kernel`: its key normed
     (RMSNorm, rounded to bf16 as the norm's output is), its RoPE tail rotated
@@ -204,13 +207,19 @@ def _write_index_fp4_kernel(
     value_at = ((chunk // 4 * LANE_KEYS + t % LANE_KEYS) * 4 + chunk % 4) * (
         PAGE // LANE_KEYS
     ) + t // LANE_KEYS
+    value_offset = value_at * 16 + b % 16
+    if NATURAL:
+        value_offset = t * (HEAD_DIM // 2) + b
     tl.store(
-        values + page * (PAGE * HEAD_DIM // 2) + value_at * 16 + b % 16,
+        values + page * (PAGE * HEAD_DIM // 2) + value_offset,
         tl.reshape(packed, (HEAD_DIM // 2,)),
     )
     g = tl.arange(0, HEAD_DIM // 32)
+    scale_offset = g * PAGE + t
+    if NATURAL:
+        scale_offset = t * (HEAD_DIM // 32) + g
     tl.store(
-        scales + page * (PAGE * HEAD_DIM // 32) + g * PAGE + t,
+        scales + page * (PAGE * HEAD_DIM // 32) + scale_offset,
         tl.reshape(e8m0, (HEAD_DIM // 32,)),
     )
 
@@ -224,6 +233,8 @@ def write_index_rows_fp4(
     count = plan.shape[0]
     if not count:
         return
+    if units.layout not in (FP4_FLYDSL, FP4_OPUS):
+        raise ValueError(f"unknown V4.1 FP4 index layout {units.layout!r}")
     _write_index_fp4_kernel[(count,)](
         keys,
         norm.weight,
@@ -240,4 +251,5 @@ def write_index_rows_fp4(
         HEAD_DIM=keys.shape[-1],
         ROPE_DIM=rope.rope_dim,
         PAGE=units.values.shape[1],
+        NATURAL=units.layout == FP4_OPUS,
     )
