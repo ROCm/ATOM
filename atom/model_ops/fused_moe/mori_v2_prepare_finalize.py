@@ -837,7 +837,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             arena_rows = (
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
             )
-            bound = self._recv_bound(topk_ids, arena_rows)
+            bound = self._recv_bound(arena_rows)
             # The "Direction-3" shrink, reproduced from the base-class walk: the
             # bound leaves graph_bs*topk*dp rows, but mori de-duplicates per
             # destination rank, so at most graph_bs*max_seqlen_q*dp can be live.
