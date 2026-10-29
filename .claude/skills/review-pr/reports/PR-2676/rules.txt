@@ -1,3 +1,0 @@
-  files=4  types=2  rules=5/36
-    [plugin-bridge       ] E2 E3
-    [dispatch-change     ] B1 B2 B6

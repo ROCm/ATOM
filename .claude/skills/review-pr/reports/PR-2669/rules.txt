@@ -1,7 +1,0 @@
-  files=3  types=6  rules=13/36
-    [tier2-shared-op     ] A1 A2 B6
-    [aiter-dep           ] E1 B5
-    [fp8-quant           ] C1 C2
-    [cudagraph-capture   ] D1 D4
-    [ep-tp-shapes        ] A3 B2
-    [stream-lifetime     ] G1 G1b
