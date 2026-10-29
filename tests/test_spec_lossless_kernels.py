@@ -27,13 +27,12 @@ if not torch.cuda.is_available():
 
 import triton
 import triton.language as tl
+from spec_lossless_reference import dspark_markov_sample_reference, sparse_q_reference
 
 from atom.model_ops.dspark_markov_sample import (
     dspark_markov_argmax,
     dspark_markov_sample,
-    dspark_markov_sample_reference,
     dspark_markov_sample_scratch,
-    sparse_q_reference,
 )
 from atom.model_ops.rejection_sampler import (
     _RATIO_ACCEPT_KEY,
