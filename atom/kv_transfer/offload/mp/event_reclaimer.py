@@ -84,4 +84,22 @@ class IPCEventReclaimer:
         # Swap before dropping references: callbacks that retire more events
         # while this batch is reclaimed leave them for the next safe point.
         retired, self._retired = self._retired, deque()
+        # Destroy only events whose work has completed. Destroying an
+        # incomplete HIP IPC event synchronizes on it, and the work it waits
+        # for can depend on a DP peer: the MP server's copy for this rank may
+        # sit behind one for a peer whose GPU is waiting in the collective
+        # this rank has not launched yet. Unfinished events stay for the next
+        # forward's rendezvous.
+        keep = deque(event for event in retired if not _completed(event))
         retired.clear()
+        self._retired.extendleft(reversed(keep))
+
+
+def _completed(event: Any) -> bool:
+    query = getattr(event, "query", None)
+    if not callable(query):
+        return True
+    try:
+        return bool(query())
+    except Exception:  # noqa: BLE001 - unknown status: keep the event
+        return False
