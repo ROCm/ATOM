@@ -12,9 +12,11 @@ payload mapping and PAGE/SLOT policy.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import logging
 import os
+import struct
 import threading
 import time
 import weakref
@@ -61,6 +63,45 @@ def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
     LMCache owns it outright.
     """
     return torch.from_numpy(np.asarray(tokens, dtype=np.int64))
+
+
+# How many leading ids of a multimodal prompt carry its media identity
+# (`tier_token_ids`): 4 x 31 bits covers the 64-bit `cache_seed`. The high bit
+# keeps a keyed id off every vocabulary id, and 32 bits is what the LMCache MP
+# server packs one id into.
+_MEDIA_KEY_TOKENS = 4
+_MEDIA_KEY_BIT = 1 << 31
+_MEDIA_KEY_PERSON = b"atom-lmc-media"
+
+
+def tier_token_ids(seq, end: int) -> list[int]:
+    """``seq``'s first ``end`` token ids, as LMCache keys them.
+
+    LMCache keys a chunk on the ids up to its end. A multimodal prompt's
+    placeholder ids are the same for every image, so two prompts that differ
+    only in their pictures would share every KV chunk, while a hybrid's state
+    images are filed under ``BlockManager`` hashes seeded with
+    ``Sequence.cache_seed`` and do not. Folding the media identity into the
+    first ids seeds every chunk key with it, as ``chain_seed`` seeds
+    mooncake_store's. A text prompt (``cache_seed == -1``) keys exactly as
+    before. Each keyed id depends on its own position and id only, so a
+    prefix's keys are those of the whole prompt.
+    """
+    tokens = list(seq.token_ids[:end])
+    seed = getattr(seq, "cache_seed", -1)
+    if seed is None or int(seed) == -1:
+        return tokens
+    salt = int(seed).to_bytes(16, "little", signed=True)
+    for i in range(min(_MEDIA_KEY_TOKENS, len(tokens))):
+        digest = hashlib.blake2b(
+            salt + struct.pack("<Iq", i, int(tokens[i])),
+            digest_size=4,
+            person=_MEDIA_KEY_PERSON,
+        ).digest()
+        tokens[i] = _MEDIA_KEY_BIT | (
+            int.from_bytes(digest, "little") & (_MEDIA_KEY_BIT - 1)
+        )
+    return tokens
 
 
 def validated_kv_role(kvc: dict) -> str:

@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
+    tier_token_ids,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
@@ -206,7 +207,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # locks belong to the requested endpoint. A full-prompt query followed
         # by rounding the result would pair the earlier KV with later state.
         boundary = self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
-        return list(seq.token_ids[:boundary])
+        return tier_token_ids(seq, boundary)
 
     def _lookup_len(self, seq: Any) -> int:
         return self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
