@@ -19,6 +19,31 @@ def mooncake_hca(local_rank, environ=os.environ):
     return f'rdma{physical_gpu}'
 
 
+def prefer_own_store_segment(path):
+    """Place this rank's Store objects on the segment it contributes.
+
+    The image's Mooncake 0.3.13.post1 is built without ENABLE_MULTI_PROTOCOL, so
+    its HIP transport republishes every segment as protocol "hip". A PUT or GET
+    whose replica sits in another process's host segment on this node then goes
+    to the HIP transport, which only knows device buffers, and fails with
+    TRANSFER_FAIL (job 11048). Keys carry tp_rank, so a rank only reads its own.
+    """
+    import vllm.v1.worker.gpu_worker as worker_module
+    group = worker_module.get_kv_transfer_group()
+    segments = []
+    for connector in getattr(group, '_connectors', [group]):
+        worker = getattr(connector, 'connector_worker', None)
+        if worker is None or not hasattr(worker, 'store_replicate_config'):
+            continue
+        segment = worker.store.get_hostname()
+        worker.store_replicate_config.preferred_segment = segment
+        segments.append(segment)
+    write_json(path, {'preferred_segments': segments})
+    if not segments:
+        raise RuntimeError('No Mooncake Store connector on this Prefill worker')
+    print(f'[store-segment] preferred_segment={segments}', flush=True)
+
+
 class StoreMemoryWorker(Worker):
     def _diagnostic_dir(self):
         return (Path(os.environ['ATOMESH_VLLM_MEMORY_DIR']) / 'runtime-evidence'
@@ -128,6 +153,8 @@ class StoreMemoryWorker(Worker):
                 worker_module.ensure_kv_transfer_initialized = original_ensure
             if bind_store:
                 bind_thread_memory(None)
+        if role == 'prefill' and os.environ.get('ATOMESH_VLLM_STORE_OWN_SEGMENT', '1') == '1':
+            prefer_own_store_segment(out / f'{role}-rank-{self.local_rank}-store-segment.json')
         record_runtime(evidence, 'after-kv-init')
         probe(evidence, 'after-kv-init', 4)
         return result
