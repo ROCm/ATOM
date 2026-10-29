@@ -45,4 +45,8 @@ def gemma_rms_norm_fp8(x, weight, epsilon, residual=None):
 
 
 def gemma_rms_norm_fp8_supported(hidden_width: int) -> bool:
-    return _fused_per_token_quant is not None and hidden_width <= MAX_HIDDEN
+    return (
+        _fused_per_token_quant is not None
+        and hidden_width <= MAX_HIDDEN
+        and dtypes.fp8 == torch.float8_e4m3fn
+    )

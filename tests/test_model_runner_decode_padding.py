@@ -112,6 +112,7 @@ def test_runner_model_height_and_sampling_rows(
         runner_module, "get_pp_group", lambda: SimpleNamespace(world_size=1)
     )
     expected_rows = running if unified and not prefill else scheduled
+    sp_prefill = sp_rank is not None and prefill
 
     def global_ids():
         full = torch.zeros(expected_rows, dtype=ids.dtype)
@@ -129,6 +130,11 @@ def test_runner_model_height_and_sampling_rows(
             return input_ids[:, None].float()
 
         def compute_logits(self, hidden):
+            if sp_prefill:
+                # The LM head picks each prompt's last row from the local shard.
+                full = global_ids()[:, None].float()
+                torch.testing.assert_close(hidden, ulysses_sp.sp_split_tokens(full))
+                hidden = full[:scheduled]
             assert hidden.shape[0] == scheduled
             return hidden + 1
 
@@ -146,7 +152,10 @@ def test_runner_model_height_and_sampling_rows(
     logits, hidden = runner.run_model(ids[:scheduled])
     # MegaMoE epochs advance on graph replays as well as eager steps.
     runner.sp_mega_moe.count_step.assert_called_once_with()
-    assert hidden.shape == (scheduled, 1)
+    if sp_prefill:
+        assert hidden is None
+    else:
+        assert hidden.shape == (scheduled, 1)
     torch.testing.assert_close(logits[:, 0], torch.arange(2, scheduled + 2).float())
     assert torch.all(ids[running:] == -99)
     for name, (original, values) in original_metadata.items():

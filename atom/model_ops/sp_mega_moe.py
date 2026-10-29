@@ -313,7 +313,7 @@ def sp_mega_moe_block(
     layer = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return layer._sp_mega_moe.forward_block(
+    return layer.sp_mega_moe.forward_block(
         layer,
         attention,
         residual,
@@ -365,27 +365,18 @@ def _unsupported_config(config):
     return None
 
 
-def _mega_moe_decoders(model):
-    """Decoders that expose their FusedMoE as `sp_mega_moe_experts`.
+def _model_layers(model, config):
+    """The registered `(layers, norm_eps)` of the model, or None.
 
-    The model runs each one's FFN region through `sp_mega_moe_block`: the
+    The model runs each layer's FFN region through `sp_mega_moe_block`: the
     post-attention GemmaRMSNorm, the router, the experts, and the next layer's
-    input GemmaRMSNorm.
+    input GemmaRMSNorm, all with `norm_eps`.
     """
-    from atom.model_ops.layernorm import GemmaRMSNorm
+    from atom.models.registry import sp_mega_moe_layers
+    from atom.utils import resolve_obj_by_qualname
 
-    decoders = [
-        module
-        for module in model.modules()
-        if getattr(module, "sp_mega_moe_experts", None) is not None
-    ]
-    if any(
-        not isinstance(decoder.input_layernorm, GemmaRMSNorm)
-        or not isinstance(decoder.post_attention_layernorm, GemmaRMSNorm)
-        for decoder in decoders
-    ):
-        return None
-    return decoders
+    find = sp_mega_moe_layers.get(config.hf_config.architectures[0])
+    return None if find is None else resolve_obj_by_qualname(find)(model)
 
 
 # MegaMoeTP setup failures that AITER gathers and raises on every rank.
@@ -414,21 +405,14 @@ def initialize_sp_mega_moe(model, config):
     reason = _unsupported_config(config)
     if reason is not None:
         return skip(reason)
-    decoders = _mega_moe_decoders(model)
-    if not decoders:
-        return skip("the model exposes no GemmaRMSNorm MoE decoder layers")
-    layers = [decoder.sp_mega_moe_experts for decoder in decoders]
+    found = _model_layers(model, config)
+    if not found or not found[0]:
+        return skip("the model has no MoE layers it can run through it")
+    layers, tail_eps = found
     for layer in layers:
         reason = _unsupported_layer(layer)
         if reason is not None:
             return skip(f"{layer.prefix}: {reason}")
-    # One eps for the post-attention norm and the next input norm the tail fuses.
-    tail_eps = decoders[0].input_layernorm.variance_epsilon
-    if any(
-        decoder.post_attention_layernorm.variance_epsilon != tail_eps
-        for decoder in decoders
-    ):
-        return skip("the RMSNorm eps differs across layers")
     shapes = {
         (
             layer.hidden_size,
@@ -491,9 +475,7 @@ def initialize_sp_mega_moe(model, config):
         return skip(f"MegaMoeTP setup failed on every rank: {exc}")
     backend = SPMegaMoE(runtime, len(layers) * math.ceil(max_local_rows / tile))
     for layer in layers:
-        layer._sp_mega_moe = backend
-    for decoder in decoders:
-        decoder._sp_mega_layer_name = decoder.sp_mega_moe_experts.layer_name
+        layer.sp_mega_moe = backend
     logger.info(
         "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens, "
         "lb_mt=%s. Each tail supplies the next GemmaNorm/FP8 (final layer BF16).",

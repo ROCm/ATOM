@@ -37,7 +37,7 @@ def test_rank_receives_its_query_heads_kv_groups_and_indexer(monkeypatch, world)
         ]
 
     monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", world)
-    monkeypatch.setattr(ulysses_sp, "_prefer_all_gather", lambda x, group: True)
+    monkeypatch.setattr(ulysses_sp, "prefer_custom_gather", lambda x, group: True)
     for rank in range(world):
         queries = range(rank * q_heads // world, (rank + 1) * q_heads // world)
         kv = sorted({h // (q_heads // kv_heads) for h in queries})

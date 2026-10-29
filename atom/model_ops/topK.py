@@ -202,8 +202,12 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
     -- as when routing ran after the gather -- not the one it had on the rank
     that routed it. The weights stay: a scored shared column's are the row's
     own. The shared columns are never written after the prefill, so any
-    micro-batch may read rows from 0."""
-    if layer.expert_layout.mode is not SharedExpertMode.LEGACY_AITER:
+    micro-batch may read rows from 0. Without EP every row carries the same
+    prefilled ids, so there is nothing to move."""
+    if (
+        layer.expert_layout.mode is not SharedExpertMode.LEGACY_AITER
+        or not layer.use_ep
+    ):
         return
     assert aiter_topK_meta_data is not None, (
         "AITER topK meta data is not initialized. "

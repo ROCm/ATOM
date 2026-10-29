@@ -142,7 +142,7 @@ def test_full_op_preserves_rank_rows_residual_and_output_ownership(
     backend.supports = lambda layer, rows: True
     backend._route = route
     layer = SimpleNamespace(
-        _sp_mega_moe=backend,
+        sp_mega_moe=backend,
         w13_weight=object(),
         w13_weight_scale=object(),
         w2_weight=object(),
@@ -221,16 +221,14 @@ def test_layer_shapes_follow_the_model_and_ineligible_layers_stay_native(
     assert "w2_weight" in fusion._unsupported_layer(layer)
 
     # Enabled by default: an ineligible model must load on the native MoE.
-    decoder = SimpleNamespace(sp_mega_moe_experts=layer)
     monkeypatch.setattr(ulysses_sp, "get_sp_world_size", lambda: 4)
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
-    monkeypatch.setattr(fusion, "_mega_moe_decoders", lambda model: [decoder])
+    monkeypatch.setattr(fusion, "_model_layers", lambda model, config: ([layer], 1e-6))
     config = SimpleNamespace(sp_mega_moe_enabled=True)
     assert fusion.initialize_sp_mega_moe(object(), config) is None
     # The compile hash reads the flag; native graphs must not reuse mega ones.
     assert config.sp_mega_moe_enabled is False
-    assert not hasattr(decoder, "_sp_mega_layer_name")
-    assert not hasattr(layer, "_sp_mega_moe")
+    assert getattr(layer, "sp_mega_moe", None) is None
 
 
 @pytest.mark.parametrize(
@@ -249,10 +247,6 @@ def test_runtime_setup_failure_keeps_the_native_moe(
     from atom.distributed import ulysses_sp
 
     layer = _servable_layer(sp_modules.moe)
-    norm = SimpleNamespace(variance_epsilon=1e-6)
-    decoder = SimpleNamespace(
-        sp_mega_moe_experts=layer, input_layernorm=norm, post_attention_layernorm=norm
-    )
     mega = ModuleType("aiter.ops.flydsl.mega_moe_tp")
     mega.MegaMoeTPConfig = dict
     mega.MegaMoeTP = Mock(side_effect=error)
@@ -264,7 +258,7 @@ def test_runtime_setup_failure_keeps_the_native_moe(
         lambda: SimpleNamespace(world_size=4, rank_in_group=0, cpu_group=None),
     )
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
-    monkeypatch.setattr(fusion, "_mega_moe_decoders", lambda model: [decoder])
+    monkeypatch.setattr(fusion, "_model_layers", lambda model, config: ([layer], 1e-6))
     config = SimpleNamespace(sp_mega_moe_enabled=True, max_num_batched_tokens=1024)
     if not falls_back:
         with pytest.raises(type(error)):
@@ -274,7 +268,7 @@ def test_runtime_setup_failure_keeps_the_native_moe(
     assert fusion.initialize_sp_mega_moe(object(), config) is None
     assert config.sp_mega_moe_enabled is False
     assert mega.MegaMoeTP.call_args.args[0]["max_local_tokens"] == 256
-    assert not hasattr(layer, "_sp_mega_moe")
+    assert getattr(layer, "sp_mega_moe", None) is None
 
 
 @pytest.fixture

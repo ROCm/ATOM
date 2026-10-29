@@ -57,10 +57,11 @@ def test_gather_rows_matches_full_gather(monkeypatch, world):
 
     shards = on_each_rank(lambda _: sp.sp_split_tokens(hidden))
     sent = []
+    monkeypatch.setattr(sp, "get_sp_group", lambda: None)
     monkeypatch.setattr(
-        sp, "_all_gather_tokens", lambda x: sent.append(x) or x.repeat(world, 1)
+        sp, "gather_tokens", lambda x, group: sent.append(x) or x.repeat(world, 1)
     )
     on_each_rank(lambda rank: sp.sp_gather_rows(shards[rank], rows))
-    monkeypatch.setattr(sp, "_all_gather_tokens", lambda x: torch.cat(sent))
+    monkeypatch.setattr(sp, "gather_tokens", lambda x, group: torch.cat(sent))
     for out in on_each_rank(lambda rank: sp.sp_gather_rows(shards[rank], rows)):
         assert torch.equal(out, hidden[rows])
