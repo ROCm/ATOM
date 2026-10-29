@@ -128,3 +128,31 @@ def test_pre_submit_rejection_keeps_other_event_owners():
     assert reclaimer.acquire_ready_event(object) is not event
     owner.ready = True
     assert reclaimer.acquire_ready_event(object) is event
+
+
+class PendingEvent(Event):
+    def __init__(self, destroyed, name):
+        super().__init__(destroyed, name)
+        self.done = False
+
+    def query(self):
+        return self.done
+
+
+def test_unfinished_events_wait_for_a_later_safe_point():
+    """Destroying an unfinished IPC event synchronizes on it, and its work can
+    depend on a DP peer waiting in the collective this rank has not launched:
+    such an event is kept until it completes."""
+    destroyed = []
+    reclaimer = IPCEventReclaimer()
+    pending = PendingEvent(destroyed, "pending")
+    reclaimer.defer(pending)
+    reclaimer.defer(Event(destroyed, "plain"))
+    reclaimer.release()
+    assert destroyed == ["plain"]
+    reclaimer.release()
+    assert destroyed == ["plain"]  # Still running: never destroyed inline.
+    pending.done = True
+    del pending
+    reclaimer.release()
+    assert destroyed == ["plain", "pending"]
