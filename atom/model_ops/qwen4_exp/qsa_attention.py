@@ -45,14 +45,23 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
+from atom.model_ops.qwen4_exp.ops.gated import (
+    is_per_token_fp8_linear,
+    sigmoid_mul,
+    sigmoid_mul_quant,
+)
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
+    qsa_cache_formats,
+    qsa_cache_row_layout,
     qsa_compress_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
+    qsa_store_quantized_rows,
     qsa_store_rows,
 )
+from atom.plugin.prepare import is_plugin_mode
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -279,6 +288,25 @@ class Qwen4ExpAttention(nn.Module):
         # derived arithmetically, which is exact while all three mRoPE rows
         # hold the linear position (i.e. text).
         self.rope_position_cache: torch.Tensor | None = None
+        # Scale planes of the quantized caches; None while a cache is BF16.
+        self.k_scale_cache: torch.Tensor | None = None
+        self.v_scale_cache: torch.Tensor | None = None
+        self.compressed_key_scale: torch.Tensor | None = None
+        # Plugin hosts allocate and bind BF16 caches of their own.
+        self.kv_format, self.index_format = (
+            ("bf16", "bf16") if is_plugin_mode() else qsa_cache_formats(atom_config)
+        )
+        # The MTP draft layer sits past the target stack. It keeps BF16 caches
+        # under quantized target caches, in a row space of its own: an FP8
+        # draft KV costs ~3.5% of the real acceptance length, a BF16 one none.
+        self.qsa_row_space = "qsa"
+        if (
+            layer_num >= int(config.num_hidden_layers)
+            and envs.ATOM_QSA_DRAFT_KV_BF16
+            and (self.kv_format, self.index_format) != ("bf16", "bf16")
+        ):
+            self.kv_format = self.index_format = "bf16"
+            self.qsa_row_space = "qsa_draft"
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
 
     def bind_caches(
@@ -288,12 +316,56 @@ class Qwen4ExpAttention(nn.Module):
         raw_key_cache: torch.Tensor,
         compressed_key_cache: torch.Tensor,
         rope_position_cache: torch.Tensor | None = None,
+        *,
+        k_scale_cache: torch.Tensor | None = None,
+        v_scale_cache: torch.Tensor | None = None,
+        compressed_key_scale: torch.Tensor | None = None,
     ) -> None:
         self.k_cache = k_cache
         self.v_cache = v_cache
         self.raw_key_cache = raw_key_cache
         self.compressed_key_cache = compressed_key_cache
         self.rope_position_cache = rope_position_cache
+        self.k_scale_cache = k_scale_cache
+        self.v_scale_cache = v_scale_cache
+        self.compressed_key_scale = compressed_key_scale
+
+    def _store_kv(self, key, value, slots) -> None:
+        if self.k_scale_cache is None:
+            aiter.reshape_and_cache_flash(
+                key,
+                value,
+                self.k_cache,
+                self.v_cache,
+                slots,
+                "auto",
+                self._unit_scale,
+                self._unit_scale,
+            )
+            return
+        qsa_store_quantized_rows(
+            self.k_cache,
+            self.k_scale_cache,
+            slots,
+            key,
+            self.v_cache,
+            self.v_scale_cache,
+            value,
+        )
+
+    def _attend(self, query, selected, block_tables, token_to_req, decode_reqs):
+        return qsa_sparse_paged_gqa(
+            query,
+            self.k_cache,
+            self.v_cache,
+            selected,
+            block_tables,
+            token_to_req,
+            softmax_scale=self.scaling,
+            num_decode_requests=decode_reqs,
+            k_scale=self.k_scale_cache,
+            v_scale=self.v_scale_cache,
+        )
 
     def _select_tokens(
         self,
@@ -323,9 +395,17 @@ class Qwen4ExpAttention(nn.Module):
             rope_position_offset=int(get_forward_context().context.is_draft),
         )
         normalized = self.indexer.normalize_compressed_keys(pooled, first_positions)
-        qsa_store_rows(
-            self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
-        )
+        if self.compressed_key_scale is None:
+            qsa_store_rows(
+                self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
+            )
+        else:
+            qsa_store_quantized_rows(
+                self.compressed_key_cache,
+                self.compressed_key_scale,
+                qsa.compressed_slot_mapping,
+                normalized,
+            )
 
         return qsa_select_paged_tokens(
             index_q,
@@ -338,13 +418,24 @@ class Qwen4ExpAttention(nn.Module):
             self.indexer.compress_ratio,
             max_seq_len=qsa.max_seq_len,
             allow_flydsl=get_forward_context().context.is_prefill,
+            compressed_k_scale=self.compressed_key_scale,
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """`quantized` is an optional `(fp8, scale)` copy of `hidden_states`
+        that an FP8 `qkv_proj` takes instead of quantizing it again; the
+        indexer still reads the BF16 `hidden_states`."""
         num_tokens = hidden_states.shape[0]
-        qkv = self.qkv_proj(hidden_states)
+        qkv = (
+            self.qkv_proj(hidden_states)
+            if quantized is None
+            else self.qkv_proj(quantized[0], x_scale=quantized[1])
+        )
         gate, q, k, v = qkv.split(
             [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
         )
@@ -365,32 +456,25 @@ class Qwen4ExpAttention(nn.Module):
             )
         else:
             qsa = qsa.for_tokens(num_tokens)
-            aiter.reshape_and_cache_flash(
-                key,
-                value,
-                self.k_cache,
-                self.v_cache,
-                qsa.slot_mapping,
-                "auto",
-                self._unit_scale,
-                self._unit_scale,
-            )
+            self._store_kv(key, value, qsa.slot_mapping)
             selected = self._select_tokens(hidden_states, positions, qsa)
-            attn_out = qsa_sparse_paged_gqa(
+            attn_out = self._attend(
                 query,
-                self.k_cache,
-                self.v_cache,
                 selected,
                 qsa.block_tables,
                 qsa.token_to_req,
-                softmax_scale=self.scaling,
-                num_decode_requests=(
+                (
                     None
                     if forward_context.context.is_prefill
                     else qsa.block_tables.shape[0]
                 ),
             )
 
+        if is_per_token_fp8_linear(self.o_proj):
+            gated, gated_scale = sigmoid_mul_quant(
+                attn_out.reshape(num_tokens, -1), gate, self.o_proj.params_dtype
+            )
+            return self.o_proj(gated, x_scale=gated_scale)
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)
         return self.o_proj(gated)
 
@@ -424,34 +508,43 @@ class Qwen4ExpAttention(nn.Module):
             "compressed_key_cache",
             "rope_position_cache",
         )
+        scale_names = ("k_scale_cache", "v_scale_cache", "compressed_key_scale")
         saved = [getattr(self, name) for name in names]
+        saved_scales = {name: getattr(self, name) for name in scale_names}
+
+        def paged(rows, heads, fmt, head_dim):
+            dim, dtype, scale_tail, scale_dtype = qsa_cache_row_layout(fmt, head_dim)
+            values = torch.zeros((pages, rows, heads, dim), device=device, dtype=dtype)
+            if scale_tail is None:
+                return values, None
+            return values, torch.ones(
+                (pages, rows, heads, *scale_tail), device=device, dtype=scale_dtype
+            )
+
+        k_cache, k_scale = paged(
+            block, self.num_kv_heads, self.kv_format, self.head_dim
+        )
+        v_cache, v_scale = paged(
+            block, self.num_kv_heads, self.kv_format, self.head_dim
+        )
+        compressed, compressed_scale = paged(
+            block // ratio, 1, self.index_format, self.indexer.index_head_dim
+        )
         self.bind_caches(
-            query.new_zeros((pages, block, self.num_kv_heads, self.head_dim)),
-            query.new_zeros((pages, block, self.num_kv_heads, self.head_dim)),
+            k_cache,
+            v_cache,
             query.new_zeros((pages, block, 1, self.indexer.index_head_dim)),
-            query.new_zeros((pages, block // ratio, 1, self.indexer.index_head_dim)),
+            compressed,
             torch.zeros((pages, block, 1, 3), device=device, dtype=torch.int64),
+            k_scale_cache=k_scale,
+            v_scale_cache=v_scale,
+            compressed_key_scale=compressed_scale,
         )
         try:
-            aiter.reshape_and_cache_flash(
-                key,
-                value,
-                self.k_cache,
-                self.v_cache,
-                logical,
-                "auto",
-                self._unit_scale,
-                self._unit_scale,
-            )
+            self._store_kv(key, value, logical)
             selected = self._select_tokens(hidden_states, positions, metadata)
-            return qsa_sparse_paged_gqa(
-                query,
-                self.k_cache,
-                self.v_cache,
-                selected,
-                metadata.block_tables,
-                metadata.token_to_req,
-                softmax_scale=self.scaling,
+            return self._attend(
+                query, selected, metadata.block_tables, metadata.token_to_req, None
             )
         finally:
-            self.bind_caches(*saved)
+            self.bind_caches(*saved, **saved_scales)

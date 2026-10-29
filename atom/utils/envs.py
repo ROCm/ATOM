@@ -147,13 +147,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the decode side scatters them into the paged KV and returns the slot.
     # 0 = staged per-page writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
-    # Mooncake P/D: how long a write Mooncake gave up on may still land. A
+    # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
-    # failure; a prefill keeps a landing slot whose write failed out of use
-    # this long. 0 = release at once.
+    # failure; a Mooncake prefill keeps a landing slot whose write failed out
+    # of use this long. 0 = release at once.
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
+    # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
+    "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
+    # MoRIIO P/D: how long a request waits for the handshake with its peer.
+    "ATOM_MORIIO_HANDSHAKE_TIMEOUT_S": lambda: float(
+        os.getenv("ATOM_MORIIO_HANDSHAKE_TIMEOUT_S", "300")
+    ),
+    # MoRIIO P/D write mode: a prefill starts no push this long after the
+    # decode asked for it.
+    "ATOM_MORIIO_WRITE_TIMEOUT_S": lambda: float(
+        os.getenv("ATOM_MORIIO_WRITE_TIMEOUT_S", "600")
+    ),
+    # MoRIIO P/D: log the layers a receive left unchanged (debugging).
+    "ATOM_MORIIO_VERIFY": lambda: _flag_env("ATOM_MORIIO_VERIFY", "0"),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
@@ -192,6 +206,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pressure) and a smaller value toward prompt-token balance (prefill
     # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
+    # Per-rank cap on in-flight load-balanced requests. 0 sprays the whole
+    # offline batch up front. >0 holds the rest and refills a rank only as it
+    # finishes, so ranks finish prefilling together and the tail stays
+    # all-decode (CUDA-graph replay). Only offline batch admission
+    # (LLMEngine.generate / generate_multimodal) uses it; online API requests
+    # keep immediate dispatch. While set, that path balances on in-flight
+    # request count and ignores dp_load_balance; CoreManager warns when that
+    # strategy is not least_requests. A non-integer or negative value warns
+    # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
+    # rank's running batch. CoreManager warns when that happens.
+    "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
     # Place a new agent session on the lightest DP rank, then keep every later
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
@@ -229,6 +254,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # padding. This is an experimental ATOM SGLang-plugin-only mode.
     "ATOM_SGLANG_PREFILL_COMPILE_ONLY": lambda: (
         os.getenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "0") == "1"
+    ),
+    # Stopgap for a HIP device whose arch is missing from sgl_kernel
+    # common_ops.so. The release image is built gfx950-only, so MI308X
+    # (gfx942) SIGSEGVs in every sgl_kernel GPU op, including xgrammar's
+    # vocab-mask apply. 0 keeps the native kernel. TODO: drop once the
+    # image ships a gfx942 sgl_kernel.
+    "ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK": lambda: (
+        os.getenv("ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK", "1") != "0"
     ),
     # Broadcast EAGLE3 verification predictions and acceptance decisions from
     # TP rank 0 so every tensor-parallel rank advances with identical results.
@@ -343,10 +376,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
-    # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
-    # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
-    # Set to 0 to retain the unmasked path.
-    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "1") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
@@ -598,6 +627,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
+    # aiter's Gluon all-reduce + residual add + RMSNorm for
+    # decode (fused calls up to 2 MiB) at TP4; aiter uses it on gfx1250 only.
+    "ATOM_ENABLE_GLUON_FUSED_AR": lambda: (
+        os.getenv("ATOM_ENABLE_GLUON_FUSED_AR", "1") == "1"
+    ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
     # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
@@ -740,6 +774,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
+    # Level name for the "atom" logger and its console handler (DEBUG, INFO,
+    # WARNING, ...); applied by atom.utils.set_atom_log_level(), which turns
+    # NOTSET and unknown names into INFO.
+    "ATOM_LOG_LEVEL": lambda: os.getenv("ATOM_LOG_LEVEL", "INFO"),
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
     # GPU timestamps for both prefill and decode phases.
@@ -757,6 +795,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # across requests (`segment_tokenizer.SegmentTokenizer`): segment ids and
     # stored prompts together, counted by the bytes they retain. 0 turns it off.
     "ATOM_TOKENIZE_CACHE_MB": lambda: int(os.getenv("ATOM_TOKENIZE_CACHE_MB", "512")),
+    # Keep the prompt block-hash chain (frontend prefix hashing) with each
+    # tokenizer-cached prefix and extend it on the next turn instead of
+    # rehashing the whole prompt. Content hashes only: KV residency is still
+    # BlockManager's. 0 hashes every prompt in full.
+    "ATOM_TOKENIZE_CACHE_BLOCK_HASHES": lambda: os.getenv(
+        "ATOM_TOKENIZE_CACHE_BLOCK_HASHES", "1"
+    )
+    == "1",
     # Warm the page cache with a background sequential reader instead of
     # leaving it to demand faults through the mmap. Measured on a local NVMe:
     # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
@@ -843,6 +889,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
     # instead of gluon. Needs aiter with #5809.
     "ATOM_PA_FLYDSL": lambda: os.getenv("ATOM_PA_FLYDSL", "0") == "1",
+    # Qwen QSA: score decode-sized index calls (<= 256 rows) with the MFMA
+    # kernel that stacks the index heads into M; 0 keeps the CUDA-core one.
+    "ATOM_QSA_STACKED_DECODE_SCORER": lambda: _flag_env(
+        "ATOM_QSA_STACKED_DECODE_SCORER", "1"
+    ),
+    # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
+    # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
+    "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -901,6 +955,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
+    ),
+    # Fuse an MXFP8 shared expert into MXFP4 routed experts (the Quark MXFP4
+    # export of MiniMax-M3.1) by re-quantizing the shared expert MXFP8 -> MXFP4
+    # at load, so the MoE runs as one 129-expert / top-5 fused MoE. Off by
+    # default: the shared expert, which every token uses, then carries MXFP4
+    # rounding error. Without it the shared expert stays an MXFP8 MLP.
+    "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
+        os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
@@ -1110,9 +1172,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
     # Only meaningful when prefill_context_parallel_size > 1;
-    # Default "1": all-gather hidden 1/W -> full before MoE and slice
-    # full -> 1/W after, so MoE sees the complete token set (MoE itself is
-    # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
+    # Default "1": FusedMoE routes its 1/W rows, gathers them (hidden states in
+    # the experts' format with their top-k weights and ids) to the full token
+    # set, and reduce-scatters the routed experts' output back to 1/W. Costs
+    # one routed-rows all-gather and one reduce-scatter per layer.
     # "0": MoE runs on each rank's 1/W token shard with no extra comm.
     "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
     # Pure-TP TBO all_reduce overlap mode (see module_dispatch_ops.tbo_all_reduce):
@@ -1140,14 +1203,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
-    # gathering them on the host. The tables stay in host memory (page-locked in
-    # place, not copied to HBM); the GPU pulls only the rows a step names and
-    # dequantizes them there. On by default: the host gather gives the same rows
+    # gathering them on the host. Each rank's shard stays in host memory,
+    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
+    # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
+    # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
+    # into page-locked memory of exactly its size (hipHostMalloc on base pages,
+    # so a fragmented page cache costs no compaction), one copy_ below 512 MiB, else one thread per 128 MiB (at least 8) up to
+    # 16 and the CPUs this process may use, dropping the copied checkpoint
+    # pages from the process as it goes; 0 registers the checkpoint mapping in
+    # place (one thread, under the HIP runtime lock). Either way the shard is
+    # resident once. Copying needs the HIP runtime; elsewhere it registers in
+    # place regardless. Unset, DP attention (every rank holds the whole table)
+    # registers in place -- the shared checkpoint mapping, pinned once per node
+    # rather than copied once per rank -- and copies only if that is refused.
+    # `tools/engram/bench_uva_shard.py` measures both.
+    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

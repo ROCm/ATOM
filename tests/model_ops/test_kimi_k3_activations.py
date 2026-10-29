@@ -35,12 +35,12 @@ def test_rmsnorm_gated_matches_reference_with_strided_gate(tokens, heads, is_pre
     gate_before = gate.clone()
 
     actual = rmsnorm_gated(x, weight, gate, 1e-6, is_prefill=is_prefill)
-    x_f32 = x.float()
+    x_f32 = x.cpu().float()
     expected = (
         x_f32
         * torch.rsqrt(x_f32.square().mean(dim=-1, keepdim=True) + 1e-6)
-        * weight.float()
-        * torch.sigmoid(gate.float())
+        * weight.cpu().float()
+        * torch.sigmoid(gate.cpu().float())
     ).to(torch.bfloat16)
 
     assert not gate.is_contiguous()
@@ -48,7 +48,7 @@ def test_rmsnorm_gated_matches_reference_with_strided_gate(tokens, heads, is_pre
     assert actual.dtype == x.dtype
     assert torch.equal(x, x_before)
     assert torch.equal(gate, gate_before)
-    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.05)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.05)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -73,17 +73,20 @@ def test_rmsnorm_gated_long_prefill_matches_reference(tokens, heads):
 
     actual = rmsnorm_gated(x, weight, gate, 1e-6, is_prefill=True)
 
-    # Bound temporary fp32 memory while checking production 4K-16K prefills.
+    # CPU FP32 reference with the same BF16 output boundary; bound temporary
+    # memory while checking production 4K-16K prefills.
     for start in range(0, tokens, 256):
         stop = min(start + 256, tokens)
-        x_chunk = x[start:stop].float()
+        x_chunk = x[start:stop].cpu().float()
         expected = (
             x_chunk
             * torch.rsqrt(x_chunk.square().mean(dim=-1, keepdim=True) + 1e-6)
-            * weight.float()
-            * torch.sigmoid(gate[start:stop].float())
+            * weight.cpu().float()
+            * torch.sigmoid(gate[start:stop].cpu().float())
         ).to(torch.bfloat16)
-        torch.testing.assert_close(actual[start:stop], expected, rtol=0.02, atol=0.05)
+        torch.testing.assert_close(
+            actual[start:stop].cpu(), expected, rtol=0.02, atol=0.05
+        )
 
     assert not gate.is_contiguous()
     assert actual.shape == x.shape

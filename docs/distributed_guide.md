@@ -136,7 +136,7 @@ This ensures:
 When a DP rank has no real work but other ranks do, it executes dummy batches to participate in collective operations:
 
 - **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a one-sequence decode dummy through the model, triggering AllReduce and MORI collectives so other ranks are not blocked.
-- **Dummy prefill** — when prefill token graphs are recorded and a peer prefills, `Scheduler.dummy_prefill` makes the same call a request-less prefill instead. `ForwardMode._pad_to_token_graph` raises it to the bucket every prefilling rank replays, since ranks replaying different buckets hang the group.
+- **Dummy prefill** — when prefill token graphs are recorded and a peer prefills, `Scheduler.dummy_prefill` makes the same call a request-less prefill instead. `ForwardMode._pad_to_token_graph` raises it, and without the prefill delayer a decoding rank's rows too, to the bucket every rank of the step replays, since ranks replaying different buckets hang the group.
 
 ### Device assignment
 
@@ -258,6 +258,7 @@ drained and warns if it is invoked while requests are still charged.
 - `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
 - CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens}`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
+- Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
   session once, then keep all later turns on its cache owner without spill.
 

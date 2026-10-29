@@ -5,6 +5,8 @@
 query rows are cut into bands, grouped by request, and split across DCP ranks.
 Host arithmetic only."""
 
+import itertools
+
 import numpy as np
 import pytest
 import torch
@@ -116,10 +118,42 @@ def test_dcp_split_bands_only_this_rank_s_rows(world, count):
 
 def test_pcp_owned_rows_group_by_request_and_pad():
     """A PCP rank owns rows `first, first + stride, ...`; grouped by request
-    from the host's `cu_seqlens_q`, the padding rows past the last request one
-    group more."""
-    cu = np.array([0, 3, 3, 8], dtype=np.int32)
-    # Rank 1 of 2 owns rows 1, 3, 5, 7 of 8, then one padding row.
-    starts = pcp_owned_rows_by_request(cu, 1, 2, 5)
-    assert starts.tolist() == [0, 1, 1, 4, 5]
+    from the host's `cu_seqlens_q`, the padding rows past the last request in
+    its group. One group per request: the FP4 scorer reads group b's keys off
+    `block_tables[b]`, a table with a row per request."""
+    cu = np.array([0, 3, 3, 7], dtype=np.int32)
+    # 7 tokens pad to 8: rank 1 of 2 owns rows 1, 3, 5 and padding row 7.
+    assert pcp_owned_rows_by_request(cu, 1, 2, 4).tolist() == [0, 1, 1, 4]
     assert pcp_owned_rows_by_request(cu, 0, 2, 4).tolist() == [0, 2, 2, 4]
+    # 6 tokens pad to 8: rank 3 of 4 owns row 3 and padding row 7, so the last
+    # request's group holds padding only.
+    cu = np.array([0, 5, 6], dtype=np.int32)
+    assert pcp_owned_rows_by_request(cu, 3, 4, 2).tolist() == [0, 1, 2]
+
+
+def _owned_rows_reference(lens, world, rank):
+    """Brute force: walk the rows `rank` owns, padding rows to the last request."""
+    total = sum(lens)
+    padded = -(-total // world) * world
+    bounds = np.cumsum([0, *lens])
+    counts = [0] * len(lens)
+    for row in range(rank, padded, world):
+        if row >= total:
+            counts[-1] += 1
+        else:
+            counts[int(np.searchsorted(bounds, row, side="right")) - 1] += 1
+    return np.concatenate([[0], np.cumsum(counts)]).tolist()
+
+
+def test_pcp_owned_rows_match_brute_force():
+    for world in (2, 3, 4, 8):
+        for lens in itertools.product((1, 2, 3, 5), repeat=3):
+            cu = np.cumsum([0, *lens]).astype(np.int32)
+            owned = -(-sum(lens) // world)
+            for rank in range(world):
+                got = pcp_owned_rows_by_request(cu, rank, world, owned)
+                assert got.tolist() == _owned_rows_reference(lens, world, rank), (
+                    world,
+                    lens,
+                    rank,
+                )
