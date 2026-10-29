@@ -154,11 +154,35 @@ attention 3D at 5 query tokens) picks a quarter of MTP3's KV segments a sequence
 | + the TP sampling and tokenizer settings (now the DP default) | **9,019** | **24.36** | **120.6** | 679 ms | **6.18 ms** | 3.11 |
 | ... + MTP4 (`SPEC=4`) | 7,924 | 21.93 | 100.6 | 798 ms | 7.45 ms | 3.50 |
 | ... + `ATOM_PREFILL_DECODE_INTERVAL=4` | 8,568 | 23.71 | 113.9 | 628 ms | 6.85 ms | |
+| + `AITER_GEMM_FAST_LAUNCH=1 AITER_FLYDSL_FAST_LAUNCH=1` | 9,341 | 25.58 | 125.4 | 559 ms | 5.26 ms | 3.10 |
+| ... + shared expert on the main stream (#2825, now the default) | 10,050 | 27.35 | 145.4 | 559 ms | 5.18 ms | |
+| ... + DP prefill token graphs (side stream on) | 9,570 | 26.18 | 131.9 | 512 ms | 4.87 ms | 3.10 |
+| all of the above + `AITER_GFX12_MIN_SEGMENTS=64` | **10,142** | 26.98 | 144.3 | **515 ms** | **4.83 ms** | 3.11 |
 
 `serve_ep.sh` now sets `ATOM_SPEC_FUSED_VERIFY_SAMPLE`, `AITER_TOPK_FIRST_SMALL_K_TOPP`,
-`ATOM_SAMPLER_SPLIT_SOFTMAX` and `ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER` on DP points too. MTP4
-gains 12.5% tokens a forward but the decode step grows ~19 -> ~26 ms at 32 sequences an engine, so DP
-points keep MTP3; interval 4 trades a 7% lower TTFT for an 11% higher TPOT, so they keep 8.
+`ATOM_SAMPLER_SPLIT_SOFTMAX` and `ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER` on DP points too. Interval
+4 trades a 7% lower TTFT for an 11% higher TPOT, so DP points keep 8.
+
+MTP4 gains 12.5% tokens a forward, but on aiter before alizaidy/qwen35-c128-host-attn the decode step
+grew 14.2 -> 21.9 ms (decode-only steps, the slowest rank), +7 ms of it the verify attention at 5 query
+tokens: no D256 config past 4 query tokens, so 3 query blocks a sequence, each re-reading the KV, and
+the split heuristic then dropped from 32 to 8 KV segments (1117 against 479 us a launch). With the
+q <= 8 config the kernel takes ~1.17x its q = 4 time and MTP4 ties MTP3 per token, so DP points keep MTP3.
+
+Prefill on DP points runs eager (prefill token graphs needed a single DP rank, #2790) and host-bound:
+~110 ms a step from 2 to 16k tokens a rank. aiter's cached launch paths cut the bf16 GEMM launch from
+~87 to ~15 us and an MoE layer's host time from ~940 to ~310 us, both bitwise equal to the default
+paths. `ATOM_DP_PREFILL_GRAPH=1` replays a prefill bucket on steps every rank prefills (any other step
+runs eagerly on every rank, and no rank runs a dummy prefill): on DP2 + EP2 with the cached launches a
+prefill step takes 13 / 45 / 82 ms at < 2k / 2-12k / >= 12k tokens a rank, against 113 / 108 / 105 ms
+eager, and greedy outputs differ from eager on no more requests than eager does from itself (4 of 160
+batched prompts, 0 of 27 single-batch prompts). At c128 these cut the TTFT and TPOT medians by ~8% but
+leave TPS and the E2E interactivity (a mean over requests) within noise: the shared-expert side stream
+was what held the tail.
+
+`AITER_GFX12_MIN_SEGMENTS=64` (the last point; `serve_ep.sh` does not set it) raises the gfx1250 decode /
+verify attention's KV split to at least 64 segments: 5-23% faster a launch at 40k-190k-token contexts,
+10-21% slower at 16k-64k with 32 sequences, since inside a graph the split cannot see the context lengths.
 
 ## Prefill / decode interval
 

@@ -51,6 +51,15 @@ if [ "$MODE" = dp ]; then
   export AITER_TOPK_FIRST_SMALL_K_TOPP=${AITER_TOPK_FIRST_SMALL_K_TOPP:-1}
   export ATOM_SAMPLER_SPLIT_SOFTMAX=${ATOM_SAMPLER_SPLIT_SOFTMAX:-1}
   export ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER=${ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER:-1}
+  # DP prefill runs eager and host-bound (~110 ms a step whatever its size): aiter's cached launch
+  # paths for the bf16 GEMMs and the FlyDSL MoE kernels (need aiter alizaidy/qwen35-c128-host-attn;
+  # ignored by an older aiter), and prefill token graphs on steps every rank prefills, with buckets
+  # up to the 16384-token chunk and up to 16 prefill requests a rank recorded
+  export AITER_GEMM_FAST_LAUNCH=${AITER_GEMM_FAST_LAUNCH:-1}
+  export AITER_FLYDSL_FAST_LAUNCH=${AITER_FLYDSL_FAST_LAUNCH:-1}
+  export ATOM_DP_PREFILL_GRAPH=${ATOM_DP_PREFILL_GRAPH:-1}
+  export ATOM_GDN_GRAPH_MAX_SEQS=${ATOM_GDN_GRAPH_MAX_SEQS:-16}
+  export ATOM_TOKEN_GRAPH_SIZES=${ATOM_TOKEN_GRAPH_SIZES:-256,512,1024,1536,2048,3072,4096,6144,8192,12288,16384}
 fi
 # keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
 # first eager multi-request prefill, a ~35 s stall a fresh server
