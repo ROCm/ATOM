@@ -98,9 +98,10 @@ attempt. Workers initialize Store only after hugepage compact finishes on every
 NUMA node (`completed`), or that node is skipped because its target is below
 1 GiB. A probe failure, a shortfall, or the per-node timeout publishes
 `status=failed` and no worker mounts Store. Missing workers still time out.
-Each node is given 1800 seconds. The case requests all 128 CPUs on the node so
-both NUMA nodes are inside the job cpuset; the previous 114-CPU allocation left
-node 0 with no allowed CPU and the compact exited immediately.
+Each node is given 1800 seconds. The coordinating worker runs pinned to its
+GPU's NUMA node, so `numa_exec.py` binds within the container's cpuset rather
+than the inherited affinity; inheriting it left node 0 with no allowed CPU and
+its compact exited immediately (jobs 10945 and 10969).
 
 The common environment explicitly sets `MC_MAX_CONCURRENT_REG_MR=1`,
 `NCCL_DMABUF_ENABLE=0`, `MC_GID_INDEX=1`, and `MC_IB_TC=104`. It does not

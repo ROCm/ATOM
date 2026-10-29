@@ -22,6 +22,11 @@ MPOL_BIND = 2
 # set_mempolicy has no glibc wrapper and libnuma is not guaranteed.
 SET_MEMPOLICY_SYSCALL = {"x86_64": 238, "aarch64": 237}
 ULONG_BITS = ctypes.sizeof(ctypes.c_ulong) * 8
+CGROUP_CPUSETS = (
+    "/sys/fs/cgroup/cpuset.cpus.effective",
+    "/sys/fs/cgroup/cpuset/cpuset.effective_cpus",
+)
+INIT_STATUS = "/proc/1/status"
 
 
 def parse_cpulist(text: str) -> set[int]:
@@ -44,9 +49,31 @@ def node_cpus(node: int) -> set[int]:
         raise SystemExit(f"numa_exec: NUMA node {node} does not exist ({path})")
 
 
+def container_cpus() -> set[int]:
+    """CPUs the container may use, independent of the caller's affinity."""
+    for path in CGROUP_CPUSETS:
+        try:
+            with open(path) as f:
+                cpus = parse_cpulist(f.read())
+        except OSError:
+            continue
+        if cpus:
+            return cpus
+    try:
+        with open(INIT_STATUS) as f:
+            for line in f:
+                if line.startswith("Cpus_allowed_list:"):
+                    return parse_cpulist(line.split(":", 1)[1])
+    except OSError:
+        pass
+    return os.sched_getaffinity(0)
+
+
 def bind_cpus(node: int) -> None:
     # A container cpuset can hide part of the node; keep only allowed CPUs.
-    cpus = node_cpus(node) & os.sched_getaffinity(0)
+    # The caller may be a worker already pinned to its GPU's node, so intersect
+    # with the container cpuset rather than the inherited affinity.
+    cpus = node_cpus(node) & container_cpus()
     if not cpus:
         raise SystemExit(
             f"numa_exec: no CPU of NUMA node {node} is allowed in this cpuset"

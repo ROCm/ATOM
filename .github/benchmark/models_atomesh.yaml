@@ -2111,9 +2111,6 @@ models:
         - &m31_vllm_pd
           name: m31-vllm-1p1d-tp4-mcstore-smoke
           runner:
-            # The node has 128 CPUs. 114 left NUMA node 0 outside the cpuset,
-            # so hugepage compact exited before faulting any pages there.
-            cpus_per_task: 128
             exclude_nodes: pit2-p03-g09,pit2-p03-g10,pit2-p03-g23,pit2-p03-g25
           topology: 1p1d
           pd_worker_layout: single_node
