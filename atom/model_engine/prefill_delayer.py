@@ -103,7 +103,7 @@ fires smaller — that is a request-routing problem, out of scope here.
 
 Cross-DP comms
 --------------
-Single ``all_reduce(SUM)`` over a 12-int64 cpu buffer (gloo-safe). Booleans are
+Single ``all_reduce(SUM)`` over a 13-int64 cpu buffer (gloo-safe). Booleans are
 encoded as 0/1 and read back as ``sum > 0`` (logical OR). All timing is
 tick-based (``hold_ticks``), which is deterministic across ranks — no per-rank
 wall-clock, so ranks never diverge on a timeout boundary. The cost gate's step
@@ -130,7 +130,7 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "tru
 _STEP_EMA_WEIGHT = 0.2
 # The reduce buffer: these fixed slots, each rank's prefill cost, then the cost
 # gate's `_Gate` (`PrefillDelayer.__init__`).
-_FIXED_SLOTS = 12
+_FIXED_SLOTS = 13
 
 
 class _Gate(NamedTuple):
@@ -411,6 +411,10 @@ class PrefillDelayer:
         #                                the step the decode-protection
         #                                interval answers; a mixed step decoded
         #                                beside its prefill and arms none)
+        #   slot 12 = prefill_budget     (SUM over prefillable ranks → what one
+        #                                step can admit; the fill target's
+        #                                denominator. Below max_num_batched_tokens
+        #                                when mixed batching reserves decode rows)
         # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
         #   slot `_FIXED_SLOTS` + r = rank r's prefill chunk cost (one-hot, SUM
         #                → every rank's cost), read back as rank_prefill_costs
@@ -555,6 +559,7 @@ class PrefillDelayer:
         arrived_requests: int = 0,
         next_completion_steps: int | None = None,
         admittable_requests: int | None = None,
+        prefill_budget: int | None = None,
     ) -> PrefillDecision:
         """Whether this rank may admit new prefills this tick (FIRE), and how
         many ranks have prefill to admit.
@@ -570,7 +575,7 @@ class PrefillDelayer:
                 fit cannot change the hard interval decision.
             pending_tokens: this rank's accumulated prefill tokens — fresh
                 waiting new-tokens PLUS the remaining tokens of resumable
-                partials — already capped at max_num_batched_tokens by the
+                partials — already capped at ``prefill_budget`` by the
                 caller. The local scheduler bounds its scan and uses chunk
                 limits, so this signal can omit work beyond that scan.
             running_decode_batch: decode seqs running on this rank (NOT counting
@@ -602,6 +607,10 @@ class PrefillDelayer:
                 FIRE could put into this rank's decode batch now: resumable
                 partials plus waiting heads that fit the free seq slots.
                 None falls back to `waiting_requests`.
+            prefill_budget: the prefill tokens one step can admit on this rank
+                (`Scheduler._prefill_budget`): ``max_num_batched_tokens`` less
+                the decode-first reserve under mixed batching. None means the
+                whole batch budget.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -645,6 +654,9 @@ class PrefillDelayer:
         self._reduce_buf[9] = 1 if blocked else 0
         self._reduce_buf[10] = 1 if unreachable else 0
         self._reduce_buf[11] = 1 if self._prefill_only_since_last_decision else 0
+        if prefill_budget is None:
+            prefill_budget = self.max_num_batched_tokens
+        self._reduce_buf[12] = int(prefill_budget) if prefillable else 0
         if self._cost_slots:
             self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
             self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
@@ -729,6 +741,7 @@ class PrefillDelayer:
             n_blocked,
             n_unreachable,
             prefill_only_n,
+            g_prefill_budget,
         ) = reduced[:_FIXED_SLOTS]
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
@@ -832,7 +845,10 @@ class PrefillDelayer:
             return self._hold(g_pending)
 
         # ---- goal: fire once the aggregate fills a worthwhile forward ----
-        budget = n_prefillable * self.max_num_batched_tokens
+        # What the prefillable ranks can admit this step, not the batch budget:
+        # under mixed batching a rank holds decode rows back, and pending past
+        # its prefill budget is work it cannot take in one step anyway.
+        budget = g_prefill_budget
         fill = g_pending / budget if budget > 0 else 1.0
         if fill >= self.target_fill:
             return self._fire("fill", g_pending)

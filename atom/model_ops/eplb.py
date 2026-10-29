@@ -1023,8 +1023,8 @@ def _plan_single_layer_migration(
         rbase = r * num_local_physical_experts
         old_r = old_list[rbase : rbase + num_local_physical_experts]
         new_r = new_list[rbase : rbase + num_local_physical_experts]
-        old_set = set(x for x in old_r if x >= 0)
-        new_set = set(x for x in new_r if x >= 0)
+        old_set = {x for x in old_r if x >= 0}
+        new_set = {x for x in new_r if x >= 0}
         for logical in sorted(new_set):
             if logical not in old_set:
                 recv_ranks_by_logical.setdefault(logical, []).append(r)
@@ -1505,17 +1505,20 @@ class ExpertLoadMonitor:
                 tuple(topk_physical.shape),
             )
 
-    def on_forward_end(self, is_dummy_run: bool, is_pure_prefill: bool = True) -> None:
+    def on_forward_end(self, is_dummy_run: bool, carries_prefill: bool = True) -> None:
         # Commit this pass's load to the sliding window ONLY on a real
-        # (non-dummy) pure-prefill forward -- EPLB balances on prefill load
-        # only, so decode / DP-mixed / dummy passes are dropped here. Committing
-        # is a purely local op, so gating it per-rank never desyncs the
-        # (step-driven, collective) rebalance -- lockstep is enforced separately
-        # by on_forward_pass_end, which advances on a group-uniform prefill flag.
+        # (non-dummy) forward that carried prefill -- EPLB balances on prefill
+        # load, so decode-only / dummy passes are dropped here. A mixed
+        # prefill+decode pass commits: its rows are prefill all but for a few
+        # percent, and dropping it would leave the window empty while the step
+        # gate below advanced on it. Committing is a purely local op, so gating
+        # it per-rank never desyncs the (step-driven, collective) rebalance --
+        # lockstep is enforced separately by on_forward_pass_end, which advances
+        # on a group-uniform prefill flag.
         if (
             not self.enabled
             or is_dummy_run
-            or not is_pure_prefill
+            or not carries_prefill
             or self._cur_pass_count is None
             or self._expert_load_window is None
         ):
@@ -2472,20 +2475,13 @@ def with_eplb_forward_monitor(fn):
             return fn(self, batch, *args, **kwargs)
         finally:
             is_dummy_run = getattr(batch, "is_dummy_run", False)
-            # Pure-prefill = has prefill tokens and no decode tokens (batches are
-            # not mixed today; the decode==0 check also future-proofs the TODO
-            # mixed batch). Local per-rank signal -- no DP sync needed, since only
-            # the (non-collective) window commit is gated; the step still advances.
-            is_pure_prefill = (
-                getattr(batch, "total_tokens_num_prefill", 0) > 0
-                and getattr(batch, "total_tokens_num_decode", 0) == 0
-            )
-            # Recording gate commits clean load on pure-prefill only (local op).
-            monitor.on_forward_end(is_dummy_run, is_pure_prefill)
-            # Step gate advances on prefill ACTIVITY (has-prefill), reduced to a
-            # group-uniform flag. Coincides with the pure-prefill commit above
-            # under the no-mixed-batch invariant (see on_forward_pass_end).
+            # One local signal for both gates: this pass carried prefill, pure
+            # or mixed with decode. The recording gate commits this pass's load
+            # on it (local op, no DP sync); the step gate advances on its
+            # group-uniform OR. The two must agree, or steps advance over load
+            # the window never saw and a rebalance plans on an empty window.
             local_has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
+            monitor.on_forward_end(is_dummy_run, local_has_prefill)
             dp_any_has_prefill = getattr(self, "_eplb_any_rank_has_prefill", None)
             manager.on_forward_pass_end(local_has_prefill, dp_any_has_prefill)
 

@@ -146,7 +146,7 @@ def test_unsliced_per_row_field_raises_instead_of_falling_through():
     view._batch = _FakeBatch(8)
     view._np = 3
 
-    with pytest.raises(MixedViewUnslicedField, match="does not slice"):
+    with pytest.raises(MixedViewUnslicedField, match="does not expose"):
         _ = view.per_row_thing
 
 
@@ -201,17 +201,25 @@ def test_private_names_still_raise_attribute_error():
 
 
 @requires_aiter
-def test_batch_wide_values_still_delegate():
-    """Only per-row arrays are refused; everything else passes through."""
-    from atom.model_ops.attentions.deepseek_v4_attn import _MixedDecodeView
+def test_only_listed_fields_pass_through(monkeypatch):
+    """Nothing falls through by default -- not a batch scalar, not a list
+    shorter than the batch. Deciding by length let both through, and either
+    can be wrong for the decode half: `total_seqs_num`/`is_mixed` describe the
+    whole batch, a filtered per-row list is not row-aligned at all."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        MixedViewUnslicedField,
+        _MixedDecodeView,
+    )
 
     view = _MixedDecodeView.__new__(_MixedDecodeView)
     view._batch = _FakeBatch(8)
     view._np = 3
 
+    for name in ("a_scalar", "a_short_list"):
+        with pytest.raises(MixedViewUnslicedField):
+            getattr(view, name)
+    monkeypatch.setattr(_MixedDecodeView, "_PASSES_THROUGH", frozenset({"a_scalar"}))
     assert view.a_scalar == 7
-    # Shorter than the batch, so not per-row -- delegating is correct.
-    assert view.a_short_list == [1, 2]
 
 
 class _FilterableBatch:
@@ -282,17 +290,31 @@ def test_the_precondition_check_is_not_an_assert():
     )
 
 
-def test_unsliced_guard_covers_tensors():
-    """A per-row field held as a torch.Tensor must trip the guard too.
+@requires_aiter
+def test_fields_the_length_test_let_through_now_raise():
+    """valarLip's cases: a dict keyed by whole-batch row (`replaying`), a
+    FILTERED per-row list (`state_slots`), a per-row tensor and a whole-batch
+    scalar (`is_mixed`, True through the view). Each passed the old
+    `len(val) == total_seqs_num` test or skipped it, and each would mislead a
+    decode reader silently."""
+    import torch
 
-    The guard decides by length; limiting it to list/tuple/ndarray let a tensor
-    field through unsliced. A 0-d value is a scalar and must be skipped, since
-    `len()` raises on it.
-    """
-    src = _view_source()
-    guard = re.search(r"isinstance\(val, \(([^)]*)\)\)", src)
-    assert guard and "torch.Tensor" in guard.group(1)
-    assert 'getattr(val, "ndim", 1) > 0' in src
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        MixedViewUnslicedField,
+        _MixedDecodeView,
+    )
+
+    batch = _FakeBatch(8)
+    batch.replaying = {0: 3, 5: 9}
+    batch.state_slots = [4, 5, 6]
+    batch.per_row_tensor = torch.arange(8)
+    batch.is_mixed = True
+    view = _MixedDecodeView.__new__(_MixedDecodeView)
+    view._batch = batch
+    view._np = 3
+    for name in ("replaying", "state_slots", "per_row_tensor", "is_mixed"):
+        with pytest.raises(MixedViewUnslicedField):
+            getattr(view, name)
 
 
 def test_decode_half_does_not_build_tbo_decode_ubatches():
