@@ -1222,7 +1222,8 @@ def _dense_accept_kernel(
 def dense_verify(args, q_dense, ratio_step):
     """The verify over a dense q: the same stats, race and pick kernels the
     sparse path runs, around `_dense_accept_kernel`, the race reading the
-    rejecting position's row of ``q_dense`` in place."""
+    rejecting position's row of ``q_dense`` copied to the request's row, where
+    the sparse path densifies it."""
     logits = args["target_logits"]
     cu = args["cu_num_draft_tokens"]
     steps = args["num_spec_steps"]
@@ -1296,10 +1297,12 @@ def dense_verify(args, q_dense, ratio_step):
         _RATIO_ACCEPT_KEY | ratio_step,
         num_warps=1,
     )
-    # The rejecting position's own q row, which the sparse path densifies.
+    # The rejecting position's own q row at its request's row, as the sparse
+    # path densifies it. A request without one gets some row the race masks
+    # off, since it decides from ``residual`` and ``base`` alone.
     start = torch.cat((cu.new_zeros(1), cu[:-1]))
     has_row = (residual >= 0) & (base >= 0)
-    q_row = torch.where(has_row, base + residual - start, -1).to(torch.int32)
+    q_row = torch.where(has_row, base + residual - start, 0)
     _ratio_residual_race_kernel[(batch_n, tiles)](
         residual,
         logits,
@@ -1307,8 +1310,8 @@ def dense_verify(args, q_dense, ratio_step):
         row_max,
         row_inv_z,
         None,  # no floor: unfiltered
-        q_dense,
-        q_row,
+        q_dense[q_row.long()],
+        base,
         keys,
         key_idx,
         batch_n,
@@ -1544,7 +1547,7 @@ def filtered_p(logits, temps, top_ks=None, top_ps=None, widths=None):
     assert int(cu[-1]) == rows
     (
         (row_max, row_inv_z, row_floor, part_max, part_sum, part_val, _, *filt_f32),
-        (row_argmax, part_idx, _, _, _, *filt_i32),
+        (row_argmax, part_idx, _, _, *filt_i32),
     ) = take(*_ratio_scratch_shapes(rows, len(widths), vocab), DEV, None, None)
     temps = temps.float().contiguous()
     assert _ratio_target_p(

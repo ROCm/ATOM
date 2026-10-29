@@ -155,7 +155,6 @@ def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
         (num_tokens,),  # row_argmax
         (tiles, num_tokens),  # part_amax_idx
         (batch_size,),  # residual_row
-        (batch_size,),  # residual_q_row
         (tiles, batch_size),  # part_idx
         (2, num_tokens, _FILTER_I32_WIDTH),  # filter_i32
         # One row of last-digit counts per (row, split) of the last count,
@@ -263,6 +262,26 @@ def _ratio_stats_kernel(
 
 
 @triton.jit
+def _has_q(q_base):
+    """Whether a request's q row base names live q rows. A negative base means
+    it has none (never drafted here, or its slot expired); every verify kernel
+    asks this, so the sentinel is decided here only. Not 0 for "none": row 0
+    is in range and holds a stranger's q."""
+    return q_base >= 0
+
+
+@triton.jit
+def _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx):
+    """``(row, q_base, has_q)`` of one request: the draft row it rejected at
+    (-1 if none, or greedy), its q row base, and whether that rejection has a
+    q, which the densify kernels then spread into dense row ``req_idx`` and
+    the residual race reads back from there."""
+    row = tl.load(residual_row_ptr + req_idx)
+    q_base = tl.load(q_row_base_ptr + req_idx)
+    return row, q_base, (row >= 0) & _has_q(q_base)
+
+
+@triton.jit
 def _stored_q_of(q_ids_ptr, q_probs_ptr, q_row, n, x, BLOCK_Q: tl.constexpr):
     """x's q in one stored row: its probability among the first ``n``
     entries, 0 when it is not one of them."""
@@ -319,13 +338,12 @@ def _ratio_accept_kernel(
     num_draft_tokens = end_idx - start_idx
     temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
     greedy = temp <= greedy_temperature
-    # A negative base means this request has no live q (never drafted here, or
-    # its slot expired). Its q reads as 0, so its first draft is rejected and
-    # the residual is p itself: exact, at the cost of one step's speculation.
-    # Not 0 for "none": row 0 is in range and holds a stranger's q > 0, against
-    # which `u * q < p` would accept.
+    # A request without a live q (`_has_q`) reads q as 0, so its first draft
+    # is rejected and the residual is p itself: exact, at the cost of one
+    # step's speculation. A stranger's row would hold a q > 0, against which
+    # `u * q < p` would accept.
     q_base = tl.load(q_row_base_ptr + req_idx)
-    has_q = q_base >= 0
+    has_q = _has_q(q_base)
     out_row = output_token_ids_ptr + req_idx * (num_spec_steps + 1)
 
     # Every position's (n, xslot) and the entry at xslot, in vector loads up
@@ -424,8 +442,8 @@ def _ratio_densify_clear_kernel(
     has a q; every other program returns at once."""
     req_idx = tl.program_id(0)
     tile = tl.program_id(1)
-    row = tl.load(residual_row_ptr + req_idx)
-    if (row >= 0) & (tl.load(q_row_base_ptr + req_idx) >= 0):
+    _, _, has_q = _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx)
+    if has_q:
         offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
         tl.store(
             dense_ptr + req_idx.to(tl.int64) * vocab_size + offs,
@@ -443,20 +461,17 @@ def _ratio_densify_scatter_kernel(
     q_meta_ptr,  # [num_q_rows, 2] int32
     q_row_base_ptr,  # [batch_size] int32
     dense_ptr,  # [>= batch_size, V] fp32, zeroed where it will be read
-    residual_q_row_ptr,  # [batch_size] int32 out: the dense row the residual reads
     q_width,
     vocab_size,
     BLOCK_Q: tl.constexpr,
 ):
     """One request: write the rejecting row's stored entries into its zeroed
-    dense row, and name that row for the residual race. -1 for every other
-    request, so the race reads q as 0 where there is none (as the accept walk
-    did)."""
+    dense row ``req_idx``, where the residual race reads them. A request
+    `_rejecting_row_of` finds no q for is left alone; the race reads its q as
+    0, as the accept walk did."""
     req_idx = tl.program_id(0)
-    row = tl.load(residual_row_ptr + req_idx)
-    q_base = tl.load(q_row_base_ptr + req_idx)
-    residual_q_row = -1
-    if (row >= 0) & (q_base >= 0):
+    row, q_base, has_q = _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx)
+    if has_q:
         if req_idx == 0:
             start_idx = 0
         else:
@@ -474,8 +489,6 @@ def _ratio_densify_scatter_kernel(
             tl.store(
                 dense_row + ids, probs, mask=mask & (ids >= 0) & (ids < vocab_size)
             )
-        residual_q_row = req_idx
-    tl.store(residual_q_row_ptr + req_idx, residual_q_row)
 
 
 @triton.jit(do_not_specialize=["batch_size", "residual_seed"])
@@ -486,8 +499,8 @@ def _ratio_residual_race_kernel(
     row_max_ptr,  # [num_tokens] fp32
     row_inv_z_ptr,  # [num_tokens] fp32
     row_floor_ptr,  # [num_tokens] fp32, the lowest logit p_f keeps (FILTER)
-    q_ptr,  # [num_q_rows, V] fp32
-    q_row_ptr,  # [batch_size] int32, the rejecting position's q row, or < 0
+    dense_ptr,  # [>= batch_size, V] fp32: a rejecting request's q at its row
+    q_row_base_ptr,  # [batch_size] int32, this request's first q row, or < 0
     part_key_ptr,  # [n_tiles, batch_size] fp32: best residual key
     part_idx_ptr,  # [n_tiles, batch_size] int32: its lowest id
     batch_size,
@@ -503,11 +516,9 @@ def _ratio_residual_race_kernel(
     and finding out on the host would stall the verify on a readback."""
     req_idx = tl.program_id(0)
     tile = tl.program_id(1)
-    row = tl.load(residual_row_ptr + req_idx)
+    row, _, has_q = _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx)
     if row >= 0:
         temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
-        q_row = tl.load(q_row_ptr + req_idx)
-        has_q = q_row >= 0
         offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
         vmask = offs < vocab_size
         x = tl.load(
@@ -520,7 +531,7 @@ def _ratio_residual_race_kernel(
         if FILTER:
             p = tl.where(x >= tl.load(row_floor_ptr + row), p, 0.0)
         q = tl.load(
-            q_ptr + q_row.to(tl.int64) * vocab_size + offs,
+            dense_ptr + req_idx.to(tl.int64) * vocab_size + offs,
             mask=vmask & has_q,
             other=0.0,
         )
@@ -787,7 +798,6 @@ def _ratio_sample(
             row_argmax,
             part_amax_idx,
             residual_row,
-            residual_q_row,
             part_idx,
             filter_i32,
             floor_counts,
@@ -861,7 +871,6 @@ def _ratio_sample(
         *store,
         q_row_base,
         dense,
-        residual_q_row,
         q_width,
         vocab_size,
         BLOCK_Q=min(triton.next_power_of_2(q_width), _RATIO_BLOCK_Q),
@@ -875,7 +884,7 @@ def _ratio_sample(
         row_inv_z,
         row_floor,
         dense,
-        residual_q_row,
+        q_row_base,
         part_key,
         part_idx,
         batch_size,
