@@ -2518,8 +2518,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
+        # A capture runs a full synthetic batch, so nothing is padded and the
+        # scheduled shape is the running one.
+        capture_tokens = bs * int(var["max_qlen"])
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            # One slot per row: a cache write bounded by the slot table skips
+            # the rows past it, so bs slots would drop the MTP rows.
+            slot_mapping=var["slot_mapping"].gpu[:capture_tokens],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=var["max_qlen"],
@@ -2543,9 +2548,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             attn_metadata.context_lens, create=True
         )
 
-        # A capture runs a full synthetic batch, so nothing is padded and the
-        # scheduled shape is the running one.
-        capture_tokens = bs * int(var["max_qlen"])
         positions = var["positions"].copy_to_gpu(capture_tokens)
         context = Context(
             positions=positions,
