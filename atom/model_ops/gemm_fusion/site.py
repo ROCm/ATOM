@@ -935,19 +935,18 @@ class GemmFusionSite:
     def _tag_refused(self, r, tokens) -> bool:
         """A plan whose tag carries only the low bits of ``call_id`` whose id could not be assigned
         (rank-uniform, per token count): its call is native."""
-        bits = getattr(hooks.resources(), "plan_tag_bits", None)
-        if bits is None or not bits(r.plan):
+        if not hooks.plan_tag_bits(r.plan):
             return False
         ids = hooks.token_call_ids(tokens, self._runtime_mode())
         return (self.name, tokens, r.vid, r.n_fused) in ids.refused
 
     def _call_id(self, r, tokens) -> int:
         """The launch's identity in the handshake tag. Small plans: the 31-bit ``decision_key``. A plan
-        whose tag carries only the LOW bits of call_id (the large R12-ABI sources r13 / r18): the id
-        aiter's ``tag_unique_ids`` assigned for this token count, whose low bits are distinct and
-        non-zero by construction (a ``decision_key`` collides on them)."""
-        bits = getattr(hooks.resources(), "plan_tag_bits", None)
-        if bits is not None and bits(r.plan):
+        whose tag carries only the LOW bits of call_id (the large R12-ABI sources r13 / r18, and
+        route A's r19 with its 18-bit tag): the id aiter's ``tag_unique_ids`` assigned for this
+        token count, whose low bits are distinct and non-zero by construction (a ``decision_key``
+        collides on them)."""
+        if hooks.plan_tag_bits(r.plan):
             ids = hooks.token_call_ids(tokens, self._runtime_mode())
             got = ids.ids.get((self.name, tokens, r.vid, r.n_fused))
             if got is not None:

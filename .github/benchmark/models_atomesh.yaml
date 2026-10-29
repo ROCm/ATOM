@@ -1557,6 +1557,28 @@ models:
         cudagraph: &minimax_decode_cudagraph_256 >-
           [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
     suites:
+      # Opt-in route-A / T=65536 cell: aggregated single server, SP4, GEMM fusion on.
+      # No scheduled or manual run selects this suite name today (the runners iterate
+      # nightly / weekly / smoke / accuracy), so existing cells are unchanged. Schedule
+      # it only with the route-A aiter build (18-bit r19 large tag) deployed.
+      route_a_16k:
+        - name: minimax-m3-mxfp4-agg-sp4-16k-route-a
+          topology: agg
+          display_topology: AGG-SP4-16K-ROUTE-A
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [65536]
+          osl: 1
+          concurrency: [1]
+          prefill: {}
+          decode:
+            workers: 1
+            tp: 1
+            extra_args: "--sequence-parallel-size 4 --gemm-fusion-profile minimax_m3_sp4_gfx950_v1 --gemm-fusion-check-period 1"
+          server:
+            common_args:
+              max_model_len: 65536
+              max_num_batched_tokens: 65536
       nightly:
         - name: minimax-m3-fp4-1p1d-tp4
           topology: 1p1d
