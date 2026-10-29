@@ -72,11 +72,17 @@ for run in runs:
                     cases = []
                 for probe in cases:
                     if probe.get('case') not in {'default-prefill', 'default-decode',
-                                                  'fresh-prefill', 'fresh-decode'}:
+                                                  'fresh-prefill', 'fresh-decode',
+                                                  'anchor-193g', 'anchor-subranges-193g',
+                                                  'default-dmabuf-193g', 'disable-dmabuf-193g',
+                                                  'default-dmabuf-64g'}:
                         continue
                     if probe.get('status') not in {'running', 'success', 'failed'}:
                         continue
                     entry = {'case': probe['case'], 'status': probe['status']}
+                    if isinstance(probe.get('ranks_results'), list):
+                        entry['rank_statuses'] = [r.get('status') for r in probe['ranks_results']]
+                        entry['native_zero_verified'] = sum(r.get('native_zero_verified') is True for r in probe['ranks_results'])
                     result = job / 'triton-probe' / probe['case'] / 'results.json'
                     if result.is_file():
                         try:
@@ -118,6 +124,13 @@ for run in runs:
                         for role in ('prefill', 'decode') for rank in range(4)]
             sources += list((current / 'runtime-evidence').glob('*/*/result.json'))
             sources += list((current / 'runtime-evidence').glob('*/*-hip-load.json'))
+            if case == 'triton-probe':
+                sources += [job / 'triton-probe/summary.json']
+                for entry in row['triton_cases']:
+                    for rank in range(4):
+                        rank_root = job / 'triton-probe' / entry['case'] / f'rank-{rank}'
+                        sources += [rank_root / name for name in ('memory.json', 'result.json', 'failure.json', 'engine.json', 'registration.json', 'worker.log')]
+                        sources += list(rank_root.glob('stage-probe-*/result.json'))
             for source in sources:
                 if not source.is_file() or not source.resolve().is_relative_to(job.resolve()):
                     continue

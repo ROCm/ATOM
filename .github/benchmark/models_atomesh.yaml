@@ -2162,6 +2162,7 @@ models:
               ATOMESH_VLLM_MODE: inspect
               ATOMESH_INSPECT_RUN_ID: "latest"
               ATOMESH_INSPECT_CASE: triton-probe
+              ATOMESH_INSPECT_RECOVER_LOGS: "1"
 
         - <<: *m31_vllm_pd
           name: m31-vllm-inspect-smoke
