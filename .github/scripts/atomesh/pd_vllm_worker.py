@@ -31,6 +31,7 @@ def prefer_own_store_segment(path):
     import vllm.v1.worker.gpu_worker as worker_module
     group = worker_module.get_kv_transfer_group()
     segments = []
+    fence = os.environ.get('ATOMESH_VLLM_STORE_SAVE_FENCE', '1') == '1'
     for connector in getattr(group, '_connectors', [group]):
         worker = getattr(connector, 'connector_worker', None)
         if worker is None or not hasattr(worker, 'store_replicate_config'):
@@ -38,10 +39,31 @@ def prefer_own_store_segment(path):
         segment = worker.store.get_hostname()
         worker.store_replicate_config.preferred_segment = segment
         segments.append(segment)
-    write_json(path, {'preferred_segments': segments})
+        if fence:
+            fence_store_saves(worker)
+    write_json(path, {'preferred_segments': segments, 'save_fence': 'device_synchronize' if fence else None})
     if not segments:
         raise RuntimeError('No Mooncake Store connector on this Prefill worker')
-    print(f'[store-segment] preferred_segment={segments}', flush=True)
+    print(f'[store-segment] preferred_segment={segments} save_fence={fence}', flush=True)
+
+
+def fence_store_saves(worker):
+    """Finish all of this device's work before a Store save records its event.
+
+    The Store worker records a CUDA event on the current stream and its send
+    thread PUTs once that event completes. Job 11054 reloaded those blocks as
+    garbage while the same blocks sent to Decode were correct, so the event did
+    not cover every KV write.
+    """
+    import torch
+    original = worker.wait_for_save
+
+    def wait_for_save(metadata):
+        if any(request.can_save for request in metadata.requests):
+            torch.cuda.synchronize()
+        return original(metadata)
+
+    worker.wait_for_save = wait_for_save
 
 
 class StoreMemoryWorker(Worker):
