@@ -71,6 +71,14 @@ _FLYDSL_WIDTHS = (1027, 2051, 3075, 4099)
 
 
 @functools.cache
+def _flydsl_arch_supported() -> bool:
+    # aiter's entry raises on anything but gfx942 instead of falling back.
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx942"
+
+
+@functools.cache
 def _flydsl_attention_op():
     # Imported on first use so the flag-off path needs no FlyDSL QSA in aiter.
     from aiter.ops.flydsl.kernels.qsa.attention import qsa_sparse_attention_flydsl
@@ -502,6 +510,13 @@ class Qwen4ExpAttention(nn.Module):
             not envs.ATOM_QSA_FLYDSL_ATTN
             or qsa.host_lens is None
             or width is None
+            # Padding a selection laid out for another budget or ratio moves the
+            # causal tail: the kernel would read it at the wrong column.
+            or self.indexer.compress_ratio != 4
+            or self.indexer.token_topk + 3 not in _FLYDSL_WIDTHS
+            # The prefixed path gathers raw cache rows; the kernel takes BF16 only.
+            or self.k_scale_cache is not None
+            or not _flydsl_arch_supported()
             or torch.cuda.is_current_stream_capturing()
             or self.num_kv_heads != 1
             or self.num_heads not in (12, 6, 3)
