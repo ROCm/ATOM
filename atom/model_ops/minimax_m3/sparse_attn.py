@@ -881,7 +881,7 @@ def _gemma_norm_rope_head(
     return tl.where(in_rot, roped, normed)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_slots"])
 def _fused_qknorm_rope_kv_insert_shuffle_kernel(
     qkv_ptr,  # [num_tokens, row_elems]
     q_norm_w_ptr,  # [head_dim]
@@ -890,7 +890,8 @@ def _fused_qknorm_rope_kv_insert_shuffle_kernel(
     ik_norm_w_ptr,  # [idx_head_dim]
     cos_sin_ptr,  # [max_pos, rotary_dim]  (first half cos, second half sin)
     positions_ptr,  # [num_tokens] int64
-    slot_mapping_ptr,  # [num_tokens] int64 (logical slot = block*128 + offset)
+    slot_mapping_ptr,  # [num_slots] int64 (logical slot = block*128 + offset)
+    num_slots,  # tokens at or past it are padding
     q_out_ptr,  # [num_tokens, num_heads*head_dim]
     iq_out_ptr,  # [num_tokens, num_index_heads*idx_head_dim]
     kc_ptr,  # SHUFFLE K [nb, nkv, head_dim//x, 16, x]  (contiguous)
@@ -964,7 +965,8 @@ def _fused_qknorm_rope_kv_insert_shuffle_kernel(
             out.to(iq_out_ptr.dtype.element_ty),
         )
 
-    slot = tl.load(slot_mapping_ptr + tok)
+    # A padding token reads no slot and writes no cache.
+    slot = tl.load(slot_mapping_ptr + tok, mask=tok < num_slots, other=-1)
     page = slot // ASM_PAGE
     s = slot % ASM_PAGE
     valid_slot = slot >= 0
@@ -1023,7 +1025,7 @@ def minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
     index_q_norm_weight: torch.Tensor,  # [idx_head_dim]
     index_k_norm_weight: torch.Tensor,  # [idx_head_dim]
     num_index_heads: int,
-    slot_mapping: torch.Tensor,  # [num_tokens] int64 logical slots
+    slot_mapping: torch.Tensor,  # [num_slots] int64 logical slots
     kv_cache_k: torch.Tensor,  # SHUFFLE K cache [phys, num_kv_heads, head_dim//x, 16, x]
     kv_cache_v: torch.Tensor,  # SHUFFLE V cache [phys, num_kv_heads, 16//x, head_dim, x]
     index_cache: torch.Tensor,  # index K cache, viewable as [-1, idx_head_dim]
@@ -1036,7 +1038,8 @@ def minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
     One fused kernel doing q/index_q norm+rope (-> q_out/index_q_out), k norm+rope
     + raw v -> SHUFFLE K/V cache, and index_k norm+rope -> page-128 index cache.
     Math matches the AITER fused op oracle; K/V writes match
-    ``reshape_and_cache(asm_layout=True)``.
+    ``reshape_and_cache(asm_layout=True)``. Tokens past the slot table are
+    padding: they get q_out and index_q_out rows, but no cache write.
     """
     num_tokens = qkv.shape[0]
     head_dim = q_norm_weight.shape[-1]
@@ -1054,6 +1057,7 @@ def minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
         cos_sin_cache,
         positions,
         slot_mapping,
+        slot_mapping.shape[0],
         q_out,
         index_q_out,
         kv_cache_k,
