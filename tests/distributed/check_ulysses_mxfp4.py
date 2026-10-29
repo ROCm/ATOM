@@ -62,10 +62,21 @@ def main():
     for tokens in (16, 8192, 32768):
         x = torch.randn(tokens // world, hidden, dtype=torch.bfloat16, device="cuda")
         gathered = sp.sp_moe_gather(x)
+        # The layer's shapes may not select a prequantizing two-stage config (the
+        # shipped profile picks the one-stage path for some M), in which case
+        # `gather_sp_input` moves BF16 rows: check that path against the same
+        # gather, and the eligible one byte-exactly below.
+        prequant = method._sp_input_can_prequantize(layer, x.shape[0] * world, x.dtype)
         actual, scale = method.gather_sp_input(layer, x)
-        if tokens == 16:
+        if not prequant:
             assert scale is None
             same_bytes(actual, gathered)
+            if rank == 0:
+                print(
+                    f"PASS SP{world} {tokens}: BF16 gather fallback "
+                    "(prequant not selected by the 2-stage config)",
+                    flush=True,
+                )
             continue
         reference, reference_scale = quant(gathered, quant_dtype=dtypes.fp4x2)
         same_bytes(actual, reference)
