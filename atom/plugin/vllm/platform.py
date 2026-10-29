@@ -410,7 +410,8 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
        step) would swallow the whole backbone rather than break around
        attention. Say NONE outright.
 
-    2. Refuse prefix caching. vLLM's prefix cache is bookkeeping: registering a
+    2. Refuse prefix caching unless something writes V4.1's STATE at the
+       boundaries vLLM reports. vLLM's prefix cache is bookkeeping: registering a
        cached block is a claim that the backend left recoverable state at that
        block's boundary, and the mamba-style managers that participate only
        report a hit as far as a boundary they hold state for. V4.1's forward
@@ -421,8 +422,9 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
        align mode still caches the last complete block's state and the group
        still reports the boundary. So this is a property of the contract, not a
        flag -- any STATE group that joins prefix caching will be handed a
-       boundary nobody wrote. ``validate_runtime_config`` refuses it too, but
-       only once the worker is already up.
+       boundary nobody wrote, unless AtomLMCacheOffloadConnector or the
+       PAGE-backed state checkpoints write it and cap each hit to a boundary
+       they hold.
 
     3. Refuse every speculative method except DSpark, which vLLM drives itself;
        see ``_refuse_unsupported_v41_speculation``.

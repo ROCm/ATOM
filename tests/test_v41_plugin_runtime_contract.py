@@ -279,8 +279,6 @@ def test_proxy_factory_stages_unbound_profiling_full_only(
             profiling=staged_on == "scratch",
         )
         assert common.atom_v41_prepared is prepared
-    # The checkpoint step runs once per real step and never under capture:
-    # it is the one piece of per-step work a captured graph must not replay.
     # The checkpoint step runs on a real step whose pool is bound, and never
     # under capture: it is the one piece of per-step work a captured graph
     # must not replay. An unbound step returns before staging, so there is no
