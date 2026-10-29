@@ -179,17 +179,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """`len(self._lookup_token_ids(seq))` without copying the prompt."""
         return int(seq.num_prompt_tokens)
 
-    def _withholds_last_prompt_token(self, seq) -> bool:
-        """Whether a full-prompt hit gives back its last token (`_loadable_hit`).
-
-        It must wherever the request claims what it loads: a load that ends at
-        the prompt's end leaves the forward nothing to compute. A layout whose
-        claim stops short of the load on its own overrides this. Asked only of
-        a hit covering the whole prompt.
-        """
-        del seq
-        return True
-
     def install_hit_cap_hook(self, hook) -> None:
         """Let a hybrid connector shorten every hit this scheduler reports.
 
@@ -521,14 +510,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         if not hit:
             return 0, False
-        num_prompt = seq.num_prompt_tokens
         frontier = int(seq.num_cached_tokens)
-        hit = self._loadable_hit(
-            hit,
-            num_prompt,
-            withhold_last=int(hit) != int(num_prompt)
-            or self._withholds_last_prompt_token(seq),
-        )
+        hit = self._loadable_hit(seq, hit)
         if self._hit_cap_hook is not None:
             # After `_loadable_hit`, so the hook caps the hit that will
             # actually be requested; before the save floor is recorded, so a

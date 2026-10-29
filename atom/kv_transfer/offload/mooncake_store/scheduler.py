@@ -536,7 +536,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         # to a chunk (`_loadable_hit`), and no shorter one reaches the load
         # threshold. The lookup would block the scheduler thread for nothing.
         num_prompt = int(seq.num_prompt_tokens)
-        if self._loadable_hit(num_prompt, num_prompt) < self._min_load_tokens:
+        if self._loadable_hit(seq, num_prompt) < self._min_load_tokens:
             return 0
         # Stamped before asking: the lease runs from the master's answer.
         self._looked_up_at[sid] = time.monotonic()

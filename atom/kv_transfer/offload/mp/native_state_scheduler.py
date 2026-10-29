@@ -372,37 +372,23 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         boundaries = getattr(seq, "_mp_boundary_by_hash", None)
         if boundaries is None:
             boundaries = seq._mp_boundary_by_hash = {}
-        found = self._next_image(seq, start, frontier, boundaries)
+        found = self._highest_image(seq, start, frontier, boundaries)
         seq._mp_save_frontier_memo = _SaveFrontierMemo(
             frontier, floor, saved, store.generation, found
         )
         return found
 
-    def _next_image(
-        self, seq: Any, start: int, frontier: int, boundaries: dict | None = None
-    ) -> int:
-        """The boundary of the next image to store above `start`, or 0.
-
-        The highest one this request still holds, stored directly: a rung at
-        the prompt's end, which a continuation loads, and otherwise the
-        prompt-end anchor (`align_checkpoint_anchor`), which a resend loads
-        since a load stops on a chunk strictly below the prompt. Which one is
-        stored depends only on what is in HBM when the save is issued, never
-        on a second round trip, and an image evicted first just yields the
-        next one down. Lower rungs stay unsaved, as do any that formed while
-        an earlier save of the request was in flight: one save per request
-        already serialises them, and storing every one would hold
-        `should_defer_free` and the state budget for a whole ladder per
-        prompt. A prompt on the chunk grid with a rung at its end therefore
-        stores no anchor: its continuations resume at the end, and a
-        byte-identical resend falls back to the HBM hit.
-        """
-        return self._highest_image(seq, start, frontier, boundaries)
-
     def _highest_image(
-        self, seq: Any, low: int, high: int, boundaries: dict | None
+        self, seq: Any, low: int, high: int, boundaries: dict | None = None
     ) -> int:
-        """Highest chunk boundary in `(low, high]` holding a checkpoint, or 0."""
+        """Highest chunk boundary in `(low, high]` holding a checkpoint, or 0.
+
+        The image a save stores: a rung at the prompt's end, which a
+        continuation loads, and otherwise the prompt-end anchor
+        (`align_checkpoint_anchor`), which a resend loads. One per save, as
+        HBM holds them when it is issued; storing every rung would hold
+        `should_defer_free` and the state budget for a whole ladder per prompt.
+        """
         for boundary in range(self._chunk_floor(high), low, -self.chunk_size):
             prefix_hash = self._boundary_hash(seq, boundary)
             if boundaries is not None:
@@ -419,7 +405,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         available = self._chunk_floor(available)
         if self._page_only:
             return available if available > self._save_floor(saved) else saved
-        return self._next_image(seq, self._save_floor(saved), available) or saved
+        return self._highest_image(seq, self._save_floor(saved), available) or saved
 
     def _may_emit_save(self) -> bool:
         return len(self._save_inflight) < self._max_pending_saves

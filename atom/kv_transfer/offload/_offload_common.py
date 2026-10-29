@@ -720,17 +720,25 @@ class OffloadSchedulerMixin(ABC):
         chunk = int(self.chunk_size or 256)
         return (max(0, int(tokens)) // chunk) * chunk
 
-    def _loadable_hit(
-        self, hit: int, num_prompt: int, *, withhold_last: bool = True
-    ) -> int:
-        """Turn a lookup hit into a length the external tier can actually serve.
+    def _withholds_last_prompt_token(self, seq) -> bool:
+        """Whether a full-prompt hit gives back its last token (`_loadable_hit`).
+
+        It must wherever the request claims what it loads: a load that ends at
+        the prompt's end leaves the forward nothing to compute. A layout whose
+        claim stops short of the load on its own overrides this. Asked only of
+        a hit covering the whole prompt.
+        """
+        del seq
+        return True
+
+    def _loadable_hit(self, seq, hit: int) -> int:
+        """Turn `seq`'s lookup hit into a length the external tier can serve.
 
         Two steps, in this order:
 
         * A hit covering the whole prompt leaves nothing to compute, so step
-          back one token -- unless `withhold_last` is False, for a request
-          whose claim stops short of the load on its own (see
-          `_withholds_last_prompt_token`).
+          back one token -- unless `_withholds_last_prompt_token` says the
+          request's claim stops short of the load on its own.
         * Floor to a chunk. `retrieve` resolves the tier at chunk granularity,
           so a `hit` that is not a chunk multiple names tokens the tier does
           not hold and the load's `ret_mask[hbm:lmc].all()` check can never
@@ -743,7 +751,7 @@ class OffloadSchedulerMixin(ABC):
         """
 
         hit = int(hit)
-        if withhold_last and hit == int(num_prompt):
+        if hit == int(seq.num_prompt_tokens) and self._withholds_last_prompt_token(seq):
             hit -= 1
         return self._chunk_floor(hit)
 

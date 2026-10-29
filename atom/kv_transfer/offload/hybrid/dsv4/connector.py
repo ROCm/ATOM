@@ -2008,10 +2008,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if not hit:
             self._clear_lookup_retry_state(sid)
             return 0, False
-        num_prompt = seq.num_prompt_tokens
-        # Withheld: unlike the chunked hybrids, V4 claims the sidecar boundary
-        # it reports below, so a full-prompt hit has to leave a token.
-        hit = self._loadable_hit(hit, num_prompt, withhold_last=True)
+        # Withheld (the default `_withholds_last_prompt_token`): unlike the
+        # chunked hybrids, V4 claims the sidecar boundary it reports below, so
+        # a full-prompt hit has to leave a token.
+        hit = self._loadable_hit(seq, hit)
         self._hit_save_floors[sid] = hit
         if bool(getattr(seq, "has_per_req_cache", False)):
             boundary_hashes, _ = self._sidecar_hash_data(seq)
