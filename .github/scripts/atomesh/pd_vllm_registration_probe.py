@@ -82,10 +82,9 @@ def worker(root, rank, kv_gib):
         observe('after-kv-registration', 13)
         # Exercise the installed original kernel with an exact CPU check.
         from vllm.v1.worker.utils import _zero_kv_blocks_kernel
-        import triton
         segment = torch.full((4, 1536), 7, dtype=torch.int32, device='cuda')
         tensor = lambda values, dtype: torch.tensor(values, dtype=dtype, device='cuda')
-        _zero_kv_blocks_kernel[(1, 2, 2)](
+        _zero_kv_blocks_kernel[(2, 1, 2)](
             tensor([segment.data_ptr()], torch.uint64), tensor([1536], torch.int64),
             tensor([1300], torch.int64), tensor([0, 2], torch.int64), BLOCK_SIZE=1024)
         torch.cuda.synchronize()
