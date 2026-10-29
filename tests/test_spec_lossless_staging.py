@@ -334,6 +334,32 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     assert {"a", "b", "c"} <= set(prop._staging.slots._slot_of)
 
 
+def test_the_v4_mono_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
+    """The V4 mono proposer replaces the native warmup without calling it, so
+    it clears the staged row bases itself before warming."""
+    from atom.models.deepseek_v4.mono.proposer import MonoDSparkProposer
+
+    prop = proposer(monkeypatch)
+    stage(prop, batch(["a", "b", "c"]))
+    assert any(base >= 0 for base in dest(prop)[:3])
+    mono = MonoDSparkProposer.__new__(MonoDSparkProposer)
+    mono.__dict__.update(vars(prop))
+    seen = {}
+
+    def retire():
+        seen["np"] = mono._draft_row_base_buf.np.tolist()
+        seen["gpu"] = mono._draft_row_base_buf.gpu.tolist()
+
+    mono._mono_session = SimpleNamespace(
+        retire_draft_captures_for_startup=retire,
+        draft_runner=SimpleNamespace(_request_destinations=[]),
+    )
+    mono.block = SimpleNamespace(will_capture=False, release_graphs=lambda: None)
+    monkeypatch.setattr(prop.runner, "capture_sizes", [], raising=False)
+    mono.warmup_draft_graphs(None)
+    assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
+
+
 def test_each_rows_filters_ride_the_publication(monkeypatch):
     prop = proposer(monkeypatch)
     counts = stage(prop, batch(["a", "b"], top_ks=[-1, 7], top_ps=[0.8, 1.0]))
