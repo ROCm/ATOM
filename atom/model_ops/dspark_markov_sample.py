@@ -74,12 +74,90 @@ _BLOCK_K = 64
 # ATOM defaults max_num_seqs to 512, so this is reachable, not theoretical).
 _MIN_BLOCK_ROW = 16
 _MAX_BLOCK_ROW = 64
-# Triton forms the offset expressions below in int32 before sign-extending
-# into the pointer, so a tensor whose largest element offset does not fit is
+# The GEMV addresses base, W1 and W2 in int64 (`_markov_logits_tile`), but the
+# id and output offsets are still formed in int32 before sign-extending into
+# the pointer, so a tensor whose largest element offset does not fit is
 # handed to torch instead of silently wrapping.
 _MAX_INT32 = 2**31 - 1
 # An id block is one of these two; both ends of this op index with it.
 _ID_DTYPES = (torch.int32, torch.int64)
+
+
+@triton.jit
+def _markov_logits_tile(
+    base_ptr,
+    prev_ids_ptr,
+    w1_ptr,
+    w2_ptr,
+    embed_out_ptr,
+    tile,
+    offs_row,
+    offs_v,
+    row_mask,
+    v_mask,
+    rank,
+    stride_base_row,
+    stride_prev,
+    stride_w1_vocab,
+    stride_embed_row,
+    stride_w2_vocab,
+    vocab_offset,
+    BLOCK_ROW: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """``base + W1[prev] @ W2^T`` on one (row tile, V tile), fp32, -inf on
+    padded vocab lanes; tile 0 also publishes ``W1[prev]`` to ``embed_out``.
+
+    The GEMV both stage-1 kernels run; each keeps only its own tail. ``base``
+    holds the tile's columns from 0, W2 is read from vocab id ``vocab_offset``
+    on (a TP rank's shard of the LM head; 0 for the whole vocab). The vocab
+    and row offsets are int64: `[max_bs, T, V]` logits and a whole W2 pass
+    2**31 elements at serving sizes.
+    """
+    # Strided: the caller's ids are one column of its `[B, T + 1]` block, so
+    # assuming unit stride here reads another position's tokens.
+    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+
+    acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
+    for k in range(tl.cdiv(rank, BLOCK_K)):
+        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < rank
+        # W1[x_{k-1}] rows, [BLOCK_ROW, BLOCK_K], gathered here rather than
+        # handed in: every tile program reads these same values anyway, so
+        # the gather rides along in L2 and costs no launch of its own.
+        embed = tl.load(
+            w1_ptr + prev[:, None].to(tl.int64) * stride_w1_vocab + offs_k[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        # One tile publishes the row for the confidence head; the rest hold
+        # the same values and would only write them again.
+        if tile == 0:
+            tl.store(
+                embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_k[None, :],
+                embed,
+                mask=row_mask[:, None] & k_mask[None, :],
+            )
+        # W2^T tile, [BLOCK_K, BLOCK_V]. W2 is stored [V, r] so the rank axis
+        # is the contiguous one: each vocab column is one 2*BLOCK_K-byte run.
+        w2 = tl.load(
+            w2_ptr
+            + (vocab_offset + offs_v[None, :]).to(tl.int64) * stride_w2_vocab
+            + offs_k[:, None],
+            mask=v_mask[None, :] & k_mask[:, None],
+            other=0.0,
+        )
+        # Zeros from the rank mask contribute exact 0.0 terms, so padding the
+        # K tile does not perturb the sum.
+        acc = tl.dot(embed, w2, acc)
+
+    base = tl.load(
+        base_ptr + offs_row[:, None].to(tl.int64) * stride_base_row + offs_v[None, :],
+        mask=row_mask[:, None] & v_mask[None, :],
+        other=0.0,
+    )
+    return tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
 
 
 @triton.jit
@@ -115,49 +193,28 @@ def _dspark_markov_argmax_stage1(
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     row_mask = offs_row < num_rows
     v_mask = offs_v < vocab_size
-    # Strided: the caller's ids are one column of its `[B, T + 1]` block, so
-    # assuming unit stride here reads another position's tokens.
-    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
-
-    acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
-    for k in range(tl.cdiv(rank, BLOCK_K)):
-        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < rank
-        # W1[x_{k-1}] rows, [BLOCK_ROW, BLOCK_K], gathered here rather than
-        # handed in: every tile program reads these same values anyway, so
-        # the gather rides along in L2 and costs no launch of its own.
-        embed = tl.load(
-            w1_ptr + prev[:, None] * stride_w1_vocab + offs_k[None, :],
-            mask=row_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        # One tile publishes the row for the confidence head; the rest hold
-        # the same values and would only write them again.
-        if tile == 0:
-            tl.store(
-                embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_k[None, :],
-                embed,
-                mask=row_mask[:, None] & k_mask[None, :],
-            )
-        # W2^T tile, [BLOCK_K, BLOCK_V]. W2 is stored [V, r] so the rank axis
-        # is the contiguous one: each vocab column is one 2*BLOCK_K-byte run.
-        w2 = tl.load(
-            w2_ptr
-            + (vocab_offset + offs_v[None, :]) * stride_w2_vocab
-            + offs_k[:, None],
-            mask=v_mask[None, :] & k_mask[:, None],
-            other=0.0,
-        )
-        # Zeros from the rank mask contribute exact 0.0 terms, so padding the
-        # K tile does not perturb the sum.
-        acc = tl.dot(embed, w2, acc)
-
-    base = tl.load(
-        base_ptr + offs_row[:, None] * stride_base_row + offs_v[None, :],
-        mask=row_mask[:, None] & v_mask[None, :],
-        other=0.0,
+    vals = _markov_logits_tile(
+        base_ptr,
+        prev_ids_ptr,
+        w1_ptr,
+        w2_ptr,
+        embed_out_ptr,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        rank,
+        stride_base_row,
+        stride_prev,
+        stride_w1_vocab,
+        stride_embed_row,
+        stride_w2_vocab,
+        vocab_offset,
+        BLOCK_ROW,
+        BLOCK_V,
+        BLOCK_K,
     )
-    vals = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
     # `v_mask` also covers the all--inf row: without it a padded lane, which
     # is -inf too, could win the id.
     tile_max, tile_idx = argmax_lowest_id(
@@ -657,39 +714,28 @@ def _dspark_markov_sample_stage1(
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     row_mask = offs_row < num_rows
     v_mask = offs_v < vocab_size
-    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
-
-    acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
-    for k in range(tl.cdiv(rank, BLOCK_K)):
-        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < rank
-        embed = tl.load(
-            w1_ptr + prev[:, None].to(tl.int64) * stride_w1_vocab + offs_k[None, :],
-            mask=row_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        if tile == 0:
-            tl.store(
-                embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_k[None, :],
-                embed,
-                mask=row_mask[:, None] & k_mask[None, :],
-            )
-        w2 = tl.load(
-            w2_ptr + offs_v[None, :].to(tl.int64) * stride_w2_vocab + offs_k[:, None],
-            mask=v_mask[None, :] & k_mask[:, None],
-            other=0.0,
-        )
-        acc = tl.dot(embed, w2, acc)
-
-    base = tl.load(
-        base_ptr + offs_row[:, None].to(tl.int64) * stride_base_row + offs_v[None, :],
-        mask=row_mask[:, None] & v_mask[None, :],
-        other=0.0,
+    logits = _markov_logits_tile(
+        base_ptr,
+        prev_ids_ptr,
+        w1_ptr,
+        w2_ptr,
+        embed_out_ptr,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        rank,
+        stride_base_row,
+        stride_prev,
+        stride_w1_vocab,
+        stride_embed_row,
+        stride_w2_vocab,
+        0,
+        BLOCK_ROW,
+        BLOCK_V,
+        BLOCK_K,
     )
-    # Pre-clamped by the caller to SAMPLER_EPS, so no row divides by zero. A
-    # greedy row's scores are only scratch: finalize publishes the exact delta
-    # on its argmax instead.
-    logits = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
     # The greedy op's own (max, lowest id), taken before the division: a
     # near-zero temperature can round distinct logits onto one value.
     raw_max, raw_idx = argmax_lowest_id(
@@ -697,6 +743,9 @@ def _dspark_markov_sample_stage1(
     )
     tl.store(part_amax_val_ptr + tile * num_rows + offs_row, raw_max, mask=row_mask)
     tl.store(part_amax_idx_ptr + tile * num_rows + offs_row, raw_idx, mask=row_mask)
+    # Pre-clamped by the caller to SAMPLER_EPS, so no row divides by zero. A
+    # greedy row's scores are only scratch: finalize publishes the exact delta
+    # on its argmax instead.
     temperature = tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0)
     scaled = logits / temperature[:, None]
     # Only a row with a destination is read back; the rest draft the argmax.
