@@ -175,6 +175,7 @@ def _stub_v4_runtime_imports():
     # The indexer's scorer needs aiter's kernels; the builder only names them.
     indexer = types.ModuleType("atom.model_ops.indexer")
     indexer.NATURAL, indexer.PRESHUFFLE = "natural", "preshuffle"
+    indexer.MFMA = "mfma"
     for name in ("ConcatKeys", "IndexRows"):
         setattr(indexer, name, type(name, (), {}))
     for name in ("Fp4LaunchStorages", "concat_rows", "fp4_rows", "fp8_rows"):

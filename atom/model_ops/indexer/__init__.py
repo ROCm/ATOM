@@ -14,6 +14,7 @@ no kernels (``schedule``) does not import AITER."""
 import importlib
 
 _EXPORTS = {
+    "MFMA": ".rows",
     "NATURAL": ".rows",
     "PRESHUFFLE": ".rows",
     "ConcatKeys": ".rows",
@@ -31,6 +32,7 @@ _EXPORTS = {
 }
 
 __all__ = [
+    "MFMA",
     "NATURAL",
     "PRESHUFFLE",
     "ConcatKeys",

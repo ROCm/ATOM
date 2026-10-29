@@ -180,6 +180,7 @@ def layout(
     attention_fp8_bf16: bool = False,
     qkv_norm_handoff: bool = False,
     indexer_hadamard: bool = True,
+    indexer_mfma_scales: bool = False,
     n_experts: int = N_EXPERTS,
     top_k: int = TOP_K,
     inter: int = INTER,
@@ -367,6 +368,7 @@ def stage_tasks(
     attention_fp8_bf16: bool = False,
     qkv_norm_handoff: bool = False,
     indexer_hadamard: bool = True,
+    indexer_mfma_scales: bool = False,
     index_topk_refresh: bool = True,
     n_experts: int = N_EXPERTS,
 ):

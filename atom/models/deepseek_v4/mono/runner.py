@@ -234,6 +234,11 @@ class V4MonoDecodeRunner:
                     compressor_projection_bf16=True,
                     attention_fp8_bf16=True,
                     indexer_hadamard=False,
+                    indexer_layout=(
+                        block.attn.indexer.indexer_layout
+                        if indexed
+                        else V4Config.indexer_layout
+                    ),
                     index_topk_refresh=index_topk_refresh if indexed else True,
                     index_topk_source_layer=index_topk_source_layer if indexed else -1,
                 )

@@ -349,3 +349,19 @@ measured 2026-05-23 at commit bf9b133e):
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9530|±  |0.0058|
 |     |       |strict-match    |     5|exact_match|↑  |0.9538|±  |0.0058|
 ```
+
+## OPUS FP4 indexer
+
+The FP4 indexer uses AITER's `mqa_logits_mxfp4_config` /
+`mqa_logits_mxfp4` API. It requires both AITER
+[writer layouts #7128](https://github.com/ROCm/aiter/pull/7128) and
+[MQA API #6952](https://github.com/ROCm/aiter/pull/6952).
+
+On gfx950, `ATOM_V4_UNIFIED_MQA=opus` (default) selects the matching MFMA
+query/cache scales. `ATOM_V4_UNIFIED_MQA=flydsl` selects FlyDSL's preshuffle.
+Set the backend before starting the server; caches cannot be shared between
+these layouts. V4 Mono on gfx950 reads and writes either layout, sharing the
+selected cache directly with native prefill and fallback execution. Its existing
+V4-Pro TP8 deployment requirements still apply; selecting OPUS does not enable
+additional Mono model or parallelism profiles.
+On gfx1250, OPUS uses natural FP4 rows and scales.
