@@ -949,9 +949,13 @@ def test_the_large_sources_of_the_shipped_profile_are_the_ones_atom_tags_with_19
     real_gf,
 ):
     """Route B runs the 512 / 768 bucket rows on src r18, which is the r13 ABI generation: its
-    kernels put only ``call_id & 0x7FFFF`` in the tag (LG_TAG_CALL_BITS 19), exactly like r13.
+    large plans put only ``call_id & 0x7FFFF`` in the tag (LG_TAG_CALL_BITS 19), exactly like r13.
     ATOM's call-id gate must classify BOTH as 19-bit plans; the shipped profile may only carry
-    large sources ATOM knows are tagged that way (a new source shows up here first)."""
+    large sources ATOM knows are tagged that way (a new source shows up here first).
+
+    NEGATIVE CONTROL: the same source name exists as a SMALL plan (pre-R12 SMALL_ABI 2, full
+    ``call_id`` in the tag) — the ABI-generation guard must keep it out of the 19-bit gate.
+    """
     _needs_pad_m(real_gf)
     from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
 
@@ -994,6 +998,19 @@ def test_the_large_sources_of_the_shipped_profile_are_the_ones_atom_tags_with_19
             # THE contract: ATOM's 19-bit call-id tag gate must cover this source
             assert FusionResourcesWrapper.plan_tag_bits(plan) == 19
             checked.add(src)
+        # NEGATIVE: the real SMALL r18 plan (pre-R12, ABI generation 2) tags the FULL call_id;
+        # the ABI guard must not send it into the 19-bit path on the source name alone.
+        variants = importlib.import_module("aiter.ops.gemm_fusion.sp_qkv.variants")
+        small_ctx = real_gf.MatchCtx(
+            arch="gfx950", cu=256, world=4, m=16, available=caps, graph_mode="eager"
+        )
+        small = variants.SpQkvSmall(
+            spec_mod.sp_qkv_spec("dense"),
+            {"src": "r18", "sk": 3, "nh": 1, "no_credit": 1},
+            small_ctx,
+        )
+        assert (small.src, small.abi) == ("r18", 2)
+        assert FusionResourcesWrapper.plan_tag_bits(small) is None
     except ImportError as e:
         pytest.skip(f"variants need the native stack to import: {e}")
     assert checked == sources

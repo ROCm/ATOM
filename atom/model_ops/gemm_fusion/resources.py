@@ -248,17 +248,21 @@ class FusionResourcesWrapper:
 
     @staticmethod
     def plan_tag_bits(plan):
-        """19 for a plan whose handshake tag carries only the low 19 bits of ``call_id`` (the large
-        R12-ABI sources r13 and r18, E = STEP << 32 | (m_real - 1) << 19 | call_id & 0x7FFFF), else
-        None.
+        """19 for a LARGE plan whose handshake tag carries only the low 19 bits of ``call_id`` (the
+        large R12-ABI sources r13 and r18, E = STEP << 32 | (m_real - 1) << 19 | call_id & 0x7FFFF),
+        else None.
 
-        r18 is the route-B large source and runs on the r13 ABI (large_rt: LG_COMM_ABI_VERSION 5,
-        LG_TAG_CALL_BITS 19), so its tags carry the same 19 bits. The shipped profile runs the
-        512 / 768 bucket rows on r18 and the 1024..8192 grid on r13; both need the 19-bit ids. A
-        future large source of the same tag width must be added here (or aiter should expose the
-        width on the plan instead of ATOM hard-coding source names).
+        The guard is source AND ABI generation, never ``src`` alone: the LARGE r13 / r18 plans are
+        ABI generation 4 (LG_COMM_ABI_VERSION 5, LG_TAG_CALL_BITS 19), while the SMALL r18 plan is
+        the pre-R12 SMALL_ABI 2 plan, whose tags carry the FULL ``call_id``. The shipped profile
+        runs its 512 / 768 bucket rows on the large r18 plan and the 1024..8192 grid on large r13;
+        both need the 19-bit ids. A future large source of the same tag width must be added here
+        (or aiter should expose the width on the plan instead of ATOM hard-coding source names).
         """
-        return 19 if getattr(plan, "src", None) in ("r13", "r18") else None
+        if getattr(plan, "src", None) not in ("r13", "r18"):
+            return None
+        # LARGE_ABI generation 4 == LG_COMM_ABI_VERSION 5 only; the small r18 plan is ABI 2.
+        return 19 if getattr(plan, "abi", None) == 4 else None
 
     def reduce_max(self, values):
         """Elementwise MAX all-reduce of small ints over the SP group; trivial on one rank.

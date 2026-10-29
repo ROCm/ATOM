@@ -4834,12 +4834,34 @@ def test_the_adapter_has_tag_unique_ids_only_when_aiter_does_and_names_the_tagge
     assert w.tag_unique_ids([("s", 64, "v", 1)]) is None  # an aiter without the helper
     fake.tag_unique_ids = lambda keys: {k: 7 for k in keys}
     assert w.tag_unique_ids([("s", 64, "v", 1)]) == {("s", 64, "v", 1): 7}
-    # the large R12-ABI sources whose kernels put only call_id & 0x7FFFF in the tag: r13 (the
-    # 1024..8192 grid) and r18 (the route-B 512 / 768 bucket rows, r13 ABI); r12 / small are not
-    assert w.plan_tag_bits(SimpleNamespace(src="r13")) == 19
-    assert w.plan_tag_bits(SimpleNamespace(src="r18")) == 19
-    assert w.plan_tag_bits(SimpleNamespace(src="r12")) is None
-    assert w.plan_tag_bits(SimpleNamespace(src="r19")) is None
+    # the 19-bit gate is for the LARGE R12-ABI sources only: ABI generation 4 ==
+    # LG_COMM_ABI_VERSION 5, i.e. the 1024..8192 grid (r13) and the route-B 512 / 768 bucket rows
+    # (r18). The SMALL r18 plan is the pre-R12 SMALL_ABI 2 plan and tags the FULL call_id.
+    assert w.plan_tag_bits(SimpleNamespace(src="r13", abi=4)) == 19
+    assert w.plan_tag_bits(SimpleNamespace(src="r18", abi=4)) == 19
+    assert (
+        w.plan_tag_bits(SimpleNamespace(src="r18", abi=2)) is None
+    )  # the SMALL r18 plan
+    assert w.plan_tag_bits(SimpleNamespace(src="r12", abi=3)) is None
+    assert (
+        w.plan_tag_bits(SimpleNamespace(src="r19", abi=3)) is None
+    )  # a small R12 plan
+    assert (
+        w.plan_tag_bits(SimpleNamespace(src="r13")) is None
+    )  # no ABI: fail safe, no gate
+
+
+def test_a_small_src_r18_plan_is_not_given_the_large_19_bit_gate(monkeypatch):
+    """r18 exists as a LARGE route-B plan (ABI generation 4, 19-bit tag) and as a SMALL pre-R12
+    plan (SMALL_ABI 2, full call_id in the tag): ``src`` alone would misclassify the small one.
+    """
+    w = _adapter(monkeypatch, SimpleNamespace())
+    small = SimpleNamespace(src="r18", abi=2, n_stages=2)
+    large = SimpleNamespace(src="r18", abi=4, n_stages=1)
+    assert (
+        w.plan_tag_bits(small) is None
+    )  # no low-19 gate: the tag carries the whole call_id
+    assert w.plan_tag_bits(large) == 19  # the LARGE r18 plan: same width as r13
 
 
 # ============ the golden adapter serves an unprepared token count through the prepared bucket's site ========
