@@ -373,7 +373,7 @@ mkdir -p "${LOG_ROOT}"
 if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
   # Archived logs may be reclaimed; admission uses fresh scheduler state.
   c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-jobs.json"
-  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-C88-MC ]]; then
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-C88-MC || "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-C88-MR256-MC ]]; then
     c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-c88-jobs.json"
   elif [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-PP8-MC ]]; then
     c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-pp-jobs.json"

@@ -140,7 +140,7 @@ class LaunchTest(unittest.TestCase):
     def test_candidates_preserve_unrelated_recipe_settings(self):
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
         for concurrency, variant in ((32, "PP8"), (72, "OPUS"), (88, "OPUS"),
-                                     (72, "JUNCTION"), (72, "P16K")):
+                                     (72, "JUNCTION"), (72, "P16K"), (88, "MR256")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
@@ -171,6 +171,10 @@ class LaunchTest(unittest.TestCase):
                 argv, _ = render(candidate, "decode", *ADDR, phase="eval")
                 spec = json.loads(argv[argv.index("--speculative-config") + 1])
                 self.assertEqual(spec["rejection_sample_method"], "standard")
+            elif variant == "MR256":
+                env = candidate["roles"]["prefill"]["env"]
+                self.assertEqual(env["MC_MAX_MR_SIZE"], str(256 << 20))
+                env["MC_MAX_MR_SIZE"] = base["roles"]["prefill"]["env"]["MC_MAX_MR_SIZE"]
             else:
                 args = candidate["roles"]["prefill"]["args"]
                 self.assertEqual(args["max-num-batched-tokens"], 16384)
