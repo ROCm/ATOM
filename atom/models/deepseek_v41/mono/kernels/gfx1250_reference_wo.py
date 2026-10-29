@@ -24,7 +24,9 @@ from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_attention_score imp
 from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_attention_pv import stage_attn_irq_c1
 from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_indexer import vector_address
 from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_projection import _weight_step
-from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_sync import reference_mailbox, publish_plain, scalar_address
+from atom.models.deepseek_v41.mono.kernels.gfx1250_reference_sync import (
+    reference_mailbox, publish_plain, scalar_address, uniform_stage_context,
+)
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
 from atom.mono.device.ops import (
     bf16_round, fp8_pack4, fresh, kernel_symbol, lane_gather, launcher, row_sum, rsrc, traced, uniform,
@@ -271,6 +273,29 @@ def stage_wob_c1(c, task, ops):
             dst = preg(c["peer_addr"](p), c["peer"]["attn"], "attn")
             c["put_bf"](dst, 2*attn_region_pair(c["rank"], 0, 1, col), [v0, v1])
     gpu.barrier()
+
+
+@traced
+def wob_values_c1(c, ops):
+    """Original wave-ordered sums, held until the caller publishes this task."""
+    wob_matrices_c1(c, ops)
+    v0, v1 = fx.Float32(0.), fx.Float32(0.)
+    if c["tid"] < 8:
+        v0 = row_sum(c["red"], 2*c["tid"], 0)
+        v1 = row_sum(c["red"], 2*c["tid"]+1, 0)
+    return v0, v1
+
+
+@traced
+def put_wob_values_c1(c, task, v0, v1):
+    """Publish the same BF16 payload/tag pairs; caller joins after all tasks."""
+    from atom.models.deepseek_v41.mono.kernels.attn_post import attn_region_pair
+    from atom.mono.device.sync import preg
+    if c["tid"] < 8:
+        col = task*16+2*c["tid"]
+        for p in range_constexpr(c["d"].tp):
+            dst = preg(c["peer_addr"](p), c["peer"]["attn"], "attn")
+            c["put_bf"](dst, 2*attn_region_pair(c["rank"], 0, 1, col), [v0, v1])
 
 
 @traced
@@ -558,14 +583,15 @@ def build_reference_attention_wob_c1(debug=False, reduce=True, seam=False, ffn=F
         for region in layout:
             c[region] = sreg(scratch, layout[region][0], region)
         for task in range(first_task(bid,0), d.head_tiles.count*8, BLOCKS):
-            stage_attn_score_c1(c, task, 8)
+            stage_attn_score_c1(uniform_stage_context(c,("am","al","ap","irdy"),("q","pool","sel","sbound","kmeta")), task, 8)
         for task in range(first_task(bid,64), d.head_tiles.count*16, BLOCKS):
-            stage_attn_irq_c1(c, task, 1, debug)
+            stage_attn_irq_c1(uniform_stage_context(c,("am","al","ap","irdy","xo","xos"),("pool","sel","sbound","kmeta","sink","pos","cos","sin")), task, 1, debug)
         gpu.barrier()
         task = first_task(bid,160)
         if task < d.woa_tasks:
-            ops = woa_loads_c1(c, task)
-            woa_tile_c1(c, task, ops, debug)
+            cw = uniform_stage_context(c,("xo","xos","x8b","x8bs"),("woa","woa_s"))
+            ops = woa_loads_c1(cw, task)
+            woa_tile_c1(cw, task, ops, debug)
         if const_expr(down):
             # Keep the mother's single immutable-table read, but materialize
             # its bases before the first publishing stage. Keeping these
@@ -580,19 +606,30 @@ def build_reference_attention_wob_c1(debug=False, reduce=True, seam=False, ffn=F
         has_second = wob_second < HIDDEN//16
         ops = wob_loads_c1(c, wob_task)
         ops2 = wob_loads_c1(c, has_second.select(wob_second,wob_task))
-        poll_copy(c, tid, THREADS, [
-            (c["x8b"], lambda u:u, d.yb_words, c["xl"], d.yb_words),
-            (c["x8bs"], lambda u:u, d.o_rows//32, c["xsl"], d.o_rows//32),
+        cw = uniform_stage_context(c,("x8b","x8bs"))
+        poll_copy(cw, tid, THREADS, [
+            (cw["x8b"], lambda u:u, d.yb_words, c["xl"], d.yb_words),
+            (cw["x8bs"], lambda u:u, d.o_rows//32, c["xsl"], d.o_rows//32),
         ])
         gpu.barrier()
-        stage_wob_c1(c, wob_task, ops)
+        # Keep each original N16 task and K reduction. Capture the first
+        # task's sums before reusing red, then publish both tasks together.
+        # The intervening CTA join protects LDS without any pending peer
+        # stores; the final join still drains every tagged publication.
+        first0, first1 = wob_values_c1(c, ops)
+        second0, second1 = fx.Float32(0.), fx.Float32(0.)
         if has_second:
-            stage_wob_c1(c, wob_second, ops2)
+            gpu.barrier()
+            second0, second1 = wob_values_c1(c, ops2)
+        put_wob_values_c1(c, wob_task, first0, first1)
+        if has_second:
+            put_wob_values_c1(c, wob_second, second0, second1)
+        gpu.barrier()
         if const_expr(reduce):
             for task in range(first_task(bid,0), HIDDEN//32, BLOCKS):
                 if const_expr(seam):
                     pre = slice_prefetch_c1(c, task)
-                stage_attn_reduce_c1(c, task)
+                stage_attn_reduce_c1(uniform_stage_context(c,roots=("sym",)), task)
                 if const_expr(not seam or debug):
                     if tid < 32:
                         fx.ptr_store(fx.ptr_load(c["pend_lds"]+tid).to(fx.BFloat16),

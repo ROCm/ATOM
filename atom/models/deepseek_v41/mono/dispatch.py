@@ -157,7 +157,7 @@ def install_mono_decode(
     does not serve."""
     import os
 
-    if os.getenv("ATOM_DSV41_GFX1250_REFERENCE_MONO", "0") == "1":
+    if os.getenv("ATOM_DSV41_GFX1250_REFERENCE_MHTJSTEST", "0") == "1":
         from atom.models.deepseek_v41.mono.gfx1250_reference_runner import install_reference_decode
 
         return install_reference_decode(model, atom_config, drafter, metadata_builder)

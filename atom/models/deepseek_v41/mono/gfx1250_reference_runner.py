@@ -113,6 +113,12 @@ class Gfx1250ReferenceRunner(V41MonoDecodeRunner):
             self.scratch = torch.zeros((self.scratch.numel() + 15) // 16 * 16,
                                        dtype=torch.uint8, device=self.scratch.device)
         dev = self.scratch.device
+        # _key_row performs the raw selection load before choosing WINDOW.
+        # Retain the rows-sized bound view, backed by every token's512-int span.
+        self._window_selection_storage = torch.zeros(self.max_rows * 512,
+            dtype=torch.int32, device=dev)
+        self.no_bound = self._window_selection_storage[:self.max_rows]
+        self._full['no_bound'] = self.no_bound
         self.diag = torch.zeros(256 * 8 + 16, dtype=torch.int32, device=dev)
         self.ingress = torch.empty_like(self.res_ffn)
         self.ingress_pre = torch.empty_like(self.gates_ffn[0])
@@ -371,5 +377,5 @@ def install_reference_decode(model, config, drafter, metadata_builder):
     bound = []
     bind_agreed(lambda: bound.extend(bind_reference_model(model, config.tensor_parallel_size)), get_tp_group().cpu_group)
     runner = Gfx1250ReferenceRunner(model, bound, config.max_model_len)
-    logger.info("gfx1250 reference mono installed %d layers before KV sizing", len(bound))
+    logger.info("gfx1250 reference mhtjstest installed %d layers before KV sizing", len(bound))
     return ReferenceDecodeModel(model, runner)

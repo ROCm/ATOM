@@ -29,7 +29,7 @@ def _raise_diagnostic_values(cache, values):
         context = getattr(cache, "_gfx1250_decode", None)
         detail = context.sync_detail.cpu().tolist() if context is not None else None
         raise RuntimeError(
-            f"[gfx1250 mono] TP diagnostic {values[-1]}, local {local}; "
+            f"[gfx1250 mhtjstest] TP diagnostic {values[-1]}, local {local}; "
             f"local wait [code,wanted,observed,source,producer_epoch,stage,published_stage,reserved,norm_wave0..7]: {detail}; "
             "discard output and stop dispatch"
         )
@@ -57,7 +57,7 @@ class DeferredDiagnostics:
     def stage(self, metadata, rows):
         if self.staged:
             raise RuntimeError(
-                "[gfx1250 mono] diagnostics must be accepted once per output"
+                "[gfx1250 mhtjstest] diagnostics must be accepted once per output"
             )
         self.accept_count = len(self.caches)
         if metadata.step.decode and rows in (1, 2):
@@ -69,7 +69,7 @@ class DeferredDiagnostics:
 
     def accept(self):
         if not self.staged:
-            raise RuntimeError("[gfx1250 mono] no staged diagnostic output")
+            raise RuntimeError("[gfx1250 mhtjstest] no staged diagnostic output")
         for _ in range(self.accept_count):
             values = self.queue.receive()
             cache = self.caches.popleft()

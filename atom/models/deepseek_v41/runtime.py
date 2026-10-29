@@ -295,7 +295,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
     def stage_forward_diagnostics(self, rows, stream, deferred):
         if not deferred or not any(os.getenv(flag, "0") == "1" for flag in (
-            "ATOM_DSV41_GFX1250_K1", "ATOM_DSV41_GFX1250_REFERENCE_MONO",
+            "ATOM_DSV41_GFX1250_K1", "ATOM_DSV41_GFX1250_REFERENCE_MHTJSTEST",
         )):
             return
         from .mono.gfx1250_diagnostics import DeferredDiagnostics
@@ -308,7 +308,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
     def check_forward_diagnostics(self, rows):
         if any(os.getenv(flag, "0") == "1" for flag in (
-            "ATOM_DSV41_GFX1250_K1", "ATOM_DSV41_GFX1250_REFERENCE_MONO",
+            "ATOM_DSV41_GFX1250_K1", "ATOM_DSV41_GFX1250_REFERENCE_MHTJSTEST",
         )):
             from .mono.gfx1250_runner import check_k1_diagnostics
 
@@ -332,7 +332,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                     "ATOM_DSV41_GFX1250_K2",
                 )
             ):
-                raise ValueError("[gfx1250 mono] merged K2 requires K1 and K2 enabled")
+                raise ValueError("[gfx1250 mhtjstest] merged K2 requires K1 and K2 enabled")
         if os.getenv("ATOM_DSV41_GFX1250_K1", "0") == "1":
             from atom.config import CUDAGraphMode
 
