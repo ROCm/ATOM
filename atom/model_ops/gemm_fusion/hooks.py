@@ -287,8 +287,9 @@ def _refuse_colliding_call_ids() -> None:
 
 class _TokenIds:
     """The call-id verdicts of one token count: ``ids`` = the ids aiter assigned to the launches whose
-    tag carries only the low bits of ``call_id`` (large r13), ``refused`` = the keys that must run
-    native (a collision among the launches of this token count, or no id could be assigned).
+    tag carries only the low bits of ``call_id`` (the large R12-ABI sources r13 / r18),
+    ``refused`` = the keys that must run native (a collision among the launches of this token count,
+    or no id could be assigned).
     """
 
     __slots__ = ("ids", "refused")

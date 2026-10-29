@@ -4834,7 +4834,10 @@ def test_the_adapter_has_tag_unique_ids_only_when_aiter_does_and_names_the_tagge
     assert w.tag_unique_ids([("s", 64, "v", 1)]) is None  # an aiter without the helper
     fake.tag_unique_ids = lambda keys: {k: 7 for k in keys}
     assert w.tag_unique_ids([("s", 64, "v", 1)]) == {("s", 64, "v", 1): 7}
+    # the large R12-ABI sources whose kernels put only call_id & 0x7FFFF in the tag: r13 (the
+    # 1024..8192 grid) and r18 (the route-B 512 / 768 bucket rows, r13 ABI); r12 / small are not
     assert w.plan_tag_bits(SimpleNamespace(src="r13")) == 19
+    assert w.plan_tag_bits(SimpleNamespace(src="r18")) == 19
     assert w.plan_tag_bits(SimpleNamespace(src="r12")) is None
     assert w.plan_tag_bits(SimpleNamespace(src="r19")) is None
 

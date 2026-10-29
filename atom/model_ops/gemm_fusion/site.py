@@ -943,9 +943,9 @@ class GemmFusionSite:
 
     def _call_id(self, r, tokens) -> int:
         """The launch's identity in the handshake tag. Small plans: the 31-bit ``decision_key``. A plan
-        whose tag carries only the LOW bits of call_id (large r13): the id aiter's ``tag_unique_ids``
-        assigned for this token count, whose low bits are distinct and non-zero by construction (a
-        ``decision_key`` collides on them)."""
+        whose tag carries only the LOW bits of call_id (the large R12-ABI sources r13 / r18): the id
+        aiter's ``tag_unique_ids`` assigned for this token count, whose low bits are distinct and
+        non-zero by construction (a ``decision_key`` collides on them)."""
         bits = getattr(hooks.resources(), "plan_tag_bits", None)
         if bits is not None and bits(r.plan):
             ids = hooks.token_call_ids(tokens, self._runtime_mode())

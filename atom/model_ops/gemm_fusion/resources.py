@@ -249,9 +249,16 @@ class FusionResourcesWrapper:
     @staticmethod
     def plan_tag_bits(plan):
         """19 for a plan whose handshake tag carries only the low 19 bits of ``call_id`` (the large
-        r13 source, E = STEP << 32 | (m_real - 1) << 19 | call_id & 0x7FFFF), else None.
+        R12-ABI sources r13 and r18, E = STEP << 32 | (m_real - 1) << 19 | call_id & 0x7FFFF), else
+        None.
+
+        r18 is the route-B large source and runs on the r13 ABI (large_rt: LG_COMM_ABI_VERSION 5,
+        LG_TAG_CALL_BITS 19), so its tags carry the same 19 bits. The shipped profile runs the
+        512 / 768 bucket rows on r18 and the 1024..8192 grid on r13; both need the 19-bit ids. A
+        future large source of the same tag width must be added here (or aiter should expose the
+        width on the plan instead of ATOM hard-coding source names).
         """
-        return 19 if getattr(plan, "src", None) == "r13" else None
+        return 19 if getattr(plan, "src", None) in ("r13", "r18") else None
 
     def reduce_max(self, values):
         """Elementwise MAX all-reduce of small ints over the SP group; trivial on one rank.

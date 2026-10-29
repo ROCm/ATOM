@@ -943,3 +943,57 @@ def test_the_site_resolves_every_m_through_aiters_real_bucket_for_m_on_the_shipp
         padded += 1
     assert padded > 100  # most of m 1..256 is served by padding
     assert hooks.world_or_1() == 4
+
+
+def test_the_large_sources_of_the_shipped_profile_are_the_ones_atom_tags_with_19_bits(
+    real_gf,
+):
+    """Route B runs the 512 / 768 bucket rows on src r18, which is the r13 ABI generation: its
+    kernels put only ``call_id & 0x7FFFF`` in the tag (LG_TAG_CALL_BITS 19), exactly like r13.
+    ATOM's call-id gate must classify BOTH as 19-bit plans; the shipped profile may only carry
+    large sources ATOM knows are tagged that way (a new source shows up here first)."""
+    _needs_pad_m(real_gf)
+    from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
+
+    prof = real_gf.load_profile(PROFILE_NAME)
+    large = [r for r in prof.rows() if r.vid == "sp_qkv.large.v1"]
+    assert large
+    sources = {r.params.get("src") for r in large}
+    assert sources == {"r13", "r18"}  # both on the r13 tag ABI (generation 4)
+    spec_mod = importlib.import_module("aiter.ops.gemm_fusion.sp_qkv.specs")
+    caps = frozenset({"mori_cco", "sdma", "gfx950_sc_bypass"})
+    checked = set()
+    try:
+        for row in large:
+            src = row.params.get("src")
+            if src in checked:
+                continue
+            mode = next(
+                m
+                for m in spec_mod.MODES
+                if spec_mod.sp_qkv_spec(m).prefix(1).signature() == row.sig
+            )
+            ctx = real_gf.MatchCtx(
+                arch=row.arch,
+                cu=row.cu,
+                world=row.world,
+                m=row.m,
+                available=caps,
+                graph_mode="eager",
+            )
+            # ATOM matches the site's FULL spec (2-stage): at a large m only the 1-stage
+            # sp_qkv.large.v1 prefix resolves, exactly as in the engine
+            plan, n = real_gf.match_prefix(
+                spec_mod.sp_qkv_spec(mode), ctx, PROFILE_NAME
+            )
+            assert plan is not None and n == 1
+            assert (plan.vid, plan.src, plan.abi) == ("sp_qkv.large.v1", src, 4)
+            assert (
+                plan.pad_m is True
+            )  # a bucket also serves every real m above its floor
+            # THE contract: ATOM's 19-bit call-id tag gate must cover this source
+            assert FusionResourcesWrapper.plan_tag_bits(plan) == 19
+            checked.add(src)
+    except ImportError as e:
+        pytest.skip(f"variants need the native stack to import: {e}")
+    assert checked == sources
