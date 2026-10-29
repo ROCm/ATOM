@@ -38,6 +38,7 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
     BlockManager,
+    FillReservation,
     draft_kv_lookahead,
 )
 from atom.model_engine.dynamic_chunking import (
@@ -976,6 +977,43 @@ class Scheduler:
                 return True
         return False
 
+    def _parks_for_tier_lookup(self, seq: Sequence, lookup_detachable: bool) -> bool:
+        """Whether admission parks a fresh `seq` in `prefix_waiters` for its
+        tier lookup: one still in flight that it may not detach. Admission and
+        the fill probe both ask this, so the probe passes over what admission
+        does."""
+        return (
+            not lookup_detachable
+            and self.kv_connector is not None
+            and self._offload_lookup_pending(seq)
+        )
+
+    def _parks_for_inflight_prefix(
+        self,
+        seq: Sequence,
+        num_cached_blocks: int,
+        *,
+        needs_remote_load: bool = False,
+        peek: bool = False,
+    ) -> bool:
+        """Whether admission parks `seq`, which fits with `num_cached_blocks`
+        HBM hit blocks, in `prefix_waiters` behind a hybrid producer's
+        prompt-end checkpoint still in flight. Admission and the fill probe
+        both ask this; the probe peeks (`_wait_for_inflight_prefix`) and,
+        unable to query the connector, takes `needs_remote_load` as False."""
+        return (
+            self._local_prefill_coalescing
+            and (not needs_remote_load or self._connector_flag("is_offload"))
+            and self._wait_for_inflight_prefix(
+                seq,
+                max(
+                    num_cached_blocks * self.block_manager.hash_block_size,
+                    seq.offload_joint.kv_prefix_tokens,
+                ),
+                peek=peek,
+            )
+        )
+
     def _waiting_prefills(self):
         for seq in self.waiting:
             if (
@@ -1031,8 +1069,7 @@ class Scheduler:
         # What the seqs counted so far take from the pool: admission allocates
         # them one after another, so each later seq fits only in what the
         # earlier ones leave (Phase 2 stops at the first refusal).
-        reserved_blocks = 0
-        reserved_state_slots = 0
+        fill = FillReservation()
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
@@ -1043,14 +1080,7 @@ class Scheduler:
                 )
             else:
                 # The exact probe's answer; the walk is memoised across ticks.
-                demand: list[int] = []
-                cached_blocks = self.block_manager.can_allocate_memoized(
-                    seq,
-                    reserved_blocks=reserved_blocks,
-                    reserved_state_slots=reserved_state_slots,
-                    demand=demand,
-                    observe=False,
-                )
+                cached_blocks = self.block_manager.can_allocate_memoized(seq, fill)
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
                 if slots <= self._num_parked_remote_kv:
@@ -1061,24 +1091,14 @@ class Scheduler:
                     break
                 resume = cached_blocks * self.block_manager.hash_block_size
                 # Seqs admission passes over rather than prefills this pass
-                # (`prefix_waiters`): a pending tier lookup it cannot detach, or
-                # a hybrid producer's prompt-end checkpoint still in flight.
-                if (
-                    self.kv_connector is not None
-                    and self._offload_lookup_pending(seq)
-                    and not (
-                        self._lookup_detach_enabled(seq)
-                        and self._can_detach_tier_lookup(
-                            seq, AdmissionProbe(cached_blocks)
-                        )
-                    )
-                ):
+                # (`prefix_waiters`), by admission's own predicates.
+                hbm_probe = AdmissionProbe(cached_blocks)
+                detachable = self._lookup_detach_enabled(seq) and (
+                    self._can_detach_tier_lookup(seq, hbm_probe)
+                )
+                if self._parks_for_tier_lookup(seq, detachable):
                     continue
-                if self._local_prefill_coalescing and self._wait_for_inflight_prefix(
-                    seq,
-                    max(resume, seq.offload_joint.kv_prefix_tokens),
-                    peek=True,
-                ):
+                if self._parks_for_inflight_prefix(seq, cached_blocks, peek=True):
                     continue
                 cached = self.block_manager.replay_start(seq, resume, hit=True)
             remaining = (
@@ -1106,9 +1126,7 @@ class Scheduler:
             slots -= 1
             if not offload_resume:
                 # An offload resume already holds its blocks (pre-park allocate).
-                reserved_blocks += demand[0] if demand else 0
-                if seq.has_per_req_cache:
-                    reserved_state_slots += self.block_manager.state_slots_per_req
+                fill.take()
             if pending >= budget:
                 return True, budget
             if slots == 0:
@@ -2240,9 +2258,7 @@ class Scheduler:
             if (
                 not remote_ready_for_decode
                 and not offload_resume
-                and not lookup_detachable
-                and self.kv_connector is not None
-                and self._offload_lookup_pending(seq)
+                and self._parks_for_tier_lookup(seq, lookup_detachable)
             ):
                 prefix_waiters.append(seq)
                 continue
@@ -2391,16 +2407,8 @@ class Scheduler:
             resume = num_cached_blocks * self.block_manager.hash_block_size
             start = self.block_manager.replay_start(seq, resume, hit=True)
             num_new_tokens = self._new_prefill_tokens(seq, start, resume)
-            if (
-                self._local_prefill_coalescing
-                and (not needs_remote_load or self._connector_flag("is_offload"))
-                and self._wait_for_inflight_prefix(
-                    seq,
-                    max(
-                        num_cached_blocks * self.block_manager.hash_block_size,
-                        seq.offload_joint.kv_prefix_tokens,
-                    ),
-                )
+            if self._parks_for_inflight_prefix(
+                seq, num_cached_blocks, needs_remote_load=needs_remote_load
             ):
                 prefix_waiters.append(seq)
                 continue
