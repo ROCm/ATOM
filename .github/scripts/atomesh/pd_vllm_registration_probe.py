@@ -67,7 +67,8 @@ def worker(root, rank, kv_gib):
              'MC_TE_FILTERS': os.environ.get('MC_TE_FILTERS'),
              'MC_HIP_NUM_STREAMS': os.environ.get('MC_HIP_NUM_STREAMS'),
              'MC_HIP_NUM_EVENTS': os.environ.get('MC_HIP_NUM_EVENTS'),
-             'MC_MAX_MR_SIZE': os.environ.get('MC_MAX_MR_SIZE')})
+             'MC_MAX_MR_SIZE': os.environ.get('MC_MAX_MR_SIZE'),
+             'MOONCAKE_DISABLE_HIP_DMABUF': os.environ.get('MOONCAKE_DISABLE_HIP_DMABUF')})
         assert rc == 0, f'Engine initialization failed: {rc}'
         barrier(root, 'engine-init', rank)
         observe('after-engine-init', 11)
@@ -128,9 +129,9 @@ def run_suite(out):
     base.update(plan['common_env'])
     base.update(VLLM_PLUGINS='', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
     rows = []
-    cases = [('single-mr-193g', 193, {'MC_MAX_MR_SIZE': str(256 * GIB)}),
-             ('split-64g-193g', 193, {'MC_MAX_MR_SIZE': str(64 * GIB)}),
-             ('hip-ipc-only-193g', 193, {'ATOMESH_PROBE_REGISTER_MODE': 'hip_ipc'})]
+    cases = [('default-dmabuf-193g', 193, {}),
+             ('disable-dmabuf-193g', 193, {'MOONCAKE_DISABLE_HIP_DMABUF': '1'}),
+             ('default-dmabuf-64g', 64, {})]
     for name, kv_gib, overrides in cases:
         root = out / name
         root.mkdir()
@@ -143,7 +144,8 @@ def run_suite(out):
         try:
             for rank in range(4):
                 env = role_env(base, 'decode', '127.0.0.1', plan['decode']['env'])
-                for key in ('MC_HIP_NUM_STREAMS', 'MC_HIP_NUM_EVENTS', 'MC_DISABLE_HIP', 'ATOMESH_PROBE_REGISTER_MODE'):
+                for key in ('MC_HIP_NUM_STREAMS', 'MC_HIP_NUM_EVENTS', 'MC_DISABLE_HIP', 'ATOMESH_PROBE_REGISTER_MODE',
+                            'MOONCAKE_DISABLE_HIP_DMABUF'):
                     env.pop(key, None)
                 env.update(overrides)
                 env['MC_TE_FILTERS'] = f'rdma{rank + 4}'
