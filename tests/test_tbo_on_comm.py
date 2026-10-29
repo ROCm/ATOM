@@ -7,6 +7,7 @@ test_tbo_mark_used_on_compute.py). CPU only: the TBO hooks and
 `record_stream` are monkeypatched."""
 
 import inspect
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -80,6 +81,12 @@ def test_tp_all_reduce_output_is_held(tbo, monkeypatch):
     """Pure TP+TBO's overlapped all-reduce allocates its output on the comm
     stream, like the PCP gathers."""
     mdo = pytest.importorskip("atom.model_ops.module_dispatch_ops")
+    # Imported inside, ahead of the TBO branch; CI's aiter lacks it.
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.communication_op",
+        SimpleNamespace(tensor_model_parallel_all_reduce=lambda x: pytest.fail()),
+    )
     monkeypatch.setenv("ATOM_TBO_TP_AR_MODE", "overlap")
     monkeypatch.setattr(ub, "tbo_current_ubatch_id", lambda: 0)
     monkeypatch.setattr(ub, "tbo_get_comm_stream", lambda: "comm stream")
