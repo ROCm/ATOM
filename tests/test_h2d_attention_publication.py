@@ -179,18 +179,25 @@ def test_kpool_verify_publishes_the_mtp_layers_rows_a_token_behind(monkeypatch):
 
 def test_sparse_mtp_verify_plans_only_the_real_tokens(monkeypatch):
     """A cudagraph-padded sparse MTP verify plans its per-token work over the
-    scheduled tokens: a padded token has zero sparse KV, yet would still get a
-    work item reading the sparse-index buffer past what the step wrote (#287)."""
+    scheduled tokens, and says so in the metadata. The MTP drafter's step 0
+    reuses this plan with the target's UNPADDED stream (scheduled tokens rows);
+    the persistent kernel reads q and writes o for every work item, so a plan
+    over the padded count ran past both (#287)."""
     q = 3
     runner, builder = make_runner(monkeypatch, "mla", q=q, sparse=True, tbo=False)
     planned = []
-    builder._set_mla_persistent_worker_buffers_sparse_mtp = (
-        lambda num_tokens, *a, **kw: planned.append(num_tokens) or {}
-    )
+
+    def plan(num_tokens, *a, **kw):
+        planned.append(num_tokens)
+        return {"sparse_mtp_num_tokens": num_tokens}
+
+    builder._set_mla_persistent_worker_buffers_sparse_mtp = plan
     batch = decode_batch(2, q)
     start_decode(runner, builder, batch, q)
-    builder.prepare_decode(batch, 4, 4 * q, q)
+    attn_metadata, _ = builder.prepare_decode(batch, 4, 4 * q, q)
     assert planned == [2 * q]
+    # What MLAAttention._forward_decode checks q's rows against.
+    assert attn_metadata.sparse_mtp_num_tokens == 2 * q
     finish(runner)
 
 
