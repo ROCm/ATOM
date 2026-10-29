@@ -236,6 +236,8 @@ def test_kimi_k3_vision_quant_excludes_cover_regex_and_globs():
             "vision_tower*",
             "*.vision_tower.*",
             "model.vision_tower",
+            # Excluded layer by layer, as amd/Kimi-K3-Quark-MXFP4-AttnFP8 does.
+            "vision_tower.encoder.blocks.0.mlp.fc0",
         ):
             assert (
                 KimiK3ForConditionalGeneration_._maybe_ignore_quant_config(
@@ -246,6 +248,32 @@ def test_kimi_k3_vision_quant_excludes_cover_regex_and_globs():
                 )
                 is None
             ), exclude
+        """)
+
+
+def test_kimi_k3_projector_excluded_layer_by_layer():
+    """Exact per-layer excludes on the projector exclude the projector; an
+    exclude elsewhere does not."""
+    _run_without_test_stubs("""
+        from types import SimpleNamespace
+
+        from atom.config import QuantizationConfig
+        from atom.plugin.vllm.models.kimi_k3 import (
+            KimiK3ForConditionalGeneration_,
+        )
+
+        model = SimpleNamespace(
+            atom_config=SimpleNamespace(quant_config=QuantizationConfig())
+        )
+        quant_config = object()
+        ignore = KimiK3ForConditionalGeneration_._maybe_ignore_quant_config
+        excludes = ["mm_projector.proj.0", "mm_projector.proj.2"]
+        assert ignore(model, quant_config, excludes, "mm_projector") is None
+        assert ignore(model, quant_config, excludes, "vision_tower") is quant_config
+        assert (
+            ignore(model, quant_config, ["mm_projector_extra.x"], "mm_projector")
+            is quant_config
+        )
         """)
 
 
