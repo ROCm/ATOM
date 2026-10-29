@@ -73,9 +73,14 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-      - name: Prefer latest main aiter wheel manifest and fallback to artifact
+      - name: Download aiter wheel built from ROCm/aiter#7010 head (014d07dc7)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_REPO: ROCm/aiter
+          AITER_WORKFLOW_RUN_ID: "40491952550"
+          AITER_WORKFLOW_ARTIFACT_NAME: aiter-whl-40491952550-py3.12
+          AITER_WORKFLOW_ARTIFACT_ID: "12738957349"
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
@@ -112,7 +117,6 @@ jobs:
           # to the job owner rather than decided here.
           atomesh_levels = {
               "DeepSeek-R1-0528": "main",
-              "gpt-oss-120b": "nightly",
           }
           filtered = [m for m in models if atomesh_levels.get(m["model_name"], "skip") in allowed]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
