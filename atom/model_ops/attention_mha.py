@@ -434,8 +434,9 @@ class PagedAttentionImpl(nn.Module):
         the separate kernels at 16384 tokens, Qwen3.5 TP4 on MI355X), so
         above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS run them separately:
         Gemma q/k norm in one launch, the Qwen3.5 MRoPE Triton kernel (or the
-        module's own rotary when that declines), then the per-token FP8 cache
-        write. Same SHUFFLE layout and scales the fused kernel writes.
+        module's own rotary when that declines), then the cache write: per-token
+        FP8 for an fp8 cache, a plain copy otherwise. Same SHUFFLE layout and
+        scales the fused kernel writes.
         """
         from atom.model_ops.layernorm import DualRMSNorm
         from atom.model_ops.triton_mrope import try_mrope_qk_fused
@@ -463,16 +464,30 @@ class PagedAttentionImpl(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        aiter.reshape_and_cache_with_pertoken_quant(
-            k,
-            v,
-            k_cache,
-            v_cache,
-            k_scale,
-            v_scale,
-            attn_metadata.slot_mapping,
-            asm_layout=True,
-        )
+        # Only an fp8 cache has scales: a bf16 one leaves k_scale None.
+        if self.kv_cache_dtype == "fp8":
+            aiter.reshape_and_cache_with_pertoken_quant(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                attn_metadata.slot_mapping,
+                asm_layout=True,
+            )
+        else:
+            aiter.reshape_and_cache(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                kv_cache_dtype="auto",
+                k_scale=None,
+                v_scale=None,
+                asm_layout=True,
+            )
         return q, k, v
 
     def _gather_prefix_and_concat_kv(
