@@ -1,0 +1,9 @@
+{
+  "purpose": "Require fresh scheduler absence of the cancelled PP predecessor before retrying corrected MLA cache discovery",
+  "jobs": [
+    {"job_id": "7788", "run_id": "38296153235"},
+    {"job_id": "8540", "run_id": "38740874930"},
+    {"job_id": "8541", "run_id": "38740903706"},
+    {"job_id": "11007", "run_id": "40866596053", "actions_conclusion": "cancelled", "cleanup_verified": false}
+  ]
+}
