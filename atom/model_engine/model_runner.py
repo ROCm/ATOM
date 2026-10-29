@@ -112,6 +112,7 @@ from atom.utils import (
     envs,
     get_hf_text_config,
     init_exit_handler,
+    register_crash_release,
     resolve_obj_by_qualname,
     worker_process_name,
 )
@@ -673,7 +674,8 @@ class tokenIDProcessor:
                 new_curr=np.asarray(new_curr, dtype=np.intp),
             )
 
-        # TODO: remove this when we support mixed prefill and decode in one batch
+        # A pure-prefill batch (a mixed one returned above): its ids are the
+        # scheduler's, and nothing is deferred.
         if total_reqs_prefill > 0:
             # Decode does not publish an empty prefill prefix: an explicit
             # zero copy is still a publication in this forward's ledger.
@@ -864,12 +866,29 @@ def _profile_runner_stage(method):
     return wrapped
 
 
+def close_kv_connector() -> None:
+    """Close this process's KV connector, if it has one that closes.
+
+    Only offload workers define `close()` (moriio etc. do not). It joins their
+    copy threads and, for the LMCache MP connector, unregisters this rank from
+    the MP server, which otherwise keeps its GPU IPC mapping of the KV pool --
+    and the memory -- until its reaper times out. Idempotent: the connectors
+    drop what they released."""
+    connector = get_kvconnector()
+    close = getattr(connector, "close", None) if connector is not None else None
+    if callable(close):
+        close()
+
+
 class ModelRunner:
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
         self.structured_compile_executor = None
         self.structured_compilations = OrderedDict()
+        # A crash exits without `exit()`; the connector's close is the part of
+        # it a server outside this process waits on (`run_exiting_on_crash`).
+        register_crash_release(close_kv_connector)
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -1304,11 +1323,7 @@ class ModelRunner:
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
         #    pool it copies out of is dropped and before the dist env goes away.
-        #    Guarded: only offload workers define close() (moriio etc. do not).
-        connector = get_kvconnector()
-        close = getattr(connector, "close", None) if connector is not None else None
-        if callable(close):
-            close()
+        close_kv_connector()
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()

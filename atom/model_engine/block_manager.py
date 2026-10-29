@@ -615,24 +615,21 @@ class BlockManager:
 
         The raise is unreachable through `Scheduler` and the checkpoint cache
         cannot make it reachable: a READY unpinned checkpoint counts as
-        available, and both callers sit behind a pin-aware check in the same
-        pass. `allocate` protects the checkpoint it is about to pin -- the
-        joint boundary when that image is in HBM, otherwise the HBM-hit
-        checkpoint -- and sees the pin taken before the fresh blocks.
-        `may_append` runs only in a pass that scheduled no prefill
-        (`scheduler.py`, `if num_seqs_prefill > 0` returns first), so every
-        pin was already released at the top of that pass -- except for the
-        draft lookahead an admission allocates right after its `allocate`.
-        `can_allocate` charged those blocks (`draft_lookahead_blocks`) against
-        the HBM-hit checkpoint; when a joint needs more, `_fit_joint` charges
-        that same demand plus the private tail against the checkpoint
-        `allocate` will pin. Under contention the reachable outcome is a
-        refused admission, not this.
-
-        That second half rests on prefill and decode never sharing a pass. If
-        the mixed batch that `scheduler.py` has a TODO for lands, `may_append`
-        starts running alongside this pass's pins and the argument has to be
-        redone.
+        available, and each caller sits right behind a pin-aware check that
+        counts the same set. `allocate` protects the checkpoint it is about to
+        pin -- the joint boundary when that image is in HBM, otherwise the
+        HBM-hit checkpoint -- and sees the pin taken before the fresh blocks,
+        and the draft lookahead an admission allocates right after its
+        `allocate` included: `can_allocate` charged those blocks
+        (`draft_lookahead_blocks`) against the HBM-hit checkpoint, and when a
+        joint needs more, `_fit_joint` charges that same demand plus the private
+        tail against the checkpoint `allocate` will pin. `may_append` follows
+        `can_append`, and both ask about the same eligible set (`_is_evictable`:
+        READY, unpinned): pins this pass's prefill admissions took -- a mixed
+        step's -- are outside it for both, and nothing is consumed between the
+        two (the scheduler's decode loop may preempt in between, which only
+        frees). Under contention the reachable outcome is a refused admission
+        or a skipped decode, not this.
         """
         if not self._ensure_page_units(1):
             raise AssertionError("No PAGE unit available for a fresh KV block")
