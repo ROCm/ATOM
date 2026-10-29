@@ -127,6 +127,13 @@ cannot affect a server that does not use the feature.
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
 | **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
 
+## NUMA binding
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_NUMA_BIND** | bool | 0 (false) | Bind GPU workers to NUMA-local CPUs and preferred memory. |
+| **ATOM_NUMA_BIND_PER_GPU** | bool | 1 (true) | With `ATOM_NUMA_BIND=1`, split each NUMA node's physical cores into disjoint per-GPU groups while preserving SMT siblings. Set `0` for the former shared node-wide mask. |
+
 ## Kernel / backend selection
 
 | Variable | Type | Default | Description |
