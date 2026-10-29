@@ -34,8 +34,11 @@ Four deliberate divergences from that reference:
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 
@@ -210,6 +213,24 @@ _ATTN_RES_CATCHALL = (4, 2, 2)  # T > largest bucket
 _ATTN_RES_BF16_CONFIG = (8, 2, 2)
 
 
+@functools.cache
+def _attn_res_tdm_module():
+    """The gfx1250 Gluon kernel module, which streams the candidate rows through
+    LDS with TDM, or None where it does not apply. Chosen per arch, never per
+    token count, so a row's result does not depend on its batch peers."""
+    if not envs.ATOM_KIMI_K3_ATTN_RES_GLUON_TDM:
+        return None
+    try:
+        from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+        if get_arch() != "gfx1250":
+            return None
+        from atom.model_ops.kimi_k3 import attention_residual_gluon
+    except ImportError:
+        return None
+    return attention_residual_gluon
+
+
 def _pick_attn_res_config(tokens: int):
     for max_tokens, nw, ns, bl in _ATTN_RES_CONFIGS:
         if tokens <= max_tokens:
@@ -253,8 +274,7 @@ def _apply_attn_res_impl(
     ``(y, prefix_out)``. It requires ``out_norm_weight``: quantizing an unnormed
     mix would hand the consumer an activation on the wrong scale entirely.
     """
-    T, B, H = block_residual.shape
-    Bp = B + 1
+    T, _, H = block_residual.shape
     do_add = add_hidden is not None
     do_add2 = add_hidden2 is not None
     if do_add2 and not do_add:
@@ -284,10 +304,37 @@ def _apply_attn_res_impl(
     hs = add_hidden.contiguous() if do_add else ps
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
+    flags = {
+        "DO_ADD": do_add,
+        "DO_ADD2": do_add2,
+        "WRITE_PREF": do_add,
+        "OUT_NORM": out_norm,
+        "QUANT": quant,
+    }
 
+    tdm = _attn_res_tdm_module()
+    if tdm is not None and tdm.attn_res_tdm_supported(br):
+        tdm.launch_attn_res_tdm(
+            br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
+        )
+    else:
+        _launch_attn_res_triton(
+            br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
+        )
+    prefix_out = pref if do_add else prefix_sum
+    if quant:
+        return y, y_scale, prefix_out
+    return y, prefix_out
+
+
+def _launch_attn_res_triton(
+    br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
+):
+    T, B, H = br.shape
+    Bp = B + 1
     nw, ns, bl = (
         _ATTN_RES_BF16_CONFIG
-        if ps.dtype == torch.bfloat16 and quant_dtype is None
+        if ps.dtype == torch.bfloat16 and not flags["QUANT"]
         else _pick_attn_res_config(T)
     )
     _attn_res_fused_kernel[(T,)](
@@ -318,16 +365,8 @@ def _apply_attn_res_impl(
         BD=triton.next_power_of_2(H),
         num_stages=ns,
         num_warps=nw,
-        DO_ADD=do_add,
-        DO_ADD2=do_add2,
-        WRITE_PREF=do_add,
-        OUT_NORM=out_norm,
-        QUANT=quant,
+        **flags,
     )
-    prefix_out = pref if do_add else prefix_sum
-    if quant:
-        return y, y_scale, prefix_out
-    return y, prefix_out
 
 
 def _apply_attn_res_op(
