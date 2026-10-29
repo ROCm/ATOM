@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -18,10 +18,10 @@ from atom.models.deepseek_v4.mono.config import (
 )
 from atom.mono.runtime.consensus import MonoUnsupported
 
-__all__ = ["V4CacheAdapter"]
+__all__ = ["V4CacheAdapter", "V4MetadataStorage"]
 
 # Whole-step capacity is distinct from a device launch's 1..8 live rows.
-# Bound independent metadata/peer lanes while bringing up the low-C DSpark grid.
+# Bound independent metadata/peer lanes for the admitted decode profiles.
 _MAX_VERIFY_REQUESTS = 16
 _MAX_VERIFY_ROWS = _MAX_VERIFY_REQUESTS * max(SUPPORTED_SAMPLES)
 
@@ -67,45 +67,35 @@ class _V4Bucket:
     compressed_lookup: dict = field(default_factory=dict)
 
 
-class V4CacheAdapter:
-    """Exact-row views of ATOM's production cache and request metadata.
+class V4MetadataStorage:
+    """Allocate persistent Mono metadata before Native profiles its KV budget.
 
-    No request state is allocated or cleared. The engine publishes metadata
-    before eager execution or graph replay, not through pointers to rotating
-    H2D buffers. Wider batches use prepared whole-request buckets, including
-    ordinary C4's exact S3 tail; padding rows are never bound to a bucket.
-    The first profile accepts only in-place state updates,
-    not state forks. Ragged construction prepares q-specific shapes without
-    changing deployment admission; its live offsets come from the native
-    cu_seqlens_q mirror and never include graph padding requests.
+    These buffers do not depend on the cache allocation. Cache binding later
+    attaches native tensor views without replacing any of this storage.
     """
 
     def __init__(
         self,
         model,
-        builder,
         configs,
+        tables,
         *,
-        max_rows: int = 16,
-        tokens_per_seq: int = 1,
-        max_requests: int | None = None,
+        max_rows: int,
+        tokens_per_seq: int,
+        max_requests: int,
+        launch_rows: tuple[int, ...],
+        request_widths: tuple[int, ...],
         ragged: bool = False,
-        launch_rows: tuple[int, ...] = SUPPORTED_SAMPLES,
         fused_metadata: bool = False,
-        request_widths: tuple[int, ...] = (1, 2, 4, 8),
     ):
-        from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
-            FP4_GFX950_PRESHUFFLE,
-        )
-
-        self.model, self.builder = model, builder
-        self.configs = tuple(configs)
+        self.model = model
+        self.ragged = ragged
         self.fused_metadata = fused_metadata
+        self.configs = tuple(configs)
         if len(model.layers) != len(self.configs) or not self.configs:
             raise MonoUnsupported("one configuration per real target layer is required")
         max_requests = self._validate_capacity(max_rows, tokens_per_seq, max_requests)
         self.max_rows = max_rows
-        self.ragged = ragged
         self.tokens_per_seq = int(tokens_per_seq)
         self.max_requests = max_requests
         if (
@@ -128,12 +118,189 @@ class V4CacheAdapter:
         ):
             raise MonoUnsupported("invalid prepared request widths")
         self.request_widths = tuple(sorted(request_widths))
+        self.table_cols = tables.shape[1]
+        self.device = tables.device
+        self.ropes = []
+        shared = {}
+        for block, cfg in zip(model.layers, self.configs):
+            rotary = block.attn.rotary_emb
+            cos, sin = rotary.cos_cache, rotary.sin_cache
+            if (
+                cos.shape != sin.shape
+                or cos.shape[-1] != cfg.rope_dim // 2
+                or cos.shape[0] < cfg.max_seq
+                or cos.device != self.device
+                or sin.device != self.device
+            ):
+                raise MonoUnsupported("real YaRN table geometry/device")
+            key = (cos.data_ptr(), sin.data_ptr(), cfg.max_seq, cfg.rope_dim)
+            if key not in shared:
+                shared[key] = tuple(
+                    t[: cfg.max_seq].reshape(cfg.max_seq, -1).float().contiguous()
+                    for t in (cos, sin)
+                )
+            self.ropes.append((cos, sin, shared[key]))
+        self._prepare_buckets()
+
+    @staticmethod
+    def _validate_capacity(max_rows, tokens_per_seq, max_requests):
+        if type(max_rows) is not int or not 1 <= max_rows <= _MAX_VERIFY_ROWS:
+            raise MonoUnsupported(
+                f"the production adapter supports at most {_MAX_VERIFY_ROWS} live rows"
+            )
+        if (
+            type(tokens_per_seq) is not int
+            or tokens_per_seq not in SUPPORTED_SAMPLES
+            or max_rows % tokens_per_seq
+        ):
+            raise MonoUnsupported(
+                "the production adapter requires whole fixed-width request spans"
+            )
+        requests = max_rows // tokens_per_seq if max_requests is None else max_requests
+        if (
+            type(requests) is not int
+            or not 1 <= requests <= _MAX_VERIFY_REQUESTS
+            or requests * tokens_per_seq != max_rows
+        ):
+            raise MonoUnsupported(
+                "request and row capacities disagree or exceed the 16-request budget"
+            )
+        return requests
+
+    def _prepare_buckets(self):
+        """Allocate stable whole-request lanes from explicit device candidates."""
+        launch_rows = getattr(self, "launch_rows", SUPPORTED_SAMPLES)
+        request_widths = getattr(self, "request_widths", (1, 2, 4, 8))
+        self.prepared_widths = tuple(
+            request_width * self.tokens_per_seq
+            for request_width in request_widths
+            if request_width <= self.max_requests
+            and request_width * self.tokens_per_seq in launch_rows
+        )
+        if not self.prepared_widths:
+            raise MonoUnsupported(
+                "no exact Mono launch width serves this request profile"
+            )
+        if self.ragged:
+            self.prepared_shapes = tuple(
+                (count * q, q)
+                for q in range(1, self.tokens_per_seq + 1)
+                for count in request_widths
+                if count <= self.max_requests and count * q in launch_rows
+            )
+            self._shape_buckets = {
+                (width, q): tuple(
+                    self._make_bucket(width, lane, tokens_per_seq=q)
+                    for lane in range(self.max_requests // (width // q))
+                )
+                for width, q in self.prepared_shapes
+            }
+        else:
+            self.prepared_shapes = tuple(
+                (width, self.tokens_per_seq) for width in self.prepared_widths
+            )
+            largest = max(self.prepared_widths)
+            self._shape_buckets = {
+                (width, self.tokens_per_seq): tuple(
+                    self._make_bucket(width, lane)
+                    for lane in range(
+                        self.max_rows // largest if width == largest else 1
+                    )
+                )
+                for width in self.prepared_widths
+            }
+        self._buckets = {
+            width: self._shape_buckets[(width, self.tokens_per_seq)]
+            for width in self.prepared_widths
+        }
+
+    def _make_bucket(
+        self, width: int, ordinal: int, *, tokens_per_seq=None
+    ) -> _V4Bucket:
+        positions = torch.zeros(width, dtype=torch.int32, device=self.device)
+        tokens = torch.zeros_like(positions)
+        slots = torch.zeros_like(positions)
+        slots_in = torch.zeros_like(positions)
+        tables = torch.zeros(
+            (width, self.table_cols), dtype=torch.int32, device=self.device
+        )
+        metadata = {}
+        compressed_lookup = {}
+        for cfg in self.configs:
+            if cfg.compress_ratio not in metadata:
+                metadata[cfg.compress_ratio] = (
+                    torch.zeros((2, width), dtype=torch.int32, device=self.device),
+                    torch.full(
+                        (width, cfg.n_keys), -1, dtype=torch.int32, device=self.device
+                    ),
+                    torch.arange(cfg.window, dtype=torch.int32, device=self.device),
+                    torch.arange(cfg.n_index, dtype=torch.int32, device=self.device),
+                )
+                if cfg.n_index and not cfg.indexed:
+                    # Allocation-local constants, not request cache contents.
+                    # Keep live block-table gathers and visibility checks in
+                    # publication; graph replay may change both every step.
+                    ids = metadata[cfg.compress_ratio][3]
+                    kpb = BLOCK_TOKENS // cfg.compress_ratio
+                    compressed_lookup[cfg.compress_ratio] = (
+                        ids.div(kpb, rounding_mode="floor").long()[None, :],
+                        ids.remainder(kpb)[None, :],
+                    )
+        return _V4Bucket(
+            width,
+            ordinal,
+            positions,
+            tokens,
+            slots,
+            slots_in,
+            tables,
+            metadata,
+            (),
+            self.tokens_per_seq if tokens_per_seq is None else tokens_per_seq,
+            compressed_lookup,
+        )
+
+
+class V4CacheAdapter:
+    """Exact-row views of ATOM's production cache and request metadata.
+
+    No request state is allocated or cleared. The engine publishes metadata
+    before eager execution or graph replay, not through pointers to rotating
+    H2D buffers. Wider batches use prepared whole-request buckets, including
+    ordinary C4's exact S3 tail; padding rows are never bound to a bucket.
+    The first profile accepts only in-place state updates,
+    not state forks. Ragged construction prepares q-specific shapes without
+    changing deployment admission; its live offsets come from the native
+    cu_seqlens_q mirror and never include graph padding requests.
+    """
+
+    def __init__(self, model, builder, storage: V4MetadataStorage):
+        from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+            FP4_GFX950_PRESHUFFLE,
+        )
+
+        self.model, self.builder = model, builder
+        self.configs = storage.configs
+        self.ragged = storage.ragged
+        self.fused_metadata = storage.fused_metadata
+        self.max_rows = storage.max_rows
+        self.tokens_per_seq = storage.tokens_per_seq
+        self.max_requests = storage.max_requests
+        self.launch_rows = storage.launch_rows
+        self.request_widths = storage.request_widths
+        self.prepared_widths = storage.prepared_widths
+        self.prepared_shapes = storage.prepared_shapes
         self.geometry = builder.pool_geometry
         self.sources, layer_bases = [], []
         tables = builder.model_runner.forward_vars["block_tables"].gpu
         self.table_cols = tables.shape[1]
         self.device = tables.device
-        ropes = {}
+        if (
+            model is not storage.model
+            or self.table_cols != storage.table_cols
+            or self.device != storage.device
+        ):
+            raise MonoUnsupported("prepared Mono metadata no longer matches the model")
 
         def view(owner, name):
             value = getattr(owner, name, None)
@@ -148,7 +315,9 @@ class V4CacheAdapter:
             self.sources.append((owner, name, value, signature))
             return value.detach()
 
-        for block, cfg in zip(model.layers, self.configs):
+        for block, cfg, rope_storage in zip(
+            model.layers, self.configs, storage.ropes, strict=True
+        ):
             attn, cmp = block.attn, block.attn.compressor
             kv_owner = view(attn, "unified_kv")
             if (
@@ -289,22 +458,21 @@ class V4CacheAdapter:
                         f"scores={tuple(scores.shape)}/{scores.stride()}/{scores.dtype}"
                     )
             rope = attn.rotary_emb
-            cos, sin = view(rope, "cos_cache"), view(rope, "sin_cache")
-            rk = (cos.data_ptr(), sin.data_ptr())
-            if rk not in ropes:
-                if (
-                    cos.shape[-1] != cfg.rope_dim // 2
-                    or cos.shape != sin.shape
-                    or cos.shape[0] < cfg.max_seq
-                ):
-                    raise MonoUnsupported("real YaRN table geometry")
-                ropes[rk] = tuple(
-                    t[: cfg.max_seq].reshape(cfg.max_seq, -1).float().contiguous()
-                    for t in (cos, sin)
-                )
-            layer_bases.append((cfg, kv, ropes[rk], state))
+            view(rope, "cos_cache")
+            view(rope, "sin_cache")
+            source_cos, source_sin, prepared_rope = rope_storage
+            if rope.cos_cache is not source_cos or rope.sin_cache is not source_sin:
+                raise MonoUnsupported("RoPE owner changed after Mono preparation")
+            layer_bases.append((cfg, kv, prepared_rope, state))
         self._layer_bases = tuple(layer_bases)
-        self._prepare_buckets()
+        self._shape_buckets = {
+            shape: tuple(self._bind_bucket(bucket) for bucket in buckets)
+            for shape, buckets in storage._shape_buckets.items()
+        }
+        self._buckets = {
+            width: self._shape_buckets[(width, self.tokens_per_seq)]
+            for width in self.prepared_widths
+        }
         self.published_buckets: tuple[tuple[int, _V4Bucket], ...] = ()
         self.published_contract: tuple[
             tuple[int | None, int, int, tuple[int, ...]], ...
@@ -312,137 +480,26 @@ class V4CacheAdapter:
         self.published_rows = 0
         self.published_layout = ()
 
-    @staticmethod
-    def _validate_capacity(max_rows, tokens_per_seq, max_requests):
-        if type(max_rows) is not int or not 1 <= max_rows <= _MAX_VERIFY_ROWS:
-            raise MonoUnsupported(
-                f"the production adapter supports at most {_MAX_VERIFY_ROWS} live rows"
-            )
-        if (
-            type(tokens_per_seq) is not int
-            or tokens_per_seq not in SUPPORTED_SAMPLES
-            or max_rows % tokens_per_seq
-        ):
-            raise MonoUnsupported(
-                "the production adapter requires whole fixed-width request spans"
-            )
-        requests = max_rows // tokens_per_seq if max_requests is None else max_requests
-        if (
-            type(requests) is not int
-            or not 1 <= requests <= _MAX_VERIFY_REQUESTS
-            or requests * tokens_per_seq != max_rows
-        ):
-            raise MonoUnsupported(
-                "request and row capacities disagree or exceed the 16-request budget"
-            )
-        return requests
-
-    def _prepare_buckets(self):
-        """Allocate stable whole-request lanes from explicit device candidates."""
-        launch_rows = getattr(self, "launch_rows", SUPPORTED_SAMPLES)
-        request_widths = getattr(self, "request_widths", (1, 2, 4, 8))
-        self.prepared_widths = tuple(
-            request_width * self.tokens_per_seq
-            for request_width in request_widths
-            if request_width <= self.max_requests
-            and request_width * self.tokens_per_seq in launch_rows
-        )
-        if not self.prepared_widths:
-            raise MonoUnsupported(
-                "no exact Mono launch width serves this request profile"
-            )
-        if self.ragged:
-            self.prepared_shapes = tuple(
-                (count * q, q)
-                for q in range(1, self.tokens_per_seq + 1)
-                for count in request_widths
-                if count <= self.max_requests and count * q in launch_rows
-            )
-            self._shape_buckets = {
-                (width, q): tuple(
-                    self._make_bucket(width, lane, tokens_per_seq=q)
-                    for lane in range(self.max_requests // (width // q))
-                )
-                for width, q in self.prepared_shapes
-            }
-        else:
-            self.prepared_shapes = tuple(
-                (width, self.tokens_per_seq) for width in self.prepared_widths
-            )
-            largest = max(self.prepared_widths)
-            self._shape_buckets = {
-                (width, self.tokens_per_seq): tuple(
-                    self._make_bucket(width, lane)
-                    for lane in range(
-                        self.max_rows // largest if width == largest else 1
-                    )
-                )
-                for width in self.prepared_widths
-            }
-        self._buckets = {
-            width: self._shape_buckets[(width, self.tokens_per_seq)]
-            for width in self.prepared_widths
-        }
-
-    def _make_bucket(
-        self, width: int, ordinal: int, *, tokens_per_seq=None
-    ) -> _V4Bucket:
-        positions = torch.zeros(width, dtype=torch.int32, device="cuda")
-        tokens = torch.zeros_like(positions)
-        slots = torch.zeros_like(positions)
-        slots_in = torch.zeros_like(positions)
-        tables = torch.zeros((width, self.table_cols), dtype=torch.int32, device="cuda")
-        metadata = {}
-        compressed_lookup = {}
-        for cfg in self.configs:
-            if cfg.compress_ratio not in metadata:
-                metadata[cfg.compress_ratio] = (
-                    torch.zeros((2, width), dtype=torch.int32, device="cuda"),
-                    torch.full(
-                        (width, cfg.n_keys), -1, dtype=torch.int32, device="cuda"
-                    ),
-                    torch.arange(cfg.window, dtype=torch.int32, device="cuda"),
-                    torch.arange(cfg.n_index, dtype=torch.int32, device="cuda"),
-                )
-                if cfg.n_index and not cfg.indexed:
-                    # Allocation-local constants, not request cache contents.
-                    # Keep live block-table gathers and visibility checks in
-                    # publication; graph replay may change both every step.
-                    ids = metadata[cfg.compress_ratio][3]
-                    kpb = BLOCK_TOKENS // cfg.compress_ratio
-                    compressed_lookup[cfg.compress_ratio] = (
-                        ids.div(kpb, rounding_mode="floor").long()[None, :],
-                        ids.remainder(kpb)[None, :],
-                    )
+    def _bind_bucket(self, bucket: _V4Bucket) -> _V4Bucket:
         layers = []
         for cfg, kv, rope, state_base in self._layer_bases:
-            dest, indices, _, _ = metadata[cfg.compress_ratio]
-            state = dict(state_base, state_slots=slots, state_slots_in=slots_in)
+            dest, indices, _, _ = bucket.metadata[cfg.compress_ratio]
+            state = dict(
+                state_base, state_slots=bucket.slots, state_slots_in=bucket.slots_in
+            )
             layers.append(
                 LayerStep(
-                    positions,
+                    bucket.positions,
                     kv,
                     dest,
                     indices,
                     *rope,
-                    tables,
+                    bucket.tables,
                     self.geometry.envelope_rows,
                     state,
                 )
             )
-        return _V4Bucket(
-            width,
-            ordinal,
-            positions,
-            tokens,
-            slots,
-            slots_in,
-            tables,
-            metadata,
-            tuple(layers),
-            self.tokens_per_seq if tokens_per_seq is None else tokens_per_seq,
-            compressed_lookup,
-        )
+        return replace(bucket, layers=tuple(layers))
 
     def _layout(self, context, *, padded_rows):
         from atom.models.deepseek_v4.mono.verify_plan import (
@@ -838,10 +895,15 @@ class V4CacheAdapter:
             and requests == 3
             and context.context.running_bs == 4
         )
-        if not exact_tail and (
-            rows not in self.prepared_widths or context.context.running_bs != requests
-        ):
+        if not rows or (not exact_tail and context.context.running_bs != requests):
             return None
+        if rows not in self.prepared_widths and not exact_tail:
+            # A captured fixed-q batch may span several prepared lanes. Validate
+            # its whole-request partition, not just individual kernel widths.
+            try:
+                self._plan(rows)
+            except MonoUnsupported:
+                return None
         var = self.builder.model_runner.forward_vars
         slots = var["v4_meta_state_slot_out"].np[:requests]
         slots_in = var["v4_meta_state_slot_in"].np[:requests]
