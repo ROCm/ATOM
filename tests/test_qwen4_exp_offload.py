@@ -84,6 +84,8 @@ def _builder():
     builder.num_spec = 1
     builder.ngram_context_len = 2
     builder.eos_token_id = 7
+    builder._ssm_storage = lambda: "kv"
+    builder._qsa_fields = lambda: [SimpleNamespace(name=n) for n in ("k", "v")]
     builder.num_state_layers = lambda: 2
     builder._state_shape_for_runner = lambda: ((3, 4), (2, 2))
     builder._state_dtypes = lambda: (torch.bfloat16, torch.float32)
@@ -149,6 +151,104 @@ def test_layout_id_names_ple_and_forks_under_pipeline_parallel(monkeypatch):
     builder.model_runner.config.pipeline_parallel_size = 2
     assert not cls._uses_paged_checkpoints(builder)
     assert not cls.state_transfer(builder).copies
+
+
+def _layout_id(builder, cls, monkeypatch):
+    monkeypatch.setattr(
+        "atom.model_ops.attentions.gdn_attn.get_tp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    return cls.state_transfer(builder).paged_layout_id
+
+
+def test_layout_id_names_the_page_fields_and_the_ssm_storage(monkeypatch):
+    """BF16 draft rows add `*_draft` fields and FlyDSL decode stores the SSM
+    transposed; neither shows in the parent's shapes, so both are spelled."""
+    builder, cls = _builder()
+    plain = _layout_id(builder, cls, monkeypatch)
+    assert ":ssm_storage=kv:page=k,v:ple_conv=" in plain
+
+    names = ("k", "v", "k_scale", "v_scale", "k_draft", "v_draft")
+    builder._qsa_fields = lambda: [SimpleNamespace(name=n) for n in names]
+    draft = _layout_id(builder, cls, monkeypatch)
+    assert ":page=k,v,k_scale,v_scale,k_draft,v_draft:" in draft
+
+    builder._ssm_storage = lambda: "vk"
+    transposed = _layout_id(builder, cls, monkeypatch)
+    assert ":ssm_storage=vk:" in transposed
+    assert len({plain, draft, transposed}) == 3
+
+
+def _flydsl_builder(monkeypatch, *, replayssm=False):
+    """A builder with one GDN layer whose 128x128 SSM state FlyDSL can decode."""
+    from atom.model_ops.attentions.gdn_attn import LINEAR_STATE_ROWS
+    from atom.model_ops.fla_ops import gdn_flydsl
+
+    monkeypatch.setattr(gdn_flydsl, "ops", lambda: object())
+    monkeypatch.setattr(gdn_flydsl, "decode_device_supported", lambda device: True)
+    gdn_flydsl.backend.cache_clear()
+    builder, cls = _builder()
+    del builder._ssm_storage
+    builder.replayssm = replayssm
+    builder.device = torch.device("cpu")
+    builder._state_shape_for_runner = lambda: ((3, 4), (2, 128, 128))
+    builder._state_dtypes = lambda: (torch.bfloat16, torch.float32)
+
+    class _GdnLayer:
+        base_linear_attention = True
+        impl = SimpleNamespace(
+            allow_aiter_flydsl=True, dt_bias=torch.zeros(1, dtype=torch.bfloat16)
+        )
+
+    layer = _GdnLayer()
+    builder._pool_rows = {LINEAR_STATE_ROWS: {layer: 0}}
+    return builder, cls, layer
+
+
+@pytest.mark.parametrize(
+    "env, replayssm, storage",
+    [
+        ({}, False, "vk"),
+        ({"ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": "1"}, False, "kv"),
+        ({"ATOM_GDN_DECODE_BACKEND": "triton"}, False, "kv"),
+        ({}, True, "kv"),
+    ],
+)
+def test_ssm_storage_follows_the_decode_switches(monkeypatch, env, replayssm, storage):
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    from atom.model_ops.fla_ops import gdn_flydsl
+
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    try:
+        builder, cls, _ = _flydsl_builder(monkeypatch, replayssm=replayssm)
+        assert cls._ssm_storage(builder) == storage
+        layout = _layout_id(builder, cls, monkeypatch)
+        assert f":ssm_storage={storage}:" in layout
+    finally:
+        gdn_flydsl.backend.cache_clear()
+
+
+def test_binding_refuses_an_ssm_order_the_layout_id_does_not_say(monkeypatch):
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+    from atom.model_ops.fla_ops import gdn_flydsl
+
+    try:
+        builder, cls, layer = _flydsl_builder(monkeypatch)
+        state = torch.zeros(2, 2, 128, 128)
+        monkeypatch.setattr(
+            GDNAttentionMetadataBuilder,
+            "build_kv_cache_tensor",
+            lambda self, module: SimpleNamespace(v_cache=state),
+        )
+        bound = cls._build_gdn_cache_tensor(builder, layer)
+        assert bound.v_cache.stride() == state.transpose(-1, -2).stride()
+        builder._ssm_storage_order = "kv"
+        with pytest.raises(RuntimeError, match="ssm_storage=kv"):
+            cls._build_gdn_cache_tensor(builder, layer)
+    finally:
+        gdn_flydsl.backend.cache_clear()
 
 
 def test_ple_layout_id_and_checkpoint_planes_match_the_allocated_state(monkeypatch):

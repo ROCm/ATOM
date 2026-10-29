@@ -335,17 +335,26 @@ def snapshot_kv_encoding(hf: object) -> str:
     return json.dumps(fields, sort_keys=True, default=str)
 
 
-# Text-config model types whose PAGE segment set changes with image input:
-# the Qwen3.8 QSA arena adds a `rope_positions` field when `multimodal_config`
-# is set (`Qwen4ExpMetadataBuilder.cache_rope_positions`).
-_IMAGE_INPUT_SEGMENT_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
+# Text-config model types whose PAGE segment set is not fixed by the fields
+# above: the Qwen3.8 QSA arena (`Qwen4ExpMetadataBuilder._qsa_fields`) adds a
+# `rope_positions` field when `multimodal_config` is set, and BF16 `*_draft`
+# fields when the MTP draft keeps BF16 caches under quantized target caches.
+_QSA_PAGE_SEGMENT_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
 
 
-def _page_segments_follow_image_input(hf_config) -> bool:
-    from atom.utils import get_hf_text_config
+def _qsa_page_segments(config) -> dict[str, Any] | None:
+    """The Qwen3.8 PAGE segment facts the namespace must key; None elsewhere."""
+    from atom.utils import envs, get_hf_text_config
 
-    text_config = get_hf_text_config(hf_config)
-    return getattr(text_config, "model_type", None) in _IMAGE_INPUT_SEGMENT_MODEL_TYPES
+    text_config = get_hf_text_config(config.hf_config)
+    if getattr(text_config, "model_type", None) not in _QSA_PAGE_SEGMENT_MODEL_TYPES:
+        return None
+    return {
+        "image_input": getattr(config, "multimodal_config", None) is not None,
+        # The draft layer's cache format (`QSAAttention.qsa_row_space`): its
+        # own BF16 rows, or the target's rows and format.
+        "draft_kv": "bf16" if envs.ATOM_QSA_DRAFT_KV_BF16 else "target",
+    }
 
 
 def build_page_namespace(
@@ -403,12 +412,14 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
-    if _page_segments_follow_image_input(hf):
-        # Same checkpoint, another segment set: with image input on, Qwen3.8
-        # caches `rope_positions` after its index keys, so a block holds more
-        # bytes and the GDN image starts elsewhere. Keyed only where the
-        # segment set depends on it; every other namespace is unchanged.
-        document["image_input"] = getattr(config, "multimodal_config", None) is not None
+    qsa_segments = _qsa_page_segments(config)
+    if qsa_segments is not None:
+        # Same checkpoint, another segment set: image input adds
+        # `rope_positions` after the index keys, and BF16 draft rows add
+        # `*_draft` fields, so a block holds other bytes and the GDN image
+        # starts elsewhere. Keyed only where the segment set depends on them;
+        # every other namespace is unchanged.
+        document.update(qsa_segments)
     canonical = json.dumps(
         document,
         sort_keys=True,

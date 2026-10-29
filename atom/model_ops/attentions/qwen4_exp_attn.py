@@ -41,7 +41,11 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
 
-from .gdn_attn import GDNAttentionBackend, GDNAttentionMetadataBuilder
+from .gdn_attn import (
+    LINEAR_STATE_ROWS,
+    GDNAttentionBackend,
+    GDNAttentionMetadataBuilder,
+)
 from .pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
@@ -187,20 +191,55 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     BACKEND = Qwen4ExpBackend
 
+    def _gdn_flydsl_policy(self, module, state):
+        from atom.model_ops.fla_ops.gdn_flydsl import select_policy
+        from atom.utils import envs
+
+        attention = module.impl
+        return select_policy(
+            allowed=attention.allow_aiter_flydsl,
+            replayssm=self.replayssm,
+            lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
+            state=state,
+            activation_dtype=attention.dt_bias.dtype,
+        )
+
+    def _ssm_storage(self) -> str:
+        """`vk` when FlyDSL decode keeps the SSM state transposed, else `kv`.
+
+        The layout id is spelled at sizing, before any state is allocated, so
+        this asks `select_policy` the binding question about a one-slot probe
+        of the same shape, dtype and device. The logical `:ssm=` shape is the
+        same either way; a checkpoint copies the physical bytes.
+        """
+        storage = getattr(self, "_ssm_storage_order", None)
+        if storage is None:
+            _, shape_v = self._state_shape_for_runner()
+            _, dtype_v = self._state_dtypes()
+            probe = torch.empty((1, *shape_v), dtype=dtype_v, device=self.device)
+            transposed = {
+                self._gdn_flydsl_policy(module, probe).decode
+                for module in self.pool_rows.get(LINEAR_STATE_ROWS, {})
+                if hasattr(module, "base_linear_attention")
+            }
+            if len(transposed) > 1:
+                raise RuntimeError("GDN layers disagree on the SSM storage order")
+            storage = self._ssm_storage_order = "vk" if True in transposed else "kv"
+        return storage
+
     def _build_gdn_cache_tensor(self, module):
         cache = super().build_kv_cache_tensor(module)
         if hasattr(module, "base_linear_attention"):
-            from atom.model_ops.fla_ops.gdn_flydsl import select_policy
-            from atom.utils import envs
-
             attention = module.impl
-            policy = select_policy(
-                allowed=attention.allow_aiter_flydsl,
-                replayssm=self.replayssm,
-                lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
-                state=cache.v_cache,
-                activation_dtype=attention.dt_bias.dtype,
-            )
+            policy = self._gdn_flydsl_policy(module, cache.v_cache)
+            if self._uses_paged_checkpoints() and policy.decode != (
+                self._ssm_storage() == "vk"
+            ):
+                raise RuntimeError(
+                    "GDN SSM state is bound "
+                    f"{'VK' if policy.decode else 'KV'} but the checkpoint "
+                    f"layout id says ssm_storage={self._ssm_storage()}"
+                )
             attention.gdn_flydsl_policy = policy
             self._flydsl_prefill_enabled = (
                 getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
@@ -433,13 +472,21 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         transfer = super().state_transfer()
         if not transfer.copies:
             return transfer
-        fragment = self._ple_layout_fragment()
-        if not fragment:
-            return transfer
+        # The PAGE fields (`*_draft` and `rope_positions` come and go) and the
+        # SSM's physical order are what the parent's id cannot see.
+        layout_id = (
+            transfer.paged_layout_id
+            + f":ssm_storage={self._ssm_storage()}"
+            + ":page="
+            + ",".join(field.name for field in self._qsa_fields())
+            + self._ple_layout_fragment()
+        )
+        if not self._ple_planes():
+            return replace(transfer, paged_layout_id=layout_id)
         # Not readable midstep even under ATOM_GDN_STATE_MIDSTEP: a midstep
         # snapshot is the GDN chunk kernel's `h`, and nothing snapshots the PLE
         # conv / n-gram windows inside a forward, so prefill stays cut onto rungs.
-        return StateTransfer.copy(transfer.paged_layout_id + fragment)
+        return StateTransfer.copy(layout_id)
 
     def _ple_layout_fragment(self) -> str:
         planes = self._ple_planes()

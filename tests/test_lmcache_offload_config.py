@@ -243,6 +243,31 @@ def test_qwen38_page_namespace_separates_image_input():
     )
 
 
+def test_qwen38_page_namespace_separates_the_draft_cache_format(monkeypatch):
+    """BF16 draft rows under FP8 target rows add `*_draft` PAGE fields; a
+    restart that flips the draft format must not read the other block size."""
+    config = _qwen38_config(image_input=False)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
+    bf16_draft = offcfg.build_page_namespace(config, _lmcache_config(), 1)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
+    target_draft = offcfg.build_page_namespace(config, _lmcache_config(), 1)
+    assert bf16_draft != target_draft
+
+
+@pytest.mark.parametrize("model_type", [None, "qwen3_5_moe_text"])
+def test_draft_cache_format_leaves_other_page_namespaces_unchanged(
+    monkeypatch, model_type
+):
+    config = _config()
+    if model_type is not None:
+        config.hf_config.compress_ratios = None
+        config.hf_config.model_type = model_type
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
+    before = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == before
+
+
 @pytest.mark.parametrize("model_type", [None, "qwen3_5_moe_text"])
 def test_image_input_leaves_other_page_namespaces_unchanged(model_type):
     # Their segment set does not depend on it: keying it would only split a
