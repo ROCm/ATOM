@@ -2066,6 +2066,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The base routing over the layer's logical experts, its prefilled
         shared column widened in where the legacy layout fuses one."""
+        from atom.model_ops.fused_moe.fused_topk_dispatch import try_fused_topk
+
+        fused = try_fused_topk(self, layer, router_logits)
+        if fused is not None:
+            return fused
         layout = layer.expert_layout
         return _select_logical(
             layer,
