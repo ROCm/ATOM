@@ -184,7 +184,18 @@ _flydsl_pa_routed: set[tuple] = set()
 _flydsl_plan_refused: set[tuple] = set()
 
 
-def flydsl_plan_shape(head_dim) -> dict:
+# ATOM_FLYDSL_PA_LOWBS_CAP: head-256 plan shape per batch size, measured at
+# MTP-3 verify (32 rows), ctx 150k, tile + reduce per layer: bs1 53.2 -> 26.4
+# us at 256 partitions, bs2 55.1 -> 37.8 us at 128 (256 gives 46.1 there). The
+# budget is 4x the ceiling, as benched. Every other batch keeps the 64 / 256
+# shape.
+_FLYDSL_D256_LOWBS_SHAPE = {
+    1: {"max_partitions": 256, "workgroup_budget": 1024},
+    2: {"max_partitions": 128, "workgroup_budget": 512},
+}
+
+
+def flydsl_plan_shape(head_dim, num_seqs=None) -> dict:
     """plan_pa_decode shape kwargs for a head size: empty, i.e. aiter's
     defaults, except at head_dim 256.
 
@@ -196,8 +207,18 @@ def flydsl_plan_shape(head_dim) -> dict:
     19 Qwen3.5 TP4 MTP-3 shapes, same error against the reference). Remove
     once aiter #5949, a parallel head-256 reducer above 64 partitions, is in
     the image.
+
+    ``num_seqs``: the plan's batch. With ATOM_FLYDSL_PA_LOWBS_CAP=1, batch 1
+    and 2 take a larger ceiling (``_FLYDSL_D256_LOWBS_SHAPE``): at 64 a
+    single long request runs on 64 of 256 CUs. That needs a reducer that is
+    fast above 64 partitions (nightly_202610251529: 4.9-5.4 us at 256).
+    None, or any other batch, keeps the 64 cap.
     """
     if head_dim == 256:
+        if num_seqs is not None and envs.ATOM_FLYDSL_PA_LOWBS_CAP:
+            lowbs = _FLYDSL_D256_LOWBS_SHAPE.get(int(num_seqs))
+            if lowbs is not None:
+                return dict(lowbs)
         return {"max_partitions": 64, "workgroup_budget": 256}
     return {}
 
@@ -513,7 +534,17 @@ def _flydsl_prepare_explicit_plan(
 
     device = q.device
     num_kv_heads = int(k_cache.shape[1])
-    shape = {} if plan_partition_cap is not None else flydsl_plan_shape(q.shape[-1])
+    # Checked first: this runs on every layer's call, and a matching plan
+    # needs no shape.
+    if existing_plan is not None and flydsl_plan_matches(
+        existing_plan, num_seqs, num_kv_heads
+    ):
+        return existing_plan
+    shape = (
+        {}
+        if plan_partition_cap is not None
+        else flydsl_plan_shape(q.shape[-1], num_seqs)
+    )
     if existing_plan is not None:
         max_partitions = int(existing_plan.max_partitions)
     elif plan_partition_cap is not None:
@@ -521,11 +552,6 @@ def _flydsl_prepare_explicit_plan(
     else:
         max_partitions = shape.get("max_partitions")
     workgroup_budget = shape.get("workgroup_budget")
-
-    if existing_plan is not None and flydsl_plan_matches(
-        existing_plan, num_seqs, num_kv_heads
-    ):
-        return existing_plan
 
     from atom.utils.tbo.ubatching import tbo_current_ubatch_id
 
