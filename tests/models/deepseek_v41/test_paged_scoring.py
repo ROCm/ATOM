@@ -147,6 +147,86 @@ def test_paged_scoring_bands_match_one_shot(
         assert workspace._logits.data_ptr() == storage
 
 
+def _is_gfx1250():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+    except ImportError:
+        return False
+    return get_gfx() == "gfx1250"
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="gfx1250 FlyDSL logits only")
+@pytest.mark.parametrize("rows", [600, 64])
+@pytest.mark.parametrize("floor", [2, 4])
+def test_index_logits_splitkv_floor_matches_the_kernels_own_split(
+    monkeypatch, rows, floor
+):
+    """`ATOM_INDEXER_LOGITS_SPLITKV` raises the kernel's KV split, never lowers
+    it, and changes how the KV is cut, not the sums: the band's logits and its
+    top-k come out identical to the default. 600 rows is the c512 decode band
+    the kernel gives few splits; 64 rows already gets more than the floor."""
+    from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250 import (
+        default_split_kv,
+        device_cu_count,
+    )
+
+    from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.deepseek_v41.index_plane import IndexUnits
+    from atom.model_ops.indexer import score as shared
+
+    torch.manual_seed(313)
+    heads, dim, tile, units = 32, 128, 8, 1024
+    values = torch.randn(units, tile * dim, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.ones(units, tile, dtype=torch.float32, device="cuda")
+    plane = torch.cat((values.view(torch.uint8), scales.view(torch.uint8)), dim=1)
+    plane = IndexUnits(plane.view(units, tile, dim + 4))
+    query = torch.randn(rows, heads, dim, dtype=torch.bfloat16, device="cuda")
+    weights = torch.randn(rows, heads, dtype=torch.bfloat16, device="cuda")
+    tiles = torch.randperm(units, dtype=torch.int32, device="cuda").repeat(rows, 1)
+    visible = torch.randint(
+        1, tile * units + 1, (rows,), dtype=torch.int32, device="cuda"
+    )
+    real_score = shared._fp8_paged_mqa_logits
+    cu = device_cu_count(torch.cuda.current_device())
+
+    def run(splitkv_floor):
+        monkeypatch.setattr(shared, "_SPLITKV_FLOOR", splitkv_floor)
+        calls = []
+
+        def observe(*args, **call_kwargs):
+            # The kernel leaves columns past a row's bound unwritten; zero the
+            # plane so both runs agree there and the whole band compares.
+            args[3].zero_()
+            real_score(*args, **call_kwargs)
+            own = default_split_kv(args[0].shape[0], args[6], cu)
+            calls.append((call_kwargs.get("SplitKV"), own, args[3].clone()))
+
+        monkeypatch.setattr(shared, "_fp8_paged_mqa_logits", observe)
+        selected, _ = scoring.score_topk_paged(
+            query,
+            weights,
+            plane,
+            tiles,
+            visible,
+            topk=512,
+            weights_scale=0.01,
+            block_size=tile,
+        )
+        return selected, calls
+
+    expected, default_calls = run(0)
+    actual, floor_calls = run(floor)
+    assert default_calls and len(floor_calls) == len(default_calls)
+    for (default_split, _, default_logits), (used_split, own, logits) in zip(
+        default_calls, floor_calls
+    ):
+        assert default_split is None and used_split == max(floor, own)
+        assert torch.equal(logits, default_logits)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("index_block_rows", [8, 16, 32])

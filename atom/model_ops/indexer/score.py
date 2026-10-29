@@ -30,7 +30,7 @@ from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logi
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
 from atom.distributed.dcp_utils import get_dcp_group
-from atom.utils import forward_context
+from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region
 
 from .rows import NATURAL, IndexCache, IndexRows
@@ -43,6 +43,32 @@ _fp8_paged_mqa_logits = (
     if get_gfx() == "gfx1250"
     else deepgemm_fp8_paged_mqa_logits
 )
+
+# `ATOM_INDEXER_LOGITS_SPLITKV`: a floor on FlyDSL's KV split for the gfx1250
+# FP8 logits. The kernel's own choice, `default_split_kv`, is about two
+# workgroups per CU, so a single band of ~600 decode rows (a V4.1 c512 step on
+# MI455X) gets one split; there 2 measured 78 -> 69 us at 11k context, with
+# identical logits. A smaller band already gets more splits and keeps them: the
+# value only ever raises the split. Unset or 0 keeps the kernel's choice, and
+# the Triton kernel off gfx1250 never sees the argument.
+_SPLITKV_FLOOR = 0
+if get_gfx() == "gfx1250":
+    from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx1250 import (
+        default_split_kv,
+        device_cu_count,
+    )
+
+    _SPLITKV_FLOOR = envs.ATOM_INDEXER_LOGITS_SPLITKV
+
+
+def _fp8_logits_kwargs(batch, width, device):
+    """`SplitKV` for one band's FP8 logits launch: the kernel's own choice
+    raised to `_SPLITKV_FLOOR`, from host integers alone (graph-capture
+    safe); no argument when the floor is off."""
+    if _SPLITKV_FLOOR <= 0:
+        return {}
+    own = default_split_kv(batch, width, device_cu_count(device.index))
+    return {"SplitKV": max(_SPLITKV_FLOOR, own)}
 
 
 def score_topk(
@@ -161,6 +187,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 rows.width,
                 KVBlockSize=cache.rows_per_block,
                 Preshuffle=True,
+                **_fp8_logits_kwargs(count // group, rows.width, weights.device),
             )
         if on_band is not None:
             on_band(scores, span)
