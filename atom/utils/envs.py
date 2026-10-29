@@ -272,6 +272,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Kimi-K3 attn-res on gfx1250: Gluon kernel that streams the candidate rows
+    # through LDS with TDM. 0 falls back to the Triton kernel.
+    "ATOM_KIMI_K3_ATTN_RES_GLUON_TDM": lambda: (
+        os.getenv("ATOM_KIMI_K3_ATTN_RES_GLUON_TDM", "1") == "1"
+    ),
     # Deprecated: use ATOM_MLA_KV_SHUFFLED. Only effective together with
     # ATOM_USE_TRITON_MLA=1.
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
