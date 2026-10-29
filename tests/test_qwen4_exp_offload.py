@@ -85,7 +85,7 @@ def _builder():
     builder.ngram_context_len = 2
     builder.eos_token_id = 7
     builder._ssm_storage = lambda: "kv"
-    builder._qsa_fields = lambda: [SimpleNamespace(name=n) for n in ("k", "v")]
+    builder._qsa_fields = lambda: _fields()[:2]
     builder.num_state_layers = lambda: 2
     builder._state_shape_for_runner = lambda: ((3, 4), (2, 2))
     builder._state_dtypes = lambda: (torch.bfloat16, torch.float32)
@@ -166,17 +166,41 @@ def test_layout_id_names_the_page_fields_and_the_ssm_storage(monkeypatch):
     transposed; neither shows in the parent's shapes, so both are spelled."""
     builder, cls = _builder()
     plain = _layout_id(builder, cls, monkeypatch)
-    assert ":ssm_storage=kv:page=k,v:ple_conv=" in plain
+    kv = "(4,2,8),torch.bfloat16"
+    assert f":ssm_storage=kv:page=k={kv};v={kv}:ple_conv=" in plain
 
     names = ("k", "v", "k_scale", "v_scale", "k_draft", "v_draft")
-    builder._qsa_fields = lambda: [SimpleNamespace(name=n) for n in names]
+    builder._qsa_fields = lambda: [
+        EntryField(n, 2, (4, 2, 8), torch.bfloat16) for n in names
+    ]
     draft = _layout_id(builder, cls, monkeypatch)
-    assert ":page=k,v,k_scale,v_scale,k_draft,v_draft:" in draft
+    assert f":page={';'.join(f'{n}={kv}' for n in names)}:" in draft
 
     builder._ssm_storage = lambda: "vk"
     transposed = _layout_id(builder, cls, monkeypatch)
     assert ":ssm_storage=vk:" in transposed
     assert len({plain, draft, transposed}) == 3
+
+
+def test_layout_id_tells_apart_fields_of_the_same_name_and_other_bytes(
+    monkeypatch,
+):
+    """With BF16 KV, an FP8 and an FP4 index both add `index_compressed` and
+    `index_compressed_scale`; the id alone must keep their images apart."""
+    builder, cls = _builder()
+
+    def index(dim, dtype, scale):
+        return [
+            EntryField("index_compressed", 2, (1, 1, dim), dtype),
+            EntryField("index_compressed_scale", 2, (1, 1, *scale), dtype),
+        ]
+
+    builder._qsa_fields = lambda: index(4, torch.uint8, ())
+    fp8_like = _layout_id(builder, cls, monkeypatch)
+    builder._qsa_fields = lambda: index(2, torch.uint8, (1,))
+    fp4_like = _layout_id(builder, cls, monkeypatch)
+    assert fp8_like != fp4_like
+    assert ":page=index_compressed=(1,1,2),torch.uint8;" in fp4_like
 
 
 def _flydsl_builder(monkeypatch, *, replayssm=False):

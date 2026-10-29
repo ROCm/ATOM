@@ -82,6 +82,11 @@ class _PlePlane(NamedTuple):
         return math.prod(self.shape) * self.dtype.itemsize
 
 
+def _shape_and_dtype(field) -> str:
+    """`(shape),dtype` of one slot or entry, as the layout id spells it."""
+    return f"{tuple(field.shape)},{field.dtype}".replace(" ", "")
+
+
 @dataclass
 class Qwen4ExpQSAMetadata:
     """Per-forward addressing for one QSA layer's three paged caches."""
@@ -457,13 +462,13 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         transfer = super().state_transfer()
         if not transfer.copies:
             return transfer
-        # The PAGE fields (`*_draft` and `rope_positions` come and go) and the
-        # SSM's physical order are what the parent's id cannot see.
+        # The PAGE fields (`*_draft` and `rope_positions` come and go, and a
+        # field's bytes per block follow its cache format) and the SSM's
+        # physical order are what the parent's id cannot see.
         layout_id = (
             transfer.paged_layout_id
             + f":ssm_storage={self._ssm_storage()}"
-            + ":page="
-            + ",".join(field.name for field in self._qsa_fields())
+            + self._page_layout_fragment()
             + self._ple_layout_fragment()
         )
         if not self._ple_planes:
@@ -473,16 +478,19 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         # conv / n-gram windows inside a forward, so prefill stays cut onto rungs.
         return StateTransfer.copy(layout_id)
 
+    def _page_layout_fragment(self) -> str:
+        """Each QSA field's name, per-entry shape and dtype, in arena order."""
+        return ":page=" + ";".join(
+            f"{field.name}={_shape_and_dtype(field)}" for field in self._qsa_fields()
+        )
+
     def _ple_layout_fragment(self) -> str:
         planes = self._ple_planes
         if not planes:
             return ""
         fragment = ""
         for plane in planes:
-            dims = ",".join(map(str, plane.shape)) + (
-                "," if len(plane.shape) == 1 else ""
-            )
-            fragment += f":ple_{plane.tag}=({dims}),{plane.dtype}"
+            fragment += f":ple_{plane.tag}={_shape_and_dtype(plane)}"
         return fragment + ":ple_order=" + ",".join(plane.tag for plane in planes)
 
     def _ple_checkpoint_planes(self) -> list[tuple[int, int]]:
