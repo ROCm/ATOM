@@ -92,6 +92,8 @@ class OnlineQuantStreamer:
         # Side streams avoid serializing workers on the default stream.
         self._worker_stream = threading.local()
 
+        from atom.model_ops.linear import pad_slot_numel
+
         for mod_name, m in candidates:
             # Coverage comes from copy counts or explicit MoE regions.
             m._stream_loaded_numel = 0
@@ -114,8 +116,11 @@ class OnlineQuantStreamer:
             # Mixed semantic and generic accounting cannot trigger early.
             m._stream_moe_declined_param_ids = set()
             m._stream_tracking_invalid = False
+            # A K-padded MLP linear's padded slots are never loaded.
             m._stream_expected_numel = sum(
-                p.numel() for _, p in m.named_parameters(recurse=False) if p is not None
+                p.numel() - pad_slot_numel(m, p)
+                for _, p in m.named_parameters(recurse=False)
+                if p is not None
             )
             for _, p in m.named_parameters(recurse=False):
                 if p is not None:

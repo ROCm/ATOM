@@ -76,12 +76,12 @@ def _mxfp4_linear_double(k):
     )
 
 
-def _load(monkeypatch, k):
+def _load(monkeypatch, k, double=None):
     monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **kw: None)
     monkeypatch.setattr(
         linear_mod.fp4_utils, "e8m0_shuffle", lambda s: s, raising=False
     )
-    LinearBase.process_weights_after_loading(_mxfp4_linear_double(k))
+    LinearBase.process_weights_after_loading(double or _mxfp4_linear_double(k))
 
 
 def test_unaligned_mxfp4_k_is_refused_at_load(monkeypatch):
@@ -98,6 +98,23 @@ def test_non_shuffle_path_is_not_refused(monkeypatch):
     """gemm_afp4wfp4 reads the raw layout and has no K-tail problem."""
     monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
     _load(monkeypatch, KIMI_K3_DENSE_DOWN_K)
+
+
+def test_the_32x4_scale_layout_is_not_refused(monkeypatch):
+    """gfx1250's 32x4-scale kernels take K % 128, so K=4224 is fine there."""
+    import aiter.ops.shuffle
+
+    monkeypatch.setattr(linear_mod, "use_mxfp4_n32k4_scale", lambda w: True)
+    monkeypatch.setattr(aiter.ops.shuffle, "shuffle_mxfp8fp4_scale", lambda s: s)
+    double = _mxfp4_linear_double(KIMI_K3_DENSE_DOWN_K)
+    _load(monkeypatch, KIMI_K3_DENSE_DOWN_K, double)
+    assert double.fp4_n32k4_scale
+
+    # An owner that reads the legacy e8m0 layout itself is still refused.
+    double = _mxfp4_linear_double(KIMI_K3_DENSE_DOWN_K)
+    double.needs_e8m0_shuffled_scale = True
+    with pytest.raises(RuntimeError, match=r"K=4224"):
+        _load(monkeypatch, KIMI_K3_DENSE_DOWN_K, double)
 
 
 def test_the_refusal_is_mxfp4_only(monkeypatch):

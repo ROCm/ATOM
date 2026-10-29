@@ -29,15 +29,19 @@ if not torch.cuda.is_available():
 from aiter import QuantType, dtypes
 
 from atom.config import QuantizationConfig
+from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
 from atom.model_ops import linear as linear_mod
 from atom.model_ops.linear import (
     MXFP4_PRESHUFFLE_K_ALIGN,
     LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    _fill_pad_tails,
     mxfp4_k_pad_align,
+    pad_slot_numel,
 )
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import NVFP4_DTYPE, LayerQuantConfig
+from atom.quantization.quark.utils import dequantize_nvfp4
 
 TP = 8
 INTER = 33792  # Kimi-K3 dense MLP
@@ -235,3 +239,183 @@ def test_an_unpadded_mxfp4_down_is_refused(monkeypatch, tp_rank):
     down = RowParallelLinear(INTER, HIDDEN, quant_config=qc, prefix="mlp.down_proj")
     with pytest.raises(RuntimeError, match=r"mlp\.down_proj.*K=4224"):
         _process(monkeypatch, down)
+
+
+# ── a source requantized online to MXFP4 is padded in its own scheme ──────
+
+
+def _online_to_mxfp4(source):
+    """A checkpoint in ``source``, requantized online to MXFP4."""
+    target = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2)
+    return SimpleNamespace(
+        online_quant=True,
+        blockscale_e8m0_scale=False,
+        get_layer_quant_config=lambda *_a, use_online_quant=False, **_k: (
+            target if use_online_quant else source
+        ),
+    )
+
+
+NVFP4_SRC = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=NVFP4_DTYPE)
+FP8_BLOCK_SRC = LayerQuantConfig(
+    quant_type=QuantType.per_1x128,
+    quant_dtype=dtypes.fp8,
+    weight_block_size=[128, 128],
+)
+
+
+@pytest.fixture
+def online_build(monkeypatch):
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "0")
+    monkeypatch.setattr(
+        linear_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(torch_dtype=torch.bfloat16),
+    )
+
+
+def _online_pair(source, inter=INTER):
+    qc = _online_to_mxfp4(source)
+    align = mxfp4_k_pad_align(qc, "mlp.down_proj")
+    assert align == MXFP4_PRESHUFFLE_K_ALIGN
+    gate_up = MergedColumnParallelLinear(
+        HIDDEN,
+        [inter, inter],
+        quant_config=qc,
+        prefix="mlp.gate_up_proj",
+        output_pad_align=align,
+    )
+    down = RowParallelLinear(
+        inter,
+        HIDDEN,
+        quant_config=qc,
+        reduce_results=False,
+        prefix="mlp.down_proj",
+        input_pad_align=align,
+    )
+    return gate_up, down
+
+
+def _poison(layer):
+    layer.weight.data.view(torch.uint8).fill_(0xAB)
+    layer.weight_scale.data.view(torch.uint8).fill_(0x7F)  # NaN as e4m3fn
+    _fill_pad_tails(layer)
+
+
+def test_nvfp4_source_pad_scales_are_one_not_nan(tp_rank, online_build):
+    """NVFP4 scales are e4m3fn, where the e8m0 "1.0" byte 0x7F is NaN; the
+    online requant dequantizes them, so a NaN there would reach the output."""
+    gate_up, down = _online_pair(NVFP4_SRC)
+    assert gate_up.weight_scale.dtype == torch.float8_e4m3fn
+    for layer in (gate_up, down):
+        _poison(layer)
+
+    for start, end in gate_up._pad_output_rows:
+        assert (gate_up.weight_scale.data[start:end].float() == 1.0).all()
+        tail = dequantize_nvfp4(
+            gate_up.weight.data[start:end],
+            gate_up.weight_scale.data[start:end],
+            torch.tensor(1.0),
+        )
+        assert (tail == 0).all()
+    s_start = REAL // 16  # one e4m3fn scale per 16 of K
+    assert (down.weight_scale.data[:, s_start:].float() == 1.0).all()
+    tail = dequantize_nvfp4(
+        down.weight.data[:, REAL // 2 :],
+        down.weight_scale.data[:, s_start:],
+        torch.tensor(1.0),
+    )
+    assert (tail == 0).all()
+
+
+@pytest.mark.parametrize("tp_rank", [0, 3, 7], indirect=True)
+def test_fp8_block_source_is_padded_by_whole_blocks(tp_rank, online_build):
+    """Kimi-K3's 4224 per rank is 33 blocks of 128: the pad is one more block
+    of zero weights with scale 1.0, and each rank's real blocks load in front."""
+    gate_up, down = _online_pair(FP8_BLOCK_SRC)
+    assert gate_up.weight_scale.shape == (2 * PADDED // 128, HIDDEN // 128)
+    assert down.weight_scale.shape == (HIDDEN // 128, PADDED // 128)
+
+    blocks = INTER // 128
+    gs = torch.arange(blocks * 2, dtype=torch.float32).view(blocks, 2) + 2
+    us = gs + 1000
+    gate_up.weight_loader(gate_up.weight_scale, gs, 0)
+    gate_up.weight_loader(gate_up.weight_scale, us, 1)
+    ds = torch.arange(2 * blocks, dtype=torch.float32).view(2, blocks) + 2
+    down.weight_loader(down.weight_scale, ds)
+    for layer in (gate_up, down):
+        layer.weight.data.view(torch.uint8).fill_(0xAB)
+        _fill_pad_tails(layer)
+
+    real_b, pad_b = REAL // 128, PADDED // 128  # 33, 34
+    g = gate_up.weight_scale.data.cpu()
+    assert torch.equal(g[:real_b], gs.chunk(TP, 0)[tp_rank])
+    assert torch.equal(g[pad_b : pad_b + real_b], us.chunk(TP, 0)[tp_rank])
+    assert (g[real_b:pad_b] == 1.0).all() and (g[pad_b + real_b :] == 1.0).all()
+    d = down.weight_scale.data.cpu()
+    assert torch.equal(d[:, :real_b], ds.chunk(TP, 1)[tp_rank])
+    assert (d[:, real_b:] == 1.0).all()
+    assert (_u8(gate_up.weight)[REAL:PADDED] == 0).all()
+    assert (_u8(down.weight)[:, REAL:] == 0).all()
+
+
+@pytest.mark.parametrize("tp_rank", [0], indirect=True)
+def test_fp8_block_source_refused_when_blocks_straddle_the_pad(tp_rank, online_build):
+    """Qwen3-Next's 512-wide shared expert at TP8 is 64 per rank: a 128-row
+    scale block would cover real and padded rows, so it can't be padded."""
+    with pytest.raises(NotImplementedError, match=r"per_1x128.*straddle"):
+        _online_pair(FP8_BLOCK_SRC, inter=512)
+
+
+# ── online-quant streaming does not wait for the padded slots ─────────────
+
+
+@pytest.mark.parametrize("tp_rank", [0, 7], indirect=True)
+def test_streaming_expects_only_the_real_shards(monkeypatch, tp_rank):
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING", "1")
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING_THREADS", "0")
+    monkeypatch.setattr(
+        linear_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(torch_dtype=torch.bfloat16),
+    )
+    gate_up, down = _online_pair(NVFP4_SRC)
+    for layer in (gate_up, down):
+        assert layer._stream_online_quant and layer.weight.is_meta
+        streamer = OnlineQuantStreamer.maybe_create(layer, load_dummy=None)
+        padded = sum(
+            pad_slot_numel(layer, p) for p in (layer.weight, layer.weight_scale)
+        )
+        assert padded > 0
+        full = sum(p.numel() for p in layer.parameters(recurse=False))
+        assert layer._stream_expected_numel == full - padded
+        del streamer
+
+    # gate_up: the real shards (and global scales) alone complete the module.
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
+    monkeypatch.setattr(
+        linear_mod,
+        "quant_weight_online",
+        lambda w, *_a, **_k: (
+            torch.zeros(w.shape[0], w.shape[1] // 2, dtype=torch.uint8).view(
+                dtypes.fp4x2
+            ),
+            torch.full((w.shape[0], w.shape[1] // 32), 127, dtype=torch.uint8).view(
+                dtypes.fp8_e8m0
+            ),
+        ),
+    )
+    gate_up, _ = _online_pair(NVFP4_SRC)
+    streamer = OnlineQuantStreamer.maybe_create(gate_up, load_dummy=None)
+    for shard_id in (0, 1):
+        for param, value in (
+            (gate_up.weight, torch.full((INTER, HIDDEN // 2), 0x22, dtype=torch.uint8)),
+            (
+                gate_up.weight_scale,
+                torch.full((INTER, HIDDEN // 16), 2.0, dtype=torch.float8_e4m3fn),
+            ),
+            (gate_up.weight_scale_2, torch.tensor(1.0)),
+        ):
+            streamer.run(param.weight_loader, (param, value, shard_id))
+    assert id(gate_up) in streamer.done_module_ids
