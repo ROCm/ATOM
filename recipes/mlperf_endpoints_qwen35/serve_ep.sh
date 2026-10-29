@@ -43,6 +43,15 @@ if [ "$MODE" = tp ]; then
   export ATOM_MTP_FUSED_KV_INDPTR=${ATOM_MTP_FUSED_KV_INDPTR:-1}
   export ATOM_SAMPLER_SPLIT_SOFTMAX=${ATOM_SAMPLER_SPLIT_SOFTMAX:-1}
 fi
+# DP decode step (c128 DP4/EP4): the sampling and tokenizer settings of the TP block above (verify
+# and bonus rows sampled in one call, register-resident top-p, the split-row softmax, the per-segment
+# normalizer cache): +11% c128 TPS, TPOT 6.70 -> 6.18 ms. The rest of the TP block is TP-only.
+if [ "$MODE" = dp ]; then
+  export ATOM_SPEC_FUSED_VERIFY_SAMPLE=${ATOM_SPEC_FUSED_VERIFY_SAMPLE:-1}
+  export AITER_TOPK_FIRST_SMALL_K_TOPP=${AITER_TOPK_FIRST_SMALL_K_TOPP:-1}
+  export ATOM_SAMPLER_SPLIT_SOFTMAX=${ATOM_SAMPLER_SPLIT_SOFTMAX:-1}
+  export ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER=${ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER:-1}
+fi
 # keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
 # first eager multi-request prefill, a ~35 s stall a fresh server
 export TRITON_CACHE_AUTOTUNING=${TRITON_CACHE_AUTOTUNING:-1}
