@@ -642,23 +642,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 ),
             )
 
+        # gfx1250: MegaMoE over mori's cco instead of the gfx942/950-only v1
+        # kernels. Gated by ATOM_MORI_V2, and decided before anything reads
+        # .all2all_manager, which would pin the default (v1) manager.
+        if moe.use_mori_kernels and envs.ATOM_MORI_V2:
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                make_mori_v2_prepare_finalize,
+                mori_v2_all2all_manager,
+            )
+
+            return make_mori_v2_prepare_finalize(
+                moe, mori_v2_all2all_manager(ep_group.device_communicator)
+            )
+
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
-            from atom.utils import envs as _atom_envs
-
-            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
-            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
-            if _atom_envs.ATOM_MORI_V2:
-                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-                    make_mori_v2_prepare_finalize,
-                )
-
-                return make_mori_v2_prepare_finalize(moe, all2all_manager)
-
             assert quant_config is not None
 
             # One branch decides the whole wire format: the dtype dispatch() will

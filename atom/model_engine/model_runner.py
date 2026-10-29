@@ -1169,11 +1169,14 @@ class ModelRunner:
         # which destroy_dist_env() destroys. Looked up rather than imported: a
         # run without MegaMoE never loaded the module.
         mega = sys.modules.get("atom.model_ops.fused_moe.mori_v2_prepare_finalize")
-        if mega is not None:
-            mega.close_mega_transports()
-        # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
-        #    Must happen while ops module is still alive for CustomAllreduce cleanup.
-        destroy_dist_env()
+        try:
+            if mega is not None:
+                mega.close_mega_transports()
+        finally:
+            # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
+            #    Must happen while ops module is still alive for CustomAllreduce
+            #    cleanup.
+            destroy_dist_env()
         # 2. Release CUDA graphs
         self.req_graph = None
         # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
