@@ -1,5 +1,7 @@
 # DSV4.1 大并发：完整 owner 窗口的下一步方案
 
+当前下一项结构优化见[FP8 owner完整FFN/Window-RS方案](dsv41_fp8_owner_window_next.md)。它基于`f723af820`及迁移后R3：decode仍做BF16 AG，prefill已做一次量化供两路；owner输出为RS，EP1预选routes接口尚未开放。下述迁移前AR预算与旧EP4方案不直接作为当前实施合同。
+
 2026-10-29 代码归并更新：FP8 owner六文件迁移已收进显式可选路径，见[实现与证据边界](dsv41_fp8_owner_result.md#代码归并与运行入口)。下述旧时间戳中的生产未修改和排队状态仅描述当时；新结构优化必须以迁移后的EP1/full M1536为基线。
 
 2026-10-29 10:53 UTC 更新：旧owner＋retained-prefill已迁移至FP8 KV、EP1、full M1536，并完成同工作负载C256/8K1K/n2560整网。迁移版6281.294tok/s，对保留主线5269.811为1.191939×（+19.19%），TPOT46.187→38.588ms；真实AL2.488826→2.471299，decode行数略增。每rank正式4个新Triton特化，且为新单臂对保留基线，尚未稳定性能／任务精度验收。完整配置、实际路由、成本及下一步见[FP8 owner迁移整网结果](dsv41_fp8_owner_result.md)。以下旧时间戳记录为历史过程；生产atom/保持f2d3，EP4和packed仍独立比较。
