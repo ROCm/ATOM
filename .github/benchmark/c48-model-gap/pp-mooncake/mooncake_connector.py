@@ -2392,7 +2392,9 @@ class MooncakeConnectorWorker:
         current_platform.set_device(self.device_id)
         if self.dcp_staging_bytes:
             self._sender_thread_state.slot = next(self._sender_slots)
-            self._sender_thread_state.stream = torch.cuda.Stream(device=self.device_id)
+            self._sender_thread_state.stream = torch.cuda.Stream(
+                device=self.device_id, priority=-1
+            )
             self._sender_thread_state.poisoned = False
 
     def _send_blocks(
