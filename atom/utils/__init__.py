@@ -194,6 +194,51 @@ def get_mp_context() -> ForkContext | SpawnContext:
     return multiprocessing.get_context("spawn")
 
 
+# Local releases a crashing worker still owes before `os._exit`: resources a
+# server outside this process holds for it until told otherwise (e.g. the LMCache
+# MP server's GPU IPC mapping of the KV pool). Collectives never go here -- they
+# are what the crash exit skips.
+_CRASH_RELEASES: list[Callable[[], Any]] = []
+# How long a crashing worker waits for them before exiting regardless.
+CRASH_RELEASE_TIMEOUT_S = 10.0
+
+
+def register_crash_release(release: Callable[[], Any]) -> None:
+    """Run ``release`` if this process crashes (`run_exiting_on_crash`).
+
+    It must not issue a collective, and it gets `CRASH_RELEASE_TIMEOUT_S`
+    together with every other release before the process exits anyway.
+    Registering the same callable twice runs it once."""
+    if release not in _CRASH_RELEASES:
+        _CRASH_RELEASES.append(release)
+
+
+def _run_crash_releases(log: logging.Logger) -> None:
+    """Every registered release, each guarded, on a daemon thread the crash
+    exit waits a bounded time for: a release that hangs must not turn the
+    crash back into the hang the exit exists to avoid."""
+    if not _CRASH_RELEASES:
+        return
+
+    def run() -> None:
+        for release in _CRASH_RELEASES:
+            try:
+                release()
+            except BaseException:  # one failure must not skip the rest
+                log.exception("crash release %r failed", release)
+
+    import threading
+
+    worker = threading.Thread(target=run, name="crash-release", daemon=True)
+    worker.start()
+    worker.join(CRASH_RELEASE_TIMEOUT_S)
+    if worker.is_alive():
+        log.error(
+            "crash releases still running after %.0fs; exiting without them",
+            CRASH_RELEASE_TIMEOUT_S,
+        )
+
+
 def run_exiting_on_crash(entry: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
     """Process target: run ``entry``; if it raises, report it and end the process now.
 
@@ -205,6 +250,11 @@ def run_exiting_on_crash(entry: Callable[..., Any], *args: Any, **kwargs: Any) -
     minutes on DeepSeek-V4-Pro CI, where 7 of 8 runners had already printed an
     OOM traceback). ``os._exit`` skips that teardown, the way a signal death
     does, which the parent already detects at once.
+
+    What the skipped teardown would have released outside this process --
+    the LMCache MP server's mapping of the KV pool, held until its reaper
+    times out otherwise -- is released first, through `register_crash_release`
+    and within `CRASH_RELEASE_TIMEOUT_S`.
 
     A clean return and ``sys.exit(0)`` keep the normal teardown.
     """
@@ -218,6 +268,7 @@ def run_exiting_on_crash(entry: Callable[..., Any], *args: Any, **kwargs: Any) -
             "%s crashed; exiting without interpreter teardown",
             multiprocessing.current_process().name,
         )
+        _run_crash_releases(log)
         for handler in logging.getLogger().handlers + log.handlers:
             handler.flush()
         sys.stdout.flush()

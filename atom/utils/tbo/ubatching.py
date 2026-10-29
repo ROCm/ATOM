@@ -12,6 +12,8 @@ from atom.config import get_current_atom_config
 from atom.utils.tbo.ubatch_splitting import (
     decode_bucket_splits,
     decode_ubatch_request_ranges,
+    mixed_cut_inside_prefill,
+    token_midpoint_cuts,
 )
 
 
@@ -54,9 +56,8 @@ def _precompute_prefill_token_split(
     # meets_min_tokens: this rank's prefill reached the min-token bar
     # (ATOM_TBO_PREFILL_MIN_TOKENS, e.g. 8k) — big enough to be worth TBO.
     meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
-    ub0 = num_pref_tokens // 2
-    ub1 = num_pref_tokens - ub0
-    return meets_min_tokens, True, ub0, ub1
+    _, cut, end = token_midpoint_cuts(num_pref_tokens, 2)
+    return meets_min_tokens, True, cut, end - cut
 
 
 def _precompute_prefill_req_split(
@@ -125,10 +126,10 @@ def _precompute_mixed_token_split(
     total_tokens = int(
         np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64).sum()
     )
-    # can_split: need >= 2 tokens to cut into two non-empty halves.
-    if total_tokens < 2:
+    # can_split: two non-empty halves, cut where the split itself cuts.
+    cuts = token_midpoint_cuts(total_tokens, 2)
+    if cuts is None:
         return False, False, 0, 0
-    ub0 = total_tokens // 2
 
     # One contiguous cut of a `[prefill | decode]` layout can never leave BOTH
     # halves mixed: whichever side the cut falls on, the other side is pure.
@@ -148,11 +149,12 @@ def _precompute_mixed_token_split(
     # Real mixed batches are overwhelmingly prefill (measured: 15831 prefill vs
     # 379 decode tokens), so the midpoint lands inside the prefill region and
     # this rejects almost nothing.
-    if ub0 >= num_pref_tokens:
+    if not mixed_cut_inside_prefill(cuts, num_pref_tokens):
         return False, False, 0, 0
 
     meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
-    return meets_min_tokens, True, ub0, total_tokens - ub0
+    _, cut, end = cuts
+    return meets_min_tokens, True, cut, end - cut
 
 
 def _precompute_decode(batch) -> tuple[bool, bool, int, int]:

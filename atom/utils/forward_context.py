@@ -672,12 +672,12 @@ class AttentionMetaData:
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
-    # Mixed prefill+decode (Phase 2) split-dispatch sub-metadata. For a mixed
-    # batch the builder returns ONE AttentionMetaData whose `slot_mapping` covers
-    # all tokens (merged prefill-then-decode), and whose attention dispatch is
-    # driven by these two nested objects: `prefill_attn_metadata` for the first
-    # `context.num_prefill_tokens` rows and `decode_attn_metadata` for the rest.
-    # None for non-mixed batches.
+    # Mixed prefill+decode split-dispatch sub-metadata. For a mixed batch the
+    # builder returns ONE carrier (`_mixed_carrier`) holding the whole batch's
+    # spans and state slots, and attention runs per segment under these two:
+    # `prefill_attn_metadata` for the first `context.num_prefill_tokens` rows,
+    # `decode_attn_metadata` for the rest. The carrier has no `slot_mapping`;
+    # each segment's metadata carries its own. None for non-mixed batches.
     prefill_attn_metadata: "AttentionMetaData | None" = None
     decode_attn_metadata: "AttentionMetaData | None" = None
 

@@ -1004,7 +1004,7 @@ class Scheduler:
             self._dynamic_chunking_counts = counts
 
     def _probe_local_prefill_work(self) -> tuple[bool, int]:
-        budget = self.max_num_batched_tokens
+        budget = self._prefill_budget()
         pending = 0
         if self._partial_prefill_count:
             for seq in self.running:
@@ -1176,17 +1176,30 @@ class Scheduler:
 
     def _prefill_budget(self) -> int:
         """Tokens this step's prefill may take: the batch budget less the
-        decode-first reserve. Under mixed batching every running decode keeps
-        the width the decode loop spends on it (`decode_spec_width + 1`);
-        without it the reserve is 0 and prefill takes the whole budget."""
+        decode-first reserve. Under mixed batching every running decode the
+        decode loop can schedule this step keeps the width it spends on it
+        (`decode_spec_width + 1`); without it the reserve is 0 and prefill
+        takes the whole budget.
+
+        Not counted: a row whose PP token is still in flight, which the decode
+        loop skips (`_pp_inflight_token_block`). And the reserve never takes
+        the last `max_num_batched_tokens // 8`: with enough decodes it would
+        reach the whole budget, and an in-progress chunked prompt, which holds
+        its blocks, would get no chunk until the decodes drain. Decodes the
+        rest of the budget cannot hold wait a step, as on a full step."""
+        budget = self.max_num_batched_tokens
         if not self.enable_mixed_prefill_decode:
-            return self.max_num_batched_tokens
-        n_decode = sum(1 for s in self.running if not s.is_partial_prefill)
-        n_decode = min(n_decode, self.max_num_seqs)
-        reserve = min(
-            n_decode * (self.decode_spec_width + 1), self.max_num_batched_tokens
+            return budget
+        in_flight = self._pp_inflight_token_block
+        n_decode = sum(
+            1
+            for s in self.running
+            if not s.is_partial_prefill and s.id not in in_flight
         )
-        return self.max_num_batched_tokens - reserve
+        n_decode = min(n_decode, self.max_num_seqs)
+        floor = max(1, budget // 8)
+        reserve = min(n_decode * (self.decode_spec_width + 1), budget - floor)
+        return budget - max(reserve, 0)
 
     def _estimate_prefill_chunk_cost(self) -> float:
         """Cost of the chunk this rank would prefill with its prefill budget
@@ -2064,7 +2077,7 @@ class Scheduler:
                 pending_tokens = min(
                     self._waiting_new_token_count()
                     + self._partial_prefill_remaining_tokens(),
-                    self.max_num_batched_tokens,
+                    self._prefill_budget(),
                 )
             # DP prefill cost balancing: this rank's chunk cost rides the same
             # all_reduce, estimated only when this rank has prefill work. Not
@@ -2094,6 +2107,7 @@ class Scheduler:
                 prefill_cost=prefill_cost,
                 waiting_requests=len(self.waiting) + self._partial_prefill_count,
                 arrived_requests=self._arrived_requests,
+                prefill_budget=self._prefill_budget(),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)
@@ -2982,7 +2996,15 @@ class Scheduler:
             total_seqs_num_prefill=num_seqs_prefill,
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
-            num_spec_step=self.decode_spec_width,
+            # A pure-prefill batch verifies nothing, as on the prefill-only fast
+            # path: under DP a block drafter MAX-reduces `num_spec_step + 1`
+            # into the group's query width, so a prefill-only rank reporting
+            # the decode width would widen every decoding peer's step.
+            num_spec_step=(
+                0
+                if num_seqs_prefill > 0 and num_seqs_decode == 0
+                else self.decode_spec_width
+            ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             num_cached_tokens=num_cached_tokens_list,
             # None on a pure-decode batch, where `produces_output` answers from

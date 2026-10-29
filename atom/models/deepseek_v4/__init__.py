@@ -1679,14 +1679,18 @@ _profiler_enabled = getattr(torch.autograd, "_profiler_enabled", None) or (lambd
 
 @contextmanager
 def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool, input_ids):
-    """Present ONE half of a mixed batch to the downstream code as a whole batch.
+    """Point the forward context at ONE half of a mixed batch, for the segment
+    tail (`_launch_compressors`, `_qk_norm_rope`, `_sparse_attention`).
 
-    The segment tail (`_launch_compressors`, `_qk_norm_rope`,
-    `_sparse_attention`) reads its batch off the forward context rather than off its arguments, so
-    running it per half means swapping what the context says and swapping it
-    back. Named and scoped rather than inlined because the swap is otherwise
-    invisible: anything reached from inside here sees a FABRICATED batch, with
-    no signature or type to say so, and the only warning would be a comment.
+    Swapped: `attn_metadata` (the segment's own), `is_prefill` and `input_ids`
+    (sliced). That is everything the tail reads -- it sizes every launch off
+    `seg_md` and the tensors it is handed. NOT swapped, and still the whole
+    batch's: `positions`, `scheduled_tokens`, `running_tokens`, `scheduled_bs`,
+    `scheduled_tokens_gpu` and `is_mixed` (True). A segment op that sized
+    itself off the context would launch the decode half's rows at the whole
+    batch's height, so one that needs any of these must have it swapped here
+    first. Named and scoped rather than inlined because the swap is otherwise
+    invisible: nothing in a signature says the context describes one segment.
 
     Restoring is this block's own job, not its caller's. It used to be the
     caller's, which meant a segment that returned normally still left the
@@ -1747,8 +1751,8 @@ def _mixed_span(tag: str):
     `forward_impl`, reached through `v4_attention_with_output`, which is
     registered `@mark_spliting_op(is_custom=True)` and is therefore opaque to
     Dynamo. A plain-Python predicate placed in a TRACED region instead would be
-    evaluated once against the warmup batch and baked out -- the same way the
-    `is_mixed` assert in `_forward_piecewise_attention` is.
+    evaluated once against the warmup batch and baked out, which is why
+    `_forward_tr_hybrid_attention` carries no `is_mixed` check.
     """
     if _profiler_enabled():
         return torch.profiler.record_function(tag)
