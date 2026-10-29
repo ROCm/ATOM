@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -34,6 +34,16 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 _MAX_SAVE_ATTEMPTS = 3
+
+
+class _SaveFrontierMemo(NamedTuple):
+    """`_save_frontier`'s last answer for one request, and what it depended on."""
+
+    frontier: int
+    floor: int
+    saved: int
+    generation: int
+    found: int
 
 
 @dataclass
@@ -340,31 +350,31 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if self._page_only:
             # No image to wait for: any computed chunk boundary will do.
             return frontier if frontier > floor else 0
-        entry = self._save_tracker.get(str(seq.id))
-        saved = int(entry[1]) if entry is not None and entry[0] is seq else 0
+        sid = str(seq.id)
+        saved = int(self._save_tracker[sid][1]) if self._is_tracked(sid, seq) else 0
         start = max(floor, saved)
         store = self._checkpoints.store
         memo = getattr(seq, "_mp_save_frontier_memo", None)
-        if memo is not None and memo[:3] == (frontier, floor, saved):
-            changed = store.changed_since(memo[3])
+        if memo is not None and (memo.frontier, memo.floor, memo.saved) == (
+            frontier,
+            floor,
+            saved,
+        ):
+            changed = store.changed_since(memo.generation)
             boundaries = getattr(seq, "_mp_boundary_by_hash", {})
             if changed is not None and not any(
                 start < boundaries.get(prefix_hash, 0) <= frontier
                 for prefix_hash in changed
             ):
-                seq._mp_save_frontier_memo = (
-                    frontier,
-                    floor,
-                    saved,
-                    store.generation,
-                    memo[4],
-                )
-                return memo[4]
+                seq._mp_save_frontier_memo = memo._replace(generation=store.generation)
+                return memo.found
         boundaries = getattr(seq, "_mp_boundary_by_hash", None)
         if boundaries is None:
             boundaries = seq._mp_boundary_by_hash = {}
         found = self._next_image(seq, start, frontier, boundaries)
-        seq._mp_save_frontier_memo = (frontier, floor, saved, store.generation, found)
+        seq._mp_save_frontier_memo = _SaveFrontierMemo(
+            frontier, floor, saved, store.generation, found
+        )
         return found
 
     def _next_image(
@@ -407,8 +417,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         available = self._chunk_floor(available)
         if self._page_only:
             return available if available > self._save_floor(saved) else saved
-        start = max(self._save_floor(saved), saved)
-        return self._next_image(seq, start, available) or saved
+        return self._next_image(seq, self._save_floor(saved), available) or saved
 
     def _may_emit_save(self) -> bool:
         return len(self._save_inflight) < self._max_pending_saves
