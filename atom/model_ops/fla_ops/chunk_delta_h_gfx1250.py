@@ -82,7 +82,7 @@ def _chunk_h_gfx1250_kernel(
     i_nh = gl.program_id(1)
     i_n = i_nh // H
     i_h = i_nh % H
-    if IS_VARLEN and HAS_N:
+    if IS_VARLEN and HAS_N:  # noqa: SIM102 (a constexpr, then a device load)
         # a bucket-shaped grid: programs past the step's sequence count have no work
         if i_n >= gl.load(n_ptr):
             return

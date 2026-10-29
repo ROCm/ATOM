@@ -166,7 +166,7 @@ def _fused_inverse_recompute_kernel(
     HAS_NT: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    if IS_VARLEN and HAS_NT:
+    if IS_VARLEN and HAS_NT:  # noqa: SIM102 (a constexpr, then a device load)
         # a bucket-shaped grid: programs past the step's chunk count have no work
         if i_t >= tl.load(nt_ptr):
             return

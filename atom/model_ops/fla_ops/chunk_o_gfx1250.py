@@ -68,7 +68,7 @@ def _chunk_o_gfx1250_kernel(
     i_t = gl.program_id(1)
     i_b = i_bh // H
     i_h = i_bh % H
-    if IS_VARLEN and HAS_NT:
+    if IS_VARLEN and HAS_NT:  # noqa: SIM102 (a constexpr, then a device load)
         if i_t >= gl.load(nt_ptr):
             return
     if IS_VARLEN:
