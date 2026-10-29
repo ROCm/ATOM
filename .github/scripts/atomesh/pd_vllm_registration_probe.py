@@ -66,7 +66,8 @@ def worker(root, rank, kv_gib):
         dump(out / 'engine.json', {'initialize_rc': rc, 'rank': rank,
              'MC_TE_FILTERS': os.environ.get('MC_TE_FILTERS'),
              'MC_HIP_NUM_STREAMS': os.environ.get('MC_HIP_NUM_STREAMS'),
-             'MC_HIP_NUM_EVENTS': os.environ.get('MC_HIP_NUM_EVENTS')})
+             'MC_HIP_NUM_EVENTS': os.environ.get('MC_HIP_NUM_EVENTS'),
+             'MC_MAX_MR_SIZE': os.environ.get('MC_MAX_MR_SIZE')})
         assert rc == 0, f'Engine initialization failed: {rc}'
         barrier(root, 'engine-init', rank)
         observe('after-engine-init', 11)
@@ -75,8 +76,18 @@ def worker(root, rank, kv_gib):
         torch.cuda.synchronize()
         barrier(root, 'kv-allocation', rank)
         observe('after-kv-allocation', 12)
-        rc = engine.batch_register_memory([kv.data_ptr()], [kv.numel()])
-        dump(out / 'registration.json', {'rc': rc, 'bytes': kv.numel()})
+        register_mode = os.environ.get('ATOMESH_PROBE_REGISTER_MODE', 'mooncake')
+        if register_mode == 'hip_ipc':
+            import ctypes
+            from pd_vllm_triton_probe import mapped_gpu_libraries
+            lib = ctypes.CDLL(next(p for p in mapped_gpu_libraries() if 'libamdhip64' in p))
+            lib.hipIpcGetMemHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.hipIpcGetMemHandle.restype = ctypes.c_int
+            ipc_handle = (ctypes.c_byte * 64)()
+            rc = lib.hipIpcGetMemHandle(ipc_handle, ctypes.c_void_p(kv.data_ptr()))
+        else:
+            rc = engine.batch_register_memory([kv.data_ptr()], [kv.numel()])
+        dump(out / 'registration.json', {'rc': rc, 'bytes': kv.numel(), 'mode': register_mode})
         assert rc == 0, f'GPU registration failed: {rc}'
         barrier(root, 'kv-registration', rank)
         observe('after-kv-registration', 13)
@@ -97,8 +108,9 @@ def worker(root, rank, kv_gib):
         dump(out / 'result.json', {'status': 'success', 'native_zero_verified': True})
         # Keep all four large allocations alive until every rank completes checks.
         barrier(root, 'verification', rank)
-        rc = engine.batch_unregister_memory([kv.data_ptr()])
-        assert rc == 0, f'GPU unregistration failed: {rc}'
+        if register_mode == 'mooncake':
+            rc = engine.batch_unregister_memory([kv.data_ptr()])
+            assert rc == 0, f'GPU unregistration failed: {rc}'
         return 0
     except Exception:
         failure = {'status': 'failed', 'traceback': traceback.format_exc()}
@@ -116,9 +128,9 @@ def run_suite(out):
     base.update(plan['common_env'])
     base.update(VLLM_PLUGINS='', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
     rows = []
-    cases = [('default-193g', 193, {}),
-             ('one-stream-193g', 193, {'MC_HIP_NUM_STREAMS': '1', 'MC_HIP_NUM_EVENTS': '1'}),
-             ('default-128g', 128, {})]
+    cases = [('single-mr-193g', 193, {'MC_MAX_MR_SIZE': str(256 * GIB)}),
+             ('split-64g-193g', 193, {'MC_MAX_MR_SIZE': str(64 * GIB)}),
+             ('hip-ipc-only-193g', 193, {'ATOMESH_PROBE_REGISTER_MODE': 'hip_ipc'})]
     for name, kv_gib, overrides in cases:
         root = out / name
         root.mkdir()
@@ -131,7 +143,7 @@ def run_suite(out):
         try:
             for rank in range(4):
                 env = role_env(base, 'decode', '127.0.0.1', plan['decode']['env'])
-                for key in ('MC_HIP_NUM_STREAMS', 'MC_HIP_NUM_EVENTS', 'MC_DISABLE_HIP'):
+                for key in ('MC_HIP_NUM_STREAMS', 'MC_HIP_NUM_EVENTS', 'MC_DISABLE_HIP', 'ATOMESH_PROBE_REGISTER_MODE'):
                     env.pop(key, None)
                 env.update(overrides)
                 env['MC_TE_FILTERS'] = f'rdma{rank + 4}'
