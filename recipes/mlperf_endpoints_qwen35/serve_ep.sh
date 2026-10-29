@@ -2,7 +2,7 @@
 # Qwen3.5-35B-A3B-MXFP4 MLPerf Endpoints (agentic) server on gfx1250, after the DSv4.1 endpoints
 # recipe's server. usage: serve_ep.sh <tp|dp> <outdir>   (run_ep.sh calls it; see the recipe .md)
 # tp: TP4 (the interactive points). dp: DP4 attention + EP4 MoE (the high-concurrency points:
-# KV is not duplicated across ranks, ~2x the TP4 capacity). SPEC=3: MTP with 3 draft tokens.
+# KV is not duplicated across ranks, ~2x the TP4 capacity). SPEC=<n>: MTP with n draft tokens.
 MODE=$1; OUT=$2; mkdir -p $OUT; cd ${ATOM_DIR:-/app/ATOM}
 MODEL=${MODEL:-/data/Qwen3.5-35B-A3B-MXFP4}
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0,1,2,3} OMP_NUM_THREADS=4 AITER_LOG_LEVEL=WARNING
@@ -17,6 +17,22 @@ export HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 ATOM_GC_THRESHOLD=20000,50,50
 # aiter custom all-reduce (TP4 only). TP4 GSM8K with it is 0.86 once prefill attention runs on
 # FlyDSL (aiter FMHA v_hdim 256); RCCL (MAX_SIZE=0) cannot be captured into hipGraphs on this host.
 [ "$MODE" = tp ] && export AITER_CUSTOM_AR_MIN_SIZE=131072 AITER_CUSTOM_AR_MAX_SIZE=8388608
+# TP4 decode (c16, 2026-10-28; an EXTRA_ENV setting wins):
+# - HSA_NO_SCRATCH_RECLAIM=1: keep scratch allocated. Each step's eager sampling and token-broadcast
+#   kernels use scratch; with reclaim the GPU stalls ~120-230 us before each of them to re-allocate it
+#   (4 times a step): -10% decode step at equal batch.
+# - fused MTP verify sampling (ATOM #2801), the sampler's split-row softmax (ATOM #2803) and aiter's
+#   register-resident small-k top-p (ROCm/aiter#7113); each is a no-op on a tree without its PR.
+# - scheduling: 16 decode-only steps after a prefill, 2 stall ticks, prefill token graphs up to 4096.
+if [ "$MODE" = tp ]; then
+  export HSA_NO_SCRATCH_RECLAIM=${HSA_NO_SCRATCH_RECLAIM:-1}
+  export ATOM_SPEC_FUSED_VERIFY_SAMPLE=${ATOM_SPEC_FUSED_VERIFY_SAMPLE:-1}
+  export ATOM_SAMPLER_SPLIT_SOFTMAX=${ATOM_SAMPLER_SPLIT_SOFTMAX:-1}
+  export AITER_TOPK_FIRST_SMALL_K_TOPP=${AITER_TOPK_FIRST_SMALL_K_TOPP:-1}
+  export ATOM_PREFILL_DECODE_INTERVAL=${ATOM_PREFILL_DECODE_INTERVAL:-16}
+  export ATOM_PREFILL_DELAYER_STALL_TICKS=${ATOM_PREFILL_DELAYER_STALL_TICKS:-2}
+  export ATOM_TOKEN_GRAPH_SIZES=${ATOM_TOKEN_GRAPH_SIZES:-256,512,1024,2048,3072,4096}
+fi
 # --level 0 (no torch.compile; decode graphs are still captured): at level 3 TP4 hung ~7 min
 # into c8 (all ranks stuck behind the sampled-token broadcast, NCCL watchdog at 10 min).
 LEVEL=${LEVEL:-0}; KV=${KV:-bf16}; MAX_LEN=${MAX_LEN:-262144}
@@ -52,7 +68,7 @@ case $MODE in
       ARGS+=(--enable-dp-attention --enable-expert-parallel --max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}") ;;
   *) echo "unknown mode $MODE"; exit 1 ;;
 esac
-# SPEC=3: MTP speculative decoding (graphed draft steps); the checkpoint keeps the MTP
+# SPEC=<n>: MTP speculative decoding (graphed draft steps); the checkpoint keeps the MTP
 # layer BF16 and gfx1250 has no BF16 fused MoE, so its routed experts are quantized to MXFP4 at load
 SPEC=${SPEC:-0}
 [ "$SPEC" -gt 0 ] && ARGS+=(--method mtp --num-speculative-tokens $SPEC
