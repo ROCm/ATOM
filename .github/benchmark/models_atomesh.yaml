@@ -6116,7 +6116,7 @@ models:
         accuracy:
           task: gsm8k
           fewshot: 5
-          concurrency: [64]
+          eval_concurrency: [64]
           max_gen_toks: 4096
           threshold: 0.0
         benchmark: *id001
@@ -6226,7 +6226,7 @@ models:
         accuracy:
           task: gsm8k
           fewshot: 5
-          concurrency: [64]
+          eval_concurrency: [64]
           max_gen_toks: 4096
           threshold: 0.0
         benchmark:
@@ -6588,7 +6588,7 @@ models:
         accuracy:
           task: gsm8k
           fewshot: 5
-          concurrency: [64]
+          eval_concurrency: [64]
           max_gen_toks: 4096
           threshold: 0.0
         benchmark: *id001
@@ -6698,7 +6698,7 @@ models:
         accuracy:
           task: gsm8k
           fewshot: 5
-          concurrency: [64]
+          eval_concurrency: [64]
           max_gen_toks: 4096
           threshold: 0.0
         benchmark:
