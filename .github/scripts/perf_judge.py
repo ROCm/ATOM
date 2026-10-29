@@ -538,24 +538,56 @@ def main_drift(series, models):
 # --------------------------------------------------------------------------
 # Pairing
 # --------------------------------------------------------------------------
-def pair_results(base_results, head_results, base2_results=None):
+def pair_results(base_results, head_results, base2_results=None, *, with_dropped=False):
     """Match head measurements to base measurements by configuration key.
 
     ``base2_results`` is an optional second reading of the base commit taken
     after head. When present the baseline is the mean of the two readings and
     the drift between them is carried through for reporting.
+
+    ``with_dropped`` is keyword-only and defaults to False so every existing
+    caller -- the 14 call sites across this module and the test suite that
+    unpack a single return value -- is unaffected. When true, the return value
+    is ``(pairs, dropped)`` instead of just ``pairs``: ``dropped`` lists every
+    head measurement that could not be paired, each tagged with backend,
+    model, isl/osl and concurrency so a caller can name it in a report, plus
+    why it was dropped -- the base commit never measured that configuration,
+    or one side's throughput was missing or zero.
     """
     base_map = {_config_key(d): d for d in base_results}
     base2_map = {_config_key(d): d for d in (base2_results or [])}
     pairs = []
+    dropped = []
     for head in head_results:
         key = _config_key(head)
         base = base_map.get(key)
+        conc = int(head.get("max_concurrency", 0))
+        isl_osl = (
+            f"{head.get('random_input_len', 0)}/{head.get('random_output_len', 0)}"
+        )
         if base is None:
+            dropped.append(
+                {
+                    "backend": _backend_name(head),
+                    "model": _display_model(head),
+                    "isl_osl": isl_osl,
+                    "conc": conc,
+                    "reason": "base never measured this configuration",
+                }
+            )
             continue
         base_tput = base.get(TPUT_KEY)
         head_tput = head.get(TPUT_KEY)
         if not base_tput or not head_tput:
+            dropped.append(
+                {
+                    "backend": _backend_name(head),
+                    "model": _display_model(head),
+                    "isl_osl": isl_osl,
+                    "conc": conc,
+                    "reason": "missing or zero throughput",
+                }
+            )
             continue
         base2 = base2_map.get(key)
         base2_tput = base2.get(TPUT_KEY) if base2 else None
@@ -583,6 +615,8 @@ def pair_results(base_results, head_results, base2_results=None):
                 "ttft_pct": _delta_or_none(base, head, TTFT_KEY),
             }
         )
+    if with_dropped:
+        return pairs, dropped
     return pairs
 
 
@@ -860,8 +894,18 @@ def _single_escalations(members, history_cv):
     return flags
 
 
-def judge(pairs, history_cv, expected_entries=None, drift=None):
-    """Two-layer verdict: per model entry, then across entries."""
+def judge(pairs, history_cv, expected_entries=None, drift=None, dropped=None):
+    """Two-layer verdict: per model entry, then across entries.
+
+    ``dropped`` is the record ``pair_results(..., with_dropped=True)`` returns
+    alongside its pairs: measurements that never made it into a pair at all,
+    because the base commit did not measure that configuration or because a
+    throughput was missing or zero. Those are lost judging levels exactly like
+    a level that never arrived from a job that died outright, so they count
+    the same way against coverage -- a family that silently lost one of three
+    levels must not read as fully judged just because the two that remain
+    happen to clear the linkage criterion.
+    """
     families = collections.defaultdict(list)
     for pair in pairs:
         families[(pair["backend"], pair["model"], pair["isl_osl"])].append(pair)
@@ -880,7 +924,13 @@ def judge(pairs, history_cv, expected_entries=None, drift=None):
     # Entries that were expected but produced no usable pair at all (the whole
     # job died) never reach ``results``, so they have to be counted separately.
     n_missing = max(0, (expected_entries or 0) - len(results))
-    incomplete = (len(results) - len(judged)) + n_missing
+    # Levels the pairing step itself dropped -- a lost level, not a lost
+    # family, so it has to be counted even when the family it belonged to still
+    # cleared FAMILY_MIN_CONFIGS on what remained. Only judging-eligible levels
+    # count: a dropped reference level (c < JUDGE_MIN_CONC) was never part of
+    # the verdict's evidence to begin with.
+    judging_dropped = [d for d in (dropped or []) if d["conc"] >= JUDGE_MIN_CONC]
+    incomplete = (len(results) - len(judged)) + n_missing + len(judging_dropped)
 
     # A positive finding stands on its own -- missing coverage elsewhere does
     # not weaken it. But the absence of a finding is only as good as the
@@ -927,6 +977,8 @@ def judge(pairs, history_cv, expected_entries=None, drift=None):
         "n_judged": len(judged),
         "n_insufficient": len(results) - len(judged),
         "n_missing": n_missing,
+        "n_dropped": len(judging_dropped),
+        "dropped": judging_dropped,
         "n_unclear": len(unclear),
         "n_drifted": len(drifted),
         "n_bad_baseline": len(bad_baseline),
@@ -1495,8 +1547,18 @@ def _coverage_gaps(report):
         )
     if report.get("n_missing"):
         gaps.append(f"{report['n_missing']} model(s) reported nothing at all")
+    if report.get("n_dropped"):
+        gaps.append(f"{report['n_dropped']} judging level(s) were dropped from pairing")
     if gaps:
         out += ["", "Coverage gaps: " + "; ".join(gaps) + "."]
+    # A count alone does not say which evidence is missing -- the per-level
+    # table only ever shows the levels that survived pairing, so a reader has
+    # no way to tell a family that lost a level from one that never had it.
+    for d in report.get("dropped", []):
+        out.append(
+            f"- **{d['model']} c={d['conc']}** was dropped before judging "
+            f"({d['reason']})."
+        )
     return out
 
 
@@ -1636,7 +1698,9 @@ def main():
     base2_results = (
         load_results(args.base2_dir, recursive=True) if args.base2_dir else []
     )
-    pairs = pair_results(base_results, head_results, base2_results)
+    pairs, dropped = pair_results(
+        base_results, head_results, base2_results, with_dropped=True
+    )
 
     if not pairs:
         print("No base/head pairs matched -- nothing to judge.", file=sys.stderr)
@@ -1675,7 +1739,13 @@ def main():
 
     models = {p["model"] for p in pairs}
     drift = main_drift(history_series, models) if history_series else None
-    report = judge(pairs, history_cv, expected_entries=args.expect_entries, drift=drift)
+    report = judge(
+        pairs,
+        history_cv,
+        expected_entries=args.expect_entries,
+        drift=drift,
+        dropped=dropped,
+    )
     report["context"] = args.context
     report["n_pairs"] = len(pairs)
     report["history_configs"] = len(history_cv)

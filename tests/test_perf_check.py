@@ -353,6 +353,107 @@ def test_mostly_dead_matrix_does_not_read_as_clean(tmp_path):
     assert report["n_missing"] == 4
 
 
+def test_head_without_a_matching_base_is_not_silently_dropped(tmp_path):
+    """Kimi-K3 has three judging levels (32/64/256). Base never measured
+    c=64 for it -- the job that produced it died -- but head did. Losing that
+    level leaves two judging levels behind, which on their own still clear
+    FAMILY_MIN_CONFIGS: the family alone would read clean. `pair_results`
+    used to drop this silently (``if base is None: continue``) and nothing
+    downstream ever saw it, so the whole run read clean too."""
+    concs = [32, 64, 256]
+    spec = flat(tput=-0.4, tpot=-0.1)
+    base_dir, head_dir = write_pair(tmp_path, spec, concs=concs)
+    (base_dir / "Kimi-K3-8192-1024-64-0.8.json").unlink()
+
+    pairs, dropped = pj.pair_results(
+        pj.load_results(base_dir, recursive=True),
+        pj.load_results(head_dir, recursive=True),
+        with_dropped=True,
+    )
+    assert dropped == [
+        {
+            "backend": "ATOM",
+            "model": "Kimi-K3",
+            "isl_osl": "8192/1024",
+            "conc": 64,
+            "reason": "base never measured this configuration",
+        }
+    ]
+
+    report = pj.judge(pairs, {}, expected_entries=5, dropped=dropped)
+    kimi = next(f for f in report["families"] if f["model"] == "Kimi-K3")
+    assert kimi["status"] == "clean"  # the family alone cannot see the drop
+    assert report["verdict"] != "clean"
+    assert report["verdict"] == "partial"
+    assert report["n_dropped"] == 1
+
+    body = pj.render(report, "")
+    assert "Kimi-K3 c=64" in body
+    assert "dropped before judging" in body
+    assert "base never measured this configuration" in body
+
+
+def test_zero_throughput_pair_is_dropped_and_named(tmp_path):
+    """Same shape, the other drop path: head's throughput reads zero (so
+    ``if not base_tput or not head_tput: continue`` fires) instead of base
+    being absent. GLM-5.2-FP8 keeps two of its three judging levels clean, so
+    the family alone reads clean -- the run, and the rendered comment, must
+    still say a level went missing and name it."""
+    concs = [32, 64, 256]
+    spec = flat(tput=-0.4, tpot=-0.1)
+    spec["GLM-5.2-FP8"] = {"per_conc": {32: 0.0, 64: -100.0, 256: 0.0}, "tpot": 0.0}
+    base_dir, head_dir = write_pair(tmp_path, spec, concs=concs)
+
+    pairs, dropped = pj.pair_results(
+        pj.load_results(base_dir, recursive=True),
+        pj.load_results(head_dir, recursive=True),
+        with_dropped=True,
+    )
+    assert dropped == [
+        {
+            "backend": "ATOM",
+            "model": "GLM-5.2-FP8",
+            "isl_osl": "8192/1024",
+            "conc": 64,
+            "reason": "missing or zero throughput",
+        }
+    ]
+
+    report = pj.judge(pairs, {}, expected_entries=5, dropped=dropped)
+    glm = next(f for f in report["families"] if f["model"] == "GLM-5.2-FP8")
+    assert glm["status"] == "clean"  # the family alone cannot see the drop
+    assert report["verdict"] != "clean"
+    assert report["verdict"] == "partial"
+    assert report["n_dropped"] == 1
+
+    # A count is not enough -- the per-level table still only shows the levels
+    # that survived pairing, so the comment must name the one that did not.
+    body = pj.render(report, "")
+    assert "GLM-5.2-FP8 c=64" in body
+    assert "missing or zero throughput" in body
+
+
+def test_pair_results_default_return_is_unchanged(tmp_path):
+    """Backward-compatibility guard for the 14 existing call sites: without
+    ``with_dropped``, ``pair_results`` must still return exactly one value,
+    with exactly the same contents as before."""
+    concs = [32, 64, 256]
+    spec = flat(tput=-0.4, tpot=-0.1)
+    base_dir, head_dir = write_pair(tmp_path, spec, concs=concs)
+    (base_dir / "Kimi-K3-8192-1024-64-0.8.json").unlink()
+    base_results = pj.load_results(base_dir, recursive=True)
+    head_results = pj.load_results(head_dir, recursive=True)
+
+    plain = pj.pair_results(base_results, head_results)
+    explicit_off = pj.pair_results(base_results, head_results, with_dropped=False)
+    pairs_only, _dropped = pj.pair_results(
+        base_results, head_results, with_dropped=True
+    )
+
+    assert isinstance(plain, list)
+    assert plain == explicit_off == pairs_only
+
+
 def test_nothing_judgeable_is_inconclusive(tmp_path):
     report = run_judge(tmp_path, flat(), concs=[4, 32], expect=5)
     assert report["verdict"] == "inconclusive"
