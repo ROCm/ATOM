@@ -29,6 +29,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     LayerMajorArena,
     carve_layer_major,
     entry_bytes_for,
+    published_bytes_for,
 )
 
 # Bytes an MFMA tile is addressed in.
@@ -153,6 +154,9 @@ class MhaKvPool:
         # is empty rather than absent, which keeps the positions fixed.
         self.field_groups = [self.cache_fields, self.scale_fields, self.extra_fields]
         self.entry_bytes = sum(entry_bytes_for(g) for g in self.field_groups)
+        # What `region_tensors` publishes per entry: the fields without the
+        # alignment gaps `entry_bytes` bills between them.
+        self.published_bytes = sum(published_bytes_for(g) for g in self.field_groups)
         self.cache: LayerMajorArena | None = None
         self.scale: LayerMajorArena | None = None
         self.extra: LayerMajorArena | None = None

@@ -532,6 +532,7 @@ class LayerMajorArena:
         self.fields = list(fields)
         self.entries = entries
         self.entry_bytes = entry_bytes_for(fields)
+        self.published_bytes = published_bytes_for(fields)
         self._align = max([_ALIGN] + [f.align for f in self.fields])
         self._offsets = {f.name: start for f, start, _ in field_extents(self.fields)}
         self._by_name = {f.name: f for f in self.fields}

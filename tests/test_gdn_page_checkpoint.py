@@ -15,6 +15,10 @@ import torch
 
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+from atom.model_ops.attentions.pool_layout.entry_arena import (
+    EntryField,
+    LayerMajorArena,
+)
 from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
     layer_major_page_unit_bases,
     layer_major_page_unit_regions,
@@ -35,8 +39,10 @@ def _builder_cls():
 
 
 def _uses_paged_checkpoints(config):
+    cls = _builder_cls()
     builder = SimpleNamespace(model_runner=SimpleNamespace(config=config))
-    return _builder_cls()._uses_paged_checkpoints(builder)
+    builder._wants_paged_checkpoints = cls._wants_paged_checkpoints.__get__(builder)
+    return cls._uses_paged_checkpoints(builder)
 
 
 def _config(model_type, *, pp=1, rapidserve=False, wrapped=False):
@@ -141,6 +147,22 @@ class TestMhaRegionsMatchThePublishedPages:
         _, sizes = layer_major_page_unit_regions([pool])
         assert published == int(sizes.sum())
         assert published < pool.entry_bytes
+
+    def test_an_arena_states_its_published_bytes_as_a_pool_does(self):
+        """Qwen3.8's QSA arena is a PAGE pool of its own; the padding its
+        `entry_bytes` bills between an int8 plane and its scales is no region."""
+        arena = LayerMajorArena(
+            [
+                EntryField("k", 2, (16, 3), torch.int8),
+                EntryField("k_scale", 2, (16,), torch.float32),
+            ],
+            4,
+            "cpu",
+        )
+        published = layer_major_published_page_bytes([arena])
+        _, sizes = layer_major_page_unit_regions([arena])
+        assert published == int(sizes.sum()) == arena.published_bytes
+        assert published < arena.entry_bytes
 
     def test_regions_are_the_page_region_contract(self):
         pool = _pool(kv_dtype=torch.int8)

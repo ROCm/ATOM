@@ -390,6 +390,38 @@ def test_validate_config_rejects_pd_connectors(kv_transfer_config, backend):
         Qwen4ExpBackend.validate_config(builder.model_runner.config)
 
 
+@pytest.mark.parametrize("switch", ["pipeline_parallel_size", "enable_rapidserve"])
+def test_validate_config_names_an_unsupported_connector_before_the_deployment(
+    switch,
+):
+    """Under PP or RapidServe a P/D connector is still refused for being one."""
+    builder, _ = _builder()
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
+
+    config = builder.model_runner.config
+    setattr(config, switch, 2 if switch == "pipeline_parallel_size" else True)
+    config.kv_transfer_config = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    with pytest.raises(ValueError, match="disaggregated serving is not supported"):
+        Qwen4ExpBackend.validate_config(config)
+
+
+def test_the_deployment_gate_is_the_parents_and_only_the_model_gate_is_qwens():
+    _, cls = _builder()
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+
+    assert "_uses_paged_checkpoints" not in vars(cls)
+    assert "_wants_paged_checkpoints" in vars(cls)
+    assert "_uses_paged_checkpoints" in vars(GDNAttentionMetadataBuilder)
+
+
+def test_the_ple_planes_are_declared_once():
+    builder, _ = _builder()
+    planes = builder._ple_planes
+    assert [plane.name for plane in planes] == ["ple_conv_state", "ple_ngram_state"]
+    builder.model_runner.config.hf_config = None  # no second read
+    assert builder._ple_planes is planes
+
+
 def _transfer_config(kv_transfer_config):
     return SimpleNamespace(kv_transfer_config=kv_transfer_config)
 

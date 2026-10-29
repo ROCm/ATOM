@@ -25,20 +25,18 @@ from collections.abc import Iterable
 import numpy as np
 import torch
 
-from atom.model_ops.attentions.pool_layout.entry_arena import published_bytes_for
-
 
 def layer_major_published_page_bytes(pools: Iterable) -> int:
-    """Bytes one scheduler block of an ``MhaKvPool`` publishes as PAGE regions.
+    """Bytes one scheduler block of these pools publishes as PAGE regions.
 
-    ``MhaKvPool.entry_bytes`` also counts alignment padding between fields.
-    Those gaps are not part of any ``region_tensors`` row, and ``lmcache_mp``
-    requires the checkpoint unit to equal the sum of the published regions.
+    Each pool (``MhaKvPool`` or ``LayerMajorArena``) states its own
+    ``published_bytes``. Its ``entry_bytes`` also counts alignment padding
+    between fields. Those gaps are not part of any ``region_tensors`` row, and
+    ``lmcache_mp`` requires the checkpoint unit to equal the sum of the
+    published regions.
     """
 
-    return sum(
-        published_bytes_for(group) for pool in pools for group in pool.field_groups
-    )
+    return sum(pool.published_bytes for pool in pools)
 
 
 def layer_major_page_unit_regions(pools: Iterable) -> tuple[np.ndarray, np.ndarray]:

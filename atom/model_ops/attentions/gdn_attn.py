@@ -1562,6 +1562,21 @@ GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
 )
 
 
+def paged_checkpoints_deployable(config) -> bool:
+    """Whether a deployment can keep PAGE checkpoints: one stage, no RapidServe.
+
+    ``get_num_blocks`` raises when a copying transfer meets pipeline
+    parallelism or RapidServe, and answering yes there would turn "this model
+    keeps fork-slot checkpoints" into "this model does not start". Kimi's
+    ``_uses_paged_checkpoints`` is the same two switches and no model gate,
+    because that builder is Kimi-only.
+    """
+
+    if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
+        return False
+    return not getattr(config, "enable_rapidserve", False)
+
+
 def draft_kv_write_slots(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
@@ -1615,20 +1630,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     fuse_mtp_decode_position_update = False
 
     def _uses_paged_checkpoints(self) -> bool:
-        """PAGE image for the Qwen GDN/MHA family; fork otherwise.
+        """PAGE image where the deployment allows it and the model wants it.
 
-        Off under pipeline parallelism and RapidServe. ``get_num_blocks``
-        raises when a copying transfer meets either, and answering yes there
-        would turn "this model keeps fork-slot checkpoints" into "this model
-        does not start". Kimi's ``_uses_paged_checkpoints`` is the same two
-        switches and no model-type set, because that builder is Kimi-only.
+        The deployment half is ``paged_checkpoints_deployable`` and is not
+        overridden; a subclass answers only ``_wants_paged_checkpoints``.
         """
 
         config = self.model_runner.config
-        if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1 or getattr(
-            config, "enable_rapidserve", False
-        ):
-            return False
+        return paged_checkpoints_deployable(config) and self._wants_paged_checkpoints(
+            config
+        )
+
+    def _wants_paged_checkpoints(self, config) -> bool:
+        """The model gate: the Qwen GDN/MHA family keeps PAGE images."""
+
         from atom.utils import get_hf_text_config
 
         text = get_hf_text_config(config.hf_config)
@@ -1720,10 +1735,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         """Pools holding the image, in published order.
 
         Each has ``region_tensors()`` (the views a transfer publishes and the
-        copy addresses) and ``region_layout()`` (the same regions from the
-        declared offsets). Everything below reads the PAGE image through this,
-        so a builder that keeps its pages elsewhere overrides it together with
-        ``_published_page_unit_bytes``.
+        copy addresses), ``region_layout()`` (the same regions from the
+        declared offsets) and ``published_bytes``. Everything below reads the
+        PAGE image through this, so a builder that keeps its pages elsewhere
+        overrides it, and ``_published_page_unit_bytes`` with it: sizing asks
+        for the bytes before any pool is allocated.
         """
         return list(self.kv_pools.values())
 
@@ -1734,7 +1750,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         super().release_kv_pools()
 
     def _published_page_unit_bytes(self) -> int:
-        """Bytes one block publishes, from the declaration (before allocation)."""
+        """Bytes one block publishes, from the declared pools.
+
+        ``checkpoint_page_unit_bytes`` asks at sizing, before
+        ``_page_unit_pools`` holds anything.
+        """
         from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
             layer_major_published_page_bytes,
         )
@@ -1756,8 +1776,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         pools = self._page_unit_pools()
         # Keyed on the pool objects: a pool's regions do not move while it is
         # allocated, and walking ~120 region tensors per call cost more than
-        # the step's copy bookkeeping. An MHA pool keeps its identity across
-        # a release and the next allocation, so `release_kv_pools` drops this.
+        # the step's copy bookkeeping. Every allocation declares new pools
+        # (`_allocate_kv_pools`, a new QSA arena), which moves the key. A
+        # release keeps the released pools until then, so `release_kv_pools`
+        # drops this: its views would name, and keep alive, freed memory.
         cached = getattr(self, "_page_unit_region_cache", None)
         if (
             cached is not None
@@ -1793,7 +1815,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return layer_major_page_unit_stream_sizes(self._page_unit_regions(), units)
 
     def page_unit_views(self, unit_ids):
-        """MHA views of one checkpoint image, for the in-process state tier.
+        """Views of one checkpoint image over ``_page_unit_pools``, for the
+        in-process state tier.
 
         The tier packs these bytes and unpacks them into ``state_entry_views``.
         The copy plan already wrote the slot stream across these regions, so
