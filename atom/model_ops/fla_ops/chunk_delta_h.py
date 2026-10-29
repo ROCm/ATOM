@@ -8,6 +8,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import functools
+
 import torch
 
 import triton
@@ -15,13 +17,17 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp
-from .utils import use_cuda_graph
 
-NUM_WARPS = [2, 4, 8, 16]
+# The Triton kernel's launch configuration, fixed: an autotuner would time its
+# configs on the first launch of every process -- in the serving loop, on the
+# launch's own (in-place) arguments. gfx1250 runs `chunk_delta_h_gfx1250`.
+_TRITON_BV, _TRITON_NUM_WARPS, _TRITON_NUM_STAGES = 32, 4, 2
 
-# (heads, key / value heads and dims, chunk, dtypes) whose slot-indexed in-place
-# launch is tuned in this process (`chunk_gated_delta_rule_fwd_h`)
-_SLOT_VARIANT_TUNED: set = set()
+
+@functools.lru_cache(maxsize=None)
+def _use_gfx1250_kernel(device_index: int) -> bool:
+    props = torch.cuda.get_device_properties(device_index)
+    return props.gcnArchName.split(":")[0] == "gfx1250"
 
 
 @triton.heuristics(
@@ -35,16 +41,6 @@ _SLOT_VARIANT_TUNED: set = set()
         "HAS_N": lambda args: args["n_ptr"] is not None,
         "USE_STATE_IDX": lambda args: args["h0_idx"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
-    ],
-    key=["H", "K", "V", "BT"],
-    use_cuda_graph=use_cuda_graph,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
@@ -434,43 +430,46 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), N * H)
+    if (
+        _use_gfx1250_kernel(k.device.index)
+        and gk is None
+        and K == 128
+        and V % 16 == 0
+        and BT == 64
+        and k.dtype == torch.bfloat16
+    ):
+        from .chunk_delta_h_gfx1250 import chunk_h_gfx1250
 
-    def launch(h0, ht, h0_idx, ht_idx):
-        chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
-            k=k,
-            v=u,
-            w=w,
-            v_new=v_new,
-            g=g,
-            gk=gk,
-            h=h,
-            h0=h0,
-            ht=ht,
-            cu_seqlens=cu_seqlens,
-            chunk_offsets=chunk_offsets,
-            n_ptr=n_ptr,
-            h0_idx=h0_idx,
-            ht_idx=ht_idx,
-            h0_flag=h0_flag,
-            T=T,
-            H=H,
-            Hg=Hg,
-            K=K,
-            V=V,
-            BT=BT,
+        chunk_h_gfx1250(
+            k, w, u, g, h, v_new, initial_state, final_state, cu_seqlens,
+            chunk_offsets, n_ptr, h0_idx, ht_idx, h0_flag, T, N, NT, H, Hg, K, V, BT,
         )
+        return h, v_new, (None if in_place else final_state)
 
-    tune_key = (H, Hg, K, V, BT, k.dtype, initial_state.dtype if in_place else None)
-    if state_slots is not None and tune_key not in _SLOT_VARIANT_TUNED:
-        # The autotuner times every config on the launch's own arguments, and
-        # this launch updates the pool in place: each trial would start from
-        # the state the previous one left. Tune once a process on a scratch
-        # copy of this step's slots; the launch below reuses the config.
-        scratch = initial_state.index_select(0, h0_idx)
-        rows = torch.arange(N, device=scratch.device, dtype=h0_idx.dtype)
-        launch(scratch, scratch if output_final_state else None, rows, rows)
-        _SLOT_VARIANT_TUNED.add(tune_key)
-    launch(initial_state, final_state, h0_idx, ht_idx)
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[(triton.cdiv(V, _TRITON_BV), N * H)](
+        k=k,
+        v=u,
+        w=w,
+        v_new=v_new,
+        g=g,
+        gk=gk,
+        h=h,
+        h0=initial_state,
+        ht=final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_offsets=chunk_offsets,
+        n_ptr=n_ptr,
+        h0_idx=h0_idx,
+        ht_idx=ht_idx,
+        h0_flag=h0_flag,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        BV=_TRITON_BV,
+        num_warps=_TRITON_NUM_WARPS,
+        num_stages=_TRITON_NUM_STAGES,
+    )
     return h, v_new, (None if in_place else final_state)
