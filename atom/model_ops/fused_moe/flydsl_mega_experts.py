@@ -31,7 +31,9 @@ Memory: MegaMoEV2 instances are shared across all MoE layers (process-level
 cache keyed by shape/quant/mtpr); both capacities are built in the same order
 on all ranks before capture. Per-layer weights are swapped in before forward
 (``_s1_w1`` / ``_s1_w1_scale`` / ``w2`` / ``w2_scale`` are runtime pointer args,
-not baked into the kernel).
+not baked into the kernel). With MoonEP, the shuffles write directly into the
+layer's final symmetric ``[home | prefetch]`` storage, so there is no second
+full-weight staging copy.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ import os
 
 import torch
 
+from atom.config import get_current_atom_config
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
 
@@ -97,18 +100,76 @@ def build_mega_weights(layer) -> None:
             f"weights={E}, dispatch={expected_local}. The shared expert must "
             "occupy the fixed tail slot in every Mega weight tensor."
         )
-    layer._mega_w1 = shuffle_weight_a16w4(w13, 16, True).contiguous()
-
     s1 = layer.w13_weight_scale.data  # [E, 2*inter, hidden//32] e8m0
     s1f = s1.reshape(E * s1.shape[1], s1.shape[2])  # 2D (E*2*inter, hidden//32)
-    layer._mega_w1_scale = shuffle_scale_a16w4(s1f, E, True).contiguous()
-
     w2 = layer.w2_weight.data  # [E, hidden, inter//2] fp4-packed uint8
-    layer._mega_w2 = shuffle_weight_a16w4(w2, 16, False).contiguous()
-
     s2 = layer.w2_weight_scale.data  # [E, hidden, inter//32] e8m0
     s2f = s2.reshape(E * s2.shape[1], s2.shape[2])  # 2D (E*hidden, inter//32)
-    layer._mega_w2_scale = shuffle_scale_a16w4(s2f, E, False).contiguous()
+
+    if envs.ATOM_ENABLE_MOONEP:
+        from aiter.dist.parallel_state import get_ep_group
+        from aiter.ops.flydsl.kernels.moonep_weights import MoonEPWeightPool
+        from aiter.ops.shuffle import shuffle_scale_a16w4_out_shape
+
+        if getattr(get_current_atom_config(), "eplb_enable", False):
+            raise ValueError("ATOM_ENABLE_MOONEP=1 cannot be combined with EPLB")
+        # This property initializes Mori's symmetric heap. Weight post-process
+        # runs in the same layer order on every EP rank, which is required for
+        # collective symmetric allocations.
+        manager = get_ep_group().device_communicator.all2all_manager
+        rank, world = int(manager.rank), int(manager.world_size)
+        slots = envs.MOONEP_PREFETCH_SLOTS
+        if world not in (4, 8):
+            raise ValueError(f"MoonEP supports EP4 and EP8, got EP{world}")
+        if not 0 < slots <= 64:
+            raise ValueError(f"MoonEP prefetch_slots must be in [1, 64], got {slots}")
+        # MegaMoEV2 allocates on cuda:<rank>, so the EP rank must be the device.
+        if torch.cuda.current_device() != rank:
+            raise ValueError(
+                f"MoonEP needs EP rank {rank} on cuda:{rank}, "
+                f"running on cuda:{torch.cuda.current_device()}"
+            )
+
+        def _shuffled_scale_part_shape(scale: torch.Tensor) -> tuple[int, int]:
+            """Per-expert shape of ``shuffle_scale_a16w4``'s output for ``scale``.
+
+            The shuffle pads the last dim to a multiple of 8 (E8M0 1.0), and its
+            ``out=`` is the pool's home rows, so they must have the padded shape.
+            """
+            rows = int(scale.shape[1])
+            _, cols = shuffle_scale_a16w4_out_shape((E * rows, scale.shape[2]))
+            return (rows, cols)
+
+        pool = MoonEPWeightPool(
+            rank=rank,
+            world_size=world,
+            experts_per_rank=E,
+            prefetch_slots=slots,
+            parts=[
+                (tuple(w13.shape[1:]), w13.dtype),
+                (_shuffled_scale_part_shape(s1), s1.dtype),
+                (tuple(w2.shape[1:]), w2.dtype),
+                (_shuffled_scale_part_shape(s2), s2.dtype),
+            ],
+        )
+        outputs = (
+            pool.home[0],
+            pool.home[1].reshape(E * s1.shape[1], -1),
+            pool.home[2],
+            pool.home[3].reshape(E * s2.shape[1], -1),
+        )
+        layer._mega_w1 = shuffle_weight_a16w4(w13, 16, True, out=outputs[0])
+        layer._mega_w1_scale = shuffle_scale_a16w4(s1f, E, True, out=outputs[1])
+        layer._mega_w2 = shuffle_weight_a16w4(w2, 16, False, out=outputs[2])
+        layer._mega_w2_scale = shuffle_scale_a16w4(s2f, E, False, out=outputs[3])
+        pool.finish_home()
+        layer._moonep_weight_pool = pool
+    else:
+        # Keep ordinary Mega's allocation and layout path unchanged.
+        layer._mega_w1 = shuffle_weight_a16w4(w13, 16, True).contiguous()
+        layer._mega_w1_scale = shuffle_scale_a16w4(s1f, E, True).contiguous()
+        layer._mega_w2 = shuffle_weight_a16w4(w2, 16, False).contiguous()
+        layer._mega_w2_scale = shuffle_scale_a16w4(s2f, E, False).contiguous()
 
     global _MEGA_BUILD_DBG
     if not _MEGA_BUILD_DBG:

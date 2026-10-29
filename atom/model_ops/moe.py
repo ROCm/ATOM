@@ -2578,6 +2578,19 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         from atom.model_ops.fused_moe.flydsl_mega_experts import MegaFusedExperts
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        # MegaMoE (with or without MoonEP) quantizes the bf16 rows inside its
+        # own dispatch, so routed-row gathering must not pre-quantize them.
+        self.routed_rows_wire = None
+        if envs.ATOM_ENABLE_MOONEP:
+            from atom.model_ops.fused_moe.moonep_mega_experts import MoonEPMegaExperts
+
+            self.fused_experts = MoonEPMegaExperts.for_layer(
+                layer,
+                self.moe,
+                model_dim=self.hidden_size,
+                inter_dim=self.intermediate_size,
+            )
+            return
         self.fused_experts = MegaFusedExperts(
             layer,
             model_dim=self.hidden_size,
@@ -2585,8 +2598,6 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             mtpr=self.moe.max_num_tokens,
             quant="a8w4",
         )
-        # MegaMoE quantizes the bf16 rows itself, inside its dispatch.
-        self.routed_rows_wire = None
 
     def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:
         """Return expert-major views owned by EPLB."""

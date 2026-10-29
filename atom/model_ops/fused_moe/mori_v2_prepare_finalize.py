@@ -457,6 +457,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         mega_geometry: dict | None = None,
+        moonep_experts: int | None = None,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -473,6 +474,10 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self._mega_geometry = mega_geometry
         self.mega: Any = None
         self.is_fused = mega_geometry is not None
+        # The logical expert count when MoonEP balances this layer; the shared
+        # MegaMoE is then built over its virtual experts.
+        self._moonep_experts = moonep_experts
+        self.moonep: Any = None
 
     def bind_mega_transport(self, layer: torch.nn.Module, quant_method: Any) -> None:
         """Build the shared MegaMoE once the layer reveals the model-wide recipe.
@@ -512,6 +517,19 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
             combine_quant=_MEGA_COMBINE_QUANT,
         )
+        if getattr(self, "_moonep_experts", None) is not None:
+            from atom.model_ops.fused_moe.moonep_mega_gfx1250 import MoonEPLayer
+
+            geometry = self._mega_geometry
+            self.moonep = MoonEPLayer(
+                layer,
+                ep_rank=geometry["ep_rank"],
+                ep_size=geometry["ep_size"],
+                ep_src_global_rank=geometry["ep_src_global_rank"],
+                num_experts=self._moonep_experts,
+                topk=geometry["num_experts_per_token"],
+                max_tokens_per_rank=self.max_tokens_per_rank,
+            )
 
     @staticmethod
     def combine_quant_for_step() -> str:
@@ -741,6 +759,8 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         # a4w4, mega bf16 + a8w4 all match to the last bit). Off by default
         # until it has run a real serve.
         if mega is not None and triton_experts is not None:
+            if getattr(self.prepare_finalize, "moonep", None) is not None:
+                raise RuntimeError("ATOM_ENABLE_MOONEP=1 needs the aiter experts")
             if mega._config.stage1_fused:
                 raise RuntimeError(
                     "triton_mega_moe drives MegaMoE's token-major dispatch and "
@@ -807,14 +827,23 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         self._assert_recipe_matches(mega, kwargs)
 
         ids = topk_ids.to(torch.int32).contiguous()
+        w1_scale, w2_scale = kwargs.get("w1_scale"), kwargs.get("w2_scale")
+        moonep = getattr(self.prepare_finalize, "moonep", None)
+        if moonep is not None:
+            from atom.model_ops.fused_moe.moonep_mega_gfx1250 import (
+                moonep_balance_step,
+            )
+
+            ids = moonep.route(ids.contiguous(), balance=moonep_balance_step())
+            w1, w1_scale, w2, w2_scale = moonep.windows
         out = mega(
             hidden_states.contiguous(),
             topk_weights.to(torch.float32).contiguous(),
             ids,
             w1=w1,
             w2=w2,
-            w1_scale=kwargs.get("w1_scale"),
-            w2_scale=kwargs.get("w2_scale"),
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
             bias1=kwargs.get("bias1"),
             bias2=kwargs.get("bias2"),
             a1_scale=kwargs.get("a1_scale"),
@@ -874,6 +903,16 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
     ep_size = all2all_manager.world_size
 
     if _resolve_transport() == "mega":
+        num_experts, moonep_experts = moe.num_experts, None
+        if envs.ATOM_ENABLE_MOONEP:
+            from atom.model_ops.fused_moe.moonep_mega_gfx1250 import (
+                check_moonep_geometry,
+                moonep_virtual_experts,
+            )
+
+            check_moonep_geometry(ep_size=ep_size, num_experts=num_experts)
+            moonep_experts = num_experts
+            num_experts = moonep_virtual_experts(num_experts, ep_size)
         # Geometry only; the expert-GEMM recipe comes from the layer later.
         return MoriV2PrepareAndFinalize(
             None,
@@ -885,11 +924,14 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
                 "ep_src_global_rank": ep_src_global_rank,
                 "hidden_dim": moe.hidden_dim,
                 "max_num_inp_token_per_rank": moe.max_num_tokens,
-                "num_experts": moe.num_experts,
+                "num_experts": num_experts,
                 "num_experts_per_token": moe.experts_per_token,
                 "data_type_itemsize": moe.in_dtype.itemsize,
             },
+            moonep_experts=moonep_experts,
         )
+    if envs.ATOM_ENABLE_MOONEP:
+        raise ValueError("ATOM_ENABLE_MOONEP=1 needs the fused MegaMoE transport")
 
     op = init_mori_v2_op(
         ep_rank=all2all_manager.rank,
