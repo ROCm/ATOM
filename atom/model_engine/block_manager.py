@@ -974,11 +974,29 @@ class BlockManager:
             "evicted_total": self.total_evicted_blocks,
         }
 
+    def joint_boundary_tokens(self, seq: Sequence, kv_prefix_tokens: int) -> int:
+        """The joint boundary a tier hit of `kv_prefix_tokens` would land on, or 0.
+
+        A read-only probe for a connector shaping the hit it reports: the
+        admission recomputes the boundary from the hit the connector settled
+        on. Measured against the gated HBM hit; a replay can only raise that
+        hit, so this never misses a boundary the admission would find.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+        walk = self._walk_prefix(seq)
+        hbm = self._gated_hit(seq, len(walk.hashes), walk.hashes)
+        return self._joint_kv_boundary(
+            seq, hbm, walk.hashes, kv_prefix_tokens=kv_prefix_tokens
+        ).boundary_tokens
+
     def _joint_kv_boundary(
         self,
         seq: Sequence,
         hbm_boundary: int,
         block_hashes: list[int],
+        *,
+        kv_prefix_tokens: int | None = None,
     ) -> JointBoundaryDecision:
         """The boundary above the HBM hit that BOTH legs can reach, as a value.
 
@@ -1019,7 +1037,9 @@ class BlockManager:
         # `get_kvconnector` returned, and one without `chunk_size` would zero
         # this and disable the feature silently.
         chunk = self._joint_chunk_tokens
-        lmc_tokens = int(seq.offload_joint.kv_prefix_tokens or 0)
+        if kv_prefix_tokens is None:
+            kv_prefix_tokens = seq.offload_joint.kv_prefix_tokens
+        lmc_tokens = int(kv_prefix_tokens or 0)
         if chunk <= 0:
             return self._no_joint("no_chunk_size")
         # Floored to the grid everything below compares against, so the

@@ -184,7 +184,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         It must wherever the request claims what it loads: a load that ends at
         the prompt's end leaves the forward nothing to compute. A layout whose
-        claim stops short of the load on its own overrides this.
+        claim stops short of the load on its own overrides this. Asked only of
+        a hit covering the whole prompt.
         """
         del seq
         return True
@@ -523,7 +524,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         num_prompt = seq.num_prompt_tokens
         frontier = int(seq.num_cached_tokens)
         hit = self._loadable_hit(
-            hit, num_prompt, withhold_last=self._withholds_last_prompt_token(seq)
+            hit,
+            num_prompt,
+            withhold_last=int(hit) != int(num_prompt)
+            or self._withholds_last_prompt_token(seq),
         )
         if self._hit_cap_hook is not None:
             # After `_loadable_hit`, so the hook caps the hit that will

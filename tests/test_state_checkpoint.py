@@ -1604,6 +1604,29 @@ class TestPagedCopyCheckpoint:
         assert whole.offload_joint.boundary_tokens == 11 * BLOCK
         assert whole.offload_joint.kv_tokens == len(tokens)
 
+    def test_the_joint_probe_names_the_boundary_a_full_hit_lands_on(self):
+        """What a hybrid connector asks before reporting a full-prompt hit
+        whole: the rung in the last chunk while only the tier can bring it
+        back, and 0 when HBM already resumes there or the hit is withheld."""
+        tokens = list(range(48))
+        chunk = 4 * BLOCK
+        bm = self._joint_bm(chunk=chunk)
+        first, h = self._prompt_with_a_rung_at(bm, 11, tokens)
+        self._with_tier(bm, h)
+        assert bm.joint_boundary_tokens(stateful_seq(tokens), len(tokens)) == 0
+
+        victim = first.block_table[0]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h)
+        self._reset_joint_counters(bm)
+        seq = stateful_seq(tokens)
+        assert bm.joint_boundary_tokens(seq, len(tokens)) == 11 * BLOCK
+        assert bm.joint_boundary_tokens(seq, 2 * chunk) == 0
+        # A probe: nothing committed, nothing counted.
+        assert seq.offload_joint.boundary_tokens == 0
+        assert bm.joint_boundaries == 0 and not bm.joint_skips
+
     def test_an_unaligned_hbm_hit_still_reaches_the_rung_above_it(self):
         """A hit that is not a multiple of the KV chunk used to refuse the
         whole CPU prefix (`hbm_off_chunk_grid`). The shared claim stops at

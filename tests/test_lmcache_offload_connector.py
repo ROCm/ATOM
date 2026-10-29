@@ -6057,7 +6057,10 @@ def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(
     """A chunk-aligned prompt resent whole, with HBM empty and the tier holding
     all of it. Withholding the last token would floor the KV leg's ceiling to
     512, under the 704 rung that prompt kept, and no joint boundary could form.
-    A hybrid claims the joint boundary instead, so the hit stays whole.
+    A hybrid claims the joint boundary instead, so the hit stays whole when
+    the block manager lands a boundary in that last chunk, and is withheld
+    when none does: a whole hit nothing backs would hold a parked slot for a
+    load `_decide_load_after_alloc` refuses.
 
     Every state-owning family takes this path, so each is built through the
     layout selection a server runs; what keeps the forward from skipping the
@@ -6082,16 +6085,34 @@ def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(
     assert type(sched) is scheduler_cls
     sched._min_load_tokens = 0
     sched._lookup_client = _LookupClient(hit=768)
-    hybrid = SimpleNamespace(
-        id=7,
-        num_prompt_tokens=768,
-        token_ids=list(range(768)),
-        num_cached_tokens=0,
-        has_per_req_cache=True,
-        offload_joint=OffloadJointRecord(),
+    asked = []
+    joint = {7: 704, 9: 448, 10: 0}
+    sched.bind_block_manager(
+        SimpleNamespace(
+            joint_boundary_tokens=lambda seq, tokens: (
+                asked.append((seq.id, tokens)) or joint[seq.id]
+            )
+        )
     )
 
+    def stateful(request_id):
+        return SimpleNamespace(
+            id=request_id,
+            num_prompt_tokens=768,
+            token_ids=list(range(768)),
+            num_cached_tokens=0,
+            has_per_req_cache=True,
+            offload_joint=OffloadJointRecord(),
+        )
+
+    # A boundary at or below the withheld floor, or none: withholding loses
+    # nothing, and the hit reports no more than a boundary can back.
+    for request_id in (9, 10):
+        assert sched.get_num_new_matched_tokens(stateful(request_id)) == (512, True)
+
+    hybrid = stateful(7)
     assert sched.get_num_new_matched_tokens(hybrid) == (768, True)
+    assert asked == [(9, 768), (10, 768), (7, 768)]
     ls = sched._load_specs["7"]
     assert ls.lmcache_cached_tokens == 768
 
