@@ -254,6 +254,39 @@ def test_qwen38_page_namespace_separates_the_draft_cache_format(monkeypatch):
     assert bf16_draft != target_draft
 
 
+@pytest.mark.parametrize(
+    "kv_dtype,speculative",
+    [
+        pytest.param("bf16", SimpleNamespace(method="mtp"), id="bf16-mtp"),
+        pytest.param("auto", SimpleNamespace(method="mtp"), id="auto-mtp"),
+        pytest.param("fp8", None, id="fp8-no-spec"),
+        pytest.param("fp8", SimpleNamespace(method="eagle3"), id="fp8-eagle3"),
+    ],
+)
+def test_qwen38_page_namespace_ignores_the_draft_env_without_draft_rows(
+    monkeypatch, kv_dtype, speculative
+):
+    """`*_draft` fields need an MTP draft under quantized target caches; any
+    other server stores the same bytes either way, and keying the env would
+    only orphan its tier across a restart that flips it."""
+    config = _qwen38_config(image_input=False)
+    config.kv_cache_dtype = config.index_cache_dtype = kv_dtype
+    config.speculative_config = speculative
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
+    before = offcfg.build_page_namespace(config, _lmcache_config(), 1)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 1) == before
+
+
+def test_qwen38_draft_rows_follow_a_quantized_index_cache_alone(monkeypatch):
+    config = _qwen38_config(image_input=False)
+    config.kv_cache_dtype, config.index_cache_dtype = "bf16", "fp8"
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
+    before = offcfg.build_page_namespace(config, _lmcache_config(), 1)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 1) != before
+
+
 @pytest.mark.parametrize("model_type", [None, "qwen3_5_moe_text"])
 def test_draft_cache_format_leaves_other_page_namespaces_unchanged(
     monkeypatch, model_type

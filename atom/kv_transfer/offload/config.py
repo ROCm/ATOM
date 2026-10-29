@@ -341,16 +341,23 @@ _QSA_PAGE_SEGMENT_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
 
 def _qsa_page_segments(config) -> dict[str, Any] | None:
     """The Qwen3.8 PAGE segment facts the namespace must key; None elsewhere."""
+    from atom.model_ops.attentions.qwen4_exp_transfer import qsa_caches_quantized
     from atom.utils import envs, get_hf_text_config
 
     text_config = get_hf_text_config(config.hf_config)
     if getattr(text_config, "model_type", None) not in _QSA_PAGE_SEGMENT_MODEL_TYPES:
         return None
+    # The draft layer's cache format (`QSAAttention.qsa_row_space`): BF16 rows
+    # of its own only for an MTP draft under quantized target caches, the
+    # target's rows and format otherwise, whatever the env says.
+    draft_rows = (
+        getattr(getattr(config, "speculative_config", None), "method", None) == "mtp"
+        and qsa_caches_quantized(config)
+        and envs.ATOM_QSA_DRAFT_KV_BF16
+    )
     return {
         "image_input": getattr(config, "multimodal_config", None) is not None,
-        # The draft layer's cache format (`QSAAttention.qsa_row_space`): its
-        # own BF16 rows, or the target's rows and format.
-        "draft_kv": "bf16" if envs.ATOM_QSA_DRAFT_KV_BF16 else "target",
+        "draft_kv": "bf16" if draft_rows else "target",
     }
 
 
