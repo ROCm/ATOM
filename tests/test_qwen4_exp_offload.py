@@ -15,9 +15,9 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     entry_bytes_for,
     published_bytes_for,
 )
-from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-    mha_page_unit_regions,
-    mha_page_unit_views,
+from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
+    layer_major_page_unit_regions,
+    layer_major_page_unit_views,
 )
 
 
@@ -35,7 +35,7 @@ def test_qsa_regions_are_one_contiguous_block_each():
     arena = LayerMajorArena(_fields(), entries=3, device="cpu")
     published = published_bytes_for(_fields())
     assert published <= entry_bytes_for(_fields())
-    bases, sizes = mha_page_unit_regions([arena])
+    bases, sizes = layer_major_page_unit_regions([arena])
     assert int(sizes.sum()) == published
     assert len(bases) == 8  # 4 fields * 2 layers
     for _, tensor in arena.region_tensors():
@@ -51,7 +51,7 @@ def test_one_qsa_block_round_trips_through_page_views():
         row = tensor[1].view(torch.uint8).reshape(-1)
         row.copy_(blob[at : at + row.numel()])
         at += row.numel()
-    views = mha_page_unit_views([arena], [1])
+    views = layer_major_page_unit_views([arena], [1])
     packed = torch.cat([view.view(torch.uint8).reshape(-1) for view in views])
     assert torch.equal(packed, blob)
 
@@ -530,18 +530,20 @@ def test_page_unit_regions_are_cached_per_pool_until_release(monkeypatch):
     """Called several times a step: the key is the pool objects, not a walk
     over every region tensor, and a release drops it before the addresses
     change."""
-    from atom.model_ops.attentions.pool_layout import mha_page_unit_geometry
+    from atom.model_ops.attentions.pool_layout import layer_major_page_geometry
 
     builder, cls = _paged_builder()
     first = cls._page_unit_regions(builder)
-    real = mha_page_unit_geometry.mha_page_unit_regions
+    real = layer_major_page_geometry.layer_major_page_unit_regions
     walks = []
 
     def counted(pools):
         walks.append(len(pools))
         return real(pools)
 
-    monkeypatch.setattr(mha_page_unit_geometry, "mha_page_unit_regions", counted)
+    monkeypatch.setattr(
+        layer_major_page_geometry, "layer_major_page_unit_regions", counted
+    )
     for _ in range(3):
         assert cls._page_unit_regions(builder) is first
     assert walks == []

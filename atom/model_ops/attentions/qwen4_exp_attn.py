@@ -76,7 +76,11 @@ class _PlePlane(NamedTuple):
 
 
 def _qwen38_offload_ready(config) -> bool:
-    """PAGE checkpoints are possible only for a single worker without RapidServe."""
+    """Deployment checks for PAGE checkpoints: one pipeline stage, no RapidServe.
+
+    Tensor parallelism passes (each rank stores its own shard's image). Whether
+    an offload tier is configured at all is `qwen38_offload_configured`'s call.
+    """
 
     if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
         return False

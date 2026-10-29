@@ -1735,11 +1735,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     def _published_page_unit_bytes(self) -> int:
         """Bytes one block publishes, from the declaration (before allocation)."""
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_published_page_bytes,
+        from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
+            layer_major_published_page_bytes,
         )
 
-        return mha_published_page_bytes(self._declare_kv_pools().values())
+        return layer_major_published_page_bytes(self._declare_kv_pools().values())
 
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
         """Where a scheduler block sits in the paged pool.
@@ -1749,8 +1749,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         ``lmcache_mp`` would name different bytes.
         """
 
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_regions,
+        from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
+            layer_major_page_unit_regions,
         )
 
         pools = self._page_unit_pools()
@@ -1766,7 +1766,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         ):
             return cached[1]
         key = tuple(pools)
-        regions = mha_page_unit_regions(pools)
+        regions = layer_major_page_unit_regions(pools)
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
         owned = int(regions[1].sum())
@@ -1779,18 +1779,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return regions
 
     def _page_unit_bases(self, unit_ids):
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_bases,
+        from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
+            layer_major_page_unit_bases,
         )
 
-        return mha_page_unit_bases(self._page_unit_regions(), unit_ids)
+        return layer_major_page_unit_bases(self._page_unit_regions(), unit_ids)
 
     def _page_unit_stream_sizes(self, units: int):
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_stream_sizes,
+        from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
+            layer_major_page_unit_stream_sizes,
         )
 
-        return mha_page_unit_stream_sizes(self._page_unit_regions(), units)
+        return layer_major_page_unit_stream_sizes(self._page_unit_regions(), units)
 
     def page_unit_views(self, unit_ids):
         """MHA views of one checkpoint image, for the in-process state tier.
@@ -1801,12 +1801,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         ``image_bytes``.
         """
 
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_views,
+        from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
+            layer_major_page_unit_views,
         )
 
         self._page_unit_regions()
-        return mha_page_unit_views(
+        return layer_major_page_unit_views(
             self._page_unit_pools(), unit_ids, image_bytes=self._image_bytes()
         )
 
@@ -1823,8 +1823,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def page_unit_segments(self, unit_ids):
         """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
 
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_segments,
+        from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
+            layer_major_page_unit_segments,
         )
 
         runtime = getattr(self.model_runner, "state_runtime", None)
@@ -1836,7 +1836,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             raise RuntimeError("page_unit_segments called without a checkpoint spec")
         regions = self._page_unit_regions()
         first_region = self._page_unit_pools()[0].region_tensors()[0][1]
-        return mha_page_unit_segments(
+        return layer_major_page_unit_segments(
             regions,
             unit_ids,
             entries=int(first_region.shape[0]),
