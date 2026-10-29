@@ -72,11 +72,19 @@ def check(card_text: str, tree: pathlib.Path, changed=()):
                         for m in tree.rglob(base)
                         if m.is_file()
                     ]
+                if not hits:
+                    # Nothing by that name anywhere: the path is invented.
+                    yield "bad", f"{path}:{lineno} -- no such file in the tree"
+                    continue
                 if len(hits) != 1:
-                    yield "bad", (
-                        f"{path}:{lineno} -- no such file in the tree"
-                        if not hits
-                        else f"{path}:{lineno} -- ambiguous, {len(hits)} files share that name"
+                    # The name is real but under-specified -- several files carry it and
+                    # none is in the diff, so the finding is pointing at context code by
+                    # bare basename. A reader cannot follow that, which is worth saying,
+                    # but it does not make the finding wrong the way an invented path
+                    # does. Measured on a real run: ATOM has five scheduler.py.
+                    yield "note", (
+                        f"{path}:{lineno} -- ambiguous, {len(hits)} files share that "
+                        f"name and none is in this diff; cite the directory"
                     )
                     continue
                 f = tree / hits[0]
