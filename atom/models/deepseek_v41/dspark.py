@@ -7,6 +7,7 @@ from copy import copy
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from aiter.tuned_gemm import tgemm
+from aiter.utility.dtypes import fp8 as _fp8_dtype
 from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
@@ -22,7 +23,12 @@ from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
-from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
+from atom.model_ops.layernorm import (
+    _QV_PER_1X32,
+    RMSNorm,
+    _aiter_rms_quant,
+    rmsnorm2d_fwd_,
+)
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.deepseek_v4 import make_v4_quant_config
@@ -249,6 +255,29 @@ class DeepseekV41DSpark(DSparkDraftModel):
         first = self.mtp[0]
         return first.main_norm(first.main_proj(aux_concat))
 
+    def project_context_quant(self, aux_concat):
+        """main_norm(main_proj(x)) fused into (fp8, group32 e8m0 scale).
+
+        Emits exactly the (x, x_scale) pair ``native_quant_linear`` would have
+        produced with its own ``rmsnorm2d_fwd_`` + ``quantize_fp8`` (group32,
+        UE8M0, row-major), so the fused KV GEMM reads them and skips both.
+        """
+        first = self.mtp[0]
+        proj = first.main_proj(aux_concat)
+        nrm = first.main_norm
+        shp = proj.shape
+        out, scale, _ = _aiter_rms_quant(
+            proj.reshape(-1, shp[-1]).contiguous(),
+            nrm.weight,
+            nrm.eps,
+            _QV_PER_1X32,
+            False,  # transpose_scale: row-major
+            None,  # res1
+            _fp8_dtype,  # value_dtype -> mxfp8 path (group32, no shuffle)
+            False,  # e8m0_scale (ignored for mxfp8; scale is always e8m0)
+        )
+        return out.view(shp), scale.view(*shp[:-1], shp[-1] // 32)
+
     @property
     def context_layers(self):
         return tuple(layer.attn for layer in self.mtp)
@@ -273,11 +302,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
         # projected and then written nowhere.
-        hidden = self.project_context(aux_concat[: step.width].unsqueeze(0))
+        ctx = aux_concat[: step.width].unsqueeze(0)
         positions = positions[: step.width][None]
         layers = self.context_layers
         fused = self._context_kv_fusion()
         if fused is None:
+            hidden = self.project_context(ctx)
             for attention in layers:
                 keys = attention.project_context(
                     hidden, positions, self.rope, packed=cache.window_fp8
@@ -285,12 +315,17 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
         weight, weight_scale, group_rows, width, preshuffled = fused
+        # main_norm(main_proj(x)) + the fused KV GEMM's own group32 quantize_fp8
+        # as one rmsnorm->mxfp8 kernel, so native_quant_linear reads (fp8, e8m0
+        # scale) and skips both its rmsnorm and its quant launch. Bit-exact.
+        hidden_fp8, hidden_scale = self.project_context_quant(ctx)
         kv = native_quant_linear(
-            hidden,
+            hidden_fp8,
             weight,
             weight_scale,
             weight_group_rows=group_rows,
             weight_preshuffled=preshuffled,
+            x_scale=hidden_scale,
         ).unflatten(-1, (len(layers), width))
         tail = self._draft_kv_tail_fusion()
         if tail is None:
