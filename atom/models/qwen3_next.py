@@ -15,8 +15,11 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_config.qwen3_next import Qwen3NextConfig
+
+# registers torch.ops.aiter.maybe_dual_stream_forward
+from atom.model_ops import module_dispatch_ops  # noqa: F401
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -163,7 +166,21 @@ class Qwen3NextMLP(nn.Module):
         return out
 
 
+_SHARED_EXPERT_STREAM: torch.cuda.Stream | None = None
+
+
+def _shared_expert_stream() -> torch.cuda.Stream:
+    """One side stream per process, shared by every layer's MoE block."""
+    global _SHARED_EXPERT_STREAM
+    if _SHARED_EXPERT_STREAM is None:
+        _SHARED_EXPERT_STREAM = torch.cuda.Stream()
+    return _SHARED_EXPERT_STREAM
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
+    # set in __init__ (a block built without it runs single-stream)
+    _use_dual_stream = False
+
     def __init__(
         self, config, quant_config, prefix: str = "", reduce_results: bool = True
     ):
@@ -238,6 +255,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
 
+        # The shared expert reads only this rank's tokens, so it can run beside
+        # the routed experts -- their dispatch / combine under EP, their small
+        # kernels at decode under TP -- instead of after them.
+        self._use_dual_stream = (
+            self.shared_expert is not None
+            and envs.ATOM_QWEN_SHARED_EXPERT_STREAM
+            and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+            and not get_current_atom_config().enable_tbo
+        )
+        if self._use_dual_stream:
+            self.alt_stream = _shared_expert_stream()
+            get_current_atom_config().compilation_config.static_forward_context[
+                prefix
+            ] = self
+
         self.experts = FusedMoE(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
@@ -256,12 +288,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             shared_expert_prefix=f"{prefix}.shared_expert",
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # NOTE: hidden_states can have either 1D or 2D shape.
-        orig_shape = hidden_states.shape
-        _num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-
+    def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts + 1)
         logits = self.gate(hidden_states)
         if not self.is_rocm_aiter_fusion_shared_expert_enabled:
@@ -276,14 +303,46 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             # Apply shared expert gate: the merged gate output contains
             # [routed_logits, shared_expert_gate_logits], extract the tail
             shared_gate_logits = logits[:, self.n_routed_experts :]
-            final_hidden_states = shared_expert_gate_add(
+            return shared_expert_gate_add(
                 shared_output,
                 shared_gate_logits,
                 routed_output,
                 ATOM_FUSED_SIGMOID_GATE,
             )
+        return routed_output
+
+    def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """`single_stream_moe_forward` with the shared expert on `alt_stream`;
+        the gated combine runs on the main stream after the join."""
+        logits = self.gate(hidden_states)
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            shared_output = self.shared_expert(hidden_states)
+        routed_output = self.experts(
+            hidden_states=hidden_states,
+            router_logits=logits[:, : self.n_routed_experts],
+        )
+        current_stream.wait_stream(self.alt_stream)
+        return shared_expert_gate_add(
+            shared_output,
+            logits[:, self.n_routed_experts :],
+            routed_output,
+            ATOM_FUSED_SIGMOID_GATE,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # NOTE: hidden_states can have either 1D or 2D shape.
+        orig_shape = hidden_states.shape
+        _num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if self._use_dual_stream:
+            final_hidden_states = torch.ops.aiter.maybe_dual_stream_forward(
+                hidden_states, self.prefix
+            )
         else:
-            final_hidden_states = routed_output
+            final_hidden_states = self.single_stream_moe_forward(hidden_states)
 
         if self.tp_size > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
