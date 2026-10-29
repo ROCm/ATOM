@@ -2,7 +2,7 @@
 # Qwen3.5-35B-A3B-MXFP4 MLPerf Endpoints (agentic) server on gfx1250, after the DSv4.1 endpoints
 # recipe's server. usage: serve_ep.sh <tp|dp> <outdir>   (run_ep.sh calls it; see the recipe .md)
 # tp: TP4 (the interactive points). dp: DP4 attention + EP4 MoE (the high-concurrency points:
-# KV is not duplicated across ranks, ~2x the TP4 capacity). SPEC=3: MTP with 3 draft tokens.
+# KV is not duplicated across ranks, ~2x the TP4 capacity). SPEC=<n>: MTP with n draft tokens.
 MODE=$1; OUT=$2; mkdir -p $OUT; cd ${ATOM_DIR:-/app/ATOM}
 MODEL=${MODEL:-/data/Qwen3.5-35B-A3B-MXFP4}
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0,1,2,3} OMP_NUM_THREADS=4 AITER_LOG_LEVEL=WARNING
@@ -27,7 +27,8 @@ export HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 ATOM_GC_THRESHOLD=20000,50,50
 # Then the MoE route count staged once per forward (passed to aiter's fused_moe as num_valid_routes:
 # needs aiter alizaidy/qwen35-c16-perf, set ATOM_MOE_PRECOMPUTED_NVR=0 with an older aiter), and the
 # MTP draft: replicated fc and embedding (no all-gather / all-reduce), both pre-fc norms in one launch,
-# the argmax packs exchanged by one all-reduce, the GDN kv-indptr rebuild in one launch.
+# the argmax packs exchanged by one all-reduce, the GDN kv-indptr rebuild in one launch. And the
+# sampler's softmax over the 248k vocab split across programs a row (one block a row otherwise).
 if [ "$MODE" = tp ]; then
   export ATOM_SPEC_FUSED_VERIFY_SAMPLE=${ATOM_SPEC_FUSED_VERIFY_SAMPLE:-1}
   export ATOM_TP_TOKEN_SYNC_ALLGATHER=${ATOM_TP_TOKEN_SYNC_ALLGATHER:-1}
@@ -40,6 +41,7 @@ if [ "$MODE" = tp ]; then
   export ATOM_MTP_DUAL_PRE_FC_NORM=${ATOM_MTP_DUAL_PRE_FC_NORM:-1}
   export ATOM_ARGMAX_HEAD_AR_GATHER=${ATOM_ARGMAX_HEAD_AR_GATHER:-1}
   export ATOM_MTP_FUSED_KV_INDPTR=${ATOM_MTP_FUSED_KV_INDPTR:-1}
+  export ATOM_SAMPLER_SPLIT_SOFTMAX=${ATOM_SAMPLER_SPLIT_SOFTMAX:-1}
 fi
 # keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
 # first eager multi-request prefill, a ~35 s stall a fresh server
@@ -82,7 +84,7 @@ case $MODE in
       ARGS+=(--enable-dp-attention --enable-expert-parallel --max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}") ;;
   *) echo "unknown mode $MODE"; exit 1 ;;
 esac
-# SPEC=3: MTP speculative decoding (graphed draft steps); the checkpoint keeps the MTP
+# SPEC=<n>: MTP speculative decoding (graphed draft steps); the checkpoint keeps the MTP
 # layer BF16 and gfx1250 has no BF16 fused MoE, so its routed experts are quantized to MXFP4 at load
 SPEC=${SPEC:-0}
 [ "$SPEC" -gt 0 ] && ARGS+=(--method mtp --num-speculative-tokens $SPEC

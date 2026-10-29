@@ -32,7 +32,7 @@ overrides, `SPEC=0` turns it off); `run_ep.sh` picks the server from the concurr
 
 | Concurrency | Server |
 |---|---|
-| 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p, MoE routes staged once per forward, MTP draft with replicated fc / embedding, one-launch pre-fc norms, all-reduce argmax exchange and one-launch GDN kv-indptr |
+| 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p, MoE routes staged once per forward, MTP draft with replicated fc / embedding, one-launch pre-fc norms, all-reduce argmax exchange and one-launch GDN kv-indptr, split-row sampler softmax |
 | 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
@@ -73,6 +73,11 @@ request twice, the second from the prefix cache, gives the same text), `DONE` wi
 success count, and `OUTPUTS` (`check_outputs.py`: the share of outputs that are token salad; it
 should be 0).
 
+`bench_summary.py name=$R/runs/c16 ...` prints a point's headline numbers side by side with others: turns,
+output and total tok/s (total: every prompt token, cached or not, plus the output), the prefill tok/s
+of the tokens the prefix cache did not hold, E2E interactivity, TTFT and TPOT (median, mean, p90, p99)
+and MTP tokens a forward.
+
 Knobs: `CAP_MIN` (default 30), `STOP_FIRST` (1: stop issuing at the first trajectory completion
 once all have started), `TRAJ_X` (trajectories = max(613, `TRAJ_X` x c), default 4: the client
 repeats trajectories with a fresh salt, so the 30-minute cap and not an exhausted pool ends every
@@ -103,6 +108,41 @@ above the range: 2,048 conversations run and the rest queue (hence the TTFT and 
 the then 900 s turn timeout); it shows the cap, not the hardware. These points predate the
 [prefill / decode interval](#prefill--decode-interval) (they ran with 0). Interactivity is the
 report's "E2E average interactivity": output tokens over turn latency, TTFT included.
+
+### TP4 c16 (2026-10-28)
+
+On image `gfx1250-atom-20261028-qwen35`, 30 minutes each, both clean:
+
+| | First (image ATOM + #2768 + #2790, MTP3) | With the TP4 decode settings below |
+|---|---|---|
+| Turns (failed) | 9,376 (0) | 10,818 (0) |
+| Output tok/s (report TPS) | 1,902 | **2,141** |
+| Total tok/s (input + output) | 402,346 | 477,085 |
+| E2E interactivity | 278.7 | **365.2** |
+| TTFT median / p99 | 334 / 794 ms | **309 / 676 ms** |
+| TPOT median / p99 | 2.32 / 4.02 ms | **1.76 / 3.31 ms** |
+| MTP tokens a forward | 3.14 | 3.59 |
+
+The second point ran ATOM 38d645db (#2740) + #2798 (merged) + #2801 + #2803 with aiter
+alizaidy/gfx1250-qwen-support be1cab9d + ROCm/aiter#7113. It used the Gluon fused all-reduce + RMSNorm for
+decode, which #2766 now enables by default, and these settings, which `serve_ep.sh` sets for TP:
+
+| Setting | What it does | Measured (TP4 c16 traces, decode step at equal batch) |
+|---|---|---|
+| MTP4 (`SPEC=4`) | one more draft token | 3.46 tokens a forward against ~3.00 for MTP3 on the same traffic, step +12%: ~+3% per sequence |
+| `ATOM_SPEC_FUSED_VERIFY_SAMPLE=1` (#2801) | one sampler pass and one TP broadcast for the verify and bonus rows | ~-0.15 to -0.21 ms (-2 to -3%) |
+| `ATOM_SAMPLER_SPLIT_SOFTMAX=1` (#2803) | the sampler's softmax over the 248k vocab split across 61 programs a row | ~-85 us of GPU time a step |
+| `AITER_TOPK_FIRST_SMALL_K_TOPP=1` (aiter#7113) | register-resident top-p for k <= 64 (the client's top_k is 20) | ~-3 us a step once scratch reclaim is off |
+
+That point also ran `HSA_NO_SCRATCH_RECLAIM=1` and the scheduling `ATOM_PREFILL_DECODE_INTERVAL=16`,
+`ATOM_PREFILL_DELAYER_STALL_TICKS=2`, `ATOM_TOKEN_GRAPH_SIZES=256,...,4096`; the recipe sets neither.
+Against the tip with #2803 (10-minute TP4 c16 points, 2026-10-29): scratch reclaim off measured no gain
+(TPOT 1.55 -> 1.58 ms), since aiter#7113 and the all-gather token sync removed the kernels that used
+scratch; the scheduling cut TPOT 8% but raised the TTFT median 46 -> 183 ms, TPS 2,529 -> 2,385.
+
+With MTP4 the verify attention (unified
+attention 3D at 5 query tokens) picks a quarter of MTP3's KV segments a sequence and takes 65 against
+40 us a launch: a config for that shape would make MTP4 a clearer gain.
 
 ## Prefill / decode interval
 
