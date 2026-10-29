@@ -1,6 +1,8 @@
 """Check how the C48 launcher wires the Prefill LMCache MP sidecar port."""
 
 import json
+import os
+import subprocess
 import sys
 import types
 import unittest
@@ -18,6 +20,34 @@ def transfer(argv):
 
 
 class LaunchTest(unittest.TestCase):
+    def test_pp_recipe_overrides_tp_only_runtime_visibility(self):
+        source = (Path(__file__).resolve().parents[1] / "pd_server_atom.sh").read_text()
+        start = source.index('role_tp="${PREFILL_TP_SIZE}"')
+        bootstrap = source[start:source.index('rm -rf /root/.cache/atom/', start)]
+        prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
+        for name in ("C32-MC", "C32-PP8-MC", "C32-AX109-PP8-MC"):
+            config = json.loads((GAP / (prefix + name + ".json")).read_text())
+            for rank, role in enumerate(("prefill", "decode")):
+                with self.subTest(case=name, role=role):
+                    environment = dict(os.environ, NODE_RANK=str(rank), xP="1",
+                                       PREFILL_SINGLE_NODE_PD="0",
+                                       PREFILL_TP_SIZE=str(config["roles"]["prefill"]["args"]["tensor-parallel-size"]),
+                                       DECODE_TP_SIZE=str(config["roles"]["decode"]["args"]["tensor-parallel-size"]))
+                    environment.pop("HIP_VISIBLE_DEVICES", None)
+                    result = subprocess.run(
+                        [os.environ.get("PD_TEST_BASH", "bash"), "--noprofile", "--norc", "-c",
+                         'set -euo pipefail\nexport PATH="/usr/bin:/bin:$PATH"\n' + bootstrap
+                         + '\nprintf "%s" "$HIP_VISIBLE_DEVICES"'],
+                        env=environment, capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    _, overrides = render(config, role, *ADDR)
+                    visible = overrides.get("HIP_VISIBLE_DEVICES", result.stdout).split(",")
+                    args = config["roles"][role]["args"]
+                    workers = args["tensor-parallel-size"] * args.get("pipeline-parallel-size", 1)
+                    self.assertEqual(len(visible), workers)
+                    self.assertEqual(workers, config["roles"][role]["gpus"])
+
     def test_eval_removes_synthetic_acceptance_without_changing_benchmark(self):
         config = json.loads((GAP / "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C32-PP8-MC.json").read_text())
         before = json.dumps(config)
@@ -108,6 +138,8 @@ class LaunchTest(unittest.TestCase):
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
             if variant == "PP8":
+                self.assertEqual(candidate["roles"]["prefill"]["env"].pop("HIP_VISIBLE_DEVICES"),
+                                 "0,1,2,3,4,5,6,7")
                 for role in ("prefill", "decode"):
                     self.assertEqual(candidate["roles"][role]["env"].pop("C48_MOONCAKE_DCP_TRANSFER"), "1")
                 self.assertEqual(candidate["roles"]["prefill"]["env"].pop("VLLM_PP_LAYER_PARTITION"),
