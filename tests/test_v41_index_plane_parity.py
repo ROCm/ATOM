@@ -65,7 +65,9 @@ def test_plugin_index_plane_matches_the_resolved_default(monkeypatch):
     fixture = ROOT / "tests/models/deepseek_v41/fixtures"
     # The quantization parser resolves AITER enums; only that GPU dependency
     # is bypassed, and the real default resolution runs.
-    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    monkeypatch.setattr(
+        config_module, "QuantizationConfig", lambda *args, **kwargs: None
+    )
     # As the plugin builds it for V4.1: no index_cache_dtype, no transport.
     cfg = Config(
         model=str(fixture),
