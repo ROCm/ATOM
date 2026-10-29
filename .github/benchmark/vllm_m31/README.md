@@ -64,10 +64,11 @@ Store before the next starts, and writes a separate artifact directory.
 `suite-status.json` records progress. A failed smoke, benchmark, or teardown
 stops the sequence. Each measurement still runs for 3600 seconds.
 
-Automatic allocation currently excludes `pit2-p03-g09` after two unexplained
-SIGKILL exits there; explicitly pinned nodes bypass the automatic exclusion.
-The read-only inspection case emits schema-filtered status for its configured
-Actions ID, never raw logs or arbitrary file content.
+Automatic model allocations exclude `pit2-p03-g09`, `-g10`, `-g23`, and
+`-g25` after previous interrupted allocations. The current no-model diagnostic
+is pinned to `pit2-p03-g37`. Explicit dispatch placement overrides case placement.
+Read-only inspection emits status and, when enabled, bounded logs/results from
+this experiment's namespace into an Actions artifact.
 
 Memory preparation follows successful CI `40376309047` (commit
 `fc9bf7aa215f33067a8b0728279d076c0da5a313`). The custom
@@ -133,28 +134,42 @@ trigger this retry path. A host cleanup timeout is fatal, not resubmitted.
 The model image, revisions, prefix caches, DSpark3 and benchmark workload
 remain as specified above. Store belongs to P only, with the capacities above.
 
-The `m31-vllm-triton-probe` case runs no-model GPU diagnostics using the same
-container launcher and image. It starts no servers, connectors, Store, model
-loads, or downloads. Four subprocesses cover the P/D GPU masks (logical GPU 0,
-physical GPUs 0 and 4), with default and fresh Triton caches. Each checks a
-minimal write, installed vLLM device/UVA staged writes, and KV block zeroing.
-`triton-probe/summary.json` reports numeric correctness and failures. Each case
-saves host kernel/amdgpu version, HIP API versions, loaded GPU libraries,
-Triton target/cache location, and compiled IR/HSACO before binary loading.
-A missing command is recorded as unavailable. Run on the failed node with
-`atomesh_single_node=pit2-p03-g12`, case `m31-vllm-triton-probe`, dashboard off.
+The current `m31-vllm-triton-probe` case selects the `registration_memory`
+matrix. Four processes on GPUs 4–7 each allocate a 64 GiB non-KV fixture and
+193 GiB KV storage, initialize the image's native Mooncake TransferEngine on
+one HCA, and check fresh Triton kernels before/after registration. It loads no
+model and starts no Store. Successful cases must also execute the installed
+`_zero_kv_blocks_kernel` and verify zeroed and untouched elements exactly.
 
-The current no-model probe matrix compares a fresh-cache baseline, explicit
-core/devel COMGR preloads, and Mooncake-before/after-Torch imports, including
-core-COMGR preload controls. It records hashes/inodes of both COMGR copies.
-No connector, Store or model is initialized. This follows smoke 40724865295:
-the failing zeroing HSACO is byte-identical to the successful minimal probe,
-but the two processes loaded COMGR from different SDK directories.
+The default DMA-BUF path was isolated in CI `40801749720`: registering 64 GiB
+subtracts another 64 GiB from KFD free VRAM; registering 193 GiB with about
+30 GiB free clamps free VRAM to zero, then kernel loading fails with HIP 209.
+`MOONCAKE_DISABLE_HIP_DMABUF=1` makes kernels run but reports about 148,833 GiB
+free with 772 MR chunks, so it is not a valid fix for this experiment.
+`NCCL_DMABUF_ENABLE=0` does not control Mooncake's registration path.
 
-The next smoke sets `LD_PRELOAD` to the image's
-`_rocm_sdk_core/lib/libamd_comgr.so.3` before starting vLLM services. The core
-and devel COMGR paths are hardlinks to identical bytes. In no-model run
-40727829376, importing Mooncake before Torch aborted during Triton compilation;
-preloading COMGR made both import orders pass all four native/minimal checks.
-This is a loader-order workaround candidate; the full model smoke must verify
-whether it also fixes its HIP 209. It does not replace any image package.
+[Mooncake PR #4657](https://github.com/kvcache-ai/Mooncake/pull/4657) addresses
+this amdgpu accounting bug by holding one peer-memory pin per allocation while
+data MRs remain on DMA-BUF. The image does not contain its
+`MC_HIP_KFD_PIN_FIX` implementation. `pd_vllm_kfd_pin.py` uses the image's HIP
+and libibverbs ABI for the same allocation-level mechanism without replacing
+the installed packages. The model adapter is opt-in through
+`ATOMESH_VLLM_KFD_PIN_ADAPTER=1`; it is currently **not enabled** in the recipe.
+
+Before adding anchors, the adapter tests a private 64 MiB HIP allocation to
+distinguish affected and fixed drivers. It binds at the outer KV connector,
+so P Transfer and Store share one anchor per underlying allocation. It checks
+free VRAM after native registration, retaining the fixed KV pool and anchors
+for the worker lifetime: a Transfer-only unregister cannot release a pin while
+P Store still owns a data MR. This experiment adapter does not support replacing
+or resizing the KV pool within a worker. Its diagnostic additionally removes
+all native data MRs, releases anchors, and verifies the final memory accounting.
+
+The active diagnostic cases are `anchor-193g`, `anchor-subranges-193g`, and
+`adapter-193g`; the second covers multiple regions within one allocation,
+including a length not aligned to 2 MiB, and the third exercises the private
+driver probe and the model adapter entry point. Per-rank artifacts include
+`memory.json`, `registration.json`, stage results, and `kfd-pin.json` for the
+adapter. A diagnostic pass is not a model smoke pass. Enable the model adapter
+only after GPU validation, then require all existing smoke correctness and
+precision checks before starting the full C32 run.
