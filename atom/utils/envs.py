@@ -894,6 +894,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefill eager.
     "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1") == "1",
     "ATOM_GDN_GRAPH_MAX_SEQS": lambda: int(os.getenv("ATOM_GDN_GRAPH_MAX_SEQS", "8")),
+    # Prefill token graphs for the GDN/MHA builder (Qwen3.5 / Qwen3-Next) under
+    # DP attention. A DP group replays a prefill bucket only on a step every
+    # rank prefills (`ForwardMode.prefill_graph_all_ranks`); any other step --
+    # a rank decoding, or idle on a dummy decode -- runs eagerly as before, and
+    # no rank is held to a dummy prefill (`Scheduler.dummy_prefill`). 0 (the
+    # default) records no prefill buckets under DP.
+    "ATOM_DP_PREFILL_GRAPH": lambda: os.getenv("ATOM_DP_PREFILL_GRAPH", "0") == "1",
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1",

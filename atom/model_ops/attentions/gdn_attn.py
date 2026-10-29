@@ -1688,11 +1688,29 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # (`ATOM_GDN_PREFILL_IN_GRAPH`) those ranks would replay prefill GDN kernels
     # over another step's tables. Without recorded buckets a DP group runs its
     # prefills eagerly, as before.
+    #
+    # `ATOM_DP_PREFILL_GRAPH` brings up the one DP case that needs neither: a
+    # step on which EVERY rank of the group prefills a real batch. Each rank then
+    # lays out its own prefill at the group's bucket and its GDN tables are its
+    # own step's, so the recording serves it as it serves a single rank. Any
+    # other step runs eagerly on every rank (`token_graph_needs_all_prefill`,
+    # `ForwardMode.prefill_graph_all_ranks`), and the scheduler is told no
+    # prefill bucket exists (`ModelRunner.prefill_token_graphs`), so it never
+    # turns a decoding rank into a dummy prefill.
     @property
     def supports_token_graph(self) -> bool:
         from aiter.dist.parallel_state import get_dp_group
 
-        return get_dp_group().world_size == 1
+        return get_dp_group().world_size == 1 or envs.ATOM_DP_PREFILL_GRAPH
+
+    @property
+    def token_graph_needs_all_prefill(self) -> bool:
+        """A prefill bucket replays only on a step every DP rank prefills: a
+        decoding or dummy rank would replay the inline GDN prefill kernels over
+        tables its own step never wrote."""
+        from aiter.dist.parallel_state import get_dp_group
+
+        return get_dp_group().world_size > 1
     # The bucket a padded prefill is being laid out at, while `prepare_prefill`
     # runs; None otherwise.
     _token_graph_tokens: int | None = None

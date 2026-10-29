@@ -7,7 +7,7 @@ from collections.abc import Container
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Union
 
 import numpy as np
 import torch
@@ -165,6 +165,11 @@ class ForwardMode:
     # TBO graph, which recorded that split; the scheduled requests on an eager
     # TBO split. None when the step does not split a decode.
     ubatch_split_bs: int | None = None
+    # The recorded prefill buckets replay only on a step EVERY DP rank prefills
+    # (`AttentionMetadataBuilder.token_graph_needs_all_prefill`): a decoding
+    # rank, or an idle one on a dummy decode, cannot replay them, so the group
+    # runs such a step eagerly as one. Set once by the runner after recording.
+    prefill_graph_all_ranks: ClassVar[bool] = False
 
     @classmethod
     def decide(
@@ -351,6 +356,9 @@ class ForwardMode:
         running = running_tokens_per_dp_rank
         np.copyto(running, sync.scheduled_tokens_per_dp_rank)
         if not graphable or not any(sync.prefill_across_dp):
+            return 0
+        if ForwardMode.prefill_graph_all_ranks and not all(sync.prefill_across_dp):
+            # `prefill_across_dp` is the exchange's, so every rank skips alike.
             return 0
         group = region_graph.TokenGraph.bucket(int(running.max()), "prefill")
         if group is None:

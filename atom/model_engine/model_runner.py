@@ -1365,7 +1365,13 @@ class ModelRunner:
     def prefill_token_graphs(self) -> bool:
         """Whether a prefill step replays token graphs -- a bucket some prefill
         record pass captured -- which is what makes an idle DP rank's dummy
-        prefill worth its decode (`Scheduler.prefill_token_graphs`)."""
+        prefill worth its decode (`Scheduler.prefill_token_graphs`).
+
+        False for a builder whose buckets replay only on a step every DP rank
+        prefills (`ForwardMode.prefill_graph_all_ranks`): no rank is to give
+        its decode to a dummy prefill those buckets cannot serve."""
+        if ForwardMode.prefill_graph_all_ranks:
+            return False
         return bool(TokenGraph.captured_sizes("prefill"))
 
     def warmup_max_tokens(self) -> int:
@@ -3225,14 +3231,6 @@ class ModelRunner:
                     )
                     hidden_states = None
                     logits = None
-                elif self._is_pure_middle_chunk(batch):
-                    if _pcp_tbo_balanced:
-                        model_output = self._restore_pcp_balanced_output(
-                            model_output, _pcp_bal_groups, _pcp_size
-                        )
-                    # Middle chunk: no logits, but drafter needs hidden states.
-                    hidden_states = model_output
-                    logits = None
                 else:
                     if _pcp_tbo_balanced:
                         model_output = self._restore_pcp_balanced_output(
@@ -3245,10 +3243,18 @@ class ModelRunner:
                         # A prefill padded to a token-graph bucket: the model ran
                         # the bucket's rows; what follows (the draft's prefill,
                         # its KV) runs the scheduled ones, positions included.
+                        # A middle chunk too: its rows still feed the draft KV
+                        # (`compute_draft_kv`) and, under DP, the lockstep
+                        # draft pass (`propose(align_only=True)`).
                         context.positions = context.positions[
                             ..., : context.scheduled_tokens
                         ].contiguous()
-                    logits = self._compute_logits(hidden_states, greedy_ids)
+                    # Middle chunk: no logits, but drafter needs hidden states.
+                    logits = (
+                        None
+                        if self._is_pure_middle_chunk(batch)
+                        else self._compute_logits(hidden_states, greedy_ids)
+                    )
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
@@ -4426,6 +4432,11 @@ class ModelRunner:
             return
         if self.attn_metadata_builder.supports_token_graph:
             self._record_tr_graphs()
+            ForwardMode.prefill_graph_all_ranks = bool(
+                getattr(
+                    self.attn_metadata_builder, "token_graph_needs_all_prefill", False
+                )
+            )
         self._record_prefill_req_graphs()
         reset_forward_context()
         # The recording forwards' eager halves cached activations outside the
