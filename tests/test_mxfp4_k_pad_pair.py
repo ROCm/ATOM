@@ -512,3 +512,63 @@ def test_tp1_per_token_scale_loads_into_a_padded_down(monkeypatch, online_build)
     w = _pattern(HIDDEN, REAL)
     down.weight_loader(down.weight, w.view(dtypes.fp8))
     assert torch.equal(_u8(down.weight)[:, :REAL], w)
+
+
+# ── a padded param never takes the fused-on-disk direct copy ──────────────
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_merged_on_disk_whose_shape_matches_the_padded_param(monkeypatch, rank):
+    """intermediate 256 at TP2: 128 per rank pads to 256, so the padded param
+    (2 x 256 rows) has the unsharded [gate | up] checkpoint's shape. It must
+    still be split and sharded, not copied whole."""
+    group = SimpleNamespace(world_size=2, rank_in_group=rank)
+    monkeypatch.setattr(linear_mod, "get_tp_group", lambda: group)
+    qc = _qc(*MXFP4)
+    inter = 256
+    gate_up = MergedColumnParallelLinear(
+        HIDDEN,
+        [inter, inter],
+        quant_config=qc,
+        prefix="mlp.gate_up_proj",
+        output_pad_align=mxfp4_k_pad_align(qc, "mlp.down_proj"),
+    )
+    assert gate_up.weight.shape == (2 * 256, HIDDEN // 2)
+    gate, up = _pattern(inter, HIDDEN // 2), _pattern(inter, HIDDEN // 2).flip(0)
+    fused = torch.cat([gate, up])
+    assert fused.shape == gate_up.weight.shape  # the coincidence
+    gate_up.weight_loader(gate_up.weight, fused, None)
+    w = _u8(gate_up.weight)
+    assert torch.equal(w[:128], gate.chunk(2, 0)[rank])
+    assert torch.equal(w[256:384], up.chunk(2, 0)[rank])
+
+
+# ── one resolver for the runtime scheme ───────────────────────────────────
+
+
+def test_kimi_and_the_pad_decision_share_one_resolver():
+    """KimiMLP's fused act-quant decision and mxfp4_k_pad_align must not drift."""
+    from atom.models.kimi_k3 import model as kimi_model
+    from atom.quant_spec import effective_layer_quant
+
+    assert kimi_model._effective_layer_quant is effective_layer_quant
+    for source in (NVFP4_SRC, FP8_BLOCK_SRC):
+        qc = _online_to_mxfp4(source)
+        qt, qd = effective_layer_quant(qc, "mlp.down_proj")
+        assert (qt.value, qd) == (QuantType.per_1x32.value, dtypes.fp4x2)
+
+
+def test_weight_scale_row_group_compares_by_value():
+    """A per_1x128 QuantType from another aiter import still groups by 128;
+    the padding's block-straddle check and scale slicing read this."""
+
+    class Foreign:
+        value = QuantType.per_1x128.value
+
+        def __eq__(self, other):
+            return self is other
+
+        __hash__ = object.__hash__
+
+    double = SimpleNamespace(native_a8_group_rows=None, quant_type=Foreign())
+    assert LinearBase.weight_scale_row_group.fget(double) == 128

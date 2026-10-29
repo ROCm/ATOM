@@ -39,6 +39,7 @@ from atom.quant_spec import (
     NVFP4_DTYPE,
     NVFP4_GROUP_SIZE,
     LayerQuantConfig,
+    effective_layer_quant,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -142,13 +143,15 @@ else:
     gemm_afp4wfp4 = None
 
 
-# The preshuffled MXFP4 GEMMs walk K in 256-wide steps and none of them masks a
-# tail: at a K that is not a multiple of 256 the last step reads the padded scale
-# columns and the bytes past each row, i.e. uninitialized memory, and the result
-# is garbage at an M that depends on what happens to be there. The triton
-# preshuffle kernel asserts on this at call time; the ASM `gemm_a4w4` does not.
-# A model with such a layer must zero-pad K to this multiple (Kimi-K3's dense
-# MLP does), so `process_weights_after_loading` refuses it at load instead.
+# The preshuffled MXFP4 GEMMs on the e8m0-shuffled scale layout walk K in
+# 256-wide steps and none of them masks a tail: at a K that is not a multiple of
+# 256 the last step reads activation scale columns the quant never wrote and the
+# bytes past each row, and the result is garbage whenever that memory is. The
+# triton preshuffle kernel asserts on this at call time; the ASM `gemm_a4w4`
+# does not. So `process_weights_after_loading` refuses such a weight at load; an
+# MLP pair pads its K instead (see mxfp4_k_pad_align). Exempt: gfx1250's 32x4
+# scale layout (K % 128, below) and the non-shuffle Triton GEMM, which reads the
+# raw layout.
 MXFP4_PRESHUFFLE_K_ALIGN = 256
 # gfx1250's 32x4-scale gemm_a4w4 kernels take K in steps of 128 (4 x 32).
 MXFP4_N32K4_K_ALIGN = 128
@@ -163,8 +166,10 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
             f"{MXFP4_PRESHUFFLE_K_ALIGN}. The preshuffled MXFP4 GEMMs do not "
             "handle a K tail and would read uninitialized memory. If this is an "
             "MLP down_proj, build its pair with output_pad_align / "
-            "input_pad_align from mxfp4_k_pad_align(); otherwise set "
-            "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1."
+            "input_pad_align from mxfp4_k_pad_align(). Otherwise keep this "
+            "layer out of MXFP4 (for online quant, list it in exclude_layer of "
+            "--online_quant_config), or set ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 "
+            "to run every MXFP4 GEMM on the non-shuffle Triton kernel."
         )
 
 
@@ -194,14 +199,7 @@ def mxfp4_k_pad_align(
     """
     if quant_config is None or use_fp4_non_shuffle_triton_gemm():
         return None
-    cfg = quant_config.get_layer_quant_config(prefix)
-    if quant_config.online_quant:
-        from atom.quant_spec import should_skip_online_quant
-
-        online = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
-        if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online):
-            cfg = online
-    if not _is_mxfp4(cfg.quant_type, cfg.quant_dtype):
+    if not _is_mxfp4(*effective_layer_quant(quant_config, prefix)):
         return None
     return MXFP4_N32K4_K_ALIGN if _mxfp4_n32k4_backend() else MXFP4_PRESHUFFLE_K_ALIGN
 
@@ -214,7 +212,14 @@ def padded_partition_size(size_per_partition: int, align: int | None) -> int:
 
 
 def _fill_unit_scale(scale: torch.Tensor) -> None:
-    """Write 1.0 in the scale's own encoding (e8m0 0x7F, e4m3fn 0x38, ...)."""
+    """Write 1.0 in the scale's own encoding (e8m0 0x7F, e4m3fn 0x38, ...).
+
+    MoE's ``intermediate_pad`` zeroes its pad scales' bytes instead. Either is
+    inert, since the weights beside them are zero; this uses 1.0 because these
+    slots may be dequantized for online requant from any source encoding, and
+    1.0 is the same exact value in all of them (byte 0 is 0 in e4m3fn but
+    2**-127 in e8m0).
+    """
     if scale.dtype == torch.uint8:  # e8m0 held as raw bytes
         scale.fill_(127)
     else:
@@ -1094,7 +1099,8 @@ class LinearBase(nn.Module):
         """Number of weight rows represented by one row of source scales."""
         if self.native_a8_group_rows is not None:
             return self.native_a8_group_rows
-        return 128 if self.quant_type == QuantType.per_1x128 else 1
+        # By value, like the padding code that reads it (plugin-mode QuantType).
+        return 128 if self.quant_type.value == QuantType.per_1x128.value else 1
 
     @staticmethod
     def weight_loader_process(
@@ -2006,14 +2012,10 @@ class MergedColumnParallelLinear(LinearBase):
             prefix=prefix,
         )
         if self.output_sizes != self._ckpt_output_sizes:
-            assert self.tp_size == get_tp_group().world_size
-            for real, padded in zip(self._ckpt_output_sizes, self.output_sizes):
-                _check_pad_source(
-                    self, prefix, real // self.tp_size, padded // self.tp_size
-                )
             rows, off = [], 0
             for real, padded in zip(self._ckpt_output_sizes, self.output_sizes):
                 r, p = real // self.tp_size, padded // self.tp_size
+                _check_pad_source(self, prefix, r, p)
                 rows.append((off + r, off + p))
                 off += p
             self._pad_output_rows = rows
@@ -2044,7 +2046,7 @@ class MergedColumnParallelLinear(LinearBase):
 
             # Split loaded_weight by the requested shard sizes (pre-TP), as the
             # checkpoint holds them, then load each shard individually.
-            ckpt_sizes = getattr(self, "_ckpt_output_sizes", self.output_sizes)
+            ckpt_sizes = self._ckpt_output_sizes
             shard_sizes = [ckpt_sizes[i] for i in loaded_shard_id]
             current_offset = 0
             for shard_id, shard_size in zip(loaded_shard_id, shard_sizes):
@@ -2069,8 +2071,14 @@ class MergedColumnParallelLinear(LinearBase):
                 self, "weight_scale", None
             ) or param is getattr(self, "input_scale", None)
 
-            # For fused weight, need to match param shape
-            if param_data.shape == loaded_weight.shape:
+            # For fused weight, need to match param shape. Only an unpadded
+            # param can match the unsharded tensor (TP=1): a padded one can
+            # coincide in shape (128 per rank padded to 256 at TP2) while
+            # holding a different layout, so it always splits.
+            if (
+                self.output_sizes == self._ckpt_output_sizes
+                and param_data.shape == loaded_weight.shape
+            ):
                 # Shapes match - direct copy
                 param.weight_loader_process(param_data, loaded_weight)
                 return
@@ -2078,7 +2086,7 @@ class MergedColumnParallelLinear(LinearBase):
             # Otherwise, split the fused weight -- at the sizes the checkpoint
             # holds, not any padded ones -- and load each output shard.
             current_offset = 0
-            ckpt_sizes = getattr(self, "_ckpt_output_sizes", self.output_sizes)
+            ckpt_sizes = self._ckpt_output_sizes
             for shard_id, output_size in enumerate(ckpt_sizes):
                 shard_size = output_size
                 if is_scale_param and self.weight_scale_row_group > 1:
@@ -2093,7 +2101,7 @@ class MergedColumnParallelLinear(LinearBase):
         # Offset in the (possibly padded) parameter; size of the real shard the
         # checkpoint holds, written at the front of its padded slot.
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-        ckpt_sizes = getattr(self, "_ckpt_output_sizes", self.output_sizes)
+        ckpt_sizes = self._ckpt_output_sizes
         shard_size = ckpt_sizes[loaded_shard_id] // self.tp_size
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
@@ -2893,7 +2901,6 @@ class RowParallelLinear(LinearBase):
         )
         self._pad_input = pad_input
         if pad_input is not None:
-            assert self.tp_size == get_tp_group().world_size
             _check_pad_source(self, prefix, *pad_input)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -2915,7 +2922,7 @@ class RowParallelLinear(LinearBase):
                 param.weight_loader_process(param_data, loaded_weight)
                 return
             shard_size = param_data.size(self.tp_dim)
-            pad_input = getattr(self, "_pad_input", None)
+            pad_input = self._pad_input
             if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
                 loaded_weight = loaded_weight.repeat(1, self.tp_size)
             elif pad_input is not None and param_data.size(self.tp_dim) > 1:

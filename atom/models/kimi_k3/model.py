@@ -65,7 +65,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.quant_spec import should_skip_online_quant
+from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -197,26 +197,9 @@ _RMS_FUSABLE_QUANT_TYPES = (
 )
 
 
-def _effective_layer_quant(
-    quant_config: QuantizationConfig | None, prefix: str
-) -> tuple[QuantType, torch.dtype | None]:
-    """Resolve the ``(quant_type, quant_dtype)`` a Linear runs with at runtime.
-
-    Same resolution the Linear itself performs (mirrors
-    ``LinearBase.online_quantize_weight`` and deepseek_v2's MLA setup): the static
-    checkpoint scheme, overridden by the online-quant target when that override
-    actually applies (``should_skip_online_quant``). A preceding RMSNorm uses this
-    to decide whether -- and in which scheme (fp8 / fp4x2, per-token / block) -- to
-    fuse its activation quant, rather than hard-coding one layout.
-    """
-    if quant_config is None:
-        return QuantType.No, None
-    cfg = quant_config.get_layer_quant_config(prefix)
-    if quant_config.online_quant:
-        online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
-        if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
-            cfg = online_cfg
-    return cfg.quant_type, cfg.quant_dtype
+# The runtime scheme of a layer; shared with the MLP pair's K padding decision
+# (``mxfp4_k_pad_align``) so the two cannot disagree.
+_effective_layer_quant = effective_layer_quant
 
 
 def _is_e8m0_blockscale(

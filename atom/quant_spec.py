@@ -141,6 +141,25 @@ def will_online_requant(
     )
 
 
+def effective_layer_quant(quant_config, prefix: str):
+    """The ``(quant_type, quant_dtype)`` a layer runs with at runtime.
+
+    The static checkpoint scheme, overridden by the online-quant target when
+    that override applies to this layer (``should_skip_online_quant``) -- the
+    same resolution ``LinearBase.online_quantize_weight`` performs. Anything
+    that must agree with the layer's runtime format (a preceding norm's fused
+    activation quant, an MLP pair's K padding) resolves it here, once.
+    """
+    if quant_config is None:
+        return QuantType.No, None
+    cfg = quant_config.get_layer_quant_config(prefix)
+    if quant_config.online_quant:
+        online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+        if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
+            cfg = online_cfg
+    return cfg.quant_type, cfg.quant_dtype
+
+
 def validate_nvfp4_online_target(quant_config, prefix: str) -> None:
     """Reject an NVFP4 source layer that online quantization will not convert.
 
