@@ -2148,6 +2148,7 @@ models:
 
         - <<: *m31_vllm_pd
           name: m31-vllm-triton-probe
+          nodes: [pit2-p03-g37]
           runner:
             exclude_nodes: pit2-p03-g09,pit2-p03-g23
             time_limit: "00:20:00"
