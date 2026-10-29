@@ -77,8 +77,10 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.models.registry import mono_decode_installers, support_model_arch_dict
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.spec_decode.status import SpecStatusQueue
@@ -113,57 +115,6 @@ from atom.utils.tbo import (
 )
 
 logger = logging.getLogger("atom")
-
-support_model_arch_dict = {
-    "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
-    "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
-    "LlamaForCausalLM": "atom.models.llama.LlamaForCausalLM",
-    "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
-    "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.runtime.DeepseekV41RuntimeModel",
-    "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
-    "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
-    "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
-    "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
-    "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
-    "Qwen4ExpForConditionalGeneration": (
-        "atom.models.qwen4_exp.Qwen4ExpForConditionalGeneration"
-    ),
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
-    "Qwen3_5MoeForCausalLM": "atom.models.qwen3_5.Qwen3_5MoeForCausalLM",
-    "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
-    "KimiK3ForConditionalGeneration": (
-        "atom.models.kimi_k3.KimiK3ForConditionalGeneration"
-    ),
-    "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
-    "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
-    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
-    "Mistral3ForConditionalGeneration": "atom.models.mistral3.Mistral3TextOnly",
-    "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
-    "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
-    "MiniMaxM3SparseForConditionalGeneration": (
-        "atom.models.minimax_m3.vl.MiniMaxM3SparseForConditionalGenerationVL"
-    ),
-    "Glm5NextForConditionalGeneration": (
-        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
-    ),
-}
-# Mono decode by wrapping the loaded model: the installer runs after the drafter
-# armed its hooks on the unwrapped layers. Architectures not listed here route
-# mono decode inside their own model class instead.
-mono_decode_installers = {
-    "DeepseekV4ForCausalLM": (
-        "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
-    ),
-    "DeepseekV41ForCausalLM": (
-        "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
-    ),
-    "KimiK3ForConditionalGeneration": (
-        "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
-    ),
-}
 
 
 def max_schedulable_decode_bs(
@@ -2965,34 +2916,15 @@ class ModelRunner:
         if not hasattr(inner, "start_layer"):
             return
 
-        # Replicate the model's per-layer shared/full classification
-        # (_should_skip_index_topk in deepseek_v2.py).
         hf = self.config.hf_config
-        num_layers = int(hf.num_hidden_layers)
-        indexer_types = getattr(hf, "indexer_types", None)
-        index_topk_pattern = getattr(hf, "index_topk_pattern", None)
-        index_topk_freq = int(getattr(hf, "index_topk_freq", 1))
-        index_skip_topk_offset = int(getattr(hf, "index_skip_topk_offset", 1))
-
-        def _is_shared(layer_idx):
-            if not 0 <= layer_idx < num_layers:
-                return False
-            if indexer_types is not None:
-                return indexer_types[layer_idx] == "shared"
-            if index_topk_pattern is not None:
-                return index_topk_pattern[layer_idx] == "S"
-            if index_topk_freq <= 1:
-                return False
-            return max(layer_idx - index_skip_topk_offset, 0) % index_topk_freq != 0
-
         # This rank consumes the prior rank's top-k iff its first layer is shared.
-        self._pp_recv_needs_sparse = (not pp.is_first_rank) and _is_shared(
-            inner.start_layer
+        self._pp_recv_needs_sparse = (not pp.is_first_rank) and skips_index_topk(
+            hf, inner.start_layer
         )
         # The next rank consumes this rank's top-k iff ITS first layer
         # (== this rank's end_layer) is shared.
-        self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
-            inner.end_layer
+        self._pp_send_needs_sparse = (not pp.is_last_rank) and skips_index_topk(
+            hf, inner.end_layer
         )
         # Transfer the physical producer row width, not the logical top-k.
         # GLM-5.3 appends up to index_kpool-1 tail tokens and rounds each row

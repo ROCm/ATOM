@@ -3,7 +3,7 @@
 
 """Native MoonViT3d vision encoder for Kimi-K3.
 
-Pure PyTorch port of the reference ``modeling_kimi_k3.py`` vision stack: the
+Port of the reference ``modeling_kimi_k3.py`` vision stack: the
 MoonViT3d tower, the ``sd2_tpool`` patch merger and the PatchMergerMLPV2
 projector.  Module and parameter names mirror the checkpoint exactly
 (``vision_tower.*`` / ``mm_projector.*``), so the loader needs no rename rules.
@@ -16,96 +16,46 @@ embeddings before the first collective).
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from aiter.tuned_gemm import gemm_a16w16
 from torch import nn
 
-from atom.multimodal.processing import expand_media_placeholders
-
-if TYPE_CHECKING:
-    from atom.config import Config
+from atom.models.kimi_k3.image_processing import as_pair
 
 # The 2D RoPE grid is precomputed per (height, width); the processor caps both
 # at `patch_limit_on_one_side` (512 in preprocessor_config.json).
 MAX_GRID_SIDE = 512
 
 
-def _as_pair(value) -> tuple[int, int]:
-    if isinstance(value, int):
-        return (value, value)
-    if isinstance(value, Sequence) and len(value) == 2:
-        return (int(value[0]), int(value[1]))
-    raise ValueError(f"Expected an int or a length-2 sequence, got {value!r}")
+def _vision_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    if not x.is_cuda:
+        return F.linear(x, weight, bias)
+    # Flatten explicitly so strided batches cannot select a BLAS fallback.
+    flat = x.reshape(-1, x.shape[-1]).contiguous()
+    out = gemm_a16w16(flat, weight, bias=bias, otype=x.dtype)
+    return out.reshape(*x.shape[:-1], weight.shape[0])
 
 
-def kimi_k3_tokens_per_image(grid_thws, merge_kernel_size) -> list[int]:
-    """Image-token count per grid after the ``sd2_tpool`` merge.
+class KimiK3VisionLinear(nn.Linear):
+    """Replicated native projection retaining the checkpoint parameter layout."""
 
-    The merge pools the temporal axis away and downsamples each spatial axis by
-    the merge kernel, so a ``(t, h, w)`` patch grid yields ``(h // kh) * (w //
-    kw)`` tokens regardless of ``t``.
-    """
-    kernel_h, kernel_w = _as_pair(merge_kernel_size)
-    grids = grid_thws.tolist() if hasattr(grid_thws, "tolist") else grid_thws
-    return [(int(h) // kernel_h) * (int(w) // kernel_w) for _, h, w in grids]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _vision_linear(x, self.weight, self.bias)
 
 
-def build_kimi_k3_inputs(
-    atom_config: "Config",
-    processor: Any,
-    messages: list[dict],
-    images: list,
-    chat_template_kwargs: dict,
-    tools: Any = None,
-) -> tuple[list[int], dict]:
-    """Build Kimi-K3 inputs via ``KimiK3Processor``.
+class KimiK3PatchProjection(nn.Conv2d):
+    """Project already separated patches with the original 4D Conv weight."""
 
-    The K3 processor takes messages plus a separate ``medias`` list (its chat
-    encoder is Python, not Jinja), returns ``grid_thws`` rather than
-    ``image_grid_thw``, and emits a single ``<|media_pad|>`` per image that the
-    reference model expands while merging embeddings. Normalize all three so the
-    engine sees the same contract as every other multimodal model.
-    """
-    multimodal_config = getattr(atom_config, "multimodal_config", None)
-    if multimodal_config is None:
-        raise ValueError(
-            "Kimi-K3 image requests need the full HF config; start the server "
-            "with --trust-remote-code."
-        )
-
-    template_kwargs = dict(chat_template_kwargs)
-    template_kwargs.pop("tokenize", None)
-    if tools:
-        template_kwargs["tools"] = tools
-
-    medias = [{"type": "image", "image": image} for image in images]
-    inputs = processor(
-        messages=messages,
-        medias=medias,
-        return_tensors="pt",
-        **template_kwargs,
-    )
-
-    grid_thws = inputs["grid_thws"]
-    input_ids = inputs["input_ids"][0].tolist()
-    placeholder_token_id = int(
-        getattr(multimodal_config, "media_placeholder_token_id", 163605)
-    )
-    tokens_per_image = kimi_k3_tokens_per_image(
-        grid_thws, multimodal_config.vision_config.merge_kernel_size
-    )
-    input_ids = expand_media_placeholders(
-        input_ids, tokens_per_image, placeholder_token_id
-    )
-
-    multimodal_data = {
-        "pixel_values": inputs["pixel_values"],
-        "image_grid_thw": grid_thws,
-    }
-    return input_ids, multimodal_data
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4 or tuple(x.shape[1:]) != (self.in_channels, *self.kernel_size):
+            raise ValueError("Expected one complete image patch per input row")
+        out = _vision_linear(x.flatten(1), self.weight.flatten(1), self.bias)
+        return out[:, :, None, None]
 
 
 def _get_1d_sincos_pos_embed(embed_dim: int, t_size: int) -> np.ndarray:
@@ -166,12 +116,16 @@ class KimiK3InterpPosEmb(nn.Module):
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         pos_embs = []
+        per_grid: dict[tuple[int, int], torch.Tensor] = {}
         for t, h, w in grid_thws.tolist():
             if t > self.num_frames:
                 raise ValueError(
                     f"frame count {t} > pos-emb num_frames {self.num_frames}"
                 )
-            pos_emb_2d = self._resample(h, w)
+            pos_emb_2d = per_grid.get((h, w))
+            if pos_emb_2d is None:
+                pos_emb_2d = self._resample(h, w)
+                per_grid[(h, w)] = pos_emb_2d
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
@@ -202,8 +156,8 @@ class KimiK3PatchEmbed(nn.Module):
         pos_emb_interpolation_mode: str = "bilinear",
     ) -> None:
         super().__init__()
-        self.patch_size = _as_pair(patch_size)
-        self.proj = nn.Conv2d(
+        self.patch_size = as_pair(patch_size)
+        self.proj = KimiK3PatchProjection(
             in_dim,
             out_dim,
             kernel_size=self.patch_size,
@@ -328,8 +282,8 @@ class KimiK3VisionMLP(nn.Module):
     def __init__(self, dims: list[int], bias: bool = False):
         super().__init__()
         assert len(dims) == 3
-        self.fc0 = nn.Linear(dims[0], dims[1], bias=bias)
-        self.fc1 = nn.Linear(dims[1], dims[2], bias=bias)
+        self.fc0 = KimiK3VisionLinear(dims[0], dims[1], bias=bias)
+        self.fc1 = KimiK3VisionLinear(dims[1], dims[2], bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc1(F.gelu(self.fc0(x), approximate="tanh"))
@@ -368,8 +322,10 @@ class KimiK3VisionBlock(nn.Module):
             raise NotImplementedError(f"Unsupported norm_type: {norm_type}")
 
         self.mlp = KimiK3VisionMLP([hidden_dim, mlp_dim, hidden_dim], bias=linear_bias)
-        self.wqkv = nn.Linear(hidden_dim, self.qkv_hidden_size * 3, bias=attn_bias)
-        self.wo = nn.Linear(self.qkv_hidden_size, hidden_dim, bias=attn_bias)
+        self.wqkv = KimiK3VisionLinear(
+            hidden_dim, self.qkv_hidden_size * 3, bias=attn_bias
+        )
+        self.wo = KimiK3VisionLinear(self.qkv_hidden_size, hidden_dim, bias=attn_bias)
 
     def _attention(
         self,
@@ -470,7 +426,7 @@ class KimiK3VisionTower(nn.Module):
 
     def __init__(self, vision_config) -> None:
         super().__init__()
-        self.merge_kernel_size = _as_pair(vision_config.merge_kernel_size)
+        self.merge_kernel_size = as_pair(vision_config.merge_kernel_size)
         self.merge_type = getattr(vision_config, "merge_type", "sd2_tpool")
         if self.merge_type != "sd2_tpool":
             raise NotImplementedError(f"Unsupported merge_type: {self.merge_type}")
@@ -536,7 +492,7 @@ class KimiK3PatchMergerProjector(nn.Module):
 
     def __init__(self, vision_config) -> None:
         super().__init__()
-        kernel_h, kernel_w = _as_pair(vision_config.merge_kernel_size)
+        kernel_h, kernel_w = as_pair(vision_config.merge_kernel_size)
         mm_hidden_size = (
             getattr(vision_config, "mm_hidden_size", None)
             or vision_config.vt_hidden_size
@@ -544,9 +500,9 @@ class KimiK3PatchMergerProjector(nn.Module):
         self.hidden_size = mm_hidden_size * kernel_h * kernel_w
         text_hidden_size = vision_config.text_hidden_size
         self.proj = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size, bias=False),
+            KimiK3VisionLinear(self.hidden_size, self.hidden_size, bias=False),
             nn.GELU(),
-            nn.Linear(self.hidden_size, text_hidden_size, bias=False),
+            KimiK3VisionLinear(self.hidden_size, text_hidden_size, bias=False),
         )
         self.post_norm = nn.RMSNorm(
             text_hidden_size, eps=getattr(vision_config, "projector_ln_eps", 1e-5)

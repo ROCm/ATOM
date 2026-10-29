@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.models.deepseek_v4.mono.build import _build_launches, kernel_kwargs
 from atom.models.deepseek_v4.mono.config import (
@@ -181,11 +182,12 @@ class Dsv4Variant:
 
     def advance_step(self):
         """``step += 1`` and clear a slice of stale mailbox pairs so tags can wrap; graph-capturable."""
-        self._advance(
+        _run_compiled(
+            self._advance,
             self.step.data_ptr(),
             self.scratch.data_ptr(),
             self.sym,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
 
     def close(self):
