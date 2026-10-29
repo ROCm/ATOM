@@ -151,7 +151,9 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.attn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
-            fuse_quant=hc_fn is not None,
+            # HIP packs imply the fused quant; the Triton seam fuses it too when
+            # ATOM_DSV41_MHC_FUSE_QUANT is set (bit-exact group32 mxfp8).
+            fuse_quant=hc_fn is not None or envs.ATOM_DSV41_MHC_FUSE_QUANT,
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,

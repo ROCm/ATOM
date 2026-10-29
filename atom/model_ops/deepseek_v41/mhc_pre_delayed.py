@@ -8,8 +8,9 @@ the owed post, the gate projection, Sinkhorn, the collapse with the carried
 pre-mix and the sublayer's input RMSNorm. HIP uses one compute kernel on gfx950;
 Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
 
-The norm is the sublayer's own. Attention can request HIP's fused MXFP8
-output alongside BF16 for its other readers; FFN keeps the BF16 interface.
+The norm is the sublayer's own. Attention can request the seam's fused MXFP8
+output alongside BF16 for its other readers -- from HIP Mega-MHC on gfx950 or
+from the Triton seam (`quant_mxfp8`) elsewhere; FFN keeps the BF16 interface.
 """
 
 from functools import cache
@@ -178,13 +179,17 @@ def v41_mhc_pre_delayed(
     with_post = sublayer_output is not None
     kernel = mhc_fused_post_pre_delayed_rmsnorm
     options = {}
-    if fuse_quant and not w_preshuffle_bf16:
-        raise ValueError("Fused mHC quantization requires the HIP backend")
+    # Triton emits the mxfp8 layer_input itself (its own group32 quantize_fp8,
+    # bit-identical), so the sublayer-input quant fuses without a HIP rebuild;
+    # HIP Mega-MHC does the same through its `out_dtype="mxfp8"`.
+    triton_fuse_quant = fuse_quant and not w_preshuffle_bf16
     if w_preshuffle_bf16:
         kernel = _hip_ops()[0]
         options["w_preshuffle_bf16"] = True
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
-    new_residual, post, comb, normed, pre = kernel(
+    elif triton_fuse_quant:
+        options["quant_mxfp8"] = True
+    seam_out = kernel(
         residual.view(rows, hc_mult, hidden),
         hc_fn,
         hc_scale,
@@ -204,8 +209,13 @@ def v41_mhc_pre_delayed(
         norm_eps=norm_eps,
         **options,
     )
-    if fuse_quant:
-        normed, quant, scale = normed
+    if triton_fuse_quant:
+        # The Triton seam returns the two mxfp8 tensors flat after the bf16 five.
+        new_residual, post, comb, normed, pre, quant, scale = seam_out
+    else:
+        new_residual, post, comb, normed, pre = seam_out
+        if fuse_quant:
+            normed, quant, scale = normed
     outputs = [
         normed.view(*outer, hidden),
         pre.view(*outer, hc_mult),

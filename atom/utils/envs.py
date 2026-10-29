@@ -390,6 +390,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
+    # V4.1 delayed mHC attention seam: fold the attention-input (wqkv_a) quant
+    # into the seam. HIP Mega-MHC always does this on gfx950; this flag also
+    # enables it for the Triton seam (`quant_mxfp8`, group32 mxfp8, bit-exact)
+    # on every other arch. Off until GPU-validated; flip to "1" once confirmed.
+    "ATOM_DSV41_MHC_FUSE_QUANT": lambda: _flag_env("ATOM_DSV41_MHC_FUSE_QUANT"),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
