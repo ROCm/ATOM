@@ -144,6 +144,22 @@ With MTP4 the verify attention (unified
 attention 3D at 5 query tokens) picks a quarter of MTP3's KV segments a sequence and takes 65 against
 40 us a launch: a config for that shape would make MTP4 a clearer gain.
 
+### DP4 + EP4 c128 (2026-10-29)
+
+10-minute points on the tip (6cdc02f9), MTP3, 40 sequences an engine, 0 failed and clean outputs on each:
+
+| Point | TPS | QPS | E2E interactivity | TTFT median | TPOT median | MTP tokens a forward |
+|---|---|---|---|---|---|---|
+| tip defaults (profiler window at minute 8) | 8,122 | 22.27 | 102.7 | 779 ms | 6.70 ms | |
+| + the TP sampling and tokenizer settings (now the DP default) | **9,019** | **24.36** | **120.6** | 679 ms | **6.18 ms** | 3.11 |
+| ... + MTP4 (`SPEC=4`) | 7,924 | 21.93 | 100.6 | 798 ms | 7.45 ms | 3.50 |
+| ... + `ATOM_PREFILL_DECODE_INTERVAL=4` | 8,568 | 23.71 | 113.9 | 628 ms | 6.85 ms | |
+
+`serve_ep.sh` now sets `ATOM_SPEC_FUSED_VERIFY_SAMPLE`, `AITER_TOPK_FIRST_SMALL_K_TOPP`,
+`ATOM_SAMPLER_SPLIT_SOFTMAX` and `ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER` on DP points too. MTP4
+gains 12.5% tokens a forward but the decode step grows ~19 -> ~26 ms at 32 sequences an engine, so DP
+points keep MTP3; interval 4 trades a 7% lower TTFT for an 11% higher TPOT, so they keep 8.
+
 ## Prefill / decode interval
 
 The four DP engines step in lockstep: every layer's MoE dispatch waits for all of them, so a step
