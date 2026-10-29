@@ -765,8 +765,9 @@ else:
         f"{reason or 'reason unrecorded, which is itself a defect in this step'}. "
         "Report it as a gap in the evidence. A missing test target is a finding about the "
         "PR only if the changed path is EXECUTED at run time: this triage counts anything "
-        "under aiter/ as runtime surface, and a tuned-config table, a tuner input CSV or a "
-        "codegen manifest is read and looked up, never executed. Establish which."
+          "under atom/ as runtime surface (RUNTIME_PREFIXES above), and a tuned-config "
+          "table, a tuner input CSV or a codegen manifest is read and looked up, never "
+          "executed. Establish which."
     )
 PY
 fi

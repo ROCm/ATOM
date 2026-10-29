@@ -35,7 +35,15 @@ REQUIRED = [
 ]
 # citations.txt rides here rather than in REQUIRED: it is advisory, and a run whose
 # worker died before writing a card has no citations to check -- absence is not a defect.
-OPTIONAL = ["late_findings.txt", "citations.txt"]
+OPTIONAL = [
+    "late_findings.txt",
+    "citations.txt",
+    # Why validation did not run, kept with the report rather than only in the scratch
+    # dir: "validation was not applicable" and "validation was required and skipped" are
+    # different facts about a PR, and a reader auditing the archive months later cannot
+    # tell them apart from the card alone.
+    "auto_validation_outcome.txt",
+]
 
 
 def read(p):
