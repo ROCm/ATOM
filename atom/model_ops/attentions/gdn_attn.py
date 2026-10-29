@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 import torch
 import triton
+import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -1574,6 +1575,53 @@ GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
 )
 
 
+@triton.jit
+def _mtp_decode_kv_indptr_kernel(
+    context_lens_ptr,
+    num_reject_ptr,
+    kv_indptr_ptr,
+    rows,
+    num_real,
+    PAGE: tl.constexpr,
+    HAS_REJECT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    real = offs < num_real
+    ctx = tl.load(context_lens_ptr + offs, mask=offs < rows, other=0)
+    if HAS_REJECT:
+        ctx = ctx - tl.load(num_reject_ptr + offs, mask=real, other=0)
+        tl.store(context_lens_ptr + offs, ctx, mask=real)
+    # Lengths are positive, so `//` (truncating) is the floor division.
+    counts = tl.where(real, (ctx + PAGE - 1) // PAGE, 0)
+    tl.store(kv_indptr_ptr + 1 + offs, tl.cumsum(counts, axis=0), mask=offs < rows)
+    tl.store(kv_indptr_ptr + offs, 0, mask=offs == 0)
+
+
+def mtp_decode_kv_indptr(
+    context_lens: torch.Tensor,
+    num_reject_tokens: torch.Tensor | None,
+    kv_indptr: torch.Tensor,
+    num_real: int,
+    page: int,
+) -> None:
+    """`prepare_mtp_decode`'s CSR rebuild in one launch: drop the rejected
+    tokens from the real rows' `context_lens`, then `kv_indptr` = 0 followed by
+    the running sum of their page counts (0 for a pad row)."""
+    rows = context_lens.shape[0]
+    _mtp_decode_kv_indptr_kernel[(1,)](
+        context_lens,
+        num_reject_tokens if num_reject_tokens is not None else context_lens,
+        kv_indptr,
+        rows,
+        num_real,
+        PAGE=page,
+        HAS_REJECT=num_reject_tokens is not None,
+        BLOCK=max(16, triton.next_power_of_2(rows)),
+        num_warps=1,
+    )
+
+
 def draft_kv_write_slots(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
@@ -2390,20 +2438,25 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # The proposer advances positions from the accepted target row, but
         # context_lens still includes the rejected verify suffix on step 1.
         context_lens = var["context_lens"].gpu[:running_bs]
-        if num_reject_tokens is not None:
-            context_lens[:bs].sub_(num_reject_tokens[:bs])
-
         # Prefill leaves the persistent CSR indptr stale; a draft can also
         # cross a page boundary. Rebuild it from this step's actual lengths.
         kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
-        counts = torch.div(
-            context_lens + self.block_size - 1,
-            self.block_size,
-            rounding_mode="floor",
-        )
-        counts[bs:] = 0
-        kv_indptr[:1].zero_()
-        torch.cumsum(counts, dim=0, dtype=kv_indptr.dtype, out=kv_indptr[1:])
+        if envs.ATOM_MTP_FUSED_KV_INDPTR and context_lens.is_cuda:
+            # The same rebuild as below, one launch instead of up to seven.
+            mtp_decode_kv_indptr(
+                context_lens, num_reject_tokens, kv_indptr, bs, self.block_size
+            )
+        else:
+            if num_reject_tokens is not None:
+                context_lens[:bs].sub_(num_reject_tokens[:bs])
+            counts = torch.div(
+                context_lens + self.block_size - 1,
+                self.block_size,
+                rounding_mode="floor",
+            )
+            counts[bs:] = 0
+            kv_indptr[:1].zero_()
+            torch.cumsum(counts, dim=0, dtype=kv_indptr.dtype, out=kv_indptr[1:])
         kv_indices_generate_triton(
             var["block_tables"].gpu[:running_bs],
             var["kv_indices"].gpu,

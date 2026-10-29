@@ -1018,6 +1018,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the custom all-gather, and pick the winner in one kernel. Three
     # launches instead of six; token-identical.
     "ATOM_ARGMAX_HEAD_AR_GATHER": lambda: _flag_env("ATOM_ARGMAX_HEAD_AR_GATHER", "0"),
+    # GDN-hybrid MTP: each draft step's context_lens fix-up and kv_indptr rebuild
+    # (GDNAttentionMetadataBuilder.prepare_mtp_decode) in one Triton launch
+    # instead of up to seven eager ones. Integer math, so the same result.
+    "ATOM_MTP_FUSED_KV_INDPTR": lambda: _flag_env("ATOM_MTP_FUSED_KV_INDPTR", "0"),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
