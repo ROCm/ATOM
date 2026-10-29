@@ -1,6 +1,7 @@
 {
-  "purpose": "Require scheduler closure before replacing the timed-out paired batch",
+  "purpose": "Require fresh scheduler absence for the historical C48 jobs without depending on retained log files",
   "jobs": [
+    {"job_id": "7788", "run_id": "38296153235"},
     {"job_id": "8540", "run_id": "38740874930", "actions_conclusion": "cancelled", "actions_timeout_confirmed": true},
     {"job_id": "8541", "run_id": "38740903706", "actions_conclusion": "cancelled", "actions_timeout_confirmed": true}
   ]

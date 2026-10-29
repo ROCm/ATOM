@@ -371,9 +371,7 @@ fi
 
 mkdir -p "${LOG_ROOT}"
 if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
-  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_c48_previous_jobs.py" \
-    --controller "${SPUR_CONTROLLER_ADDR}" \
-    --output "${RESULT_DIR}/${ATOMESH_CELL_ID}-previous-jobs.json"
+  # Archived logs may be reclaimed; admission uses fresh scheduler state.
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_spur_allocation.py" check-previous \
     --controller "${SPUR_CONTROLLER_ADDR}" \
     --previous-manifest "${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-jobs.json" \
