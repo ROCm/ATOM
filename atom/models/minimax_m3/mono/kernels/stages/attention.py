@@ -36,7 +36,6 @@ from atom.mono.device.mx import (
     FP8,
     FP8_MAX,
     UNIT_SCALE,
-    clamp_fp8,
     mfma_scaled,
 )
 from atom.mono.device.ops import (
@@ -377,7 +376,13 @@ def split_defs(k4ctx):
                 acquire()
             n_ctx = uniform(fx.ptr_load(blk + 16))
             page = uniform(fx.ptr_load(blk + wave // 4))  # junk past the context
-            qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
+            # q is K1's e4m3 (unit scale, saturated): one dword per thread
+            qw = fx.Int32(
+                bo.buffer_load(
+                    rsrc(q), tok * (O_K // 4) + tid, vec_width=1, dtype=T.i32,
+                    cache_modifier=CM_K1,
+                )
+            )  # fmt: skip
             # every independent load first: both tiles' K and V rows and scales
             at = page * FP4_PAGE_BYTES
             toks = [(wave % 4) * 32 + 16 * j + l16 for j in range(2)]
@@ -410,8 +415,7 @@ def split_defs(k4ctx):
                             )
                         )
                     )
-            # e4m3, saturating as the aiter writer's q_out cast is: q beyond 448 is 448
-            fx.ptr_store(fp8_pack4(*[clamp_fp8(v) for v in qv]), q8 + tid)
+            fx.ptr_store(qw, q8 + tid)
             gpu.barrier()
             stamp(12)
             # q (B operand): head l16's elements 16 g .. + 16 then 64 + 16 g .. + 16

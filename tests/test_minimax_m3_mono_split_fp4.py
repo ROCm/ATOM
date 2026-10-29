@@ -183,7 +183,7 @@ def _pages(n_pages, seed):
 def _reference(q, kd, vd, n_ctx, t):
     """Partition t of one token: (o [H, 128], m [H], l [H]) over the keys
     t * 256 .. min(n_ctx, t * 256 + 256) of the sparse context ``kd`` / ``vd``
-    ([n_sparse, 128] floats), q cast to e4m3 as the stage does."""
+    ([n_sparse, 128] floats), q already e4m3 (K1's output)."""
     lo, hi = t * SPLIT_KEYS, min(n_ctx, t * SPLIT_KEYS + SPLIT_KEYS)
     if hi <= lo:
         return None
@@ -227,8 +227,11 @@ def _check_split(n_ctx, scale, table_shift=0):
     seq_v = torch.stack([vd[order[s]] for s in range(n_slots)]).reshape(-1, HEAD_DIM)
 
     g = torch.Generator(device="cuda").manual_seed(4)
-    q = (torch.randn(tokens, H, HEAD_DIM, device="cuda", generator=g) * scale).to(
-        torch.bfloat16
+    # K1's q: e4m3, unit scale, saturating (the aiter writer's q_out convention)
+    q = (
+        (torch.randn(tokens, H, HEAD_DIM, device="cuda", generator=g) * scale)
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
     )
     table = torch.zeros(tokens * N_SPLIT, TABLE_WORDS, device="cuda", dtype=torch.int32)
     for t in range(N_SPLIT):

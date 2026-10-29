@@ -56,7 +56,7 @@ from atom.models.minimax_m3.mono.kernels.index_score import (
     step_rows,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
-from atom.mono.device.mx import FP8_MAX
+from atom.mono.device.mx import FP8_MAX, clamp_fp8
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -535,12 +535,22 @@ def emit_pre_attn(
             else:
                 out = head_norm_rope(e, lane, gw4, cs, sn, eps)
                 if is_q:
-                    bo.buffer_store(
-                        fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
-                        rsrc(q_out),
-                        (tk * LOCAL_Q_HEADS + ht) * HEAD_DIM + d0,
-                        cache_modifier=cm_out,
-                    )
+                    if const_expr(kv_mxfp4):
+                        # e4m3, unit scale, saturating, cast from the f32 elements:
+                        # the aiter writer's q_out convention (the split stage reads it as is)
+                        bo.buffer_store(
+                            fp8_pack4(*[clamp_fp8(v) for v in out]),
+                            rsrc(q_out),
+                            ((tk * LOCAL_Q_HEADS + ht) * HEAD_DIM + d0) // 4,
+                            cache_modifier=cm_out,
+                        )
+                    else:
+                        bo.buffer_store(
+                            fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
+                            rsrc(q_out),
+                            (tk * LOCAL_Q_HEADS + ht) * HEAD_DIM + d0,
+                            cache_modifier=cm_out,
+                        )
                 if is_iq:
                     bo.buffer_store(
                         fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),

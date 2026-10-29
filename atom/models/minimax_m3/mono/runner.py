@@ -327,9 +327,11 @@ class MonoDecodeRunner:
             torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
         ]
         self.h = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
+        # kv_mxfp4: e4m3 bytes (unit scale), the aiter writer's q_out convention
         self.q = torch.empty(
-            MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
-        )
+            MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM,
+            dtype=torch.uint8 if self.kv_mxfp4 else bf16, device=dev,
+        )  # fmt: skip
         self.iq = torch.empty(MAX_TOKENS, 1, HEAD_DIM, dtype=bf16, device=dev)
         # layer 0's residual input: its K1 takes (embedding, 0), acc = embedding
         self.zero_res = torch.zeros(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
