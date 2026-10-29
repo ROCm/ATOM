@@ -1948,7 +1948,11 @@ class Scheduler:
         is "could prefill", not "did admit"; a failed admission still idles.
         ``last_fire_aligned`` is the #2600 one-sequence cap, not this gate.
         """
-        if not self.dp_phase_lockstep or not delayer_allows or self.prefill_token_graphs:
+        if (
+            not self.dp_phase_lockstep
+            or not delayer_allows
+            or self.prefill_token_graphs
+        ):
             return False
         delayer = self.prefill_delayer
         if delayer is None or delayer.dp_size <= 1:
