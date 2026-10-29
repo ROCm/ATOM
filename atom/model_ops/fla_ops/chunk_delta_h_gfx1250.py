@@ -246,7 +246,8 @@ def _chunk_h_gfx1250_kernel(
             gl.amd.gfx1250.tdm.async_store(vn_desc, [t0, v0], vn_cur)
         b_k = k_smem.index(buf).permute([1, 0]).load(OP_A)
         b_vgb = vg_smem.load(OP_B)
-        state = state + gl.amd.gfx1250.wmma(b_k, b_vgb, zero_h)
+        # accumulate into the decayed state, as Triton folds `h += dot(k, v)`
+        state = gl.amd.gfx1250.wmma(b_k, b_vgb, state)
         # the state entering the next chunk
         h_smem.index((i_t + 1) % NB).store(state.to(h_smem.dtype))
 
