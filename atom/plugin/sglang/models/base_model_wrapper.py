@@ -72,6 +72,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
     # ATOM owns checkpoint quantization parsing, allocation and weight loading
     # for external models; SGLang must not construct its native quant_config.
     sglang_skip_quant_config = True
+    # ATOM splits prefill across PCP ranks inside forward from the full batch;
+    # SGLang must not shard inputs or drive model.model/lm_head for CP extend.
+    atom_owns_prefill_cp = True
 
     def __init__(
         self,
