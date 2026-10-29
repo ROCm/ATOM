@@ -481,32 +481,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             raise RuntimeError("Qwen3.8 PAGE checkpoint has no QSA arena")
         return [arena]
 
-    def clear_page_units(self, unit_ids) -> None:
-        """Reset these PAGE units in the QSA arena (`BlockPool.state_images`).
-
-        The GDN builder's version walks `kv_pools`, which this builder leaves
-        empty: Qwen3.8's PAGE images live in the QSA arena. Every field goes
-        back to its declared fill, the state a block has before first use.
-        """
-        ids = np.fromiter(unit_ids, dtype=np.int64)
-        if not ids.size:
-            return
-        arena = getattr(self, "qsa_arena", None)
-        if arena is None:
-            return
-        held = getattr(self, "_clear_ids", None)
-        if held is None or held.np.size < arena.entries:
-            self._clear_ids = CpuGpuBuffer(
-                arena.entries, dtype=torch.int64, device=self.device
-            )
-            self._clear_ids_uploaded = torch.cuda.Event()
-        # Returns at once before the first record.
-        self._clear_ids_uploaded.synchronize()
-        self._clear_ids.np[: ids.size] = ids
-        device_ids = self._clear_ids.copy_to_gpu(ids.size)
-        self._clear_ids_uploaded.record()
-        arena.reset_entries(device_ids)
-
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Back every paged field with the runner's shared allocation."""
         from atom.model_ops.attentions.pool_layout.qsa_page_unit_geometry import (

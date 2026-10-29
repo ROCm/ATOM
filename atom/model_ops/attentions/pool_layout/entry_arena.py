@@ -600,20 +600,3 @@ class LayerMajorArena:
                 for layer in range(field.layers)
             )
         return regions
-
-    def reset_entries(self, entries: torch.Tensor) -> None:
-        """Put every field of ``entries`` back to its declared fill, in every layer.
-
-        One `index_fill_` per field: a view is `[layers, entries, ...]`, so
-        indexing the entry axis reaches all layers at once. A 1-byte field is
-        filled through its bytes, since `index_fill_` has no fp8 kernel on
-        either device.
-        """
-        for field in self.fields:
-            view = self.view(field.name)
-            fill = field.fill
-            if field.dtype.itemsize == 1 and field.dtype is not torch.uint8:
-                view = view.view(torch.uint8)
-                if fill:
-                    fill = int(torch.tensor(fill, dtype=field.dtype).view(torch.uint8))
-            view.index_fill_(1, entries, fill)

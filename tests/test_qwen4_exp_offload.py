@@ -2,7 +2,6 @@
 
 """Qwen3.8 offload: QSA pages are the checkpoint destination, PLE rides along."""
 
-import functools
 from types import SimpleNamespace
 
 import pytest
@@ -60,55 +59,6 @@ def test_one_qsa_block_round_trips_through_page_views():
     views = mha_page_unit_views([pool], [1])
     packed = torch.cat([view.view(torch.uint8).reshape(-1) for view in views])
     assert torch.equal(packed, blob)
-
-
-def _mixed_fields(fills=(0.0, 0.0, 0.0, 0.0, 0.0)):
-    """fp8 K/V, fp32 scales, bf16 and fp4-in-uint8 index rows, the element
-    types a QSA block holds, plus a signed 1-byte type."""
-    block = 4
-    dtypes = (
-        (torch.float8_e4m3fn, (block, 2, 8)),
-        (torch.float32, (block, 2)),
-        (torch.bfloat16, (block, 1, 4)),
-        (torch.uint8, (block, 1, 2)),
-        (torch.int8, (block, 1, 4)),
-    )
-    return [
-        EntryField(f"f{i}", 2, shape, dtype, fill=fill)
-        for i, ((dtype, shape), fill) in enumerate(zip(dtypes, fills))
-    ]
-
-
-def _block_bytes(arena, name, block):
-    return arena.view(name)[:, block].contiguous().view(torch.uint8)
-
-
-def test_reset_entries_zeroes_only_those_blocks_of_a_runner_buffer():
-    """The runner's QSA arena sits on a shared buffer, so every fill is zero;
-    the fp8 and 1-byte fields take the byte path `index_fill_` needs."""
-    fields = _mixed_fields()
-    blocks = 6
-    buf = torch.full((entry_bytes_for(fields) * blocks,), 0x7F, dtype=torch.uint8)
-    arena = LayerMajorArena(fields, blocks, "cpu", buf=buf)
-    arena.reset_entries(torch.tensor([1, 4]))
-    arena.reset_entries(torch.tensor([2]))
-    for field in fields:
-        for block in range(blocks):
-            raw = _block_bytes(arena, field.name, block)
-            want = 0 if block in (1, 2, 4) else 0x7F
-            assert raw.eq(want).all(), (field.name, field.dtype, block)
-
-
-def test_reset_entries_restores_a_non_zero_fill():
-    fills = (1.0, float("-inf"), -2.0, 3.0, -1.0)
-    fields = _mixed_fields(fills)
-    arena = LayerMajorArena(fields, 3, "cpu")
-    arena.buf.fill_(0x7F)
-    arena.reset_entries(torch.tensor([1]))
-    for field, fill in zip(fields, fills):
-        assert arena.view(field.name)[:, 1].float().eq(fill).all(), field.name
-        for block in (0, 2):
-            assert _block_bytes(arena, field.name, block).eq(0x7F).all()
 
 
 def test_dense_codec_keeps_qsa_side_caches_and_ignores_absent_ones():
@@ -375,43 +325,6 @@ def test_qwen38_accepts_the_lmcache_tiers(kv_transfer_config):
     config = _transfer_config(kv_transfer_config)
     check_qwen38_kv_transfer(config)
     assert qwen38_offload_configured(config) is bool(kv_transfer_config)
-
-
-class _HostEvent:
-    def record(self):
-        pass
-
-    def synchronize(self):
-        pass
-
-
-def test_clear_page_units_resets_the_qsa_arena_with_no_kv_pools(monkeypatch):
-    """Qwen3.8's PAGE images live in the QSA arena and it has no MHA pool, so a
-    released unit is cleared there; `kv_pools` would size nothing."""
-    builder, cls = _builder()
-    from atom.model_ops.attentions import qwen4_exp_attn
-    from atom.utils import CpuGpuBuffer
-
-    monkeypatch.setattr(
-        qwen4_exp_attn,
-        "CpuGpuBuffer",
-        functools.partial(CpuGpuBuffer, pin_memory=False),
-    )
-    monkeypatch.setattr(torch.cuda, "Event", _HostEvent)
-    fields = _mixed_fields()
-    blocks = 6
-    buf = torch.full((entry_bytes_for(fields) * blocks,), 0x7F, dtype=torch.uint8)
-    builder.qsa_arena = LayerMajorArena(fields, blocks, "cpu", buf=buf)
-    builder.kv_pools = {}
-    builder.device = torch.device("cpu")
-    cls.clear_page_units(builder, [1, 4])
-    cls.clear_page_units(builder, iter([2]))
-    cls.clear_page_units(builder, ())
-    for field in fields:
-        for block in range(blocks):
-            raw = _block_bytes(builder.qsa_arena, field.name, block)
-            want = 0 if block in (1, 2, 4) else 0x7F
-            assert raw.eq(want).all(), (field.name, block)
 
 
 def _paged_builder(blocks=3, *, spec=True):
