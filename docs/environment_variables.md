@@ -311,6 +311,7 @@ All default off.
 | **ATOM_MTP_DUAL_PRE_FC_NORM** | bool | 0 (false) | Qwen3.5 MTP: `pre_fc_norm_embedding` and `pre_fc_norm_hidden` in one launch of the two-input Gemma RMSNorm, each written into its half of the fc input, instead of two launches and a `torch.cat`. Bitwise the same. |
 | **ATOM_ARGMAX_HEAD_AR_GATHER** | bool | 0 (false) | TP greedy argmax head (the MTP draft): exchange the per-rank (max, index) packs as an all-reduce of a zero-padded byte image (exact: one nonzero term a value) instead of the custom all-gather, and pick the winner in one kernel. Token-identical. |
 | **ATOM_MTP_FUSED_KV_INDPTR** | bool | 0 (false) | GDN-hybrid MTP: each draft step's `context_lens` fix-up and `kv_indptr` rebuild (`GDNAttentionMetadataBuilder.prepare_mtp_decode`) in one Triton launch instead of up to seven. Integer math, so the same result. |
+| **ATOM_MTP_DRAFT_RANK_CHECK** | bool | 0 (false) | Debug: all-gather each propose step's draft ids over TP and log any rank disagreement (a replicated draft component must draft the same ids on every rank). Syncs the host every decode step; validation only. |
 
 ## Engram (DeepSeek-V4.1)
 

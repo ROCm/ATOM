@@ -1022,6 +1022,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (GDNAttentionMetadataBuilder.prepare_mtp_decode) in one Triton launch
     # instead of up to seven eager ones. Integer math, so the same result.
     "ATOM_MTP_FUSED_KV_INDPTR": lambda: _flag_env("ATOM_MTP_FUSED_KV_INDPTR", "0"),
+    # Debug: all-gather each step's draft ids over TP after propose and log any
+    # rank disagreement. Syncs the host every decode step -- validation only.
+    "ATOM_MTP_DRAFT_RANK_CHECK": lambda: (
+        os.getenv("ATOM_MTP_DRAFT_RANK_CHECK", "0").lower() in ("1", "true")
+    ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(

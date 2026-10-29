@@ -175,6 +175,7 @@ def test_flag_defaults_are_off(monkeypatch):
     for name in (
         "ATOM_QWEN35_MTP_REPLICATED_EMBED",
         "ATOM_MTP_REPLICATED_FC",
+        "ATOM_MTP_DRAFT_RANK_CHECK",
     ):
         monkeypatch.delenv(name, raising=False)
         assert not getattr(envs, name)
