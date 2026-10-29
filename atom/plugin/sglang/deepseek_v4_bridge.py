@@ -29,17 +29,21 @@ def _fp4_rowgroup_decode_enabled() -> bool:
 
         from atom.config import get_current_atom_config
         from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
-            FP4_GFX1250_NATURAL,
+            FP4_GFX950_PRESHUFFLE,
             fp4_indexer_layout_for_arch,
         )
         from atom.model_ops.v4_kernels import fp4_indexer_enabled
+        from atom.utils import envs
 
         dtype = get_current_atom_config().index_cache_dtype
     except Exception:  # noqa: BLE001 - ATOM config is absent outside a loaded model
         return False
     if not fp4_indexer_enabled(dtype):
         return False
-    return fp4_indexer_layout_for_arch(get_gfx()) != FP4_GFX1250_NATURAL
+    return (
+        fp4_indexer_layout_for_arch(get_gfx(), backend=envs.ATOM_V4_UNIFIED_MQA)
+        == FP4_GFX950_PRESHUFFLE
+    )
 
 
 def _init_v4_split_plans(md) -> None:
