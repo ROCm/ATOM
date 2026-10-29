@@ -348,3 +348,50 @@ only by admitting it) — run it directly to see which guard broke if it's red:
 ```bash
 bash .claude/skills/review-pr/selftest.sh
 ```
+
+## 7. Reading what comes out, and what a red gate means
+
+### The card
+
+Three things to check by hand:
+
+1. **"What it does"** is exactly one sentence, and it reads like something you would say
+   to a reviewer who has not opened the diff -- not a restatement of the PR title, not a
+   list of changed files.
+2. **Every finding has three parts**: problem, impact, and an action ending in a verb
+   phrase ("Author must fix X" / "Reviewer should ask Y"). A finding missing any of the
+   three, or ending without a verb, is a gap in the worker's output, not something to
+   wave through.
+3. **The validation line states its tier honestly.** `Validation (deterministic)` is
+   entitled only by a head-matched `validation_report.json` from `validate-atom-pr`,
+   which runs only when `REVIEW_AUTO_VALIDATE=1` (off by default, see section 2c).
+   Otherwise the line must read `N/A — no runtime surface changed`, or `NOT RUN —
+   <reason>`, which is an evidence gap rather than a defect in the PR. A pass/fail that
+   no validator produced means something upstream regressed.
+
+### A red gate
+
+A red gate means the review was **withheld on purpose** -- that step did not happen, or
+not to the standard the gate checks. The rejection names the specific thing missing.
+
+- **First red**: re-run the worker. Most reds are the model not following the output
+  format that particular time, not a defect in the pipeline.
+- **The same gate red three times running**: that is not bad luck. Either the gate or
+  `SKILL.md`'s instruction to the worker is wrong -- the check lives in `triage.py`, the
+  instruction in `SKILL.md`, and one of the two needs fixing. Fix that, not the symptom.
+- **Never relax a gate to make it pass.** A gate exists to catch one specific way the
+  model can cheat the review; loosening it to clear a red defeats the only thing it is for.
+
+### Why `7 green / 0 findings` proves less than it looks
+
+It is not evidence the gates did their work -- it may be evidence they were never asked
+to. With zero findings, `run_one.sh` writes the `NONE AVAILABLE` refutation line itself
+and the refuter never runs; a `refutations.txt` holding only a comment clears the
+refutations gate just the same. An empty card is therefore the cheapest path through the
+whole pipeline for a worker that did not look, and every gate can read green without a
+model ever having been asked to defend a finding.
+
+This is inherited from aiter, not a porting defect, and the fix is not to tighten the
+gates here. It is to read a `7 green / 0 findings` card the way you would read a human
+reviewer who approved without comment: plausible on a trivial PR, worth a second look on
+anything else.
