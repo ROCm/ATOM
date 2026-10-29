@@ -21,7 +21,12 @@ from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
-from atom.model_ops.base_attention import Attention, _flydsl_plan_max_batch
+from atom.model_ops.base_attention import (
+    Attention,
+    _flydsl_arch_supported,
+    _flydsl_explicit_plan_api,
+    _flydsl_plan_max_batch,
+)
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
@@ -85,6 +90,16 @@ def _validate_sparse_flydsl_config(
         raise ValueError(
             "MiniMax-M3 sparse paged attention on this GPU requires "
             "ATOM_PA_FLYDSL=1 because there is no gluon fallback"
+        )
+    if not _flydsl_arch_supported():
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention requires a GPU supported by "
+            "aiter's FlyDSL paged decode because there is no gluon fallback"
+        )
+    if not _flydsl_explicit_plan_api():
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention requires aiter's FlyDSL "
+            "explicit-plan API (#5809) because there is no gluon fallback"
         )
     tp_size = get_tensor_model_parallel_world_size()
     local_kv_heads = max(1, int(config.num_key_value_heads) // tp_size)

@@ -1048,7 +1048,15 @@ class TestExplicitPlan:
         )
         return ba, built
 
-    def _call(self, ba, owner=None, existing_plan=None, cap=8, head_dim=128):
+    def _call(
+        self,
+        ba,
+        owner=None,
+        cache_owner=None,
+        existing_plan=None,
+        cap=8,
+        head_dim=128,
+    ):
         import torch
 
         n = 16
@@ -1062,6 +1070,7 @@ class TestExplicitPlan:
             context_bound=2048,
             existing_plan=existing_plan,
             plan_step_owner=owner,
+            plan_cache_owner=cache_owner,
         )
 
     def test_default_budget_needs_no_tuning_module(self, monkeypatch):
@@ -1081,11 +1090,17 @@ class TestExplicitPlan:
         """All sparse layers of one step share lengths, so one refresh serves 57."""
         ba, _ = self._setup(monkeypatch)
         step = SimpleNamespace()
-        plans = [self._call(ba, owner=step) for _ in range(57)]
+        plans = [self._call(ba, owner=step, cache_owner=step) for _ in range(57)]
         assert all(p is plans[0] for p in plans)
         assert plans[0].refreshed == 0, "only the build may fill it in this step"
-        assert self._call(ba, owner=SimpleNamespace()) is not plans[0]
+        next_step = SimpleNamespace()
+        assert self._call(ba, owner=next_step, cache_owner=next_step) is not plans[0]
         assert ba._FLYDSL_RUNTIME_PLANS == {}, "step plans must not become process-wide"
+
+        changing = SimpleNamespace()
+        plan = self._call(ba, cache_owner=changing)
+        assert self._call(ba, cache_owner=changing) is plan
+        assert plan.refreshed == 1, "unshared layer lengths must refresh every call"
 
     def test_the_forward_context_is_not_the_step(self, monkeypatch):
         """The vLLM plugin never sets ATOM's ForwardContext for this model.
@@ -1098,7 +1113,8 @@ class TestExplicitPlan:
         ba, _ = self._setup(monkeypatch)
         stale = SimpleNamespace()
         monkeypatch.setattr(fc, "get_forward_context", lambda: stale)
-        plans = [self._call(ba, owner=SimpleNamespace()) for _ in range(3)]
+        steps = [SimpleNamespace() for _ in range(3)]
+        plans = [self._call(ba, owner=s, cache_owner=s) for s in steps]
         assert len({id(plan) for plan in plans}) == 3
         assert ba._FLYDSL_RUNTIME_PLANS == {}
 
@@ -1111,6 +1127,8 @@ class TestExplicitPlan:
         ba, _ = self._setup(monkeypatch)
         step = SimpleNamespace()
         plan = self._call(ba, owner=step)  # warmup: builds it
+        assert not hasattr(step, "_flydsl_runtime_plans")
+        assert plan in ba._FLYDSL_RUNTIME_PLANS.values()
         self._call(ba, owner=step)
         assert plan.refreshed == 0
         self.capturing = True  # capture forward, same metadata
@@ -1209,6 +1227,7 @@ class TestExplicitPlan:
                 assert getattr(owner.body, "id", None) == "decode_md", relpath
                 assert getattr(owner.orelse, "value", 0) is None, relpath
                 assert "local_blocks" in ast.unparse(owner.test), relpath
+                assert "plan_cache_owner" not in kw, relpath
 
     def test_sparse_prefill_sites_scope_plan_to_their_metadata(self):
         """Variable prefill rows must not enter the process-wide plan cache."""
@@ -1225,6 +1244,7 @@ class TestExplicitPlan:
             assert getattr(owner.body, "id", None) == "prefill_md", relpath
             assert getattr(owner.orelse, "value", 0) is None, relpath
             assert "local_blocks" in ast.unparse(owner.test), relpath
+            assert getattr(calls[0].get("plan_cache_owner"), "id", None) == "prefill_md"
 
     def test_tbo_ubatches_do_not_share_a_step_plan(self, monkeypatch):
         """TBO ubatches share one compute stream; each needs its own plan."""
@@ -1234,12 +1254,12 @@ class TestExplicitPlan:
         ubatch = [0]
         monkeypatch.setattr(ubatching, "tbo_current_ubatch_id", lambda: ubatch[0])
         step = SimpleNamespace()
-        ub0 = self._call(ba, owner=step)
+        ub0 = self._call(ba, owner=step, cache_owner=step)
         ubatch[0] = 1
-        ub1 = self._call(ba, owner=step)
+        ub1 = self._call(ba, owner=step, cache_owner=step)
         assert ub1 is not ub0, "ub1 would overwrite ub0's lengths mid-step"
         ubatch[0] = 0
-        assert self._call(ba, owner=step) is ub0
+        assert self._call(ba, owner=step, cache_owner=step) is ub0
 
     def test_old_aiter_api_takes_gluon(self, monkeypatch):
         """An aiter without #5809's required work plan must not be routed."""
@@ -1835,9 +1855,17 @@ class TestNoGluonFlyDSLRouting:
         assert _route(monkeypatch, 1) == "paged_attention_unified"
         assert _route(monkeypatch, 4) == "paged_attention_unified"
 
-    @pytest.mark.parametrize("accepts", [True, False])
-    def test_unified_arm_hands_accepted_calls_to_flydsl(self, monkeypatch, accepts):
+    @pytest.mark.parametrize(
+        "env, accepts, error",
+        [
+            (True, True, None),
+            (False, False, "set ATOM_PA_FLYDSL=1"),
+            (True, False, "did not take this call"),
+        ],
+    )
+    def test_unified_arm_reports_no_gluon_route(self, monkeypatch, env, accepts, error):
         mha, _ba = self._no_gluon(monkeypatch)
+        monkeypatch.setattr(mha.envs, "ATOM_PA_FLYDSL", env)
         monkeypatch.setattr(
             mha, "flydsl_decode_seqs", lambda **kw: 4 if accepts else None
         )
@@ -1859,11 +1887,11 @@ class TestNoGluonFlyDSLRouting:
             m(8, 1, 128),
             SimpleNamespace(attn_metadata=md),
         )
-        if accepts:
+        if error is None:
             assert call() == "flydsl"
         else:
             # Per-token FP8 scales on unified attention: refused, not wrong.
-            with pytest.raises(NotImplementedError, match="per-token KV scales"):
+            with pytest.raises(NotImplementedError, match=error):
                 call()
 
     def test_use_unified_attn_keeps_decode_off_flydsl(self, monkeypatch):

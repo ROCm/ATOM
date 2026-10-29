@@ -32,7 +32,7 @@ def _warn_removed_flydsl_plan_env() -> None:
         logger.warning(
             "ATOM_PA_FLYDSL_PLAN is no longer used and is ignored; FlyDSL "
             "paged decode always uses its work planner. Set ATOM_PA_FLYDSL=0 "
-            "for gluon."
+            "to disable FlyDSL where another backend is available."
         )
 
 
@@ -174,8 +174,8 @@ def run_pa_fwd_asm(
 
 
 # Copies of aiter's own limits, pinned against its source by a test. Mirroring
-# them is what lets an unsupported call fall back instead of raising inside
-# aiter; a copy that drifts either over-rejects or stops protecting.
+# them lets the gate decline an unsupported call before entering aiter; a copy
+# that drifts either over-rejects or stops protecting.
 _FLYDSL_PA_MAX_PARTITIONS = 256
 _FLYDSL_PA_TILE = 256
 _FLYDSL_PA_BLOCK_SIZES = (16, 64, 128)
@@ -218,7 +218,7 @@ def _flydsl_explicit_plan_api() -> bool:
     """Whether aiter has #5809's FlyDSL decode API (a required work plan).
 
     An older aiter would raise on the first call; probing once lets the gate
-    fall back to gluon instead.
+    decline the call before entering aiter.
     """
     import inspect
 
@@ -239,9 +239,15 @@ def _flydsl_explicit_plan_api() -> bool:
             and "max_context_length" in params
         )
     if not ok:
+        fallback = (
+            "using gluon"
+            if pa_decode_gluon_supports_arch()
+            else "this GPU has no gluon fallback"
+        )
         logger.warning(
             "FlyDSL paged decode is enabled but this aiter predates the #5809 "
-            "decode API; using gluon."
+            "decode API; %s.",
+            fallback,
         )
     return ok
 
@@ -264,11 +270,11 @@ def _flydsl_pa_decode_num_seqs(
     sliding_window: int,
     ps: bool,
 ) -> int | None:
-    """Sequence count to run aiter's FlyDSL paged decode with, or None for gluon.
+    """Sequence count to run aiter's FlyDSL paged decode with, or None to decline.
 
-    Mirrors the kernel's own validation, so an unsupported call falls back to
-    gluon instead of raising from inside aiter. Every clause below is a hard
-    reject there, not a preference.
+    Mirrors the kernel's own validation, so an unsupported call is rejected
+    before entering aiter. The caller uses gluon where available and raises
+    otherwise. Every clause below is a hard reject there, not a preference.
 
     Why a count rather than a bool: FlyDSL demands
     ``q.shape[0] == context_lens.shape[0] * query_length`` exactly, but ATOM
@@ -408,7 +414,7 @@ def _flydsl_plan_scratch(
     head_dim,
     out_dtype,
     device,
-    plan_step_owner=None,
+    plan_cache_owner=None,
 ):
     """Partial-output buffers for a planned call, allocated once per shape.
 
@@ -422,7 +428,7 @@ def _flydsl_plan_scratch(
     plan gets its own buffers. Allocation stays here because the shapes come
     from the query tensor; only the per-step planner kernel moved out.
 
-    A step-owned plan keeps its scratch on the same owner. Sparse prefill row
+    A cache-owned plan keeps its scratch on the same owner. Sparse prefill row
     counts vary with every prompt; retaining those buffers in the process-wide
     cache would keep one large allocation per distinct prompt length forever.
     """
@@ -434,11 +440,11 @@ def _flydsl_plan_scratch(
     # same time. The plan is stored alongside so its id cannot be recycled.
     key = (id(plan), *want, head_dim, out_dtype, device.index)
     scratch = _FLYDSL_PLAN_SCRATCH
-    if plan_step_owner is not None:
-        scratch = getattr(plan_step_owner, "_flydsl_plan_scratch", None)
+    if plan_cache_owner is not None:
+        scratch = getattr(plan_cache_owner, "_flydsl_plan_scratch", None)
         if scratch is None:
             scratch = {}
-            plan_step_owner._flydsl_plan_scratch = scratch
+            plan_cache_owner._flydsl_plan_scratch = scratch
     hit = scratch.get(key)
     hit = hit[1] if hit is not None else None
     if hit is None:
@@ -489,6 +495,7 @@ def _flydsl_prepare_explicit_plan(
     context_bound,
     existing_plan,
     plan_step_owner=None,
+    plan_cache_owner=None,
 ):
     """Return the explicit plan aiter #5809 requires.
 
@@ -497,6 +504,9 @@ def _flydsl_prepare_explicit_plan(
     default budget.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
+    ``plan_cache_owner``: the object that owns plan/scratch storage. Omit it
+    for process-lifetime storage (required by captured decode graphs); sparse
+    prefill passes its ephemeral metadata so variable row counts are released.
     Plans are window-free: the gate rejects sliding windows.
     """
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
@@ -536,11 +546,11 @@ def _flydsl_prepare_explicit_plan(
         plan_step_owner is not None,
     )
     plans = _FLYDSL_RUNTIME_PLANS
-    if plan_step_owner is not None:
-        plans = getattr(plan_step_owner, "_flydsl_runtime_plans", None)
+    if plan_cache_owner is not None:
+        plans = getattr(plan_cache_owner, "_flydsl_runtime_plans", None)
         if plans is None:
             plans = {}
-            plan_step_owner._flydsl_runtime_plans = plans
+            plan_cache_owner._flydsl_runtime_plans = plans
     plan = plans.get(plan_key)
     lengths = context_lens[:num_seqs]
     if plan_step_owner is not None:
@@ -566,7 +576,7 @@ def _flydsl_prepare_explicit_plan(
             **budget,
         )
         plans[plan_key] = plan
-        if plan_step_owner is None:
+        if plan_cache_owner is None:
             logger.info(
                 "flydsl plan: batch=%d ql=%d context_bound=%d "
                 "kv_heads=%d max_partitions=%d capacity=%d",
@@ -596,7 +606,7 @@ def flydsl_decode_seqs(*, max_context_length=None, **kwargs):
     # aiter's planner rejects more sequences than one plan holds.
     if flydsl_seqs and flydsl_seqs > _flydsl_plan_max_batch():
         flydsl_seqs = None
-    # Only on the FlyDSL path; a bound below the query window goes to gluon.
+    # Only on the FlyDSL path; a bound below the query window declines the call.
     if flydsl_seqs:
         context_bound = _flydsl_context_bound(
             max_context_length, kwargs["block_tables"], kwargs["k_cache"]
@@ -632,6 +642,7 @@ def run_pa_decode(
     work_plan=None,
     max_context_length: int | None = None,
     plan_step_owner=None,
+    plan_cache_owner=None,
     plan_partition_cap: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
@@ -642,8 +653,8 @@ def run_pa_decode(
 
     gluon unless ``ATOM_PA_FLYDSL=1``, and then only where FlyDSL's
     domain covers the call: ``_flydsl_pa_decode_num_seqs`` mirrors the kernel's
-    own validation so an unsupported shape falls back here instead of raising
-    inside aiter.
+    own validation. Unsupported shapes fall back on GPUs with gluon support;
+    a GPU without gluon raises an explicit error.
     """
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
@@ -685,7 +696,15 @@ def run_pa_decode(
         _flydsl_pa_routed.add(route_sig)
         logger.info(
             "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d head_dim=%d %s)",
-            f"flydsl[{flydsl_seqs} seqs]" if flydsl_seqs else "gluon",
+            (
+                f"flydsl[{flydsl_seqs} seqs]"
+                if flydsl_seqs
+                else (
+                    "gluon"
+                    if pa_decode_gluon_supports_arch()
+                    else "unsupported(no gluon)"
+                )
+            ),
             q.shape[0],
             max_seqlen_q,
             context_lens.shape[0],
@@ -734,6 +753,7 @@ def run_pa_decode(
             context_bound=context_bound,
             existing_plan=work_plan,
             plan_step_owner=plan_step_owner,
+            plan_cache_owner=plan_cache_owner,
         )
         es, ml, tmp = _flydsl_plan_scratch(
             work_plan,
@@ -742,7 +762,7 @@ def run_pa_decode(
             q.shape[-1],
             output.dtype,
             context_lens.device,
-            plan_step_owner=plan_step_owner,
+            plan_cache_owner=plan_cache_owner,
         )
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL

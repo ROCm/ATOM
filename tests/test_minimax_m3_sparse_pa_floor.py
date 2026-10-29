@@ -99,19 +99,25 @@ def test_real_device_agrees_with_aiter(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "gluon, enabled, max_tokens, error",
+    "gluon, enabled, arch, api, max_tokens, error",
     [
-        (True, False, 65536, None),
-        (False, False, 32768, "requires ATOM_PA_FLYDSL=1"),
-        (False, True, 32768, None),
-        (False, True, 65536, "lower --max-num-batched-tokens"),
+        (True, False, False, False, 65536, None),
+        (False, False, True, True, 32768, "requires ATOM_PA_FLYDSL=1"),
+        (False, True, False, True, 32768, "GPU supported"),
+        (False, True, True, False, 32768, "explicit-plan API"),
+        (False, True, True, True, 32768, None),
+        (False, True, True, True, 65536, "lower --max-num-batched-tokens"),
     ],
 )
-def test_flydsl_startup_config(monkeypatch, gluon, enabled, max_tokens, error):
+def test_flydsl_startup_config(
+    monkeypatch, gluon, enabled, arch, api, max_tokens, error
+):
     monkeypatch.setattr(
         minimax_m3_model, "pa_decode_gluon_supports_arch", lambda: gluon
     )
     monkeypatch.setattr(minimax_m3_model.envs, "ATOM_PA_FLYDSL", enabled)
+    monkeypatch.setattr(minimax_m3_model, "_flydsl_arch_supported", lambda: arch)
+    monkeypatch.setattr(minimax_m3_model, "_flydsl_explicit_plan_api", lambda: api)
     monkeypatch.setattr(
         minimax_m3_model, "get_tensor_model_parallel_world_size", lambda: 4
     )
