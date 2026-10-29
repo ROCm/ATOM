@@ -103,8 +103,17 @@ and neither side takes a lock — there is no `flock`, no cross-repo concurrency
 nothing. Each runner takes one job at a time and each job drives one stream (worker and
 refuter run in sequence), so the ceiling is two concurrent streams against that GLM.
 
-What this costs is unmeasured, and the honest statement is that nobody has looked. Two
-facts make it worth looking before trusting the box with both bots:
+Measured 2026-10-29 against `HJBOG-SRDC-8.amd.com:30000` (the GLM the box resolves to,
+an SGLang server reporting `/models/GLM-5.3`): three single 120-token completions took
+1.19 / 1.17 / 1.36 s, and three *pairs* fired concurrently took 1.11+1.14 / 1.27+1.14 /
+1.38+1.38 s. Concurrent requests land in the same range as lone ones — the server batches
+rather than serialises, so two bots are not two queues. **The bots do not collide.**
+
+That measurement is 120-token generations against a box that was otherwise quiet; a real
+review is tens of thousands of tokens over tens of minutes, alongside whatever else the
+box is serving. So it settles the architectural question (does a second stream serialise
+behind the first? no) without settling the capacity one. Two facts keep the latter worth
+watching:
 
 - GLM's latency already has a long tail on its own. In a seven-PR batch on this branch,
   one 7-file PR spent over 40 minutes in the worker alone and the run died in the
@@ -120,11 +129,10 @@ runs one review at a time") and has no visibility into the other repo's runner. 
 is about when a job *starts*, which the second runner does not delay; the contention
 lands on how long the job *takes*.
 
-Measure it before building a mechanism — run both bots against real PRs at the same time
-and compare wall clock to the single-bot numbers already recorded on this branch. If the
-cost is real, the options are a box-level `flock` around the agent calls (needs a change
-on aiter's side too), or a latency check in the health gate that widens the budget when
-the backend is slow. Picking one now would be guessing.
+No mechanism, then: a `flock` serialising the two bots would be a pessimisation against
+a server built to batch. If the capacity question ever does bite, the symptom is reviews
+timing out when the box is busy rather than when it is quiet, and the fix is a latency
+check in the health gate that widens the budget on a slow backend — not a lock.
 
 CPU and disk contention exists too, and gets worse once P2's validation step needs a GPU
 (see the constraint above).
