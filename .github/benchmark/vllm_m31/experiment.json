@@ -58,7 +58,6 @@
     "NCCL_DMABUF_ENABLE": "0",
     "MC_GID_INDEX": "1",
     "MC_IB_TC": "104",
-    "MC_IB_PCI_RELAXED_ORDERING": "1",
     "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": "600",
     "LD_PRELOAD": "/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamd_comgr.so.3"
   },

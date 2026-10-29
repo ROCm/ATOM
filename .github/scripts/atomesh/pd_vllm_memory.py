@@ -66,7 +66,7 @@ def cpu_numa_nodes(sysfs=Path('/sys')):
             if (path / 'cpulist').read_text().strip()]
 
 
-def prepare(store, model_path, out, timeout=600):
+def prepare(store, model_path, out, timeout=1800):
     """Successful CI 40376309047: best-effort THP, then try native Store setup.
 
     Preparation does not reserve pages or prove that MR registration will work.
@@ -85,7 +85,7 @@ def prepare(store, model_path, out, timeout=600):
 
     def warn(reason, **details):
         state['warnings'].append({'reason': reason, **details})
-        print(f'[store-memory][WARN] {reason}: {details}; continuing toward Store registration', flush=True)
+        print(f'[store-memory][WARN] {reason}: {details}; Store stays unmounted until every node finishes', flush=True)
 
     write_json(summary, state)
     print('[store-memory] dropping clean model page cache before NUMA THP preparation', flush=True)
@@ -162,7 +162,7 @@ def prepare(store, model_path, out, timeout=600):
     state['status'] = 'completed_with_warnings' if state['warnings'] else 'completed'
     state['finished_at'] = time.time()
     write_json(summary, state)
-    print(f'[store-memory] best-effort THP preparation {state["status"]}; attempting Store registration', flush=True)
+    print(f'[store-memory] THP preparation {state["status"]}; Store mounts only if every node finished', flush=True)
     return state
 
 
@@ -218,6 +218,18 @@ def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
                             write_json(terminal, {'status': 'failed', 'coordinator': participant,
                                                   'error': str(exc), 'finished_at': time.time()})
                             raise
+                        unfinished = [row for row in preparation['nodes']
+                                      if row.get('status') not in ('completed', 'skipped_low_memory')]
+                        if not preparation['nodes'] or unfinished:
+                            detail = ', '.join(
+                                f"node {row.get('node')} {row.get('status')}" for row in unfinished)
+                            error = ('hugepage compact did not finish before Store initialization'
+                                     + (': ' + detail if detail else ': no NUMA node was compacted'))
+                            write_json(terminal, {'status': 'failed', 'coordinator': participant,
+                                                  'error': error,
+                                                  'preparation_status': preparation['status'],
+                                                  'finished_at': time.time()})
+                            raise RuntimeError(error)
                         write_json(terminal, {'status': 'completed', 'coordinator': participant,
                                               'preparation_status': preparation['status'],
                                               'workers': [p.stem for p in expected],

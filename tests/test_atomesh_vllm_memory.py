@@ -213,7 +213,7 @@ class THPPreparationTest(unittest.TestCase):
 
 class PostLoadPreparationTest(unittest.TestCase):
     def test_both_roles_arrive_before_one_preparation_and_all_continue(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare', return_value={'status': 'completed'}) as prepare:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare', return_value={'status': 'completed', 'nodes': [{'node': 0, 'status': 'completed'}]}) as prepare:
             root = Path(tmp)
             participants = [(role, rank) for role in ('prefill', 'decode') for rank in range(4)]
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -234,7 +234,7 @@ class PostLoadPreparationTest(unittest.TestCase):
             self.assertEqual(result['status'], 'completed')
             self.assertEqual(len(result['workers']), 8)
 
-    def test_all_workers_continue_after_partial_thp_and_timeout(self):
+    def test_partial_thp_and_timeout_block_store_initialization(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             registrations = []
@@ -254,12 +254,13 @@ class PostLoadPreparationTest(unittest.TestCase):
                 with ThreadPoolExecutor(max_workers=8) as pool:
                     futures = [pool.submit(worker, r, i) for r in ('prefill', 'decode') for i in range(4)]
                     for future in futures:
-                        future.result(timeout=6)
+                        with self.assertRaises(RuntimeError):
+                            future.result(timeout=6)
             self.assertEqual(command.call_count, 3)  # One eviction, two probes, once for all ranks.
-            self.assertEqual(len(registrations), 8)
+            self.assertEqual(registrations, [])
             result = json.loads((root / 'store-memory-gate/result.json').read_text())
-            self.assertEqual(result['status'], 'completed')
-            self.assertEqual(result['preparation_status'], 'completed_with_warnings')
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('hugepage compact did not finish', result['error'])
             self.assertFalse((root / memory.MARKER).exists())
 
     def test_missing_worker_times_out_without_cleaning(self):

@@ -93,19 +93,22 @@ P uses the glibc THP hint and the role-specific MR limits above. The earlier mal
 perturbation, sequential P/D startup and separate native Store PUT/GET preflight
 in `57888067b` were reverted.
 
-`store-memory-gate/` records each worker's arrival and completion of the single
-preparation attempt. Its `status=completed` allows every worker to initialize
-Store even when `preparation_status=completed_with_warnings`. This does not
-claim successful Store registration. Unexpected preparation errors still
-publish a terminal failure for waiting workers; missing workers still time out.
+`store-memory-gate/` records each worker's arrival and the single preparation
+attempt. Workers initialize Store only after hugepage compact finishes on every
+NUMA node (`completed`), or that node is skipped because its target is below
+1 GiB. A probe failure, a shortfall, or the per-node timeout publishes
+`status=failed` and no worker mounts Store. Missing workers still time out.
+Each node is given 1800 seconds. The case requests all 128 CPUs on the node so
+both NUMA nodes are inside the job cpuset; the previous 114-CPU allocation left
+node 0 with no allowed CPU and the compact exited immediately.
 
 The common environment explicitly sets `MC_MAX_CONCURRENT_REG_MR=1`,
-`NCCL_DMABUF_ENABLE=0`, `MC_GID_INDEX=1`, `MC_IB_TC=104`, and
-`MC_IB_PCI_RELAXED_ORDERING=1`. The first variable is parsed by the installed
-Mooncake 0.3.13.post1 but does not limit its RDMA registration path. Relaxed
-ordering is requested when libibverbs exposes the required symbol; verify the
-actual selection in engine logs. The Store/Transfer JSON configs match the
-successful reference. The MiniMax fixed image and native Mooncake package are
+`NCCL_DMABUF_ENABLE=0`, `MC_GID_INDEX=1`, and `MC_IB_TC=104`. It does not
+set `MC_IB_PCI_RELAXED_ORDERING`. The successful Kimi reference left that
+variable unset, and requesting `IBV_ACCESS_RELAXED_ORDERING` made this image's
+host MR registration return EINVAL. The first variable is parsed by the installed
+Mooncake 0.3.13.post1 but does not limit its RDMA registration path. The
+Store/Transfer JSON configs match the successful reference. The MiniMax fixed image and native Mooncake package are
 retained; the reference ran Kimi K3 with a custom Mooncake wheel, so this is
 alignment of the Store/RDMA settings rather than a copy of its entire stack.
 
