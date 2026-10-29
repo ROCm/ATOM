@@ -185,6 +185,14 @@ def test_page_checkpoints_follow_an_offload_connector(
         assert cls.checkpoint_page_unit_bytes(builder) is None
 
 
+def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
+    """Only `Qwen4ExpBackend` builds this builder; a flattened or renamed text
+    type must not turn the state tier off after validation accepted offload."""
+    builder, cls = _builder()
+    builder.model_runner.config.hf_config.model_type = "qwen4_exp_flattened"
+    assert cls._uses_paged_checkpoints(builder)
+
+
 def test_validate_config_allows_offload_and_rejects_rapidserve():
     builder, _ = _builder()
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend

@@ -382,16 +382,13 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         """QSA pages hold the image when an offload tier reads it; fork otherwise.
 
         The parent builder would aim the image at MHA regions, so this one
-        answers for itself.
+        answers for itself. No model-type test: only `Qwen4ExpBackend` builds
+        this class, and a second spelling of the type would otherwise turn the
+        state tier off after `validate_config` had accepted the offload.
         """
 
         config = self.model_runner.config
-        if not _qwen38_offload_ready(config) or not qwen38_offload_configured(config):
-            return False
-        from atom.utils import get_hf_text_config
-
-        text = get_hf_text_config(self.model_runner.config.hf_config)
-        return getattr(text, "model_type", None) in ("qwen4_exp", "qwen4_exp_text")
+        return _qwen38_offload_ready(config) and qwen38_offload_configured(config)
 
     def state_transfer(self):
         from atom.model_engine.state_runtime import StateTransfer
