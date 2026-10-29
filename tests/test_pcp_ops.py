@@ -315,7 +315,7 @@ class _FakePcpGroup:
         return out
 
 
-@pytest.mark.parametrize("ws", [2, 4, 8])
+@pytest.mark.parametrize("ws", [2, 4, 6, 8])
 def test_grouped_gather_restores_every_tensor_in_one_collective(monkeypatch, ws):
     """The extend K (fp8 bytes + bf16 RoPE tail) and its positions travel in
     one collective, and each comes back in global token order."""
@@ -337,28 +337,6 @@ def test_grouped_gather_restores_every_tensor_in_one_collective(monkeypatch, ws)
         group = _FakePcpGroup([[s[2]] for s in shards], rank)
         monkeypatch.setattr(pu, "get_pcp_group", lambda g=group: g)
         assert torch.equal(pu.pcp_allgather_rerange(shards[rank][2], ws), fulls[2])
-
-
-def test_grouped_gather_takes_one_tensor_at_a_time_where_aiter_has_no_kernel(
-    monkeypatch,
-):
-    """At 6 ranks aiter's custom all-reduce is on but its all-gatherv kernel is
-    not (2, 4 and 8 only) and would throw: gather each tensor on its own."""
-    ws, n = 6, 12
-    fulls = [torch.arange(n, dtype=torch.int64), torch.randn(n, 3)]
-    shards = [[pu.pcp_round_robin_split(t, ws, r) for t in fulls] for r in range(ws)]
-    gathers = []
-
-    class Group:
-        def all_gather(self, x, dim=0):
-            i = next(i for i, t in enumerate(shards[0]) if t.dtype == x.dtype)
-            gathers.append(i)
-            return torch.cat([s[i] for s in shards])
-
-    monkeypatch.setattr(pu, "get_pcp_group", lambda: Group())
-    got = pu.pcp_allgather_rerange_many(shards[0], ws)
-    assert gathers == [0, 1]
-    assert all(torch.equal(g, f) for g, f in zip(got, fulls))
 
 
 def test_needs_id_sync_is_one_predicate_for_both_groups():

@@ -159,10 +159,6 @@ def pcp_allgather_rerange_many(
     assert all(t.shape[0] == inputs[0].shape[0] for t in inputs), [
         t.shape[0] for t in inputs
     ]
-    # aiter's custom all-gatherv kernel exists for 2, 4 and 8 ranks only, while
-    # its custom all-reduce (which `all_gatherv` tries first) also runs at 6.
-    if pcp_size not in (2, 4, 8):
-        return [pcp_allgather_rerange(t, pcp_size) for t in inputs]
     comm = get_pcp_group().device_communicator
     gathered = gather_rows(
         lambda ts: comm.all_gatherv(ts, dim=0), [t.contiguous() for t in inputs]
