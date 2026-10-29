@@ -99,7 +99,13 @@ case $MODE in
       # the sigmoid gates as one launch each on DP points too: the MoE shared-expert combine (three
       # eager kernels a layer) and the attention output gate (two a full-attention layer)
       export ATOM_FUSED_SIGMOID_GATE=${ATOM_FUSED_SIGMOID_GATE:-1}
-      ARGS+=(--enable-dp-attention --enable-expert-parallel --max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}") ;;
+      # MHA prefill and decode on aiter's unified attention over the paged cache, with 64-token KV blocks:
+      # no KV gather before the prefill FMHA, and the 64-token decode / verify configs (see the recipe's
+      # "DP4 + EP4 c2048"). Needs aiter alizaidy/gfx1250-qwen-support from 3d3228c1: before it the 2D
+      # kernel took the block-table stride as a constant and recompiled for every prefill batch.
+      export ATOM_USE_UNIFIED_ATTN=${ATOM_USE_UNIFIED_ATTN:-1}
+      ARGS+=(--enable-dp-attention --enable-expert-parallel --max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}"
+        --block-size ${BLOCK_SIZE:-64}) ;;
   *) echo "unknown mode $MODE"; exit 1 ;;
 esac
 # SPEC=<n>: MTP speculative decoding (graphed draft steps); the checkpoint keeps the MTP

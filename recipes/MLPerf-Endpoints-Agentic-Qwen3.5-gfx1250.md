@@ -33,7 +33,7 @@ overrides, `SPEC=0` turns it off); `run_ep.sh` picks the server from the concurr
 | Concurrency | Server |
 |---|---|
 | 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p, MoE routes staged once per forward, MTP draft with replicated fc / embedding, one-launch pre-fc norms, all-reduce argmax exchange and one-launch GDN kv-indptr, split-row sampler softmax |
-| 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8) |
+| 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8), unified attention with 64-token KV blocks |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
 `--level 0`, 16k-token prefill chunks, decode graphs captured at every size up to `max-num-seqs`.
@@ -183,6 +183,51 @@ was what held the tail.
 `AITER_GFX12_MIN_SEGMENTS=64` (the last point; `serve_ep.sh` does not set it) raises the gfx1250 decode /
 verify attention's KV split to at least 64 segments: 5-23% faster a launch at 40k-190k-token contexts,
 10-21% slower at 16k-64k with 32 sequences, since inside a graph the split cannot see the context lengths.
+
+### DP4 + EP4 c2048 (2026-10-29)
+
+Profiled c2048 points, MTP3, 512 sequences an engine; generation tok/s is the engines' mean over the 2 minutes
+before a 15 s profiler window at minute 3, step times are DP rank 0's in that window:
+
+| Point | Generation tok/s | Prefill step | Decode step (median) | MTP tokens a forward |
+|---|---|---|---|---|
+| ATOM 6cdc02f9, aiter a0df93d2 | 27.4k | 169 ms | 18.5 ms | 2.73 |
+| + the GDN kernels below | 28.9k | 159 ms | 17.5 ms | 2.72 |
+| + fp32-tap conv, unified attention with 64-token KV blocks (aiter 3d3228c1) | **33.1k** | **147 ms** | **15.5 ms** | 2.72 |
+
+GSM8K on the last stack (DEP4, 3-shot, 256 concurrent): 0.8635 flexible / 0.8499 strict (0.861 / 0.851
+before). The GDN changes, per layer at 16k prefill tokens (32 value heads):
+
+| Stage | Before | After |
+|---|---|---|
+| conv1d + q / k L2 norm | 134 us | 67 us (one kernel; fp32 FMA taps, each output the correctly rounded bf16 of an fp64 conv) |
+| cumsum + k k^T, solve_tril, merge / recompute w u | 251 us | 145 us (two kernels) |
+| chunk_h (the recurrence) | 242-511 us | 98-202 us (Gluon, no runtime autotune) |
+| chunk_o + gated RMSNorm | 143 us | 101 us (Gluon, the norm in its epilogue) |
+| decode: fused GDN verify (96 sequences) | 64 us | 32 us |
+
+Unified attention replaces the prefill FMHA and its KV gather (63 -> 57 ms a prefill step) and takes the
+64-token decode / verify configs (verify attention 518 -> 336 us a launch). The GDN prefill kernels no longer
+autotune at runtime anywhere (chunk_h, chunk_o, solve_tril and the short-prefill path did).
+
+These points ran the DSv4.1 recipe's exact-flow harness, not `run_ep.sh`. The last one's server:
+
+```bash
+ATOM_MORI_V2=1 MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 MORI_SHMEM_HEAP_SIZE=16G ATOM_DP_LM_HEAD_MODE=allgather \
+ATOM_DP_SESSION_AFFINITY=1 ATOM_FUSED_SIGMOID_GATE=1 ATOM_QWEN_SHARED_EXPERT_STREAM=0 ATOM_USE_UNIFIED_ATTN=1 \
+ATOM_PREFILL_DECODE_INTERVAL=16 ATOM_PREFILL_DELAYER_STALL_TICKS=2 ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072,4096 \
+ATOM_DISABLE_MMAP=true ATOM_GC_THRESHOLD=20000,50,50 HSA_NO_SCRATCH_RECLAIM=1 HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0 \
+HIP_FORCE_DEV_KERNARG=1 HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 AITER_LOG_LEVEL=WARNING \
+python3 -m atom.entrypoints.openai_server --model /data/Qwen3.5-35B-A3B-MXFP4 --trust-remote-code -tp 4 \
+  --kv_cache_dtype bf16 --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --block-size 64 --level 0 --enable-expert-parallel --enable-dp-attention --max-num-seqs 512 \
+  --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64,96,128,192,256,320,384,448,512]' \
+  --method mtp --num-speculative-tokens 3 \
+  --online_quant_config '{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4"}}'
+```
+
+`serve_ep.sh` now sets the unified attention and the 64-token blocks on DP points; it also sets the DP
+sampling, fast-launch and prefill-graph settings above, which these c2048 points did not run.
 
 ## Prefill / decode interval
 
