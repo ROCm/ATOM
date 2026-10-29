@@ -309,6 +309,7 @@ All default off.
 | **ATOM_MTP_REPLICATED_FC** | bool | 0 (false) | Qwen3.5 MTP at TP>1: hold the whole `mtp.fc` (2H -> H) on every rank instead of column-parallel + all-gather. Its input is the same on every rank, so is its output; the GEMM is bitwise the same. A prefill chunk over 1024 tokens still runs this rank's rows and the all-gather. |
 | **ATOM_QWEN35_MTP_REPLICATED_EMBED** | bool | 0 (false) | Qwen3.5 MTP at TP>1: the full vocab embedding on every rank for the draft only (the target keeps its shard), gathered from the shards once the draft shares the target's embedding: a local lookup instead of the masked lookup + all-reduce, bit-identical. About 0.76 GB more per rank. |
 | **ATOM_MTP_DUAL_PRE_FC_NORM** | bool | 0 (false) | Qwen3.5 MTP: `pre_fc_norm_embedding` and `pre_fc_norm_hidden` in one launch of the two-input Gemma RMSNorm, each written into its half of the fc input, instead of two launches and a `torch.cat`. Bitwise the same. |
+| **ATOM_ARGMAX_HEAD_AR_GATHER** | bool | 0 (false) | TP greedy argmax head (the MTP draft): exchange the per-rank (max, index) packs as an all-reduce of a zero-padded byte image (exact: one nonzero term a value) instead of the custom all-gather, and pick the winner in one kernel. Token-identical. |
 
 ## Engram (DeepSeek-V4.1)
 

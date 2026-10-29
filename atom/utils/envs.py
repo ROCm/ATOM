@@ -1013,6 +1013,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the two-input Gemma norm, written straight into the fc input -- no
     # torch.cat. Same kernel and math as the two norms, so bitwise the same.
     "ATOM_MTP_DUAL_PRE_FC_NORM": lambda: _flag_env("ATOM_MTP_DUAL_PRE_FC_NORM", "0"),
+    # TP greedy argmax head: exchange the per-rank (max, index) packs through an
+    # all-reduce of a zero-padded byte image (exact: one nonzero term a value)
+    # instead of the custom all-gather, and pick the winner in one kernel. Three
+    # launches instead of six; token-identical.
+    "ATOM_ARGMAX_HEAD_AR_GATHER": lambda: _flag_env("ATOM_ARGMAX_HEAD_AR_GATHER", "0"),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
