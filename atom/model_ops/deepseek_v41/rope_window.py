@@ -251,4 +251,9 @@ def rope_quant_window(
         EMIT_PACKED=values is not None,
         EMIT_QUERY_FP8=query_fp8 is not None,
         WRITE_RING=ring is not None,
+        # One head_dim=512 row per program, amax the only (order-free)
+        # reduction: a single 32-lane wavefront is optimal. Triton's
+        # default num_warps=4 oversubscribes and runs ~43% slower on
+        # the prefill chunks that dominate this kernel's time.
+        num_warps=1,
     )
