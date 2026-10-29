@@ -77,7 +77,7 @@ c48_append_port_mount() {
   c48_fix_sha=aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa
   if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-PP8-MC ]]; then
     c48_fix_dir=pp-aux-hidden
-    c48_fix_sha=05f18e8d4c279c310da5567d889752d1bbb35d1a5f44b94b9c2b6f68556b9151
+    c48_fix_sha=5620f0ecf2c82a522f65f348238e08d28125382b82416ae5afc68ffb7be15bd4
   fi
   c48_fix_source="$1/.github/benchmark/c48-model-gap/${c48_fix_dir}/linear.py"
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/linear.py"

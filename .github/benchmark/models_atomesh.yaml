@@ -6261,6 +6261,7 @@ models:
             ATOMESH_PRE_CLEAN_GPU: '1'
             ATOMESH_AGENTIC_TORCH_PROFILE: '0'
           prefill:
+            VLLM_PP_LAYER_PARTITION: '12,12,12,12,12,12,12,9'
             VLLM_ROCM_USE_AITER: '1'
             AITER_BF16_FP8_MOE_BOUND: '0'
             AITER_FLYDSL_STAGE2_FP8: '1'
