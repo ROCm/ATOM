@@ -32,6 +32,7 @@ from atom.config import QuantizationConfig
 from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
 from atom.model_ops import linear as linear_mod
 from atom.model_ops.linear import (
+    MXFP4_N32K4_K_ALIGN,
     MXFP4_PRESHUFFLE_K_ALIGN,
     LinearBase,
     MergedColumnParallelLinear,
@@ -393,7 +394,6 @@ def test_streaming_expects_only_the_real_shards(monkeypatch, tp_rank):
         del streamer
 
     # gate_up: the real shards (and global scales) alone complete the module.
-    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
     monkeypatch.setattr(
         linear_mod,
         "quant_weight_online",
@@ -407,6 +407,8 @@ def test_streaming_expects_only_the_real_shards(monkeypatch, tp_rank):
         ),
     )
     gate_up, _ = _online_pair(NVFP4_SRC)
+    # Built padded for the preshuffled GEMM; skip only the shuffle at finalize.
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
     streamer = OnlineQuantStreamer.maybe_create(gate_up, load_dummy=None)
     for shard_id in (0, 1):
         for param, value in (
@@ -419,3 +421,94 @@ def test_streaming_expects_only_the_real_shards(monkeypatch, tp_rank):
         ):
             streamer.run(param.weight_loader, (param, value, shard_id))
     assert id(gate_up) in streamer.done_module_ids
+
+
+# ── the alignment follows the GEMM the layer will run on ──────────────────
+
+
+def test_align_follows_the_backend(monkeypatch):
+    qc = _qc(*MXFP4)
+    assert mxfp4_k_pad_align(qc, "x") == MXFP4_PRESHUFFLE_K_ALIGN
+    # gfx1250's 32x4-scale kernels step K by 128: Kimi-K3's 4224 needs nothing.
+    monkeypatch.setattr(linear_mod, "_mxfp4_n32k4_backend", lambda: True)
+    assert mxfp4_k_pad_align(qc, "x") == MXFP4_N32K4_K_ALIGN == 128
+    # The non-shuffle Triton GEMM reads the raw layout: no tail, no padding.
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
+    assert mxfp4_k_pad_align(qc, "x") is None
+
+
+def test_no_padding_when_the_backend_takes_the_real_k(monkeypatch, tp_rank):
+    monkeypatch.setattr(linear_mod, "_mxfp4_n32k4_backend", lambda: True)
+    gate_up, down = _pair()
+    assert gate_up.weight.shape == (2 * REAL, HIDDEN // 2)
+    assert down.weight.shape == (HIDDEN, REAL // 2)
+    assert down._pad_input is None
+
+
+# ── W4A8: the native group32 path pads, so its slots are filled too ───────
+
+
+def test_w4a8_native_pad_slots_are_filled(monkeypatch, tp_rank):
+    """fp4 weights + FP8 activations take the native group32 branch of
+    process_weights_after_loading, which returns early; the fill runs first."""
+    qc = QuantizationConfig()
+    qc.global_spec = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=dtypes.fp4x2,
+        activation_dtype=torch.float8_e4m3fn,
+        weight_block_size=(1, 32),
+        is_dynamic=True,
+    )
+    align = mxfp4_k_pad_align(qc, "mlp.down_proj")
+    gate_up = MergedColumnParallelLinear(
+        HIDDEN,
+        [INTER, INTER],
+        quant_config=qc,
+        prefix="mlp.gate_up_proj",
+        output_pad_align=align,
+    )
+    down = RowParallelLinear(
+        INTER,
+        HIDDEN,
+        quant_config=qc,
+        reduce_results=False,
+        prefix="mlp.down_proj",
+        input_pad_align=align,
+    )
+    assert gate_up.native_a8_group_rows is not None
+    for layer in (gate_up, down):
+        layer.weight.data.view(torch.uint8).fill_(0xAB)
+        layer.weight_scale.data.view(torch.uint8).fill_(0xFF)  # NaN as e8m0
+        _process(monkeypatch, layer)
+
+    gw, gs = _u8(gate_up.weight), _u8(gate_up.weight_scale)
+    for start, end in gate_up._pad_output_rows:
+        assert (gw[start:end] == 0).all() and (gs[start:end] == 127).all()
+    dw, ds = _u8(down.weight), _u8(down.weight_scale)
+    assert (dw[:, REAL // 2 :] == 0).all() and (ds[:, REAL // 32 :] == 127).all()
+
+
+# ── TP=1: a per-token (N, 1) scale has no K to pad ────────────────────────
+
+
+def test_tp1_per_token_scale_loads_into_a_padded_down(monkeypatch, online_build):
+    group = SimpleNamespace(world_size=1, rank_in_group=0)
+    monkeypatch.setattr(linear_mod, "get_tp_group", lambda: group)
+    src = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
+    qc = _online_to_mxfp4(src)
+    down = RowParallelLinear(
+        REAL,
+        HIDDEN,
+        quant_config=qc,
+        reduce_results=False,
+        prefix="mlp.down_proj",
+        input_pad_align=mxfp4_k_pad_align(qc, "mlp.down_proj"),
+    )
+    assert down._pad_input == (REAL, PADDED)
+    assert down.weight_scale.shape == (HIDDEN, 1)
+    scale = torch.arange(HIDDEN, dtype=torch.float32).view(HIDDEN, 1) + 1
+    down.weight_loader(down.weight_scale, scale)
+    assert torch.equal(down.weight_scale.data.cpu(), scale)
+    w = _pattern(HIDDEN, REAL)
+    down.weight_loader(down.weight, w.view(dtypes.fp8))
+    assert torch.equal(_u8(down.weight)[:, :REAL], w)

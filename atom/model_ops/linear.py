@@ -70,11 +70,15 @@ def use_mxfp4_n32k4_scale(weight: torch.Tensor) -> bool:
     The owner can still require the legacy layout for direct scale readers.
     AITER's gemm_a4w4 selects the FlyDSL or ASM backend for each shape.
     """
-    if (
-        not envs.ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE
-        or use_fp4_non_shuffle_triton_gemm()
-        or weight.dim() != 2
-        or weight.shape[1] * 2 % 128  # 32x4 packs 4 scales of 32 K: K % 128
+    if weight.dim() != 2 or weight.shape[1] * 2 % 128:  # 32x4 packs 4x32 K
+        return False
+    return _mxfp4_n32k4_backend()
+
+
+def _mxfp4_n32k4_backend() -> bool:
+    """Whether eligible per_1x32 FP4 weights get the 32x4 scale layout here."""
+    if not envs.ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE or (
+        use_fp4_non_shuffle_triton_gemm()
     ):
         return False
     from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -146,6 +150,8 @@ else:
 # A model with such a layer must zero-pad K to this multiple (Kimi-K3's dense
 # MLP does), so `process_weights_after_loading` refuses it at load instead.
 MXFP4_PRESHUFFLE_K_ALIGN = 256
+# gfx1250's 32x4-scale gemm_a4w4 kernels take K in steps of 128 (4 x 32).
+MXFP4_N32K4_K_ALIGN = 128
 
 
 def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
@@ -177,13 +183,16 @@ def mxfp4_k_pad_align(
 ) -> int | None:
     """K alignment a gate_up -> act -> down MLP must pad its intermediate to.
 
-    ``prefix`` is the down_proj's: its K is the per-rank intermediate. Returns
-    ``MXFP4_PRESHUFFLE_K_ALIGN`` when that layer ends up MXFP4 -- statically, or
-    through an online-quant override that applies to it -- and ``None``
-    otherwise. Pass the result to BOTH linears of the pair (``output_pad_align``
-    on gate_up, ``input_pad_align`` on down) so they agree on the padding.
+    ``prefix`` is the down_proj's: its K is the per-rank intermediate. When
+    that layer ends up MXFP4 -- statically, or through an online-quant override
+    that applies to it -- returns the K step of the GEMM it will run on:
+    ``MXFP4_PRESHUFFLE_K_ALIGN`` for the preshuffled e8m0 kernels, 128 for
+    gfx1250's 32x4-scale kernels, and ``None`` (no padding) for the
+    non-shuffle Triton GEMM, which reads the raw layout. ``None`` otherwise.
+    Pass the result to BOTH linears of the pair (``output_pad_align`` on
+    gate_up, ``input_pad_align`` on down) so they agree on the padding.
     """
-    if quant_config is None:
+    if quant_config is None or use_fp4_non_shuffle_triton_gemm():
         return None
     cfg = quant_config.get_layer_quant_config(prefix)
     if quant_config.online_quant:
@@ -192,9 +201,9 @@ def mxfp4_k_pad_align(
         online = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
         if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online):
             cfg = online
-    if _is_mxfp4(cfg.quant_type, cfg.quant_dtype):
-        return MXFP4_PRESHUFFLE_K_ALIGN
-    return None
+    if not _is_mxfp4(cfg.quant_type, cfg.quant_dtype):
+        return None
+    return MXFP4_N32K4_K_ALIGN if _mxfp4_n32k4_backend() else MXFP4_PRESHUFFLE_K_ALIGN
 
 
 def padded_partition_size(size_per_partition: int, align: int | None) -> int:
@@ -1424,6 +1433,11 @@ class LinearBase(nn.Module):
         shuffled and its N left unpadded, with the RuntimeError that exists to
         catch exactly that skipped along with the padding.
         """
+        # Before any requant or shuffle, and before the native group32 return
+        # below (W4A8 pads too): the padded slots of a K-padded MLP pair were
+        # allocated empty and nothing in the checkpoint writes them.
+        if self.weight.numel():
+            _fill_pad_tails(self)
         # A native group32 weight keeps its compact scales, and its bytes too
         # unless it is one the preshuffled group32 GEMM reads.
         if self.native_a8_group_rows is not None:
@@ -1439,9 +1453,6 @@ class LinearBase(nn.Module):
             return
         if self.weight.numel() == 0:
             return
-        # Before any requant or shuffle: the padded slots of a K-padded MLP pair
-        # were allocated empty and nothing in the checkpoint writes them.
-        _fill_pad_tails(self)
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
@@ -2907,10 +2918,11 @@ class RowParallelLinear(LinearBase):
             pad_input = getattr(self, "_pad_input", None)
             if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
                 loaded_weight = loaded_weight.repeat(1, self.tp_size)
-            elif pad_input is not None:
+            elif pad_input is not None and param_data.size(self.tp_dim) > 1:
                 # The checkpoint holds the real K per rank; write it at the
                 # front of the padded slot. In this param's own units, which
-                # are elements, fp4x2 bytes or one-per-32 scales alike.
+                # are elements, fp4x2 bytes or one-per-32 scales alike. A
+                # param with no K extent (a per-token (N, 1) scale) has none.
                 real_k, padded_k = pad_input
                 shard_size, rem = divmod(shard_size * real_k, padded_k)
                 assert rem == 0, (self.prefix, param_data.shape, pad_input)
