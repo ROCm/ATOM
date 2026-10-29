@@ -16,6 +16,13 @@ class KfdPinAnchors:
         self.hip = C.CDLL(next(p for p in mapped_gpu_libraries() if 'libamdhip64' in p))
         self.hip.hipMemGetAddressRange.argtypes = [C.POINTER(C.c_void_p), C.POINTER(C.c_size_t), C.c_void_p]
         self.hip.hipMemGetAddressRange.restype = C.c_int
+        for name, args in (
+            ('hipMalloc', [C.POINTER(C.c_void_p), C.c_size_t]),
+            ('hipFree', [C.c_void_p]),
+            ('hipMemGetInfo', [C.POINTER(C.c_size_t), C.POINTER(C.c_size_t)]),
+        ):
+            fn = getattr(self.hip, name)
+            fn.argtypes, fn.restype = args, C.c_int
         self.verbs = C.CDLL(ctypes.util.find_library('ibverbs') or 'libibverbs.so.1', use_errno=True)
         for name, args, result in (
             ('ibv_get_device_list', [C.POINTER(C.c_int)], C.POINTER(C.c_void_p)),
@@ -52,6 +59,51 @@ class KfdPinAnchors:
             self.context = None
             raise OSError(error, 'ibv_alloc_pd')
 
+    def memory_info(self):
+        free, total = C.c_size_t(), C.c_size_t()
+        rc = self.hip.hipMemGetInfo(C.byref(free), C.byref(total))
+        if rc:
+            raise RuntimeError(f'hipMemGetInfo failed: {rc}')
+        if free.value > total.value:
+            raise RuntimeError('KFD free memory exceeds total memory')
+        return free.value, total.value
+
+    def probe_driver(self, engine):
+        """Use a private allocation: caller buffers can be pinned already."""
+        size = 64 * 1024**2
+        ptr = C.c_void_p()
+        rc = self.hip.hipMalloc(C.byref(ptr), size)
+        if rc:
+            raise RuntimeError(f'Cannot allocate private KFD probe: {rc}')
+        registered = False
+        try:
+            before, _ = self.memory_info()
+            if before < 2 * size:
+                raise RuntimeError('Insufficient memory to disambiguate KFD probe')
+            rc = engine.batch_register_memory([ptr.value], [size])
+            if rc:
+                raise RuntimeError(f'KFD probe registration failed: {rc}')
+            registered = True
+            after, _ = self.memory_info()
+            drop = before - after
+            if abs(drop) < size // 4:
+                needed = False
+            elif abs(drop - size) < size // 4:
+                needed = True
+            else:
+                raise RuntimeError(f'Inconclusive KFD probe: {drop} bytes for {size}')
+        finally:
+            if registered:
+                rc = engine.batch_unregister_memory([ptr.value])
+                if rc:
+                    # Keep the allocation alive if the native MR could remain.
+                    raise RuntimeError(f'KFD probe unregistration failed: {rc}')
+            rc = self.hip.hipFree(ptr)
+            if rc:
+                raise RuntimeError(f'KFD probe hipFree failed: {rc}')
+        return {'needed': needed, 'probe_bytes': size, 'before_bytes': before,
+                'after_bytes': after, 'drop_bytes': drop}
+
     def acquire(self, address, length):
         base, size = C.c_void_p(), C.c_size_t()
         rc = self.hip.hipMemGetAddressRange(C.byref(base), C.byref(size), C.c_void_p(address))
@@ -84,3 +136,87 @@ class KfdPinAnchors:
             if rc:
                 raise OSError(rc, 'ibv_close_device')
             self.context = None
+
+
+def bind_connector(group, hca, evidence):
+    """Bind once at the outer connector, before Transfer and Store see the KV.
+
+    The fixed-pool experiment retains anchors and their tensors for the worker
+    lifetime. In particular, a Transfer-only unregister must not release an
+    anchor while the P Store still has a data MR for the same allocation.
+    Process teardown releases the experiment's native contexts and pins.
+    """
+    from pathlib import Path
+    import json
+    import torch
+
+    if hasattr(group, '_atomesh_kfd_adapter'):
+        return
+    connectors = getattr(group, '_connectors', [group])
+    transfer = next(c for c in connectors if c.__class__.__name__ == 'MooncakeConnector')
+    engine = transfer.connector_worker.engine
+    original = group.register_kv_caches
+    state = {'status': 'bound'}
+    group._atomesh_kfd_adapter = state
+    evidence = Path(evidence)
+    evidence.mkdir(parents=True, exist_ok=True)
+
+    def record():
+        path = evidence / 'kfd-pin.json'
+        path.write_text(json.dumps(state, indent=2) + '\n')
+        print('[kfd-pin] ' + json.dumps(state), flush=True)
+
+    def tensors(value):
+        if isinstance(value, torch.Tensor):
+            yield value
+        elif isinstance(value, dict):
+            for child in value.values():
+                yield from tensors(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                yield from tensors(child)
+        else:
+            raise TypeError(f'Unsupported KV cache container {type(value)}')
+
+    def register(kv_caches):
+        if state['status'] != 'bound':
+            raise RuntimeError('KFD adapter requires one fixed KV pool per worker')
+        pins = KfdPinAnchors(hca)
+        # Retain the pin context before any registration so failures cannot
+        # release anchors ahead of partially registered native data MRs.
+        group._atomesh_kfd_pins = pins
+        group._atomesh_kfd_cache_tensors = kv_caches
+        try:
+            if os.environ.get('MOONCAKE_DISABLE_HIP_DMABUF', '0') != '0':
+                raise RuntimeError('KFD adapter requires the native DMA-BUF data path')
+            state['driver_probe'] = pins.probe_driver(engine)
+            state['hca'] = hca
+            before, total = pins.memory_info()
+            reserved_before = torch.cuda.memory_reserved()
+            if state['driver_probe']['needed']:
+                for tensor in tensors(kv_caches):
+                    if not tensor.is_cuda:
+                        raise ValueError('Expected device KV storage')
+                    storage = tensor.untyped_storage()
+                    pins.acquire(storage.data_ptr(), storage.nbytes())
+            state.update(status='registering', anchors=len(pins.anchors),
+                         allocation_bytes=sum(r['allocation_bytes'] for r in pins.anchors.values()),
+                         before_free_bytes=before, total_bytes=total)
+            record()
+            result = original(kv_caches)
+            after, _ = pins.memory_info()
+            reserved_delta = torch.cuda.memory_reserved() - reserved_before
+            unexplained = before - after - reserved_delta
+            state.update(after_free_bytes=after, torch_reserved_delta=reserved_delta,
+                         unexplained_drop_bytes=unexplained)
+            if abs(unexplained) > 512 * 1024**2:
+                raise RuntimeError(f'KFD accounting shifted by {unexplained} untracked bytes')
+            state['status'] = 'verified'
+            record()
+            return result
+        except Exception as exc:
+            state.update(status='failed', error=str(exc))
+            record()
+            raise
+
+    group.register_kv_caches = register

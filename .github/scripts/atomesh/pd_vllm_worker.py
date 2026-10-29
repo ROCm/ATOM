@@ -100,11 +100,24 @@ class StoreMemoryWorker(Worker):
         )
         evidence = self._diagnostic_dir()
         record_runtime(evidence, 'before-kv-init')
+        original_ensure = None
+        if os.environ.get('ATOMESH_VLLM_KFD_PIN_ADAPTER') == '1':
+            import vllm.v1.worker.gpu_worker as worker_module
+            from pd_vllm_kfd_pin import bind_connector
+            original_ensure = worker_module.ensure_kv_transfer_initialized
+            def ensure_with_kfd_adapter(*args, **kwargs):
+                result = original_ensure(*args, **kwargs)
+                bind_connector(worker_module.get_kv_transfer_group(), hca, evidence)
+                return result
+            worker_module.ensure_kv_transfer_initialized = ensure_with_kfd_adapter
         try:
             result = super().initialize_from_config(kv_cache_config)
         except Exception as exc:
             record_failure(evidence, exc)
             raise
+        finally:
+            if original_ensure is not None:
+                worker_module.ensure_kv_transfer_initialized = original_ensure
         record_runtime(evidence, 'after-kv-init')
         probe(evidence, 'after-kv-init', 4)
         return result

@@ -99,6 +99,17 @@ def worker(root, rank, kv_gib):
             lib.hipIpcGetMemHandle.restype = ctypes.c_int
             ipc_handle = (ctypes.c_byte * 64)()
             rc = lib.hipIpcGetMemHandle(ipc_handle, ctypes.c_void_p(kv.data_ptr()))
+        elif os.environ.get('ATOMESH_PROBE_KFD_ADAPTER') == '1':
+            from types import SimpleNamespace
+            from pd_vllm_kfd_pin import bind_connector
+            class MooncakeConnector:
+                connector_worker = SimpleNamespace(engine=engine)
+                def register_kv_caches(self, caches):
+                    return engine.batch_register_memory(addresses, lengths)
+            group = MooncakeConnector()
+            bind_connector(group, os.environ['MC_TE_FILTERS'], out)
+            rc = group.register_kv_caches({'kv': kv})
+            anchors = group._atomesh_kfd_pins
         else:
             rc = engine.batch_register_memory(addresses, lengths)
         dump(out / 'registration.json', {'rc': rc, 'bytes': kv.numel(), 'mode': register_mode})
@@ -152,7 +163,8 @@ def run_suite(out):
     rows = []
     cases = [('anchor-193g', 193, {'ATOMESH_PROBE_KFD_ANCHOR': '1'}),
              ('anchor-subranges-193g', 193, {'ATOMESH_PROBE_KFD_ANCHOR': '1',
-                                          'ATOMESH_PROBE_SUBRANGES': '1'})]
+                                          'ATOMESH_PROBE_SUBRANGES': '1'}),
+             ('adapter-193g', 193, {'ATOMESH_PROBE_KFD_ADAPTER': '1'})]
     for name, kv_gib, overrides in cases:
         root = out / name
         root.mkdir()
@@ -167,7 +179,7 @@ def run_suite(out):
                 env = role_env(base, 'decode', '127.0.0.1', plan['decode']['env'])
                 for key in ('MC_HIP_NUM_STREAMS', 'MC_HIP_NUM_EVENTS', 'MC_DISABLE_HIP', 'ATOMESH_PROBE_REGISTER_MODE',
                             'MOONCAKE_DISABLE_HIP_DMABUF', 'ATOMESH_PROBE_KFD_ANCHOR',
-                            'ATOMESH_PROBE_SUBRANGES'):
+                            'ATOMESH_PROBE_SUBRANGES', 'ATOMESH_PROBE_KFD_ADAPTER'):
                     env.pop(key, None)
                 env.update(overrides)
                 env['MC_TE_FILTERS'] = f'rdma{rank + 4}'

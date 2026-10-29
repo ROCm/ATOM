@@ -73,7 +73,7 @@ for run in runs:
                 for probe in cases:
                     if probe.get('case') not in {'default-prefill', 'default-decode',
                                                   'fresh-prefill', 'fresh-decode',
-                                                  'anchor-193g', 'anchor-subranges-193g',
+                                                  'anchor-193g', 'anchor-subranges-193g', 'adapter-193g',
                                                   'default-dmabuf-193g', 'disable-dmabuf-193g',
                                                   'default-dmabuf-64g'}:
                         continue
@@ -129,7 +129,7 @@ for run in runs:
                 for entry in row['triton_cases']:
                     for rank in range(4):
                         rank_root = job / 'triton-probe' / entry['case'] / f'rank-{rank}'
-                        sources += [rank_root / name for name in ('memory.json', 'result.json', 'failure.json', 'engine.json', 'registration.json', 'worker.log')]
+                        sources += [rank_root / name for name in ('memory.json', 'result.json', 'failure.json', 'engine.json', 'registration.json', 'kfd-pin.json', 'worker.log')]
                         sources += list(rank_root.glob('stage-probe-*/result.json'))
             for source in sources:
                 if not source.is_file() or not source.resolve().is_relative_to(job.resolve()):
