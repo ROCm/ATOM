@@ -1003,6 +1003,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per draft pass for 12 MB of weight per rank; the GEMM is bitwise the same.
     # A prefill chunk over 1024 tokens keeps this rank's rows and the gather.
     "ATOM_MTP_REPLICATED_FC": lambda: _flag_env("ATOM_MTP_REPLICATED_FC", "0"),
+    # Full vocab embedding on every rank for the MTP draft only (the target keeps
+    # its sharded one): a local lookup instead of masked-embedding + all-reduce,
+    # bit-identical (x + 0 + 0 + 0). +(tp-1)/tp of the table (~0.76 GB) per rank.
+    "ATOM_QWEN35_MTP_REPLICATED_EMBED": lambda: (
+        os.getenv("ATOM_QWEN35_MTP_REPLICATED_EMBED", "0").lower() in ("1", "true")
+    ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(

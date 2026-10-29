@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Qwen3.5 MTP draft TP options: the replicated fc (ATOM_MTP_REPLICATED_FC).
+"""Qwen3.5 MTP draft TP options: the replicated fc (ATOM_MTP_REPLICATED_FC) and
+embedding (ATOM_QWEN35_MTP_REPLICATED_EMBED).
 
 The tests run against a fake 4-rank TP group (all_gather returns what the
 ranks' shards concatenate to), so they check the wiring and the bit-exactness
@@ -12,6 +13,7 @@ import torch
 from torch import nn
 
 import atom.models.qwen3_5_mtp as mtp
+from atom.model_ops.embed_head import ReplicatedEmbedding
 
 VOCAB, HIDDEN, TP = 64, 16, 4
 
@@ -29,6 +31,14 @@ class _FakeTP:
     def all_gather(self, t, dim=-1, use_custom=False):
         assert dim == 0
         return self.full_of[t.data_ptr()].clone()
+
+
+def _sharded(full, rank=1):
+    rows = full.shape[0] // TP
+    shard = nn.Module()
+    shard.weight = nn.Parameter(full[rank * rows : (rank + 1) * rows].clone())
+    shard.num_embeddings = full.shape[0]
+    return shard
 
 
 class _FakeFc(nn.Module):
@@ -107,9 +117,62 @@ def test_fc_stays_column_parallel_at_tp1(monkeypatch):
     assert not (envs.ATOM_MTP_REPLICATED_FC and mtp.get_tp_group().world_size > 1)
 
 
+def _draft(monkeypatch, *, embed):
+    fake = _FakeTP()
+    monkeypatch.setattr(mtp, "get_tp_group", lambda: fake)
+    monkeypatch.setenv("ATOM_QWEN35_MTP_REPLICATED_EMBED", "1" if embed else "0")
+    # VocabParallelEmbedding is asserted on; skip its TP-reading __init__.
+    monkeypatch.setattr(mtp, "VocabParallelEmbedding", nn.Module)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    g = torch.Generator().manual_seed(0)
+    embed_full = torch.randn(VOCAB, HIDDEN, generator=g).to(torch.bfloat16)
+    draft = object.__new__(mtp.Qwen3_5MTP)
+    nn.Module.__init__(draft)
+    draft.model = nn.Module()
+    draft.model.embed_tokens = _sharded(embed_full)
+    fake.full_of[draft.model.embed_tokens.weight.data.data_ptr()] = embed_full
+    return draft, embed_full
+
+
+def test_embed_flag_off_is_a_noop(monkeypatch):
+    draft, _ = _draft(monkeypatch, embed=False)
+    before = draft.model.embed_tokens
+    draft.post_share_with_target(target_base=None)
+    assert draft.model.embed_tokens is before
+
+
+def test_replicated_embed_is_the_gathered_table(monkeypatch):
+    draft, embed_full = _draft(monkeypatch, embed=True)
+    draft.post_share_with_target(target_base=None)
+    emb = draft.model.embed_tokens
+    assert isinstance(emb, ReplicatedEmbedding)
+    assert torch.equal(emb.weight.data, embed_full)
+
+
+def test_masked_shards_summed_equal_full_lookup():
+    """Why the replicated lookup is bit-identical to masked-embedding +
+    all-reduce: every rank but the owner contributes exact zeros, and the
+    rank-ordered fp32 sum of x and zeros, rounded to bf16, is x."""
+    g = torch.Generator().manual_seed(1)
+    table = torch.randn(VOCAB, HIDDEN, generator=g).to(torch.bfloat16)
+    ids = torch.tensor([0, 5, 17, 63, 31])
+    rows = VOCAB // TP
+    partials = []
+    for r in range(TP):
+        own = (ids >= r * rows) & (ids < (r + 1) * rows)
+        part = torch.zeros(len(ids), HIDDEN, dtype=torch.bfloat16)
+        part[own] = table[ids[own]]
+        partials.append(part.float())
+    summed = (((partials[0] + partials[1]) + partials[2]) + partials[3]).bfloat16()
+    assert torch.equal(summed, table[ids])
+
+
 def test_flag_defaults_are_off(monkeypatch):
     from atom.utils import envs
 
-    for name in ("ATOM_MTP_REPLICATED_FC",):
+    for name in (
+        "ATOM_QWEN35_MTP_REPLICATED_EMBED",
+        "ATOM_MTP_REPLICATED_FC",
+    ):
         monkeypatch.delenv(name, raising=False)
         assert not getattr(envs, name)

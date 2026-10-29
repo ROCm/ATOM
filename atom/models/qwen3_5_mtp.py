@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3.5 MTP model."""
 
+import logging
 import re
 
 import torch
@@ -11,9 +12,14 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.config import Config
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
 from atom.model_ops.linear import ColumnParallelLinear, ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5RMSNorm,
@@ -23,6 +29,9 @@ from atom.models.utils import IntermediateTensors
 from atom.utils import envs
 
 from .utils import maybe_prefix
+
+logger = logging.getLogger("atom")
+
 
 # Up to here (decode and draft steps) the replicated fc runs whole on each rank.
 _REPLICATED_FC_MAX_TOKENS = 1024
@@ -207,6 +216,37 @@ class Qwen3_5MTP(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
+
+    def post_share_with_target(self, target_base: nn.Module) -> None:
+        """Replicate the draft's embedding once it is final
+        (ATOM_QWEN35_MTP_REPLICATED_EMBED).
+
+        Runs after the drafter shared the target's embed, so it is whatever the
+        draft really reads. The table is all-gathered from the sharded copy
+        rather than re-read from the checkpoint, so the replicated rows are
+        those very bits. A no-op with the flag off.
+        """
+        tp = get_tp_group()
+        if not (envs.ATOM_QWEN35_MTP_REPLICATED_EMBED and tp.world_size > 1):
+            return
+        sharded = self.model.embed_tokens
+        assert isinstance(sharded, VocabParallelEmbedding), type(sharded)
+        full = tp.all_gather(sharded.weight.data, dim=0)
+        assert full.shape[0] == sharded.num_embeddings, tuple(full.shape)
+        # Built on meta, then handed the gathered table: no second full-size
+        # allocation for a weight that is overwritten anyway.
+        with torch.device("meta"):
+            replicated = ReplicatedEmbedding(full.shape[0], full.shape[1])
+        replicated.weight = atom_parameter(full)
+        # Only the draft's attribute is rebound; the target keeps its shard.
+        self.model.embed_tokens = replicated
+        logger.info(
+            "Qwen3.5 MTP embedding: REPLICATED (%d x %d per rank, no "
+            "post-embed all-reduce)",
+            full.shape[0],
+            full.shape[1],
+        )
+        torch.cuda.empty_cache()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
