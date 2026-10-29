@@ -915,6 +915,7 @@ async def generate_async_multimodal(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    return_token_ids: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -993,7 +994,7 @@ async def generate_async_multimodal(
         else 0.0
     )
 
-    yield {
+    response = {
         "text": text,
         "token_ids": all_token_ids,
         "finish_reason": finish_reason,
@@ -1005,6 +1006,9 @@ async def generate_async_multimodal(
         "tpot": tpot,
         "latency": finished_at - started_at,
     }
+    if return_token_ids and seq is not None:
+        response["prompt_token_ids"] = list(seq.prompt_token_ids)
+    yield response
 
 
 async def generate_async_fanout(
@@ -1841,6 +1845,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
