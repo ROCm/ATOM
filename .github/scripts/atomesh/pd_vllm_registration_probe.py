@@ -77,6 +77,19 @@ def worker(root, rank, kv_gib):
         torch.cuda.synchronize()
         barrier(root, 'kv-allocation', rank)
         observe('after-kv-allocation', 12)
+        before_registration_free = torch.cuda.mem_get_info()[0]
+        addresses, lengths = [kv.data_ptr()], [kv.numel()]
+        if os.environ.get('ATOMESH_PROBE_SUBRANGES') == '1':
+            half = kv.numel() // 2
+            addresses, lengths = [kv.data_ptr(), kv.data_ptr() + half], [half, half - 128 * 1024]
+        anchors = None
+        if os.environ.get('ATOMESH_PROBE_KFD_ANCHOR') == '1':
+            from pd_vllm_kfd_pin import KfdPinAnchors
+            anchors = KfdPinAnchors(os.environ['MC_TE_FILTERS'])
+            for address, length in zip(addresses, lengths):
+                anchors.acquire(address, length)
+            assert len(anchors.anchors) == 1, 'Subranges must share one allocation anchor'
+            observe('after-anchor')
         register_mode = os.environ.get('ATOMESH_PROBE_REGISTER_MODE', 'mooncake')
         if register_mode == 'hip_ipc':
             import ctypes
@@ -87,11 +100,13 @@ def worker(root, rank, kv_gib):
             ipc_handle = (ctypes.c_byte * 64)()
             rc = lib.hipIpcGetMemHandle(ipc_handle, ctypes.c_void_p(kv.data_ptr()))
         else:
-            rc = engine.batch_register_memory([kv.data_ptr()], [kv.numel()])
+            rc = engine.batch_register_memory(addresses, lengths)
         dump(out / 'registration.json', {'rc': rc, 'bytes': kv.numel(), 'mode': register_mode})
         assert rc == 0, f'GPU registration failed: {rc}'
         barrier(root, 'kv-registration', rank)
         observe('after-kv-registration', 13)
+        if anchors:
+            assert abs(torch.cuda.mem_get_info()[0] - before_registration_free) < 16 * 1024**2, 'KFD accounting changed across anchored registration'
         # Exercise the installed original kernel with an exact CPU check.
         from vllm.v1.worker.utils import _zero_kv_blocks_kernel
         segment = torch.full((4, 1536), 7, dtype=torch.int32, device='cuda')
@@ -106,12 +121,18 @@ def worker(root, rank, kv_gib):
         stages = [json.loads((out / f'stage-probe-{s}' / 'result.json').read_text())
                   for s in ('before-engine', 'after-engine-init', 'after-kv-allocation', 'after-kv-registration')]
         assert all(s['status'] == 'success' for s in stages), 'One or more stage probes failed'
-        dump(out / 'result.json', {'status': 'success', 'native_zero_verified': True})
         # Keep all four large allocations alive until every rank completes checks.
         barrier(root, 'verification', rank)
         if register_mode == 'mooncake':
-            rc = engine.batch_unregister_memory([kv.data_ptr()])
+            rc = engine.batch_unregister_memory(addresses)
             assert rc == 0, f'GPU unregistration failed: {rc}'
+        if anchors:
+            anchors.close()
+            observe('after-unregistration', 14)
+            assert json.loads((out / 'stage-probe-after-unregistration/result.json').read_text())['status'] == 'success'
+            assert abs(torch.cuda.mem_get_info()[0] - before_registration_free) < 32 * 1024**2, 'KFD accounting changed after removing anchors'
+        dump(out / 'result.json', {'status': 'success', 'native_zero_verified': True,
+                                  'anchored_accounting_verified': anchors is not None})
         return 0
     except Exception:
         failure = {'status': 'failed', 'traceback': traceback.format_exc()}
@@ -129,9 +150,9 @@ def run_suite(out):
     base.update(plan['common_env'])
     base.update(VLLM_PLUGINS='', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
     rows = []
-    cases = [('default-dmabuf-193g', 193, {}),
-             ('disable-dmabuf-193g', 193, {'MOONCAKE_DISABLE_HIP_DMABUF': '1'}),
-             ('default-dmabuf-64g', 64, {})]
+    cases = [('anchor-193g', 193, {'ATOMESH_PROBE_KFD_ANCHOR': '1'}),
+             ('anchor-subranges-193g', 193, {'ATOMESH_PROBE_KFD_ANCHOR': '1',
+                                          'ATOMESH_PROBE_SUBRANGES': '1'})]
     for name, kv_gib, overrides in cases:
         root = out / name
         root.mkdir()
@@ -145,7 +166,8 @@ def run_suite(out):
             for rank in range(4):
                 env = role_env(base, 'decode', '127.0.0.1', plan['decode']['env'])
                 for key in ('MC_HIP_NUM_STREAMS', 'MC_HIP_NUM_EVENTS', 'MC_DISABLE_HIP', 'ATOMESH_PROBE_REGISTER_MODE',
-                            'MOONCAKE_DISABLE_HIP_DMABUF'):
+                            'MOONCAKE_DISABLE_HIP_DMABUF', 'ATOMESH_PROBE_KFD_ANCHOR',
+                            'ATOMESH_PROBE_SUBRANGES'):
                     env.pop(key, None)
                 env.update(overrides)
                 env['MC_TE_FILTERS'] = f'rdma{rank + 4}'
