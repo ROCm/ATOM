@@ -95,7 +95,7 @@ c48_append_port_mount() {
       [[ "${c48_fix_digest%% *}" == "${c48_pp_sha}" ]] || return 2
       docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
     done <<'C48_PP_MOONCAKE_FILES'
-mooncake_connector.py 0680399eb8ee44f4610d2cc125498707953ea162519f8e0ed6552c0f3cfb21df
+mooncake_connector.py f4291a3ddecd415d1d24135d5a4d356bb6aedac2ebb58a90282af512a95fb4a2
 dcp_transfer.py 706b4ebc441a2a0f3ae2eaf9de432af0738b129033bc8278da55886dc300992e
 dcp_staging.py 253741ba6c6b8537a0678152d7dfd57e6da8139392f73148c8fcbe84727a49a5
 C48_PP_MOONCAKE_FILES

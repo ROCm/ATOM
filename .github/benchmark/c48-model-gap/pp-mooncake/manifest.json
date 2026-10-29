@@ -1,11 +1,11 @@
 {
-  "source_sha": "8d7b47076af6dd65204387de33492e44a3677752",
+  "source_sha": "e3d7f52dd92e2190ddb9a07dbe65a9ecd6d01aa3",
   "sha256": {
-    "mooncake_connector.py": "0680399eb8ee44f4610d2cc125498707953ea162519f8e0ed6552c0f3cfb21df",
+    "mooncake_connector.py": "f4291a3ddecd415d1d24135d5a4d356bb6aedac2ebb58a90282af512a95fb4a2",
     "dcp_transfer.py": "706b4ebc441a2a0f3ae2eaf9de432af0738b129033bc8278da55886dc300992e",
     "dcp_staging.py": "253741ba6c6b8537a0678152d7dfd57e6da8139392f73148c8fcbe84727a49a5"
   },
-  "validation": "285 CPU AST-adapter tests; GPU validation pending",
+  "validation": "306 CPU AST-adapter tests, including raw [B,H,N,C] views and padded allocations; GPU validation pending",
   "staging_bytes_per_sender": 67108864,
   "reference_harness_commit": "a55063bd"
 }

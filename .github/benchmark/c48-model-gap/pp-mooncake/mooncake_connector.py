@@ -2490,16 +2490,18 @@ class MooncakeConnectorWorker:
             is_mla_region = isinstance(
                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
             )
-            if is_mla_region and cache.ndim >= 3 and cache[0].is_contiguous():
+            if (
+                is_mla_region
+                and layer_spec.tokens_per_state == 1
+                and cache.ndim in (3, 4)
+                and (cache.ndim == 3 or cache.shape[1] == 1)
+                and cache[0].is_contiguous()
+            ):
                 # HMA can enlarge logical blocks independently on P and D.
-                # Derive the physical layout from the registered tensor.
-                logical_blocks = self.kv_cache_config.num_blocks
-                if logical_blocks > 0 and cache.shape[0] % logical_blocks == 0:
-                    ratio = cache.shape[0] // logical_blocks
-                    if ratio > 0 and layer_spec.block_size % ratio == 0:
-                        kernel_size = layer_spec.block_size // ratio
-                        if cache.shape[1] == kernel_size:
-                            self.mla_block_sizes[layer_name] = kernel_size
+                # Raw views are [B, H=1, N, C], or legacy [B, N, C].
+                kernel_size = cache.shape[-2]
+                if kernel_size > 0 and layer_spec.block_size % kernel_size == 0:
+                    self.mla_block_sizes[layer_name] = kernel_size
             tensor_blocks = cache.shape[0] if cache.ndim > 1 else num_blocks
             if cache.ndim == 1:
                 # A flat buffer is block-major only when it is an integral run
@@ -2603,7 +2605,10 @@ class MooncakeConnectorWorker:
                 block_len = region_cache.stride(0) * region_cache.element_size()
                 region_base_addresses.append(base_addr)
 
-                if isinstance(layer_spec, KpoolTailSpec):
+                if layer_name in self.mla_block_sizes:
+                    # A padded allocation need not be exactly block-major.
+                    kv_block_len = region_cache[0].nbytes
+                elif isinstance(layer_spec, KpoolTailSpec):
                     kv_block_len = layer_spec.unpadded_page_size_bytes // 2
                 elif isinstance(layer_spec, AttentionSpec) and block_is_contiguous:
                     assert (
