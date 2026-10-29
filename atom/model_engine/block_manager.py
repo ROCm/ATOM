@@ -2914,8 +2914,24 @@ class BlockManager:
 
         Unchanged when the chunk finishes the prompt, or when it is shorter
         than reaching the next boundary.
+
+        Under a tier anchor grid (`align_checkpoint_anchor`) the chunk ends at
+        the prompt-end anchor instead when the forward would snapshot it
+        elsewhere: a forward from off the midstep grid moves the anchor off the
+        tier grid, where the tier never stores it. The end of a forward is
+        read exactly.
         """
-        if not self._midstep_applies(seq) or start + chunk >= seq.num_tokens:
+        if not self._midstep_applies(seq):
+            return chunk
+        anchor = seq.checkpoint_end_pos
+        if (
+            self.checkpoint_anchor_grid != self.hash_block_size
+            and start < anchor < start + chunk
+            and snap_midstep_position(anchor, start, start + chunk, self.midstep_grid)
+            != anchor
+        ):
+            return anchor - start
+        if start + chunk >= seq.num_tokens:
             return chunk
         hbs = self.hash_block_size
         aligned = (start + chunk) // hbs * hbs - start

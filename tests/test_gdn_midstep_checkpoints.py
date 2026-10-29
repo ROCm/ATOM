@@ -335,6 +335,30 @@ class TestPagedMidstep:
         # The anchor at 40 was read at 32, so the resume starts there.
         assert bm.can_allocate(stateful_seq(PROMPT)) == 32 // BLOCK
 
+    def test_a_tier_anchor_grid_ends_the_chunk_on_the_anchor(self):
+        """LMCache MP stores images only on its chunk grid. A forward that
+        would snapshot the anchor at 40 elsewhere (at 32 from 0, at 36 from 4)
+        ends on it instead and reads it exactly; one whose own grid reaches 40
+        is left alone, and without a tier grid nothing changes."""
+        bm = self.bm()
+        bm.align_checkpoint_anchor(2 * BLOCK)
+        seq = admitted(bm)
+        assert seq.checkpoint_end_pos == 40
+        assert bm.align_midstep_chunk(seq, 0, 44) == 40
+        assert bm.align_midstep_chunk(seq, 4, 40) == 36
+        assert bm.align_midstep_chunk(seq, 8, 36) == 36
+        assert bm.align_midstep_chunk(seq, 40, 4) == 4
+        bm.plan_midstep(seq, 0, 40)
+        assert seq.midstep_anchor_pos == 40
+        bm.hash_blocks(seq, 40)
+        bm.complete_previous_state_batch()
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        assert bm.can_allocate(stateful_seq(PROMPT)) == 40 // BLOCK
+
+        plain = self.bm()
+        assert plain.align_midstep_chunk(admitted(plain), 0, 44) == 44
+
     def test_a_cancelled_forward_hands_its_scratch_back_vacant(self):
         bm = self.bm()
         seq = admitted(bm)
