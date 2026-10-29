@@ -7,6 +7,7 @@ test_tbo_mark_used_on_compute.py). CPU only: the TBO hooks and
 `record_stream` are monkeypatched."""
 
 import inspect
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,10 @@ def test_every_tensor_returned_is_held_for_the_compute_stream(tbo):
     tbo.clear()
     assert ub.tbo_on_comm(lambda: a) is a
     assert tbo == ["comm", "compute", (id(a), "compute stream")]
+    # FusedMoE's DP gather returns its rows with their counts.
+    tbo.clear()
+    ub.tbo_on_comm(lambda: ((a, b), 3, [3, 5]))
+    assert tbo == ["comm", "compute", *held]
 
 
 def test_both_compressor_projections_are_held(tbo, monkeypatch):
@@ -71,10 +76,77 @@ def test_both_compressor_projections_are_held(tbo, monkeypatch):
     assert tbo == ["comm", "compute", *((id(t), "compute stream") for t in out)]
 
 
-def test_v4_attention_and_moe_comm_phases_go_through_tbo_on_comm():
+def test_tp_all_reduce_output_is_held(tbo, monkeypatch):
+    """Pure TP+TBO's overlapped all-reduce allocates its output on the comm
+    stream, like the PCP gathers."""
+    mdo = pytest.importorskip("atom.model_ops.module_dispatch_ops")
+    monkeypatch.setenv("ATOM_TBO_TP_AR_MODE", "overlap")
+    monkeypatch.setattr(ub, "tbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(ub, "tbo_get_comm_stream", lambda: "comm stream")
+    reduced = torch.ones(3)
+
+    def all_reduce(x, stream):
+        tbo.append(("all_reduce", stream))
+        return reduced
+
+    monkeypatch.setattr(
+        ub, "tbo_get_ubatch_tp_comm", lambda i: SimpleNamespace(all_reduce=all_reduce)
+    )
+    assert mdo.tbo_all_reduce(torch.zeros(3)) is reduced
+    held = (id(reduced), "compute stream")
+    assert tbo == ["comm", ("all_reduce", "comm stream"), "compute", held]
+
+
+def test_side_stream_compressors_hold_their_gathered_inputs(monkeypatch):
+    """Under a graph the compressors run on side streams, while a PCP prefill
+    gathers their inputs on the main stream, which may reuse that memory once
+    `_launch_compressors` returns."""
+    v4 = pytest.importorskip("atom.models.deepseek_v4")
+    log = []
+    monkeypatch.setattr(
+        torch.Tensor, "record_stream", lambda t, s: log.append((id(t), s))
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+    monkeypatch.delenv("ATOM_V4_BYPASS_ATTN", raising=False)
+    combined = [torch.zeros(2), torch.ones(2)]
+    streams = [SimpleNamespace(wait_stream=lambda s: None) for _ in combined]
+    read = []
+    pairs = [(lambda x, combined, **kw: read.append(combined), s) for s in streams]
+    attn = SimpleNamespace(
+        compress_ratio=4,
+        _compressors_async=lambda: True,
+        _compressor_streams=lambda: pairs,
+        _pcp_gather_compressor_inputs=lambda x, cs: combined,
+    )
+    fc = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=SimpleNamespace(
+            compress_plans={4: None},
+            state_slot_in=None,
+            state_slot_out=None,
+            block_tables=None,
+        ),
+        main_stream=None,
+    )
+    monkeypatch.setattr(v4, "get_forward_context", lambda: fc)
+    monkeypatch.setattr(v4, "_pcp_active", lambda: True)
+    v4.DeepseekV4Attention._launch_compressors(attn, torch.zeros(2))
+    assert read == combined
+    assert log == [(id(c), s) for c, s in zip(combined, streams)]
+
+
+def test_tbo_comm_phases_go_through_tbo_on_comm():
     """A comm phase written out by hand -- yield, collective, switch back --
-    skips the hold: the PCP+TBO extend K was overwritten that way."""
+    skips the hold: the PCP+TBO extend K was overwritten that way. Mori's
+    dispatch / combine return views of its own buffers, which the caching
+    allocator never hands out, so its hand-written phases stay."""
     v4 = pytest.importorskip("atom.models.deepseek_v4")
     moe = pytest.importorskip("atom.model_ops.moe")
-    for src in (inspect.getsource(v4), inspect.getsource(moe.FusedMoE._run_experts)):
+    mdo = pytest.importorskip("atom.model_ops.module_dispatch_ops")
+    for src in (
+        inspect.getsource(v4),
+        inspect.getsource(moe.FusedMoE._run_experts),
+        inspect.getsource(moe.FusedMoE.forward_impl_graph),
+        inspect.getsource(mdo.tbo_all_reduce),
+    ):
         assert "tbo_yield_and_switch_from_compute_to_comm(" not in src

@@ -137,13 +137,21 @@ def pcp_allgather_rerange(
     return _rerange(gathered, pcp_size, input_.shape[0])
 
 
+def gather_rows(gather, rows):
+    """`gather(list of tensors) -> list of tensors` over `rows`, one-byte
+    dtypes carried as uint8: aiter's grouped `all_gatherv` copies bytes
+    whatever the dtype, but its PyNCCL fallback has no fp8 / e8m0 / fp4x2."""
+    gathered = gather(
+        [t.view(torch.uint8) if t.element_size() == 1 else t for t in rows]
+    )
+    return tuple(g.view(t.dtype) for g, t in zip(gathered, rows))
+
+
 def pcp_allgather_rerange_many(
     inputs: list[torch.Tensor], pcp_size: int | None = None
 ) -> list[torch.Tensor]:
     """`pcp_allgather_rerange` of every tensor in `inputs` (same row count) in
-    one grouped collective. One-byte dtypes travel as uint8: past its custom
-    all-gather size limit `all_gatherv` falls back to PyNCCL, which has no fp8
-    dtype."""
+    one grouped collective."""
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
@@ -155,15 +163,11 @@ def pcp_allgather_rerange_many(
     # its custom all-reduce (which `all_gatherv` tries first) also runs at 6.
     if pcp_size not in (2, 4, 8):
         return [pcp_allgather_rerange(t, pcp_size) for t in inputs]
-    sent = [
-        t.contiguous().view(torch.uint8) if t.element_size() == 1 else t.contiguous()
-        for t in inputs
-    ]
-    gathered = get_pcp_group().device_communicator.all_gatherv(sent, dim=0)
-    return [
-        _rerange(g.view(t.dtype), pcp_size, t.shape[0])
-        for g, t in zip(gathered, inputs)
-    ]
+    comm = get_pcp_group().device_communicator
+    gathered = gather_rows(
+        lambda ts: comm.all_gatherv(ts, dim=0), [t.contiguous() for t in inputs]
+    )
+    return [_rerange(g, pcp_size, t.shape[0]) for g, t in zip(gathered, inputs)]
 
 
 def _rerange(gathered: torch.Tensor, pcp_size: int, local_len: int) -> torch.Tensor:

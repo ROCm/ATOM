@@ -2009,6 +2009,10 @@ class DeepseekV4Attention(nn.Module):
         for (compressor, stream), comb in zip(pairs, combined):
             if side:
                 stream.wait_stream(fc.main_stream)
+                if comb is not None:
+                    # Made on the main stream, which may reuse it once this
+                    # returns: hold it until the side stream has read it.
+                    comb.record_stream(stream)
             with torch.cuda.stream(stream) if side else nullcontext():
                 compressor(
                     x,

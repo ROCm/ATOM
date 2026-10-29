@@ -6,6 +6,7 @@ read on the compute stream must not be handed to the next comm-stream
 allocation while the compute stream has yet to read it. Under PCP+TBO the
 gathered extend K was overwritten that way by the other ubatch's gather."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -49,7 +50,43 @@ def test_marked_tensor_is_held_until_the_compute_stream_reads_it(monkeypatch):
     assert not _next_comm_allocation_takes_it(monkeypatch, mark=True)
 
 
+@pytest.mark.skipif(
+    any(
+        "expandable_segments:true" in os.environ.get(var, "").lower().replace(" ", "")
+        for var in (
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "PYTORCH_HIP_ALLOC_CONF",
+            "PYTORCH_ALLOC_CONF",
+        )
+    ),
+    reason="relies on the default caching allocator handing a freed block of "
+    "the same size straight back to the stream that made it",
+)
 def test_unmarked_tensor_goes_straight_back_to_the_comm_stream(monkeypatch):
     """Pins the hazard itself: if this stops holding, the test above no longer
     shows anything."""
     assert _next_comm_allocation_takes_it(monkeypatch, mark=False)
+
+
+def test_marking_while_a_graph_records(monkeypatch):
+    """Decode TBO's overlapped all-reduce and the side-stream compressors mark
+    their tensors while a graph records: the mark must neither break the
+    capture nor the replay."""
+    comm, compute = torch.cuda.Stream(), torch.cuda.Stream()
+    ctx = SimpleNamespace(compute_stream=compute)
+    monkeypatch.setattr(ubatching, "_get_current_tbo_context", lambda: ctx)
+    x = torch.ones((N,), device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph, stream=comm):
+        gathered = x * 2
+        compute.wait_stream(comm)
+        with torch.cuda.stream(compute):
+            ubatching.tbo_mark_used_on_compute(gathered)
+            out = gathered + 1
+        comm.wait_stream(compute)
+    del gathered
+    x.fill_(3)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.full_like(x, 7))

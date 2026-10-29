@@ -605,11 +605,18 @@ def tbo_mark_used_on_compute(*tensors):
     compute stream, which reads them. Freed without it, their memory goes back
     to the comm stream at once, and the comm stream waits only on its own
     ubatch's compute: the other ubatch's next collective can overwrite them
-    before this ubatch's kernels have read them. Skips anything not a tensor."""
+    before this ubatch's kernels have read them. Walks into lists and tuples;
+    skips anything else not a tensor."""
     stream = _get_current_tbo_context().compute_stream
-    for t in tensors:
-        if isinstance(t, torch.Tensor):
-            t.record_stream(stream)
+
+    def mark(items):
+        for t in items:
+            if isinstance(t, torch.Tensor):
+                t.record_stream(stream)
+            elif isinstance(t, (list, tuple)):
+                mark(t)
+
+    mark(tensors)
 
 
 def tbo_on_comm(fn: Callable, *args):
