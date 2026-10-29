@@ -21,9 +21,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import buffer_load, mfma
 
-from .nvfp4 import Nvfp4Cache
-from .nvfp4_gfx950 import fits_buffer_offsets
-from .utils import robust_allocator
+from .nvfp4 import Nvfp4Cache, fits_buffer_offsets
 
 _LOG2E = 1.4426950408889634
 _LN2 = gl.constexpr(0.6931471805599453)
@@ -466,7 +464,7 @@ def _nvfp4_sparse_decode_kernel(
     )
 
 
-def can_use_nvfp4_decode_gfx950(
+def can_use_nvfp4_decode(
     q: torch.Tensor,
     k_cache: Nvfp4Cache,
     v_cache: Nvfp4Cache,
@@ -501,7 +499,7 @@ def can_use_nvfp4_decode_gfx950(
 
 
 @torch.no_grad()
-def flash_decode_nvfp4_gfx950(
+def flash_decode_nvfp4(
     q: torch.Tensor,  # [rows, num_q_heads, 128]
     k_cache: Nvfp4Cache,
     v_cache: Nvfp4Cache,
@@ -513,10 +511,9 @@ def flash_decode_nvfp4_gfx950(
     sm_scale: float,
 ) -> torch.Tensor:
     """Sparse attention of every row over its top-k blocks; callers check
-    `can_use_nvfp4_decode_gfx950` first. Returns O [rows, num_q_heads, 128]."""
+    `can_use_nvfp4_decode` first. Returns O [rows, num_q_heads, 128]."""
     from .merge import _merge_topk_attn_out_kernel
 
-    triton.set_allocator(robust_allocator)
     batch_size, num_q_heads, head_dim = q.shape
     page_size = k_cache.page_size
     num_kv_heads = k_cache.num_heads

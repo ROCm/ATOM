@@ -43,6 +43,25 @@ def test_refusal(gfx, index_fp4, kv_nvfp4, tp, reuses_topk, refused):
         assert refused in reason
 
 
+@pytest.mark.parametrize("index_fp4, kv_nvfp4", [(True, False), (False, True)])
+def test_plugin_mode_refuses_fp4_caches(index_fp4, kv_nvfp4):
+    # The vLLM / SGLang bridges bind their own caches: refused, not silently FP8.
+    reason = m3_fp4_cache_unsupported_reason(
+        "gfx950", index_fp4, kv_nvfp4, 4, HEADS, KV_HEADS, False, plugin=True
+    )
+    assert "plugin mode" in reason
+    assert (
+        m3_fp4_cache_unsupported_reason(
+            "gfx950", False, False, 4, HEADS, KV_HEADS, False, plugin=True
+        )
+        is None
+    )
+
+
+# Four sparse layers out of six (layers 1 and 3 dense).
+SPARSE = {"sparse_attention_config": {"sparse_attention_freq": [1, 0, 1, 0, 1, 1]}}
+
+
 @pytest.mark.parametrize(
     "fields, reuses",
     [
@@ -67,12 +86,32 @@ def test_refusal(gfx, index_fp4, kv_nvfp4, tp, reuses_topk, refused):
             },
             False,
         ),
+        # The offset shifts sharing past every sparse layer: none reuses.
+        (
+            {
+                "use_index_cache": True,
+                "index_topk_freq": 4,
+                "index_skip_topk_offset": 1000,
+            },
+            False,
+        ),
+        # An "S" past the last sparse layer's ordinal (3) is never read.
+        (
+            {"use_index_cache": True, "index_topk_pattern": ["F", "F", "F", "F", "S"]},
+            False,
+        ),
+        ({"use_index_cache": True, "index_topk_pattern": ["F", "F", "F", "S"]}, True),
     ],
 )
 def test_reuses_index_topk_follows_the_model_rule(fields, reuses):
+    """The startup check's rule is the model's schedule over its sparse layers."""
     from types import SimpleNamespace
 
-    assert m3_reuses_index_topk(SimpleNamespace(**fields)) is reuses
+    from atom.models.minimax_m3.index_schedule import should_skip_index_topk
+
+    cfg = SimpleNamespace(**SPARSE, **fields)
+    assert m3_reuses_index_topk(cfg) is reuses
+    assert reuses is any(should_skip_index_topk(cfg, layer)[0] for layer in range(6))
 
 
 def test_nvfp4_pool_fields_and_views():

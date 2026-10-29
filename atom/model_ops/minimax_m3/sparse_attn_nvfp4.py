@@ -8,7 +8,7 @@ The cache is the NVFP4 layout of ``index_fp4`` per kv head:
 
 A row is a decode query row or a prefill query token. It attends the top-k
 128-blocks the indexer picked for it, addressed through its request's block
-table, up to its own causal length. ``nvfp4_kernels.decode_gfx950`` does the
+table, up to its own causal length. ``nvfp4_kernels.decode`` does the
 attention; this module maps ATOM's batch onto its per-row (request, causal
 length) arguments.
 """
@@ -17,9 +17,9 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.minimax_m3.nvfp4_kernels.decode_gfx950 import (
-    can_use_nvfp4_decode_gfx950,
-    flash_decode_nvfp4_gfx950,
+from atom.model_ops.minimax_m3.nvfp4_kernels.decode import (
+    can_use_nvfp4_decode,
+    flash_decode_nvfp4,
 )
 from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import Nvfp4Cache
 
@@ -32,7 +32,7 @@ def check_nvfp4_sparse_attention(q, k_payload, k_scale, v_payload, v_scale, topk
     fixed per deployment, so one call per layer at its first forward is enough."""
     k = Nvfp4Cache(payload=k_payload, scales=k_scale)
     v = Nvfp4Cache(payload=v_payload, scales=v_scale)
-    if not can_use_nvfp4_decode_gfx950(q, k, v, topk_idx, BLOCK):
+    if not can_use_nvfp4_decode(q, k, v, topk_idx, BLOCK):
         raise ValueError(
             "ATOM_M3_SPARSE_KV_NVFP4: the gfx950 NVFP4 attention kernel needs "
             f"16 q heads per kv head and head dim 128; got q {tuple(q.shape)}, "
@@ -54,7 +54,7 @@ def nvfp4_sparse_attention(
     sm_scale: float,
 ) -> torch.Tensor:
     """O ``[rows, num_heads, D]`` of every row over its top-k blocks."""
-    return flash_decode_nvfp4_gfx950(
+    return flash_decode_nvfp4(
         q.contiguous(),
         Nvfp4Cache(payload=k_payload, scales=k_scale),
         Nvfp4Cache(payload=v_payload, scales=v_scale),

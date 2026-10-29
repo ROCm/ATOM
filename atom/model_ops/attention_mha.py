@@ -1193,6 +1193,12 @@ class PagedAttentionImpl(nn.Module):
         )
 
 
+def _step_stage(stage: torch.Tensor, num_tokens: int, page_dim: int) -> torch.Tensor:
+    """The leading pages of a token-major staging buffer that a step's
+    ``num_tokens`` rows occupy (``page_dim`` is the buffer's page-row axis)."""
+    return stage[: -(-num_tokens // stage.shape[page_dim])]
+
+
 class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """MiniMax-M3 sparse attention as a first-class ``PagedAttentionImpl``.
 
@@ -1406,9 +1412,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.index_cache_dtype if self.index_cache_dtype == "fp8" else "auto"
         )
         index_fp4 = self.index_scale is not None
+        # Only the staging pages this step writes: the writer checks the index
+        # cache against the KV pages it is given, and a persistent FP8 index pool
+        # may be smaller than the whole staging buffer (max_num_batched_tokens rows).
         if self.kv_nvfp4:
-            fused_k_cache = self.kv_stage[:, 0]
-            fused_v_cache = self.kv_stage[:, 1]
+            kv_stage = _step_stage(self.kv_stage, num_tokens, page_dim=2)
+            fused_k_cache, fused_v_cache = kv_stage[:, 0], kv_stage[:, 1]
             fused_kv_slot_mapping = self.kv_stage_slots[:num_tokens]
             fused_kv_block_size = self.kv_stage.shape[2]
             kv_cache_dtype = "auto"
@@ -1419,7 +1428,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             # SHUFFLE page size (== ASM_PAGE_SIZE == 16)
             fused_kv_block_size = k_cache.shape[3]
         if index_fp4:
-            fused_index_cache = self.index_stage
+            fused_index_cache = _step_stage(self.index_stage, num_tokens, page_dim=1)
             fused_index_slot_mapping = self.index_stage_slots[:num_tokens]
         else:
             fused_index_cache = self.index_cache
@@ -1594,7 +1603,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         ):
             return False
         from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import Nvfp4Cache
-        from atom.model_ops.minimax_m3.nvfp4_kernels.verify_topk_gfx950 import (
+        from atom.model_ops.minimax_m3.nvfp4_kernels.verify_topk import (
             can_fuse_verify_topk,
         )
         from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
@@ -1885,7 +1894,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             if self._fused_verify_topk(index_q, max_query_len):
                 # NVFP4 attention reads top-k ids only: no sparse block table.
                 from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import Nvfp4Cache
-                from atom.model_ops.minimax_m3.nvfp4_kernels.verify_topk_gfx950 import (
+                from atom.model_ops.minimax_m3.nvfp4_kernels.verify_topk import (
                     fused_verify_topk_idx,
                 )
 

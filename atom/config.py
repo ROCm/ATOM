@@ -1920,19 +1920,12 @@ def qrep_for_step(
 
 
 def m3_reuses_index_topk(text_config) -> bool:
-    """Whether any MiniMax-M3 sparse layer reuses the previous layer's top-k.
+    """Whether any MiniMax-M3 sparse layer reuses the previous layer's top-k:
+    the model's own schedule (``models/minimax_m3/index_schedule``) over its
+    sparse layers, ``index_skip_topk_offset`` and the pattern's bounds included."""
+    from atom.models.minimax_m3.index_schedule import reuses_index_topk
 
-    The rule of ``models/minimax_m3/model._should_skip_minimax_m3_index_topk``,
-    over all layers: off without ``use_index_cache``; else an explicit
-    ``index_topk_pattern`` decides (any ``"S"`` reuses) and takes precedence
-    over ``index_topk_freq`` (above 1 reuses).
-    """
-    if not getattr(text_config, "use_index_cache", False):
-        return False
-    pattern = getattr(text_config, "index_topk_pattern", None)
-    if pattern is not None:
-        return "S" in pattern
-    return int(getattr(text_config, "index_topk_freq", 1) or 1) > 1
+    return reuses_index_topk(text_config)
 
 
 def m3_fp4_cache_unsupported_reason(
@@ -1943,6 +1936,7 @@ def m3_fp4_cache_unsupported_reason(
     num_heads: int,
     num_kv_heads: int,
     reuses_topk: bool,
+    plugin: bool = False,
 ) -> str | None:
     """Why MiniMax-M3's FP4 index cache / NVFP4 sparse KV cannot run here, or None.
 
@@ -1950,10 +1944,13 @@ def m3_fp4_cache_unsupported_reason(
     decode e2m1 with a gfx950-only instruction. The NVFP4 attention kernel
     serves 16 q heads per kv head on a rank (M3.1 at TP4: 16 / 1) and only layers
     that run their own indexer: a layer reusing the previous top-k writes no
-    NVFP4 K/V.
+    NVFP4 K/V. The vLLM / SGLang plugin bridges bind their own caches and know
+    neither layout, so a plugin deployment would silently keep FP8.
     """
     if not (index_fp4 or kv_nvfp4):
         return None
+    if plugin:
+        return "FP4/NVFP4 MiniMax-M3 caches are not supported in plugin mode"
     if gfx != "gfx950":
         return f"FP4/NVFP4 MiniMax-M3 caches need gfx950, not {gfx}"
     if kv_nvfp4:
@@ -2769,6 +2766,7 @@ class Config:
                     text_cfg.num_attention_heads,
                     text_cfg.num_key_value_heads,
                     m3_reuses_index_topk(text_cfg),
+                    plugin=self.plugin_config is not None,
                 )
                 if fp4_off is not None:
                     raise ValueError(fp4_off)

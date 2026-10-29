@@ -262,7 +262,7 @@ def test_attention_check_refuses_eight_q_heads():
 def test_fused_verify_topk_matches_scorer(bs, ctx):
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
     from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import Nvfp4Cache
-    from atom.model_ops.minimax_m3.nvfp4_kernels.verify_topk_gfx950 import (
+    from atom.model_ops.minimax_m3.nvfp4_kernels.verify_topk import (
         can_fuse_verify_topk,
         fused_verify_topk_idx,
     )
@@ -295,6 +295,87 @@ def test_fused_verify_topk_matches_scorer(bs, ctx):
     assert not can_fuse_verify_topk(q[: 2 * q_rows], cache, q_rows, topk, 1, PAGE, PAGE)
     padded = torch.cat([q, q[:2]])  # 2 rows past the last whole group
     assert not can_fuse_verify_topk(padded, cache, q_rows, topk, 1, PAGE, PAGE)
+
+
+@pytest.mark.parametrize("seq_lens", [[2688] * 3, [2688, 5120, 4000, 129]])
+def test_fused_verify_topk_ties_match_scorer(seq_lens):
+    """Tied scores at the selection cutoff: both paths keep the higher block ids.
+
+    A zero query scores every block 0, so the whole selection is decided by the
+    tie rule. 2688 tokens are 21 blocks: 20 candidates for 15 slots after the
+    forced local block, so the cutoff falls inside the tie.
+    """
+    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+    from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import Nvfp4Cache
+    from atom.model_ops.minimax_m3.nvfp4_kernels.verify_topk import (
+        can_fuse_verify_topk,
+        fused_verify_topk_idx,
+    )
+    from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import decode_rows
+
+    torch.manual_seed(8)
+    bs, q_rows, topk, blocks = len(seq_lens), 8, 16, 256
+    payload, scale = fp4_cache(blocks, seed=9)
+    cache = Nvfp4Cache(payload=payload, scales=scale)
+    ctx = max(seq_lens)
+    maxb = (ctx + PAGE - 1) // PAGE
+    bt = torch.stack([torch.randperm(blocks, device=DEV)[:maxb] for _ in range(bs)])
+    bt = bt.to(torch.int32)
+    seq = torch.tensor(seq_lens, device=DEV, dtype=torch.int32)
+    q = torch.zeros(bs * q_rows, 1, D, device=DEV, dtype=torch.bfloat16)
+    assert can_fuse_verify_topk(q, cache, q_rows, topk, 1, PAGE, PAGE)
+    ref = minimax_m3_index_topk_decode(
+        q, payload, bt, seq, max_seq_len=ctx, topk=topk, init_blocks=0,
+        local_blocks=1, num_kv_heads=1, sm_scale=D**-0.5, max_query_len=q_rows,
+        index_kv_scale=scale,
+    )[0]  # fmt: skip
+    req, row_seq = decode_rows(seq, bs * q_rows, q_rows)
+    got = fused_verify_topk_idx(
+        q, cache, bt, row_seq, ctx, req, q_rows, PAGE, topk, 0, 1, D**-0.5, 1.0
+    )[0]
+    assert _same_sets(ref, got)
+    # The last row of a 21-block request: the forced block 20 and the top 15 of
+    # 0..19 by id.
+    if seq_lens[0] == 2688:
+        assert got[q_rows - 1].sort().values.tolist() == list(range(5, 21))
+
+
+def test_step_staging_fits_a_small_fp8_index_pool():
+    """NVFP4 KV with an FP8 index: the writer checks the index pool against the KV
+    pages it is given, so it gets only the step's staging pages, not the whole
+    buffer (sized for max_num_batched_tokens), which the pool may be smaller than."""
+    import aiter
+
+    from atom.model_ops.attention_mha import _step_stage
+
+    torch.manual_seed(10)
+    T, heads, rot = 1, 16, 64
+    kv_stage = torch.zeros(4, 2, PAGE, 1, D, dtype=torch.bfloat16, device=DEV)
+    index_pool = torch.zeros(2, PAGE, D, dtype=torch.float8_e4m3fn, device=DEV)
+    qkv = torch.randn(T, (heads + 4) * D, dtype=torch.bfloat16, device=DEV)
+    w = [torch.randn(D, dtype=torch.bfloat16, device=DEV) * 0.1 for _ in range(4)]
+    cos_sin = torch.randn(4096, rot, dtype=torch.bfloat16, device=DEV)
+    pos = torch.zeros(T, dtype=torch.int64, device=DEV)
+    slots = torch.arange(T, dtype=torch.int64, device=DEV)
+
+    def write(stage):
+        q_out = torch.empty(T, heads * D, dtype=torch.bfloat16, device=DEV)
+        index_q = torch.empty(T, D, dtype=torch.bfloat16, device=DEV)
+        aiter.fused_qknorm_idxrqknorm(
+            qkv, w[0], w[1], cos_sin, pos, heads, 1, rot, 1e-6, w[2], w[3], 1,
+            slots, stage[:, 0], stage[:, 1], index_pool, PAGE, q_out, index_q,
+            slots, kv_cache_dtype="auto", index_cache_dtype="fp8",
+            k_scale=None, v_scale=None, asm_layout=False,
+        )  # fmt: skip
+
+    # AITER's host check (index_cache.numel() >= kv pages * 128 * 128) aborts the
+    # process on failure, so the whole buffer is checked by its arithmetic only.
+    assert index_pool.numel() < kv_stage.shape[0] * PAGE * D
+    step = _step_stage(kv_stage, T, page_dim=2)
+    assert step.shape[0] == 1
+    write(step)
+    torch.cuda.synchronize()
+    assert kv_stage[0, 0, 0].abs().sum() > 0  # the token's K landed in page 0
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

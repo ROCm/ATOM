@@ -7,9 +7,9 @@ row's best ``KP`` blocks in registers; the program reduces its warps' lists to t
 split's best ``KP``, and a merge kernel reduces the splits' lists, adds the forced
 init/local blocks and writes ascending ids. The scores are 16x16x32 MFMA products
 (bf16, or for an NVFP4 cache fp16 even dims then odd dims). Blocks rank by score, then
-lower block id, the order of ``minimax_m3_index_topk_decode``; every list keeps its
+the higher block id, the order of ``index_topk._pack_score_key``; every list keeps its
 blocks' top ``KP`` in that order, so the ids equal that score + top-k path's whatever
-the split of the blocks.
+the split of the blocks, ties at the cutoff included.
 """
 
 import torch
@@ -19,8 +19,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import buffer_load, mfma
 
-from .nvfp4 import Nvfp4Cache
-from .nvfp4_gfx950 import nvfp4_buffer_loadable, nvfp4_even_odd_w
+from .nvfp4 import Nvfp4Cache, nvfp4_buffer_loadable, nvfp4_even_odd_w
 
 _KP = 16
 _WARPS = 4
@@ -45,8 +44,10 @@ def _ordered(s):
 
 @gluon.jit
 def _key(ordered, blk):
-    """Rank of a block as one int64: score, then the lower block id."""
-    return (ordered.to(gl.int64) << 32) | ((~blk).to(gl.int64) & 0xFFFFFFFF)
+    """Rank of a block as one int64: score, then the higher block id. An empty
+    entry's negative id lands above every block id in the low word, so a masked
+    (-inf) block never displaces it."""
+    return (ordered.to(gl.int64) << 32) | (blk.to(gl.int64) & 0xFFFFFFFF)
 
 
 @gluon.jit
@@ -217,12 +218,13 @@ def _score_round(
         s,
         float("-inf"),
     )
-    # A warp's blocks come in ascending id order, so a new block outranks the list's
-    # worst entry only with a higher score; keys in a list are distinct.
-    o = _ordered(s)
+    # A block replaces the list's worst entry when its key is larger: a higher score,
+    # or an equal score and (ids ascend within a warp) a higher id. Keys in a list
+    # are distinct.
+    key = _key(_ordered(s), blk[:, None])
     thr = gl.min(top_k, axis=2)
-    hit = (o > (thr >> 32).to(gl.int32))[:, :, None] & (top_k == thr[:, :, None])
-    return gl.where(hit, _key(o, blk[:, None])[:, :, None], top_k)
+    hit = (key > thr)[:, :, None] & (top_k == thr[:, :, None])
+    return gl.where(hit, key[:, :, None], top_k)
 
 
 @gluon.jit
@@ -513,7 +515,7 @@ def _verify_index_topk_merge_kernel(
         other=NO_KEY,
     )
     # Empty entries have negative ids.
-    key = tl.where((~key).to(tl.int32) >= 0, key, NO_KEY)
+    key = tl.where(key.to(tl.int32) >= 0, key, NO_KEY)
     BIG: tl.constexpr = 0x7FFFFFFF
 
     # Forced blocks: init [0, init_blocks) and local [n_blocks - local_blocks, n_blocks).
@@ -522,11 +524,11 @@ def _verify_index_topk_merge_kernel(
     n_forced = n_init + n_blocks - local_start
     t = tl.arange(0, KT)
     kept = tl.full([KT], BIG, tl.int32)
-    # Highest score first, lower block id on ties.
+    # Highest score first, higher block id on ties.
     for j in tl.static_range(KT):
         if j < topk - n_forced:
             best = tl.max(key, axis=0)
-            pick = tl.where(best != NO_KEY, (~best).to(tl.int32), BIG)
+            pick = tl.where(best != NO_KEY, best.to(tl.int32), BIG)
             kept = tl.where(t == j, pick, kept)
             key = tl.where(key == best, NO_KEY, key)
     forced = tl.where(

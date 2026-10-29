@@ -656,6 +656,7 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         ](
             q,
             cache,
+            cache,  # scale pointer, unused without IS_FP4
             result,
             kw["block_table"],
             kw["cu_seqlens_q"],
@@ -667,6 +668,8 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
             chunk,
             *q.stride(),
             *cache.stride(),
+            0,  # scale strides, unused without IS_FP4
+            0,
             *result.stride(),
             kw["block_table"].stride(0),
             BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
