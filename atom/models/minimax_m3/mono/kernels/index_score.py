@@ -30,6 +30,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.minimax_m3.mono.config import (
+    FP4_PAGE_BYTES,
+    FP4_SCALE_OFFSET,
     HEAD_DIM,
     LONG_FROM_BLOCKS,
     MAX_INDEX_BLOCKS,
@@ -48,6 +50,7 @@ from atom.mono.device.ops import (
     lane_gather,
     launcher,
     mfma_bf16,
+    mxfp4_to_bf16x8,
     permlane_swap,
     readlane,
     rsrc,
@@ -73,6 +76,14 @@ def _f32(x: float) -> float:
 def index_scale_log2e(sm_scale: float) -> float:
     """fp32(sm_scale * log2 e), the scorer's scale."""
     return _f32(_f32(sm_scale) * _f32(LOG2E))
+
+
+def q_chunk_offset(s, g4, mxfp4):
+    """First index q element of lane group ``g4``'s operand of k-chunk ``s``: an
+    FP8 key tile is split across the four lane groups by 8-element parts of each
+    32-element chunk (``split_tiles``), an MXFP4 one by whole 32-element e8m0
+    groups, a chunk s the group's s-th eight."""
+    return 32 * g4 + 8 * s if mxfp4 else 32 * s + 8 * g4
 
 
 def scored_count(n_blk, init_blocks: int, local_blocks: int):
@@ -120,7 +131,7 @@ def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
     wait_new_keys=None, prepare=None, heads=ONE_INDEX_HEAD, q_frag_head=None,
-    prepare_heads=None,
+    prepare_heads=None, mxfp4=False,
 ):  # fmt: skip
     """This CTA's (``slot``) share of the step's score tasks: up to BLOCKS tasks,
     task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA u % BLOCKS
@@ -144,8 +155,14 @@ def emit_index_scores(
     pair k * MAX_INDEX_BLOCKS + h * (MAX_INDEX_BLOCKS / TP) + b / TP <- the score
     of token k's block b for head h. ``q_frag_head(k, s, h)``: head h's B operand
     (every lane its own h); ``prepare_heads()`` (with CTA barriers, on every CTA)
-    makes those requests' rows' heads first. The other requests score as above."""
+    makes those requests' rows' heads first. The other requests score as above.
+
+    ``mxfp4``: ``index_cache`` is 8704 B MXFP4 pages (``kv_mxfp4``): a lane's key
+    bytes are one 16 B load and its group's e8m0 scale, widened to bf16 by
+    ``v_cvt_scalef32_pk_bf16_fp4`` (exact), the same bf16 MFMA after it; ``q_frag``
+    must hand out ``q_chunk_offset``'s layout. Not with indexer context parallelism."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
+    assert not (mxfp4 and heads.count > 1), "MXFP4 index keys: no indexer CP"
     l16 = lane % 16
     g4 = lane // 16
     r_ic = rsrc(index_cache)
@@ -196,43 +213,71 @@ def emit_index_scores(
         col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
         return col, pick(seq, col)
 
+    tile_words = 5 if mxfp4 else 8
+
     def load_raw(page, tiles):
-        """Key tiles ``tiles`` (16 keys each) of a block, in flight: lane g4 =
+        """Key tiles ``tiles`` (16 keys each) of a block, in flight. FP8: lane g4 =
         lane / 16 reads its key's bytes 32 g4 .. 32 g4 + 32 with two 16 B loads
         (half the load instructions of eight-byte operand reads, scattered over
         the rows: 1M context, S = 16, scores 125 -> 100 us); ``split_tiles``
-        makes them MFMA operands."""
+        makes them MFMA operands. MXFP4: the key's elements 32 g4 .. + 32 are one
+        16 B load, and its four e8m0 scales a dword (each lane group takes its
+        byte)."""
         words = []
         for i in tiles:
-            row = (page * INDEX_BLOCK_BYTES + (16 * i + l16) * HEAD_DIM + 32 * g4) // 4
-            for h in range_constexpr(2):
+            if const_expr(mxfp4):
+                key = 16 * i + l16
+                at = page * (FP4_PAGE_BYTES // 4)
                 w = fx.Vector(
-                    bo.buffer_load(r_ic, row + 4 * h, vec_width=4, dtype=T.i32)
+                    bo.buffer_load(
+                        r_ic,
+                        at + key * (HEAD_DIM // 8) + 4 * g4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
                 )
-                words += [w[e] for e in range(4)]
+                sc = bo.buffer_load(
+                    r_ic, at + FP4_SCALE_OFFSET // 4 + key, vec_width=1, dtype=T.i32
+                )
+                words += [w[e] for e in range(4)] + [fx.Int32(sc)]
+            else:
+                row = (
+                    page * INDEX_BLOCK_BYTES + (16 * i + l16) * HEAD_DIM + 32 * g4
+                ) // 4
+                for h in range_constexpr(2):
+                    w = fx.Vector(
+                        bo.buffer_load(r_ic, row + 4 * h, vec_width=4, dtype=T.i32)
+                    )
+                    words += [w[e] for e in range(4)]
         return fx.Vector.from_elements(words, fx.Int32)
 
     def split_tiles(raw, tiles):
         """``load_raw``'s words -> per tile the MFMA A operands: tile i holds keys
-        16 i + lane % 16, k = 32 s + 8 (lane / 16). A 4 x 4 transpose of the 8 B
-        parts across the key's four lanes (permlane swaps) gives each lane part
-        g4 of every chunk s."""
+        16 i + lane % 16, k = 32 s + 8 (lane / 16). FP8: a 4 x 4 transpose of the
+        8 B parts across the key's four lanes (permlane swaps) gives each lane
+        part g4 of every chunk s. MXFP4: chunk s is the lane group's s-th dword
+        widened to bf16 (k = 32 g4 + 8 s, see ``q_chunk_offset``)."""
         out = []
         for n in range_constexpr(len(tiles)):
-            d = [raw[8 * n + e] for e in range(8)]
-            # part j = dwords 2 j, 2 j + 1; lanes g4 and g4 ^ 2, then g4 ^ 1, trade
-            for off, pairs in ((32, ((0, 2), (1, 3))), (16, ((0, 1), (2, 3)))):
-                for a, b in pairs:
-                    for w in range_constexpr(2):
-                        d[2 * a + w], d[2 * b + w] = permlane_swap(
-                            off, d[2 * a + w], d[2 * b + w]
-                        )
-            out.append(
-                [
-                    fx.Vector.from_elements([d[2 * s], d[2 * s + 1]], fx.Int32)
-                    for s in range(HEAD_DIM // 32)
-                ]
-            )
+            d = [raw[tile_words * n + e] for e in range(tile_words)]
+            if const_expr(mxfp4):
+                code = (d[4] >> (g4 * 8)) & 0xFF
+                scale = (code << 23).bitcast(fx.Float32)
+                out.append([mxfp4_to_bf16x8(d[s], scale) for s in range(4)])
+            else:
+                # part j = dwords 2 j, 2 j + 1; lanes g4 and g4 ^ 2, then g4 ^ 1, trade
+                for off, pairs in ((32, ((0, 2), (1, 3))), (16, ((0, 1), (2, 3)))):
+                    for a, b in pairs:
+                        for w in range_constexpr(2):
+                            d[2 * a + w], d[2 * b + w] = permlane_swap(
+                                off, d[2 * a + w], d[2 * b + w]
+                            )
+                out.append(
+                    [
+                        fx.Vector.from_elements([d[2 * s], d[2 * s + 1]], fx.Int32)
+                        for s in range(HEAD_DIM // 32)
+                    ]
+                )
         return out
 
     def tiles_max(b, qb, col_seq, tiles, kw):
@@ -243,7 +288,8 @@ def emit_index_scores(
         for n, i in enumerate(tiles):
             c = fx.Vector.filled(4, 0.0, fx.Float32)
             for s in range_constexpr(HEAD_DIM // 32):
-                c = mfma_bf16(fp8x8_bf16_pk(kw[n][s]), qb[s], c)
+                a = kw[n][s] if mxfp4 else fp8x8_bf16_pk(kw[n][s])
+                c = mfma_bf16(a, qb[s], c)
             # lane holds keys 16 i + 4 (lane / 16) + e of column lane % 16
             key0 = b * SPARSE_BLOCK + 16 * i + 4 * g4
             for e in range_constexpr(4):
@@ -363,7 +409,7 @@ def emit_index_scores(
             emit_cp_tasks()
 
 
-def q_frag_from(iq, heads=ONE_INDEX_HEAD):
+def q_frag_from(iq, heads=ONE_INDEX_HEAD, mxfp4=False):
     """(``q_frag``, ``q_frag_head``) reading index q from memory: [token][head]
     [HEAD_DIM] bf16, ``heads.count`` heads a token."""
 
@@ -372,7 +418,11 @@ def q_frag_from(iq, heads=ONE_INDEX_HEAD):
         return fx.Vector(
             bo.buffer_load(
                 rsrc(iq),
-                ((tk * heads.count + head) * HEAD_DIM + 32 * s + 8 * (lane // 16)) // 2,
+                (
+                    (tk * heads.count + head) * HEAD_DIM
+                    + q_chunk_offset(s, lane // 16, mxfp4)
+                )
+                // 2,
                 vec_width=4,
                 dtype=T.i32,
             )
@@ -393,6 +443,7 @@ class ScoreBuild:
     local_blocks: int = field(metadata={"sym": "lb"})
     index_heads: int = field(metadata={"sym": "ih"})
     index_own: int = field(metadata={"sym": "io"})
+    mxfp4: bool = field(metadata={"sym": "im"})
     sm_scale: float
 
 
@@ -402,14 +453,15 @@ def build_index_score_kernel(
     local_blocks: int,
     tokens: int = 1,
     heads: IndexHeads = ONE_INDEX_HEAD,
+    mxfp4: bool = False,
 ):
     """``@flyc.jit`` launcher of the score tasks alone (index q from memory,
     ``heads.count`` heads a token), for K4's harnesses: scores into mailbox
-    ``iscore`` with K4's layer tag."""
+    ``iscore`` with K4's layer tag. ``mxfp4``: the index cache is MXFP4 pages."""
     assert 1 <= tokens <= MAX_TOKENS
     key = ScoreBuild(
         tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
-        index_heads=heads.count, index_own=heads.own, sm_scale=sm_scale,
+        index_heads=heads.count, index_own=heads.own, mxfp4=mxfp4, sm_scale=sm_scale,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     scale = index_scale_log2e(sm_scale)
@@ -440,12 +492,13 @@ def build_index_score_kernel(
         mbox = Mailbox(layer)
         mb_put = mbox.put
         k_heads = IndexHeads(ih_count, ih_own)
-        q_frag, q_frag_head = q_frag_from(iq, k_heads)
+        q_frag, q_frag_head = q_frag_from(iq, k_heads, mxfp4)
         emit_index_scores(
             fx.block_idx.x, tid % 64, uniform(tid // 64), red, mb_put,
             Addr("iscore", Space.SCRATCH, iscore),
             q_frag, tokens, q_len, init_blocks, local_blocks, scale, index_cache,
             block_table, seq_lens, bt_width, heads=k_heads, q_frag_head=q_frag_head,
+            mxfp4=mxfp4,
         )  # fmt: skip
 
     @launcher(kernel_name)
