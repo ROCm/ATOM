@@ -38,6 +38,7 @@ def _layer(scoring_func, grouped, groups, topk_group, top_k, scale, **extra):
         num_fused_shared_experts=0,
         expert_mask=None,
         e_score_correction_bias="bias",
+        use_ep=False,
         **extra,
     )
 
@@ -83,6 +84,9 @@ def test_herd_candidates_take_the_layers_own_routing(monkeypatch, decode_step, p
     assert kwargs.get("routed_scaling_factor", 1.0) == 1.0
     assert kwargs.get("custom_routing_function") is None
     assert kwargs.get("num_fused_shared_experts", 0) == 0
+    # Pure TP routes pad rows like real ones, as _select_logical does, so the
+    # candidates carry no -1 rows for the count fused_moe is not given.
+    assert kwargs["mask_pad_rows"] is False
     assert kwargs["scoring_func"] == scoring_func
     assert kwargs["e_score_correction_bias"] == "bias"
     assert kwargs["use_grouped_topk"] is grouped

@@ -2088,6 +2088,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 renormalize=False,
                 scoring_func=layer.scoring_func,
                 e_score_correction_bias=layer.e_score_correction_bias,
+                # Pad rows as _select_logical routes them: aiter's HERD drop
+                # skips -1 rows only with the count pure TP no longer passes.
+                mask_pad_rows=layer.use_ep,
             )
         layout = layer.expert_layout
         return _select_logical(
