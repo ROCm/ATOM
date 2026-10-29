@@ -663,11 +663,23 @@ severities = {
 # explicitly skipped with a non-empty reason recorded in its own report. This does not relax
 # anything about stages a validator DID attempt: a stage that ran and failed is still "fail",
 # not "done", and still blocks completeness exactly as before.
-def _stage_done(stage: dict) -> bool:
+# Two tiers, because "skipped with a reason" is honest for work a validator never claimed
+# to do and dishonest for the work that IS its evidence. A stage naming something outside
+# the validator's declared scope -- an independent shape grid, a runtime kernel-symbol
+# receipt, an index-width scan this script runs itself -- may say so and still count.
+# baseline_control and correctness_repo_tests may not: without the base run, "head fails"
+# and "was already failing" are the same report, which is the one thing this component
+# exists to tell apart. A stage that ran and failed is "fail" either way, as before.
+SCOPE_DECLARABLE = frozenset(
+    {"correctness_s1_grid", "execution_receipt", "index_width_scan"}
+)
+
+
+def _stage_done(stage: dict, name: str = "") -> bool:
     status = stage.get("status")
     if status in ("pass", "info"):
         return True
-    if status == "skip" and bool(stage.get("note")):
+    if status == "skip" and bool(stage.get("note")) and name in SCOPE_DECLARABLE:
         return True
     return False
 
@@ -676,15 +688,15 @@ complete = (
     selection["runner"] in {"pytest", "script"}
     and bool(coverage)
     and bool(coverage_basis)
-    and _stage_done(report["stages"]["merge_sim"])
-    and _stage_done(report["stages"]["gpu_claim"])
-    and _stage_done(report["stages"]["runtime_compat"])
-    and _stage_done(report["stages"]["test_policy"])
-    and _stage_done(report["stages"]["baseline_control"])
-    and _stage_done(report["stages"]["correctness_repo_tests"])
-    and _stage_done(report["stages"]["correctness_s1_grid"])
-    and _stage_done(report["stages"]["execution_receipt"])
-    and _stage_done(report["stages"]["index_width_scan"])
+    and _stage_done(report["stages"]["merge_sim"], "merge_sim")
+    and _stage_done(report["stages"]["gpu_claim"], "gpu_claim")
+    and _stage_done(report["stages"]["runtime_compat"], "runtime_compat")
+    and _stage_done(report["stages"]["test_policy"], "test_policy")
+    and _stage_done(report["stages"]["baseline_control"], "baseline_control")
+    and _stage_done(report["stages"]["correctness_repo_tests"], "correctness_repo_tests")
+    and _stage_done(report["stages"]["correctness_s1_grid"], "correctness_s1_grid")
+    and _stage_done(report["stages"]["execution_receipt"], "execution_receipt")
+    and _stage_done(report["stages"]["index_width_scan"], "index_width_scan")
 )
 expected_verdict = (
     "BLOCK"
