@@ -97,10 +97,37 @@ green by finding the neighbor's runner instead of its own would be exactly the k
 false pass this project keeps finding, so this is worth re-checking by eye any time
 either runner's name changes.
 
-The two runners will also compete for the box's CPU and disk during concurrent reviews
-— P0 needs no GPU, so that contention (not GPU contention) is the only one that exists
-today; it will get worse, not better, once P2's validation step needs a GPU too (see
-the constraint above).
+The two runners also compete for something more consequential than CPU and disk: **the
+same GLM**. Both bots run `claude-glm`, which resolves one remote GLM over one tunnel,
+and neither side takes a lock — there is no `flock`, no cross-repo concurrency group,
+nothing. Each runner takes one job at a time and each job drives one stream (worker and
+refuter run in sequence), so the ceiling is two concurrent streams against that GLM.
+
+What this costs is unmeasured, and the honest statement is that nobody has looked. Two
+facts make it worth looking before trusting the box with both bots:
+
+- GLM's latency already has a long tail on its own. In a seven-PR batch on this branch,
+  one 7-file PR spent over 40 minutes in the worker alone and the run died in the
+  refuter. The run budget is 7200 s; a second concurrent stream eats into headroom that
+  a single stream has already been observed to exhaust.
+- The health gate cannot see this. It deep-probes with a real one-token inference, which
+  catches a wedged backend, but it does not time the response — so a GLM that is healthy
+  and congested is indistinguishable from one that is healthy and idle. The failure mode
+  it would produce is a timeout an hour later, not a refusal up front.
+
+`queue_gate.py` does not close this either: it reasons about ATOM's own queue ("the box
+runs one review at a time") and has no visibility into the other repo's runner. Its ETA
+is about when a job *starts*, which the second runner does not delay; the contention
+lands on how long the job *takes*.
+
+Measure it before building a mechanism — run both bots against real PRs at the same time
+and compare wall clock to the single-bot numbers already recorded on this branch. If the
+cost is real, the options are a box-level `flock` around the agent calls (needs a change
+on aiter's side too), or a latency check in the health gate that widens the budget when
+the backend is slow. Picking one now would be guessing.
+
+CPU and disk contention exists too, and gets worse once P2's validation step needs a GPU
+(see the constraint above).
 
 ---
 
