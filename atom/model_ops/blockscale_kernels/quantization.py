@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter import dtypes
+from triton.language.extra.hip import libdevice
 
 # The FP8 an activation is quantized to, and the three forms every writer and
 # reader of one of those rows needs. gfx942 is FNUZ and every other target is
@@ -42,6 +43,63 @@ def quantize_fp8_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
     else:
         tl.store(Y + offsets, q, offsets < SIZE)
         tl.store(S + groups, code.to(tl.uint8), groups < SIZE // 32)
+
+
+@triton.jit
+def _hw_rcp(x):
+    return tl.inline_asm_elementwise(
+        "v_rcp_f32 $0, $1", "=v,v", [x], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _hw_exp2(x):
+    return tl.inline_asm_elementwise(
+        "v_exp_f32 $0, $1", "=v,v", [x], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _ocml_exp_neg(g):
+    # exp(-g) as hipcc emits __ocml_exp_f32 for aiter's activation kernels:
+    # -log2(e) split hi/lo, exponent split off with rint, hardware exp2, ldexp.
+    # libdevice.exp evaluates the reduced argument in a different order.
+    c_hi = -1.4426950216293335
+    c_lo = -1.925962855864327e-08
+    ph = g * c_hi
+    pl = tl.fma(g, c_lo, tl.fma(g, c_hi, -ph))
+    n = libdevice.rint(ph)
+    e = libdevice.ldexp(_hw_exp2(tl.fma(g, c_hi, -n) + pl), n.to(tl.int32))
+    e = tl.where(g > 103.2789306640625, 0.0, e)
+    return tl.where(g < -88.72283935546875, float("inf"), e)
+
+
+@triton.jit
+def silu_mul_quantize_fp8_kernel(
+    X, Y, S, GROUPS, D, X_STRIDE, LIMIT, HAS_LIMIT: tl.constexpr
+):
+    # aiter silu_and_mul (gate min LIMIT, up med3, (up * x) * rcp(1 + exp(-x)),
+    # BF16 product) followed by `quantize_fp8_kernel` on that BF16 row, without
+    # the BF16 round trip. Both halves must match bit for bit: the unfused path
+    # is the reference the GEMM was validated against.
+    groups = tl.program_id(0) * 32 + tl.arange(0, 32)
+    per_row = D // 32
+    rows = groups // per_row
+    cols = (groups % per_row)[:, None] * 32 + tl.arange(0, 32)[None, :]
+    live = (groups < GROUPS)[:, None]
+    src = X + rows[:, None].to(tl.int64) * X_STRIDE + cols
+    g = tl.load(src, live, other=0).to(tl.float32)
+    u = tl.load(src + D, live, other=0).to(tl.float32)
+    if HAS_LIMIT:
+        g = tl.minimum(g, LIMIT)
+        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
+    x = ((u * g) * _hw_rcp(_ocml_exp_neg(g) + 1.0)).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), 1), AMAX_FLOOR)
+    code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
+    scale = (code << 23).to(tl.float32, bitcast=True)
+    q = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX).to(FP8_TL_DTYPE)
+    tl.store(Y + rows[:, None].to(tl.int64) * D + cols, q, live)
+    tl.store(S + groups, code.to(tl.uint8), groups < GROUPS)
 
 
 @triton.jit

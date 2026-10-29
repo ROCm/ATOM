@@ -164,6 +164,10 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
 # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
 _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+# Bit-exact: silu_and_mul + w2's group32 quantize_fp8 as one Triton kernel (no
+# 128-multiple constraint; tiles on group-32). Kills one standalone
+# quantize_fp8 launch per shared-expert forward. Flip via env to A/B.
+_V4_FUSE_SILU_QUANT = os.environ.get("ATOM_V4_FUSE_SILU_QUANT", "0") == "1"
 ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 
 
@@ -2772,6 +2776,16 @@ class Expert(nn.Module):
                 dtype_quant=dtypes.fp8,
                 transpose_scale=True,
             )
+            return self.w2(x_fp8, x_scale=x_scale)
+        if _V4_FUSE_SILU_QUANT and weights is None and combined.dtype == torch.bfloat16:
+            # w2 (RowParallelLinear, native FP8 group32) would quantize its input
+            # with exactly quantize_fp8. Emit the same FP8 + group32 e8m0 scale
+            # from one kernel and let w2 skip its own quant. Imported lazily:
+            # blockscale pulls in the Triton quant kernels, which the CPU-only
+            # unit-test env (stubbed triton) can't evaluate at module load.
+            from atom.model_ops.blockscale import silu_and_mul_quantize_fp8
+
+            x_fp8, x_scale = silu_and_mul_quantize_fp8(combined, self.swiglu_limit)
             return self.w2(x_fp8, x_scale=x_scale)
         out = torch.empty(
             (combined.shape[0], combined.shape[-1] // 2),

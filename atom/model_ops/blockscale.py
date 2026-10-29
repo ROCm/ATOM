@@ -19,6 +19,7 @@ from .blockscale_kernels.quantization import (
     FP8_DTYPE,
     quantize_fp4_kernel,
     quantize_fp8_kernel,
+    silu_mul_quantize_fp8_kernel,
 )
 
 
@@ -73,6 +74,34 @@ def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
             dequantize,
         )
     return output if dequantize else (output, scales)
+
+
+def silu_and_mul_quantize_fp8(x: torch.Tensor, limit: float = 0.0):
+    """aiter ``silu_and_mul(out, x, limit)`` then ``quantize_fp8(out)``, fused.
+
+    ``x`` is ``[tokens, 2 * d]`` BF16 laid out ``[gate | up]``; returns E4M3
+    ``[tokens, d]`` and group32 E8M0 scales ``[tokens, d // 32]``.
+    """
+    if x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[-1] % 64:
+        raise ValueError("Expected [tokens, 2 * d] BF16 with d divisible by 32")
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    t, d = x.shape[0], x.shape[1] // 2
+    output = torch.empty((t, d), device=x.device, dtype=FP8_DTYPE)
+    scales = torch.empty((t, d // 32), device=x.device, dtype=torch.float8_e8m0fnu)
+    groups = t * (d // 32)
+    if groups:
+        silu_mul_quantize_fp8_kernel[(triton.cdiv(groups, 32),)](
+            x,
+            output,
+            scales.view(torch.uint8),
+            groups,
+            d,
+            x.stride(0),
+            float(limit),
+            limit > 0,
+        )
+    return output, scales
 
 
 def quantize_fp4(
