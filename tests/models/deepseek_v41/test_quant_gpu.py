@@ -185,3 +185,122 @@ def test_real_weight_slice_gemm(prefix, fp4):
         x.cuda(), b.cuda(), s.cuda(), weight_group_rows=group_n, dtype=torch.float32
     ).cpu()
     torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-5)
+
+
+@pytest.mark.parametrize("rows", [0, 1, 120, 2048])
+@pytest.mark.parametrize("limit", [0.0, 10.0])
+def test_silu_mul_quantize_fp8_matches_activation_then_quant(rows, limit):
+    """The shared expert's fused activation + quant is `quantize_fp8` of what
+    `aiter.silu_and_mul` stores: same E8M0 scales, and FP8 bytes equal but for
+    the rare one-code difference `exp`'s rounding can make on a BF16 tie."""
+    from aiter import silu_and_mul
+
+    from atom.model_ops.blockscale import quantize_fp8, silu_mul_quantize_fp8
+
+    torch.manual_seed(rows)
+    inter = 2304  # V4.1's moe_intermediate_size: 72 groups, not a power of two
+    x = (torch.randn(rows, 2 * inter, device="cuda") * 4).bfloat16()
+    if rows:
+        x[0] = 0  # an all-zero row: the amax floor's scale
+    out = torch.empty(rows, inter, device="cuda", dtype=torch.bfloat16)
+    if rows:
+        silu_and_mul(out, x, limit)
+    ref_q, ref_s = quantize_fp8(out)
+    q, s = silu_mul_quantize_fp8(x, limit)
+    assert q.shape == (rows, inter) and s.shape == (rows, inter // 32)
+    assert torch.equal(s.view(torch.uint8), ref_s.view(torch.uint8))
+    diff = (q.view(torch.uint8).int() - ref_q.view(torch.uint8).int()).abs()
+    assert diff.numel() == 0 or (diff.max() <= 1 and (diff > 0).float().mean() < 1e-5)
+
+
+@pytest.mark.parametrize("rows", [1, 120, 192, 3000])
+@pytest.mark.parametrize("with_post", [False, True])
+def test_triton_seam_quant_is_quantize_fp8_of_its_bf16(rows, with_post):
+    """`pre_delayed(..., fuse_quant=True)` on the Triton seam: its MXFP8 copy is
+    bit-equal to quantizing the BF16 normed input it returns."""
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
+        pre_delayed,
+        triton_quant_out_supported,
+    )
+
+    if not triton_quant_out_supported():
+        pytest.skip("AITER's Triton mHC seam has no quant_out")
+    torch.manual_seed(rows)
+    hidden = 5120
+    residual = torch.randn(rows, 4, hidden, device="cuda", dtype=torch.bfloat16)
+    args = (
+        residual,
+        torch.rand(rows, 4, device="cuda"),
+        torch.randn(24, 4 * hidden, device="cuda") * 0.01,
+        torch.rand(3, device="cuda"),
+        torch.randn(24, device="cuda") * 0.1,
+        (torch.rand(hidden, device="cuda") * 2).bfloat16(),
+    )
+    options = {
+        "rms_eps": 1e-6,
+        "hc_eps": 1e-6,
+        "sinkhorn_iters": 20,
+        "post_mult": 2.0,
+        "norm_eps": 1e-6,
+    }
+    if with_post:
+        options.update(
+            sublayer_output=torch.randn(
+                rows, hidden, device="cuda", dtype=torch.bfloat16
+            ),
+            post_mix=torch.rand(rows, 4, device="cuda"),
+            combination=torch.rand(rows, 4, 4, device="cuda"),
+        )
+    plain = pre_delayed(*args, **options)
+    fused = pre_delayed(*args, fuse_quant=True, **options)
+    bf16, q, s = fused[1]
+    assert torch.equal(bf16, plain[1])
+    for a, b in zip(fused[2:], plain[2:]):
+        assert torch.equal(a, b)
+    ref_q, ref_s = quantize_fp8(bf16)
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(s.view(torch.uint8), ref_s.view(torch.uint8))
+
+
+def test_shared_expert_reads_the_seams_quant_and_fuses_its_own():
+    """With a native FP8 gate_up and w2, the shared expert takes the seam's
+    MXFP8 input as is (when it covers the call's rows) and hands w2 the fused
+    activation's quant."""
+    from atom.model_ops.blockscale import quantize_fp8, silu_mul_quantize_fp8
+    from atom.models.deepseek_v4 import Expert
+
+    calls = {}
+
+    def gate_up(x, x_scale=None):
+        calls["gate_up"] = (x, x_scale)
+        return combined
+
+    def w2(x, x_scale=None):
+        calls["w2"] = (x, x_scale)
+        return torch.zeros(x.shape[0], 64, device="cuda")
+
+    torch.manual_seed(0)
+    rows, inter = 7, 256
+    combined = (torch.randn(rows, 2 * inter, device="cuda") * 3).bfloat16()
+    expert = Expert.__new__(Expert)
+    torch.nn.Module.__init__(expert)
+    expert.gate_up_proj = gate_up
+    expert.w2 = w2
+    w2.native_a8_group_rows = 32
+    expert.swiglu_limit = 10.0
+    expert.use_fused_clamp_act_mul = False
+
+    x = torch.randn(rows, 64, device="cuda", dtype=torch.bfloat16)
+    expert.quantized_input = quantize_fp8(x)
+    expert(x)
+    assert calls["gate_up"][0] is expert.quantized_input[0]
+    assert calls["gate_up"][1] is expert.quantized_input[1]
+    want_q, want_s = silu_mul_quantize_fp8(combined, 10.0)
+    assert torch.equal(calls["w2"][0].view(torch.uint8), want_q.view(torch.uint8))
+    assert torch.equal(calls["w2"][1].view(torch.uint8), want_s.view(torch.uint8))
+
+    # A quant of other rows (a padded pass) is not this call's input.
+    expert.quantized_input = quantize_fp8(x[:3])
+    expert(x)
+    assert calls["gate_up"][0] is x and calls["gate_up"][1] is None

@@ -8,10 +8,12 @@ the owed post, the gate projection, Sinkhorn, the collapse with the carried
 pre-mix and the sublayer's input RMSNorm. HIP uses one compute kernel on gfx950;
 Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
 
-The norm is the sublayer's own. Attention can request HIP's fused MXFP8
-output alongside BF16 for its other readers; FFN keeps the BF16 interface.
+The norm is the sublayer's own. A seam whose input feeds a native FP8 GEMM can
+request the normed input as MXFP8 alongside BF16 for its other readers: HIP's
+fused output, or the Triton seam's `quant_out` when AITER has it.
 """
 
+import inspect
 from functools import cache
 
 import torch
@@ -30,6 +32,16 @@ def _hip_ops():
     except ImportError:
         return None
     return mega_mhc, mega_mhc_shuffle_fn
+
+
+@cache
+def triton_quant_out_supported() -> bool:
+    """Whether AITER's Triton seam can also write the normed input as group32
+    MXFP8 (`quant_out`); older AITER builds cannot, and the GEMM then quantizes
+    its own input."""
+    return (
+        "quant_out" in inspect.signature(mhc_fused_post_pre_delayed_rmsnorm).parameters
+    )
 
 
 def pack_mhc_fn(fn):
@@ -178,12 +190,12 @@ def v41_mhc_pre_delayed(
     with_post = sublayer_output is not None
     kernel = mhc_fused_post_pre_delayed_rmsnorm
     options = {}
-    if fuse_quant and not w_preshuffle_bf16:
-        raise ValueError("Fused mHC quantization requires the HIP backend")
     if w_preshuffle_bf16:
         kernel = _hip_ops()[0]
         options["w_preshuffle_bf16"] = True
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
+    elif fuse_quant:
+        options["quant_out"] = True
     new_residual, post, comb, normed, pre = kernel(
         residual.view(rows, hc_mult, hidden),
         hc_fn,

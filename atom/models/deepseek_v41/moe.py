@@ -134,5 +134,29 @@ class MoE(V4MoE):
         v41_record_tbo_expert_output(routed)
         return routed, is_complete
 
+    @property
+    def takes_quantized_input(self) -> bool:
+        """Whether the seam should hand this MoE its input already quantized:
+        only the shared expert reads it (the router and the routed experts take
+        BF16), and only a native FP8 gate_up GEMM can use it."""
+        shared = self.shared_experts
+        return (
+            shared is not None and shared.gate_up_proj.native_a8_group_rows is not None
+        )
+
     def forward(self, hidden):
-        return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
+        """``hidden`` is BF16, or the seam's ``(bf16, fp8, scale)`` when
+        `takes_quantized_input`: the FP8 copy goes to the shared expert's
+        gate_up for this call only."""
+        if not isinstance(hidden, tuple):
+            return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
+        hidden, quant, scale = hidden
+        width = hidden.shape[-1]
+        self.shared_experts.quantized_input = (
+            quant.reshape(-1, width),
+            scale.reshape(-1, width // 32),
+        )
+        try:
+            return super().forward(hidden.reshape(-1, width)).view_as(hidden)
+        finally:
+            self.shared_experts.quantized_input = None

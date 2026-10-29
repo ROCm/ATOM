@@ -76,6 +76,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     FP4_GFX1250_NATURAL,
     fp4_indexer_layout_for_arch,
 )
+from atom.model_ops.blockscale import silu_mul_quantize_fp8
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
@@ -2750,6 +2751,9 @@ class Expert(nn.Module):
         # quant through a single aiter triton kernel. The fused kernel emits
         # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
         self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
+        # `(fp8, e8m0 scale)` of this call's `x`, set by an owner whose norm
+        # already quantized it for a native FP8 gate_up (V4.1's MoE).
+        self.quantized_input = None
 
     def forward(
         self,
@@ -2762,7 +2766,16 @@ class Expert(nn.Module):
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
-        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        quantized = self.quantized_input
+        if quantized is not None and quantized[0].shape[0] == x.shape[0]:
+            combined = self.gate_up_proj(quantized[0], x_scale=quantized[1])
+        else:
+            combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        if weights is None and self.w2.native_a8_group_rows is not None:
+            # A native FP8 w2 reads group32 MXFP8: quantize in the activation's
+            # own launch instead of a separate pass inside w2.
+            x_fp8, x_scale = silu_mul_quantize_fp8(combined, self.swiglu_limit)
+            return self.w2(x_fp8, x_scale=x_scale)
         if self.use_fused_clamp_act_mul:
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,

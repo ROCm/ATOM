@@ -19,6 +19,7 @@ from .blockscale_kernels.quantization import (
     FP8_DTYPE,
     quantize_fp4_kernel,
     quantize_fp8_kernel,
+    silu_mul_quantize_fp8_kernel,
 )
 
 
@@ -73,6 +74,31 @@ def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
             dequantize,
         )
     return output if dequantize else (output, scales)
+
+
+def silu_mul_quantize_fp8(x: torch.Tensor, limit: float = 0.0):
+    """`quantize_fp8(silu_and_mul(x, limit))` in one launch: `x` [rows, 2 * inter]
+    BF16 [gate | up]; `limit > 0` clamps gate above and up both sides first."""
+    if x.ndim != 2 or x.shape[-1] % 64 or x.dtype != torch.bfloat16:
+        raise ValueError("Expected BF16 [rows, 2 * inter] with inter % 32 == 0")
+    x = x.contiguous()
+    rows, inter = x.shape[0], x.shape[1] // 2
+    output = torch.empty((rows, inter), device=x.device, dtype=FP8_DTYPE)
+    scales = torch.empty(
+        (rows, inter // 32), device=x.device, dtype=torch.float8_e8m0fnu
+    )
+    if rows:
+        block_groups = 32
+        silu_mul_quantize_fp8_kernel[(rows, triton.cdiv(inter // 32, block_groups))](
+            x,
+            output,
+            scales.view(torch.uint8),
+            inter,
+            float(limit),
+            limit > 0,
+            block_groups,
+        )
+    return output, scales
 
 
 def quantize_fp4(

@@ -45,6 +45,38 @@ def quantize_fp8_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
 
 
 @triton.jit
+def silu_mul_quantize_fp8_kernel(
+    X,
+    Y,
+    S,
+    INTER: tl.constexpr,
+    LIMIT,
+    HAS_LIMIT: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    # Row `pid(0)` of `X` is [gate | up], each INTER wide. The product is
+    # rounded to BF16 first, as `aiter.silu_and_mul` stores it, then quantized
+    # exactly as `quantize_fp8_kernel` quantizes that BF16 row.
+    row = tl.program_id(0).to(tl.int64)
+    groups = tl.program_id(1) * BLOCK_GROUPS + tl.arange(0, BLOCK_GROUPS)
+    cols = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
+    mask = groups[:, None] < INTER // 32
+    gate = tl.load(X + row * 2 * INTER + cols, mask, other=0).to(tl.float32)
+    up = tl.load(X + row * 2 * INTER + INTER + cols, mask, other=0).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, LIMIT)
+        up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
+    act = gate * (1.0 / (1.0 + tl.exp(-gate)))
+    x = (act * up).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), 1), AMAX_FLOOR)
+    code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
+    scale = (code << 23).to(tl.float32, bitcast=True)
+    q = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX).to(FP8_TL_DTYPE)
+    tl.store(Y + row * INTER + cols, q, mask)
+    tl.store(S + row * (INTER // 32) + groups, code.to(tl.uint8), groups < INTER // 32)
+
+
+@triton.jit
 def quantize_fp4_kernel(
     X,
     Y,

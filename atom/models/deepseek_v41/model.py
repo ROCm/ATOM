@@ -14,6 +14,7 @@ from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
     pack_mhc_fn,
     pre_delayed,
+    triton_quant_out_supported,
 )
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
@@ -151,7 +152,11 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.attn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
-            fuse_quant=hc_fn is not None,
+            fuse_quant=hc_fn is not None
+            or (
+                self.attn.wqkv_a.native_a8_group_rows is not None
+                and triton_quant_out_supported()
+            ),
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,
@@ -172,6 +177,10 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.ffn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
+            # Triton only: on gfx950 the HIP seam keeps FFN on its BF16 output.
+            fuse_quant=hc_fn is None
+            and self.ffn.takes_quantized_input
+            and triton_quant_out_supported(),
             sublayer_output=output,
             post_mix=post,
             combination=comb,
