@@ -233,8 +233,19 @@ def test_layer_shapes_follow_the_model_and_ineligible_layers_stay_native(
     assert not hasattr(layer, "_sp_mega_moe")
 
 
-@pytest.mark.parametrize("error", [RuntimeError, torch.OutOfMemoryError])
-def test_runtime_setup_failure_keeps_the_native_moe(monkeypatch, sp_modules, error):
+@pytest.mark.parametrize(
+    "error,falls_back",
+    [
+        (RuntimeError("SdmaComm: MORI SDMA setup failed on ranks [0, 1, 2, 3]"), True),
+        (ImportError("no MORI"), True),
+        # One rank's compile error or OOM leaves its peers inside a collective.
+        (RuntimeError("compile failed"), False),
+        (torch.OutOfMemoryError("HIP out of memory"), False),
+    ],
+)
+def test_runtime_setup_failure_keeps_the_native_moe(
+    monkeypatch, sp_modules, error, falls_back
+):
     from atom.distributed import ulysses_sp
 
     layer = _servable_layer(sp_modules.moe)
@@ -244,7 +255,7 @@ def test_runtime_setup_failure_keeps_the_native_moe(monkeypatch, sp_modules, err
     )
     mega = ModuleType("aiter.ops.flydsl.mega_moe_tp")
     mega.MegaMoeTPConfig = dict
-    mega.MegaMoeTP = Mock(side_effect=error("SDMA unavailable"))
+    mega.MegaMoeTP = Mock(side_effect=error)
     monkeypatch.setitem(sys.modules, mega.__name__, mega)
     monkeypatch.setattr(ulysses_sp, "get_sp_world_size", lambda: 4)
     monkeypatch.setattr(
@@ -255,10 +266,10 @@ def test_runtime_setup_failure_keeps_the_native_moe(monkeypatch, sp_modules, err
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
     monkeypatch.setattr(fusion, "_mega_moe_decoders", lambda model: [decoder])
     config = SimpleNamespace(sp_mega_moe_enabled=True, max_num_batched_tokens=1024)
-    if error is torch.OutOfMemoryError:
-        # One rank's OOM must not leave the ranks on different MoE paths.
-        with pytest.raises(error):
+    if not falls_back:
+        with pytest.raises(type(error)):
             fusion.initialize_sp_mega_moe(object(), config)
+        assert config.sp_mega_moe_enabled is True
         return
     assert fusion.initialize_sp_mega_moe(object(), config) is None
     assert config.sp_mega_moe_enabled is False
@@ -266,9 +277,20 @@ def test_runtime_setup_failure_keeps_the_native_moe(monkeypatch, sp_modules, err
     assert not hasattr(layer, "_sp_mega_moe")
 
 
-def test_epoch_reset_follows_counted_steps(monkeypatch):
+@pytest.fixture
+def host_copies(monkeypatch):
+    # The timeout bits are copied to pinned memory behind an event.
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda: SimpleNamespace(record=Mock(), query=lambda: True)
+    )
+
+
+def test_epoch_reset_follows_counted_steps(monkeypatch, host_copies):
     monkeypatch.setattr(fusion, "RESET_LAUNCHES", 8)
-    runtime = SimpleNamespace(reset=Mock())
+    runtime = SimpleNamespace(
+        reset=Mock(), error_flag=lambda: torch.zeros(1, dtype=torch.int32)
+    )
     backend = SPMegaMoE(runtime, 3)
     for _ in range(3):
         backend.count_step()
@@ -276,3 +298,19 @@ def test_epoch_reset_follows_counted_steps(monkeypatch):
     assert backend.launches == 0
     backend.count_step()
     assert backend.launches == 3
+
+
+def test_timed_out_launch_fails_a_later_step(monkeypatch, host_copies):
+    # The step's output is already invalid; the epoch reset must not hide it.
+    monkeypatch.setattr(fusion, "RESET_LAUNCHES", 2)
+    flag = torch.zeros(1, dtype=torch.int32)
+    runtime = SimpleNamespace(
+        error_flag=lambda: flag, reset=Mock(side_effect=flag.zero_), cfg=Mock(rank=2)
+    )
+    backend = SPMegaMoE(runtime, 1)
+    backend.count_step()
+    flag[0] = 4  # a wait in this step timed out
+    backend.count_step()
+    runtime.reset.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="rank 2: a MegaMoeTP wait timed out"):
+        backend.count_step()

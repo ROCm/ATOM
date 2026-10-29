@@ -39,3 +39,28 @@ def test_shards_keep_token_order_and_publish_padded_counts(monkeypatch, world, t
         assert counts == (shards[0].numel(),) * world
     finally:
         reset_forward_context()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_gather_rows_matches_full_gather(monkeypatch, world):
+    # Last rows of prompts of 1, 3, 3, 1, 2 and 3 tokens: they land on every
+    # rank, on a shard's first and last row, and next to the padded tail.
+    hidden, rows = torch.randn(13, 8), torch.tensor([0, 3, 6, 7, 9, 12])
+    monkeypatch.setattr(sp, "_SP_WORLD_SIZE", world)
+
+    def on_each_rank(fn):
+        out = []
+        for rank in range(world):
+            monkeypatch.setattr(sp, "get_sp_rank", lambda rank=rank: rank)
+            out.append(fn(rank))
+        return out
+
+    shards = on_each_rank(lambda _: sp.sp_split_tokens(hidden))
+    sent = []
+    monkeypatch.setattr(
+        sp, "_all_gather_tokens", lambda x: sent.append(x) or x.repeat(world, 1)
+    )
+    on_each_rank(lambda rank: sp.sp_gather_rows(shards[rank], rows))
+    monkeypatch.setattr(sp, "_all_gather_tokens", lambda x: torch.cat(sent))
+    for out in on_each_rank(lambda rank: sp.sp_gather_rows(shards[rank], rows)):
+        assert torch.equal(out, hidden[rows])

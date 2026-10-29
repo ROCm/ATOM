@@ -12,6 +12,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
+from atom.distributed.ulysses_sp import sp_gather_rows
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
@@ -260,7 +261,8 @@ class ParallelLMHead(VocabParallelEmbedding):
             # context = get_context()
             if context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
-                x = x[last_indices].contiguous()
+                # Under Ulysses SP, x is this rank's token shard.
+                x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
         logits = tgemm.mm(x, self.weight, self.bias)

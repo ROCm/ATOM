@@ -70,6 +70,24 @@ def attn_head_shard_size() -> int:
     return get_tp_group().world_size * _SP_WORLD_SIZE
 
 
+def check_sp_attention_layer(sp, name, sinks, alibi_slopes, rotary_emb, index_heads):
+    """Refuse what the config cannot see: per-layer features and indexer heads."""
+    if sinks is not None or alibi_slopes is not None:
+        raise ValueError("Ulysses SP does not support attention sinks or ALiBi slopes.")
+    # The model body sees only this rank's token shard, so RoPE must run in the
+    # impl on the exchanged sequence with the global positions.
+    if rotary_emb is None:
+        raise ValueError(
+            f"Ulysses SP requires RoPE inside the attention impl; {name} has none."
+        )
+    # Indexer query heads shard or replicate like KV heads.
+    if index_heads % sp and sp % index_heads:
+        raise ValueError(
+            f"--sequence-parallel-size {sp} cannot shard the {index_heads} "
+            f"indexer query heads of {name}."
+        )
+
+
 def sp_pad_len(total_tokens: int, sp_size: int | None = None) -> int:
     """Token count rounded up so the sequence splits evenly across the group."""
     if sp_size is None:
@@ -117,6 +135,12 @@ def sp_split_tokens(x: torch.Tensor) -> torch.Tensor:
 # Small payloads can benefit from the registered-buffer all-gather. Large
 # prefills use all-to-all to avoid receiving unused heads.
 _ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
+# Output rows per rank from which an attention output takes the prefill head
+# exchange (FP8 with a gathered amax, the four-rank exchange kernel); decode
+# stays below it on the all-gather.
+HEAD_EXCHANGE_MIN_LOCAL_ROWS = 2048
+# AITER custom_all_reduce kMaxBlocks.
+_CA_MAX_BLOCKS = 80
 
 
 def _custom_gather_ok(payload: torch.Tensor, group) -> bool:
@@ -170,6 +194,19 @@ def sp_gather_tokens(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     return _all_gather_tokens(x)[:total_tokens]
 
 
+def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    """``sp_gather_tokens(x, T)[rows]``, moving only the selected rows.
+
+    Every rank sends one row per index, and the copy from its owner is kept.
+    """
+    if _SP_WORLD_SIZE <= 1:
+        return x[rows].contiguous()
+    local, n = x.shape[0], rows.numel()
+    picked = x[(rows - get_sp_rank() * local).clamp(0, local - 1)]
+    owner = rows.long() // local
+    return _all_gather_tokens(picked)[owner * n + torch.arange(n, device=x.device)]
+
+
 def ulysses_gather_heads(x: torch.Tensor, group=None) -> torch.Tensor:
     """``[S, H/W*D] -> [S/W, H*D]``: give up the sequence, regain all heads."""
     w = _SP_WORLD_SIZE if group is None else group.world_size
@@ -206,7 +243,7 @@ def head_exchange_communicator(x, *, group=None):
         not x.is_cuda
         or not envs.ATOM_USE_CUSTOM_ALL_GATHER
         or x.ndim != 2
-        or x.shape[0] < 8192
+        or x.shape[0] < 4 * HEAD_EXCHANGE_MIN_LOCAL_ROWS
         or x.shape[0] % 4
         or x.shape[1] * x.element_size() % 16
         or x.dtype != torch.bfloat16
@@ -257,7 +294,7 @@ def exchange_heads(x, ca, *, registered=False):
         pool.data_ptr,
         pool.max_size,
         not (registered or graph_registered),
-        80,
+        _CA_MAX_BLOCKS,
     )
     return out
 

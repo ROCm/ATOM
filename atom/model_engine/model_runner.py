@@ -146,6 +146,16 @@ def max_schedulable_decode_bs(
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
+def sp_token_graph_ladder(sizes, sp: int, max_bs: int) -> list[int]:
+    """Capture ladder for SP token graphs, one batch size per local bucket.
+
+    A token graph's bucket is its local rows (`sp_local_len`), so each rung is
+    rounded up to a multiple of `sp`. Rounding past `max_bs` would overrun the
+    per-request buffers, so the top rung is clamped to it instead of dropped.
+    """
+    return sorted({min(-(-bs // sp) * sp, max_bs) for bs in sizes}, reverse=True)
+
+
 # Re-exported under the old private name: this module is where the predicate
 # used to live and where callers (and tests) still import it from.
 _kv_config_has_producer = kv_config_has_producer
@@ -832,6 +842,11 @@ class ModelRunner:
         )
 
         self._build_and_load_model(model_class)
+        # After weight processing, before warmup and capture. Here rather than in
+        # the loader so a runner that builds its model differently still sets it.
+        from atom.model_ops.sp_mega_moe import initialize_sp_mega_moe
+
+        self.sp_mega_moe = initialize_sp_mega_moe(self.model, config)
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -979,9 +994,6 @@ class ModelRunner:
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
         load_elapsed = time.perf_counter() - load_start
-        from atom.model_ops.sp_mega_moe import initialize_sp_mega_moe
-
-        self.sp_mega_moe = initialize_sp_mega_moe(self.model, config)
         logger.info(
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
@@ -3194,21 +3206,26 @@ class ModelRunner:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
-                    model_output = sp_gather_tokens(model_output, sp_total_tokens)
                     # Middle chunk: no logits, but drafter needs hidden states.
-                    hidden_states = model_output
+                    # SP refuses drafters, so its token shards stay local.
+                    hidden_states = None if sp_is_enabled() else model_output
                     logits = None
                 else:
                     if _pcp_tbo_balanced:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
-                    # Restore global token order before selecting scheduled rows.
-                    model_output = sp_gather_tokens(model_output, sp_total_tokens)
-                    # PP carries the full run between stages. Only the last
-                    # stage returns scheduled rows to sampling/draft consumers.
-                    hidden_states = model_output[: context.scheduled_tokens]
-                    logits = self.model.compute_logits(hidden_states)
+                    if sp_is_enabled() and is_prefill:
+                        # The LM head gathers only each prompt's last row.
+                        hidden_states = None
+                        logits = self.model.compute_logits(model_output)
+                    else:
+                        # Restore global token order before selecting rows.
+                        model_output = sp_gather_tokens(model_output, sp_total_tokens)
+                        # PP carries the full run between stages. Only the last
+                        # stage returns scheduled rows to sampling/draft consumers.
+                        hidden_states = model_output[: context.scheduled_tokens]
+                        logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
@@ -3932,12 +3949,6 @@ class ModelRunner:
         # Config owns the declared ladder; the runner only narrows it to what
         # this deployment can actually schedule (see the bound below).
         self.capture_sizes = self.config.capture_sizes
-        if tr_hybrid and sp_is_enabled():
-            # A token graph's bucket is its local rows (`sp_local_len`), and SP
-            # pads a batch to a multiple of its width: keep the ladder on that
-            # multiple so each recorded bucket is one batch size.
-            sp = get_sp_world_size()
-            self.capture_sizes = list({-(-bs // sp) * sp for bs in self.capture_sizes})
         self.capture_sizes.sort(reverse=True)
 
         # Drop any capture size the scheduler could never produce. `schedule_decode`
@@ -3966,6 +3977,10 @@ class ModelRunner:
         max_bs = max_schedulable_decode_bs(
             max_seq_bs, self.config.max_num_batched_tokens, full_q_len
         )
+        if tr_hybrid and sp_is_enabled():
+            self.capture_sizes = sp_token_graph_ladder(
+                self.capture_sizes, get_sp_world_size(), max_bs
+            )
         oversized = [s for s in self.capture_sizes if s > max_bs]
         if oversized:
             self.capture_sizes = [s for s in self.capture_sizes if s <= max_bs]
@@ -4300,6 +4315,13 @@ class ModelRunner:
         if self.config.disagg_is_decode:
             return
         if self.attn_metadata_builder.supports_token_graph:
+            # Their attention ops are recorded inline, so a prefill token graph
+            # would replay the synthetic prompt's attention on real prompts.
+            if sp_is_enabled() or self.config.tp_replicated_o_proj:
+                raise ValueError(
+                    "Ulysses SP and ATOM_TP_REPLICATED_O_PROJ do not support an "
+                    "attention backend with prefill token graphs."
+                )
             self._record_tr_graphs()
         self._record_prefill_req_graphs()
         reset_forward_context()

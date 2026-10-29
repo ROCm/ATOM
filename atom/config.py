@@ -2302,10 +2302,18 @@ class Config:
             )
         if self.enable_tbo or self.enable_tbo_decode:
             raise ValueError("Ulysses SP does not support TBO token slicing.")
+        # Also keeps each TR_HYBRID decode token bucket one (bs, q=1) request
+        # bucket, which the inline-recorded sp_attention_fp8 relies on.
         if self.speculative_config is not None:
             raise ValueError(
                 "Ulysses SP does not support speculative decoding: draft model "
                 "inputs and auxiliary hidden states are not sequence-sharded."
+            )
+        if self.kv_transfer_config:
+            raise ValueError(
+                "Ulysses SP does not support KV transfer or offload connectors: "
+                "they address KV by TP rank, while each SP rank holds 1/SP of "
+                "the KV heads."
             )
         # Local import: atom.utils pulls in atom.config at module scope.
         from atom.utils import get_hf_text_config
@@ -2351,6 +2359,8 @@ class Config:
                 "ATOM_TP_REPLICATED_O_PROJ requires TP>1 with SP1, PCP1, DCP1, "
                 "PP1 and DP1 without DP attention."
             )
+        # Speculative decoding: see the SP refusal; this attention is also
+        # recorded inline.
         if (
             self.enable_expert_parallel
             or self.moe_all2all_backend not in ("auto", "none")
@@ -2551,6 +2561,17 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        if hasattr(self, "kv_transfer_config") and isinstance(
+            self.kv_transfer_config, str
+        ):
+            import json
+
+            try:
+                self.kv_transfer_config = json.loads(self.kv_transfer_config)
+            except json.JSONDecodeError:
+                import ast
+
+                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         self.sp_mega_moe_enabled = (
@@ -2651,17 +2672,6 @@ class Config:
             else torch.bfloat16
         )
 
-        if hasattr(self, "kv_transfer_config") and isinstance(
-            self.kv_transfer_config, str
-        ):
-            import json
-
-            try:
-                self.kv_transfer_config = json.loads(self.kv_transfer_config)
-            except json.JSONDecodeError:
-                import ast
-
-                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
         # After the parse above: the P/D clause reads `kv_role` off
         # `kv_transfer_config`, which arrives from the CLI as a string.
         self._resolve_throughput_step_interval()

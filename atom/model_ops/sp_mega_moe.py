@@ -114,9 +114,35 @@ class SPMegaMoE:
         self.runtime = runtime
         self.launches_per_step = launches_per_step
         self.launches = 0
+        # Host copy of the runtime's sticky timeout bits, and the event after it.
+        self._errors = self._errors_copied = None
+
+    def _raise_on_timeout(self):
+        """Fail on a timed-out launch of an earlier step, without a host sync.
+
+        A timeout invalidates that step's output and the KV written from it, and
+        its bits are only cleared by the collective reset(), so it is fatal.
+        """
+        if self._errors_copied is not None:
+            if not self._errors_copied.query():
+                return
+            if self._errors.item():
+                raise RuntimeError(
+                    f"SP MegaMoE rank {self.runtime.cfg.rank}: a MegaMoeTP wait "
+                    f"timed out (error bits {self._errors.item():#x}); the output "
+                    "of a recent step is invalid."
+                )
+        flag = self.runtime.error_flag()
+        if self._errors is None:
+            self._errors = torch.empty_like(flag, device="cpu").pin_memory()
+            self._errors_copied = torch.cuda.Event()
+        self._errors.copy_(flag, non_blocking=True)
+        self._errors_copied.record()
 
     def count_step(self):
         """Count a model step's launches up front, so graph replays count too."""
+        # Before the reset below, which would clear a pending timeout.
+        self._raise_on_timeout()
         self.launches += self.launches_per_step
         if self.launches >= RESET_LAUNCHES:
             # Collective; every SP rank runs the same steps.
@@ -362,6 +388,14 @@ def _mega_moe_decoders(model):
     return decoders
 
 
+# MegaMoeTP setup failures that AITER gathers and raises on every rank.
+_AGREED_SETUP_FAILURES = (
+    "SdmaComm: MORI SDMA setup failed on ranks",
+    "SymmetricArena: mapping failed on ranks",
+    "MegaMoeTP.prepare: warmup launches timed out",
+)
+
+
 def initialize_sp_mega_moe(model, config):
     """After weight processing, before warmup/capture.
 
@@ -447,12 +481,14 @@ def initialize_sp_mega_moe(model, config):
             key = (runtime.launch_config(rows), runtime.tail_ok(rows))
             representatives.setdefault(key, rows)
         runtime.prepare(sorted(representatives.values()), tail=True, tail_bf16=True)
-    except torch.OutOfMemoryError:
-        # May hit one rank only; falling back there alone would desync the ranks.
-        raise
-    except (ImportError, RuntimeError) as exc:
-        # Missing MORI or MORI without SDMA: every rank raises together.
-        return skip(f"MegaMoeTP setup failed: {exc}")
+    except ImportError as exc:
+        return skip(f"MegaMoeTP unavailable: {exc}")
+    except RuntimeError as exc:
+        # Any other failure (OOM, a compile error) may hit one rank while its
+        # peers wait in a collective; falling back there alone desyncs them.
+        if not str(exc).startswith(_AGREED_SETUP_FAILURES):
+            raise
+        return skip(f"MegaMoeTP setup failed on every rank: {exc}")
     backend = SPMegaMoE(runtime, len(layers) * math.ceil(max_local_rows / tile))
     for layer in layers:
         layer._sp_mega_moe = backend

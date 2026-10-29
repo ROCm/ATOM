@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 from conftest import atom_config_double
 
 from atom.config import Config
+from atom.distributed.ulysses_sp import check_sp_attention_layer
 
 
 @pytest.mark.parametrize("world", [1, 2, 4, 8, 16, 32])
@@ -45,6 +47,7 @@ def test_gqa_rejects_partial_heads(query_heads, kv_heads, world):
         ({"prefill_context_parallel_size": 2}, "same rank dimension"),
         ({"enable_tbo": True}, "TBO token slicing"),
         ({"speculative_config": object()}, "speculative decoding"),
+        ({"kv_transfer_config": {"kv_connector": "mooncake"}}, "KV transfer"),
         ({"hf_config": SimpleNamespace(kv_lora_rank=512)}, "MHA models only"),
     ],
 )
@@ -52,6 +55,35 @@ def test_unsharded_execution_paths_are_rejected(overrides, reason):
     config = atom_config_double(sequence_parallel_size=4, **overrides)
     with pytest.raises(ValueError, match=reason):
         Config._init_sequence_parallel(config)
+
+
+def test_replicated_o_proj_rejects_speculative_decoding():
+    # Its inline-recorded attention needs one (bs, q=1) request per token bucket.
+    config = atom_config_double(
+        tp_replicated_o_proj=True,
+        tensor_parallel_size=4,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        speculative_config=object(),
+    )
+    with pytest.raises(ValueError, match="speculative decoding"):
+        Config._validate_tp_replicated_o_proj(config)
+
+
+def test_sp_attention_needs_rope_in_the_impl():
+    # A model that ropes before attention sees only its token shard there.
+    with pytest.raises(ValueError, match="RoPE inside the attention impl"):
+        check_sp_attention_layer(4, "layers.0.attn", None, None, None, 0)
+
+
+@pytest.mark.parametrize(
+    "index_heads,world,ok", [(0, 4, True), (4, 8, True), (8, 4, True), (6, 4, False)]
+)
+def test_sp_indexer_heads_shard_or_replicate(index_heads, world, ok):
+    expect = nullcontext() if ok else pytest.raises(ValueError, match="cannot shard")
+    with expect:
+        check_sp_attention_layer(
+            world, "layers.0.attn", None, None, object(), index_heads
+        )
 
 
 def test_layouts_that_change_the_graph_do_not_share_compiled_artifacts():
