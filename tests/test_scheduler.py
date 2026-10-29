@@ -3478,7 +3478,7 @@ class TestLocalPrefillProbeMatchesAdmission:
     def test_probe_skips_prefix_waiters_without_starting_their_wait(
         self, seq_factory, monkeypatch
     ):
-        sched, a, b = self._two_hits_waiting(seq_factory, 40)
+        sched, a, _b = self._two_hits_waiting(seq_factory, 40)
         sched._local_prefill_coalescing = True
         calls = []
 
