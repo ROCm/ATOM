@@ -2107,6 +2107,9 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
         prefix_bypass_left = min(16, self.max_num_seqs)
+        # Prefix hashes whose demand rung a request admitted this pass is cut at
+        # (`_take_checkpoint_demand`).
+        demands_cut: set[int] = set()
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -2526,6 +2529,7 @@ class Scheduler:
                 # hit: they are not served from the cache.
                 seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
+            self._take_checkpoint_demand(seq, hbm_probe.block_hashes, demands_cut)
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
 
@@ -3465,6 +3469,35 @@ class Scheduler:
         if num_new_tokens > budget_remaining and num_batched_tokens > 0:
             return None
         return num_new_tokens
+
+    def _take_checkpoint_demand(
+        self, seq: Sequence, block_hashes: list[int], demands_cut: set[int]
+    ) -> None:
+        """Leave one request per prefix a demand cut in this admission pass.
+
+        A demand rung is filed by the forward that ends on it, so every request
+        admitted in the same pass behind the same cached prefix finds the same
+        checkpoint missing. Each is then cut at the demand, a chunk of a few
+        tokens, and the batch budget lets the next one in: a burst of first
+        turns behind one cached template header was admitted 511 at a time at
+        32 tokens each, every one holding the KV of its whole prompt, and the
+        rank needed minutes to finish them before it could admit anything else.
+        The first request files the checkpoint; the rest are sized as if there
+        were no demand. They compute that prefix either way.
+
+        Keyed by the chained hash of the demand's last block, which names the
+        prefix and so the position.
+        """
+        demand = seq.checkpoint_demand_pos
+        if not demand:
+            return
+        i = demand // self.block_manager.hash_block_size - 1
+        if not 0 <= i < len(block_hashes):
+            return
+        if block_hashes[i] in demands_cut:
+            seq.checkpoint_demand_pos = 0
+        else:
+            demands_cut.add(block_hashes[i])
 
     def _finalize_prefill_chunk(self, seq: Sequence, start: int, chunk: int) -> int:
         """Align a prefill chunk to the state checkpoint boundary and vet forks.
