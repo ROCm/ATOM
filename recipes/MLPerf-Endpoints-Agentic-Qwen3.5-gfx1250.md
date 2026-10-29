@@ -27,12 +27,12 @@ The scripts are in [`mlperf_endpoints_qwen35/`](mlperf_endpoints_qwen35/). Relat
 | Dataset | `mlperf_agentic_inference_dataset`, 613 trajectories, 20,297 assistant turns |
 
 Concurrency: **1-2048, a power of two or three times one** (1, 2, 3, 4, 6, 8, 12, 16, 24, ..., 768,
-1024, 1536, 2048). Every point runs MTP with 3 draft tokens (`SPEC=0` turns it off); `run_ep.sh`
-picks the server from the concurrency:
+1024, 1536, 2048). Every point runs MTP, with 4 draft tokens on TP points and 3 on DP (`SPEC=<n>`
+overrides, `SPEC=0` turns it off); `run_ep.sh` picks the server from the concurrency:
 
 | Concurrency | Server |
 |---|---|
-| 1-16 | TP4, custom all-reduce |
+| 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p, MoE routes staged once per forward, MTP draft with replicated fc / embedding, one-launch pre-fc norms, all-reduce argmax exchange and one-launch GDN kv-indptr |
 | 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
@@ -82,6 +82,10 @@ their trajectories: 22% of turns at c2048), `MODE` / `SPEC`
 (override the table above), `SEQ_CAP` (512). A full compliant run is `CAP_MIN=600 STOP_FIRST=0`.
 `ATOM_PREFILL_DECODE_INTERVAL` in the environment overrides the DP points' default of 8 (0 is the
 scheduling before it; see [Prefill / decode interval](#prefill--decode-interval)).
+
+Traces: `TRACE_AT_MIN=5 TRACE_S=10 TRACE_STOP=1 bash run_ep.sh 16` takes a 10 s torch-profiler window of
+every rank 5 minutes into the benchmark (`$RUNS/c16/trace/rank_<r>/`) and then ends the point, so a
+traced point takes about 10 minutes.
 
 ## Results
 

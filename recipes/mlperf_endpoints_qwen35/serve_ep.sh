@@ -16,7 +16,34 @@ export HIP_FORCE_DEV_KERNARG=1 HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0
 export HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 ATOM_GC_THRESHOLD=20000,50,50
 # aiter custom all-reduce (TP4 only). TP4 GSM8K with it is 0.86 once prefill attention runs on
 # FlyDSL (aiter FMHA v_hdim 256); RCCL (MAX_SIZE=0) cannot be captured into hipGraphs on this host.
-[ "$MODE" = tp ] && export AITER_CUSTOM_AR_MIN_SIZE=131072 AITER_CUSTOM_AR_MAX_SIZE=8388608
+# From 16 KB up: a 128 KB floor sent every decode all-reduce of a batch of up to 8 (x 4 verify tokens
+# x 2048 x bf16 = 128 KB) to RCCL.
+[ "$MODE" = tp ] && export AITER_CUSTOM_AR_MIN_SIZE=${AITER_CUSTOM_AR_MIN_SIZE:-16384} \
+  AITER_CUSTOM_AR_MAX_SIZE=${AITER_CUSTOM_AR_MAX_SIZE:-8388608}
+# TP decode step (c16): verify and bonus rows sampled in one call, the sampled ids synced over the
+# custom all-gather instead of an RCCL broadcast, one launch per sigmoid gate, the tokenizer cache for
+# Qwen's NFC normalizer, aiter's register-resident top-p for the top-k-first sampler (the generic
+# kernel spills, and every launch then waits on a scratch grow). Each one: the environment wins.
+# Then the MoE route count staged once per forward (passed to aiter's fused_moe as num_valid_routes:
+# needs aiter alizaidy/qwen35-c16-perf, set ATOM_MOE_PRECOMPUTED_NVR=0 with an older aiter), and the
+# MTP draft: replicated fc and embedding (no all-gather / all-reduce), both pre-fc norms in one launch,
+# the argmax packs exchanged by one all-reduce, the GDN kv-indptr rebuild in one launch.
+if [ "$MODE" = tp ]; then
+  export ATOM_SPEC_FUSED_VERIFY_SAMPLE=${ATOM_SPEC_FUSED_VERIFY_SAMPLE:-1}
+  export ATOM_TP_TOKEN_SYNC_ALLGATHER=${ATOM_TP_TOKEN_SYNC_ALLGATHER:-1}
+  export ATOM_FUSED_SIGMOID_GATE=${ATOM_FUSED_SIGMOID_GATE:-1}
+  export ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER=${ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER:-1}
+  export AITER_TOPK_FIRST_SMALL_K_TOPP=${AITER_TOPK_FIRST_SMALL_K_TOPP:-1}
+  export ATOM_MOE_PRECOMPUTED_NVR=${ATOM_MOE_PRECOMPUTED_NVR:-1}
+  export ATOM_MTP_REPLICATED_FC=${ATOM_MTP_REPLICATED_FC:-1}
+  export ATOM_QWEN35_MTP_REPLICATED_EMBED=${ATOM_QWEN35_MTP_REPLICATED_EMBED:-1}
+  export ATOM_MTP_DUAL_PRE_FC_NORM=${ATOM_MTP_DUAL_PRE_FC_NORM:-1}
+  export ATOM_ARGMAX_HEAD_AR_GATHER=${ATOM_ARGMAX_HEAD_AR_GATHER:-1}
+  export ATOM_MTP_FUSED_KV_INDPTR=${ATOM_MTP_FUSED_KV_INDPTR:-1}
+fi
+# keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
+# first eager multi-request prefill, a ~35 s stall a fresh server
+export TRITON_CACHE_AUTOTUNING=${TRITON_CACHE_AUTOTUNING:-1}
 # --level 0 (no torch.compile; decode graphs are still captured): at level 3 TP4 hung ~7 min
 # into c8 (all ranks stuck behind the sampled-token broadcast, NCCL watchdog at 10 min).
 LEVEL=${LEVEL:-0}; KV=${KV:-bf16}; MAX_LEN=${MAX_LEN:-262144}
@@ -57,8 +84,11 @@ esac
 SPEC=${SPEC:-0}
 [ "$SPEC" -gt 0 ] && ARGS+=(--method mtp --num-speculative-tokens $SPEC
   --online_quant_config '{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4"}}')
+# TRACE_DIR=<dir>: torch profiler on every rank, armed only; run_ep.sh's TRACE_AT_MIN takes the window
+# (traces under $TRACE_DIR/rank_<r>/). Unset, nothing changes.
+[ -n "$TRACE_DIR" ] && mkdir -p $TRACE_DIR && ARGS+=(--torch-profiler-dir $TRACE_DIR --mark-trace)
 [ -n "$EXTRA_ENV" ] && export $EXTRA_ENV
 printf '%q ' python3 -m atom.entrypoints.openai_server "${ARGS[@]}" $EXTRA_ARGS > $OUT/server_cmd.txt; echo >> $OUT/server_cmd.txt
-env | grep -E '^(ATOM|AITER|FLYDSL|HIP|HSA|MORI|MEGA)_' | sort > $OUT/server_env.txt
+env | grep -E '^(ATOM|AITER|FLYDSL|HIP|HSA|MORI|MEGA|TRITON)_' | sort > $OUT/server_env.txt
 # PY_ENTRY: another entry point taking the same arguments (debugging wrappers)
 exec python3 -u ${PY_ENTRY:--m atom.entrypoints.openai_server} "${ARGS[@]}" $EXTRA_ARGS > $OUT/server.log 2>&1

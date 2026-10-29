@@ -2,24 +2,49 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3.5 MTP model."""
 
+import logging
 import re
 
 import torch
+from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.config import Config
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.linear import ColumnParallelLinear
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
+from atom.model_ops.linear import ColumnParallelLinear, ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5RMSNorm,
     get_qwen3_5_text_config,
 )
 from atom.models.utils import IntermediateTensors
+from atom.utils import envs
 
 from .utils import maybe_prefix
+
+logger = logging.getLogger("atom")
+
+
+# Up to here (decode and draft steps) the replicated fc runs whole on each rank.
+_REPLICATED_FC_MAX_TOKENS = 1024
+
+
+def _dual_norm_inputs_ok(a: torch.Tensor, b: torch.Tensor) -> bool:
+    # What the two-input norm takes: 2-D rows of one dtype, last dim contiguous.
+    return (
+        a.dim() == b.dim() == 2
+        and a.shape == b.shape
+        and a.dtype == b.dtype
+        and a.stride(-1) == b.stride(-1) == 1
+    )
 
 
 # @support_torch_compile
@@ -43,13 +68,22 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             config.hidden_size,
         )
 
-        self.fc = ColumnParallelLinear(
+        # Replicated fc (ATOM_MTP_REPLICATED_FC): every rank has the whole fc
+        # output without the all-gather. Its input is the same on every rank (the
+        # post-collective target hidden and the draft token's embedding), so is
+        # its output.
+        self.replicated_fc = (
+            envs.ATOM_MTP_REPLICATED_FC and get_tp_group().world_size > 1
+        )
+        fc_cls = ReplicatedLinear if self.replicated_fc else ColumnParallelLinear
+        self.fc = fc_cls(
             self.config.hidden_size * 2,
             self.config.hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.fc",
         )
+        self.dual_pre_fc_norm = envs.ATOM_MTP_DUAL_PRE_FC_NORM
 
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
@@ -75,6 +109,51 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _fc(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.replicated_fc:
+            return get_tp_group().all_gather(self.fc(x))
+        tp = get_tp_group()
+        if (
+            x.shape[0] <= _REPLICATED_FC_MAX_TOKENS
+            or tp.world_size == 1
+            or self.fc.quant_type.value != QuantType.No.value
+            or getattr(self.fc.weight, "is_shuffled", False)
+        ):
+            return self.fc(x)
+        # A prefill chunk: the full GEMM would be TP times the FLOPs, so this
+        # rank's rows of the weight (what ColumnParallelLinear holds) and the
+        # all-gather, as without the flag.
+        rows = self.fc.weight.shape[0] // tp.world_size
+        shard = self.fc.weight[tp.rank_in_group * rows :][:rows]
+        return tp.all_gather(tgemm.mm(x, shard, None, otype=x.dtype))
+
+    def _pre_fc_norms(
+        self, inputs_embeds: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """cat([pre_fc_norm_embedding(e), pre_fc_norm_hidden(h)], -1) in one
+        launch: the two-input mode of the kernel GemmaRMSNorm runs, each norm
+        storing into its half of the fc input."""
+        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+
+        hidden = hidden_states.shape[-1]
+        out = torch.empty(
+            (hidden_states.shape[0], 2 * hidden),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        fused_qk_rmsnorm_group_quant(
+            q=inputs_embeds,
+            q_weight=self.pre_fc_norm_embedding.weight.data,
+            q_epsilon=self.pre_fc_norm_embedding.variance_epsilon,
+            q_out_unquantized=out[:, :hidden],
+            k=hidden_states,
+            k_weight=self.pre_fc_norm_hidden.weight.data,
+            k_epsilon=self.pre_fc_norm_hidden.variance_epsilon,
+            k_out=out[:, hidden:],
+            gemma_norm=True,
+        )
+        return out
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -88,11 +167,13 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-        hidden_states = self.pre_fc_norm_hidden(hidden_states)
-        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-        hidden_states = self.fc(hidden_states)
-        hidden_states = get_tp_group().all_gather(hidden_states)
+        if self.dual_pre_fc_norm and _dual_norm_inputs_ok(inputs_embeds, hidden_states):
+            hidden_states = self._pre_fc_norms(inputs_embeds, hidden_states)
+        else:
+            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self._fc(hidden_states)
         residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -176,6 +257,37 @@ class Qwen3_5MTP(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
+
+    def post_share_with_target(self, target_base: nn.Module) -> None:
+        """Replicate the draft's embedding once it is final
+        (ATOM_QWEN35_MTP_REPLICATED_EMBED).
+
+        Runs after the drafter shared the target's embed, so it is whatever the
+        draft really reads. The table is all-gathered from the sharded copy
+        rather than re-read from the checkpoint, so the replicated rows are
+        those very bits. A no-op with the flag off.
+        """
+        tp = get_tp_group()
+        if not (envs.ATOM_QWEN35_MTP_REPLICATED_EMBED and tp.world_size > 1):
+            return
+        sharded = self.model.embed_tokens
+        assert isinstance(sharded, VocabParallelEmbedding), type(sharded)
+        full = tp.all_gather(sharded.weight.data, dim=0)
+        assert full.shape[0] == sharded.num_embeddings, tuple(full.shape)
+        # Built on meta, then handed the gathered table: no second full-size
+        # allocation for a weight that is overwritten anyway.
+        with torch.device("meta"):
+            replicated = ReplicatedEmbedding(full.shape[0], full.shape[1])
+        replicated.weight = atom_parameter(full)
+        # Only the draft's attribute is rebound; the target keeps its shard.
+        self.model.embed_tokens = replicated
+        logger.info(
+            "Qwen3.5 MTP embedding: REPLICATED (%d x %d per rank, no "
+            "post-embed all-reduce)",
+            full.shape[0],
+            full.shape[1],
+        )
+        torch.cuda.empty_cache()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

@@ -34,6 +34,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.sigmoid_gate import output_gate_mul, shared_expert_gate_add
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
@@ -56,6 +57,7 @@ ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
+ATOM_FUSED_SIGMOID_GATE = envs.ATOM_FUSED_SIGMOID_GATE
 
 
 def mamba_v2_sharded_weight_loader(
@@ -274,8 +276,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             # Apply shared expert gate: the merged gate output contains
             # [routed_logits, shared_expert_gate_logits], extract the tail
             shared_gate_logits = logits[:, self.n_routed_experts :]
-            shared_output = F.sigmoid(shared_gate_logits) * shared_output
-            final_hidden_states = shared_output + routed_output
+            final_hidden_states = shared_expert_gate_add(
+                shared_output,
+                shared_gate_logits,
+                routed_output,
+                ATOM_FUSED_SIGMOID_GATE,
+            )
         else:
             final_hidden_states = routed_output
 
@@ -465,8 +471,7 @@ class Qwen3NextAttention(nn.Module):
             attn_output, attn_scale = sigmoid_mul_fp8_group_quant(attn_output, gate)
             output = self.o_proj(attn_output, x_scale=attn_scale)
         elif self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            attn_output = output_gate_mul(attn_output, gate, ATOM_FUSED_SIGMOID_GATE)
             output = self.o_proj(attn_output)
         else:
             output = self.o_proj(attn_output)

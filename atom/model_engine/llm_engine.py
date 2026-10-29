@@ -693,7 +693,9 @@ class InputOutputProcessor:
         self.block_size = block_size
         self.requests = {}
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
-            tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
+            tokenizer,
+            envs.ATOM_TOKENIZE_CACHE_MB << 20,
+            per_segment_normalizer=envs.ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER,
         )
         # `has_per_req_cache` flags model architectures that need a
         # per-request stateful buffer outside the paged KV pool. Sequences

@@ -6,13 +6,20 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from aiter import topk_select
-from aiter.dist.communication_op import tensor_model_parallel_all_gather
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
-from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
+from atom.model_ops.lm_head_argmax import (
+    lm_head_argmax_pack,
+    lm_head_argmax_pick,
+    lm_head_argmax_units,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
@@ -348,6 +355,16 @@ class ParallelLMHead(VocabParallelEmbedding):
                 tie="low",
                 output_idx=out.view(-1, 1),
             )
+            return out
+        if envs.ATOM_ARGMAX_HEAD_AR_GATHER and out.is_contiguous():
+            # The packs' all-gather as an exact all-reduce of their byte images
+            # (lm_head_argmax.py): the plain all-reduce is the cheaper collective
+            # at this size, and one kernel then picks and writes the token.
+            units = lm_head_argmax_units(
+                logits, self.vocab_start_idx, self.tp_rank, self.tp_size
+            )
+            units = tensor_model_parallel_all_reduce(units)
+            lm_head_argmax_pick(units, self.tp_size, out.view(-1))
             return out
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.

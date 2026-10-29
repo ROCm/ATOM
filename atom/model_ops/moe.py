@@ -108,7 +108,11 @@ from atom.quantization.quark.utils import (
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
-from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
+from atom.utils.forward_context import (
+    get_forward_context,
+    pass_scheduled_routes_gpu,
+    pass_scheduled_tokens_gpu,
+)
 from atom.utils.tbo.ubatching import (
     tbo_active,
     tbo_enabled,
@@ -2431,6 +2435,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # writes the output in the model dtype, not x's.
                 a1_scale = x_scale
                 moe_extra_args["dtype"] = self.moe.in_dtype
+            if envs.ATOM_MOE_PRECOMPUTED_NVR:
+                # `scheduled_tokens_gpu * topk`, staged with it, in place of
+                # the multiply aiter's grouped TP path launches per layer.
+                num_valid_routes = pass_scheduled_routes_gpu(
+                    scheduled_tokens_gpu, topk_ids.shape[1]
+                )
+                if num_valid_routes is not None:
+                    moe_extra_args["num_valid_routes"] = num_valid_routes
             return fused_moe(
                 x,
                 layer.w13_weight,

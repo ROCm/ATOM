@@ -2,6 +2,7 @@ import copy
 import logging
 
 import torch
+from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 from torch.profiler import record_function
 
@@ -1065,6 +1066,39 @@ class EagleProposer(Drafter):
                     input_ids = next_input_ids
                     hidden_states = sample_hidden_states
 
+        if envs.ATOM_MTP_DRAFT_RANK_CHECK:
+            self._check_draft_rank_agreement(draft_token_ids)
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k], contiguous: every consumer indexes by sequence.
         return draft_token_ids.t().contiguous()
+
+    def _check_draft_rank_agreement(self, draft_token_ids: torch.Tensor) -> None:
+        """ATOM_MTP_DRAFT_RANK_CHECK: every TP rank must draft the same ids.
+
+        The drafts feed the next verify on every rank, so a rank that drafts
+        differently runs a different target batch. A replicated draft component
+        holds this only if its input bits and kernels are the same everywhere;
+        this checks it end to end. All-gathers and syncs: validation only.
+        """
+        tp = get_tp_group()
+        if tp.world_size == 1:
+            return
+        ids = draft_token_ids.contiguous()
+        gathered = tp.all_gather(ids, dim=0).view(tp.world_size, *ids.shape)
+        bad = int((gathered != gathered[:1]).any(dim=0).sum())
+        self._rank_check_steps = getattr(self, "_rank_check_steps", 0) + 1
+        self._rank_check_bad = getattr(self, "_rank_check_bad", 0) + bad
+        if bad:
+            logger.error(
+                "MTP draft rank check: %d of %d draft ids differ across TP "
+                "ranks (step %d)",
+                bad,
+                ids.numel(),
+                self._rank_check_steps,
+            )
+        elif self._rank_check_steps % 1000 == 0:
+            logger.info(
+                "MTP draft rank check: %d propose steps, %d mismatching ids",
+                self._rank_check_steps,
+                self._rank_check_bad,
+            )
