@@ -5,8 +5,15 @@
 # paged is then an auditable PR rather than an edit in repo settings that nobody sees.
 # If on-call rotation ever has to be changed by someone without commit rights, add an
 # override channel back -- but add it deliberately, not by default.
-flow     zufayu   the review pipeline itself (bot logic / prompts)
-env      zufayu   the runner environment (gh, token, git, disk)
-glm      zufayu   the model backend serving the review agent
-atom     zufayu   the ATOM serving framework
-machine  zufayu   the machine (GPU, disk, network, OS)
+#
+# The mapping is aiter's, from the CLASSES table in its own _notify.py: same box, same
+# team, same services, so a GLM outage or a dead disk reaches the person who already
+# owns it there. It also matches the ATOM review roster's domains -- gyohuangxin's ATOM
+# review group is CI, valarLip leads Serving. P0 shipped with all five rows pointing at
+# zufayu, which carried the mechanism across and left the routing behind; a map that
+# pages one person for every class is a map that stops being read.
+flow     zufayu       the review pipeline itself (bot logic / prompts)
+env      zufayu       the runner environment (gh, token, git, disk)
+glm      yhl-amd      the model backend serving the review agent
+atom     valarLip     the ATOM serving framework
+machine  gyohuangxin  the machine (GPU, disk, network, OS)
