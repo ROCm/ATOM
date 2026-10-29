@@ -19,8 +19,8 @@ from atom.models.minimax_m3.mono.config import (
     FP4_SCALE_OFFSET,
     HEAD_DIM,
 )
-from atom.mono.device.mx import FP8_MAX
-from atom.mono.device.ops import butterfly, hw_rcp, traced
+from atom.mono.device.mx import FP8_MAX, clamp_fp8
+from atom.mono.device.ops import butterfly, fp8_pack4, hw_rcp, traced
 
 
 def ld_bf16x4(r, k, cm=0):
@@ -30,6 +30,12 @@ def ld_bf16x4(r, k, cm=0):
     )
     v = w.bitcast(fx.BFloat16).to(fx.Float32)
     return [v[j] for j in range(4)]
+
+
+def pack_q_e4m3(v):
+    """Four f32 -> one dword of four unit-scale E4M3 bytes, saturating at +-448:
+    the aiter writer's ``q_out`` convention (K1's main-Q store over MXFP4 K / V)."""
+    return fp8_pack4(*[clamp_fp8(x) for x in v])
 
 
 def ld_bf16x12(r, word, cm=0):

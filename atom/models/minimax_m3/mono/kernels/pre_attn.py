@@ -47,6 +47,7 @@ from atom.models.minimax_m3.mono.kernels.common import (
     ar_pack_sumsq,
     ld_bf16x4,
     mxfp4_row_store,
+    pack_q_e4m3,
     per_token_fp8_scale,
 )
 from atom.models.minimax_m3.mono.kernels.index_score import (
@@ -56,7 +57,7 @@ from atom.models.minimax_m3.mono.kernels.index_score import (
     step_rows,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
-from atom.mono.device.mx import FP8_MAX, clamp_fp8
+from atom.mono.device.mx import FP8_MAX
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -539,7 +540,7 @@ def emit_pre_attn(
                         # e4m3, unit scale, saturating, cast from the f32 elements:
                         # the aiter writer's q_out convention (the split stage reads it as is)
                         bo.buffer_store(
-                            fp8_pack4(*[clamp_fp8(v) for v in out]),
+                            pack_q_e4m3(out),
                             rsrc(q_out),
                             ((tk * LOCAL_Q_HEADS + ht) * HEAD_DIM + d0) // 4,
                             cache_modifier=cm_out,

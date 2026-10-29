@@ -27,6 +27,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, dequantize_pages
 from atom.models.minimax_m3.mono.config import HEAD_DIM
+from atom.models.minimax_m3.mono.kernels.common import pack_q_e4m3
 from atom.models.minimax_m3.mono.kernels.stages.attention import split_defs
 from atom.models.minimax_m3.mono.layout import (
     N_SPLIT,
@@ -273,3 +274,40 @@ def _check_split(n_ctx, scale, table_shift=0):
         rel = ((got_o - want_o).norm() / want_o.norm().clamp_min(1e-12)).item()
         assert rel < 1e-2, f"partition {t}: O relative error {rel:.3e}"
     assert math.isfinite(rel)
+
+
+def _q_pack_launcher():
+    @flyc.kernel(name="mono_q_e4m3_pack_test", known_block_size=[64, 1, 1])
+    def kernel(x: Int64, out: Int64):
+        t = fx.thread_idx.x
+        v = [
+            fx.Float32(bo.buffer_load(rsrc(x), 4 * t + j, vec_width=1, dtype=T.f32))
+            for j in range(4)
+        ]
+        bo.buffer_store(pack_q_e4m3(v), rsrc(out), t)
+
+    @flyc.jit
+    def launch(x: Int64, out: Int64, stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+        kernel(x, out).launch(grid=(1,), block=(64,), stream=stream)
+
+    return launch
+
+
+def test_k1_writes_q_as_saturating_e4m3():
+    """K1's main-Q store over MXFP4 K / V: in-range values are torch's e4m3 cast,
+    anything beyond +-448 (inf too) saturates to +-448, NaN stays NaN."""
+    g = torch.Generator(device="cuda").manual_seed(7)
+    x = torch.randn(64, 4, device="cuda", generator=g) * 30
+    x[0] = torch.tensor([1000.0, -1000.0, 448.0, -448.0])
+    x[1] = torch.tensor([449.0, -3e38, float("inf"), float("-inf")])
+    x[2] = torch.tensor([float("nan"), 0.0, -0.0, 1e-9])
+    out = torch.zeros(64, dtype=torch.int32, device="cuda")
+    _q_pack_launcher()(x.data_ptr(), out.data_ptr())
+    torch.cuda.synchronize()
+    got = out.view(torch.uint8).view(64, 4).view(torch.float8_e4m3fn).float()
+    want = x.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+    nan = x.isnan()
+    assert torch.equal(got.isnan(), nan), "NaN must stay NaN, and only NaN"
+    assert torch.equal(got[~nan], want[~nan])
+    assert got[0].tolist() == [448.0, -448.0, 448.0, -448.0]
+    assert got[1].tolist() == [448.0, -448.0, 448.0, -448.0]
