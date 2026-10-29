@@ -225,25 +225,13 @@ def test_plugin_mode_is_not_refused_by_the_model_validator():
     registers V4.1 at all -- so this gate guarded no reachable configuration
     while reading as though it did.
 
-    `is_vllm` survives only to skip the two native transport checks; see
-    `test_vllm_plugin_transport_is_gated_by_the_platform`.
+    The validator does not read `is_vllm` at all; the plugin's transport and
+    speculation gates are in `atom.plugin.vllm.platform` too.
     """
     validate_runtime_config(
         runtime_config(plugin_config=SimpleNamespace(is_vllm=False))
     )
     validate_runtime_config(vllm_plugin_config())
-
-
-def test_vllm_plugin_transport_is_gated_by_the_platform():
-    """On the plugin `kv_transfer_config` names vLLM's connector, which ATOM's
-    registry does not know; `atom.plugin.vllm.platform` admits or refuses it."""
-    transfer = {
-        "kv_connector": "AtomLMCacheOffloadConnector",
-        "kv_load_failure_policy": "recompute",
-    }
-    validate_runtime_config(vllm_plugin_config(kv_transfer_config=transfer))
-    with pytest.raises(ValueError, match="unknown KV connector"):
-        validate_runtime_config(runtime_config(kv_transfer_config=transfer))
 
 
 def _attach_uncompiled_backbone(model):

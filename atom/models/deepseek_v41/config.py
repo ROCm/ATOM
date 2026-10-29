@@ -342,13 +342,6 @@ def validate_runtime_config(config):
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
-
-    # On the vLLM plugin the transport is vLLM's own `kv_connector`, not an
-    # ATOM connector name, and `atom.plugin.vllm.platform` gates it (and the
-    # plugin's speculation and prefix caching) by vLLM's names, so the two
-    # transport checks below are native only.
-    plugin = config.plugin_config
-    on_vllm_plugin = plugin is not None and bool(getattr(plugin, "is_vllm", False))
     for name, enabled in (
         (
             "CUDAGraph mode (use FULL, TR_HYBRID or enforce_eager=True)",
@@ -387,8 +380,7 @@ def validate_runtime_config(config):
             # STATE slot (`get_kv_transfer_tensors`). MoRI-IO and in-process
             # offload read SLOT codecs this runtime does not publish.
             "KV transfer other than lmcache_mp or mooncake",
-            not on_vllm_plugin
-            and KVConnectorFactory.connector_name(config.kv_transfer_config)
+            KVConnectorFactory.connector_name(config.kv_transfer_config)
             not in (None, "lmcache_mp", "mooncake"),
         ),
         (
@@ -397,9 +389,7 @@ def validate_runtime_config(config):
             # an implicit producer would keep deferred output and decode T0
             # into the slot before handing it over.
             "Mooncake P/D without an explicit kv_role",
-            not on_vllm_plugin
-            and KVConnectorFactory.connector_name(config.kv_transfer_config)
-            == "mooncake"
+            KVConnectorFactory.connector_name(config.kv_transfer_config) == "mooncake"
             and isinstance(config.kv_transfer_config, dict)
             and config.kv_transfer_config.get("kv_role")
             not in ("kv_producer", "kv_consumer"),

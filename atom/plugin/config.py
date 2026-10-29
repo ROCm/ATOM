@@ -446,6 +446,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     # page size, so it has to be resolved here -- before Config.__post_init__
     # runs the V4.1 runtime gate on it -- rather than left as vLLM's spelling.
     kv_cache_dtype = vllm_cache_config.cache_dtype
+    kv_transfer_config = _vllm_kv_transfer_config(config)
     from atom.plugin.vllm.deepseek_v41_bridge import (
         is_deepseek_v41_vllm_config,
         v41_kv_cache_dtype,
@@ -453,6 +454,12 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     if is_deepseek_v41_vllm_config(config):
         kv_cache_dtype = v41_kv_cache_dtype(config)
+        # V4.1's transport is gated against vLLM's connector names by
+        # `enforce_deepseek_v41_constraints` and driven by vLLM, which hands
+        # AtomLMCacheOffloadConnector its own view of the config. The model's
+        # validator only knows ATOM's connector registry, where every vLLM name
+        # is unknown, so it is not given one.
+        kv_transfer_config = {}
 
     return Config(
         model=vllm_model_config.model,
@@ -471,8 +478,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         # vLLM's KV transport, carried across so a model's own
         # `validate_runtime_config` can gate on it. Without this the gate reads
         # an empty dict in plugin mode and admits every connector silently --
-        # the check passes because it was never asked the question.
-        kv_transfer_config=_vllm_kv_transfer_config(config),
+        # the check passes because it was never asked the question. V4.1 is
+        # the exception above: its gate is the platform's.
+        kv_transfer_config=kv_transfer_config,
         port=None,
         torch_profiler_dir=None,
         compilation_config=vllm_compilation_config,
