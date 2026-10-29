@@ -106,7 +106,11 @@ class DeepSeekV3AttributionCellsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cells = generate_cells("DeepSeek-V3")
-        cls.cells = {cell["env"]["common"]["KV_CONNECTOR"]: cell for cell in cells}
+        cls.cells = {
+            cell["env"]["common"]["KV_CONNECTOR"]: cell
+            for cell in cells
+            if cell["topology"].startswith("1p1d_tp8_")
+        }
 
     def test_both_connectors_are_present(self):
         self.assertEqual(set(self.cells), {"mooncake", "moriio"})
@@ -151,6 +155,79 @@ class DeepSeekV3AttributionCellsTest(unittest.TestCase):
             self.assertTrue(cell["accuracy"]["apply_chat_template"])
             # V3 does not think, so gsm8k answers fit well inside this.
             self.assertEqual(cell["accuracy"]["max_gen_toks"], 512)
+
+
+class DeepSeekV3LowLatencyDecodeCellTest(unittest.TestCase):
+    """DP attention + MoRI EP with only the decode role on low latency."""
+
+    @classmethod
+    def setUpClass(cls):
+        cells = generate_cells("DeepSeek-V3")
+        cls.cell = next(
+            cell for cell in cells if cell["topology"] == "1p1d_dpa8_ep8_ll_moriio"
+        )
+
+    def test_only_decode_runs_low_latency(self):
+        prefill = self.cell["service"]["prefill"]["extra_args"]
+        decode = self.cell["service"]["decode"]["extra_args"]
+        for args in (prefill, decode):
+            self.assertIn("--enable-dp-attention --enable-expert-parallel", args)
+        self.assertNotIn("--all2all-backend", prefill)
+        self.assertIn("--all2all-backend low-latency", decode)
+        self.assertEqual(self.cell["env"]["decode"]["ATOM_MORI_V1_LL"], "1")
+        self.assertIsNone(self.cell["env"]["prefill"].get("ATOM_MORI_V1_LL"))
+
+    def test_fp8_moe_keeps_the_shared_expert_separate(self):
+        for role in ("prefill", "decode"):
+            self.assertEqual(self.cell["env"][role]["ATOM_FUSE_SHARED_EXPERT"], "0")
+
+    def test_cell_is_a_two_node_moriio_gsm8k_run(self):
+        env = self.cell["env"]["common"]
+        self.assertEqual(env["KV_CONNECTOR"], "moriio")
+        self.assertEqual(env["ATOM_MORIIO_MODE"], "write")
+        self.assertEqual(env["MORI_SHMEM_HEAP_SIZE"], "16G")
+        self.assertEqual(self.cell["server_args"]["max_num_batched_tokens"], 16384)
+        self.assertTrue(self.cell["eval_only"])
+        self.assertEqual(self.cell["accuracy"]["threshold"], 0.90)
+        self.assertEqual(self.cell["num_nodes"], 2)
+
+
+class DeepSeekV3CrossNodeLowLatencyDecodeCellTest(unittest.TestCase):
+    """2P2D: each role spans two nodes, decode on InterNodeV1LL."""
+
+    @classmethod
+    def setUpClass(cls):
+        cells = generate_cells("DeepSeek-V3")
+        cls.cell = next(
+            cell for cell in cells if cell["topology"] == "1p1d_dpa16_ep16_ll_moriio"
+        )
+
+    def test_each_role_spans_two_nodes(self):
+        self.assertEqual(self.cell["num_nodes"], 4)
+        for role in ("prefill", "decode"):
+            self.assertEqual(self.cell["service"][role]["nodes_per_worker"], 2)
+
+    def test_only_decode_runs_inter_node_ll_at_vllm_geometry(self):
+        service, env = self.cell["service"], self.cell["env"]
+        self.assertIn("--all2all-backend low-latency", service["decode"]["extra_args"])
+        self.assertNotIn("--all2all-backend", service["prefill"]["extra_args"])
+        self.assertEqual(env["decode"]["ATOM_MORI_V1_LL"], "1")
+        geometry = (
+            "MORI_EP_BLOCK_NUM",
+            "MORI_EP_RDMA_BLOCK_NUM",
+            "MORI_EP_WARP_PER_BLOCK",
+        )
+        self.assertEqual([env["decode"][k] for k in geometry], ["64", "32", "8"])
+        for key in ("ATOM_MORI_V1_LL", *geometry):
+            self.assertIsNone(env["prefill"].get(key))
+
+    def test_cross_node_settings(self):
+        self.assertEqual(self.cell["server_args"]["gpu_memory_utilization"], 0.70)
+        for role in ("prefill", "decode"):
+            env = self.cell["env"][role]
+            self.assertEqual(env["MORI_ENABLE_HOST_PROXY"], "1")
+            self.assertEqual(env["ATOM_FUSE_SHARED_EXPERT"], "0")
+            self.assertEqual(env["ATOM_DP_LM_HEAD_MODE"], "default")
 
 
 class KvConnectorTest(unittest.TestCase):

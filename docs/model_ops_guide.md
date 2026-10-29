@@ -277,7 +277,7 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 | `rocm_aiter_grouped_topk` | `aiter.grouped_topk` | Grouped top-k (DeepSeek) |
 | `rocm_aiter_biased_grouped_topk` | `aiter.biased_grouped_topk` | Biased grouped top-k (DeepSeek V3) |
 
-**Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`.
+**Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`. Under DP attention with MoRI EP, fusion is wired up only for MXFP4 / NVFP4 routed experts; FP8 MoE models such as DeepSeek-V3 must run with `ATOM_FUSE_SHARED_EXPERT=0`, or `FusedMoE` raises `NotImplementedError`.
 
 ### `FusedMoEParallelConfig`
 

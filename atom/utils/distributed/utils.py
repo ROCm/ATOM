@@ -2,17 +2,17 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ipaddress
+from datetime import timedelta
+
+import torch
+from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
     _get_default_timeout,
     _unregister_process_group,
 )
-from torch.distributed import ProcessGroup
 from torch.distributed.rendezvous import rendezvous
-import torch
-from datetime import timedelta
-
 
 from atom.utils import is_torch_equal_or_newer
 
@@ -30,6 +30,20 @@ def get_tcp_uri(ip: str, port: int) -> str:
         return f"tcp://[{ip}]:{port}"
     else:
         return f"tcp://{ip}:{port}"
+
+
+def raise_default_group_timeout(seconds: int) -> None:
+    """Raise, never lower, the timeout torch gives groups created without one.
+
+    aiter builds its gloo groups that way. Across nodes their first collective
+    after the weight load waits for the slowest node, and a cold read of a large
+    checkpoint from NFS can trail another node's by more than the 30 minutes.
+    """
+    from torch.distributed import distributed_c10d
+
+    distributed_c10d.default_pg_timeout = max(
+        distributed_c10d.default_pg_timeout, timedelta(seconds=seconds)
+    )
 
 
 def init_gloo_process_group(
