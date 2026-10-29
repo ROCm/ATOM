@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import inspect
 import sys
+import textwrap
 import types
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1245,6 +1248,7 @@ def test_split_logits_do_not_wrap_in_int32(v4_builder_cls, monkeypatch):
 
 _MOONCAKE = {"kv_connector": "mooncake"}
 _OFFLOAD = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+_LOAD_ONLY = {"kv_connector": "lmcache_offload", "kv_role": "kv_consumer"}
 
 
 def _multi(*connectors):
@@ -1258,9 +1262,12 @@ def _multi(*connectors):
         ("true", False, {}, 8),
         ("1", False, {**_MOONCAKE, "kv_role": "kv_producer"}, 8),
         ("1", False, _multi({**_MOONCAKE, "kv_role": "kv_producer"}, _OFFLOAD), 8),
-        ("1", False, {"kv_connector": "lmcache_offload", "kv_role": "kv_consumer"}, 8),
+        ("1", False, _LOAD_ONLY, 8),
+        ("1", False, _multi(_LOAD_ONLY), 8),
+        ("1", False, {**_multi(_MOONCAKE, _OFFLOAD), "kv_role": "kv_consumer"}, 8),
         ("1", True, {}, 1),
         ("1", False, {**_MOONCAKE, "kv_role": "kv_consumer"}, 1),
+        ("1", False, {"kv_connector": "moriio", "kv_role": "kv_consumer"}, 1),
         ("1", False, _multi({**_MOONCAKE, "kv_role": "kv_consumer"}, _OFFLOAD), 1),
         ("1", False, _multi(_OFFLOAD, {**_MOONCAKE, "kv_role": "kv_consumer"}), 1),
         ("0", False, {}, 1),
@@ -1271,8 +1278,11 @@ def _multi(*connectors):
         "pd_prefill",
         "multi_pd_prefill",
         "offload_load_only",
+        "multi_offload_load_only",
+        "multi_top_level_role_only",
         "prefill_tbo",
         "pd_decode",
+        "moriio_pd_decode",
         "multi_pd_decode",
         "multi_pd_decode_offload_first",
         "flag_off",
@@ -1286,7 +1296,8 @@ def test_the_split_world_follows_the_run(
     rows whole, and so, for now, does prefill TBO, whose ubatches' rows do
     not take the split yet, and so does a P/D decode instance, which only
     recomputes prefills: under `multi` too, whose P/D sub-connector holds the
-    role, wherever it is listed. Reading the world is no collective: the
+    role, wherever it is listed (a role on `multi` alone reaches no
+    sub-connector, which runs as a producer). Reading the world is no collective: the
     startup gather is the builder's `__init__`'s (`_warm_split_gather`)."""
     module = v4_builder_cls._indexer_qsplit_world_size.__globals__
     monkeypatch.setitem(module, "get_tensor_model_parallel_world_size", lambda: 8)
@@ -1330,6 +1341,19 @@ def test_a_run_that_splits_gathers_at_startup(v4_builder_cls, world, gathers):
     builder._init_indexer_qsplit(SimpleNamespace())
     assert builder._indexer_qsplit_world == world
     assert warmed == gathers
+
+
+def test_the_builder_inits_the_split(v4_builder_cls):
+    """`__init__` calls `_init_indexer_qsplit`: the builder is too heavy to
+    construct here, so its source is read. Without the call the startup
+    gather is gone and the split's state unset until a prefill reads it."""
+    init = ast.parse(textwrap.dedent(inspect.getsource(v4_builder_cls.__init__)))
+    calls = [
+        node.func.attr
+        for node in ast.walk(init)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    assert calls.count("_init_indexer_qsplit") == 1
 
 
 def test_the_startup_gather_is_the_split_s(v4_builder_cls, monkeypatch):
