@@ -116,9 +116,10 @@ class V4MonoEngine:
         self.abort_step()
         mono, runner = self.session, self.owner
         fc, mode = context.context, context.context.forward_mode
+        # Ordinary decode leaves logits and sampling on the native path.
         allow_auto = bool(
             batch is not None
-            and (batch.temperatures == 0).all()
+            and (mono.profile.native_sampling or (batch.temperatures == 0).all())
             and not any(batch.return_logprobs)
         )
         if mode.use_cudagraph and not fc.is_prefill and mode.running_tokens_are_unified:
