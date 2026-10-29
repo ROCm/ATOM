@@ -19,7 +19,11 @@ from types import SimpleNamespace
 import pytest
 from conftest import MockConfig
 
-from atom.model_engine.block_manager import AdmissionProbe, BlockManager
+from atom.model_engine.block_manager import (
+    AdmissionProbe,
+    BlockManager,
+    JointBoundaryDecision,
+)
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.page_unit_checkpoint import (
@@ -3219,6 +3223,55 @@ class TestPromptEndAnchor:
         bm.allocate(seq, bm.can_allocate(seq))
         assert seq.checkpoint_end_pos == ref.checkpoint_end_pos
         assert bm.checkpointers_at(seq, seq.checkpoint_end_pos)
+
+    def _tier_grid_manager(self):
+        bm = make_block_manager(
+            demand_config(
+                kv_cache_block_size=64,
+                num_kvcache_blocks=400,
+                max_model_len=16384,
+                max_num_batched_tokens=16384,
+                state_checkpoint_interval_tokens=8192,
+            )
+        )
+        bm.align_checkpoint_anchor(256)
+        return bm
+
+    def test_a_hit_on_the_tier_grid_keeps_the_anchor_past_it(self):
+        """Chunk 256, block 64: a turn that hits 8192 with an 8300-token
+        prompt. The grid floors its anchor 8256 onto the hit, where no forward
+        of this turn reaches it, so the hash-block anchor stays and is kept."""
+        bm = self._tier_grid_manager()
+        run_prompt_on_the_ladder(
+            bm, Sequence(list(range(8200)), 64, has_per_req_cache=True)
+        )
+        seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
+        hit = bm.can_allocate(seq)
+        assert hit * 64 == 8192
+        assert seq.checkpoint_end_pos == 8256
+        bm.allocate(seq, hit)
+        assert forward_on_the_ladder(bm, seq) == [8256]
+        assert bm.checkpointers_at(seq, 8256)
+
+    def test_a_joint_boundary_on_the_tier_grid_keeps_the_anchor_past_it(
+        self, monkeypatch
+    ):
+        """The same frontier reached by a tier load: `can_allocate` saw no
+        HBM hit and aligned the anchor to 8192, where the joint then lands."""
+        bm = self._tier_grid_manager()
+        seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
+        probe = AdmissionProbe()
+        bm.can_allocate(seq, record=False, probe=probe)
+        assert probe.num_cached_blocks == 0
+        assert seq.checkpoint_end_pos == 8192
+        joint = JointBoundaryDecision(
+            boundary_tokens=8192, boundary_hash=1, kv_tokens=8192, claim_tokens=0
+        )
+        monkeypatch.setattr(bm, "_joint_kv_boundary", lambda *_: joint)
+        monkeypatch.setattr(bm, "_fit_joint", lambda decision, _probe: decision)
+        bm.record_allocation(seq, probe)
+        assert seq.offload_joint.boundary_tokens == 8192
+        assert seq.checkpoint_end_pos == 8256
 
     def test_an_anchor_grid_off_the_hash_grid_is_refused(self):
         bm = make_block_manager(demand_config())

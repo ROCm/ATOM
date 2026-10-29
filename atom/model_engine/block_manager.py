@@ -1287,7 +1287,7 @@ class BlockManager:
             live_blocks=num_new_blocks,
             protected_hash=protected_hash,
         )
-        self._record_checkpoint_end(seq)
+        self._record_checkpoint_end(seq, num_cached_blocks * self.hash_block_size)
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
@@ -1548,6 +1548,11 @@ class BlockManager:
             )
             decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)
+            # The prefill resumes at the joint boundary, not at the HBM hit
+            # `can_allocate` placed the anchor against.
+            hbm_tokens = probe.num_cached_blocks * self.hash_block_size
+            if decision.boundary_tokens > hbm_tokens:
+                self._record_checkpoint_end(seq, decision.boundary_tokens)
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -2640,7 +2645,7 @@ class BlockManager:
             self.demands_recorded += not seq.checkpoint_demand_counted
             seq.checkpoint_demand_counted = True
 
-    def _record_checkpoint_end(self, seq: Sequence) -> None:
+    def _record_checkpoint_end(self, seq: Sequence, cached_tokens: int = 0) -> None:
         """Reserve this prompt's own end as a resume point.
 
         The ladder guesses where reuse will resume and the demand learns it one
@@ -2659,6 +2664,10 @@ class BlockManager:
         position keepable, and `checkpointers_at` re-checks it against the
         forward that actually lands. Applying it here as well keeps the cut and
         the keep from disagreeing, which is the standing contract between them.
+
+        `cached_tokens` is where this request's prefill resumes: the HBM hit
+        from `can_allocate`, then the joint boundary from `record_allocation`
+        when a tier load lands past it.
         """
         seq.checkpoint_end_pos = 0
         if not self.state.enabled:
@@ -2723,11 +2732,13 @@ class BlockManager:
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
         # Floored after the cap, which is a hash-block position: a tier grid
         # (`align_checkpoint_anchor`) need not contain it. Moving left keeps
-        # both tests above. A prompt with no grid position left keeps the
-        # hash-block anchor instead: the tier never stores it, but the next
-        # turn still resumes from it in HBM, as it did before the grid.
+        # both tests above. A grid position at or below `cached_tokens`, where
+        # this request resumes, is one no forward of it reaches (every reader
+        # wants `start < pos`). A prompt with no grid position past it keeps
+        # the hash-block anchor instead: the tier never stores it, but the
+        # next turn still resumes from it in HBM, as it did before the grid.
         aligned = end - end % self.checkpoint_anchor_grid
-        if aligned > 0:
+        if aligned > cached_tokens:
             end = aligned
         if end > 0:
             seq.checkpoint_end_pos = end
