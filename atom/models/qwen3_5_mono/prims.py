@@ -227,6 +227,26 @@ def lane_val(v, lane_idx: int):
     return fx.Int32(rocdl.readlane(T.i32, fx.Float32(v).bitcast(fx.Int32).ir_value(), lane_idx)).bitcast(fx.Float32)
 
 
+def wave_sum_scatter(v, lane):
+    """Wave sums of 32 per-lane values v[0..31] at once, lane n ending with the sum of
+    v[n]: a reduce-scatter butterfly (each stage keeps half the values and adds the
+    partner lane's other half) in 31 shuffles, not 32 x 5."""
+    vals = list(v)
+    assert len(vals) == WAVE
+    o = WAVE // 2
+    while o >= 1:
+        half = len(vals) // 2
+        b = (lane & o) != 0
+        nv = []
+        for i in range(half):
+            keep = b.select(vals[i + half], vals[i])
+            send = b.select(vals[i], vals[i + half])
+            nv.append(keep + send.shuffle_xor(o, WAVE))
+        vals = nv
+        o //= 2
+    return vals[0]
+
+
 def col8_sum(v, lane):
     """Wave sums of 8 per-lane values v[0..7] at once (a butterfly that halves the
     values a lane carries each stage: 9 shuffles, not 8 x 5): lane l ends with the sum
