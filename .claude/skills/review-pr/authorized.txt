@@ -3,23 +3,33 @@
 # commit) to change who is allowed -- version-controlled and auditable. Reviews run on a
 # shared box; keep it curated.
 #
-# Contents: everyone who authored or reviewed one of the last 300 merged ROCm/ATOM PRs,
-# bots excluded (copilot-pull-request-reviewer, github-actions, github-advanced-security).
-# Built 2026-10-29; regenerate with:
-#   gh pr list --repo ROCm/ATOM --state merged --limit 300 --json reviews,author \
-#     --jq '[(.[].reviews[].author.login),(.[].author.login)]|unique|.[]'
+# Contents (built 2026-10-29), the union of two rosters, 79 logins:
 #
-# This is wider than aiter's list, which takes reviewers only: ATOM's merged-PR authors
-# are vetted contributors too, and a list that only a handful of people can trigger reads
-# as a broken bot to everyone else. Trimming it is a one-line PR if the shared box needs
+#  1. ATOM: everyone who authored or reviewed one of the last 300 merged ROCm/ATOM PRs.
+#     Regenerate with:
+#       gh pr list --repo ROCm/ATOM --state merged --limit 300 --json reviews,author \
+#         --jq '[(.[].reviews[].author.login),(.[].author.login)]|unique|.[]'
+#  2. aiter: aiter's own allowlist as of c1c482e00 -- its review roster plus recent
+#     merged-PR reviewers. The two bots share a box and largely a team; 14 logins were
+#     already on both lists.
+#
+# Bots excluded throughout (copilot-pull-request-reviewer, github-actions,
+# github-advanced-security). Trimming this is a one-line PR if the shared box needs
 # tighter access.
 amd-ruitang3
 amitkumar-amd
 aoli26
 avininjamay8
 azaidy
+Bernard-Liu
+binding7012
 Boss2002n
+brunomazzottiamd
 coderfeli
+damien-lejeune
+Dewei-Wang-sh
+fangche123
+fsx950223
 ganyi1996ppo
 gbyu-amd
 GwilliamHu
@@ -31,9 +41,11 @@ IvanShan177
 jamesETsmith
 Jasen2201
 JiaoliangYu
+JohnQinAMD
 junhaha666
 junna2016
 junyyang-amd
+k50112113
 karverma-amd
 kvnloo
 lcskrishna
@@ -41,28 +53,40 @@ leo-automation
 linsun12
 mengfei-jiang
 MengqingCao
+MHYangAMD
+mjkvaak-amd
 mohbasit
+msaffari-amd
+nidal567
 NidhoggD1
 onil-gunawardana-amd
 PerryZhang01
 peterjunpark
 poznano-amd
 qichu-yun
+ruanjm
+samremes
+shengnxu
+simondanielsson
 srinivamd
 ssharma4-amd
 valarLip
 venkat1361
 vgokhale
+vpietila-amd
 wanzhenchn
 whx-sjtu
 wuhuikx
 XiaobingSuper
+xiaofei-zheng
 xysheng-AMD
+xytpai
 yanboshao
 yhl-amd
 yifehuan
 yitingw1
 Yuechguo
+yzhou103
 zejunchen-zejun
 ZhangLirong-amd
 zhangxinyuanliuhengyu
