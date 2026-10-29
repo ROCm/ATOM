@@ -332,35 +332,6 @@ def snapshot_kv_encoding(hf: object) -> str:
     return json.dumps(fields, sort_keys=True, default=str)
 
 
-# Text-config model types whose PAGE segment set is not fixed by the fields
-# above: the Qwen3.8 QSA arena (`Qwen4ExpMetadataBuilder._qsa_fields`) adds a
-# `rope_positions` field when `multimodal_config` is set, and BF16 `*_draft`
-# fields when the MTP draft keeps BF16 caches under quantized target caches.
-_QSA_PAGE_SEGMENT_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
-
-
-def _qsa_page_segments(config) -> dict[str, Any] | None:
-    """The Qwen3.8 PAGE segment facts the namespace must key; None elsewhere."""
-    from atom.model_ops.attentions.qwen4_exp_transfer import qsa_caches_quantized
-    from atom.utils import envs, get_hf_text_config
-
-    text_config = get_hf_text_config(config.hf_config)
-    if getattr(text_config, "model_type", None) not in _QSA_PAGE_SEGMENT_MODEL_TYPES:
-        return None
-    # The draft layer's cache format (`QSAAttention.qsa_row_space`): BF16 rows
-    # of its own only for an MTP draft under quantized target caches, the
-    # target's rows and format otherwise, whatever the env says.
-    draft_rows = (
-        getattr(getattr(config, "speculative_config", None), "method", None) == "mtp"
-        and qsa_caches_quantized(config)
-        and envs.ATOM_QSA_DRAFT_KV_BF16
-    )
-    return {
-        "image_input": getattr(config, "multimodal_config", None) is not None,
-        "draft_kv": "bf16" if draft_rows else "target",
-    }
-
-
 def build_page_namespace(
     config,
     cfg,
@@ -416,13 +387,13 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
-    qsa_segments = _qsa_page_segments(config)
+    from atom.model_ops.attentions.qwen4_exp_qsa_fields import qsa_page_segments
+
+    qsa_segments = qsa_page_segments(config)
     if qsa_segments is not None:
-        # Same checkpoint, another segment set: image input adds
-        # `rope_positions` after the index keys, and BF16 draft rows add
-        # `*_draft` fields, so a block holds other bytes and the GDN image
-        # starts elsewhere. Keyed only where the segment set depends on them;
-        # every other namespace is unchanged.
+        # Same checkpoint, another segment set: the QSA arena's field rules
+        # decide it. Keyed only where the segment set depends on them; every
+        # other namespace is unchanged.
         document.update(qsa_segments)
     canonical = json.dumps(
         document,

@@ -11,6 +11,8 @@ on a plain runner.
 
 from __future__ import annotations
 
+from .qwen4_exp_qsa_fields import qsa_caches_quantized
+
 # The offload tiers that read Qwen3.8's PAGE checkpoint image. Other offload
 # backends (mooncake_store) check a Qwen3-Next/3.5 layout and would refuse this
 # one only at startup, with a hint for the wrong model.
@@ -44,20 +46,6 @@ def qwen38_offload_configured(config) -> bool:
     return any(
         name in QWEN38_OFFLOAD_BACKENDS for name in qwen38_transfer_leaves(config)
     )
-
-
-def qsa_caches_quantized(config) -> bool:
-    """Whether the QSA K/V or compressed index-key cache is stored quantized.
-
-    Resolved as `qsa_cache_formats` resolves it, which lives with the kernels
-    and so needs AITER: an unset index dtype follows the KV cache's. Quantized
-    target caches are also what gives the MTP draft layer its own `*_draft`
-    rows (`QSAAttention.qsa_row_space`).
-    """
-
-    kv = getattr(config, "kv_cache_dtype", None) or "bf16"
-    index = getattr(config, "index_cache_dtype", None) or kv
-    return any(dtype not in ("bf16", "auto", "bfloat16") for dtype in (kv, index))
 
 
 def check_qwen38_kv_transfer(config) -> None:

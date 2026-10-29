@@ -55,6 +55,11 @@ from .pool_layout.entry_arena import (
     published_bytes_for,
 )
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .qwen4_exp_qsa_fields import (
+    QSA_DRAFT_ROWS,
+    QSA_ROWS,
+    qsa_caches_rope_positions,
+)
 from .qwen4_exp_transfer import check_qwen38_kv_transfer, qwen38_offload_configured
 from .token_layout.batch_ids import build_batch_ids
 
@@ -75,16 +80,6 @@ class _PlePlane(NamedTuple):
     @property
     def slot_bytes(self) -> int:
         return math.prod(self.shape) * self.dtype.itemsize
-
-
-# The QSA layers' row space. Named rather than derived from
-# `layer_id // full_attention_interval`, because the row a layer holds is the
-# order it was bound in: on a non-first PP stage the global layer numbers do
-# not start at zero, and that arithmetic would index past the pool.
-QSA_ROWS = "qsa"
-# MTP draft QSA layers that keep BF16 caches while the target's are quantized
-# (`ATOM_QSA_DRAFT_KV_BF16=1`): their own rows, their own `*_draft` fields.
-QSA_DRAFT_ROWS = "qsa_draft"
 
 
 @dataclass
@@ -250,13 +245,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
         hf = model_runner.config.hf_config
-        # Image/video requests give mRoPE three genuinely different position
-        # rows, and then a compressed key's group position cannot be recomputed
-        # arithmetically. Cache the per-token axes only when the engine can
-        # actually be handed an image -- it costs ~1.4 GB of the paged budget.
-        self.cache_rope_positions = (
-            getattr(model_runner.config, "multimodal_config", None) is not None
-        )
+        self.cache_rope_positions = qsa_caches_rope_positions(model_runner.config)
         self.ngram_context_len = int(hf.ngram_size) - 1 if hf.ple_layer_ids else 0
         eos = hf.eos_token_id
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)

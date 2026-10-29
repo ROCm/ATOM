@@ -30,6 +30,9 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.topk import top_k_per_row_prefill
 
+from atom.model_ops.attentions.qwen4_exp_qsa_fields import (  # noqa: F401
+    qsa_cache_formats,
+)
 from atom.model_ops.qwen4_exp.ops import qsa_flydsl_layout
 from atom.utils import envs
 
@@ -41,26 +44,6 @@ FP8_DTYPE = dtypes.fp8
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
 FP4_GROUP = 32
 _FMT_BF16, _FMT_FP8, _FMT_FP4 = 0, 1, 2
-QSA_CACHE_FORMATS = ("bf16", "fp8", "fp4")
-
-
-def qsa_cache_formats(atom_config) -> tuple[str, str]:
-    """`(K/V format, compressed index-key format)` this engine serves.
-
-    The raw index keys stay BF16 whatever is asked: they are mean-pooled
-    before normalization, and a group can straddle a prefill chunk.
-    An unset index dtype follows the KV cache's, as `Config` resolves it.
-    """
-    kv = getattr(atom_config, "kv_cache_dtype", "bf16") or "bf16"
-    kv = "bf16" if kv in ("auto", "bfloat16") else kv
-    index = getattr(atom_config, "index_cache_dtype", None) or kv
-    index = "bf16" if index in ("auto", "bfloat16") else index
-    if kv not in ("bf16", "fp8") or index not in QSA_CACHE_FORMATS:
-        raise ValueError(
-            f"Qwen QSA serves bf16/fp8 KV and bf16/fp8/fp4 index caches, got "
-            f"kv_cache_dtype={kv!r} index_cache_dtype={index!r}"
-        )
-    return kv, index
 
 
 def qsa_cache_row_layout(fmt: str, head_dim: int):

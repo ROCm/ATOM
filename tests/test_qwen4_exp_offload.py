@@ -571,19 +571,39 @@ def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
         for index in (None, "bf16", "auto", "fp8", "fp4")
     ],
 )
-def test_quantized_cache_check_agrees_with_the_kernel_formats(
-    kv_cache_dtype, index_cache_dtype
+@pytest.mark.parametrize("draft_env", ["0", "1"])
+def test_the_draft_rows_and_the_page_namespace_read_one_rule(
+    monkeypatch, kv_cache_dtype, index_cache_dtype, draft_env
 ):
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-    from atom.model_ops.attentions.qwen4_exp_transfer import qsa_caches_quantized
-    from atom.model_ops.qwen4_exp.ops.qsa import qsa_cache_formats
+    """The layer's row space and the namespace's `draft_kv` come from the
+    same field rules (`qwen4_exp_qsa_fields`), so they cannot drift apart."""
+    from atom.model_ops.attentions.qwen4_exp_qsa_fields import (
+        QSA_DRAFT_ROWS,
+        QSA_ROWS,
+        qsa_cache_formats,
+        qsa_page_segments,
+        qsa_row_space,
+    )
 
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", draft_env)
     config = SimpleNamespace(
-        kv_cache_dtype=kv_cache_dtype, index_cache_dtype=index_cache_dtype
+        kv_cache_dtype=kv_cache_dtype,
+        index_cache_dtype=index_cache_dtype,
+        speculative_config=SimpleNamespace(method="mtp"),
+        hf_config=SimpleNamespace(model_type="qwen4_exp_text"),
     )
-    assert qsa_caches_quantized(config) is (
-        qsa_cache_formats(config) != ("bf16", "bf16")
-    )
+    draft = draft_env == "1" and qsa_cache_formats(config) != ("bf16", "bf16")
+    assert qsa_row_space(config, 40, 40) == (QSA_DRAFT_ROWS if draft else QSA_ROWS)
+    assert qsa_row_space(config, 39, 40) == QSA_ROWS
+    assert qsa_page_segments(config)["draft_kv"] == ("bf16" if draft else "target")
+
+
+def test_the_kernels_serve_the_formats_the_field_rules_resolve():
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    from atom.model_ops.attentions import qwen4_exp_qsa_fields
+    from atom.model_ops.qwen4_exp.ops import qsa
+
+    assert qsa.qsa_cache_formats is qwen4_exp_qsa_fields.qsa_cache_formats
 
 
 def _paged_builder(blocks=3, *, spec=True):
