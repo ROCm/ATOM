@@ -259,6 +259,9 @@ def run_worker(out):
 
 
 def run_suite(out):
+    if os.environ.get('ATOMESH_ENV_ATOMESH_TRITON_PROBE_MATRIX') == 'registration_memory':
+        from pd_vllm_registration_probe import run_suite as run_registration_suite
+        return run_registration_suite(out)
     out.mkdir(parents=True, exist_ok=True)
     plan = json.loads((HERE.parents[1] / 'benchmark/vllm_m31/experiment.json').read_text())
     from pd_vllm_m31 import role_env
