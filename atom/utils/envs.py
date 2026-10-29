@@ -956,6 +956,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
+    # Renormalized softmax top-k routing, eager and captured alike, uses the
+    # Triton kernel in `model_ops/triton_topk_softmax.py` for the shapes it
+    # supports, in launches of up to 20 rows per CU (same bits as AITER, ~2x
+    # faster at 512 experts; AITER is faster on longer launches and takes
+    # them). 0 puts every pass on AITER's `topk_softmax`.
+    "ATOM_TRITON_TOPK_SOFTMAX": lambda: (
+        os.getenv("ATOM_TRITON_TOPK_SOFTMAX", "1").lower() == "1"
+    ),
     # Fuse an MXFP8 shared expert into MXFP4 routed experts (the Quark MXFP4
     # export of MiniMax-M3.1) by re-quantizing the shared expert MXFP8 -> MXFP4
     # at load, so the MoE runs as one 129-expert / top-5 fused MoE. Off by
