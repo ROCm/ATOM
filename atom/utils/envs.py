@@ -351,6 +351,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
+    # Fuse the attention wo_a -> wo_b group-32 MXFP8 quant into the wo_a GEMM's
+    # epilogue (aiter batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant), so the
+    # standalone quantize_fp8 launch between the two GEMMs is removed. Bit-exact
+    # with the unfused bf16 GEMM + quantize_fp8; gfx1250 flydsl mxfp8_32 only,
+    # otherwise falls back to the unfused path. Default off.
+    "ATOM_V41_FUSE_WOA_QUANT": lambda: os.getenv("ATOM_V41_FUSE_WOA_QUANT", "0")
+    == "1",
     # MegaMoE stage 2 (gemm2-fused EP combine): the grouped gemm2 epilogue
     # P2P-writes its weighted per-(token,k) results straight into the peers'
     # combine staging, so combine only barriers + sums. Requires the mxfp4 weight
