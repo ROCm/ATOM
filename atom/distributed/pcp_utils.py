@@ -24,6 +24,8 @@ from aiter.dist.parallel_state import (
     get_prefill_context_model_parallel_world_size,
 )
 
+from atom.distributed.token_transport import reduce_scatter_tokens
+
 
 class PcpBalGroup(NamedTuple):
     """One request group for PCP+TBO request-boundary split prefill.
@@ -159,7 +161,7 @@ def pcp_reduce_scatter(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
-    return get_pcp_group().reduce_scatter(input_.contiguous(), dim=0)
+    return reduce_scatter_tokens(input_, get_pcp_group())
 
 
 def pcp_all_reduce(input_: torch.Tensor, pcp_size: int | None = None) -> torch.Tensor:

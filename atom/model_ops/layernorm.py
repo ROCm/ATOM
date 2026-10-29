@@ -26,6 +26,10 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
+from atom.model_ops.gemma_norm_fp8 import (
+    gemma_rms_norm_fp8,
+    gemma_rms_norm_fp8_supported,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
@@ -997,11 +1001,31 @@ def fused_allreduce_gemma_rms_norm_quant(
             )
         )
         return out_fp8, scale_out, residual_out
+    return gemma_rms_norm_quant(hidden_states, residual, norm)
 
+
+def gemma_rms_norm_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gemma RMSNorm + per-token FP8 quant of rows with no all-reduce pending."""
     from aiter import get_hip_quant
     from aiter.utility.dtypes import fp8
 
-    normed, residual_out = norm(hidden_states, residual)
+    if (
+        hidden_states.dtype == norm.weight.dtype == torch.bfloat16
+        and hidden_states.ndim == 2
+        and hidden_states.stride(1) == 1
+        and gemma_rms_norm_fp8_supported(hidden_states.shape[1])
+    ):
+        return gemma_rms_norm_fp8(
+            hidden_states, norm.weight, norm.variance_epsilon, residual
+        )
+    if residual is None:
+        normed, residual_out = norm(hidden_states), hidden_states
+    else:
+        normed, residual_out = norm(hidden_states, residual)
     out_fp8, scale_out = get_hip_quant(QuantType.per_Token)(
         normed,
         quant_dtype=fp8,

@@ -8,11 +8,16 @@ sequence metadata. Dense weights are replicated; MoE weights remain sharded.
 SP uses AITER's PCP rank dimension and runs with ``-tp 1 -sp W``.
 """
 
-from functools import cache, partial
+from functools import partial
 
 import torch
 
-from atom.utils import envs
+from atom.distributed.token_transport import (
+    gather_heads,
+    gather_tokens,
+    prefer_custom_gather,
+    reduce_scatter_tokens,
+)
 
 # Keep GPU imports lazy for CPU-only metadata consumers. Set by ModelRunner.
 _SP_WORLD_SIZE: int = 1
@@ -132,66 +137,11 @@ def sp_split_tokens(x: torch.Tensor) -> torch.Tensor:
     return x[sp_local_slice(total)].contiguous()
 
 
-# Small payloads can benefit from the registered-buffer all-gather. Large
-# prefills use all-to-all to avoid receiving unused heads.
-_ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
-# Output rows per rank from which an attention output takes the prefill head
-# exchange (FP8 with a gathered amax, the four-rank exchange kernel); decode
-# stays below it on the all-gather.
-HEAD_EXCHANGE_MIN_LOCAL_ROWS = 2048
-# AITER custom_all_reduce kMaxBlocks.
-_CA_MAX_BLOCKS = 80
-
-
-def _custom_gather_ok(payload: torch.Tensor, group) -> bool:
-    """Whether AITER's registered-buffer all-gather supports this payload.
-
-    All predicates must agree across ranks: choosing different collectives
-    deadlocks. Padded SP shards have equal shapes on every rank.
-    """
-    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
-        return False
-    ca_comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
-    if ca_comm is None or ca_comm.disabled:
-        return False
-    return bool(ca_comm.should_custom_ag(payload))
-
-
-def _custom_reduce_scatter_ok(payload: torch.Tensor, group) -> bool:
-    """Rank-invariant gate for AITER's registered-buffer reduce-scatter."""
-    ca_comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
-    if ca_comm is None or ca_comm.disabled:
-        return False
-    return bool(ca_comm.should_custom_rs(payload, 0))
-
-
-def _prefer_all_gather(payload: torch.Tensor, group) -> bool:
-    """Use registered-buffer all-gather only for small supported payloads."""
-    if payload.numel() * payload.element_size() > _ALLGATHER_MAX_PAYLOAD_BYTES:
-        return False
-    return _custom_gather_ok(payload, group)
-
-
-def _all_gather_tokens(x: torch.Tensor, group=None) -> torch.Tensor:
-    """Gather token shards, preferring graph-compatible AITER transports."""
-    x = x.contiguous()
-    world = _SP_WORLD_SIZE if group is None else group.world_size
-    group = get_sp_group() if group is None else group
-    if _custom_gather_ok(x, group):
-        return group.all_gather(x, use_custom=True, dim=0)
-    pynccl = getattr(getattr(group, "device_communicator", None), "pynccl_comm", None)
-    if pynccl is not None and not pynccl.disabled:
-        out = x.new_empty((x.shape[0] * world, *x.shape[1:]))
-        pynccl.all_gather(out, x)
-        return out
-    return group.all_gather(x, dim=0)
-
-
 def sp_gather_tokens(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     """Inverse of `sp_split_tokens`: all-gather the chunks and drop the pad."""
     if _SP_WORLD_SIZE <= 1:
         return x
-    return _all_gather_tokens(x)[:total_tokens]
+    return gather_tokens(x, get_sp_group())[:total_tokens]
 
 
 def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
@@ -204,116 +154,8 @@ def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     local, n = x.shape[0], rows.numel()
     picked = x[(rows - get_sp_rank() * local).clamp(0, local - 1)]
     owner = rows.long() // local
-    return _all_gather_tokens(picked)[owner * n + torch.arange(n, device=x.device)]
-
-
-def ulysses_gather_heads(x: torch.Tensor, group=None) -> torch.Tensor:
-    """``[S, H/W*D] -> [S/W, H*D]``: give up the sequence, regain all heads."""
-    w = _SP_WORLD_SIZE if group is None else group.world_size
-    if w <= 1:
-        return x
-    x = x.reshape(x.shape[0], -1)
-    s_local, width = x.shape[0] // w, x.shape[1]
-    explicit_group = group
-    group = get_sp_group() if group is None else group
-
-    # AITER's last-dimension gather requires 16-byte alignment.
-    if width * x.element_size() % 16 == 0 and _prefer_all_gather(x, group):
-        start = group.rank_in_group * s_local
-        return group.all_gather(x, use_custom=True, dim=1)[start : start + s_local]
-
-    return _swap_heads(x, s_local, width, group=explicit_group)
-
-
-@cache
-def _head_exchange_kernel():
-    """AITER's four-rank head exchange, or None if this AITER lacks it."""
-    try:
-        import aiter.ops.sp_head_exchange as ops
-    except ModuleNotFoundError as exc:
-        if exc.name != "aiter.ops.sp_head_exchange":
-            raise
-        return None
-    return getattr(ops, "sp_head_exchange", None)
-
-
-def head_exchange_communicator(x, *, group=None):
-    """Select the four-rank prefill exchange; decode uses the regular gather."""
-    if (
-        not x.is_cuda
-        or not envs.ATOM_USE_CUSTOM_ALL_GATHER
-        or x.ndim != 2
-        or x.shape[0] < 4 * HEAD_EXCHANGE_MIN_LOCAL_ROWS
-        or x.shape[0] % 4
-        or x.shape[1] * x.element_size() % 16
-        or x.dtype != torch.bfloat16
-        or not x.is_contiguous()
-        or _head_exchange_kernel() is None
-    ):
-        return None
-    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
-
-    from atom.plugin.prepare import is_plugin_mode
-
-    if is_plugin_mode():
-        return None
-    if group is None:
-        if get_sp_world_size() != 4 or get_tensor_model_parallel_world_size() != 1:
-            return None
-        group = get_sp_group()
-    elif group.world_size != 4 or get_sp_world_size() != 1:
-        return None
-    ca = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
-    if ca is None or ca.disabled or getattr(ca, "_pool", None) is None:
-        return None
-    if not ca.should_custom_ag(x):
-        return None
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return ca if get_gfx_runtime() == "gfx950" else None
-
-
-def exchange_heads(x, ca, *, registered=False):
-    """Read just this rank's token slice from each peer and concatenate heads.
-
-    The output is already in the o-projection's row layout. All operations use
-    the communicator's current stream. Registered scratch must be produced
-    immediately before this call; end_sync protects its reuse.
-    """
-    out = torch.empty((x.shape[0] // 4, x.shape[1] * 4), device=x.device, dtype=x.dtype)
-    pool = ca._pool["input"]
-    graph_registered = (
-        ca._IS_CAPTURING
-        and torch.cuda.is_current_stream_capturing()
-        and ca.enable_register_for_capturing
-    )
-    _head_exchange_kernel()(
-        ca._ptr,
-        x,
-        out,
-        pool.data_ptr,
-        pool.max_size,
-        not (registered or graph_registered),
-        _CA_MAX_BLOCKS,
-    )
-    return out
-
-
-def _swap_heads(x, s_local, width, group=None):
-    """``[w*s_local, width] -> [s_local, w*width]`` by all-to-all."""
-    if x.is_cuda:
-        ca = head_exchange_communicator(x, group=group)
-        if ca is not None:
-            return exchange_heads(x, ca)
-    from atom.distributed.sp_kernels import all_to_all_into
-
-    world = _SP_WORLD_SIZE if group is None else group.world_size
-    group = get_sp_group() if group is None else group
-    send = x.reshape(world, s_local, width).contiguous()
-    recv = torch.empty_like(send)
-    all_to_all_into(recv, send, group)
-    # recv[i] is head-group i for our token chunk -> concatenate on heads.
-    return recv.permute(1, 0, 2).reshape(s_local, world * width)
+    gathered = gather_tokens(picked, get_sp_group())
+    return gathered[owner * n + torch.arange(n, device=x.device)]
 
 
 def sp_moe_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
@@ -325,19 +167,7 @@ def sp_moe_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
 
     out = try_quick_reduce_scatter(x, group)
-    if out is not None:
-        return out
-    # The generic communicator allocates a second output and copies it even
-    # for dim=0. PyNccl can write the final token shard directly.
-    if not _custom_reduce_scatter_ok(x, group):
-        pynccl = getattr(
-            getattr(group, "device_communicator", None), "pynccl_comm", None
-        )
-        if pynccl is not None and not pynccl.disabled:
-            out = x.new_empty((x.shape[0] // _SP_WORLD_SIZE, *x.shape[1:]))
-            pynccl.reduce_scatter(out, x)
-            return out
-    return group.reduce_scatter(x, dim=0)
+    return out if out is not None else reduce_scatter_tokens(x, group)
 
 
 _SCATTER = 0  # zero means one head shard per rank
@@ -378,7 +208,7 @@ def _exchange_columns(source, spec, owner):
     """Exchange fused fields described by (column offset, width, head shards)."""
     w = _SP_WORLD_SIZE
     group = get_sp_group()
-    if not _prefer_all_gather(source, group):
+    if not prefer_custom_gather(source, group):
         from atom.distributed.sp_kernels import pack_fields
 
         return _exchange(pack_fields(source, tuple(spec), w))
@@ -467,4 +297,4 @@ def ulysses_attention(
         )
     if output_transform is not None:
         return output_transform(out)
-    return ulysses_gather_heads(out)
+    return gather_heads(out, get_sp_group())

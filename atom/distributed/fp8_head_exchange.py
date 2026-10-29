@@ -13,34 +13,26 @@ import triton.language as tl
 from aiter import dtypes
 
 from atom.config import get_current_atom_config
-from atom.distributed.ulysses_sp import (
+from atom.distributed.token_transport import (
     HEAD_EXCHANGE_MIN_LOCAL_ROWS,
-    _all_gather_tokens,
     exchange_heads,
-    get_sp_group,
-    get_sp_world_size,
+    gather_heads,
+    gather_tokens,
     head_exchange_communicator,
-    ulysses_attention,
-    ulysses_gather_heads,
 )
+from atom.distributed.ulysses_sp import get_sp_group, ulysses_attention
 from atom.utils import mark_spliting_op
 
 
-def local_token_fp8_supported(*, tp_replicated_o_proj: bool = False) -> bool:
-    """Whether token-local BF16 activations may be quantized to per-token FP8.
+def token_fp8_supported() -> bool:
+    """Whether this deployment can quantize BF16 activations to per-token FP8.
 
-    True for Ulysses SP, or TP with a replicated o_proj: after the head
-    exchange each rank holds whole tokens and no all-reduce is pending. Check
-    at construction; querying it from forward would introduce a graph break.
+    Only meaningful for rows that hold whole tokens with no all-reduce pending
+    (Ulysses SP, or after the replicated o_proj's head exchange); the caller
+    owns that layout check. Check at construction: querying it from forward
+    would introduce a graph break.
     """
-    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
-
-    sp, tp = get_sp_world_size(), get_tensor_model_parallel_world_size()
-    if tp_replicated_o_proj:
-        layout = sp == 1 and tp > 1
-    else:
-        layout = sp > 1 and tp == 1
-    if not layout or not torch.cuda.is_available() or dtypes.fp8 != torch.float8_e4m3fn:
+    if not torch.cuda.is_available() or dtypes.fp8 != torch.float8_e4m3fn:
         return False
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -149,7 +141,7 @@ def quantize_with_gathered_amax(
     return q, scale
 
 
-def gather_heads_fp8(x: torch.Tensor, group=None) -> tuple[torch.Tensor, torch.Tensor]:
+def gather_heads_fp8(x: torch.Tensor, group) -> tuple[torch.Tensor, torch.Tensor]:
     """Replace BF16 head all-to-all followed by o_proj's FP8 quantizer.
 
     One small BF16 amax all-gather precedes the FP8 payload exchange. Viewing
@@ -157,7 +149,7 @@ def gather_heads_fp8(x: torch.Tensor, group=None) -> tuple[torch.Tensor, torch.T
     this supports both AITER custom all-gather and PyNccl all-to-all.
     """
     x = x.reshape(x.shape[0], -1)
-    world = get_sp_world_size() if group is None else group.world_size
+    world = group.world_size
     assert world > 1 and x.shape[1] % 2 == 0
     # Piecewise compilation reuses the initially traced graph at other token
     # counts. Keep this runtime choice inside the opaque attention op so decode
@@ -165,28 +157,25 @@ def gather_heads_fp8(x: torch.Tensor, group=None) -> tuple[torch.Tensor, torch.T
     if x.shape[0] // world < HEAD_EXCHANGE_MIN_LOCAL_ROWS:
         from aiter.ops.quant import per_token_quant_hip
 
-        return per_token_quant_hip(
-            ulysses_gather_heads(x, group=group), quant_dtype=dtypes.fp8
-        )
-    amax = _all_gather_tokens(head_amax(x), group=group)
+        return per_token_quant_hip(gather_heads(x, group), quant_dtype=dtypes.fp8)
+    amax = gather_tokens(head_amax(x), group)
     from atom.distributed.sp_registered_buffer import registered_input_view
 
     # The FP8 payload has half the row bytes of x; the exchange needs 16B rows.
-    ca = head_exchange_communicator(x, group=group) if x.shape[1] % 16 == 0 else None
-    comm_group = get_sp_group() if group is None else group
+    ca = head_exchange_communicator(x, group) if x.shape[1] % 16 == 0 else None
     scratch = registered_input_view(ca, x.shape, dtypes.fp8) if ca is not None else None
     q, scale = quantize_with_gathered_amax(
         x,
         amax,
         world,
-        comm_group.rank_in_group,
+        group.rank_in_group,
         out=scratch,
     )
     payload = q.view(torch.bfloat16)
     output = (
         exchange_heads(payload, ca, registered=True)
         if scratch is not None
-        else ulysses_gather_heads(payload, group=group)
+        else gather_heads(payload, group)
     )
     return output.view(dtypes.fp8), scale
 
@@ -221,6 +210,14 @@ def sp_attention_fp8(
     attn = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
+    group = get_sp_group()
     return ulysses_attention(
-        attn, q, k, v, positions, None, qkv, output_transform=gather_heads_fp8
+        attn,
+        q,
+        k,
+        v,
+        positions,
+        None,
+        qkv,
+        output_transform=lambda out: gather_heads_fp8(out, group),
     )

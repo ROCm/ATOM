@@ -15,7 +15,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.config import get_current_atom_config
 from atom.distributed.fp8_head_exchange import gather_heads_fp8
-from atom.distributed.ulysses_sp import _all_gather_tokens, ulysses_gather_heads
+from atom.distributed.token_transport import gather_heads, gather_tokens
 from atom.utils import mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -79,8 +79,8 @@ def replicated_o_proj_attention(
     if output.shape[0] == 0:
         return _attention_fake(q, k, v, positions, layer_name, qkv, fp8_output, world)
     if fp8_output:
-        return gather_heads_fp8(output, group=group)
-    output = ulysses_gather_heads(output, group=group)
+        return gather_heads_fp8(output, group)
+    output = gather_heads(output, group)
     # A fixed tuple schema keeps graph tracing independent of batch size. The
     # BF16 consumer ignores this scale; the FP8 consumer always receives it.
     return output, torch.ones(
@@ -116,7 +116,7 @@ def replicated_o_proj_gather(x: torch.Tensor, world: int) -> torch.Tensor:
     x = x.contiguous()
     if x.element_size() == 1:
         x = x.view(torch.bfloat16)
-    return _all_gather_tokens(x, group=group).view(dtype)
+    return gather_tokens(x, group).view(dtype)
 
 
 def _moe_fake(
