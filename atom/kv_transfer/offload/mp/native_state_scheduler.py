@@ -383,20 +383,21 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     ) -> int:
         """The boundary of the next image to store above `start`, or 0.
 
-        The highest one a resend of this prompt can load comes first: a load
-        stops on a chunk strictly below the prompt, so that is the prompt-end
-        anchor (`align_checkpoint_anchor`), and storing it first pins it
-        before anything else queues. Only then a rung at the prompt's end,
-        which a continuation loads. Lower rungs that became available in the
-        same step stay unsaved, as do any that formed while an earlier save
-        of the request was in flight: one save per request already serialises
-        them, and storing every one would hold `should_defer_free` and the
-        state budget for a whole ladder per prompt.
+        The highest one this request still holds, stored directly: a rung at
+        the prompt's end, which a continuation loads, and otherwise the
+        prompt-end anchor (`align_checkpoint_anchor`), which a resend loads
+        since a load stops on a chunk strictly below the prompt. Which one is
+        stored depends only on what is in HBM when the save is issued, never
+        on a second round trip, and an image evicted first just yields the
+        next one down. Lower rungs stay unsaved, as do any that formed while
+        an earlier save of the request was in flight: one save per request
+        already serialises them, and storing every one would hold
+        `should_defer_free` and the state budget for a whole ladder per
+        prompt. A prompt on the chunk grid with a rung at its end therefore
+        stores no anchor: its continuations resume at the end, and a
+        byte-identical resend falls back to the HBM hit.
         """
-        reach = min(frontier, self._chunk_floor(max(int(seq.num_prompt_tokens) - 1, 0)))
-        return self._highest_image(
-            seq, start, reach, boundaries
-        ) or self._highest_image(seq, max(start, reach), frontier, boundaries)
+        return self._highest_image(seq, start, frontier, boundaries)
 
     def _highest_image(
         self, seq: Any, low: int, high: int, boundaries: dict | None
