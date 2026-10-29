@@ -875,6 +875,25 @@ run_benchmark() {
 }
 
 ensure_aiperf() {
+  if [[ -n "${AGENTX_HARNESS_VERSION:-}" ]]; then
+    [[ "${AGENTX_HARNESS_VERSION}" == "1.0.9" ]] || {
+      echo "Unsupported AgentX comparison version: ${AGENTX_HARNESS_VERSION}" >&2
+      return 2
+    }
+    AIPERF_VENV="/tmp/atomesh-agentx-venv-${AGENTX_HARNESS_VERSION}"
+    local installed=""
+    if [[ -x "${AIPERF_VENV}/bin/python" ]]; then
+      installed="$("${AIPERF_VENV}/bin/python" -c 'from importlib.metadata import version; print(version("agentx-harness"))' 2>/dev/null || true)"
+    fi
+    if [[ "${installed}" != "${AGENTX_HARNESS_VERSION}" ]]; then
+      if ! python3 -m venv "${AIPERF_VENV}"; then
+        uv venv --seed --python "$(command -v python3)" "${AIPERF_VENV}"
+      fi
+      "${AIPERF_VENV}/bin/python" -m pip install "agentx-harness==${AGENTX_HARNESS_VERSION}"
+    fi
+    [[ "$("${AIPERF_VENV}/bin/agentx" --version)" == "${AGENTX_HARNESS_VERSION}" ]]
+    return
+  fi
   local current_commit=""
   if [[ -d "${AIPERF_DIR}/.git" ]]; then
     current_commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || true)"

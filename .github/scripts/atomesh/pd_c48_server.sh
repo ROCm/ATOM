@@ -115,12 +115,32 @@ start_vllm_server() {
 
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
-  "${AIPERF_VENV}/bin/python" -m pip install 'datasets>=4.7.0'
+  if [[ -z "${AGENTX_HARNESS_VERSION:-}" ]]; then
+    "${AIPERF_VENV}/bin/python" -m pip install 'datasets>=4.7.0'
+  fi
   local out_dir="${RUN_DIR}/benchmark_results/c48-${ATOMESH_C48_CASE}" conc
   conc="$(python3 -c 'import json, sys; (c,) = json.load(open(sys.argv[1]))["benchmark"]["concurrencies"]; print(int(c))' \
     "${ATOMESH_SCRIPT_DIR}/../../benchmark/c48-model-gap/${ATOMESH_C48_CASE}.json")"
   mkdir -p "${out_dir}"
-  git -C "${AIPERF_DIR}" rev-parse HEAD > "${out_dir}/aiperf-commit.txt"
+  local -a client_args=()
+  if [[ -n "${AGENTX_HARNESS_VERSION:-}" ]]; then
+    printf 'agentx-harness==%s\n' "${AGENTX_HARNESS_VERSION}" > "${out_dir}/client-package.txt"
+    # Match the effective flags in the ATOM AgentX 1.0.9 recipe.
+    client_args=(--endpoint /v1/chat/completions --endpoint-type chat --streaming
+      --stats-interval 30 --random-seed 42
+      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}"
+      --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}"
+      --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}"
+      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}"
+      --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}"
+      --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}"
+      --use-server-token-count --no-gpu-telemetry
+      --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}"
+      --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}"
+      --slice-duration "${AIPERF_SLICE_DURATION}")
+  else
+    git -C "${AIPERF_DIR}" rev-parse HEAD > "${out_dir}/aiperf-commit.txt"
+  fi
   "${AIPERF_VENV}/bin/python" -m pip freeze > "${out_dir}/client-packages.txt"
   snapshot_eval_metrics "${out_dir}" before
   local -a profile_wrapper=()
@@ -137,6 +157,7 @@ run_aiperf_agentic_benchmark() {
   # Paths and addresses follow this allocation; no template or context override.
   local benchmark_rc=0
   "${profile_wrapper[@]}" "${AIPERF_VENV}/bin/aiperf" profile \
+    "${client_args[@]}" \
     --scenario agentx --url "http://127.0.0.1:${ROUTER_PORT}" \
     --model "${SERVED_MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
     --concurrency "${conc}" --benchmark-duration 3600 --tokenizer-trust-remote-code \
