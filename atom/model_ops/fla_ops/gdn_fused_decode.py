@@ -21,7 +21,7 @@ import torch
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 
-from .layernorm_guard import layer_norm_fwd
+from .layernorm_guard import calc_rows_per_block, layer_norm_fwd
 
 logger = logging.getLogger("atom")
 
@@ -194,9 +194,45 @@ def verify(layer, mixed_qkv, b, a, z, conv_state, ssm_state, layer_cache, md, ou
     return True
 
 
+def _per_head_weight(norm, heads):
+    """``norm.weight`` once per head, for `gated_rmsnorm_`'s groups. Built on the
+    first eager call (warmup); None inside a graph capture that comes first."""
+    cached = getattr(norm, "_per_head_weight", None)
+    key = (heads, norm.weight.data_ptr())
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    weight = norm.weight.detach().repeat(heads)
+    object.__setattr__(norm, "_per_head_weight", (key, weight))
+    return weight
+
+
 def gated_rmsnorm_(core, z, norm):
-    """``norm(core) * silu(z)`` in place on ``[tokens, heads, dim]``, as one kernel."""
-    rows = core.shape[0] * core.shape[1]
+    """``norm(core) * silu(z)`` in place on ``[tokens, heads, dim]``, as one kernel.
+
+    Each head is a group of one ``[tokens, heads * dim]`` row, so ``z`` -- a
+    column slice of the input projection -- is read where it lies rather than
+    copied into ``[tokens * heads, dim]`` rows first. The tiles are those of the
+    row layout (same rows per block), so the result is bitwise the same."""
+    tokens, heads, dim = core.shape
+    weight = _per_head_weight(norm, heads)
+    if weight is not None:
+        flat = core.view(tokens, heads * dim)
+        layer_norm_fwd(
+            flat,
+            weight,
+            None,
+            norm.eps,
+            z=z.flatten(1),
+            out=flat,
+            group_size=dim,
+            norm_before_gate=True,
+            is_rms_norm=True,
+            rows_per_block=calc_rows_per_block(tokens * heads, core.device),
+        )
+        return
+    rows = tokens * heads
     layer_norm_fwd(
         core.view(rows, -1),
         norm.weight,
