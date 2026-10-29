@@ -5,7 +5,7 @@ from pathlib import Path
 
 from vllm.v1.worker.gpu_worker import Worker
 
-from pd_vllm_memory import prepare_after_load, write_json
+from pd_vllm_memory import bind_thread_memory, cpu_numa_nodes, prepare_after_load, write_json
 from pd_vllm_diagnostics import record_runtime, record_failure
 from pd_vllm_stage_probe import probe
 
@@ -92,12 +92,20 @@ class StoreMemoryWorker(Worker):
             'store_enabled': role == 'prefill',
         })
         print(f'[mooncake] {role} rank={self.local_rank} MC_TE_FILTERS={hca} store={role == "prefill"}', flush=True)
-        prepare_after_load(
+        gate = prepare_after_load(
             json.loads(Path(os.environ['ATOMESH_VLLM_STORE_CONFIG_PATH']).read_text()),
             self.vllm_config.model_config.model,
             out, role, self.local_rank,
             timeout=int(os.environ.get('VLLM_ENGINE_READY_TIMEOUT_S', '7200')),
         )
+        store_nodes = gate.get('store_nodes')
+        bind_store = role == 'prefill' and store_nodes and set(store_nodes) != set(cpu_numa_nodes())
+        write_json(out / f'{role}-rank-{self.local_rank}-store-numa.json', {
+            'store_nodes': store_nodes, 'bound': bool(bind_store)})
+        if bind_store:
+            bind_thread_memory(store_nodes)
+            print(f'[store-memory] {role}-{self.local_rank}: Store allocation bound to NUMA {store_nodes}',
+                  flush=True)
         evidence = self._diagnostic_dir()
         record_runtime(evidence, 'before-kv-init')
         original_ensure = None
@@ -118,6 +126,8 @@ class StoreMemoryWorker(Worker):
         finally:
             if original_ensure is not None:
                 worker_module.ensure_kv_transfer_initialized = original_ensure
+            if bind_store:
+                bind_thread_memory(None)
         record_runtime(evidence, 'after-kv-init')
         probe(evidence, 'after-kv-init', 4)
         return result

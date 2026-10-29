@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -66,7 +68,29 @@ def cpu_numa_nodes(sysfs=Path('/sys')):
             if (path / 'cpulist').read_text().strip()]
 
 
-def prepare(store, model_path, out, timeout=1800):
+def bind_thread_memory(nodes):
+    """MPOL_BIND this thread, and threads it creates afterwards, to ``nodes``.
+
+    ``None`` restores MPOL_DEFAULT. A policy is per thread, so the Store's
+    registration threads inherit it only if they are created while it is set.
+    """
+    syscall_nr = {'x86_64': 238, 'aarch64': 237}[platform.machine()]
+    libc = ctypes.CDLL(None, use_errno=True)
+    if nodes is None:
+        rc = libc.syscall(syscall_nr, 0, None, ctypes.c_ulong(0))
+    else:
+        bits = ctypes.sizeof(ctypes.c_ulong) * 8
+        mask = (ctypes.c_ulong * (max(nodes) // bits + 1))()
+        for node in nodes:
+            mask[node // bits] |= 1 << (node % bits)
+        # The kernel reads maxnode - 1 bits.
+        rc = libc.syscall(syscall_nr, 2, mask, ctypes.c_ulong(len(mask) * bits + 1))
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f'set_mempolicy({nodes}) failed: {os.strerror(err)}')
+
+
+def prepare(store, model_path, out, timeout=1800, first_timeout=600):
     """Successful CI 40376309047: best-effort THP, then try native Store setup.
 
     Preparation does not reserve pages or prove that MR registration will work.
@@ -85,18 +109,26 @@ def prepare(store, model_path, out, timeout=1800):
 
     def warn(reason, **details):
         state['warnings'].append({'reason': reason, **details})
-        print(f'[store-memory][WARN] {reason}: {details}; Store stays unmounted until every node finishes', flush=True)
+        print(f'[store-memory][WARN] {reason}: {details}', flush=True)
 
     write_json(summary, state)
-    print('[store-memory] dropping clean model page cache before NUMA THP preparation', flush=True)
+    print('[store-memory] dropping clean model page cache (this and other models) before NUMA THP preparation',
+          flush=True)
+    # Earlier allocations leave other models' page cache on this node; on
+    # pit2-p03-g12 it filled about 1 TiB and left no free 2 MiB block on NUMA 0.
+    # This helper uses fadvise and never deletes files.
+    roots = [str(model_path)] + [root for root in os.environ.get(
+        'ATOMESH_VLLM_PAGE_CACHE_ROOTS', '/share_nfs/models').split(':') if root and Path(root).is_dir()]
+    state['page_cache_roots'] = roots
+    began = time.monotonic()
     try:
-        # Exact snapshot only. This helper uses fadvise and never deletes files.
-        result = subprocess.run([sys.executable, str(HERE / 'drop_page_cache.py'), str(model_path)],
-                                check=False, timeout=120)
+        result = subprocess.run([sys.executable, str(HERE / 'drop_page_cache.py'), *roots],
+                                check=False, timeout=900)
         if result.returncode:
             warn('cache_eviction_failed', rc=result.returncode)
     except subprocess.TimeoutExpired:
-        warn('cache_eviction_timeout', timeout_seconds=120)
+        warn('cache_eviction_timeout', timeout_seconds=900)
+    state['page_cache_seconds'] = time.monotonic() - began
     try:
         nodes = cpu_numa_nodes()
     except OSError as exc:
@@ -104,48 +136,47 @@ def prepare(store, model_path, out, timeout=1800):
         warn('numa_unavailable', error=str(exc))
     if not nodes:
         warn('no_cpu_numa_nodes')
+    # Spur runs the container unprivileged, so this is usually 'unavailable'.
     state['host_clean'] = drop_and_compact_host(nodes)
-    if state['host_clean']['status'] != 'completed':
-        warn('host_clean_unavailable', **state['host_clean'])
     write_json(summary, state)
-    for node in nodes:
-        row = {'node': node, 'desired_bytes': int(segments / len(nodes))}
-        state['nodes'].append(row)
+
+    def probe_node(node, desired, limit, attempt):
+        row = {'node': node, 'desired_bytes': int(desired), 'attempt': attempt}
         try:
             info = node_meminfo(Path('/sys'), node)
             reclaimable = info['MemFree'] + info['Active(file)'] + info['Inactive(file)']
         except (OSError, ValueError, KeyError, SystemExit) as exc:
             row['status'] = 'numa_memory_unavailable'
             warn(row['status'], node=node, error=str(exc))
-            write_json(summary, state)
-            continue
-        # Match the successful worker: global segments only, capped by current
-        # free + reclaimable file pages with 64 GiB left on this NUMA node.
-        gib = min(segments / len(nodes), reclaimable - 64 * GIB) / GIB
+            return row
+        # Global segments only, capped by current free + reclaimable file pages
+        # with 64 GiB left on this NUMA node.
+        gib = min(desired, reclaimable - 64 * GIB) / GIB
         row['reclaimable_bytes'] = reclaimable
         row['target_gib'] = max(0, gib)
+        row['huge_blocks_before'] = node_free_huge_blocks(node)
         if gib * GIB < row['desired_bytes']:
             warn('thp_target_capped', node=node, target_gib=max(0, gib))
         if gib < 1:
             row['status'] = 'skipped_low_memory'
-            write_json(summary, state)
-            continue
-        result_path = out / f'thp-node-{node}.json'
+            return row
+        result_path = out / f'thp-node-{node}-{attempt}.json'
         # Integer GiB rounding matches the successful CI's helper invocation.
         row['requested_bytes'] = int(f'{gib:.0f}') * GIB
-        print(f'[store-memory] NUMA {node}: compacting {gib:.0f} of {row["desired_bytes"] / GIB:g} GiB', flush=True)
+        print(f'[store-memory] NUMA {node} ({attempt}): compacting {gib:.0f} of '
+              f'{row["desired_bytes"] / GIB:g} GiB, limit {limit} s', flush=True)
         began = time.monotonic()
         try:
-            with (logs / f'thp-node-{node}.log').open('w') as log:
+            with (logs / f'thp-node-{node}-{attempt}.log').open('w') as log:
                 result = subprocess.run([
                     sys.executable, str(HERE / 'numa_exec.py'), str(node),
                     sys.executable, str(HERE / 'pd_vllm_memory.py'), 'probe',
                     '--gib', f'{gib:.0f}', '--output', str(result_path)],
-                    stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+                    stdout=log, stderr=subprocess.STDOUT, timeout=limit, check=False)
             row['rc'] = result.returncode
             row['status'] = 'probe_failed' if result.returncode else 'completed'
         except subprocess.TimeoutExpired:
-            row.update(status='thp_timeout', rc=None, timeout_seconds=timeout)
+            row.update(status='thp_timeout', rc=None, timeout_seconds=limit)
         row['elapsed_seconds'] = time.monotonic() - began
         try:
             measured = json.loads(result_path.read_text())
@@ -162,11 +193,28 @@ def prepare(store, model_path, out, timeout=1800):
         if row['status'] != 'completed':
             warn(row['status'], node=node, rc=row['rc'], huge_bytes=row['huge_bytes'],
                  requested_bytes=row['requested_bytes'])
+        return row
+
+    # A node whose memory is pinned by page cache other tenants keep mapped
+    # (pit2-p03-g12 NUMA 0: 833 GiB active file, no free 2 MiB block) never
+    # compacts. Give up on it early and place the whole pool on the nodes that
+    # did compact; the Prefill workers bind their Store allocation there.
+    for node in nodes:
+        state['nodes'].append(probe_node(node, segments / len(nodes), min(timeout, first_timeout), 'share'))
         write_json(summary, state)
+    usable = [row['node'] for row in state['nodes'] if row.get('status') == 'completed']
+    failed = [row['node'] for row in state['nodes']
+              if row.get('status') not in ('completed', 'skipped_low_memory')]
+    state['store_nodes'] = list(nodes) if not failed else []
+    if failed and usable:
+        rows = [probe_node(node, segments / len(usable), timeout, 'pool') for node in usable]
+        state['nodes'].extend(rows)
+        if all(row.get('status') == 'completed' for row in rows):
+            state['store_nodes'] = usable
     state['status'] = 'completed_with_warnings' if state['warnings'] else 'completed'
     state['finished_at'] = time.time()
     write_json(summary, state)
-    print(f'[store-memory] THP preparation {state["status"]}; Store mounts only if every node finished', flush=True)
+    print(f'[store-memory] THP preparation {state["status"]}; Store nodes {state["store_nodes"]}', flush=True)
     return state
 
 
@@ -202,7 +250,7 @@ def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
                 if result['status'] != 'completed':
                     raise RuntimeError(f"Store memory preparation failed: {result.get('error')}")
                 print(f'[store-memory] {participant}: preparation complete; initializing Store', flush=True)
-                return
+                return result
             if time.monotonic() >= deadline:
                 raise TimeoutError('Timed out waiting for all workers and Store memory preparation')
             if all(path.exists() for path in expected):
@@ -222,11 +270,10 @@ def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
                             write_json(terminal, {'status': 'failed', 'coordinator': participant,
                                                   'error': str(exc), 'finished_at': time.time()})
                             raise
-                        unfinished = [row for row in preparation['nodes']
-                                      if row.get('status') not in ('completed', 'skipped_low_memory')]
-                        if not preparation['nodes'] or unfinished:
+                        if not preparation['store_nodes']:
                             detail = ', '.join(
-                                f"node {row.get('node')} {row.get('status')}" for row in unfinished)
+                                f"node {row.get('node')} ({row.get('attempt')}) {row.get('status')}"
+                                for row in preparation['nodes'] if row.get('status') != 'completed')
                             error = ('hugepage compact did not finish before Store initialization'
                                      + (': ' + detail if detail else ': no NUMA node was compacted'))
                             write_json(terminal, {'status': 'failed', 'coordinator': participant,
@@ -236,6 +283,7 @@ def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
                             raise RuntimeError(error)
                         write_json(terminal, {'status': 'completed', 'coordinator': participant,
                                               'preparation_status': preparation['status'],
+                                              'store_nodes': preparation['store_nodes'],
                                               'workers': [p.stem for p in expected],
                                               'finished_at': time.time()})
                     finally:
