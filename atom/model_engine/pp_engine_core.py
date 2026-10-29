@@ -17,13 +17,14 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.observability import tracing
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
 # Collect poll timeout when the step made no other progress: bounds both
 # new-request admission latency and busy-spinning while batches are in flight.
-_PP_HEAD_IDLE_POLL_MS = 1
+_PP_IDLE_POLL_MS = 1
 
 
 class PPEngineCoreProc(EngineCore):
@@ -62,10 +63,13 @@ class PPEngineCoreProc(EngineCore):
         )
 
     def busy_loop(self):
-        if self.is_head:
-            self._head_busy_loop()
-        else:
-            self._downstream_busy_loop()
+        try:
+            if self.is_head:
+                self._head_busy_loop()
+            else:
+                self._downstream_busy_loop()
+        finally:
+            tracing.shutdown()
 
     def _head_busy_loop(self):
         shutdown = False
@@ -141,6 +145,7 @@ class PPEngineCoreProc(EngineCore):
                     scheduled_batch.connector_meta_output,
                 )
             self.pp_transport.send_metadata(scheduled_batch)
+            tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
             self.scheduler.mark_pp_inflight(scheduled_batch)
@@ -156,7 +161,7 @@ class PPEngineCoreProc(EngineCore):
         # that adopts a model calibrated from the prefills it launched.
         self._poll_dynamic_chunking_calibration()
 
-        poll_ms = 0 if launched else _PP_HEAD_IDLE_POLL_MS
+        poll_ms = 0 if launched else _PP_IDLE_POLL_MS
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
             if not needs_output and not scheduled_batch.pp_completion_ack:
@@ -245,7 +250,7 @@ class PPEngineCoreProc(EngineCore):
         )
 
     def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
-        """Override: fan the idle connector metadata out to every PP stage.
+        """Fan idle offload work and P/D terminal metadata to every PP stage.
 
         ``Scheduler.schedule()`` returns None once waiting and running are
         both empty, so the connector-only batch it normally builds never
@@ -262,7 +267,13 @@ class PPEngineCoreProc(EngineCore):
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
-        if connector is None or not getattr(connector, "is_offload", False):
+        if connector is None or not (
+            getattr(connector, "is_offload", False)
+            or (
+                getattr(connector, "is_producer", False)
+                and getattr(connector, "enable_chunked_transfer", False)
+            )
+        ):
             return
         self._dispatch_connector_only_batch(
             ScheduledBatch(
@@ -331,6 +342,7 @@ class PPEngineCoreProc(EngineCore):
             finished_sending=kvoutput.finished_sending,
             finished_recving=kvoutput.finished_recving,
             failed_recving=kvoutput.failed_recving,
+            received_handoffs=kvoutput.received_handoffs,
         )
         if not non_offload.is_empty():
             self.scheduler._update_from_kv_xfer_finished(non_offload)
@@ -340,8 +352,8 @@ class PPEngineCoreProc(EngineCore):
             kvoutput.finished_loading
             or kvoutput.failed_loading
             or kvoutput.finished_saving
-            # connector_completions are offload channel events (kimi_k3 state
-            # dispositions, dsv4 checkpoint boundaries). They too span all PP
+            # Connector channels include offload state events and chunked P/D
+            # source-read completion. They all span every PP
             # stages, so they must reach the aggregator rather than the
             # scheduler directly -- and count as "offload work" so this poll
             # does not early-return and strand them.
@@ -378,6 +390,17 @@ class PPEngineCoreProc(EngineCore):
     # -- Downstream busy loop ------------------------------------------------
 
     def _downstream_busy_loop(self):
+        # Chunked P waits for every stage's D-ready report before forwarding.
+        # When all requests wait, no forward wakes recv_metadata. Poll status
+        # at the head's idle cadence instead of adding up to 100 ms to TTFT.
+        connector = getattr(self.scheduler, "kv_connector", None)
+        metadata_poll_ms = (
+            _PP_IDLE_POLL_MS
+            if self.kv_transfer_enabled
+            and getattr(connector, "is_producer", False)
+            and getattr(connector, "enable_chunked_transfer", False)
+            else 100
+        )
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
@@ -393,7 +416,7 @@ class PPEngineCoreProc(EngineCore):
                     break
                 if self._is_idle_rl_weights_offloaded():
                     continue
-                batch = self.pp_transport.recv_metadata(timeout_ms=100)
+                batch = self.pp_transport.recv_metadata(timeout_ms=metadata_poll_ms)
                 if batch is None:
                     if self.kv_transfer_enabled:
                         self._poll_and_send_kv_status()

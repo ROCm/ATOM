@@ -37,12 +37,20 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
+from atom.kv_transfer.disaggregation.chunked_prefill import chunked_topology_supported
+from atom.kv_transfer.disaggregation.mooncake.endpoint import (
+    DEFAULT_HANDSHAKE_PORT,
+    producer_endpoint,
+)
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
+from atom.observability.tracing import TraceMiddleware, set_request_id
+from atom.observability.tracing import initialize as initialize_tracing
+from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -403,8 +411,10 @@ def _get_dp_session_affinity_ids(
     When its Dynamo-affinity header option is enabled it also sends the parent
     session ID for forked agent trees. CoreManager retains that lineage for
     observability but deliberately assigns each child correlation ID its own
-    strict cache owner, matching SGLang's agentic routing. Clients without a
-    session header retain normal DP load balancing.
+    strict cache owner, matching SGLang's agentic routing. The MLPerf Endpoints
+    agentic client instead sends ``X-Session-ID`` on every turn of a
+    conversation. Clients without a session header retain normal DP load
+    balancing.
     """
     if os.environ.get("ATOM_DP_SESSION_AFFINITY", "0").lower() not in {
         "1",
@@ -416,9 +426,11 @@ def _get_dp_session_affinity_ids(
     if raw_request is None:
         return None, None
 
-    session_id = raw_request.headers.get(
-        "x-dynamo-session-id"
-    ) or raw_request.headers.get("x-correlation-id")
+    session_id = (
+        raw_request.headers.get("x-dynamo-session-id")
+        or raw_request.headers.get("x-session-id")
+        or raw_request.headers.get("x-correlation-id")
+    )
     parent_id = raw_request.headers.get("x-dynamo-parent-session-id")
     return session_id, parent_id
 
@@ -655,9 +667,14 @@ def _get_multimodal_processor():
             _get_engine_config(), tokenizer, custom_message_encoder
         )
         if processor is None:
+            # The checkpoint path: model_name may be --served-model-name.
             processor = AutoProcessor.from_pretrained(
-                model_name, trust_remote_code=True
+                _get_engine_config().model, trust_remote_code=True
             )
+            # A checkpoint that ships its template for the tokenizer only
+            # (MiniMax-M3.1) renders with the server's, --chat-template included.
+            if processor.chat_template is None:
+                processor.chat_template = tokenizer.chat_template
     return processor
 
 
@@ -898,6 +915,7 @@ async def generate_async_multimodal(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    return_token_ids: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -976,7 +994,7 @@ async def generate_async_multimodal(
         else 0.0
     )
 
-    yield {
+    response = {
         "text": text,
         "token_ids": all_token_ids,
         "finish_reason": finish_reason,
@@ -988,6 +1006,9 @@ async def generate_async_multimodal(
         "tpot": tpot,
         "latency": finished_at - started_at,
     }
+    if return_token_ids and seq is not None:
+        response["prompt_token_ids"] = list(seq.prompt_token_ids)
+    yield response
 
 
 async def generate_async_fanout(
@@ -1151,6 +1172,28 @@ def _validate_return_token_ids(
         raise ValueError(
             "return_token_ids is not supported with stream=true; the ids are "
             "returned on the response body, which a stream does not have"
+        )
+
+
+def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
+    """Reject unroutable D requests before enqueue or successful SSE headers.
+
+    The router cancels the waiting P request on this HTTP error. A worker-only
+    receive failure would let D recover locally while P waits for ready forever.
+    """
+    if not params or not (
+        params.get("chunked_transfer") and params.get("do_remote_prefill")
+    ):
+        return
+    cfg = engine.config
+    if not chunked_topology_supported(
+        params.get("remote_tp_size", 1),
+        cfg.tensor_parallel_size,
+        cfg.pipeline_parallel_size,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Chunked P/D requires D PP=1 and D TP a multiple of positive P TP",
         )
 
 
@@ -1527,6 +1570,7 @@ async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    await asyncio.to_thread(initialize_tracing)
     metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
@@ -1556,8 +1600,11 @@ async def lifespan(app: FastAPI):
         _background_tasks.clear()
         await _metrics_exporter.wait_for_render()
         logger.info("Server shutting down, releasing resources...")
-        if engine is not None:
-            engine.close()
+        try:
+            if engine is not None:
+                engine.close()
+        finally:
+            await asyncio.to_thread(shutdown_tracing)
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1565,6 +1612,7 @@ app.add_middleware(
     RequestTimingMiddleware,
     observe_ttft=_request_metrics.observe_time_to_first_token,
 )
+app.add_middleware(TraceMiddleware, model=lambda: model_name)
 
 
 # ---- Error handlers ----
@@ -1607,6 +1655,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     """Handle chat completion requests (OpenAI-compatible)."""
 
     validate_model(request.model)
+    _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         request.tools = normalize_chat_tools(request.tools)
@@ -1654,6 +1703,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        set_request_id(request_id)
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -1795,6 +1845,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
                 raw_request,
@@ -1881,6 +1932,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
 
     validate_model(request.model)
+    _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
@@ -1899,6 +1951,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
+        set_request_id(request_id)
         dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
         dp_routing = {
             "data_parallel_rank": request.data_parallel_rank,
@@ -2010,6 +2063,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     and returns Anthropic-formatted responses. Enables Claude Code and other
     Anthropic-compatible tools to use ATOM as a backend.
     """
+    _validate_chunked_receive(request.kv_transfer_params)
     # One validator over the shape both endpoints share: this path already
     # converts, so validating the conversion leaves a single rule rather than
     # a second one in Anthropic's spelling. It checked nothing before, so a
@@ -2086,6 +2140,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         request_id = uuid.uuid4().hex[:24]
+        set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
         input_tokens = len(tokenizer.encode(prompt))
 
@@ -2419,6 +2474,7 @@ async def responses_create(raw_request: Request):
                 }
             },
         )
+    _validate_chunked_receive(kv_transfer_params)
     kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
     unsupported = unsupported_responses_parameter(body)
@@ -2505,6 +2561,7 @@ async def responses_create(raw_request: Request):
         )
 
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
+        set_request_id(request_id)
         input_tokens = len(tokenizer.encode(prompt))
 
         max_ctx = 30720
@@ -2761,7 +2818,7 @@ async def get_gc_census(top: int = 30, types_per_owner: int = 2):
 
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
     kv_role = kv_cfg.get("kv_role")
-    handshake_port = kv_cfg.get("handshake_port", 6301)
+    handshake_port = kv_cfg.get("handshake_port", DEFAULT_HANDSHAKE_PORT)
     if kv_role is not None or kv_cfg.get("kv_connector") != "multi":
         return kv_role, handshake_port
 
@@ -2787,12 +2844,30 @@ async def kv_transfer_info():
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
     kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
-    return {
+    info = {
         "tp_size": cfg.tensor_parallel_size,
         "dp_size": cfg.parallel_config.data_parallel_size,
         "kv_role": kv_role,
         "handshake_port": handshake_port,
     }
+    from atom.kv_transfer.disaggregation.pd_producer import iter_connector_configs
+    from atom.utils.network import get_ip
+
+    for sub, _ in iter_connector_configs(kv_cfg):
+        if (
+            sub.get("kv_connector") == "mooncake"
+            and sub.get("kv_role", "kv_producer") == "kv_producer"
+            and sub.get("enable_chunked_transfer", False)
+        ):
+            info["chunked_transfer"] = producer_endpoint(
+                host=get_ip(),
+                handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
+                pp_size=cfg.pipeline_parallel_size,
+                block_size=cfg.kv_cache_block_size,
+                dcp_size=cfg.decode_context_parallel_size,
+            )
+            break
+    return info
 
 
 @app.get("/server_info")

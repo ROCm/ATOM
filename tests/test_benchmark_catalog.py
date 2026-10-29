@@ -107,7 +107,7 @@ def test_load_variants_shape():
 
 # Variant suffixes that existed when the structured catalog replaced the
 # hard-coded matrix `exclude` block. The migration guarantee is scoped to these;
-# variants added later (e.g. -dpa-mtp3) are validated by the band invariants below.
+# variants added later (e.g. -dpa-dspark) are validated by the band invariants below.
 LEGACY_SUFFIXES = {"", "-mtp3", "-dpa"}
 
 
@@ -161,26 +161,24 @@ def test_param_lists_override_and_conc_band():
     assert sorted(c["suffix"] for c in cells) == [
         "-dpa",
         "-dpa-dspark",
-        "-dpa-mtp3",
         "-dpa-tbo",
     ]
     rfs = {c["result_filename"] for c in cells}
     assert "deepseek-v4-pro-dpa-1024-1024-512-0.7" in rfs
     assert "deepseek-v4-pro-dpa-dspark-1024-1024-512-0.7" in rfs
-    assert "deepseek-v4-pro-dpa-mtp3-1024-1024-512-0.7" in rfs
     assert "deepseek-v4-pro-dpa-tbo-1024-1024-512-0.7" in rfs
 
 
 def test_model_filter():
-    cells = catalog.build_cells(CATALOG, model_filter={"glm-5-2-fp8"})
-    assert {c["prefix"] for c in cells} == {"glm-5-2-fp8"}
+    cells = catalog.build_cells(CATALOG, model_filter={"gpt-oss-120b"})
+    assert {c["prefix"] for c in cells} == {"gpt-oss-120b"}
 
 
 def test_validate_dispatch_inputs_in_sync_and_drift():
     prefixes = {m["prefix"] for m in catalog._load_catalog(CATALOG)["models"]}
     assert catalog.validate_dispatch_inputs(CATALOG, prefixes) == []
     # missing a checkbox
-    assert catalog.validate_dispatch_inputs(CATALOG, prefixes - {"glm-5-2-fp8"})
+    assert catalog.validate_dispatch_inputs(CATALOG, prefixes - {"gpt-oss-120b"})
     # extra checkbox
     assert catalog.validate_dispatch_inputs(CATALOG, prefixes | {"ghost"})
 
@@ -458,12 +456,19 @@ def test_agentic_nightly_grid_and_shared_capture_recipe():
         assert "--enforce-eager" not in args
         assert "--max-num-seqs" not in args
         assert captures == list(range(1, 33)) + [48, 64, 96, 128, 160, 192, 224, 256]
+        layout = (
+            "dep"
+            if "--enable-expert-parallel" in args
+            else "dtp" if "--enable-dp-attention" in args else "tp"
+        )
         for conc in json.loads(config["concurrency"]):
-            assert (tp, conc) not in points
-            points.add((tp, conc))
-    assert points == {(2, c) for c in [1, 2, 4, 8, 16, 32, 64, 128]} | {
-        (4, c) for c in [1, 4, 8]
-    }
+            assert (tp, layout, conc) not in points
+            points.add((tp, layout, conc))
+    assert points == (
+        {(2, "tp", c) for c in [1, 2, 4, 8, 16, 32, 64, 128]}
+        | {(4, "tp", c) for c in [1, 4, 8]}
+        | {(2, "dtp", 128), (2, "dep", 128)}
+    )
 
 
 def test_agentic_nightly_subset_keeps_each_tp_grid():

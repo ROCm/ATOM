@@ -10,6 +10,7 @@ import torch
 
 from atom.models.utils import get_pp_indices
 from atom.utils.forward_context import get_published_dcp_local_context_lens
+from atom.utils.tbo.ubatch_splitting import decode_ubatch_request_ranges
 
 try:
     import aiter  # noqa: F401
@@ -18,7 +19,9 @@ try:
     from atom.model_ops.attentions.aiter_mla import (
         AiterMLAMetadataBuilder,
         _pad_prefill_mla_draft_tail,
+        indexes_by_token_table,
     )
+    from atom.model_ops.indexer import ConcatKeys, concat_rows
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
 
@@ -31,6 +34,43 @@ def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
 
 def test_global_index_cache_layout_without_schedule_is_unchanged():
     assert aiter_mla._global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
+
+
+def test_dsa_layers_price_only_the_real_index_layers(monkeypatch):
+    from atom.config import flatten_dsa_config
+
+    # A hybrid stack: every fourth layer is full attention and owns an index
+    # plane; the layers between are linear attention.
+    full_layers = [4, 8, 12]
+    hf = SimpleNamespace(
+        num_hidden_layers=12,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+        linear_attn_config={"full_attn_layers": full_layers},
+        dsa_config={
+            "dsa_layers": full_layers,
+            "index_topk": 2048,
+            "index_num_heads": 32,
+            "index_head_dim": 128,
+            "index_rope_dim": 0,
+            "index_topk_freq": 1,
+        },
+    )
+    flatten_dsa_config(hf)
+    builder, runner = _builder(None, total_local_layers=len(full_layers))
+    runner.config.hf_config = hf
+    runner.config.speculative_config = None
+    runner.config.kv_cache_dtype = "bf16"
+    runner.block_size = 128
+    _mock_pp(monkeypatch, rank=0, world_size=1)
+    expected = tuple(layer - 1 for layer in full_layers)
+    assert builder._index_cache_layout() == (expected, expected)
+    # This exercises the actual pool declaration/pricing consumer, not just
+    # the config attribute. Index planes on the linear-attention layers would
+    # inflate this by 128 * 144 bytes each for every scheduler PAGE unit.
+    pool = builder._declare_kv_pool()
+    assert pool.entry_bytes == len(full_layers) * 128 * (576 * 2 + 144)
 
 
 def test_padded_prefill_mla_rows_have_empty_initialized_kv_ranges():
@@ -193,8 +233,9 @@ def test_pp_shared_indexer_uses_the_producer_buffer_width(monkeypatch):
             num_hidden_layers=4,
             indexer_types=("full", "shared", "shared", "full"),
             index_topk=2048,
-            index_topk_freq=1,
-            index_skip_topk_offset=1,
+            # As GLM-5.2 ships it: index_topk_freq > 1 turns the index cache on.
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
         )
     )
     runner.attn_metadata_builder = SimpleNamespace(index_topk_out=2176)
@@ -589,12 +630,22 @@ def _capture_metadata_builder(dcp_world_size, *, is_sparse):
         var["dcp_local_context_lens"] = _FakeMetadataBuffer(bs)
 
     builder = object.__new__(AiterMLAMetadataBuilder)
-    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=var,
+        block_size=1,
+        config=SimpleNamespace(max_model_len=1024),
+    )
     builder.block_size = 1
     builder.is_sparse = is_sparse
     builder.dcp_world_size = dcp_world_size
+    builder.index_kpool = 1
+    builder._indexer_fp4 = False
+    builder.index_logits_workspace = None
     builder._publishes_dcp_local_lens = is_sparse and dcp_world_size > 1
-    builder._tbo_full_running_bs = 0
+    builder.indexes_by_token_table = indexes_by_token_table(
+        is_sparse, dcp_world_size, builder.index_kpool
+    )
+    builder._tbo_ubatch_request_ranges = []
     builder.dtype_q = None
     builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
     return builder, var
@@ -632,9 +683,15 @@ def test_cudagraph_capture_keeps_non_sparse_dcp_paths_independent(
     assert metadata.dcp_local_context_lens is None
 
 
-def test_ubatch_metadata_views_full_dcp_local_context_buffer():
+@pytest.mark.parametrize(
+    ("scheduled_bs", "expected"),
+    # ubatch 1 starts where its micro-batch's requests do, not at half the
+    # padded batch: 3 scheduled requests split [0, 1) / [1, 3).
+    [(4, [13, 14]), (3, [12, 13])],
+)
+def test_ubatch_metadata_views_full_dcp_local_context_buffer(scheduled_bs, expected):
     builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
-    builder._tbo_full_running_bs = 4
+    builder._tbo_ubatch_request_ranges = decode_ubatch_request_ranges(scheduled_bs, 2)
     builder._set_ubatch_mla_buffers = lambda *args, **kwargs: None
     var["dcp_local_context_lens"].gpu.copy_(
         torch.tensor([11, 12, 13, 14], dtype=torch.int32)
@@ -666,6 +723,33 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer():
 
     torch.testing.assert_close(
         metadata.dcp_local_context_lens,
-        torch.tensor([13, 14], dtype=torch.int32),
+        torch.tensor(expected, dtype=torch.int32),
     )
     assert "ub1_dcp_local_context_lens" not in var
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_a_tbo_prefill_ubatch_scores_against_the_whole_steps_keys(world):
+    """A token split can cut a request in two: the second ubatch's rows of it
+    see keys the first ubatch's tokens wrote, so an ubatch scores against the
+    step's gathered keys -- row starts unrebased -- and under DCP this rank's
+    share of its own rows."""
+    keys = ConcatKeys(
+        block_tables=torch.zeros(2, 4, dtype=torch.int32),
+        cu_committed=torch.tensor([0, 6, 10], dtype=torch.int32),
+        total=10,
+        row_starts=torch.tensor([0] * 6 + [6] * 4, dtype=torch.int32),
+    )
+    step = concat_rows(torch.arange(1, 11, dtype=torch.int32), keys)
+    builder = SimpleNamespace(dcp_rank=world - 1, dcp_world_size=world)
+    # Tokens 4..10: the last two of request 0, then request 1.
+    ub_slice = SimpleNamespace(token_slice=slice(4, 10), request_slice=slice(0, 2))
+
+    rows = AiterMLAMetadataBuilder._ubatch_prefill_index_rows(
+        builder, step, None, None, ub_slice
+    )
+
+    assert rows.row_ends.tolist() == list(range(5, 11))
+    assert rows.concat.total == 10
+    assert rows.concat.row_starts.tolist() == [0, 0, 6, 6, 6, 6]
+    assert rows.split.world == world

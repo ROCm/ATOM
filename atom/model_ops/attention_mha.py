@@ -1472,8 +1472,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # page-16 view is a pure zero-copy reinterpretation of the page-128 view.
         # We re-view here (at attention time) instead of at bind time so the binder
         # has no M3-specific KV/scale code.
+        from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
+
         layer = kv_cache_data[f"layer_{self.layer_num}"]
-        k_cache, v_cache, k_scale, v_scale = self._to_page16_shuffle(
+        k_cache, v_cache, k_scale, v_scale = to_page16_shuffle(
             layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
         )
 

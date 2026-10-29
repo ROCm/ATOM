@@ -112,7 +112,7 @@ def runtime_config(**overrides):
         {"enable_rapidserve": True},
         {"online_quant_config": {}},
         {"eplb_enable": True},
-        {"kv_cache_dtype": "fp8"},
+        {"kv_cache_dtype": "fp16"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
         # a hit's one-PAGE rebuild would not cover the window
@@ -125,12 +125,25 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
-def test_lmcache_mp_is_the_only_kv_transfer_admitted():
+def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
     validate_runtime_config(
         runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
     )
-    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
-        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+    for role in ("kv_producer", "kv_consumer"):
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={"kv_connector": "mooncake", "kv_role": role}
+            )
+        )
+    # Mooncake's implicit producer default would escape producer detection.
+    with pytest.raises(ValueError, match="without an explicit kv_role"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
+        )
+    for connector in ("lmcache_offload", "moriio", "multi"):
+        with pytest.raises(
+            ValueError, match="KV transfer other than lmcache_mp or mooncake"
+        ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
             )
@@ -366,7 +379,7 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
             index_cache_dtype="fp8",
             enforce_eager=not graph,
             compilation_config=SimpleNamespace(
-                level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                level=0, cudagraph_mode=CUDAGraphMode.TR_HYBRID
             ),
         )
     )
@@ -403,7 +416,7 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         compilation_config=SimpleNamespace(
             level=level,
             cudagraph_mode=(
-                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.PIECEWISE
+                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.TR_HYBRID
             ),
         ),
         hf_config=SimpleNamespace(),
@@ -442,7 +455,7 @@ def test_level3_requires_full_graph_or_eager_runtime():
             runtime_config(
                 enforce_eager=False,
                 compilation_config=SimpleNamespace(
-                    level=3, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                    level=3, cudagraph_mode=CUDAGraphMode.TR_HYBRID
                 ),
             )
         )
@@ -459,13 +472,13 @@ def test_shortening_the_index_block_moves_bytes_without_adding_any(rows):
     the two regions interleave changes.
     """
     geo = V41PoolGeometry(
-        40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True, index_block_rows=rows
+        40, ((2, 2), (20, 1)), 64, 128, 512, 128, kv_dtype="fp4", index_block_rows=rows
     )
     assert geo.index_row_bytes == 132
     assert (
         geo.paged_bytes
         == V41PoolGeometry(
-            40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True
+            40, ((2, 2), (20, 1)), 64, 128, 512, 128, kv_dtype="fp4"
         ).paged_bytes
     )
 
@@ -549,7 +562,9 @@ def test_real_config_accepts_tbo_before_dpa_rank_expansion(
     # The quantization parser resolves AITER enums. Only bypass that GPU
     # dependency; execute the real Config.__post_init__, HF config load,
     # V4.1 admission check and engine rank planner on CPU.
-    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    monkeypatch.setattr(
+        config_module, "QuantizationConfig", lambda *args, **kwargs: None
+    )
     cfg = Config(
         model=str(fixture),
         tensor_parallel_size=tp,
@@ -596,7 +611,9 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     monkeypatch.setattr(config_module, "get_hf_config", lambda *args, **kwargs: hf)
     monkeypatch.setattr(config_module, "get_generation_config", lambda *args: None)
     # Quantization resolves AITER enums; keep this admission test CPU-only.
-    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    monkeypatch.setattr(
+        config_module, "QuantizationConfig", lambda *args, **kwargs: None
+    )
     validated = []
 
     def start_core(config):

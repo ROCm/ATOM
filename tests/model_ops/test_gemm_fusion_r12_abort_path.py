@@ -308,7 +308,11 @@ def test_every_forward_entry_checks_the_launch_gate_before_anything_else(key):
 
 
 def test_a_graph_replay_is_always_preceded_by_the_launch_gate_check():
-    """A captured graph runs no Python, so the check must be made right before ``replay()``."""
+    """A captured graph runs no Python, so the check must be made right before ``replay()``.
+
+    Main's #2688 single-graph-per-region mechanism replays through ``self.req_graph``:
+    the gate check is still the statement immediately before the only replay of a
+    served step (staging the SP shard, if on, sits before the check)."""
     fn = _runner_functions()[("ModelRunner", "run_model")]
     replays = 0
     for node in ast.walk(fn):
@@ -318,7 +322,7 @@ def test_a_graph_replay_is_always_preceded_by_the_launch_gate_check():
                 continue
             for i, stmt in enumerate(stmts):
                 src = ast.unparse(stmt)
-                if src.startswith("self.graphs[") and src.endswith(".replay()"):
+                if src.startswith("logits = self.req_graph.replay("):
                     replays += 1
                     assert i > 0 and _is_gate_check(stmts[i - 1]), src
     assert replays == 1  # the only replay of a served step

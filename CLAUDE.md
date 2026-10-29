@@ -44,7 +44,7 @@ diffusion_server.py → DiffusionEngine → DiffusionCoreManager → DiffusionEn
 Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
-- Models: `atom/models/` — registered in `model_runner.py:support_model_arch_dict`
+- Models: `atom/models/` — registered in `atom/models/registry.py:support_model_arch_dict`
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
@@ -70,12 +70,13 @@ Key entry points:
   / math primitives), a model's
   kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4.1 and
   Kimi-K3, both wrapped after load through
-  `model_runner.mono_decode_installers`; V4.1's per-step cell decisions live in
+  `models.registry.mono_decode_installers`; V4.1's per-step cell decisions live in
   `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
-  kernel and its CPU I3 test. Kimi-K3 runs only its KDA layers — K1 (the
-  attention seam through the KDA recurrence) and K2 (`o_proj` + the latent MoE)
-  — and only on a uniform speculative verify of at most 8 rows; the MLA layers
-  keep the original paged path. Which steps it serves and how a served step is
+  kernel and its CPU I3 test. Kimi-K3 runs K1 (the attention seam through
+  the KDA recurrence) and K2 (`o_proj` + the latent MoE) on its KDA layers, and
+  only on a uniform speculative verify of at most 16 rows. The MLA layers keep
+  their original paged attention but also run K2; an MLA layer that cannot bind
+  K2 stays on the production path alone. Which steps it serves and how a served step is
   keyed live in `kimi_k3/mono/plan.py`, apart from `runner.py` so the CPU test
   gate can reach them without AITER or FlyDSL. GLM-5.2's single `kernels/kernel.py` covers the
   whole layer, `kernels/op.py` is its host wrapper, and `kernels/geometry.py` /
@@ -113,7 +114,7 @@ Key entry points:
 
 - **Adding a model**: see `/add-model` for full guide
 - **Model reuse**: DeepSeek V3/V3.2/GLM-5 share `deepseek_v2.py`; MTP models in `deepseek_mtp.py`, `qwen3_next_mtp.py`, and `qwen3_5_mtp.py`
-- **Compilation levels**: `--level` 0=eager, 1=torch.compile, 2=dynamo once, 3=piecewise+CUDAGraph (default)
+- **Compilation levels**: `--level` 0=eager, 1=torch.compile, 2=dynamo once, 3=piecewise compile (default); CUDA graphs are `--cudagraph-mode`'s, independent of the level
 
 ## Dependencies
 

@@ -73,7 +73,7 @@ class SlurmResultsTest(unittest.TestCase):
                 "5147 CANCELLED -1:0",
             ),
             (
-                {"USES_SPUR_CONTROLLER": "0", "SLURM_ACCOUNT": "amd-frameworks"},
+                {"USES_SPUR_CONTROLLER": "0", "SLURM_ACCOUNT": "amd-atom"},
                 "-j 5147 -X -n -P -o JobIDRaw,State,ExitCode",
                 "999|FAILED|1:0\n5147|COMPLETED|0:0",
             ),

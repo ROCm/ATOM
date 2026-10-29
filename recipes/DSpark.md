@@ -43,7 +43,7 @@ python -m atom.entrypoints.openai_server \
   --trust-remote-code \
   --server-port 7777 \
   --torch-profiler-dir ./log \
-  --cudagraph-mode PIECEWISE \
+  --cudagraph-mode TR_HYBRID \
   --enable-dp-attention \
   --dspark-config '{"confidence_schedule": true, "ragged": true, "ragged_graph_sizes": "8"}'
 ```
@@ -136,7 +136,8 @@ Performance on 8xMI355X GPUs with the following environment:
 - Date measured: 2026-07-21.
 - Docker image: rocm/atom:latest.
 - `--kv_cache_dtype fp8`, `--method dspark --num-speculative-tokens 7`,
-  `--cudagraph-mode PIECEWISE`, `--enable-dp-attention`.
+  `--cudagraph-mode PIECEWISE` (since replaced by TR_HYBRID, which these
+  numbers were not re-measured under), `--enable-dp-attention`.
 - DSpark config: `confidence_schedule=true, ragged=true, ragged_graph_sizes="8"`.
 
 ### FP8 (TP8, FP8 KV Cache) — DSpark (confidence-scheduled ragged verify)

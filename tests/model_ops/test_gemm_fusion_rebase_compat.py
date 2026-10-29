@@ -69,7 +69,10 @@ def _compute_hash():
         {
             "hashlib": hashlib,
             "Any": Any,
-            "envs": SimpleNamespace(ATOM_REPLICATE_VOCAB_EMBED=False),
+            "envs": SimpleNamespace(
+                ATOM_REPLICATE_VOCAB_EMBED=False,
+                ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=False,
+            ),
         },
         "atom/config.py",
     )
@@ -89,6 +92,9 @@ MAIN_STUB = {
     "enable_decoder_swa_bounded_replay": True,
     "hf_config": SimpleNamespace(),
     "speculative_config": None,
+    # main's #2688-era factors, read directly (not via getattr)
+    "max_model_len": 4096,
+    "max_num_seqs": 8,
 }
 NEUTRAL = {
     "sequence_parallel_size": 1,
@@ -270,16 +276,21 @@ def _prepare_runner(sp_on, with_drafter=False, pd_producer=False):
     )
     runner._maybe_create_tbo_slices = lambda *a: None
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=pd_producer)
+    # main's #2688 prepare_inputs reads the step's GPU scalar through forward_vars
+    runner.forward_vars = {"batch_info": SimpleNamespace(gpu=[0, 0, 0])}
+    runner.running_tokens_per_dp_rank = SimpleNamespace(rows=[0])
     if with_drafter:
         runner.drafter = object()
     return runner
 
 
 @pytest.mark.parametrize("sp_on,expected_tokens", [(True, 32), (False, 17)])
-def test_prepare_inputs_publishes_running_tokens_only_under_sp(sp_on, expected_tokens):
-    """CI failure: the SP padded-token test extracts prepare_inputs by name; main's version calls
-    _verifies_drafts, so that method must be extracted with it."""
+def test_prepare_inputs_publishes_the_dp_rank_row_table(sp_on, expected_tokens):
+    """Main's #2688 API publishes ``running_tokens_per_dp_rank`` (the table
+    ``ForwardMode.decide`` settled); under SP the SP expansion happens inside
+    ``forward_context.set_forward_context``, so the runner forwards the table."""
     runner = _prepare_runner(sp_on)
+    runner.running_tokens_per_dp_rank = SimpleNamespace(tokens=expected_tokens)
     batch = SimpleNamespace(
         total_tokens_num_prefill=0,
         total_tokens_num=17,
@@ -288,19 +299,20 @@ def test_prepare_inputs_publishes_running_tokens_only_under_sp(sp_on, expected_t
         is_dummy_run=False,
     )
     mode = SimpleNamespace(
-        sync=None,
+        sync=SimpleNamespace(ub_max_tokens_across_dp=None, ub_tokens_across_dp=None),
         tbo_collective_active=False,
         running_tokens_are_unified=True,
         running_bs=32,
         running_tokens=32,
         max_seqlen_q=1,
         scheduled_bs=17,
+        ubatch_split_bs=None,
     )
     ns = runner.prepare_inputs.__globals__
     ns["_forward_context"].clear()
     runner.prepare_inputs(batch, "ids", mode)
     (published,) = ns["_forward_context"]
-    assert published["num_tokens"] == expected_tokens
+    assert published["running_tokens_per_dp_rank"] is runner.running_tokens_per_dp_rank
     assert published["spec_decode_metadata"] is None  # no drafter: nothing to verify
 
 

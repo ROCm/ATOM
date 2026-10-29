@@ -10,6 +10,7 @@ import torch
 
 from atom.utils import CpuGpuBuffer
 from atom.utils.h2d import PublicationError
+from atom.utils.tbo import decode_ubatch_request_ranges
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
@@ -25,6 +26,7 @@ def make_runner(
     dcp=1,
     sparse=False,
     fp4=False,
+    kpool=1,
     tbo=True,
     base=None,
     bind=True,
@@ -62,6 +64,7 @@ def make_runner(
     runner.config = SimpleNamespace(
         pipeline_parallel_size=pp,
         max_model_len=128,
+        max_num_batched_tokens=runner.max_num_batched_tokens,
         enable_tbo=tbo,
         enable_tbo_decode=tbo,
         kv_cache_dtype="bf16",
@@ -73,7 +76,7 @@ def make_runner(
             num_attention_heads=16,
             num_key_value_heads=1,
             index_topk=8,
-            index_kpool=1,
+            index_kpool=kpool,
             index_head_dim=128,
             index_n_heads=32,
             indexer_compress_ratio=4,
@@ -85,7 +88,7 @@ def make_runner(
     runner.tokenID_processor = SimpleNamespace(num_rejected=None)
     runner.forward_vars = {
         name: CpuGpuBuffer(64, dtype=torch.int32, device=runner.device)
-        for name in ("input_ids", "decode_src")
+        for name in ("input_ids", "decode_src", "batch_info")
     }
     runner.forward_vars["positions"] = CpuGpuBuffer(
         64, dtype=torch.int64, device=runner.device, publication_group="positions"
@@ -103,7 +106,6 @@ def make_runner(
         builder.set_mla_persistent_worker_buffers = lambda *a, **kw: {}
         builder._set_mla_persistent_worker_buffers_sparse_mtp = lambda *a, **kw: {}
         builder._set_ubatch_mla_buffers = lambda *a, **kw: None
-        builder._publish_indexer_fp4_prefill_schedule = lambda *a, **kw: None
     runner.attn_metadata_builder = builder
     runner._init_forward_vars_ring()
     if bind:
@@ -157,6 +159,24 @@ def assert_repeat_does_not_write(runner, call):
         assert torch.equal(runner.forward_vars[name].cpu, expected), name
 
 
+def test_kpool_verify_publishes_the_mtp_layers_rows_a_token_behind(monkeypatch):
+    """A pooled indexer's verify: the target's rows see the pools position p+1
+    closes, the MTP layer's -- draft step 0, on the same metadata, its
+    positions a token behind -- the pools p closes."""
+    q = 3
+    runner, builder = make_runner(
+        monkeypatch, "mla", q=q, sparse=True, tbo=False, kpool=4
+    )
+    batch = decode_batch(2, q)
+    start_decode(runner, builder, batch, q)
+    md, _ = builder.prepare_decode(batch, 4, 4 * q, q)
+    positions = np.concatenate([np.arange(n - q, n) for n in batch.context_lens])
+    rows = len(positions)
+    assert md.index_rows.row_ends[:rows].tolist() == ((positions + 1) // 4).tolist()
+    assert md.mtp_index_rows.row_ends[:rows].tolist() == (positions // 4).tolist()
+    finish(runner)
+
+
 @pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp", [1, 2])
 @pytest.mark.parametrize(
@@ -201,7 +221,9 @@ def test_decode_csr_tbo_delayed_slot_reuse(
             names.append("sparse_kv_indptr")
         if sparse and dcp > 1:
             names.append("dcp_local_context_lens")
-        if fp4:
+        # DCP's decode scores inside its fused exchange, off no row ends.
+        reads_row_ends = fp4 and dcp == 1
+        if reads_row_ends:
             names.append("index_row_ends")
         for name in names:
             assert (
@@ -233,11 +255,14 @@ def test_decode_csr_tbo_delayed_slot_reuse(
                 for j in range(q)
             ] + [0] * ((4 - count) * q)
             saved.append((md.dcp_local_context_lens.clone(), expected_local))
-        if fp4:
+        if reads_row_ends:
             # the FP4 indexer's bound: row j of a request sees context - q + j + 1
             expected_rows = [int(n) - q + j + 1 for n in lengths for j in range(q)]
             saved.append(
-                (md.index_row_ends.clone(), expected_rows + [0] * ((4 - count) * q))
+                (
+                    runner.forward_vars["index_row_ends"].gpu[: 4 * q].clone(),
+                    expected_rows + [0] * ((4 - count) * q),
+                )
             )
         if sparse:
             effective = [min(int(n) - q + j + 1, 8) for n in lengths for j in range(q)]
@@ -253,12 +278,22 @@ def test_decode_csr_tbo_delayed_slot_reuse(
                 )
             )
         if tbo:
-            for ub, lo in enumerate((0, 2)):
-                n = max(0, min(count - lo, 2))
+            # Each ubatch holds the scheduled requests its micro-batch runs,
+            # not half the padded batch: count=3 is ubatch 0 = [0, 1).
+            for ub, (lo, hi) in enumerate(decode_ubatch_request_ranges(count, 2)):
+                n = hi - lo
                 p = f"ub{ub}_"
-                expected_ub = [v - expected[lo] for v in expected[lo : lo + 3]]
+                expected_ub = [
+                    expected[lo + min(j, n)] - expected[lo] for j in range(3)
+                ]
                 saved.append(
                     (runner.forward_vars[p + "kv_indptr"].gpu[:3].clone(), expected_ub)
+                )
+                saved.append(
+                    (
+                        runner.forward_vars[p + "context_lens"].gpu[:n].clone(),
+                        runner.forward_vars["context_lens"].np[lo:hi].tolist(),
+                    )
                 )
                 saved.append(
                     (
@@ -478,30 +513,27 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
         builder.publish_cu_seqlens_q(batch, SimpleNamespace(running_bs=4))
         for name in (
             "cu_seqlen_ks",
-            "cu_seqlen_ke",
             "sparse_kv_indptr",
             "kv_last_page_lens",
         ):
             runner.forward_vars[name].gpu.fill_(-99)
         torch.cuda._sleep(3_000_000)
-        md, _ = builder.prepare_prefill(batch, 4)
-        starts, ends, bids, selected = [], [], [], []
+        md, _ = builder.prepare_prefill(batch, 4, batch.total_tokens_num)
+        starts, bids, selected = [], [], []
         base = 0
         for i, (n, old) in enumerate(zip(counts, prefix)):
             for j in range(int(n)):
                 starts.append(base)
-                ends.append(base + int(old) + j + 1)
                 bids.append(i)
                 selected.append(min(int(old) + j + 1, 8))
             base += int(n + old)
         saved.extend(
             [
                 (md.cu_seqlen_ks.clone(), starts),
-                (md.cu_seqlen_ke.clone(), ends),
                 (md.batch_id_per_q_token.clone(), bids),
                 (md.sparse_kv_indptr.clone(), [0] + np.cumsum(selected).tolist()),
                 (
-                    runner.forward_vars["cu_seqlen_ke"].gpu[tokens:].clone(),
+                    runner.forward_vars["cu_seqlen_ks"].gpu[tokens:].clone(),
                     [-99] * (64 - tokens),
                 ),
             ]
@@ -514,7 +546,10 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
                 )
             )
         assert_repeat_does_not_write(
-            runner, lambda batch=batch: builder.prepare_prefill(batch, 4)
+            runner,
+            lambda batch=batch: builder.prepare_prefill(
+                batch, 4, batch.total_tokens_num
+            ),
         )
         finish(runner)
     torch.cuda.synchronize()
@@ -546,7 +581,7 @@ def test_attention_reentry_preserves_sources_and_first_consumer(
             batch.num_cached_tokens = (
                 batch.context_lens - batch.num_scheduled_tokens
             ).tolist()
-            return builder.prepare_prefill(batch, 4)
+            return builder.prepare_prefill(batch, 4, batch.total_tokens_num)
 
         names = ("cu_seqlens_k", "context_lens", "positions", "slot_mapping")
         cu = runner.forward_vars["cu_seqlens_q"]
@@ -623,10 +658,12 @@ def test_shared_maps_skip_h2d_per_slot_and_tbo_buffer(monkeypatch, kind, transpo
         start_decode(runner, builder, batch, 1)
         torch.cuda._sleep(2_000_000)
         builder.prepare_decode(batch, 4, 4, 1)
+        # 3 scheduled requests split [0, 1) / [1, 3), each padded to half of 4.
+        (lo0, hi0), (lo1, hi1) = decode_ubatch_request_ranges(3, 2)
         for name, selected, width in (
             ("block_tables", rows, 4),
-            ("ub0_block_tables", rows[:2], 2),
-            ("ub1_block_tables", rows[2:], 2),
+            ("ub0_block_tables", rows[lo0:hi0], 2),
+            ("ub1_block_tables", rows[lo1:hi1], 2),
         ):
             buf = runner.forward_vars[name]
             mapping = tuple(tuple(row) for row in selected)

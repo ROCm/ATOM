@@ -29,6 +29,7 @@ from atom.model_ops.attention_mla import (
     triton_gather_kv_indices_sparse,
 )
 from atom.models.glm52.mono.config import (
+    FUSED_INDEXER_TP,
     fused_index_capacity,
     fused_indexer_refusal,
     indexer_cp_refusal,
@@ -254,7 +255,7 @@ def _publish_selected_indices(
     readers attend to the wrong (past the first request, another REQUEST's)
     KV: fluent, silently wrong output.
 
-    ATOM's own producer (``deepseek_v2.py``'s ``sparse_attn_indexer``)
+    ATOM's own producer (``indexer_forward.py``'s ``sparse_attn_indexer``)
     branches on ``max_seqlen_q`` because ``sparse_kv_indptr`` itself changes
     indexing domain with it (``aiter_mla.py``): per-REQUEST
     (``running_bs + 1`` entries) at ``max_seqlen_q == 1`` -- this step's
@@ -390,8 +391,12 @@ class Glm52MonoRunner:
         # kernel build fails -- always through `tp_uniform_local_validation`
         # at that point, since a build-time failure is not guaranteed
         # symmetric across ranks the way this deployment-config read is.
+        # `Glm5TP4MonoKernel` is the fused indexer's only build and refuses any
+        # TP but its own, so a TP8 deployment keeps the external-indexer path.
         self._fused_indexer_on = (
-            envs.ATOM_GLM52_FUSED_INDEXER and fused_indexer_refusal(atom_config) is None
+            envs.ATOM_GLM52_FUSED_INDEXER
+            and atom_config.tensor_parallel_size == FUSED_INDEXER_TP
+            and fused_indexer_refusal(atom_config) is None
         )
         # Narrower than `_fused_indexer_on` and read the same way: once, from
         # static deployment config, so every rank agrees without a collective.

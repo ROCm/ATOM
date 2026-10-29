@@ -14,10 +14,10 @@ Ported from SGLang's DSA round-robin CP path
 """
 
 import logging
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
+import numpy as np
 import torch
-
 from aiter.dist.parallel_state import (
     get_pcp_group,
     get_prefill_context_model_parallel_rank,
@@ -61,7 +61,7 @@ def pcp_is_enabled() -> bool:
 
 def pcp_pad_len(
     total_tokens: int,
-    pcp_size: Optional[int] = None,
+    pcp_size: int | None = None,
     multiple: int = 1,
 ) -> int:
     """Padded token count so the global sequence is divisible by pcp_size * multiple.
@@ -86,7 +86,7 @@ def pcp_pad_len(
 
 
 def pcp_round_robin_split(
-    input_: torch.Tensor, pcp_size: Optional[int] = None, pcp_rank: Optional[int] = None
+    input_: torch.Tensor, pcp_size: int | None = None, pcp_rank: int | None = None
 ) -> torch.Tensor:
     """Take this rank's round-robin shard along dim 0.
 
@@ -109,7 +109,7 @@ def pcp_round_robin_split(
 
 
 def pcp_allgather_rerange(
-    input_: torch.Tensor, pcp_size: Optional[int] = None
+    input_: torch.Tensor, pcp_size: int | None = None
 ) -> torch.Tensor:
     """All-gather round-robin shards along dim 0 and restore original token order.
 
@@ -149,23 +149,12 @@ def pcp_allgather_rerange(
 #     original stripe tokens. No rerange/slice needed.
 
 
-def pcp_allgather_rankmajor(
-    input_: torch.Tensor, pcp_size: Optional[int] = None
-) -> torch.Tensor:
-    """Gather this rank's 1/W stripe shard into the full rank-major sequence
-    via a plain all_gather (dim=0). Inverse of pcp_reduce_scatter."""
-    if pcp_size is None:
-        pcp_size = get_pcp_world_size()
-    if pcp_size <= 1:
-        return input_
-    return get_pcp_group().all_gather(input_.contiguous(), dim=0)
-
-
 def pcp_reduce_scatter(
-    input_: torch.Tensor, pcp_size: Optional[int] = None
+    input_: torch.Tensor, pcp_size: int | None = None
 ) -> torch.Tensor:
     """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
-    stripe via a plain reduce_scatter (dim=0). Inverse of pcp_allgather_rankmajor."""
+    stripe via a plain reduce_scatter (dim=0). Inverse of the rank-major gather
+    (FusedMoE._run_experts gathers its routed rows that way)."""
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
@@ -173,9 +162,7 @@ def pcp_reduce_scatter(
     return get_pcp_group().reduce_scatter(input_.contiguous(), dim=0)
 
 
-def pcp_all_reduce(
-    input_: torch.Tensor, pcp_size: Optional[int] = None
-) -> torch.Tensor:
+def pcp_all_reduce(input_: torch.Tensor, pcp_size: int | None = None) -> torch.Tensor:
     """All-reduce (sum) over the PCP group, no token reshaping. DECODE path:
     tokens are pcp-redundant (every rank holds the same full batch), so just sum
     the pcp-half of the intermediate that combine_outputs' tp all_reduce missed.
@@ -189,7 +176,7 @@ def pcp_all_reduce(
 
 
 def pcp_round_robin_query_indices(
-    n_global_q: int, pcp_size: Optional[int] = None, pcp_rank: Optional[int] = None
+    n_global_q: int, pcp_size: int | None = None, pcp_rank: int | None = None
 ) -> torch.Tensor:
     """Global query indices owned by this rank under round-robin split.
 
@@ -203,6 +190,20 @@ def pcp_round_robin_query_indices(
         pcp_rank = get_pcp_rank()
     # Returns a CPU LongTensor of owned global query positions.
     return torch.arange(pcp_rank, n_global_q, pcp_size, dtype=torch.long)
+
+
+def pcp_owned_rows_by_request(
+    cu_seqlens_q: np.ndarray, first: int, stride: int, owned: int
+) -> np.ndarray:
+    """Starts of the rows a PCP rank owns (`first`, `first + stride`, ...,
+    `owned` of them) grouped by request (`cu_seqlens_q`). Padding rows join
+    the last request's group: one group per `block_tables` row, and at
+    position 0 they read no key."""
+    cu = np.asarray(cu_seqlens_q, dtype=np.int64)
+    below = (np.maximum(cu - first, 0) + stride - 1) // stride
+    starts = below - below[0]
+    starts[-1] = owned
+    return starts.astype(np.int32)
 
 
 # pcp_pad_indptr / pcp_pad_dense share the (tensor, n_pad) signature but pad two

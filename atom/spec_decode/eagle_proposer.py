@@ -26,18 +26,11 @@ logger = logging.getLogger("atom")
 
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
-    # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
-    from atom.models.deepseek_v2 import _pcp_active
-
-    if _pcp_active():
-        return True
-
-    if draft_model.__class__.__name__ != "DeepseekV4MTP":
-        return False
-
-    from atom.models.deepseek_v4 import _pcp_active as _pcp_active_v4
-
-    return _pcp_active_v4()
+    """Whether this draft prefill must be split onto 1/pcp query rows: the
+    target forward's answer, cached by ModelRunner before drafting."""
+    del draft_model  # a property of the batch, not of the draft model
+    ctx = getattr(get_forward_context(), "context", None)
+    return bool(getattr(ctx, "target_pcp_split", False))
 
 
 def _pcp_split_draft_inputs(
@@ -50,7 +43,7 @@ def _pcp_split_draft_inputs(
     A draft prefill reuses the target's attn_metadata, already reindexed to
     1/pcp by the builder, so its q rows must be split to match or aiter aborts
     on `kv_indptr_prefix length must be N+1`. Both draft prefill entry points
-    need this: `propose()`'s i==0 step and `precompute_context_kv`.
+    need this: `propose()`'s i==0 step and `compute_draft_kv`.
 
     Callers gate on `_pcp_active_for_draft_model` first. Returns the shards
     plus (n_global, pcp_ws) for callers that must all-gather back.
@@ -59,6 +52,8 @@ def _pcp_split_draft_inputs(
     which the pad-and-split below would corrupt. No MRoPE model can reach the
     PCP draft path today.
     """
+    # FusedMoE gathers its routed rows across the PCP group on this flag.
+    get_forward_context().context.pcp_split = True
     pcp_ws = get_pcp_world_size()
     n_global = input_ids.shape[0]
     assert positions.shape[0] == n_global and hidden_states.shape[0] == n_global, (
@@ -327,9 +322,6 @@ class EagleProposer(Drafter):
         `propose(align_only=True)` for its collectives -- the same redo -- so
         `draft_kv_duplicates_propose` has the runner skip this call there.
 
-        NOTE: unverified against real weights. `build_drafter` routes anything
-        carrying `dspark_block_size` to `DSparkProposer`, and every model on
-        hand takes that branch.
         """
         if not next_token_ids:
             return
@@ -395,7 +387,7 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
+    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm every size from the state the target's capture left behind.
 
         `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
@@ -422,7 +414,7 @@ class EagleProposer(Drafter):
             return build_context(**kwargs)
 
         try:
-            super().warmup_draft_graphs(build_pristine_context, stream, end_trace)
+            super().warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
             restore()
 
@@ -528,7 +520,7 @@ class EagleProposer(Drafter):
         # the verify step's has the right row count, wrong rows. Published
         # unconditionally: a prefill target (every step on a PD prefill node)
         # never built one, yet steps 1+ still reach the DCP sparse indexer.
-        builder._publish_dcp_token_block_tables(attn_metadata, running_bs, 1)
+        builder._publish_token_block_tables(attn_metadata, running_bs, 1)
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
@@ -626,6 +618,7 @@ class EagleProposer(Drafter):
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
         scheduled_bs = context.scheduled_bs
+        batch_info = self.runner.forward_vars["batch_info"].gpu
         # Mid-steps run at the recorded shape the startup sweep warmed -- but
         # only when one exists at this batch. Widening is for reaching a
         # recording; without one it just hands the variable-length MoE gather
@@ -714,6 +707,7 @@ class EagleProposer(Drafter):
                     running_tokens=running_bs if i else input_ids.shape[0],
                     # Only a widened mid-step runs a height the group agreed on.
                     running_tokens_are_unified=i > 0 and self.step is not None,
+                    scheduled_tokens_gpu=batch_info[0:1] if i else batch_info[1:2],
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------
                 # The draft's first pass is a prefill that reuses the target's

@@ -29,14 +29,10 @@ from typing import ClassVar
 import torch
 from aiter import (
     QuantType,
-    cp_gather_indexer_k_quant_cache,
     dtypes,
     fused_qk_rmsnorm,
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
-    indexer_k_quant_and_cache,
-    top_k_per_row_decode,
-    top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
@@ -44,60 +40,46 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
 from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
     fused_rms_mxfp4_quant,
 )
-from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
-from atom.distributed.dcp_utils import (
-    get_dcp_group,
-    get_dcp_rank,
-    get_dcp_world_size,
-)
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
-    pcp_all_reduce,
-    pcp_allgather_rankmajor,
     pcp_allgather_rerange,
     pcp_is_enabled,
     pcp_pad_dense,
     pcp_pad_len,
-    pcp_reduce_scatter,
     pcp_round_robin_split,
 )
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
 # shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
 # `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
-    indexer_qk_rope_quant_and_cache,
     is_rocm_aiter_fp4bmm_enabled,
     qrep_tp_override,
-    triton_convert_req_index_to_global_index,
-    triton_convert_req_index_to_global_index_dsa_prefill,
-    triton_gather_kv_indices_sparse,
 )
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.dcp_ops import (
-    dcp_decode_candidate_exchange_fused,
-    triton_filter_and_convert_dcp_index_prefill,
-)
 from atom.model_ops.embed_head import (
     ParallelLMHead,
     ReplicatedEmbedding,
     VocabParallelEmbedding,
 )
-from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+
+# Side-effect import: registers `torch.ops.aiter.sparse_attn_indexer`, the op
+# `Indexer.forward_impl` runs.
+from atom.model_ops.indexer import indexer_forward as _indexer_forward  # noqa: F401
+from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -108,20 +90,11 @@ from atom.model_ops.linear import (
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
     use_triton_gemm,
+    uses_mxfp4_n32k4_scale,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.sparse_indexer_chunk import (
-    dcp_qsplit_rows,
-    decode_band_rows,
-    flat_view,
-    sparse_indexer_row_chunk,
-)
 from atom.model_ops.sparse_indexer_fp4 import (
-    FP4_MQA_BLOCK_K,
-    FP4_MQA_PARALLEL_UNIT_NUM,
-    FP4_QUANT_BLOCK_SIZE,
     assert_fp4_indexer_supported,
-    fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
 )
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
@@ -143,6 +116,7 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import token_graph
 
 # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
@@ -175,7 +149,6 @@ ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_F
 ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
     envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
 )
-SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 ENABLE_GLM_FUSED_INDEXER = envs.ATOM_ENABLE_GLM_FUSED_INDEXER
 _FP8_DTYPES = tuple(
     dtype
@@ -199,8 +172,8 @@ def _pcp_active() -> bool:
         matches the metadata builder, which gates its reindex on
         `not batch.is_dummy_run`, so model split and metadata reindex stay in
         lock-step);
-      * short batches that fall back to dense MHA prefill (max_seqlen_k <=
-        index_topk): only the sparse indexer / sparse-attn path is PCP-wired.
+      * prefills the builder sent to dense MHA (`attn_metadata.run_sparse`
+        False): only the sparse indexer / sparse-attn path is PCP-wired.
 
     Every PCP call site (model split/gather, indexer, MLA write, metadata
     reindex) keys off the SAME batch-global condition so they agree within a
@@ -215,10 +188,7 @@ def _pcp_active() -> bool:
         return False
     if not bool(context.is_prefill) or bool(getattr(context, "is_dummy_run", False)):
         return False
-    index_topk = getattr(get_current_atom_config().hf_config, "index_topk", None)
-    if index_topk is None:
-        return False
-    return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(index_topk)
+    return attn_metadata.run_sparse
 
 
 def _install_increment_version_pcp_shim() -> None:
@@ -400,51 +370,6 @@ def _extract_layer_index_from_prefix(prefix: str) -> int:
         if part.isdigit():
             return int(part)
     return 0
-
-
-def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
-    if not getattr(config, "use_index_cache", False):
-        # IndexShare (e.g. GLM-5.2): index_topk_freq > 1 shares the indexer across
-        # layers, so enable the cache even if the config omits the flag; otherwise
-        # there is nothing to skip.
-        if int(getattr(config, "index_topk_freq", 1)) > 1:
-            config.use_index_cache = True
-        else:
-            return False
-
-    layer_id = _extract_layer_index_from_prefix(prefix)
-
-    # GLM-5.2 MTP layer (index >= num_hidden_layers): the MTP block ships its
-    # OWN indexer weights and computes its own top-k for the drafted position,
-    # so do not skip it. `index_share_for_mtp_iteration` only concerns sharing
-    # across MULTIPLE MTP draft steps (num_speculative_tokens>1); it does NOT
-    # mean the MTP reuses the target model's index. Matches vLLM upstream and
-    # the ATOM sglang plugin, which both run the MTP indexer independently.
-    num_hidden_layers = getattr(config, "num_hidden_layers", None)
-    if num_hidden_layers is not None and layer_id >= num_hidden_layers:
-        return False
-
-    # GLM-5.2 IndexShare: per-layer schedule, "shared" reuses the prior "full"
-    # layer's topk. Authoritative when present; else fall back to pattern/freq.
-    indexer_types = getattr(config, "indexer_types", None)
-    if indexer_types is not None:
-        return (
-            0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
-        )
-
-    index_topk_pattern = getattr(config, "index_topk_pattern", None)
-    if index_topk_pattern is not None:
-        return (
-            0 <= layer_id < len(index_topk_pattern)
-            and index_topk_pattern[layer_id] == "S"
-        )
-
-    index_topk_freq = int(getattr(config, "index_topk_freq", 1))
-    if index_topk_freq <= 0:
-        raise ValueError("index_topk_freq must be a positive integer")
-    # offset defaults to 1 = prior `layer_id - 1` behavior for DeepSeek configs.
-    offset = int(getattr(config, "index_skip_topk_offset", 1))
-    return max(layer_id - offset, 0) % index_topk_freq != 0
 
 
 def _indexer_weights_shared(config: PretrainedConfig, prefix: str) -> bool:
@@ -1190,12 +1115,6 @@ class DeepseekV2MoE(nn.Module):
         self._use_dual_stream = False
         self.alt_stream = alt_stream
         self.prefix = prefix
-        # Keep the structural dispatch decision independent of the current
-        # forward context. Runtime prefill/decode/dummy gating stays inside the
-        # opaque custom op so torch.compile cannot bake a dummy-run result.
-        self._pcp_moe_merge_enabled = (
-            bool(envs.ATOM_PCP_MOE_MERGE) and get_pcp_world_size() > 1
-        )
         self.is_rocm_aiter_fusion_shared_expert_enabled = (
             is_rocm_aiter_fusion_shared_expert_enabled(
                 shared_expert_prefix=f"{prefix}.shared_experts",
@@ -1220,7 +1139,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        if self._pcp_moe_merge_enabled or self._use_dual_stream:
+        if self._use_dual_stream:
             compilation_config = get_current_atom_config().compilation_config
             compilation_config.static_forward_context[prefix] = self
 
@@ -1294,62 +1213,6 @@ class DeepseekV2MoE(nn.Module):
         )
         return final_hidden_states
 
-    def _pcp_moe_merge_active(self) -> bool:
-        if not bool(envs.ATOM_PCP_MOE_MERGE) or get_pcp_world_size() <= 1:
-            return False
-        ctx = get_forward_context()
-        context = getattr(ctx, "context", None)
-        return not (context is None or bool(getattr(context, "is_dummy_run", False)))
-
-    def _pcp_moe_merge_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        ctx = get_forward_context()
-        is_prefill = bool(getattr(ctx.context, "is_prefill", False))
-        pcp_query_split = is_prefill and _pcp_active()
-        pcp_size = get_pcp_world_size()
-
-        shared_output = None
-        if (
-            self.n_shared_experts is not None
-            and not self.is_rocm_aiter_fusion_shared_expert_enabled
-        ):
-            # Shared-expert weights are still sharded only by ATOM TP, not by the
-            # folded PCP*TP routed-expert sharding. Keep shared experts on local
-            # query rows; only routed experts use PCP merge collectives.
-            shared_output = self.shared_experts(hidden_states)
-
-        # ATOM_PCP_MOE_MERGE folds PCP into routed-expert weight sharding.
-        # Round-robin prefill gives each PCP rank different token rows, so every
-        # routed-weight shard must first evaluate the same rank-major full-token
-        # input. reduce_scatter then sums the partials and restores this rank's
-        # original local stripe. Decode and short dense prefill already hold the
-        # same token rows on every PCP rank and only need an all-reduce.
-        if pcp_query_split:
-            routed_input = pcp_allgather_rankmajor(hidden_states, pcp_size)
-            expected_full_tokens = int(hidden_states.shape[0]) * pcp_size
-            assert int(routed_input.shape[0]) == expected_full_tokens, (
-                "PCP MoE gather returned an unexpected token count: "
-                f"local={hidden_states.shape[0]}, pcp={pcp_size}, "
-                f"gathered={routed_input.shape[0]}"
-            )
-        else:
-            routed_input = hidden_states
-
-        routed_output = self.routed_expert_forward(routed_input)
-        if pcp_query_split:
-            routed_output = pcp_reduce_scatter(routed_output, pcp_size)
-            assert routed_output.shape == hidden_states.shape, (
-                "PCP MoE reduce-scatter did not restore the local token shape: "
-                f"expected={tuple(hidden_states.shape)}, "
-                f"got={tuple(routed_output.shape)}"
-            )
-        else:
-            routed_output = pcp_all_reduce(routed_output, pcp_size)
-
-        final_hidden_states = self.combine_outputs(
-            routed_output, shared_output, hidden_states
-        )
-        return final_hidden_states
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert (
             hidden_states.dim() == 2
@@ -1358,47 +1221,11 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[1] == self.experts.hidden_size
         ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
 
-        if self._pcp_moe_merge_enabled:
-            return torch.ops.aiter.deepseek_v2_moe_pcp_merge_forward(
-                hidden_states, self.prefix
-            )
-
         if self._use_dual_stream:
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
 
         # Non-dual-stream path: shared experts + routed experts sequentially
         return self.single_stream_moe_forward(hidden_states)
-
-
-def deepseek_v2_moe_pcp_merge_forward(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    """Dispatch V2 PCP MoE merge without baking runtime context into Dynamo."""
-    moe = get_current_atom_config().compilation_config.static_forward_context[
-        layer_name
-    ]
-    if moe._pcp_moe_merge_active():
-        return moe._pcp_moe_merge_forward(hidden_states)
-    # Dummy/warmup must follow the ordinary MoE path because model inputs were
-    # not round-robin split. Reuse the exact non-PCP dual-stream gating logic.
-    return _module_dispatch_ops.maybe_dual_stream_forward(hidden_states, layer_name)
-
-
-def _deepseek_v2_moe_pcp_merge_forward_fake(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="deepseek_v2_moe_pcp_merge_forward",
-    op_func=deepseek_v2_moe_pcp_merge_forward,
-    mutates_args=(),
-    fake_impl=_deepseek_v2_moe_pcp_merge_forward_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -1420,712 +1247,6 @@ class DeepseekV32IndexerCache(nn.Module):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
-
-
-def _dcp_gather_indexer_k_prefill(
-    kv_cache: torch.Tensor,
-    prefill_metadata,
-    head_dim: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather the full-sequence indexer K under DCP for prefill top-k.
-
-    The index cache holds only this rank's round-robin 1/W, so a plain gather
-    would return a 1/W-long prefix of garbage. Gather the local shard with LOCAL
-    cu_seqlens (the gather's own slot formula, block_table[j//bs]*bs + j%bs, is
-    exactly the round-robin write layout), all-gather it, then de-interleave back
-    to global order -- the same local-shard + all-gather the decode path uses, on
-    k rather than logits. Returns (k_fp8, k_scale) in global order.
-    """
-    local_total = prefill_metadata.dcp_indexer_local_total
-    k_fp8_local = torch.empty([local_total, head_dim], device=device, dtype=dtypes.fp8)
-    k_scale_local = torch.empty([local_total, 1], device=device, dtype=torch.float32)
-    cp_gather_indexer_k_quant_cache(
-        kv_cache,
-        k_fp8_local,
-        k_scale_local.view(dtypes.fp8),
-        prefill_metadata.block_tables,
-        prefill_metadata.dcp_indexer_local_cu_seqlens,
-        preshuffle=True,
-    )
-    dcp_group = get_dcp_group()
-    # fp8 has no collective support; move the bytes as uint8.
-    gathered_k = dcp_group.all_gather(k_fp8_local.view(torch.uint8), dim=0).view(
-        dtypes.fp8
-    )
-    gathered_scale = dcp_group.all_gather(k_scale_local, dim=0)
-    gather_index = prefill_metadata.dcp_indexer_gather_index
-    k_fp8 = gathered_k.index_select(0, gather_index)
-    k_scale = gathered_scale.index_select(0, gather_index)
-    return k_fp8, k_scale
-
-
-def _dcp_stage_indexer_fp4_prefill(
-    kv_cache: torch.Tensor,
-    kv_cache_scale: torch.Tensor,
-    prefill_metadata,
-    total_kv: int,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stage the whole key set's FP4 index planes into pages of this rank's own.
-
-    Same three steps as `_dcp_gather_indexer_k_prefill` -- read the local shard,
-    all-gather it, de-interleave back to global order -- on the two E2M1/e8m0
-    planes instead of the one FP8 one. It ends in a paged buffer rather than a
-    flat one because every FP4 mqa-logits kernel is paged; over an identity
-    block table, column j of the scores is then flat KV index j, the space
-    `cu_seqlen_ks/ke` and the DCP prefill filter already speak.
-
-    The two planes disagree on their row axis, so both the read and the write
-    bend through `fp4_index_scale_rows`; see it for what goes wrong otherwise.
-    """
-    # Built once per forward by the metadata builder.
-    page = prefill_metadata.dcp_indexer_fp4_read_page
-    row = prefill_metadata.dcp_indexer_fp4_read_row
-    data = kv_cache[page, :, :, row, :]
-    scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]
-
-    dcp_group = get_dcp_group()
-    gather_index = prefill_metadata.dcp_indexer_gather_index
-    data = dcp_group.all_gather(data, dim=0).index_select(0, gather_index)
-    scale = dcp_group.all_gather(scale, dim=0).index_select(0, gather_index)
-
-    page = prefill_metadata.dcp_indexer_fp4_stage_page
-    row = prefill_metadata.dcp_indexer_fp4_stage_row
-    scale_row = prefill_metadata.dcp_indexer_fp4_stage_scale_row
-    pages = -(-total_kv // block_size)
-    staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
-    staged[page, :, :, row, :] = data
-    staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
-    staged_scale[page, :, :, scale_row] = scale
-    return staged, staged_scale
-
-
-def _prefill_mqa_logits_fp4(
-    prefill_metadata,
-    chunk: slice,
-    whole_batch: bool,
-    q_fp4: torch.Tensor,
-    q_scale: torch.Tensor,
-    weights: torch.Tensor,
-    kv_cache: torch.Tensor,
-    kv_scale: torch.Tensor,
-    weights_scale: float,
-    kv_block_size: int,
-    block_tables: torch.Tensor,
-) -> torch.Tensor:
-    """One chunk of ragged-prefill FP4 logits, scored out of the paged cache.
-
-    A split chunk rebuilds the schedule rather than slicing the forward's:
-    `cta_info` encodes absolute row ids, so a slice would drop its rows.
-    """
-    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
-        compute_prefill_schedule,
-        flydsl_pa_mqa_logits_fp4_prefill,
-    )
-
-    rows = prefill_metadata.batch_id_per_q_token[chunk]
-    starts = prefill_metadata.indexer_fp4_local_starts[chunk]
-    ends = prefill_metadata.indexer_fp4_local_ends[chunk]
-    width = prefill_metadata.indexer_fp4_max_seq_len
-    if whole_batch:
-        cta_info = prefill_metadata.indexer_fp4_cta_info
-        n_ctas = prefill_metadata.indexer_fp4_n_ctas
-    else:
-        _, cta_info, n_ctas = compute_prefill_schedule(
-            rows,
-            starts,
-            ends,
-            FP4_MQA_BLOCK_K,
-            max(FP4_MQA_PARALLEL_UNIT_NUM, q_fp4.shape[0]),
-            width,
-        )
-    logits = torch.empty(
-        q_fp4.shape[0], width, dtype=torch.float32, device=q_fp4.device
-    )
-    flydsl_pa_mqa_logits_fp4_prefill(
-        q_fp4,
-        q_scale,
-        kv_cache,
-        kv_scale,
-        block_tables,
-        weights,
-        rows,
-        starts,
-        ends,
-        width,
-        weight_scale=weights_scale,
-        block_k=FP4_MQA_BLOCK_K,
-        kv_block_size=kv_block_size,
-        out=logits,
-        cta_info=cta_info,
-        n_ctas=n_ctas,
-    )
-    return logits
-
-
-_warned_no_logits_ws = False
-
-
-def _decode_logits(ws: torch.Tensor | None, rows: int, width: int) -> torch.Tensor:
-    """`[rows, width]` band of the shared workspace (fails if it is too small),
-    or a per-forward tensor, once warned, when no workspace was bound."""
-    global _warned_no_logits_ws
-    if ws is not None:
-        return flat_view(ws, rows, width)
-    if not _warned_no_logits_ws:
-        _warned_no_logits_ws = True
-        logger.warning(
-            "Sparse indexer: no logits workspace bound; decode logits are "
-            "allocated per forward (%d x %d fp32)",
-            rows,
-            width,
-        )
-    return torch.empty(rows, width, dtype=torch.float32, device="cuda")
-
-
-def sparse_attn_indexer(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    kv_cache: torch.Tensor,
-    q_input: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    sparse_kv_indices_buffer: torch.Tensor,
-    dcp_sparse_kv_indptr_buffer: torch.Tensor,
-    dcp_owned_counts_buffer: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-    k_norm_bias: torch.Tensor,
-    k_norm_eps: float,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    weights_scale: float,
-    is_neox_style: bool,
-    use_qk_rope_cache_fusion: bool,
-    stable_topk: bool,
-    indexer_logits_ws: torch.Tensor | None = None,
-) -> None:
-    # Room for the DCP prefill all-gather to land in place. It produces
-    # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
-    # than there are prefill rows; giving the allocation that slack is what
-    # lets the gather write straight into this tensor instead of through a
-    # staging buffer. Those trailing rows are never read: the owned-slot filter
-    # sizes its grid from `dsa_kv_indptr` (`num_tokens = shape[0] - 1` in
-    # `triton_filter_and_convert_dcp_index_prefill`), not from this tensor.
-    _dcp_gather_slack = max(get_dcp_world_size() - 1, 0)
-    topk_indices = torch.empty(
-        hidden_states.shape[0] + _dcp_gather_slack,
-        topk_tokens,
-        dtype=torch.int32,
-        device=hidden_states.device,
-    )
-    # careful! this will be None in dummy run
-    forward_context = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    context = forward_context.context
-    slot_mapping = attn_metadata.slot_mapping
-    # Skip for dummy runs to avoid corrupting KV cache
-    if forward_context.context.is_dummy_run:
-        # dummy runner
-        return
-    # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
-    num_decode_tokens = (
-        context.scheduled_bs * attn_metadata.max_seqlen_q
-        if not context.is_prefill
-        else 0
-    )
-    runner_block_size = get_current_atom_config().kv_cache_block_size
-    cp_kv_cache_interleave_size = get_current_atom_config().dcp_config.interleave_size
-    # Which width this indexer's cache is in -- the one thing the arguments
-    # cannot say, and a thing the traced graph piece already committed to.
-    fwd_ctx = get_current_atom_config().compilation_config.static_forward_context
-    # A custom op cannot take a module, so the Indexer is reached by undoing the
-    # one name `Indexer.__init__` builds: `prefix` + ".k_cache". Both spellings
-    # have to move together; a miss is a KeyError here, at the first forward.
-    indexer_module = fwd_ctx[k_cache_prefix.rsplit(".k_cache", 1)[0]]
-    indexer_fp4 = indexer_module._indexer_fp4
-    q_fp4_scale = None
-    if not indexer_fp4:
-        kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
-    # PCP prefill: `k` (and `positions`) arrive as the full PADDED key set
-    # [S_pad] produced by an all-gather of the round-robin shards. The KV-cache
-    # write (driven by slot_mapping) and the gathered-KV sizing (total_kv =
-    # k.shape[0]) both use the real token count S_real == slot_mapping length,
-    # so trim the round-robin padding here. Gated on the same condition as the
-    # caller's PCP path (sparse prefill with max_seqlen_k > topk); no-op
-    # otherwise.
-    if (
-        pcp_is_enabled()
-        and context.is_prefill
-        and attn_metadata.max_seqlen_k > topk_tokens
-    ):
-        n_real = slot_mapping.shape[0]
-        k = k[:n_real]
-        if positions is not None:
-            positions = positions[:n_real]
-    if indexer_fp4:
-        # `weights_out` comes back unscaled in q's dtype: the FP4 mqa-logits
-        # kernels apply the per-group q scale inside the MFMA and take
-        # `weights_scale` as their own fp32 scalar, so either folded in here
-        # would be applied twice. `preshuffle` has no FP4 spelling.
-        q_bf16 = q_input
-        q_quant = torch.empty(
-            (*q_bf16.shape[:-1], head_dim // 2), device=q_bf16.device, dtype=torch.uint8
-        )
-        q_fp4_scale = torch.empty(
-            fp4_q_scale_shape(q_bf16.shape[0], q_bf16.shape[1], head_dim),
-            device=q_bf16.device,
-            dtype=torch.uint8,
-        )
-        # AITER requires contiguous [rows, heads] output. Non-DCP skips
-        # slot<0 rows, whose scorer bounds are empty; DCP computes every row.
-        weights_mqa = torch.empty(
-            weights.shape,
-            dtype=weights.dtype,
-            device=weights.device,
-        )
-        indexer_qk_rope_quant_and_cache(
-            q_bf16,
-            q_quant,
-            weights,
-            weights_mqa,
-            k,
-            kv_cache,
-            slot_mapping,
-            k_norm_weight,
-            k_norm_bias,
-            positions,
-            cos_cache,
-            sin_cache,
-            k_norm_eps,
-            FP4_QUANT_BLOCK_SIZE,
-            scale_fmt,
-            weights_scale,
-            is_neox=is_neox_style,
-            q_scale_out=q_fp4_scale,
-            kv_cache_scale=indexer_module.k_cache.kv_cache_scale,
-        )
-    elif use_qk_rope_cache_fusion:
-        q_bf16 = q_input
-        q_quant = torch.empty_like(q_bf16, dtype=dtypes.fp8)
-        weights_out = torch.empty(
-            weights.shape, device=weights.device, dtype=torch.float32
-        )
-        indexer_qk_rope_quant_and_cache(
-            q_bf16,
-            q_quant,
-            weights,
-            weights_out,
-            k,
-            kv_cache,
-            slot_mapping,
-            k_norm_weight,
-            k_norm_bias,
-            positions,
-            cos_cache,
-            sin_cache,
-            k_norm_eps,
-            quant_block_size,
-            scale_fmt,
-            weights_scale,
-            preshuffle=True,
-            is_neox=is_neox_style,
-        )
-        weights = weights_out
-    else:
-        q_quant = q_input
-        indexer_k_quant_and_cache(
-            k,
-            kv_cache,
-            slot_mapping,
-            quant_block_size,
-            scale_fmt,
-            preshuffle=True,
-        )
-    if not indexer_fp4:
-        weights_mqa = weights
-    if context.is_prefill:
-        # Below index_topk the indexer is a no-op: top-k would select every token,
-        # so prefill runs dense (attention_mla.use_prefill_mla gates on the same
-        # threshold).
-        if attn_metadata.max_seqlen_k <= topk_tokens:
-            return
-        prefill_metadata = attn_metadata
-        num_prefills = context.scheduled_bs
-        # Size the gathered-KV buffer off the KEY length, not the hidden/query
-        # length. Under PCP the query side (hidden_states) is 1/pcp while `k` is
-        # the full all-gathered key set, so `k.shape[0]` is the correct full
-        # token count; without PCP the two are equal so behaviour is unchanged.
-        # When has_cached, gather full KV (cached + new) for indexer top-k.
-        total_kv = (
-            prefill_metadata.total_kv if prefill_metadata.has_cached else k.shape[0]
-        )
-        if prefill_metadata.block_tables.shape[0] < num_prefills:
-            new_shape = (num_prefills, prefill_metadata.block_tables.shape[1])
-            prefill_metadata.block_tables = torch.full(
-                new_shape,
-                -1,
-                dtype=torch.long,
-                device=prefill_metadata.block_tables.device,
-            )
-        if indexer_fp4:
-            # The paged FP4 scorer reads the cache in place -- except under DCP,
-            # where in place is only this rank's 1/W of the sequence.
-            k_fp8 = k_scale = None
-            fp4_kv_cache = kv_cache
-            fp4_kv_scale = indexer_module.k_cache.kv_cache_scale
-            fp4_block_tables = prefill_metadata.block_tables
-            if get_dcp_world_size() > 1:
-                fp4_kv_cache, fp4_kv_scale = _dcp_stage_indexer_fp4_prefill(
-                    kv_cache,
-                    fp4_kv_scale,
-                    prefill_metadata,
-                    total_kv,
-                    runner_block_size,
-                )
-                fp4_block_tables = prefill_metadata.dcp_indexer_fp4_block_tables
-        elif get_dcp_world_size() > 1:
-            k_fp8, k_scale = _dcp_gather_indexer_k_prefill(
-                kv_cache, prefill_metadata, head_dim, k.device
-            )
-        else:
-            k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
-            k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
-            cp_gather_indexer_k_quant_cache(
-                kv_cache,
-                k_fp8,
-                k_scale.view(dtypes.fp8),
-                prefill_metadata.block_tables,
-                (
-                    prefill_metadata.cu_seqlens_k
-                    if prefill_metadata.has_cached
-                    else prefill_metadata.cu_seqlens_q
-                ),
-                preshuffle=True,
-            )
-        # Per-row window bounds, in the column space this scorer emits.
-        if indexer_fp4:
-            cu_seqlen_ks = prefill_metadata.indexer_fp4_local_starts
-            cu_seqlen_ke = prefill_metadata.indexer_fp4_local_ends
-        else:
-            cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
-            cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
-        num_tokens = hidden_states.shape[0]
-        q_prefill = q_quant[num_decode_tokens:num_tokens]
-        weights_prefill = weights_mqa[num_decode_tokens:num_tokens]
-        num_rows = q_prefill.shape[0]
-        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices_prefill = topk_indices[num_decode_tokens:num_tokens, :topk_tokens]
-        row_width = (
-            prefill_metadata.indexer_fp4_max_seq_len if indexer_fp4 else total_kv
-        )
-        # The dense logits buffer is [num_rows, row_width] fp32. For FP8 that
-        # width is total_kv, the sum of all co-scheduled prefill contexts, and
-        # is unbounded by max_num_batched_tokens, so a burst of long-context
-        # requests can push a single allocation to tens of GiB (#1376). Under
-        # chunked prefill num_rows is already capped by max_num_batched_tokens,
-        # so the OOM is driven by the column dim. Chunk along the Q (query-row)
-        # dimension with q_chunk sized so the buffer [q_chunk, row_width] fp32
-        # stays within the memory budget — q_chunk shrinks as row_width grows.
-        # Each chunk still scores the FULL KV, so every row's top-k is computed
-        # completely in one shot: the result is exact with no cross-chunk merge,
-        # the kernel's column indices are already global (no remapping), and each
-        # chunk writes straight into its output row slice (no copy). When a
-        # single chunk fits, the loop runs exactly once and matches the original
-        # single-shot behavior. ``row_width`` (not total_kv) is the buffer's real
-        # column count: the FP4 scorer emits into a padded max-seq-len space.
-        # Under DCP every rank holds the whole gathered index cache, so having
-        # all W of them score every row recomputes the SAME top-k W times.
-        # Score only this rank's slice of the QUERY ROWS instead: against the
-        # full key set, so the top-k is the EXACT global one, and the
-        # [rows, topk] selections are all-gathered back below. At dcp=1 this
-        # degenerates to the whole range, which is the original behaviour.
-        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
-            num_rows, get_dcp_rank(), get_dcp_world_size()
-        )
-        chunk_tokens = sparse_indexer_row_chunk(
-            max(row_hi - row_lo, 1), row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
-        )
-        for chunk_start in range(row_lo, row_hi, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, row_hi)
-            # Per-row window bounds slice 1:1 with this chunk's rows.
-            row_starts = cu_seqlen_ks[chunk_start:chunk_end]
-            row_ends = cu_seqlen_ke[chunk_start:chunk_end]
-            if indexer_fp4:
-                chunk = slice(chunk_start, chunk_end)
-                logits = _prefill_mqa_logits_fp4(
-                    prefill_metadata,
-                    chunk,
-                    # `_prefill_mqa_logits_fp4` rebuilds its ragged schedule
-                    # whenever it is handed less than the whole batch, because
-                    # cta_info encodes absolute row ids. Under DCP the row
-                    # range is a rank's slice, which is such a partial batch.
-                    get_dcp_world_size() == 1 and chunk_tokens == num_rows,
-                    q_prefill[chunk],
-                    q_fp4_scale[num_decode_tokens:num_tokens][chunk],
-                    weights_prefill[chunk],
-                    fp4_kv_cache,
-                    fp4_kv_scale,
-                    weights_scale,
-                    runner_block_size,
-                    fp4_block_tables,
-                )
-            else:
-                logits = fp8_mqa_logits(
-                    Q=q_prefill[chunk_start:chunk_end],
-                    KV=k_fp8,
-                    kv_scales=k_scale,
-                    weights=weights_prefill[chunk_start:chunk_end],
-                    cu_starts=row_starts,
-                    cu_ends=row_ends,
-                    # The -inf prefill of this buffer has no reader. It exists
-                    # so a position outside a row's window cannot win the
-                    # top-k, but `top_k_per_row_prefill` below is handed the
-                    # same row_starts / row_ends and offsets every access by
-                    # rowStart, bounded by rowEnd - rowStart, so it never looks
-                    # outside the window. 449 us per full-index layer at
-                    # ISL=49152.
-                    clean_logits=False,
-                )
-            top_k_per_row_prefill(
-                logits=logits,
-                rowStarts=row_starts,
-                rowEnds=row_ends,
-                indices=topk_indices_prefill[chunk_start:chunk_end],
-                values=None,
-                numRows=chunk_end - chunk_start,
-                stride0=logits.stride(0),
-                stride1=logits.stride(1),
-                stable=stable_topk,
-            )
-        if get_dcp_world_size() > 1:
-            # DCP: topk_indices hold GLOBAL flat KV indices (the indexer scored the
-            # full sequence via the all-gathered k). Keep only the positions this
-            # rank owns (pos % W == r), map them through the round-robin
-            # virtual-block layout, and COMPACT them to the front -- the same
-            # treatment the decode path gets, with the row unit being a query token
-            # instead of a request.
-            # Gather the selections in place. Rank-major concatenation lands
-            # back in ROW order because the split is contiguous with a uniform
-            # stride: rank r scored [r*rows_per_rank, (r+1)*rows_per_rank), so
-            # gathered row i IS row i, and scoring already wrote those rows
-            # here. The gather region is `world_size` whole strides, which runs
-            # up to `_dcp_gather_slack` rows past the prefill rows; the tail is
-            # uninitialised and never read.
-            gather_rows = rows_per_rank * get_dcp_world_size()
-            gather_region = topk_indices[
-                num_decode_tokens : num_decode_tokens + gather_rows, :topk_tokens
-            ]
-            # In-place all-gather: the input is this rank's own slot inside the
-            # output, which is the form RCCL/NCCL supports. Called on the
-            # process group directly because the group wrapper's `all_gather`
-            # only has an out-of-place form, which would allocate and copy --
-            # the two things this is removing.
-            # `slot_lo`, not `row_lo`: the input must be this rank's OWN slot,
-            # and `row_lo` is clamped to the row count for scoring, so a rank
-            # with no rows would hand in a lower rank's slot instead.
-            torch.distributed.all_gather_into_tensor(
-                gather_region,
-                gather_region[slot_lo : slot_lo + rows_per_rank],
-                group=get_dcp_group().device_group,
-            )
-            # The filter below must be handed the WHOLE `topk_indices`: it calls
-            # `.contiguous()` on what it gets, so passing a row slice would
-            # silently copy the very bytes this gather just avoided moving.
-            triton_filter_and_convert_dcp_index_prefill(
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.batch_id_per_q_token,
-                topk_indices,
-                attn_metadata.cu_seqlens_k,
-                attn_metadata.block_tables,
-                get_dcp_rank(),
-                get_dcp_world_size(),
-                runner_block_size,
-                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
-                owned_counts=dcp_owned_counts_buffer,
-                NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            )
-        else:
-            triton_convert_req_index_to_global_index_dsa_prefill(
-                attn_metadata.sparse_cu_seqlens_q,
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.batch_id_per_q_token,
-                topk_indices,
-                attn_metadata.block_tables,
-                attn_metadata.cu_seqlens_k,
-                NUM_TOPK_TOKENS=topk_tokens,
-                PAGE_SIZE=runner_block_size,
-                out=sparse_kv_indices_buffer,
-                seq_local=indexer_fp4,
-            )
-    else:
-        decode_metadata = attn_metadata
-        if not indexer_fp4:
-            # kv_cache size requirement [num_block, block_size, n_head, head_dim],
-            # we only have [num_block, block_size, head_dim],
-            kv_cache = kv_cache.unsqueeze(-2)
-        padded_q_decode_tokens = q_quant[:num_decode_tokens].reshape(
-            context.scheduled_bs, -1, *q_quant.shape[1:]
-        )
-        # TODO: move and optimize below logic with triton kernels
-        batch_size = padded_q_decode_tokens.shape[0]
-        next_n = padded_q_decode_tokens.shape[1]
-        assert batch_size == context.scheduled_bs
-        num_padded_tokens = batch_size * next_n
-        batch_size, next_n, _heads, _ = padded_q_decode_tokens.shape
-        num_rows = batch_size * next_n
-        dcp_world_size = get_dcp_world_size()
-        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        if dcp_world_size > 1:
-            # The fused exchange scores this rank's own shard and writes the KV
-            # slots it owns -- ownership filter, slot localize and compaction all
-            # inside the op -- straight into sparse_kv_indices_buffer and
-            # dcp_sparse_kv_indptr_buffer. So there is no global logits plane
-            # left to rank and no topk_indices left to convert: everything the
-            # non-DCP path does below has already happened, and we return here.
-            dcp_decode_candidate_exchange_fused(
-                attn_metadata,
-                padded_q_decode_tokens,
-                kv_cache,
-                weights_mqa,
-                get_dcp_rank(),
-                num_decode_tokens,
-                topk_tokens,
-                max_model_len,
-                runner_block_size,
-                stable_topk,
-                cp_kv_cache_interleave_size,
-                out_kv_indices=sparse_kv_indices_buffer,
-                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
-                owned_counts=dcp_owned_counts_buffer,
-                q_scale=q_fp4_scale,
-                kv_scale=(
-                    indexer_module.k_cache.kv_cache_scale if indexer_fp4 else None
-                ),
-                weights_scale=weights_scale,
-            )
-            return
-        # Non-DCP: this rank holds the whole plane, so its top-k is already the
-        # global one.
-        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        if indexer_fp4:
-            from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
-
-            logits = torch.empty(
-                [num_rows, max_model_len], dtype=torch.float32, device="cuda"
-            )
-            flydsl_pa_mqa_logits_fp4(
-                padded_q_decode_tokens,
-                q_fp4_scale[:num_decode_tokens],
-                kv_cache,
-                indexer_module.k_cache.kv_cache_scale,
-                weights=weights_mqa[:num_padded_tokens],
-                max_seq_len=max_model_len,
-                weight_scale=weights_scale,
-                kv_block_size=runner_block_size,
-                out=logits,
-                **Fp4MqaRaggedMetadata(
-                    decode_metadata.cu_seqlens_q[: batch_size + 1],
-                    next_n,
-                    attn_metadata.block_tables,
-                ).kernel_args(
-                    decode_metadata.index_row_ends[:num_rows],
-                    heads=padded_q_decode_tokens.shape[-2],
-                    page_size=runner_block_size,
-                    max_seq_len=max_model_len,
-                ),
-            )
-            top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.context_lens,
-                topk_indices_decode,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                stable=stable_topk,
-            )
-        else:
-            # Score in chunks of whole requests (as V4.1).
-            band = decode_band_rows(
-                num_rows,
-                max_model_len,
-                next_n,
-                (
-                    None
-                    if indexer_logits_ws is None
-                    else indexer_logits_ws.numel() // max_model_len
-                ),
-            )
-            logits = _decode_logits(indexer_logits_ws, band, max_model_len)
-            for r0 in range(0, num_rows, band):
-                r1 = min(r0 + band, num_rows)
-                b0, b1 = r0 // next_n, r1 // next_n
-                scores = logits[: r1 - r0]
-                deepgemm_fp8_paged_mqa_logits(
-                    padded_q_decode_tokens[b0:b1],
-                    kv_cache,
-                    weights[r0:r1],
-                    scores,
-                    decode_metadata.context_lens[b0:b1],
-                    attn_metadata.block_tables[b0:b1],
-                    max_model_len,
-                    KVBlockSize=runner_block_size,
-                    Preshuffle=True,
-                )
-                top_k_per_row_decode(
-                    scores,
-                    next_n,
-                    decode_metadata.context_lens[b0:b1],
-                    topk_indices_decode[r0:r1],
-                    r1 - r0,
-                    scores.stride(0),
-                    scores.stride(1),
-                    stable=stable_topk,
-                )
-        if attn_metadata.max_seqlen_q > 1:
-            triton_gather_kv_indices_sparse(
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.batch_id_per_q_token,
-                topk_indices,
-                attn_metadata.kv_indices,
-                attn_metadata.kv_indptr,
-                NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
-            )
-        else:
-            triton_convert_req_index_to_global_index(
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.kv_indptr,
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.kv_indices,
-                topk_indices,
-                NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
-            )
-
-
-direct_register_custom_op(
-    op_name="sparse_attn_indexer",
-    op_func=sparse_attn_indexer,
-    mutates_args=[
-        "kv_cache",
-        "sparse_kv_indices_buffer",
-        "dcp_sparse_kv_indptr_buffer",
-        "dcp_owned_counts_buffer",
-        "indexer_logits_ws",
-    ],
-    fake_impl=lambda *_args, **_kwargs: None,
-)
 
 
 def _dequant_fp8_block_to_bf16(
@@ -2330,6 +1451,8 @@ class Indexer(nn.Module):
         cache_config: str,
         use_wk_weights_proj_fusion: bool = True,
         prefix: str = "",
+        *,
+        external_k_weights: bool = False,
     ):
         super().__init__()
         self.atom_config = atom_config
@@ -2341,7 +1464,21 @@ class Indexer(nn.Module):
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128
-        self.rope_dim = config.qk_rope_head_dim  # 64
+        self.rope_dim = getattr(config, "index_rope_dim", config.qk_rope_head_dim)
+        # A NoPE FP8 cache has its own writer: the RoPE writer requires 64
+        # rotary lanes and uses a different Q scale policy. Under DCP every
+        # rank still projects all Q rows; the writer skips negative K slots.
+        self.use_nope_cache_fusion = (
+            not self._indexer_fp4
+            and self.rope_dim == 0
+            and self.head_dim == 128
+            and not pcp_is_enabled()
+        )
+        self.external_k_weights = external_k_weights
+        if external_k_weights and not self.use_nope_cache_fusion:
+            raise ValueError(
+                "External indexer projections require the FP8 NoPE writer and PCP1"
+            )
         self.q_lora_rank = q_lora_rank  # 1536
         # no tensor parallel, just replicated
         self.wq_b = ReplicatedLinear(
@@ -2361,9 +1498,16 @@ class Indexer(nn.Module):
             and self.rope_dim == self.head_dim // 2
         )
         self.use_wk_weights_proj_fusion = (
-            use_wk_weights_proj_fusion and self.use_qk_rope_cache_fusion
+            not external_k_weights
+            and use_wk_weights_proj_fusion
+            and self.use_qk_rope_cache_fusion
         )
-        if self.use_wk_weights_proj_fusion:
+        if external_k_weights:
+            # The owning attention packs these BF16 weight rows with its
+            # q_a/kv_a projection. Do not allocate duplicate parameters here.
+            self.wk = None
+            self.weights_proj = None
+        elif self.use_wk_weights_proj_fusion:
             self.wk_weights_proj = IndexerWkWeightsProjLinear(
                 hidden_size,
                 self.head_dim,
@@ -2404,14 +1548,9 @@ class Indexer(nn.Module):
         self.max_model_len = atom_config.max_model_len
         self.prefix = prefix
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
-        # The stable top-k path is only needed to keep GLM-5.2 sparse KV
-        # selection identical across tensor-parallel ranks. TP=1 keeps the
-        # regular path. The MTP draft rewrites model_type to deepseek_mtp but
-        # retains the GLM-only index_share_for_mtp_iteration marker.
-        is_glm52 = getattr(config, "model_type", None) == "glm_moe_dsa" or bool(
-            getattr(config, "index_share_for_mtp_iteration", False)
-        )
-        self.stable_topk = is_glm52 and get_tensor_model_parallel_world_size() > 1
+        # Tensor-parallel ranks must select identical sparse KV, so ties break
+        # by global position; TP=1 keeps the regular top-k.
+        self.stable_topk = get_tensor_model_parallel_world_size() > 1
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
         self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
@@ -2422,8 +1561,6 @@ class Indexer(nn.Module):
             0, dtype=torch.int32, device="cuda"
         )
         self.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
-        # Set by the MLA metadata builder (aiter_mla.py).
-        self.indexer_logits_ws: torch.Tensor | None = None
         atom_config.compilation_config.static_forward_context[prefix] = self
 
         # Rope module used by `forward_impl` (and the `sparse_attn_indexer_pcp`
@@ -2431,19 +1568,11 @@ class Indexer(nn.Module):
         # DeepseekV2MLAAttention right after construction; mirrors V4's
         # `self.indexer.rotary_emb = self.rotary_emb`.
         self.rotary_emb = None
+        # NoPE's unfused op never reads rotary tables, but the shared op ABI
+        # accepts tensors. A stable empty buffer avoids dereferencing None.
+        self.register_buffer("_empty_rope_cache", torch.empty(0), persistent=False)
 
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
-
-    def uses_logits_workspace(self) -> bool:
-        """Whether `forward_impl` hands `indexer_logits_ws` to the native op.
-
-        Plugins swap in their own op, and subclasses may override
-        `forward_impl`; neither takes the workspace.
-        """
-        return (
-            type(self).forward_impl is Indexer.forward_impl
-            and self.sparse_attn_indexer_impl is torch.ops.aiter.sparse_attn_indexer
-        )
 
     def forward(
         self,
@@ -2452,6 +1581,8 @@ class Indexer(nn.Module):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
+        *,
+        projected_k_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         # Under PCP, route the whole indexer through the Dynamo-opaque
         # `sparse_attn_indexer_pcp` op so the runtime `_pcp_active()` branch
@@ -2470,7 +1601,14 @@ class Indexer(nn.Module):
                 self.sparse_kv_indices_buffer,
             )
             return
-        self.forward_impl(hidden_states, qr, qr_scale, positions, rotary_emb)
+        self.forward_impl(
+            hidden_states,
+            qr,
+            qr_scale,
+            positions,
+            rotary_emb,
+            projected_k_weights=projected_k_weights,
+        )
 
     def forward_impl(
         self,
@@ -2479,6 +1617,8 @@ class Indexer(nn.Module):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
+        *,
+        projected_k_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         # The opaque PCP op can't pass a module, so it relies on
         # the bound `self.rotary_emb`; direct callers (non-PCP / plugins) may still
@@ -2488,7 +1628,9 @@ class Indexer(nn.Module):
         q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        if self.use_wk_weights_proj_fusion:
+        if self.external_k_weights:
+            k, weights = projected_k_weights
+        elif self.use_wk_weights_proj_fusion:
             k, weights = torch.split(
                 self.wk_weights_proj(hidden_states),
                 [self.head_dim, self.n_head],
@@ -2511,20 +1653,25 @@ class Indexer(nn.Module):
         # for padded rows, and only the owner rank writes K cache.
         unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp
         positions_op = positions
-        if unfused_qk_rope:
-            q_pe, _ = torch.split(
-                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
+        if self.use_nope_cache_fusion:
+            # The custom op publishes the normalized K and folds Q scales into
+            # head weights in one launch. Pass the unnormalized BF16 projections.
+            q_input = q
+        elif unfused_qk_rope:
             if pcp:
                 pcp_ws = get_pcp_world_size()
                 # k is 1/pcp (from 1/pcp hidden); gather to full padded [S_pad].
                 k = pcp_allgather_rerange(k, pcp_ws)
                 positions_op = pcp_allgather_rerange(positions, pcp_ws)
             k = self.k_norm(k)
-            k_pe, _ = torch.split(
-                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
-            if pcp:
+            if self.rope_dim:
+                q_pe, _ = torch.split(
+                    q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+                )
+                k_pe, _ = torch.split(
+                    k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+                )
+            if self.rope_dim and pcp:
                 # Rope q (1/pcp) and k (full) separately: they have different
                 # token counts under PCP so they can't share one rope call. The
                 # rope kernel is 2-component (ropes query AND key in place) and
@@ -2533,7 +1680,7 @@ class Indexer(nn.Module):
                 # on the rotary_dim views (q_pe/k_pe alias q/k).
                 rotary_emb(positions, q_pe, torch.empty_like(q_pe))
                 rotary_emb(positions_op, torch.empty_like(k_pe), k_pe)
-            else:
+            elif self.rope_dim:
                 q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
 
             q = q.view(-1, self.head_dim)
@@ -2567,13 +1714,20 @@ class Indexer(nn.Module):
             self.k_norm.bias,
             self.k_norm.eps,
             positions_op,
-            rotary_emb.cos_cache.squeeze(-2).squeeze(-2),
-            rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
+            (
+                rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+                if self.rope_dim
+                else self._empty_rope_cache
+            ),
+            (
+                rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+                if self.rope_dim
+                else self._empty_rope_cache
+            ),
             self._weights_scale,
-            rotary_emb.is_neox_style,
+            rotary_emb.is_neox_style if self.rope_dim else False,
             not unfused_qk_rope,
             self.stable_topk,
-            *((self.indexer_logits_ws,) if self.uses_logits_workspace() else ()),
         )
 
 
@@ -2684,6 +1838,8 @@ class DeepseekV2MLAAttention(nn.Module):
             # path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) is selected. The loader
             # honors this flag in LinearBase.process_weights_after_loading.
             self.fused_qkv_a_proj.needs_preshuffled_weight = True
+            # Under Triton GEMMs the fused FP4 forward reads its weight scale directly.
+            self.fused_qkv_a_proj.needs_e8m0_shuffled_scale = use_triton_gemm()
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -2779,7 +1935,9 @@ class DeepseekV2MLAAttention(nn.Module):
         self.skip_topk = False
 
         if self.is_v32:
-            self.skip_topk = _should_skip_index_topk(config, prefix)
+            self.skip_topk = skips_index_topk(
+                config, _extract_layer_index_from_prefix(prefix)
+            )
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -2906,7 +2064,17 @@ class DeepseekV2MLAAttention(nn.Module):
                 hidden_states, hidden_states_scale = hidden_states
 
         if self.q_lora_rank is not None:
+            q_uses_n32k4 = False
+            if self.quant_dtype == dtypes.fp4x2:
+                q_uses_n32k4 = uses_mxfp4_n32k4_scale(self.q_b_proj)
+                if self.is_v32 and self.indexer is not None and not self.skip_topk:
+                    q_uses_n32k4 = q_uses_n32k4 or uses_mxfp4_n32k4_scale(
+                        self.indexer.wq_b
+                    )
             if self.fuse_qknorm_quant and use_triton_gemm():
+                q_scale_shuffle_padding = not (
+                    q_uses_n32k4 and hidden_states.shape[0] < MXFP4_QUANT_BLOCK_SIZE
+                )
                 q_c, q_c_scale, kv_c_normed, k_pe = (
                     _fuse_qkv_a_proj_reduce_rmsnorm_quant(
                         hidden_states,
@@ -2922,7 +2090,7 @@ class DeepseekV2MLAAttention(nn.Module):
                         dtype_quant=self.quant_dtype,
                         hidden_states_quant_scale=hidden_states_scale,
                         shuffle=True,
-                        scale_shuffle_padding=True,
+                        scale_shuffle_padding=q_scale_shuffle_padding,
                         group_size=128,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
@@ -2942,7 +2110,9 @@ class DeepseekV2MLAAttention(nn.Module):
                 if self.fuse_qknorm_quant or self.fuse_qknorm:
                     q_shuffle = False
                     q_scale_shuffle_padding = False
-                    if self.quant_dtype == dtypes.fp4x2 and not use_triton_gemm():
+                    if self.quant_dtype == dtypes.fp4x2 and (
+                        not use_triton_gemm() or q_uses_n32k4
+                    ):
                         q_shuffle, q_scale_shuffle_padding = (
                             _mxfp4_activation_quant_layout(q_c.shape[0])
                         )
@@ -3325,6 +2495,7 @@ def use_replicated_vocab_embed(config: PretrainedConfig) -> bool:
     )
 
 
+@token_graph
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
     def __init__(
@@ -3541,6 +2712,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         # is inactive (`pcp=1` or decode) this whole block is skipped and the
         # forward is identical to the original path.
         pcp = _pcp_active()
+        # FusedMoE gathers its routed rows across the PCP group on this flag.
+        get_forward_context().context.pcp_split = pcp
         n_global = positions.shape[0]
         if pcp:
             pcp_ws = get_pcp_world_size()
@@ -3627,6 +2800,16 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # HF quant config uses "indexers_proj" but the ATOM module path is
         # "indexer.weights_proj".  str.replace translates each exclude entry.
         "indexers_proj": "indexer.weights_proj",
+    }
+    # IQ2R checkpoints store each layer's routed and fused shared experts as one
+    # stacked gate/up and down matrix.
+    weights_mapping: ClassVar[dict[str, str]] = {
+        ".mlp.up_gate_proj.0.iq2r_data": ".mlp.experts.w13_weight",
+        ".mlp.up_gate_proj.0.iq2r_auxiliary": ".mlp.experts.w13_weight_scale",
+        ".mlp.down_proj.0.iq2r_data": ".mlp.experts.w2_weight",
+        ".mlp.down_proj.0.iq2r_auxiliary": ".mlp.experts.w2_weight_scale",
+        ".mlp.up_gate_proj.0.iq2r_tN": ".mlp.experts.w13_iq2r_tile_n",
+        ".mlp.down_proj.0.iq2r_tN": ".mlp.experts.w2_iq2r_tile_n",
     }
 
     def __init__(

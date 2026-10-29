@@ -140,9 +140,8 @@ exports = {
     "REQUEST_RATE": cell["request_rate"],
     "BENCH_NUM_PROMPTS_MULTIPLIER": cell["num_prompts_multiplier"],
     "BENCHMARK_KIND": benchmark.get("kind", "random"),
-    "AIPERF_DIR": benchmark.get("aiperf_dir", ""),
-    "AIPERF_VENV": benchmark.get("aiperf_venv", ""),
-    "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
+    "AGENTX_HARNESS_VERSION": benchmark.get("agentx_harness_version", ""),
+    "AGENTX_VENV": benchmark.get("agentx_venv", ""),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
     "AIPERF_APPLY_CHAT_TEMPLATE": str(
@@ -170,9 +169,6 @@ exports = {
         "cancel_drain_timeout", ""
     ),
     "AIPERF_HTTP_TCP_USER_TIMEOUT": benchmark.get("http_tcp_user_timeout", ""),
-    "AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES": benchmark.get(
-        "dataset_weka_live_assistant_responses", ""
-    ),
     "AIPERF_DATASET_CONFIGURATION_TIMEOUT": benchmark.get(
         "dataset_configuration_timeout", ""
     ),
@@ -254,8 +250,8 @@ exports = {
     "SWEBENCH_MAX_WORKERS": "" if accuracy.get("max_workers") is None else accuracy.get("max_workers"),
     "SWEBENCH_EVAL_TIMEOUT": "" if accuracy.get("instance_timeout") is None else accuracy.get("instance_timeout"),
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
-    "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-frameworks"),
-    "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-atom"),
+    "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-spur"),
     "SLURM_QOS": "amd-aifw-dev-qos" if is_crusoe_v2 else runner.get("slurm_qos", ""),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
@@ -424,7 +420,10 @@ EOF
 EOF
   {
     printf 'export %q=%q\n' GITHUB_WORKSPACE "${REPO_ROOT}"
-    printf 'exec %q\n' "${JOB_SCRIPT}"
+    # git tracks the job script as 0644 and only the workflow chmods it, so a
+    # submission from anywhere else would exec a non-executable file and die
+    # with 126 before writing a log. Every other call site already uses bash.
+    printf 'exec bash %q\n' "${JOB_SCRIPT}"
   } >> "${SUBMIT_SCRIPT}"
   chmod +x "${SUBMIT_SCRIPT}"
 }

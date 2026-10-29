@@ -2,7 +2,7 @@
 """CPU coverage for SP MoE routing, transport, and tiled-sort eligibility."""
 
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -36,10 +36,10 @@ def sp_modules(request):
 def _layer(moe):
     method = object.__new__(moe.Mxfp4MoEMethod)
     method.quant_type = moe.QuantType.per_1x32
-    return SimpleNamespace(
+    layer = SimpleNamespace(
         quant_method=method,
         moe_parallel_config=SimpleNamespace(
-            dp_logical_ratio=1, use_all2all_kernels=False
+            dp_logical_ratio=1, use_all2all_kernels=False, pcp_merge=False
         ),
         expert_layout=SimpleNamespace(
             shared_is_routed=False, uses_dispatch_remap=False
@@ -65,6 +65,23 @@ def _layer(moe):
         reduce_results=False,
         prefix="experts",
     )
+    # The test drives FusedMoE.forward_impl unbound; bind the real expert call.
+    layer._run_experts = MethodType(moe.FusedMoE._run_experts, layer)
+    return layer
+
+
+def _patch_forward(monkeypatch, moe, layer):
+    """main's _run_experts needs a forward context and the new method hooks."""
+    context = SimpleNamespace(is_dummy_run=False, pcp_split=False)
+    monkeypatch.setattr(
+        moe, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
+    method = layer.quant_method
+    method.select_experts = Mock(return_value=(object(), object()))
+    method.place_experts = Mock(
+        side_effect=lambda layer, weights, ids, gathered=False: (weights, ids)
+    )
+    return context
 
 
 @pytest.mark.parametrize(
@@ -85,6 +102,7 @@ def test_forward_selects_local_routing_by_capability(
     layer = _layer(moe)
     vars(layer).update(override)
     method = layer.quant_method
+    _patch_forward(monkeypatch, moe, layer)
     hidden = torch.empty(rows, 2, dtype=torch.bfloat16)
     logits = torch.empty(rows, 4)
     gathered = torch.empty(rows * 4, 2, dtype=torch.bfloat16)
@@ -104,8 +122,10 @@ def test_forward_selects_local_routing_by_capability(
     result = moe.FusedMoE.forward_impl(layer, hidden, logits)
 
     assert result.shape == hidden.shape
-    assert method.apply.call_args.kwargs["x"] is gathered
-    assert method.apply.call_args.kwargs["sp_input_scale"] is scale
+    kwargs = method.apply.call_args.kwargs
+    assert kwargs["x"] is gathered
+    assert kwargs["x_scale"] is scale
+    assert kwargs["scheduled_tokens_gpu"] is None
     scatter.assert_called_once_with(gathered)
     if local_routing:
         method.gather_sp_routed_input.assert_called_once_with(
@@ -113,12 +133,17 @@ def test_forward_selects_local_routing_by_capability(
         )
         method.gather_sp_input.assert_not_called()
         gather.assert_not_called()
-        assert method.apply.call_args.kwargs["sp_topk"] == (weights, ids)
+        method.select_experts.assert_not_called()
+        assert kwargs["topk_weights"] is weights
+        assert kwargs["topk_ids"] is ids
     else:
         method.gather_sp_routed_input.assert_not_called()
         method.gather_sp_input.assert_called_once_with(layer, hidden, token_group=None)
         gather.assert_called_once_with(logits)
-        assert "sp_topk" not in method.apply.call_args.kwargs
+        selection = method.select_experts.call_args.args
+        assert selection[0] is layer and selection[1] is gathered
+        assert selection[2].shape == logits.repeat(4, 1).shape
+        assert "sp_topk" not in kwargs
 
 
 @pytest.mark.parametrize("sp_enabled,all2all", [(False, False), (True, True)])
@@ -129,6 +154,7 @@ def test_non_sp_and_routed_all2all_skip_sp_gather(
     layer = _layer(moe)
     layer.moe_parallel_config.use_all2all_kernels = all2all
     hidden, logits = torch.empty(4, 2), torch.empty(4, 4)
+    _patch_forward(monkeypatch, moe, layer)
     layer.quant_method.apply = Mock(return_value=hidden)
     gather, scatter = Mock(), Mock()
     monkeypatch.setattr(moe, "get_dp_group", lambda: SimpleNamespace(world_size=1))
@@ -140,8 +166,9 @@ def test_non_sp_and_routed_all2all_skip_sp_gather(
 
     gather.assert_not_called()
     scatter.assert_not_called()
-    assert "sp_topk" not in layer.quant_method.apply.call_args.kwargs
-    assert "sp_input_scale" not in layer.quant_method.apply.call_args.kwargs
+    kwargs = layer.quant_method.apply.call_args.kwargs
+    assert kwargs["x_scale"] is None and kwargs["scheduled_tokens_gpu"] is None
+    layer.quant_method.select_experts.assert_called_once()
 
 
 @pytest.mark.parametrize("rows", [1, 8192])
@@ -156,6 +183,7 @@ def test_tp_token_gather_returns_global_partial_without_reduction(
     gathered = torch.empty(rows * 4, 2, dtype=torch.bfloat16)
     scale, weights, ids = (object() for _ in range(3))
     method = layer.quant_method
+    _patch_forward(monkeypatch, moe, layer)
     method._sp_input_can_prequantize = Mock(return_value=True)
     method.gather_sp_input = Mock(return_value=(gathered, scale))
     method.gather_sp_routed_input = Mock(return_value=(gathered, scale, weights, ids))
@@ -178,7 +206,7 @@ def test_tp_token_gather_returns_global_partial_without_reduction(
         method.gather_sp_routed_input.assert_called_once_with(
             layer, hidden, logits, token_group=group
         )
-        assert method.apply.call_args.kwargs["sp_topk"] == (weights, ids)
+        assert method.apply.call_args.kwargs["topk_weights"] is weights
         gather.assert_not_called()
     else:
         method.gather_sp_input.assert_called_once_with(layer, hidden, token_group=group)
@@ -222,7 +250,7 @@ def test_routed_gather_preserves_local_route_weights_and_ids(monkeypatch, sp_mod
     weights = torch.linspace(0.1, 0.9, 12).reshape(3, 4)
     ids = torch.arange(12, dtype=torch.int32).reshape(3, 4)
     payload, scale = object(), object()
-    method.select_experts_with_record = Mock(return_value=(weights, ids))
+    method.select_experts = Mock(return_value=(weights, ids))
     method.gather_sp_input = Mock(return_value=(payload, scale))
     monkeypatch.setattr(moe, "sp_moe_gather", lambda value: value.repeat(4, 1))
 
@@ -236,9 +264,8 @@ def test_routed_gather_preserves_local_route_weights_and_ids(monkeypatch, sp_mod
         gathered_weights.view(torch.int32), weights.repeat(4, 1).view(torch.int32)
     )
     assert torch.equal(gathered_ids, ids.repeat(4, 1))
-    selection = method.select_experts_with_record.call_args.kwargs
-    assert selection["hidden_states"] is hidden
-    assert selection["router_logits"] is logits
+    selection = method.select_experts.call_args
+    assert selection.args == (layer, hidden, logits)
 
 
 def test_unsupported_prequantization_gathers_original_input(monkeypatch, sp_modules):
@@ -276,23 +303,14 @@ def test_apply_passes_only_supported_sp_options(
     method.fused_experts = None
     method.use_triton = method.use_triton_decode = method.use_triton_ep = False
     method.is_guinterleave = False
-    # main's Mxfp4MoEMethod.apply reads it; the test bypasses __init__, which is what sets it
     method.fp8_activations = False
+    method.moe = SimpleNamespace(in_dtype=torch.bfloat16)
     weights, ids, hidden, output = (object() for _ in range(4))
     input_scale = object() if prequantized else None
-    method.select_experts_with_record = Mock(return_value=(weights, ids))
     run_moe = Mock(return_value=output)
     monkeypatch.setattr(moe, "fused_moe", run_moe)
 
-    result = method.apply(
-        layer,
-        hidden,
-        object(),
-        top_k=4,
-        renormalize=True,
-        sp_input_scale=input_scale,
-        sp_topk=(weights, ids) if prequantized else None,
-    )
+    result = method.apply(layer, hidden, weights, ids, x_scale=input_scale)
 
     assert result is output
     assert run_moe.call_args.args == (
@@ -305,10 +323,8 @@ def test_apply_passes_only_supported_sp_options(
     options = run_moe.call_args.kwargs
     assert options["a1_scale"] is input_scale
     if prequantized:
-        method.select_experts_with_record.assert_not_called()
         assert options["dtype"] == torch.bfloat16
     else:
-        method.select_experts_with_record.assert_called_once()
         assert "dtype" not in options
     if tiled_sort:
         assert options["use_tiled_sort"] is True

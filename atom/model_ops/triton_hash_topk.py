@@ -30,6 +30,7 @@ def _hash_topk_kernel(
     tid2eid_ptr,  # [vocab, topk] int32 token-id -> expert-id table
     out_ids_ptr,  # [N, topk] int32 (or first topk cols of a wider buffer)
     out_w_ptr,  # [N, topk] fp32 (or first topk cols of a wider buffer)
+    num_valid_rows_ptr,  # [1] int32: rows at or past it route to -1
     stride_g_row,
     stride_g_col,
     stride_tid_row,
@@ -40,6 +41,7 @@ def _hash_topk_kernel(
     topk,
     scaling,
     RENORM: tl.constexpr,
+    HAS_NUM_VALID_ROWS: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ):
     t = tl.program_id(0)
@@ -72,6 +74,10 @@ def _hash_topk_kernel(
         s = tl.sum(w, axis=0)
         w = w / tl.maximum(s, 1e-20)
     w = w * scaling
+    if HAS_NUM_VALID_ROWS:
+        pad = t >= tl.load(num_valid_rows_ptr)
+        eid = tl.where(pad, -1, eid)
+        w = tl.where(pad, 0.0, w)
 
     tl.store(out_ids_ptr + t * stride_oid_row + offs_k, eid, mask=mask)
     tl.store(out_w_ptr + t * stride_ow_row + offs_k, w, mask=mask)
@@ -85,12 +91,14 @@ def hash_topk_triton(
     scaling: float,
     out_ids: torch.Tensor,  # [N, topk] int32 destination
     out_weights: torch.Tensor,  # [N, topk] fp32 destination
+    num_valid_rows: torch.Tensor | None = None,
 ) -> None:
     """Fill ``out_ids`` / ``out_weights`` in place with the hash-routing result.
 
     ``out_ids`` / ``out_weights`` may be standalone ``[N, topk]`` tensors or
     ``[:, :topk]`` slices of a wider preallocated buffer (their row stride is
-    read from the tensors, column stride is assumed 1).
+    read from the tensors, column stride is assumed 1). Rows at or past
+    ``num_valid_rows`` (``[1]`` int32 on device) get ids -1 and weights 0.
     """
     num_tokens = gating_output.shape[0]
     if num_tokens == 0:
@@ -104,6 +112,7 @@ def hash_topk_triton(
         tid2eid,
         out_ids,
         out_weights,
+        num_valid_rows,
         gating_output.stride(0),
         gating_output.stride(1),
         tid2eid.stride(0),
@@ -114,6 +123,7 @@ def hash_topk_triton(
         topk,
         scaling,
         RENORM=renormalize,
+        HAS_NUM_VALID_ROWS=num_valid_rows is not None,
         BLOCK_TOPK=triton.next_power_of_2(topk),
         num_warps=1,
     )
