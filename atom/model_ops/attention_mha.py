@@ -1623,6 +1623,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         sm = getattr(attn_metadata, "sparse_attention_metadata", None)
         return sm if sm is not None else attn_metadata
 
+    def _row_map(self, metadata, key: tuple, compute):
+        """The NVFP4 row map (row -> request, causal length) of this forward,
+        computed by its first sparse layer and reused by the later ones. A layer
+        number at or below the one that stored it means a new forward (or a
+        graph capture after a warmup on the same metadata): recompute."""
+        entry = getattr(metadata, "_nvfp4_row_map", None)
+        if entry is not None and entry[0] < self.layer_num and entry[1] == key:
+            return entry[2]
+        rows = compute()
+        metadata._nvfp4_row_map = (self.layer_num, key, rows)
+        return rows
+
     def _topk_cache_state(self, sparse_metadata):
         if self.index_topk_cache_state is None:
             return None
@@ -1754,7 +1766,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if self.kv_nvfp4:
             from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import prefill_rows
 
-            row_req, row_seq = prefill_rows(cu_seqlens_q, prefix_lens, q.shape[0])
+            row_req, row_seq = self._row_map(
+                prefill_md,
+                ("prefill", q.shape[0]),
+                lambda: prefill_rows(cu_seqlens_q, prefix_lens, q.shape[0]),
+            )
             output = self._nvfp4_attention(
                 q,
                 k_cache,
@@ -1884,9 +1900,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if self.kv_nvfp4:
             from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import decode_rows
 
-            # One mapping per layer, read by the fused top-k and the attention.
-            row_req, row_seq = decode_rows(
-                decode_md.seq_lens, q.shape[0], max_query_len
+            # One mapping per forward, read by the fused top-k and the attention.
+            row_req, row_seq = self._row_map(
+                decode_md,
+                ("decode", q.shape[0], max_query_len),
+                lambda: decode_rows(decode_md.seq_lens, q.shape[0], max_query_len),
             )
         if cached_topk is None:
             if index_q is None:

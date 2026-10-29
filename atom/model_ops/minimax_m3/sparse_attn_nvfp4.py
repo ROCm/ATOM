@@ -86,11 +86,8 @@ def decode_rows(seq_lens: torch.Tensor, rows: int, max_query_len: int):
     request-major, ``max_query_len`` query tokens per request, the last at the
     request's full length. Rows past ``len(seq_lens) * max_query_len`` are
     padding: request 0, length 0, so no kernel reads a block for them. One
-    launch; computed once per layer and shared by the index top-k and the
-    attention.
-
-    shortcut: once per layer (60 launches a step), not once per step; moving it
-    into the metadata builder's graph buffers would save the rest."""
+    launch, once per forward (``SparseMHAPagedAttentionImpl._row_map``), shared
+    by the index top-k and the attention of every sparse layer."""
     req = torch.empty(rows, dtype=torch.int32, device=seq_lens.device)
     seq = torch.empty(rows, dtype=torch.int32, device=seq_lens.device)
     block = 256

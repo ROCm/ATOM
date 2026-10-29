@@ -1965,6 +1965,28 @@ def m3_fp4_cache_unsupported_reason(
     return None
 
 
+def m3_nvfp4_stage_unsupported_reason(stage_pages: int, index_pages: int) -> str | None:
+    """Why NVFP4 sparse KV cannot run with this persistent (FP8 / BF16) index
+    pool, or None.
+
+    The NVFP4 K/V is written through a token-major staging buffer of
+    ``stage_pages`` 128-token pages, sized for the largest step (the larger of
+    max_num_batched_tokens and max_num_seqs x (draft + 1) rows). AITER's
+    page-128 writer checks the index cache against the KV pages it is given,
+    and a captured graph bucket can run more rows than the pool holds, so the
+    pool must hold at least the staging buffer. An FP4 index is staged too and
+    is not coupled this way.
+    """
+    if index_pages >= stage_pages:
+        return None
+    return (
+        f"ATOM_M3_SPARSE_KV_NVFP4 with an FP8/BF16 index cache needs the KV pool "
+        f"to hold one full step: {index_pages} pages < {stage_pages} staging "
+        "pages. Lower --max-num-batched-tokens / --max-num-seqs, give the KV "
+        "cache more memory, or use --index-cache-dtype fp4."
+    )
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,

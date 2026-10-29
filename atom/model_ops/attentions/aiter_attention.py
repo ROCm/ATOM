@@ -804,6 +804,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             module.impl.kv_stage, module.impl.kv_stage_slots = self._quant_stage(
                 "kv", (2, self.block_size, geometry.num_kv_heads, geometry.head_dim)
             )
+            impl = module.impl
+            if impl.index_cache is not None and impl.index_scale is None:
+                from atom.config import m3_nvfp4_stage_unsupported_reason
+
+                reason = m3_nvfp4_stage_unsupported_reason(
+                    impl.kv_stage.shape[0], impl.index_cache.shape[0]
+                )
+                if reason is not None:
+                    raise ValueError(reason)
         elif config.kv_cache_dtype == "fp8":
             module.k_scale, module.v_scale = pool.scale_views(row)
 
