@@ -369,6 +369,9 @@ def main():
         if role == 'prefill':
             env['MOONCAKE_CONFIG_PATH'] = common['ATOMESH_VLLM_STORE_CONFIG_PATH']
         env["ATOMESH_VLLM_ROLE"] = role
+        if mode == 'smoke':
+            # /reset_prefix_cache is a development endpoint in this vLLM.
+            env['VLLM_SERVER_DEV_MODE'] = '1'
         cfg = json.loads((CONFIG / f'{role}-kv.json').read_text())
         dump(out / f'{role}-kv.json', cfg)
         args = dict(plan['common_args'])
