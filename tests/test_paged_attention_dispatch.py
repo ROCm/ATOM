@@ -631,6 +631,14 @@ class TestWorkPlanWiring:
                 _FakePlan(capacity=1024), 4, 16, 128, torch.bfloat16, dev
             )
             assert big[0].shape[1] == 1024
+
+            global_keys = set(_FLYDSL_PLAN_SCRATCH)
+            step = SimpleNamespace()
+            _flydsl_plan_scratch(
+                _FakePlan(capacity=512), 4, 16, 128, torch.bfloat16, dev, step
+            )
+            assert len(step._flydsl_plan_scratch) == 1
+            assert set(_FLYDSL_PLAN_SCRATCH) == global_keys
         finally:
             # The cache is a module global with no eviction; leaving ~25 MB of
             # live CUDA buffers behind would charge every later test for it.
@@ -1076,10 +1084,8 @@ class TestExplicitPlan:
         plans = [self._call(ba, owner=step) for _ in range(57)]
         assert all(p is plans[0] for p in plans)
         assert plans[0].refreshed == 0, "only the build may fill it in this step"
-        step = SimpleNamespace()  # next step: the builder makes new metadata
-        self._call(ba, owner=step)
-        self._call(ba, owner=step)
-        assert plans[0].refreshed == 1, "a new step must refresh exactly once"
+        assert self._call(ba, owner=SimpleNamespace()) is not plans[0]
+        assert ba._FLYDSL_RUNTIME_PLANS == {}, "step plans must not become process-wide"
 
     def test_the_forward_context_is_not_the_step(self, monkeypatch):
         """The vLLM plugin never sets ATOM's ForwardContext for this model.
@@ -1092,10 +1098,9 @@ class TestExplicitPlan:
         ba, _ = self._setup(monkeypatch)
         stale = SimpleNamespace()
         monkeypatch.setattr(fc, "get_forward_context", lambda: stale)
-        plan = self._call(ba, owner=SimpleNamespace())
-        self._call(ba, owner=SimpleNamespace())
-        self._call(ba, owner=SimpleNamespace())
-        assert plan.refreshed == 2, "each step's metadata must refresh once"
+        plans = [self._call(ba, owner=SimpleNamespace()) for _ in range(3)]
+        assert len({id(plan) for plan in plans}) == 3
+        assert ba._FLYDSL_RUNTIME_PLANS == {}
 
     def test_capture_records_its_own_refresh(self, monkeypatch):
         """Warmup and capture share one metadata object and stream.
@@ -1205,6 +1210,22 @@ class TestExplicitPlan:
                 assert getattr(owner.orelse, "value", 0) is None, relpath
                 assert "local_blocks" in ast.unparse(owner.test), relpath
 
+    def test_sparse_prefill_sites_scope_plan_to_their_metadata(self):
+        """Variable prefill rows must not enter the process-wide plan cache."""
+        import ast
+
+        for relpath in (
+            "model_ops/attention_mha.py",
+            "plugin/vllm/attention/minimax_m3_attnetion.py",
+        ):
+            calls = self._call_kwargs(relpath, "minimax_m3_sparse_attn_prefill_asm")
+            assert len(calls) == 1
+            owner = calls[0].get("plan_step_owner")
+            assert isinstance(owner, ast.IfExp), f"{relpath}: {owner}"
+            assert getattr(owner.body, "id", None) == "prefill_md", relpath
+            assert getattr(owner.orelse, "value", 0) is None, relpath
+            assert "local_blocks" in ast.unparse(owner.test), relpath
+
     def test_tbo_ubatches_do_not_share_a_step_plan(self, monkeypatch):
         """TBO ubatches share one compute stream; each needs its own plan."""
         from atom.utils.tbo import ubatching
@@ -1212,12 +1233,13 @@ class TestExplicitPlan:
         ba, _ = self._setup(monkeypatch)
         ubatch = [0]
         monkeypatch.setattr(ubatching, "tbo_current_ubatch_id", lambda: ubatch[0])
-        ub0 = self._call(ba, owner=SimpleNamespace())
+        step = SimpleNamespace()
+        ub0 = self._call(ba, owner=step)
         ubatch[0] = 1
-        ub1 = self._call(ba, owner=SimpleNamespace())
+        ub1 = self._call(ba, owner=step)
         assert ub1 is not ub0, "ub1 would overwrite ub0's lengths mid-step"
         ubatch[0] = 0
-        assert self._call(ba, owner=SimpleNamespace()) is ub0
+        assert self._call(ba, owner=step) is ub0
 
     def test_old_aiter_api_takes_gluon(self, monkeypatch):
         """An aiter without #5809's required work plan must not be routed."""
@@ -1735,6 +1757,7 @@ class TestFlyDSLConstantsMatchAiter:
         from atom.model_ops.base_attention import (
             _FLYDSL_PA_TILE,
             _FLYDSL_PLAN_MAX_BATCH,
+            _FLYDSL_PLAN_SCAN_LDS_BYTES,
         )
 
         src = self._aiter_src("ops/flydsl/pa_decode.py")
@@ -1745,6 +1768,9 @@ class TestFlyDSLConstantsMatchAiter:
         assert (
             str(_FLYDSL_PLAN_MAX_BATCH) in plan_src
         ), "aiter's planner batch cap moved"
+        assert (
+            f"_PLAN_SCAN_LDS_BYTES = {_FLYDSL_PLAN_SCAN_LDS_BYTES}" in plan_src
+        ), "aiter's planner scan storage moved"
 
 
 class TestNoGluonFlyDSLRouting:

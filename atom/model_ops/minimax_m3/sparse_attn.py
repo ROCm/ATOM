@@ -1517,6 +1517,7 @@ def minimax_m3_sparse_attn_prefill_asm(
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
     sparse_ctx: torch.Tensor | None = None,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
+    plan_step_owner=None,
 ) -> None:
     """Block-sparse PREFILL via AITER ASM pa_fwd_asm, per-token-as-decode.
 
@@ -1572,4 +1573,5 @@ def minimax_m3_sparse_attn_prefill_asm(
         output,
         k_scale,
         v_scale,
+        plan_step_owner=plan_step_owner,
     )

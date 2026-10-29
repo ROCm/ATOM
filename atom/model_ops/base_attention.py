@@ -402,7 +402,13 @@ def flydsl_plan_matches(plan, num_seqs: int, num_kv_heads: int) -> bool:
 
 
 def _flydsl_plan_scratch(
-    plan, query_length, query_group_size, head_dim, out_dtype, device
+    plan,
+    query_length,
+    query_group_size,
+    head_dim,
+    out_dtype,
+    device,
+    plan_step_owner=None,
 ):
     """Partial-output buffers for a planned call, allocated once per shape.
 
@@ -415,6 +421,10 @@ def _flydsl_plan_scratch(
     ones raises a shape error. Keyed by capacity so a refresh that resized the
     plan gets its own buffers. Allocation stays here because the shapes come
     from the query tensor; only the per-step planner kernel moved out.
+
+    A step-owned plan keeps its scratch on the same owner. Sparse prefill row
+    counts vary with every prompt; retaining those buffers in the process-wide
+    cache would keep one large allocation per distinct prompt length forever.
     """
     rows = query_length * query_group_size
     want = (int(plan.num_kv_heads), int(plan.capacity), rows)
@@ -423,7 +433,13 @@ def _flydsl_plan_scratch(
     # ubatch -- would otherwise share one triple of buffers and write it at the
     # same time. The plan is stored alongside so its id cannot be recycled.
     key = (id(plan), *want, head_dim, out_dtype, device.index)
-    hit = _FLYDSL_PLAN_SCRATCH.get(key)
+    scratch = _FLYDSL_PLAN_SCRATCH
+    if plan_step_owner is not None:
+        scratch = getattr(plan_step_owner, "_flydsl_plan_scratch", None)
+        if scratch is None:
+            scratch = {}
+            plan_step_owner._flydsl_plan_scratch = scratch
+    hit = scratch.get(key)
     hit = hit[1] if hit is not None else None
     if hit is None:
         hit = (
@@ -431,7 +447,7 @@ def _flydsl_plan_scratch(
             torch.empty(want, dtype=torch.float32, device=device),
             torch.empty(*want, head_dim, dtype=out_dtype, device=device),
         )
-        _FLYDSL_PLAN_SCRATCH[key] = (plan, hit)
+        scratch[key] = (plan, hit)
     return hit
 
 
@@ -519,7 +535,13 @@ def _flydsl_prepare_explicit_plan(
         device.index,
         plan_step_owner is not None,
     )
-    plan = _FLYDSL_RUNTIME_PLANS.get(plan_key)
+    plans = _FLYDSL_RUNTIME_PLANS
+    if plan_step_owner is not None:
+        plans = getattr(plan_step_owner, "_flydsl_runtime_plans", None)
+        if plans is None:
+            plans = {}
+            plan_step_owner._flydsl_runtime_plans = plans
+    plan = plans.get(plan_key)
     lengths = context_lens[:num_seqs]
     if plan_step_owner is not None:
         # Warmup and capture share the metadata; keying on capture state makes
@@ -543,17 +565,18 @@ def _flydsl_prepare_explicit_plan(
             query_length=query_length,
             **budget,
         )
-        _FLYDSL_RUNTIME_PLANS[plan_key] = plan
-        logger.info(
-            "flydsl plan: batch=%d ql=%d context_bound=%d "
-            "kv_heads=%d max_partitions=%d capacity=%d",
-            num_seqs,
-            query_length,
-            context_bound,
-            num_kv_heads,
-            int(plan.max_partitions),
-            int(plan.capacity),
-        )
+        plans[plan_key] = plan
+        if plan_step_owner is None:
+            logger.info(
+                "flydsl plan: batch=%d ql=%d context_bound=%d "
+                "kv_heads=%d max_partitions=%d capacity=%d",
+                num_seqs,
+                query_length,
+                context_bound,
+                num_kv_heads,
+                int(plan.max_partitions),
+                int(plan.capacity),
+            )
     else:
         plan_pa_decode(
             lengths,
@@ -719,6 +742,7 @@ def run_pa_decode(
             q.shape[-1],
             output.dtype,
             context_lens.device,
+            plan_step_owner=plan_step_owner,
         )
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
