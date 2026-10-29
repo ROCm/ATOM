@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Gate: every `file:line` a finding cites must point at what the finding says is there.
+
+The other gates check that a finding which fired reaches the card. None of them check
+that the card's citations are accurate, and a batch of seven real ATOM reviews produced
+twelve findings of which two carried a citation defect: one inflated a count, and one
+cited `envs.py:263` for a construct that lives at :253, where :263 holds an unrelated
+env var entry. The mechanism in both was sound -- but a reviewer who clicks the line and
+finds different code stops trusting the whole card, so a wrong citation costs more than
+the finding earns.
+
+Existence alone does not catch this: in the real case the file existed and the line was
+in range. So each citation is also checked for proximity -- an identifier the finding
+quotes in backticks must appear within PROXIMITY lines of the cited one. The tolerance
+is deliberately loose enough for the line drift that review of a moving branch produces,
+and tight enough for the ten-line miss that actually happened.
+
+Usage:  check_citations.py <WORK_DIR> [TREE]
+        TREE defaults to <WORK_DIR>/merge-target, falling back to <WORK_DIR>/head.
+Exit 0 = every citation checks out (or the card cites nothing). Exit 1 = at least one
+does not; the offending lines are printed.
+"""
+
+import pathlib
+import re
+import sys
+
+PROXIMITY = 5  # lines; see module docstring
+FINDING = re.compile(r"^(🔴|⚠️|📝)")
+# path/to/file.ext:1234 -- the extension keeps 'PR#2695:' and bare 'note:7' out
+CITATION = re.compile(r"\b([\w./-]+\.[A-Za-z]{1,6}):(\d+)\b")
+# What a finding says is at the cited line, in the two shapes cards use:
+# `an_identifier` in backticks, or "an excerpt of the line" in double quotes.
+# Reading only the first misjudges every finding that quotes the text instead --
+# a stale-docstring finding names the docstring, not a symbol.
+QUOTED = re.compile(r"`([A-Za-z_][\w.]{2,})`")
+EXCERPT = re.compile(r"[\"\u201c]([^\"\u201c\u201d]{12,})[\"\u201d]")
+
+
+def tree_for(work: pathlib.Path, explicit: str | None) -> pathlib.Path | None:
+    if explicit:
+        p = pathlib.Path(explicit)
+        return p if p.is_dir() else None
+    for name in ("merge-target", "head"):
+        p = work / name
+        if p.is_dir():
+            return p
+    return None
+
+
+def check(card_text: str, tree: pathlib.Path, changed=()):
+    """Yield one complaint string per bad citation.
+
+    `changed` is the PR's changed paths; a bare basename resolves against those first.
+    """
+    for raw in card_text.split("\n"):
+        if not FINDING.match(raw.strip()):
+            continue
+        quoted = set(QUOTED.findall(raw))
+        excerpts = [e.strip() for e in EXCERPT.findall(raw)]
+        for path, lineno in CITATION.findall(raw):
+            f = tree / path
+            if not f.is_file():
+                # Cards usually cite a bare basename. Resolve it the way a reader does:
+                # against the files this PR actually touched, not the whole tree -- a
+                # repo this size has several `scheduler.py`, and only one is in the diff.
+                base = pathlib.Path(path).name
+                hits = [c for c in changed if pathlib.Path(c).name == base]
+                if len(hits) != 1:
+                    hits = [
+                        str(m.relative_to(tree))
+                        for m in tree.rglob(base)
+                        if m.is_file()
+                    ]
+                if len(hits) != 1:
+                    yield "bad", (
+                        f"{path}:{lineno} -- no such file in the tree"
+                        if not hits
+                        else f"{path}:{lineno} -- ambiguous, {len(hits)} files share that name"
+                    )
+                    continue
+                f = tree / hits[0]
+                if not f.is_file():
+                    yield "bad", f"{path}:{lineno} -- {hits[0]} is in the diff but not the tree"
+                    continue
+            try:
+                lines = f.read_text(encoding="utf-8", errors="replace").split("\n")
+            except OSError as e:
+                yield "bad", f"{path}:{lineno} -- unreadable ({e})"
+                continue
+            n = int(lineno)
+            if not 1 <= n <= len(lines):
+                yield "bad", f"{path}:{lineno} -- file has {len(lines)} lines"
+                continue
+            if not quoted and not excerpts:
+                continue  # nothing quoted to locate; existence is all we can check
+            lo, hi = max(1, n - PROXIMITY), min(len(lines), n + PROXIMITY)
+            window = "\n".join(lines[lo - 1 : hi])
+            if any(q in window for q in quoted):
+                continue
+            if any(e in window for e in excerpts):
+                continue
+            elsewhere = [q for q in quoted if q in "\n".join(lines)]
+            if elsewhere:
+                where = []
+                for q in elsewhere[:1]:
+                    for i, l in enumerate(lines, 1):
+                        if q in l:
+                            where.append(f"`{q}` is at :{i}")
+                            break
+                yield "note", (
+                    f"{path}:{lineno} -- none of {sorted(quoted)} within "
+                    f"±{PROXIMITY} lines; {'; '.join(where)}"
+                )
+
+
+def main(argv):
+    if len(argv) < 2:
+        sys.exit("usage: check_citations.py <WORK_DIR> [TREE]")
+    work = pathlib.Path(argv[1])
+    card = work / "card.md"
+    if not card.is_file():
+        print("CITATIONS: no card.md to check")
+        return 1
+    tree = tree_for(work, argv[2] if len(argv) > 2 else None)
+    if tree is None:
+        print("CITATIONS: no tree to resolve citations against")
+        return 1
+    diff = work / "pr.diff"
+    changed = ()
+    if diff.is_file():
+        changed = re.findall(
+            r"^\+\+\+ b/(.+)$",
+            diff.read_text(encoding="utf-8", errors="replace"),
+            re.MULTILINE,
+        )
+    out = list(check(card.read_text(encoding="utf-8"), tree, changed))
+    bad = [m for sev, m in out if sev == "bad"]
+    notes = [m for sev, m in out if sev == "note"]
+    # Only the deterministic failures gate. Proximity is a heuristic -- matching prose
+    # against source lines is fuzzy, and two rounds of tightening it on seven real
+    # reviews traded one class of false alarm for another (an excerpt rule that fixed a
+    # stale-docstring finding broke three findings whose line numbers were exact). A
+    # heuristic that withholds correct reviews costs more than the defect it catches, so
+    # it prints for the human reading the card and does not fail the gate.
+    for n in notes:
+        print(f"CITATIONS NOTE: {n}")
+    if bad:
+        print(f"CITATIONS BAD: {len(bad)} citation(s) do not resolve")
+        for b in bad:
+            print(f"  {b}")
+        return 1
+    print(
+        "CITATIONS: every cited file:line resolves"
+        + (f" ({len(notes)} proximity note(s))" if notes else "")
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

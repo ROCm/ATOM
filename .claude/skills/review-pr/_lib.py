@@ -33,7 +33,9 @@ REQUIRED = [
     "rules.txt",
     "pr_meta.json",
 ]
-OPTIONAL = ["late_findings.txt"]
+# citations.txt rides here rather than in REQUIRED: it is advisory, and a run whose
+# worker died before writing a card has no citations to check -- absence is not a defect.
+OPTIONAL = ["late_findings.txt", "citations.txt"]
 
 
 def read(p):

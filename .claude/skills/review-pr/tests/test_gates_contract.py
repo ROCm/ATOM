@@ -38,7 +38,12 @@ PROJ = str(HERE.parent.parent.parent)
 
 def test_required_artifacts_are_pinned():
     assert _lib.REQUIRED == EXPECTED_REQUIRED
-    assert _lib.OPTIONAL == ["late_findings.txt"]
+    # citations.txt is OPTIONAL, not REQUIRED, and the distinction is load-bearing: a
+    # REQUIRED artifact missing means a step was skipped and the gates say so, while a
+    # run whose worker died before writing a card has nothing to check citations in.
+    # Promoting it to REQUIRED would turn "there was no card" into "the citation check
+    # was skipped" -- two different failures wearing the same face.
+    assert _lib.OPTIONAL == ["late_findings.txt", "citations.txt"]
 
 
 def test_gate_roster_is_pinned(tmp_path):

@@ -257,6 +257,18 @@ fi
 # 0-finding card (NONE AVAILABLE) or a count mismatch.
 python3 "$SKILL/_apply_refutation.py" "$W/card.md" "$W/independent.txt"
 
+# 3c) citation check. Measured on seven real ATOM reviews: the deterministic half (does
+# the cited file resolve in the diff, is the line within the file) never fired -- zero
+# findings in that batch cited a file or line that does not exist -- while the proximity
+# half caught a real defect, a finding citing envs.py:263 for a construct that lives at
+# :253. Proximity is a heuristic and it misfires: a finding legitimately quotes symbols
+# that live elsewhere (the remedy it proposes, a caller, a related flag), and two rounds
+# of tightening it traded one class of false alarm for another. It ran 1-for-2 on real
+# cards. So this is not a gate: it writes its verdict where the collector picks it up and
+# the job log shows it, and a human deciding whether to trust a card can see it. Making a
+# 50%-precision heuristic withhold reviews would cost more than the defect it catches.
+python3 "$SKILL/check_citations.py" "$W" 2>&1 | tee "$W/citations.txt" || true
+
 # 4) gates + collect (call the python directly; no thin shell wrappers)
 say "gates..."
 # errexit is on: a bare call exits here on a red gate, and the EXIT trap then reports "exited
