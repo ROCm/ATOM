@@ -575,6 +575,55 @@ def _paged_builder(blocks=3, *, spec=True):
     return builder, cls
 
 
+class _QSALayer:
+    """A QSA module as the bind walk sees it: hashable, with a row space."""
+
+    is_qsa_attention = True
+
+    def __init__(self, layer_num, row_space="qsa"):
+        self.layer_num = layer_num
+        self.qsa_row_space = row_space
+        self.bound = None
+
+    def bind_caches(self, *caches, **scales):
+        self.bound = (caches, scales)
+
+
+def test_a_bf16_target_gives_the_mtp_draft_layer_its_own_rows():
+    """`*_draft` rows exist only under quantized target caches with
+    ATOM_QSA_DRAFT_KV_BF16 (`QSAAttention.qsa_row_space`), which
+    lmcache_offload refuses until #2655. With BF16 caches the MTP layer is
+    one more row of the target's fields, and the in-process codec is handed
+    exactly the rows that layer binds."""
+    builder, cls = _builder()
+    del builder._qsa_fields  # the real declaration, not `_builder`'s stand-in
+    hf = builder.model_runner.config.hf_config
+    hf.head_dim, hf.indexer_head_dim = 8, 4
+    builder.model_runner._get_num_kv_heads = lambda: 2
+    builder.block_size = 4
+    builder.cache_rope_positions = False
+    builder.device = torch.device("cpu")
+    builder.kv_pools = {}
+    target, draft = _QSALayer(0), _QSALayer(1)
+    builder._pool_rows = {"qsa": {target: 0, draft: 1}}
+
+    names = [field.name for field in cls._qsa_fields(builder)]
+    assert names == ["k", "v", "index_raw", "index_compressed"]
+    cls.allocate_kv_cache_tensors(builder, blocks=2, buf=None)
+    arena = builder.qsa_arena
+    for layer, row in ((target, 0), (draft, 1)):
+        tensor = cls.build_kv_cache_tensor(builder, layer)
+        caches, scales = layer.bound
+        handed = (tensor.k_cache, tensor.v_cache)
+        handed += (tensor.index_raw, tensor.index_compressed)
+        for name, bound, view in zip(names, caches, handed):
+            assert view.data_ptr() == arena.view(name)[row].data_ptr(), name
+            assert view.data_ptr() == bound.data_ptr(), name
+        assert caches[4] is None and tensor.rope_positions is None
+        assert set(scales.values()) == {None}
+        assert tensor.k_scale is None and tensor.v_scale is None
+
+
 def test_qsa_builder_inherits_the_page_contract_through_hooks():
     """One PAGE contract: the QSA builder overrides only the pool hooks."""
     _, cls = _builder()
