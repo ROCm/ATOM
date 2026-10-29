@@ -1,0 +1,9 @@
+{
+  "purpose": "Before retrying C88, require the runner-quota-failed predecessor to be absent from Slurm's active queue",
+  "jobs": [
+    {"job_id": "7788", "run_id": "38296153235"},
+    {"job_id": "8540", "run_id": "38740874930"},
+    {"job_id": "8541", "run_id": "38740903706"},
+    {"job_id": "10952", "run_id": "40843950368", "actions_conclusion": "failure", "cleanup_verified": false}
+  ]
+}

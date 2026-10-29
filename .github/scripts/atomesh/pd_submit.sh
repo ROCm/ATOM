@@ -372,9 +372,13 @@ fi
 mkdir -p "${LOG_ROOT}"
 if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
   # Archived logs may be reclaimed; admission uses fresh scheduler state.
+  c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-jobs.json"
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-C88-MC ]]; then
+    c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-c88-jobs.json"
+  fi
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_spur_allocation.py" check-previous \
     --controller "${SPUR_CONTROLLER_ADDR}" \
-    --previous-manifest "${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-jobs.json" \
+    --previous-manifest "${c48_previous_manifest}" \
     --output "${RESULT_DIR}/${ATOMESH_CELL_ID}-previous-inactive.json"
 fi
 # Recorded before sbatch so the job summary can point at the logs even when the

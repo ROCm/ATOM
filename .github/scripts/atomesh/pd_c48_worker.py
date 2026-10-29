@@ -266,15 +266,15 @@ class ManifestWorker(Worker):
         if os.environ.get("C48_MOONCAKE_DCP_TRANSFER") == "1":
             import hashlib
             from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
-                dcp_transfer, mooncake_connector,
+                dcp_staging, dcp_transfer, mooncake_connector,
             )
-            assert hasattr(mooncake_connector.MooncakeConnectorWorker, "_build_dcp_request_params")
+            assert hasattr(mooncake_connector.MooncakeConnectorWorker, "_send_staged_dcp")
             assert {"mla_block_sizes", "mamba_state_sizes", "req_num_tokens"}.issubset(
                 mooncake_connector.MooncakeXferMetadata.__struct_fields__)
             data["mooncake_dcp"] = {
                 module.__name__: {"path": module.__file__,
                                   "sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()}
-                for module in (mooncake_connector, dcp_transfer)
+                for module in (mooncake_connector, dcp_transfer, dcp_staging)
             }
         out = Path(os.environ["C48_DIAG_DIR"])
         out.mkdir(parents=True, exist_ok=True)

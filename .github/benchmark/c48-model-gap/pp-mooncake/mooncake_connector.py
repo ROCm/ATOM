@@ -36,6 +36,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.dcp_staging import (
+    stage_dcp_tokens,
+    staged_write_spans,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.dcp_transfer import (
     plan_dcp_copy_spans,
 )
@@ -689,6 +693,7 @@ class SendBlockMeta:
     need_send: int = 0
     sent: int = 0
     sending: int = 0
+    kv_ready_event: torch.cuda.Event | None = None
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -1241,6 +1246,14 @@ class MooncakeConnectorWorker:
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
+        self.dcp_staging_bytes = int(
+            kv_transfer_config.kv_connector_extra_config.get("dcp_staging_bytes", 0)
+        )
+        if self.dcp_staging_bytes < 0:
+            raise ValueError("dcp_staging_bytes must be nonnegative")
+        self._dcp_staging_buffer: torch.Tensor | None = None
+        self._sender_thread_state = threading.local()
+        self._sender_slots = itertools.count()
         # Create more tasks than workers to keep the thread pool saturated.
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
@@ -1681,6 +1694,9 @@ class MooncakeConnectorWorker:
                         "Request %s expired before sending on P side.", d_req_id
                     )
 
+            stage_mla = (
+                self.dcp_staging_bytes > 0 and self.dcp_size != meta.remote_dcp_size
+            )
             (
                 src_ptrs,
                 dst_ptrs,
@@ -1692,6 +1708,7 @@ class MooncakeConnectorWorker:
                 meta,
                 local_regions,
                 remote_regions,
+                stage_mla=stage_mla,
             )
             err_req_set = set(err_reqs)
             ok_ready_reqs = [
@@ -1700,15 +1717,22 @@ class MooncakeConnectorWorker:
                 if d_req_id not in err_req_set
             ]
 
-            if src_ptrs:
+            if src_ptrs or (stage_mla and ok_ready_reqs):
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                send_fn = self._send_staged_dcp if stage_mla else self._send_blocks
+                staging_args = (
+                    (ok_ready_reqs, meta, local_regions, remote_regions)
+                    if stage_mla
+                    else ()
+                )
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
-                    self._send_blocks,
+                    send_fn,
                     remote_session,
                     src_ptrs,
                     dst_ptrs,
                     lengths,
+                    *staging_args,
                 )
 
                 if ret_value != 0:
@@ -1796,6 +1820,8 @@ class MooncakeConnectorWorker:
         agent_meta: MooncakeXferMetadata,
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
+        *,
+        stage_mla: bool = False,
     ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
         src_ptrs = []
         dst_ptrs = []
@@ -1908,6 +1934,7 @@ class MooncakeConnectorWorker:
                         agent_meta,
                         local_regions,
                         remote_regions,
+                        stage_mla=stage_mla,
                     )
                 except (KeyError, ValueError) as exc:
                     err_reqs.append(d_req_id)
@@ -2106,6 +2133,8 @@ class MooncakeConnectorWorker:
         meta: MooncakeXferMetadata,
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
+        *,
+        stage_mla: bool = False,
     ) -> tuple[list[int], list[int], list[int]]:
         """Build byte descriptors without treating Mamba states as token pages."""
         src, dst, lengths = [], [], []
@@ -2142,6 +2171,8 @@ class MooncakeConnectorWorker:
                     remote_offset += destination_size
                 continue
 
+            if stage_mla:
+                continue
             source_kernel = self.mla_block_sizes[local.layer_name]
             destination_kernel = meta.mla_block_sizes[remote.layer_name]
             span_key = (group, source_kernel, destination_kernel)
@@ -2202,11 +2233,167 @@ class MooncakeConnectorWorker:
                 lengths.append(count * token_bytes)
         return src, dst, lengths
 
+    def _send_staged_dcp(
+        self,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        ready_reqs: list[tuple[ReqId, SendBlockMeta]],
+        meta: MooncakeXferMetadata,
+        local_regions: list[TransferRegion],
+        remote_regions: list[TransferRegion],
+    ) -> int:
+        """A sender thread owns its slot until all synchronous writes finish."""
+        state = self._sender_thread_state
+        if state.poisoned:
+            return -1
+        try:
+            assert self._dcp_staging_buffer is not None
+            staging = self._dcp_staging_buffer[state.slot]
+            with torch.cuda.stream(state.stream):
+                for req_id, send_meta in ready_reqs:
+                    if any(meta.req_blocks[req_id][1]):
+                        if send_meta.kv_ready_event is None:
+                            raise ValueError("Missing model-stream KV readiness event")
+                        state.stream.wait_event(send_meta.kv_ready_event)
+                state.stream.synchronize()
+                if src_ptrs:
+                    ret = self._send_blocks(remote_session, src_ptrs, dst_ptrs, lengths)
+                    if ret != 0:
+                        state.poisoned = True
+                        return ret
+                for req_id, send_meta in ready_reqs:
+                    if not any(meta.req_blocks[req_id][1]):
+                        continue
+                    num_tokens = meta.req_num_tokens[req_id]
+                    block_tables = {}
+                    for local, remote in zip(local_regions, remote_regions):
+                        if isinstance(self._layer_specs[local.layer_name], MambaSpec):
+                            continue
+                        group = local.group_index
+                        destination = meta.req_blocks[req_id][1][group]
+                        if not destination:
+                            continue
+                        source = send_meta.local_block_ids[group]
+                        source_size = self.kv_cache_config.transfer_groups[
+                            group
+                        ].kv_cache_spec.block_size
+                        destination_size = meta.remote_group_block_sizes[group]
+                        source_kernel = self.mla_block_sizes[local.layer_name]
+                        destination_kernel = meta.mla_block_sizes[remote.layer_name]
+                        cache = self.device_kv_caches[local.layer_name]
+                        factor = source_size // source_kernel
+                        if (
+                            num_tokens <= 0
+                            or len(source) * source_size < num_tokens
+                            or min(source, default=-1) < 0
+                            or (max(source, default=0) + 1) * factor > cache.shape[0]
+                        ):
+                            raise ValueError(
+                                "DCP staging source does not cover the prompt"
+                            )
+                        first_logical = cdiv(
+                            num_tokens, destination_size * meta.remote_dcp_size
+                        ) - len(destination)
+                        if first_logical < 0:
+                            raise ValueError(
+                                "DCP staging destination includes lookahead"
+                            )
+                        first_token = first_logical * destination_size
+                        cycles, tail = divmod(
+                            num_tokens,
+                            meta.remote_dcp_size * meta.remote_interleave_size,
+                        )
+                        owned = cycles * meta.remote_interleave_size + min(
+                            max(
+                                tail
+                                - meta.remote_dcp_rank * meta.remote_interleave_size,
+                                0,
+                            ),
+                            meta.remote_interleave_size,
+                        )
+                        count = max(owned - first_token, 0)
+                        destination_blocks = [
+                            block * (destination_size // destination_kernel) + offset
+                            for block in destination
+                            for offset in range(destination_size // destination_kernel)
+                        ]
+                        if any(block < 0 for block in destination_blocks):
+                            raise ValueError("Negative DCP destination block")
+                        token_bytes = local.kv_block_len // source_kernel
+                        chunk_tokens = staging.numel() // token_bytes
+                        if chunk_tokens <= 0:
+                            raise ValueError("DCP staging slot cannot hold one token")
+                        if group not in block_tables:
+                            block_tables[group] = torch.tensor(
+                                source, dtype=torch.int64, device=cache.device
+                            )
+                        for start in range(0, count, chunk_tokens):
+                            size = min(count - start, chunk_tokens)
+                            out = staging[: size * token_bytes].view(size, token_bytes)
+                            stage_dcp_tokens(
+                                cache,
+                                block_tables[group],
+                                out,
+                                source_logical_size=source_size,
+                                source_kernel_size=source_kernel,
+                                local_token_start=first_token + start,
+                                dcp_size=meta.remote_dcp_size,
+                                dcp_rank=meta.remote_dcp_rank,
+                                interleave_size=meta.remote_interleave_size,
+                            )
+                            state.stream.synchronize()
+                            chunk_src, chunk_dst, chunk_lengths = [], [], []
+                            for (
+                                offset,
+                                block,
+                                block_offset,
+                                tokens,
+                            ) in staged_write_spans(
+                                destination_blocks, destination_kernel, start, size
+                            ):
+                                source_ptr = out.data_ptr() + offset * token_bytes
+                                destination_ptr = (
+                                    remote.base_addr
+                                    + block * remote.block_len
+                                    + block_offset * token_bytes
+                                )
+                                length = tokens * token_bytes
+                                if (
+                                    chunk_src
+                                    and chunk_dst[-1] + chunk_lengths[-1]
+                                    == destination_ptr
+                                    and chunk_src[-1] + chunk_lengths[-1] == source_ptr
+                                ):
+                                    chunk_lengths[-1] += length
+                                else:
+                                    chunk_src.append(source_ptr)
+                                    chunk_dst.append(destination_ptr)
+                                    chunk_lengths.append(length)
+                            ret = self._send_blocks(
+                                remote_session, chunk_src, chunk_dst, chunk_lengths
+                            )
+                            if ret != 0:
+                                state.poisoned = True
+                                return ret
+            return 0
+        except Exception:
+            # Failed synchronous writes may still retain the registered source.
+            # Never overwrite this thread's slot again after an uncertain failure.
+            state.poisoned = True
+            logger.exception("Mooncake staged DCP transfer failed")
+            return -1
+
     def _bind_sender_thread_device(self) -> None:
         """ThreadPoolExecutor initializer â€” binds each pool thread to the
         correct CUDA device.  CUDA device selection is thread-local, so
         without this, NVLink transfers fail for TP ranks > 0."""
         current_platform.set_device(self.device_id)
+        if self.dcp_staging_bytes:
+            self._sender_thread_state.slot = next(self._sender_slots)
+            self._sender_thread_state.stream = torch.cuda.Stream(device=self.device_id)
+            self._sender_thread_state.poisoned = False
 
     def _send_blocks(
         self,
@@ -2463,6 +2650,14 @@ class MooncakeConnectorWorker:
                 collapsed_views,
             )
 
+        if self.dcp_staging_bytes and not self.is_kv_consumer:
+            self._dcp_staging_buffer = torch.empty(
+                (self.num_sender_workers, self.dcp_staging_bytes),
+                dtype=torch.uint8,
+                device=next(iter(kv_caches.values())).device,
+            )
+            kv_data_ptrs.append(self._dcp_staging_buffer.data_ptr())
+            kv_data_lens.append(self._dcp_staging_buffer.nbytes)
         ret_value = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
@@ -2841,13 +3036,18 @@ class MooncakeConnectorWorker:
             else:
                 self.receive_kv(remote_engine_id, pull_metas)
 
-    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+    async def record_send_reqs(
+        self,
+        metadata: MooncakeConnectorMetadata,
+        kv_ready_event: torch.cuda.Event | None = None,
+    ):
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
                 send_meta = self.reqs_need_send[transfer_id]
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
+                send_meta.kv_ready_event = kv_ready_event
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
@@ -2878,8 +3078,14 @@ class MooncakeConnectorWorker:
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
+            kv_ready_event = None
+            if self.dcp_staging_bytes and any(
+                blocks for _, blocks in metadata.reqs_to_send.values()
+            ):
+                kv_ready_event = torch.cuda.Event()
+                kv_ready_event.record()
             asyncio.run_coroutine_threadsafe(
-                self.record_send_reqs(metadata), self.sender_loop
+                self.record_send_reqs(metadata, kv_ready_event), self.sender_loop
             )
 
     def _producer_cache_is_replicated(self) -> bool:

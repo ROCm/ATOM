@@ -60,12 +60,13 @@ class PortMountTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         rc, pp = mounts(base + "-PP8-MC")
         self.assertEqual(rc, 0)
-        self.assertEqual(len(normal) + 2, len(pp))
-        self.assertEqual(normal[:-1], pp[:-3])
+        self.assertEqual(len(normal) + 3, len(pp))
+        self.assertEqual(normal[:-1], pp[:-4])
         self.assertIn("/latent-down-mxfp4/linear.py,", normal[-1])
-        self.assertIn("/pp-aux-hidden/linear.py,", pp[-3])
-        self.assertIn("/pp-mooncake/mooncake_connector.py,", pp[-2])
-        self.assertIn("/pp-mooncake/dcp_transfer.py,", pp[-1])
+        self.assertIn("/pp-aux-hidden/linear.py,", pp[-4])
+        self.assertIn("/pp-mooncake/mooncake_connector.py,", pp[-3])
+        self.assertIn("/pp-mooncake/dcp_transfer.py,", pp[-2])
+        self.assertIn("/pp-mooncake/dcp_staging.py,", pp[-1])
 
     def test_manager_overlay_only_for_cpuref(self):
         rc, base = mounts("V-QD")

@@ -112,6 +112,8 @@ class LaunchTest(unittest.TestCase):
                 self.assertEqual(candidate["roles"]["prefill"]["env"].pop("VLLM_PP_LAYER_PARTITION"),
                                  "12,12,12,12,12,12,12,9")
                 args = candidate["roles"]["prefill"]["args"]
+                connector = args["kv-transfer-config"]["kv_connector_extra_config"]["connectors"][0]
+                self.assertEqual(connector["kv_connector_extra_config"].pop("dcp_staging_bytes"), 64 << 20)
                 self.assertEqual(args.pop("pipeline-parallel-size"), 8)
                 for key in ("tensor-parallel-size", "decode-context-parallel-size"):
                     self.assertEqual(args[key], 1)
