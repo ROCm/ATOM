@@ -7,16 +7,27 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
+from .utils import FLA_GDN_FIX_BT, check_shared_mem
 
-BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+# The Triton kernel's launch configuration, fixed: an autotuner would time its
+# configurations on the first launch of every process, in the serving loop.
+# gfx1250 runs `chunk_o_gfx1250`.
+_TRITON_BK = _TRITON_BV = 64 if check_shared_mem() else 32
+_TRITON_NUM_WARPS, _TRITON_NUM_STAGES = 4, 2
+
+
+@functools.cache
+def _use_gfx1250_kernel(device_index: int) -> bool:
+    props = torch.cuda.get_device_properties(device_index)
+    return props.gcnArchName.split(":")[0] == "gfx1250"
 
 
 @triton.heuristics(
@@ -25,16 +36,6 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_NT": lambda args: args["nt_ptr"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
@@ -189,6 +190,7 @@ def chunk_fwd_o(
     head_major_vk: bool = False,
     chunk_indices: torch.Tensor | None = None,
     plan=None,
+    gate=None,
 ) -> torch.Tensor:
     """Returns the attention output tensor.
 
@@ -199,6 +201,10 @@ def chunk_fwd_o(
     entry point asserts these contracts before .apply() (so input_guard's
     silent .contiguous() clone can't defeat them); we re-assert here as a
     defense-in-depth backstop for any caller that bypasses the public API.
+
+    ``gate`` = (z, norm weight, eps): ``o`` receives the layer's gated RMSNorm
+    ``norm(o) * weight * silu(z)`` (groups of V, z ``[B, T, H, V]`` or
+    ``[T, H, V]`` with contiguous ``[H, V]`` rows) instead of the raw output.
     """
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[1] if head_major_vk else v.shape[-2]
@@ -236,10 +242,39 @@ def chunk_fwd_o(
             "assumes stride (H*V, 1) on the (T, V) plane)"
         )
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
+    if (
+        not head_major_vk
+        and _use_gfx1250_kernel(q.device.index)
+        and K == 128
+        and V == 128
+        and BT == 64
+        and q.dtype == torch.bfloat16
+    ):
+        from .chunk_o_gfx1250 import chunk_o_gfx1250
 
-    chunk_fwd_kernel_o[grid](
+        return chunk_o_gfx1250(
+            q,
+            k,
+            v,
+            h,
+            g,
+            o,
+            scale,
+            cu_seqlens,
+            chunk_indices,
+            nt_ptr,
+            NT,
+            T,
+            B,
+            H,
+            Hg,
+            K,
+            V,
+            BT,
+            gate=gate,
+        )
+
+    chunk_fwd_kernel_o[(triton.cdiv(V, _TRITON_BV), NT, B * H)](
         q,
         k,
         v,
@@ -256,7 +291,26 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        BK=_TRITON_BK,
+        BV=_TRITON_BV,
         HEAD_MAJOR_VK=head_major_vk,
         USE_EXP2=head_major_vk,
+        num_warps=_TRITON_NUM_WARPS,
+        num_stages=_TRITON_NUM_STAGES,
     )
+    if gate is not None:
+        from .layernorm_guard import layer_norm_fwd
+
+        z, weight, eps = gate
+        rows = o.view(-1, V)
+        layer_norm_fwd(
+            rows,
+            weight,
+            None,
+            eps,
+            z=z.reshape(-1, V),
+            out=rows,
+            norm_before_gate=True,
+            is_rms_norm=True,
+        )
     return o

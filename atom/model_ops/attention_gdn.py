@@ -206,6 +206,10 @@ class GatedDeltaNet(nn.Module):
             validate_data=False,
         )
 
+    def _output_gate(self, z: torch.Tensor):
+        """The gated RMSNorm as the chunked prefill's ``output_gate``."""
+        return (z, self.gated_norm.weight, self.gated_norm.eps)
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -362,6 +366,11 @@ class GatedDeltaNet(nn.Module):
             value_spec = value_spec.view(1, num_tokens_spec, -1, self.head_v_dim)
 
         # 1.2: Process the remaining part
+        # The prefill conv L2-normalizes q and k in its epilogue unless the
+        # FlyDSL prefill (which normalizes the raw q and k itself) may take them.
+        qk_normed_by_conv = gdn_metadata.num_prefills > 0 and not (
+            flydsl_policy is not None and flydsl_policy.prefill and not use_replayssm
+        )
         if gdn_metadata.num_prefills > 0:
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
@@ -379,6 +388,7 @@ class GatedDeltaNet(nn.Module):
                 k_dim_size=self.num_k_heads * self.head_k_dim // self.tp_size,
                 v_dim_size=self.num_v_heads * self.head_v_dim // self.tp_size,
                 metadata=gdn_metadata,
+                qk_l2norm_head_dim=self.head_k_dim if qk_normed_by_conv else None,
             )
         elif gdn_metadata.num_decodes > 0:
             query_non_spec, key_non_spec, value_non_spec = causal_conv1d_update(
@@ -523,6 +533,8 @@ class GatedDeltaNet(nn.Module):
         # (pure prefill); the merge below then sees the same data_ptr and skips
         # its copy.
         wrote_core_attn_out = False
+        # Whether the prefill output kernel already applied the gated RMSNorm.
+        gate_fused = False
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
@@ -551,6 +563,7 @@ class GatedDeltaNet(nn.Module):
                 # state pool by slot (`fla_ops.varlen_plan`). No checkpoints
                 # on this path: the builder keeps those steps eager.
                 wrote_core_attn_out = spec_sequence_masks is None
+                gate_fused = wrote_core_attn_out and z is not None
                 core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
@@ -561,7 +574,7 @@ class GatedDeltaNet(nn.Module):
                     output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=not qk_normed_by_conv,
                     o=(
                         core_attn_out[:num_actual_tokens].unsqueeze(0)
                         if wrote_core_attn_out
@@ -569,6 +582,9 @@ class GatedDeltaNet(nn.Module):
                     ),
                     keep_intermediate_states=False,
                     plan=plan,
+                    output_gate=(
+                        self._output_gate(z[:num_actual_tokens]) if gate_fused else None
+                    ),
                 )
             elif use_flydsl_prefill:
                 core_attn_out_non_spec, last_recurrent_state, flydsl_h = prefill(
@@ -594,6 +610,9 @@ class GatedDeltaNet(nn.Module):
                 # fresh `o` that step 3 would copy over (a 64 MiB memcpy per
                 # GDN layer at T=16384).
                 wrote_core_attn_out = spec_sequence_masks is None
+                # With the output written in place, its kernel applies the gated
+                # RMSNorm in its epilogue; step 4 then has nothing to normalize.
+                gate_fused = wrote_core_attn_out and z is not None
                 core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
@@ -604,11 +623,14 @@ class GatedDeltaNet(nn.Module):
                     output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=not qk_normed_by_conv,
                     o=(
                         core_attn_out[:num_actual_tokens].unsqueeze(0)
                         if wrote_core_attn_out
                         else None
+                    ),
+                    output_gate=(
+                        self._output_gate(z[:num_actual_tokens]) if gate_fused else None
                     ),
                     # Only when there is somewhere to put them; `h` is large and is
                     # dropped on return otherwise.
@@ -778,7 +800,7 @@ class GatedDeltaNet(nn.Module):
         elif core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
-        if z is not None:
+        if z is not None and not gate_fused:
             gdn_fused_decode.gated_rmsnorm_(
                 core_attn_out[:num_actual_tokens],
                 z[:num_actual_tokens],

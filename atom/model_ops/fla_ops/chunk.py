@@ -9,7 +9,6 @@
 import warnings
 
 import torch
-import triton
 from einops import rearrange
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -17,10 +16,9 @@ from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .fused_cumsum_kkt import fused_cumsum_kkt
-from .fused_merge_recompute import fused_merge_recompute
-from .index import prepare_chunk_indices
+from .fused_inverse_recompute import fused_inverse_recompute
 from .l2norm import l2norm_fwd
-from .solve_tril import solve_tril, solve_tril_16x16_kernel
+from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard, is_amd
 from .wy_fast import recompute_w_u_fwd
 
@@ -45,45 +43,20 @@ def chunk_gated_delta_rule_fwd(
     keep_intermediate_states: bool = False,
     plan=None,
     state_slots=None,
+    output_gate=None,
 ):
-    B, T = q.shape[0], q.shape[1]
-    Hv = g.shape[2]
+    T = q.shape[1]
 
     if is_amd and T >= 64:
-        # OP-B: HIP fast path. 3 fused kernels replace 4-step:
+        # HIP fast path: 2 kernels for the 4 steps below.
         # chunk_local_cumsum + chunk_scaled_dot_kkt → fused_cumsum_kkt
-        # solve_tril(BT=64) (full inverse) → solve_tril_16x16 (diag only)
-        # recompute_w_u_fwd → fused_merge_recompute (cross-block inverse + w/u in SMEM)
-        g, A = fused_cumsum_kkt(
+        # solve_tril + recompute_w_u_fwd → fused_inverse_recompute (the chunk's
+        # inverse in 16 x 16 blocks, then w / u)
+        g, A, beta_hm, scale_hm = fused_cumsum_kkt(
             g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan
         )
-        if plan is not None:
-            chunk_indices_16, NT_16, nt16_ptr = (
-                plan.chunk_indices_16, plan.nt16_max, plan.nt16
-            )
-        else:
-            chunk_indices_16 = (
-                prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
-            )
-            NT_16 = (
-                len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
-            )
-            nt16_ptr = None
-        Ai16 = torch.empty(B, T, Hv, 16, device=A.device, dtype=torch.float32)
-        solve_tril_16x16_kernel[(NT_16, B * Hv)](
-            A=A,
-            Ai=Ai16,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices_16,
-            nt_ptr=nt16_ptr,
-            T=T,
-            H=Hv,
-            BT=64,
-            USE_TMA=False,
-            DOT_PRECISION="ieee",
-        )
-        w, u = fused_merge_recompute(
-            k, v, beta, g, A, Ai16, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan
+        w, u = fused_inverse_recompute(
+            k, v, A, beta_hm, scale_hm, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan
         )
     else:
         g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
@@ -120,7 +93,8 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         o=o,
-            plan=plan,
+        plan=plan,
+        gate=output_gate,
     )
     # `h` is the recurrent state at EVERY chunk boundary — [B, NT, H, K, V],
     # where h[:, j] is the state after j*chunk_size tokens. The SSM state cache
@@ -184,6 +158,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         keep_intermediate_states: bool = False,
         plan=None,
         state_slots=None,
+        output_gate=None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -206,6 +181,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             keep_intermediate_states=keep_intermediate_states,
             plan=plan,
             state_slots=state_slots,
+            output_gate=output_gate,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -240,6 +216,7 @@ def chunk_gated_delta_rule(
     keep_intermediate_states: bool = False,
     plan=None,
     state_slots=None,
+    output_gate=None,
 ):
     r"""
     Args:
@@ -273,6 +250,12 @@ def chunk_gated_delta_rule(
             `pop_last_intermediate_states` to collect. Default: `False`, which
             drops them as soon as the forward returns — they are ~33 MB at
             T=8192, H=8, K=V=128, so a caller that never pops must not ask.
+        output_gate (Optional[tuple]):
+            ``(z, norm_weight, eps)``: ``o`` receives the gated RMSNorm
+            ``norm(o) * norm_weight * silu(z)`` (groups of V) instead of the raw
+            output -- on gfx1250 in the output kernel's epilogue. ``z`` is
+            ``[T, H, V]`` (or ``[B, T, H, V]``) with contiguous ``[H, V]`` rows.
+            Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -397,6 +380,7 @@ def chunk_gated_delta_rule(
         keep_intermediate_states,
         plan,
         state_slots,
+        output_gate,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

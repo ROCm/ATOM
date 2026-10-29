@@ -21,10 +21,6 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-    key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
-)
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_scalar_kernel(
     s,
@@ -77,14 +73,6 @@ def chunk_local_cumsum_scalar_kernel(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps)
-        for BS in BS_LIST
-        for num_warps in [2, 4, 8]
-    ],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
-)
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
     s,
@@ -176,6 +164,8 @@ def chunk_local_cumsum_scalar(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        # fixed: the autotuner's gfx1250 picks were 4 warps at 32 heads, 1 at 8
+        num_warps=4 if H >= 16 else 1,
     )
     return g
 
@@ -205,13 +195,13 @@ def chunk_local_cumsum_vector(
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
-    def grid(meta):
-        return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
+    # fixed launch: the largest feature block the shared memory allows
+    BS = BS_LIST[-1]
 
     # keep cumulative normalizer in fp32
     # this kernel is equivalent to
     # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
-    chunk_local_cumsum_vector_kernel[grid](
+    chunk_local_cumsum_vector_kernel[(triton.cdiv(S, BS), NT, B * H)](
         g_org,
         g,
         cu_seqlens,
@@ -221,8 +211,10 @@ def chunk_local_cumsum_vector(
         H=H,
         S=S,
         BT=BT,
+        BS=BS,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        num_warps=4,
     )
     return g
 

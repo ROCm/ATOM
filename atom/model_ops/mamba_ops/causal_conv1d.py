@@ -9,10 +9,222 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.hip import libdevice
 
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 PAD_SLOT_ID = -1
+
+
+@triton.jit()
+def _causal_conv1d_fwd_rows_kernel(
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    conv_states_ptr,
+    cache_indices_ptr,
+    cache_indices_in_ptr,
+    has_initial_states_ptr,
+    query_start_loc_ptr,
+    batch_ptr,
+    token_chunk_offset_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    eps,
+    dim: tl.constexpr,
+    k_dim_size: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_istate_seq: tl.constexpr,
+    stride_istate_dim: tl.constexpr,
+    stride_istate_token: tl.constexpr,
+    stride_cache_indices: tl.constexpr,
+    query_token_stride: tl.constexpr,
+    key_token_stride: tl.constexpr,
+    value_token_stride: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
+    NP2_STATELEN: tl.constexpr,
+    QK_L2NORM: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """`_causal_conv1d_fwd_kernel` for width 4 without prefix-cache block
+    states, on the same (sequence, BLOCK_M-token chunk) programs: the chunk's
+    tokens are an unrolled loop, so every row is one independent load issued up
+    front and the window shifts in registers, and one wave covers BLOCK_N
+    channels (16 B a lane) where the reference spreads them over four.
+    QK_L2NORM L2-normalizes each HEAD_DIM-wide head of q and k after the bf16
+    rounding of the conv output, which is what `l2norm_fwd` on the stored q and
+    k computes. The taps are fp32 FMAs, oldest first after the bias, as the
+    fused GDN verify kernel's conv: the reference kernel rounds each product to
+    the input dtype, which costs ALU time and puts its outputs at 1.45x the bf16
+    rounding error of an fp64 conv, where these are the correctly rounded value.
+    SiLU takes the hardware exp and reciprocal (about 1 fp32 ulp), which moves
+    about 1 bf16 output in 10^5 by one step. The conv states match the reference
+    kernel bit for bit."""
+    state_len: tl.constexpr = KERNEL_WIDTH - 1
+    tl.static_assert(KERNEL_WIDTH == 4)
+    idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
+    chunk_offset = tl.load(token_chunk_offset_ptr + tl.program_id(0))
+    if idx_seq == pad_slot_id:
+        return
+    block_start = tl.program_id(1) * BLOCK_N
+    idx_feats = block_start + tl.arange(0, BLOCK_N)
+    mask_feats = idx_feats < dim
+    sequence_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+    seqlen = tl.load(query_start_loc_ptr + idx_seq + 1) - sequence_start_index
+    slot_in = tl.load(cache_indices_in_ptr + idx_seq * stride_cache_indices).to(
+        tl.int64
+    )
+    if USE_PAD_SLOT:  # noqa: SIM102
+        if slot_in == pad_slot_id:
+            return
+    load_init_state = (chunk_offset == 0) & (
+        tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
+    )
+    state_in_base = (
+        conv_states_ptr + slot_in * stride_istate_seq + idx_feats * stride_istate_dim
+    )
+    x_base = x_ptr + sequence_start_index * stride_x_token + idx_feats
+    token_offset = chunk_offset * BLOCK_M
+    # the window before the chunk: the tokens before it, or the initial state
+    first = chunk_offset == 0
+    col0 = tl.load(
+        x_base + (token_offset - 3) * stride_x_token,
+        mask=mask_feats & (~first),
+        other=0.0,
+    )
+    col1 = tl.load(
+        x_base + (token_offset - 2) * stride_x_token,
+        mask=mask_feats & (~first),
+        other=0.0,
+    )
+    col2 = tl.load(
+        x_base + (token_offset - 1) * stride_x_token,
+        mask=mask_feats & (~first),
+        other=0.0,
+    )
+    s0 = tl.load(state_in_base, mask=mask_feats & load_init_state, other=0.0)
+    s1 = tl.load(
+        state_in_base + stride_istate_token,
+        mask=mask_feats & load_init_state,
+        other=0.0,
+    )
+    s2 = tl.load(
+        state_in_base + 2 * stride_istate_token,
+        mask=mask_feats & load_init_state,
+        other=0.0,
+    )
+    col0 = tl.where(first, s0, col0)
+    col1 = tl.where(first, s1, col1)
+    col2 = tl.where(first, s2, col2)
+    w0 = tl.load(w_ptr + idx_feats * stride_w_dim, mask=mask_feats, other=0.0)
+    w1 = tl.load(
+        w_ptr + idx_feats * stride_w_dim + stride_w_width, mask=mask_feats, other=0.0
+    )
+    w2 = tl.load(
+        w_ptr + idx_feats * stride_w_dim + 2 * stride_w_width,
+        mask=mask_feats,
+        other=0.0,
+    )
+    w3 = tl.load(
+        w_ptr + idx_feats * stride_w_dim + 3 * stride_w_width,
+        mask=mask_feats,
+        other=0.0,
+    )
+    w0 = w0.to(tl.float32)
+    w1 = w1.to(tl.float32)
+    w2 = w2.to(tl.float32)
+    w3 = w3.to(tl.float32)
+    if HAS_BIAS:
+        acc0 = tl.load(bias_ptr + idx_feats, mask=mask_feats, other=0.0).to(tl.float32)
+    else:
+        acc0 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    is_qk = block_start < 2 * k_dim_size
+    for r in tl.static_range(BLOCK_M):
+        row = token_offset + r
+        valid = row < seqlen
+        x_r = tl.load(x_base + row * stride_x_token, mask=mask_feats & valid, other=0.0)
+        acc = tl.fma(col0.to(tl.float32), w0, acc0)
+        acc = tl.fma(col1.to(tl.float32), w1, acc)
+        acc = tl.fma(col2.to(tl.float32), w2, acc)
+        acc = tl.fma(x_r.to(tl.float32), w3, acc)
+        col0 = col1
+        col1 = col2
+        col2 = x_r
+        if SILU_ACTIVATION:
+            acc = libdevice.fast_dividef(acc, 1.0 + libdevice.fast_expf(-acc))
+        token_pos = sequence_start_index + row
+        if is_qk:
+            if QK_L2NORM:
+                heads: tl.constexpr = BLOCK_N // HEAD_DIM
+                y = tl.reshape(
+                    acc.to(query_ptr.dtype.element_ty).to(tl.float32),
+                    (heads, HEAD_DIM),
+                )
+                rstd = tl.rsqrt(tl.sum(y * y, axis=1) + eps)
+                acc = tl.reshape(y * rstd[:, None], (BLOCK_N,))
+            if block_start < k_dim_size:
+                tl.store(
+                    query_ptr + token_pos * query_token_stride + idx_feats,
+                    acc,
+                    mask=mask_feats & valid,
+                )
+            else:
+                tl.store(
+                    key_ptr + token_pos * key_token_stride + idx_feats - k_dim_size,
+                    acc,
+                    mask=mask_feats & valid,
+                )
+        else:
+            tl.store(
+                value_ptr + token_pos * value_token_stride + idx_feats - 2 * k_dim_size,
+                acc,
+                mask=mask_feats & valid,
+            )
+
+    # The first chunk moves the sequence's last state_len inputs into its write
+    # slot, after every read of the initial state above (the slots may be equal).
+    if chunk_offset == 0:
+        idx_state = tl.arange(0, NP2_STATELEN)
+        mask_state = idx_state < state_len
+        state_src = seqlen - state_len + idx_state
+        state_in_x = state_src >= 0
+        new_x = tl.load(
+            x_base[None, :] + (state_src * stride_x_token)[:, None],
+            mask=(mask_state & state_in_x)[:, None] & mask_feats[None, :],
+            other=0.0,
+        )
+        keep_old = (
+            mask_state & (state_src < 0) & load_init_state & (slot_in < num_cache_lines)
+        )
+        old_state = tl.load(
+            state_in_base[None, :]
+            + ((state_src + state_len) * stride_istate_token)[:, None],
+            mask=keep_old[:, None] & mask_feats[None, :],
+            other=0.0,
+        )
+        new_state = tl.where(state_in_x[:, None], new_x, old_state)
+        slot_out = tl.load(cache_indices_ptr + idx_seq * stride_cache_indices).to(
+            tl.int64
+        )
+        tl.debug_barrier()
+        tl.store(
+            conv_states_ptr
+            + slot_out * stride_istate_seq
+            + (idx_feats * stride_istate_dim)[None, :]
+            + (idx_state * stride_istate_token)[:, None],
+            new_state,
+            mask=mask_state[:, None] & mask_feats[None, :],
+        )
 
 
 @triton.jit()
@@ -533,8 +745,14 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    qk_l2norm_head_dim: int | None = None,
+    qk_l2norm_eps: float = 1e-6,
 ):
     """support varlen + continuous batching when x is 2D tensor
+
+    qk_l2norm_head_dim: L2-normalize each head of this width of the returned
+        query and key, as `l2norm_fwd` would after the conv (fused into the
+        width-4 kernel's epilogue).
 
     x: (dim,cu_seq_len)
         cu_seq_len = total tokens of all seqs in that batch
@@ -762,6 +980,67 @@ def causal_conv1d_fn(
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
 
+    rows_block_n = _rows_block_n(k_dim_size, v_dim_size, qk_l2norm_head_dim)
+    if (
+        width == 4
+        and rows_block_n is not None
+        and block_idx_last_scheduled_token is None
+        and conv_states is not None
+        and cache_indices is not None
+        and has_initial_state is not None
+        and stride_x_dim == 1
+    ):
+        programs = num_program(
+            {
+                "BLOCK_M": BLOCK_M,
+                "batch_ptr": batch_ptr,
+                "token_chunk_offset_ptr": token_chunk_offset_ptr,
+                "x_ptr": x,
+            },
+            args,
+        )
+        _causal_conv1d_fwd_rows_kernel[(programs, dim // rows_block_n)](
+            x,
+            weight,
+            bias,
+            conv_states,
+            cache_indices,
+            cache_indices if cache_indices_in is None else cache_indices_in,
+            has_initial_state,
+            query_start_loc,
+            batch_ptr,
+            token_chunk_offset_ptr,
+            query,
+            key,
+            value,
+            qk_l2norm_eps,
+            dim=dim,
+            k_dim_size=k_dim_size,
+            num_cache_lines=num_cache_lines,
+            stride_x_token=stride_x_token,
+            stride_w_dim=stride_w_dim,
+            stride_w_width=stride_w_width,
+            stride_istate_seq=stride_istate_seq,
+            stride_istate_dim=stride_istate_dim,
+            stride_istate_token=stride_istate_token,
+            stride_cache_indices=stride_cache_indices,
+            query_token_stride=query_token_stride,
+            key_token_stride=key_token_stride,
+            value_token_stride=value_token_stride,
+            pad_slot_id=pad_slot_id,
+            HAS_BIAS=bias is not None,
+            KERNEL_WIDTH=width,
+            SILU_ACTIVATION=activation in ["silu", "swish"],
+            USE_PAD_SLOT=pad_slot_id is not None,
+            NP2_STATELEN=np2_statelen,
+            QK_L2NORM=qk_l2norm_head_dim is not None,
+            HEAD_DIM=qk_l2norm_head_dim or rows_block_n,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=rows_block_n,
+            num_warps=1,
+        )
+        return query, key, value
+
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -817,7 +1096,29 @@ def causal_conv1d_fn(
         BLOCK_N=256,
         num_stages=2,
     )
+    if qk_l2norm_head_dim is not None:
+        from atom.model_ops.fla_ops.l2norm import l2norm_fwd
+
+        query = l2norm_fwd(query.view(-1, qk_l2norm_head_dim), qk_l2norm_eps).view(
+            query.shape
+        )
+        key = l2norm_fwd(key.view(-1, qk_l2norm_head_dim), qk_l2norm_eps).view(
+            key.shape
+        )
     return query, key, value
+
+
+def _rows_block_n(k_dim_size, v_dim_size, qk_l2norm_head_dim):
+    """Channels a program of `_causal_conv1d_fwd_rows_kernel` covers: inside
+    one of q / k / v, and whole heads when it normalizes q and k (None: no
+    width fits, so the reference kernel runs)."""
+    for block_n in (256, 128):
+        if k_dim_size % block_n or v_dim_size % block_n:
+            continue
+        if qk_l2norm_head_dim is not None and block_n % qk_l2norm_head_dim:
+            continue
+        return block_n
+    return None
 
 
 @triton.jit()
