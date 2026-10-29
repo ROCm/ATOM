@@ -207,6 +207,18 @@ live in the repo: `ATOM_RUN_BUDGET`, `ATOM_AGENT_TIMEOUT`, `ATOM_REVIEW_RETRIES`
 reviews it — follow `run_one.sh`'s own defaults and failure-message hints instead of
 pre-guessing an override here.
 
+## 2b. Two repo *variables* (Settings -> Secrets and variables -> Actions -> Variables)
+
+Distinct from the `.env` above: these are repo-level, read by the free `gate` and
+`watchdog` jobs that run on `ubuntu-latest` and never see the box's `.env`.
+
+| name | unset behaviour |
+|---|---|
+| `ATOM_REVIEW_AUTHORIZED` | falls back to `authorized.txt` on the default branch -- the intended steady state. Set it only to change the allowlist without a commit. |
+| `ATOM_MAX_WAIT_HOURS` | the watchdog uses its built-in default. |
+
+Neither is required for a first run.
+
 ## 3. gh auth off the job environment
 
 `fetch.sh` calls `gh` to read the PR. Authenticate it under `GH_CONFIG_DIR` rather than exporting
@@ -223,8 +235,10 @@ Expected output: `ROCm/ATOM` (or `zufayu/ATOM` while registered against the fork
 
 ## 4. Bot identity
 
-P0 needs no token for this (`rocm-atom-bot` doesn't exist yet). When it does: set the repo secret
-`ATOM_BOT_TOKEN` to the bot account's PAT. The workflow binds it as a step env var at five
+`rocm-atom-bot` was registered on 2026-10-29 (`public_repo` scope, `pull` on the repo — enough
+to comment on a public repo, though **not yet exercised against `ROCm/ATOM`**; see
+`ADMIN-HANDOFF.md` §4 for the interaction-limit check that could silently block it).
+Set the repo secret `ATOM_BOT_TOKEN` to that account's PAT. The workflow binds it as a step env var at five
 places (gate's queue step, the watchdog job, review's claim step, review's notify step, and the
 report job) — including steps that run inside the review job. The one step that is never given
 it is `run_one.sh`'s own "Review (headless GLM)" step: that step carries no `ATOM_BOT_TOKEN` env,
