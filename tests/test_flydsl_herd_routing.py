@@ -80,7 +80,9 @@ def test_herd_candidates_take_the_layers_own_routing(monkeypatch, decode_step, p
     # One extra candidate, raw scores: fused_moe drops, renormalises and scales.
     assert kwargs["top_k"] == top_k + 1
     assert kwargs["renormalize"] is False
-    assert kwargs["routed_scaling_factor"] == 1.0
+    assert kwargs.get("routed_scaling_factor", 1.0) == 1.0
+    assert kwargs.get("custom_routing_function") is None
+    assert kwargs.get("num_fused_shared_experts", 0) == 0
     assert kwargs["scoring_func"] == scoring_func
     assert kwargs["e_score_correction_bias"] == "bias"
     assert kwargs["use_grouped_topk"] is grouped
@@ -149,22 +151,3 @@ def test_herd_applies_the_routed_scale_the_layer_folds_in(monkeypatch, profile):
     kwargs = calls.pop()
     assert kwargs["herd_topk"] == top_k
     assert kwargs["herd_routed_scaling_factor"] == herd_scale
-
-
-@pytest.mark.parametrize(
-    "scoring_func,grouped,fused_shared,expected",
-    [
-        ("sqrtsoftplus", False, 0, 2.0),
-        ("sigmoid", True, 0, 2.0),
-        ("sigmoid", False, 1, 2.0),
-        ("sigmoid", False, 0, 1.0),
-        ("softmax", False, 1, 1.0),
-    ],
-)
-def test_routing_scale_matches_select_experts(
-    scoring_func, grouped, fused_shared, expected
-):
-    assert (
-        moe_mod.FusedMoE.routing_scale(scoring_func, grouped, fused_shared, 2.0)
-        == expected
-    )
