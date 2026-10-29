@@ -1094,6 +1094,11 @@ class LinearBase(nn.Module):
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
 
+    def pad_slot_numel(self, param: nn.Parameter) -> int:
+        """Elements of ``param`` in a K-padded pair's padded slots (see
+        ``pad_slot_numel``); online-quant streaming does not wait for them."""
+        return pad_slot_numel(self, param)
+
     @property
     def weight_scale_row_group(self) -> int:
         """Number of weight rows represented by one row of source scales."""
