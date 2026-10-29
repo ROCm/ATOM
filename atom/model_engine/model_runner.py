@@ -19,7 +19,6 @@ import tqdm
 from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
-    get_pcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -30,6 +29,7 @@ from torch.profiler import record_function
 from atom.config import Config, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
+    get_pcp_group,
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_pad_len,
@@ -77,8 +77,10 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.models.registry import mono_decode_installers, support_model_arch_dict
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.spec_decode.status import SpecStatusQueue
@@ -114,52 +116,6 @@ from atom.utils.tbo import (
 
 logger = logging.getLogger("atom")
 
-support_model_arch_dict = {
-    "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
-    "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
-    "LlamaForCausalLM": "atom.models.llama.LlamaForCausalLM",
-    "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
-    "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.runtime.DeepseekV41RuntimeModel",
-    "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
-    "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
-    "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
-    "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
-    "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
-    "Qwen4ExpForConditionalGeneration": (
-        "atom.models.qwen4_exp.Qwen4ExpForConditionalGeneration"
-    ),
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
-    "Qwen3_5MoeForCausalLM": "atom.models.qwen3_5.Qwen3_5MoeForCausalLM",
-    "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
-    "KimiK3ForConditionalGeneration": (
-        "atom.models.kimi_k3.KimiK3ForConditionalGeneration"
-    ),
-    "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
-    "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
-    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
-    "Mistral3ForConditionalGeneration": "atom.models.mistral3.Mistral3TextOnly",
-    "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
-    "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
-    "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
-    "Glm5NextForConditionalGeneration": (
-        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
-    ),
-}
-# Mono decode by wrapping the loaded model: the installer runs after the drafter
-# armed its hooks on the unwrapped layers. Architectures not listed here route
-# mono decode inside their own model class instead.
-mono_decode_installers = {
-    "DeepseekV41ForCausalLM": (
-        "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
-    ),
-    "KimiK3ForConditionalGeneration": (
-        "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
-    ),
-}
-
 
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
@@ -183,6 +139,13 @@ def max_schedulable_decode_bs(
 # Re-exported under the old private name: this module is where the predicate
 # used to live and where callers (and tests) still import it from.
 _kv_config_has_producer = kv_config_has_producer
+
+
+def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
+    """Whether sampled ids feed the next forward on device (deferred-out or a
+    drafter), so they must agree across a group. Shared by the PCP and TP
+    broadcasts so the two conditions cannot drift."""
+    return is_deferred_out or has_drafter
 
 
 class TokenLocations(NamedTuple):
@@ -248,12 +211,26 @@ class tokenIDProcessor:
             device=device,
             publication_group="input_ids",
         )
+        # [scheduled requests, scheduled tokens, scheduled draft tokens]: each
+        # pass's real row count (its `Context.scheduled_tokens_gpu` is the
+        # entry). Not `cu_seqlens_q[-1]`: a token-graph bucket was recorded at
+        # its own request count.
+        self.batch_info = CpuGpuBuffer(
+            3, dtype=torch.int32, device=device, publication_group="input_ids"
+        )
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
+        # The drafter's `draft_tokens_per_seq`, set once it is loaded.
+        self.draft_tokens_per_seq = 0
         # Block-drafter warmup fabricates at least two requests, even when
         # the service admits only one. Real batches/graphs obey max_num_seqs.
         self._output_request_capacity = max(runner.config.max_num_seqs, 2)
 
+        # Every D2H queued on this stream must keep its GPU source referenced
+        # until the copy is known to have completed (its event waited on). The
+        # sources are fresh default-stream tensors and the caching allocator
+        # does not see the side-stream read: a dropped source goes to the next
+        # allocation, and a late copy then reads the next step's data.
         self.async_copy_stream = torch.cuda.Stream(runner.device)
         self.zero_spec_counts = torch.zeros(
             2 * self._output_request_capacity, dtype=torch.int32, device=device
@@ -278,19 +255,25 @@ class tokenIDProcessor:
                 else None
             )
             copy_done.record(self.async_copy_stream)
-        cpu_tensor_handle.append((cpu_tensor, copy_done))
+        # The sampled ids and logprobs are fresh every step; the entry holds
+        # them until recv_async_output has waited on copy_done.
+        cpu_tensor_handle.append((cpu_tensor, copy_done, (gpu_tensor, gpu_logprobs)))
         self.logprobs_cpu.append(cpu_logprobs)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
             return torch.empty(0, dtype=torch.int32, device="cpu")
-        cpu_tensor, event = cpu_tensor_handle.pop(0)
-        event.synchronize()
+        cpu_tensor, copy_done, _ = cpu_tensor_handle[0]
+        copy_done.synchronize()
+        # Pop only after the wait: the pop drops the GPU sources, and the
+        # allocator may reuse them once the copy has completed.
+        cpu_tensor_handle.pop(0)
         return cpu_tensor
 
     def recv_logprobs(self) -> list[float] | None:
         """Pop and return the earliest logprobs from the async copy queue.
-        Must be called after recv_async_output (which synchronizes the event).
+        Must be called after recv_async_output, which waits for the copy that
+        fills this tensor (the same copy_done covers both).
         """
         if not self.logprobs_cpu:
             return None
@@ -311,8 +294,18 @@ class tokenIDProcessor:
     def recv_spec_status(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         return self.spec_status_queue.receive() or (None, None)
 
+    def _wait_for_pending_copies(self) -> None:
+        """Wait for every queued D2H before its entry (and source) is dropped."""
+        for _, copy_done, _ in getattr(self, "token_ids_cpu", ()):
+            copy_done.synchronize()
+        for name in ("_draft_token_ids_queue", "spec_status_queue"):
+            queue = getattr(self, name, None)
+            if queue is not None:
+                queue.drain()
+
     def clean(self):
-        self.token_ids_cpu: list[torch.Tensor] = []
+        self._wait_for_pending_copies()
+        self.token_ids_cpu: list[tuple] = []
         self.logprobs_cpu: list[torch.Tensor | None] = []
 
         self.prev_batch: ScheduledBatch | None = None
@@ -458,9 +451,11 @@ class tokenIDProcessor:
 
     def _publish_input_ids(self, count, group):
         if group is None:
+            self.batch_info.copy_to_gpu()
             return self.input_ids.copy_to_gpu(count)
         group.counts[group.indices["input_ids"]] = count
         group.counts[group.indices["decode_src"]] = None
+        group.counts[group.indices["batch_info"]] = 3
         group.publish(group.counts)
         return self.input_ids.gpu[:count]
 
@@ -481,6 +476,12 @@ class tokenIDProcessor:
         GPU still works; only what follows (the attention metadata, through
         `num_rejected`) reads the status.
         """
+        bs = batch.total_seqs_num
+        self.batch_info.np[:] = (
+            bs,
+            batch.total_tokens_num,
+            bs * self.draft_tokens_per_seq,
+        )
         input_ids, locs = self._stage_input_ids(batch, max_seqlen_q, publication_group)
         # The speculative status queue is filled in postprocess but drained here, so a
         # step whose postprocess is skipped must not drain it: `forward()` bails
@@ -623,6 +624,7 @@ class tokenIDProcessor:
         counts = group.counts
         counts[group.indices["input_ids"]] = total_tokens_decode
         counts[group.indices["decode_src"]] = bs
+        counts[group.indices["batch_info"]] = 3
         group.publish(counts)
         # How wide the forward reads: a replayed decode graph takes a fixed
         # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
@@ -724,6 +726,8 @@ class ModelRunner:
             torch.float16,
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+        if envs.ATOM_ENABLE_GLUON_FUSED_AR:
+            os.environ["AITER_GLUON_FUSED_AR"] = "1"
         # Which attention this model's config asks for. The runner holds the
         # answer, not the question: what makes a model MLA or a hybrid is the
         # selector's to know, and it is asked the same way of a draft.
@@ -840,6 +844,10 @@ class ModelRunner:
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+            # A block drafter's width reads the loaded draft model's window.
+            self.tokenID_processor.draft_tokens_per_seq = (
+                self.drafter.draft_tokens_per_seq
+            )
             # NOTE: aux-hidden-state capture is armed AFTER the optional TBO wrap
             # below, so the drafter's capture hook lands on the object whose
             # forward returns the final (concatenated) output. See arm_aux_capture.
@@ -890,7 +898,10 @@ class ModelRunner:
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
-                self.model, config, getattr(self, "drafter", None)
+                self.model,
+                config,
+                getattr(self, "drafter", None),
+                metadata_builder=self.attn_metadata_builder,
             )
         self._init_forward_vars_ring()
         self._init_h2d_publication()
@@ -1248,7 +1259,7 @@ class ModelRunner:
         collectives: a decode, or with ``prefill`` -- the group's prefill step
         (`Scheduler.dummy_prefill`) -- a request-less prefill of the smallest
         token-graph bucket's tokens, which `ForwardMode._pad_to_token_graph`
-        raises to the bucket every prefilling rank of the group replays.
+        raises to the bucket every rank of the group replays.
 
         Two mechanisms lean on the fabricated id being -1: this pass flushes
         the previous real step's tokens (`prepare_sampled_ids` reports the
@@ -1387,6 +1398,7 @@ class ModelRunner:
         self.forward_vars = {
             "input_ids": self.tokenID_processor.input_ids,
             "decode_src": self.tokenID_processor.decode_src,
+            "batch_info": self.tokenID_processor.batch_info,
             "positions": CpuGpuBuffer(
                 self.max_num_batched_tokens, publication_group="positions", **i64_kwargs
             ),
@@ -1564,6 +1576,7 @@ class ModelRunner:
         # payload and source-index mirrors from this slot before writing.
         self.tokenID_processor.input_ids = self.forward_vars["input_ids"]
         self.tokenID_processor.decode_src = self.forward_vars["decode_src"]
+        self.tokenID_processor.batch_info = self.forward_vars["batch_info"]
 
     @_profile_runner_stage
     def _gate_staging_reuse(self):
@@ -2559,6 +2572,7 @@ class ModelRunner:
             running_tokens=running_tokens,
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
+            scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
         pcp_size = self.config.prefill_context_parallel_size
@@ -2848,11 +2862,6 @@ class ModelRunner:
         # context.positions = local per-group concat so _make_ubatch_context
         # slices each ubatch's forward positions correctly.
         forward_context.context.positions = positions
-        # Hash MoE: local per-group-concat ids. Each ForCausalLM.forward
-        # allgathers its ubatch's slice (g_i local, H_i/pcp) across pcp ranks →
-        # H_i ids, matching moe_pcp_merge_forward's per-ubatch hidden allgather.
-        if envs.ATOM_PCP_MOE_MERGE:
-            forward_context.context.input_ids = input_ids
         return input_ids, positions
 
     def _restore_pcp_balanced_output(
@@ -2907,34 +2916,15 @@ class ModelRunner:
         if not hasattr(inner, "start_layer"):
             return
 
-        # Replicate the model's per-layer shared/full classification
-        # (_should_skip_index_topk in deepseek_v2.py).
         hf = self.config.hf_config
-        num_layers = int(hf.num_hidden_layers)
-        indexer_types = getattr(hf, "indexer_types", None)
-        index_topk_pattern = getattr(hf, "index_topk_pattern", None)
-        index_topk_freq = int(getattr(hf, "index_topk_freq", 1))
-        index_skip_topk_offset = int(getattr(hf, "index_skip_topk_offset", 1))
-
-        def _is_shared(layer_idx):
-            if not 0 <= layer_idx < num_layers:
-                return False
-            if indexer_types is not None:
-                return indexer_types[layer_idx] == "shared"
-            if index_topk_pattern is not None:
-                return index_topk_pattern[layer_idx] == "S"
-            if index_topk_freq <= 1:
-                return False
-            return max(layer_idx - index_skip_topk_offset, 0) % index_topk_freq != 0
-
         # This rank consumes the prior rank's top-k iff its first layer is shared.
-        self._pp_recv_needs_sparse = (not pp.is_first_rank) and _is_shared(
-            inner.start_layer
+        self._pp_recv_needs_sparse = (not pp.is_first_rank) and skips_index_topk(
+            hf, inner.start_layer
         )
         # The next rank consumes this rank's top-k iff ITS first layer
         # (== this rank's end_layer) is shared.
-        self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
-            inner.end_layer
+        self._pp_send_needs_sparse = (not pp.is_last_rank) and skips_index_topk(
+            hf, inner.end_layer
         )
         # Transfer the physical producer row width, not the logical top-k.
         # GLM-5.3 appends up to index_kpool-1 tail tokens and rounds each row
@@ -3006,8 +2996,20 @@ class ModelRunner:
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
         # Profiler label. Kind (prefix) distinguishes real/dummy and
-        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
-        # `build_run_label`.
+        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches; `tok`
+        # shows the rows padded past the scheduled ones and `dp` what every DP
+        # rank scheduled. See `build_run_label`.
+        sync = forward_mode.sync
+        # The sync's rows are the DP group, a group of one's its own row.
+        dp, dp_rank = None, 0
+        if len(sync.prefill_across_dp) > 1:
+            dp = tuple(
+                zip(
+                    sync.scheduled_tokens_per_dp_rank.tolist(),
+                    sync.prefill_across_dp,
+                )
+            )
+            dp_rank = self.config.parallel_config.data_parallel_rank
         label = build_run_label(
             is_prefill=is_prefill,
             use_cudagraph=forward_mode.use_cudagraph,
@@ -3017,6 +3019,9 @@ class ModelRunner:
             running_bs=context.running_bs,
             batch=batch,
             detailed_suffix=self._detailed_label_suffix(batch),
+            running_tokens=forward_mode.running_tokens,
+            dp=dp,
+            dp_rank=dp_rank,
         )
 
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
@@ -3045,10 +3050,13 @@ class ModelRunner:
                 if forward_mode.running_tokens > forward_mode.scheduled_tokens:
                     input_ids, positions = self._padded_inputs(forward_mode)
                 # The multimodal runtime owns request leases and span scatter.
+                # Only the first PP stage embeds tokens; later stages receive
+                # hidden states.
                 inputs_embeds = None
                 if (
                     is_prefill
                     and hasattr(self.model, "get_vision_embeddings")
+                    and get_pp_group().is_first_rank
                     and batch is not None
                     and hasattr(batch, "multimodal_data")
                     and batch.multimodal_data
@@ -3275,22 +3283,28 @@ class ModelRunner:
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
             )
-            # PCP ranks decode redundantly and are consistent only while their
-            # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
-            # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
-            # then differ per rank and the emitted streams fork. Sync the
-            # decision instead: the ids and the verdict.
+            # PCP ranks decode redundantly but not bit-identically, so their
+            # accept counts can differ: take rank 0's verdict. Ids are synced
+            # below, outside this branch.
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
-                _g = get_pcp_group()
-                sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
-                verdict = _g.broadcast(verdict, src=0)
+                verdict = get_pcp_group().broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
-        # Drafter input must agree across TP ranks.
-        if get_tp_group().world_size > 1 and (
-            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        # Near-tie argmaxes differ across PCP ranks (~1 bf16 ULP) and the ids
+        # feed the next forward, whose MoE all_reduce assumes identical rows.
+        if get_pcp_world_size() > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+        ):
+            sampled_tokens = get_pcp_group().broadcast(
+                sampled_tokens.contiguous(), src=0
+            )
+
+        # Drafter input must agree across TP ranks. Ids only: the verdict is
+        # deterministic on TP ranks' bit-identical inputs.
+        if get_tp_group().world_size > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
@@ -3303,6 +3317,8 @@ class ModelRunner:
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
             ).squeeze(-1)
+            # No PCP broadcast: logprobs never feed the next forward and only
+            # worker 0's leave.
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
@@ -3389,9 +3405,13 @@ class ModelRunner:
         )
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
-        """Publish a GPU event for final prefill chunks to transfer connectors."""
+        """Publish completed chunk snapshots and the legacy final-ready event."""
         if batch.total_seqs_num_prefill <= 0:
             return
+        connector = get_kvconnector()
+        publish = getattr(connector, "publish_prefill_chunks", None)
+        if callable(publish):
+            publish(batch)
         if batch.is_final_chunk is None:
             req_ids = batch.req_ids
         else:
@@ -3404,10 +3424,16 @@ class ModelRunner:
             ]
         if not req_ids:
             return
-        connector = get_kvconnector()
         callback = getattr(connector, "record_kv_cache_ready", None)
         if callable(callback):
             callback(req_ids)
+
+    def _settle_target_pcp_split(self) -> None:
+        """Snapshot the target forward's `pcp_split` before drafting clears it.
+        Call right after `run_model`."""
+        if getattr(self, "drafter", None) is not None:
+            ctx = get_forward_context().context
+            ctx.target_pcp_split = bool(ctx.pcp_split)
 
     @_profile_runner_stage
     @torch.inference_mode()
@@ -3432,11 +3458,12 @@ class ModelRunner:
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
+        self._settle_target_pcp_split()
+        drafter = getattr(self, "drafter", None)
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
 
-        drafter = getattr(self, "drafter", None)
         # An output-less batch still runs propose() for its DP collectives.
         will_align_draft = (
             self._dp_draft_lockstep_active()
@@ -4219,15 +4246,12 @@ class ModelRunner:
         sizes = sorted(
             {n for n in envs.ATOM_TOKEN_GRAPH_SIZES if 0 < n <= limit}, reverse=True
         )
-        dp_rank = self.config.parallel_config.data_parallel_rank
         for running_tokens in sizes:
-            # The recorded MoE bounds its dispatch by this table: its own
-            # bucket plus the largest on every peer, which covers any step
-            # whose prefilling ranks all replay one bucket
-            # (`ForwardMode._pad_to_token_graph`). Too wide a bound only sorts
-            # more rows; too narrow would drop received ones.
-            self.running_tokens_per_dp_rank.fill(sizes[0])
-            self.running_tokens_per_dp_rank[dp_rank] = running_tokens
+            # Every rank records this bucket at once and replays it only
+            # together, a decoding rank included (`ForwardMode.
+            # _pad_to_token_graph`), so the recording's collectives -- the
+            # MoE's DP exchange among them -- are sized for every rank at it.
+            self.running_tokens_per_dp_rank.fill(running_tokens)
             # A fresh step for each pass: a replaying forward spends its
             # step's indptrs on the tail (`rows_of`).
             for mode in (None, "record"):
@@ -4273,6 +4297,15 @@ class ModelRunner:
         self.h2d_owner.begin()
         try:
             built = build(*args, **kwargs)
+            context = built[1]
+            # The synthetic step's own counts, not the last real step's: a
+            # stale count past these rows would send the MoE sort out of
+            # bounds. The draft slot stays 0, as the capture never looks up
+            # the drafter.
+            batch_info = self.forward_vars["batch_info"]
+            batch_info.np[:] = (context.scheduled_bs, context.scheduled_tokens, 0)
+            batch_info.copy_to_gpu()
+            context.scheduled_tokens_gpu = batch_info.gpu[1:2]
             self.h2d_owner.finish()
         except BaseException:
             self.h2d_owner.fail()
@@ -4345,10 +4378,13 @@ class ModelRunner:
             replay = partial(self.req_graph.replay, key=key)
             B = bs * max_q_len
             # Every row of the recording is real here: time the whole of it
-            # (the DP pad-row mask reads the real token count from here).
+            # (routing reads the real token count from `batch_info`).
             cu = self.forward_vars["cu_seqlens_q"]
             cu.np[: bs + 1] = np.arange(0, B + 1, max_q_len, dtype=np.int32)
             cu.copy_to_gpu(bs + 1)
+            batch_info = self.forward_vars["batch_info"]
+            batch_info.np[:] = (bs, B, 0)
+            batch_info.copy_to_gpu()
             # Warm replay, then timed replays (median for robustness to jitter).
             replay()
             torch.cuda.synchronize()
@@ -4508,6 +4544,7 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, hidden_states = self.run_model(input_ids, batch)
+            self._settle_target_pcp_split()
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 

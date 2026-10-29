@@ -23,6 +23,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION",
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
+    "ATOM_ENABLE_GLUON_FUSED_AR",
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
@@ -44,7 +45,6 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
-    "ATOM_MEGA_MASK_PAD_ROWS",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -101,6 +101,9 @@ class TestEnvsDefaults:
     def test_ds_input_rmsnorm_quant_fusion_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is True
 
+    def test_gluon_fused_ar_default_enabled(self):
+        assert _get_envs().ATOM_ENABLE_GLUON_FUSED_AR is True
+
     def test_model_sensitive_rmsnorm_default_disabled(self):
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False
 
@@ -151,9 +154,6 @@ class TestEnvsDefaults:
 
     def test_use_flydsl_fp8_prefill_attn_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
-
-    def test_mega_mask_pad_rows_default_enabled(self):
-        assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is True
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
@@ -297,10 +297,6 @@ class TestEnvsOverrides:
     def test_use_flydsl_gather_kv_b_proj_only_one_enables(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
-
-    def test_mega_mask_pad_rows_can_be_disabled(self, monkeypatch):
-        monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "0")
-        assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is False
 
 
 class TestIsSet:

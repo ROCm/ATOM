@@ -208,7 +208,9 @@ class QueryRows:
 class ReplayPlan:
     """The decoder's rows of a replayed prefill, on the device at the
     addresses every step of its request bucket publishes (`TailLayout`).
-    ``tail``: their step."""
+    ``tail``: their step. ``filled_gpu`` / ``finishing_gpu``: [1] int32 on
+    the device, the real rows of the decoder's passes -- the tail's ``filled``
+    rows (layers 20-38), its finishing requests (layer 39's one row each)."""
 
     tail: BatchStep
     tail_rows: torch.Tensor
@@ -217,6 +219,8 @@ class ReplayPlan:
     query_ptrs: torch.Tensor
     last_rows: torch.Tensor
     filled: int
+    filled_gpu: torch.Tensor
+    finishing_gpu: torch.Tensor
 
     def queries(self) -> QueryRows:
         """Layer 39's queries. Built where they are read, so a recording reads

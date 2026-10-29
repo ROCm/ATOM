@@ -91,7 +91,9 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
     # A window wide enough that one image outgrows a PAGE unit: an FP8 index
     # plane puts 32 tokens in a PAGE, and the fixture's own 4-token window
     # leaves a state entry that fits in a single one.
-    geo = replace(geometry(small_config), packed=packed, window_size=32)
+    geo = replace(
+        geometry(small_config), kv_dtype="fp4" if packed else "bf16", window_size=32
+    )
     spec = checkpoint_spec(geo)
     assert spec.units_per_checkpoint > 1
     # Enough PAGEs for the interleaved unit ids below, which is what makes the
@@ -174,7 +176,9 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
         DeepseekV41MetadataBuilder,
     )
 
-    geo = replace(geometry(small_config), packed=packed, window_size=32)
+    geo = replace(
+        geometry(small_config), kv_dtype="fp4" if packed else "bf16", window_size=32
+    )
     spec = checkpoint_spec(geo)
     assert spec.units_per_checkpoint > 1
     pages = max(40, 2 * spec.units_per_checkpoint)
@@ -293,7 +297,7 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(
         8,
         512,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         layer_ratios=(ratio,),
         index_topk=topk,
     )
@@ -352,7 +356,7 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
         8,
         512,
         32,
-        packed=True,
+        kv_dtype="fp4",
         layer_ratios=(ratio,),
         index_topk=8,
     )
@@ -711,7 +715,7 @@ def test_shared_indptr_launch_matches_row_counts_and_replay(
         128,
         512,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         layer_ratios=ratios,
         index_topk=64,
     )

@@ -169,6 +169,29 @@ ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
+
+# Catalog paths name the Hugging Face org (<root>/<org>/<model>), but some
+# clusters keep the same weights flat under <root>/<model>.
+resolve_model_path() {
+  local path="$1"
+  local trimmed="${path%/}"
+  if [[ "${trimmed}" != /* || -e "${trimmed}" ]]; then
+    printf '%s' "${path}"
+    return 0
+  fi
+  local flat
+  flat="$(dirname -- "$(dirname -- "${trimmed}")")"
+  flat="${flat%/}/$(basename -- "${trimmed}")"
+  if [[ -e "${flat}" ]]; then
+    echo "[paths] ${path} not found; using ${flat}" >&2
+    printf '%s' "${flat}"
+  else
+    printf '%s' "${path}"
+  fi
+}
+MODEL_PATH="$(resolve_model_path "${MODEL_PATH}")"
+DRAFT_MODEL_PATH="$(resolve_model_path "${DRAFT_MODEL_PATH}")"
+
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
 SPEC_DECODE_ACCEPTANCE_LENGTH="${SPEC_DECODE_ACCEPTANCE_LENGTH:-}"
 STATE_CHECKPOINT_INTERVAL_TOKENS="${STATE_CHECKPOINT_INTERVAL_TOKENS:-}"
@@ -251,10 +274,10 @@ WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-5000}"
 WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 
 BENCHMARK_KIND="${BENCHMARK_KIND:-random}"
-AIPERF_DIR="${AIPERF_DIR:-/tmp/atomesh-aiperf}"
-AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
-AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
-AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
+# The AgentX client InferenceX benchmarks with (infx/bench/agentic/requirements.txt).
+AGENTX_HARNESS_VERSION="${AGENTX_HARNESS_VERSION:-1.0.9}"
+AGENTX_VENV="${AGENTX_VENV:-/tmp/atomesh-agentx-venv}"
+AIPERF_SCENARIO="${AIPERF_SCENARIO:-agentx}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
 AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-false}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
@@ -269,7 +292,6 @@ AIPERF_FAILED_REQUEST_THRESHOLD="${AIPERF_FAILED_REQUEST_THRESHOLD:-0.50}"
 AIPERF_SLICE_DURATION="${AIPERF_SLICE_DURATION:-1.0}"
 AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT:-300}"
 AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT:-900000}"
-AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES:-0}"
 AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT:-1800}"
 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT:-1800}"
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
@@ -366,6 +388,61 @@ apply_role_env() {
   apply_prefixed_env "${prefix}" "${role_ip}"
 }
 
+# KV_CONNECTOR (env.common) picks the connector of the built-in kv-transfer
+# configs. MoRI IO advertises get_ip(), which falls back to the default-route
+# address, so pin it to the address the router and the peer role dial.
+prepare_kv_connector() {
+  case "${KV_CONNECTOR:-mooncake}" in
+    mooncake) ;;
+    moriio)
+      export ATOM_HOST_IP="${ATOM_HOST_IP:-${host_ip}}"
+      python3 - <<'PY' || true
+import importlib.metadata as md
+
+for dist in ("amd-mori-nightly", "amd-mori", "mori"):
+    try:
+        print(f"[kv] moriio with {dist} {md.version(dist)}")
+        break
+    except md.PackageNotFoundError:
+        continue
+else:
+    print("[kv] moriio: no MoRI distribution metadata found")
+PY
+      ;;
+    *)
+      echo "ERROR: unsupported KV_CONNECTOR=${KV_CONNECTOR} (expected mooncake or moriio)" >&2
+      return 2
+      ;;
+  esac
+}
+
+# A role's catalog JSON wins over the built-in config, but must not name a
+# different connector than an explicit KV_CONNECTOR.
+kv_transfer_config() {
+  local role="$1"
+  local override="$2"
+  local ip="$3"
+  local port="$4"
+  if [[ -z "${override}" ]]; then
+    local extra=""
+    if [[ "${KV_CONNECTOR:-mooncake}" == moriio ]]; then
+      extra=',"moriio_mode":"write"'
+    fi
+    printf '{"kv_role":"%s","kv_connector":"%s","proxy_ip":"%s","handshake_port":%s%s}' \
+      "${role}" "${KV_CONNECTOR:-mooncake}" "${ip}" "${port}" "${extra}"
+    return 0
+  fi
+  if [[ -n "${KV_CONNECTOR:-}" ]]; then
+    local named
+    named="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("kv_connector", ""))' "${override}")" || return 2
+    if [[ "${named}" != "${KV_CONNECTOR}" ]]; then
+      echo "ERROR: KV_CONNECTOR=${KV_CONNECTOR} but the ${role} kv-transfer-config names '${named}'" >&2
+      return 2
+    fi
+  fi
+  printf '%s' "${override}"
+}
+
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
 if [[ -z "${host_ip}" ]]; then
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -373,6 +450,7 @@ fi
 host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
+prepare_kv_connector || exit 2
 
 # GPU timing is opt-in; agentic reports need it on both service roles.
 if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
@@ -1821,11 +1899,7 @@ start_prefill() {
     )
   fi
   local prefill_kv_transfer_config
-  if [[ -n "${PREFILL_KV_TRANSFER_CONFIG}" ]]; then
-    prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG}"
-  else
-    prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
-  fi
+  prefill_kv_transfer_config="$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a prefill_profiler_args=()
   build_torch_profiler_args "${log_name}" prefill_profiler_args
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
@@ -1888,11 +1962,7 @@ start_decode() {
     )
   fi
   local decode_kv_transfer_config
-  if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
-    decode_kv_transfer_config="${DECODE_KV_TRANSFER_CONFIG}"
-  else
-    decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
-  fi
+  decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a decode_profiler_args=()
   build_torch_profiler_args "${log_name}" decode_profiler_args
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
@@ -2089,28 +2159,25 @@ run_benchmark() {
   done
 }
 
-ensure_aiperf() {
-  local current_commit=""
-  if [[ -d "${AIPERF_DIR}/.git" ]]; then
-    current_commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || true)"
-  fi
-  if [[ -x "${AIPERF_VENV}/bin/aiperf" && "${current_commit}" == "${AIPERF_COMMIT}" ]]; then
-    return
-  fi
+ensure_agentx_harness() {
+  # The ATOM image ships this release in its own venv and links `agentx` onto
+  # PATH; reuse it, or an earlier install, on an exact match.
+  local bin
+  for bin in "$(command -v agentx 2>/dev/null)" "${AGENTX_VENV}/bin/agentx"; do
+    if [[ -x "${bin}" && "$("${bin}" --version 2>/dev/null)" == "${AGENTX_HARNESS_VERSION}" ]]; then
+      AGENTX_VENV="$(dirname "$(dirname "$(readlink -f "${bin}")")")"
+      echo "[agentx] using agentx-harness ${AGENTX_HARNESS_VERSION} in ${AGENTX_VENV}"
+      return
+    fi
+  done
 
-  echo "[aiperf] preparing ${AIPERF_DIR} @ ${AIPERF_COMMIT}"
-  mkdir -p "$(dirname "${AIPERF_DIR}")" "$(dirname "${AIPERF_VENV}")"
-  if [[ ! -d "${AIPERF_DIR}/.git" ]]; then
-    rm -rf "${AIPERF_DIR}"
-    git clone https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_DIR}"
-  fi
-  git -C "${AIPERF_DIR}" fetch https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_COMMIT}"
-  git -C "${AIPERF_DIR}" checkout --detach "${AIPERF_COMMIT}"
-  rm -rf "${AIPERF_VENV}"
-  python3 -m venv "${AIPERF_VENV}"
-  "${AIPERF_VENV}/bin/python" -m pip install --upgrade pip
-  "${AIPERF_VENV}/bin/python" -m pip install -e "${AIPERF_DIR}"
-  "${AIPERF_VENV}/bin/aiperf" --version
+  echo "[agentx] installing agentx-harness==${AGENTX_HARNESS_VERSION} into ${AGENTX_VENV}"
+  mkdir -p "$(dirname "${AGENTX_VENV}")"
+  rm -rf "${AGENTX_VENV}"
+  python3 -m venv "${AGENTX_VENV}"
+  "${AGENTX_VENV}/bin/python" -m pip install --upgrade pip
+  "${AGENTX_VENV}/bin/python" -m pip install "agentx-harness==${AGENTX_HARNESS_VERSION}"
+  "${AGENTX_VENV}/bin/agentx" --version
 }
 
 write_aiperf_dashboard_json() {
@@ -2302,7 +2369,7 @@ wait_for_torch_traces() {
 }
 
 run_aiperf_agentic_benchmark() {
-  ensure_aiperf
+  ensure_agentx_harness
 
   if is_agentic_session_affinity; then
     # dp_sticky keys off X-Session-ID. Without it every turn is placed by load
@@ -2372,13 +2439,12 @@ run_aiperf_agentic_benchmark() {
     fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
-    AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
       python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
       --output "${out_dir}/metrics" "${report_args[@]}" -- \
-      "${AIPERF_VENV}/bin/aiperf" profile \
+      "${AGENTX_VENV}/bin/agentx" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \
       --url "http://127.0.0.1:${ROUTER_PORT}" \
@@ -2580,6 +2646,7 @@ run_eval() {
 
   IFS=',' read -r -a eval_concs <<< "${EVAL_CONCURRENCY}"
   local eval_conc tag result_dir
+  local below=()
   for eval_conc in "${eval_concs[@]}"; do
     eval_conc="${eval_conc//[[:space:]]/}"
     [[ -n "${eval_conc}" ]] || continue
@@ -2600,13 +2667,14 @@ run_eval() {
       --log_samples \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" <<'PY'
+    if ! python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 result_dir = Path(sys.argv[1])
 eval_conc = sys.argv[2]
+threshold = sys.argv[3]
 json_files = list(result_dir.rglob("*.json")) if result_dir.is_dir() else []
 if not json_files:
     print("[eval] ERROR: no result JSON found")
@@ -2623,10 +2691,27 @@ print("=========================================")
 print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
+if threshold:
+    if not isinstance(score, (int, float)) or score < float(threshold):
+        raise SystemExit(
+            f"[eval] FAIL: concurrent={eval_conc} gsm8k score {score} "
+            f"is below threshold {float(threshold):.4f}"
+        )
+    print(
+        f"[eval] PASS: concurrent={eval_conc} gsm8k score {score:.4f} "
+        f">= threshold {float(threshold):.4f}"
+    )
 PY
+    then
+      below+=("${eval_conc}")
+    fi
   done
 
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
+  if (( ${#below[@]} )); then
+    echo "[eval] FAIL: concurrency ${below[*]} did not pass" >&2
+    return 1
+  fi
 }
 
 run_benchmark_and_eval() {
