@@ -527,6 +527,12 @@ EOF
     wait "${docker_pid}"
     docker_rc=$?
   fi
+  if [[ "${docker_rc}" -ne 0 && -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+    timeout --kill-after=2s 10s docker inspect --format '{{json .State}}' "${container}" \
+      > "${rank_dir}/container${phase_suffix}.state.json" \
+      2> "${rank_dir}/container${phase_suffix}.state.err"
+    printf '%s\n' "$?" > "${rank_dir}/container${phase_suffix}.state.rc"
+  fi
   set -e
   # Other ranks exit once the router stops answering.
   bounded_docker_rm "${router_container}"
