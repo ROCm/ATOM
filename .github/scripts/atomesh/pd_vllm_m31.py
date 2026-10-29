@@ -470,7 +470,7 @@ def main():
         (out / f'{role}-final.prom').write_text(request(url+'/metrics'))
 
 
-def smoke_then_sweep(run_phase=None, *, smoke_only=False):
+def smoke_then_sweep(run_phase=None, *, smoke_only=False, concurrencies=(32, 48, 64)):
     """Use one allocation; each phase owns fresh engines and a fresh CPU Store."""
     run_phase = run_phase or main
     keys = ('RUN_DIR', 'CONC_LIST', 'ATOMESH_ENV_ATOMESH_VLLM_MODE')
@@ -481,8 +481,7 @@ def smoke_then_sweep(run_phase=None, *, smoke_only=False):
     try:
         selected = [('smoke', 'smoke', 1)]
         if not smoke_only:
-            selected += [('c32', 'benchmark', 32), ('c48', 'benchmark', 48),
-                         ('c64', 'benchmark', 64)]
+            selected += [(f'c{c}', 'benchmark', c) for c in concurrencies]
         for name, mode, concurrency in selected:
             os.environ.update(RUN_DIR=str(root / name), CONC_LIST=str(concurrency),
                               ATOMESH_ENV_ATOMESH_VLLM_MODE=mode)
@@ -517,6 +516,8 @@ if __name__ == '__main__':
         mode = os.environ.get('ATOMESH_ENV_ATOMESH_VLLM_MODE')
         if mode in ('smoke', 'smoke_then_sweep'):
             smoke_then_sweep(smoke_only=mode == 'smoke')
+        elif mode == 'smoke_then_c32':
+            smoke_then_sweep(concurrencies=(32,))
         else:
             main()
     except StoreMemoryUnavailable as exc:

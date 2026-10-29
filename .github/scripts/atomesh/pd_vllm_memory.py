@@ -104,6 +104,10 @@ def prepare(store, model_path, out, timeout=1800):
         warn('numa_unavailable', error=str(exc))
     if not nodes:
         warn('no_cpu_numa_nodes')
+    state['host_clean'] = drop_and_compact_host(nodes)
+    if state['host_clean']['status'] != 'completed':
+        warn('host_clean_unavailable', **state['host_clean'])
+    write_json(summary, state)
     for node in nodes:
         row = {'node': node, 'desired_bytes': int(segments / len(nodes))}
         state['nodes'].append(row)
@@ -238,6 +242,52 @@ def prepare_after_load(store, model_path, out, role, rank, timeout=7200):
                         fcntl.flock(lock, fcntl.LOCK_UN)
                     continue
             time.sleep(0.2)
+
+
+def node_free_huge_blocks(node):
+    """Free order>=9 (2 MiB) blocks of a node's Normal zone, from /proc/buddyinfo."""
+    for line in Path('/proc/buddyinfo').read_text().splitlines():
+        fields = line.replace(',', ' ').split()
+        if fields[1] == str(node) and fields[3] == 'Normal':
+            return sum(int(count) << (order - 9) for order, count in enumerate(fields[4:]) if order >= 9)
+    return None
+
+
+def drop_and_compact_host(nodes):
+    """Drop the host page cache and compact each node before faulting THP.
+
+    Page cache left by earlier allocations fragments a node badly enough that a
+    single-threaded THP fault can stall in direct compaction for over 30 min
+    (job 10979, NUMA 1). The native container is privileged, so writing these
+    sysctls uses permissions it already has; without them this only reports.
+    """
+    from numa_memory_budget import node_meminfo
+    drop = Path('/proc/sys/vm/drop_caches')
+    record = {'status': 'unavailable', 'nodes': {}}
+    if not os.access(drop, os.W_OK):
+        return record
+    began = time.monotonic()
+    try:
+        before = {node: (node_meminfo(Path('/sys'), node)['MemFree'], node_free_huge_blocks(node))
+                  for node in nodes}
+        os.sync()
+        drop.write_text('3\n')
+        record['drop_seconds'] = time.monotonic() - began
+        for node in nodes:
+            started = time.monotonic()
+            path = Path(f'/sys/devices/system/node/node{node}/compact')
+            (path if os.access(path, os.W_OK) else Path('/proc/sys/vm/compact_memory')).write_text('1\n')
+            record['nodes'][str(node)] = {
+                'free_bytes_before': before[node][0], 'huge_blocks_before': before[node][1],
+                'free_bytes_after': node_meminfo(Path('/sys'), node)['MemFree'],
+                'huge_blocks_after': node_free_huge_blocks(node),
+                'compact_seconds': time.monotonic() - started}
+    except (OSError, ValueError, KeyError, IndexError, SystemExit) as exc:
+        record.update(status='failed', error=str(exc))
+        return record
+    record.update(status='completed', elapsed_seconds=time.monotonic() - began)
+    print(f'[store-memory] host page cache dropped and nodes compacted: {json.dumps(record)}', flush=True)
+    return record
 
 
 def clean_host():
