@@ -3,6 +3,7 @@ from typing import ClassVar
 
 import numpy as np
 import torch
+from aiter import QuantType
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -20,7 +21,11 @@ from atom.model_config.qwen3_5_moe import (
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
-from atom.model_ops.layernorm import fused_ar_gemma_per_group_supported
+from atom.model_ops.layernorm import (
+    fused_ar_gemma_per_group_supported,
+    gluon_gemm_ar_init,
+    gluon_gemm_ar_supported,
+)
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
 )
@@ -239,6 +244,9 @@ def load_fused_expert_weights(
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
+    # Set by the decoder layer: it runs out_proj in one kernel with its next norm.
+    skip_out_proj = False
+
     def create_qkvz_proj(
         self,
         hidden_size: int,
@@ -365,6 +373,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # Part 3: Output Projection
         # ============================================================
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
+        if self.skip_out_proj:
+            return core_attn_out
         output = self.out_proj(core_attn_out, x_scale=maybe_scale)
         return output
 
@@ -473,6 +483,23 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 )
             )
+
+        # o_proj / out_proj and the all-reduce + RMSNorm of post_attention_layernorm in
+        # one aiter kernel: the attention skips its last projection, and forward runs
+        # it with the norm.
+        if self.layer_type == "linear_attention":
+            attn, proj = self.linear_attn, self.linear_attn.out_proj
+        else:
+            attn, proj = self.self_attn, self.self_attn.o_proj
+        self.fuse_gemm_ar = (
+            fuse_allreduce_norm
+            and not self.layer_scale
+            and proj.quant_type.value == QuantType.No.value
+            and gluon_gemm_ar_supported(config.hidden_size, proj.input_size)
+        )
+        if self.fuse_gemm_ar:
+            gluon_gemm_ar_init()
+            attn.skip_out_proj = True
 
 
 @token_graph
