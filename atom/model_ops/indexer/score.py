@@ -22,7 +22,8 @@ FP8 launch, the top-k -- follows the rows alone and is recorded.
 
 import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes
-from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits, flydsl_pa_mqa_logits_fp4
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -33,6 +34,15 @@ from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
 from .rows import NATURAL, IndexCache, IndexRows
+
+# gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
+# included); it reads the same packed preshuffled pages as the Triton kernel
+# and takes the same arguments.
+_fp8_paged_mqa_logits = (
+    flydsl_fp8_paged_mqa_logits
+    if get_gfx() == "gfx1250"
+    else deepgemm_fp8_paged_mqa_logits
+)
 
 
 def score_topk(
@@ -47,9 +57,13 @@ def score_topk(
     on_band=None,
     out: torch.Tensor | None = None,
     keys=None,
+    request_local: bool = True,
 ) -> torch.Tensor:
     """`[rows.out_rows, topk]` int32 of `rows`' query rows against `cache`,
     each band scored into the plane the rows were cut to (`rows.workspace`).
+    `request_local=False` leaves FP8 concat rows' ids as places in the
+    gathered run, for a consumer that subtracts `rows.concat.row_starts`
+    itself (MLA's prefill slot conversion).
 
     FP8: `query` [rows, heads, dim] e4m3 and `weights` [rows, heads] fp32 with
     the query scale folded in. FP4: `query` is `(values, scales)`, each
@@ -63,7 +77,9 @@ def score_topk(
     if out is None:
         out = torch.empty(rows.out_rows, topk, dtype=torch.int32, device=weights.device)
     if rows.concat is not None:
-        _score_concat(query, weights, cache, rows, topk, stable, out, keys)
+        _score_concat(
+            query, weights, cache, rows, topk, stable, out, keys, request_local
+        )
     else:
         _score_paged(
             query, weights, cache, rows, topk, weight_scale, stable, on_band, out
@@ -133,7 +149,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 rows,
             )
         else:
-            deepgemm_fp8_paged_mqa_logits(
+            _fp8_paged_mqa_logits(
                 query[span].view(
                     count // group, group, weights.shape[1], query.shape[-1]
                 ),
@@ -195,7 +211,9 @@ def _gather_concat(query, cache, keys):
     return k_fp8, k_scale
 
 
-def _score_concat(query, weights, cache, rows, topk, stable, out, gathered):
+def _score_concat(
+    query, weights, cache, rows, topk, stable, out, gathered, request_local
+):
     """FP8 prefill against the gathered keys. The top-k reports a key's place
     in the gathered run; less its request's start it is the request's own."""
     keys = rows.concat
@@ -228,7 +246,7 @@ def _score_concat(query, weights, cache, rows, topk, stable, out, gathered):
             k=topk,
             stable=stable,
         )
-    if rows.bands:
+    if request_local and rows.bands:
         scored = slice(rows.bands[0][0], rows.bands[-1][1])
         picked, base = out[scored], keys.row_starts[scored].unsqueeze(1)
         torch.where(picked < 0, picked, picked - base, out=picked)

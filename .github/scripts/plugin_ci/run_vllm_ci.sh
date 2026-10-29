@@ -175,7 +175,9 @@ else
 fi
 
 MODEL_CACHE_MOUNT=""
-if [[ -d "/models" ]]; then
+if [[ -d "/share_nfs/models" ]]; then
+  MODEL_CACHE_MOUNT="-v /share_nfs/models:/models"
+elif [[ -d "/models" ]]; then
   MODEL_CACHE_MOUNT="-v /models:/models"
 elif [[ -d "/it-share/models" ]]; then
   MODEL_CACHE_MOUNT="-v /it-share/models:/models"
