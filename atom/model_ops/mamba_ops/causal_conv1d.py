@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.hip import libdevice
 
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
@@ -62,9 +63,13 @@ def _causal_conv1d_fwd_rows_kernel(
     channels (16 B a lane) where the reference spreads them over four.
     QK_L2NORM L2-normalizes each HEAD_DIM-wide head of q and k after the bf16
     rounding of the conv output, which is what `l2norm_fwd` on the stored q and
-    k computes. Per element the arithmetic is the reference kernel's (bias, the
-    taps oldest first with each product in the input dtype, then SiLU), so the
-    outputs and the conv states match it bit for bit."""
+    k computes. The taps are fp32 FMAs, oldest first after the bias, as the
+    fused GDN verify kernel's conv: the reference kernel rounds each product to
+    the input dtype, which costs ALU time and puts its outputs at 1.45x the bf16
+    rounding error of an fp64 conv, where these are the correctly rounded value.
+    SiLU takes the hardware exp and reciprocal (about 1 fp32 ulp), which moves
+    about 1 bf16 output in 10^5 by one step. The conv states match the reference
+    kernel bit for bit."""
     state_len: tl.constexpr = KERNEL_WIDTH - 1
     tl.static_assert(KERNEL_WIDTH == 4)
     idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
@@ -135,6 +140,10 @@ def _causal_conv1d_fwd_rows_kernel(
         mask=mask_feats,
         other=0.0,
     )
+    w0 = w0.to(tl.float32)
+    w1 = w1.to(tl.float32)
+    w2 = w2.to(tl.float32)
+    w3 = w3.to(tl.float32)
     if HAS_BIAS:
         acc0 = tl.load(bias_ptr + idx_feats, mask=mask_feats, other=0.0).to(tl.float32)
     else:
@@ -144,16 +153,15 @@ def _causal_conv1d_fwd_rows_kernel(
         row = token_offset + r
         valid = row < seqlen
         x_r = tl.load(x_base + row * stride_x_token, mask=mask_feats & valid, other=0.0)
-        acc = acc0
-        acc += col0 * w0
-        acc += col1 * w1
-        acc += col2 * w2
-        acc += x_r * w3
+        acc = tl.fma(col0.to(tl.float32), w0, acc0)
+        acc = tl.fma(col1.to(tl.float32), w1, acc)
+        acc = tl.fma(col2.to(tl.float32), w2, acc)
+        acc = tl.fma(x_r.to(tl.float32), w3, acc)
         col0 = col1
         col1 = col2
         col2 = x_r
         if SILU_ACTIVATION:
-            acc = acc / (1 + tl.exp(-acc))
+            acc = libdevice.fast_dividef(acc, 1.0 + libdevice.fast_expf(-acc))
         token_pos = sequence_start_index + row
         if is_qk:
             if QK_L2NORM:
