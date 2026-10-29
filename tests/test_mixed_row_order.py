@@ -142,3 +142,41 @@ def test_a_real_mixed_step_records_each_rows_own_metric():
         ("atom:decode_request_context_tokens", str(decode.id)): 7,
         ("atom:prefill_request_context_tokens", str(prefill.id)): 13,
     }
+
+
+def test_eplb_commits_a_mixed_passs_load_and_counts_its_step(monkeypatch):
+    """EPLB's two gates agree on a mixed pass: the step it advances on carries
+    load into the window. Recording only pure-prefill passes would leave the
+    window empty under mixed batching while the rebalance schedule ran on."""
+    from atom.model_ops import eplb
+
+    calls = []
+    monitor = SimpleNamespace(
+        on_forward_start=lambda: None,
+        on_forward_end=lambda dummy, carries: calls.append(("record", carries)),
+    )
+    manager = SimpleNamespace(
+        monitor=monitor,
+        live_metadata=object(),
+        on_forward_pass_end=lambda local, dp_any: calls.append(("step", local)),
+    )
+    monkeypatch.setattr(eplb, "_MANAGER", manager)
+    forward = eplb.with_eplb_forward_monitor(lambda self, batch: None)
+    runner = SimpleNamespace()
+    for n_prefill_tokens, n_decode_tokens in ((40, 3), (40, 0), (0, 3)):
+        forward(
+            runner,
+            SimpleNamespace(
+                is_dummy_run=False,
+                total_tokens_num_prefill=n_prefill_tokens,
+                total_tokens_num_decode=n_decode_tokens,
+            ),
+        )
+    assert calls == [
+        ("record", True),  # mixed
+        ("step", True),
+        ("record", True),  # pure prefill
+        ("step", True),
+        ("record", False),  # pure decode
+        ("step", False),
+    ]

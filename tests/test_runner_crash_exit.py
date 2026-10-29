@@ -80,3 +80,37 @@ def test_sys_exit_keeps_its_code(code, expected):
     proc = _start(run_exiting_on_crash, _exit_with, code)
     assert not _join(proc, _EXIT_WITHIN_S)
     assert proc.exitcode == expected
+
+
+def _crash_after_registering_a_release(marker):
+    from atom.utils import register_crash_release
+
+    register_crash_release(lambda: marker.write_text("released"))
+    raise RuntimeError("simulated runner OOM")
+
+
+def _crash_with_a_release_that_hangs():
+    from atom import utils
+
+    utils.CRASH_RELEASE_TIMEOUT_S = 1.0
+    utils.register_crash_release(threading.Event().wait)
+    raise RuntimeError("simulated runner OOM")
+
+
+def test_a_crash_runs_the_registered_releases_first(tmp_path):
+    """What the skipped teardown would have released outside this process
+    (the LMCache MP server's mapping of the KV pool) is released before the
+    crash exit, through `register_crash_release`."""
+    marker = tmp_path / "released"
+    proc = _start(run_exiting_on_crash, _crash_after_registering_a_release, marker)
+    assert not _join(proc, _EXIT_WITHIN_S)
+    assert proc.exitcode == 1
+    assert marker.read_text() == "released"
+
+
+def test_a_release_that_hangs_does_not_hold_the_exit():
+    proc = _start(run_exiting_on_crash, _crash_with_a_release_that_hangs)
+    start = time.monotonic()
+    assert not _join(proc, _EXIT_WITHIN_S), "a hanging release held the crash exit"
+    assert time.monotonic() - start < _EXIT_WITHIN_S
+    assert proc.exitcode == 1

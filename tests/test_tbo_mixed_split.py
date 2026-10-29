@@ -221,3 +221,61 @@ def test_maybe_create_ubatch_slices_leaves_prefill_path_alone():
     )
     assert slices is not None
     assert all(s.num_prefill_tokens is None for s in slices)
+
+
+def test_precompute_and_split_agree_on_random_batches():
+    """What each rank reports to the DP sync (the precomputes) and what it then
+    cuts (the splits) agree on every batch, pure prefill and mixed, including
+    whether a split happens at all. A disagreement sizes the per-ubatch
+    all_gathers differently across ranks: a hang, not an error."""
+    from atom.utils.tbo.ubatch_splitting import (
+        _split_prefill_token_midpoint,
+        split_mixed_token_midpoint,
+    )
+    from atom.utils.tbo.ubatching import (
+        _precompute_mixed_token_split,
+        _precompute_prefill_token_split,
+    )
+
+    rng = np.random.default_rng(0)
+    for _ in range(2000):
+        n_pref = int(rng.integers(0, 6))
+        n_dec = int(rng.integers(0, 6))
+        n = n_pref + n_dec
+        if n == 0:
+            continue
+        toks = np.concatenate(
+            [rng.integers(1, 300, n_pref), rng.integers(1, 9, n_dec)]
+        ).astype(np.int64)
+        n_pref_tokens = int(toks[:n_pref].sum())
+
+        _, can, ub0, ub1 = _precompute_prefill_token_split(toks, n_pref, 0)
+        slices = (
+            _split_prefill_token_midpoint(n_pref, toks, 2, None) if n_pref else None
+        )
+        assert can == (slices is not None)
+        if can:
+            assert [s.token_slice.stop - s.token_slice.start for s in slices] == [
+                ub0,
+                ub1,
+            ]
+
+        _, can, ub0, ub1 = _precompute_mixed_token_split(toks, n, n_pref_tokens, 0)
+        slices = split_mixed_token_midpoint(n, n_pref, n_pref_tokens, toks)
+        assert can == (slices is not None)
+        if can:
+            assert [s.token_slice.stop - s.token_slice.start for s in slices] == [
+                ub0,
+                ub1,
+            ]
+            assert slices[0].num_prefill_tokens == ub0  # ubatch 0 is pure prefill
+
+
+def test_a_mixed_split_honours_the_ubatch_token_cap():
+    from atom.utils.tbo.ubatch_splitting import split_mixed_token_midpoint
+
+    toks = np.asarray([600, 600, 1, 1], dtype=np.int64)
+    assert split_mixed_token_midpoint(4, 2, 1200, toks) is not None
+    assert (
+        split_mixed_token_midpoint(4, 2, 1200, toks, max_tokens_per_ubatch=500) is None
+    )

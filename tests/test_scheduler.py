@@ -3490,6 +3490,35 @@ class TestMixedBatch:
             sched.register_prefill_hashes(batch, list(sched.running))
         assert [c.args[0] for c in hash_blocks.call_args_list] == [prefill_seq]
 
+    def test_reserve_skips_rows_whose_pp_token_is_in_flight(self):
+        """The decode loop skips a row whose PP token is in flight, so the
+        reserve does not hold its width back from prefill."""
+        sched = self._mixed_scheduler(max_num_batched_tokens=64, max_num_seqs=16)
+        sched.running.extend(
+            SimpleNamespace(id=i, is_partial_prefill=False) for i in range(6)
+        )
+        assert sched._prefill_budget() == 64 - 6
+        sched._pp_inflight_token_block.update({0, 1, 2})
+        assert sched._prefill_budget() == 64 - 3
+
+    def test_an_in_progress_prompt_keeps_a_chunk_under_a_full_reserve(
+        self, seq_factory
+    ):
+        """With more decodes than the batch budget the reserve would take all
+        of it, and a chunked prompt that already holds its blocks would get no
+        chunk until the decodes drain. It keeps `max_num_batched_tokens // 8`;
+        the decodes that do not fit wait a step, as on any full step."""
+        sched = self._mixed_scheduler(
+            max_num_batched_tokens=16, max_num_seqs=32, num_kvcache_blocks=200
+        )
+        for i in range(20):
+            self._ready_decode_seq(sched, seq_factory, [100 + i, 1, 2, 3])
+        prompt = seq_factory(list(range(200, 240)))  # 40 tokens: chunked
+        sched.add(prompt)
+        batch, _ = sched.schedule()
+        assert prompt.id in batch.req_ids
+        assert batch.num_scheduled_tokens[batch.req_ids.index(prompt.id)] >= 16 // 8
+
     def test_mixed_final_prefill_chunk_completes_its_trace(self, seq_factory):
         """With progress advanced at schedule time, a mixed step's final
         prefill chunk closes its prefill span even though a decode row shares
@@ -3620,6 +3649,28 @@ class TestMixedSpecDecodeReserve:
         assert self._sched(3).decode_spec_width == 3
         # Drafting-only under PP: no draft rows are forwarded, none reserved.
         assert self._sched(3, pipeline_parallel_size=2).decode_spec_width == 0
+
+    def test_a_pure_prefill_step_verifies_nothing(self, seq_factory):
+        """With the flag on a pure-prefill batch leaves through the decode
+        loop's fall-through, not the prefill-only return. It still verifies
+        nothing: under DP a block drafter MAX-reduces `num_spec_step + 1`, and
+        a prefill rank reporting the decode width widens its decoding peers."""
+        sched = self._sched(3)
+        sched.add(seq_factory([1, 2, 3, 4]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_decode == 0 and batch.total_seqs_num_prefill == 1
+        assert batch.num_spec_step == 0
+
+    def test_a_mixed_step_keeps_the_decode_width(self, seq_factory):
+        sched = self._sched(3)
+        decode = seq_factory([1, 2, 3, 4])
+        sched.add(decode)
+        sched.schedule()
+        decode.num_cached_tokens = decode.num_prompt_tokens
+        decode.append_token(99)
+        sched.add(seq_factory(list(range(10, 20))))
+        batch, _ = sched.schedule()
+        assert batch.is_mixed and batch.num_spec_step == 3
 
     def test_mixed_step_fills_the_budget_exactly(self, seq_factory):
         sched = self._sched(3)
