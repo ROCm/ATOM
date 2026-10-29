@@ -1635,11 +1635,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return getattr(text, "model_type", None) in GDN_PAGE_CHECKPOINT_MODEL_TYPES
 
     def state_transfer(self) -> StateTransfer:
-        """PAGE image for Qwen GDN hybrids; fork for everyone else.
+        """PAGE image when ``_uses_paged_checkpoints`` says so; fork otherwise.
 
-        A model type outside the MHA set, including one this method sees as
-        ``qwen4_exp``, stays on fork. Qwen4ExpMetadataBuilder overrides this
-        and points the image at its QSA arena.
+        That hook decides who gets the image: here the Qwen3-Next / Qwen3.5
+        model types, and ``Qwen4ExpMetadataBuilder``'s own answer for Qwen3.8.
+        Qwen3.8 builds this same ``gdn-paged-state-v1`` id through ``super()``
+        and appends what its QSA pages and PLE state add. Where the image's
+        bytes live is ``_page_unit_pools``' business, not this method's.
         Pipeline parallelism and RapidServe stay on fork so sizing does not
         refuse to start.
         """
@@ -1678,14 +1680,16 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
     def checkpoint_page_unit_bytes(self) -> int | None:
-        """Bytes of one MHA page that a transfer actually publishes.
+        """Bytes of one page that a transfer actually publishes.
 
-        ``ModelRunner`` sizes the checkpoint unit from the paged pool's
-        ``entry_bytes`` unless a backend returns a number here. ``None`` keeps
-        that charged size. Kimi's MLA pool needs no override: its charged
-        entry is exactly the rows the page geometry walks.
+        The page is whatever ``_page_unit_pools`` holds: the MHA pool here,
+        the QSA arena for Qwen3.8 (``_published_page_unit_bytes`` sums the
+        declared fields either way). ``ModelRunner`` sizes the checkpoint unit
+        from the paged pool's ``entry_bytes`` unless a backend returns a
+        number here. ``None`` keeps that charged size. Kimi's MLA pool needs no
+        override: its charged entry is exactly the rows the page geometry walks.
 
-        Qwen's ``MhaKvPool`` does not work that way. The pool is one
+        Qwen3-Next / Qwen3.5's ``MhaKvPool`` does not work that way. The pool is one
         allocation ATOM lays out itself. Each field (K, V, scale) is rounded
         up to 256 bytes so a kernel sees aligned rows, and ``entry_bytes``
         bills those gaps. ``region_tensors()`` publishes only the real fields,

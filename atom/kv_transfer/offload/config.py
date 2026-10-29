@@ -63,13 +63,10 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
 # `kimi_linear` family `kimi_k3` owns. The types `attn_family` resolves to
 # `Family.GDN` (Qwen3-Next, Qwen3.5) plus Qwen3.8's, which it resolves to
 # `Family.QSA_GDN` (`qwen4_exp_text`; `qwen4_exp` is the wrapper name a native
-# config flattens to). Note the attribute skew: the guard below reads
-# `hf_config.model_type` while `attn_family` reads the text config. On the
-# native path they agree only because `get_hf_config` flattens the text type
-# up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
-# offload is ever wired into plugin mode this guard must switch to the text
-# config to stay in sync.
-# Unreachable today -- no plugin caller passes a `kv_transfer_config`.
+# config flattens to). `_layout_from_model` matches it against the text
+# config's `model_type` (`get_hf_text_config`), the attribute `attn_family`
+# reads, so a wrapped config such as Qwen3.5's multimodal one resolves to its
+# text type here and in the backend selector alike.
 # MiniMax-M3 is not here either: it is sparse *paged* attention
 # (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
 # state, so it is NOT a GDN/linear model. It does get its own PAGE-only `m3`
