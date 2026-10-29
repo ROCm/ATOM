@@ -3,7 +3,11 @@
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+from aiter.ops.batched_gemm_op_a8w8 import (
+    batched_gemm_a8w8_mxscale_bpreshuffle,
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant,
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported,
+)
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
@@ -32,6 +36,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
+from atom.utils import envs
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
@@ -287,6 +292,9 @@ class Attention(nn.Module):
             quant_config=native_quant_config(),
             reduce_results=True,
         )
+        # Resolved on the first `_project_out` (needs the loaded wo_a shape):
+        # whether to fuse the wo_a->wo_b quant into the wo_a GEMM epilogue.
+        self._fuse_woa_quant: bool | None = None
         self.compressor = (
             Compressor(
                 config.hidden_size, self.head_dim, spec.ratio, config.rms_norm_eps
@@ -349,11 +357,41 @@ class Attention(nn.Module):
             num_groups=self.groups,
             quant_group_size=32,
         )
+        wo_a_w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+        wo_a_ws = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
+        if self._fuse_woa_quant is None:
+            # Probe once, when the weight's shape is known: the fused-quant
+            # epilogue only exists for gfx1250 flydsl mxfp8_32.
+            self._fuse_woa_quant = envs.ATOM_V41_FUSE_WOA_QUANT and (
+                batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
+                    tuple(wo_a_ws.shape), self.o_rank, int(wo_a_w.shape[-1])
+                )
+            )
+            import sys as _sys
+
+            print(
+                f"[ATOM_V41_FUSE_WOA_QUANT] env={bool(envs.ATOM_V41_FUSE_WOA_QUANT)} "
+                f"resolved_fused={bool(self._fuse_woa_quant)} "
+                f"wo_a_ws={tuple(wo_a_ws.shape)} o_rank={self.o_rank} "
+                f"n={int(wo_a_w.shape[-1])}",
+                file=_sys.stderr,
+                flush=True,
+            )
+        if self._fuse_woa_quant:
+            # wo_a GEMM emits the (e4m3, e8m0) pair wo_b reads directly, so the
+            # standalone quantize_fp8 between wo_a and wo_b is removed.
+            y8, y_scale = batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
+                x_fp8, wo_a_w, x_scale, wo_a_ws
+            )
+            return self.wo_b(
+                y8.view(*output.shape[:-2], -1),
+                x_scale=y_scale.view(*output.shape[:-2], -1),
+            )
         y = batched_gemm_a8w8_mxscale_bpreshuffle(
             x_fp8,
-            self.wo_a.weight.view(self.groups, self.o_rank, -1),
+            wo_a_w,
             x_scale,
-            self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1),
+            wo_a_ws,
             dtype=output.dtype,
         )
         return self.wo_b(y.view(*output.shape[:-2], -1))
