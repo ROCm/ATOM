@@ -306,6 +306,7 @@ All default off.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_MOE_PRECOMPUTED_NVR** | bool | 0 (false) | Stage each `batch_info` count times the MoE top-k next to the counts (same host-to-device copy) and pass it to aiter's `fused_moe` as `num_valid_routes`, so the gfx1250 grouped TP path does not launch the `num_local_tokens * topk` multiply in every MoE layer. Needs an aiter whose `fused_moe` takes `num_valid_routes`; with the flag off ATOM never passes it. |
+| **ATOM_MTP_REPLICATED_FC** | bool | 0 (false) | Qwen3.5 MTP at TP>1: hold the whole `mtp.fc` (2H -> H) on every rank instead of column-parallel + all-gather. Its input is the same on every rank, so is its output; the GEMM is bitwise the same. A prefill chunk over 1024 tokens still runs this rank's rows and the all-gather. |
 
 ## Engram (DeepSeek-V4.1)
 

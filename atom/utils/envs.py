@@ -997,6 +997,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DRAFT_STEP0_CUDAGRAPH": lambda: (
         os.getenv("ATOM_DRAFT_STEP0_CUDAGRAPH", "1").lower() == "1"
     ),
+    # --- Qwen3.5 MTP draft path (all default OFF) ---
+    # Qwen3.5 MTP: the fc (2H -> H, bf16) replicated on every TP rank instead of
+    # column-parallel + all-gather. Drops an RCCL all-gather and its reorder copy
+    # per draft pass for 12 MB of weight per rank; the GEMM is bitwise the same.
+    # A prefill chunk over 1024 tokens keeps this rank's rows and the gather.
+    "ATOM_MTP_REPLICATED_FC": lambda: _flag_env("ATOM_MTP_REPLICATED_FC", "0"),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(

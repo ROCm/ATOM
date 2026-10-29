@@ -5,12 +5,14 @@
 import re
 
 import torch
+from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.linear import ColumnParallelLinear
+from atom.model_ops.linear import ColumnParallelLinear, ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
@@ -18,8 +20,12 @@ from atom.models.qwen3_5 import (
     get_qwen3_5_text_config,
 )
 from atom.models.utils import IntermediateTensors
+from atom.utils import envs
 
 from .utils import maybe_prefix
+
+# Up to here (decode and draft steps) the replicated fc runs whole on each rank.
+_REPLICATED_FC_MAX_TOKENS = 1024
 
 
 # @support_torch_compile
@@ -43,7 +49,15 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             config.hidden_size,
         )
 
-        self.fc = ColumnParallelLinear(
+        # Replicated fc (ATOM_MTP_REPLICATED_FC): every rank has the whole fc
+        # output without the all-gather. Its input is the same on every rank (the
+        # post-collective target hidden and the draft token's embedding), so is
+        # its output.
+        self.replicated_fc = (
+            envs.ATOM_MTP_REPLICATED_FC and get_tp_group().world_size > 1
+        )
+        fc_cls = ReplicatedLinear if self.replicated_fc else ColumnParallelLinear
+        self.fc = fc_cls(
             self.config.hidden_size * 2,
             self.config.hidden_size,
             bias=False,
@@ -75,6 +89,24 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _fc(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.replicated_fc:
+            return get_tp_group().all_gather(self.fc(x))
+        tp = get_tp_group()
+        if (
+            x.shape[0] <= _REPLICATED_FC_MAX_TOKENS
+            or tp.world_size == 1
+            or self.fc.quant_type.value != QuantType.No.value
+            or getattr(self.fc.weight, "is_shuffled", False)
+        ):
+            return self.fc(x)
+        # A prefill chunk: the full GEMM would be TP times the FLOPs, so this
+        # rank's rows of the weight (what ColumnParallelLinear holds) and the
+        # all-gather, as without the flag.
+        rows = self.fc.weight.shape[0] // tp.world_size
+        shard = self.fc.weight[tp.rank_in_group * rows :][:rows]
+        return tp.all_gather(tgemm.mm(x, shard, None, otype=x.dtype))
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -91,8 +123,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-        hidden_states = self.fc(hidden_states)
-        hidden_states = get_tp_group().all_gather(hidden_states)
+        hidden_states = self._fc(hidden_states)
         residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
