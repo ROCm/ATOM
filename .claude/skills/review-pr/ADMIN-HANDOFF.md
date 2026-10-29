@@ -80,10 +80,11 @@ Neither blocks a first run.
 
 ## 3b. The trigger allowlist takes effect only after merge
 
-`authorized.txt` lists the 79 logins that may say `atom-bot review`: everyone who
-authored or reviewed one of the last 300 merged ROCm/ATOM PRs, unioned with aiter's own
-allowlist (the two bots share a box and largely a team; 14 logins were on both). Bots
-excluded. The gate
+`authorized.txt` lists the 88 logins that may say `atom-bot review`: the team's
+maintained reviewer roster (42 people, eight on the ATOM review rota), unioned with
+everyone who authored or reviewed one of the last 300 merged ROCm/ATOM PRs, unioned with
+aiter's own allowlist. Bots excluded. The roster leads for a reason: mining PR data alone
+missed a reviewer who is on the rota. The gate
 reads it **from the default branch**, so while this work is still a PR branch the file is
 invisible to the gate and every trigger is refused (the parser fails closed on a missing
 file). Two ways through, pick one:
