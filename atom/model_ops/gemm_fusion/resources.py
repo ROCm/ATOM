@@ -48,6 +48,58 @@ def fusion_resources_cls(gf):
     return importlib.import_module(name + ".resources").FusionResources
 
 
+# The low call_id bits a LARGE plan's handshake tag carries, per aiter source. Route A
+# (r19, LARGE_ABI generation 6) repartitions the r13 13-bit m_real / 19-bit call_id word to
+# 14-bit m_real / 18-bit call_id, so it needs narrower tag ids than r13 / r18.
+_LARGE_TAG_BITS_FALLBACK = {
+    "r11": 19,
+    "r12": 19,
+    "r13": 19,
+    "r14": 19,
+    "r18": 19,
+    "r19": 18,
+}
+_LARGE_SRC = "sp_qkv.large.v1"
+
+
+def large_tag_bits(src: str) -> int:
+    """Low ``call_id`` bits of a large plan's handshake tag, from aiter's authoritative
+    ``specs.large_tag_bits`` when the installed build exposes it (route A), else the
+    fallback table above. Unknown sources keep aiter's own default (19)."""
+    try:
+        from aiter.ops.gemm_fusion.sp_qkv.specs import large_tag_bits as _aiter_width
+
+        return int(_aiter_width(src))
+    except Exception:  # noqa: BLE001 - absent on older aiter / CPU-only tests
+        return _LARGE_TAG_BITS_FALLBACK.get(src, 19)
+
+
+def large_plan_tag_bits(plan) -> int | None:
+    """The low ``call_id`` bits of a LARGE plan's handshake tag (19 for the r13 / r18
+    generations, 18 for route A's r19), or None when the plan's tag carries the whole
+    ``call_id`` (every SMALL plan, and any ABI generation this wrapper does not know).
+
+    The guard is the plan *kind* AND ABI generation, never ``src`` alone: ``r19`` also names
+    a SMALL source (``SMALL_ABI`` 3) whose tags carry the full id, while the route-A r19 is
+    the LARGE source at generation 6. The ``vid`` gate separates them; ``vid`` is absent
+    only on test doubles, which are then classified by ABI as before. A future large source
+    of the same tag width must be added to ``_LARGE_TAG_BITS_FALLBACK`` (or aiter should
+    expose the width on the plan instead of ATOM names)."""
+    vid = getattr(plan, "vid", None)
+    if vid is not None and vid != _LARGE_SRC:
+        return None
+    abi = getattr(plan, "abi", None)
+    # LARGE_ABI: 4 = r13 / r18 (LG_COMM_ABI_VERSION 5, 19 call bits),
+    #           5 = r14 (LG_COMM_ABI_VERSION 6, same 19-bit tag word),
+    #           6 = r19 route A (LG_COMM_ABI_VERSION 7, 18 call bits).
+    if abi not in (4, 5, 6):
+        return None
+    src = getattr(plan, "src", None)
+    if src is None:
+        return None
+    return large_tag_bits(src)
+
+
 class FusionResourcesWrapper:
     def __init__(self, sp_group, world: int, profile: str):
         gf = aiter_gf()
@@ -238,31 +290,32 @@ class FusionResourcesWrapper:
             kw["per_tokens"] = True
         return callid.check_call_ids(keys, **kw)
 
-    def tag_unique_ids(self, keys):
-        """``{key: call_id}`` whose LOW tag bits are distinct and non-zero within every token count
-        (aiter's ``tag_unique_ids``, for plans whose tag carries only those bits), or None when this
-        aiter has no such helper. A pure function of the key set."""
+    def tag_unique_ids(self, keys, tag_bits=None):
+        """``{key: call_id}`` whose LOW ``tag_bits`` bits are distinct and non-zero within every
+        token count (aiter's ``tag_unique_ids``, for plans whose tag carries only those bits), or
+        None when this aiter has no such helper. ``tag_bits=None`` keeps aiter's default (19, the
+        r13 / r18 large tag); route A's r19 large plans repartition the tag to 18 call bits and
+        must pass it. A pure function of the key set."""
         callid = self._callid_module()
         fn = None if callid is None else getattr(callid, "tag_unique_ids", None)
-        return None if fn is None else fn(keys)
+        if fn is None:
+            return None
+        if tag_bits is None:
+            return fn(keys)
+        try:
+            return fn(keys, tag_bits=tag_bits)
+        except TypeError:
+            # An aiter older than the route-A tag-width argument can only assign 19-bit ids;
+            # returning them for a narrower tag would be wrong, so report "no ids" and let the
+            # caller refuse the buckets (native) instead of launching with unknown low bits.
+            return None
 
     @staticmethod
     def plan_tag_bits(plan):
-        """19 for a LARGE plan whose handshake tag carries only the low 19 bits of ``call_id`` (the
-        large R12-ABI sources r13 and r18, E = STEP << 32 | (m_real - 1) << 19 | call_id & 0x7FFFF),
-        else None.
-
-        The guard is source AND ABI generation, never ``src`` alone: the LARGE r13 / r18 plans are
-        ABI generation 4 (LG_COMM_ABI_VERSION 5, LG_TAG_CALL_BITS 19), while the SMALL r18 plan is
-        the pre-R12 SMALL_ABI 2 plan, whose tags carry the FULL ``call_id``. The shipped profile
-        runs its 512 / 768 bucket rows on the large r18 plan and the 1024..8192 grid on large r13;
-        both need the 19-bit ids. A future large source of the same tag width must be added here
-        (or aiter should expose the width on the plan instead of ATOM hard-coding source names).
+        """Delegates to the single module-level helper (``large_plan_tag_bits``); kept as a
+        wrapper method because the site/hook call sites historically asked the resources object.
         """
-        if getattr(plan, "src", None) not in ("r13", "r18"):
-            return None
-        # LARGE_ABI generation 4 == LG_COMM_ABI_VERSION 5 only; the small r18 plan is ABI 2.
-        return 19 if getattr(plan, "abi", None) == 4 else None
+        return large_plan_tag_bits(plan)
 
     def reduce_max(self, values):
         """Elementwise MAX all-reduce of small ints over the SP group; trivial on one rank.

@@ -298,6 +298,18 @@ class _TokenIds:
         self.ids, self.refused = ids, frozenset(refused)
 
 
+def plan_tag_bits(plan):
+    """The single tag-width entry point for sites and call-id builders: the resources wrapper
+    method when one is installed (test doubles rely on that indirection), else the module-level
+    helper (``resources.large_plan_tag_bits``). ``None``: the plan's tag carries the full
+    ``call_id``; an int is the number of low bits that reach the handshake tag."""
+    from .resources import large_plan_tag_bits
+
+    res = _RES
+    fn = getattr(res, "plan_tag_bits", None) if res is not None else None
+    return fn(plan) if fn is not None else large_plan_tag_bits(plan)
+
+
 def token_call_ids(tokens, mode) -> _TokenIds:
     """The call-id verdicts for one token count, built once and cached. Only the launches of ONE
     token count (= one forward pass) can meet in a handshake, so that is the scope of the check: over
@@ -321,17 +333,42 @@ def _build_token_call_ids(tokens, mode) -> _TokenIds:
             keys[(s.name, tokens, r.vid, r.n_fused)] = r
     if not keys or _RES is None:
         return _TokenIds({}, ())
-    bits_of = getattr(_RES, "plan_tag_bits", None)
-    tagged = [k for k, r in keys.items() if bits_of is not None and bits_of(r.plan)]
-    ids, refused = {}, set()
+    bits_of = plan_tag_bits
+    tagged = [k for k, r in keys.items() if bits_of(r.plan)]
+    ids, refused, bits = {}, set(), None
     if tagged:
-        try:
-            ids = _RES.tag_unique_ids(tagged) or {}
-        except ValueError:  # more (site, vid, n_fused) triples than tag ids
-            ids = {}
-        if not ids:
-            refused.update(tagged)  # no id can be assigned: those launches run native
-    bits = max((bits_of(keys[k].plan) for k in tagged), default=None)
+        widths = {bits_of(keys[k].plan) for k in tagged}
+        if len(widths) != 1:
+            # Route A keeps one tag family per token count (r13 / r18 19 bits, r19 18 bits).
+            # A mixture cannot be checked with one width, so the safe outcome is native.
+            refused.update(tagged)
+            logger.warning(
+                "gemm_fusion: mixed tag widths %s at tokens=%d (%s); refusing the fused "
+                "launches (native on every rank)",
+                sorted(widths),
+                tokens,
+                mode,
+            )
+        else:
+            bits = widths.pop()
+            try:
+                ids = _RES.tag_unique_ids(tagged, tag_bits=bits) or {}
+            except TypeError:
+                # A test double / older wrapper without the width argument.
+                try:
+                    ids = _RES.tag_unique_ids(tagged) or {}
+                except ValueError:  # more (site, vid, n_fused) triples than tag ids
+                    ids = {}
+                if ids and bits != 19:
+                    # The helper cannot honour a narrower tag: its ids may collide on the bits
+                    # the kernel actually keeps, so run those buckets native.
+                    refused.update(tagged)
+                    ids = {}
+            except ValueError:  # more (site, vid, n_fused) triples than tag ids
+                ids = {}
+            if not ids:
+                # No id can be assigned: those launches run native.
+                refused.update(tagged)
 
     def key_fn(site, tok, vid, n):
         got = ids.get((site, tok, vid, n))

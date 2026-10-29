@@ -59,7 +59,15 @@ def main():
         (experts, hidden, intermediate // 32), 120, dtype=torch.uint8, device="cuda"
     ).view(dtypes.fp8_e8m0)
     quant = get_hip_quant(QuantType.per_1x32)
-    for tokens in (16, 8192, 32768):
+    # Route-A / 16K runs need the 65536-token shape; keep the default set small for
+    # the standing evidence run and opt in with e.g.
+    #   ATOM_CHECK_MXFP4_TOKENS=16,8192,32768,65536 torchrun ...
+    token_counts = [
+        int(t)
+        for t in os.environ.get("ATOM_CHECK_MXFP4_TOKENS", "16,8192,32768").split(",")
+        if t.strip()
+    ]
+    for tokens in token_counts:
         x = torch.randn(tokens // world, hidden, dtype=torch.bfloat16, device="cuda")
         gathered = sp.sp_moe_gather(x)
         # The layer's shapes may not select a prequantizing two-stage config (the
