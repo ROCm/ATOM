@@ -1,18 +1,19 @@
-"""Run SGLang tc_piecewise prefill as Inductor compile-only.
+"""Run SGLang prefill as Inductor compile-only.
 
-SGLang currently couples its prefill ``tc_piecewise`` compiler to per-bucket
-CUDA Graph capture and static input staging.  This optional plugin patch keeps
-the existing FX split/Inductor path, including ATOM's attention split ops, but
-executes the dynamic compiled callable directly against the live ForwardBatch.
-
-Enable with ``ATOM_SGLANG_PREFILL_COMPILE_ONLY=1``.  The patch intentionally
-uses the existing ``tc_piecewise`` backend name so no SGLang source or CLI
-schema change is required.
+SGLang 0.5.22 rejects ``--cuda-graph-backend-prefill tc_piecewise``. The Qwen
+accuracy case launches with the supported ``breakable`` prefill backend, which
+still carries the prefill capture sizes. When
+``ATOM_SGLANG_PREFILL_COMPILE_ONLY=1`` is set, this patch rewrites that
+published config to the internal piecewise backend, forces the Inductor
+compiler, and executes the compiled callable against the live ForwardBatch
+instead of capturing per-bucket CUDA graphs. Capturing the 8192/16384 prefill
+graphs during server startup makes the ROCm worker exit before it is ready.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -75,6 +76,77 @@ def _compile_only_prefill_scope() -> Iterator[None]:
         _COMPILE_ONLY_PREFILL_ACTIVE = previous
 
 
+def _published_prefill_config():
+    try:
+        from sglang.srt.runtime_context import get_exec
+
+        graph = getattr(get_exec(), "graph", None)
+        cfg = getattr(graph, "cuda_graph_config", None)
+    except Exception:  # noqa: BLE001 - published config is optional
+        return None
+    if cfg is None:
+        return None
+    return getattr(cfg, "prefill", None)
+
+
+def _promote_compile_only_prefill(server_args, backend_cls):
+    """Point a supported prefill backend at the internal piecewise compiler.
+
+    The runner reads ``get_exec().graph.cuda_graph_config.prefill``. Older
+    call sites still pass a config on ``server_args``, so both objects are
+    rewritten when they still say ``breakable``.
+    """
+
+    configs = []
+    for prefill in (
+        resolve_prefill_cuda_graph_config(server_args),
+        _published_prefill_config(),
+    ):
+        if prefill is not None and all(prefill is not item for item in configs):
+            configs.append(prefill)
+    breakable = getattr(backend_cls, "BREAKABLE", "breakable")
+    for prefill in configs:
+        if getattr(prefill, "backend", None) == breakable:
+            prefill.backend = backend_cls.TC_PIECEWISE
+    return configs[-1] if configs else None
+
+
+def _install_piecewise_prefill_resolver(backend_cls, piecewise_backend_cls) -> None:
+    """Let the 0.5.22 runner construct the piecewise backend by name.
+
+    ``resolve_prefill_backend`` only builds ``breakable`` and ``full``. The
+    prefill runner imports that function by name, so the runner module has to
+    see the piecewise constructor as well.
+    """
+
+    try:
+        from sglang.srt.model_executor.runner_backend import utils as backend_utils
+    except ImportError as exc:
+        logger.info("SGLang piecewise prefill resolver patch skipped: %s", exc)
+        return
+    original_resolve = getattr(backend_utils, "resolve_prefill_backend", None)
+    if original_resolve is None or getattr(
+        original_resolve, "_atom_compile_only", False
+    ):
+        return
+
+    def resolve_prefill_backend(cuda_graph_runner):
+        if (
+            getattr(cuda_graph_runner, "prefill_backend_name", None)
+            == backend_cls.TC_PIECEWISE
+        ):
+            return piecewise_backend_cls(cuda_graph_runner)
+        return original_resolve(cuda_graph_runner)
+
+    resolve_prefill_backend._atom_compile_only = True
+    backend_utils.resolve_prefill_backend = resolve_prefill_backend
+    runner_module = sys.modules.get(
+        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner"
+    )
+    if runner_module is not None and hasattr(runner_module, "resolve_prefill_backend"):
+        runner_module.resolve_prefill_backend = resolve_prefill_backend
+
+
 def apply_prefill_compile_only_patch() -> bool:
     """Install the compile-only behavior when explicitly enabled."""
 
@@ -98,6 +170,8 @@ def apply_prefill_compile_only_patch() -> bool:
         )
         return False
 
+    _install_piecewise_prefill_resolver(Backend, TcPiecewiseCudaGraphBackend)
+
     if getattr(PrefillCudaGraphRunner, "_atom_compile_only_patched", False):
         return False
 
@@ -120,8 +194,8 @@ def apply_prefill_compile_only_patch() -> bool:
         return runner.prefill_backend_name == Backend.TC_PIECEWISE
 
     def init_compile_only_runner(self, model_runner):
-        prefill = resolve_prefill_cuda_graph_config(model_runner.server_args)
-        if prefill is None or prefill.backend != Backend.TC_PIECEWISE:
+        prefill = _promote_compile_only_prefill(model_runner.server_args, Backend)
+        if prefill is None or getattr(prefill, "backend", None) != Backend.TC_PIECEWISE:
             return original_runner_init(self, model_runner)
 
         # TcPiecewise compiles during runner construction. Set the branch before

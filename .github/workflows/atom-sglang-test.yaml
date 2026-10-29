@@ -249,7 +249,7 @@ jobs:
             runner: linux-atom-pitt-mi350x-8
           - model_name: "Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8"
             model_path: "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4"
-            extra_args: "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --max-running-requests 256 --context-length 32768 --disable-radix-cache --page-size 16 --reasoning-parser qwen3 --enable-torch-compile --torch-compile-max-bs 64 --cuda-graph-backend-prefill tc_piecewise --cuda-graph-max-bs-prefill 16384 --cuda-graph-bs-prefill 8192 16384 --cuda-graph-tc-compiler inductor"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --max-running-requests 256 --context-length 32768 --disable-radix-cache --page-size 16 --reasoning-parser qwen3 --enable-torch-compile --torch-compile-max-bs 64 --cuda-graph-backend-prefill breakable --cuda-graph-max-bs-prefill 16384 --cuda-graph-bs-prefill 8192 16384"
             env_vars: |
               SGLANG_DEFAULT_SERVER_ARGS=
               SGLANG_PLUGINS=atom_sglang
