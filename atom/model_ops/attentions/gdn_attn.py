@@ -1713,22 +1713,15 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # -- PAGE pools: the one thing a subclass with another pool overrides --
 
     def _page_unit_pools(self) -> list:
-        """Pools whose ``region_tensors()`` hold the image, in published order.
+        """Pools holding the image, in published order.
 
-        Everything below reads the PAGE image through this, so a builder that
-        keeps its pages elsewhere (Qwen3.8's QSA arena) overrides it and
-        ``_page_unit_arenas`` / ``_published_page_unit_bytes``, nothing else.
+        Each has ``region_tensors()`` (the views a transfer publishes and the
+        copy addresses) and ``region_layout()`` (the same regions from the
+        declared offsets). Everything below reads the PAGE image through this,
+        so a builder that keeps its pages elsewhere overrides it together with
+        ``_published_page_unit_bytes``.
         """
         return list(self.kv_pools.values())
-
-    def _page_unit_arenas(self) -> list:
-        """The arenas behind ``_page_unit_pools``, in the same region order."""
-        return [
-            arena
-            for pool in self._page_unit_pools()
-            for arena in (pool.cache, pool.scale, pool.extra)
-            if arena is not None
-        ]
 
     def _published_page_unit_bytes(self) -> int:
         """Bytes one block publishes, from the declaration (before allocation)."""
@@ -1838,10 +1831,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def _with_paged_state_contract(self, transfer):
         """Attach the native checkpoint contract to the published PAGE regions.
 
-        The regions a unit spans are checked against the arenas' own byte
-        offsets (``LayerMajorArena.region_layout``), not against
-        ``_page_unit_regions``: both of those read the same pool views and
-        would move together.
+        The regions a unit spans are checked against the pools' declared byte
+        offsets (``region_layout``), not against ``_page_unit_regions``: both
+        of those read the same ``region_tensors`` views and would move
+        together.
         """
 
         if transfer is None or not self._uses_paged_checkpoints():
@@ -1858,8 +1851,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         ]
         expected = [
             region
-            for arena in self._page_unit_arenas()
-            for region in arena.region_layout()
+            for pool in self._page_unit_pools()
+            for region in pool.region_layout()
         ]
         if published != expected or sum(size for _, size in expected) != int(
             spec.page_unit_bytes

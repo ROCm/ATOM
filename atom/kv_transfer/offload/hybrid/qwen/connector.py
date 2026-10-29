@@ -9,7 +9,7 @@ KDA shapes. Qwen3-Next and Qwen3.5 publish those views from their MHA pool
 (``pool_layout/mha_page_unit_geometry``) under the ``gdn-paged-state`` layout id
 spelled in ``GDNAttentionMetadataBuilder.state_transfer``. Qwen3.8
 (``qwen4_exp``) publishes them from its QSA arena
-(``pool_layout/qsa_page_unit_geometry``) through the same builder contract,
+(``LayerMajorArena.region_tensors``) through the same builder contract,
 and appends the PLE conv / n-gram windows to the image and to the layout id
 (``Qwen4ExpMetadataBuilder.state_transfer``). These subclasses exist so the
 selected layout is ``qwen`` rather than ``kimi_k3``.

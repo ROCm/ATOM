@@ -13,14 +13,11 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
     entry_bytes_for,
+    published_bytes_for,
 )
 from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
     mha_page_unit_regions,
     mha_page_unit_views,
-)
-from atom.model_ops.attentions.pool_layout.qsa_page_unit_geometry import (
-    QsaRegionPool,
-    qsa_published_page_bytes,
 )
 
 
@@ -36,27 +33,25 @@ def _fields():
 
 def test_qsa_regions_are_one_contiguous_block_each():
     arena = LayerMajorArena(_fields(), entries=3, device="cpu")
-    pool = QsaRegionPool(arena)
-    published = qsa_published_page_bytes(_fields())
+    published = published_bytes_for(_fields())
     assert published <= entry_bytes_for(_fields())
-    bases, sizes = mha_page_unit_regions([pool])
+    bases, sizes = mha_page_unit_regions([arena])
     assert int(sizes.sum()) == published
     assert len(bases) == 8  # 4 fields * 2 layers
-    for _, tensor in pool.region_tensors():
+    for _, tensor in arena.region_tensors():
         assert tensor.is_contiguous()
         assert tensor.shape[0] == 3
 
 
 def test_one_qsa_block_round_trips_through_page_views():
     arena = LayerMajorArena(_fields(), entries=2, device="cpu")
-    pool = QsaRegionPool(arena)
-    blob = torch.arange(qsa_published_page_bytes(_fields()), dtype=torch.uint8)
+    blob = torch.arange(published_bytes_for(_fields()), dtype=torch.uint8)
     at = 0
-    for _, tensor in pool.region_tensors():
+    for _, tensor in arena.region_tensors():
         row = tensor[1].view(torch.uint8).reshape(-1)
         row.copy_(blob[at : at + row.numel()])
         at += row.numel()
-    views = mha_page_unit_views([pool], [1])
+    views = mha_page_unit_views([arena], [1])
     packed = torch.cat([view.view(torch.uint8).reshape(-1) for view in views])
     assert torch.equal(packed, blob)
 
@@ -335,7 +330,7 @@ def _paged_builder(blocks=3, *, spec=True):
     builder.kv_pools = {}
     builder._pool_rows = {}
     cls.allocate_kv_cache_tensors(builder, blocks=blocks, buf=None)
-    published = qsa_published_page_bytes(_fields())
+    published = published_bytes_for(_fields())
     builder.model_runner.state_runtime = (
         SimpleNamespace(
             checkpoint_spec=SimpleNamespace(
@@ -362,30 +357,30 @@ def test_qsa_builder_inherits_the_page_contract_through_hooks():
     ):
         assert name not in vars(cls), name
         assert name in vars(GDNAttentionMetadataBuilder), name
-    for name in ("_page_unit_pools", "_page_unit_arenas", "_published_page_unit_bytes"):
+    for name in ("_page_unit_pools", "_published_page_unit_bytes"):
         assert name in vars(cls), name
+    assert not hasattr(GDNAttentionMetadataBuilder, "_page_unit_arenas")
 
 
-def test_qsa_region_pool_is_built_once_per_allocation(monkeypatch):
+def test_qsa_regions_are_built_once_per_allocation(monkeypatch):
+    """The PAGE copy and the store thread read the image through the arena's
+    regions every step; building them is fields x layers `as_strided` views."""
     builder, cls = _paged_builder()
-    from atom.model_ops.attentions.pool_layout import qsa_page_unit_geometry
-
-    built = []
+    arena = cls._page_unit_pools(builder)[0]
+    assert arena is builder.qsa_arena
+    arena.region_tensors()
     monkeypatch.setattr(
-        qsa_page_unit_geometry.QsaRegionPool,
-        "__init__",
-        lambda self, arena: built.append(arena),
+        LayerMajorArena,
+        "view",
+        lambda *_: pytest.fail("region views rebuilt after the first walk"),
     )
-    pool = cls._page_unit_pools(builder)[0]
     for _ in range(3):
         cls.page_unit_views(builder, [0, 1])
         cls.page_unit_segments(builder, [0, 1])
         cls.get_kv_transfer_tensors(builder)
-    assert cls._page_unit_pools(builder)[0] is pool
-    assert built == []
+    assert cls._page_unit_pools(builder)[0] is arena
 
     cls.release_kv_pools(builder)
-    assert builder.qsa_region_pool is None
     with pytest.raises(RuntimeError, match="no QSA arena"):
         cls._page_unit_pools(builder)
 
@@ -425,7 +420,8 @@ def test_transfer_contract_catches_published_regions_drifting(monkeypatch):
     """Published views and the copy's regions read the same pool, so the check
     compares them with the arena's own offsets: a reorder there is caught."""
     builder, cls = _paged_builder()
-    rows = builder.qsa_region_pool._rows
+    builder.qsa_arena.region_tensors()
+    rows = builder.qsa_arena._regions
     rows[0], rows[2] = rows[2], rows[0]  # k.0 <-> v.0
     builder._page_unit_region_cache = None
     with pytest.raises(RuntimeError, match="do not match the checkpoint PAGE unit"):
@@ -437,10 +433,10 @@ def test_transfer_contract_catches_a_missing_field():
     closed. The unit-size check sees it first; a reorder, which keeps the
     size, is what needs the arena comparison (the test above)."""
     builder, cls = _paged_builder()
-    builder.qsa_region_pool._rows = [
+    builder.qsa_arena._regions = [
         row
-        for row in builder.qsa_region_pool._rows
-        if ".index_compressed." not in row[0]
+        for row in builder.qsa_arena.region_tensors()
+        if not row[0].startswith("index_compressed.")
     ]
     builder._page_unit_region_cache = None
     with pytest.raises(RuntimeError, match="PAGE unit is 592 B"):
@@ -456,3 +452,23 @@ def test_arena_region_layout_matches_its_views():
         for layer in range(field.layers)
     ]
     assert arena.region_layout() == expected
+
+
+def test_arena_region_tensors_name_each_field_layer_and_match_the_layout():
+    """The walk `MhaKvPool` / `MlaKvPool` / Qwen3.8 share: role names and order
+    as the MHA pool always published them, and the views sit where the
+    declared offsets say."""
+    arena = LayerMajorArena(_fields(), entries=5, device="cpu")
+    regions = arena.region_tensors()
+    assert [role for role, _ in regions] == [
+        f"{field.name}.layer_{layer}"
+        for field in arena.fields
+        for layer in range(field.layers)
+    ]
+    assert [
+        (tensor.data_ptr(), tensor.stride(0) * tensor.element_size())
+        for _, tensor in regions
+    ] == arena.region_layout()
+    again = arena.region_tensors()
+    assert again is not regions
+    assert all(a is b for (_, a), (_, b) in zip(regions, again, strict=True))

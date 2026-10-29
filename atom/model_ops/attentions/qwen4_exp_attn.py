@@ -40,7 +40,12 @@ from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
 
 from .gdn_attn import GDNAttentionBackend, GDNAttentionMetadataBuilder
-from .pool_layout.entry_arena import EntryField, LayerMajorArena, entry_bytes_for
+from .pool_layout.entry_arena import (
+    EntryField,
+    LayerMajorArena,
+    entry_bytes_for,
+    published_bytes_for,
+)
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .qwen4_exp_transfer import check_qwen38_kv_transfer, qwen38_offload_configured
 from .token_layout.batch_ids import build_batch_ids
@@ -460,22 +465,13 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     # The PAGE image lives in the QSA arena; the parent's PAGE contract
     # (`_page_unit_regions`, `page_unit_views`, `page_unit_segments`,
     # `checkpoint_page_unit_bytes`, `get_kv_transfer_tensors`' tail) reads it
-    # through these three hooks.
+    # through these two hooks. The arena is its own pool: `region_tensors()`
+    # and `region_layout()` are `LayerMajorArena`'s.
 
     def _published_page_unit_bytes(self) -> int:
-        from atom.model_ops.attentions.pool_layout.qsa_page_unit_geometry import (
-            qsa_published_page_bytes,
-        )
-
-        return qsa_published_page_bytes(self._qsa_fields())
+        return published_bytes_for(self._qsa_fields())
 
     def _page_unit_pools(self) -> list:
-        pool = getattr(self, "qsa_region_pool", None)
-        if pool is None:
-            raise RuntimeError("Qwen3.8 PAGE checkpoint has no QSA arena")
-        return [pool]
-
-    def _page_unit_arenas(self) -> list:
         arena = getattr(self, "qsa_arena", None)
         if arena is None:
             raise RuntimeError("Qwen3.8 PAGE checkpoint has no QSA arena")
@@ -483,18 +479,10 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Back every paged field with the runner's shared allocation."""
-        from atom.model_ops.attentions.pool_layout.qsa_page_unit_geometry import (
-            QsaRegionPool,
-        )
-
         self.num_blocks = blocks
         self.qsa_arena = LayerMajorArena(
             self._qsa_fields(), blocks, self.device, buf=buf
         )
-        # Once per allocation: the PAGE copy and the store thread read the
-        # image through it every step, and building it is fields x layers
-        # `as_strided` views.
-        self.qsa_region_pool = QsaRegionPool(self.qsa_arena)
         return {}
 
     def release_kv_pools(self) -> None:
@@ -502,7 +490,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             for module in self.pool_rows.get(space, {}):
                 module.bind_caches(None, None, None, None, None)
         self.qsa_arena = None
-        self.qsa_region_pool = None
         super().release_kv_pools()
 
     def get_kv_transfer_tensors(self):

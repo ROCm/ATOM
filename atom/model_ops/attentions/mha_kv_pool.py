@@ -290,7 +290,18 @@ class MhaKvPool:
         V) makes that worth having.
         """
         return [
-            (f"{name}.layer_{layer}", view[layer])
-            for name, view in self._views.items()
-            for layer in range(len(view))
+            region
+            for arena in (self.cache, self.scale, self.extra)
+            if arena is not None
+            for region in arena.region_tensors()
+        ]
+
+    def region_layout(self) -> list[tuple[int, int]]:
+        """`region_tensors`' `(base address, bytes per entry)`, from the arenas'
+        declared offsets rather than the views (`LayerMajorArena.region_layout`)."""
+        return [
+            region
+            for arena in (self.cache, self.scale, self.extra)
+            if arena is not None
+            for region in arena.region_layout()
         ]

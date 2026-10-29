@@ -24,6 +24,8 @@ from collections.abc import Iterable
 import numpy as np
 import torch
 
+from atom.model_ops.attentions.pool_layout.entry_arena import published_bytes_for
+
 
 def mha_published_page_bytes(pools: Iterable) -> int:
     """Bytes one scheduler block publishes as MHA PAGE regions.
@@ -33,12 +35,9 @@ def mha_published_page_bytes(pools: Iterable) -> int:
     requires the checkpoint unit to equal the sum of the published regions.
     """
 
-    total = 0
-    for pool in pools:
-        for group in pool.field_groups:
-            for field in group:
-                total += field.bytes_per_entry
-    return total
+    return sum(
+        published_bytes_for(group) for pool in pools for group in pool.field_groups
+    )
 
 
 def mha_page_unit_regions(pools: Iterable) -> tuple[np.ndarray, np.ndarray]:

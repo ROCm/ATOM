@@ -258,6 +258,17 @@ def entry_bytes_for(fields: list[EntryField]) -> int:
     return _align_up(end)
 
 
+def published_bytes_for(fields: list[EntryField]) -> int:
+    """Bytes one entry publishes as transfer regions, alignment gaps excluded.
+
+    `entry_bytes_for` also bills the padding between fields. A layer-major
+    pool publishes one region per field per layer (`region_tensors`), so those
+    gaps are not a region, and `lmcache_mp` requires a PAGE checkpoint unit to
+    equal the published sum.
+    """
+    return sum(field.bytes_per_entry for field in fields)
+
+
 def checkpoint_ranges_for(fields: list[EntryField]) -> list[tuple[int, int]]:
     """`(offset, num_bytes)` of an entry a checkpoint image holds.
 
@@ -524,6 +535,7 @@ class LayerMajorArena:
         self._align = max([_ALIGN] + [f.align for f in self.fields])
         self._offsets = {f.name: start for f, start, _ in field_extents(self.fields)}
         self._by_name = {f.name: f for f in self.fields}
+        self._regions: list[tuple[str, torch.Tensor]] | None = None
 
         want = self.entry_bytes * entries
         if buf is None:
@@ -600,3 +612,21 @@ class LayerMajorArena:
                 for layer in range(field.layers)
             )
         return regions
+
+    def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        """One `(role, tensor)` per (field, layer), in field order.
+
+        A tensor is `view(name)[layer]`, `[entries, *shape]`, so a row is one
+        entry and `stride(0)` its bytes. This is the granularity a transfer
+        registers: an entry's bytes are `entries` apart, so no coarser range
+        is one entry. Built on first use and kept, since the buffer never
+        moves; each call returns a new list over the same tensors.
+        """
+        if self._regions is None:
+            self._regions = [
+                (f"{field.name}.layer_{layer}", view[layer])
+                for field in self.fields
+                for view in (self.view(field.name),)
+                for layer in range(field.layers)
+            ]
+        return list(self._regions)
