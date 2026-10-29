@@ -24,12 +24,22 @@ export HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 ATOM_GC_THRESHOLD=20000,50,50
 # custom all-gather instead of an RCCL broadcast, one launch per sigmoid gate, the tokenizer cache for
 # Qwen's NFC normalizer, aiter's register-resident top-p for the top-k-first sampler (the generic
 # kernel spills, and every launch then waits on a scratch grow). Each one: the environment wins.
+# Then the MoE route count staged once per forward (passed to aiter's fused_moe as num_valid_routes:
+# needs aiter alizaidy/qwen35-c16-perf, set ATOM_MOE_PRECOMPUTED_NVR=0 with an older aiter), and the
+# MTP draft: replicated fc and embedding (no all-gather / all-reduce), both pre-fc norms in one launch,
+# the argmax packs exchanged by one all-reduce, the GDN kv-indptr rebuild in one launch.
 if [ "$MODE" = tp ]; then
   export ATOM_SPEC_FUSED_VERIFY_SAMPLE=${ATOM_SPEC_FUSED_VERIFY_SAMPLE:-1}
   export ATOM_TP_TOKEN_SYNC_ALLGATHER=${ATOM_TP_TOKEN_SYNC_ALLGATHER:-1}
   export ATOM_FUSED_SIGMOID_GATE=${ATOM_FUSED_SIGMOID_GATE:-1}
   export ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER=${ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER:-1}
   export AITER_TOPK_FIRST_SMALL_K_TOPP=${AITER_TOPK_FIRST_SMALL_K_TOPP:-1}
+  export ATOM_MOE_PRECOMPUTED_NVR=${ATOM_MOE_PRECOMPUTED_NVR:-1}
+  export ATOM_MTP_REPLICATED_FC=${ATOM_MTP_REPLICATED_FC:-1}
+  export ATOM_QWEN35_MTP_REPLICATED_EMBED=${ATOM_QWEN35_MTP_REPLICATED_EMBED:-1}
+  export ATOM_MTP_DUAL_PRE_FC_NORM=${ATOM_MTP_DUAL_PRE_FC_NORM:-1}
+  export ATOM_ARGMAX_HEAD_AR_GATHER=${ATOM_ARGMAX_HEAD_AR_GATHER:-1}
+  export ATOM_MTP_FUSED_KV_INDPTR=${ATOM_MTP_FUSED_KV_INDPTR:-1}
 fi
 # keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
 # first eager multi-request prefill, a ~35 s stall a fresh server

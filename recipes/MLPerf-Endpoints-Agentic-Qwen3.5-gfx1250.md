@@ -32,7 +32,7 @@ overrides, `SPEC=0` turns it off); `run_ep.sh` picks the server from the concurr
 
 | Concurrency | Server |
 |---|---|
-| 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p |
+| 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p, MoE routes staged once per forward, MTP draft with replicated fc / embedding, one-launch pre-fc norms, all-reduce argmax exchange and one-launch GDN kv-indptr |
 | 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
