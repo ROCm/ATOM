@@ -46,12 +46,31 @@ def qwen38_offload_configured(config) -> bool:
     )
 
 
+def qsa_caches_quantized(config) -> bool:
+    """Whether the QSA K/V or compressed index-key cache is stored quantized.
+
+    Resolved as `qsa_cache_formats` resolves it, which lives with the kernels
+    and so needs AITER: an unset index dtype follows the KV cache's. Quantized
+    target caches are also what gives the MTP draft layer its own `*_draft`
+    rows (`QSAAttention.qsa_row_space`).
+    """
+
+    kv = getattr(config, "kv_cache_dtype", None) or "bf16"
+    index = getattr(config, "index_cache_dtype", None) or kv
+    return any(dtype not in ("bf16", "auto", "bfloat16") for dtype in (kv, index))
+
+
 def check_qwen38_kv_transfer(config) -> None:
-    """Refuse every configured transport but the two LMCache offload tiers."""
+    """Refuse every configured transport but the two LMCache offload tiers.
+
+    `lmcache_offload` is refused with quantized QSA caches as well, until
+    ROCm/ATOM#2655 lands.
+    """
 
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    for name in qwen38_transfer_leaves(config):
+    leaves = qwen38_transfer_leaves(config)
+    for name in leaves:
         if not KVConnectorFactory.is_offload_backend(name):
             # A P/D connector moves the QSA pages alone, and decode would
             # continue from a zero recurrent state: fluent, wrong output and
@@ -69,3 +88,16 @@ def check_qwen38_kv_transfer(config) -> None:
                 f"kv_connector={name!r} does not read the QSA/GDN/PLE PAGE "
                 "checkpoint image."
             )
+    if "lmcache_offload" in leaves and qsa_caches_quantized(config):
+        # The in-process codec copies what `build_kv_cache_tensor` hands it,
+        # which has no scale planes and the target's rows for the draft layer:
+        # a CPU hit restores quantized K/V and index keys under stale scales.
+        # lmcache_mp publishes every arena field and is unaffected.
+        raise ValueError(
+            "Qwen3.8 lmcache_offload does not carry the scale planes of a "
+            "quantized QSA cache yet (kv_cache_dtype="
+            f"{getattr(config, 'kv_cache_dtype', None)!r}, index_cache_dtype="
+            f"{getattr(config, 'index_cache_dtype', None)!r}). Use "
+            "--kv-cache-dtype bf16 --index-cache-dtype bf16, or lmcache_mp, "
+            "which stores every QSA field; ROCm/ATOM#2655 lifts this."
+        )

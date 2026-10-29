@@ -463,6 +463,97 @@ def test_qwen38_accepts_the_lmcache_tiers(kv_transfer_config):
     assert qwen38_offload_configured(config) is bool(kv_transfer_config)
 
 
+_IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
+_MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype, index_cache_dtype",
+    [
+        ("fp8", None),  # the index cache follows the KV cache
+        ("fp8", "fp8"),
+        ("fp8", "bf16"),
+        ("bf16", "fp8"),
+        ("bf16", "fp4"),
+        ("auto", "fp4"),
+    ],
+)
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        _IN_PROCESS,
+        {"kv_connector": "multi", "connectors": [_MP, _IN_PROCESS]},
+    ],
+)
+def test_qwen38_refuses_in_process_offload_of_quantized_caches(
+    kv_transfer_config, kv_cache_dtype, index_cache_dtype
+):
+    """The in-process codec has no field for the QSA scale planes: a CPU hit
+    would restore FP8 rows under the scales of the blocks' previous owners.
+    Refused until ROCm/ATOM#2655 lands."""
+    from atom.model_ops.attentions.qwen4_exp_transfer import check_qwen38_kv_transfer
+
+    config = SimpleNamespace(
+        kv_transfer_config=kv_transfer_config,
+        kv_cache_dtype=kv_cache_dtype,
+        index_cache_dtype=index_cache_dtype,
+    )
+    with pytest.raises(ValueError, match="lmcache_offload.*#2655"):
+        check_qwen38_kv_transfer(config)
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config, kv_cache_dtype, index_cache_dtype",
+    [
+        (_IN_PROCESS, "bf16", "bf16"),
+        (_IN_PROCESS, "bf16", None),
+        (_IN_PROCESS, "auto", "bfloat16"),
+        (_IN_PROCESS, None, None),
+        (_MP, "fp8", None),
+        (_MP, "fp8", "fp4"),
+        (_MP, "bf16", "fp8"),
+        (None, "fp8", "fp8"),
+    ],
+)
+def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
+    kv_transfer_config, kv_cache_dtype, index_cache_dtype
+):
+    """lmcache_mp publishes every arena field, scales and `*_draft` rows
+    included; without offload nothing is transferred."""
+    from atom.model_ops.attentions.qwen4_exp_transfer import check_qwen38_kv_transfer
+
+    check_qwen38_kv_transfer(
+        SimpleNamespace(
+            kv_transfer_config=kv_transfer_config,
+            kv_cache_dtype=kv_cache_dtype,
+            index_cache_dtype=index_cache_dtype,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype, index_cache_dtype",
+    [
+        (kv, index)
+        for kv in ("bf16", "auto", "bfloat16", "fp8")
+        for index in (None, "bf16", "auto", "fp8", "fp4")
+    ],
+)
+def test_quantized_cache_check_agrees_with_the_kernel_formats(
+    kv_cache_dtype, index_cache_dtype
+):
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    from atom.model_ops.attentions.qwen4_exp_transfer import qsa_caches_quantized
+    from atom.model_ops.qwen4_exp.ops.qsa import qsa_cache_formats
+
+    config = SimpleNamespace(
+        kv_cache_dtype=kv_cache_dtype, index_cache_dtype=index_cache_dtype
+    )
+    assert qsa_caches_quantized(config) is (
+        qsa_cache_formats(config) != ("bf16", "bf16")
+    )
+
+
 def _paged_builder(blocks=3, *, spec=True):
     """A builder with a CPU QSA arena allocated the way the runner does."""
     builder, cls = _builder()
