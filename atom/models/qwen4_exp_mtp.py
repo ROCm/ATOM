@@ -155,6 +155,13 @@ class Qwen4ExpMTP(nn.Module):
     disable_fused_shared_loading = True
     fused_shared_experts = 0
     get_expert_mapping = Qwen4ExpForConditionalGeneration.get_expert_mapping
+    draft_graph_supports_mrope = True
+    reuse_draft_graph_step_buffers = True
+
+    @staticmethod
+    def draft_graph_hidden_state_shape(draft_hf) -> tuple[int, ...]:
+        """The draft carries the whole hyper-connection bundle between steps."""
+        return (draft_hf.hc_count, draft_hf.hidden_size)
 
     def __init__(self, atom_config: Config):
         super().__init__()

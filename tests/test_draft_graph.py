@@ -174,13 +174,55 @@ def test_staging_a_source_whose_leading_axis_is_not_the_batch_fails_loudly():
     """Every staged source is indexed as `[rows, *StagedInput.shape]`.
 
     MRoPE positions are the live case: they keep the token axis LAST (`[3, N]`),
-    so a drafter must not hand them to a pass at all. Without this the mismatch
+    so a drafter must declare them `batch_last`. Without this the mismatch
     surfaced as a `copy_` size error two frames down, which reads like a
     batch-size bug rather than a layout one.
     """
     g = _graph()
-    with pytest.raises(AssertionError, match="leading axis is not the batch"):
+    with pytest.raises(AssertionError, match="batch axis leading"):
         g._stage_one("row", 8, torch.zeros(3, 8, dtype=torch.int32))
+
+
+def _mrope_graph():
+    return _graph(
+        inputs={
+            "pos": StagedInput(shape=(3,), dtype=torch.int64, batch_last=True),
+            "row": StagedInput(dtype=torch.int32),
+        }
+    )
+
+
+def test_batch_last_input_is_contiguous_and_tail_repeats_the_last_column():
+    """MRoPE positions stage as a contiguous `[3, bs]`, the runner's own layout."""
+    g = _mrope_graph()
+    src = torch.arange(6, dtype=torch.int64).view(3, 2) * 10
+    staged = g.stage(4, {"pos": src, "row": torch.tensor([1, 2], dtype=torch.int32)})
+    pos = staged["pos"]
+    assert pos.shape == (3, 4) and pos.is_contiguous()
+    assert pos.tolist() == [[0, 10, 10, 10], [20, 30, 30, 30], [40, 50, 50, 50]]
+    assert staged["row"].tolist() == [1, 2, 2, 2]
+    assert pos.data_ptr() == g._buffers["pos"].data_ptr()
+    # One flat buffer, so every batch's view starts at the same address.
+    assert g._stage_one("pos", 2, None).data_ptr() == pos.data_ptr()
+
+
+def test_batch_last_capacity_counts_sequences_not_elements():
+    g = _mrope_graph()
+    assert g.buffer("pos", 256).shape == (3, 256)
+    with pytest.raises(AssertionError, match="capacity"):
+        g.buffer("pos", 257)
+
+
+def test_batch_last_sources_must_agree_with_leading_ones():
+    g = _mrope_graph()
+    with pytest.raises(AssertionError, match="batches of"):
+        g.stage(
+            4,
+            {
+                "pos": torch.zeros(3, 2, dtype=torch.int64),
+                "row": torch.zeros(3, dtype=torch.int32),
+            },
+        )
 
 
 def test_sources_that_disagree_on_the_batch_are_refused():
