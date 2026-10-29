@@ -1029,6 +1029,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
+    # Qwen3-Next / Qwen3.5: run the unfused shared expert beside the routed
+    # experts on a side stream (up to ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD tokens).
+    "ATOM_QWEN_SHARED_EXPERT_STREAM": lambda: (
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_STREAM", "1").lower() in ("1", "true")
+    ),
+    # Run the engine-core and worker loops under a frame that holds one large
+    # CPython data-stack chunk (atom/utils/deep_stack.py): on CPython 3.11 / 3.12
+    # a hot path straddling the end of a 16 KiB frame chunk maps and unmaps a
+    # chunk on every call across it, each munmap a TLB shootdown.
+    "ATOM_DEEP_FRAME_STACK": lambda: (
+        os.getenv("ATOM_DEEP_FRAME_STACK", "1").lower() in ("1", "true")
+    ),
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),

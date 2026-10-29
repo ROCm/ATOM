@@ -76,6 +76,9 @@ case $MODE in
       # same lockstep step and each decode waits for the prefill beside it (see the recipe's "Prefill /
       # decode interval"). An ATOM_PREFILL_DECODE_INTERVAL in the environment wins; 0 is the old scheduling.
       export ATOM_PREFILL_DECODE_INTERVAL=${ATOM_PREFILL_DECODE_INTERVAL:-8}
+      # the sigmoid gates as one launch each on DP points too: the MoE shared-expert combine (three
+      # eager kernels a layer) and the attention output gate (two a full-attention layer)
+      export ATOM_FUSED_SIGMOID_GATE=${ATOM_FUSED_SIGMOID_GATE:-1}
       ARGS+=(--enable-dp-attention --enable-expert-parallel --max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}") ;;
   *) echo "unknown mode $MODE"; exit 1 ;;
 esac

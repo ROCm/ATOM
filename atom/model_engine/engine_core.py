@@ -39,6 +39,7 @@ from atom.utils import (
     make_zmq_socket,
     set_process_title,
 )
+from atom.utils.deep_stack import run_on_deep_stack
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
@@ -399,7 +400,7 @@ class EngineCore:
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
                 engine = EngineCore(config, input_address, output_address)
-            engine.busy_loop()
+            run_on_deep_stack(engine.busy_loop)
         except Exception:
             logger.exception("run_engine failed")
             raise
@@ -1222,7 +1223,7 @@ class PrefillEngineCore(EngineCore):
         try:
             engine = PrefillEngineCore(config, input_address, output_address)
             engine._init_disagg()
-            engine.busy_loop()
+            run_on_deep_stack(engine.busy_loop)
         except Exception:
             logger.exception("PrefillEngineCore.run_engine failed")
             raise
@@ -1487,7 +1488,7 @@ class DecodeEngineCore(EngineCore):
         try:
             engine = DecodeEngineCore(config, input_address, output_address)
             engine._init_disagg()
-            engine.busy_loop()
+            run_on_deep_stack(engine.busy_loop)
         except Exception:
             logger.exception("DecodeEngineCore.run_engine failed")
             raise
