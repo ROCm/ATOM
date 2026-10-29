@@ -1031,8 +1031,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     # Qwen3-Next / Qwen3.5: run the unfused shared expert beside the routed
     # experts on a side stream (up to ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD tokens).
+    # Off by default: captured into the decode graphs, the fork runs as a parallel
+    # branch on a second stream, so every decode step runs on two streams.
     "ATOM_QWEN_SHARED_EXPERT_STREAM": lambda: (
-        os.getenv("ATOM_QWEN_SHARED_EXPERT_STREAM", "1").lower() in ("1", "true")
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_STREAM", "0").lower() in ("1", "true")
     ),
     # Run the engine-core and worker loops under a frame that holds one large
     # CPython data-stack chunk (atom/utils/deep_stack.py): on CPython 3.11 / 3.12
