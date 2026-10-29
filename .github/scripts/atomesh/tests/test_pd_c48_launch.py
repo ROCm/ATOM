@@ -59,7 +59,7 @@ class LaunchTest(unittest.TestCase):
                    "DG5-PNT-SWB-C88-MC": "DG5-PNT-SWB-C88-CPU26"}
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-"
         cases = sorted(p for p in GAP.glob(prefix + "*-MC.json")
-                       if "-PP8-" not in p.stem and "-OPUS-" not in p.stem)
+                       if p.stem.split("-")[-2] in {f"C{n}" for n in (1, 4, 16, 32, 48, 56, 72, 88)})
         self.assertEqual(len(cases), 8)
         for path in cases:
             suffix = path.stem.removeprefix(prefix)
@@ -100,9 +100,10 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(mooncake_hca(1, {"HIP_VISIBLE_DEVICES": "4,5,6,7"}), "rdma5")
         self.assertEqual(mooncake_hca(0, {"ROCR_VISIBLE_DEVICES": "6", "HIP_VISIBLE_DEVICES": "0"}), "rdma6")
 
-    def test_pp_and_opus_candidates_preserve_unrelated_recipe_settings(self):
+    def test_candidates_preserve_unrelated_recipe_settings(self):
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
-        for concurrency, variant in ((32, "PP8"), (72, "OPUS"), (88, "OPUS")):
+        for concurrency, variant in ((32, "PP8"), (72, "OPUS"), (88, "OPUS"),
+                                     (72, "JUNCTION"), (72, "P16K")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
@@ -118,8 +119,21 @@ class LaunchTest(unittest.TestCase):
                 for key in ("tensor-parallel-size", "decode-context-parallel-size"):
                     self.assertEqual(args[key], 1)
                     args[key] = base["roles"]["prefill"]["args"][key]
-            else:
+            elif variant == "OPUS":
                 self.assertEqual(candidate["roles"]["decode"]["env"].pop("AITER_MLA_USE_OPUS"), "1")
+            elif variant == "JUNCTION":
+                prefill = candidate["roles"]["prefill"]
+                self.assertTrue(prefill["args"].pop("enable-mamba-shared-prefix-checkpoint"))
+                self.assertEqual(prefill["env"].pop("C48_EXPECT_SHARED_PREFIX_CHECKPOINT"), "1")
+                self.assertEqual(prefill["env"]["C48_P_NO_TAIL_SPLIT"], "0")
+                prefill["env"]["C48_P_NO_TAIL_SPLIT"] = "1"
+                argv, _ = render(candidate, "decode", *ADDR, phase="eval")
+                spec = json.loads(argv[argv.index("--speculative-config") + 1])
+                self.assertEqual(spec["rejection_sample_method"], "standard")
+            else:
+                args = candidate["roles"]["prefill"]["args"]
+                self.assertEqual(args["max-num-batched-tokens"], 16384)
+                args["max-num-batched-tokens"] = 8192
             self.assertEqual(candidate, base)
 
     def test_nic_limits_degrades_without_verbs(self):

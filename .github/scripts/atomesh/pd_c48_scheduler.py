@@ -43,6 +43,11 @@ def create_scheduler(*args, **kwargs):
         # Skip the extra Prefill step that only registers the prompt's partial-tail
         # Mamba state; internal checkpoints and block-boundary states still cache.
         scheduler.mamba_partial_cache_hit = False
+    if (os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1"
+            and os.environ["C48_DIAG_ROLE"] == "prefill"
+            and not (requested and scheduler.mamba_shared_prefix_checkpoint
+                     and manager.mamba_shared_prefix_checkpoint)):
+        raise RuntimeError("C72 junction candidate did not enable shared-prefix checkpoints")
     record = {
         "role": os.environ["C48_DIAG_ROLE"],
         "no_tail_split": no_tail_split,
@@ -57,6 +62,8 @@ def create_scheduler(*args, **kwargs):
             getattr(scheduler.connector, "supports_divergent_local_hybrid_hits", False)
         ),
         "scheduler_block_size": scheduler.block_size,
+        "cache_config_block_size": scheduler.cache_config.block_size,
+        "internal_prefill_checkpoints": scheduler.mamba_has_prefill_checkpoint_blocks,
         "max_num_scheduled_tokens": scheduler.max_num_scheduled_tokens,
         "max_num_batched_tokens": config.scheduler_config.max_num_batched_tokens,
         "max_num_active_reqs": scheduler.max_num_active_reqs,
