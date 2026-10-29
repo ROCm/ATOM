@@ -495,6 +495,47 @@ def test_qwen38_accepts_the_lmcache_tiers(kv_transfer_config):
     assert qwen38_offload_configured(config) is bool(kv_transfer_config)
 
 
+@pytest.mark.parametrize("reads", [True, False])
+def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(reads):
+    """The knowledge lives on the registration, not in a Qwen3.8 list."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+    from atom.model_ops.attentions.qwen4_exp_transfer import (
+        check_qwen38_kv_transfer,
+        qwen38_offload_configured,
+    )
+
+    name = "page_image_tier_under_test"
+    KVConnectorFactory.register(
+        name,
+        worker_module="unused",
+        worker_class="Unused",
+        scheduler_module="unused",
+        scheduler_class="Unused",
+        offload=True,
+        reads_page_images=reads,
+    )
+    try:
+        config = _transfer_config({"kv_connector": name, "kv_role": "offload"})
+        if reads:
+            check_qwen38_kv_transfer(config)
+        else:
+            with pytest.raises(ValueError, match=f"kv_connector={name!r} does not"):
+                check_qwen38_kv_transfer(config)
+        assert qwen38_offload_configured(config) is reads
+    finally:
+        for table in (
+            KVConnectorFactory._registry,
+            KVConnectorFactory._aliases,
+            KVConnectorFactory._requires_pd_staging,
+            KVConnectorFactory._reads_block_regions,
+            KVConnectorFactory._copies_whole_block_regions,
+            KVConnectorFactory._offload,
+            KVConnectorFactory._reads_page_images,
+        ):
+            table.pop(name, None)
+    assert KVConnectorFactory.page_image_readers() == ["lmcache_mp", "lmcache_offload"]
+
+
 _IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
 _MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
 

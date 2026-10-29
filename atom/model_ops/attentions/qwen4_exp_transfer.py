@@ -4,19 +4,14 @@
 """Which KV transfer connectors Qwen3.8-Flash-Next (`qwen4_exp`) may run.
 
 Qwen3.8's GDN and PLE state ride the PAGE checkpoint image behind its QSA
-pages, and only the LMCache offload tiers read that image. Kept apart from
-`qwen4_exp_attn` so the connector rules import without AITER and are tested
-on a plain runner.
+pages, so it runs only the tiers that declare `reads_page_images` at
+registration (`KVConnectorFactory`). Kept apart from `qwen4_exp_attn` so the
+connector rules import without AITER and are tested on a plain runner.
 """
 
 from __future__ import annotations
 
 from .qwen4_exp_qsa_fields import qsa_caches_quantized
-
-# The offload tiers that read Qwen3.8's PAGE checkpoint image. Other offload
-# backends (mooncake_store) check a Qwen3-Next/3.5 layout and would refuse this
-# one only at startup, with a hint for the wrong model.
-QWEN38_OFFLOAD_BACKENDS = frozenset({"lmcache_offload", "lmcache_mp"})
 
 
 def qwen38_transfer_leaves(config) -> list[str]:
@@ -43,8 +38,11 @@ def qwen38_offload_configured(config) -> bool:
     validated only as the offload tier's image so far.
     """
 
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
     return any(
-        name in QWEN38_OFFLOAD_BACKENDS for name in qwen38_transfer_leaves(config)
+        KVConnectorFactory.reads_page_images(name)
+        for name in qwen38_transfer_leaves(config)
     )
 
 
@@ -70,9 +68,12 @@ def check_qwen38_kv_transfer(config) -> None:
                 "(lmcache_offload or lmcache_mp) or run without "
                 "kv_transfer_config."
             )
-        if name not in QWEN38_OFFLOAD_BACKENDS:
+        if not KVConnectorFactory.reads_page_images(name):
+            # mooncake_store, say: it checks a Qwen3-Next/3.5 layout and would
+            # refuse this one only at startup, with a hint for the wrong model.
             raise ValueError(
-                "Qwen3.8 offload supports lmcache_offload and lmcache_mp; "
+                "Qwen3.8 offload supports "
+                f"{', '.join(KVConnectorFactory.page_image_readers())}; "
                 f"kv_connector={name!r} does not read the QSA/GDN/PLE PAGE "
                 "checkpoint image."
             )
