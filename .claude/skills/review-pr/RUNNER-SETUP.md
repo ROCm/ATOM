@@ -254,6 +254,18 @@ Distinct from the `.env` above: these are repo-level, read by the free `gate` an
 
 Neither is required for a first run.
 
+## 2c. Kernel validation stays off, and says so
+
+`atom-review-bot.yml` sets `REVIEW_AUTO_VALIDATE: '0'`, matching aiter's workflow line
+for line, including the reason: validating a PR means running its code on this box, and
+ROCm/ATOM is public. Do not flip it as part of bringing the runner up.
+
+The validator itself (`.claude/skills/validate-atom-pr/`) is installed and callable, and
+a review whose PR *wanted* validation says so on the card rather than staying quiet --
+see that skill's "How it gets invoked" section for the three cases it distinguishes and
+for the per-invocation override. Turning it on repo-wide is a separate decision about
+untrusted code, not a runner-setup step.
+
 ## 3. gh auth off the job environment
 
 `fetch.sh` calls `gh` to read the PR. Authenticate it under `GH_CONFIG_DIR` rather than exporting

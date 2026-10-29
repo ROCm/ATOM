@@ -60,6 +60,49 @@ Exit code: `0` PASS, `2` INCONCLUSIVE, `1` otherwise (BLOCK/NEEDS_WORK) — this
 and a report is always written on every path, including BLOCK, so fetch.sh's gate always has
 something to read.
 
+## How it gets invoked, and why it does not run itself
+
+`review-pr`'s `fetch.sh` calls this validator automatically only when
+`REVIEW_AUTO_VALIDATE=1`. The workflow sets it to `'0'`, and so does aiter's: the
+comment on both lines reads `kernel validation off by default (self-hosted + public
+repo)`.
+
+That default is a security decision, not an oversight. ROCm/ATOM is public, anyone can
+open a PR, and validating one means executing its code on a self-hosted box. The trigger
+allowlist bounds this -- a review only starts when one of the 88 logins in
+`authorized.txt` asks for it -- so the exposure is not "any stranger runs code here" but
+"a maintainer triggering a review on a stranger's PR runs that stranger's code". That is
+the same hazard as any CI that builds PR branches on self-hosted runners, and it is
+worth deciding deliberately rather than inheriting.
+
+**The capability being off is not the same as the gap being silent.** When triage decides
+a PR needs validation and none ran, `fetch.sh` tells the worker, in these words, to
+`Report it as a gap in the evidence`, and hands it the reason. It distinguishes three
+cases that collapse into one unhelpful sentence if you let them:
+
+- not applicable -- no runtime surface changed, so `a static-only review is complete
+  here, not deficient`;
+- required but not run -- with the recorded reason, which for the default case is
+  `auto-validation is disabled (REVIEW_AUTO_VALIDATE=0)`;
+- required, not run, and the reason was not recorded -- `which is itself a defect in
+  this step`.
+
+So the reviewer reading the card is told when this PR is one that wanted validation. The
+reason is archived in `auto_validation_outcome.txt` alongside the report, because
+months later "validation was not applicable" and "validation was required and skipped"
+are different facts about a PR and the card alone does not separate them.
+
+**To run it for one review**, set the flag for that invocation rather than changing the
+default:
+
+```bash
+REVIEW_AUTO_VALIDATE=1 bash .claude/skills/review-pr/run_one.sh <PR> ROCm/ATOM
+```
+
+Turning it on repo-wide means deciding the untrusted-code question first -- restricting
+it to PRs from known authors, or running it somewhere disposable. Flip the workflow's
+`REVIEW_AUTO_VALIDATE` only after that, and record which answer you chose.
+
 ## CLI
 
 ```
