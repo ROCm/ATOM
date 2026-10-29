@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793210795225,
+  "lastUpdate": 1793297212143,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4524,6 +4524,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8946,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40724005038 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610281502 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1569 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "PerryZhang01",
+            "username": "PerryZhang01",
+            "email": "Perry.Zhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ce46c7c8dbe1ff3066c09b6dd9958d8856879dfd",
+          "message": "fix(plugin): green the vLLM 0.31 plugin CI cells; V4-Flash and GLM-5.2 on Model Runner V2 (#2818)\n\n* fix(plugin): build the reused TP communicator with aiter's own __init__\n\nReusedPyNcclCudaCommunicator copied CudaCommunicator.__init__ by hand to avoid\na second ncclCommInitRank, so every field aiter adds is missing on it. aiter\nnow reads self.gluon_ar_plain in all_reduce, and every vLLM-plugin run dies at\nengine init with AttributeError.\n\nBuild a plain CudaCommunicator instead, handing it vLLM's PyNccl communicator\nin place of the one its __init__ would create. aiter then sets every field it\nreads (Gluon all-reduce, ownership, all2all state) and RCCL still inits no\nduplicate communicator; a check fails loudly if aiter ever builds its own.\n\n* fix(deepseek_v2): set pcp_split only on an installed ATOM context\n\n#2725 writes get_forward_context().context.pcp_split on every forward, but\nthe vLLM plugin installs no ATOM context, so every DeepSeek-V2-family model\non the plugin (GLM-5.2 in CI) dies on its first forward with\n'NoneType' object has no attribute 'pcp_split'. The plugin runs no PCP and\nthe readers short-circuit on PCP being off, so the flag is only needed where\nthe context exists.\n\n* fix(plugin): accept reduce_results in the vLLM GDN subclasses\n\n#2520 made the Qwen3.5 decoder layer pass reduce_results to its\nGatedDeltaNet, so the norm after it can fuse the TP all-reduce. The\nplugin swaps that class for Qwen3_5GatedDeltaNetVllm, whose __init__\nspelled out the old signature, and model construction failed:\n\n    TypeError: Qwen3_5GatedDeltaNetVllm.__init__() got an unexpected\n    keyword argument 'reduce_results'\n\nAccept it and pass it through. allreduce_norm_fusion_enabled() keeps the\nfusion off in plugin mode, so the plugin layer passes True and computes\nwhat it did before #2520. Qwen3NextGatedDeltaNetVllm narrowed its\nparent's signature the same way; the Qwen3-Next layer does not pass the\nargument today, so it is aligned before it does.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* fix(plugin): carry V4.1's MX scale across the capture break as bytes\n\nvLLM's eager_break_during_capture weak-refs every argument of the call it\nbreaks out through torch.ops._C.weak_ref_tensor, a stable-ABI op that\naccepts the fp8 e4m3/e5m2 family but not float8_e8m0fnu. Since the HIP\nMega-MHC norm became the default (#2568) it hands QKV an e8m0 MX scale,\nand graph capture of the V4.1 plugin cell failed:\n\n    Not yet supported ScalarType 44, please file an issue ...\n\n_forward now passes an e8m0 scale as a uint8 view of the same storage,\nwith its dtype as a non-tensor keyword, and _attend_block views it back.\nThe weak ref still points at the caller's buffer on every replay.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* fix(docker): backport vLLM's Kimi-K3 KDA autotune key fix\n\nThe base image moved from Triton 3.7.0 to 3.8.0 between the 10-13 and\n10-25 nightlies. 3.8 checks autotune keys against the kernel's arguments\nat decoration time, and the pinned vLLM (db9527a46) keys\nchunk_kda_fwd_kernel_intra_sub_chunk on NC, which is not one. Importing\nvllm.models.kimi_k3 raised, and model inspection failed for every\nKimi-K3 deployment:\n\n    ValueError: key contains names that are not kernel arguments: NC.\n\nvllm-project/vllm#60446 (fc3931739) drops NC from the key, upstream on\n10-09 but after the pinned commit. Apply it as a patch on top of the\npinned commit. A scan of every @triton.autotune in the image's vLLM finds\nno other key naming a non-argument.\n\nThe PR job reuses the nightly vLLM image unless the vLLM commit or the\nATOM base recipe changes, so a change to the vLLM recipe or its patches\nwas never built by its own PR. Rebuild the vLLM image when either changes.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* fix(plugin): serve DeepSeek-V4 under vLLM's Model Runner V2\n\nvLLM runs DeepseekV4ForCausalLM on V1 on ROCm; with\nVLLM_USE_V2_MODEL_RUNNER=1 the V4 cell died in V2's kernel warmup:\n\n    RuntimeError: DeepSeek-V4 request(s) resumed at chunk_start [2, 2, ...]\n    into a fresh slot, but no state checkpoint path is bound\n\nThe state-slot hooks were V1's alone. V2 has no _update_states; it drops\nfinished and preempted requests in finish_requests, which execute_model\ncalls first. Hook that method on V2 (the same body as V1's\n_update_states hook) and initialize_kv_cache on every runner class, so\nslots come back and the checkpoint groups get their ids. Without this,\nslots would run out after max_num_seqs requests.\n\nV2's kernel warmup also schedules real-looking requests. Their prefill\nwas built before the forward bound the proxy cache, so it took no slots\nand the following decode found them fresh at chunk_start 2. The metadata\nbuilder now binds from the proxy, as V4.1's does, with the arguments the\nwrapper's forward would pass. V1 is unchanged: its dummy runs carry no\nrequest ids, so they still take throwaway arange slots after the bind.\n\nPrefix caching (state-checkpoint stores run from V1's _model_forward) and\nthe MTP draft (a V1 get_kv_cache_spec hook, and V2 sizing the drafter's\nhidden buffer from the class) still hook V1 alone; under V2 they are\nrefused at model construction instead of served wrong.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* ci(plugin): run the V4-Flash and GLM-5.2 cells on Model Runner V2\n\nvLLM keeps DeepseekV4ForCausalLM and GlmMoeDsaForCausalLM on V1 on ROCm\n(ROCM_DEFAULT_MRV1_ARCHITECTURES) unless VLLM_USE_V2_MODEL_RUNNER is set,\nso no PR cell ran either model on V2; the other four cells already select\nV2 by default. Set it on both cells. GLM-5.2 needs no code change for V2;\nDeepSeek-V4 needs the previous commit.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: XiaobingZhang <xiaobingzhangupc@gmail.com>\nCo-authored-by: perzhang <perzhang@amd.com>\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-29T16:43:19Z",
+          "url": "https://github.com/ROCm/ATOM/commit/ce46c7c8dbe1ff3066c09b6dd9958d8856879dfd"
+        },
+        "date": 1793297211311,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9469,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40909647683 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610291449 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9469 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.906,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40909647683 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610291449 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1615 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
