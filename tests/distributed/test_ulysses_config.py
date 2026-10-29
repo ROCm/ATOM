@@ -92,6 +92,9 @@ def test_moe_layouts_cannot_reuse_incompatible_sp_compilation_artifacts():
         index_cache_dtype="bf16",
         hf_config=SimpleNamespace(),
         speculative_config=None,  # main's compute_hash reads it (draft width keys the cache)
+        # main's #2688-era factors, read directly (not via getattr)
+        max_model_len=132096,
+        max_num_seqs=128,
     )
     keys = [Config.compute_hash(config)]
     config.enable_expert_parallel = True

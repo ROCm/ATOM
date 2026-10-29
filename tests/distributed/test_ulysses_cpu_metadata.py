@@ -137,6 +137,10 @@ def test_runner_publishes_padded_token_counts_for_sp_moe(
         prepare_model_inputs=lambda *args: None,
     )
     runner._maybe_create_tbo_slices = lambda *args: None
+    # main's #2688 prepare_inputs reads the step's GPU scalar through forward_vars
+    # and publishes the DP-rank row table `ForwardMode.decide` settled.
+    runner.forward_vars = {"batch_info": SimpleNamespace(gpu=[0, 0, 0])}
+    runner.running_tokens_per_dp_rank = np.array([32], dtype=np.int64)
     batch = SimpleNamespace(
         total_tokens_num_prefill=0,
         total_tokens_num=17,
@@ -145,17 +149,21 @@ def test_runner_publishes_padded_token_counts_for_sp_moe(
         is_dummy_run=False,
     )
     mode = SimpleNamespace(
-        sync=None,
+        sync=SimpleNamespace(ub_max_tokens_across_dp=None, ub_tokens_across_dp=None),
         tbo_collective_active=False,
         running_tokens_are_unified=True,
         running_bs=32,
         running_tokens=32,
         max_seqlen_q=1,
         scheduled_bs=17,
+        ubatch_split_bs=None,
+        token_graph=False,
     )
     try:
         runner.prepare_inputs(batch, torch.arange(32), mode)
-        expected = (8,) * world if world > 1 else None
+        # Under SP the table is the padded local width per SP rank; without SP it
+        # is the step's rows per DP rank, forwarded as the array holds them.
+        expected = (8,) * world if world > 1 else (32,)
         assert get_forward_context().context.running_tokens_across_dp == expected
     finally:
         reset_forward_context()
@@ -172,6 +180,7 @@ def test_forward_context_without_aiter_or_triton():
                 import sys
                 from types import SimpleNamespace
 
+                import numpy as np
                 import torch
 
                 sys.modules["aiter"] = None
@@ -188,23 +197,34 @@ def test_forward_context_without_aiter_or_triton():
                     parallel_config=SimpleNamespace(data_parallel_size=1),
                     compilation_config=SimpleNamespace(static_forward_context={}),
                 )
-                context = SimpleNamespace()
+                context = SimpleNamespace(forward_mode=None)
                 sp.set_sp_world_size(4)
-                set_forward_context(None, config, context, num_tokens=17)
+                set_forward_context(
+                    None,
+                    config,
+                    context,
+                    running_tokens_per_dp_rank=np.array([17], dtype=np.int64),
+                )
                 assert get_forward_context().context is context
                 assert context.running_tokens_across_dp == (5, 5, 5, 5)
 
-                set_forward_context(None, config, context, num_tokens=8)
+                set_forward_context(
+                    None,
+                    config,
+                    context,
+                    running_tokens_per_dp_rank=np.array([8], dtype=np.int64),
+                )
                 assert context.running_tokens_across_dp == (2, 2, 2, 2)
-                set_forward_context(None, config, context)
-                assert context.running_tokens_across_dp is None
 
                 sp.set_sp_world_size(1)
-                counts = torch.tensor([3, 7], dtype=torch.int32)
-                set_forward_context(None, config, context, num_tokens_across_dp=counts)
+                counts = np.array([3, 7], dtype=np.int64)
+                set_forward_context(
+                    None,
+                    config,
+                    context,
+                    running_tokens_per_dp_rank=counts,
+                )
                 assert context.running_tokens_across_dp == (3, 7)
-                set_forward_context(None, config, context, num_tokens=17)
-                assert context.running_tokens_across_dp is None
                 assert sp.get_sp_rank() == 0
                 assert sys.modules["aiter"] is None
                 assert sys.modules["triton"] is None
