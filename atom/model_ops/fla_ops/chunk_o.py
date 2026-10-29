@@ -24,7 +24,7 @@ _TRITON_BK = _TRITON_BV = 64 if check_shared_mem() else 32
 _TRITON_NUM_WARPS, _TRITON_NUM_STAGES = 4, 2
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _use_gfx1250_kernel(device_index: int) -> bool:
     props = torch.cuda.get_device_properties(device_index)
     return props.gcnArchName.split(":")[0] == "gfx1250"
@@ -253,8 +253,25 @@ def chunk_fwd_o(
         from .chunk_o_gfx1250 import chunk_o_gfx1250
 
         return chunk_o_gfx1250(
-            q, k, v, h, g, o, scale, cu_seqlens, chunk_indices, nt_ptr, NT, T, B, H,
-            Hg, K, V, BT, gate=gate,
+            q,
+            k,
+            v,
+            h,
+            g,
+            o,
+            scale,
+            cu_seqlens,
+            chunk_indices,
+            nt_ptr,
+            NT,
+            T,
+            B,
+            H,
+            Hg,
+            K,
+            V,
+            BT,
+            gate=gate,
         )
 
     chunk_fwd_kernel_o[(triton.cdiv(V, _TRITON_BV), NT, B * H)](

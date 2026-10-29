@@ -191,7 +191,9 @@ def _chunk_h_gfx1250_kernel(
         if USE_G:
             gl.amd.gfx1250.tdm.async_load(g_desc, [c, 0], g_smem.index(i))
     if USE_INITIAL_STATE:
-        state = gl.load(h0 + state_off, mask=(state_off >= 0) & use_h0, other=0.0).to(gl.float32)
+        state = gl.load(h0 + state_off, mask=(state_off >= 0) & use_h0, other=0.0).to(
+            gl.float32
+        )
     else:
         state = gl.zeros([K, BV], gl.float32, layout=WMMA)
     # the state entering chunk 0, bf16; each chunk writes the next one's
@@ -199,7 +201,6 @@ def _chunk_h_gfx1250_kernel(
 
     rows_t = gl.arange(0, BT, layout=gl.SliceLayout(1, WMMA))
     zero_v = gl.zeros([BT, BV], gl.float32, layout=WMMA)
-    zero_h = gl.zeros([K, BV], gl.float32, layout=WMMA)
 
     for i_t in range(NT):
         buf = i_t % NB
@@ -214,7 +215,9 @@ def _chunk_h_gfx1250_kernel(
         gl.barrier()
         h_cur = h_smem.index(buf)
         if STORE_H:
-            gl.amd.gfx1250.tdm.async_store(h_desc, [((boh + i_t) * H + i_h) * K, v0], h_cur)
+            gl.amd.gfx1250.tdm.async_store(
+                h_desc, [((boh + i_t) * H + i_h) * K, v0], h_cur
+            )
         nxt = gl.minimum(i_t + NB - 1, NT - 1) * BT
         nbuf = (i_t + NB - 1) % NB
         gl.amd.gfx1250.tdm.async_load(w_desc, [nxt, 0], w_smem.index(nbuf))
@@ -232,7 +235,9 @@ def _chunk_h_gfx1250_kernel(
         b_v = b_u - b_v
         if USE_G:
             b_g = g_smem.index(buf).reshape([BT]).load(gl.SliceLayout(1, WMMA))
-            b_g_last = gl.sum(gl.where(rows_t == gl.minimum(BT, T - t0) - 1, b_g, 0.0), 0)
+            b_g_last = gl.sum(
+                gl.where(rows_t == gl.minimum(BT, T - t0) - 1, b_g, 0.0), 0
+            )
             b_vg = b_v * gl.where(m_t, gl.exp(b_g_last - b_g), 0.0)[:, None]
             state = state * gl.exp(b_g_last)
         else:
@@ -256,12 +261,12 @@ def _chunk_h_gfx1250_kernel(
         gl.store(ht + state_off, state.to(ht.dtype.element_ty))
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _num_cus(device_index):
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _layouts(K, BT, BV, num_warps, split="M"):
     if split == "M":
         warp_bases = [[1, 0], [2, 0], [4, 0]][: num_warps.bit_length() - 1]
@@ -312,9 +317,33 @@ def launch_config(N, H, num_cus):
 
 
 def chunk_h_gfx1250(
-    k, w, u, g, h, v_new, h0, ht, cu_seqlens, chunk_offsets, n_ptr, h0_idx, ht_idx,
-    h0_flag, T, N, NT_ALL, H, Hg, K, V, BT, store_h=True, BV=None, num_warps=None,
-    num_buffers=None, split="M",
+    k,
+    w,
+    u,
+    g,
+    h,
+    v_new,
+    h0,
+    ht,
+    cu_seqlens,
+    chunk_offsets,
+    n_ptr,
+    h0_idx,
+    ht_idx,
+    h0_flag,
+    T,
+    N,
+    NT_ALL,
+    H,
+    Hg,
+    K,
+    V,
+    BT,
+    store_h=True,
+    BV=None,
+    num_warps=None,
+    num_buffers=None,
+    split="M",
 ):
     bv, nb, nw = launch_config(N, H, _num_cus(k.device.index))
     BV = BV or bv
@@ -322,9 +351,29 @@ def chunk_h_gfx1250(
     num_warps = num_warps or nw
     layouts = _layouts(K, BT, BV, num_warps, split)
     _chunk_h_gfx1250_kernel[(triton.cdiv(V, BV), N * H)](
-        k, u, w, v_new, g, h, h0, ht, cu_seqlens, chunk_offsets, n_ptr, h0_idx,
-        ht_idx, h0_flag, T, NT_ALL,
-        H=H, Hg=Hg, K=K, V=V, BT=BT, BV=BV, NUM_BUFFERS=num_buffers,
+        k,
+        u,
+        w,
+        v_new,
+        g,
+        h,
+        h0,
+        ht,
+        cu_seqlens,
+        chunk_offsets,
+        n_ptr,
+        h0_idx,
+        ht_idx,
+        h0_flag,
+        T,
+        NT_ALL,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        NUM_BUFFERS=num_buffers,
         USE_G=g is not None,
         USE_INITIAL_STATE=h0 is not None,
         STORE_FINAL_STATE=ht is not None,
@@ -333,8 +382,13 @@ def chunk_h_gfx1250(
         IS_VARLEN=cu_seqlens is not None,
         HAS_N=n_ptr is not None,
         USE_STATE_IDX=h0_idx is not None,
-        WMMA=layouts[0], OP_A=layouts[1], OP_B=layouts[2], SMEM_A_ROW=layouts[3],
-        SMEM_A_COL=layouts[4], SMEM_TILE=layouts[5], SMEM_STATE=layouts[6],
+        WMMA=layouts[0],
+        OP_A=layouts[1],
+        OP_B=layouts[2],
+        SMEM_A_ROW=layouts[3],
+        SMEM_A_COL=layouts[4],
+        SMEM_TILE=layouts[5],
+        SMEM_STATE=layouts[6],
         SMEM_G=layouts[7],
         num_warps=num_warps,
     )

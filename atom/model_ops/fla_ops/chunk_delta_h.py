@@ -6,12 +6,10 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# ruff: noqa: E501
 
 import functools
 
 import torch
-
 import triton
 import triton.language as tl
 
@@ -24,7 +22,7 @@ from .op import exp
 _TRITON_BV, _TRITON_NUM_WARPS, _TRITON_NUM_STAGES = 32, 4, 2
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _use_gfx1250_kernel(device_index: int) -> bool:
     props = torch.cuda.get_device_properties(device_index)
     return props.gcnArchName.split(":")[0] == "gfx1250"
@@ -400,7 +398,10 @@ def chunk_gated_delta_rule_fwd_h(
     if plan is not None:
         N, NT, chunk_offsets = plan.n_max, plan.nt64_max, plan.chunk_offsets
         n_ptr, h0_idx, ht_idx, h0_flag = (
-            plan.num_seqs, plan.state_idx_in, plan.state_idx, plan.has_initial_state
+            plan.num_seqs,
+            plan.state_idx_in,
+            plan.state_idx,
+            plan.has_initial_state,
         )
     else:
         chunk_indices = (
@@ -441,10 +442,29 @@ def chunk_gated_delta_rule_fwd_h(
         from .chunk_delta_h_gfx1250 import chunk_h_gfx1250
 
         chunk_h_gfx1250(
-            k, w, u, g, h, v_new, initial_state, final_state, cu_seqlens,
-            chunk_offsets, n_ptr, h0_idx, ht_idx, h0_flag, T, N,
+            k,
+            w,
+            u,
+            g,
+            h,
+            v_new,
+            initial_state,
+            final_state,
+            cu_seqlens,
+            chunk_offsets,
+            n_ptr,
+            h0_idx,
+            ht_idx,
+            h0_flag,
+            T,
+            N,
             # every chunk of h, of all B batch rows: the h store's bound
-            h.shape[0] * h.shape[1], H, Hg, K, V, BT,
+            h.shape[0] * h.shape[1],
+            H,
+            Hg,
+            K,
+            V,
+            BT,
         )
         return h, v_new, (None if in_place else final_state)
 

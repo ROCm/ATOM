@@ -60,11 +60,15 @@ def chunk_gated_delta_rule_fwd(
         )
         if plan is not None:
             chunk_indices_16, NT_16, nt16_ptr = (
-                plan.chunk_indices_16, plan.nt16_max, plan.nt16
+                plan.chunk_indices_16,
+                plan.nt16_max,
+                plan.nt16,
             )
         else:
             chunk_indices_16 = (
-                prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
+                prepare_chunk_indices(cu_seqlens, 16)
+                if cu_seqlens is not None
+                else None
             )
             NT_16 = (
                 len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
