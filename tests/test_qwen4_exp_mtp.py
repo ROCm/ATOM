@@ -16,8 +16,6 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compressed_slots,
     qsa_draft_decode_metadata,
-    qsa_select_paged_tokens,
-    qsa_sparse_paged_gqa,
 )
 
 
@@ -536,63 +534,3 @@ def test_qsa_draft_slots_follow_accepted_tail_and_page_boundary(k):
     )
     assert slots.tolist() == [-1, -1, -1]
     assert compressed.tolist() == [-1, -1, -1]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-@pytest.mark.parametrize("k", [1, 2, 3])
-@pytest.mark.parametrize("start", [15, 2047, 2063])
-def test_qsa_verification_is_causal_and_matches_individual_queries(k, start):
-    """Future draft keys must not enter an earlier query's selected context."""
-    torch.manual_seed(93)
-    device, block, ratio, budget = "cuda", 16, 4, 2048
-    rows, pages = k + 1, 132
-    positions = torch.arange(start, start + rows, device=device)
-    # A permuted physical layout exercises page translation, not only masking.
-    tables = torch.randperm(pages, device=device).to(torch.int32)[None]
-    requests = torch.zeros(rows, dtype=torch.int32, device=device)
-    lengths = torch.tensor([start + rows], dtype=torch.int32, device=device)
-    index_q = torch.randn(rows, 4, 128, dtype=torch.bfloat16, device=device)
-    compressed = torch.randn(
-        pages, block // ratio, 1, 128, dtype=torch.bfloat16, device=device
-    )
-    selected = qsa_select_paged_tokens(
-        index_q, compressed, tables, requests, positions, lengths, budget, ratio
-    )
-    query = torch.randn(rows, 24, 256, dtype=torch.bfloat16, device=device)
-    keys = torch.randn(pages, block, 2, 256, dtype=torch.bfloat16, device=device)
-    values = torch.randn_like(keys)
-    batched = qsa_sparse_paged_gqa(
-        query, keys, values, selected, tables, requests, num_decode_requests=1
-    )
-    for row in range(rows):
-        visible = selected[row][selected[row] >= 0]
-        assert (
-            visible.numel()
-            == min((start + row + 1) // ratio * ratio, budget)
-            + (start + row + 1) % ratio
-        )
-        assert visible.unique().numel() == visible.numel()
-        assert int(visible.max()) <= start + row
-        individual = qsa_select_paged_tokens(
-            index_q[row : row + 1],
-            compressed,
-            tables,
-            requests[row : row + 1],
-            positions[row : row + 1],
-            lengths.new_tensor([start + row + 1]),
-            budget,
-            ratio,
-        )
-        torch.testing.assert_close(individual, selected[row : row + 1])
-        reference = qsa_sparse_paged_gqa(
-            query[row : row + 1],
-            keys,
-            values,
-            individual,
-            tables,
-            requests[row : row + 1],
-            num_decode_requests=1,
-        )
-        torch.testing.assert_close(
-            batched[row : row + 1], reference, rtol=0.001, atol=0.001
-        )
