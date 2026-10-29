@@ -460,7 +460,10 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 or config.prefill_context_parallel_size != 1
                 or config.decode_context_parallel_size != 1
                 or config.index_cache_dtype != "fp4"
-                or config.kv_cache_dtype != "bf16"
+                or not (
+                    config.kv_cache_dtype == "bf16"
+                    or (config.kv_cache_dtype == "fp8" and self.owner_service_prefill)
+                )
                 or (config.enable_expert_parallel and self.owner_ep4_contract is None)
                 or (
                     config.speculative_config is not None
@@ -469,7 +472,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 or not getattr(config, "enable_decoder_swa_bounded_replay", False)
             ):
                 raise ValueError(
-                    "row-sharded prefill requires TP4 or verified native EP4, BF16 KV, FP4 index and bounded replay; speculation requires the explicit DSpark5 owner deployment"
+                    "row-sharded prefill requires TP4 BF16/FP8 KV or verified BF16 EP4, FP4 index and bounded replay; speculation requires the explicit DSpark5 owner deployment"
                 )
             split = late_layer_start(config.hf_config) - 1
             for i in range(2, split):

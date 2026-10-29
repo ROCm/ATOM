@@ -2,7 +2,9 @@
 
 本方案的目标是减少真实消费者之间的重复计算、HBM 往返和跨卡传输，并把依赖交接留在设备端。融合边界由数据所有权、数值语义和可调度性决定。不能用合并文件、少几个 launch、单个 GEMM 更快或换专家布局代替完整链路目标。
 
-R13/C5 性能候选、运行入口和分支已收敛到锁定主线；大 M 的 shared add＋ragged padding 输出融合也已完成整网与 GSM8K 验收。输入链的专用注册缓冲及原生Mega-MHC融合量化已完成实现和整网验证：GSM8K通过，完整ABBA仅+0.1218%，未确认稳定收益，故已归档候选并恢复已验收模型路径。生产另保留DSpark融合KV预热修复。块完成发布和更深归约融合仍是设计，各阶段收益分别核对。下一轮的具体接口、缓冲生命周期、搬运账本和验证顺序见 [大 prefill 输入融合方案](dsv41_prefill_input_fusion_plan.md)。
+2026-10-29：当前主线部署已转到public random C256的TP4/EP1、FP8 KV、真实DSpark5、full M1536。owner＋retained-prefill迁移完整运行测得1.191939×（相对保留同配置主线，存在时间间隔与正式冷特化），代码已归入可选路径；见[结果及归并说明](dsv41_fp8_owner_result.md)。下述BF16/EP4优化为历史证据，不能与新倍率相乘。
+
+R13/C5 性能候选、运行入口和分支已收敛到锁定主线；大 M 的 shared add＋ragged padding 输出融合也已完成整网与 GSM8K 验收。输入链的专用注册缓冲及原生Mega-MHC融合量化已完成实现和整网验证：GSM8K通过，完整ABBA仅+0.1218%，未确认稳定收益，故已归档候选并恢复已验收模型路径。生产另保留DSpark融合KV预热修复。块完成发布和更深归约融合仍是设计，各阶段收益分别核对。注册输入的完整证据见 [输入融合方案](dsv41_prefill_input_fusion_plan.md)。当前继续的重叠消融和shared/G2共用最终发送缓冲方案见 [大 prefill 执行计划](dsv41_prefill_pipeline_plan.md)。
 
 ## 1. 基线与证据边界
 
@@ -142,7 +144,7 @@ flowchart LR
 |---|---|---|---|
 | norm→FFN输入 | owner-local BF16；独立一次FP8 value/scale量化；eager custom AG有copy-in | 独立量化重读norm、Q/scale到注册发送区的重复复制 | router仍需要原BF16；shared/routed的scale格式和舍入；graph是否已有registered输入需单独确认 |
 | route→expert | 本地top6 ID/weight小包AG | 全M logits传输、重复top-k、重复sort/布局转换 | global ID、tie规则、有效owner行、sentinel/mask |
-| G1→G2 | 原生FP8中间量化/排序消费 | 写通用中间布局后再转成G2布局 | FP4权重/FP8 activation、原scale规则与K累加 |
+| G1→G2 | 当前大M原生G1已融合SiLU/FP8并直写G2布局 | 已融合部分不再计为待消除搬运；输入scale重排需另有消费者合同 | FP4权重/FP8 activation、原scale规则与K累加 |
 | G2/shared→RS | 原生本地专家输出、shared相加、RS | 独立完整combine tensor、重复清零/复制及整层末尾等待 | 每行所有本地expert贡献、shared就绪、原数值顺序 |
 | RS→下层mHC/norm | owner结果进入下一层 | 纯搬运、可延迟的residual/post物化 | mHC读取完整H的统计；最后层flush；prefill→decode和拒绝路径 |
 | state publication | 选择性owner状态/packet | 重复打包相同状态、无读者广播 | KV、Engram、压缩状态、spec commit/rollback及generation |
@@ -218,7 +220,7 @@ buffer由graph/runner持有，容量由immutable plan确定。保留地址、sha
 | 4 整网接入 | 同一LayerPlan接入真实early/late层与owner状态 | 小并发/尾段/填充/补请求/结束请求、KV与回滚、full-key warm、正式zero-cold |
 | 5 任务与服务验收 | 固定checkpoint/协议GSM8K；fresh主线/候选对照；清理前后对照 | 任务门槛、适用L2及真实路由证据；吞吐/TPOT/尾延迟各自报告 |
 
-上表记录总体递进顺序。输出布局融合已完成完整单层、整网和GSM验收；IPC逐包方案已停止；第6节B的串行norm→quant→专用注册arena已完成整网验证并因未确认稳定收益而归档，后续候选的接口与停止条件以 [新输入方案](dsv41_prefill_input_fusion_plan.md) 为准。若完整链不收益、GEMM退化吃掉节省、producer不能前进、数值/状态不合格或接口需要复制一整条forward，停止该候选并保留当前已验收生产路径，不用参数扫描或更多独立小包凑倍率。
+上表记录总体递进顺序。输出布局融合已完成完整单层、整网和GSM验收；IPC逐包方案已停止；第6节B的串行norm→quant→专用注册arena已完成整网验证并因未确认稳定收益而归档，历史接口与停止条件见[执行计划](dsv41_prefill_pipeline_plan.md)。两项输入重叠原型均无净收益；shared/G2共用最终RS缓冲在768请求筛选为1.025947×，2560请求完整对照仅1.002954×，未默认推广；shared激活融合完整链只省3.2/11.7微秒，未进入服务测试。当前expert排序上的分段ready、两种预取和owner stage均已停止。若完整链不收益、GEMM退化吃掉节省、producer不能前进、数值/状态不合格或接口需要复制一整条forward，停止该候选并保留当前已验收生产路径，不用参数扫描或更多独立小包凑倍率。
 
 不以2×作未经证据支持的预测。先保住实测1.3×，再用完整周期净节省制定下一阶段目标。小并发Mono应先在合法TP配置中做真实开关对照，保持同输入/状态和proposal预算；targetEP4＋draftTP4是独立部署设计，不能直接改全局config来恢复草稿Mono。
 

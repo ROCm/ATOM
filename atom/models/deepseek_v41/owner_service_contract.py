@@ -26,6 +26,9 @@ def owner_prefill_enabled(
         and config.decode_context_parallel_size == 1
         and (not config.enable_expert_parallel or ep4_verified is True)
         and config.index_cache_dtype == "fp4"
-        and config.kv_cache_dtype == "bf16"
+        and (
+            config.kv_cache_dtype == "bf16"
+            or (config.kv_cache_dtype == "fp8" and not config.enable_expert_parallel)
+        )
         and config.enable_decoder_swa_bounded_replay
     )

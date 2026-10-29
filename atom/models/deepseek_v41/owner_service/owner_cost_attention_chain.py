@@ -78,6 +78,7 @@ def forward_owner(
     from atom.utils.region_graph import join_stream
 
     from .owner_grouped_attention import attend_grouped_head_shards
+    from .owner_head_attention import attend_fp8_head_shards
 
     # Current main's Mega-MHC returns BF16 for cache/index readers together
     # with the QKV projection's already quantized input and scale.
@@ -88,7 +89,7 @@ def forward_owner(
     if cache.current_step is not step or cache.workspace is None:
         raise ValueError("Actual private cache/Step/scorer must be bound")
     if not step.decode or step.replay is not None or cache.packed:
-        raise ValueError("This diagnostic assembles native BF16 tentative decode")
+        raise ValueError("Owner target requires native BF16 or FP8 tentative decode")
     if attention.heads * 4 != heads.sink.numel() or not 0 <= tp_rank < 4:
         raise ValueError("Full owner heads must preserve all four original TP shards")
     rows, dim = step.width, attention.head_dim
@@ -125,12 +126,14 @@ def forward_owner(
     ).view(rows, attention.heads * 4, dim)
     if observe is not None:
         observe("query_pre_rope", query)
+    query_fp8 = cache.query_fp8(query)
     _, window_kv = cache.rope_quant_window(
         attention.spec.layer_id,
         query,
         kv_normed,
         rope,
         step,
+        query_fp8=query_fp8,
     )
     join_stream(attention.index_stream, attention.compress_stream)
     csr = cache.attention_indices(attention.spec, step)
@@ -165,8 +168,9 @@ def forward_owner(
         )
     # Keep native per-TP head geometry. No rank-0 selection is broadcast and no
     # arithmetic is substituted by a newly compiled attention implementation.
-    output = attend_grouped_head_shards(
-        query,
+    attend = attend_fp8_head_shards if cache.kv_fp8 else attend_grouped_head_shards
+    output = attend(
+        query_fp8 if cache.kv_fp8 else query,
         cache.pool,
         csr[0],
         csr[1],

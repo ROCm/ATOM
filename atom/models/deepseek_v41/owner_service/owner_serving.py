@@ -92,13 +92,12 @@ class OwnerEngram:
 
 
 class ContextPacket:
-    # The owner gather transports BF16 keys. The native writer applies the
-    # destination window policy after restoring global target row order.
-    window_fp8 = False
+    # Use the destination writer's policy before projection/quantization.
     packed = False
 
-    def __init__(self, step):
+    def __init__(self, step, *, window_fp8=False):
         self.step, self.keys = step, {}
+        self.window_fp8 = window_fp8
 
     def write_window(self, layer, keys, step):
         if step is not self.step:
@@ -121,6 +120,9 @@ class OwnerServing:
         self.dirty = {}
         self.active = None
         self.graphs = {}
+        from atom.utils.graph_holders import register_graph_holder
+
+        register_graph_holder(self)
         self.graph_pool = None
         self.stable_graphs = os.environ.get("DSV41_OWNER_STABLE_GRAPHS") == "1"
         self.graph_inputs = None
@@ -701,6 +703,19 @@ class OwnerServing:
         self.done_recorded = True
         return logits, hidden
 
+    def release_graphs(self):
+        """Retire this owner's captures before their communicators are destroyed.
+
+        The caller must stop replay and synchronize all ranks first. Keep the
+        sealed coverage contract; releasing captures does not enable new ones.
+        """
+        count = len(self.graphs)
+        for graph, _, _ in self.graphs.values():
+            graph.reset()
+        self.graphs.clear()
+        self.graph_pool = None
+        return count
+
     def publish_graph_coverage(self, *, missing_key=None):
         """Exact local bindings, written only on capture/seal/refusal.
 
@@ -734,7 +749,7 @@ class OwnerServing:
         import torch.distributed as dist
 
         metadata, original, auxiliary, inverse = self.active
-        recorder = ContextPacket(metadata.step)
+        recorder = ContextPacket(metadata.step, window_fp8=original.cache.window_fp8)
         projection = copy.copy(metadata)
         projection.cache = recorder
         with owner_context(projection):
@@ -742,14 +757,36 @@ class OwnerServing:
         layers = tuple(layer.spec.layer_id for layer in drafter.model.context_layers)
         if tuple(recorder.keys) != layers:
             raise ValueError("Incomplete owner-to-global draft context packet")
-        local = torch.stack([recorder.keys[layer][0] for layer in layers])
+        if recorder.window_fp8:
+            # One lossless byte collective carries both planes of each row.
+            local = torch.stack(
+                [
+                    torch.cat(
+                        tuple(t[0].view(torch.uint8) for t in recorder.keys[layer]),
+                        dim=-1,
+                    )
+                    for layer in layers
+                ]
+            )
+        else:
+            local = torch.stack([recorder.keys[layer][0] for layer in layers])
         packets = [torch.empty_like(local) for _ in range(4)]
         dist.all_gather(packets, local, group=self.group.device_group)
-        stage_major = torch.stack(packets).permute(1, 0, 2, 3).reshape(3, -1, 512)
+        stage_major = (
+            torch.stack(packets)
+            .permute(1, 0, 2, 3)
+            .reshape(len(layers), -1, local.shape[-1])
+        )
         keys = stage_major.index_select(1, inverse)
         # Native writer uses global target slots, absolute positions and ring133.
         for i, layer in enumerate(layers):
-            original.cache.write_window(layer, keys[i : i + 1], original.step)
+            payload = keys[i : i + 1]
+            if recorder.window_fp8:
+                payload = (
+                    payload[..., :512].view(torch.float8_e4m3fn),
+                    payload[..., 512:].view(torch.float8_e8m0fnu),
+                )
+            original.cache.write_window(layer, payload, original.step)
         self.counters["compact_draft_context_updates"] += 1
 
 

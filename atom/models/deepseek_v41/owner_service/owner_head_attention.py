@@ -57,3 +57,51 @@ def attend_original_head_shards(
         if result is not out_part:
             out_part.copy_(result)
     return output
+
+
+def attend_fp8_head_shards(
+    query,
+    pool,
+    prefix_ids,
+    prefix_indptr,
+    window,
+    window_ids,
+    window_indptr,
+    sink,
+    softmax_scale,
+    shard_heads,
+):
+    """Native V4.1 MXFP8 attention for each original TP head shard.
+
+    Copies preserve the native dense Q/scale/output ABI. Their cost belongs to
+    the owner path; this migration does not claim a fused FP8 grouped kernel.
+    """
+    import torch
+
+    from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+        sparse_attn_v41_paged_2src,
+    )
+
+    values, scales = query
+    if (
+        values.ndim != 3
+        or values.shape[1] != 4 * shard_heads
+        or scales.shape != (*values.shape[:-1], values.shape[-1] // 32)
+    ):
+        raise ValueError("FP8 owner attention requires four original head shards")
+    args = (pool, prefix_ids, prefix_indptr, window, window_ids, window_indptr)
+    return torch.cat(
+        [
+            sparse_attn_v41_paged_2src(
+                (
+                    values[:, start : start + shard_heads].contiguous(),
+                    scales[:, start : start + shard_heads].contiguous(),
+                ),
+                *args,
+                sink[start : start + shard_heads],
+                softmax_scale,
+            )
+            for start in range(0, values.shape[1], shard_heads)
+        ],
+        dim=1,
+    )

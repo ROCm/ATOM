@@ -33,6 +33,17 @@ def config():
 
 
 class OwnerPrefillTests(unittest.TestCase):
+    def test_fp8_ep1_admitted_but_fp8_ep4_still_refused(self):
+        deployment = config()
+        deployment.kv_cache_dtype = "fp8"
+        arguments = {"owner_service": True, "retained_prefill": True}
+        self.assertTrue(owner_prefill_enabled(deployment, **arguments))
+        deployment.enable_expert_parallel = True
+        self.assertFalse(owner_prefill_enabled(deployment, **arguments))
+        self.assertFalse(
+            owner_prefill_enabled(deployment, ep4_verified=True, **arguments)
+        )
+
     def test_ep_requires_verified_modules_and_keeps_deployment_constraints(self):
         deployment = config()
         deployment.enable_expert_parallel = True

@@ -16,6 +16,9 @@ from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.shuffle import shuffle_weight
 from torch import nn
 
+from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    sparse_attn_v41_paged_2src,
+)
 from atom.model_ops.deepseek_v41.row_sharded_mhc import gather_norm
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
@@ -160,19 +163,21 @@ def forward(
     kv, window_kv = cache.rope_quant_window(
         attention.spec.layer_id, None, kv_normed, rope, step
     )
-    cache.rotate_query(query, rope, positions)
+    query_fp8 = cache.query_fp8(query)
+    cache.rotate_query(query, rope, positions, query_fp8=query_fp8)
     prefix, pptr, extend, eptr = cache.attention_indices(attention.spec, step)
     pptr = pptr[start : start + valid + 1]
     eptr = eptr[start : start + valid + 1]
     if cache.packed:
         # packed_prefill assumes a local, capacity-declared flat CSR index list.
-        raise ValueError("owner attention prototype currently requires BF16 KV")
-    output = sparse_attn_v4_paged_2src(
-        query,
+        raise ValueError("owner attention requires row-addressed BF16 or FP8 KV")
+    attend = sparse_attn_v41_paged_2src if cache.kv_fp8 else sparse_attn_v4_paged_2src
+    output = attend(
+        query_fp8 if cache.kv_fp8 else query,
         cache.pool,
         prefix,
         pptr,
-        kv.flatten(0, 1),
+        kv if cache.kv_fp8 else kv.flatten(0, 1),
         extend,
         eptr,
         attention.sink_owned,
