@@ -534,5 +534,3 @@ def test_qsa_draft_slots_follow_accepted_tail_and_page_boundary(k):
     )
     assert slots.tolist() == [-1, -1, -1]
     assert compressed.tolist() == [-1, -1, -1]
-
-
