@@ -1307,7 +1307,15 @@ class BlockManager:
             live_blocks=num_new_blocks,
             protected_hash=protected_hash,
         )
-        self._record_checkpoint_end(seq, num_cached_blocks * self.hash_block_size)
+        # Where the prefill resumes: the HBM hit, or the tier's load point when
+        # that is further (an LMCache MP load lands there with no joint).
+        self._record_checkpoint_end(
+            seq,
+            max(
+                num_cached_blocks * self.hash_block_size,
+                int(seq.offload_joint.kv_prefix_tokens or 0),
+            ),
+        )
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
@@ -1327,7 +1335,8 @@ class BlockManager:
         # request per scheduling pass for a list nobody read. Nothing above
         # consumes it: `_record_checkpoint_demand` takes `block_hashes` as an
         # argument, and `_record_checkpoint_end` derives its position from
-        # `num_prompt_tokens` alone. Its one reader is `midstep_positions`.
+        # the prompt length, the resume point and `checkpoint_anchor_grid`.
+        # Its one reader is `midstep_positions`.
         #
         # Free unless a backend declares `readable_midstep`: the call returns
         # at its first line otherwise. Qwen GDN does under
@@ -1568,8 +1577,8 @@ class BlockManager:
             )
             decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)
-            # The prefill resumes at the joint boundary, not at the HBM hit
-            # `can_allocate` placed the anchor against.
+            # The prefill resumes at the joint boundary, which can sit below
+            # the lookup's hit `can_allocate` placed the anchor against.
             hbm_tokens = probe.num_cached_blocks * self.hash_block_size
             if decision.boundary_tokens > hbm_tokens:
                 self._record_checkpoint_end(seq, decision.boundary_tokens)
@@ -2665,7 +2674,7 @@ class BlockManager:
             self.demands_recorded += not seq.checkpoint_demand_counted
             seq.checkpoint_demand_counted = True
 
-    def _record_checkpoint_end(self, seq: Sequence, cached_tokens: int = 0) -> None:
+    def _record_checkpoint_end(self, seq: Sequence, cached_tokens: int) -> None:
         """Reserve this prompt's own end as a resume point.
 
         The ladder guesses where reuse will resume and the demand learns it one
@@ -2685,9 +2694,11 @@ class BlockManager:
         forward that actually lands. Applying it here as well keeps the cut and
         the keep from disagreeing, which is the standing contract between them.
 
-        `cached_tokens` is where this request's prefill resumes: the HBM hit
-        from `can_allocate`, then the joint boundary from `record_allocation`
-        when a tier load lands past it.
+        `cached_tokens` is where this request's prefill resumes: from
+        `can_allocate`, the HBM hit or the LMCache hit the lookup reported
+        (`kv_prefix_tokens`, where an LMCache MP load lands), whichever is
+        further; then the joint boundary from `record_allocation` when a joint
+        load commits one.
         """
         seq.checkpoint_end_pos = 0
         if not self.state.enabled:

@@ -3276,6 +3276,17 @@ class TestPromptEndAnchor:
         assert forward_on_the_ladder(bm, seq) == [8256]
         assert bm.checkpointers_at(seq, 8256)
 
+    def test_an_lmcache_mp_load_on_the_tier_grid_keeps_the_anchor_past_it(self):
+        """LMCache MP is no state tier, so no joint re-records the anchor: the
+        load point the lookup reported is where this turn resumes. HBM evicted,
+        the prompt resent: an anchor floored onto 8192 would sit at the load
+        point, where no forward of this turn reaches it."""
+        bm = self._tier_grid_manager()
+        seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
+        seq.offload_joint.kv_prefix_tokens = 8192
+        assert bm.can_allocate(seq) == 0
+        assert seq.checkpoint_end_pos == 8256
+
     def test_a_joint_boundary_on_the_tier_grid_keeps_the_anchor_past_it(
         self, monkeypatch
     ):
