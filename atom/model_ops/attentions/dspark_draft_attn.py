@@ -22,11 +22,12 @@ the split-KV grid, so a long context is spread over segments instead of walked
 by one program. The block rows come back out of the pool with the prefix, so
 over an fp8 pool they are read quantized.
 
-Over an fp8 pool the query is cast to the pool's dtype too. That is the
-precision SGLang's verify kernel runs this checkpoint at (it casts q to the
-pool dtype for the prefix dot), and it is what lets gfx950 take aiter's Gluon
-kernel, which needs q and KV in one dtype: about 1.6x faster than the Triton
-fallback at bs 32 / 128k context.
+On gfx950, over an fp8 pool, the query is cast to the pool's dtype too. The
+reason is speed: aiter's Gluon kernel needs q and KV in one dtype and is about
+1.6x faster than the Triton path at bs 32 / 128k context. It costs precision
+only down to what this checkpoint was validated at -- SGLang's verify kernel
+casts q to the pool dtype for the prefix dot. Gluon is gfx950-only, so
+elsewhere q stays bf16: the cast would buy nothing there.
 """
 
 from __future__ import annotations
@@ -70,12 +71,16 @@ class DSparkDraftUnifiedAttention:
     """aiter ``unified_attention`` (3D split-KV) on the folded draft block."""
 
     def __init__(self, device, max_bs: int = 0):
+        from aiter.jit.utils.chip_info import get_gfx
         from aiter.ops.triton.attention.unified_attention import unified_attention
 
         self.device = device
         self._ua = unified_attention
-        # q's descale when it is cast to an fp8 pool's dtype: the cast is a
-        # plain one, so 1.0. Built here so no replay allocates it.
+        # Whether an fp8 pool's q is cast to the pool dtype: only where that
+        # selects the Gluon kernel (see the module docstring).
+        self.q_to_pool_dtype = get_gfx() == "gfx950"
+        # q's descale when it is cast: the cast is a plain one, so 1.0. Built
+        # here so no replay allocates it.
         self._q_descale = torch.ones(1, dtype=torch.float32, device=device)
         # One query row per sequence: `cu_seqlens_q` is a constant ramp. Built
         # here, ahead of any capture, for the engine's widest batch, so a
@@ -110,7 +115,7 @@ class DSparkDraftUnifiedAttention:
         hkv = k_cache.shape[2]
         qf = fold_block_queries(q, bs, hkv)
         of = torch.empty_like(qf)
-        quantized = k_cache.dtype.itemsize == 1
+        quantized = self.q_to_pool_dtype and k_cache.dtype.itemsize == 1
         if quantized:
             qf = qf.to(k_cache.dtype)
         self._ua(

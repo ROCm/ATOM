@@ -121,9 +121,8 @@ element and apply it to every token. Hence the explicit `numel() == 1` guard in
 `_store_cfg`, the same check as
 `AttentionImpl._reject_per_token_scales_on_unified` (attention_mha.py:182).
 
-`float8_e4m3fnuz` is NOT usable here: triton upcasts it to fp16 on gfx950, so
-the fp8 read measures slower than bf16. `aiter.utility.dtypes.d_dtypes["fp8"]`
-is `float8_e4m3fn` on this arch, which is what the pool is built from.
+The pool's fp8 is the platform's, `aiter.utility.dtypes.d_dtypes["fp8"]`, as
+the target's is: `float8_e4m3fn` on gfx950, `float8_e4m3fnuz` on gfx942.
 """
 
 import logging
@@ -415,9 +414,8 @@ class KimiK3DFlashAttention(nn.Module):
                 )
         k_f, v_f = float(k_scale), float(v_scale)
         # Not `== torch.bfloat16`: any 1-byte cache element is a quantized one
-        # and anything wider holds its own values. fp8_e4m3fn is what
-        # `d_dtypes["fp8"]` is on gfx950; fnuz must never reach here (triton
-        # upcasts it to fp16 and the read goes slower than bf16).
+        # and anything wider holds its own values -- e4m3fn on gfx950, fnuz on
+        # gfx942, whichever `d_dtypes["fp8"]` the target's pool is.
         quantized = k_cache.dtype.itemsize == 1
         dev = k_cache.device
         self._store = (

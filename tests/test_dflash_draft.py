@@ -393,10 +393,9 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
     scales=True`. Getting that wrong is not a crash: both read the plane's
     first element and apply it to every token.
 
-    `float8_e4m3fn` specifically, never `fnuz`: triton upcasts fnuz to fp16 on
-    gfx950, which measures slower than the bf16 it was meant to beat.
+    The platform's fp8 -- `d_dtypes["fp8"]`, as the target's pool is:
+    `float8_e4m3fn` on gfx950, `float8_e4m3fnuz` on gfx942.
     """
-    import torch
 
     dk = pytest.importorskip(
         "atom.spec_decode.draft_kv",
@@ -434,9 +433,12 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
 
     assert builder is not None
     builder._make_pool(layers=5, target_block_size=128)
-    assert (
-        seen["kv_dtype"] is torch.float8_e4m3fn
-    ), f"draft pool must be fp8_e4m3fn under an fp8 target, got {seen['kv_dtype']}"
+    from aiter import dtypes
+
+    assert seen["kv_dtype"] is dtypes.d_dtypes["fp8"], (
+        f"draft pool must take the target's fp8 ({dtypes.d_dtypes['fp8']}), "
+        f"got {seen['kv_dtype']}"
+    )
     assert seen["per_tensor_scales"] is True
 
     # ... and the pool it describes really has no scale region.
@@ -447,7 +449,7 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
         world_size=8,
         block_size=128,
         layers=5,
-        kv_dtype=torch.float8_e4m3fn,
+        kv_dtype=dtypes.d_dtypes["fp8"],
         per_tensor_scales=True,
     )
     assert pool.scale_fields == []
@@ -1192,9 +1194,10 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     one = torch.ones(1, dtype=torch.float32, device=dev)
     read(q, k_pool, v_pool, block_tables, kv_lens, o, scale, one, one)
 
-    # Over an fp8 pool the read casts q to the pool's dtype (as SGLang's verify
-    # kernel does); the reference takes the same q.
-    q_ref = q.to(k_pool.dtype).to(q.dtype) if kv_dtype == "fp8" else q
+    # Where the read casts q to an fp8 pool's dtype (gfx950), the reference
+    # takes the same q.
+    cast = kv_dtype == "fp8" and read.q_to_pool_dtype
+    q_ref = q.to(k_pool.dtype).to(q.dtype) if cast else q
     args = (q_ref, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
     ref = _reference_block_attn(*args)
     # fp8 runs both dots at fp8 on gfx950 (Gluon); measured max 3.7e-2 there,
