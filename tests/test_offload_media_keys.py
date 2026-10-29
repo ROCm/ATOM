@@ -161,3 +161,23 @@ def test_lmcache_mp_native_state_lookup_is_keyed_the_same_way():
     assert NativeStateLMCacheMPConnectorScheduler._lookup_token_ids(stub, text) == list(
         text.token_ids[: PROMPT - CHUNK]
     )
+
+
+def test_dsv4_lookup_is_keyed_the_same_way():
+    """V4 takes no image today; keyed through the same helper, its KV keys
+    cannot drift from its state keys once it does."""
+    from atom.kv_transfer.offload.hybrid.dsv4.connector import DSV4OffloadScheduler
+
+    asked = []
+    stub = SimpleNamespace(
+        _lookup_in_step=[],
+        _lookup_client=SimpleNamespace(
+            lookup=lambda ids, lookup_id: asked.append(ids) or PROMPT
+        ),
+        _remember_tier_hit=lambda *_args: None,
+    )
+    for seed in (11, -1):
+        seq = _seq("A", seed)
+        assert DSV4OffloadScheduler._fresh_tier_lookup(stub, seq, "A") == PROMPT
+        assert asked[-1] == tier_token_ids(seq, PROMPT)
+    assert asked[-1] == list(seq.token_ids)
