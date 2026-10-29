@@ -161,7 +161,6 @@ def indexer_qsplit_world(
     *,
     physical_tp: int,
     enabled: bool,
-    plugin: bool,
     gfx1250_opus: bool,
     dp_attention: bool,
     tbo: bool,
@@ -177,17 +176,15 @@ def indexer_qsplit_world(
     attention, PCP and DCP each break; a prefill TBO's ubatch rows do not
     take it yet. Simulated TP (`--fake-eplb` on fewer devices) reports a
     width the device group does not have. gfx1250 OPUS scores through its own
-    plans and plugin bridges build their own rows. A P/D decode instance
-    (`kv_consumer`) prefills only to recompute, too rarely to pay for the
-    split's startup gather. Within this width a prefill step still splits
-    only from `ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS` index logits (the V4
-    builder's `_prefill_row_split`).
+    plans. A P/D decode instance (`kv_consumer`) prefills only to recompute,
+    too rarely to pay for the split's startup gather. Within this width a
+    prefill step still splits only from `ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS`
+    index logits (the V4 builder's `_prefill_row_split`).
     """
     if (
         not enabled
         or tp <= 1
         or physical_tp != tp
-        or plugin
         or gfx1250_opus
         or dp_attention
         or tbo

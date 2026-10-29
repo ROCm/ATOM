@@ -141,7 +141,6 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.plugin.prepare import is_plugin_mode
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import (
@@ -2240,7 +2239,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             tp,
             physical_tp=torch.distributed.get_world_size(get_tp_group().device_group),
             enabled=envs.ATOM_V4_INDEXER_QSPLIT,
-            plugin=is_plugin_mode(),
             gfx1250_opus=self.indexer_layout == FP4_GFX1250_NATURAL,
             dp_attention=bool(config.enable_dp_attention),
             # A TBO run's prefill does not split: its ubatches' rows do not take

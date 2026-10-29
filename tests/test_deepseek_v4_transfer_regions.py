@@ -1307,7 +1307,6 @@ def test_the_split_world_follows_the_run(
         lambda: SimpleNamespace(rank_in_group=3, device_group="tp"),
     )
     monkeypatch.setitem(module, "get_pcp_world_size", lambda: 1)
-    monkeypatch.setitem(module, "is_plugin_mode", lambda: False)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 8)
     gathers = []
     monkeypatch.setattr(

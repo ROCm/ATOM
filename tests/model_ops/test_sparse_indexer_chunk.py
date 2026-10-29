@@ -195,7 +195,6 @@ def test_flat_view_shares_the_workspace_and_refuses_to_grow():
 _GATE = {
     "physical_tp": 8,
     "enabled": True,
-    "plugin": False,
     "gfx1250_opus": False,
     "dp_attention": False,
     "tbo": False,
@@ -223,13 +222,10 @@ def test_qsplit_off_where_ranks_do_not_share_the_rows(tp, override):
     assert indexer_qsplit_world(tp, **{**_GATE, **override}) == 1
 
 
-@pytest.mark.parametrize(
-    "override", [{"tbo": True}, {"plugin": True}, {"gfx1250_opus": True}]
-)
-def test_qsplit_not_yet_under_tbo_plugins_or_gfx1250_opus(override):
+@pytest.mark.parametrize("override", [{"tbo": True}, {"gfx1250_opus": True}])
+def test_qsplit_not_yet_under_tbo_or_gfx1250_opus(override):
     """Known limitation: the ranks share these rows, but a TBO ubatch's
-    rows, a plugin bridge's and gfx1250 OPUS's plans do not take the split
-    yet."""
+    rows and gfx1250 OPUS's plans do not take the split yet."""
     assert indexer_qsplit_world(8, **{**_GATE, **override}) == 1
 
 
