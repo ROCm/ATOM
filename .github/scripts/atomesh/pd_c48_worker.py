@@ -192,6 +192,67 @@ def prepare_store_memory(worker):
         done.touch()
 
 
+def enable_native_mla_96(config):
+    """Opt-in native 96-head CPRR control for the pinned K3 decode recipe."""
+    if os.environ.get("C48_D_MLA_NATIVE96") != "1":
+        return None
+    import hashlib
+    import importlib
+
+    pc = config.parallel_config
+    topology = (pc.tensor_parallel_size, pc.decode_context_parallel_size,
+                pc.pipeline_parallel_size, pc.prefill_context_parallel_size)
+    if (os.environ.get("C48_DIAG_ROLE") != "decode" or topology != (8, 8, 1, 1)
+            or pc.cp_kv_cache_interleave_size != 1
+            or config.cache_config.cache_dtype != "fp8"
+            or config.speculative_config.num_speculative_tokens != 4
+            or config.model_config.hf_text_config.num_attention_heads != 96
+            or os.environ.get("VLLM_ROCM_AITER_MLA_DCP_VERIFY") != "asm"
+            or os.environ.get("AITER_MLA_USE_OPUS", "0") != "0"):
+        raise ValueError("Native96 requires decode TP8/DCP8, PP1/PCP1, interleave=1, FP8, four drafts and ASM without OPUS")
+    mla = importlib.import_module("aiter.mla")
+    backend = importlib.import_module("vllm.v1.attention.backends.mla.rocm_aiter_mla")
+    mla_hash = hashlib.sha256(Path(mla.__file__).read_bytes()).hexdigest()
+    if mla.get_gfx() != "gfx950" or mla_hash != "6f6a902ab55fd78c8323e848144d181f72b683a4e0f7eaafb7550f529109050a":
+        raise RuntimeError(f"Native96 requires the pinned gfx950 AITER dispatcher, got {mla_hash}")
+    kernel = (Path(mla.__file__).resolve().parents[1] / "aiter_meta/hsa/gfx950/mla"
+              / "mla_a8w8_qh32_qseqlen4_gqaratio32_lse_cprr_ps.co")
+    if not kernel.is_file():
+        raise RuntimeError(f"Native96 CPRR kernel is missing: {kernel}")
+    original = (16, 32, 64, 128)
+    enabled = original + (96,)
+    if not getattr(backend, "_c48_native96_enabled", False):
+        if backend._NATIVE_CPRR_HEADS != original or backend._asm_dcp_verify_heads(96) != 128:
+            raise RuntimeError("Unexpected vLLM CPRR head selection before Native96")
+        # Appending, rather than sorting, preserves padding for every other head count.
+        backend._NATIVE_CPRR_HEADS = enabled
+        backend._c48_native96_enabled = True
+    if backend._NATIVE_CPRR_HEADS != enabled or backend._asm_dcp_verify_heads(96) != 96:
+        raise RuntimeError("Native96 head selection did not activate")
+    return {"selected_heads": 96, "original_padded_heads": 128,
+            "native_head_choices": list(enabled), "aiter_mla_sha256": mla_hash,
+            "backend_sha256": hashlib.sha256(Path(backend.__file__).read_bytes()).hexdigest(),
+            "kernel_path": str(kernel), "kernel_sha256": hashlib.sha256(kernel.read_bytes()).hexdigest()}
+
+
+def native_mla_96_builders(runner):
+    """Verify actual target metadata builders, including every microbatch copy."""
+    observed = []
+    for groups in runner.attn_groups:
+        for group in groups:
+            for builder in group.metadata_builders:
+                if getattr(builder, "_decode_num_heads", None) != 96:
+                    continue
+                if (not builder._asm_dcp_verify or builder._asm_dcp_verify_heads != 96
+                        or builder._num_attention_heads != 96
+                        or not 3 <= builder._mtp_decode_qlen <= 6):
+                    raise RuntimeError("Native96 metadata builder is not using the supported CPRR shape")
+                observed.append({"heads": builder._num_attention_heads, "max_query_length": builder._mtp_decode_qlen})
+    if not observed:
+        raise RuntimeError("Native96 has no matching target metadata builder")
+    return observed
+
+
 class ManifestWorker(Worker):
     def compile_or_warm_up_model(self):
         result = super().compile_or_warm_up_model()
@@ -213,7 +274,15 @@ class ManifestWorker(Worker):
             prepare_store_memory(self)
         with startup_stage(self, "initialize_from_config"):
             try:
-                return super().initialize_from_config(kv_cache_config)
+                result = super().initialize_from_config(kv_cache_config)
+                if getattr(self, "_c48_native96", None) is not None:
+                    self._c48_native96["metadata_builders"] = native_mla_96_builders(self.model_runner)
+                    path = Path(os.environ["C48_DIAG_DIR"]) / f'decode-rank-{self.rank}.json'
+                    record = json.loads(path.read_text())
+                    record["mla_native96"] = self._c48_native96
+                    path.write_text(json.dumps(record, indent=2) + "\n")
+                    print(f"[C48-NATIVE96] rank={self.rank} {json.dumps(self._c48_native96)}", flush=True)
+                return result
             finally:
                 if store:
                     with open("/proc/self/smaps_rollup") as f:
@@ -239,6 +308,7 @@ class ManifestWorker(Worker):
 
     def load_model(self, *, load_dummy_weights=False):
         from pd_c48_memory import LoadingMemoryProbe
+        self._c48_native96 = enable_native_mla_96(self.vllm_config)
         with LoadingMemoryProbe(self):
             super().load_model(load_dummy_weights=load_dummy_weights)
         runner = self.model_runner
@@ -253,6 +323,8 @@ class ManifestWorker(Worker):
                 "speculative": inspect_speculative(spec,
                     int(os.environ["C48_DIAG_DRAFT_TOKENS"]),
                     float(os.environ["C48_DIAG_AL"]) if os.environ["C48_DIAG_AL"] else None)}
+        if self._c48_native96 is not None:
+            data["mla_native96"] = self._c48_native96
         if os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1":
             import hashlib
             from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import worker as store_worker
