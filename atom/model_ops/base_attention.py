@@ -223,6 +223,58 @@ def flydsl_plan_shape(head_dim, num_seqs=None) -> dict:
     return {}
 
 
+# aiter traits.D256_PIPE_MAX_ROWS values ATOM_FLYDSL_D256_PIPE_MAX_ROWS may
+# set: 1-3 M-tiles of 16 rows. Four take a different per-token V-scale load
+# (op_softmax, M_TILES >= 4) that no test covers on the pipe.
+_FLYDSL_D256_PIPE_ROWS_ALLOWED = (16, 32, 48)
+_flydsl_d256_pipe_rows_applied = False
+
+
+def _apply_flydsl_d256_pipe_max_rows() -> None:
+    """Set aiter's head-256 pipe row limit from ATOM_FLYDSL_D256_PIPE_MAX_ROWS.
+
+    Once per process, before the first FlyDSL paged decode. aiter reads the
+    module global inside ``d256_pipe`` at kernel selection, so assigning it
+    is the same change as editing traits.py, without touching the install
+    (the pa_k5_rows bench applied it the same way). No stale kernel: the
+    selected path (``D256_PIPE``) is part of the traits cache key, which is
+    part of both the in-process and FlyDSL's on-disk cache keys; a shape
+    that flips to the pipe is a new key. Kernels already selected are not
+    re-selected, which is why this runs before the first call.
+    """
+    global _flydsl_d256_pipe_rows_applied
+    _flydsl_d256_pipe_rows_applied = True
+    rows = envs.ATOM_FLYDSL_D256_PIPE_MAX_ROWS
+    if not rows:
+        return
+    if rows not in _FLYDSL_D256_PIPE_ROWS_ALLOWED:
+        logger.warning(
+            "ATOM_FLYDSL_D256_PIPE_MAX_ROWS=%d ignored: accepted values are %s",
+            rows,
+            _FLYDSL_D256_PIPE_ROWS_ALLOWED,
+        )
+        return
+    try:
+        from aiter.ops.flydsl.kernels.pa_decode import traits
+    except ImportError:
+        traits = None
+    old = getattr(traits, "D256_PIPE_MAX_ROWS", None)
+    if old is None:
+        logger.warning(
+            "ATOM_FLYDSL_D256_PIPE_MAX_ROWS=%d ignored: this aiter has no "
+            "pa_decode traits.D256_PIPE_MAX_ROWS",
+            rows,
+        )
+        return
+    traits.D256_PIPE_MAX_ROWS = rows
+    logger.info(
+        "flydsl pa_decode: head-256 pipe row limit %d -> %d "
+        "(ATOM_FLYDSL_D256_PIPE_MAX_ROWS)",
+        old,
+        rows,
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def _flydsl_arch_supported() -> bool:
     """Whether FlyDSL builds kernels for the running GPU.
@@ -743,6 +795,8 @@ def run_pa_decode(
         )
 
     if flydsl_seqs:
+        if not _flydsl_d256_pipe_rows_applied:
+            _apply_flydsl_d256_pipe_max_rows()
         from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
 
         n = flydsl_seqs

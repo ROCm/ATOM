@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
-"""Opt-in FlyDSL paged-decode plan shape for head_dim 256 (Qwen3.5).
+"""Two opt-in FlyDSL paged-decode switches for head_dim 256 (Qwen3.5).
 
 ATOM_FLYDSL_PA_LOWBS_CAP: plan ceiling per batch size (bs1 256, bs2 128, else
-64) for capture-owned and runtime plans. Wiring only; numerics and timing are
-GPU work.
+64) for capture-owned and runtime plans. ATOM_FLYDSL_D256_PIPE_MAX_ROWS: aiter's
+pipe row limit set in-process. Wiring only; numerics and timing are GPU work.
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
+import inspect
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -234,3 +236,84 @@ class TestRuntimePlans:
         captured = _Plan(1, 256)
         assert self._call(ba, 1, existing_plan=captured) is captured
         assert built == [] and calls == []
+
+
+class TestPipeRows:
+    """ATOM_FLYDSL_D256_PIPE_MAX_ROWS sets aiter's traits constant once."""
+
+    @pytest.fixture
+    def traits(self, monkeypatch):
+        traits = pytest.importorskip("aiter.ops.flydsl.kernels.pa_decode.traits")
+        from atom.model_ops import base_attention as ba
+
+        # Restored after each test whatever the test sets.
+        monkeypatch.setattr(traits, "D256_PIPE_MAX_ROWS", traits.D256_PIPE_MAX_ROWS)
+        monkeypatch.setattr(ba, "_flydsl_d256_pipe_rows_applied", False)
+        return traits
+
+    def test_unset_leaves_aiter_alone(self, monkeypatch, traits):
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.delenv("ATOM_FLYDSL_D256_PIPE_MAX_ROWS", raising=False)
+        before = traits.D256_PIPE_MAX_ROWS
+        ba._apply_flydsl_d256_pipe_max_rows()
+        assert traits.D256_PIPE_MAX_ROWS == before
+        assert ba._flydsl_d256_pipe_rows_applied
+
+    def test_48_puts_mtp5_verify_on_the_pipe(self, monkeypatch, traits):
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(traits, "D256_PIPE_MAX_ROWS", 32)
+        # MTP-5 verify, GQA 8: 48 rows, generic path at aiter's 32.
+        assert not traits.d256_pipe("gfx950", "fp8", 256, 16, 6, 8)
+        monkeypatch.setenv("ATOM_FLYDSL_D256_PIPE_MAX_ROWS", "48")
+        ba._apply_flydsl_d256_pipe_max_rows()
+        assert traits.D256_PIPE_MAX_ROWS == 48
+        assert traits.d256_pipe("gfx950", "fp8", 256, 16, 6, 8)
+        assert traits.d256_pipe("gfx950", "fp8", 256, 16, 4, 8), "MTP-3 unchanged"
+        assert not traits.d256_pipe("gfx950", "fp8", 256, 16, 7, 8)
+
+    @pytest.mark.parametrize("rows", ["64", "40", "-16"])
+    def test_unvalidated_values_are_refused(self, monkeypatch, traits, caplog, rows):
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(traits, "D256_PIPE_MAX_ROWS", 32)
+        monkeypatch.setenv("ATOM_FLYDSL_D256_PIPE_MAX_ROWS", rows)
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            ba._apply_flydsl_d256_pipe_max_rows()
+        assert traits.D256_PIPE_MAX_ROWS == 32
+        assert "ignored" in caplog.text
+
+    def test_missing_constant_is_reported(self, monkeypatch, traits, caplog):
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.delattr(traits, "D256_PIPE_MAX_ROWS")
+        monkeypatch.setenv("ATOM_FLYDSL_D256_PIPE_MAX_ROWS", "48")
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            ba._apply_flydsl_d256_pipe_max_rows()
+        assert not hasattr(traits, "D256_PIPE_MAX_ROWS")
+        assert "no pa_decode traits.D256_PIPE_MAX_ROWS" in caplog.text
+
+    def test_the_selected_path_is_in_the_cache_key(self):
+        """No stale kernel: aiter keys compiled kernels by the D256_PIPE choice.
+
+        Read from aiter's source so a refactor that drops it from the key (and
+        would let a cached generic kernel serve a pipe selection) goes red.
+        """
+        traits = pytest.importorskip("aiter.ops.flydsl.kernels.pa_decode.traits")
+        src = inspect.getsource(traits)
+        key = src[src.index("cache_key = (") :]
+        # Up to the tuple's closing line: entries may hold calls, e.g. bool(...).
+        key = key[: key.index("\n        )")]
+        assert "D256_PIPE," in key, key
+        # The limit is read at selection time, not bound at import.
+        assert "<= D256_PIPE_MAX_ROWS" in inspect.getsource(traits.d256_pipe)
+
+    def test_applied_before_the_kernel_import(self):
+        """run_pa_decode applies the limit before its first FlyDSL call."""
+        from atom.model_ops import base_attention as ba
+
+        src = inspect.getsource(ba.run_pa_decode)
+        apply = src.index("_apply_flydsl_d256_pipe_max_rows()")
+        assert apply < src.index("_flydsl_pa_decode(")
+        assert apply < src.index("import pa_decode as _flydsl_pa_decode")
