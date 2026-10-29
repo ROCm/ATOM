@@ -40,16 +40,13 @@ from typing import Any
 
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-from atom.kv_transfer.offload.mp.transfer import (
-    _terminal_future_result,
-    _UnprovableSubmission,
-)
+from atom.kv_transfer.offload.mp.transfer import _UnprovableSubmission
 
-# How long the preemption fence waits for one transfer before it gives up and
-# lets the step proceed. The MP worker already enforces its own, much longer,
-# per-transfer deadline and reports a stuck transfer through `get_finished`;
-# this bound only stops a wedged server process from hanging the engine inside
-# `execute_model`. It is deliberately not silent -- see `wait_for_requests`.
+# The preemption fence waits as long as the worker's own transfer deadline
+# (`_transfer_deadline_s`): a transfer still running before that is healthy, so
+# preempting its request must not stop the engine sooner. Past it the fence
+# raises -- fail-stop, the verdict the worker reaches for the transfer itself.
+# This is the bound only for a worker that carries no deadline.
 _FENCE_TIMEOUT_S = 30.0
 _FENCE_POLL_S = 0.0005
 
@@ -149,7 +146,8 @@ class MPOffloadWorkerAdapter:
 
         import time
 
-        deadline = time.monotonic() + _FENCE_TIMEOUT_S
+        bound_s = float(getattr(inner, "_transfer_deadline_s", _FENCE_TIMEOUT_S))
+        deadline = time.monotonic() + bound_s
         while True:
             with lock:
                 pending = [
@@ -167,11 +165,10 @@ class MPOffloadWorkerAdapter:
                     ).items()
                     if owner in wanted
                 ]
-            outstanding = submitting + [
-                operation_id
-                for operation_id, future in pending
-                if not _terminal_future_result(future)[0]
-            ]
+            # Not polled here: the drain thread polls these futures and drops
+            # terminal ones from the pending maps, and a second poller would
+            # race it on LMCache's future, which imports the server's event.
+            outstanding = submitting + [operation_id for operation_id, _ in pending]
             if not outstanding:
                 return
             # Causes that waiting cannot clear, named now rather than as a
@@ -195,22 +192,22 @@ class MPOffloadWorkerAdapter:
                     "server may have the request and still write its blocks"
                 )
             drain = getattr(inner, "_drain_thread", None)
-            if submitting and (drain is None or not drain.is_alive()):
+            if drain is None or not drain.is_alive():
                 raise RuntimeError(
                     "ATOM LMCache MP: preemption fence found no drain thread to "
-                    f"submit {submitting} for {sorted(wanted)}"
+                    f"submit or poll {outstanding} for {sorted(wanted)}"
                 )
-            if submitting:
-                wake = getattr(inner, "_drain_wake", None)
-                if wake is not None:
-                    wake.set()
+            wake = getattr(inner, "_drain_wake", None)
+            if wake is not None:
+                wake.set()
             if time.monotonic() >= deadline:
                 # Fail-stop: returning would let the forward overwrite blocks
                 # a transfer still reads, caching one wrong prefix silently.
                 raise RuntimeError(
                     f"ATOM LMCache MP: preemption fence timed out after "
-                    f"{_FENCE_TIMEOUT_S:.0f}s with {len(outstanding)} transfer(s) "
-                    f"still in flight for {sorted(wanted)}"
+                    f"{bound_s:.0f}s, the transfer deadline, with "
+                    f"{len(outstanding)} transfer(s) still in flight for "
+                    f"{sorted(wanted)}"
                 )
             time.sleep(_FENCE_POLL_S)
 

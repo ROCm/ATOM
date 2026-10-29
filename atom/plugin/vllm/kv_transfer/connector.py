@@ -348,6 +348,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # that never turns into a dispatched load is an unrecoverable hang, so
         # it is at least named in the log. See `_check_promised_loads`.
         self._promised_loads: dict[str, int] = {}
+        # Parked promises of requests that finished before a load dispatched.
+        # vLLM holds their blocks until a `finished_recving` names them, so the
+        # withdrawal still goes out with the next step's metadata.
+        self._finished_withdrawals: list[tuple[str, list[int]]] = []
+        # Requests admitted without waiting for their lookup, by HBM hit; the
+        # lookup is sent once vLLM has allocated (`update_state_after_alloc`).
+        self._detach_after_alloc: dict[str, int] = {}
 
         # Worker half: the release list handed over by the scheduler for this
         # step, plus the completions owed back to it. Both are drained by the
@@ -579,6 +586,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "checkpoint groups registered (ATOM_V41_STATE_CHECKPOINTS=1 with "
                 "prefix caching and --mamba-cache-mode align); the checkpoint is "
                 "what carries the state with the PAGE bytes."
+            )
+        kv_transfer_config = getattr(
+            getattr(self, "_vllm_config", None), "kv_transfer_config", None
+        )
+        policy = getattr(kv_transfer_config, "kv_load_failure_policy", "fail")
+        if policy != "recompute":
+            raise ValueError(
+                "ATOM offload connector: DeepSeek-V4.1 offload needs "
+                "kv_load_failure_policy='recompute'. Its KV groups report every "
+                "load that does not land through `failed_recving` -- a declined "
+                "state ride or a lost tier prefix as well as a fault -- and "
+                f"{policy!r} turns each into a failed request."
             )
 
     def _page_tp_replication_factor(self) -> int:
@@ -1754,14 +1773,22 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         use.
 
         Safe to decide here, before vLLM allocates: unlike ATOM's own
-        allocator, vLLM never keeps less of the local hit than it offered.
+        allocator, vLLM never keeps less of the local hit than it offered. The
+        lookup itself waits for the allocation, as `detach_lookup` requires: a
+        request vLLM cannot allocate for is asked again next step, and sending
+        it here resent the whole prompt's lookup on every attempt.
         """
         can_detach = getattr(self._scheduler, "can_detach_lookup", None)
-        detach = getattr(self._scheduler, "detach_lookup", None)
-        if can_detach is None or detach is None:
+        if (
+            can_detach is None
+            or getattr(self._scheduler, "detach_lookup", None) is None
+        ):
             return False
         hbm = int(num_computed_tokens)
-        return bool(can_detach(seq, hbm)) and bool(detach(seq, hbm))
+        if not can_detach(seq, hbm):
+            return False
+        self._detach_after_alloc[str(seq.id)] = hbm
+        return True
 
     def _lookup_in_flight(self, seq) -> bool:
         """Send `seq`'s tier lookup without waiting; True while it is out.
@@ -1797,6 +1824,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         seq = self._seqs.get_or_create(request)
         self._requests[str(request.request_id)] = request
+        hbm = self._detach_after_alloc.pop(str(request.request_id), None)
+        if hbm is not None:
+            self._scheduler.detach_lookup(seq, hbm)
         if int(num_external_tokens) > 0:
             promise = self._promised_loads.get(request.request_id)
             if promise is not None:
@@ -1934,6 +1964,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # with the KV cache 94.9% full.
             self._scheduler.reconcile_recurrent_rides()
 
+        # After this step's saves and rides, like the ride reconciliation: an
+        # operation built here is in the live set the deadline walks.
+        self._scheduler.enforce_transfer_deadlines()
         return AtomOffloadMetadata(
             inner,
             preempted,
@@ -2078,6 +2111,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         timeout = offload_save_abandon_timeout_s()
         if timeout <= 0 or not self._deferred_frees:
             return
+        if not getattr(self._scheduler, "abandons_saves", True):
+            # MP gives a save's blocks back only on its report. Dropping the
+            # ranks' reports here would free nothing and leave the quorum
+            # unreachable; `enforce_transfer_deadlines` fail-stops instead.
+            return
         now = time.monotonic()
         if now < self._next_save_reconcile_at:
             return
@@ -2162,6 +2200,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self._kda_planner is not None and self._kda_planner.has_pending_work():
             return True
+        # A ride pin is given back by the step's reconciliation, and the MP
+        # scheduler pumps lookups and ends sessions from a step as well.
+        if self._v41_planner is not None and self._v41_planner.has_ride_pins():
+            return True
+        scheduler = getattr(self, "_scheduler", None)
+        if scheduler is not None and scheduler.has_pending_work():
+            return True
         return bool(self._deferred_frees or self._releases_in_flight)
 
     def has_pending_block_frees(self) -> bool:
@@ -2184,6 +2229,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self._deferred_frees or self._releases_in_flight:
             return True
         if self._kda_planner is not None and self._kda_planner.has_pending_work():
+            return True
+        # A ride's pin is retired in `build_connector_meta`, after vLLM asks
+        # this; a recent one is blocks about to come back, like a lease.
+        if self._v41_planner is not None and self._v41_planner.has_ride_pins(
+            max_age_s=self._PENDING_FREE_HORIZON_S
+        ):
             return True
         scheduler = self._scheduler
         # Only recent leases. Waiting stalls the running loop for the step,
@@ -2229,8 +2280,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         same list, and treating that as the load landing is what let this go
         unseen. A dispatched load carries a `load_operation`/`load_spec`.
         """
+        finished, self._finished_withdrawals = self._finished_withdrawals, []
         if not self._promised_loads:
-            return []
+            return finished
         # Declined at dispatch this step: no later step will dispatch them.
         declined = getattr(self._scheduler, "declined_loads", None) or set()
         for meta in getattr(inner, "requests", ()) or ():
@@ -2271,7 +2323,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 sorted(expired),
                 self._PROMISE_GRACE_STEPS,
             )
-        return withdrawn
+        return finished + withdrawn
 
     def _promised_block_ids(self, req_id: str, start: int, need: int) -> list[int]:
         """The blocks a withdrawn promise reserved and nothing wrote.
@@ -2496,8 +2548,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _request_finished(self, request) -> tuple[bool, dict | None]:
         req_id = request.request_id
-        self._promised_loads.pop(req_id, None)
+        promise = self._promised_loads.pop(req_id, None)
+        if promise is not None and promise[3]:
+            # Parked, never dispatched: nothing else would send the
+            # `finished_recving` vLLM frees an aborted parked request's blocks on.
+            _, start, need, _parked = promise
+            self._finished_withdrawals.append(
+                (req_id, self._promised_block_ids(req_id, start, need))
+            )
         self._requests.pop(str(req_id), None)
+        self._detach_after_alloc.pop(str(req_id), None)
         if self._kda_planner is not None:
             self._kda_planner.forget_pending(str(req_id))
             self._kda_planner.forget_request(str(req_id))

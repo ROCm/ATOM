@@ -710,6 +710,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if hook is not None:
             hook(live_operations)
 
+    #: Whether `abandon_save` really gives a stalled save's blocks back. A
+    #: backend that cannot prove its server stopped reading sets it False and
+    #: bounds a stalled transfer with `enforce_transfer_deadlines` instead.
+    abandons_saves: bool = True
+
+    def enforce_transfer_deadlines(self) -> None:
+        """Fail-stop on a transfer past its deadline, once per scheduler step.
+
+        Called by whoever drives the step after that step's saves are built.
+        Nothing to bound here; the MP backend overrides it.
+        """
+
     def reconcile_recurrent_rides(self) -> None:
         """Give back the pins of rides whose transfer is over.
 
@@ -928,6 +940,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         for sid, seq in load_items:
             ls = self._load_specs.pop(sid, None)
             if ls is None or not ls.can_load:
+                self.declined_loads.add(sid)
                 logger.debug(
                     "[OFFLOAD-LOAD-SKIP] seq=%s ls=%s can_load=%s",
                     sid,

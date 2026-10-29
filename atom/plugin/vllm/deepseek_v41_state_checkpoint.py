@@ -373,9 +373,14 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
         return ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
 
     def matches(self, vllm_config) -> bool:
+        """V4.1 with the switch on. Without it no checkpoint layer exists, and
+        every hook keyed on this adapter (pool sizing, placement) would size
+        and place checkpoints for groups nobody registered."""
         from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
 
-        return bool(is_deepseek_v41_vllm_config(vllm_config))
+        return v41_state_checkpoints_requested() and bool(
+            is_deepseek_v41_vllm_config(vllm_config)
+        )
 
     def sizing(self, vllm_config) -> V41StateCheckpointSizing:
         return v41_state_checkpoint_sizing(vllm_config)
@@ -688,14 +693,15 @@ def install_v41_store_sites() -> int:
         @functools.wraps(original)
         def execute_model(self, *args, _orig=original, **kwargs):
             output = _orig(self, *args, **kwargs)
-            # Always flush here, drafter or not -- do NOT defer to the next
-            # build the way the vendored V1 site does. That deferral exists
-            # because V1's drafter runs in `sample_tokens`, AFTER the
-            # `_model_forward` the stores are attached to, so the slot is not
-            # final yet. The V2 runner has no `_model_forward`: `execute_model`
-            # already covers the target forward, the drafter and sampling, so
-            # the slot IS final here, and deferring instead carries the store
-            # across the NEXT step's forward.
+            # Flush here, drafter or not -- do NOT defer to the next build the
+            # way the vendored V1 site does. The V2 runner has no
+            # `_model_forward`: `execute_model` returns after the target
+            # forward, and `sample_tokens` then samples, commits a speculative
+            # step and runs the drafter. For a step that did not speculate the
+            # slot is final here -- the drafter writes past the window the
+            # checkpoint holds (`v41_drafter_in_target_slot`) -- and deferring
+            # instead carries the store across the NEXT step's forward. (V4.1
+            # refuses pipeline parallelism, so every rank reaches the commit.)
             #
             # Measured with DSpark on, before this: every checkpoint held the state
             # of the following boundary -- planned 2560 stored at cursor 3072,

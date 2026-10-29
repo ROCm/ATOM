@@ -64,6 +64,10 @@ logger = logging.getLogger("atom")
 # recently exported events (2048), which holds step events after their
 # transfers finish.
 _OWNED_IPC_CAP = 8192
+# Past the cap with the stream still busy, the most destroyed in one step: a
+# stream that is never idle (async scheduling) pays them a batch at a time
+# rather than all at once.
+_BUSY_RELEASE_BATCH = 64
 
 
 def _stream_idle() -> bool:
@@ -81,8 +85,8 @@ def _sole_owner_refcount() -> int:
 _SOLE_OWNER_REFCOUNT = _sole_owner_refcount()
 
 
-def _take_unshared(owned: deque[Any]) -> list[Any]:
-    """Remove and return the entries of `owned` nothing else holds any more.
+def _take_unshared(owned: deque[Any], limit: int | None = None) -> list[Any]:
+    """Remove and return up to `limit` entries nothing else holds any more.
 
     Every entry is checked: one held for good elsewhere (a logged exception's
     traceback, say) must not keep the ones behind it alive.
@@ -90,7 +94,9 @@ def _take_unshared(owned: deque[Any]) -> list[Any]:
     unshared = []
     for _ in range(len(owned)):
         entry = owned.popleft()
-        if sys.getrefcount(entry) <= _SOLE_OWNER_REFCOUNT:
+        if (limit is None or len(unshared) < limit) and sys.getrefcount(
+            entry
+        ) <= _SOLE_OWNER_REFCOUNT:
             unshared.append(entry)
         else:
             owned.append(entry)
@@ -424,21 +430,26 @@ class LMCacheMPConnector(KVConnectorBase):
         its next submission and each exported event in a ring, and the drain
         thread's locals hold some between rounds; letting go first would
         leave the destroy to whichever of them lets go last, on the drain
-        thread. Past `_OWNED_IPC_CAP` the idle check is skipped, so a stream
-        that is never idle cannot grow the backlog without bound.
+        thread. Past `_OWNED_IPC_CAP` a busy stream still releases, at most
+        `_BUSY_RELEASE_BATCH` a step, so one that is never idle can neither grow
+        the backlog without bound nor pay it in one step.
         """
         with self._lock:
             owned = len(self._owned_events) + len(self._owned_futures)
-        if not owned or (owned < _OWNED_IPC_CAP and not _stream_idle()):
+        if not owned:
             return
+        idle = _stream_idle()
+        if owned < _OWNED_IPC_CAP and not idle:
+            return
+        limit = None if idle else _BUSY_RELEASE_BATCH
         # Futures first: each retains its step event, which is unshared only
         # once they are gone. The drain thread adds futures under `_lock`; the
         # events are this thread's alone, so their scan holds no lock the drain
         # thread waits on. The destroys run outside the lock.
         with self._lock:
-            unshared = _take_unshared(self._owned_futures)
+            unshared = _take_unshared(self._owned_futures, limit)
         del unshared
-        unshared = _take_unshared(self._owned_events)
+        unshared = _take_unshared(self._owned_events, limit)
         del unshared
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:

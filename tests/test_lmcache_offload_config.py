@@ -492,3 +492,16 @@ def test_page_namespace_survives_a_worker_normalising_hf_config():
     assert offcfg.build_page_namespace(
         scheduler, _lmcache_config(), 4
     ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+
+@pytest.mark.parametrize("override", ["dsv41", "kimi_k3"])
+def test_a_state_owning_model_keeps_its_own_layout(override):
+    """Another state-owning layout has no tier for this model's state either."""
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "qwen3_next"
+    config.kv_transfer_config = {"offload_layout": override}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+    config.kv_transfer_config = {"offload_layout": "qwen"}
+    assert offcfg.select_offload_layout(config) == "qwen"

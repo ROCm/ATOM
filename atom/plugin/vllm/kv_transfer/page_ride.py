@@ -29,6 +29,7 @@ The host planner must provide:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 #: vLLM's placeholder block. ``vllm.v1.attention.backends.utils.NULL_BLOCK_ID``
@@ -52,6 +53,16 @@ class PageRideMixin:
         # operation -> the blocks pinned for it, given back in
         # `retire_ride_pins` once the scheduler no longer lists it as live.
         self._ride_pins: dict[Any, tuple[int, ...]] = {}
+        self._ride_pinned_at: dict[Any, float] = {}
+
+    def has_ride_pins(self, max_age_s: float | None = None) -> bool:
+        """Whether a ride still holds blocks; with ``max_age_s``, one pinned
+        that recently (an older one is a stalled save, not blocks about to
+        come back)."""
+        if max_age_s is None:
+            return bool(self._ride_pins)
+        oldest = time.monotonic() - max_age_s
+        return any(at > oldest for at in self._ride_pinned_at.values())
 
     def bind_gpu_block_pool(self, pool) -> None:
         self._pool = pool
@@ -157,6 +168,7 @@ class PageRideMixin:
             # the share back on every exit the save has, terminal or not.
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
             self._ride_pins[operation] = tuple(block_ids)
+            self._ride_pinned_at[operation] = time.monotonic()
         return RecurrentStateTransfer(boundary_tokens=end, block_ids=tuple(block_ids))
 
     def retire_ride_pins(self, live_operations) -> None:
@@ -174,5 +186,6 @@ class PageRideMixin:
         live = set(live_operations)
         for operation in [op for op in self._ride_pins if op not in live]:
             block_ids = self._ride_pins.pop(operation)
+            self._ride_pinned_at.pop(operation, None)
             if pool is not None:
                 pool.free_blocks([pool.blocks[block_id] for block_id in block_ids])

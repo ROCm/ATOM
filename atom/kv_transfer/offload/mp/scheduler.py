@@ -200,6 +200,12 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         del timeout_s  # See abandon_save: no release without a report.
         return []
 
+    abandons_saves = False
+
+    def enforce_transfer_deadlines(self) -> None:
+        # The vLLM plugin never calls `process_completions`; this is its hook.
+        self._enforce_transfer_deadlines()
+
     def _enforce_transfer_deadlines(self) -> None:
         """Fail-stop when a dispatched transfer never reports.
 

@@ -171,8 +171,9 @@ def _kv_holding_request_will_prefill(scheduler) -> bool:
     as a verify row `(1024, 6, 5)`, refused by `_v41_prepare_kwargs`.
 
     Only requests that will actually prefill count. One still waiting for its
-    load stays parked this step; counting it would clear the batch's drafts
-    for as long as any load is in flight.
+    load stays parked this step, and an idle streaming-input session waits for
+    its client; counting either would clear the batch's drafts for as long as
+    it waits.
     """
     queue = getattr(scheduler, "kv_holding_waiting", None)
     if not queue:
@@ -180,10 +181,12 @@ def _kv_holding_request_will_prefill(scheduler) -> bool:
     from vllm.v1.request import RequestStatus
 
     done = getattr(scheduler, "finished_recving_kv_req_ids", None) or ()
+    parked = {
+        RequestStatus.WAITING_FOR_REMOTE_KVS,
+        getattr(RequestStatus, "WAITING_FOR_STREAMING_REQ", None),
+    }
     return any(
-        request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
-        or request.request_id in done
-        for request in queue
+        request.status not in parked or request.request_id in done for request in queue
     )
 
 

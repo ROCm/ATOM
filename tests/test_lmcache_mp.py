@@ -731,9 +731,26 @@ def test_mp_lookup_rejects_retrieve_beyond_lookup_hit(monkeypatch):
     assert client.hit_tokens("req") == 8
 
 
+def _main_thread_clock(values):
+    """`time.monotonic` stepping through `values` on this thread only.
+
+    The patch is process-wide, and drain threads that earlier tests left
+    running call the clock too; they get the real time, so they cannot use up
+    the sequence this test drives.
+    """
+    ticks = iter(values)
+    real = transfer.time.monotonic
+
+    def clock():
+        if threading.current_thread() is threading.main_thread():
+            return next(ticks)
+        return real()
+
+    return clock
+
+
 def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
-    ticks = iter([0.0, 0.0, 2.0])
-    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(transfer.time, "monotonic", _main_thread_clock([0.0, 0.0, 2.0]))
     monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, None])
     client = mp_lookup._MPLookupClient(
@@ -753,8 +770,7 @@ def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
 
 
 def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
-    ticks = iter([0.0, 0.0, 2.0])
-    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(transfer.time, "monotonic", _main_thread_clock([0.0, 0.0, 2.0]))
     monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, None])
     client = mp_lookup._MPLookupClient(
@@ -885,8 +901,9 @@ def test_mp_lookup_timeout_is_not_recorded_as_a_tier_miss(monkeypatch):
     held long enough to keep a dead tier from costing a timeout every step.
     """
 
-    ticks = iter([0.0, 0.0, 2.0, 0.0])
-    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        transfer.time, "monotonic", _main_thread_clock([0.0, 0.0, 2.0, 0.0])
+    )
     scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
     adapter = lookup._adapter
     adapter.results.clear()
@@ -2388,7 +2405,8 @@ def test_preemption_fence_covers_queued_transfers_and_fails_stop(monkeypatch):
 
     from atom.plugin.vllm.kv_transfer import mp_worker_adapter
 
-    monkeypatch.setattr(mp_worker_adapter, "_FENCE_TIMEOUT_S", 0.01)
+    # Bounded by the worker's own transfer deadline, not a constant of its own.
+    monkeypatch.setattr(mp_worker_adapter, "_FENCE_TIMEOUT_S", 3600.0)
     inner = SimpleNamespace(
         _lock=threading.Lock(),
         _pending_saves={},
@@ -2397,10 +2415,11 @@ def test_preemption_fence_covers_queued_transfers_and_fails_stop(monkeypatch):
         _drain_wake=threading.Event(),
         _drain_thread=SimpleNamespace(is_alive=lambda: True),
         _drain_error=None,
+        _transfer_deadline_s=0.01,
     )
     fence = mp_worker_adapter.MPOffloadWorkerAdapter(inner)
     fence.wait_for_requests(["8"])  # someone else's transfer: no wait
-    with pytest.raises(RuntimeError, match="preemption fence timed out"):
+    with pytest.raises(RuntimeError, match="timed out after 0s, the transfer deadline"):
         fence.wait_for_requests(["7"])
     assert inner._drain_wake.is_set()
 
@@ -2609,3 +2628,24 @@ def test_the_v41_checkpoint_switch_parses_like_other_switches(monkeypatch):
         assert envs.ATOM_V41_STATE_CHECKPOINTS is on
     monkeypatch.delenv("ATOM_V41_STATE_CHECKPOINTS")
     assert envs.ATOM_V41_STATE_CHECKPOINTS is False
+
+
+def test_a_busy_stream_past_the_cap_releases_a_batch_per_step():
+    """Async scheduling rarely idles; the backlog is paid off, not dumped."""
+    entries = deque(object() for _ in range(5))
+    first = mp_worker._take_unshared(entries, limit=2)
+    assert len(first) == 2 and len(entries) == 3
+    assert len(mp_worker._take_unshared(entries)) == 3 and not entries
+
+
+def test_mp_bounds_a_stalled_save_by_its_deadline_not_by_abandoning_it():
+    """MP cannot release a save's blocks without its report, so the plugin
+    keeps the quorum and drives the deadline from its own per-step hook."""
+    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
+        mp_scheduler.LMCacheMPConnectorScheduler
+    )
+    assert sched.abandons_saves is False
+    called = []
+    sched._enforce_transfer_deadlines = lambda: called.append(True)
+    sched.enforce_transfer_deadlines()
+    assert called == [True]

@@ -166,9 +166,12 @@ def test_an_unridable_finished_save_retires_and_frees_its_lease():
 # -- connector ---------------------------------------------------------------
 
 
-def _options_stub(*, v41=True, groups=(1,), mamba=(), **options):
+def _options_stub(*, v41=True, groups=(1,), mamba=(), policy="recompute", **options):
     stub = SimpleNamespace(
         _config=SimpleNamespace(kv_transfer_config=dict(options)),
+        _vllm_config=SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_load_failure_policy=policy)
+        ),
         _is_deepseek_v41=v41,
         _v41_checkpoint_group_ids=tuple(groups),
         _mamba_groups=list(mamba),
@@ -195,6 +198,13 @@ def test_v41_offload_refusals(options, groups, match):
         AtomLMCacheOffloadConnector._refuse_v41_without_ride(stub)
 
 
+def test_v41_offload_refuses_the_fail_policy():
+    """A declined ride is reported as a failed load; `fail` ends the request."""
+    stub = _options_stub(policy="fail", **{"atom.offload.backend": "mp"})
+    with pytest.raises(ValueError, match="kv_load_failure_policy='recompute'"):
+        AtomLMCacheOffloadConnector._refuse_v41_without_ride(stub)
+
+
 def test_v41_rides_its_checkpoint_groups_on_mp():
     stub = _options_stub(**{"atom.offload.backend": "mp"})
     AtomLMCacheOffloadConnector._refuse_v41_without_ride(stub)
@@ -206,7 +216,7 @@ def _alloc_connector():
     c._attn_group_id = 0
     c._requests = {}
     c._abandoned_loads = set()
-    c._promised_loads = {}
+    c._promised_loads, c._detach_after_alloc = {}, {}
     c._kda_planner = None
     c._scheduler = SimpleNamespace(update_state_after_alloc=lambda seq: None)
     seq = SimpleNamespace(num_cached_tokens=0, set_block_table=lambda ids: None)
@@ -233,6 +243,7 @@ def _promising_connector(parked, declined=()):
     c._config = SimpleNamespace(kv_cache_block_size=16)
     c._seqs = {"7": SimpleNamespace(block_table=list(range(100, 116)))}
     c._scheduler = SimpleNamespace(declined_loads=set(declined))
+    c._finished_withdrawals = []
     return c
 
 
@@ -247,6 +258,24 @@ def test_an_undispatched_promise_is_withdrawn_only_if_vllm_parked_it(parked):
     assert c._promised_loads == {}
 
 
+def test_a_parked_promise_is_withdrawn_when_its_request_finishes():
+    """vLLM frees an aborted parked request's blocks on a `finished_recving`."""
+    c = _promising_connector(True)
+    c._requests, c._kda_planner, c._detach_after_alloc = {}, None, {}
+    c._scheduler = SimpleNamespace(
+        declined_loads=set(),
+        request_finished=Mock(),
+        should_defer_free=Mock(return_value=False),
+    )
+    c._seqs = SimpleNamespace(
+        get=lambda req_id: SimpleNamespace(block_table=list(range(100, 116))),
+        drop=lambda req_id: None,
+    )
+    c._request_finished(SimpleNamespace(request_id="7"))
+    out = c._check_promised_loads(SimpleNamespace(requests=[]))
+    assert out == [("7", [102, 103, 104, 105])] and c._promised_loads == {}
+
+
 def test_a_load_declined_at_dispatch_is_withdrawn_that_step():
     """No later step dispatches it, so the parked request is released now."""
     c = _promising_connector(True, declined={"7"})
@@ -256,9 +285,14 @@ def test_a_load_declined_at_dispatch_is_withdrawn_that_step():
 
 def _lookup_connector(*, pending, detachable):
     c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
-    seq = SimpleNamespace(set_num_cached_tokens=Mock())
+    seq = SimpleNamespace(
+        id="r",
+        num_cached_tokens=512,
+        set_num_cached_tokens=Mock(),
+        set_block_table=Mock(),
+    )
     c._seqs = SimpleNamespace(get_or_create=lambda request: seq)
-    c._requests, c._promised_loads = {}, {}
+    c._requests, c._promised_loads, c._detach_after_alloc = {}, {}, {}
     c._kda_planner = c._v41_planner = None
     c._scheduler = SimpleNamespace(
         get_num_new_matched_tokens=Mock(return_value=(512, True)),
@@ -283,6 +317,20 @@ def test_a_tier_lookup_never_blocks_schedule(pending, detachable, expected):
     """In flight: ask again next step. Ruled out by the local hit: don't wait."""
     c = _lookup_connector(pending=pending, detachable=detachable)
     assert c.get_num_new_matched_tokens(SimpleNamespace(request_id="r"), 0) == expected
+
+
+def test_a_detached_lookup_is_sent_once_vllm_has_allocated():
+    """A request vLLM cannot allocate for is asked again; no lookup each time."""
+    c = _lookup_connector(pending=False, detachable=True)
+    request = SimpleNamespace(request_id="r")
+    for _ in range(3):
+        assert c.get_num_new_matched_tokens(request, 512) == (0, False)
+    c._scheduler.detach_lookup.assert_not_called()
+    c._scheduler.update_state_after_alloc = Mock()
+    c._attn_group_id = 0
+    c.update_state_after_alloc(request, ([1, 2],), 0)
+    c._scheduler.detach_lookup.assert_called_once()
+    assert c._detach_after_alloc == {}
 
 
 def test_a_multi_group_failure_travels_by_request_and_stays_received():
@@ -610,3 +658,45 @@ def test_the_pool_hook_leaves_v41_without_checkpoints_to_the_reserve_patch(
         lambda *_args: configs, object(), {adapter.proxy_layer_name: object()}, [0]
     )
     assert out is configs
+
+
+def test_a_stalled_mp_save_keeps_its_rank_reports():
+    """Dropping them would free nothing on MP and make the quorum unreachable."""
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._deferred_frees, c._deferred_free_at = {"r0"}, {"r0": 0.0}
+    c._next_save_reconcile_at = 0.0
+    c._save_reports = {"r0": {0, 1}}
+    c._scheduler = SimpleNamespace(abandons_saves=False, abandon_save=Mock())
+    c._reconcile_stale_saves()
+    c._scheduler.abandon_save.assert_not_called()
+    assert c._save_reports == {"r0": {0, 1}}
+
+
+def test_an_idle_streaming_session_does_not_drop_the_drafts():
+    from vllm.v1.request import RequestStatus
+
+    from atom.plugin.vllm.v41_speculative import _kv_holding_request_will_prefill
+
+    status = getattr(RequestStatus, "WAITING_FOR_STREAMING_REQ", None)
+    if status is None:
+        pytest.skip("this vLLM has no streaming-input sessions")
+    idle = SimpleNamespace(status=status, request_id="s")
+    scheduler = SimpleNamespace(kv_holding_waiting=[idle])
+    assert not _kv_holding_request_will_prefill(scheduler)
+    resumed = SimpleNamespace(status=RequestStatus.WAITING, request_id="w")
+    scheduler.kv_holding_waiting.append(resumed)
+    assert _kv_holding_request_will_prefill(scheduler)
+
+
+def test_the_v41_adapter_matches_only_with_the_switch_on(monkeypatch):
+    """Off, no checkpoint group exists for its hooks to size or place."""
+    from atom.plugin.vllm import deepseek_v41_bridge
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import _V41_ADAPTER
+
+    monkeypatch.setattr(
+        deepseek_v41_bridge, "is_deepseek_v41_vllm_config", lambda _config: True
+    )
+    monkeypatch.setenv("ATOM_V41_STATE_CHECKPOINTS", "0")
+    assert not _V41_ADAPTER.matches(object())
+    monkeypatch.setenv("ATOM_V41_STATE_CHECKPOINTS", "1")
+    assert _V41_ADAPTER.matches(object())

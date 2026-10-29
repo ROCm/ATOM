@@ -172,19 +172,15 @@ def _is_v41_checkpoint_layer(name: str) -> bool:
     """Whether a layer is one PAGE unit of a V4.1 checkpoint.
 
     Asks the adapter rather than matching a string here, so the suffix has one
-    owner. False when the mechanism is not importable, which is every build
-    that has no checkpoints at all.
+    owner, without registering it: a name check has no business changing
+    which adapters the hooks see. False when the mechanism is not importable,
+    which is every build that has no checkpoints at all.
     """
     try:
-        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
-            register_v41_state_checkpoint_adapter,
-        )
-
-        return bool(
-            register_v41_state_checkpoint_adapter().is_state_checkpoint_layer(name)
-        )
-    except Exception:  # noqa: BLE001 - no mechanism means no checkpoint layers
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import _V41_ADAPTER
+    except ImportError:
         return False
+    return bool(_V41_ADAPTER.is_state_checkpoint_layer(name))
 
 
 def _spec_is_v41_proxy_with_draft(kv_cache_spec) -> bool:

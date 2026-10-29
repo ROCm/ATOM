@@ -27,8 +27,9 @@ import torch
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
 # never reuse one another's objects even when the HF model config is identical.
 # Version 4 hashes `sliding_window` and `candidate_block_size`, a canonical
-# `head_dim`, and the speculative config without per-process fields. That moves
-# every model's digest, so objects stored under version 3 are unreachable.
+# `head_dim`, and the speculative config without per-process or nested
+# model-config fields. That moves every model's digest, so objects stored under
+# version 3 are unreachable.
 PAGE_LAYOUT_VERSION = 4
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
@@ -175,17 +176,20 @@ def select_offload_layout(config) -> str:
             "does not preserve the NSA index cache. Drop the override or set "
             "it to 'm3'."
         )
-    # An override may pick between compatible layouts, but it may not strip a
-    # state-owning model down to a layout with no tier for its per-request state
-    # -- the same silent-wrong-output the GDN refusal pre-empts, reached by a
-    # different door (an explicit `dense` rather than a fall-through).
-    if natural in _STATE_OWNING_LAYOUTS and mapped not in _STATE_OWNING_LAYOUTS:
+    # An override may pick between compatible layouts, but a state-owning
+    # model's state tier is its own: any other layout, state-owning or not,
+    # has no tier for that state -- the same silent-wrong-output the GDN
+    # refusal pre-empts, reached by a different door (an explicit override
+    # rather than a fall-through). `dsv41` on a K3 model, say, reaches the
+    # dense connector with the state tier off.
+    if natural in _STATE_OWNING_LAYOUTS and mapped != natural:
         raise ValueError(
             f"lmcache_offload: offload_layout={override!r} would run a "
             f"{natural!r}-family model (per-request recurrent state) on the "
             f"{mapped!r} layout, which owns no tier for that state -- its KV "
             "prefix would be restored over stale state (silent wrong output). "
-            "Drop the override, or disable offload for this model."
+            f"Drop the override, set it to {natural!r}, or disable offload for "
+            "this model."
         )
     return mapped
 
@@ -305,6 +309,16 @@ _PAGE_PLACEMENT_FIELDS = frozenset({"target_parallel_config", "draft_parallel_co
 # the digest (see `_PAGE_PLACEMENT_FIELDS` and `_canonical_head_dim`).
 _PAGE_SPECULATIVE_BEHAVIOUR_FIELDS = frozenset({"disable_eagle_block_drop"})
 
+# The model and load configs nested in a speculative config: each process fills
+# them in (`hf_config` included) on its own, as `_canonical_head_dim` documents
+# for the target's, so hashing them can split the namespace the same way. The
+# bytes are already named without them: the target by the HF fields hashed
+# above, the draft by the speculative config's own `model`, `method` and
+# `num_speculative_tokens`.
+_PAGE_SPECULATIVE_NESTED_FIELDS = frozenset(
+    {"target_model_config", "draft_model_config", "draft_load_config"}
+)
+
 
 def _stable_speculative_config(value: Any) -> Any:
     """The speculative config with everything per-process removed.
@@ -322,7 +336,11 @@ def _stable_speculative_config(value: Any) -> Any:
 
     stable = _stable_config_value(value)
     if isinstance(stable, dict):
-        dropped = _PAGE_PLACEMENT_FIELDS | _PAGE_SPECULATIVE_BEHAVIOUR_FIELDS
+        dropped = (
+            _PAGE_PLACEMENT_FIELDS
+            | _PAGE_SPECULATIVE_BEHAVIOUR_FIELDS
+            | _PAGE_SPECULATIVE_NESTED_FIELDS
+        )
         return {key: item for key, item in stable.items() if key not in dropped}
     return stable
 
