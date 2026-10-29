@@ -45,6 +45,7 @@ def chunk_gated_delta_rule_fwd(
     keep_intermediate_states: bool = False,
     plan=None,
     state_slots=None,
+    output_gate=None,
 ):
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
@@ -120,7 +121,8 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         o=o,
-            plan=plan,
+        plan=plan,
+        gate=output_gate,
     )
     # `h` is the recurrent state at EVERY chunk boundary — [B, NT, H, K, V],
     # where h[:, j] is the state after j*chunk_size tokens. The SSM state cache
@@ -184,6 +186,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         keep_intermediate_states: bool = False,
         plan=None,
         state_slots=None,
+        output_gate=None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -206,6 +209,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             keep_intermediate_states=keep_intermediate_states,
             plan=plan,
             state_slots=state_slots,
+            output_gate=output_gate,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -240,6 +244,7 @@ def chunk_gated_delta_rule(
     keep_intermediate_states: bool = False,
     plan=None,
     state_slots=None,
+    output_gate=None,
 ):
     r"""
     Args:
@@ -273,6 +278,12 @@ def chunk_gated_delta_rule(
             `pop_last_intermediate_states` to collect. Default: `False`, which
             drops them as soon as the forward returns — they are ~33 MB at
             T=8192, H=8, K=V=128, so a caller that never pops must not ask.
+        output_gate (Optional[tuple]):
+            ``(z, norm_weight, eps)``: ``o`` receives the gated RMSNorm
+            ``norm(o) * norm_weight * silu(z)`` (groups of V) instead of the raw
+            output -- on gfx1250 in the output kernel's epilogue. ``z`` is
+            ``[T, H, V]`` (or ``[B, T, H, V]``) with contiguous ``[H, V]`` rows.
+            Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -397,6 +408,7 @@ def chunk_gated_delta_rule(
         keep_intermediate_states,
         plan,
         state_slots,
+        output_gate,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
