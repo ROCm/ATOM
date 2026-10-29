@@ -51,6 +51,11 @@ class ConcatKeys(NamedTuple):
     row_starts: torch.Tensor
 
 
+def _check_split_group(group: str) -> None:
+    if group not in ("dcp", "tp"):
+        raise ValueError(f"RowSplit group must be 'dcp' or 'tp', got {group!r}")
+
+
 class RowSplit(NamedTuple):
     """Rows split across ranks that each score against the whole key set:
     this rank scores `[first, end)` into its slot of `stride` rows at `slot`,
@@ -81,8 +86,7 @@ class RowSplit(NamedTuple):
         group: Literal["dcp", "tp"] = "dcp",
     ) -> "RowSplit":
         """This rank's split of `rows`."""
-        if group not in ("dcp", "tp"):
-            raise ValueError(f"RowSplit group must be 'dcp' or 'tp', got {group!r}")
+        _check_split_group(group)
         stride, slot, first, end = qsplit_rows(rows, rank, world)
         return cls(first, end, slot, stride, world, group)
 
@@ -95,8 +99,7 @@ class RowSplit(NamedTuple):
         contiguous shares leave the last rank the most work; striped ones
         even it out. The gathered slots are rank-major, so the scorer
         transposes them back to row order."""
-        if group not in ("dcp", "tp"):
-            raise ValueError(f"RowSplit group must be 'dcp' or 'tp', got {group!r}")
+        _check_split_group(group)
         stride = -(-rows // world)
         count = len(range(rank, rows, world))
         return cls(0, count, rank * stride, stride, world, group, stripe=True)

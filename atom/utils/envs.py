@@ -495,7 +495,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # replicated across TP, so without this every rank repeats the same scoring.
     # 0 restores the full per-rank scoring. This and the bound below must be the
     # same on every rank: a split step's ranks gather together.
-    "ATOM_V4_INDEXER_QSPLIT": lambda: os.getenv("ATOM_V4_INDEXER_QSPLIT", "1") == "1",
+    "ATOM_V4_INDEXER_QSPLIT": lambda: _flag_env("ATOM_V4_INDEXER_QSPLIT", "1"),
     # The fewest index logits -- the keys a prefill step's rows see in all -- at
     # which ATOM_V4_INDEXER_QSPLIT splits the step. The split saves index
     # scoring, which grows with them, and on FP4 the logits bands a rank no

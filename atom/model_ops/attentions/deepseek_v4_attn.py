@@ -165,11 +165,13 @@ def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
 
 
 def _is_pd_consumer(kv_transfer_config: dict | None) -> bool:
-    """A P/D decode instance; a load-only offload node sets the same role."""
-    from atom.kv_transfer.disaggregation.factory import resolve_pd_backend
+    """A P/D decode instance: its P/D connector, `multi`'s sub-connector
+    included, is a `kv_consumer`. A load-only offload node, also
+    `kv_consumer`, has no P/D connector and is not one."""
+    from atom.kv_transfer.disaggregation.factory import pd_transfer_config
 
-    cfg = kv_transfer_config or {}
-    return resolve_pd_backend(cfg) is not None and cfg.get("kv_role") == "kv_consumer"
+    pd = pd_transfer_config(kv_transfer_config)
+    return pd is not None and pd.get("kv_role") == "kv_consumer"
 
 
 def _validate_fp4_indexer_transfer(kv_transfer_config: dict) -> None:
@@ -560,10 +562,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.indexer_layout = (
             fp4_indexer_layout_for_arch(get_gfx()) if self._indexer_fp4 else "fp8"
         )
-        self._indexer_qsplit_world = self._indexer_qsplit_world_size(
-            model_runner.config
-        )
-        self._indexer_qsplit_min_logits = envs.ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS
+        # A collective on the TP group when the run splits: every TP rank
+        # builds this builder.
+        self._init_indexer_qsplit(model_runner.config)
         if self.indexer_layout == FP4_GFX1250_NATURAL:
             if self.max_bs > 2048:
                 raise ValueError(
@@ -2222,13 +2223,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             max(int(np.diff(starts).max()), 1),
         )
 
+    def _init_indexer_qsplit(self, config) -> None:
+        """The split's TP width and logits bound. A run that splits gathers
+        once here, on the TP group (`_warm_split_gather`)."""
+        self._indexer_qsplit_world = self._indexer_qsplit_world_size(config)
+        self._indexer_qsplit_min_logits = envs.ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS
+        if self._indexer_qsplit_world > 1:
+            self._warm_split_gather(self._indexer_qsplit_world)
+
     def _indexer_qsplit_world_size(self, config) -> int:
-        """See `indexer_qsplit_world`; read once, its inputs are fixed per run.
-        A run that splits warms the split's gather here (`_warm_split_gather`)."""
+        """See `indexer_qsplit_world`; read once, its inputs are fixed per run."""
         tp = get_tensor_model_parallel_world_size()
         if tp <= 1:
             return 1
-        world = indexer_qsplit_world(
+        return indexer_qsplit_world(
             tp,
             physical_tp=torch.distributed.get_world_size(get_tp_group().device_group),
             enabled=envs.ATOM_V4_INDEXER_QSPLIT,
@@ -2242,9 +2250,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             dcp=int(config.decode_context_parallel_size),
             kv_consumer=_is_pd_consumer(config.kv_transfer_config),
         )
-        if world > 1:
-            self._warm_split_gather(world)
-        return world
 
     def _warm_split_gather(self, world: int) -> None:
         """Gather once on the TP group's ProcessGroup before the memory

@@ -1244,38 +1244,50 @@ def test_split_logits_do_not_wrap_in_int32(v4_builder_cls, monkeypatch):
 
 
 _MOONCAKE = {"kv_connector": "mooncake"}
+_OFFLOAD = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+
+
+def _multi(*connectors):
+    return {"kv_connector": "multi", "connectors": list(connectors)}
 
 
 @pytest.mark.parametrize(
     "enabled, tbo, kv, world",
     [
         ("1", False, {}, 8),
+        ("true", False, {}, 8),
         ("1", False, {**_MOONCAKE, "kv_role": "kv_producer"}, 8),
+        ("1", False, _multi({**_MOONCAKE, "kv_role": "kv_producer"}, _OFFLOAD), 8),
         ("1", False, {"kv_connector": "lmcache_offload", "kv_role": "kv_consumer"}, 8),
         ("1", True, {}, 1),
         ("1", False, {**_MOONCAKE, "kv_role": "kv_consumer"}, 1),
+        ("1", False, _multi({**_MOONCAKE, "kv_role": "kv_consumer"}, _OFFLOAD), 1),
+        ("1", False, _multi(_OFFLOAD, {**_MOONCAKE, "kv_role": "kv_consumer"}), 1),
         ("0", False, {}, 1),
     ],
     ids=[
         "splits",
+        "flag_true",
         "pd_prefill",
+        "multi_pd_prefill",
         "offload_load_only",
         "prefill_tbo",
         "pd_decode",
+        "multi_pd_decode",
+        "multi_pd_decode_offload_first",
         "flag_off",
     ],
 )
-def test_a_run_that_splits_warms_the_split_s_gather(
+def test_the_split_world_follows_the_run(
     v4_builder_cls, monkeypatch, enabled, tbo, kv, world
 ):
-    """With the flag on, plain TP8 splits, a P/D prefill instance and a
-    load-only offload node included; the flag off keeps the rows whole, and
-    so, for now, does prefill TBO, whose ubatches' rows do not take the split
-    yet, and so does a P/D decode instance, which only recomputes prefills.
-    A run that splits gathers once at startup, on the TP group and from this
-    rank's own slot as the split does, so what RCCL allocates on its first
-    all-gather is inside the memory profile; one that does not never
-    gathers."""
+    """With the flag on ("1" or "true"), plain TP8 splits, a P/D prefill
+    instance and a load-only offload node included; the flag off keeps the
+    rows whole, and so, for now, does prefill TBO, whose ubatches' rows do
+    not take the split yet, and so does a P/D decode instance, which only
+    recomputes prefills: under `multi` too, whose P/D sub-connector holds the
+    role, wherever it is listed. Reading the world is no collective: the
+    startup gather is the builder's `__init__`'s (`_warm_split_gather`)."""
     module = v4_builder_cls._indexer_qsplit_world_size.__globals__
     monkeypatch.setitem(module, "get_tensor_model_parallel_world_size", lambda: 8)
     monkeypatch.setitem(
@@ -1304,9 +1316,41 @@ def test_a_run_that_splits_warms_the_split_s_gather(
         kv_transfer_config=kv,
     )
     assert builder._indexer_qsplit_world_size(config) == world
-    if world == 1:
-        assert gathers == []
-        return
+    assert gathers == []
+
+
+@pytest.mark.parametrize("world, gathers", [(8, [8]), (1, [])])
+def test_a_run_that_splits_gathers_at_startup(v4_builder_cls, world, gathers):
+    """A run that splits gathers once at startup, before the memory profile;
+    one that does not never gathers."""
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder._indexer_qsplit_world_size = lambda config: world
+    warmed = []
+    builder._warm_split_gather = warmed.append
+    builder._init_indexer_qsplit(SimpleNamespace())
+    assert builder._indexer_qsplit_world == world
+    assert warmed == gathers
+
+
+def test_the_startup_gather_is_the_split_s(v4_builder_cls, monkeypatch):
+    """The startup gather runs on the TP group and from this rank's own slot,
+    as the split does, so what RCCL allocates on its first all-gather is
+    inside the memory profile."""
+    module = v4_builder_cls._warm_split_gather.__globals__
+    monkeypatch.setitem(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=3, device_group="tp"),
+    )
+    gathers = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        lambda out, mine, group: gathers.append((out, mine, group)),
+    )
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder.device = "cpu"
+    builder._warm_split_gather(8)
     [(out, mine, group)] = gathers
-    assert group == "tp" and out.numel() == world
+    assert group == "tp" and out.numel() == 8
     assert mine.numel() == 1 and mine.data_ptr() == out[3:].data_ptr()
