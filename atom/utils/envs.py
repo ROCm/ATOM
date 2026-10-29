@@ -930,8 +930,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Renormalized softmax top-k routing, eager and captured alike, uses the
     # Triton kernel in `model_ops/triton_topk_softmax.py` for the shapes it
-    # supports (same bits as AITER, ~2x faster at 512 experts). 0 puts every
-    # pass on AITER's `topk_softmax`.
+    # supports, in launches of up to 20 rows per CU (same bits as AITER, ~2x
+    # faster at 512 experts; AITER is faster on longer launches and takes
+    # them). 0 puts every pass on AITER's `topk_softmax`.
     "ATOM_TRITON_TOPK_SOFTMAX": lambda: (
         os.getenv("ATOM_TRITON_TOPK_SOFTMAX", "1").lower() == "1"
     ),

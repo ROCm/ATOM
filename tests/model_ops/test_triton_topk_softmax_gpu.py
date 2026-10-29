@@ -4,10 +4,12 @@
 """The Triton routing kernel must reproduce AITER's `topk_softmax` exactly.
 
 `rocm_aiter_topk_softmax_impl` runs it, eager and captured alike, for the
-shapes it supports, and AITER for the rest or with
-`ATOM_TRITON_TOPK_SOFTMAX=0`. Any difference -- an expert id, the order of
-tied experts, or the last bit of a weight -- would make that switch change
-outputs, hence bit-exactness rather than a tolerance.
+shapes it supports up to `triton_topk_softmax_max_rows()` rows, and AITER
+for longer launches, the other shapes or with `ATOM_TRITON_TOPK_SOFTMAX=0`.
+Any difference -- an expert id, the order of tied experts, or the last bit
+of a weight -- would route a token differently in a long prefill than in a
+short pass, or make that switch change outputs, hence bit-exactness rather
+than a tolerance.
 """
 
 import functools
@@ -21,7 +23,10 @@ if not torch.cuda.is_available():
 
 aiter = pytest.importorskip("aiter")
 
-from atom.model_ops.topk_softmax_dispatch import triton_topk_softmax_supported
+from atom.model_ops.topk_softmax_dispatch import (
+    triton_topk_softmax_max_rows,
+    triton_topk_softmax_supported,
+)
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 
 EXPERTS, TOPK = 512, 10
@@ -447,3 +452,76 @@ def test_select_experts_counts_the_pass_rows(
         outside[offset : offset + rows] = False
         assert bool(meta_w[outside].isnan().all())
         assert bool((meta_ids[outside] == EXPERTS).all())
+
+
+@pytest.mark.parametrize("count", [None, "some"])
+@pytest.mark.parametrize("past_cutoff", [False, True])
+@pytest.mark.parametrize("experts,k,shared", [(512, 10, 1), (256, 8, 1), (128, 8, 0)])
+def test_impl_matches_aiter_on_both_sides_of_the_row_cutoff(
+    experts, k, shared, past_cutoff, count, monkeypatch
+):
+    """At `triton_topk_softmax_max_rows()` rows the impl runs the Triton
+    kernel, one row more AITER's; on both sides, eager and replayed, with or
+    without a row count, it matches AITER's kernel bit for bit, and so does
+    the other kernel run directly on the same launch."""
+    from atom.model_ops import topK
+
+    if count and not AITER_HAS_NUM_VALID_ROWS:
+        pytest.skip("AITER predates ROCm/aiter#6916")
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    cutoff = triton_topk_softmax_max_rows()
+    assert cutoff > 0, "no launch would take the Triton kernel"
+    rows = cutoff + past_cutoff
+    torch.manual_seed(rows + experts + shared)
+    width = experts + shared
+    logits = torch.cat(
+        [
+            _logits(rows // 2, width, 2.0, False),
+            _logits(rows - rows // 2, width, 0.05, True),
+        ]
+    )
+    num_valid_rows = (
+        None
+        if count is None
+        else torch.tensor([rows * 2 // 3], dtype=torch.int32, device="cuda")
+    )
+    scoring_func = "sigmoid" if shared else ""
+
+    def outputs():
+        # The shared columns' ids are prefilled (`init_aiter_topK_meta_data`).
+        w = torch.full((rows, k + shared), float("nan"), device="cuda")
+        ids = torch.full((rows, k + shared), experts, dtype=torch.int32, device="cuda")
+        return w, ids
+
+    w_ref, ids_ref = outputs()
+    scratch = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+    kwargs = {} if num_valid_rows is None else {"num_valid_rows": num_valid_rows}
+    aiter.topk_softmax(
+        w_ref, ids_ref[:, :k], scratch, logits, True, shared, scoring_func, **kwargs
+    )
+    w_tri, ids_tri = outputs()
+    triton_topk_softmax(w_tri, ids_tri[:, :k], logits, shared, num_valid_rows)
+
+    if shared:
+        monkeypatch.setattr(topK, "aiter_topK_meta_data", outputs())
+    used = _record_kernels(monkeypatch, topK)
+
+    def route():
+        return topK.rocm_aiter_topk_softmax_impl(
+            logits, k, True, shared, experts, scoring_func or None,
+            num_valid_rows=num_valid_rows,
+        )  # fmt: skip
+
+    w_eager, ids_eager = (t.clone() for t in route())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w_graph, ids_graph = route()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert used == ["aiter" if past_cutoff else "triton"] * 2
+    for w, ids in ((w_eager, ids_eager), (w_graph, ids_graph), (w_tri, ids_tri)):
+        assert torch.equal(ids, ids_ref)
+        assert torch.equal(_bits(w), _bits(w_ref))
+    if num_valid_rows is not None:
+        assert bool((ids_ref[rows * 2 // 3 :, :k] == -1).all())
