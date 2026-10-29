@@ -1,5 +1,7 @@
 # ATOM / DeepSeek-V4.1-Flash Agentic Benchmark
 
+**Update:** The [four-GPU supplement](#d-four-gpu-supplement--october-29-2026) adds TP4 1c, TP4 4c and DPA4 32c, including SA results, validation and recorded commands. Sections 1–7 and Appendices A–C below describe the original two-GPU batch.
+
 Test batch: the evening of October 28 through the early morning of October 29, 2026. All displayed times are **Beijing time (UTC+8)**. The measurement sending windows span **10-28 23:43:06 to 10-29 03:53:44**. Report prepared on October 29, 2026.
 
 The batch completed **10 points**: plain TP2 at concurrency 1, 2, 4, 8, 16, 32, 64 and 128, plus DPA at concurrency 64 and 128. Each point used **2 GPUs and a 3600-second measurement sending window**. In total, **54,730** requests were issued, **54,686** completed successfully, **0** were reported as request errors, and **44** were canceled during post-window draining. DPA 256c is outside this report's scope.
@@ -467,3 +469,348 @@ PY
 ```
 
 Filtering and percentile rules are specified in Section 4: calculate per-request latency, take its linearly interpolated p90, then invert. These commands do not reconstruct the metrics from aggregate JSON and do not use `full_response_*`.
+
+## D. Four-GPU supplement — October 29, 2026
+
+This supplement adds **TP4 1c, TP4 4c and DPA4 32c**, each with **4 GPUs and a 3600-second formal sending window**. Across these three points, **5,810 requests** were issued, **5,807 succeeded**, **0 had request errors**, and **3 were canceled during post-window draining**. Every scenario and submission validation passed, all clients exited with code 0, and no run was marked canceled. The earlier interrupted TP4 4c attempt is excluded.
+
+The same pinned ATOM/AITER revisions, model copy, AgentX/AIPerf 1.0.12, dataset revision and synthetic acceptance recipe from Sections 5–7 were retained. ATOM remained at `c8f7f0583c07e5d3cf77ab01a44f2fce860e7835` and AITER at `bc7011fb079b7101711a6dd5c8823a18999dbe48`. TBO, KV offload and expert parallel were disabled. All accepted four-GPU points ran sequentially on GPUs 0–3; a persistent TP2 service occupied GPUs 4–5 on the same host during these measurements. Host resources were shared.
+
+### D.1 SA results
+
+**X-axis: E2E Normalized Interactivity (tok/s/user). Y-axis: Total Throughput per Chip (tok/s/GPU).** The alternative interactivity column is decode-only interactivity. Throughput is divided by **4** for this supplement; interactivity is per user. Total throughput counts input and output tokens, including cached input tokens.
+
+| Mode | Concurrency | E2E Normalized Interactivity | Interactivity | Total Throughput / GPU | Input Throughput / GPU | Output Throughput / GPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TP4 | 1 | 256.19 | 401.50 | 7,123.59 | 7,079.69 | 43.90 |
+| TP4 | 4 | 355.06 | 536.70 | 10,315.00 | 10,245.20 | 69.79 |
+| DPA4 | 32 | 111.24 | 162.25 | 59,036.07 | 58,696.24 | 339.82 |
+
+### D.2 Latency and request accounting
+
+Each latency cell is **p50 / p90 / p95**. These exported latency percentiles describe successful profiling requests. E2E normalized interactivity above is calculated from per-request records, not from these aggregate percentiles.
+
+| Mode | Concurrency | TTFT (ms) | Decode ITL (ms) | Request latency (s) |
+| --- | ---: | ---: | ---: | ---: |
+| TP4 | 1 | 136.188 / 471.680 / 1342.663 | 1.508 / 2.491 / 3.145 | 2.115 / 10.435 / 12.710 |
+| TP4 | 4 | 77.752 / 197.637 / 326.734 | 1.485 / 1.863 / 2.158 | 0.899 / 6.048 / 8.673 |
+| DPA4 | 32 | 199.559 / 641.550 / 1041.387 | 4.318 / 6.164 / 7.074 | 2.308 / 12.457 / 20.122 |
+
+| Point | Issued | Successful | Errors | Drain canceled | Interactivity eligible | TTFT time coverage | ITL time coverage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tp4-c1 | 319 | 319 | 0 | 0 | 317 | 99.983128% | 100.000000% |
+| tp4-c4 | 763 | 763 | 0 | 0 | 761 | 99.937518% | 99.938753% |
+| dpa4-c32 | 4,728 | 4,725 | 0 | 3 | 4,723 | 99.998832% | 100.000000% |
+
+Each point contains two successful one-token outputs without a decode ITL. These contribute to throughput but are excluded from interactivity. Non-profiling records are excluded; drain cancellations do not contribute to successful-request metrics. All three points passed the 95% minimum time coverage requirement. DPA4 canceled three remaining requests after its 30-second request grace period; no forced cancellation-drain completion was recorded.
+
+| Point | Sending start (UTC+8) | Sending end (UTC+8) | Formal window (s) | Successful-request span (s) |
+| --- | --- | --- | ---: | ---: |
+| tp4-c1 | 10-29 10:47:53.740 | 10-29 11:47:53.740 | 3600.000 | 3609.352627028 |
+| tp4-c4 | 10-29 13:10:16.604 | 10-29 14:10:16.604 | 3600.000 | 3597.791440276 |
+| dpa4-c32 | 10-29 11:56:01.074 | 10-29 12:56:01.076 | 3600.002 | 3604.124866694 |
+
+Formal sending-window duration and the successful-request span are different quantities. SA throughput below uses the latter, including successful requests that finish during draining. A span slightly below 3600 seconds does not shorten the configured or observed sending window.
+
+### D.3 Per-request calculation method
+
+The unchanged `.github/scripts/atomesh/interactivity.py` module identified in Section 4 reads each point’s `profile_export.jsonl`. Only successful profiling requests contribute to throughput. Interactivity additionally requires positive OSL and available TTFT/ITL. Warmup and canceled requests are excluded.
+
+```text
+itl_i = inter_token_latency_i / 1000                         # milliseconds → seconds
+eff_i = itl_i + (time_to_first_token_i / 1000) / OSL_i
+Interactivity = 1 / p90(itl_i)
+E2E Normalized Interactivity = 1 / p90(eff_i)
+request_span_s = (max request_end_ns - min request_start_ns) / 1e9
+Total Throughput / GPU = (sum ISL + sum OSL) / request_span_s / 4
+Output Throughput / GPU = sum OSL / request_span_s / 4
+```
+
+Percentiles use linear interpolation of latency followed by its reciprocal. ITL is AIPerf `inter_token_latency`, not `full_response_*`. To reproduce the JSONL calculation in Appendix C.5, set `num_gpus = 4` and use the corresponding supplemental raw file under `/scratch/atom-agentic-20261029/tp4-supplement/points/`. Do not use a two-GPU divisor.
+
+### D.4 Recorded server and client commands
+
+The commands below are reconstructed directly from each accepted point’s recorded argument list and environment. Source installations, tokenizer snapshot, dataset cache and package versions are those described earlier in this report. Server launches clear the listed optional variables before setting the recorded recipe. Each point uses a fresh server. Run the server and client in separate terminals, and run the points sequentially.
+
+The recorded client entry point was `agentx profile`, which applies the `agentx` scenario. Warmup used 10 requests per lane; the formal duration was 3600 seconds. The public dataset was `semianalysis_cc_traces_weka_062126` at revision `23f152f6f0f9399a85901b89a6458def0ef16729`, with 393 traces and seed 42. Offline cache and session-ID behavior are included below. An equivalent direct AIPerf invocation replaces `agentx profile` with `aiperf profile --scenario agentx` from the same virtual environment and keeps all other arguments and environment settings.
+
+<details>
+<summary>TP4, concurrency 1: recorded commands</summary>
+
+Server:
+
+```bash
+env \
+  -u ATOM_KV_OFFLOAD \
+  -u ATOM_KV_OFFLOAD_EXTRA_CONFIG \
+  -u ROCR_VISIBLE_DEVICES \
+  -u CUDA_VISIBLE_DEVICES \
+  -u ATOM_BUNDLE_WORK \
+  -u GPU_MAX_HW_QUEUES \
+  -u ATOM_DP_LB_REQ_EQUIV \
+  -u ATOM_ENABLE_PREFILL_DELAYER \
+  OMP_NUM_THREADS=4 \
+  ATOM_NUMA_BIND=0 \
+  ATOM_DISABLE_MMAP=true \
+  AITER_LOG_LEVEL=WARNING \
+  BENCHMARK_PRECISION=fp4 \
+  PRECISION=fp4 \
+  BENCHMARK_MODEL_KEY=dsv41flash \
+  ATOM_DSV41_BENCHMARK_SYNTHETIC=1 \
+  ATOM_DP_DISPATCH_DEPTH=0 \
+  ATOM_DP_SESSION_AFFINITY=0 \
+  ATOM_PREFILL_DECODE_INTERVAL=0 \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  ATOM_DP_BASE_PORT=30000 \
+  ATOM_DP_MASTER_PORT=30500 \
+  USE_ATOMESH_ENTRYPOINTS=0 \
+  AITER_MAX_JOBS=8 \
+  /opt/venv/bin/python3 -m atom.entrypoints.openai_server \
+  --model /scratch/DeepSeek-V4.1-Flash \
+  --host 127.0.0.1 \
+  --server-port 8200 \
+  --port 10000 \
+  --kv_cache_dtype bf16 \
+  --trust-remote-code \
+  --index-cache-dtype fp4 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 \
+  --attn-prefill-chunk-size 16384 \
+  --enable_prefix_caching \
+  --block-size 16 \
+  --state-checkpoint-interval-tokens 8192 \
+  --level 3 \
+  --cudagraph-mode FULL \
+  --method dspark \
+  --num-speculative-tokens 5 \
+  --spec-decode-acceptance-length 3.51 \
+  --tool-call-parser dsml_v41 \
+  --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,48,64,128]' \
+  -tp 4 \
+  --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+  --timeout-keep-alive 900
+```
+
+Client:
+
+```bash
+env \
+  HF_HOME=/scratch/atom-agentic-20261028/hf-cache \
+  HF_DATASETS_CACHE=/scratch/atom-agentic-20261028/hf-cache/datasets \
+  HF_HUB_OFFLINE=1 \
+  HF_DATASETS_OFFLINE=1 \
+  HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+  AIPERF_HTTP_TCP_USER_TIMEOUT=900000 \
+  AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300 \
+  AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom: \
+  AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=0 \
+  TOKENIZERS_PARALLELISM=false \
+  /scratch/atom-agentic-20261028/agentx-venv/bin/agentx profile \
+  --url http://127.0.0.1:8200 \
+  --model deepseek-ai/DeepSeek-V4.1-Flash \
+  --tokenizer deepseek-ai/DeepSeek-V4.1-Flash \
+  --tokenizer-revision provider-copy-20261028 \
+  --concurrency 1 \
+  --benchmark-duration 3600 \
+  --tokenizer-trust-remote-code \
+  --server-metrics http://127.0.0.1:8200/metrics \
+  --output-artifact-dir /scratch/atom-agentic-20261029/tp4-supplement/points/tp4-c1/aiperf_artifacts \
+  --public-dataset semianalysis_cc_traces_weka_062126
+```
+
+</details>
+
+<details>
+<summary>TP4, concurrency 4: recorded commands</summary>
+
+Server:
+
+```bash
+env \
+  -u ATOM_KV_OFFLOAD \
+  -u ATOM_KV_OFFLOAD_EXTRA_CONFIG \
+  -u ROCR_VISIBLE_DEVICES \
+  -u CUDA_VISIBLE_DEVICES \
+  -u ATOM_BUNDLE_WORK \
+  -u GPU_MAX_HW_QUEUES \
+  -u ATOM_DP_LB_REQ_EQUIV \
+  -u ATOM_ENABLE_PREFILL_DELAYER \
+  OMP_NUM_THREADS=4 \
+  ATOM_NUMA_BIND=0 \
+  ATOM_DISABLE_MMAP=true \
+  AITER_LOG_LEVEL=WARNING \
+  BENCHMARK_PRECISION=fp4 \
+  PRECISION=fp4 \
+  BENCHMARK_MODEL_KEY=dsv41flash \
+  ATOM_DSV41_BENCHMARK_SYNTHETIC=1 \
+  ATOM_DP_DISPATCH_DEPTH=0 \
+  ATOM_DP_SESSION_AFFINITY=0 \
+  ATOM_PREFILL_DECODE_INTERVAL=0 \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  ATOM_DP_BASE_PORT=31000 \
+  ATOM_DP_MASTER_PORT=31500 \
+  USE_ATOMESH_ENTRYPOINTS=0 \
+  AITER_MAX_JOBS=8 \
+  /opt/venv/bin/python3 -m atom.entrypoints.openai_server \
+  --model /scratch/DeepSeek-V4.1-Flash \
+  --host 127.0.0.1 \
+  --server-port 8201 \
+  --port 10100 \
+  --kv_cache_dtype bf16 \
+  --trust-remote-code \
+  --index-cache-dtype fp4 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 \
+  --attn-prefill-chunk-size 16384 \
+  --enable_prefix_caching \
+  --block-size 16 \
+  --state-checkpoint-interval-tokens 8192 \
+  --level 3 \
+  --cudagraph-mode FULL \
+  --method dspark \
+  --num-speculative-tokens 5 \
+  --spec-decode-acceptance-length 3.51 \
+  --tool-call-parser dsml_v41 \
+  --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,48,64,128]' \
+  -tp 4 \
+  --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+  --timeout-keep-alive 900
+```
+
+Client:
+
+```bash
+env \
+  HF_HOME=/scratch/atom-agentic-20261028/hf-cache \
+  HF_DATASETS_CACHE=/scratch/atom-agentic-20261028/hf-cache/datasets \
+  HF_HUB_OFFLINE=1 \
+  HF_DATASETS_OFFLINE=1 \
+  HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+  AIPERF_HTTP_TCP_USER_TIMEOUT=900000 \
+  AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300 \
+  AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom: \
+  AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=0 \
+  TOKENIZERS_PARALLELISM=false \
+  /scratch/atom-agentic-20261028/agentx-venv/bin/agentx profile \
+  --url http://127.0.0.1:8201 \
+  --model deepseek-ai/DeepSeek-V4.1-Flash \
+  --tokenizer deepseek-ai/DeepSeek-V4.1-Flash \
+  --tokenizer-revision provider-copy-20261028 \
+  --concurrency 4 \
+  --benchmark-duration 3600 \
+  --tokenizer-trust-remote-code \
+  --server-metrics http://127.0.0.1:8201/metrics \
+  --output-artifact-dir /scratch/atom-agentic-20261029/tp4-supplement/points/tp4-c4/aiperf_artifacts \
+  --public-dataset semianalysis_cc_traces_weka_062126
+```
+
+</details>
+
+<details>
+<summary>DPA4, concurrency 32: recorded commands</summary>
+
+Server:
+
+```bash
+env \
+  -u ATOM_KV_OFFLOAD \
+  -u ATOM_KV_OFFLOAD_EXTRA_CONFIG \
+  -u ROCR_VISIBLE_DEVICES \
+  -u CUDA_VISIBLE_DEVICES \
+  -u ATOM_BUNDLE_WORK \
+  -u GPU_MAX_HW_QUEUES \
+  -u ATOM_DP_LB_REQ_EQUIV \
+  -u ATOM_ENABLE_PREFILL_DELAYER \
+  OMP_NUM_THREADS=4 \
+  ATOM_NUMA_BIND=0 \
+  ATOM_DISABLE_MMAP=true \
+  AITER_LOG_LEVEL=WARNING \
+  BENCHMARK_PRECISION=fp4 \
+  PRECISION=fp4 \
+  BENCHMARK_MODEL_KEY=dsv41flash \
+  ATOM_DSV41_BENCHMARK_SYNTHETIC=1 \
+  ATOM_DP_DISPATCH_DEPTH=0 \
+  ATOM_DP_SESSION_AFFINITY=1 \
+  ATOM_DP_LB_REQ_EQUIV=512 \
+  ATOM_ENABLE_PREFILL_DELAYER=1 \
+  ATOM_PREFILL_DECODE_INTERVAL=10 \
+  GPU_MAX_HW_QUEUES=5 \
+  HIP_VISIBLE_DEVICES=0,1,2,3 \
+  ATOM_DP_BASE_PORT=32000 \
+  ATOM_DP_MASTER_PORT=32500 \
+  USE_ATOMESH_ENTRYPOINTS=0 \
+  AITER_MAX_JOBS=8 \
+  /opt/venv/bin/python3 -m atom.entrypoints.openai_server \
+  --model /scratch/DeepSeek-V4.1-Flash \
+  --host 127.0.0.1 \
+  --server-port 8202 \
+  --port 10200 \
+  --kv_cache_dtype bf16 \
+  --trust-remote-code \
+  --index-cache-dtype fp4 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 \
+  --attn-prefill-chunk-size 16384 \
+  --enable_prefix_caching \
+  --block-size 16 \
+  --state-checkpoint-interval-tokens 8192 \
+  --level 3 \
+  --cudagraph-mode FULL \
+  --method dspark \
+  --num-speculative-tokens 5 \
+  --spec-decode-acceptance-length 3.51 \
+  --tool-call-parser dsml_v41 \
+  --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,48,64,128]' \
+  -tp 4 \
+  --enable-dp-attention \
+  --dp-load-balance least_tokens \
+  --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+  --timeout-keep-alive 900
+```
+
+Client:
+
+```bash
+env \
+  HF_HOME=/scratch/atom-agentic-20261028/hf-cache \
+  HF_DATASETS_CACHE=/scratch/atom-agentic-20261028/hf-cache/datasets \
+  HF_HUB_OFFLINE=1 \
+  HF_DATASETS_OFFLINE=1 \
+  HF_HUB_DISABLE_IMPLICIT_TOKEN=1 \
+  AIPERF_HTTP_TCP_USER_TIMEOUT=900000 \
+  AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300 \
+  AIPERF_REQUIRED_SERVER_METRIC_PREFIX=atom: \
+  AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=1 \
+  TOKENIZERS_PARALLELISM=false \
+  /scratch/atom-agentic-20261028/agentx-venv/bin/agentx profile \
+  --url http://127.0.0.1:8202 \
+  --model deepseek-ai/DeepSeek-V4.1-Flash \
+  --tokenizer deepseek-ai/DeepSeek-V4.1-Flash \
+  --tokenizer-revision provider-copy-20261028 \
+  --concurrency 32 \
+  --benchmark-duration 3600 \
+  --tokenizer-trust-remote-code \
+  --server-metrics http://127.0.0.1:8202/metrics \
+  --output-artifact-dir /scratch/atom-agentic-20261029/tp4-supplement/points/dpa4-c32/aiperf_artifacts \
+  --public-dataset semianalysis_cc_traces_weka_062126
+```
+
+</details>
+
+### D.5 Preserved export values and evidence
+
+The following values are retained directly from the AIPerf aggregate export for traceability. They are whole-instance values and use AIPerf’s throughput accounting; the SA table in D.1 is recomputed independently from raw successful-request timestamps.
+
+| Point | Exported total throughput (tok/s) | Exported output throughput (tok/s) | Exported benchmark duration (s) |
+| --- | ---: | ---: | ---: |
+| tp4-c1 | 28,494.292961 | 175.613076 | 3609.352627200 |
+| tp4-c4 | 41,234.673318 | 279.008346 | 3597.791440384 |
+| dpa4-c32 | 234,460.950029 | 1,349.603591 | 3604.124866560 |
+
+Raw JSONL SHA256 values (the complete logs, exports and manifests are retained in the local evidence archive):
+
+| Point | SHA256 |
+| --- | --- |
+| tp4-c1 | `9aeee6d63c20e34d9a3464df0901d2c4baeb685adfe77bf5aa425f548b77f8f0` |
+| tp4-c4 | `47deeba75db74085cb8af472e5edc9ad414d9abbe189b172a0e506e18bf83164` |
+| dpa4-c32 | `d6a4ab8255c59dd9dbc137009733d475aabf3992fefc375a38985fe382cdb86b` |
