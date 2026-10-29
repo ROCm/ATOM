@@ -23,7 +23,9 @@ The physical block size matches the scheduler's (`block_ratio == 1`), so each
 block table entry directly addresses a page in both main and index-key caches.
 """
 
+import math
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -53,6 +55,20 @@ from .token_layout.batch_ids import build_batch_ids
 # The PLE convolution and n-gram windows have exactly the GDN
 # recurrent state's lifetime and multiplicity, so it shares its index space.
 PLE_STATE_SLOT_CLASS = STATE_SLOT_CLASS
+
+
+class _PlePlane(NamedTuple):
+    """One PLE state tensor: `shape` is a single slot's, without the slot dim."""
+
+    name: str
+    tag: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    fill: int
+
+    @property
+    def slot_bytes(self) -> int:
+        return math.prod(self.shape) * self.dtype.itemsize
 
 
 def _qwen38_offload_ready(config) -> bool:
@@ -267,13 +283,35 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     def _compress_ratio(self) -> int:
         return int(self.model_runner.config.hf_config.indexer_compress_ratio)
 
-    def _ple_state_shape(self) -> tuple[int, int]:
+    def _ple_planes(self) -> list[_PlePlane]:
+        """Single declaration of one PLE slot, in checkpoint order.
+
+        Sizing, allocation, the checkpoint planes and the layout id all read
+        it. Empty when the model has no PLE.
+        """
         hf = self.model_runner.config.hf_config
+        if not getattr(hf, "ple_layer_ids", None):
+            return []
         state_len = (int(hf.ple_conv_kernel_size) - 1) * int(hf.ngram_size)
-        channels = int(hf.hidden_size) * int(hf.hc_count)
         # The PLE convolution is NOT tensor-parallel: every rank runs the full
         # hc_count * hidden width, matching the reference's tp_world_size=1.
-        return state_len + self.num_spec, channels
+        channels = int(hf.hidden_size) * int(hf.hc_count)
+        return [
+            _PlePlane(
+                "ple_conv_state",
+                "conv",
+                (channels, state_len + self.num_spec),
+                self.model_runner.config.torch_dtype,
+                0,
+            ),
+            _PlePlane(
+                "ple_ngram_state",
+                "ngram",
+                (self.ngram_context_len + self.num_spec,),
+                torch.int64,
+                self.eos_token_id,
+            ),
+        ]
 
     # ------------------------------------------------------------------ #
     # Pool sizing and allocation                                          #
@@ -359,14 +397,13 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     def _ple_state_spec(self) -> SubPoolSpec | None:
         """Both PLE windows share one state slot; absent when there is no PLE."""
-        hf = self.model_runner.config.hf_config
-        if not getattr(hf, "ple_layer_ids", None):
+        planes = self._ple_planes()
+        if not planes:
             return None
-        state_len, channels = self._ple_state_shape()
-        entry = state_len * channels * self.model_runner.config.torch_dtype.itemsize
-        entry += (int(hf.ngram_size) - 1 + self.num_spec) * torch.int64.itemsize
         return state_pool(
-            PLE_STATE_SLOT_CLASS, entry, entries_per_req=self.slots_per_req()
+            PLE_STATE_SLOT_CLASS,
+            sum(plane.slot_bytes for plane in planes),
+            entries_per_req=self.slots_per_req(),
         )
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
@@ -405,58 +442,47 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         return StateTransfer.copy(transfer.paged_layout_id + fragment)
 
     def _ple_layout_fragment(self) -> str:
-        hf = self.model_runner.config.hf_config
-        if not getattr(hf, "ple_layer_ids", None):
+        planes = self._ple_planes()
+        if not planes:
             return ""
-        state_len, channels = self._ple_state_shape()
-        ngram = self.ngram_context_len + self.num_spec
-        dtype = self.model_runner.config.torch_dtype
-        # One slot's shape as `allocate_per_req_cache` lays it out.
-        return (
-            f":ple_conv=({channels},{state_len}),{dtype}"
-            f":ple_ngram=({ngram},),{torch.int64}"
-            ":ple_order=conv,ngram"
-        )
+        fragment = ""
+        for plane in planes:
+            dims = ",".join(map(str, plane.shape)) + (
+                "," if len(plane.shape) == 1 else ""
+            )
+            fragment += f":ple_{plane.tag}=({dims}),{plane.dtype}"
+        return fragment + ":ple_order=" + ",".join(plane.tag for plane in planes)
 
     def _ple_checkpoint_planes(self) -> list[tuple[int, int]]:
-        """`(bytes, layers)` for PLE conv then n-gram. Empty when there is no PLE."""
-
-        hf = self.model_runner.config.hf_config
-        if not getattr(hf, "ple_layer_ids", None):
-            return []
-        state_len, channels = self._ple_state_shape()
-        conv = state_len * channels * self.model_runner.config.torch_dtype.itemsize
-        ngram = (self.ngram_context_len + self.num_spec) * torch.int64.itemsize
-        return [(conv, 1), (ngram, 1)]
+        """`(bytes, layers)` for each PLE plane. Empty when there is no PLE."""
+        return [(plane.slot_bytes, 1) for plane in self._ple_planes()]
 
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
         return super()._checkpoint_plane_shapes() + self._ple_checkpoint_planes()
 
+    def _ple_tensors(self, what: str) -> list[torch.Tensor]:
+        """The runner's PLE tensors in `_ple_planes` order; empty before allocation."""
+        states = [
+            getattr(self.model_runner, plane.name, None) for plane in self._ple_planes()
+        ]
+        if all(state is None for state in states):
+            return []
+        if any(state is None for state in states):
+            raise RuntimeError(f"{what} is missing conv or n-gram state")
+        return states
+
     def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
-        planes = super()._checkpoint_plane_tensors()
-        runner = self.model_runner
-        conv = getattr(runner, "ple_conv_state", None)
-        ngram = getattr(runner, "ple_ngram_state", None)
-        if conv is None and ngram is None:
-            return planes
-        if conv is None or ngram is None:
-            raise RuntimeError("PLE checkpoint is missing conv or n-gram state")
         # GDN planes are `(layers, slots, ...)`. PLE is allocated `(slots, ...)`.
-        return planes + [conv.unsqueeze(0), ngram.unsqueeze(0)]
+        return super()._checkpoint_plane_tensors() + [
+            state.unsqueeze(0) for state in self._ple_tensors("PLE checkpoint")
+        ]
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         views = super().state_entry_views(slot)
-        runner = self.model_runner
-        conv = getattr(runner, "ple_conv_state", None)
-        ngram = getattr(runner, "ple_ngram_state", None)
-        if conv is None and ngram is None:
-            return views
-        if conv is None or ngram is None:
-            raise RuntimeError("PLE state views are missing conv or n-gram state")
-        if not 0 <= slot < conv.shape[0] or slot >= ngram.shape[0]:
-            raise IndexError(f"state_entry_views: PLE slot {slot} out of range")
-        views.append(conv[slot : slot + 1])
-        views.append(ngram[slot : slot + 1])
+        for state in self._ple_tensors("PLE state views"):
+            if not 0 <= slot < state.shape[0]:
+                raise IndexError(f"state_entry_views: PLE slot {slot} out of range")
+            views.append(state[slot : slot + 1])
         return views
 
     # The PAGE image lives in the QSA arena; the parent's PAGE contract
@@ -513,34 +539,19 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
         caches = super().allocate_per_req_cache(entries)
-        hf = self.model_runner.config.hf_config
-        if not getattr(hf, "ple_layer_ids", None):
-            return caches
-        state_len, channels = self._ple_state_shape()
-        caches["ple_conv_state"] = torch.zeros(
-            entries.get(PLE_STATE_SLOT_CLASS, 0),
-            channels,
-            state_len,
-            dtype=self.model_runner.config.torch_dtype,
-            device="cuda",
-        )
-        caches["ple_ngram_state"] = torch.full(
-            (
-                entries.get(PLE_STATE_SLOT_CLASS, 0),
-                self.ngram_context_len + self.num_spec,
-            ),
-            self.eos_token_id,
-            dtype=torch.int64,
-            device="cuda",
-        )
+        slots = entries.get(PLE_STATE_SLOT_CLASS, 0)
+        for plane in self._ple_planes():
+            caches[plane.name] = torch.full(
+                (slots, *plane.shape), plane.fill, dtype=plane.dtype, device="cuda"
+            )
         return caches
 
     def relocate_state_slots(self, pairs) -> None:
         super().relocate_state_slots(pairs)
         destinations, sources = [], []
         # The shared pool relocates individual slots, never request groups.
-        for name in ("ple_conv_state", "ple_ngram_state"):
-            state = getattr(self.model_runner, name, None)
+        for plane in self._ple_planes():
+            state = getattr(self.model_runner, plane.name, None)
             if state is not None:
                 for src, dst in pairs:
                     destinations.append(state[dst : dst + 1])

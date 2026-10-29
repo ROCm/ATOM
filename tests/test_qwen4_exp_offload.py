@@ -83,6 +83,7 @@ def _builder():
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.num_spec = 1
     builder.ngram_context_len = 2
+    builder.eos_token_id = 7
     builder.num_state_layers = lambda: 2
     builder._state_shape_for_runner = lambda: ((3, 4), (2, 2))
     builder._state_dtypes = lambda: (torch.bfloat16, torch.float32)
@@ -148,6 +149,38 @@ def test_layout_id_names_ple_and_forks_under_pipeline_parallel(monkeypatch):
     builder.model_runner.config.pipeline_parallel_size = 2
     assert not cls._uses_paged_checkpoints(builder)
     assert not cls.state_transfer(builder).copies
+
+
+def test_ple_layout_id_and_checkpoint_planes_match_the_allocated_state(monkeypatch):
+    """The layout id, checkpoint plane sizes and slot size all come from the
+    tensors `allocate_per_req_cache` really creates, so none can drift."""
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    import re
+
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+    from atom.model_ops.attentions.qwen4_exp_attn import PLE_STATE_SLOT_CLASS
+
+    if not torch.cuda.is_available():
+        pytest.skip("allocates the PLE state on the GPU")
+    builder, cls = _builder()
+    builder.slots_per_req = lambda: 1
+    monkeypatch.setattr(
+        GDNAttentionMetadataBuilder, "allocate_per_req_cache", lambda self, e: {}
+    )
+    caches = cls.allocate_per_req_cache(builder, {PLE_STATE_SLOT_CLASS: 4})
+    states = [caches["ple_conv_state"], caches["ple_ngram_state"]]
+    assert int(states[1][0, 0]) == builder.eos_token_id
+
+    fragment = cls._ple_layout_fragment(builder)
+    declared = re.findall(r":ple_(\w+)=\(([\d,]+)\),(torch\.\w+)", fragment)
+    assert [tag for tag, _, _ in declared] == ["conv", "ngram"]
+    assert fragment.endswith(":ple_order=conv,ngram")
+    for (_, dims, dtype), state in zip(declared, states):
+        assert tuple(int(d) for d in dims.split(",") if d) == tuple(state.shape[1:])
+        assert dtype == str(state.dtype)
+    slot_bytes = [state[0].numel() * state.element_size() for state in states]
+    assert cls._ple_checkpoint_planes(builder) == [(n, 1) for n in slot_bytes]
+    assert cls._ple_state_spec(builder).entry_bytes == sum(slot_bytes)
 
 
 @pytest.mark.parametrize(
