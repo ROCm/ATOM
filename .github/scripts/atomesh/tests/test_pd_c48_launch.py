@@ -34,6 +34,7 @@ class LaunchTest(unittest.TestCase):
                                        PREFILL_TP_SIZE=str(config["roles"]["prefill"]["args"]["tensor-parallel-size"]),
                                        DECODE_TP_SIZE=str(config["roles"]["decode"]["args"]["tensor-parallel-size"]))
                     environment.pop("HIP_VISIBLE_DEVICES", None)
+                    environment.pop("CUDA_VISIBLE_DEVICES", None)
                     result = subprocess.run(
                         [os.environ.get("PD_TEST_BASH", "bash"), "--noprofile", "--norc", "-c",
                          'set -euo pipefail\nexport PATH="/usr/bin:/bin:$PATH"\n' + bootstrap
@@ -42,7 +43,13 @@ class LaunchTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     _, overrides = render(config, role, *ADDR)
-                    visible = overrides.get("HIP_VISIBLE_DEVICES", result.stdout).split(",")
+                    # The launcher's first vLLM import materializes CUDA from HIP
+                    # before recipe overrides are passed to the served process.
+                    effective = {"HIP_VISIBLE_DEVICES": result.stdout,
+                                 "CUDA_VISIBLE_DEVICES": result.stdout, **overrides}
+                    self.assertEqual(effective["HIP_VISIBLE_DEVICES"],
+                                     effective["CUDA_VISIBLE_DEVICES"])
+                    visible = effective["HIP_VISIBLE_DEVICES"].split(",")
                     args = config["roles"][role]["args"]
                     workers = args["tensor-parallel-size"] * args.get("pipeline-parallel-size", 1)
                     self.assertEqual(len(visible), workers)
@@ -139,6 +146,8 @@ class LaunchTest(unittest.TestCase):
             candidate["name"] = base["name"]
             if variant == "PP8":
                 self.assertEqual(candidate["roles"]["prefill"]["env"].pop("HIP_VISIBLE_DEVICES"),
+                                 "0,1,2,3,4,5,6,7")
+                self.assertEqual(candidate["roles"]["prefill"]["env"].pop("CUDA_VISIBLE_DEVICES"),
                                  "0,1,2,3,4,5,6,7")
                 for role in ("prefill", "decode"):
                     self.assertEqual(candidate["roles"][role]["env"].pop("C48_MOONCAKE_DCP_TRANSFER"), "1")

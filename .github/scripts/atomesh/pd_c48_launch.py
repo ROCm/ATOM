@@ -141,7 +141,7 @@ def main() -> None:
             metadata_path.write_text(json.dumps(metadata) + "\n")
             record["model_files"][str(root)]["checkpoint_metadata_artifact"] = str(metadata_path)
         record["platform_environment"] = {key: value for key, value in os.environ.items()
-            if key.startswith(("NCCL_", "MORI_", "HSA_", "HIP_", "GLOO_", "MC_", "MOONCAKE_", "VLLM_MOONCAKE_"))}
+            if key.startswith(("NCCL_", "MORI_", "HSA_", "HIP_", "CUDA_", "GLOO_", "MC_", "MOONCAKE_", "VLLM_MOONCAKE_"))}
     options.output.write_text(json.dumps(record, indent=2) + "\n")
     print("[C48] " + json.dumps(record), flush=True)
     if options.execute:
