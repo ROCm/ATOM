@@ -114,3 +114,20 @@ def test_a_router_the_route_stage_does_not_implement_is_refused(
     servable, override, reason
 ):
     assert reason in config_refusal(_atom_config(**override))
+
+
+@pytest.mark.parametrize(
+    ("draft_tokens", "refused"),
+    [
+        (7, False),  # 8 rows: one request
+        (15, False),  # 16 rows: one request, the widest the buffers hold
+        (16, True),  # 17 rows
+    ],
+)
+def test_the_row_cap_bounds_the_speculative_width(servable, draft_tokens, refused):
+    assert k3_config.MAX_ROWS == 16
+    atom_config = _atom_config()
+    atom_config.speculative_config = SimpleNamespace(
+        method="dspark", num_speculative_tokens=draft_tokens
+    )
+    assert (config_refusal(atom_config) is not None) is refused

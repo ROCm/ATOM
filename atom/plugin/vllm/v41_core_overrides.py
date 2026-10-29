@@ -27,6 +27,9 @@ from atom.model_ops.attentions.deepseek_v41.backend import (
     DeepseekV41MetadataBuilder,
 )
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    sparse_attn_v41_paged_2src,
+)
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
@@ -406,7 +409,16 @@ def _attn_out_buffer(self, hidden):
 
 
 def _attend_block(
-    self, attn_out, hidden, hidden_scale, cache, _step, rope, queries, hidden_fp8=None
+    self,
+    attn_out,
+    hidden,
+    hidden_scale,
+    cache,
+    _step,
+    rope,
+    queries,
+    hidden_fp8=None,
+    hidden_scale_dtype=None,
 ):
     """Everything from the compressor fork to the attention rows, in place.
 
@@ -415,7 +427,12 @@ def _attend_block(
     to rebind them, so an argument would hold the capture's step on every
     replay. The cache outlives every step and `begin_step` leaves the current
     one on it. `_step` is the fallback for the window before a pool is bound.
+
+    `hidden_scale_dtype` is set when `_forward` passed the scale as a uint8
+    view; the scale is viewed back to it here.
     """
+    if hidden_scale_dtype is not None:
+        hidden_scale = hidden_scale.view(hidden_scale_dtype)
     step = getattr(cache, "current_step", None) or _step
     compressed = self._fork_compress(hidden, cache, step, rope)
     # Auxiliary readers keep BF16; QKV can reuse the preceding MHC quantization.
@@ -429,16 +446,18 @@ def _attend_block(
     query = self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim))
     # One launch for both rotations, the KV row's FP8 bytes and, where a
     # decode allows it, the window write. `window_kv` is what is left for
-    # `write_window` below, which is nothing when that fold happened.
+    # `write_window` below, which is nothing when that fold happened. The
+    # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
+    query_fp8 = cache.query_fp8(query)
     if queries is None:
         kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, query, kv_normed, rope, step
+            self.spec.layer_id, query, kv_normed, rope, step, query_fp8
         )
     else:
         kv, window_kv = cache.rope_quant_window(
             self.spec.layer_id, None, kv_normed, rope, step
         )
-        cache.rotate_query(query, rope, queries.positions)
+        cache.rotate_query(query, rope, queries.positions, query_fp8)
     # A forked compressor was already waited at the scorer, on whichever
     # stream that ran; joining it again costs one wait and keeps one rule.
     join_stream(self.index_stream, self.compress_stream)
@@ -448,6 +467,12 @@ def _attend_block(
         else queries.indices(cache, self.spec)
     )
     flat_query = query.flatten(0, 1)
+    if cache.kv_fp8:
+        attend = sparse_attn_v41_paged_2src
+        attending = tuple(part.flatten(0, 1) for part in query_fp8)
+    else:
+        attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
+        attending = flat_query
     if step.decode:
         cache.write_window(self.spec.layer_id, window_kv, step)
         if cache.packed:
@@ -462,8 +487,8 @@ def _attend_block(
         else:
             # The window, this step's rows included, is read through the
             # ring: the second source, beside the selection in the pool.
-            output = sparse_attn_v4_paged_2src(
-                flat_query,
+            output = attend(
+                attending,
                 cache.pool,
                 prefix,
                 prefix_indptr,
@@ -475,13 +500,12 @@ def _attend_block(
                 out=flat_query,
             )
     else:
-        prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
-        output = prefill(
-            flat_query,
+        output = attend(
+            attending,
             cache.pool,
             prefix,
             prefix_indptr,
-            kv.flatten(0, 1),
+            kv.flatten(0, -2),
             second,
             second_indptr,
             self.attn_sink,
@@ -506,8 +530,25 @@ def _forward(
 ):
     """`Attention.forward` with its attention half inside a capture break."""
     attn_out = _attn_out_buffer(self, hidden)
+    # The break weak-refs every argument through a stable-ABI op that refuses
+    # float8_e8m0fnu ("Not yet supported ScalarType 44"), the MX scale the
+    # fused MHC quant hands QKV. The scale crosses as a uint8 view of the same
+    # bytes, so the weak ref still points at the caller's buffer on replay.
+    scale_view_kwargs = {}
+    if hidden_scale is not None and hidden_scale.dtype == torch.float8_e8m0fnu:
+        scale_view_kwargs = {"hidden_scale_dtype": hidden_scale.dtype}
+        hidden_scale = hidden_scale.view(torch.uint8)
     type(self)._atom_v41_attend_block(
-        self, attn_out, hidden, hidden_scale, cache, step, rope, queries, hidden_fp8
+        self,
+        attn_out,
+        hidden,
+        hidden_scale,
+        cache,
+        step,
+        rope,
+        queries,
+        hidden_fp8,
+        **scale_view_kwargs,
     )
     return self._project_out(
         attn_out,

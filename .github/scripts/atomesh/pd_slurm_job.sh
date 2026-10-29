@@ -98,6 +98,7 @@ allow = (
     "CONC_LIST",
     "BENCH_",
     "BENCHMARK_KIND",
+    "AGENTX_",
     "AIPERF_",
     "RANDOM_RANGE_RATIO",
     "REQUEST_RATE",
@@ -381,6 +382,9 @@ EOF
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
     -e NCCL_NET_PLUGIN=none
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+    # MoRI ignores NCCL_IB_*; give it the same ionic HCAs and RoCE GID index.
+    -e MORI_RDMA_DEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+    -e MORI_IB_GID_INDEX="${NCCL_IB_GID_INDEX}"
     -e NCCL_CROSS_NIC=0
     -e NCCL_PXN_DISABLE=0
     -e NCCL_NET_DISABLE_INTRA=1

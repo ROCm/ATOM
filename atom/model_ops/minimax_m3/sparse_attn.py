@@ -20,19 +20,44 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
+from aiter.ops.attention import pa_fwd_asm_supports_arch
 
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
-# Page-16 SHUFFLE layout for the AITER ASM / gluon paged-attention path. The KV
+# Page-16 SHUFFLE layout for the AITER paged-attention path. The KV
 # cache is allocated with physical page size 16 (the ASM kernel page), and each
 # logical sparse block (128 tokens) spans PAGES_PER_SPARSE_BLOCK contiguous
 # physical 16-pages. Used by the fused SHUFFLE KV-insert and the sparse
 # block-table builders.
 ASM_PAGE_SIZE = 16
 PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE  # 8
+
+
+def to_page16_shuffle(k_cache, v_cache, k_scale, v_scale):
+    """Reinterpret the standard page-128 SHUFFLE KV/scale views as page-16
+    SHUFFLE for the MiniMax-M3 paged kernels. Zero-copy (128 == 8*16):
+
+        K:     [N, nkv, hd//x, 128, x] -> [N*8, nkv, hd//x, 16, x]
+        V:     [N, nkv, 128//x, hd, x] -> [N*8, nkv, 16//x, hd, x]
+        scale: [N, nkv, 128]           -> [N*8, nkv, 16]   (fp8 only)
+
+    Scales are re-viewed only when present (fp8); bf16 passes them through
+    (None).
+    """
+    n_blocks, nkv = k_cache.shape[0], k_cache.shape[1]
+    x = k_cache.shape[-1]
+    head_dim = k_cache.shape[2] * x
+    num_phys16 = n_blocks * PAGES_PER_SPARSE_BLOCK
+
+    k16 = k_cache.view(num_phys16, nkv, head_dim // x, ASM_PAGE_SIZE, x)
+    v16 = v_cache.view(num_phys16, nkv, ASM_PAGE_SIZE // x, head_dim, x)
+    if k_scale is not None and v_scale is not None:
+        k_scale = k_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
+        v_scale = v_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
+    return k16, v16, k_scale, v_scale
 
 
 @dataclass
@@ -246,7 +271,8 @@ def _sparse_pa_ran_on_asm(
 
     rows, group, head_dim = q.shape
     if (
-        k_scale is None
+        not pa_fwd_asm_supports_arch()
+        or k_scale is None
         or not _is_fp8_kv_cache_tensor(k_cache)
         or group > PA_ASM_MAX_QUERY_GROUP_SIZE
         or rows <= _gluon_one_pass_max_rows(q.device.index)
@@ -1050,7 +1076,7 @@ def minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
 
 # ---------------------------------------------------------------------------
 # Sparse block-table builders: compact selected logical 128-blocks into a
-# dense page-16 block_table + context_lens for the ASM/gluon paged-attention
+# dense page-16 block_table + context_lens for the paged-attention
 # decode/prefill path. Each selected 128-block expands into
 # PAGES_PER_SPARSE_BLOCK == 8 contiguous physical 16-pages.
 # ---------------------------------------------------------------------------
@@ -1296,7 +1322,7 @@ def minimax_m3_build_sparse_block_table_prefill(
 
 
 # ---------------------------------------------------------------------------
-# Gluon paged-attention runners over the page-16 SHUFFLE KV cache (fp8|bf16).
+# Paged-attention runners over the page-16 SHUFFLE KV cache (fp8|bf16).
 # decode + prefill (per-token-as-decode); fp8 selected by the cache dtype.
 # ---------------------------------------------------------------------------
 @torch.no_grad()
@@ -1343,7 +1369,7 @@ def minimax_m3_sparse_attn_decode_asm(
     # sparse layer of a step (sharing one topk/init/local config) has the same
     # per-row lengths and the FlyDSL plan is refreshed once per step. Callers
     # pass no plan_step_owner otherwise.
-    _sparse_pa_per_row(
+    sparse_pa_per_row(
         q,
         k_cache,
         v_cache,
@@ -1359,7 +1385,7 @@ def minimax_m3_sparse_attn_decode_asm(
 
 
 @torch.no_grad()
-def _sparse_pa_per_row(
+def sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1371,8 +1397,9 @@ def _sparse_pa_per_row(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     plan_step_owner=None,
+    plan_cache_owner=None,
 ) -> None:
-    """Run one sparse selection per row, on ASM where it pays and Gluon else.
+    """Run one sparse selection per row, on ASM where it pays and PA decode else.
 
     A row is a decode sequence or a prefill query token -- both are a length-1
     "sequence" with its own 16-page block_table + context_len, so both halves
@@ -1387,7 +1414,7 @@ def _sparse_pa_per_row(
     from atom.model_ops.base_attention import run_pa_decode
 
     assert q.shape[-1] == 128, "Paged attention here requires head_dim == 128."
-    # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1.
+    # Collapse (token, kv_head) -> row so PA decode sees num_kv_heads_view == 1.
     # sparse_bt/ctx already carry kv-head-encoded page ids (page = phys16*Hkv +
     # kvh), matching the collapsed cache view. Zero-copy; Hkv == 1 is identity.
     assert q.is_contiguous(), "contiguous q required for the kv-head view"
@@ -1435,10 +1462,10 @@ def _sparse_pa_per_row(
     compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
     if is_fp8 and k_scale is not None:
         pbs = k_scale.shape[-1]
-        gluon_k_scale = k_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
-        gluon_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
+        pa_k_scale = k_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
+        pa_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
     else:
-        gluon_k_scale = gluon_v_scale = None
+        pa_k_scale = pa_v_scale = None
     run_pa_decode(
         output=out_view,
         q=q_view,
@@ -1452,8 +1479,8 @@ def _sparse_pa_per_row(
         context_partition_size=context_partition_size,
         compute_type=compute_type,
         q_scale=None,
-        k_scale=gluon_k_scale,
-        v_scale=gluon_v_scale,
+        k_scale=pa_k_scale,
+        v_scale=pa_v_scale,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=temporary_output,
@@ -1462,6 +1489,7 @@ def _sparse_pa_per_row(
         sliding_window=-1,
         ps=True,
         plan_step_owner=plan_step_owner,
+        plan_cache_owner=plan_cache_owner,
         # Bounded topk window per row: keep the static split cap.
         plan_partition_cap=max_context_partition_num,
     )
@@ -1491,6 +1519,8 @@ def minimax_m3_sparse_attn_prefill_asm(
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
     sparse_ctx: torch.Tensor | None = None,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
+    plan_step_owner=None,
+    plan_cache_owner=None,
 ) -> None:
     """Block-sparse PREFILL via AITER ASM pa_fwd_asm, per-token-as-decode.
 
@@ -1535,7 +1565,7 @@ def minimax_m3_sparse_attn_prefill_asm(
             block_page_stride=block_page_stride,
         )
 
-    _sparse_pa_per_row(
+    sparse_pa_per_row(
         q,
         k_cache,
         v_cache,
@@ -1546,4 +1576,6 @@ def minimax_m3_sparse_attn_prefill_asm(
         output,
         k_scale,
         v_scale,
+        plan_step_owner=plan_step_owner,
+        plan_cache_owner=plan_cache_owner,
     )

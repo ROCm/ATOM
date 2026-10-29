@@ -25,6 +25,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.config import get_current_atom_config
 from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
@@ -272,6 +273,12 @@ class V41MonoDecodeRunner:
         dp = get_dp_group()
         return dp if tp == 1 and dp.world_size > 1 else get_tp_group()
 
+    @property
+    def kv_fp8(self) -> bool:
+        """The pool's rows are MXFP8 (``V41PoolGeometry.kv_dtype`` fp8): the
+        attention dequantizes them, K1 writes its window row so."""
+        return get_current_atom_config().kv_cache_dtype == "fp8"
+
     def _bind_rank(self) -> None:
         """This rank, the TP size every build is for and DP attention's ranks,
         the MoE expert parallel or TP over them (``config_refusal`` refused the
@@ -345,6 +352,7 @@ class V41MonoDecodeRunner:
                 timeline=self.timeline,
                 diag_off=self.diag_off,
                 tok_par=self._tok_par(s),
+                kv_fp8=self.kv_fp8,
             )
             for spec, block in zip(self.model.topology, self.model.layers)
         ]
@@ -364,6 +372,7 @@ class V41MonoDecodeRunner:
             tok_par=self._tok_par(s),
             ep=self.ep,
             moe_tp=self.moe_tp,
+            kv_fp8=self.kv_fp8,
         )
 
     def _rows_build(self, s: int) -> RowsBuild:
@@ -633,7 +642,7 @@ class V41MonoDecodeRunner:
         })  # fmt: skip
         # the caller's stream: a FlyDSL launcher left to its default submits on the
         # NULL stream, outside a graph capture
-        self.build.launchers[key](*args, stream=torch.cuda.current_stream())
+        _run_compiled(self.build.launchers[key], *args, torch.cuda.current_stream())
         return res_out, (pre, post, comb)
 
     def _index_projection_args(self, key, weights) -> dict:
@@ -660,7 +669,7 @@ class V41MonoDecodeRunner:
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
             "tl": self._timeline_ptr("k2", layer_id),
         })  # fmt: skip
-        self.build.layer_post(*args, stream=torch.cuda.current_stream())
+        _run_compiled(self.build.layer_post, *args, torch.cuda.current_stream())
 
     def _attn_post(self, spec, block, weights, residual, gates, step, cache, rope):
         """K2a: the decode sparse attention over this layer's keys (its class's
@@ -675,7 +684,7 @@ class V41MonoDecodeRunner:
             "layer": POST_TAG0 + layer_id,
             "tl": self._timeline_ptr("k2a", layer_id),
         })  # fmt: skip
-        self.build.attn_post(*args, stream=torch.cuda.current_stream())
+        _run_compiled(self.build.attn_post, *args, torch.cuda.current_stream())
 
     def _peer_args(self) -> dict:
         p = torch.Tensor.data_ptr
@@ -734,7 +743,7 @@ class V41MonoDecodeRunner:
             # where the merged launch's layout puts K2b's regions
             "scratch": self.scratch.data_ptr() + k2.moe_base(key_a),
         })  # fmt: skip
-        self.build.moe(*args, stream=torch.cuda.current_stream())
+        _run_compiled(self.build.moe, *args, torch.cuda.current_stream())
 
     def _moe_args(self, weights) -> dict:
         """K2b's own arguments but its input."""

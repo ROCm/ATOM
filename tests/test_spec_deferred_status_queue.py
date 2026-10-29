@@ -28,10 +28,16 @@ def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
     batch.total_tokens_num = 4
     batch.total_tokens_num_prefill = 4
     batch.total_tokens_num_decode = 0
+    batch.total_seqs_num = len(is_final_chunk)
     batch.total_seqs_num_prefill = len(is_final_chunk)
     batch.total_seqs_num_decode = 0
     batch.is_final_chunk = is_final_chunk
     return batch
+
+
+def _batch_info():
+    """`tokenIDProcessor.batch_info`: what `prepare_input_ids` writes first."""
+    return SimpleNamespace(np=np.zeros(3, dtype=np.int32), copy_to_gpu=mock.Mock())
 
 
 def _batch_with_ids(req_ids: list[int], *, is_dummy_run: bool) -> ScheduledBatch:
@@ -108,6 +114,8 @@ def _processor() -> tokenIDProcessor:
         gpu=np.zeros(8, dtype=np.int32),
         copy_to_gpu=mock.Mock(),
     )
+    processor.batch_info = _batch_info()
+    processor.draft_tokens_per_seq = 0
     processor.recv_spec_status = mock.Mock(
         return_value=(
             np.array([2], dtype=np.int32),
@@ -208,6 +216,7 @@ def _decode_batch(*, num_spec_step: int) -> ScheduledBatch:
     batch.total_tokens_num = 3
     batch.total_tokens_num_prefill = 0
     batch.total_tokens_num_decode = 3
+    batch.total_seqs_num = 3
     batch.total_seqs_num_prefill = 0
     batch.total_seqs_num_decode = 3
     batch.num_spec_step = num_spec_step
@@ -360,9 +369,11 @@ def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
         gpu=np.zeros(bs, dtype=np.int32),
         copy_to_gpu=mock.Mock(return_value=np.zeros(bs, dtype=np.int32)),
     )
+    processor.batch_info = _batch_info()
+    processor.draft_tokens_per_seq = 3
     input_ids_group = SimpleNamespace(
-        counts=[None, None],
-        indices={"input_ids": 0, "decode_src": 1},
+        counts=[None, None, None],
+        indices={"input_ids": 0, "decode_src": 1, "batch_info": 2},
         publish=mock.Mock(),
         check_writable=mock.Mock(),
     )
@@ -413,6 +424,7 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
         total_tokens_num=8,
         total_tokens_num_prefill=0,
         total_tokens_num_decode=8,
+        total_seqs_num=2,
         total_seqs_num_prefill=0,
         total_seqs_num_decode=2,
         num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
@@ -430,7 +442,9 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
         result = tokenIDProcessor.prepare_input_ids(processor, batch, 4)
 
     assert result.shape == (8,)
-    assert input_ids_group.counts == [8, 2]
+    assert input_ids_group.counts == [8, 2, 3]
+    # Two requests, eight scheduled tokens, three draft tokens each.
+    np.testing.assert_array_equal(processor.batch_info.np, [2, 8, 6])
     fill_ids.assert_called_once()
     # Both requests are new, so their draft columns come from the draft table,
     # not from `scheduled_tokens` (which would leave 1-3 and 5-7 here).
@@ -463,4 +477,4 @@ def test_a_producer_dp_dummy_stages_without_a_draft_table():
         result = tokenIDProcessor.prepare_input_ids(processor, batch, 1)
 
     assert result.shape == (1,)
-    assert input_ids_group.counts == [1, 1]
+    assert input_ids_group.counts == [1, 1, 3]
