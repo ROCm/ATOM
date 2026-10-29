@@ -1453,7 +1453,7 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
 @cache
 def _log_flydsl_herd_batch(num_tokens: int, top_k: int) -> None:
     logger.info(
-        "FlyDSL HERD decode routing: %d tokens, Top-%d candidates, fused drop to %d",
+        "FlyDSL HERD decode routing: %d tokens, Top-%d candidates, drop to %d",
         num_tokens,
         top_k + 1,
         top_k,
@@ -1523,8 +1523,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # HERD on the FlyDSL routed experts. Keyed off aiter's own
         # AITER_FLYDSL_USE_HERD so one flag arms both halves: select_experts()
         # routes Top-(K+1) candidates and fused_moe(herd_topk=K) drops each token's
-        # least batch-popular candidate inside the gfx1250 route/prefix-sum
-        # kernel. That kernel takes no expert_mask, so TP only.
+        # least batch-popular candidate. aiter's HERD drop takes no expert_mask,
+        # so TP only.
         self.use_flydsl_herd = (
             _FLYDSL_USE_HERD
             and self.is_gfx1250
@@ -2098,7 +2098,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_states=x,
                 router_logits=router_logits,
                 top_k=layer.top_k + 1,
-                use_grouped_topk=False,
+                use_grouped_topk=layer.use_grouped_topk,
+                topk_group=layer.topk_group,
+                num_expert_group=layer.num_expert_group,
                 renormalize=False,
                 scoring_func=layer.scoring_func,
                 e_score_correction_bias=layer.e_score_correction_bias,
@@ -2321,7 +2323,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         if herd_topk:
             moe_extra_args["herd_topk"] = herd_topk
-            moe_extra_args["herd_routed_scaling_factor"] = layer.routed_scaling_factor
+            moe_extra_args["herd_routed_scaling_factor"] = FusedMoE.routing_scale(
+                layer.scoring_func,
+                layer.use_grouped_topk,
+                0,
+                layer.routed_scaling_factor,
+            )
         _ep_triton_now = False
         if self.use_triton_ep and self.using_modular_kernel:
             # Phase split, transport version. FusedMoEModularKernel.forward runs
@@ -2534,8 +2541,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         experts only: routing runs before apply(), so a step the Triton experts
         or the communication-fused backend take keeps the plain routes.
         Hash-routed layers (custom_routing_function) keep their table lookup.
-        The fused drop always renormalises and folds the routed scale in, which
-        is the sqrtsoftplus contract of select_experts.
+        Grouped top-k qualifies with one group, where it is a plain top-k. The
+        drop renormalises the kept K, so the layer must renormalise; it applies
+        the routed scale the layer's own routing folds in (routing_scale).
         """
         if (
             not self.use_flydsl_herd
@@ -2547,10 +2555,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if not _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M:
             return False
         if (
-            layer.use_grouped_topk
+            (
+                layer.use_grouped_topk
+                and (layer.num_expert_group != 1 or layer.topk_group != 1)
+            )
             or not layer.renormalize
             or layer.custom_routing_function is not None
-            or layer.scoring_func != "sqrtsoftplus"
             or layer.apply_router_weight_on_input
             or layer.num_fused_shared_experts > 0
             or layer.expert_mask is not None
@@ -5280,6 +5290,23 @@ class FusedMoE(torch.nn.Module):
             return
 
     @staticmethod
+    def routing_scale(
+        scoring_func: str,
+        use_grouped_topk: bool,
+        num_fused_shared_experts: int,
+        routed_scaling_factor: float,
+    ) -> float:
+        """The routed scale `select_experts` folds into the routing weights.
+        Grouped top-k and sqrtsoftplus fold it in; sigmoid does only with a
+        fused shared column (MiniMax-M3 applies it outside the MoE otherwise);
+        the softmax top-k never applies it."""
+        if use_grouped_topk or scoring_func == "sqrtsoftplus":
+            return routed_scaling_factor
+        if scoring_func == "sigmoid" and num_fused_shared_experts > 0:
+            return routed_scaling_factor
+        return 1.0
+
+    @staticmethod
     def select_experts(
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
@@ -5363,12 +5390,11 @@ class FusedMoE(torch.nn.Module):
                         device=router_logits.device,
                     )
 
-                # MiniMax-M3 applies the routed scale outside MoE when shared
-                # experts are not fused; DeepSeek-V4 folds it into routing.
-                route_scale = (
-                    routed_scaling_factor
-                    if fuse_shared or scoring_func == "sqrtsoftplus"
-                    else 1.0
+                route_scale = FusedMoE.routing_scale(
+                    scoring_func,
+                    False,
+                    num_fused_shared_experts,
+                    routed_scaling_factor,
                 )
                 topk_gating(
                     topk_weights,
