@@ -286,6 +286,12 @@ def test_validate_config_allows_offload_connectors(kv_transfer_config):
             },
             "mooncake",
         ),
+        # The connector is built from the canonical name, so the check is too.
+        ({"kv_connector": "Mooncake", "kv_role": "kv_producer"}, "mooncake"),
+        ({"kv_connector": "MoRIIO", "kv_role": "kv_consumer"}, "moriio"),
+        ({"kv_connector": " moriio", "kv_role": "kv_consumer"}, "moriio"),
+        # An offload backend that does not read the Qwen3.8 PAGE image.
+        ({"kv_connector": "mooncake_store", "kv_role": "offload"}, "mooncake_store"),
     ],
 )
 def test_validate_config_rejects_pd_connectors(kv_transfer_config, backend):
@@ -296,6 +302,79 @@ def test_validate_config_rejects_pd_connectors(kv_transfer_config, backend):
     builder.model_runner.config.kv_transfer_config = kv_transfer_config
     with pytest.raises(ValueError, match=f"kv_connector={backend!r}"):
         Qwen4ExpBackend.validate_config(builder.model_runner.config)
+
+
+def _transfer_config(kv_transfer_config):
+    return SimpleNamespace(kv_transfer_config=kv_transfer_config)
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config, backend",
+    [
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "mooncake"),
+        ({"kv_connector": "Mooncake", "kv_role": "kv_producer"}, "mooncake"),
+        ({"kv_connector": "MoRIIO", "kv_role": "kv_consumer"}, "moriio"),
+        ({"kv_connector": " moriio", "kv_role": "kv_consumer"}, "moriio"),
+        ({"kv_role": "kv_producer"}, "moriio"),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": " MOONCAKE ", "kv_role": "kv_producer"},
+                ],
+            },
+            "mooncake",
+        ),
+    ],
+)
+def test_qwen38_refuses_every_pd_spelling(kv_transfer_config, backend):
+    """A raw-string check let `"Mooncake"` past while the factory built the
+    mooncake connector from its canonical name; the GDN/PLE state then never
+    reached decode."""
+    from atom.model_ops.attentions.qwen4_exp_transfer import check_qwen38_kv_transfer
+
+    with pytest.raises(ValueError, match=f"disaggregated.*kv_connector={backend!r}"):
+        check_qwen38_kv_transfer(_transfer_config(kv_transfer_config))
+
+
+def test_qwen38_refuses_an_offload_backend_that_skips_its_image():
+    """mooncake_store is an offload tier, but its layout check is Qwen3-Next's:
+    refused at validation, not after PAGE checkpoints resized the KV budget."""
+    from atom.model_ops.attentions.qwen4_exp_transfer import (
+        check_qwen38_kv_transfer,
+        qwen38_offload_configured,
+    )
+
+    config = _transfer_config({"kv_connector": "Mooncake_Store", "kv_role": "offload"})
+    with pytest.raises(ValueError, match="kv_connector='mooncake_store' does not read"):
+        check_qwen38_kv_transfer(config)
+    assert not qwen38_offload_configured(config)
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        None,
+        {},
+        {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+        {"kv_connector": " LMCache_MP", "kv_role": "offload"},
+        {"kv_connector": "LMCacheMPConnector", "kv_role": "offload"},
+        {
+            "kv_connector": "multi",
+            "connectors": [{"kv_connector": "LMCacheOffloadConnector"}],
+        },
+    ],
+)
+def test_qwen38_accepts_the_lmcache_tiers(kv_transfer_config):
+    from atom.model_ops.attentions.qwen4_exp_transfer import (
+        check_qwen38_kv_transfer,
+        qwen38_offload_configured,
+    )
+
+    config = _transfer_config(kv_transfer_config)
+    check_qwen38_kv_transfer(config)
+    assert qwen38_offload_configured(config) is bool(kv_transfer_config)
 
 
 class _HostEvent:

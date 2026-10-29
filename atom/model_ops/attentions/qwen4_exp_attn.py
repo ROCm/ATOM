@@ -42,6 +42,7 @@ from atom.utils.block_tables import block_table_state
 from .gdn_attn import GDNAttentionBackend, GDNAttentionMetadataBuilder
 from .pool_layout.entry_arena import EntryField, LayerMajorArena, entry_bytes_for
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .qwen4_exp_transfer import check_qwen38_kv_transfer, qwen38_offload_configured
 from .token_layout.batch_ids import build_batch_ids
 
 # The PLE convolution and n-gram windows have exactly the GDN
@@ -55,24 +56,6 @@ def _qwen38_offload_ready(config) -> bool:
     if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
         return False
     return not getattr(config, "enable_rapidserve", False)
-
-
-def _qwen38_offload_configured(config) -> bool:
-    """Whether a configured offload tier reads the PAGE checkpoint image.
-
-    A server without one keeps fork-slot checkpoints, as on main: PAGE images
-    change the KV budget, the hit behaviour and the copy path, and have been
-    validated only as the offload tier's image so far.
-    """
-
-    if not config.kv_transfer_config:
-        return False
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    return any(
-        KVConnectorFactory.is_offload_backend(name)
-        for name, _ in KVConnectorFactory.leaf_connectors(config) or ()
-    )
 
 
 # The QSA layers' row space. Named rather than derived from
@@ -153,20 +136,7 @@ class Qwen4ExpBackend(GDNAttentionBackend):
                 "Qwen3.8 offload needs PAGE checkpoints; pipeline parallelism "
                 "and RapidServe stay on fork slots"
             )
-        from atom.kv_transfer.disaggregation.factory import resolve_pd_backend
-
-        pd_backend = resolve_pd_backend(config.kv_transfer_config)
-        if pd_backend is not None:
-            # GDN and PLE ride the PAGE checkpoint image, which only the
-            # offload tiers read. A P/D connector moves the QSA pages alone,
-            # and decode would continue from a zero recurrent state: fluent,
-            # wrong output and no error.
-            raise ValueError(
-                "Qwen3.8 disaggregated serving is not supported: "
-                f"kv_connector={pd_backend!r} would transfer the QSA pages "
-                "without the GDN and PLE state. Use an offload connector "
-                "(lmcache_offload or lmcache_mp) or run without kv_transfer_config."
-            )
+        check_qwen38_kv_transfer(config)
         if len(set(config.hf_config.ple_layer_ids or [])) > 1:
             raise ValueError("Qwen backend currently allocates state for one PLE layer")
         qsa_cache_formats(config)
@@ -411,7 +381,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         """
 
         config = self.model_runner.config
-        if not _qwen38_offload_ready(config) or not _qwen38_offload_configured(config):
+        if not _qwen38_offload_ready(config) or not qwen38_offload_configured(config):
             return False
         from atom.utils import get_hf_text_config
 
