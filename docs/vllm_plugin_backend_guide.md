@@ -201,8 +201,8 @@ allocate the arena, and carves its own planes -- main latent, index plane, and
 a per-request state region -- out of that storage. The plugin path serves the
 text backbone only; image requests are refused at startup, as is any
 KV-transfer connector other than `AtomLMCacheOffloadConnector`. Prefix caching
-needs V4.1's state checkpoints (`ATOM_V41_STATE_CHECKPOINTS=1`) or that
-connector; see the
+needs V4.1's state checkpoints (`ATOM_V41_STATE_CHECKPOINTS=1` and
+`--mamba-cache-mode align`), and that connector needs them too; see the
 [LMCache recipe](../recipes/atom_vllm/DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md).
 DSpark speculation and CUDA graphs are supported, each behind an explicit flag. See the
 [DeepSeek-V4.1-Flash vLLM recipe](../recipes/atom_vllm/DeepSeek-V4.1-Flash.md)

@@ -48,7 +48,10 @@ from atom.kv_transfer.offload.mp.transfer import _UnprovableSubmission
 # raises -- fail-stop, the verdict the worker reaches for the transfer itself.
 # This is the bound only for a worker that carries no deadline.
 _FENCE_TIMEOUT_S = 30.0
-_FENCE_POLL_S = 0.0005
+# At most one drain wake per this long while the fence waits. The fence blocks
+# on the drain's round signal in between; a tighter cadence only has the two
+# threads contend for `_lock` and the GIL, slowing the transfer it waits on.
+_FENCE_POLL_S = 0.005
 
 
 def _req_id_of(completion: Any) -> str:
@@ -197,9 +200,6 @@ class MPOffloadWorkerAdapter:
                     "ATOM LMCache MP: preemption fence found no drain thread to "
                     f"submit or poll {outstanding} for {sorted(wanted)}"
                 )
-            wake = getattr(inner, "_drain_wake", None)
-            if wake is not None:
-                wake.set()
             if time.monotonic() >= deadline:
                 # Fail-stop: returning would let the forward overwrite blocks
                 # a transfer still reads, caching one wrong prefix silently.
@@ -209,7 +209,23 @@ class MPOffloadWorkerAdapter:
                     f"{len(outstanding)} transfer(s) still in flight for "
                     f"{sorted(wanted)}"
                 )
-            time.sleep(_FENCE_POLL_S)
+            # The drain polls these futures and drops terminal ones; wake it
+            # once, then block until it finishes a round or the slot ends.
+            slot_end = time.monotonic() + _FENCE_POLL_S
+            wake = getattr(inner, "_drain_wake", None)
+            if wake is not None:
+                wake.set()
+            round_done = getattr(inner, "_drain_round_cv", None)
+            if round_done is not None:
+                with round_done:
+                    seen = getattr(inner, "_drain_rounds", 0)
+                    round_done.wait_for(
+                        lambda seen=seen: getattr(inner, "_drain_rounds", 0) != seen,
+                        timeout=_FENCE_POLL_S,
+                    )
+            remaining = slot_end - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
 
 
 __all__ = ["MPOffloadWorkerAdapter"]

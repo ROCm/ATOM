@@ -88,15 +88,16 @@ _SOLE_OWNER_REFCOUNT = _sole_owner_refcount()
 def _take_unshared(owned: deque[Any], limit: int | None = None) -> list[Any]:
     """Remove and return up to `limit` entries nothing else holds any more.
 
-    Every entry is checked: one held for good elsewhere (a logged exception's
-    traceback, say) must not keep the ones behind it alive.
+    Entries are checked until `limit` are taken: one held for good elsewhere
+    (a logged exception's traceback, say) goes to the back rather than keep
+    the ones behind it alive, and the unchecked rest stay queued in order.
     """
     unshared = []
     for _ in range(len(owned)):
+        if limit is not None and len(unshared) >= limit:
+            break
         entry = owned.popleft()
-        if (limit is None or len(unshared) < limit) and sys.getrefcount(
-            entry
-        ) <= _SOLE_OWNER_REFCOUNT:
+        if sys.getrefcount(entry) <= _SOLE_OWNER_REFCOUNT:
             unshared.append(entry)
         else:
             owned.append(entry)
@@ -365,9 +366,19 @@ class LMCacheMPConnector(KVConnectorBase):
         self._drain_wake.set()
         drain, self._drain_thread = self._drain_thread, None
         if drain is not None:
-            # Bounded: the loop only ever waits on a 2 ms queue poll plus one
-            # round of futures, and the adapter shutdown below is the backstop.
+            # Bounded: the loop waits at most its 50 ms wake timeout, then runs
+            # one last round that submits what is queued and polls once.
             drain.join(timeout=30.0)
+            if drain.is_alive():
+                # A submit is still blocked (the client's own timeout is longer),
+                # and the client is not thread-safe: shutting it down under the
+                # drain thread, or handing that thread a None adapter, is worse
+                # than leaving the instance to the server's reaper.
+                logger.error(
+                    "LMCache MP transfer drain did not stop within 30 s; "
+                    "leaving its client to the server's reaper"
+                )
+                return
         adapter, self._adapter = self._adapter, None
         if adapter is None:
             return
@@ -702,11 +713,15 @@ class LMCacheMPConnector(KVConnectorBase):
         self._drain_thread.start()
 
     def _drain_loop(self) -> None:
-        while not self._drain_stop.is_set():
+        while True:
+            # Read before the round, so the round that sees it is a whole one:
+            # what `close` finds queued is still submitted and polled once.
+            stopping = self._drain_stop.is_set()
             try:
                 # The timeout is a backstop for teardown and for a rank that
                 # has stopped stepping, not the working cadence.
-                self._drain_wake.wait(timeout=0.05)
+                if not stopping:
+                    self._drain_wake.wait(timeout=0.05)
                 # Cleared before the work, so a wake raised while this round is
                 # running is kept for the next round rather than swallowed.
                 self._drain_wake.clear()
@@ -725,6 +740,8 @@ class LMCacheMPConnector(KVConnectorBase):
                 with self._drain_round_cv:
                     self._drain_rounds += 1
                     self._drain_round_cv.notify_all()
+                if stopping:
+                    return
             except BaseException as exc:
                 # Deadline expiry and any unexpected failure are fail-stop, and
                 # this thread is not the one that can stop the engine.

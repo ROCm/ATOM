@@ -670,3 +670,44 @@ def test_v4_adapter_spec_is_native_and_k_follows_it(monkeypatch):
     ) == (s.page_unit_bytes, s.slot_bytes, s.image_bytes, s.layout_id)
     assert s.k == s.spec.units_per_checkpoint == -(-s.image_bytes // s.page_unit_bytes)
     assert a.block_size == 128 and a.matches(vc) and s == v4_state_checkpoint_sizing(vc)
+
+
+def test_decode_keeps_take_the_callers_exact_starts(monkeypatch):
+    """V2's input-batch count is an optimistic upper bound; V4.1 passes the
+    step's own `seq_lens - query_lens` and the batch is not read."""
+    import atom.plugin.vllm.req_id_passthrough_patch as passthrough
+
+    monkeypatch.setattr(passthrough, "get_current_req_ids", lambda: ["a", "b"])
+
+    def batch_read(*args):
+        raise AssertionError("read the input batch")
+
+    monkeypatch.setattr(G, "_exact_starts", batch_read)
+    seen = {}
+    monkeypatch.setattr(
+        G,
+        "store_decode_keeps",
+        lambda worker, ids, starts, fresh: seen.setdefault("keep", list(starts)),
+    )
+    monkeypatch.setattr(
+        G,
+        "record_decode_candidates",
+        lambda worker, ids, slots, starts, lens, block, name: seen.setdefault(
+            "candidates", list(starts)
+        ),
+    )
+    monkeypatch.setattr(G, "current_state_checkpoint_store_plan", dict)
+    G.plan_state_checkpoint_ops(
+        NS(decode_candidates={"a": (0, {})}),
+        NS(),
+        rows=2,
+        slots=np.array([0, 1]),
+        chunk_start=np.array([9, 300]),
+        lens=np.array([1, 1]),
+        fresh_rows=(),
+        block=BLOCK,
+        is_target=True,
+        name="Fake",
+        starts=np.array([9, 300]),
+    )
+    assert seen == {"keep": [9, 300], "candidates": [9, 300]}

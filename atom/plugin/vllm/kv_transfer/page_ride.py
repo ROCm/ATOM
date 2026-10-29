@@ -55,14 +55,31 @@ class PageRideMixin:
         self._ride_pins: dict[Any, tuple[int, ...]] = {}
         self._ride_pinned_at: dict[Any, float] = {}
 
-    def has_ride_pins(self, max_age_s: float | None = None) -> bool:
+    def has_ride_pins(
+        self, max_age_s: float | None = None, sole_holder: bool = False
+    ) -> bool:
         """Whether a ride still holds blocks; with ``max_age_s``, one pinned
         that recently (an older one is a stalled save, not blocks about to
-        come back)."""
-        if max_age_s is None:
+        come back); with ``sole_holder``, one whose retirement frees a block --
+        the pin is a refcount share, and a block its request or another ride
+        still holds does not come back when the pin goes."""
+        if max_age_s is None and not sole_holder:
             return bool(self._ride_pins)
-        oldest = time.monotonic() - max_age_s
-        return any(at > oldest for at in self._ride_pinned_at.values())
+        oldest = None if max_age_s is None else time.monotonic() - max_age_s
+        pool = self._pool
+        for operation, block_ids in self._ride_pins.items():
+            if (
+                oldest is not None
+                and self._ride_pinned_at.get(operation, oldest) <= oldest
+            ):
+                continue
+            if not sole_holder:
+                return True
+            if pool is not None and any(
+                pool.blocks[block_id].ref_cnt <= 1 for block_id in block_ids
+            ):
+                return True
+        return False
 
     def bind_gpu_block_pool(self, pool) -> None:
         self._pool = pool

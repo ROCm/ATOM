@@ -693,6 +693,18 @@ def test_the_plugin_cache_restores_on_a_deferred_read(small_config, monkeypatch)
     cache.prepare_state(begin_step(cache, [replace(resumed, position=8)]))
 
 
+def test_the_plugin_cache_defers_a_step_with_nothing_to_restore(small_config):
+    """Only a row above its floor that did not run last step can need a
+    restore; with the opt-out every other step keeps the deferred read."""
+    cache = _plugin_cache(replace(geometry(small_config), window_size=32), 8, 4)
+    resumed = PagedRequest(27, 7, 0, 1, 0, (0, 1))
+    assert cache._may_restore(begin_step(cache, [resumed]))
+    assert not cache._may_restore(begin_step(cache, [replace(resumed, position=8)]))
+    assert not cache._may_restore(
+        begin_step(cache, [PagedRequest(31, 0, 0, 1, 0, (0, 1))])
+    )
+
+
 def test_the_plugin_cache_leaves_vllm_warmup_rows_unjudged(small_config):
     """vLLM warms SSM groups with `_warmup_N_` through slots nothing wrote."""
     cache = _plugin_cache(replace(geometry(small_config), window_size=32), 8, 4)

@@ -167,8 +167,10 @@ class V41BoundaryPlanner(PageRideMixin):
         total = int(getattr(request, "num_tokens", 0) or 0)
         if self.keep_a_prefill_tail and total and total - hit < 2:
             # `cap_hit`'s rule: a one-token tail is admitted as a padded verify
-            # row. Declined rather than moved a PAGE back, where no checkpoint
-            # need exist; the tier can still serve the prefix.
+            # row. The scheduler patch has already re-asked vLLM for a hit that
+            # leaves two (`apply_vllm_v41_local_hit_cap_patch`), so this is the
+            # guard for a vLLM that cannot be asked: declined rather than moved
+            # a PAGE back, where no checkpoint need exist.
             return 0
         return hit
 
@@ -210,6 +212,12 @@ class V41BoundaryPlanner(PageRideMixin):
         admission has already happened and PAGE alone would leave the request
         on someone else's state.
         """
+        # Every admission reallocates, so what an earlier one recorded names
+        # blocks vLLM has since freed (a failed or withdrawn load sends the
+        # request back to WAITING). Dropped before the early returns: a
+        # failure here must not leave the old destination for
+        # `take_ride_state` to find.
+        self.forget_ride(str(request.request_id))
         boundary = int(num_total_computed)
         if boundary <= 0 or boundary % self.hash_block_size:
             return False

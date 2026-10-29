@@ -299,7 +299,9 @@ def _v41_state_checkpoints_can_serve(vllm_config) -> bool:
                 register_v41_state_checkpoint_adapter(), vllm_config
             )
         )
-    except Exception:  # noqa: BLE001
+    except ImportError:
+        # Absent mechanism means no checkpoints; any other error is a real
+        # fault and must not quietly turn every V4.1 HBM hit off.
         return False
 
 
@@ -1841,6 +1843,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         num_total_computed = int(seq.num_cached_tokens) + int(num_external_tokens)
         seq.set_block_table(list(attention_blocks))
         self._scheduler.update_state_after_alloc(seq)
+        if int(num_external_tokens) == 0 and (
+            self._promised_loads.pop(request.request_id, None) is not None
+        ):
+            # vLLM admitted the request without the tokens the lookup promised
+            # (`skip_reading_prefix_cache`, a local sub-block tail, a hit no
+            # longer than the replay window). It runs RUNNING and computes them
+            # itself, so the queued load would write blocks this step's forward
+            # fills and report `finished_recving` for a request never parked.
+            self._scheduler.cancel_pending_load(seq)
         if self._kda_planner is not None and num_external_tokens > 0:
             self._kda_planner.resolve_load(
                 request,
@@ -2229,14 +2240,25 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         all) and a lease does not owe one, because the next request's step
         drains it.
         """
-        if self._deferred_frees or self._releases_in_flight:
+        if self._releases_in_flight:
+            return True
+        # Only recent deferrals, like the leases below: on MP a finished
+        # request whose save stalls stays deferred until the transfer deadline
+        # fail-stops it, and counting it would trade every preemption in that
+        # window for a step that frees nothing.
+        oldest = time.monotonic() - self._PENDING_FREE_HORIZON_S
+        if any(
+            self._deferred_free_at.get(req_id, oldest) > oldest
+            for req_id in self._deferred_frees
+        ):
             return True
         if self._kda_planner is not None and self._kda_planner.has_pending_work():
             return True
         # A ride's pin is retired in `build_connector_meta`, after vLLM asks
-        # this; a recent one is blocks about to come back, like a lease.
+        # this. Only a recent pin that is a block's last holder is blocks about
+        # to come back; retiring any other drops a share and frees nothing.
         if self._v41_planner is not None and self._v41_planner.has_ride_pins(
-            max_age_s=self._PENDING_FREE_HORIZON_S
+            max_age_s=self._PENDING_FREE_HORIZON_S, sole_holder=True
         ):
             return True
         scheduler = self._scheduler
@@ -2339,7 +2361,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         seq = self._seqs.get(req_id)
         if seq is None:
             return []
-        block_size = int(self._config.kv_cache_block_size)
+        # Virtual, as in `build_connector_meta`: under DCP one block id covers
+        # `kv_cache_block_size * decode_context_parallel_size` tokens.
+        block_size = int(
+            getattr(self._scheduler, "virtual_block_size", 0)
+            or self._config.kv_cache_block_size
+        )
         if block_size <= 0:
             return []
         table = list(seq.block_table)

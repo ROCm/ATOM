@@ -238,7 +238,8 @@ def _v41_state_checkpoints_configured(vllm_config) -> bool:
         )
 
         return v41_state_checkpoints_active(vllm_config)
-    except Exception:  # noqa: BLE001 - absence means the mechanism is off
+    except ImportError:
+        # Absence means the mechanism is off; any other error surfaces.
         return False
 
 
@@ -254,29 +255,28 @@ def _v41_state_tier_configured(vllm_config) -> bool:
 
 
 def _refuse_v41_kv_transfer(vllm_config) -> None:
-    """Refuse every KV connector on this path, including `lmcache_mp`.
+    """Refuse every KV connector on this path but AtomLMCacheOffloadConnector.
 
     A V4.1 request's recoverable state is not its PAGEs alone: the window
     ring, the compressor rings and the Engram cursor live in the STATE region,
     and a connector that restores PAGE bytes without them hands the forward a
     prefix it cannot continue from.
 
-    The model's check admits `lmcache_mp` because ATOM's own transport
-    checkpoints STATE through its PAGE-backed images. That reasoning does not
-    carry over here: in plugin mode vLLM resolves the connector through *its*
-    registry, where `LMCacheMPConnector` is vLLM's own, and ATOM's STATE
-    checkpoint path is not what runs. The name alone is why it was admitted --
-    ATOM registers `LMCacheMPConnector` as an alias of `lmcache_mp`.
+    `lmcache_mp` included. Natively the model admits `lmcache_mp` because
+    ATOM's own transport checkpoints STATE through its PAGE-backed images.
+    That reasoning does not carry over here: in plugin mode vLLM resolves the
+    connector through *its* registry, where `LMCacheMPConnector` is vLLM's
+    own, and ATOM's STATE checkpoint path is not what runs.
 
-    Every other name is refused here too, rather than left to
-    `KVConnectorFactory.connector_name`, which raises "unknown KV connector"
-    for vLLM's own `NixlConnector` / `OffloadingConnector` / `MooncakeConnector`
-    -- an error about ATOM's registry, in answer to a question about V4.1.
+    This is the only gate on the plugin's transport: `atom.plugin.config` does
+    not carry V4.1's into the ATOM Config, so the model's own check never sees
+    vLLM's connector names.
 
-    ATOM's own `AtomLMCacheOffloadConnector` is the one exception: it stores
-    a whole state checkpoint at PAGE boundaries and caps every hit, local or
-    external, to a boundary it holds. Nothing else joins it without both
-    properties -- a wrong admission is a silently wrong continuation.
+    `AtomLMCacheOffloadConnector` is the one exception: it stores a whole state
+    checkpoint at PAGE boundaries and caps every hit, local or external, to a
+    boundary it holds. It needs the state checkpoints on (the connector refuses
+    to start without them). Nothing else joins it without both properties --
+    a wrong admission is a silently wrong continuation.
     """
     transfer = getattr(vllm_config, "kv_transfer_config", None)
     if transfer is None:
@@ -289,11 +289,12 @@ def _refuse_v41_kv_transfer(vllm_config) -> None:
     if _v41_state_tier_configured(vllm_config):
         return
     msg = (
-        f"DeepSeek-V4.1 on the vLLM plugin does not support KV transfer "
-        f"({connector}): a request's window ring, compressor rings and Engram "
-        "cursor live in the STATE region, and no connector on this path "
-        "restores them, so a hit would resume from PAGEs whose state is "
-        "missing. Run without --kv-transfer-config."
+        f"DeepSeek-V4.1 on the vLLM plugin supports KV transfer only through "
+        f"AtomLMCacheOffloadConnector, not {connector}: a request's window "
+        "ring, compressor rings and Engram cursor live in the STATE region, "
+        "and only that connector restores them with the PAGEs (it needs "
+        "ATOM_V41_STATE_CHECKPOINTS=1, prefix caching and --mamba-cache-mode "
+        "align). Configure it, or run without --kv-transfer-config."
     )
     logger.error(msg)
     raise ValueError(msg)
@@ -410,8 +411,8 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
        step) would swallow the whole backbone rather than break around
        attention. Say NONE outright.
 
-    2. Refuse prefix caching unless something writes V4.1's STATE at the
-       boundaries vLLM reports. vLLM's prefix cache is bookkeeping: registering a
+    2. Refuse prefix caching unless the state checkpoints write V4.1's STATE at
+       the boundaries vLLM reports. vLLM's prefix cache is bookkeeping: registering a
        cached block is a claim that the backend left recoverable state at that
        block's boundary, and the mamba-style managers that participate only
        report a hit as far as a boundary they hold state for. V4.1's forward
@@ -422,9 +423,9 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
        align mode still caches the last complete block's state and the group
        still reports the boundary. So this is a property of the contract, not a
        flag -- any STATE group that joins prefix caching will be handed a
-       boundary nobody wrote, unless AtomLMCacheOffloadConnector or the
-       PAGE-backed state checkpoints write it and cap each hit to a boundary
-       they hold.
+       boundary nobody wrote, unless the PAGE-backed state checkpoints write
+       it and cap each hit to a boundary they hold. AtomLMCacheOffloadConnector
+       carries those checkpoints to its tier, so it needs them on as well.
 
     3. Refuse every speculative method except DSpark, which vLLM drives itself;
        see ``_refuse_unsupported_v41_speculation``.
@@ -444,19 +445,19 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
     if (
         cache_config is not None
         and getattr(cache_config, "enable_prefix_caching", False)
-        and not _v41_state_tier_configured(vllm_config)
         and not _v41_state_checkpoints_configured(vllm_config)
     ):
         msg = (
             "DeepSeek-V4.1 on the vLLM plugin supports prefix caching only "
-            "alongside AtomLMCacheOffloadConnector. A block-table hit "
-            "restores the compressed pages but not the per-request window "
-            "ring, compressor rings or Engram cursor that CSA2 attention "
-            "reads alongside them, and a V4.1 forward cannot leave them at "
-            "the interior block boundary vLLM's cache assumes. The connector "
-            "owns a tier for exactly that state and caps every hit, local or "
-            "external, to a boundary whose state it stored. Pass "
-            "--no-enable-prefix-caching, or configure the connector."
+            "with its state checkpoints (ATOM_V41_STATE_CHECKPOINTS=1 and "
+            "--mamba-cache-mode align); AtomLMCacheOffloadConnector needs them "
+            "too. A block-table hit restores the compressed pages but not the "
+            "per-request window ring, compressor rings or Engram cursor that "
+            "CSA2 attention reads alongside them, and a V4.1 forward cannot "
+            "leave them at the interior block boundary vLLM's cache assumes. "
+            "The checkpoints store that state at the boundaries vLLM caches "
+            "and cap every hit to one they hold. Pass "
+            "--no-enable-prefix-caching, or turn the checkpoints on."
         )
         logger.error(msg)
         raise ValueError(msg)

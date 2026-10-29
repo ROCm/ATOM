@@ -309,6 +309,8 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
     #: `[(slot, wanted_position, request_id)]` for exactly the rows whose cursor
     #: is not where the scheduler wants it; returns how many it restored.
     checkpoint_restore = None
+    #: The requests the previous `prepare_state` saw; see `_may_restore`.
+    _last_step_ids: frozenset = frozenset()
 
     def __init__(self, *args, backing: torch.Tensor, **kwargs):
         # Set before `super().__init__`, which calls `_allocate_backing` while
@@ -326,21 +328,39 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         Explicit metadata publication does not establish the probe's safety;
         keep this workaround until a separate test does.
 
-        `ATOM_V41_BLOCKING_STATE_PROBE=0` opts back out, except with state
-        checkpoints on: a restore has to see this step's cursors before the
-        reset and the Engram staging, and the deferred read judges them only
-        on the next call.
+        `ATOM_V41_BLOCKING_STATE_PROBE=0` opts back out, except on a step that
+        may restore a state checkpoint (`_may_restore`): a restore has to see
+        this step's cursors before the reset and the Engram staging, and the
+        deferred read judges them only on the next call.
         """
-        import os
+        from atom.utils import envs
 
-        override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
+        blocking = envs.ATOM_V41_BLOCKING_STATE_PROBE
         if self.checkpoint_restore is not None:
-            blocking = True
-        elif override is not None and override != "":
-            blocking = override not in ("0", "false", "False")
-        else:
-            blocking = True
+            # Tracked every step, so the previous step's rows are known when
+            # the switch lets a step go without the read.
+            may_restore = self._may_restore(step)
+            blocking = blocking or may_restore
         return super().prepare_state(step, histories=histories or blocking)
+
+    def _may_restore(self, step) -> bool:
+        """Whether a row of this step could need a checkpoint restore.
+
+        Only a row that starts above its floor (what `prepare_state` calls not
+        fresh) and did not run in the previous step: an admission at a prefix
+        hit, or a preempted request coming back. A row that ran last step on
+        its own slot left its state there, which is what `_restore_stale_rows`
+        must not overwrite anyway.
+        """
+        count = step.scheduled_bs
+        ids = [span.request_id for span in step.requests[:count]]
+        seen, self._last_step_ids = self._last_step_ids, frozenset(ids)
+        above_floor = (
+            step.request_positions[:count] != step.request_floors[:count]
+        ) | (step.request_cached_until[:count] > 0)
+        return any(
+            bool(above) and rid not in seen for rid, above in zip(ids, above_floor)
+        )
 
     def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
         """Restore checkpoints into the rows the contract is about to reject.

@@ -234,7 +234,16 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
             # whose length is not a whole number of blocks reaches it only if
             # a chunk ends there, which is this clip -- without it a prompt
             # shorter than one chunk of tier has no boundary to be reused at.
-            anchor = (total // block) * block
+            #
+            # The checkpoint scheduler's anchor, which stops short of the
+            # speculative tail: one at `total // block * block` would leave a
+            # one-token prefill step after it and a boundary no hit is served
+            # at (`cap_hit`, `cap_local_hit`).
+            anchor = getattr(request, "_atom_img_anchor", None)
+            if anchor is None:
+                tail = 2 if getattr(planner, "keep_a_prefill_tail", False) else 1
+                anchor = min(total, int(request.num_tokens) - tail) // block * block
+            anchor = int(anchor)
             if start < anchor < end:
                 return anchor - start
             return num_new_tokens
@@ -281,6 +290,27 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
 
     from atom.plugin.vllm.v41_speculative import _is_v41_speculating
 
+    def _hit_leaving(self, request, tail: int):
+        """vLLM's own hit, asked again to leave ``tail`` tokens to compute.
+
+        `get_computed_blocks` fixes the limit at one token short of the
+        request; the coordinator query beneath it takes the limit and only
+        reads. Asking it again lets every group agree on the boundary below,
+        where truncating the hit instead would leave a checkpoint group's last
+        block null. None when this vLLM does not expose the query.
+        """
+        manager = self.kv_cache_manager
+        coordinator = getattr(manager, "coordinator", None)
+        create = getattr(manager, "create_kv_cache_blocks", None)
+        if coordinator is None or create is None:
+            return None
+        found = coordinator.find_longest_cache_hit(
+            request.block_hashes, int(request.num_tokens) - tail
+        )
+        num = int(found[1])
+        uncached = int(found[2]) if len(found) > 2 else 0
+        return create(found[0]), num, (num + uncached if uncached else 0)
+
     @functools.wraps(original)
     def _wrapped(self, request, *args, **kwargs):
         # Forwarded as given: vLLM 0.33 adds `max_cache_hit_length`, and this
@@ -291,6 +321,21 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
         if num_local <= 0:
             return blocks, num_local, boundary, divergent
         planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
+        if int(request.num_tokens) - int(num_local) < 2 and (
+            planner.keep_a_prefill_tail
+            if planner is not None
+            else _is_v41_speculating(self)
+        ):
+            # Under speculation a one-token tail is admitted as a padded verify
+            # row, which V4.1 refuses beside a prefill: re-ask for a hit that
+            # leaves two, rather than discard the whole hit (a resubmitted
+            # prompt of N * PAGE + 1 tokens would recompute from 0).
+            again = _hit_leaving(self, request, 2)
+            if again is not None:
+                blocks, num_local, boundary = again
+                divergent = False
+                if num_local <= 0:
+                    return blocks, num_local, boundary, divergent
         if planner is not None:
             capped = int(planner.cap_local_hit(request, int(num_local)))
         elif int(request.num_tokens) - int(num_local) < 2 and _is_v41_speculating(self):

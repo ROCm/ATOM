@@ -126,11 +126,11 @@ class _V2InputBatchView:
         disagrees with `seq_lens - query_lens` on some batches (13 vs 9) and
         agrees on others, and no field of the V2 batch reproduces the step's
         number (`num_draft_tokens_per_req` corrects one case and breaks the
-        other). So it is offered for arithmetic (`_exact_starts`) but the
+        other). V4.1 therefore takes its decode-keep starts from the step's own
+        `seq_lens - query_lens` (`snapshot_v41_batch`), not from here; the
         class declares `atom_row_order_unverifiable`, and the row-order
         cross-check skips rather than fire on a difference that says nothing
-        about row order. A decode keep built on a wrong start is still caught
-        downstream, by the state cursor the restore is judged against. The two index spaces are
+        about row order. The two index spaces are
         the same object on V1's persistent batch and different on V2, so this
         one is left in row order deliberately: its readers are row-order
         readers -- `_check_row_alignment` compares it against the step's own

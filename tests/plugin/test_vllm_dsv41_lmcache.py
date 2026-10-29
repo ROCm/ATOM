@@ -384,6 +384,20 @@ def test_prefill_chunks_end_where_a_checkpoint_can_sit(prompt, start, budget, ex
     assert _clip()(sched, request, start, budget) == expected
 
 
+@pytest.mark.parametrize("anchor_on_request", [True, False])
+def test_the_last_chunk_stops_short_of_the_speculative_tail(anchor_on_request):
+    """Under DSpark a 4097-token prompt's anchor is 3840, not 4096: cutting at
+    4096 would leave a one-token prefill step and a boundary no hit is served
+    at. The checkpoint scheduler's anchor is read when it is on the request."""
+    planner = SimpleNamespace(boundary_grid=256, keep_a_prefill_tail=True)
+    sched = SimpleNamespace(connector=SimpleNamespace(_v41_planner=planner))
+    request = SimpleNamespace(num_prompt_tokens=4097, num_tokens=4097)
+    if anchor_on_request:
+        request._atom_img_anchor = 3840
+    assert _clip()(sched, request, 3840, 257) == 257
+    assert _clip()(sched, request, 3584, 513) == 256
+
+
 def test_a_landed_load_in_kv_holding_waiting_clears_the_drafts():
     """vLLM drains `kv_holding_waiting` first; checking `waiting` alone missed it."""
     pytest.importorskip("vllm")
@@ -700,3 +714,126 @@ def test_the_v41_adapter_matches_only_with_the_switch_on(monkeypatch):
     assert not _V41_ADAPTER.matches(object())
     monkeypatch.setenv("ATOM_V41_STATE_CHECKPOINTS", "1")
     assert _V41_ADAPTER.matches(object())
+
+
+# -- review round 9 ----------------------------------------------------------
+
+
+def test_a_withdrawn_promise_names_its_blocks_in_virtual_units():
+    """Under DCP one block id covers `kv_cache_block_size * DCP` tokens."""
+    c = _promising_connector(True, declined={"7"})
+    c._scheduler.virtual_block_size = 32
+    assert c._check_promised_loads(SimpleNamespace(requests=[])) == [("7", [101, 102])]
+
+
+@pytest.mark.parametrize(
+    "promised, external, cancelled",
+    [(True, 0, True), (True, 512, False), (False, 0, False)],
+)
+def test_an_admission_without_the_promised_tokens_cancels_the_load(
+    promised, external, cancelled
+):
+    """vLLM can admit RUNNING with 0 external tokens (skip_reading_prefix_cache,
+    a local sub-block tail); the queued load would then report finished_recving
+    for a request vLLM never parked."""
+    c = _alloc_connector()
+    c._scheduler = SimpleNamespace(
+        update_state_after_alloc=Mock(), cancel_pending_load=Mock()
+    )
+    if promised:
+        c._promised_loads["r0"] = [0, 0, 512, False]
+    blocks = SimpleNamespace(get_block_ids=lambda: ([3, 4], [7, 8]))
+    c.update_state_after_alloc(SimpleNamespace(request_id="r0"), blocks, external)
+    assert c._scheduler.cancel_pending_load.called is cancelled
+    assert ("r0" in c._promised_loads) is (promised and not cancelled)
+
+
+def test_a_failed_resolve_drops_an_earlier_admissions_destination():
+    """The old destination names blocks vLLM freed when the load failed."""
+    p = _planner()
+    request = SimpleNamespace(request_id="r")
+    assert p.resolve_load(request, 512, group_blocks=([3, 4], [7, 8]))
+    assert not p.resolve_load(request, 512, group_blocks=([3, 4], [7, 0]))
+    assert p.take_ride_state(request, "r", 512, operation=None) is None
+
+
+@pytest.mark.parametrize("ref_cnt, frees", [(1, True), (2, False)])
+def test_only_a_pin_that_holds_a_block_alone_frees_it(ref_cnt, frees):
+    """Retiring a pin drops one share; a block its request still holds stays."""
+    p, request = _ride()
+    p._pool.blocks[42].ref_cnt = ref_cnt
+    p.take_ride_state(request, "r0", 512, operation="op")
+    assert p.has_ride_pins(max_age_s=10.0)
+    assert p.has_ride_pins(max_age_s=10.0, sole_holder=True) is frees
+
+
+@pytest.mark.parametrize("age_s, pending", [(0.0, True), (60.0, False)])
+def test_only_a_recent_deferred_free_holds_off_preemption(age_s, pending):
+    """A deferral stuck behind a stalled MP save frees nothing until its
+    deadline; counting it would stall every preemption until then."""
+    import time
+
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._releases_in_flight = set()
+    c._deferred_frees = {"r"}
+    c._deferred_free_at = {"r": time.monotonic() - age_s}
+    c._kda_planner = c._v41_planner = c._scheduler = None
+    assert c.has_pending_block_frees() is pending
+
+
+@pytest.mark.parametrize("tail, expected", [(1, 4096), (2, 0)])
+def test_a_cut_never_leaves_less_than_the_tail(tail, expected):
+    """A rung at 4096 of a 4097-token prompt leaves a one-token prefill step
+    under speculation; the anchor (3840) is the last usable boundary."""
+    from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
+        StateCheckpointPlacement,
+    )
+
+    placement = StateCheckpointPlacement(interval=256, demand=False, block=256)
+    assert placement.cut(3840, 4097, 4097, 0, 3840, tail=tail) == expected
+
+
+def test_a_one_token_tail_hit_is_asked_again_not_dropped(monkeypatch):
+    """A resubmitted N * PAGE + 1 prompt hits one token short under DSpark;
+    vLLM is asked again for a hit leaving two instead of recomputing from 0."""
+    import sys
+    import types
+
+    from atom.plugin.vllm import scheduler as patches
+
+    asked = []
+
+    class Coordinator:
+        def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
+            asked.append(max_cache_hit_length)
+            return ["blocks to 3840"], 3840, 0
+
+    class Manager:
+        coordinator = Coordinator()
+
+        def create_kv_cache_blocks(self, computed):
+            return ("kv", computed)
+
+    class Scheduler:
+        kv_cache_manager = Manager()
+        connector = SimpleNamespace(
+            _v41_planner=SimpleNamespace(
+                keep_a_prefill_tail=True, cap_local_hit=lambda request, hit: hit
+            )
+        )
+
+        def _get_local_prefix_cache_hit(self, request):
+            return ["blocks to 4096"], 4096, 0, False
+
+    module = types.ModuleType("vllm.v1.core.sched.scheduler")
+    module.Scheduler = Scheduler
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    patches.apply_vllm_v41_local_hit_cap_patch()
+    request = SimpleNamespace(num_tokens=4097, block_hashes=(1, 2, 3))
+    assert Scheduler()._get_local_prefix_cache_hit(request) == (
+        ("kv", ["blocks to 3840"]),
+        3840,
+        0,
+        False,
+    )
+    assert asked == [4095]

@@ -834,8 +834,14 @@ def plan_state_checkpoint_ops(
     block: int,
     is_target: bool,
     name: str,
+    starts=None,
 ) -> None:
     """Restores for this step's prefix hits; stores where the scheduler hashed.
+
+    ``starts``: each row's exact first position this step, when the caller
+    already derived it from the step's own ``seq_lens - query_lens``. Without
+    it the decode keeps read the input batch (`_exact_starts`), whose V2
+    count is an optimistic upper bound.
 
     A row bound to a fresh slot with ``chunk_start > 0`` resumes from a cached
     prefix (a cross-request hit, or a preempted request's own blocks): its slot
@@ -871,7 +877,8 @@ def plan_state_checkpoint_ops(
 
     req_ids = list(get_current_req_ids() or [])[:rows]
     if worker.decode_candidates or _decode_plan:
-        starts = _exact_starts(rows, name)
+        if starts is None:
+            starts = _exact_starts(rows, name)
         store_decode_keeps(worker, req_ids, starts, fresh_rows)
         record_decode_candidates(worker, req_ids, slots, starts, lens, block, name)
     for i in resumed:

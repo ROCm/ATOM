@@ -1391,9 +1391,9 @@ def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
     # Comparing the two would turn that documented independence into a crash.
     #
     # So what has to be settled first is whether a divergence is a bug at all
-    # on this path, now that every KV connector is refused here and the
-    # park-and-readmit case that motivated the independence cannot arise. Until
-    # it is, this stays inert rather than fatal on an unverified premise.
+    # on this path, where AtomLMCacheOffloadConnector parks and re-admits
+    # requests just as the note above describes. Until it is, this stays inert
+    # rather than fatal on an unverified premise.
     batch_computed = getattr(input_batch, "num_computed_tokens_cpu", None)
     if batch_computed is None:
         return
@@ -2081,6 +2081,9 @@ def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, pre
                 # worker, so the wrong type sat here unexercised.
                 chunk_start=np.asarray(snapshot.num_computed[:rows], dtype=np.int64),
                 lens=np.asarray(snapshot.query_lens[:rows], dtype=np.int64),
+                # The same exact `seq_lens - query_lens`, for the decode keeps
+                # too: V2's input-batch count is an optimistic upper bound.
+                starts=np.asarray(snapshot.num_computed[:rows], dtype=np.int64),
                 # None: a prefix hit was restored in `prepare_state`, through
                 # the cache's hook, before the staging above advanced the
                 # cursor. Restoring here again would overwrite that.

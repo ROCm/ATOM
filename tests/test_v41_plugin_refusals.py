@@ -114,7 +114,9 @@ def test_every_kv_connector_is_refused(connector):
         SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector=connector)),
         SimpleNamespace(kv_transfer_config={"kv_connector": connector}),
     ):
-        with pytest.raises(ValueError, match="does not support KV transfer") as raised:
+        with pytest.raises(
+            ValueError, match="KV transfer only through AtomLMCacheOffloadConnector"
+        ) as raised:
             refuse(config)
         assert connector in str(raised.value)
 

@@ -94,14 +94,32 @@ class StateCheckpointPlacement:
         return compressed_hit if has_room else 0
 
     def cut(
-        self, start: int, end: int, num_prompt_tokens: int, demand: int, anchor: int
+        self,
+        start: int,
+        end: int,
+        num_prompt_tokens: int,
+        demand: int,
+        anchor: int,
+        tail: int = 1,
+        num_tokens: int | None = None,
     ) -> int:
-        """Earliest position in ``(start, end]`` a forward must end on, or 0."""
+        """Earliest position in ``(start, end]`` a forward must end on, or 0.
+
+        Never one that leaves fewer than ``tail`` tokens to compute (out of
+        ``num_tokens``, the prompt by default): under speculation that last
+        token would run as a one-row prefill step beside verify rows, and a hit
+        there is never served (`anchor` stops short for the same reason).
+        """
         rung = 0
         if limit := self.limit(num_prompt_tokens):
             rung = min(end, limit)
             rung -= rung % self.interval
-        candidates = [p for p in (rung, demand, anchor) if p and start < p <= end]
+        total = num_prompt_tokens if num_tokens is None else num_tokens
+        candidates = [
+            p
+            for p in (rung, demand, anchor)
+            if p and start < p <= end and not 0 < total - p < tail
+        ]
         return min(candidates) if candidates else 0
 
     def keeps(self, pos: int, num_prompt_tokens: int, demand: int, anchor: int) -> bool:
@@ -272,7 +290,13 @@ class SchedulerStateCheckpoints:
         end = start + num_new_tokens
         demand, anchor = request_marks(request)
         target = self.placement.cut(
-            start, end, int(request.num_prompt_tokens), demand, anchor
+            start,
+            end,
+            int(request.num_prompt_tokens),
+            demand,
+            anchor,
+            tail=self.prefill_tail,
+            num_tokens=int(request.num_tokens),
         )
         request._atom_img_step = ("prefill", target or end)
         if not target:

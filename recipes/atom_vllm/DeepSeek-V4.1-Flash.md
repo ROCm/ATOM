@@ -158,8 +158,8 @@ from target proxy pages alone.
 | BF16 and packed FP4 main pool | Supported (`--kv-cache-dtype auto` / `nvfp4`) |
 | Image requests | Refused — text only |
 | DSpark speculative decoding | Supported — 5 draft tokens, fixed by the model's own config gate; the draft is the target checkpoint's `mtp.*` stages, so there is no separate draft model to pass |
-| Prefix caching | Only with the state checkpoints (`ATOM_V41_STATE_CHECKPOINTS=1`) or `AtomLMCacheOffloadConnector`; see the [LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md). Otherwise refused — a block-table hit restores the compressed pages but not the per-request window ring, compressor rings or Engram cursor that CSA2 attention reads alongside them |
-| KV transfer / offload connectors | `AtomLMCacheOffloadConnector` on its MP backend only; see the [LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md). Every other connector, `lmcache_mp` included, is refused at startup: restoring PAGE bytes without the matching per-request STATE is unsafe |
+| Prefix caching | Only with the state checkpoints (`ATOM_V41_STATE_CHECKPOINTS=1` and `--mamba-cache-mode align`); see the [LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md). Otherwise refused — a block-table hit restores the compressed pages but not the per-request window ring, compressor rings or Engram cursor that CSA2 attention reads alongside them |
+| KV transfer / offload connectors | `AtomLMCacheOffloadConnector` on its MP backend only, together with the state checkpoints and prefix caching; see the [LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md). Every other connector, `lmcache_mp` included, is refused at startup: restoring PAGE bytes without the matching per-request STATE is unsafe |
 | CUDA graphs | Opt-in with both graph flags; FULL and PIECEWISE use different staging boundaries. See [CUDA graphs](#cuda-graphs) |
 
 The connector, speculation and prefix-caching refusals are made by

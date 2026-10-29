@@ -9,6 +9,7 @@ import types
 from collections import deque
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -2649,3 +2650,51 @@ def test_mp_bounds_a_stalled_save_by_its_deadline_not_by_abandoning_it():
     sched._enforce_transfer_deadlines = lambda: called.append(True)
     sched.enforce_transfer_deadlines()
     assert called == [True]
+
+
+def test_the_release_cap_stops_scanning_once_it_is_met():
+    """The unchecked rest stay queued in order; a held entry goes to the back."""
+    held = object()
+    entries = deque([held] + [object() for _ in range(4)])
+    rest = [id(entry) for entry in list(entries)[3:]]
+    taken = mp_worker._take_unshared(entries, limit=2)
+    assert len(taken) == 2
+    assert [id(entry) for entry in entries] == rest + [id(held)]
+
+
+def test_the_last_drain_round_submits_what_close_found_queued():
+    """A save queued before `close` is submitted and polled, not dropped."""
+    import queue
+
+    fake = SimpleNamespace(
+        _drain_stop=threading.Event(),
+        _drain_wake=threading.Event(),
+        _transfer_queue=queue.Queue(),
+        _perform_save_submit=Mock(),
+        _perform_load_submit=Mock(),
+        _poll_pending_loads=Mock(),
+        _poll_pending_saves=Mock(),
+        _drain_rounds=0,
+        _drain_error=None,
+    )
+    fake._drain_round_cv = threading.Condition(threading.Lock())
+    fake._transfer_queue.put(("save", "a", "b"))
+    fake._drain_stop.set()
+    mp_worker.LMCacheMPConnector._drain_loop(fake)
+    fake._perform_save_submit.assert_called_once_with("a", "b")
+    fake._poll_pending_saves.assert_called_once()
+    assert fake._drain_rounds == 1
+
+
+def test_close_leaves_a_stuck_drains_client_alone():
+    """The client is not thread-safe; a drain still in a submit keeps it."""
+    adapter = Mock()
+    fake = SimpleNamespace(
+        _drain_stop=threading.Event(),
+        _drain_wake=threading.Event(),
+        _drain_thread=SimpleNamespace(join=lambda timeout: None, is_alive=lambda: True),
+        _adapter=adapter,
+    )
+    mp_worker.LMCacheMPConnector.close(fake)
+    adapter.shutdown.assert_not_called()
+    assert fake._adapter is adapter

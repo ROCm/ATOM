@@ -123,7 +123,9 @@ def _state_checkpoints_own_the_tail(vllm_config) -> bool:
         )
 
         return bool(state_checkpoints_on(adapter_for_config(vllm_config), vllm_config))
-    except Exception:  # noqa: BLE001 - absence means the mechanism is not on
+    except ImportError:
+        # Absence means the mechanism is not on. Anything else surfaces:
+        # answering no would reserve the STATE tail twice, which can livelock.
         return False
 
 
