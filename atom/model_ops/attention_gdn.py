@@ -362,6 +362,11 @@ class GatedDeltaNet(nn.Module):
             value_spec = value_spec.view(1, num_tokens_spec, -1, self.head_v_dim)
 
         # 1.2: Process the remaining part
+        # The prefill conv L2-normalizes q and k in its epilogue unless the
+        # FlyDSL prefill (which normalizes the raw q and k itself) may take them.
+        qk_normed_by_conv = gdn_metadata.num_prefills > 0 and not (
+            flydsl_policy is not None and flydsl_policy.prefill and not use_replayssm
+        )
         if gdn_metadata.num_prefills > 0:
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
@@ -379,6 +384,7 @@ class GatedDeltaNet(nn.Module):
                 k_dim_size=self.num_k_heads * self.head_k_dim // self.tp_size,
                 v_dim_size=self.num_v_heads * self.head_v_dim // self.tp_size,
                 metadata=gdn_metadata,
+                qk_l2norm_head_dim=self.head_k_dim if qk_normed_by_conv else None,
             )
         elif gdn_metadata.num_decodes > 0:
             query_non_spec, key_non_spec, value_non_spec = causal_conv1d_update(
@@ -561,7 +567,7 @@ class GatedDeltaNet(nn.Module):
                     output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=not qk_normed_by_conv,
                     o=(
                         core_attn_out[:num_actual_tokens].unsqueeze(0)
                         if wrote_core_attn_out
@@ -604,7 +610,7 @@ class GatedDeltaNet(nn.Module):
                     output_final_state=True,
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=not qk_normed_by_conv,
                     o=(
                         core_attn_out[:num_actual_tokens].unsqueeze(0)
                         if wrote_core_attn_out
