@@ -234,6 +234,7 @@ def test_glm_dsa_wrapper_is_registered_with_deepseek_adapter(monkeypatch):
 
     assert wrapper.model is fake_model
     assert module.GlmMoeDsaForCausalLM in module.EntryClass
+    assert wrapper.atom_owns_prefill_cp is True
     setup_hook.assert_called_once_with(fake_model)
 
 

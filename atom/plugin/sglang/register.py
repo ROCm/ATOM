@@ -245,6 +245,41 @@ def _allow_prefill_cp_on_hip_for_atom() -> None:
     _PREFILL_CP_PLATFORM_HOOK_REGISTERED = True
 
 
+def _route_prefill_cp_to_atom_model_forward() -> None:
+    """0.5.20 runs CP extend through EagerRunner._execute_extend_cp.
+
+    That path calls model.get_input_embeddings(), shards the embeddings
+    itself and drives model.model and model.lm_head directly, bypassing the
+    wrapper forward. ATOM wrappers split prefill across PCP ranks inside
+    their own forward from the full batch, so hand them the unsharded inputs
+    the same way the non-CP extend path does.
+    """
+    try:
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+    except Exception:  # noqa: BLE001 - optional across SGLang versions
+        return
+
+    original_execute_extend_cp = getattr(EagerRunner, "_execute_extend_cp", None)
+    if original_execute_extend_cp is None or getattr(
+        EagerRunner, "_atom_prefill_cp_patched", False
+    ):
+        return
+
+    def execute_extend_cp_with_atom_forward(self, forward_batch, kwargs):
+        model = self.model_runner.model
+        if not getattr(model, "atom_owns_prefill_cp", False):
+            return original_execute_extend_cp(self, forward_batch, kwargs)
+        return model.forward(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            **kwargs,
+        )
+
+    EagerRunner._execute_extend_cp = execute_extend_cp_with_atom_forward
+    EagerRunner._atom_prefill_cp_patched = True
+
+
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
@@ -274,6 +309,7 @@ def register_plugin() -> None:
     apply_qwen4_exp_rocm_patch()
     _keep_atom_full_attn_for_native_qwen4_exp()
     _allow_prefill_cp_on_hip_for_atom()
+    _route_prefill_cp_to_atom_model_forward()
     install_sglang_replayssm_commit()
     register_kimi_k3_text_only_processor()
 
