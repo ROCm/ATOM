@@ -1176,6 +1176,31 @@ Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale
 (`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
+### Multimodal prompts: seeded keys
+
+LMCache keys a chunk on the token ids up to its end, and a multimodal prompt's
+image placeholder ids are the same for every picture. Keyed on the raw ids, two
+prompts that differ only in their images would share every KV chunk, while a
+hybrid's state images (filed under `BlockManager` hashes seeded with
+`Sequence.cache_seed`) would not. Every LMCache lookup, save and load therefore
+passes its ids through `tier_token_ids(seq, end)` (`_offload_common.py`): the
+in-process chunked scheduler, the `lmcache_mp` native state scheduler and the
+DSV4 connector.
+
+- A text prompt (`cache_seed == -1`) keys on its ids unchanged, so existing
+  text entries stay valid.
+- Otherwise the first 4 ids are each replaced by a 31-bit BLAKE2b digest of
+  `(cache_seed, position, id)` with bit 31 set, i.e. a value in `[2^31, 2^32)`.
+  Real vocab ids stay below `2^31`, so a seeded key never equals a text key,
+  and the value still fits the big-endian uint32 that `lmcache_mp` packs ids
+  into.
+- Each replaced id depends only on its own position and id, so a prefix's keys
+  are the prefix of the whole prompt's keys and partial hits still line up.
+
+mooncake_store seeds its chain hash the same way (`chain_seed`, see
+[Keys and lookup](#keys-and-lookup)). `tests/test_offload_media_keys.py` covers
+all three LMCache paths.
+
 ### Invariants enforced in code
 
 | Invariant | Where | Why |
