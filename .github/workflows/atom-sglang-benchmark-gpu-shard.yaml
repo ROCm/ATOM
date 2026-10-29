@@ -391,8 +391,14 @@ jobs:
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             echo "/models directory found, downloading model to ${model_dir}"
             if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
-              echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
-              exit 1
+              # hf download takes a write lock even when every file is present, so
+              # a full shared cache fails it for models that are already complete.
+              if $CONTAINER_ENGINE exec "$CONTAINER_NAME" bash -lc "test -f \"$model_dir/.download-complete\" || test -f \"$model_dir/.atom_download_complete\""; then
+                echo "::warning::Model download failed for '${MODEL_SOURCE_PATH}', but ${model_dir} has a download-complete marker; using the cached copy."
+              else
+                echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
+                exit 1
+              fi
             fi
           else
             echo "/models directory not mounted; skipping model download"
