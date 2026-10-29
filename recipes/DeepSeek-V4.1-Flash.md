@@ -102,8 +102,12 @@ What differs from gfx950:
   `ATOM_MONO_ENABLE` needs no setting. DSpark still runs: its draft passes and
   verify steps take the original, unfused path.
 - **The router GEMV** (bf16 MFMA) is gfx950-only; gfx1250 uses the regular gate.
-- **FP8 index only.** The FP4 index plane (`--index-cache-dtype fp4`) scores
-  with a gfx950 FlyDSL kernel and does not compile on gfx1250.
+- **FP4 index interface (hardware validation pending).** With
+  `--index-cache-dtype fp4`, gfx1250 uses natural query/cache rows with AITER's
+  H32 OPUS MQA API, including full-layer and candidate tables and packed logits.
+  Requires AITER [#7128](https://github.com/ROCm/aiter/pull/7128) and
+  [#6952](https://github.com/ROCm/aiter/pull/6952). gfx1250 correctness, model E2E
+  and performance remain unvalidated. gfx950 keeps the FlyDSL FP4 scorer.
 - **`--level 0`.** A first `--level 3` start can stall while ranks compile and
   autotune at different times.
 

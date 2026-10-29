@@ -181,6 +181,7 @@ def _stub_v4_runtime_imports():
     # The indexer's scorer needs aiter's kernels; the builder only names them.
     indexer = types.ModuleType("atom.model_ops.indexer")
     indexer.NATURAL, indexer.PRESHUFFLE = "natural", "preshuffle"
+    indexer.MFMA = "mfma"
     for name in ("ConcatKeys", "RowSplit", "IndexRows"):
         setattr(indexer, name, type(name, (), {}))
     for name in ("Fp4LaunchStorages", "concat_rows", "fp4_rows", "fp8_rows"):
@@ -1036,6 +1037,43 @@ def _batch_ids(rows):
     return torch.repeat_interleave(torch.arange(rows.shape[0]), torch.from_numpy(rows))
 
 
+@pytest.mark.parametrize("layout", ["fp4-gfx950-opus", "fp4-gfx1250-natural"])
+def test_opus_index_rows_keep_request_starts_and_split(
+    v4_builder_cls, monkeypatch, layout
+):
+    rows = pytest.importorskip("atom.model_ops.indexer.rows", exc_type=ImportError)
+    module = v4_builder_cls._index_rows.__globals__
+    monkeypatch.setitem(module, "fp4_rows", rows.fp4_rows)
+    monkeypatch.setitem(module, "Fp4MqaRaggedMetadata", rows.Fp4MqaRaggedMetadata)
+    cfg, schedule = SimpleNamespace(block_table_width=2), object()
+    monkeypatch.setattr(rows, "mqa_logits_mxfp4_config", lambda *a, **kw: cfg)
+    monkeypatch.setattr(rows, "mqa_logits_mxfp4_schedule", lambda *a, **kw: schedule)
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder._indexer_fp4 = True
+    builder.indexer_layout = layout
+    builder.index_logits_workspace = None
+    builder.index_n_heads = 64
+    builder.csa_rows_per_block = 64
+    metadata = SimpleNamespace(
+        max_seqlen_q=9, block_tables=torch.tensor([[2], [5]], dtype=torch.int32)
+    )
+    starts = torch.tensor([0, 1, 3], dtype=torch.int32)
+    ends = torch.tensor([65, 7, 8], dtype=torch.int32)
+    split = rows.RowSplit.striped(13, 2, 4)
+
+    result = builder._index_rows(
+        metadata, ends, 128, query_start_loc=starts, max_qlen=2, split=split
+    )
+
+    assert result.split is split
+    assert result.bands == ((0, 3),)
+    [launch] = result.fp4_bands
+    assert launch["cfg"] is cfg and launch["schedule"] is schedule
+    assert launch["query_start_loc"].tolist() == starts.tolist()
+    assert launch["row_ends"].tolist() == ends.tolist()
+    assert launch["block_tables"].tolist() == [[2, 0], [5, 0]]
+
+
 @pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "fp8"])
 def test_split_prefill_rows_are_every_world_th_row(v4_builder_cls, monkeypatch, fp4):
     """Split across TP, the prefill rows a rank publishes are every `world`-th
@@ -1068,7 +1106,6 @@ def test_split_prefill_rows_are_every_world_th_row(v4_builder_cls, monkeypatch, 
             ]
             assert handed["query_start_loc"].tolist() == [0, *np.cumsum(owned)]
             assert handed["max_qlen"] == max(max(owned), 1)
-            assert handed["row_to_batch"].tolist() == batch_ids.tolist()
         else:
             row_starts = cu_committed[batch_ids.numpy()]
             assert handed["keys"]["row_starts"].tolist() == row_starts.tolist()
@@ -1113,7 +1150,6 @@ def test_unsplit_prefill_rows_are_the_whole_step(v4_builder_cls, monkeypatch, fp
     if fp4:
         assert handed["query_start_loc"] == "the step's starts"
         assert handed["max_qlen"] is None
-        assert handed["row_to_batch"].tolist() == [0, 0, 0, 1, 1, 1, 1]
     else:
         assert handed["keys"]["row_starts"].tolist() == [0, 0, 0, 2, 2, 2, 2]
 
