@@ -1,0 +1,9 @@
+{
+  "purpose": "Require absence of the client control whose runner lost final artifacts before allocating a retry",
+  "jobs": [
+    {"job_id": "7788", "run_id": "38296153235"},
+    {"job_id": "8540", "run_id": "38740874930"},
+    {"job_id": "8541", "run_id": "38740903706"},
+    {"job_id": "11129", "run_id": "40932436398", "actions_conclusion": "failure", "cleanup_verified": false}
+  ]
+}
