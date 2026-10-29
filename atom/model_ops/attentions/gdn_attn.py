@@ -1807,7 +1807,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
     def _image_bytes(self) -> int:
-        """The checkpoint image's size, or 0 (no trim) before the spec exists."""
+        """The checkpoint image's size, or 0 (no trim) before the spec exists.
+
+        Only for ``page_unit_views``, which may be asked before the runtime
+        has a spec; ``page_unit_segments`` refuses instead.
+        """
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
         return int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
@@ -1819,13 +1823,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             mha_page_unit_segments,
         )
 
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        if spec is None:
+            # The store gathers a published image. Without the spec there is
+            # no image size to trim to, and the untrimmed unit would carry
+            # padding and whatever follows the image.
+            raise RuntimeError("page_unit_segments called without a checkpoint spec")
         regions = self._page_unit_regions()
         first_region = self._page_unit_pools()[0].region_tensors()[0][1]
         return mha_page_unit_segments(
             regions,
             unit_ids,
             entries=int(first_region.shape[0]),
-            image_bytes=self._image_bytes(),
+            image_bytes=int(spec.image_bytes),
         )
 
     def get_kv_transfer_tensors(self):

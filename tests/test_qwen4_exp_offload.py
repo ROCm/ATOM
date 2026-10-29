@@ -413,16 +413,28 @@ def test_page_unit_regions_are_cached_per_pool_until_release(monkeypatch):
     assert bases.tolist() == [base for base, _ in builder.qsa_arena.region_layout()]
 
 
-def test_page_unit_segments_take_the_untrimmed_path_before_the_spec():
-    """The store thread can ask before the runtime exists: same safe path as
-    `page_unit_views`, not an AttributeError."""
+def test_page_unit_segments_refuse_without_a_spec_and_views_do_not():
+    """The store's gather must trim to the image, so with no spec it fails at
+    once rather than gather a whole unit (padding and whatever follows). Only
+    `page_unit_views` keeps the untrimmed path, for callers ahead of the
+    runtime."""
     for runtime in (None, SimpleNamespace(checkpoint_spec=None)):
         builder, cls = _paged_builder(spec=False)
         builder.model_runner.state_runtime = runtime
-        ptrs, sizes = cls.page_unit_segments(builder, [1, 2])
+        with pytest.raises(RuntimeError, match="without a checkpoint spec"):
+            cls.page_unit_segments(builder, [1, 2])
         views = cls.page_unit_views(builder, [1, 2])
-        assert ptrs.tolist() == [view.data_ptr() for view in views]
-        assert sizes.tolist() == [view.numel() * view.element_size() for view in views]
+        assert sum(view.numel() * view.element_size() for view in views) == (
+            2 * published_bytes_for(_fields())
+        )
+
+
+def test_page_unit_segments_name_the_bytes_page_unit_views_name():
+    builder, cls = _paged_builder()
+    ptrs, sizes = cls.page_unit_segments(builder, [1, 2])
+    views = cls.page_unit_views(builder, [1, 2])
+    assert ptrs.tolist() == [view.data_ptr() for view in views]
+    assert sizes.tolist() == [view.numel() * view.element_size() for view in views]
 
 
 def test_page_unit_segments_trim_to_the_image():
