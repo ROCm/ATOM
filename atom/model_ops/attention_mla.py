@@ -2647,6 +2647,21 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     max_q_len = 1
+                    # The persistent kernel reads q and writes o for every work
+                    # item, so a plan over more rows than q holds runs past both.
+                    # The MTP drafter's step 0 reuses this plan with the
+                    # target's unpadded stream (#287), hence the check on q's
+                    # own rows. Host ints only: no sync, safe under capture.
+                    # DCP rebuilds the sparse_mtp_ plan per layer below.
+                    planned_tokens = getattr(
+                        attn_metadata, "sparse_mtp_num_tokens", None
+                    )
+                    if self.dcp_world_size == 1 and planned_tokens is not None:
+                        assert planned_tokens <= B, (
+                            f"sparse MTP plan covers {planned_tokens} query "
+                            f"rows but q holds {B}: the decode would read q "
+                            f"and write o past their ends"
+                        )
                 else:
                     # Non-MTP sparse decode: KV is packed per token at
                     # page_size=1, so last_page_len is 1 for every seq. Use the

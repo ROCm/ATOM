@@ -1050,6 +1050,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "sparse_mtp_reduce_indptr": reduce_indptr,
             "sparse_mtp_reduce_final_map": reduce_final_map,
             "sparse_mtp_reduce_partial_map": reduce_partial_map,
+            # Rows the plan addresses; every consumer's q / o must hold at
+            # least this many (checked in MLAAttention._forward_decode).
+            "sparse_mtp_num_tokens": num_tokens,
         }
 
     def set_mla_persistent_worker_buffers(
@@ -3067,14 +3070,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 running_bs, max_seqlen_q
             )
             # Plan the sparse per-token work over the REAL tokens only, as the
-            # cprr branch below does for its requests. A cudagraph-padded tail
-            # token has zero sparse KV, but get_mla_metadata_v1 still gives
-            # every row a work item, starting at sparse_kv_indptr[-1] -- the
-            # end of what this step wrote to the sparse-index buffer. With
-            # those items planned, the decode kernel memory-faults some tens of
-            # steps into a padded batch (gfx1250, FlyDSL PS1), presumably by
-            # reading indices past that end. The persistent kernel is
-            # work_indptr-driven, so the padded rows are simply left unplanned.
+            # cprr branch below does for its requests. This plan is not the
+            # target's alone: the MTP drafter's step 0 runs the target's token
+            # stream through its own sparse MLA layer reusing this metadata,
+            # and that stream is NOT padded (eagle_proposer: "Step 0 carries
+            # the target's stream and pads nothing"), so its q and o hold
+            # scheduled_tokens rows. The persistent kernel reads q and writes o
+            # for every work item, zero-KV padding included, so a plan over
+            # running_tokens reads q and writes o past their ends whenever the
+            # batch was padded: silent corruption, or a GPU memory fault when
+            # the next page is unmapped (gfx1250 FlyDSL PS1, LLM-Booster #287).
+            # The target itself runs padded q/o, and the kernel is
+            # work_indptr-driven, so its padded rows are simply left unplanned.
             ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
                 scheduled_tokens
             )
