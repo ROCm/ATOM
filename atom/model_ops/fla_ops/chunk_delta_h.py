@@ -442,7 +442,9 @@ def chunk_gated_delta_rule_fwd_h(
 
         chunk_h_gfx1250(
             k, w, u, g, h, v_new, initial_state, final_state, cu_seqlens,
-            chunk_offsets, n_ptr, h0_idx, ht_idx, h0_flag, T, N, NT, H, Hg, K, V, BT,
+            chunk_offsets, n_ptr, h0_idx, ht_idx, h0_flag, T, N,
+            # every chunk of h, of all B batch rows: the h store's bound
+            h.shape[0] * h.shape[1], H, Hg, K, V, BT,
         )
         return h, v_new, (None if in_place else final_state)
 
