@@ -85,4 +85,18 @@ c48_append_port_mount() {
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
   [[ "${c48_fix_digest%% *}" == "${c48_fix_sha}" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-PP8-MC ]]; then
+    local c48_pp_name c48_pp_sha
+    while read -r c48_pp_name c48_pp_sha; do
+      c48_fix_source="$1/.github/benchmark/c48-model-gap/pp-mooncake/${c48_pp_name}"
+      c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/${c48_pp_name}"
+      [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
+      c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
+      [[ "${c48_fix_digest%% *}" == "${c48_pp_sha}" ]] || return 2
+      docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+    done <<'C48_PP_MOONCAKE_FILES'
+mooncake_connector.py 97636a9e2fb59329776d89b995c068aa4b4a568d0a45da557a2ee5f16f47bbad
+dcp_transfer.py 706b4ebc441a2a0f3ae2eaf9de432af0738b129033bc8278da55886dc300992e
+C48_PP_MOONCAKE_FILES
+  fi
 }

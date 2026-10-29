@@ -6258,6 +6258,7 @@ models:
         env:
           common:
             ATOMESH_C48_CASE: V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C32-PP8-MC
+            C48_MOONCAKE_DCP_TRANSFER: '1'
             ATOMESH_PRE_CLEAN_GPU: '1'
             ATOMESH_AGENTIC_TORCH_PROFILE: '0'
           prefill:

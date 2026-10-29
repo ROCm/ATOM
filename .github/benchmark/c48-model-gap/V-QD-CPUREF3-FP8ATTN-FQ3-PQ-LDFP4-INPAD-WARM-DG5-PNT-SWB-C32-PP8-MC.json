@@ -192,7 +192,8 @@
         "MC_IB_TC": "104",
         "GLIBC_TUNABLES": "glibc.malloc.hugetlb=1",
         "C48_MOONCAKE_STORE_COMPACT": "1",
-        "VLLM_PP_LAYER_PARTITION": "12,12,12,12,12,12,12,9"
+        "VLLM_PP_LAYER_PARTITION": "12,12,12,12,12,12,12,9",
+        "C48_MOONCAKE_DCP_TRANSFER": "1"
       }
     },
     "decode": {
@@ -445,7 +446,8 @@
         "MC_MAX_MR_SIZE": "268435456",
         "C48_MOONCAKE_HCA_PER_GPU": "1",
         "MC_IB_TC": "104",
-        "C48_MOONCAKE_DIVERGENT_HITS": "1"
+        "C48_MOONCAKE_DIVERGENT_HITS": "1",
+        "C48_MOONCAKE_DCP_TRANSFER": "1"
       }
     }
   },

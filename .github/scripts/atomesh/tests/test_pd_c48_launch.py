@@ -107,6 +107,8 @@ class LaunchTest(unittest.TestCase):
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
             if variant == "PP8":
+                for role in ("prefill", "decode"):
+                    self.assertEqual(candidate["roles"][role]["env"].pop("C48_MOONCAKE_DCP_TRANSFER"), "1")
                 self.assertEqual(candidate["roles"]["prefill"]["env"].pop("VLLM_PP_LAYER_PARTITION"),
                                  "12,12,12,12,12,12,12,9")
                 args = candidate["roles"]["prefill"]["args"]
