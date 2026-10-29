@@ -53,17 +53,42 @@ def _spec_tokens(atom_config):
     return int(getattr(sc, "num_speculative_tokens", 0) or 0)
 
 
+def _refusal_tp1(atom_config):
+    """TP1 (kernels_tp1.py): MTP verify steps of 4 or 5 tokens a request on
+    ReplaySSM state (checked a step: the builder's metadata), any context length."""
+    checks = [
+        (not atom_config.enable_expert_parallel, "expert parallel"),
+        (atom_config.parallel_config.data_parallel_size == 1, "DP > 1"),
+        (
+            atom_config.kv_cache_dtype in ("bf16", "auto"),
+            f"kv cache {atom_config.kv_cache_dtype}",
+        ),
+        (
+            atom_config.kv_cache_block_size == 16,
+            f"block size {atom_config.kv_cache_block_size}",
+        ),
+        (
+            _spec_tokens(atom_config) in (3, 4),
+            f"{_spec_tokens(atom_config)} draft tokens",
+        ),
+    ]
+    return next((why for ok, why in checks if not ok), None)
+
+
 class QwenMonoDecode:
     def __init__(self, language_model, atom_config):
         self._lm = language_model
         self._runner = None
         self.enabled = os.environ.get("ATOM_QWEN35_MONO", "0") == "1"
         self.check = os.environ.get("ATOM_QWEN35_MONO_CHECK", "0") == "1"
-        # MTP: the verify steps (SPEC tokens a request) take the mono path; the
-        # per-draft state slots it writes need ReplaySSM off (ATOM_ENABLE_REPLAYSSM=0)
+        # MTP: the verify steps (SPEC tokens a request) take the mono path. TP4
+        # (kernels_mtp.py) writes per-draft state slots and needs ReplaySSM off
+        # (ATOM_ENABLE_REPLAYSSM=0); TP1 (kernels_tp1.py) runs on ReplaySSM
         self.spec = _spec_tokens(atom_config) > 0
+        self.tp1 = atom_config.tensor_parallel_size == 1
+        self.tokens = _spec_tokens(atom_config) + 1
         if self.enabled:
-            why = _refusal(atom_config)
+            why = _refusal_tp1(atom_config) if self.tp1 else _refusal(atom_config)
             if why is not None:
                 logger.info("Qwen3.5 mono decode off: %s", why)
                 self.enabled = False
@@ -83,7 +108,12 @@ class QwenMonoDecode:
             from atom.models.qwen3_5_mono.runner import MonoRunner, MonoUnsupported
 
             try:
-                self._runner = MonoRunner(self._lm, spec=self.spec)
+                if self.tp1:
+                    from atom.models.qwen3_5_mono.runner_tp1 import MonoRunnerTP1
+
+                    self._runner = MonoRunnerTP1(self._lm, self.tokens)
+                else:
+                    self._runner = MonoRunner(self._lm, spec=self.spec)
             except MonoUnsupported as err:
                 logger.warning("Qwen3.5 mono decode off: %s", err)
                 self.enabled = False
@@ -106,7 +136,22 @@ class QwenMonoDecode:
         gm = getattr(md, "gdn_metadata", None)
         if gm is None:
             return False
-        if self.spec:
+        if self.tp1:
+            from atom.models.qwen3_5_mono.config_tp1 import TOK
+
+            S = self.tokens
+            if (
+                not getattr(gm, "replayssm", False)
+                or gm.spec_state_indices_tensor is None
+                or gm.num_prefills != 0
+                or gm.num_decodes != 0
+                or getattr(md, "max_seqlen_q", 0) != S
+                or n % S != 0
+                or not S <= n <= TOK
+                or gm.num_spec_decodes > n // S  # graph padding: slot -1 rows
+            ):
+                return False
+        elif self.spec:
             if getattr(gm, "replayssm", False) or gm.spec_state_indices_tensor is None:
                 return False
             if (
