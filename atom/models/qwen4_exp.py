@@ -697,6 +697,22 @@ class _SequenceParallel:
             self._padded(x.contiguous()), use_custom=False, dim=0
         )
 
+    @classmethod
+    def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
+        """Sharding for a forward of `num_tokens`, or None to stay replicated:
+        no TP, below `ATOM_QWEN4_EXP_SP_MIN_TOKENS`, or under graph capture."""
+        min_tokens = envs.ATOM_QWEN4_EXP_SP_MIN_TOKENS
+        if (
+            min_tokens <= 0
+            or num_tokens < min_tokens
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return None
+        return cls(num_tokens, tp_size, get_tensor_model_parallel_rank())
+
 
 class Qwen4ExpDecoderLayer(nn.Module):
     """PLE (layer 1 only) -> HC(attn) -> attn -> HC(mlp) -> MoE.
@@ -795,7 +811,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         are all-gathered and the sub-layer partial sums reduce-scattered
         (together the same traffic as the all-reduce they replace)."""
         if not self.fused_hc:
-            return self._forward_unfused(positions, hidden_states, input_ids)
+            return self._forward_unfused(positions, hidden_states, input_ids, sp)
         if self.ple is not None:
             assert sp is None, "the PLE layer needs the full token range"
             if pending is not None:
@@ -872,8 +888,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
+        sp: _SequenceParallel | None = None,
     ) -> torch.Tensor:
+        """The MTP drafter's layer. With `sp` the streams are token-sharded as
+        in `forward`."""
         if self.ple is not None:
+            assert sp is None, "the PLE layer needs the full token range"
             ple_metadata = get_forward_context().attn_metadata.ple_metadata
             # `None` only on the warmup/profiling forwards that run before the
             # state pool exists; a served token always has metadata.
@@ -906,17 +926,25 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 )
 
         mixed, residual = self.attn_hyper_connection.mix(hidden_states)
+        if sp is not None:
+            mixed = sp.gather(mixed)
         if self.layer_type == "linear_attention":
             sub_output = self.linear_attn(mixed)
         else:
-            sub_output = self.self_attn(positions, mixed)
-        if self.tp_size > 1:
+            sub_output = self.self_attn(positions, mixed, rows=sp)
+        if sp is not None:
+            sub_output = sp.scatter(sub_output)
+        elif self.tp_size > 1:
             sub_output = tensor_model_parallel_all_reduce(sub_output)
         hidden_states = self.attn_hyper_connection.combine(sub_output, residual)
 
         mixed, residual = self.mlp_hyper_connection.mix(hidden_states)
-        # The MoE block owns its own all-reduce.
-        return self.mlp_hyper_connection.combine(self.mlp(mixed), residual)
+        if sp is not None:
+            moe_out = sp.scatter(self.mlp(sp.gather(mixed), reduce_results=False))
+        else:
+            # The MoE block owns its own all-reduce.
+            moe_out = self.mlp(mixed)
+        return self.mlp_hyper_connection.combine(moe_out, residual)
 
 
 class Qwen4ExpModel(nn.Module):
@@ -962,7 +990,6 @@ class Qwen4ExpModel(nn.Module):
         # Sequence parallelism starts after the last PLE layer, whose causal
         # short convolution needs every token of the request; with no layer
         # after it there is nothing to shard.
-        self.tp_size = get_tensor_model_parallel_world_size()
         self.sp_start_layer = 1 + max(
             (
                 i
@@ -973,18 +1000,9 @@ class Qwen4ExpModel(nn.Module):
         )
 
     def _sequence_parallel(self, num_tokens: int) -> _SequenceParallel | None:
-        min_tokens = envs.ATOM_QWEN4_EXP_SP_MIN_TOKENS
-        if (
-            self.tp_size == 1
-            or self.sp_start_layer >= self.end_layer
-            or min_tokens <= 0
-            or num_tokens < min_tokens
-            or torch.cuda.is_current_stream_capturing()
-        ):
+        if self.sp_start_layer >= self.end_layer:
             return None
-        return _SequenceParallel(
-            num_tokens, self.tp_size, get_tensor_model_parallel_rank()
-        )
+        return _SequenceParallel.maybe(num_tokens)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

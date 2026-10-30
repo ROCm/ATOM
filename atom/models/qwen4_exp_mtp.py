@@ -21,6 +21,7 @@ from atom.models.qwen4_exp import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpForConditionalGeneration,
     _Qwen4ExpQuantizationConfig,
+    _SequenceParallel,
 )
 from atom.quant_spec import LayerQuantConfig
 
@@ -138,14 +139,26 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Large (prefill) extends shard the per-token norms, fc projections
+        and hyper-connections across TP ranks like the target model does."""
         n = hidden_states.shape[0]
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        hidden_states = hidden_states.reshape(n, -1)
+        sp = _SequenceParallel.maybe(n)
+        if sp is not None:
+            inputs_embeds = sp.shard(inputs_embeds)
+            hidden_states = sp.shard(hidden_states)
+        rows = hidden_states.shape[0]
         embedding = self.fc_embedding(self.pre_fc_norm_embedding(inputs_embeds))
-        hidden = self.pre_fc_norm_hidden(hidden_states.reshape(n, -1))
+        hidden = self.pre_fc_norm_hidden(hidden_states)
         hidden = self.fc_hidden(hidden.reshape(-1, self.hidden_size))
-        hidden = hidden.view(n, self.hc_count, self.hidden_size) + embedding[:, None, :]
-        hidden = self.layers[0](positions, hidden.flatten(1), None)
+        hidden = hidden.view(rows, self.hc_count, self.hidden_size)
+        hidden = (hidden + embedding[:, None, :]).flatten(1)
+        if sp is None:
+            hidden = self.layers[0](positions, hidden, None)
+        else:
+            hidden = sp.gather(self.layers[0](positions, hidden, None, sp=sp))
         return hidden.view(n, self.hc_count, self.hidden_size)
 
 

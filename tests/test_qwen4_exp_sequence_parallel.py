@@ -47,17 +47,24 @@ class _Collectives:
 
 @pytest.fixture
 def ranks(monkeypatch):
-    """`ranks(world, fn)` runs `fn(rank)` on `world` simulated TP ranks."""
+    """`ranks(world, fn)` runs `fn(rank)` on `world` simulated TP ranks; outside
+    `ranks` the TP world size is 1."""
     local = threading.local()
     monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: local.group)
     monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_rank", lambda: local.rank)
+    monkeypatch.setattr(
+        qwen4_exp,
+        "get_tensor_model_parallel_world_size",
+        lambda: getattr(local, "world", 1),
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def run(world, fn):
         collectives = _Collectives(world)
 
         def on_rank(rank):
-            local.rank, local.group = rank, collectives.group(rank)
+            local.rank, local.world = rank, world
+            local.group = collectives.group(rank)
             return fn(rank)
 
         with ThreadPoolExecutor(world) as pool:
@@ -124,7 +131,7 @@ class _Layer:
         return hidden, (hidden.sum(1, keepdim=True), hidden[:, :1])
 
 
-def _model(tp, num_layers, ple_layer, return_hc_state, embed, hc=4):
+def _model(num_layers, ple_layer, return_hc_state, embed, hc=4):
     calls = []
     layers = [_Layer(i, i == ple_layer, calls) for i in range(num_layers)]
     hidden = embed.shape[1]
@@ -140,7 +147,6 @@ def _model(tp, num_layers, ple_layer, return_hc_state, embed, hc=4):
         start_layer=0,
         end_layer=num_layers,
         layers=layers,
-        tp_size=tp,
         # As `Qwen4ExpModel.__init__`: the layer after the last PLE layer.
         sp_start_layer=ple_layer + 1,
         hyper_connection_mixer=SimpleNamespace(
@@ -174,11 +180,11 @@ def test_model_forward_matches_unsharded(
     positions = torch.arange(tokens)
     embed = torch.randn(64, 3, dtype=torch.float64)
 
-    reference, _ = _model(1, num_layers, ple_layer, return_hc_state, embed)
+    reference, _ = _model(num_layers, ple_layer, return_hc_state, embed)
     expected = qwen4_exp.Qwen4ExpModel.forward(reference, input_ids, positions)
 
     def on_rank(rank):
-        model, calls = _model(world, num_layers, ple_layer, return_hc_state, embed)
+        model, calls = _model(num_layers, ple_layer, return_hc_state, embed)
         out = qwen4_exp.Qwen4ExpModel.forward(model, input_ids, positions)
         return out, calls
 
