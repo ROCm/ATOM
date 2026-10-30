@@ -21,7 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from .protocol import STREAM_DONE_MESSAGE
+from .protocol import openai_stop_reason
 from .sse import event_frame
 
 logger = logging.getLogger("atom")
@@ -115,8 +115,12 @@ class CodexToolContext:
                 item["namespace"] = namespace
 
 
-def unsupported_responses_parameter(body: dict) -> str | None:
+def unsupported_responses_parameter(
+    body: dict, *, deepseek_v41: bool = False
+) -> str | None:
     """Why this request cannot run on the Python Responses path, or None."""
+    if deepseek_v41:
+        return None
     if body.get("background") is True:
         return _BACKGROUND_MESSAGE
     if body.get("previous_response_id"):
@@ -472,6 +476,27 @@ def _reasoning_text(content: Any) -> str:
 # ── Non-streaming response ──────────────────────────────────────────────
 
 
+def response_status(
+    finish_reason: str | None = None, error: dict | None = None
+) -> dict:
+    status = (
+        "failed"
+        if error
+        else (
+            "incomplete"
+            if openai_stop_reason(finish_reason) == "length"
+            else "completed"
+        )
+    )
+    return {
+        "status": status,
+        "error": error,
+        "incomplete_details": (
+            {"reason": "max_output_tokens"} if status == "incomplete" else None
+        ),
+    }
+
+
 def build_responses_response(
     request_id: str,
     model: str,
@@ -483,14 +508,18 @@ def build_responses_response(
     output_tokens: int = 0,
     cache_read_input_tokens: int = 0,
     created_at: int | None = None,
+    finish_reason: str | None = None,
 ) -> dict:
     """One Responses object from ordered engine events, then Codex rewrite."""
     output = _output_items_from_events(events, request_id, context)
+    terminal = response_status(finish_reason)
+    if terminal["status"] == "incomplete" and output:
+        output[-1]["status"] = "incomplete"
     response = {
         "id": request_id,
         "object": "response",
         "created_at": created_at if created_at is not None else int(time.time()),
-        "status": "completed",
+        **terminal,
         "model": model,
         "output": output,
         "usage": {
@@ -503,6 +532,7 @@ def build_responses_response(
             True if request.parallel_tool_calls is None else request.parallel_tool_calls
         ),
         "store": False,
+        "previous_response_id": None,
         "tools": request.tools or [],
         "metadata": request.metadata or {},
         "tool_choice": (
@@ -611,6 +641,9 @@ class ResponseStreamEmitter:
         self.message_id = f"msg_{uuid.uuid4().hex}"
         self.accumulated_text = ""
         self.reasoning_buffer = ""
+        self.reasoning_item: tuple[int, str] | None = None
+        self.terminated = False
+        self._item_status = "completed"
         self.has_emitted_output_item_added = False
         self.has_emitted_content_part_added = False
         self.current_message_output_index: int | None = None
@@ -651,6 +684,8 @@ class ResponseStreamEmitter:
         ]
 
     def frames_for_events(self, events: list) -> list[str]:
+        if self.terminated:
+            return []
         frames: list[str] = []
         for etype, data in events:
             frames.extend(self._on_event(etype, data))
@@ -661,15 +696,23 @@ class ResponseStreamEmitter:
         *,
         usage: dict | None = None,
         has_tool_calls: bool = False,
+        finish_reason: str | None = None,
+        error: dict | None = None,
     ) -> list[str]:
+        if self.terminated:
+            return []
+        self.terminated = True
+        terminal = response_status(finish_reason, error)
+        self._item_status = (
+            "completed" if terminal["status"] == "completed" else "incomplete"
+        )
         frames: list[str] = []
         frames.extend(self._flush_reasoning())
         if has_tool_calls or any(state.added for state in self.tool_call_items):
             frames.extend(self._finish_tool_calls())
         else:
             frames.extend(self._finish_message())
-        frames.append(self._completed_frame(usage))
-        frames.append(STREAM_DONE_MESSAGE)
+        frames.append(self._terminal_frame(usage, terminal))
         return frames
 
     def error_frame(self, message: str, error_type: str = "api_error") -> str:
@@ -688,8 +731,51 @@ class ResponseStreamEmitter:
         if etype == "reasoning":
             if not data:
                 return []
+            frames = self._close_message_if_open()
+            if self.reasoning_item is None:
+                output_index, item_id = self._allocate("rs")
+                self.reasoning_item = output_index, item_id
+                frames.append(
+                    self._output_item_added(
+                        output_index,
+                        {
+                            "id": item_id,
+                            "type": "reasoning",
+                            "summary": [],
+                            "content": [],
+                            "status": "in_progress",
+                        },
+                    )
+                )
+                frames.append(
+                    self._event(
+                        "response.content_part.added",
+                        {
+                            "type": "response.content_part.added",
+                            "sequence_number": self._next_sequence(),
+                            "output_index": output_index,
+                            "item_id": item_id,
+                            "content_index": 0,
+                            "part": {"type": "reasoning_text", "text": ""},
+                        },
+                    )
+                )
             self.reasoning_buffer += data
-            return []
+            output_index, item_id = self.reasoning_item
+            frames.append(
+                self._event(
+                    "response.reasoning_text.delta",
+                    {
+                        "type": "response.reasoning_text.delta",
+                        "sequence_number": self._next_sequence(),
+                        "output_index": output_index,
+                        "item_id": item_id,
+                        "content_index": 0,
+                        "delta": data,
+                    },
+                )
+            )
+            return frames
         if etype == "content":
             if not data:
                 return []
@@ -708,6 +794,8 @@ class ResponseStreamEmitter:
     def _on_text(self, text: str) -> list[str]:
         frames: list[str] = []
         if self.current_item_id is None:
+            self.accumulated_text = ""
+            self.has_emitted_content_part_added = False
             output_index, item_id = self._allocate("msg")
             item = {
                 "id": item_id,
@@ -732,7 +820,7 @@ class ResponseStreamEmitter:
                         "output_index": output_index,
                         "item_id": item_id,
                         "content_index": 0,
-                        "part": {"type": "text", "text": ""},
+                        "part": {"type": "output_text", "text": ""},
                     },
                 )
             )
@@ -924,6 +1012,7 @@ class ResponseStreamEmitter:
                 }
             if namespace:
                 item["namespace"] = namespace
+            item["status"] = self._item_status
             frames.append(self._output_item_done(state.output_index, item))
         return frames
 
@@ -957,7 +1046,7 @@ class ResponseStreamEmitter:
                         "output_index": output_index,
                         "item_id": item_id,
                         "content_index": 0,
-                        "part": {"type": "text", "text": self.accumulated_text},
+                        "part": {"type": "output_text", "text": self.accumulated_text},
                     },
                 )
             )
@@ -967,7 +1056,7 @@ class ResponseStreamEmitter:
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": self.accumulated_text}],
-                "status": "completed",
+                "status": self._item_status,
             }
             frames.append(self._output_item_done(output_index, item))
         self.current_item_id = None
@@ -979,26 +1068,48 @@ class ResponseStreamEmitter:
         return self._finish_message()
 
     def _flush_reasoning(self) -> list[str]:
-        if not self.reasoning_buffer:
+        if self.reasoning_item is None:
             return []
         text = self.reasoning_buffer
         self.reasoning_buffer = ""
-        output_index, item_id = self._allocate("rs")
+        output_index, item_id = self.reasoning_item
+        self.reasoning_item = None
         item = {
             "id": item_id,
             "type": "reasoning",
             "summary": [],
             "content": [{"type": "reasoning_text", "text": text}],
-            "status": "completed",
+            "status": self._item_status,
         }
         return [
-            self._output_item_added(output_index, item),
+            self._event(
+                "response.reasoning_text.done",
+                {
+                    "type": "response.reasoning_text.done",
+                    "sequence_number": self._next_sequence(),
+                    "output_index": output_index,
+                    "item_id": item_id,
+                    "content_index": 0,
+                    "text": text,
+                },
+            ),
+            self._event(
+                "response.content_part.done",
+                {
+                    "type": "response.content_part.done",
+                    "sequence_number": self._next_sequence(),
+                    "output_index": output_index,
+                    "item_id": item_id,
+                    "content_index": 0,
+                    "part": {"type": "reasoning_text", "text": text},
+                },
+            ),
             self._output_item_done(output_index, item),
         ]
 
-    def _completed_frame(self, usage: dict | None) -> str:
+    def _terminal_frame(self, usage: dict | None, terminal: dict) -> str:
         output = list(self.completed_items)
-        if not output:
+        if not output and terminal["status"] == "completed":
             output = [
                 {
                     "id": self.message_id,
@@ -1011,10 +1122,11 @@ class ResponseStreamEmitter:
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "status": "completed",
+            **terminal,
             "model": self.model,
             "output": output,
             "store": False,
+            "previous_response_id": None,
             "parallel_tool_calls": True,
         }
         if usage is not None:
@@ -1038,10 +1150,11 @@ class ResponseStreamEmitter:
                 req.tool_choice if req.tool_choice is not None else "auto"
             )
         self.context.rewrite_response(response_obj)
+        event_type = "response." + terminal["status"]
         return self._event(
-            "response.completed",
+            event_type,
             {
-                "type": "response.completed",
+                "type": event_type,
                 "sequence_number": self._next_sequence(),
                 "response": response_obj,
             },
@@ -1089,8 +1202,9 @@ def stream_failure_frames(
 ):
     if not opened:
         yield from emitter.opening_frames()
-    yield emitter.error_frame(str(exc))
-    yield STREAM_DONE_MESSAGE
+    yield from emitter.finish_frames(
+        error={"code": "server_error", "message": str(exc)}
+    )
 
 
 def completes_a_tool_call(events) -> bool:

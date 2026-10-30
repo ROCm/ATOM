@@ -69,6 +69,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .deepseek_v41_encoder import normalize_effort, validate_thinking_tool_choice
 from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -111,6 +112,7 @@ from .serving_anthropic import (
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
+    deepseek_chat_stream,
     normalize_chat_tools,
     resolve_thinking,
     stream_chat_response,
@@ -1650,6 +1652,11 @@ async def general_error_handler(request: Request, exc: Exception):
 # ---- Endpoints ----
 
 
+def _is_deepseek_v41() -> bool:
+    # The adapter is selected from checkpoint model_type, not the public alias.
+    return getattr(custom_message_encoder, "name", None) == "encoding_dsv41"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
@@ -1672,7 +1679,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             merged_kwargs["response_format"] = request.response_format
         if isinstance(request.tool_choice, str):
             merged_kwargs["tool_choice"] = request.tool_choice
-        _th_enabled, _th_effort = resolve_thinking(request)
+        _th_enabled, _th_effort = resolve_thinking(
+            request, deepseek_v41=_is_deepseek_v41()
+        )
         if request.thinking is not None or request.reasoning_effort is not None:
             # By the name this template actually reads. `thinking` was
             # hardcoded, which is right for Kimi-K3 and a silent no-op for the
@@ -1681,7 +1690,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             # A template ignores a kwarg it does not know, so the failure was
             # invisible: the model reasoned anyway.
             # Only when the request said something about it. An effort is
-            # not an opt-in, and this is merged after the server defaults and
+            # not an opt-in for generic templates. This is merged after defaults and
             # after the client's own `chat_template_kwargs` -- so writing it
             # unconditionally overrode both.
             if reasoning_toggle is not None and _th_enabled is not None:
@@ -1689,6 +1698,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 merged_kwargs[name] = on_value if _th_enabled else off_value
             if _th_effort is not None:
                 merged_kwargs["thinking_effort"] = _th_effort
+            if _is_deepseek_v41() and _th_enabled is False:
+                merged_kwargs.pop("thinking_effort", None)
+                merged_kwargs.pop("reasoning_effort", None)
+        if _is_deepseek_v41():
+            validate_thinking_tool_choice(request.tool_choice, merged_kwargs)
 
         effective_n = _coerce_n(request.n, request.temperature)
         _validate_return_token_ids(request.return_token_ids, request.stream)
@@ -1806,6 +1820,13 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                )
+            if _is_deepseek_v41():
+                gen = deepseek_chat_stream(
+                    gen,
+                    include_usage=bool(
+                        (request.stream_options or {}).get("include_usage")
+                    ),
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
@@ -2477,7 +2498,22 @@ async def responses_create(raw_request: Request):
     _validate_chunked_receive(kv_transfer_params)
     kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
-    unsupported = unsupported_responses_parameter(body)
+    if _is_deepseek_v41():
+        # DeepSeek's Responses contract is stateless and ignores these fields.
+        body = {
+            k: v
+            for k, v in body.items()
+            if k
+            not in (
+                "background",
+                "previous_response_id",
+                "conversation",
+                "store",
+                "parallel_tool_calls",
+                "max_tool_calls",
+            )
+        }
+    unsupported = unsupported_responses_parameter(body, deepseek_v41=_is_deepseek_v41())
     if unsupported:
         return JSONResponse(
             status_code=400,
@@ -2521,7 +2557,17 @@ async def responses_create(raw_request: Request):
         if isinstance(request.reasoning, dict):
             effort = request.reasoning.get("effort")
             if effort is not None:
-                merged_kwargs["thinking_effort"] = effort
+                if _is_deepseek_v41():
+                    effort = normalize_effort(effort)
+                    merged_kwargs["thinking_mode"] = (
+                        "chat" if effort == "none" else "thinking"
+                    )
+                    merged_kwargs.pop("thinking_effort", None)
+                    merged_kwargs.pop("reasoning_effort", None)
+                    if effort != "none":
+                        merged_kwargs["thinking_effort"] = effort
+                else:
+                    merged_kwargs["thinking_effort"] = effort
 
         prompt = apply_chat_template(
             tokenizer,
@@ -2666,6 +2712,7 @@ async def responses_create(raw_request: Request):
                             for _frame in emitter.finish_frames(
                                 usage=usage,
                                 has_tool_calls=has_tool_calls,
+                                finish_reason=chunk_data.get("finish_reason"),
                             ):
                                 yield _frame
                             break
@@ -2721,6 +2768,7 @@ async def responses_create(raw_request: Request):
             output_tokens=output_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
             created_at=created_at,
+            finish_reason=final_output.get("finish_reason"),
         )
         return _with_kv_transfer_params(response, final_output)
 

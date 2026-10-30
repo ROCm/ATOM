@@ -3,11 +3,13 @@
 
 """Chat completion handler for the OpenAI-compatible API."""
 
+import json
 import logging
 import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from .deepseek_v41_encoder import normalize_effort
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
@@ -21,13 +23,61 @@ from .reasoning import (
     VALID_TEMPLATE_EFFORTS,
     ReasoningChannel,
 )
-from .sse import data_frame
+from .sse import data_frame, iter_sse_data
 from .streaming_dispatch import StreamOutputCollector
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 from .tool_parser.registry import forbids_tool_calls
 from .tool_parser.tool_parser import qualified_tool_name
 
 logger = logging.getLogger("atom")
+
+
+async def deepseek_chat_stream(source, *, include_usage: bool = False):
+    """DeepSeek carries usage on the final choice, never a usage-only chunk."""
+    pending_finish = None
+    try:
+        async for chunk in source:
+            frames = []
+            for data in iter_sse_data(chunk):
+                if data == "[DONE]":
+                    if pending_finish is not None:
+                        frames.append(data_frame(pending_finish))
+                        pending_finish = None
+                    frames.append(STREAM_DONE_MESSAGE)
+                    continue
+                payload = json.loads(data)
+                choices = payload.get("choices")
+                if (
+                    choices == []
+                    and payload.get("usage") is not None
+                    and pending_finish is not None
+                ):
+                    pending_finish["usage"] = payload["usage"]
+                    if "kv_transfer_params" in payload:
+                        pending_finish["kv_transfer_params"] = payload[
+                            "kv_transfer_params"
+                        ]
+                    frames.append(data_frame(pending_finish))
+                    pending_finish = None
+                    continue
+                if pending_finish is not None:
+                    frames.append(data_frame(pending_finish))
+                    pending_finish = None
+                if choices and any(c.get("finish_reason") is not None for c in choices):
+                    pending_finish = payload
+                else:
+                    if choices:
+                        if include_usage:
+                            payload.setdefault("usage", None)
+                        else:
+                            payload.pop("usage", None)
+                    frames.append(data_frame(payload))
+            if frames:
+                yield "".join(frames)
+        if pending_finish is not None:
+            yield data_frame(pending_finish)
+    finally:
+        await source.aclose()
 
 
 # ============================================================================
@@ -87,6 +137,8 @@ def _tool_parser_for_request(parser_cls, tools):
 
 def resolve_thinking(
     request: ChatCompletionRequest,
+    *,
+    deepseek_v41: bool = False,
 ) -> tuple[bool | None, str | int | None]:
     """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
 
@@ -115,6 +167,13 @@ def resolve_thinking(
         effort = thinking.get("effort")
     elif request.reasoning_effort is not None:
         effort = request.reasoning_effort
+    if deepseek_v41:
+        effort = normalize_effort(effort)
+        if effort == "none":
+            return False, None
+        if isinstance(effort, str) and enabled is None:
+            enabled = True
+        return enabled, effort
     if isinstance(effort, (int, float)):
         if type(effort) is not int or not 1 <= effort <= 100:
             raise ValueError("reasoning effort must be an integer in [1, 100]")
@@ -157,6 +216,12 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
     Raises ``ValueError`` (surfaced as HTTP 400) on malformed input so the
     engine is never handed a request the chat template cannot render.
     """
+    if request.stream_options is not None:
+        if request.stream is not True:
+            raise ValueError("stream_options requires stream=true")
+        include_usage = request.stream_options.get("include_usage")
+        if include_usage is not None and type(include_usage) is not bool:
+            raise ValueError("stream_options.include_usage must be a boolean")
     validate_tool_list(request.tools)
 
     tool_choice = request.tool_choice
