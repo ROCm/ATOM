@@ -1887,10 +1887,6 @@ write_metadata() {
 EOF
 }
 
-# ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
-# passes its own torch_profiler_dir (None by default), which overrides the env
-# default in Config, so the profiler is off unless the flag is on the command.
-# One directory per worker keeps P/D ranks that share a node apart.
 # Goes right after server_common, where the shared flag used to be, so a
 # --online_quant_config in a role's extra_args still wins.
 build_online_quant_args() {
@@ -1901,6 +1897,10 @@ build_online_quant_args() {
   out_args=(--online_quant_config "${config}")
 }
 
+# ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
+# passes its own torch_profiler_dir (None by default), which overrides the env
+# default in Config, so the profiler is off unless the flag is on the command.
+# One directory per worker keeps P/D ranks that share a node apart.
 build_torch_profiler_args() {
   local log_name="$1"
   local -n out_args="$2"
