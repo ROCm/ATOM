@@ -7,7 +7,7 @@ The producer packs a decode rank's MLA rows into landing slots of the
 consumer's pool and the consumer scatters them into its paged KV. Everything
 runs on CPU tensors: the NIC is a memmove, the consumer's GPU scatter is a
 memmove over the same segment table, and the ZMQ messages are routed by hand.
-The per-token path is the byte reference, as in test_pd_mla_staging.py.
+The per-token path is the byte reference, as in test_pd_kv_staging.py.
 """
 
 import ctypes
@@ -25,17 +25,20 @@ from atom.kv_transfer.disaggregation.landing_scatter import (
     segment_table,
     segment_table_capacity,
 )
-from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
+from atom.kv_transfer.disaggregation.mooncake.landing import (
     MSG_LANDING_CREDIT,
     MSG_LANDING_READY,
     LandingCredits,
     LandingReceiver,
-    mla_landing_reserve_bytes,
-    mla_landing_table_segments,
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
     pack_slots,
+)
+from atom.kv_transfer.disaggregation.staging_config import (
+    mla_landing_configured,
+    mla_landing_reserve_bytes,
+    mla_landing_table_segments,
 )
 from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
 
@@ -232,11 +235,11 @@ class _Dest:
             device=None,
             pool_slots=pool_slots,
             slot_bytes=slot_rows * TOKEN_BYTES,
-            block_size=BLOCK_SIZE,
+            units_per_page=BLOCK_SIZE,
             consumer_key="consumer:1",
             region_bases=[t.data_ptr() for t in self.regions],
             region_block_bytes=[PAGE_BYTES] * num_regions,
-            mla_regions=list(range(num_regions)),
+            region_indices=list(range(num_regions)),
             send=lambda addr, parts: self.sent.append((addr, parts)),
             finish=lambda req, failed: self.finished.append((req, failed)),
             table_segments=segment_table_capacity(pool_slots * 64),
@@ -839,13 +842,13 @@ def _producer(mc, regions, *, staging_rows=None):
     conn._nic = _Nic()
     conn._rdma_write = conn._nic.write
     if staging_rows:
-        conn._mla_staging = torch.empty(
+        conn._kv_staging = torch.empty(
             (2, staging_rows * TOKEN_BYTES), dtype=torch.uint8
         )
-        conn._mla_staging_slots = mc.SlotPool(2)
+        conn._kv_staging_slots = mc.SlotPool(2)
         conn._stream = _Stream()
         conn._send_worker_stream = lambda: conn._stream
-        conn._mla_token_views = {
+        conn._kv_source_views = {
             i: t.view(-1, TOKEN_BYTES) for i, t in enumerate(regions)
         }
         conn._landing_credits = LandingCredits()
@@ -881,8 +884,8 @@ def _landed_vs_per_token(
 ):
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
-    monkeypatch.setattr(mc, "MLA_LANDING_CREDIT_WAIT_S", credit_wait_ms / 1000)
+    monkeypatch.setattr(mc, "LANDING_MIN_SLOTS", 1)
+    monkeypatch.setattr(mc, "LANDING_CREDIT_WAIT_S", credit_wait_ms / 1000)
     num_regions = 3
     regions = _source_regions(num_regions, 40)
     rng = np.random.default_rng(dcp_size * 10 + dcp_rank + num_src)
@@ -916,12 +919,14 @@ def _landed_vs_per_token(
         dest.recv.on_ready(msgpack.loads(payload))
 
     new._send_on_socket = route
-    uploads = []
-    upload = new._upload_mla_gather_index
-    new._upload_mla_gather_index = lambda index, event: (
-        uploads.append(index.size) or upload(index, event)
-    )
-    new.uploads = uploads
+    write_slot = new._write_staging_slot
+    new.gather_indices = []
+
+    def track_index(stream, plan, index, *args, **kwargs):
+        new.gather_indices.append(index.data_ptr())
+        return write_slot(stream, plan, index, *args, **kwargs)
+
+    new._write_staging_slot = track_index
     stop = threading.Event()
 
     def pump():
@@ -948,7 +953,7 @@ def _landed_vs_per_token(
             time.sleep(0.005)
         stop.set()
         pumper.join()
-    dest.recv.stage_done("req", 0, 5, True, request.get("_mla_landed", []))
+    dest.recv.stage_done("req", 0, 5, True, request.get("_landed_slots", []))
     assert dest.finished == [("req", False)]
     for got, want in zip(dest.regions, reference):
         assert torch.equal(got, want)
@@ -966,7 +971,7 @@ def test_landed_mla_matches_per_token_bytes(monkeypatch, dcp_size, dcp_rank, num
         pool_slots=2,
     )
     labels = [label for label, _ in new._nic.labels]
-    assert set(labels) == {"landed-mla"}
+    assert set(labels) == {"landed-kv"}
     # One descriptor per landing slot.
     assert all(n == 1 for _, n in new._nic.labels)
 
@@ -984,17 +989,17 @@ def test_landing_falls_back_to_staged_pages_without_credits(monkeypatch):
         credit_wait_ms=0,
     )
     labels = [label for label, _ in new._nic.labels]
-    assert labels[0] == "landed-mla"
-    assert labels.count("landed-mla") == 1
-    assert "staged-mla" in labels
+    assert labels[0] == "landed-kv"
+    assert labels.count("landed-kv") == 1
+    assert "staged-kv" in labels
     # The staged rest reuses the index uploaded for landing.
-    assert len(new.uploads) == 1
+    assert len(set(new.gather_indices)) == 1
 
 
 def test_small_transfers_keep_the_staged_path(monkeypatch):
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 2)
+    monkeypatch.setattr(mc, "LANDING_MIN_SLOTS", 2)
     regions = _source_regions(1, 8)
     new = _producer(mc, regions, staging_rows=512)
     dst = [torch.zeros((8, PAGE_BYTES), dtype=torch.uint8)]
@@ -1009,8 +1014,8 @@ def test_small_transfers_keep_the_staged_path(monkeypatch):
     assert mc.MooncakeConnector._execute_block_transfer(
         new, request, "consumer:1", [0, 1, 2, 3], [5], "req", object()
     )
-    assert [label for label, _ in new._nic.labels] == ["staged-mla"]
-    assert "_mla_landed" not in request
+    assert [label for label, _ in new._nic.labels] == ["staged-kv"]
+    assert "_landed_slots" not in request
 
 
 def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
@@ -1021,8 +1026,8 @@ def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
     # stage 1 may still overwrite.
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
-    monkeypatch.setattr(mc, "MLA_LANDING_CREDIT_WAIT_S", 0)
+    monkeypatch.setattr(mc, "LANDING_MIN_SLOTS", 1)
+    monkeypatch.setattr(mc, "LANDING_CREDIT_WAIT_S", 0)
     dest = _Dest(num_regions=1, pool_slots=2, slot_rows=16)
     dest.recv.advertise("stage0", 2)
     landing = dest.recv.advertise("stage1", 2)
@@ -1060,8 +1065,8 @@ def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
     resume.set()
     writer.join(timeout=10)
     assert result == [True]
-    assert [label for label, _ in stage1._nic.labels] == ["staged-mla"]
-    dest.recv.stage_done("req", 1, 5, True, request.get("_mla_landed", []))
+    assert [label for label, _ in stage1._nic.labels] == ["staged-kv"]
+    dest.recv.stage_done("req", 1, 5, True, request.get("_landed_slots", []))
     assert dest.finished == [("req", True)]
 
 
@@ -1071,7 +1076,7 @@ def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
     # and the stage loses the credit for good.
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
+    monkeypatch.setattr(mc, "LANDING_MIN_SLOTS", 1)
     dest = _Dest(num_regions=1, pool_slots=1, slot_rows=16)
     landing = dest.recv.advertise("stage0", 1)
     dest.recv.begin("req", 5, [3], {0: "stage0"})
@@ -1088,7 +1093,7 @@ def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
         mc.MooncakeConnector._execute_block_transfer(
             new, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
         )
-    assert [label for label, _ in new._nic.labels] == ["landed-mla"]
+    assert [label for label, _ in new._nic.labels] == ["landed-kv"]
 
     # What _execute_transfer's handler then sends.
     sent = []
@@ -1106,7 +1111,8 @@ def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "outcome", ["failed", "past-deadline", "deadline-while-waiting-for-staging"]
+    "outcome",
+    ["failed", "exception", "past-deadline", "deadline-while-waiting-for-staging"],
 )
 def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
     # Mooncake gives up on a sync write without cancelling what it posted, so
@@ -1118,7 +1124,7 @@ def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
     mc = _mooncake()
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
+    monkeypatch.setattr(mc, "LANDING_MIN_SLOTS", 1)
     dest = _Dest(num_regions=1, pool_slots=2, slot_rows=16)
     landing = dest.recv.advertise("stage0", 1)
     new = _producer(mc, _source_regions(1, 8), staging_rows=16)
@@ -1127,30 +1133,49 @@ def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
     request["mla_landing"] = landing
     if outcome == "failed":
         new._rdma_write = lambda *_a, **_k: False
+    elif outcome == "exception":
+
+        def failed_after_submission(*args, **kwargs):
+            raise RuntimeError("NIC submission uncertain")
+
+        new._rdma_write = failed_after_submission
     elif outcome == "past-deadline":
         request["_deadline"] = time.monotonic() - 1
     else:
         request["_deadline"] = time.monotonic() + 0.05
-        acquire = new._mla_staging_slots.acquire
+        acquire = new._kv_staging_slots.acquire
 
         def acquire_late():
             time.sleep(0.1)  # the other send workers hold every staging slot
             return acquire()
 
-        new._mla_staging_slots.acquire = acquire_late
+        new._kv_staging_slots.acquire = acquire_late
         new._rdma_write = mc.MooncakeConnector._rdma_write.__get__(new)
         new.transfer_engine = None  # never reached: the deadline passed
-    assert not mc.MooncakeConnector._execute_block_transfer(
-        new, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
-    )
-    assert "_mla_landed" not in request  # nothing to announce
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="NIC submission uncertain"):
+            mc.MooncakeConnector._execute_block_transfer(
+                new, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
+            )
+    else:
+        assert not mc.MooncakeConnector._execute_block_transfer(
+            new, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
+        )
+    assert "_landed_slots" not in request  # nothing to announce
     credits = new._landing_credits
     got = {credits.acquire("consumer:1", landing["epoch"], 0) for _ in range(3)}
-    if outcome == "failed":
+    if outcome in ("failed", "exception"):
         assert got == {landing["slots"][0], None}
     else:
         assert got == set(landing["slots"]) | {None}
-    assert new._mla_staging_slots.free  # the source slot goes back either way
+    if outcome in ("failed", "exception"):
+        assert new._kv_staging_failed
+        assert len(new._kv_staging_slots.free) == 1  # failed source slot is retained
+        with pytest.raises(RuntimeError, match="staging row unavailable"):
+            new._kv_staging_slots.acquire()
+    else:
+        assert sorted(new._kv_staging_slots.free) == [0, 1]
+        assert not new._kv_staging_failed
 
 
 def test_quarantined_credits_come_back_after_the_hold(monkeypatch):
@@ -1182,19 +1207,19 @@ def test_write_done_reports_landed_slots_only_when_offered():
     conn = object.__new__(mc.MooncakeConnector)
     conn.pp_rank = 2
     conn.tp_rank = 0
-    conn._mla_staging = torch.empty(0, dtype=torch.uint8)
+    conn._kv_staging = torch.empty(0, dtype=torch.uint8)
     sent = []
     conn._send_on_socket = lambda path, parts, repeat=1: sent.append(parts)
     base = {"notify_host": "h", "notify_port": 1, "request_id": "r"}
     conn._notify_transfer_result(dict(base), success=True)
     conn._notify_transfer_result(
-        {**base, "mla_landing": {}, "_mla_landed": [4, 4, 5]}, success=True
+        {**base, "mla_landing": {}, "_landed_slots": [4, 4, 5]}, success=True
     )
     conn._notify_transfer_result({**base, "mla_landing": {}}, success=True)
     # A None offer is no offer, as for the write listener and the transfer.
     conn._notify_transfer_result({**base, "mla_landing": None}, success=True)
     # A stage without an MLA staging pool cannot land, offer or not.
-    conn._mla_staging = None
+    conn._kv_staging = None
     conn._notify_transfer_result({**base, "mla_landing": {}}, success=True)
     landed = [msgpack.loads(p[1])["landed_slots"] for p in sent]
     assert landed == [None, [4, 4, 5], [], None, None]
@@ -1222,7 +1247,7 @@ def test_landing_requests_complete_through_the_receiver():
     mc = _mooncake()
     dest = _Dest()
     conn = object.__new__(mc.MooncakeConnector)
-    conn._mla_landing = dest.recv
+    conn._landing = dest.recv
     conn._completion_lock = threading.Lock()
     conn._fence_lock = threading.Lock()
     conn._blocks_pending_fence = []
@@ -1326,7 +1351,7 @@ def _listen(monkeypatch, mc, listener, messages):
 
 def _consumer(mc, dest):
     conn = object.__new__(mc.MooncakeConnector)
-    conn._mla_landing = dest.recv
+    conn._landing = dest.recv
     return conn
 
 
@@ -1601,18 +1626,18 @@ def test_landing_is_built_only_where_it_was_reserved(monkeypatch):
     conn = object.__new__(mc.MooncakeConnector)
     conn._block_region_roles = [MLA_KV_ROLE]
     conn._has_slot_regions = False
-    assert conn._build_mla_landing() is None  # nothing reserved
+    assert conn._build_landing() is None  # nothing reserved
     both = {"kv_connector": "mooncake", "kv_role": "kv_both"}
-    assert not mc.mla_landing_configured(_config(both))
+    assert not mla_landing_configured(_config(both))
     consumer = _config({"kv_connector": "mooncake", "kv_role": "kv_consumer"})
-    assert mc.mla_landing_configured(consumer)
+    assert mla_landing_configured(consumer)
     assert mla_landing_table_segments(consumer) * 24 + (256 << 20) == (LANDING_RESERVE)
 
 
 def test_the_scatter_table_goes_up_row_by_row_in_chunks(monkeypatch):
     # A [:, :n] slice of the [3, capacity] table is not contiguous, so
     # copy_ staged it through a pageable host buffer and waited for it.
-    from atom.kv_transfer.disaggregation.mooncake import mla_landing as ml
+    from atom.kv_transfer.disaggregation.mooncake import landing as ml
 
     dest = _Dest()
     recv = dest.recv
