@@ -111,6 +111,44 @@ def test_unquantized_and_per_tensor_are_not_shuffled():
     assert weight_is_stored_preshuffled(QuantType.per_Tensor, dtypes.fp8) is False
 
 
+@pytest.mark.parametrize(
+    "env_value,gfx,expected",
+    [("1", "gfx950", True), ("0", "gfx950", False), ("1", "gfx942", False)],
+)
+def test_native_1x32_fp8_follows_its_env_var_on_gfx950(
+    monkeypatch, env_value, gfx, expected
+):
+    """A native MXFP8 (1x32) weight is held preshuffled only where AITER's
+    preshuffled group32 GEMM reads it (gfx950); the load and the sync both ask
+    here."""
+    monkeypatch.setenv("ATOM_MXFP8_1X32_PRESHUFFLE", env_value)
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx", lambda: gfx)
+    assert (
+        weight_is_stored_preshuffled(
+            QuantType.per_1x32, dtypes.fp8, native_group_rows=1
+        )
+        is expected
+    )
+
+
+def test_native_1x32_flag_leaves_fp4_and_group32_alone(monkeypatch):
+    monkeypatch.setenv("ATOM_MXFP8_1X32_PRESHUFFLE", "1")
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "0")
+    monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx", lambda: "gfx950")
+    assert (
+        weight_is_stored_preshuffled(
+            QuantType.per_1x32, dtypes.fp4x2, native_group_rows=1
+        )
+        is False
+    )
+    assert (
+        weight_is_stored_preshuffled(
+            QuantType.per_1x32, dtypes.fp8, native_group_rows=32
+        )
+        is False
+    )
+
+
 def test_mxfp4_preshuffle_selects_a_compatible_backend(monkeypatch):
     monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
     monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
