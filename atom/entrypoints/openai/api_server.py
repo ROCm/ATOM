@@ -2129,14 +2129,16 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     # a 500 -- wrong for a malformed request, and once the response is
     # streaming it arrives after the client was told the request succeeded.
     try:
+        validate_model(request.model)
         validate_tool_list(anthropic_to_openai_tools(request.tools))
         validate_max_tokens(request.max_tokens)
-    except ValueError as exc:
+    except (ValueError, HTTPException) as exc:
+        message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         return JSONResponse(
             status_code=400,
             content={
                 "type": "error",
-                "error": {"type": "invalid_request_error", "message": str(exc)},
+                "error": {"type": "invalid_request_error", "message": message},
             },
         )
 

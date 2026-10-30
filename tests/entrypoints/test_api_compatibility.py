@@ -754,6 +754,43 @@ def test_responses_accepts_served_alias_like_chat(server, stream, model):
     assert server.generations == 1
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", ["different-model", "", "renamed-model-extra"])
+def test_messages_rejects_unknown_model_before_render_or_enqueue(server, stream, model):
+    response = post(
+        "/v1/messages",
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["type"] == "error"
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "does not match" in response.json()["error"]["message"]
+    assert server.templates == []
+    assert server.generations == 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("model", ["renamed-model", "renamed-model/"])
+def test_messages_accepts_served_alias_like_chat(server, stream, model):
+    response = post(
+        "/v1/messages",
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert server.generations == 1
+
+
 def test_http_error_handler_preserves_status_headers_and_other_routes():
     from fastapi import HTTPException
     from starlette.requests import Request
