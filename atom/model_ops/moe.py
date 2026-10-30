@@ -6,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
-from functools import lru_cache
+from functools import cached_property, lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -1482,9 +1482,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self._fused_moe_prequantizes = lru_cache(maxsize=64)(
             self._fused_moe_prequantizes
         )
-        self._fp4_rows_wire = resolve_routed_rows_wire(
-            moe.in_dtype, moe.hidden_dim, fp4=True
-        )
         self.quant_config = quant_config
         self.quant_type = quant_config.quant_type
         self.quant_dtype = quant_config.quant_dtype
@@ -2088,6 +2085,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_bias=layer.w2_bias,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
+        )
+
+    @cached_property
+    def _fp4_rows_wire(self):
+        return resolve_routed_rows_wire(
+            self.moe.in_dtype, self.moe.hidden_dim, fp4=True
         )
 
     def gathered_rows_wire(self, layer, rows):
