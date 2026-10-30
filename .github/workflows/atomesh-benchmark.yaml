@@ -128,11 +128,11 @@ on:
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32,
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c48,
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c56,
-            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72,
-            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-opus,
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-opus
 
           Kimi-K3 (profile suite, 30 s torch trace from 15 min into profiling):
-            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-torch-profile
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-opus-torch-profile
 
           Kimi-K2.5:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,

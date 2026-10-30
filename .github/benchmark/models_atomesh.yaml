@@ -1009,7 +1009,8 @@ models:
         # The decode runs the recipe: the drafter's linears unquantized,
         # max_num_seqs 2 * CONC (at least 32), ReplaySSM and a 128 GiB per-rank
         # CPU tier from CONC 16, comm-group reuse from CONC 56. CONC 32 and 88
-        # are not in the recipe and take the neighbouring band. From CONC 48 the
+        # are not in the recipe: each takes the settings of the recipe point
+        # below it, CONC 16 and 72, except max_num_seqs. From CONC 48 the
         # prefill's state cache is the PD recipe's
         # (recipes/mesh/Agentic-Kimi-K3.md): on-demand KDA checkpoints at
         # observed shared-prefix targets, and a 128 GiB state cap carved from a
@@ -1058,7 +1059,7 @@ models:
             benchmark: *agentic_1m_aiperf
             run_eval: false
           name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c1-mono
-          display_topology: 1P1D-TP8EP8-TP8-DSPARK7
+          display_topology: 1P1D-TP8EP8-TP8-DSPARK7-MONO
           concurrency: [1]
           prefill: &kimi_k3_tp8ep8_prefill
             workers: 1
@@ -1192,6 +1193,7 @@ models:
         # eager, since a P/D producer never decodes. It also keeps the unsharded
         # KDA gate GEMM (f_b_proj, N 12288, K 128) in bf16: aiter has no tuned
         # FP8 config for that shape, and its untuned FP8 GEMM needs K above 192.
+        # Drop the exclusion once aiter's FP8 GEMM serves K 128.
         #
         # Each PP8 stage repacks its KV for the TP8xDCP8 decode on the MLA
         # staging streams; at high priority a repack does not wait out the
@@ -1257,12 +1259,14 @@ models:
             prefill: *kimi_k3_pp8_state128_prefill_env
             decode: *kimi_k3_pd_decode_env
 
-        # From CONC 72 the decode's MLA runs on aiter's OPUS kernel. Its error
-        # against fp32 is larger than the asm kernel's, but GSM8K held at
-        # CONC 72; lower concurrencies are unmeasured.
+        # From CONC 72 the decode's MLA runs on aiter's OPUS kernel, which the
+        # names and dashboard labels carry. Its error against fp32 is larger
+        # than the asm kernel's, but GSM8K held at CONC 72; lower concurrencies
+        # are unmeasured.
         - &kimi_k3_1p1d_pp8_dcp8_c72
           <<: *kimi_k3_1p1d_pp8_dcp8_c56
-          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-opus
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK4-OPUS
           concurrency: [72]
           server:
             common_args:
@@ -1281,7 +1285,8 @@ models:
         # flight instead of one per stage, and each rank saves and loads the
         # CPU tier on two threads.
         - <<: *kimi_k3_1p1d_pp8_dcp8_c56
-          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-opus
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK4-OPUS
           concurrency: [88]
           server:
             common_args:
@@ -1302,7 +1307,7 @@ models:
       # C72 cell it otherwise matches.
       profile:
         - <<: *kimi_k3_1p1d_pp8_dcp8_c72
-          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-torch-profile
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-opus-torch-profile
           run_eval: false
           env:
             common:

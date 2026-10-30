@@ -30,8 +30,8 @@ they add on top.
 |---:|---|---:|---|---:|
 | 48 | `dspark4-agentic-lmcache-1m-c48` | 96 | 1…480 | 0 |
 | 56 | `dspark4-agentic-lmcache-1m-c56` | 112 | 1…560 | 1 |
-| 72 | `dspark4-agentic-lmcache-1m-c72` | 144 | 1…720 | 1 |
-| 88 | `dspark4-agentic-lmcache-1m-c88` | 176 | 1…880 | 1 |
+| 72 | `dspark4-agentic-lmcache-1m-c72-opus` | 144 | 1…720 | 1 |
+| 88 | `dspark4-agentic-lmcache-1m-c88-opus` | 176 | 1…880 | 1 |
 
 Every case has the prefix `kimi-k3-mxfp4-1p1d-pp8-dcp8-` and uses the same
 128 GiB state cap, 224 GiB shared CPU pool, and on-demand setting. The
@@ -186,5 +186,6 @@ each concurrency for 3,600 seconds with 10 warmup requests per lane.
 
 For CI, select `ATOMesh Benchmark`, suite `nightly`, model `Kimi-K3-MXFP4`,
 and one exact case name, for example
-`kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72`, which runs the
-PP8 prefill rather than the TP8/DCP8 prefill above.
+`kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-opus`, which runs
+the PP8 prefill rather than the TP8/DCP8 prefill above, and from C72 the
+decode's MLA on aiter's OPUS kernel (the `-opus` suffix).
