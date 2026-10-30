@@ -177,13 +177,18 @@ class LaunchTest(unittest.TestCase):
                                      *((c, f"N3966-{tag}") for c in (72, 88) for tag in (
                                          "SDROP", "BF16-KVB-TH-SDROP", "SDROP-GX", "BF16-KVB-TH-SDROP-GX",
                                          "BF16-GX")),
-                                     *((c, "N3966-BF16-GX") for c in (16, 32, 48, 56))):
+                                     *((c, "N3966-BF16-GX") for c in (16, 32, 48, 56)),
+                                     *((c, "N3966-BF16-GX-H96OPUS") for c in (56, 72, 88))):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
             if variant.startswith("N3966"):
                 # 3966924d fuses MLA g_proj into fused_qkv_a_proj: 24 fewer PTPC modules, same weights.
                 env = candidate["roles"]["prefill"]["env"]
+                if variant.endswith("-H96OPUS"):
+                    for key in ("C48_D_MLA_NATIVE96", "AITER_MLA_USE_OPUS"):
+                        self.assertEqual(candidate["roles"]["decode"]["env"].pop(key), "1")
+                    variant = variant.removesuffix("-H96OPUS")
                 if variant.endswith("-GX"):
                     # D FULL decode graphs up to 102 requests x 5 tokens, the 512-token step budget.
                     cc = candidate["roles"]["decode"]["args"]["compilation-config"]

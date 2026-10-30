@@ -248,6 +248,14 @@ def drop_superseded_states():
     KVCacheStoreSendingThread._maybe_offload_boundary_states = patched
 
 
+# AITER dispatcher sha256 -> whether its OPUS fp8 CPRR decode also takes the native 96-head metadata.
+NATIVE96_MLA = {
+    "6f6a902ab55fd78c8323e848144d181f72b683a4e0f7eaafb7550f529109050a": False,
+    # 3966924d: OPUS vs fp32 reference 0.003 at 96 heads, same as ASM.
+    "6eae0cd4cfe0724a0b4eae8f397594dbe30f2f69f34ddc434da7d90a6e5ce2f8": True,
+}
+
+
 def enable_native_mla_96(config):
     """Opt-in native 96-head CPRR control for the pinned K3 decode recipe."""
     if os.environ.get("C48_D_MLA_NATIVE96") != "1":
@@ -263,14 +271,14 @@ def enable_native_mla_96(config):
             or config.cache_config.cache_dtype != "fp8"
             or config.speculative_config.num_speculative_tokens != 4
             or config.model_config.hf_text_config.num_attention_heads != 96
-            or os.environ.get("VLLM_ROCM_AITER_MLA_DCP_VERIFY") != "asm"
-            or os.environ.get("AITER_MLA_USE_OPUS", "0") != "0"):
-        raise ValueError("Native96 requires decode TP8/DCP8, PP1/PCP1, interleave=1, FP8, four drafts and ASM without OPUS")
+            or os.environ.get("VLLM_ROCM_AITER_MLA_DCP_VERIFY") != "asm"):
+        raise ValueError("Native96 requires decode TP8/DCP8, PP1/PCP1, interleave=1, FP8, four drafts and ASM")
     mla = importlib.import_module("aiter.mla")
     backend = importlib.import_module("vllm.v1.attention.backends.mla.rocm_aiter_mla")
     mla_hash = hashlib.sha256(Path(mla.__file__).read_bytes()).hexdigest()
-    if mla.get_gfx() != "gfx950" or mla_hash != "6f6a902ab55fd78c8323e848144d181f72b683a4e0f7eaafb7550f529109050a":
-        raise RuntimeError(f"Native96 requires the pinned gfx950 AITER dispatcher, got {mla_hash}")
+    opus = os.environ.get("AITER_MLA_USE_OPUS", "0") != "0"
+    if mla.get_gfx() != "gfx950" or mla_hash not in NATIVE96_MLA or (opus and not NATIVE96_MLA[mla_hash]):
+        raise RuntimeError(f"Native96 (OPUS={opus}) requires a pinned gfx950 AITER dispatcher, got {mla_hash}")
     kernel = (Path(mla.__file__).resolve().parents[1] / "aiter_meta/hsa/gfx950/mla"
               / "mla_a8w8_qh32_qseqlen4_gqaratio32_lse_cprr_ps.co")
     if not kernel.is_file():
@@ -395,9 +403,12 @@ class ManifestWorker(Worker):
             aiter = importlib.import_module("aiter")
             mla = importlib.import_module("aiter.mla")
             source = Path(mla.__file__).read_bytes()
-            assert callable(getattr(aiter, "opus_mla_decode_fp8_fwd", None)), "AITER lacks FP8 MLA OPUS"
+            # 3966924d folds the fp8 build into opus_mla_decode_fwd (picked by dtype); require the one the dispatcher calls.
+            ops = [n for n in ("opus_mla_decode_fp8_fwd", "opus_mla_decode_fwd")
+                   if callable(getattr(aiter, n, None)) and f"aiter.{n}(".encode() in source]
+            assert ops, "AITER lacks FP8 MLA OPUS"
             assert b"AITER_MLA_USE_OPUS" in source, "AITER MLA dispatcher lacks the OPUS switch"
-            data["aiter_mla_opus"] = {"operator_available": True, "module_path": mla.__file__,
+            data["aiter_mla_opus"] = {"operator_available": True, "operator": ops[0], "module_path": mla.__file__,
                                       "module_sha256": hashlib.sha256(source).hexdigest()}
         if os.environ.get("C48_MOONCAKE_DCP_TRANSFER") == "1":
             import hashlib
