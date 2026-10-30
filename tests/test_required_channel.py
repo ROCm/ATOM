@@ -88,8 +88,42 @@ def test_k3_opens_the_tools_channel_where_its_response_closes():
     assert K3_CHANNEL == RequiredChannel(
         after=(CLOSE, RESPONSE, SEP),
         opening=(OPEN, TOOLS, SEP, OPEN, CALL, TOOL_ATTR, EQ_QUOTE),
-        end_ids=(EOS, END_OF_MSG),
+        end_ids=(END_OF_MSG,),
     )
+
+
+def test_engine_holds_back_every_id_it_stops_on():
+    """The format names `<|end_of_msg|>`; the engine also stops on its EOS
+    and `stop_token_ids`, and a stop id left out would end the message before
+    the channel opens."""
+    from atom.model_engine.llm_engine import InputOutputProcessor
+
+    io = InputOutputProcessor.__new__(InputOutputProcessor)
+    io.config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(),
+        eos_token_id=EOS,
+        stop_token_ids=[END_OF_MSG, 7],
+        enable_dp_attention=False,
+    )
+    io.block_size = 16
+    io.num_speculative_tokens = 0
+    io.has_per_req_cache = False
+    io.segment_tokenizer = None
+    io.requests = {}
+    params = SamplingParams(required_channel=K3_CHANNEL)
+
+    (seq,) = io.preprocess_fanout([1, 2, 3], params)
+
+    assert seq.required_channel.end_ids == (7, EOS, END_OF_MSG)
+    assert seq.required_channel.after == K3_CHANNEL.after
+    assert seq.required_channel.opening == K3_CHANNEL.opening
+    assert params.required_channel is K3_CHANNEL  # the caller's is untouched
+
+
+def test_ending_on_adds_only_real_ids():
+    ch = _toy_channel()
+    assert ch.ending_on([None, -1, 2]) is ch
+    assert ch.ending_on([5, 2, 3]).end_ids == (2, 3, 5)
 
 
 def test_k3_constrains_nothing_when_its_control_tokens_split():

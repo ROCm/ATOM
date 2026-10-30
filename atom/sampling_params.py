@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 UNCONSTRAINED = -1
 """The channel state of a sequence whose request requires no channel."""
@@ -71,6 +71,18 @@ class RequiredChannel:
         for token_id in token_ids:
             state = self.step(state, int(token_id))
         return state
+
+    def ending_on(self, stop_ids: Iterable[int | None]) -> "RequiredChannel":
+        """This channel, also holding back ``stop_ids``.
+
+        The format names the ids that end its own message; the engine may end
+        a sequence on more (its EOS and ``stop_token_ids``), and any it does
+        not hold back would end the message before the channel opens."""
+        end_ids = set(self.end_ids)
+        end_ids.update(i for i in stop_ids if i is not None and i >= 0)
+        if len(end_ids) == len(self.end_ids):
+            return self
+        return replace(self, end_ids=tuple(sorted(end_ids)))
 
 
 @dataclass

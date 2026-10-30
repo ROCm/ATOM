@@ -259,13 +259,12 @@ class KimiK3Parser(ToolCallParser):
         def ids(text: str) -> tuple[int, ...]:
             return tuple(tokenizer.encode(text, add_special_tokens=False))
 
-        end_ids = set(ids(k3.END_OF_MSG))
-        if tokenizer.eos_token_id is not None:
-            end_ids.add(tokenizer.eos_token_id)
+        # The format's own end only: the engine adds every id it stops on
+        # (`RequiredChannel.ending_on`), from the same config it stops by.
         return RequiredChannel(
             after=ids(k3.RESPONSE_END),
             opening=ids(k3.TOOLS_START + KIMI_K3_CALL_PREFIX),
-            end_ids=tuple(sorted(end_ids)),
+            end_ids=ids(k3.END_OF_MSG),
         )
 
     @classmethod
