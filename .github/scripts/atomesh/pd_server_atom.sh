@@ -244,8 +244,6 @@ REQUEST_RATE="${REQUEST_RATE:-inf}"
 
 RUN_EVAL="${RUN_EVAL:-false}"
 EVAL_TASK="${EVAL_TASK:-gsm8k}"
-# EVAL_TASK may name several tasks, comma-separated (e.g. gsm8k,kimi_tool_call).
-eval_task_has() { [[ ",${EVAL_TASK// /}," == *",$1,"* ]]; }
 EVAL_FEWSHOT="${EVAL_FEWSHOT:-3}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 EVAL_MODEL_TYPE="${EVAL_MODEL_TYPE:-local-completions}"
@@ -776,7 +774,7 @@ if [[ -n "${NUM_SPEC_TOKENS}" ]]; then
   server_common+=(--num-speculative-tokens "${NUM_SPEC_TOKENS}")
 fi
 spec_decode_acceptance_for_server="${SPEC_DECODE_ACCEPTANCE_LENGTH}"
-if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]] && { eval_task_has gsm8k || eval_task_has kimi_tool_call; }; then
+if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]] && { [[ ",${EVAL_TASK// /}," == *",gsm8k,"* ]] || [[ ",${EVAL_TASK// /}," == *",kimi_tool_call,"* ]]; }; then
   spec_decode_acceptance_for_server=""
   echo "[runtime] omitting spec-decode-acceptance-length for ${EVAL_TASK} eval phase"
 fi
@@ -2607,25 +2605,6 @@ PY
   fi
 }
 
-run_eval() {
-  [[ "${RUN_EVAL}" == "true" ]] || [[ "${RUN_EVAL}" == "1" ]] || return 0
-  if [[ "${EVAL_TASK}" == "swebench_lite" ]]; then
-    run_swebench_lite_eval
-    return
-  fi
-  local rc=0
-  if eval_task_has gsm8k; then
-    run_gsm8k_eval || rc=1
-  fi
-  if eval_task_has kimi_tool_call; then
-    run_kimi_tool_call_eval || rc=1
-  fi
-  if ! eval_task_has gsm8k && ! eval_task_has kimi_tool_call; then
-    echo "[eval] unsupported task ${EVAL_TASK}; skipping"
-  fi
-  return "${rc}"
-}
-
 # The Kimi-Vendor-Verifier tool-call suite exactly as InferenceX runs it:
 # kimi_tool_call_schema_full (204 schemas x stream/non-stream = 408 cases,
 # tool_choice=required, strict, T=1) through InferenceX's adapter, at the
@@ -2635,7 +2614,9 @@ KIMI_VERIFIER_SHA256=ede9ea300c72ccfde9d8975ea4b1b54e423c7625690f6631ab1e65a7158
 INFERENCEX_ADAPTER_REF=f8eceffc1f69f832c41fe7f8ec9cecac4f7217d1
 run_kimi_tool_call_eval() {
   local tag
-  tag="$(date +%Y%m%d%H%M%S)_kimi_tool_call_${TOPOLOGY}_c${CONC_LIST%%,*}"
+  local tag_conc="${CONC_LIST:-}"
+  tag_conc="${tag_conc%%,*}"
+  tag="$(date +%Y%m%d%H%M%S)_kimi_tool_call_${TOPOLOGY}_c${tag_conc:-1}"
   local result_dir="${RUN_DIR}/eval_results/${tag}"
   local work="${RUN_DIR}/eval_results/kimi_tool_call_work"
   mkdir -p "${result_dir}" "${work}"
@@ -2688,7 +2669,22 @@ PY
   return "${rc}"
 }
 
-run_gsm8k_eval() {
+run_eval() {
+  [[ "${RUN_EVAL}" == "true" ]] || [[ "${RUN_EVAL}" == "1" ]] || return 0
+  if [[ "${EVAL_TASK}" == "swebench_lite" ]]; then
+    run_swebench_lite_eval
+    return
+  fi
+  local tool_rc=0
+  if [[ ",${EVAL_TASK// /}," == *",kimi_tool_call,"* ]]; then
+    run_kimi_tool_call_eval || tool_rc=1
+  fi
+  if ! [[ ",${EVAL_TASK// /}," == *",gsm8k,"* ]]; then
+    if ! [[ ",${EVAL_TASK// /}," == *",kimi_tool_call,"* ]]; then
+      echo "[eval] unsupported task ${EVAL_TASK}; skipping"
+    fi
+    return "${tool_rc}"
+  fi
   if ! command -v lm_eval >/dev/null 2>&1; then
     python3 -m pip install 'lm-eval[api]'
   fi
@@ -2726,7 +2722,9 @@ run_gsm8k_eval() {
     [[ -n "${eval_conc}" ]] || continue
     # Named by the perf point's concurrency so the dashboard attaches the score
     # to that point whatever concurrency the eval itself ran at.
-    tag="$(date +%Y%m%d%H%M%S)_gsm8k_${TOPOLOGY}_c${CONC_LIST%%,*}"
+    local tag_conc="${CONC_LIST:-}"
+    tag_conc="${tag_conc%%,*}"
+    tag="$(date +%Y%m%d%H%M%S)_gsm8k_${TOPOLOGY}_c${tag_conc:-${eval_conc}}"
     result_dir="${RUN_DIR}/eval_results/${tag}"
 
     echo ""
@@ -2788,6 +2786,7 @@ PY
     echo "[eval] FAIL: concurrency ${below[*]} did not pass" >&2
     return 1
   fi
+  return "${tool_rc}"
 }
 
 run_benchmark_and_eval() {
