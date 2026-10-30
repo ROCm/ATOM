@@ -168,18 +168,42 @@ def watch_startup(args, clock=time.monotonic):
 def check_previous(args):
     manifest = json.loads(args.previous_manifest.read_text())
     jobs = manifest['jobs']
-    if not jobs or any(not str(job['job_id']).isdecimal() for job in jobs):
-        raise RuntimeError('Previous-job manifest must name exact job IDs')
+    if not jobs or any(
+        not (job.get('job_id') or job.get('job_name'))
+        or ('job_id' in job and not str(job['job_id']).isdecimal())
+        or ('job_name' in job and not re.fullmatch(r'[A-Za-z0-9_.-]{1,255}', job['job_name']))
+        for job in jobs
+    ):
+        raise RuntimeError('Previous-job manifest must name exact job IDs or full job names')
+    ids = {str(job['job_id']) for job in jobs if 'job_id' in job}
+    names = {job['job_name'] for job in jobs if 'job_name' in job}
+    output_format = '%i|%.256j' if names else '%i'
     rows = command(['squeue', '--controller', args.controller,
-                    '--noheader', '--format=%i']).split()
-    if any(not row.isdecimal() for row in rows):
-        raise RuntimeError('Invalid active-job inventory')
-    active = sorted({str(job['job_id']) for job in jobs} & set(rows))
+                    '--noheader', f'--format={output_format}']).splitlines()
+    active = set()
+    ambiguous = []
+    for row in rows:
+        job_id, separator, name = row.strip().partition('|')
+        job_id = job_id.strip()
+        name = name.strip()
+        if not job_id.isdecimal() or (names and (
+            not separator or not name or '%' in name or len(name) >= 256
+            or name in {'-', '(null)', 'N/A', 'Unknown', 'unknown', '<unknown>'}
+        )):
+            raise RuntimeError('Invalid or incomplete active-job inventory')
+        if job_id in ids or name in names:
+            active.add(job_id)
+        elif names and any(expected.startswith(name.rstrip('+')) for expected in names):
+            # A scheduler that truncates job names cannot establish absence.
+            ambiguous.append({'job_id': job_id, 'reported_name': name})
+    active = sorted(active)
     save(args.output, dict(checked_at=datetime.now(timezone.utc).isoformat(),
-                          jobs=jobs, still_active=active, verified_inactive=not active,
+                          jobs=jobs, still_active=active, ambiguous_names=ambiguous,
+                          verified_inactive=not active and not ambiguous,
                           evidence_scope='Fresh scheduler absence; does not prove container cleanup'))
-    if active:
-        raise RuntimeError(f'Previous task jobs remain active: {active}; refusing a duplicate workload')
+    if active or ambiguous:
+        raise RuntimeError(f'Previous task jobs remain active or names are incomplete: '
+                           f'{active or ambiguous}; refusing a duplicate workload')
     print('[C48] Exact previous jobs are absent from the active queue', flush=True)
     return 0
 

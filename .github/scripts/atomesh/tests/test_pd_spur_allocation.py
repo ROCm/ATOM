@@ -197,6 +197,44 @@ class StartupEvidenceTest(unittest.TestCase):
             self.assertEqual(self.module.check_previous(self.args), 0)
         self.assertTrue(json.loads(self.args.output.read_text())['verified_inactive'])
 
+    def test_previous_job_name_blocks_retry_when_slurm_id_was_lost(self):
+        name = 'kimi-k3-c48-gap-c16-mc-vllm-40962044035-1'
+        manifest = self.directory / 'previous.json'
+        manifest.write_text(json.dumps({'jobs': [
+            {'job_id': '8540'}, {'job_name': name, 'run_id': '40962044035'}]}))
+        self.args.previous_manifest = manifest
+        self.args.output = self.directory / 'previous-check.json'
+        with patch.object(self.module, 'command', return_value=f'11150|{name}\n') as query:
+            with self.assertRaisesRegex(RuntimeError, 'remain active'):
+                self.module.check_previous(self.args)
+            self.assertIn('--format=%i|%.256j', query.call_args[0][0])
+            self.assertEqual(query.call_count, 1)
+        proof = json.loads(self.args.output.read_text())
+        self.assertEqual(proof['still_active'], ['11150'])
+        self.assertFalse(proof['verified_inactive'])
+        with patch.object(self.module, 'command', return_value=f'11151|{name[:-1]}2\n'):
+            self.assertEqual(self.module.check_previous(self.args), 0)
+        self.assertTrue(json.loads(self.args.output.read_text())['verified_inactive'])
+        with patch.object(self.module, 'command', return_value='8540|unrelated-name\n'):
+            with self.assertRaisesRegex(RuntimeError, 'remain active'):
+                self.module.check_previous(self.args)
+
+    def test_previous_job_name_rejects_incomplete_scheduler_output(self):
+        name = 'kimi-k3-c48-gap-c16-mc-vllm-40962044035-1'
+        manifest = self.directory / 'previous.json'
+        manifest.write_text(json.dumps({'jobs': [{'job_name': name}]}))
+        self.args.previous_manifest = manifest
+        self.args.output = self.directory / 'previous-check.json'
+        for output in ['11150\n', '11150|\n', '11150|%.256j\n', '11150|Unknown\n',
+                       '11150|kimi-k3-c48+\n',
+                       '11150|kimi-k3-c48\n', '11150|' + 'x' * 256 + '\n']:
+            with self.subTest(output=output), patch.object(self.module, 'command', return_value=output):
+                with self.assertRaises(RuntimeError):
+                    self.module.check_previous(self.args)
+        with patch.object(self.module, 'command', side_effect=RuntimeError('query failed')):
+            with self.assertRaisesRegex(RuntimeError, 'query failed'):
+                self.module.check_previous(self.args)
+
     def test_monitor_hook_preserves_failure_and_cancels_only_its_job(self):
         logs = self.directory / 'logs'
         run_dir = logs / 'slurm_job-8540'

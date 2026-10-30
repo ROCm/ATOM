@@ -1,9 +1,10 @@
 {
-  "purpose": "Require fresh scheduler absence of the cancelled PP predecessor before retrying corrected MLA cache discovery",
+  "purpose": "Refuse retry while an interrupted predecessor is still active; scheduler absence does not establish cleanup",
   "jobs": [
     {"job_id": "7788", "run_id": "38296153235"},
     {"job_id": "8540", "run_id": "38740874930"},
     {"job_id": "8541", "run_id": "38740903706"},
-    {"job_id": "11007", "run_id": "40866596053", "actions_conclusion": "cancelled", "cleanup_verified": false}
+    {"job_id": "11007", "run_id": "40866596053", "actions_conclusion": "cancelled", "cleanup_verified": false},
+    {"run_id": "40942407666", "job_name": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v-qd-cpuref3-fp8attn-fq3-pq-ldfp4-inpad-warm-dg5-pnt-swb-c32-pp8-mc-vllm-40942407666-1", "actions_conclusion": "failure", "cleanup_verified": false}
   ]
 }

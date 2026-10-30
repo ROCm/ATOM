@@ -381,6 +381,12 @@ if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
     c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-junction-jobs.json"
   elif [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-C72-AX109-MC ]]; then
     c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-client-jobs.json"
+  elif [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-C16-MC ]]; then
+    c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-c16-jobs.json"
+  elif [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-C72-P16K-MC ]]; then
+    c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-p16k-jobs.json"
+  elif [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-C72-CPU26-MC ]]; then
+    c48_previous_manifest="${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-cpu26-jobs.json"
   fi
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_spur_allocation.py" check-previous \
     --controller "${SPUR_CONTROLLER_ADDR}" \

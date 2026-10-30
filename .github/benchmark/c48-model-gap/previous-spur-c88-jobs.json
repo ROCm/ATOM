@@ -1,9 +1,10 @@
 {
-  "purpose": "Before retrying C88, require the runner-quota-failed predecessor to be absent from Slurm's active queue",
+  "purpose": "Refuse retry while an interrupted predecessor is still active; scheduler absence does not establish cleanup",
   "jobs": [
     {"job_id": "7788", "run_id": "38296153235"},
     {"job_id": "8540", "run_id": "38740874930"},
     {"job_id": "8541", "run_id": "38740903706"},
-    {"job_id": "10952", "run_id": "40843950368", "actions_conclusion": "failure", "cleanup_verified": false}
+    {"job_id": "10952", "run_id": "40843950368", "actions_conclusion": "failure", "cleanup_verified": false},
+    {"run_id": "40952797099", "job_name": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v-qd-cpuref3-fp8attn-fq3-pq-ldfp4-inpad-warm-dg5-pnt-swb-c88-mr256-mc-vllm-40952797099-1", "actions_conclusion": "failure", "cleanup_verified": false}
   ]
 }

@@ -1,0 +1,9 @@
+{
+  "purpose": "Refuse retry while an interrupted predecessor is still active; scheduler absence does not establish cleanup",
+  "jobs": [
+    {"job_id": "7788", "run_id": "38296153235"},
+    {"job_id": "8540", "run_id": "38740874930", "actions_conclusion": "cancelled", "actions_timeout_confirmed": true},
+    {"job_id": "8541", "run_id": "38740903706", "actions_conclusion": "cancelled", "actions_timeout_confirmed": true},
+    {"run_id": "40962044035", "job_name": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v-qd-cpuref3-fp8attn-fq3-pq-ldfp4-inpad-warm-dg5-pnt-swb-c16-mc-vllm-40962044035-1", "actions_conclusion": "failure", "cleanup_verified": false}
+  ]
+}
