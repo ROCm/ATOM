@@ -1340,6 +1340,7 @@ models:
       # runs gsm8k (5-shot, thinking on) and the Kimi-Vendor-Verifier
       # tool-call suite, both attached to the perf point. Differs from #4311
       # only in the LMCache pool's backing: 4 KiB pages, not 2 MiB HugeTLB.
+      # DSpark4 points: on-demand state checkpoints, state images capped at 128 GB.
       k3_infx:
         - <<: *kimi_k3_agentic_tp8
           name: kimi-k3-infx-1p1d-tp8-dspark7-agentic-1m-c1
@@ -1387,10 +1388,11 @@ models:
           env:
             common:
               ATOM_ENABLE_REPLAYSSM: "1"
-              ATOM_STATE_CHECKPOINT_DEMAND: "0"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
             prefill: &k3_infx_lmcache224_env
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "128"
           run_eval: true
           eval_concurrency: [48]
           accuracy: *k3_infx_accuracy
@@ -1405,7 +1407,7 @@ models:
           env: &k3_infx_hc_reuse_env
             common:
               ATOM_ENABLE_REPLAYSSM: "1"
-              ATOM_STATE_CHECKPOINT_DEMAND: "0"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
             prefill: *k3_infx_lmcache224_env
           eval_concurrency: [72]
