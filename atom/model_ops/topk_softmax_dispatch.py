@@ -21,9 +21,9 @@ from atom.utils import envs
 # and keeps every launch on AITER.
 #
 # The count is per CU the launch can use. On RapidServe's CU-masked streams
-# (half of MI355X's CUs) the two are about even at 22-24 rows per CU and
-# Triton is slower from 26 (30 for 512 / top-10 + a shared expert), by up to
-# 36% at 40; at 20 it is 10-24% faster for all of the shapes above.
+# (half of MI355X's CUs) the two are about even at 22-24 rows per CU, Triton
+# is slower at 26 (512 / top-10 + a shared expert: at 30) and up to 36%
+# slower at 40; at 20 it is 10-24% faster for all of the shapes above.
 TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
 
 
