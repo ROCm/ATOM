@@ -314,6 +314,22 @@ def set_inductor_config(config, runtime_shape):
         pass
 
 
+def _initialize_inductor_cache_dirs(base_cache_dir: str) -> None:
+    """Keep lower-level compiler artifacts beside ATOM's graph cache.
+
+    Saving a standalone graph does not persist Triton kernels compiled inside
+    eager/custom-op regions. Without these directories they can land under
+    /tmp/torchinductor_<user> and be recompiled in each fresh container.
+    Use the same rank-owned directory for the regular and standalone adaptors.
+    """
+    inductor_cache = os.path.join(base_cache_dir, "inductor_cache")
+    os.makedirs(inductor_cache, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
+    triton_cache = os.path.join(base_cache_dir, "triton_cache")
+    os.makedirs(triton_cache, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = triton_cache
+
+
 class InductorAdaptor(CompilerInterface):
     """
     The adaptor for the Inductor compiler, version 2.5, 2.6, 2.7.
@@ -336,16 +352,7 @@ class InductorAdaptor(CompilerInterface):
         self.base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
         if disable_cache:
             return
-        # redirect the cache directory to a sub-directory
-        # set flags so that Inductor and Triton store their cache
-        # in the cache_dir, then users only need to copy the cache_dir
-        # to another machine to reuse the cache.
-        inductor_cache = os.path.join(self.base_cache_dir, "inductor_cache")
-        os.makedirs(inductor_cache, exist_ok=True)
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
-        triton_cache = os.path.join(self.base_cache_dir, "triton_cache")
-        os.makedirs(triton_cache, exist_ok=True)
-        os.environ["TRITON_CACHE_DIR"] = triton_cache
+        _initialize_inductor_cache_dirs(self.base_cache_dir)
 
     def compile(
         self,
@@ -676,6 +683,9 @@ class InductorStandaloneAdaptor(CompilerInterface):
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
     ):
         self.cache_dir = cache_dir
+        if not disable_cache:
+            base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
+            _initialize_inductor_cache_dirs(base_cache_dir)
 
     def compile(
         self,
