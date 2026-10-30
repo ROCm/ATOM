@@ -60,7 +60,7 @@ Notes:
 
 ### DeepSeek-V4-Pro MTP (TP=8)
 
-MTP uses the same server settings as above, plus the EAGLE draft flags. `AITER_DISABLE_COMM_FUSED_MOE=1` is only for this path: with `ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1`, gfx950's comm-fused mega gemm2 faults during target-verify CUDA graph capture. The base server above does not set it. Drop the variable once that kernel survives capture.
+MTP uses the same server settings as above, plus the EAGLE draft flags and `AITER_DISABLE_COMM_FUSED_MOE=1`.
 
 ```bash
 export AITER_DISABLE_COMM_FUSED_MOE=1
