@@ -151,6 +151,10 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         )
         md.kv_indptr_extend = torch.arange(12, dtype=torch.int32, device="cuda")
         md.kv_indices_extend = torch.arange(11, dtype=torch.int32, device="cuda")
+        # The builder publishes the host copy beside each prefill indptr.
+        md.paged_prefill_indptr_cpu = {
+            "kv_indptr_extend": np.arange(12, dtype=np.int32)
+        }
         buf = runner.forward_vars["v4_indexer_cu_committed"]
         buf.gpu.fill_(77)
         torch.cuda._sleep(5_000_000)
