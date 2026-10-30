@@ -2093,6 +2093,9 @@ models:
   MiniMax-M3.1-Flash-vLLM:
     backend: vllm
     model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3.1-Flash-Quark-MXFP4"
+    # The pinned HF snapshot cache (.hf-vllm-m31) lives on /share_nfs/models.
+    model_path_by_runner:
+      atomesh-cicd: /share_nfs/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4
     precision: MXFP4
     server:
       common_args:
@@ -2188,3 +2191,18 @@ models:
           name: m31-vllm-1p1d-tp4-mcstore-validated-sweep
           concurrency: [32, 48, 64]
           env: {common: {ATOMESH_VLLM_MODE: smoke_then_sweep}}
+
+        # Smoke then C32 with the vLLM Store fixes taken from a pinned vLLM
+        # commit instead of the ATOMesh runtime patch.
+        - <<: *m31_vllm_pd
+          name: m31-vllm-1p1d-tp4-mcstore-srcport-smoke-c32
+          runner:
+            exclude_nodes: pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25,pit2-p03-g40,pit2-p03-g42,pit2-p03-g53
+          concurrency: [32]
+          env:
+            common:
+              ATOMESH_VLLM_MODE: smoke_then_c32
+              ATOMESH_VLLM_KFD_PIN_ADAPTER: "1"
+              ATOMESH_VLLM_STORE_OWN_SEGMENT: "0"
+              ATOMESH_VLLM_SOURCE_OVERLAY: "MengqingCao/vllm@c4068bcba669b25a1511054dfb4cbbb24d695f84:vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py"
+              ATOMESH_VLLM_STORE_EXTRA_CONFIG: '{"prefer_local_segment":"true","save_device_sync":"true"}'

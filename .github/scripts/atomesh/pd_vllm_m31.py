@@ -6,6 +6,7 @@ all artifacts use the existing RUN_DIR and benchmark_results contracts.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -209,6 +210,43 @@ def verify_store_load(url, before, out, name):
     raise RuntimeError(f"{name}: no successful Store GET bytes observed")
 
 
+def fetch_vllm_overlay(spec, out):
+    """Download vLLM source files pinned to one commit into ``out/vllm-overlay``.
+
+    ``spec`` is ``<owner>/<repo>@<40-hex sha>:<path>[,<path>...]`` with paths
+    under ``vllm/``; the workers import these files instead of the image's.
+    """
+    repo_ref, _, paths = spec.partition(':')
+    repo, _, sha = repo_ref.partition('@')
+    if not (repo.count('/') == 1 and re.fullmatch(r'[0-9a-f]{40}', sha) and paths):
+        raise ValueError(f'ATOMESH_VLLM_SOURCE_OVERLAY must be owner/repo@<sha>:paths, got {spec!r}')
+    root = out / 'vllm-overlay'
+    files = {}
+    for path in paths.split(','):
+        if not path.startswith('vllm/') or not path.endswith('.py') or '..' in path:
+            raise ValueError(f'Overlay path must be a vllm/ Python file: {path!r}')
+        url = f'https://raw.githubusercontent.com/{repo}/{sha}/{path}'
+        with urllib.request.urlopen(url, timeout=120) as response:
+            data = response.read()
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        files[path] = hashlib.sha256(data).hexdigest()
+    dump(out / 'vllm-overlay.json', {'repo': repo, 'commit': sha, 'files': files})
+    print(f'[vllm-overlay] {repo}@{sha}: {files}', flush=True)
+    return root
+
+
+def merge_store_extra_config(cfg, extra):
+    """Merge ``extra`` into every MooncakeStoreConnector entry of a kv-transfer config."""
+    connectors = cfg.get('kv_connector_extra_config', {}).get('connectors', [cfg])
+    stores = [c for c in connectors if c.get('kv_connector') == 'MooncakeStoreConnector']
+    if not stores:
+        raise ValueError('ATOMESH_VLLM_STORE_EXTRA_CONFIG set but no MooncakeStoreConnector is configured')
+    for store in stores:
+        store.setdefault('kv_connector_extra_config', {}).update(extra)
+
+
 def smoke(model, model_path, p_url, d_url, proxy_url, out):
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -356,6 +394,9 @@ def main():
     common['ATOMESH_VLLM_STORE_CONFIG_PATH'] = str(out / "mooncake-store.json")
     common['PYTHONPATH'] = str(HERE) + (os.pathsep + common['PYTHONPATH'] if common.get('PYTHONPATH') else '')
     common['ATOMESH_VLLM_MEMORY_DIR'] = str(out)
+    if common.get('ATOMESH_VLLM_SOURCE_OVERLAY'):
+        common['ATOMESH_VLLM_OVERLAY_DIR'] = str(fetch_vllm_overlay(common['ATOMESH_VLLM_SOURCE_OVERLAY'], out))
+    store_extra = json.loads(common.get('ATOMESH_VLLM_STORE_EXTRA_CONFIG') or '{}')
     master = start('mooncake-master', ['mooncake_master', '--port', str(ports['master'])], common, logs)
     deadline = time.monotonic() + 60
     while True:
@@ -381,6 +422,8 @@ def main():
             # /reset_prefix_cache is a development endpoint in this vLLM.
             env['VLLM_SERVER_DEV_MODE'] = '1'
         cfg = json.loads((CONFIG / f'{role}-kv.json').read_text())
+        if role == 'prefill' and store_extra:
+            merge_store_extra_config(cfg, store_extra)
         dump(out / f'{role}-kv.json', cfg)
         args = dict(plan['common_args'])
         args.update({'served-model-name': plan['model'], 'port': ports[role], 'host': '0.0.0.0',

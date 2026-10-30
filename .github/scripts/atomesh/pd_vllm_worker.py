@@ -3,6 +3,34 @@ import json
 import os
 from pathlib import Path
 
+
+def install_vllm_overlay(root):
+    """Import vLLM modules that exist under ``root`` from there, not from the image."""
+    import importlib.abc
+    import importlib.util
+    import sys
+    root = Path(root)
+
+    def overlay_file(name):
+        return root.joinpath(*name.split('.')).with_suffix('.py')
+
+    stale = [name for name in list(sys.modules) if name.startswith('vllm.') and overlay_file(name).is_file()]
+    if stale:
+        raise RuntimeError(f'vLLM overlay modules were imported before the overlay: {stale}')
+
+    class OverlayFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path, target=None):
+            if not name.startswith('vllm.') or not overlay_file(name).is_file():
+                return None
+            print(f'[vllm-overlay] {name} <- {overlay_file(name)}', flush=True)
+            return importlib.util.spec_from_file_location(name, overlay_file(name))
+
+    sys.meta_path.insert(0, OverlayFinder())
+
+
+if os.environ.get('ATOMESH_VLLM_OVERLAY_DIR'):
+    install_vllm_overlay(os.environ['ATOMESH_VLLM_OVERLAY_DIR'])
+
 from vllm.v1.worker.gpu_worker import Worker
 
 from pd_vllm_memory import bind_thread_memory, cpu_numa_nodes, prepare_after_load, write_json
@@ -45,6 +73,33 @@ def prefer_own_store_segment(path):
     if not segments:
         raise RuntimeError('No Mooncake Store connector on this Prefill worker')
     print(f'[store-segment] preferred_segment={segments} save_fence={fence}', flush=True)
+
+
+def check_store_overlay(path, overlay_dir):
+    """Fail unless the Store worker comes from the overlay with both switches on."""
+    import inspect
+    import vllm.v1.worker.gpu_worker as worker_module
+    group = worker_module.get_kv_transfer_group()
+    rows = []
+    for connector in getattr(group, '_connectors', [group]):
+        worker = getattr(connector, 'connector_worker', None)
+        if worker is None or not hasattr(worker, 'store_replicate_config'):
+            continue
+        rows.append({
+            'module_file': inspect.getfile(type(worker)),
+            'prefer_local_segment': getattr(worker, 'prefer_local_segment', None),
+            'save_device_sync': getattr(worker, 'save_device_sync', None),
+            'preferred_segment': worker.store_replicate_config.preferred_segment,
+            'own_segment': worker.store.get_hostname(),
+        })
+    write_json(path, {'overlay_dir': overlay_dir, 'store_workers': rows})
+    in_effect = bool(rows) and all(
+        row['module_file'].startswith(overlay_dir) and row['prefer_local_segment'] is True
+        and row['save_device_sync'] is True and row['preferred_segment'] == row['own_segment']
+        for row in rows)
+    if not in_effect:
+        raise RuntimeError(f'vLLM Store overlay is not in effect: {rows}')
+    print(f'[vllm-overlay] Store worker: {rows}', flush=True)
 
 
 def fence_store_saves(worker):
@@ -177,6 +232,9 @@ class StoreMemoryWorker(Worker):
                 bind_thread_memory(None)
         if role == 'prefill' and os.environ.get('ATOMESH_VLLM_STORE_OWN_SEGMENT', '1') == '1':
             prefer_own_store_segment(out / f'{role}-rank-{self.local_rank}-store-segment.json')
+        if role == 'prefill' and os.environ.get('ATOMESH_VLLM_OVERLAY_DIR'):
+            check_store_overlay(out / f'{role}-rank-{self.local_rank}-vllm-overlay.json',
+                                os.environ['ATOMESH_VLLM_OVERLAY_DIR'])
         record_runtime(evidence, 'after-kv-init')
         probe(evidence, 'after-kv-init', 4)
         return result
