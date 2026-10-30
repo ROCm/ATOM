@@ -3307,10 +3307,11 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
-            # The mask is in place. Logprobs report the model's own
-            # distribution, as they do for a request without a channel and on
-            # the verification path, which masks copies: a forced token's is
-            # its real logprob, not the masked row's 0.0.
+            # `_constrain_required_channel` below masks `logits` in place, so
+            # the logprob copy is taken BEFORE it. Logprobs report the model's
+            # own distribution, as they do for a request without a channel and
+            # on the verification path, which masks copies: a forced token's
+            # is its real logprob, not the masked row's 0.0.
             logprob_logits = logits
             if need_logprobs and getattr(batch, "required_channel", None) is not None:
                 logprob_logits = logits.clone()

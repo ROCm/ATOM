@@ -404,8 +404,12 @@ def test_postprocess_advances_over_the_tokens_it_commits(seq_factory):
 def test_pd_first_token_counts_once(seq_factory):
     """A P/D consumer appends the producer's T0 at admission, and the first
     output after it carries T0 again in `new_tokens`; it is counted at
-    admission only."""
-    ch = _toy_channel()
+    admission only.
+
+    T0 completes `after`, so every token from it on moves the state: counted
+    twice it would land one past where the output really is.
+    """
+    ch = RequiredChannel(after=(10,), opening=(20, 21, 22), end_ids=(2,))
     sched = Scheduler(MockConfig())
     seq = seq_factory(
         [3, 4, 5, 6],
@@ -414,9 +418,10 @@ def test_pd_first_token_counts_once(seq_factory):
     )
     seq.num_cached_tokens = seq.num_prompt_tokens
     sched._schedule_first_decode_after_remote_kv(seq)
-    assert seq.required_channel_state == 1
+    assert seq.required_channel_state == 1  # the next token is forced
 
     batch, _ = sched.schedule()
     assert batch.required_channel_states.tolist() == [1]
-    sched.postprocess(list(sched.running), _output(seq, [11]), batch=batch)
-    assert seq.required_channel_state == 2
+    sched.postprocess(list(sched.running), _output(seq, [20]), batch=batch)
+    assert seq.required_channel_state == 2  # counted twice it would be 3
+    assert ch.advance(0, [10, 10, 20]) == 3
