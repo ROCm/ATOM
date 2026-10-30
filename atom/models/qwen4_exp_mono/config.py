@@ -40,16 +40,33 @@ def enabled_widths(tp):
     return DECODE_ROWS if tp in ENABLED_TP else ()
 
 
-def uses_native_mxfp4_moe(atom_config) -> bool:
-    """Quark A4W4 experts consumed without converting their packed weights."""
+def _has_mxfp4_experts(atom_config) -> bool:
     quant = getattr(atom_config, "quant_config", None)
     hf_quant = getattr(quant, "hf_quant_config", None) or {}
     return (
         atom_config.tensor_parallel_size in (1, 8)
         and getattr(quant, "quant_method", None) == "quark"
-        and not getattr(quant, "online_quant", False)
         and hf_quant.get("global_quant_config", {}).get("weight", {}).get("dtype")
         == "fp4"
+    )
+
+
+def uses_mtp_target(atom_config) -> bool:
+    """The TP1 MTP3 target seam; Native owns speculative state and attention."""
+    spec = getattr(atom_config, "speculative_config", None)
+    return (
+        atom_config.tensor_parallel_size == 1
+        and _has_mxfp4_experts(atom_config)
+        and getattr(spec, "method", None) == "mtp"
+        and getattr(spec, "num_speculative_tokens", None) == 3
+    )
+
+
+def uses_native_mxfp4_moe(atom_config) -> bool:
+    """Quark experts, with online projections only at the Native MTP seam."""
+    return _has_mxfp4_experts(atom_config) and (
+        not getattr(atom_config.quant_config, "online_quant", False)
+        or uses_mtp_target(atom_config)
     )
 
 
@@ -178,7 +195,8 @@ def config_refusal(atom_config) -> str | None:
             ),
         ),
         (
-            getattr(atom_config, "speculative_config", None) is None,
+            getattr(atom_config, "speculative_config", None) is None
+            or uses_mtp_target(atom_config),
             "speculative decode",
         ),
         (

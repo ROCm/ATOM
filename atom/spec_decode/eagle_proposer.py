@@ -80,6 +80,7 @@ class EagleProposer(Drafter):
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
+
         # GLM-5.2 draft index sharing: step 0 runs the MTP indexer, steps 1+
         # reuse sparse_kv_indices_buffer via skip_topk + compact_topk_indices.
         # Gated on method=mtp, DSA index_topk and the config flag, so other
@@ -186,6 +187,8 @@ class EagleProposer(Drafter):
         `batch_id_per_q_token`, and the index kernel returns on `bid < 0` before it
         ever loads a ring slot.
         """
+        if getattr(self.model, "draft_returns_head_input", False):
+            return self.model.forward_with_head(input_ids, positions, hidden_states)
         return self.model(
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
@@ -198,6 +201,12 @@ class EagleProposer(Drafter):
         `[:scheduled_bs]`: a capture bakes the length it was made at. Slicing
         is the caller's, on the way out.
         """
+        if getattr(self.model, "draft_returns_head_input", False):
+            state, head_input = fwd_out
+            assert self._reuse_step_buffers
+            hidden_states.copy_(state[:running_bs])
+            self.model.compute_draft_ids_with_head(head_input, out=input_ids)
+            return hidden_states, input_ids
         if self._reuse_step_buffers:
             hidden_states.copy_(fwd_out[:running_bs])
             self.model.compute_draft_ids(hidden_states, out=input_ids)
@@ -745,7 +754,34 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
-                if i and self.step is not None:
+                selected_draft = (
+                    i == 0
+                    and not forward_context.context.is_prefill
+                    and not pcp_draft_prefill
+                    and d_input_ids.shape[0] == 4 * scheduled_bs
+                    and d_input_ids.shape[0] <= 16
+                    and getattr(self.model, "supports_selected_rows", False)
+                )
+                prepared_head_input = None
+                if selected_draft:
+                    if getattr(self.model, "draft_returns_head_input", False):
+                        ret_hidden_states, prepared_head_input = (
+                            self.model.forward_selected_with_head(
+                                input_ids=d_input_ids,
+                                positions=d_positions,
+                                hidden_states=d_hidden,
+                                selected_rows=last_token_indices,
+                            )
+                        )
+                    else:
+                        ret_hidden_states = self.model.forward_selected(
+                            input_ids=d_input_ids,
+                            positions=d_positions,
+                            hidden_states=d_hidden,
+                            selected_rows=last_token_indices,
+                        )
+                    graphed_ids = None
+                elif i and self.step is not None:
                     # Steps 1+ are the declared pass: one row per sequence, at
                     # a batch the startup sweep already warmed. The head rides
                     # in the recording, so this hands back both of its outputs.
@@ -780,9 +816,16 @@ class EagleProposer(Drafter):
                         else None
                     )
                     # out=None is index_select's own default: it allocates.
-                    sample_hidden_states = torch.index_select(
-                        ret_hidden_states, 0, last_token_indices, out=hidden_out
-                    )
+                    if selected_draft:
+                        if hidden_out is not None:
+                            hidden_out.copy_(ret_hidden_states)
+                            sample_hidden_states = hidden_out
+                        else:
+                            sample_hidden_states = ret_hidden_states
+                    else:
+                        sample_hidden_states = torch.index_select(
+                            ret_hidden_states, 0, last_token_indices, out=hidden_out
+                        )
                 else:
                     sample_hidden_states = ret_hidden_states[:scheduled_bs]
                 # This step's row is owned storage -- the assembled matrix's
@@ -796,9 +839,14 @@ class EagleProposer(Drafter):
                     # (DSpark's do not, but they never reach here), and it is
                     # token-identical to compute_logits().argmax(-1) because
                     # is_draft suppresses the LM head's prefill last-token slice.
-                    next_input_ids = self.model.compute_draft_ids(
-                        sample_hidden_states, out=exported
-                    )
+                    if prepared_head_input is not None:
+                        next_input_ids = self.model.compute_draft_ids_with_head(
+                            prepared_head_input, out=exported
+                        )
+                    else:
+                        next_input_ids = self.model.compute_draft_ids(
+                            sample_hidden_states, out=exported
+                        )
 
                 if i < self.mtp_k - 1:
                     # Read before step 0's rewrite below flips it to decode.

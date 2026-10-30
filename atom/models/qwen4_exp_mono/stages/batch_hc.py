@@ -2,6 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Small-batch HC gate, MFMA up projection and ordered four-stream mixing."""
 
+from functools import cache
+
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import gpu, range_constexpr
@@ -17,8 +19,37 @@ class Smem:
     partial: fx.Array[fx.Float32, 4 * 8 * 4 * 16, 16]
 
 
+@cache
+def smem_type(tokens):
+    """Keep the ordinary decode footprint; wider verify needs more HC rows."""
+    if tokens <= 4:
+        return Smem
+
+    @fx.struct
+    class VerifySmem:
+        gate: fx.Array[fx.Int32, tokens * 160, 16]
+        partial: fx.Array[fx.Float32, 4 * 8 * tokens * 16, 16]
+
+    return VerifySmem
+
+
 @traced
-def emit_up(part, normed, weight, raw, stride, sm, tokens, has_inject, store):
+def _down_value(part, token, col, nout, parts):
+    value = fx.Float32(0.0)
+    if parts == 1:
+        value = _ld_bf(part, token * nout + col)
+    else:
+        value = _ld_f32(part, token * 4 * nout + col)
+        for stream in range_constexpr(1, 4):
+            value = value + _ld_f32(part, token * 4 * nout + stream * nout + col)
+        value = bf16_round(value)
+    return value
+
+
+@traced
+def emit_up(
+    part, normed, weight, raw, stride, sm, tokens, has_inject, store, down_parts=4
+):
     nout = 324 if has_inject else 320
     tid = fx.thread_idx.x
     lane = tid % 64
@@ -57,10 +88,7 @@ def emit_up(part, normed, weight, raw, stride, sm, tokens, has_inject, store):
             gates = []
             for half in range_constexpr(2):
                 at = tid * 2 + half
-                d = _ld_f32(part, token * 4 * nout + at)
-                for stream in range_constexpr(1, 4):
-                    d = d + _ld_f32(part, token * 4 * nout + stream * nout + at)
-                d = bf16_round(d)
+                d = _down_value(part, token, at, nout, down_parts)
                 d = bf16_round(d * fx.Float32(0.25))
                 gates.append(bf16_round(d * _sigmoid(d)))
             fx.ptr_store(
@@ -71,10 +99,8 @@ def emit_up(part, normed, weight, raw, stride, sm, tokens, has_inject, store):
         if tid < tokens * 4:
             token = tid // 4
             col = 320 + tid % 4
-            value = _ld_f32(part, token * 4 * nout + col)
-            for stream in range_constexpr(1, 4):
-                value = value + _ld_f32(part, token * 4 * nout + stream * nout + col)
-            _st_bf(raw, tid, bf16_round(value))
+            value = _down_value(part, token, col, nout, down_parts)
+            _st_bf(raw, tid, value)
     gpu.barrier()
     token = fx.min(lane % 16, tokens - 1)
     row = task * 16 + lane % 16

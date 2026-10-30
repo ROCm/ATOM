@@ -6,6 +6,9 @@
 PERSISTENT_ROWS = (1,)
 BATCH_ROWS = (2, 4)
 DECODE_ROWS = (*PERSISTENT_ROWS, *BATCH_ROWS)
+# MTP3 target verification: up to four requests, four queries per request.
+MTP_TARGET_ROWS = (4, 8, 16)
+HC_ROWS = (1, 2, 4, 8, 16)
 SUPPORTED_TP = (1, 8)
 ALIGN = 16
 LAYERS = 48

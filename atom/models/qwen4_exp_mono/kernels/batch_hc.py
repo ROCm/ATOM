@@ -11,8 +11,9 @@ import triton
 from flydsl.expr.typing import Int64
 
 from atom.model_ops.qwen4_exp.ops.hc_fused import _hc_pre_kernel
+from atom.models.qwen4_exp_mono.shapes import DECODE_ROWS
 from atom.models.qwen4_exp_mono.sources import SOURCES
-from atom.models.qwen4_exp_mono.stages.batch_hc import Smem, emit_up
+from atom.models.qwen4_exp_mono.stages.batch_hc import emit_up, smem_type
 from atom.models.qwen4_exp_mono.stages.hc import _st_bf
 from atom.mono.device.ops import (
     kernel_symbol,
@@ -23,8 +24,12 @@ _STREAM = fx.Stream(None)
 
 
 @cache
-def build(tokens, has_inject=True):
-    name = kernel_symbol("qwen_batch_hc_up", b=tokens, inject=has_inject)
+def build(tokens, has_inject=True, *, native_down=False):
+    assert (tokens == 16 and has_inject) if native_down else tokens in DECODE_ROWS
+    Smem = smem_type(tokens)
+    name = kernel_symbol(
+        "qwen_batch_hc_up", b=tokens, inject=has_inject, native_down=native_down
+    )
 
     @flyc.kernel(name=name, known_block_size=[512, 1, 1])
     def kernel(
@@ -41,6 +46,7 @@ def build(tokens, has_inject=True):
             tokens,
             has_inject,
             lambda col, value: _st_bf(out, col, value),
+            down_parts=1 if native_down else 4,
         )
 
     @launcher(name)
@@ -66,7 +72,7 @@ def prepare(
 ):
     """Prepare native HC streams, normalization and down projection."""
     rows, width = h.shape
-    assert rows in (1, 2, 4) and width == 10240 and hc == 4
+    assert rows in DECODE_ROWS and width == 10240 and hc == 4
     nout = 324 if has_inject else 320
     assert w_cat.shape == (nout, 10240) and w_up.shape == (10240, 320)
     combined = block is not None

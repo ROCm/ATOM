@@ -6,6 +6,11 @@ BF16 GDN and HC enter Mono emitters for rows 1/2/4. QSA fuses norm/RoPE with
 FP8 K/V and FP32 scale publication, retaining native index selection and attention.
 Mono prepares routing and MXFP4 inputs for the native expert GEMMs. G1 writes
 BF16 before native intermediate quantization; expert weights stay packed MXFP4.
+
+MTP3 TP1 fuses attention HC up/mix/PTPC, QSA norm/RoPE/KV and q4 index
+publication/compression, GDN conv/gate, and MLP HC/router. Native PTPC GEMMs,
+ReplaySSM, fused output norm/quant, sparse attention and tuned MXMOE remain
+explicit seams. The target returns the complete HC state bundle.
 """
 
 import logging
@@ -14,14 +19,20 @@ from dataclasses import dataclass
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tp_group
+from aiter.tuned_gemm import tgemm
 
-from atom.models.qwen4_exp_mono import batch, native_qsa, quark_binding
+from atom.model_ops.qwen4_exp.ops.hc_fused import hc_combine_norm
+from atom.models.qwen4_exp_mono import batch, mtp, native_qsa, quark_binding
+from atom.models.qwen4_exp_mono.chain.moe_front_integrated_contract import (
+    step_supported as compact_step_supported,
+)
 from atom.models.qwen4_exp_mono.dims import Dims
 from atom.models.qwen4_exp_mono.kernels import (
     batch_gdn,
     batch_hc,
     batch_qsa_output,
     gdn_attention,
+    mtp_hc_ptpc,
     quark_hc_pre,
     quark_hc_router,
     quark_moe,
@@ -37,7 +48,10 @@ from atom.models.qwen4_exp_mono.launch_args import (
 )
 from atom.models.qwen4_exp_mono.layout import gdn_scratch_bytes, gdn_scratch_layout
 from atom.models.qwen4_exp_mono.plan import make_plan
-from atom.models.qwen4_exp_mono.shapes import DECODE_ROWS, HIDDEN
+from atom.models.qwen4_exp_mono.router.binding import (
+    prepare_layers as prepare_compact_layers,
+)
+from atom.models.qwen4_exp_mono.shapes import DECODE_ROWS, HIDDEN, MTP_TARGET_ROWS
 from atom.models.qwen4_exp_mono.step_meta import gdn_step_view
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.compile import launcher_resources
@@ -50,6 +64,8 @@ logger = logging.getLogger("atom")
 
 @dataclass
 class QuarkBuild:
+    mtp: object = None
+    compact_moe: object = None
     gdn: object = None
     buffers: object = None
     hc: object = None
@@ -58,6 +74,7 @@ class QuarkBuild:
     ready: torch.Tensor | None = None
     moe: object = None
     hc_router: object = None
+    native_hc_down: bool = False
     router_splits: int = 1
     hc_payload: torch.Tensor | None = None
     mixed: torch.Tensor | None = None
@@ -70,13 +87,18 @@ class QuarkBuild:
     qsa_index_qk: torch.Tensor | None = None
 
     def kernels(self):
+        if self.mtp is not None:
+            yield self.mtp.hc, mtp_hc_ptpc.ABI
         if self.persistent is not None:
             yield self.persistent, gdn_attention.ABI
-        else:
+        elif self.gdn is not None:
             yield from zip(self.gdn, batch._GDN_ABIS, strict=True)
-        yield self.hc.up, batch._HC_ABI
-        yield self.hc.final, batch._HC_ABI
-        yield self.hc_router, quark_hc_router.ABI
+        if self.hc.up is not None:
+            yield self.hc.up, batch._HC_ABI
+        if self.hc.final is not None:
+            yield self.hc.final, batch._HC_ABI
+        if self.hc_router is not None:
+            yield self.hc_router, quark_hc_router.ABI
         if self.qsa_projection is not None:
             yield self.qsa_projection, quark_qsa_projection.ABI
             yield self.qsa_output, batch._QSA_OUTPUT_ABI
@@ -103,6 +125,17 @@ class QuarkMonoRunner:
             "Qwen Quark seam",
             check_resources=self._check_resources,
         )
+        if self.mtp_target:
+            logger.info(
+                "Qwen Quark Mono MTP3 target: TP1 verify rows 4/8/16; "
+                "Mono attention HC/PTPC, q4 QSA index, conv/gate and MLP HC/router; "
+                "Native PTPC GEMMs, ReplaySSM, QSA attention "
+                "and tuned MXFP4 experts; complete HC output"
+            )
+        else:
+            self._log_decode_seams(max_model_len)
+
+    def _log_decode_seams(self, max_model_len):
         logger.info(
             "Qwen Quark Mono seam: TP%s rows 1/2/4; GDN/HC Mono; "
             "fused HC/router and MXFP4 route/quant; native G1 intermediate quant; "
@@ -126,8 +159,9 @@ class QuarkMonoRunner:
         ):
             raise MonoUnsupported("Qwen Quark seam needs gfx950 with 256 resident CTAs")
         native = self.model.model
-        if native.return_hc_state:
-            raise MonoUnsupported("Qwen Quark seam does not serve MTP")
+        self.mtp_target = native.return_hc_state
+        if self.mtp_target and self.tp != 1:
+            raise MonoUnsupported("Quark MTP target requires TP1")
         self.layers = native.layers
         self.plan = make_plan(self.layers)
         self.intermediate = self.layers[0].mlp.experts.w13_weight.shape[1] // 2
@@ -178,7 +212,12 @@ class QuarkMonoRunner:
                 )
         self.bound_weights = tuple(
             quark_binding.bind_layer(
-                layer, task, self.dims, self.device, self.max_model_len
+                layer,
+                task,
+                self.dims,
+                self.device,
+                self.max_model_len,
+                native_attention=self.mtp_target,
             )
             for layer, task in zip(self.layers, self.plan.layers, strict=True)
         )
@@ -223,7 +262,12 @@ class QuarkMonoRunner:
         bf = lambda width: torch.empty(
             (rows, width), device=self.device, dtype=torch.bfloat16
         )
-        if rows == 1 and self.tp == 1:
+        if self.mtp_target:
+            built = QuarkBuild(
+                hc=batch.HcKernels(None, None),
+                mtp=mtp.Workspace.allocate(rows, self.device),
+            )
+        elif rows == 1 and self.tp == 1:
             scratch = torch.zeros(
                 gdn_scratch_bytes(), device=self.device, dtype=torch.uint8
             )
@@ -244,12 +288,13 @@ class QuarkMonoRunner:
                     bf(self.dims.gdn_proj_dim), bf(self.dims.gdn_value_dim), bf(HIDDEN)
                 ),
             )
-        built.moe = quark_moe.Workspace.allocate(rows, self.device)
-        built.hc = batch.HcKernels(
-            batch_hc.build(rows),
-            batch_hc.build(rows, False),
-            quark_hc_pre._hc_pre_dot2 if self.tp == 8 else None,
-        )
+        if not self.mtp_target:
+            built.moe = quark_moe.Workspace.allocate(rows, self.device)
+            built.hc = batch.HcKernels(
+                batch_hc.build(rows),
+                batch_hc.build(rows, False),
+                quark_hc_pre._hc_pre_dot2 if self.tp == 8 else None,
+            )
         if self.tp == 8:
             built.qsa_projection = quark_qsa_projection.build(rows)
             built.qsa_output = batch_qsa_output.build(rows)
@@ -257,19 +302,30 @@ class QuarkMonoRunner:
             if 2048 <= self.max_model_len <= 16384:
                 built.qsa_select = quark_qsa_select.build(rows)
         built.router_splits = 2 if self.tp == 8 else 1
-        built.hc_router = quark_hc_router.build(rows, built.router_splits)
-        built.hc_payload = torch.zeros(
-            rows * 2560, device=self.device, dtype=torch.int32
-        )
+        built.native_hc_down = self.mtp_target and built.mtp.plan.native_mlp_down
+        if self.mtp_target and not built.mtp.plan.fused_router:
+            built.hc = batch.HcKernels(batch_hc.build(rows, native_down=True), None)
+        else:
+            built.hc_router = quark_hc_router.build(
+                rows, built.router_splits, native_down=built.native_hc_down
+            )
+            built.hc_payload = torch.zeros(
+                rows * 2560, device=self.device, dtype=torch.int32
+            )
         built.mixed, built.raw = bf(2560), bf(4)
         built.logits = (
             torch.empty((2, rows, 513), device=self.device, dtype=torch.float32)
             if built.router_splits == 2
-            else bf(513)
+            else bf(513) if built.hc_router is not None else None
         )
-        quark_moe.validate_native_config(
-            rows, self.intermediate, 512 // self.tp + 1, self.intermediate_pad
-        )
+        if self.mtp_target and rows == 4:
+            built.compact_moe = prepare_compact_layers(
+                self.layers, self.bound_weights, built, self.tp, self.device
+            )
+        if not self.mtp_target:
+            quark_moe.validate_native_config(
+                rows, self.intermediate, 512 // self.tp + 1, self.intermediate_pad
+            )
         return built
 
     @staticmethod
@@ -283,7 +339,8 @@ class QuarkMonoRunner:
             logger.info("Qwen Quark seam B%s resources: %s", rows, resources)
 
     def prepare(self, rows):
-        return rows in DECODE_ROWS and self.widths.prepare(rows)
+        widths = MTP_TARGET_ROWS if self.mtp_target else DECODE_ROWS
+        return rows in widths and self.widths.prepare(rows)
 
     def close(self):
         if self._running:
@@ -298,11 +355,16 @@ class QuarkMonoRunner:
             rows = input_ids.numel()
             built = self.widths[rows]
             context = get_forward_context()
+            compact = (
+                built.compact_moe
+                if self.mtp_target and compact_step_supported(context, rows)
+                else None
+            )
             # Reject incompatible state views before mutating any layer.
             steps = tuple(
                 (
                     gdn_step_view(context, task.layer_id, rows, tp=self.tp)
-                    if task.is_gdn
+                    if task.is_gdn and not self.mtp_target
                     else None
                 )
                 for task in self.plan.layers
@@ -322,10 +384,29 @@ class QuarkMonoRunner:
                 strict=True,
             ):
                 streams, pending = apply_ple(layer, streams, pending, input_ids)
-                mixed, (streams, raw) = batch.mix(
-                    layer.attn_hyper_connection, streams, pending, built
-                )
-                if task.is_gdn:
+                if self.mtp_target:
+                    ba_weight = (
+                        layer.linear_attn.in_proj_ba.weight
+                        if task.is_gdn and layer.linear_attn.quantized_inputs
+                        else None
+                    )
+                    mixed, quantized, (streams, raw) = built.mtp.mix_attention(
+                        layer.attn_hyper_connection, streams, pending, ba_weight
+                    )
+                    sub = built.mtp.attention(
+                        layer,
+                        task,
+                        positions,
+                        mixed,
+                        quantized,
+                        ba_prepared=built.mtp.ba_context is not None
+                        and ba_weight is not None,
+                    )
+                else:
+                    mixed, (streams, raw) = batch.mix(
+                        layer.attn_hyper_connection, streams, pending, built
+                    )
+                if not self.mtp_target and task.is_gdn:
                     if rows == 1 and self.tp == 1:
                         values = {
                             "gdn_input": pointer(mixed),
@@ -346,7 +427,7 @@ class QuarkMonoRunner:
                         )
                     else:
                         sub = batch.attention(built, static, step, mixed)
-                else:
+                elif not self.mtp_target:
                     if built.qsa_projection is not None:
                         built.qsa_projection(
                             mixed.data_ptr(),
@@ -390,51 +471,94 @@ class QuarkMonoRunner:
                 if self.tp > 1:
                     sub = tensor_model_parallel_all_reduce(sub)
                 hc = layer.mlp_hyper_connection
-                streams, normed, part = batch_hc.prepare(
-                    streams,
-                    hc.hc_norm.weight,
-                    hc.fused_w_cat,
-                    hc.input_mix_weight_up.weight,
-                    hc.hc_norm.variance_epsilon,
-                    hc.hc_count,
-                    True,
-                    sub,
-                    raw,
-                    pre=built.hc.pre,
-                )
-                built.hc_router(
-                    part.data_ptr(),
-                    normed.data_ptr(),
-                    bound.mlp_hc.up.data_ptr(),
-                    built.raw.data_ptr(),
-                    normed.stride(0),
-                    bound.router.data_ptr(),
-                    built.logits.data_ptr(),
-                    built.mixed.data_ptr(),
-                    built.hc_payload.data_ptr(),
-                    stream=torch.cuda.current_stream(),
-                )
+                if built.native_hc_down:
+                    # The scalar fused pre repeats down-projection work per
+                    # verify row. Native GEMM reuses weights across wider MTP
+                    # batches and publishes BF16 [rows, 324] for Mono up/router.
+                    streams, normed = hc_combine_norm(
+                        streams,
+                        hc.hc_norm.weight,
+                        hc.hc_norm.variance_epsilon,
+                        hc.hc_count,
+                        sub,
+                        raw,
+                    )
+                    part = tgemm.mm(normed, hc.fused_w_cat, otype=torch.bfloat16)
+                else:
+                    streams, normed, part = batch_hc.prepare(
+                        streams,
+                        hc.hc_norm.weight,
+                        hc.fused_w_cat,
+                        hc.input_mix_weight_up.weight,
+                        hc.hc_norm.variance_epsilon,
+                        hc.hc_count,
+                        True,
+                        sub,
+                        raw,
+                        pre=built.hc.pre,
+                    )
+                if compact is not None:
+                    compact.prepare_layer(task.layer_id, part, normed)
+                    logits = built.logits
+                elif built.hc_router is None:
+                    built.hc.up(
+                        part.data_ptr(),
+                        normed.data_ptr(),
+                        bound.mlp_hc.up.data_ptr(),
+                        built.mixed.data_ptr(),
+                        built.raw.data_ptr(),
+                        normed.stride(0),
+                        stream=torch.cuda.current_stream(),
+                    )
+                    logits = tgemm.mm(built.mixed, bound.router, otype=torch.bfloat16)
+                else:
+                    built.hc_router(
+                        part.data_ptr(),
+                        normed.data_ptr(),
+                        bound.mlp_hc.up.data_ptr(),
+                        built.raw.data_ptr(),
+                        normed.stride(0),
+                        bound.router.data_ptr(),
+                        built.logits.data_ptr(),
+                        built.mixed.data_ptr(),
+                        built.hc_payload.data_ptr(),
+                        stream=torch.cuda.current_stream(),
+                    )
+                    logits = built.logits
                 mixed, raw = built.mixed, built.raw
                 ex = layer.mlp.experts
-                built.moe.prepare(
-                    built.logits,
-                    mixed,
-                    ex.expert_map,
-                    self.tp,
-                    self.rank,
-                    router_splits=built.router_splits,
-                )
-                output = built.moe.experts_forward(
-                    mixed,
-                    bound.w13,
-                    bound.w2,
-                    bound.w13_scale,
-                    bound.w2_scale,
-                    intermediate_pad=self.intermediate_pad,
-                )
+                if self.mtp_target:
+                    # Native consumes per-pass valid rows, the shared slot and
+                    # its selected MXMOE ABI. Do not force the q1 M32 task table
+                    # onto the author's tuned M16 inline-quant kernels.
+                    output = (
+                        compact.forward_layer(task.layer_id, mixed, logits)
+                        if compact is not None
+                        else ex(hidden_states=mixed, router_logits=logits)
+                    )
+                else:
+                    built.moe.prepare(
+                        built.logits,
+                        mixed,
+                        ex.expert_map,
+                        self.tp,
+                        self.rank,
+                        router_splits=built.router_splits,
+                    )
+                    output = built.moe.experts_forward(
+                        mixed,
+                        bound.w13,
+                        bound.w2,
+                        bound.w13_scale,
+                        bound.w2_scale,
+                        intermediate_pad=self.intermediate_pad,
+                    )
                 if self.tp > 1:
                     output = tensor_model_parallel_all_reduce(output)
                 pending = output, raw
+            if self.mtp_target:
+                streams = native.hyper_connection_mixer.apply_pending(streams, pending)
+                return streams.view(rows, native.hc_count, HIDDEN)
             mixed, _ = batch.mix(native.hyper_connection_mixer, streams, pending, built)
             return mixed
         finally:

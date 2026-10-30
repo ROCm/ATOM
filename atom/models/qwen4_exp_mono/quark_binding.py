@@ -30,6 +30,7 @@ from atom.models.qwen4_exp_mono.weights import (
     _bind_gdn,
     _bind_hc,
     _bind_qsa,
+    _bind_rope,
     _tensor,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
@@ -47,12 +48,26 @@ class QuarkQsaCache:
 
 
 @dataclass(frozen=True)
+class QuarkQsaEpilogue:
+    """Norm/RoPE owners for Native PTPC projections and Mono KV publication."""
+
+    q_norm: torch.Tensor
+    k_norm: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+    index_q_norm: torch.Tensor
+    index_k_norm: torch.Tensor
+    index_cos: torch.Tensor
+    index_sin: torch.Tensor
+
+
+@dataclass(frozen=True)
 class QuarkLayerWeights:
     attn_hc: HcWeights
     mlp_hc: HcWeights
     router: torch.Tensor
     gdn: GdnWeights | None
-    qsa: QsaWeights | None
+    qsa: QsaWeights | QuarkQsaEpilogue | None
     cache: QuarkQsaCache | None
     w13: torch.Tensor
     w2: torch.Tensor
@@ -162,14 +177,42 @@ def bind_qsa_cache(attn, dims: Dims):
     )
 
 
-def bind_layer(layer, task: LayerTask, dims: Dims, device, max_model_len):
+def bind_layer(
+    layer, task: LayerTask, dims: Dims, device, max_model_len, *, native_attention=False
+):
     from aiter import QuantType, dtypes
 
-    qsa = _bind_qsa(layer, task, dims)
+    # MTP retains Native projections and ReplaySSM. Only QSA norm/RoPE and
+    # cache tensors are consumed by Mono, so do not bind PTPC as BF16 weights.
+    qsa = None if native_attention else _bind_qsa(layer, task, dims)
     cache = None
-    if qsa is not None:
+    if not task.is_gdn:
         _check_qsa_math(layer.self_attn, max_model_len)
         cache = bind_qsa_cache(layer.self_attn, dims)
+        if native_attention:
+            attn = layer.self_attn
+            cos, sin = _bind_rope(attn.rotary_emb, "QSA RoPE")
+            qsa = QuarkQsaEpilogue(
+                _tensor(attn, "q_norm.weight", (QSA_HEAD_DIM,), torch.bfloat16),
+                _tensor(attn, "k_norm.weight", (QSA_HEAD_DIM,), torch.bfloat16),
+                cos,
+                sin,
+                _tensor(
+                    attn.indexer,
+                    "q_layernorm.weight",
+                    (QSA_INDEX_HEAD_DIM,),
+                    torch.bfloat16,
+                ),
+                _tensor(
+                    attn.indexer,
+                    "k_layernorm.weight",
+                    (QSA_INDEX_HEAD_DIM,),
+                    torch.bfloat16,
+                ),
+                *_bind_rope(attn.indexer.rotary_emb, "QSA index RoPE"),
+            )
+    elif native_attention:
+        _check_mtp_gdn(layer.linear_attn, dims)
     experts = layer.mlp.experts
     if (
         experts.quant_method.quant_dtype != dtypes.fp4x2
@@ -186,7 +229,7 @@ def bind_layer(layer, task: LayerTask, dims: Dims, device, max_model_len):
         bind_hc(layer.attn_hyper_connection),
         bind_hc(layer.mlp_hyper_connection),
         _tensor(layer.mlp, "gate.weight", (ROUTER_OUTPUTS, HIDDEN), torch.bfloat16),
-        _bind_gdn(layer, task, dims),
+        None if native_attention else _bind_gdn(layer, task, dims),
         qsa,
         cache,
         _tensor(
@@ -216,6 +259,40 @@ def bind_layer(layer, task: LayerTask, dims: Dims, device, max_model_len):
     )
     _check_device(bound, device)
     return bound
+
+
+def _check_mtp_gdn(attn, dims):
+    """Admit the q4 prepare ABI before the first HC/cache/state mutation."""
+    from atom.utils.forward_context import get_forward_context
+
+    impl = attn.attn.impl
+    if (
+        dims.tp != 1
+        or (
+            impl.key_dim,
+            impl.value_dim,
+            impl.num_v_heads,
+            impl.head_k_dim,
+            impl.head_v_dim,
+        )
+        != (dims.gdn_key_dim, dims.gdn_value_dim, dims.gdn_value_heads, 128, 128)
+        or impl.activation not in (True, "silu", "swish")
+        or impl.conv1d.bias is not None
+    ):
+        raise MonoUnsupported(
+            "MTP GDN preparation needs TP1, sigmoid gates and width4 SiLU convolution"
+        )
+    _tensor(impl, "conv1d.weight", (dims.gdn_conv_dim, 1, 4), torch.bfloat16)
+    _tensor(impl, "A_log", (dims.gdn_value_heads,), torch.bfloat16)
+    _tensor(impl, "dt_bias", (dims.gdn_value_heads,), torch.bfloat16)
+    cache = get_forward_context().kv_cache_data[f"layer_{impl.layer_num}"]
+    if cache.k_cache.dtype != torch.bfloat16 or cache.k_cache.ndim != 3:
+        raise MonoUnsupported("MTP GDN preparation requires BF16 convolution history")
+    history = cache.k_cache
+    if history.shape[1] != dims.gdn_conv_dim:
+        history = history.transpose(-1, -2)
+    if history.shape[1] != dims.gdn_conv_dim or history.shape[2] < 6:
+        raise MonoUnsupported("MTP q4 convolution history must hold six tokens")
 
 
 def _bind_scale(experts, name, shape):

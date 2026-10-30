@@ -3,14 +3,18 @@
 """Native QSA operators used at Mono's projection and attention boundaries.
 
 The native model keeps its original forward API. This local seam publishes
-index caches once when Mono replaces K1, and preserves native BF16 endpoints.
+index caches once when Mono replaces K1, and preserves Native BF16/PTPC endpoints.
 """
 
 from dataclasses import dataclass
 
 import torch
 
-from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
+from atom.model_ops.qwen4_exp.ops.gated import (
+    is_per_token_fp8_linear,
+    sigmoid_mul,
+    sigmoid_mul_quant,
+)
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compress_groups,
@@ -112,13 +116,20 @@ def prepare(
     hidden_states: torch.Tensor,
     *,
     fuse_decode_index: bool = False,
+    index_query_length: int = 1,
     projected_qkv: torch.Tensor | None = None,
     projected_index_qk: torch.Tensor | None = None,
+    quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> PreparedQsa:
     """Prepare QSA projections and fuse norm/RoPE/cache when metadata is present."""
 
     num_tokens = hidden_states.shape[0]
-    qkv = module.qkv_proj(hidden_states) if projected_qkv is None else projected_qkv
+    if projected_qkv is not None:
+        qkv = projected_qkv
+    elif quantized is not None:
+        qkv = module.qkv_proj(quantized[0], x_scale=quantized[1])
+    else:
+        qkv = module.qkv_proj(hidden_states)
     gate, q, k, v = qkv.split(
         [module.q_size, module.q_size, module.kv_size, module.kv_size], -1
     )
@@ -156,7 +167,12 @@ def prepare(
         from atom.models.qwen4_exp_mono.kernels.quark_qsa_index import prepare
 
         index_query = prepare(
-            module, hidden_states, positions, qsa, projected=projected_index_qk
+            module,
+            hidden_states,
+            positions,
+            qsa,
+            projected=projected_index_qk,
+            query_length=index_query_length,
         )
     else:
         index_query = _prepare_index(module, hidden_states, positions, qsa)
@@ -221,5 +237,12 @@ def finish(
 ) -> torch.Tensor:
     """Apply the native output gate and projection to QSA attention."""
     attn_out = attend(module, prepared, selected)
+    if is_per_token_fp8_linear(module.o_proj):
+        gated, scale = sigmoid_mul_quant(
+            attn_out.reshape(prepared.gate.shape[0], -1),
+            prepared.gate,
+            module.o_proj.params_dtype,
+        )
+        return module.o_proj(gated, x_scale=scale)
     gated = sigmoid_mul(attn_out.reshape(prepared.gate.shape[0], -1), prepared.gate)
     return module.o_proj(gated)

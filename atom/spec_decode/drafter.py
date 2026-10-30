@@ -546,6 +546,15 @@ class Drafter(abc.ABC):
             not standalone_ckpt,
         )
 
+        if getattr(self.model, "supports_selected_rows", False):
+            from atom.models.qwen4_exp_mono.draft.compact import validate_layer
+
+            validate_layer(self.model.model.layers[0])
+            assert self.mtp_k == 3
+            logger.info(
+                "QWEN_DRAFT_COMPACT_READY TP1/MTP3, Native QSA all rows, BF16 tail selected rows"
+            )
+
         if spec.method == "eagle3":
             logger.info(
                 "Eagle3 draft model loaded from %s (independent embed/lm_head)",
@@ -622,6 +631,9 @@ class Drafter(abc.ABC):
             "lm_head.weight",
             "lm_head",
         )
+
+        if hasattr(self.model, "prepare_draft_head"):
+            self.model.prepare_draft_head()
 
     def _publish_draft_shape(
         self,

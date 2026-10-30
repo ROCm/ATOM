@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from atom.models.qwen4_exp_mono.dims import Dims
-from atom.models.qwen4_exp_mono.shapes import LAYERS, PERSISTENT_ROWS
+from atom.models.qwen4_exp_mono.shapes import LAYERS, MTP_TARGET_ROWS, PERSISTENT_ROWS
 from atom.mono.runtime.consensus import MonoUnsupported
 
 
@@ -23,6 +23,32 @@ class ExpertLayout(Enum):
     @staticmethod
     def for_tp(tp: int) -> "ExpertLayout":
         return ExpertLayout.REPLICATED if tp == 1 else ExpertLayout.EXPERT_ID
+
+
+@dataclass(frozen=True)
+class MtpPlan:
+    """TP1 q4 target: HC/PTPC -> attention seams -> HC/router -> Native MXMOE.
+
+    Index publication precedes compression on the stream. GDN preparation
+    owns conv history through the Native device stage; ReplaySSM alone owns
+    replay records. Engine commit remains outside the layer loop. Native
+    experts consume their own M16/valid-row ABI, including graph padding.
+    """
+
+    rows: int
+    query_length: int = 4
+
+    def __post_init__(self):
+        if self.rows not in MTP_TARGET_ROWS or self.query_length != 4:
+            raise ValueError("MTP target requires 4/8/16 rows and q4")
+
+    @property
+    def native_mlp_down(self):
+        return self.rows > 4
+
+    @property
+    def fused_router(self):
+        return self.rows != 16
 
 
 @dataclass(frozen=True)

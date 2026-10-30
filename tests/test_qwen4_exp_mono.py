@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CPU contracts for Qwen Mono admission, native state views and build setup."""
+"""Qwen Mono admission, state views, build setup and GPU state publication."""
 
 import os
 from itertools import pairwise
@@ -19,6 +19,37 @@ from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import compile_kernels
 from atom.mono.runtime.consensus import MonoUnsupported
 from tests.conftest import atom_config_double
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("tmax", [1, 4, 16])
+@pytest.mark.parametrize("is_kda", [False, True])
+def test_replay_flush_publication_preserves_uncommitted_tail(tmax, is_kda):
+    from atom.models.qwen4_exp_mono.replayssm import _publish_flush_records
+
+    cap, heads, width = 2 * tmax, 2, 128
+    k = torch.arange(3 * heads * cap * width, device="cuda", dtype=torch.int32)
+    k = (k % 251).to(torch.bfloat16).reshape(3, heads, cap, width)
+    gshape = k.shape if is_kda else k.shape[:-1]
+    g = torch.arange(gshape.numel(), device="cuda", dtype=torch.float32).reshape(gshape)
+    before_k, before_g = k.clone(), g.clone()
+    # h=1 gives overlapping source/destination when T>1. Other entries are
+    # a prefill sentinel, an empty request, and a graph-padding slot.
+    cursor = torch.tensor([1, -1, 1], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([0, 1, 2, -1], device="cuda", dtype=torch.int32)
+    cu = torch.tensor(
+        [0, tmax, 2 * tmax, 2 * tmax, 3 * tmax], device="cuda", dtype=torch.int32
+    )
+    expected_k, expected_g = before_k.clone(), before_g.clone()
+    expected_k[0, :, :tmax] = before_k[0, :, 1 : 1 + tmax]
+    expected_g[0, :, :tmax] = before_g[0, :, 1 : 1 + tmax]
+
+    _publish_flush_records(k, g, cursor, slots, cu, tmax)
+
+    # This stage is a lossless copy, including untouched slots and tail rows.
+    assert torch.equal(k, expected_k)
+    assert torch.equal(g, expected_g)
+    assert cursor.tolist() == [1, -1, 1]
 
 
 def _deployment(tp, quark=False):
@@ -122,6 +153,50 @@ def test_decode_route_requires_ordinary_rows(monkeypatch, tp, rows):
     context.context.is_prefill = False
     gdn.num_spec_decodes = rows
     assert not dispatch.step_supported(ids, positions, None, None, tp)
+
+
+@pytest.mark.parametrize("rows,requests", [(4, 1), (8, 2), (16, 4), (16, 3)])
+def test_mtp_target_keeps_verify_metadata_and_padding(monkeypatch, rows, requests):
+    cfg = _deployment(1, quark=True)
+    cfg.quant_config.online_quant = True
+    cfg.speculative_config = NS(method="mtp", num_speculative_tokens=3)
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "1")
+    wrapped = dispatch.install_mono_decode(torch.nn.Identity(), cfg, object())
+    assert isinstance(wrapped, dispatch.MonoDecodeModel) and wrapped.mtp_target
+    gdn = NS(
+        num_prefills=0,
+        num_decodes=0,
+        num_spec_decodes=requests,
+        num_actual_tokens=4 * requests,
+        replayssm=True,
+        replayssm_max_query_len=4,
+    )
+    context = NS(
+        context=NS(is_prefill=False),
+        ubatch_slices=None,
+        attn_metadata=NS(image_mask=None, gdn_metadata=gdn),
+    )
+    monkeypatch.setattr(dispatch, "get_forward_context", lambda: context)
+    ids = torch.zeros(rows, dtype=torch.int32)
+    positions = torch.zeros(3, rows, dtype=torch.int64)
+    assert dispatch.step_supported(ids, positions, None, None, mtp_target=True)
+    assert not dispatch.step_supported(ids, positions, None, None)
+    gdn.replayssm_max_query_len = 1
+    assert not dispatch.step_supported(ids, positions, None, None, mtp_target=True)
+    gdn.replayssm_max_query_len = 4
+    # A truncated/ragged verify and a non-ReplaySSM deployment stay Native.
+    gdn.num_actual_tokens -= 1
+    assert not dispatch.step_supported(ids, positions, None, None, mtp_target=True)
+    gdn.num_actual_tokens += 1
+    gdn.replayssm = False
+    assert not dispatch.step_supported(ids, positions, None, None, mtp_target=True)
+    for spec in (
+        NS(method="mtp", num_speculative_tokens=2),
+        NS(method="eagle", num_speculative_tokens=3),
+    ):
+        cfg.speculative_config = spec
+        model = torch.nn.Identity()
+        assert dispatch.install_mono_decode(model, cfg, object()) is model
 
 
 @pytest.mark.parametrize("tp", [1, 8])

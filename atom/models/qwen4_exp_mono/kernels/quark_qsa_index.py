@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Ordinary decode index preparation for the fixed Qwen QSA geometry.
+"""QSA index query/raw publication and compressed BF16 cache preparation.
 
-Each CTA owns one request's new token. It forwards that token's raw key into
-its closing group while reading the preceding three keys from the cache;
-no CTA waits for another token or updates another request. Pooling, norm and
-RoPE retain the native BF16 endpoints. The runner admits one token/request
-and BF16 index caches before any recurrent or attention state is mutated.
+q1 forwards its own raw row. q4 first publishes ALL raw/position rows, then
+compresses on the same stream. Logical positions, request tables and closing
+compressed slots retain the Native causal and cache ownership contract.
 """
 
 import torch
@@ -34,6 +32,71 @@ def _norm_rope(x, w, cos, sin, pos0, pos1, pos2, D: tl.constexpr):
 
 
 @triton.jit
+def _compress(
+    KW,
+    COS,
+    SIN,
+    SLOT,
+    CSLOT,
+    TABLE,
+    REQ,
+    LOGICAL,
+    RAW,
+    PC,
+    CC,
+    row,
+    raw,
+    BS: tl.constexpr,
+    TBS: tl.constexpr,
+    PAGES: tl.constexpr,
+    REQUESTS: tl.constexpr,
+    FORWARD_CURRENT: tl.constexpr,
+):
+    d = tl.arange(0, 128)
+    slot = tl.load(SLOT + row).to(tl.int64)
+    valid = (slot >= 0) & (slot < PAGES * BS)
+    cs = tl.load(CSLOT + row).to(tl.int64)
+    req = tl.load(REQ + row)
+    end = tl.load(LOGICAL + row)
+    if (
+        valid
+        & (cs >= 0)
+        & (cs < PAGES * (BS // 4))
+        & (end >= 3)
+        & (req >= 0)
+        & (req < REQUESTS)
+    ):
+        accum = tl.full((128,), 0, tl.float32)
+        for i in tl.static_range(3):
+            lp = end - 3 + i
+            page = tl.load(TABLE + req * TBS + lp // BS, lp // BS < TBS, -1)
+            val = tl.load(
+                RAW + (tl.maximum(page, 0).to(tl.int64) * BS + lp % BS) * 128 + d,
+                (page >= 0) & (page < PAGES),
+                0,
+            ).to(tl.float32)
+            accum = accum + val
+        if FORWARD_CURRENT:
+            last = raw.to(tl.float32)
+        else:
+            last = tl.load(RAW + slot * 128 + d).to(tl.float32)
+        accum = accum + last
+        pooled = (accum / 4).to(tl.bfloat16).to(tl.float32)
+        first = end - 3
+        page = tl.load(TABLE + req * TBS + first // BS, first // BS < TBS, -1).to(
+            tl.int64
+        )
+        fp = (tl.maximum(page, 0) * BS + first % BS) * 3
+        pv = (page >= 0) & (page < PAGES)
+        f0 = tl.load(PC + fp, pv, 0)
+        f1 = tl.load(PC + fp + 1, pv, 0)
+        f2 = tl.load(PC + fp + 2, pv, 0)
+        kw = tl.load(KW + d).to(tl.float32) + 1
+        ck = _norm_rope(pooled[None, :], kw[None, :], COS, SIN, f0, f1, f2, 128)
+        tl.store(CC + cs * 128 + d, tl.reshape(ck, (128,)))
+
+
+@triton.jit
 def _index_front(
     QK,
     QW,
@@ -57,6 +120,7 @@ def _index_front(
     TBS: tl.constexpr,
     PAGES: tl.constexpr,
     REQUESTS: tl.constexpr,
+    VERIFY: tl.constexpr,
 ):
     row = tl.program_id(0)
     d = tl.arange(0, 128)
@@ -75,44 +139,72 @@ def _index_front(
     tl.store(PC + slot * 3, p0, valid)
     tl.store(PC + slot * 3 + 1, p1, valid)
     tl.store(PC + slot * 3 + 2, p2, valid)
-    cs = tl.load(CSLOT + row).to(tl.int64)
-    req = tl.load(REQ + row)
-    end = tl.load(LOGICAL + row)
-    if (
-        valid
-        & (cs >= 0)
-        & (cs < PAGES * (BS // 4))
-        & (end >= 3)
-        & (req >= 0)
-        & (req < REQUESTS)
-    ):
-        accum = tl.full((128,), 0, tl.float32)
-        for i in tl.static_range(3):
-            lp = end - 3 + i
-            page = tl.load(TABLE + req * TBS + lp // BS, lp // BS < TBS, -1)
-            val = tl.load(
-                RAW + (tl.maximum(page, 0).to(tl.int64) * BS + lp % BS) * 128 + d,
-                (page >= 0) & (page < PAGES),
-                0,
-            ).to(tl.float32)
-            accum = accum + val
-        accum = accum + raw.to(tl.float32)
-        pooled = (accum / 4).to(tl.bfloat16).to(tl.float32)
-        first = end - 3
-        page = tl.load(TABLE + req * TBS + first // BS, first // BS < TBS, -1).to(
-            tl.int64
+    if not VERIFY:
+        _compress(
+            KW,
+            COS,
+            SIN,
+            SLOT,
+            CSLOT,
+            TABLE,
+            REQ,
+            LOGICAL,
+            RAW,
+            PC,
+            CC,
+            row,
+            raw,
+            BS,
+            TBS,
+            PAGES,
+            REQUESTS,
+            True,
         )
-        fp = (tl.maximum(page, 0) * BS + first % BS) * 3
-        pv = (page >= 0) & (page < PAGES)
-        f0 = tl.load(PC + fp, pv, 0)
-        f1 = tl.load(PC + fp + 1, pv, 0)
-        f2 = tl.load(PC + fp + 2, pv, 0)
-        kw = tl.load(KW + d).to(tl.float32) + 1
-        ck = _norm_rope(pooled[None, :], kw[None, :], COS, SIN, f0, f1, f2, 128)
-        tl.store(CC + cs * 128 + d, tl.reshape(ck, (128,)))
 
 
-def prepare(module, hidden, positions, meta, *, projected=None):
+@triton.jit
+def _index_compress(
+    KW,
+    COS,
+    SIN,
+    SLOT,
+    CSLOT,
+    TABLE,
+    REQ,
+    LOGICAL,
+    RAW,
+    PC,
+    CC,
+    BS: tl.constexpr,
+    TBS: tl.constexpr,
+    PAGES: tl.constexpr,
+    REQUESTS: tl.constexpr,
+):
+    _compress(
+        KW,
+        COS,
+        SIN,
+        SLOT,
+        CSLOT,
+        TABLE,
+        REQ,
+        LOGICAL,
+        RAW,
+        PC,
+        CC,
+        tl.program_id(0),
+        tl.full((128,), 0, tl.float32),
+        BS,
+        TBS,
+        PAGES,
+        REQUESTS,
+        False,
+    )
+
+
+def prepare(module, hidden, positions, meta, *, projected=None, query_length=1):
+    assert query_length in (1, 4)
+    rows = hidden.shape[0]
     qk = (
         module.indexer.index_qk_proj(hidden, otype=hidden.dtype)
         if projected is None
@@ -145,7 +237,30 @@ def prepare(module, hidden, positions, meta, *, projected=None):
         meta.block_tables.stride(0),
         module.raw_key_cache.shape[0],
         meta.block_tables.shape[0],
+        query_length == 4,
         num_warps=4,
         enable_fp_fusion=False,
     )
+    if query_length == 4:
+        # Stream ordering publishes every q4 raw/position row before any
+        # closing group reads another query's data. CSLOT owns the only write.
+        _index_compress[(rows,)](
+            module.indexer.k_layernorm.weight,
+            rope.cos_cache,
+            rope.sin_cache,
+            meta.slot_mapping,
+            meta.compressed_slot_mapping,
+            meta.block_tables,
+            meta.token_to_req,
+            meta.logical_positions,
+            module.raw_key_cache,
+            module.rope_position_cache,
+            module.compressed_key_cache,
+            module.raw_key_cache.shape[1],
+            meta.block_tables.stride(0),
+            module.raw_key_cache.shape[0],
+            meta.block_tables.shape[0],
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
     return iq

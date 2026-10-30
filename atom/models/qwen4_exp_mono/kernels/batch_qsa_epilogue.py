@@ -114,11 +114,12 @@ def qsa_norm_rope_cache(
     k_scale=None,
     v_scale=None,
 ):
-    """Ordinary Mono decode: normalize/rotate Q/K and publish K/V once.
+    """Normalize/rotate Q/K and publish K/V once for decode or MTP verify.
 
     The per-head norm and both RoPE products retain their BF16 endpoints.
     Query is contiguous; K goes directly to the existing NHD paged cache.
     Negative slots preserve padded-request cache rows.
+    Each CTA reads only its own query row; q4 has no inter-row dependency here.
     """
     tokens, q_heads, dim = q.shape
     if k_scale is not None and (

@@ -57,6 +57,9 @@ class _UnquantizedMTPQuantizationConfig(_Qwen4ExpQuantizationConfig):
 
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
+    # The enclosing MTP model opts in after constructing the predictor.
+    compact_draft = False
+
     def __init__(self, atom_config: Config):
         super().__init__()
         config = copy.deepcopy(atom_config.hf_config)
@@ -137,7 +140,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        selected_rows: torch.Tensor | None = None,
+        with_head_input: bool = False,
+    ):
         n = hidden_states.shape[0]
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -145,8 +150,27 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden = self.pre_fc_norm_hidden(hidden_states.reshape(n, -1))
         hidden = self.fc_hidden(hidden.reshape(-1, self.hidden_size))
         hidden = hidden.view(n, self.hc_count, self.hidden_size) + embedding[:, None, :]
-        hidden = self.layers[0](positions, hidden.flatten(1), None)
-        return hidden.view(n, self.hc_count, self.hidden_size)
+        if self.compact_draft and n <= 16:
+            from atom.models.qwen4_exp_mono.draft.compact import (
+                forward as compact_forward,
+            )
+
+            if with_head_input:
+                from atom.models.qwen4_exp_mono.draft.tail import (
+                    forward as tail_forward,
+                )
+
+                return tail_forward(self, positions, hidden.flatten(1), selected_rows)
+            hidden = compact_forward(
+                self.layers[0], positions, hidden.flatten(1), selected_rows
+            )
+        else:
+            assert selected_rows is None
+            hidden = self.layers[0](positions, hidden.flatten(1), None)
+        hidden = hidden.view(-1, self.hc_count, self.hidden_size)
+        if with_head_input:
+            return hidden, self.hyper_connection_mixer.mix(hidden.flatten(1))[0]
+        return hidden
 
 
 class Qwen4ExpMTP(nn.Module):
@@ -167,6 +191,13 @@ class Qwen4ExpMTP(nn.Module):
         super().__init__()
         self.config = atom_config.hf_config
         self.model = Qwen4ExpMultiTokenPredictor(atom_config)
+        self.supports_selected_rows = os.getenv("QWEN_DRAFT_COMPACT", "0") == "1"
+        self.model.compact_draft = self.supports_selected_rows
+        self.draft_returns_head_input = os.getenv("QWEN_DRAFT_TAIL", "0") == "1"
+        assert not self.draft_returns_head_input or self.supports_selected_rows
+        if self.supports_selected_rows:
+            assert self.model.layers[0].tp_size == 1
+
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
@@ -189,6 +220,64 @@ class Qwen4ExpMTP(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
 
+    def forward_selected(self, input_ids, positions, hidden_states, selected_rows):
+        return self.model(
+            input_ids, positions, hidden_states, selected_rows=selected_rows
+        )
+
+    def forward_with_head(self, input_ids, positions, hidden_states):
+        return self.model(input_ids, positions, hidden_states, with_head_input=True)
+
+    def forward_selected_with_head(
+        self, input_ids, positions, hidden_states, selected_rows
+    ):
+        return self.model(
+            input_ids,
+            positions,
+            hidden_states,
+            selected_rows=selected_rows,
+            with_head_input=True,
+        )
+
+    def prepare_draft_head(self):
+        self._screen_head = None
+        self._use_screen_head = os.environ.get("QWEN_HEAD_SCREEN") == "1"
+        if "QWEN_HEAD_SCREEN" not in os.environ:
+            return
+        import logging
+
+        from atom.models.qwen4_exp_mono.head.screen import HeadScreen
+
+        assert self.lm_head.tp_size == 1 and self.lm_head.bias is None
+        assert self.lm_head.weight.shape == (248320, 2560)
+        self._screen_head = HeadScreen(self.lm_head.weight)
+        if os.environ.get("QWEN_GLOBAL_HEAD") == "1":
+            from atom.models.qwen4_exp_mono.head.binding import prepare
+
+            self._screen_head = prepare(self._screen_head)
+        logging.getLogger("atom").info(
+            "QWEN_HEAD_SCREEN_BOUND %s",
+            json.dumps(
+                {
+                    "rows": 1,
+                    "vocab": 248320,
+                    "enabled": self._use_screen_head,
+                    "original_weight_dtype": str(self.lm_head.weight.dtype),
+                    "screen_only": type(self._screen_head).__name__,
+                    "refinement": "original_bf16",
+                    "same_workspace_allocated_on_both_arms": True,
+                }
+            ),
+        )
+
+    def _draft_argmax(self, head_input, *, out):
+        if self._use_screen_head and head_input.shape == (1, 2560):
+            return self._screen_head.run(head_input, out=out)
+        return self.lm_head.compute_argmax_token(head_input, out=out)
+
+    def compute_draft_ids_with_head(self, head_input, *, out):
+        return self._draft_argmax(head_input, out=out)
+
     def _head_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.hyper_connection_mixer.mix(hidden_states.flatten(1))[0]
 
@@ -204,6 +293,4 @@ class Qwen4ExpMTP(nn.Module):
         *,
         out: torch.Tensor,
     ) -> torch.Tensor:
-        return self.lm_head.compute_argmax_token(
-            self._head_input(hidden_states), out=out
-        )
+        return self._draft_argmax(self._head_input(hidden_states), out=out)
