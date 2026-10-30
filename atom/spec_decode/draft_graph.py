@@ -186,6 +186,13 @@ class DraftGraph:
         A following :meth:`stage` still owns padding ``bs`` to ``running_bs``.
         The caller must not mutate this view between that stage and the pass
         consuming it.
+
+        A leading-batch view is the front of every wider one, so a producer
+        fills ``buffer(role, scheduled_bs)``. A ``batch_last`` view's stride is
+        its own batch, so the ``scheduled_bs`` view is not the front of the
+        ``running_bs`` one; a producer fills
+        ``buffer(role, running_bs)[..., :scheduled_bs]`` instead. :meth:`stage`
+        refuses any other view of this storage rather than copy it onto itself.
         """
         assert role in self._buffers, (
             f"{self.name} has no staged input {role!r}; "
@@ -230,8 +237,17 @@ class DraftGraph:
             f"but its fixed storage expects {tuple(dst.shape)}"
         )
         # A producer may have written straight into this exact fixed-storage
-        # view. Do not turn that into a self-copy launch.
-        if src.data_ptr() != dst.data_ptr() or src.stride() != dst.stride():
+        # view. Do not turn that into a self-copy launch. Any other view of the
+        # storage overlaps `dst` at a different layout, and `copy_` over it
+        # corrupts silently.
+        buf = self._buffers[role]
+        if 0 <= src.data_ptr() - buf.data_ptr() < buf.numel() * buf.element_size():
+            assert src.data_ptr() == dst.data_ptr() and src.stride() == dst.stride(), (
+                f"draft input '{role}' of {self.name} is a view of its own fixed "
+                f"storage at strides {src.stride()}, not the {dst.stride()} this "
+                f"stage writes; see `buffer` for the view a producer fills"
+            )
+        else:
             dst.copy_(src)
         if running_bs > scheduled_bs:
             if batch_last:

@@ -206,6 +206,92 @@ def test_batch_last_input_is_contiguous_and_tail_repeats_the_last_column():
     assert g._stage_one("pos", 2, None).data_ptr() == pos.data_ptr()
 
 
+def test_a_batch_last_producer_fills_the_running_view():
+    """A batch-last view's stride is its batch, so the producer fills the
+    front of the `running_bs` view and stage then writes only the pad."""
+    g = _mrope_graph()
+    produced = g.buffer("pos", 4)[..., :2]
+    produced.copy_(torch.arange(6, dtype=torch.int64).view(3, 2) * 10)
+    version_after_produce = g._buffers["pos"]._version
+
+    pos = g.stage(4, {"pos": produced})["pos"]
+
+    assert pos.data_ptr() == produced.data_ptr()
+    assert pos.tolist() == [[0, 10, 10, 10], [20, 30, 30, 30], [40, 50, 50, 50]]
+    assert g._buffers["pos"]._version == version_after_produce + 1, "tail only"
+
+
+def test_a_batch_last_fill_of_a_narrower_view_is_refused():
+    """`buffer("pos", 2)` is `[3, 2]` at stride 2, which overlaps the `[3, 4]`
+    view at stride 4. Copying one onto the other scrambled rows 1 and 2
+    without an error, so staging it has to fail instead."""
+    g = _mrope_graph()
+    g.buffer("pos", 2).copy_(torch.arange(6, dtype=torch.int64).view(3, 2))
+    with pytest.raises(AssertionError, match="view of its own fixed storage"):
+        g.stage(4, {"pos": g.buffer("pos", 2)})
+    # At its own width the same view is the exact one stage writes.
+    assert g.stage(2, {"pos": g.buffer("pos", 2)})["pos"].tolist() == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+    ]
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+def test_a_draft_step_wider_than_the_schedule_pads_every_input(
+    recorded, req_graph_recordings
+):
+    """A mid-step at `running_bs > scheduled_bs`, staged the way
+    `EagleProposer` stages it: fresh ids and MRoPE positions, and hidden states
+    a producer wrote into the pass's own buffer."""
+    seen = {}
+
+    def forward(running_bs, **staged):
+        seen.update({role: t.clone() for role, t in staged.items()})
+        return running_bs
+
+    g = _graph(
+        forward=forward,
+        inputs={
+            "input_ids": StagedInput(dtype=torch.int32),
+            "positions": StagedInput(shape=(3,), dtype=torch.int64, batch_last=True),
+            "hidden_states": StagedInput(shape=(2, 4), dtype=torch.float32),
+        },
+    )
+    scheduled_bs, running_bs = 3, 8
+    ids = torch.tensor([5, 6, 7], dtype=torch.int32)
+    positions = torch.arange(9, dtype=torch.int64).view(3, 3) + 100
+    hidden = torch.randn(scheduled_bs, 2, 4)
+    g.buffer("hidden_states", scheduled_bs).copy_(hidden)
+    if recorded:
+        req_graph_recordings.add(
+            running_bs, "recorded", on_replay=lambda: forward(running_bs, **staged)
+        )
+
+    staged = g.stage(
+        running_bs,
+        {
+            "input_ids": ids,
+            "positions": positions,
+            "hidden_states": g.buffer("hidden_states", scheduled_bs),
+        },
+    )
+    assert g.run(running_bs, **staged) == ("recorded" if recorded else running_bs)
+
+    pad = running_bs - scheduled_bs
+    assert seen["input_ids"].tolist() == [5, 6, 7] + [7] * pad
+    assert torch.equal(
+        seen["positions"],
+        torch.cat([positions, positions[:, -1:].expand(3, pad)], dim=1),
+    )
+    assert torch.equal(
+        seen["hidden_states"],
+        torch.cat([hidden, hidden[-1:].expand(pad, 2, 4)]),
+    )
+    for role, t in staged.items():
+        assert t.data_ptr() == g._buffers[role].data_ptr(), role
+
+
 def test_batch_last_capacity_counts_sequences_not_elements():
     g = _mrope_graph()
     assert g.buffer("pos", 256).shape == (3, 256)
