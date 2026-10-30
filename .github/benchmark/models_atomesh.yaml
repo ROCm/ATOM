@@ -1197,9 +1197,10 @@ models:
         # FP8 config for that shape, and its untuned FP8 GEMM needs K above 192.
         # Drop the exclusion once aiter's FP8 GEMM serves K 128.
         #
-        # Each PP8 stage repacks its KV for the TP8xDCP8 decode on the MLA
-        # staging streams; at high priority a repack does not wait out the
-        # stage's next prefill forward.
+        # Each PP8 stage repacks its KV for the TP8xDCP8 decode into 128-page
+        # MLA staging slots, which are off unless set, on their own streams; at
+        # high priority a repack does not wait out the stage's next prefill
+        # forward.
         - &kimi_k3_1p1d_pp8_dcp8
           <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32
@@ -1224,6 +1225,7 @@ models:
             prefill: &kimi_k3_pp8_lmcache128_prefill_env
               <<: *kimi_k3_pd_lmcache128_prefill_env
               VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
+              ATOM_PD_MLA_STAGING_CHUNK_PAGES: "128"
               ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
             decode: *kimi_k3_pd_decode_env
 
