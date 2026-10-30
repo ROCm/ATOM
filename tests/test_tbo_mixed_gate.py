@@ -11,6 +11,8 @@ cannot handle -- a cut that would leave a pure-decode ubatch -- must surface
 here as can_split=False.
 """
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -128,11 +130,37 @@ def test_tbo_off_reports_no_split(is_prefill):
     assert can_split is False
 
 
-@pytest.mark.parametrize("pcp_size,is_mixed", [(1, True), (2, False), (2, True)])
-def test_runner_rejects_mixed_pcp_before_collective_sizing(pcp_size, is_mixed):
-    """The runtime backstop also protects callers that bypass Config validation."""
-    from atom.model_engine.model_runner import ModelRunner
+@pytest.fixture(scope="module")
+def runner_tbo_eligibility():
+    # Execute the real CPU-only method and splitter without importing the
+    # runner's GPU kernels. This keeps the backstop covered in non-GPU CI.
+    path = Path(__file__).resolve().parents[1] / "atom/model_engine/model_runner.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ModelRunner"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_local_tbo_eligibility"
+    )
+    scope = {
+        "ScheduledBatch": SimpleNamespace,
+        "local_tbo_precompute": local_tbo_precompute,
+    }
+    exec(  # noqa: S102 - execute the trusted repository method, not GPU imports
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), scope
+    )
+    return scope["_local_tbo_eligibility"]
 
+
+@pytest.mark.parametrize("pcp_size,is_mixed", [(1, True), (2, False), (2, True)])
+def test_runner_rejects_mixed_pcp_before_collective_sizing(
+    runner_tbo_eligibility, pcp_size, is_mixed
+):
+    """The runtime backstop also protects callers that bypass Config validation."""
     config = _Config()
     config.prefill_context_parallel_size = pcp_size
     runner = SimpleNamespace(config=config)
@@ -147,10 +175,8 @@ def test_runner_rejects_mixed_pcp_before_collective_sizing(pcp_size, is_mixed):
     batch.num_scheduled_tokens = np.asarray(tokens, dtype=np.int64)
     if pcp_size > 1 and is_mixed:
         with pytest.raises(NotImplementedError, match="mixed prefill.*PCP"):
-            ModelRunner._local_tbo_eligibility(runner, batch)
+            runner_tbo_eligibility(runner, batch)
     else:
-        meets_min, can_split, ub0, ub1 = ModelRunner._local_tbo_eligibility(
-            runner, batch
-        )
+        meets_min, can_split, ub0, ub1 = runner_tbo_eligibility(runner, batch)
         assert meets_min and can_split
         assert ub0 + ub1 == sum(tokens) // pcp_size
