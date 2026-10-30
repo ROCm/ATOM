@@ -1679,13 +1679,19 @@ class ModelRunner:
         return specs
 
     def _state_pool_names(self) -> list[str]:
-        """The per-request STATE classes the attached builders declare.
+        """The per-request STATE classes the target builder declares.
 
         Named rather than counted because both callers want to say which: one
         refuses a model whose `model_type` is missing from the per-req-cache
-        set, the other refuses P/D for it.
+        set, the other refuses P/D for it. The target's alone, because both are
+        about per-request slots: a draft's STATE class (a windowed draft KV
+        pool, `draft_window.py`) is sized per request but hands out blocks.
         """
-        return [s.name for s in self._sub_pool_specs() if s.pool is Pool.STATE]
+        return [
+            s.name
+            for s in self.attn_metadata_builder.sub_pool_specs()
+            if s.pool is Pool.STATE
+        ]
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
