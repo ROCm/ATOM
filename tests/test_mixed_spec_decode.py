@@ -213,22 +213,50 @@ def test_unverified_step_anchors_every_row_on_its_last(mixed_forward_context):
     assert anchors.tolist() == [4, 7, 11, 15]
 
 
-# ── DSpark length shrink stays off on mixed steps ───────────────────────────
+# ── DSpark length shrink preserves the prefill region ───────────────────────
 
 
-def test_mixed_step_is_never_shrunk_even_with_unchanged_composition():
-    """Two mixed steps can carry identical req_ids (a chunked prefill beside
-    the same decodes), so "the composition changed" does not keep ragged off.
-    The prefill guard at the top of `dspark_scheduler.apply_q_bucket`, which
-    the runner's `_dspark_apply_q_bucket` delegates to, does."""
+@pytest.mark.parametrize("previous_prefills", [[1, 2], [90]])
+def test_mixed_ragged_shrink_preserves_prefill_even_under_full_cudagraphs(
+    previous_prefills,
+):
     from atom.model_engine.model_runner import ModelRunner
 
     runner = SimpleNamespace(
-        drafter=SimpleNamespace(uses_confidence_schedule=True, mtp_k=K)
+        drafter=SimpleNamespace(
+            uses_confidence_schedule=True,
+            mtp_k=K,
+            verify_scheduler=SimpleNamespace(ell_by_req={3: 0, 4: 2}),
+        ),
+        config=SimpleNamespace(
+            dspark=SimpleNamespace(ragged=True, ragged_graph_sizes="4")
+        ),
+        tokenID_processor=SimpleNamespace(
+            prev_batch=SimpleNamespace(
+                req_ids=previous_prefills + [3, 4],
+                total_seqs_num_prefill=len(previous_prefills),
+                is_dummy_run=False,
+            )
+        ),
+        enforce_eager=False,
+        _tr_hybrid_active=lambda: False,
     )
-    batch = _mixed_batch(req_ids=[1, 2, 3, 4])
-    assert ModelRunner._dspark_apply_q_bucket(runner, batch) is None
-    assert batch.num_scheduled_tokens.tolist() == NUM_SCHEDULED.tolist()
+    runner._dspark_apply_ragged = types.MethodType(
+        ModelRunner._dspark_apply_ragged, runner
+    )
+    batch = _mixed_batch(
+        req_ids=[1, 2, 3, 4],
+        num_spec_step=K,
+        num_bonus=np.array([99, 99, 0, 1]),
+        scheduled_tokens=np.arange(16),
+        total_tokens_num_decode=8,
+        total_tokens_num=16,
+    )
+    assert ModelRunner._dspark_apply_q_bucket(runner, batch) == 3
+    assert batch.num_scheduled_tokens.tolist() == [5, 3, 1, 3]
+    assert batch.scheduled_tokens.tolist() == list(range(9)) + [12, 13, 14]
+    assert batch.total_tokens_num == 12
+    assert batch.total_tokens_num_prefill == 8
 
 
 # ── V4 builder pieces ────────────────────────────────────────────────────────
@@ -289,7 +317,9 @@ def test_decode_view_slices_spec_fields_and_says_where_its_rows_start():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stages through the GPU")
-def test_mixed_deferred_inputs_under_spec(monkeypatch):
+@pytest.mark.parametrize("transport", ["direct", "packed"])
+@pytest.mark.parametrize("previous_dummy", [False, True])
+def test_mixed_deferred_inputs_under_spec(monkeypatch, transport, previous_dummy):
     """Every kind of row a mixed spec step can hold, in one batch:
 
     - 40: a prefill middle chunk that was ALSO in the previous batch -- must not
@@ -302,13 +332,15 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch):
     """
     from tests.test_h2d_runner_publication import runner_with_buffers
 
-    runner = runner_with_buffers(monkeypatch, "direct", speculative=True)
+    runner = runner_with_buffers(monkeypatch, transport, speculative=True)
     processor = runner.tokenID_processor
     processor.use_spec = True
     processor.num_spec_tokens = K
     runner._gate_staging_reuse()
 
-    processor.prev_batch = SimpleNamespace(req_ids=[10, 20, 30, 40], is_dummy_run=False)
+    processor.prev_batch = SimpleNamespace(
+        req_ids=[10, 20, 30, 40], is_dummy_run=previous_dummy
+    )
     processor.prev_token_ids = torch.tensor(
         [100, 200, 300, 400], dtype=torch.int32, device="cuda"
     )
@@ -324,6 +356,7 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch):
     spec = np.zeros((4, K), dtype=np.int32)
     spec[3] = [501, 502, 503]
     batch = SimpleNamespace(
+        num_spec_step=K,
         is_mixed=True,
         is_dummy_run=False,
         req_ids=[40, 10, 30, 50],
@@ -352,15 +385,20 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch):
     ids = processor.prepare_input_ids(batch, K + 1).clone()
     runner._mark_staging_h2d_enqueued()
     runner.h2d_owner.completion.synchronize()
-    assert ids.cpu().tolist() == (
+    expected = (
         [7, 8, 9]  # prefill middle chunk, as scheduled
         + [100, 101, 102, 103]  # 10: carried-over decode
         + [300, 301, 302, 303]  # 30: first decode after its prefill row
         + [500, 501, 502, 503]  # 50: scheduler-staged
     )
+    if previous_dummy:
+        expected = [7, 8, 9] + [-1, 0, 0, 0] * 2 + [500, 501, 502, 503]
+    assert ids.cpu().tolist() == expected
     # The whole batch's counts reach the device: MoE routes rows past
     # `scheduled_tokens_gpu` (batch_info[1]) to no expert.
     assert runner.forward_vars["batch_info"].gpu[:2].tolist() == [4, 15]
     # Prefill row: nothing rejected. Carried-over rows: last step's status.
-    assert processor.num_rejected.tolist() == [0, 1, 2, 0]
-    assert processor.num_bonus.tolist() == [0, 2, 1, 0]
+    assert processor.num_rejected.tolist() == (
+        [0] * 4 if previous_dummy else [0, 1, 2, 0]
+    )
+    assert processor.num_bonus.tolist() == ([0] * 4 if previous_dummy else [0, 2, 1, 0])
