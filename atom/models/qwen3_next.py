@@ -884,13 +884,9 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         if self.fuse_gemm_ar:
-            if self.layer_type == "linear_attention":
-                proj = self.linear_attn.out_proj
-            else:
-                proj = self.self_attn.o_proj
             hidden_states, residual = gluon_gemm_allreduce_gemma_rmsnorm(
                 hidden_states.contiguous(),
-                proj.weight,
+                self.gemm_ar_proj.weight,
                 residual,
                 self.post_attention_layernorm.weight,
                 self.post_attention_layernorm.variance_epsilon,
