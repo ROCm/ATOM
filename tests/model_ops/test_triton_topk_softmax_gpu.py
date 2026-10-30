@@ -33,6 +33,13 @@ from atom.model_ops.topk_softmax_dispatch import (
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.utils import envs
 
+# The kernel comparisons run on any GPU; the dispatch tests need this GPU to
+# have a measured Triton cutoff.
+needs_cutoff = pytest.mark.skipif(
+    triton_topk_softmax_max_rows() is None,
+    reason="no measured Triton top-k softmax cutoff on this GPU architecture",
+)
+
 EXPERTS, TOPK = 512, 10
 
 
@@ -361,6 +368,7 @@ def _record_kernels(monkeypatch, topK):
 SWITCH = pytest.mark.parametrize("switch,kernel", [("1", "triton"), ("0", "aiter")])
 
 
+@needs_cutoff
 @needs_aiter_num_valid_rows
 @SWITCH
 @pytest.mark.parametrize("shared", [0, 1])
@@ -404,6 +412,7 @@ def test_impl_passes_num_valid_rows_to_both_paths(shared, switch, kernel, monkey
     assert used == [kernel] * (2 + 3)
 
 
+@needs_cutoff
 @needs_aiter_num_valid_rows
 @SWITCH
 @pytest.mark.parametrize("shared,offset", [(0, 0), (1, 0), (1, 32)])
@@ -477,6 +486,7 @@ def test_select_experts_counts_the_pass_rows(
         assert bool((meta_ids[outside] == EXPERTS).all())
 
 
+@needs_cutoff
 @pytest.mark.parametrize("count", [None, "some"])
 @pytest.mark.parametrize("past_cutoff", [False, True])
 @pytest.mark.parametrize("experts,k,shared", [(512, 10, 1), (256, 8, 1), (128, 8, 0)])
@@ -553,6 +563,7 @@ def test_impl_matches_aiter_on_both_sides_of_the_row_cutoff(
         assert bool((ids_ref[rows * 2 // 3 :, :k] == -1).all())
 
 
+@needs_cutoff
 @SWITCH
 def test_launches_only_compare_the_row_count(switch, kernel, monkeypatch):
     """Launches, direct or through `FusedMoE.select_experts`, read neither the
@@ -577,6 +588,7 @@ def test_launches_only_compare_the_row_count(switch, kernel, monkeypatch):
     monkeypatch.setattr(envs, "__getattr__", counting_getattr)
     for module, name in (
         (topk_softmax_dispatch, "_cu_num"),
+        (topk_softmax_dispatch, "_gfx"),
         (topk_softmax_dispatch, "triton_topk_softmax_max_rows"),
         (topk_softmax_dispatch, "triton_topk_softmax_supported"),
         (topk_softmax_dispatch, "triton_topk_softmax_rows"),

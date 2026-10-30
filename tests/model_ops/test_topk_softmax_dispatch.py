@@ -7,8 +7,9 @@
 skips on a GPU-less runner. These pin the choice itself, which a MoE layer
 makes once when it is built (`triton_topk_softmax_rows`): the Triton kernel
 takes exactly the shapes AITER's fused `topkGatingSoftmax` handles (its
-dispatch stops at 512 experts), only in launches of up to 20 rows per CU, and
-only with the switch on when the layer is built.
+dispatch stops at 512 experts), only in launches of up to 20 rows per CU on
+MI355X (gfx950; other architectures, not measured, stay on AITER), and only
+with the switch on when the layer is built.
 """
 
 import pytest
@@ -34,6 +35,17 @@ def cu_num(monkeypatch):
 
     set_cu_num(MI355X_CUS)
     return set_cu_num
+
+
+@pytest.fixture(autouse=True)
+def gfx(monkeypatch):
+    """The GPU architecture, which the dispatch also asks AITER for."""
+
+    def set_gfx(arch):
+        monkeypatch.setattr(topk_softmax_dispatch, "_gfx", lambda: arch)
+
+    set_gfx("gfx950")
+    return set_gfx
 
 
 def _scoring(shared):
@@ -73,10 +85,10 @@ def test_refuses_unnormalized_and_other_scoring_funcs():
 
 def test_row_cutoff_scales_with_the_cu_count(cu_num):
     assert triton_topk_softmax_max_rows() == MI355X_MAX_ROWS
-    cu_num(304)  # MI300X
-    assert triton_topk_softmax_max_rows() == 6080
-    cu_num(80)
-    assert triton_topk_softmax_max_rows() == 1600
+    cu_num(128)  # a gfx950 partition
+    assert triton_topk_softmax_max_rows() == 2560
+    cu_num(32)
+    assert triton_topk_softmax_max_rows() == 640
 
 
 # The softmax top-k shapes of the models that route through it: Qwen3.8 /
@@ -94,7 +106,24 @@ MODEL_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize("cus,max_rows", [(MI355X_CUS, MI355X_MAX_ROWS), (304, 6080)])
+@pytest.mark.parametrize(
+    "arch,cus", [("gfx942", 304), ("gfx942", 80), ("gfx1250", 256)]
+)
+@pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
+def test_unmeasured_architectures_stay_on_aiter(
+    experts, k, shared, arch, cus, cu_num, gfx, monkeypatch
+):
+    """The crossover was measured on MI355X only; elsewhere no layer takes the
+    Triton kernel, as before it existed."""
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    gfx(arch)
+    cu_num(cus)
+    assert triton_topk_softmax_max_rows() is None
+    scoring_func = "sigmoid" if shared else None
+    assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func) is None
+
+
+@pytest.mark.parametrize("cus,max_rows", [(MI355X_CUS, MI355X_MAX_ROWS), (128, 2560)])
 @pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
 def test_model_layers_take_triton_up_to_the_cutoff(
     experts, k, shared, cus, max_rows, cu_num, monkeypatch
@@ -130,15 +159,26 @@ def test_unscored_shared_experts_are_not_the_kernels(monkeypatch):
 
 
 @pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
+def test_unnormalized_layers_never_take_triton(experts, k, shared, monkeypatch):
+    """The Triton kernel always renormalizes: an unnormalized layer gets no
+    cutoff."""
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    scoring_func = "sigmoid" if shared else None
+    assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func)
+    assert triton_topk_softmax_rows(experts, k, False, shared, scoring_func) is None
+
+
+@pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
 def test_switch_off_puts_every_layer_on_aiter(experts, k, shared, monkeypatch):
     monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "0")
     scoring_func = "sigmoid" if shared else None
     assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func) is None
 
 
-def test_decides_once_from_the_switch_and_cu_count(monkeypatch, cu_num):
-    """The layer reads the switch and the CU count when it decides; nothing a
-    launch does reads them again, so changing them later moves no layer."""
+def test_decides_once_from_the_switch_and_the_gpu(monkeypatch):
+    """The layer reads the switch, the architecture and the CU count when it
+    decides; nothing a launch does reads them again, so changing them later
+    moves no layer."""
     reads = []
     get_env = envs.__getattr__
 
@@ -150,11 +190,14 @@ def test_decides_once_from_the_switch_and_cu_count(monkeypatch, cu_num):
     monkeypatch.setattr(
         topk_softmax_dispatch, "_cu_num", lambda: reads.append("cu") or MI355X_CUS
     )
+    monkeypatch.setattr(
+        topk_softmax_dispatch, "_gfx", lambda: reads.append("gfx") or "gfx950"
+    )
     monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
     max_rows = triton_topk_softmax_rows(512, 10, True, 1, "sigmoid")
     assert max_rows == MI355X_MAX_ROWS
-    assert reads == ["ATOM_TRITON_TOPK_SOFTMAX", "cu"]
-    # The switch off: no CU count needed.
+    assert reads == ["ATOM_TRITON_TOPK_SOFTMAX", "gfx", "cu"]
+    # The switch off: no GPU query needed.
     reads.clear()
     monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "0")
     assert triton_topk_softmax_rows(512, 10, True, 1, "sigmoid") is None

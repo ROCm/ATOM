@@ -10,14 +10,22 @@ module level, so the GPU-less CI runs their tests too.
 
 from atom.utils import envs
 
-# Launches of up to this many rows per compute unit take the Triton kernel,
-# longer ones AITER's. Both kernels' times step with rows per CU: Triton runs
-# one single-wave program per row, AITER packs 8-64 rows into each block.
-# Measured on MI355X (256 CUs), Triton is faster up to 20 rows per CU (256
-# experts / top-8 with or without a shared expert, 32 / top-4), 22 (128 /
-# top-4), 24 (128 / top-8, 512 / top-10) or 28 (512 / top-10 + a shared
-# expert), and AITER past it; 20 keeps Triton only where it is faster for all.
-TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = 20
+# Per GPU architecture, launches of up to this many rows per compute unit take
+# the Triton kernel, longer ones AITER's. Both kernels' times step with rows
+# per CU: Triton runs one single-wave program per row, AITER packs 8-64 rows
+# into each block. Measured on MI355X (gfx950, 256 CUs), Triton is faster up
+# to 20 rows per CU (256 experts / top-8 with or without a shared expert,
+# 32 / top-4), 22 (128 / top-4), 24 (128 / top-8, 512 / top-10) or 28 (512 /
+# top-10 + a shared expert), and AITER past it; 20 keeps Triton only where it
+# is faster for all. An architecture without an entry has not been measured
+# and keeps every launch on AITER.
+TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
+
+
+def _gfx() -> str:
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx()
 
 
 def _cu_num() -> int:
@@ -26,9 +34,11 @@ def _cu_num() -> int:
     return get_cu_num()
 
 
-def triton_topk_softmax_max_rows() -> int:
-    """The most rows a launch can have and still take the Triton kernel."""
-    return TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU * _cu_num()
+def triton_topk_softmax_max_rows() -> int | None:
+    """The most rows a launch can have and still take the Triton kernel on
+    this GPU; None where the crossover has not been measured."""
+    per_cu = TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU.get(_gfx())
+    return None if per_cu is None else per_cu * _cu_num()
 
 
 def triton_topk_softmax_supported(
@@ -64,8 +74,8 @@ def triton_topk_softmax_rows(
     """For a layer's softmax top-k routing (`rocm_aiter_topk_softmax_impl`'s
     arguments, `num_experts` routed ones), the most rows a launch can have
     and still run `triton_topk_softmax` rather than AITER's `topk_softmax`;
-    None if none can: `ATOM_TRITON_TOPK_SOFTMAX=0` or a shape the Triton
-    kernel does not take. Called once, when the layer is built, so changing
+    None if none can: `ATOM_TRITON_TOPK_SOFTMAX=0`, a shape the Triton
+    kernel does not take, or a GPU without a measured cutoff. Called once, when the layer is built, so changing
     the switch later does not move the layer.
 
     Only the row count is left to each launch, never whether the stream is
