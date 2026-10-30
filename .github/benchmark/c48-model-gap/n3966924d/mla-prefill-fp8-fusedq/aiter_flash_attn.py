@@ -38,28 +38,34 @@ logger = init_logger(__name__)
 # Sizes and worker counts are runtime args: as constexprs every new prefill
 # length cost a ~0.3 s JIT compile on the host.
 @triton.jit
-def _qkv_amax(Q, K, V, Partial, NQ, NK, NV, PARTS: tl.constexpr, BLOCK: tl.constexpr):
-    part = tl.program_id(0)
-    kind = tl.program_id(1)
-    X = Q if kind == 0 else K if kind == 1 else V
-    n = NQ if kind == 0 else NK if kind == 1 else NV
+def _amax_part(X, n, part, PARTS: tl.constexpr, BLOCK: tl.constexpr):
     offsets = part * BLOCK + tl.arange(0, BLOCK)
     acc = tl.full((BLOCK,), 0, tl.float32)
     for start in range(tl.cdiv(n, PARTS * BLOCK)):
         index = offsets + start * PARTS * BLOCK
         x = tl.load(X + index, index < n, 0).to(tl.float32)
         acc = tl.maximum(acc, tl.abs(x))
-    tl.store(Partial + kind * PARTS + part, tl.max(acc, 0))
+    return tl.max(acc, 0)
+
+
+# One branch per tensor: selecting between a < 2 GiB and a >= 2 GiB pointer
+# (TP1 context chunks) fails the AMD buffer-op lowering ("PassManager::run failed").
+@triton.jit
+def _qkv_amax(Q, K, V, Partial, NQ, NK, NV, PARTS: tl.constexpr, BLOCK: tl.constexpr):
+    part = tl.program_id(0)
+    kind = tl.program_id(1)
+    if kind == 0:
+        amax = _amax_part(Q, NQ, part, PARTS, BLOCK)
+    elif kind == 1:
+        amax = _amax_part(K, NK, part, PARTS, BLOCK)
+    else:
+        amax = _amax_part(V, NV, part, PARTS, BLOCK)
+    tl.store(Partial + kind * PARTS + part, amax)
 
 
 @triton.jit
-def _qkv_quant(Q, K, V, Q8, K8, V8, Partial, Scales, NQ, NK, NV, WORKERS,
-               PARTS: tl.constexpr, BLOCK: tl.constexpr, SINGLE_PASS: tl.constexpr):
-    worker = tl.program_id(0)
-    kind = tl.program_id(1)
-    X = Q if kind == 0 else K if kind == 1 else V
-    Y = Q8 if kind == 0 else K8 if kind == 1 else V8
-    n = NQ if kind == 0 else NK if kind == 1 else NV
+def _quant_part(X, Y, Partial, Scales, n, kind, worker, WORKERS,
+                PARTS: tl.constexpr, BLOCK: tl.constexpr, SINGLE_PASS: tl.constexpr):
     offsets = worker * BLOCK + tl.arange(0, BLOCK)
     if SINGLE_PASS:
         x = tl.load(X + offsets, offsets < n, 0).to(tl.float32)
@@ -81,6 +87,19 @@ def _qkv_quant(Q, K, V, Q8, K8, V8, Partial, Scales, NQ, NK, NV, WORKERS,
             x = tl.load(X + index, index < n, 0).to(tl.float32)
             value = tl.minimum(tl.maximum(x * inv, -448.0), 448.0)
             tl.store(Y + index, value, index < n)
+
+
+@triton.jit
+def _qkv_quant(Q, K, V, Q8, K8, V8, Partial, Scales, NQ, NK, NV, WORKERS,
+               PARTS: tl.constexpr, BLOCK: tl.constexpr, SINGLE_PASS: tl.constexpr):
+    worker = tl.program_id(0)
+    kind = tl.program_id(1)
+    if kind == 0:
+        _quant_part(Q, Q8, Partial, Scales, NQ, kind, worker, WORKERS, PARTS, BLOCK, SINGLE_PASS)
+    elif kind == 1:
+        _quant_part(K, K8, Partial, Scales, NK, kind, worker, WORKERS, PARTS, BLOCK, SINGLE_PASS)
+    else:
+        _quant_part(V, V8, Partial, Scales, NV, kind, worker, WORKERS, PARTS, BLOCK, SINGLE_PASS)
 
 
 def _qkv_config(n: int) -> tuple[int, int, int, int]:

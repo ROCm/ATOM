@@ -23,7 +23,7 @@ moriio_common.py distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py
 inproj-pad128/kda.py models/kimi_k3/amd/kda.py fce40d671e29e9c442f1733d495b049ddc563f7a0cd2a2c9b3ccddcedcc5ce7d
 online-quant-fix/meta.py model_executor/model_loader/reload/meta.py 3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d
 cpu-lru-refresh-v3/manager.py v1/simple_kv_offload/manager.py 3ba82315913ab67415b52d6172fb4bd6fbb374c5723d6fb6e0de23a529e65933
-mla-prefill-fp8-fusedq/aiter_flash_attn.py v1/attention/backends/mla/prefill/aiter_flash_attn.py 9a3b6912d98755c1f17ba974585c8d0683aa038185d137405a01238a7c4243c3
+mla-prefill-fp8-fusedq/aiter_flash_attn.py v1/attention/backends/mla/prefill/aiter_flash_attn.py a641634fe413d53044922f9172cf51dfe36ca63dd4536fa8a539d019d90ea1bd
 latent-down-mxfp4/linear.py models/kimi_k3/amd/linear.py 792cdf31b4a6ec9ddcaae5db562145d6cc839f9d3b764d86451f0438303f2e0a
 pp-aux-hidden/linear.py models/kimi_k3/amd/linear.py 51e559c07875021fa668c01d09b21823de76eb0455a0f1a48455014e61203d44
 pp-mooncake/mooncake_connector.py distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py f22bc178085c69c5bb8e6c49bbd57c57a06bd4ddf8d17eae24bbc3d8a00aa349

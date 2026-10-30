@@ -43,8 +43,8 @@
       "relative_path": "v1/attention/backends/mla/prefill/aiter_flash_attn.py",
       "ported_from_sha256": "d0b8caee05f50a132c7f6915fe0dd3d594f7eef8c5e8f95af6fe39ea24e230c3",
       "base_sha256": "55541d7ee1585de73683f06e02e3681aa63fda29cc8f2a1090dcfc14f91334ad",
-      "patched_sha256": "9a3b6912d98755c1f17ba974585c8d0683aa038185d137405a01238a7c4243c3",
-      "note": "Both import additions kept."
+      "patched_sha256": "a641634fe413d53044922f9172cf51dfe36ca63dd4536fa8a539d019d90ea1bd",
+      "note": "Both import additions kept. Q/K/V quant kernels branch per tensor instead of selecting a pointer: a >= 2 GiB K (PP8/TP1 context chunk) next to < 2 GiB Q/V failed Triton's AMD lowering."
     },
     {
       "mount_source": "latent-down-mxfp4/linear.py",
