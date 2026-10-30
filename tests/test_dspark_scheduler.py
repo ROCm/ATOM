@@ -7,6 +7,7 @@ paper's §3.5 early-stop losslessness counterexample.
 """
 
 import numpy as np
+import pytest
 import torch
 import torch as _torch
 
@@ -978,3 +979,37 @@ def test_q_bucket_still_shrinks_a_verifying_decode():
     assert apply_q_bucket(batch, runner.drafter, runner.config.dspark) == 2
     assert batch.num_scheduled_tokens.tolist() == [2]
     assert batch.total_tokens_num_decode == 2
+
+
+def test_q_bucket_preserves_prefill_and_uses_decode_rows_bonus_counts():
+    runner = _q_bucket_runner()
+    runner.drafter.verify_scheduler.ell_by_req = {7: 1, 8: 0}
+    batch = _decode_batch(width=4, num_spec_step=3)
+    batch.req_ids = [90, 7, 8]
+    batch.total_seqs_num_prefill = 1
+    batch.total_seqs_num_decode = 2
+    batch.total_tokens_num_prefill = 3
+    batch.total_tokens_num_decode = 8
+    batch.total_tokens_num = 11
+    batch.num_scheduled_tokens = np.array([3, 4, 4], dtype=np.int32)
+    batch.scheduled_tokens = np.arange(11, dtype=np.int32)
+    batch.num_bonus = np.array([99, 0, 1])
+    batch.scheduled_spec_decode_tokens = np.arange(9).reshape(3, 3)
+    assert apply_q_bucket(batch, runner.drafter, runner.config.dspark) == 2
+    assert batch.num_scheduled_tokens.tolist() == [3, 2, 2]
+    assert batch.scheduled_tokens.tolist() == [0, 1, 2, 3, 4, 7, 8]
+    assert (batch.total_tokens_num_prefill, batch.total_tokens_num_decode) == (3, 4)
+    assert batch.total_tokens_num == 7
+    assert batch.scheduled_spec_decode_tokens.tolist() == [[0], [3], [6]]
+
+
+@pytest.mark.parametrize("new_lens", [[0, 2], [2, 5], [2]])
+def test_decode_resize_rejects_invalid_spans_without_mutation(new_lens):
+    from atom.spec_decode.dspark_scheduler import resize_decode_tokens
+
+    batch = _decode_batch(width=4, num_spec_step=3)
+    batch.num_scheduled_tokens = np.array([4, 4], dtype=np.int32)
+    batch.scheduled_tokens = np.arange(8)
+    with pytest.raises(ValueError, match="scheduled span"):
+        resize_decode_tokens(batch, np.array(new_lens))
+    assert batch.scheduled_tokens.tolist() == list(range(8))

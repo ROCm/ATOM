@@ -40,23 +40,11 @@ def _schedule_src() -> str:
 
 
 def _fallthrough_src() -> str:
-    """The part of `_schedule` after the prefill-only early return."""
+    """The common decode-admission and batch-emission part of `_schedule`."""
     body = _schedule_src()
     marker = "# --- Decode scheduling (also fall-through for mixed batches) ---"
     assert marker in body, "the fall-through marker moved; re-anchor this test"
     return body[body.index(marker) :]
-
-
-def test_the_feature_flag_does_not_gate_the_bookkeeping():
-    """Only the early RETURN may depend on `enable_mixed_prefill_decode`."""
-    body = _schedule_src()
-    gated = body.count("not self.enable_mixed_prefill_decode")
-    assert gated == 1, (
-        f"_schedule tests `not enable_mixed_prefill_decode` {gated} times; "
-        "exactly one (the prefill-only early return) is expected -- gating "
-        "anything else on the flag is what silently dropped plan_midstep, "
-        "is_final_chunk and the schedule-time advance"
-    )
 
 
 def test_the_fallthrough_settles_prefill_chunks():
@@ -75,14 +63,14 @@ def test_settle_is_called_before_the_batch_is_built():
     """`plan_midstep` leaves state the batch snapshots."""
     tail = _fallthrough_src()
     assert tail.index("_settle_prefill_chunks(") < tail.index(
-        "decode_batch = ScheduledBatch("
+        "batch = ScheduledBatch("
     ), "prefill chunks must be settled before the batch snapshots them"
 
 
 def test_advance_runs_after_the_batch_is_built():
     """The batch must keep pre-advance offsets."""
     tail = _fallthrough_src()
-    assert tail.index("decode_batch = ScheduledBatch(") < tail.index(
+    assert tail.index("batch = ScheduledBatch(") < tail.index(
         "_advance_prefill_on_schedule("
     ), "advancing before the build would hand the batch post-advance offsets"
 
@@ -215,9 +203,10 @@ class TestMixedBatchBookkeeping:
         ]
         assert ready == [], "a middle chunk must not be announced as ready"
 
-    def test_a_flag_on_pure_prefill_batch_is_settled_too(self, seq_factory):
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_a_pure_prefill_batch_is_settled_with_either_flag(self, seq_factory, mixed):
         """The gate is about the BATCH's shape, not the feature's state."""
-        sched = self._mixed_sched()
+        sched = self._mixed_sched(enable_mixed_prefill_decode=mixed)
         p = seq_factory([10, 11, 12, 13])
         sched.add(p)
         with patch.object(
