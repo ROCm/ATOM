@@ -749,6 +749,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             max_kv_len,
             None,
             None,
+            max_extend_len=max_q_len,
         )
 
     def _init_draft_extend_mha(self, bs, forward_batch):
