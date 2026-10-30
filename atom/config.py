@@ -2897,6 +2897,11 @@ class Config:
                     "run over the whole batch, decode rows included"
                 ),
             ),
+            (
+                self.decode_context_parallel_size > 1,
+                "decode context parallel",
+                "mixed batching requires decode context parallel size 1",
+            ),
         ]
         blocked = [(what, why) for cond, what, why in refusals if cond]
         if blocked:
@@ -2979,6 +2984,9 @@ class Config:
         # share one artifact, as they should.
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
+        # Keep mixed attention dispatch/metadata artifacts separate from runs
+        # that only admit homogeneous batches.
+        factors.append(self.enable_mixed_prefill_decode)
         factors.append(self.index_cache_dtype)
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the

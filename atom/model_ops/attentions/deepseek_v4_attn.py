@@ -2675,8 +2675,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # device view, and on a mixed step `publish_cu_seqlens_q` has already
         # published the DECODE segment's spans into it (anchor + drafts per
         # decode seq) -- so swa_write / paged-decode index the decode kv from 0
-        # instead of running off the end (GPU OOB in swa_write). The host check
-        # is what stands between a full-batch cumsum and that OOB.
+        # instead of running off the end (GPU OOB in swa_write). The check below
+        # validates the producer's host layout; device publication and bank
+        # isolation are checked by the H2D GPU regression tests.
         #
         # Query shrinking keeps the prefill prefix and repacks only decode
         # tokens. Validate every decode-local boundary, not just a rectangular
