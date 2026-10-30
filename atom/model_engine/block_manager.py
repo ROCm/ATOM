@@ -1208,10 +1208,16 @@ class BlockManager:
         record: bool,
         block_hashes: list[int] | None,
         probe: AdmissionProbe | None = None,
+        *,
+        reserved_blocks: int = 0,
+        reserved_state_slots: int = 0,
+        demand: list[int] | None = None,
+        observe: bool = True,
     ) -> int:
         """`can_allocate` over the walk `walk_of(seq)` returns; everything but
         the walk is asked afresh on every call. `probe.num_new_blocks` is set
-        once the fit passes."""
+        once the fit passes. The reserved / demand / observe arguments serve
+        `can_allocate_memoized`'s multi-seq probe."""
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         #
         # The full per-request width, because that is what `allocate` will take:
@@ -1219,13 +1225,18 @@ class BlockManager:
         # rollback set to.
         if block_hashes is not None:
             block_hashes.clear()
-        if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
+        if seq.has_per_req_cache and not self.state.has_free(
+            self.state_slots_per_req + reserved_state_slots
+        ):
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(
-                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
-            ):
+            num_new_blocks = self.num_pool_blocks(
+                len(seq)
+            ) + self.draft_lookahead_blocks(len(seq))
+            if not self._has_page_units(num_new_blocks + reserved_blocks):
                 return -1
+            if demand is not None:
+                demand.append(num_new_blocks)
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
@@ -1256,7 +1267,8 @@ class BlockManager:
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
-        seq.num_compressed_hit_blocks = compressed_hit
+        if observe:
+            seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         # Plus the draft round's lookahead past the prompt, which the scheduler
@@ -1275,17 +1287,20 @@ class BlockManager:
         #
         # `resumable`, not the replayed hit: the counterfactual is asked of the
         # gates, whose answer a replay does not change.
-        self._record_checkpoint_demand(
-            seq,
-            hit=resumable,
-            compressed_hit=compressed_hit,
-            block_hashes=block_hashes,
-            live_blocks=num_new_blocks,
-            protected_hash=protected_hash,
-        )
-        self._record_checkpoint_end(seq)
-        if not self._has_page_units(num_new_blocks, protected_hash):
+        if observe:
+            self._record_checkpoint_demand(
+                seq,
+                hit=resumable,
+                compressed_hit=compressed_hit,
+                block_hashes=block_hashes,
+                live_blocks=num_new_blocks,
+                protected_hash=protected_hash,
+            )
+            self._record_checkpoint_end(seq)
+        if not self._has_page_units(num_new_blocks + reserved_blocks, protected_hash):
             return -1
+        if demand is not None:
+            demand.append(num_new_blocks)
         # `record_allocation` re-checks a joint against this demand instead of
         # walking the hit again.
         if probe is not None:
@@ -1471,7 +1486,15 @@ class BlockManager:
             return None
         return walk
 
-    def can_allocate_memoized(self, seq: Sequence) -> int:
+    def can_allocate_memoized(
+        self,
+        seq: Sequence,
+        *,
+        reserved_blocks: int = 0,
+        reserved_state_slots: int = 0,
+        demand: list[int] | None = None,
+        observe: bool = True,
+    ) -> int:
         """`can_allocate(seq, record=False)` for the delayer and the DP chunk
         cost, with the walk memoised per seq. The same `_evaluate`, so state
         room, the gates, the replay, checkpoint demand/end, the used hit blocks
@@ -1483,9 +1506,25 @@ class BlockManager:
         `_RECENT_INDEX_CHANGES` since the last check re-walks), no
         `clear_cache`, the first miss still resolves the same (a hit only grows
         by a publish of that hash), and token count and seed are unchanged.
+
+        A probe that walks several waiting seqs asks each one's fit against the
+        pool its predecessors would leave: `reserved_blocks` / `reserved_state_slots`
+        are what the seqs it already counted take, and `demand` (if given)
+        receives this seq's own pool blocks so the caller can add them up.
+        `observe=False` leaves the seq's hit instrumentation and checkpoint
+        demand/end untouched: a fill probe is not an admission.
         """
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
-        return self._evaluate(seq, walk_of, False, None)
+        return self._evaluate(
+            seq,
+            walk_of,
+            False,
+            None,
+            reserved_blocks=reserved_blocks,
+            reserved_state_slots=reserved_state_slots,
+            demand=demand,
+            observe=observe,
+        )
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)
