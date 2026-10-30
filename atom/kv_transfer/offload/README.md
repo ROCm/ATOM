@@ -129,10 +129,12 @@ every hit the index votes for is also sent to the workers as a *touch*
 end of LMCache's LRU (`StateByteCodec.touch`) and reports whether it was still
 there on the `k3_state_touch` channel. A prefix that hits every turn keeps its
 image as warm as its KV, and an image LMCache evicted leaves the index when its
-verdict lands. An admission about to load an image not confirmed in the last
-minute is held for a pass (at most `OFFLOAD_LOOKUP_DEFER_S`) while that
-verdict comes back, so it plans a lower boundary instead of parking on a miss
-and recomputing the whole prompt. `OFFLOAD_STATE_CPU_SIZE` caps how much of
+verdict lands. An admission about to load an image not confirmed recently is
+held for a pass (at most `OFFLOAD_LOOKUP_DEFER_S`) while that verdict comes
+back, so it plans a lower boundary instead of parking on a miss and
+recomputing the whole prompt. "Recently" scales with the pool the image has to
+age out of: 0.25 s per GiB of `LMCACHE_MAX_LOCAL_CPU_SIZE`, within 5-60 s
+(52 s for a 208.6 GiB pool; `tier_verified_for_s`). `OFFLOAD_STATE_CPU_SIZE` caps how much of
 the pool images may take; it reserves nothing, and the worker warns at startup
 when the cap is not below half of `LMCACHE_MAX_LOCAL_CPU_SIZE`.
 

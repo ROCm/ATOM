@@ -19,14 +19,15 @@ from time import monotonic
 
 logger = logging.getLogger("atom")
 
-#: How long a hash counts as known-resident after the last evidence that its
-#: image was in LMCache (stored, loaded, or confirmed by a touch). Every one of
-#: those leaves the image at the young end of LMCache's LRU, and LRU can only
-#: evict it after a pool's worth of newer entries (a 208 GiB pool at AgentX
-#: c64 turns over in about 13 minutes), so this stays well inside the time an
-#: image needs to age out. It is also longer than the usual gap between a
-#: prefix being stored and its next turn, so most loads are never held.
-_TIER_VERIFIED_FOR_S = 60.0
+#: The fastest one worker's LMCache pool is assumed to take in new entries.
+#: AgentX c64 on one GPU stored about 0.25 GiB/s (970 GB/h); four times that
+#: leaves room for a prefill-heavier load or a model with more KV per token.
+_POOL_FILL_GIB_PER_S = 1.0
+#: The share of the pool's turnover at that rate an image is trusted for.
+_POOL_TRUSTED_FRACTION = 0.25
+#: Bounds on `tier_verified_for_s`. See there.
+_TIER_VERIFIED_MIN_S = 5.0
+_TIER_VERIFIED_MAX_S = 60.0
 
 #: A hash voted on every scheduling pass is touched at most this often. The
 #: touch only has to keep the image near the young end, not track every pass.
@@ -40,8 +41,8 @@ class StateOffloadIndex:
     can drop bytes at any time, so on its own a hash here means "was stored
     once", never "is still there".
 
-    With `refresh_hits`, every hit the index votes for is also *touched*: the
-    hash is queued for `take_touches`, the worker refreshes the image's
+    With `refresh_hits`, every hit a voter registers (`want_touch`) is also
+    *touched*: the hash is queued for `take_touches`, the worker refreshes the image's
     position in LMCache's LRU the same way a KV lookup refreshes its chunks,
     and reports whether the image was still there (`apply_touch_verdict`). That
     keeps a prefix's state image as warm as its KV, and lets a hash LMCache
@@ -57,6 +58,8 @@ class StateOffloadIndex:
         can_load: bool = True,
         max_cpu_entries: int | None = None,
         refresh_hits: bool = False,
+        pool_bytes: int = 0,
+        defer_s: float | None = None,
     ) -> None:
         # The two legs are separately granted. A `kv_producer` role saves and
         # never loads, a `kv_consumer` loads and never saves, and offering a
@@ -112,6 +115,12 @@ class StateOffloadIndex:
         # connector carries no touches (the vLLM plugin), where the queue would
         # only grow.
         self.refresh_hits = bool(refresh_hits)
+        # Both fixed for the server's lifetime; `needs_verify` runs on the
+        # admission path. `pool_bytes` is one worker's LMCache CPU pool.
+        self.verified_for_s = tier_verified_for_s(pool_bytes)
+        if defer_s is None:
+            defer_s = verify_defer_s() if self.refresh_hits else 0.0
+        self.defer_s = float(defer_s)
         # Hashes voted for since the last `take_touches`.
         self._touch_wanted: set[int] = set()
         # hash -> monotonic of the last touch handed out / the last evidence
@@ -179,13 +188,8 @@ class StateOffloadIndex:
 
     def could_serve(self, h: int) -> bool:
         """Whether a load for `h` could be offered at all: this tier can load
-        AND believes it holds `h`.
-
-        A True answer is a hit vote, so under `refresh_hits` it also queues `h`
-        for a touch. This is the one predicate every voter goes through, which
-        is what makes it the place to refresh: a prefix whose state is voted
-        for on every pass stays as warm in LMCache as its KV chunks, which the
-        KV lookup refreshes on every pass.
+        AND believes it holds `h`. Pure; a voter that acts on a True answer
+        registers the hit with `want_touch`.
 
         The membership+capability half of `request_load`'s guard (minus its
         per-request in-flight check), factored out so the admission-path voters
@@ -198,13 +202,21 @@ class StateOffloadIndex:
         still-resident HBM rung, and `request_load` returned False -- the
         boundary disowned and the HBM checkpoint forfeited to a full recompute.
         """
-        if not (self.can_load and h in self.hashes):
-            return False
-        if self.refresh_hits:
-            self._touch_wanted.add(h)
-        return True
+        return self.can_load and h in self.hashes
 
     # ------------------------------- touches ------------------------------- #
+    def want_touch(self, h: int) -> None:
+        """A voter counted `h` as a hit: under `refresh_hits`, queue it for
+        `take_touches`.
+
+        Called by every voter on the hits it votes for (the resumable scan and
+        `BlockManager._request_state_load`), so a prefix whose state is voted
+        for on every pass stays as warm in LMCache as its KV chunks, which the
+        KV lookup refreshes on every pass.
+        """
+        if self.refresh_hits and h in self.hashes:
+            self._touch_wanted.add(h)
+
     def take_touches(self) -> list[int]:
         """Hashes to touch in LMCache this step, drained.
 
@@ -256,27 +268,26 @@ class StateOffloadIndex:
         touch verdict instead of parking on it now.
 
         True while `h` has not been confirmed resident within
-        `_TIER_VERIFIED_FOR_S` and its touch is still pending. A pass later
+        `verified_for_s` and its touch is still pending. A pass later
         the verdict is normally in: resident lets the load go ahead, gone has
         already dropped `h`, so the admission picks a lower boundary (an HBM
         checkpoint, an older CPU image, or a plain prefill) instead of parking
         and recomputing everything after the miss.
 
-        The hold is bounded by `defer_s` from the first time `h` was held, not
+        The hold is bounded by `defer_s` (`OFFLOAD_LOOKUP_DEFER_S`, read once
+        at construction) from the first time `h` was held, not
         from its latest touch: a held request re-probes every pass and its
         touch is re-sent every `_TIER_TOUCH_INTERVAL_S`, so a bound measured
         from the send would never run out if verdicts stopped arriving. Once
         it runs out, admissions over `h` proceed as they did before touches
         existed until any evidence about `h` arrives.
         """
-        if not self.refresh_hits or h not in self.hashes:
-            return False
-        defer_s = verify_defer_s()
-        if defer_s <= 0:
+        defer_s = self.defer_s
+        if not self.refresh_hits or defer_s <= 0 or h not in self.hashes:
             return False
         now = monotonic()
         verified = self._verified_at.get(h)
-        if verified is not None and now - verified <= _TIER_VERIFIED_FOR_S:
+        if verified is not None and now - verified <= self.verified_for_s:
             return False
         if h in self._hold_expired:
             return False
@@ -402,7 +413,7 @@ class StateOffloadIndex:
 
 def verify_defer_s() -> float:
     """How long an admission may wait for a touch verdict
-    (`StateOffloadIndex.needs_verify`).
+    (`StateOffloadIndex.needs_verify`), read once per index.
 
     `OFFLOAD_LOOKUP_DEFER_S`: the same question it already answers for a KV
     lookup in flight -- how long admission may pass over a request whose tier
@@ -411,6 +422,36 @@ def verify_defer_s() -> float:
     from atom.utils import envs
 
     return float(envs.OFFLOAD_LOOKUP_DEFER_S)
+
+
+def tier_verified_for_s(pool_bytes: int) -> float:
+    """How long a hash counts as known-resident after the last evidence that
+    its image was in LMCache (stored, loaded, or confirmed by a touch).
+
+    Each of those leaves the image at the young end of LMCache's LRU, which
+    evicts it only after a whole pool of newer entries has come in: the safe
+    window is the pool's turnover, `pool_bytes / fill rate`. The fill rate is
+    the workload's and not known at startup, so this takes a ceiling,
+    `_POOL_FILL_GIB_PER_S`, and trusts `_POOL_TRUSTED_FRACTION` of the
+    turnover at that rate: 0.25 s per GiB, 52 s for the 208.6 GiB AgentX pool,
+    whose turnover at c64 was about 14 minutes.
+
+    Clamped to [`_TIER_VERIFIED_MIN_S`, `_TIER_VERIFIED_MAX_S`] = [5 s, 60 s].
+    The floor (pools under 20 GiB) keeps the window well above a touch round
+    trip, `_TIER_TOUCH_INTERVAL_S` plus a step, or nearly every load would be
+    held. The ceiling (pools over 240 GiB) is the largest window measured
+    (AgentX c48 / c64); past it a fill rate above the assumed one would let
+    images evicted minutes earlier through. An unknown pool (0) gets the floor.
+
+    Erring either way is a cost, not wrong output: too long admits a load that
+    may miss and recompute, which is what every load did before touches; too
+    short holds a load a pass for a verdict it did not need.
+    """
+    if pool_bytes <= 0:
+        return _TIER_VERIFIED_MIN_S
+    turnover_s = pool_bytes / float(1 << 30) / _POOL_FILL_GIB_PER_S
+    window = turnover_s * _POOL_TRUSTED_FRACTION
+    return min(max(window, _TIER_VERIFIED_MIN_S), _TIER_VERIFIED_MAX_S)
 
 
 #: Offload layouts whose worker half builds a `StateOffloadTier`. Not every
@@ -622,8 +663,10 @@ def state_tier_budget_warning(
     return None
 
 
-def state_tier_chunk_tokens(config) -> int:
-    """The LMCache chunk size in tokens for the joint KV leg, or 0.
+def state_tier_lmcache_sizes(config) -> tuple[int, int]:
+    """The LMCache chunk size in tokens for the joint KV leg, and one worker's
+    CPU pool in bytes (`LMCACHE_MAX_LOCAL_CPU_SIZE`) for `tier_verified_for_s`;
+    (0, 0) when LMCache's config cannot be read.
 
     Decided from config for the same reason `state_tier_capability` is: this
     runs in the engine process at `BlockManager.__init__`, and the scheduler
@@ -652,7 +695,9 @@ def state_tier_chunk_tokens(config) -> int:
             sub, _why = _offload_subconfig(kvcfg)
             if sub is not None:
                 kvcfg = sub
-        return int(build_lmcache_config(kvcfg).chunk_size)
+        cfg = build_lmcache_config(kvcfg)
+        pool_gib = float(getattr(cfg, "max_local_cpu_size", 0) or 0)
+        return int(cfg.chunk_size), int(pool_gib * (1 << 30))
     except Exception:
         # Blind on purpose: this runs at model load, the import reaches a
         # third-party package that may be absent entirely, and the only
@@ -660,10 +705,11 @@ def state_tier_chunk_tokens(config) -> int:
         # stays off. Refusing to start would be worse.
         logger.warning(
             "state offload: could not read the LMCache chunk size; the joint "
-            "KV load needs it and stays off",
+            "KV load needs it and stays off, and the CPU pool size is taken "
+            "as unknown",
             exc_info=True,
         )
-        return 0
+        return 0, 0
 
 
 #: The connector backends whose worker half can build a `StateOffloadTier`.

@@ -285,34 +285,45 @@ class TestCodecRefresh:
 # ── the index: votes queue touches, verdicts keep it in step ───────────────
 
 
-def _index(*hashes, refresh=True):
-    idx = StateOffloadIndex(refresh_hits=refresh)
+#: Past every confirmation window `tier_verified_for_s` can give.
+STALE = so._TIER_VERIFIED_MAX_S + 1
+
+
+def _index(*hashes, refresh=True, **kw):
+    idx = StateOffloadIndex(refresh_hits=refresh, **kw)
     for h in hashes:
         idx.note_stored(h)
     return idx
 
 
 class TestIndexTouches:
-    def test_a_hit_vote_queues_a_touch(self, clock):
+    def test_could_serve_queues_nothing(self, clock):
         idx = _index(7)
         assert idx.could_serve(7) and not idx.could_serve(8)
+        assert idx.take_touches() == []
+
+    def test_a_registered_hit_queues_a_touch(self, clock):
+        idx = _index(7)
+        idx.want_touch(7)
+        idx.want_touch(8)  # not indexed: nothing to touch
         assert idx.take_touches() == [7]
         assert idx.take_touches() == []
 
     def test_no_touches_without_refresh(self, clock):
         idx = _index(7, refresh=False)
         assert idx.could_serve(7)
+        idx.want_touch(7)
         assert idx.take_touches() == []
 
     def test_a_hash_voted_every_pass_is_touched_at_an_interval(self, clock):
         idx = _index(7)
-        idx.could_serve(7)
+        idx.want_touch(7)
         assert idx.take_touches() == [7]
         clock[0] += so._TIER_TOUCH_INTERVAL_S / 2
-        idx.could_serve(7)
+        idx.want_touch(7)
         assert idx.take_touches() == []
         clock[0] += so._TIER_TOUCH_INTERVAL_S
-        idx.could_serve(7)
+        idx.want_touch(7)
         assert idx.take_touches() == [7]
         assert idx.touches_sent == 2
 
@@ -339,7 +350,7 @@ class TestIndexTouches:
 
     def test_stop_refreshing_drops_pending_touches(self, clock):
         idx = _index(7)
-        idx.could_serve(7)
+        idx.want_touch(7)
         idx.stop_refreshing()
         assert idx.take_touches() == []
         assert not idx.needs_verify(7)
@@ -351,7 +362,7 @@ class TestNeedsVerify:
 
     def test_a_stale_hash_waits_for_its_touch(self, clock):
         idx = _index(7)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert idx.needs_verify(7)
         assert idx.take_touches() == [7], "the hold asks for its own touch"
         assert idx.needs_verify(7), "still out"
@@ -360,18 +371,15 @@ class TestNeedsVerify:
 
     def test_a_gone_verdict_ends_the_hold_by_dropping_the_hash(self, clock):
         idx = _index(7)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert idx.needs_verify(7)
         idx.take_touches()
         idx.apply_touch_verdict(7, False)
         assert not idx.needs_verify(7) and not idx.could_serve(7)
 
-    def test_a_lost_verdict_holds_no_longer_than_the_lookup_defer(
-        self, clock, monkeypatch
-    ):
-        monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "2")
-        idx = _index(7)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+    def test_a_lost_verdict_holds_no_longer_than_the_lookup_defer(self, clock):
+        idx = _index(7, defer_s=2)
+        clock[0] += STALE
         # A held request re-probes every pass and its touch is re-sent every
         # interval; verdicts never come back. Re-sends must not extend the hold.
         held_for, step = 0.0, 0.05
@@ -388,27 +396,25 @@ class TestNeedsVerify:
         assert not idx.needs_verify(7), "later admissions are not held again"
         assert idx.verify_holds_expired == 1
 
-    def test_evidence_after_an_expired_hold_rearms_it(self, clock, monkeypatch):
-        monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "2")
-        idx = _index(7)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+    def test_evidence_after_an_expired_hold_rearms_it(self, clock):
+        idx = _index(7, defer_s=2)
+        clock[0] += STALE
         assert idx.needs_verify(7)
         clock[0] += 3
         assert not idx.needs_verify(7)
         idx.apply_touch_verdict(7, True)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert idx.needs_verify(7), "a fresh hold, timed from now"
         clock[0] += 1
         assert idx.needs_verify(7)
 
-    def test_a_verdict_ends_the_hold_timer(self, clock, monkeypatch):
-        monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "2")
-        idx = _index(7)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+    def test_a_verdict_ends_the_hold_timer(self, clock):
+        idx = _index(7, defer_s=2)
+        clock[0] += STALE
         assert idx.needs_verify(7)
         clock[0] += 1.5
         idx.apply_touch_verdict(7, True)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert idx.needs_verify(7)
         clock[0] += 1.5
         assert idx.needs_verify(7), "the earlier 1.5 s does not count"
@@ -417,15 +423,79 @@ class TestNeedsVerify:
     def test_a_zero_defer_never_holds(self, clock, monkeypatch):
         monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "0")
         idx = _index(7)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        assert idx.defer_s == 0
+        clock[0] += STALE
         assert not idx.needs_verify(7)
+
+    def test_the_lookup_defer_is_read_once_at_construction(self, clock, monkeypatch):
+        """`needs_verify` is on the admission path; it must not re-read and
+        re-parse `OFFLOAD_LOOKUP_DEFER_S` on every call."""
+        monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "2")
+        idx = _index(7)
+        assert idx.defer_s == 2.0
+
+        def unread():
+            raise AssertionError("OFFLOAD_LOOKUP_DEFER_S read on the admission path")
+
+        monkeypatch.setattr(so, "verify_defer_s", unread)
+        monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "0")
+        clock[0] += STALE
+        assert idx.needs_verify(7), "the value read at construction still holds"
+
+    def test_an_index_without_refresh_never_reads_the_defer(self, monkeypatch):
+        def unread():
+            raise AssertionError("read for an index that never holds")
+
+        monkeypatch.setattr(so, "verify_defer_s", unread)
+        assert StateOffloadIndex().defer_s == 0
 
     def test_a_completed_load_counts_as_verified(self, clock):
         idx = _index(7)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert idx.request_load("r", 7)
         idx.complete_load("r")
         assert not idx.needs_verify(7)
+
+
+class TestVerifiedWindow:
+    """How long a confirmed image is trusted scales with the LMCache pool it
+    has to age out of, within [5 s, 60 s]."""
+
+    GIB = 1 << 30
+
+    def test_the_agentx_pool_keeps_about_the_measured_window(self):
+        assert so.tier_verified_for_s(int(208.6 * self.GIB)) == pytest.approx(52.15)
+
+    def test_the_window_grows_with_the_pool_between_its_bounds(self):
+        sizes = [8, 20, 32, 64, 100, 208.6, 240, 512, 2048]
+        windows = [so.tier_verified_for_s(int(g * self.GIB)) for g in sizes]
+        assert windows == sorted(windows)
+        assert windows[0] == windows[1] == so._TIER_VERIFIED_MIN_S
+        assert windows[2] == pytest.approx(8.0)
+        assert windows[-3] == windows[-1] == so._TIER_VERIFIED_MAX_S
+
+    def test_an_unknown_pool_gets_the_floor(self):
+        assert so.tier_verified_for_s(0) == so._TIER_VERIFIED_MIN_S
+
+    def test_the_index_holds_by_its_own_window(self, clock):
+        idx = _index(7, pool_bytes=32 * self.GIB, defer_s=2)
+        assert idx.verified_for_s == pytest.approx(8.0)
+        clock[0] += 7.5
+        assert not idx.needs_verify(7)
+        clock[0] += 1
+        assert idx.needs_verify(7)
+
+    def test_the_block_manager_sizes_the_window_from_the_lmcache_pool(
+        self, monkeypatch
+    ):
+        from test_block_manager import _OFFLOAD_KVC, _bm_with_state_tier
+
+        monkeypatch.setattr(
+            so, "state_tier_lmcache_sizes", lambda config: (256, 100 * self.GIB)
+        )
+        bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
+        assert bm._joint_chunk_tokens == 256
+        assert bm.state_offload.verified_for_s == pytest.approx(25.0)
 
 
 # ── the connector: touches out in the metadata, verdicts back by quorum ────
@@ -534,7 +604,7 @@ class TestSchedulerPlumbing:
 
     def test_voted_hashes_reach_the_connector(self, clock):
         idx = _index(7)
-        idx.could_serve(7)
+        idx.want_touch(7)
         sent = []
         s = self._sched(
             SimpleNamespace(enqueue_state_touches=lambda hs: sent.extend(hs) or True),
@@ -545,11 +615,11 @@ class TestSchedulerPlumbing:
 
     def test_a_connector_without_touches_turns_the_refresh_off(self, clock):
         idx = _index(7)
-        idx.could_serve(7)
+        idx.want_touch(7)
         s = self._sched(SimpleNamespace(), idx)
         s._publish_state_touches()
         assert not idx.refresh_hits
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert not idx.needs_verify(7), "nothing would ever answer the hold"
 
     def test_verdicts_are_applied_to_the_index(self, clock):
@@ -609,7 +679,7 @@ class TestAdmissionHold:
         bm = _paged_bm()
         commits = self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         seq = _seq()
 
         assert not bm.record_allocation(
@@ -630,7 +700,7 @@ class TestAdmissionHold:
         bm = _paged_bm()
         self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert not bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
@@ -651,7 +721,7 @@ class TestAdmissionHold:
         bm = _paged_bm()
         self._joint(bm, monkeypatch, from_hbm=True)
         bm.state_offload.note_stored(77)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
@@ -660,7 +730,7 @@ class TestAdmissionHold:
         bm = _paged_bm()
         self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert bm.record_allocation(_seq(), AdmissionProbe(2, [1, 2]))
 
     def test_an_hbm_hit_holds_only_for_a_tier_sourced_state(self, clock, monkeypatch):
@@ -674,7 +744,7 @@ class TestAdmissionHold:
         )
         monkeypatch.setattr(bm, "_commit_joint_boundary", lambda seq, d: None)
         bm.state_offload.note_stored(2)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         resident = {2}
         monkeypatch.setattr(
             bm.paged_state_checkpoints, "contains", lambda h: h in resident
@@ -697,12 +767,118 @@ class TestAdmissionHold:
         )
         monkeypatch.setattr(bm.paged_state_checkpoints, "contains", lambda h: h == 2)
         bm.state_offload.note_stored(77)
-        clock[0] += so._TIER_VERIFIED_FOR_S + 1
+        clock[0] += STALE
         assert bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2], 1), defer_unverified=True
         )
         assert [d.skip_reason for d in commits] == ["partial_chunk_no_room"]
         assert bm.state_offload.loads_deferred_for_verify == 0
+
+
+class TestVotersRegisterTouches:
+    """`could_serve` only answers; the voters register the hits they count."""
+
+    def _bm(self):
+        bm = _paged_bm()
+        bm.paged_state_checkpoints.attach_offload(bm.state_offload)
+        bm.state_offload.note_stored(77)
+        return bm
+
+    def test_the_resumable_scan_registers_a_tier_hit(self, clock):
+        bm = self._bm()
+        assert bm.paged_state_checkpoints._reachable(77)
+        assert bm.state_offload.take_touches() == [77]
+
+    def test_an_hbm_hit_is_not_a_tier_vote(self, clock, monkeypatch):
+        bm = self._bm()
+        monkeypatch.setattr(
+            bm.paged_state_checkpoints.store, "contains", lambda h: True
+        )
+        assert bm.paged_state_checkpoints._reachable(77)
+        assert bm.state_offload.take_touches() == []
+
+    def test_asking_whether_the_tier_can_serve_registers_nothing(self, clock):
+        bm = self._bm()
+        assert bm._tier_can_serve(77)
+        assert bm.state_offload.take_touches() == []
+
+    def test_an_offered_load_registers_its_hash(self, clock):
+        bm = self._bm()
+        seq = _seq()
+        assert bm._request_state_load(seq, 77)
+        assert bm.state_offload.take_touches() == [77]
+
+
+class TestResumeHash:
+    """`allocate` and the admission hold pick the state to resume from with
+    one helper, `_state_resume_hash`."""
+
+    def test_the_joint_boundary_wins_then_a_replay_then_the_hit(self, monkeypatch):
+        bm = _paged_bm()
+        seq = _seq()
+        assert bm._state_resume_hash(seq, 77, 2) == 77
+        assert bm._state_resume_hash(seq, -1, 2) == 2
+        assert bm._state_resume_hash(seq, -1, -1) == -1
+        monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        seq.replays_hit = True
+        assert bm._state_resume_hash(seq, -1, 2) == -1, "a replay restores none"
+        assert bm._state_resume_hash(seq, 77, 2) == 77
+
+    def test_a_replayed_hit_is_not_held(self, clock, monkeypatch):
+        from atom.model_engine.block_manager import JointBoundaryDecision
+
+        bm = _paged_bm()
+        monkeypatch.setattr(
+            bm,
+            "_joint_kv_boundary",
+            lambda *a: JointBoundaryDecision(skip_reason="no_kv_reach"),
+        )
+        monkeypatch.setattr(bm, "_commit_joint_boundary", lambda seq, d: None)
+        monkeypatch.setattr(bm.paged_state_checkpoints, "contains", lambda h: False)
+        monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        bm.state_offload.note_stored(2)
+        clock[0] += STALE
+        seq = _seq()
+        seq.replays_hit = True
+        assert bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_the_hold_judges_the_hash_allocate_then_loads(self, clock, monkeypatch):
+        from test_state_checkpoint import boundary_hash, stateful_seq
+
+        bm = _paged_bm()
+        offload = bm.state_offload
+        bm.paged_state_checkpoints.attach_offload(offload)
+        first = _seq()
+        bm.allocate(first, bm.can_allocate(first))
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        # The image left HBM; only the tier has it, and not confirmed lately.
+        bm.paged_state_checkpoints.unindex(h)
+        offload.note_stored(h)
+        clock[0] += STALE
+
+        asked, attached = [], []
+        verify, attach = offload.needs_verify, bm._attach_state_slots
+        monkeypatch.setattr(
+            offload, "needs_verify", lambda x: asked.append(x) or verify(x)
+        )
+        monkeypatch.setattr(
+            bm, "_attach_state_slots", lambda s, x: attached.append(x) or attach(s, x)
+        )
+        second = stateful_seq(list(range(48)))
+        probe = AdmissionProbe()
+        probe.num_cached_blocks = bm.can_allocate(second, record=False, probe=probe)
+        assert probe.num_cached_blocks > 0
+        assert not bm.record_allocation(second, probe, defer_unverified=True)
+        offload.apply_touch_verdict(h, True)
+        assert bm.record_allocation(second, probe, defer_unverified=True)
+        assert bm.allocate(second, probe.num_cached_blocks)
+        assert set(asked) == {h} and attached == [h]
+        assert second.offload_joint.load_hash == h
 
 
 def test_the_scheduler_retries_a_held_admission(monkeypatch):

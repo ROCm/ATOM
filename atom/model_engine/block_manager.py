@@ -335,8 +335,8 @@ class BlockManager:
         # releases holds a whole image out of the pool forever.
         from atom.model_engine.state_offload import (
             state_tier_capability,
-            state_tier_chunk_tokens,
             state_tier_cpu_bytes,
+            state_tier_lmcache_sizes,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -461,13 +461,16 @@ class BlockManager:
         # The LMCache chunk size in tokens, read where the config is rather than
         # off the connector object.
         self._joint_chunk_tokens = 0
+        lmcache_pool_bytes = 0
         # Only when a joint KV load is possible at all. Reading it reaches into
         # LMCache, an optional dependency: probing on an engine that hosts no
         # state tier logged a full `ModuleNotFoundError` traceback at WARNING
         # on every start, for a number that engine has no use for. The
         # capability above is the same gate the tier itself uses.
         if kv_offload_enabled:
-            self._joint_chunk_tokens = state_tier_chunk_tokens(config)
+            self._joint_chunk_tokens, lmcache_pool_bytes = state_tier_lmcache_sizes(
+                config
+            )
         self.state_offload: StateOffloadIndex | None = None
         # (req_id, hash, target_group) admitted this pass and not yet handed to
         # the connector. Kept here rather than in the index because the slot
@@ -518,6 +521,8 @@ class BlockManager:
                 # Off again (`stop_refreshing`) if the connector turns out not
                 # to carry state touches.
                 refresh_hits=True,
+                # Sizes how long a confirmed image is trusted.
+                pool_bytes=lmcache_pool_bytes,
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -1013,7 +1018,7 @@ class BlockManager:
         if not seq.has_per_req_cache or self.paged_state_checkpoints is None:
             return self._no_joint("no_paged_checkpoints")
         hbs = self._hash_block_size()
-        # Resolved once from config at construction (`state_tier_chunk_tokens`),
+        # Resolved once from config at construction (`state_tier_lmcache_sizes`),
         # not off the connector object: the scheduler holds whatever
         # `get_kvconnector` returned, and one without `chunk_size` would zero
         # this and disable the feature silently.
@@ -1579,31 +1584,50 @@ class BlockManager:
         """Whether `allocate` would load this seq's state from the CPU tier
         under a hash not confirmed resident recently.
 
-        Mirrors which hash `allocate` hands `_attach_state_slots`: the joint
-        boundary when there is one, else the HBM hit's last block; and the
-        tier only serves it when HBM does not hold it.
+        Judges the hash `allocate` will hand `_attach_state_slots`
+        (`_state_resume_hash`), which the tier only serves when HBM does not
+        hold it.
         """
         offload = self.state_offload
         if offload is None or not offload.refresh_hits or not seq.has_per_req_cache:
             return False
-        if decision.skip_reason is None:
-            if decision.state_from_hbm:
-                return False
-            h = decision.boundary_hash
-        else:
-            if not 0 < num_cached_blocks <= len(block_hashes):
-                return False
-            if self.state.transfer.replays or (
-                self.state_replay_tokens and seq.replays_hit
-            ):
-                return False  # a replay rebuilds the state; nothing is loaded
-            h = block_hashes[num_cached_blocks - 1]
+        joint = decision.skip_reason is None
+        if joint and decision.state_from_hbm:
+            return False
+        hit_hash = (
+            block_hashes[num_cached_blocks - 1]
+            if 0 < num_cached_blocks <= len(block_hashes)
+            else -1
+        )
+        h = self._state_resume_hash(
+            seq, decision.boundary_hash if joint else -1, hit_hash
+        )
+        if h == -1:
+            return False
+        if not joint:
             if self.paged_state_checkpoints is not None:
                 if self.paged_state_checkpoints.contains(h):
                     return False
             elif self.state.lookup(h) >= 0:
                 return False
         return offload.needs_verify(h)
+
+    def _state_resume_hash(self, seq: Sequence, joint_hash: int, hit_hash: int) -> int:
+        """The hash whose state `seq` resumes from, or -1 for none.
+
+        The joint boundary when there is one (above the HBM hit by
+        construction), else the HBM hit's last block. A replay rebuilds the
+        state instead of restoring it, so it resumes from none. `allocate`
+        hands this to `_attach_state_slots`, and `_tier_state_unverified` asks
+        about it, so the admission hold judges the hash that will be loaded.
+        """
+        if joint_hash != -1:
+            return joint_hash
+        if self.state.transfer.replays or (
+            self.state_replay_tokens and seq.replays_hit
+        ):
+            return -1
+        return hit_hash
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -1800,13 +1824,16 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
-        if self.state_replay_tokens and seq.replays_hit:
-            # A replay starts from a fresh state slot, never a checkpoint: it
-            # rebuilds the state below whatever the claim above reached.
-            hit_hash = -1
-            if num_cached_blocks < requested_blocks:
-                # A KV-only load past the hit would start above a gap.
-                seq.replay_kv_load = False
+        # A replay starts from a fresh state slot, never a checkpoint: it
+        # rebuilds the state below whatever the claim above reached
+        # (`_state_resume_hash` gives it none). A KV-only load past the hit
+        # would start above a gap.
+        if (
+            self.state_replay_tokens
+            and seq.replays_hit
+            and num_cached_blocks < requested_blocks
+        ):
+            seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1822,9 +1849,9 @@ class BlockManager:
             # joint boundary and `_claim_after_load` raised `num_cached_tokens`
             # to it, so the forward resumed over a prefix the state does not
             # cover. Silent wrong output, no exception.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
@@ -1841,9 +1868,9 @@ class BlockManager:
             # above the HBM hit by construction. `num_cached_tokens` stays at
             # the HBM prefix until the KV leg lands, so the forward covers
             # `[hbm, num_prompt)` if anything goes wrong from here.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
@@ -2091,6 +2118,7 @@ class BlockManager:
             return False
         if not self.state_offload.request_load(seq.id, hit_hash):
             return False
+        self.state_offload.want_touch(hit_hash)
         seq.offload_joint.load_hash = hit_hash
         self._state_loads.append((seq.id, hit_hash, seq.state_slot))
         return True
