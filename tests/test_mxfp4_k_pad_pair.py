@@ -59,6 +59,11 @@ def _qc(quant_type, quant_dtype):
 MXFP4 = (QuantType.per_1x32, dtypes.fp4x2)
 
 
+@pytest.fixture(autouse=True)
+def _default_backends(mxfp4_default_backends):
+    """The alignment depends on the backend; pin the default ASM one."""
+
+
 @pytest.fixture
 def tp_rank(monkeypatch, request):
     rank = getattr(request, "param", 0)
@@ -227,11 +232,14 @@ def test_padded_slots_are_zero_weights_and_unit_scales(monkeypatch, tp_rank):
     gw, gs = _u8(gate_up.weight), _u8(gate_up.weight_scale)
     for start, end in gate_up._pad_output_rows:
         assert (gw[start:end] == 0).all() and (gs[start:end] == 127).all()
-    assert (gw[:REAL] == 0xAB).all(), "real rows must not be touched"
+    for real in (slice(0, REAL), slice(PADDED, PADDED + REAL)):  # gate, up
+        assert (gw[real] == 0xAB).all(), "real rows must not be touched"
+        assert (gs[real] == 0xCD).all(), "real scale rows must not be touched"
 
     dw, ds = _u8(down.weight), _u8(down.weight_scale)
     assert (dw[:, REAL // 2 :] == 0).all() and (ds[:, REAL // 32 :] == 127).all()
     assert (dw[:, : REAL // 2] == 0xAB).all(), "real columns must not be touched"
+    assert (ds[:, : REAL // 32] == 0xCD).all(), "real scale columns untouched"
 
 
 def test_an_unpadded_mxfp4_down_is_refused(monkeypatch, tp_rank):
@@ -546,12 +554,10 @@ def test_merged_on_disk_whose_shape_matches_the_padded_param(monkeypatch, rank):
 # ── one resolver for the runtime scheme ───────────────────────────────────
 
 
-def test_kimi_and_the_pad_decision_share_one_resolver():
-    """KimiMLP's fused act-quant decision and mxfp4_k_pad_align must not drift."""
-    from atom.models.kimi_k3 import model as kimi_model
+def test_effective_layer_quant_resolves_the_online_target():
+    """The one resolver the pad decision and Kimi-K3's fused act quant read."""
     from atom.quant_spec import effective_layer_quant
 
-    assert kimi_model._effective_layer_quant is effective_layer_quant
     for source in (NVFP4_SRC, FP8_BLOCK_SRC):
         qc = _online_to_mxfp4(source)
         qt, qd = effective_layer_quant(qc, "mlp.down_proj")
@@ -572,3 +578,123 @@ def test_weight_scale_row_group_compares_by_value():
 
     double = SimpleNamespace(native_a8_group_rows=None, quant_type=Foreign())
     assert LinearBase.weight_scale_row_group.fget(double) == 128
+
+
+# ── a per-tensor FP8 gate_up next to an MXFP4 down ────────────────────────
+
+FP8_PER_TENSOR = (QuantType.per_Tensor, dtypes.fp8)
+TP2_INTER = 2 * REAL  # 4224 per rank at TP2, padded to 4352
+
+
+def _tp2(monkeypatch, rank):
+    group = SimpleNamespace(world_size=2, rank_in_group=rank)
+    monkeypatch.setattr(linear_mod, "get_tp_group", lambda: group)
+
+
+def _per_tensor_gate_up(**kw):
+    return MergedColumnParallelLinear(
+        HIDDEN,
+        [TP2_INTER, TP2_INTER],
+        quant_config=_qc(*FP8_PER_TENSOR),
+        prefix="mlp.gate_up_proj",
+        output_pad_align=MXFP4_PRESHUFFLE_K_ALIGN,
+        **kw,
+    )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_fused_per_tensor_scale_loads_into_a_padded_gate_up(monkeypatch, rank):
+    """A fused-on-disk per-tensor scale has one entry per shard and no padded
+    slots: it copies as is, padded or not (it used to be split by rows)."""
+    _tp2(monkeypatch, rank)
+    gate_up = _per_tensor_gate_up()
+    assert gate_up.weight_scale.shape == (2, 1)
+    assert pad_slot_numel(gate_up, gate_up.weight_scale) == 0
+    gate_up.weight_loader(gate_up.weight_scale, torch.tensor([[2.0], [3.0]]), None)
+    assert gate_up.weight_scale.data.flatten().tolist() == [2.0, 3.0]
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_per_row_scales_requantize_row_for_row_when_padded(monkeypatch, rank):
+    """A per-tensor gate_up whose checkpoint carries one scale per row is
+    requantized to one max scale. Each row must be dequantized with its own
+    scale: the saved scale parts hold the real rows, the weight the padded."""
+    _tp2(monkeypatch, rank)
+    with torch.device("cuda"):
+        gate_up = _per_tensor_gate_up()
+    torch.manual_seed(rank)
+    shards = []
+    for shard_id in (0, 1):
+        w = (torch.randn(TP2_INTER, HIDDEN) * 50).to(dtypes.fp8)
+        # Scales that differ a lot from row to row, so a wrong one shows.
+        s = torch.linspace(0.5, 4.0, TP2_INTER).view(-1, 1) * (shard_id + 1)
+        gate_up.weight_loader(gate_up.weight, w, shard_id)
+        gate_up.weight_loader(gate_up.weight_scale, s, shard_id)
+        shards.append(w.chunk(2, 0)[rank].float() * s.chunk(2, 0)[rank])
+    monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **kw: None)
+    gate_up.process_weights_after_loading()
+
+    deq = gate_up.weight.data.float().cpu() * gate_up.weight_scale.data.max().cpu()
+    for i, ref in enumerate(shards):
+        got = deq[i * PADDED : i * PADDED + REAL]
+        rel = (got - ref).norm() / ref.norm()
+        assert rel < 0.1, f"shard {i}: relative error {rel:.3f}"
+        assert (deq[i * PADDED + REAL : (i + 1) * PADDED] == 0).all()
+
+
+# ── the padded pair runs forward like the unpadded math ───────────────────
+
+
+def test_padded_pair_forward_matches_the_real_math(monkeypatch, tp_rank):
+    """gate_up -> silu(gate) * up -> down through the padded MXFP4 pair at
+    TP8, against the same quantized weights in float at the real K. Catches a
+    wiring slip (one align without the other, a misplaced shard) that the
+    hand-padded GEMM test in test_mxfp4_k_alignment.py cannot."""
+    quant = linear_mod.get_hip_quant(QuantType.per_1x32)
+    torch.manual_seed(0)
+    w_gu = torch.randn(2 * INTER, HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.05
+    w_d = torch.randn(HIDDEN, INTER, dtype=torch.bfloat16, device="cuda") * 0.05
+    gu_q, gu_s = quant(w_gu, quant_dtype=dtypes.fp4x2, shuffle=False)
+    d_q, d_s = quant(w_d, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+    with torch.device("cuda"):
+        gate_up, down = _pair()
+    for shard_id in (0, 1):
+        rows = slice(shard_id * INTER, (shard_id + 1) * INTER)
+        gate_up.weight_loader(gate_up.weight, gu_q.view(torch.uint8)[rows], shard_id)
+        gate_up.weight_loader(
+            gate_up.weight_scale, gu_s.view(torch.uint8)[rows], shard_id
+        )
+    down.weight_loader(down.weight, d_q.view(torch.uint8))
+    down.weight_loader(down.weight_scale, d_s.view(torch.uint8))
+    for layer in (gate_up, down):
+        layer.process_weights_after_loading()
+
+    x = torch.randn(64, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    gate, up = gate_up(x).float().chunk(2, -1)
+    y = down((torch.nn.functional.silu(gate) * up).to(torch.bfloat16)).float()
+
+    # Reference: this rank's real shards, dequantized, in float.
+    def deq(q, s):
+        p = q.cpu()
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
+        )
+        v = torch.stack([lut[(p & 0xF).long()], lut[(p >> 4).long()]], -1)
+        v = v.reshape(p.shape[0], -1)
+        scale = torch.pow(2.0, s.cpu().float() - 127).repeat_interleave(32, 1)
+        return (v * scale[:, : v.shape[1]]).cuda()
+
+    r = slice(tp_rank * REAL, (tp_rank + 1) * REAL)
+    g_ref = deq(gu_q.view(torch.uint8)[:INTER][r], gu_s.view(torch.uint8)[:INTER][r])
+    u_ref = deq(gu_q.view(torch.uint8)[INTER:][r], gu_s.view(torch.uint8)[INTER:][r])
+    d_ref = deq(
+        d_q.view(torch.uint8)[:, r.start // 2 : r.stop // 2],
+        d_s.view(torch.uint8)[:, r.start // 32 : r.stop // 32],
+    )
+    a_ref = torch.nn.functional.silu(x.float() @ g_ref.T) * (x.float() @ u_ref.T)
+    y_ref = a_ref @ d_ref.T
+
+    assert gate.shape[-1] == PADDED and torch.isfinite(y).all()
+    cos = torch.nn.functional.cosine_similarity(y.flatten(), y_ref.flatten(), 0)
+    assert cos > 0.98, f"rank {tp_rank}: cosine {cos.item():.4f}"

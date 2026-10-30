@@ -1488,7 +1488,21 @@ class LinearBase(nn.Module):
                 and loaded_weight_scale_parts is not None
                 and all(part is not None for part in loaded_weight_scale_parts)
             ):
-                loaded_weight_scale = torch.cat(loaded_weight_scale_parts, dim=0)
+                parts = loaded_weight_scale_parts
+                if getattr(self, "_pad_output_rows", None):
+                    # Each part holds its shard's real rows; the weight has the
+                    # padded ones. Give the (zero) pad rows a scale of 1.0 so the
+                    # per-row requant below lines up row for row.
+                    parts = [
+                        torch.cat(
+                            [
+                                part,
+                                part.new_ones(padded - part.shape[0], *part.shape[1:]),
+                            ]
+                        )
+                        for part, padded in zip(parts, self.output_partition_sizes)
+                    ]
+                loaded_weight_scale = torch.cat(parts, dim=0)
             weight_scale_for_requant = (
                 loaded_weight_scale
                 if loaded_weight_scale is not None
@@ -2076,12 +2090,13 @@ class MergedColumnParallelLinear(LinearBase):
                 self, "weight_scale", None
             ) or param is getattr(self, "input_scale", None)
 
-            # For fused weight, need to match param shape. Only an unpadded
-            # param can match the unsharded tensor (TP=1): a padded one can
-            # coincide in shape (128 per rank padded to 256 at TP2) while
-            # holding a different layout, so it always splits.
+            # For fused weight, need to match param shape. A param with padded
+            # slots can coincide in shape with the unsharded tensor (128 per
+            # rank padded to 256 at TP2) while holding a different layout, so it
+            # always splits; one without (a per-tensor scale, one per shard)
+            # copies as before.
             if (
-                self.output_sizes == self._ckpt_output_sizes
+                self.pad_slot_numel(param) == 0
                 and param_data.shape == loaded_weight.shape
             ):
                 # Shapes match - direct copy

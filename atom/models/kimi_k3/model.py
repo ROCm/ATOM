@@ -197,11 +197,6 @@ _RMS_FUSABLE_QUANT_TYPES = (
 )
 
 
-# The runtime scheme of a layer; shared with the MLP pair's K padding decision
-# (``mxfp4_k_pad_align``) so the two cannot disagree.
-_effective_layer_quant = effective_layer_quant
-
-
 def _is_e8m0_blockscale(
     quant_config: QuantizationConfig | None, quant_type: QuantType
 ) -> bool:
@@ -292,7 +287,7 @@ class KimiMLP(nn.Module):
         super().__init__()
         hidden_size = hidden_size or config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
-        down_type, down_dtype = _effective_layer_quant(
+        down_type, down_dtype = effective_layer_quant(
             quant_config, f"{prefix}.down_proj"
         )
         # An MXFP4 down_proj's K is the per-rank intermediate (33792 / TP8 = 4224
@@ -427,7 +422,7 @@ class KimiSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=up_proj_prefix,
             )
-            up_proj_quant_type, up_proj_quant_dtype = _effective_layer_quant(
+            up_proj_quant_type, up_proj_quant_dtype = effective_layer_quant(
                 quant_config, up_proj_prefix
             )
             latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
@@ -761,7 +756,7 @@ class KimiFullAttention(nn.Module):
         if has_indexer:
             for name in ("fused_qkv_a_proj", "indexer.wk", "indexer.weights_proj"):
                 if (
-                    _effective_layer_quant(quant_config, f"{prefix}.{name}")[0]
+                    effective_layer_quant(quant_config, f"{prefix}.{name}")[0]
                     != QuantType.No
                 ):
                     raise ValueError(
@@ -879,7 +874,7 @@ class KimiFullAttention(nn.Module):
             prefix=prefix,
         )
 
-        qknorm_type, qknorm_dtype = _effective_layer_quant(
+        qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
         self.fuse_qknorm_quant = qknorm_dtype in (
@@ -893,8 +888,8 @@ class KimiFullAttention(nn.Module):
         # input_layernorm fuses its activation quant only when BOTH consumers of
         # the normed hidden state -- fused_qkv_a_proj and g_proj -- run with the
         # same fusable RMSNorm quant scheme (else a mismatched consumer mis-GEMMs).
-        a_scheme = _effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")
-        g_scheme = _effective_layer_quant(quant_config, f"{prefix}.g_proj")
+        a_scheme = effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")
+        g_scheme = effective_layer_quant(quant_config, f"{prefix}.g_proj")
         self.fuse_input_norm_quant = (
             a_scheme[0] in _RMS_FUSABLE_QUANT_TYPES and a_scheme == g_scheme
         )
@@ -902,7 +897,7 @@ class KimiFullAttention(nn.Module):
         # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
         # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
         # (ptpc_fp8) or per-1x128 block.
-        o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
         self.fuse_sigmoid_mul_quant = (
             o_dtype == dtypes.fp8
             and o_type in (QuantType.per_Token, QuantType.per_1x128)
@@ -1159,7 +1154,7 @@ class KimiKDAAttention(nn.Module):
             prefix=f"{prefix}.f_b_proj",
         )
         # rmsnorm_gated fuses only per-token FP8; otherwise o_proj quantizes itself.
-        o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
         o_norm_fuses_quant = o_type == QuantType.per_Token and o_dtype == dtypes.fp8
         self.o_norm = KimiRMSNormGated(
             self.head_dim,
@@ -1180,7 +1175,7 @@ class KimiKDAAttention(nn.Module):
         # single fused in_proj GEMM (q|k|v|g|b|f_a) that consumes the normed hidden
         # state; the (fp8, scale) rides the splitting custom op into _forward_impl.
         # Enabled for any fusable RMSNorm quant scheme (fp8 / fp4x2).
-        in_proj_type, _ = _effective_layer_quant(quant_config, f"{prefix}.in_proj")
+        in_proj_type, _ = effective_layer_quant(quant_config, f"{prefix}.in_proj")
         self.fuse_input_norm_quant = in_proj_type in _RMS_FUSABLE_QUANT_TYPES
         self.input_quant_prefix = f"{prefix}.in_proj"
 
@@ -1191,7 +1186,7 @@ class KimiKDAAttention(nn.Module):
         # GEMM is what dictates the activation layout): under ptpc the slice is
         # gathered and quantized by one kernel instead, and under any other
         # scheme this stays False and the plain .contiguous() path runs.
-        f_b_type, f_b_dtype = _effective_layer_quant(quant_config, f"{prefix}.f_b_proj")
+        f_b_type, f_b_dtype = effective_layer_quant(quant_config, f"{prefix}.f_b_proj")
         self.fuse_f_a_quant = (
             f_b_type == QuantType.per_Token and f_b_dtype == dtypes.fp8
         )
@@ -1679,7 +1674,7 @@ class KimiDecoderLayer(nn.Module):
         # MoE layers are skipped: their router gate is unquantized and the routed
         # experts are excluded, so the normed output has mixed-precision consumers.
         if hasattr(self, "mlp"):
-            ffn_type, _ = _effective_layer_quant(
+            ffn_type, _ = effective_layer_quant(
                 quant_config, f"{prefix}.mlp.gate_up_proj"
             )
             self.fuse_ffn_norm_quant = ffn_type in _RMS_FUSABLE_QUANT_TYPES

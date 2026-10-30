@@ -302,3 +302,19 @@ def mono_runs_on_gfx950(monkeypatch):
     from atom.mono.runtime import deployment
 
     monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
+
+
+@pytest.fixture
+def mxfp4_default_backends(monkeypatch):
+    """Pin the MXFP4 linear backend to the default preshuffled ASM path.
+
+    `mxfp4_k_pad_align` and the load-time K check read the backend live
+    (`ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM`, the gfx1250 32x4 switch), so a
+    test of either must not depend on what the shell exported. Imported here
+    lazily: `atom.model_ops.linear` needs AITER.
+    """
+    from atom.model_ops import linear as linear_mod
+
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "_mxfp4_n32k4_backend", lambda: False)

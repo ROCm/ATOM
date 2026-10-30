@@ -45,10 +45,8 @@ PADDED_K = 4352
 
 
 @pytest.fixture(autouse=True)
-def _default_backends(monkeypatch):
-    # The default ASM path, where the bug was.
-    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
-    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+def _default_backends(mxfp4_default_backends):
+    """The default ASM path, where the bug was."""
 
 
 # ── refused at load ───────────────────────────────────────────────────────
