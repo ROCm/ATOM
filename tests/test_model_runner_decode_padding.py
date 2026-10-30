@@ -48,7 +48,7 @@ def test_runner_model_height_and_sampling_rows(
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
     runner.sp_mega_moe = Mock()
-    runner.config = SimpleNamespace(prefill_context_parallel_size=1)
+    runner.config = SimpleNamespace(pcp_striping_size=1)
     runner._detailed_label_suffix = lambda batch: ""
     runner._tr_hybrid_active = lambda: token_graph
     runner._dynamic_chunking = runner_module.DynamicChunkingWorker(runner)

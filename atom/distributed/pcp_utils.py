@@ -25,6 +25,7 @@ from aiter.dist.parallel_state import (
 )
 
 from atom.distributed.token_transport import reduce_scatter_tokens
+from atom.distributed.ulysses_sp import sp_is_enabled
 
 
 class PcpBalGroup(NamedTuple):
@@ -58,7 +59,9 @@ def get_pcp_rank() -> int:
 
 
 def pcp_is_enabled() -> bool:
-    return get_pcp_world_size() > 1
+    """Whether prefill tokens are striped over the PCP group. SP shares the
+    group with contiguous token shards."""
+    return get_pcp_world_size() > 1 and not sp_is_enabled()
 
 
 def pcp_pad_len(

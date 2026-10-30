@@ -8,6 +8,7 @@ ATOM (AiTer Optimized Model) supports three parallelism strategies for distribut
 |-------------|----------|---------|---------------|
 | Tensor Parallel (TP) | `-tp N` / `--tensor-parallel-size N` | Shard weights across GPUs | NCCL AllReduce |
 | Data Parallel (DP) | `-dp N` / `--data-parallel-size N` | Replicate model, split requests | Gloo AllReduce (CPU) |
+| Sequence Parallel (SP) | `-sp N` / `--sequence-parallel-size N` | Split each batch's tokens across GPUs (Ulysses; `-tp 1`, MHA) | NCCL All-to-All, AllGather/ReduceScatter |
 | Expert Parallel (EP) | `--enable-expert-parallel` | Distribute MoE experts across GPUs | MORI All-to-All |
 | DP Attention | `--enable-dp-attention` | Flatten DP into TP for MoE layers | NCCL AllGather/ReduceScatter |
 

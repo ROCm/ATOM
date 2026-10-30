@@ -255,19 +255,10 @@ def _norm_input(x, residual, weight, eps, fp8):
         from atom.model_ops.gemma_norm_fp8 import gemma_rms_norm_fp8
 
         return gemma_rms_norm_fp8(x, weight, eps, residual)
-    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+    # GemmaRMSNorm's own kernel, so these tiles match the native next layer.
+    from atom.model_ops.layernorm import gemma_rms_norm_unquantized
 
-    out, res_out = torch.empty_like(x), torch.empty_like(residual)
-    if x.shape[0]:
-        fused_qk_rmsnorm_group_quant(
-            q=x,
-            q_weight=weight,
-            q_epsilon=eps,
-            q_out_unquantized=out,
-            q_res_out=res_out,
-            q_residual=residual,
-            gemma_norm=True,
-        )
+    out, res_out = gemma_rms_norm_unquantized(x, weight, eps, residual)
     return (
         out,
         torch.empty((x.shape[0], 1), device=x.device, dtype=torch.float32),
@@ -427,13 +418,25 @@ def initialize_sp_mega_moe(model, config):
     if len(shapes) != 1:
         return skip("the shared runtime needs one expert shape across layers")
     hidden, inter, experts, top_k, activation, swiglu_limit = shapes.pop()
+    from atom.model_ops.gemma_norm_fp8 import gemma_rms_norm_fp8_supported
+
+    # Rows the fused tail does not cover are normalized with the same rule.
+    if not gemma_rms_norm_fp8_supported(hidden):
+        return skip(f"no fused Gemma RMSNorm FP8 kernel for hidden size {hidden}")
+    try:
+        from aiter.ops.communication import _mori
+        from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
+
+        # Probe MORI before any collective, so every rank falls back together.
+        _mori()
+    except ImportError as exc:
+        return skip(f"MegaMoeTP unavailable: {exc}")
     group = get_sp_group()
+    local_rows = math.ceil(config.max_num_batched_tokens / group.world_size)
     max_local_rows = local_token_tile(config.max_num_batched_tokens, group.world_size)
     # Prefill needs larger row tiles than AITER's default.
     lb_mt = "6"
     try:
-        from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
-
         runtime = MegaMoeTP(
             MegaMoeTPConfig(
                 rank=group.rank_in_group,
@@ -465,15 +468,13 @@ def initialize_sp_mega_moe(model, config):
             key = (runtime.launch_config(rows), runtime.tail_ok(rows))
             representatives.setdefault(key, rows)
         runtime.prepare(sorted(representatives.values()), tail=True, tail_bf16=True)
-    except ImportError as exc:
-        return skip(f"MegaMoeTP unavailable: {exc}")
     except RuntimeError as exc:
         # Any other failure (OOM, a compile error) may hit one rank while its
         # peers wait in a collective; falling back there alone desyncs them.
         if not str(exc).startswith(_AGREED_SETUP_FAILURES):
             raise
         return skip(f"MegaMoeTP setup failed on every rank: {exc}")
-    backend = SPMegaMoE(runtime, len(layers) * math.ceil(max_local_rows / tile))
+    backend = SPMegaMoE(runtime, len(layers) * math.ceil(local_rows / tile))
     for layer in layers:
         layer.sp_mega_moe = backend
     logger.info(
