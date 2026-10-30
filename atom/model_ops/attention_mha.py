@@ -1023,6 +1023,7 @@ class PagedAttentionImpl(nn.Module):
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
+            attn_work=attn_metadata.attn_work or None,
         )
 
         return o

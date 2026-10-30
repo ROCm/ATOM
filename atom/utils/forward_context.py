@@ -598,6 +598,10 @@ class AttentionMetaData:
     # flat over the pad tail. aiter's unified_attention then locates a query
     # block from its program id instead of searching `cu_seqlens_q`.
     equal_seqlen_q: bool = False
+    # Prefill only: sum over seqs of new tokens x mean attended context (the
+    # step label's nctx), computed on the host. aiter's unified_attention uses it
+    # to see how evenly the work spreads over its 2D grid; 0 = unknown.
+    attn_work: int = 0
     max_seqlen_k: int = 0
     min_seqlen_q: int = 0
     slot_mapping: torch.Tensor | None = None
@@ -692,6 +696,7 @@ class AttentionMetaData:
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
         equal_seqlen_q: bool = False,
+        attn_work: int = 0,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
@@ -701,6 +706,7 @@ class AttentionMetaData:
         self.cu_seqlens_k = cu_seqlens_k
         self.max_seqlen_q = max_seqlen_q
         self.equal_seqlen_q = equal_seqlen_q
+        self.attn_work = attn_work
         self.max_seqlen_k = max_seqlen_k
         self.min_seqlen_q = min_seqlen_q
         self.slot_mapping = slot_mapping
