@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 import weakref
 from collections import deque
 from dataclasses import dataclass, field
@@ -39,9 +41,17 @@ class IPCEventReclaimer:
     forward, at the next forward's metadata rendezvous.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, background: bool = False) -> None:
         self._retired: deque[Any] = deque()
         self._ready_events: list[_ReadyEvent] = []
+        # With `background`, `release` hands retired events to a reaper thread
+        # that destroys them. Destroying an imported HIP IPC event can block
+        # even after `query()` reported it complete, and the work it waits for
+        # can depend on this rank's next collective (the MP server's copy waits
+        # on our producer event, our stream on the peer). Blocking the reaper
+        # instead of the runner lets that collective launch, which breaks the
+        # cycle.
+        self._reaper = _Reaper() if background else None
 
     def acquire_ready_event(self, factory: Any) -> Any:
         # LMCache also retains exported events in a ring. Owning and reusing
@@ -84,6 +94,9 @@ class IPCEventReclaimer:
         # Swap before dropping references: callbacks that retire more events
         # while this batch is reclaimed leave them for the next safe point.
         retired, self._retired = self._retired, deque()
+        if self._reaper is not None:
+            self._reaper.put(retired)
+            return
         # Destroy only events whose work has completed. Destroying an
         # incomplete HIP IPC event synchronizes on it, and the work it waits
         # for can depend on a DP peer: the MP server's copy for this rank may
@@ -103,3 +116,34 @@ def _completed(event: Any) -> bool:
         return bool(query())
     except Exception:  # noqa: BLE001 - unknown status: keep the event
         return False
+
+
+class _Reaper:
+    """Destroys retired events on a daemon thread, off the forward path."""
+
+    def __init__(self) -> None:
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._run, name="atom-ipc-event-reaper", daemon=True
+        )
+        self._thread.start()
+
+    def put(self, events: deque) -> None:
+        if events:
+            self._queue.put(events)
+
+    def flush(self, timeout: float | None = None) -> bool:
+        """Wait until everything handed over so far is destroyed (tests)."""
+        done = threading.Event()
+        self._queue.put(done)
+        return done.wait(timeout)
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if isinstance(item, threading.Event):
+                item.set()
+                continue
+            # Drop the last references here: destruction may block.
+            item.clear()
+            del item
