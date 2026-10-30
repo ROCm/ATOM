@@ -221,12 +221,13 @@ class LaunchTest(unittest.TestCase):
                     [key] = [k for k in targets if "|g_proj)$" in k]
                     self.assertNotIn("kv_b_proj", key)
                     targets[key.replace("|g_proj)$", "|kv_b_proj|g_proj)$")] = targets.pop(key)
+                    variant = variant.removesuffix("-KVB")
+                store = candidate["mooncake"].get("store")
+                if store and not variant.endswith("-R4391"):
                     # 3966924d host-MR registration fails past ~266 GB per rank; capped at the C72 1.8 TB.
-                    store = candidate["mooncake"]["store"]
                     self.assertEqual(store["global_segment_size"],
                                      min(base["mooncake"]["store"]["global_segment_size"], 224873414656))
                     store["global_segment_size"] = base["mooncake"]["store"]["global_segment_size"]
-                    variant = variant.removesuffix("-KVB")
                 self.assertEqual(json.loads(env["C48_EXPECT_QUANT"]),
                                  {"Fp8PtpcOnlineLinearMethod": 489, "Mxfp4OnlineLinearMethod": 92})
                 env["C48_EXPECT_QUANT"] = base["roles"]["prefill"]["env"]["C48_EXPECT_QUANT"]

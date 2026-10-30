@@ -578,7 +578,7 @@
     "store": {
       "mode": "embedded",
       "metadata_server": "P2PHANDSHAKE",
-      "global_segment_size": 324999839744,
+      "global_segment_size": 224873414656,
       "local_buffer_size": 67108864,
       "protocol": "rdma",
       "device_name": "",
