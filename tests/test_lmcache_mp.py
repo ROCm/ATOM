@@ -1411,18 +1411,51 @@ def test_worker_invalid_descriptor_fails_before_transport(
     assert not store.succeeded
 
 
-def test_transfer_deadline_defaults_to_twenty_minutes():
-    assert transfer._transfer_deadline_s(_config()) == 1200.0
+def test_transfer_deadline_defaults_to_thirty_seconds_and_can_be_overridden():
+    assert transfer._transfer_deadline_s(_config()) == 30.0
     assert (
         transfer._transfer_deadline_s(
-            _config(extra={"lmcache.mp.transfer_deadline_s": 30})
+            _config(extra={"lmcache.mp.transfer_deadline_s": 180})
         )
-        == 30.0
+        == 180.0
     )
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), -float("inf")])
+def test_transfer_deadline_rejects_unbounded_or_invalid_values(value):
     with pytest.raises(ValueError, match="transfer_deadline_s"):
         transfer._transfer_deadline_s(
-            _config(extra={"lmcache.mp.transfer_deadline_s": 0})
+            _config(extra={"lmcache.mp.transfer_deadline_s": value})
         )
+
+
+@pytest.mark.parametrize("kind", ["load", "save"])
+@pytest.mark.parametrize("completes", [False, True])
+def test_worker_silent_future_is_bounded_without_remote_errors(
+    fake_lmcache_modules, monkeypatch, kind, completes
+):
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _worker(_WorkerAdapter())
+    getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), object())
+    operations = getattr(worker, f"_pending_{kind}s")
+    [pending] = operations.values()
+    now[0] += 29
+    output = worker.get_finished()
+    assert not output.connector_completions
+    assert list(operations.values()) == [pending]
+    if completes:
+        finish = _finish_load if kind == "load" else _finish_save
+        finish(worker, f"{kind}:16:1")
+        worker.get_finished()
+        assert not operations
+    now[0] += 1
+    if completes:
+        worker.get_finished()
+    else:
+        with pytest.raises(transfer.LMCacheTransferUnprovable, match="30s"):
+            worker.get_finished()
+        assert list(operations.values()) == [pending]
 
 
 def test_worker_save_slices_chunk_blocks_and_preserves_operation(

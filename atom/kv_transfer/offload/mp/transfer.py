@@ -9,6 +9,7 @@ stops the engine instead of releasing memory the server may still use.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Iterable, Sequence
@@ -48,11 +49,11 @@ class _PendingSave:
     started_at: float = field(default_factory=lambda: time.monotonic())
 
 
-_DEFAULT_TRANSFER_DEADLINE_S = 1200.0
+_DEFAULT_TRANSFER_DEADLINE_S = 30.0
 # The scheduler watches the same operations from dispatch, a step or more
 # before a worker submits them. The margin lets the worker, which can name the
 # exact transfer, fail first.
-_SCHEDULER_DEADLINE_MARGIN_S = 60.0
+_SCHEDULER_DEADLINE_MARGIN_S = 10.0
 
 
 class LMCacheTransferUnprovable(RuntimeError):
@@ -73,8 +74,8 @@ def _transfer_deadline_s(config: Any) -> float:
     deadline = float(
         extra.get("lmcache.mp.transfer_deadline_s", _DEFAULT_TRANSFER_DEADLINE_S)
     )
-    if not deadline > 0:
-        raise ValueError("lmcache.mp.transfer_deadline_s must be > 0")
+    if not math.isfinite(deadline) or deadline <= 0:
+        raise ValueError("lmcache.mp.transfer_deadline_s must be finite and > 0")
     return deadline
 
 
