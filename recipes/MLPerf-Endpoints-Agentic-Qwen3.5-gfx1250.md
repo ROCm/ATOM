@@ -34,6 +34,7 @@ overrides, `SPEC=0` turns it off); `run_ep.sh` picks the server from the concurr
 |---|---|
 | 1-16 | TP4, custom all-reduce from 16 KB, fused verify sampling, all-gather token sync, fused sigmoid gates, Qwen tokenizer cache, aiter small-k top-p, MoE routes staged once per forward, MTP draft with replicated fc / embedding, one-launch pre-fc norms, all-reduce argmax exchange and one-launch GDN kv-indptr, split-row sampler softmax |
 | 24-2048 | DP4 attention + EP4 MoE (mori v2 dispatch, session affinity, [prefill / decode interval](#prefill--decode-interval) 8), unified attention with 64-token KV blocks |
+| 16 as 4xTP1 | `TP=1`: one TP1 server per GPU at c=4 (`HIP_VISIBLE_DEVICES=<gpu>`), the TP settings above plus the shared expert on its side stream; see [4xTP1 c16](#4xtp1-c16-2026-10-30) |
 
 Both: BF16 KV, prefix caching on (every turn resends the history), `--max-model-len 262144`,
 `--level 0`, 16k-token prefill chunks, decode graphs captured at every size up to `max-num-seqs`.
@@ -64,6 +65,7 @@ cd /app/ATOM/recipes/mlperf_endpoints_qwen35
 bash get_dataset.sh                # fetches and checksums the dataset into $R/dataset
 bash run_ep.sh 16                  # one point: ~35 min (server, checks, 30 min, drain)
 bash sweep.sh "1 4 16 64 256 768 1536 2048"   # one fresh server per point
+TP=1 HIP_VISIBLE_DEVICES=0 bash run_ep.sh 4      # one GPU of the 4xTP1 c16 node (its TPS x 4)
 ```
 
 Each point writes `$R/runs/c<N>/` (`report/report.txt` is the client's result; `server.log`,
@@ -143,6 +145,18 @@ scratch; the scheduling cut TPOT 8% but raised the TTFT median 46 -> 183 ms, TPS
 With MTP4 the verify attention (unified
 attention 3D at 5 query tokens) picks a quarter of MTP3's KV segments a sequence and takes 65 against
 40 us a launch: a config for that shape would make MTP4 a clearer gain.
+
+### 4xTP1 c16 (2026-10-30)
+
+One TP1 server on one GPU at c=4 (`TP=1 run_ep.sh 4`, MTP4, `max-num-seqs` 64), 10-minute points on the
+branch tips (ATOM bb47e395d, aiter 17202f82) with `ATOM_PREFILL_DECODE_INTERVAL=16`,
+`ATOM_PREFILL_DELAYER_STALL_TICKS=2`, `ATOM_TOKEN_GRAPH_SIZES=256,...,4096`, `HSA_NO_SCRATCH_RECLAIM=1`. The node
+runs four of them, so its throughput is 4x a GPU's; the per-user numbers are the GPU's:
+
+| Shared expert | Turns (failed) | Output tok/s, node (a GPU) | E2E interactivity | TTFT median | TPOT median / p90 |
+|---|---|---|---|---|---|
+| main stream (#2825's default) | 1,215 (0) | 2,741 (685) | 497 | 141 ms | 1.49 / 1.91 ms |
+| side stream (`ATOM_QWEN_SHARED_EXPERT_STREAM=1`, what `run_ep.sh` sets for this point) | 1,234 (0) | **2,945** (736) | **570** | **129 ms** | **1.38 / 1.75 ms** |
 
 ### DP4 + EP4 c128 (2026-10-29)
 

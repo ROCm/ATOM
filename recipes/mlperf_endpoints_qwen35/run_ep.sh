@@ -6,6 +6,7 @@
 # Concurrency: 1-2048, a power of two or three times one (1 2 3 4 6 8 12 16 24 ... 768 1024
 # 1536 2048). MTP on every point, 4 draft tokens on TP points and 3 on DP; c <= 16: TP4, above: DP4
 # attention + EP4 MoE (MODE=tp|dp, SPEC=<n> override; SPEC=0: no MTP).
+# 4xTP1 node at c16: TP=1 HIP_VISIBLE_DEVICES=<gpu> run_ep.sh 4 on each of the 4 GPUs (its TPS x 4 is the node's).
 # 30-minute points (defaults): CAP_MIN=30, STOP_FIRST=1, TRAJ_X=4 (trajectories = max(613, 4 c):
 # the cap, not an exhausted pool, ends every point), TURN_TIMEOUT=14400 (the benchmark's own; the drain
 # after the cap lasts until the in-flight turns finish).
@@ -31,7 +32,13 @@ export SPEC=${SPEC:-$([ "$MODE" = tp ] && echo 4 || echo 3)}
 # sequences returns partly garbage (see the recipe's Known issues); concurrency above that queues.
 if [ "$MODE" = dp ]; then N=$(( (C * 5 / 4 + 3) / 4 )); [ $N -lt 16 ] && N=16; else N=$(( C < 64 ? 64 : C )); fi
 [ $N -gt ${SEQ_CAP:-512} ] && N=${SEQ_CAP:-512}
-echo "START $(date -u +%FT%TZ) c=$C mode=$MODE spec=$SPEC max_num_seqs=$N" >> $ST
+# the 4xTP1 c16 node (TP=1, c=4 a GPU): the shared expert on its side stream next to the routed experts
+# (ATOM #2821), 685 -> 736 out tok/s a GPU and TPOT 1.49 -> 1.38 ms (10-minute points, 2026-10-30). Every
+# other point keeps the main stream (#2825's default: better on the DP points).
+if [ "$MODE" = tp ] && [ "${TP:-4}" = 1 ] && [ "$C" = 4 ]; then
+  export ATOM_QWEN_SHARED_EXPERT_STREAM=${ATOM_QWEN_SHARED_EXPERT_STREAM:-1}
+fi
+echo "START $(date -u +%FT%TZ) c=$C mode=$MODE tp=${TP:-4} spec=$SPEC max_num_seqs=$N" >> $ST
 
 # the images ship only versioned ROCm libs (libamdhip64.so.7, ...); aiter JIT modules such as
 # top_p_sampling_from_probs link against the unversioned names and fail to build without these
