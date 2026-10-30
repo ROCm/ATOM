@@ -594,7 +594,10 @@ def test_save_admission_returns_lease_when_it_raises(monkeypatch):
     def boom(*_args, **_kwargs):
         raise RuntimeError("request construction failed")
 
+    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
+
     monkeypatch.setattr(ChunkedOffloadSchedulerBase, "_build_save_request", boom)
+    monkeypatch.setattr(LMCacheMPConnectorScheduler, "_build_save_request", boom)
     with pytest.raises(RuntimeError, match="request construction failed"):
         scheduler.build_connector_meta()
     assert scheduler._native_saves == {}
