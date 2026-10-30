@@ -429,7 +429,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             scoring_func=ex.scoring_func,
             e_score_correction_bias=ex.e_score_correction_bias,
             fused_shared_experts_scoring_func=ex.shared_expert_scoring_func,
-            num_routing_experts=ex.global_num_experts,
+            num_routing_experts=ex.expert_layout.num_routed,
             num_fused_shared_experts=ex.num_fused_shared_experts,
             routed_scaling_factor=ex.routed_scaling_factor,
             triton_max_rows=ex.triton_topk_softmax_max_rows,

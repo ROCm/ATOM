@@ -89,8 +89,10 @@ def triton_topk_softmax(
     `topk_weights[:, k + s]` with sigmoid(shared logit s) for each of the
     `num_shared_experts` trailing logits.
 
-    As in AITER, a row with fewer than k finite logits picks expert 0 for the
-    rest, with weight 0. A NaN logit is never picked. AITER agrees unless the
+    As in AITER, a row with fewer than k finite logits, but at least one,
+    picks expert 0 for the rest, with weight 0. A row with no finite logit
+    (all -inf) gets NaN for every routed weight, as in AITER. A NaN logit is
+    never picked. AITER agrees unless the
     NaN is the first element of one of its per-thread vector loads (16 bf16
     below 512 experts, 32 at 512): there it may pick it, making every weight
     NaN, or misorder the row, so rows with NaNs are not bit-identical.

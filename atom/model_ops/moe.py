@@ -596,7 +596,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             layer,
             x,
             router_logits,
-            layer.global_num_experts,
+            layer.expert_layout.num_routed,
             layer.num_fused_shared_experts,
             layer.triton_topk_softmax_max_rows,
         )

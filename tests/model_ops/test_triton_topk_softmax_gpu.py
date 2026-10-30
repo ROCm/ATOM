@@ -221,6 +221,53 @@ def test_launcher_needs_a_unit_last_stride():
             triton_topk_softmax(out_w, out_ids, gating, shared)
 
 
+@needs_cutoff
+@pytest.mark.parametrize("shared", [0, 1])
+def test_mismatched_triton_launches_fail(shared, monkeypatch):
+    """The Triton kernel always renormalizes and takes the routed experts from
+    the logits' width. An unnormalized layer gets no cutoff and runs AITER's
+    unnormalized top-k; a launch handed a cutoff that is unnormalized, or
+    whose `num_routing_experts` is not its logits' routed width, fails."""
+    from atom.model_ops import topK
+
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    rows = 16
+    scoring = "sigmoid" if shared else None
+    assert triton_topk_softmax_rows(EXPERTS, TOPK, False, shared, scoring) is None
+    cutoff = _layer_rows(EXPERTS, TOPK, shared)
+    assert rows <= cutoff
+    torch.manual_seed(43 + shared)
+    logits = _logits(rows, EXPERTS + shared, 2.0, False)
+    w_ref = torch.full((rows, TOPK + shared), -1.0, device="cuda")
+    ids_ref = torch.full(
+        (rows, TOPK + shared), EXPERTS, dtype=torch.int32, device="cuda"
+    )
+    scratch = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
+    aiter.topk_softmax(
+        w_ref, ids_ref[:, :TOPK], scratch, logits, False, shared, scoring or ""
+    )
+    used = _record_kernels(monkeypatch, topK)
+    monkeypatch.setattr(topK, "aiter_topK_meta_data", _outputs(rows, shared))
+
+    def route(renormalize, routed, max_rows):
+        return topK.rocm_aiter_topk_softmax_impl(
+            logits, TOPK, renormalize, shared, routed, scoring,
+            triton_max_rows=max_rows,
+        )  # fmt: skip
+
+    w, ids = route(False, EXPERTS, None)
+    assert torch.equal(ids[:, :TOPK], ids_ref[:, :TOPK])
+    assert torch.equal(_bits(w[:, :TOPK]), _bits(w_ref[:, :TOPK]))
+    assert not torch.allclose(w_ref[:, :TOPK].sum(1), torch.ones(rows, device="cuda"))
+    with pytest.raises(AssertionError, match="always renormalizes"):
+        route(False, EXPERTS, cutoff)
+    for routed in (0, EXPERTS + shared, EXPERTS // 2):
+        with pytest.raises(AssertionError, match="routed experts"):
+            route(True, routed, cutoff)
+    route(True, EXPERTS, cutoff)
+    assert used == ["aiter", "triton"]
+
+
 @pytest.mark.parametrize("shared", [0, 1])
 def test_1024_experts_route_through_aiter(shared, monkeypatch):
     """Past AITER's fused kernel, eager and captured passes both run AITER."""

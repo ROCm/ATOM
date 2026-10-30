@@ -214,7 +214,10 @@ def rocm_aiter_topk_softmax_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`triton_max_rows`: the layer's `triton_topk_softmax_rows` for these
     arguments; launches of up to that many rows run `triton_topk_softmax`,
-    the rest (all of them when None) AITER's `topk_softmax`."""
+    the rest (all of them when None) AITER's `topk_softmax`. The cutoff was
+    decided for this routing, so a Triton launch that is not renormalized or
+    whose logits are not `num_routing_experts` wide plus the scored shared
+    columns is a mismatched caller, and fails."""
     from aiter import topk_softmax
 
     token = gating_output.shape[0]
@@ -233,6 +236,11 @@ def rocm_aiter_topk_softmax_impl(
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
     if triton_max_rows is not None and token <= triton_max_rows:
+        assert renormalize, "triton_topk_softmax always renormalizes"
+        assert (
+            num_routing_experts
+            == gating_output.shape[1] - fused_shared_experts_for_kernel
+        ), "the logits must be the routed experts' and then the scored shared ones'"
         triton_topk_softmax(
             topk_weights,
             topk_ids,
