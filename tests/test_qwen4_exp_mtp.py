@@ -656,7 +656,7 @@ _QSA_BATCHES = {
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-@pytest.mark.parametrize("calls", ["shard", "200-rows"])
+@pytest.mark.parametrize("calls", ["shard", "half-shard", "200-rows"])
 @pytest.mark.parametrize("allow_flydsl", [False, True], ids=["triton", "flydsl"])
 @pytest.mark.parametrize("tp", [2, 4, 8])
 @pytest.mark.parametrize("batch", list(_QSA_BATCHES))
@@ -664,9 +664,10 @@ def test_qsa_row_sharded_selection_matches_whole_batch(batch, tp, allow_flydsl, 
     """Sequence-parallel prefill selects each rank's rows and gathers the
     groups before expanding. The whole batch is scored in one call, which
     takes the >256-row scorer (FlyDSL in serving prefill, else Triton MFMA).
-    The shards take that scorer too when they exceed 256 rows ("shard"), and
-    the stacked <=256-row scorer for 200-row calls ("200-rows") or 129-row
-    TP8 shards. The scorers' logits differ in the last FP32 bits only (see
+    The shards take that scorer too when they exceed 256 rows: in one call
+    ("shard") or chunked in two ("half-shard": TP2 / TP4 at 2503 rows and
+    TP2 at 1025 rows stay above 256 per call). Smaller calls ("200-rows",
+    129-row TP8 shards, other half shards) take the stacked <=256-row scorer. The scorers' logits differ in the last FP32 bits only (see
     `test_qsa_index_scorers_agree_on_visible_logits`), so the selection is
     expected to match unless a top-k boundary is tied that closely."""
     _require_flydsl_scorer(allow_flydsl)
@@ -685,11 +686,17 @@ def test_qsa_row_sharded_selection_matches_whole_batch(batch, tp, allow_flydsl, 
         index_q, compressed, tables, requests, positions, lengths, **common
     )
 
-    columns = tables.shape[1] * compressed.shape[1]
-    workspace = (
-        {} if calls == "shard" else {"logits_workspace_bytes": 200 * columns * 4}
+    # The scored width, as `qsa_select_paged_groups` bounds it.
+    columns = min(
+        tables.shape[1] * compressed.shape[1],
+        1 << ((max_seq + ratio - 1) // ratio - 1).bit_length(),
     )
     chunk = -(-rows // tp)
+    rows_per_call = {"shard": None, "half-shard": -(-chunk // 2), "200-rows": 200}
+    per_call = rows_per_call[calls]
+    workspace = (
+        {} if per_call is None else {"logits_workspace_bytes": per_call * columns * 4}
+    )
     shards = []
     for rank in range(tp):
         local = slice(rank * chunk, min((rank + 1) * chunk, rows))
