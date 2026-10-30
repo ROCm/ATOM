@@ -43,17 +43,20 @@ Each rank reports local state; a single cpu ``all_reduce(SUM)`` reduces it; then
 every rank computes the SAME FIRE/HOLD from the reduced values:
 
   n_prefillable   = #ranks with admittable prefill (SUM of a 0/1 flag)
+  n_blocked       = #ranks with waiting work whose head cannot be admitted
+                    (no KV, max_num_seqs full, remote KV pending)
   G_pending       = total pending prefill tokens across ranks (fresh + partial
                     remaining, each rank capped at the token budget)
   G_running_dec   = total decode seqs across ranks
   G_arrived       = requests added across ranks since the previous tick
-  any_kv_high     = any rank with waiting work at/above the KV watermark
+  any_kv_high     = any prefillable rank at/above the KV watermark
   any_kv_low      = any prefillable rank below the low KV watermark
   any_partial     = any rank mid-chunked-prefill
   any_prefill_ran = any rank completed a prefill forward on the previous tick
 
   if any_prefill_ran:                              arm decode interval
-  if post-prefill decode interval is active and decode exists: HOLD
+  if post-prefill decode interval is active and decode exists:
+      stall = 0 if the group's work changed;      HOLD
   if n_prefillable == 0:                          FIRE   # nothing to do (vacuous)
   # -- must-fire bounds (release even if unaligned / underfilled) --
   if G_running_dec == 0:                          FIRE   # no decode to hide the wait behind
@@ -65,8 +68,9 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   if G_pending > prev_G_pending or n_prefillable != prev_n_prefillable
      or G_arrived > 0:                            stall = 0
   else:                                           stall += 1
-  # -- alignment gate: hold while some rank lacks prefill (anti-skew) --
-  if n_prefillable < dp_size:
+  # -- alignment gate: hold while some rank lacks prefill and could take
+  #    some (anti-skew); a blocked rank waits on its own decode, not on us --
+  if n_prefillable + n_blocked < dp_size:
       if stall >= stall_ticks:                    FIRE
       stall_us = G_running_dec * max(rank cost) * t_prefill  # unaligned release
       if cost_gate and (arrival rate on ranks without prefill * stall_us
@@ -89,7 +93,7 @@ fires smaller — that is a request-routing problem, out of scope here.
 
 Cross-DP comms
 --------------
-Single ``all_reduce(SUM)`` over a 9-int64 cpu buffer (gloo-safe). Booleans are
+Single ``all_reduce(SUM)`` over a 10-int64 cpu buffer (gloo-safe). Booleans are
 encoded as 0/1 and read back as ``sum > 0`` (logical OR). All timing is
 tick-based (``hold_ticks``), which is deterministic across ranks — no per-rank
 wall-clock, so ranks never diverge on a timeout boundary. The cost gate's step
@@ -116,7 +120,7 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "tru
 _STEP_EMA_WEIGHT = 0.2
 # The reduce buffer: these fixed slots, each rank's prefill cost, then the cost
 # gate's `_Gate` (`PrefillDelayer.__init__`).
-_FIXED_SLOTS = 9
+_FIXED_SLOTS = 10
 
 
 class _Gate(NamedTuple):
@@ -271,6 +275,8 @@ class PrefillDelayer:
         #                                forward on the previous scheduler tick)
         #   slot 8 = arrived_requests   (SUM → G_arrived; restarts the stall
         #                                count, see _decide)
+        #   slot 9 = blocked flag       (SUM → n_blocked; waiting work but the
+        #                                head cannot be admitted)
         # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
         #   slot `_FIXED_SLOTS` + r = rank r's prefill chunk cost (one-hot, SUM
         #                → every rank's cost), read back as rank_prefill_costs
@@ -439,11 +445,11 @@ class PrefillDelayer:
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
         low = self.token_usage_low_watermark
-        # KV-high counts any rank with waiting work: a rank whose head request
-        # cannot allocate KV reports prefillable=False, and must not hide the
-        # pressure that keeps it from aligning with its peers.
-        has_work = prefillable or waiting_requests > 0 or has_partial
-        kv_high = has_work and kv_usage >= self.kv_high_watermark
+        kv_high = prefillable and kv_usage >= self.kv_high_watermark
+        # Waiting work this rank cannot admit (its head lacks KV, max_num_seqs
+        # is full, or remote KV is pending): only its own decode completions
+        # change that, so holding its peers cannot align it.
+        blocked = not prefillable and (waiting_requests > 0 or has_partial)
         kv_low = prefillable and low is not None and kv_usage < low
         queue_hot = (
             prefillable
@@ -460,6 +466,7 @@ class PrefillDelayer:
         self._reduce_buf[6] = 1 if queue_hot else 0
         self._reduce_buf[7] = 1 if self._prefill_executed_since_last_decision else 0
         self._reduce_buf[8] = int(arrived_requests)
+        self._reduce_buf[9] = 1 if blocked else 0
         if self._cost_slots:
             self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
             self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
@@ -521,6 +528,7 @@ class PrefillDelayer:
             queue_hot_n,
             prefill_ran_n,
             g_arrived,
+            n_blocked,
         ) = reduced[:_FIXED_SLOTS]
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
@@ -554,6 +562,10 @@ class PrefillDelayer:
         if self._decode_interval_remaining > 0:
             self._decode_interval_remaining -= 1
             if n_prefillable > 0 and g_running_dec > 0:
+                # Not a coalescer tick, so the stall count does not advance,
+                # but work that arrives in the window still restarts it.
+                if self._work_changed(g_pending, n_prefillable, g_arrived):
+                    self._stall_count = 0
                 self._stat_hold += 1
                 self._stat_hold_decode_interval += 1
                 self._maybe_log()
@@ -586,24 +598,20 @@ class PrefillDelayer:
         # next one, so a rank turning (non-)prefillable or any arrival in the
         # group restarts the count. This also restarts it when the group
         # aligns, so ticks held unaligned never release an aligned forward.
-        if (
-            g_pending > self._prev_pending
-            or n_prefillable != self._prev_prefillable
-            or g_arrived > 0
-        ):
+        if self._work_changed(g_pending, n_prefillable, g_arrived):
             self._stall_count = 0
         else:
             self._stall_count += 1
-        self._prev_pending = g_pending
-        self._prev_prefillable = n_prefillable
         stalled = self._stall_count >= self.stall_ticks
 
         # ---- alignment gate: hold while a rank lacks prefill (anti-skew) for
         # stragglers to catch up, until the group's work stops changing
         # (stall: e.g. ranks with no traffic at concurrency below dp_size) or
         # (cost gate) the wait has cost more than the unaligned prefill it
-        # avoids.
-        if n_prefillable < self.dp_size:
+        # avoids. A blocked rank is no straggler: waiting cannot make its head
+        # admittable, so it keeps its peers company with a dummy prefill, as
+        # an idle rank does once released.
+        if n_prefillable + n_blocked < self.dp_size:
             if stalled:
                 return self._fire("stall", g_pending)
             if self._cost_gate and self._alignment_wait_paid(
@@ -621,6 +629,19 @@ class PrefillDelayer:
         if stalled:
             return self._fire("stall", g_pending)
         return self._hold(g_pending)
+
+    def _work_changed(self, g_pending: int, n_prefillable: int, g_arrived: int) -> bool:
+        """Whether the group's work moved since the previous coalescer tick
+        (pending grew, a rank turned (non-)prefillable, or a request arrived),
+        recording this tick's values for the next comparison."""
+        changed = (
+            g_pending > self._prev_pending
+            or n_prefillable != self._prev_prefillable
+            or g_arrived > 0
+        )
+        self._prev_pending = g_pending
+        self._prev_prefillable = n_prefillable
+        return changed
 
     def _alignment_wait_paid(self, gate: _Gate, g_running_dec: int) -> bool:
         """Whether waiting longer for alignment costs more than it can save.

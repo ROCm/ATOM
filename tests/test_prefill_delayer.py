@@ -21,6 +21,8 @@ from atom.model_engine.prefill_delayer import (
 MAX_BATCHED = 16384
 # reduce-buffer slot of the requests that arrived since the previous tick
 ARRIVED = 8
+# reduce-buffer slot of the ranks with waiting work they cannot admit
+BLOCKED = 9
 
 
 def _noop_all_reduce(tensor, op=None, group=None):
@@ -328,17 +330,41 @@ class TestAlignmentGate:
         assert call(d, pending_tokens=500, reduce=aligned) is False
         assert d._stat_fire_stall == 0
 
-    def test_kv_full_rank_without_admittable_head_releases(self):
-        # This rank's head cannot allocate KV (prefillable=False) while its
-        # peer holds prefill: its KV pressure still releases the group.
-        d = make_delayer(dp_size=2, ttft_max_ticks=1000, stall_ticks=1000)
+    def test_kv_full_blocked_rank_does_not_release_every_tick(self):
+        # DP8: this rank's head cannot allocate KV (prefillable=False, KV 0.95,
+        # 4 waiting), one peer holds 300 tokens, the group decodes. The blocked
+        # rank counts as aligned, so only the stall bound releases the
+        # underfilled forward, never KV pressure on every tick.
+        d = make_delayer(dp_size=8, ttft_max_ticks=200, stall_ticks=10)
         skip_first(d)
-        peer = _add_rank({0: 1, 1: 500, 2: 64})
+        peer = _add_rank({0: 1, 1: 300, 2: 7 * 16})
+        fired = [
+            call(d, prefillable=False, kv_usage=0.95, waiting_requests=4, reduce=peer)
+            for _ in range(100)
+        ]
+        assert sum(fired) == 9
+        assert d._stat_fire_kv == 0
+        assert d._stat_fire_stall == 9
+
+    def test_blocked_rank_does_not_hold_full_peers(self):
+        # DP8: this rank is blocked below the watermark, the seven peers each
+        # hold a full budget, and requests keep arriving on a peer. Waiting
+        # cannot make this rank admittable, so the full peers fire at once.
+        d = make_delayer(dp_size=8, ttft_max_ticks=200, stall_ticks=10)
+        skip_first(d)
+        peers = _add_rank({0: 7, 1: 7 * MAX_BATCHED, 2: 7 * 16, ARRIVED: 1})
         assert (
-            call(d, prefillable=False, kv_usage=0.95, waiting_requests=1, reduce=peer)
+            call(d, prefillable=False, kv_usage=0.85, waiting_requests=4, reduce=peers)
             is True
         )
-        assert d._stat_fire_kv == 1
+        assert d._stat_fire_fill == 1
+
+    def test_kv_high_ignores_a_rank_that_cannot_prefill(self):
+        d = make_delayer()
+        skip_first(d)
+        call(d, prefillable=False, kv_usage=0.95, waiting_requests=1)
+        assert d._reduce_buf[3] == 0
+        assert d._reduce_buf[BLOCKED] == 1
 
     def test_capped_pending_waits_for_decoding_peer_to_refill(self):
         d = make_delayer(dp_size=8, ttft_max_ticks=8, stall_ticks=10)
@@ -570,6 +596,28 @@ class TestPrefillDecodeInterval:
         # notification, the next eligible prefill must not be delayed.
         assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
         assert d._stat_hold_decode_interval == 0
+
+    def test_arrival_in_window_restarts_the_stall_count(self):
+        d = make_delayer(
+            dp_size=2, prefill_decode_interval=2, ttft_max_ticks=1000, stall_ticks=3
+        )
+        skip_first(d)
+        mixed = _add_rank({2: 64})
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # first look
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 1
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 2
+        d.notify_prefill_executed()
+        # A request arrives on the peer inside the decode-protection window.
+        arriving = _add_rank({2: 64, ARRIVED: 1})
+        assert call(d, pending_tokens=500, reduce=arriving) is False
+        assert call(d, pending_tokens=500, reduce=mixed) is False
+        assert d._stat_hold_decode_interval == 2
+        assert d._stall_count == 0
+        # The count restarts from the arrival instead of resuming at 2.
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 1
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 2
+        assert call(d, pending_tokens=500, reduce=mixed) is True  # stall 3
+        assert d._stat_fire_stall == 1
 
     def test_execution_on_peer_arms_all_ranks(self):
         d = make_delayer(dp_size=2, prefill_decode_interval=1)
