@@ -71,7 +71,7 @@ class _AtomKimiK25LanguageModelAdapter(nn.Module):
     def __init__(
         self,
         atom_lm: nn.Module,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.pp_group = get_parallel().pp_group
