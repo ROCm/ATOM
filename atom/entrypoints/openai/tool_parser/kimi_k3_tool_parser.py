@@ -18,6 +18,7 @@ parses once at flush. Plain (non-tool) answers also carry channel framing
 tokens, which are stripped from ``content``.
 """
 
+import functools
 import json
 import re
 from typing import ClassVar
@@ -230,6 +231,7 @@ class KimiK3Parser(ToolCallParser):
         )
 
     @classmethod
+    @functools.cache
     def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
         """Open the tools channel where the response channel closes.
 
@@ -244,6 +246,9 @@ class KimiK3Parser(ToolCallParser):
         None, constraining nothing, if this tokenizer does not read a control
         token as a single id: forcing a split spelling would hand the model a
         sequence it never writes.
+
+        Cached per tokenizer: a server has one, so every required request
+        shares one channel instead of re-encoding it.
         """
         controls = ("<|open|>", "<|close|>", "<|sep|>", k3.END_OF_MSG)
         if any(

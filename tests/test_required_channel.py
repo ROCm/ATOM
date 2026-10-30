@@ -95,6 +95,22 @@ def test_k3_constrains_nothing_when_its_control_tokens_split():
     assert KimiK3Parser.required_call_channel(K3Tokenizer(split_controls=True)) is None
 
 
+def test_k3_channel_is_encoded_once_per_tokenizer():
+    class CountingTokenizer(K3Tokenizer):
+        calls = 0
+
+        def encode(self, text, add_special_tokens=False):
+            CountingTokenizer.calls += 1
+            return super().encode(text, add_special_tokens)
+
+    tokenizer = CountingTokenizer()
+    first = required_call_channel(KimiK3Parser, tokenizer, "required", TOOLS_ARG)
+    calls = CountingTokenizer.calls
+    again = required_call_channel(KimiK3Parser, tokenizer, "required", TOOLS_ARG)
+    assert again is first == K3_CHANNEL
+    assert CountingTokenizer.calls == calls
+
+
 @pytest.mark.parametrize(
     "parser",
     [DsmlParser, DsmlV41Parser, GlmParser, KimiParser, MiniMaxParser, QwenXmlParser],
