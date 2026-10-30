@@ -29,7 +29,7 @@ Responses uses the same schema under
 `text.format: {"type": "json_schema", "name": "answer", "schema": {...}}`.
 `text.format: {"type": "json_object"}` is also supported.
 
-Schemas are checked before enqueue and compiled with XGrammar. Only local
+Schemas are checked before enqueue and compiled with llguidance 1.9.1 in strict mode. Only local
 references are allowed. Unsupported grammar constructs cause a request error;
 compilation is not a claim of complete JSON Schema vocabulary support. A final
 JSON Schema validator additionally checks the visible answer before a successful
@@ -37,6 +37,19 @@ completion is returned. A validation failure becomes an error, never a successfu
 invalid JSON result. Streaming deltas are provisional until the terminal event.
 An output token cap can still produce partial JSON: Chat reports `length` and
 Responses reports `incomplete` in that case.
+
+Supported intersections and numeric `multipleOf` constraints are compiled into
+the grammar. An exact normalization pass additionally supports numeric/Boolean/null
+negation, negation over finite enums, conditions on finite object discriminators,
+and `uniqueItems` over finite item domains. Finite expansions are capped at 256
+branches or arrays. General negation, unbounded discriminator domains and
+unbounded `uniqueItems`, and `uniqueItems` combined with `prefixItems` remain unsupported and fail before generation. A 400 for
+an unsupported schema is not positive feature support. Client `x-guidance`
+annotations cannot enable lenient compilation or change JSON separators.
+
+The initial XGrammar-based candidate silently ignored some constraints and
+returned 500 only at final validation. This revision replaces that behavior;
+it does not claim complete coverage of the JSON Schema standard.
 
 Constraints apply to the final answer; reasoning remains unconstrained until its
 configured end marker. Target logits are masked before sampling. For speculative

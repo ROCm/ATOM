@@ -25,17 +25,15 @@ def structured_stop_token_ids(config, tokenizer):
 
 class StructuredOutput:
     def __init__(self, tokenizer, vocab_size, stop_token_ids):
-        import xgrammar as xgr
+        from llguidance.hf import from_tokenizer
 
-        self.xgr = xgr
+        from . import structured_grammar as grammar
+
+        self.xgr = grammar
         self.stop_ids = list(stop_token_ids)
-        info = xgr.TokenizerInfo.from_huggingface(
-            tokenizer, vocab_size=vocab_size, stop_token_ids=self.stop_ids
-        )
-        self.compiler = xgr.GrammarCompiler(info, max_threads=1, cache_enabled=False)
-        self.compile = lru_cache(maxsize=128)(
-            lambda schema: self.compiler.compile_json_schema(schema, strict_mode=False)
-        )
+        info = from_tokenizer(tokenizer, n_vocab=vocab_size, eos_token=self.stop_ids)
+        self.compiler = grammar.GrammarCompiler(info)
+        self.compile = lru_cache(maxsize=128)(self.compiler.compile_json_schema)
         self.vocab_size = vocab_size
         self.pending = {}
 
