@@ -1449,9 +1449,9 @@ class Scheduler:
         return total
 
     def _next_decode_completion_steps(self) -> int | None:
-        """An upper bound on the decode steps until a running decode completes:
-        the fewest tokens any of them has left to max_tokens (EOS, or several
-        accepted tokens a step, only bring it sooner). None without decode."""
+        """Decode steps until the first running decode reaches max_tokens if
+        every step accepts all its draft tokens; None without decode. EOS can
+        come sooner, rejected drafts make it later."""
         fewest = None
         for seq in self.running:
             if seq.is_partial_prefill:
@@ -1459,7 +1459,9 @@ class Scheduler:
             left = seq.max_tokens - seq.num_completion_tokens
             if fewest is None or left < fewest:
                 fewest = left
-        return fewest
+        if fewest is None:
+            return None
+        return -(-fewest // (1 + self.mtp_k))
 
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,

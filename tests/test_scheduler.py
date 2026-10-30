@@ -1753,6 +1753,29 @@ class TestPreempt:
         assert len(seq.block_table) == 0
 
 
+class TestNextDecodeCompletionSteps:
+    """Steps until a running decode reaches max_tokens, the delayer's
+    `next_completion_steps`: partial prefills excluded, drafts accepted."""
+
+    def test_none_without_decode(self, scheduler, seq_factory):
+        partial = seq_factory(list(range(8)))
+        partial.is_partial_prefill = True
+        scheduler.running = deque([partial])
+        assert scheduler._next_decode_completion_steps() is None
+
+    def test_fewest_tokens_left_in_steps(self, scheduler, seq_factory):
+        near = seq_factory(
+            list(range(8)), sampling_params=SamplingParams(max_tokens=10)
+        )
+        for t in range(3):
+            near.append_token(t)  # 7 left
+        far = seq_factory(list(range(8)), sampling_params=SamplingParams(max_tokens=50))
+        scheduler.running = deque([far, near])
+        assert scheduler._next_decode_completion_steps() == 7
+        scheduler.mtp_k = 3  # up to 4 tokens a step
+        assert scheduler._next_decode_completion_steps() == 2
+
+
 def _spec_config(mtp_k):
     """Stand-in for SpeculativeConfig, carrying the two members the scheduler
     reads: the draft width and whether the drafter consumes the target's token

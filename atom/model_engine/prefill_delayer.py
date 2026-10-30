@@ -30,7 +30,9 @@ bounds do not impose a hard end-to-end TTFT limit.
 
 It is NOT about mixing prefill+decode in one forward. It DOES preserve cross-DP
 phase alignment: it only releases when every rank is prefill-ready (so all ranks
-enter prefill together and the MoE collective stays aligned), except when a
+enter prefill together and the MoE collective stays aligned) or blocked (it has
+waiting work whose head cannot be admitted, which no wait changes; it runs a
+dummy prefill beside its peers and adds no pending tokens), except when a
 must-fire bound forces release regardless, the group's work stops changing
 (stall), or the cost gate measures that waiting longer no longer pays
 off. Pending-token probes are capped per rank, so a flat pending sum alone is
@@ -51,8 +53,8 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   n_unreachable   = #ranks with neither, whose next decode completion (the
                     slot a new request would fill) lies past the hold's TTFT
                     bound, or that run no decode
-  G_pending       = total pending prefill tokens across ranks (fresh + partial
-                    remaining, each rank capped at the token budget)
+  G_pending       = total pending prefill tokens across prefillable ranks
+                    (fresh + partial remaining, each capped at the budget)
   G_running_dec   = total decode seqs across ranks
   G_arrived       = requests added across ranks since the previous tick
   any_kv_high     = any prefillable rank at/above the KV watermark
@@ -451,10 +453,11 @@ class PrefillDelayer:
                 (fresh prefills and resumable partials); read by the cost gate.
             arrived_requests: requests added to this rank since the previous
                 call; the cost gate's arrival rate.
-            next_completion_steps: an upper bound on the decode steps until
-                one of this rank's running decodes completes (its fewest
-                remaining max_tokens); None when it runs no decode. Read only
-                when this rank has no prefill and no waiting work.
+            next_completion_steps: decode steps until one of this rank's
+                running decodes reaches max_tokens if every step accepts all
+                its draft tokens (EOS can come sooner); None when it runs no
+                decode. Read only when this rank has no prefill and no
+                waiting work.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -485,7 +488,9 @@ class PrefillDelayer:
         )
 
         self._reduce_buf[0] = 1 if prefillable else 0
-        self._reduce_buf[1] = int(pending_tokens)
+        # A blocked rank counts toward alignment but can admit none of its
+        # pending tokens, so they must not fill the forward.
+        self._reduce_buf[1] = int(pending_tokens) if prefillable else 0
         self._reduce_buf[2] = int(running_decode_batch)
         self._reduce_buf[3] = 1 if kv_high else 0
         self._reduce_buf[4] = 1 if kv_low else 0

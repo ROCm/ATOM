@@ -362,6 +362,26 @@ class TestAlignmentGate:
         )
         assert d._stat_fire_fill == 1
 
+    def test_blocked_rank_pending_does_not_fill_the_forward(self):
+        # This rank is blocked with a full budget of waiting tokens; its one
+        # prefillable peer holds 300. Aligned, but the forward is underfilled:
+        # hold instead of firing `fill` on tokens the blocked rank cannot admit.
+        d = make_delayer(dp_size=2, ttft_max_ticks=200, stall_ticks=10)
+        skip_first(d)
+        peer = _add_rank({0: 1, 1: 300, 2: 64})
+        assert (
+            call(
+                d,
+                prefillable=False,
+                pending_tokens=MAX_BATCHED,
+                waiting_requests=4,
+                reduce=peer,
+            )
+            is False
+        )
+        assert d._reduce_buf[1] == 300
+        assert d._stat_fire_fill == 0
+
     def test_kv_high_ignores_a_rank_that_cannot_prefill(self):
         d = make_delayer()
         skip_first(d)
