@@ -147,6 +147,9 @@ class SamplingParams:
     # Set by the server for `tool_choice="required"` when the tool-call format
     # defines one (Kimi-K3 only); None leaves the output unconstrained.
     required_channel: RequiredChannel | None = None
+    json_schema: str | None = None
+    # Generated reasoning tokens are unconstrained until this marker closes.
+    structured_reasoning_end: tuple[int, ...] = ()
 
     def __post_init__(self):
         # 0 also means disabled, as in vLLM/SGLang; MLPerf Endpoints workloads send it
