@@ -1511,7 +1511,7 @@ class Scheduler:
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
         self._register_connector_admission(seq)
-        self.waiting.append(seq)
+        self._enqueue_waiting(seq)
         self._arrived_requests += 1
 
     def extend(self, seqs: list[Sequence]):
@@ -1520,8 +1520,17 @@ class Scheduler:
             self.metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
             self._register_connector_admission(seq)
-        self.waiting.extend(seqs)
+        for seq in seqs:
+            self._enqueue_waiting(seq)
         self._arrived_requests += len(seqs)
+
+    def _enqueue_waiting(self, seq: Sequence) -> None:
+        if getattr(seq, "dp_prefetch_priority", False):
+            # Routed away from the rank holding its prefix: admit it first so
+            # the tier load of that prefix into this rank starts now.
+            self.waiting.appendleft(seq)
+        else:
+            self.waiting.append(seq)
 
     def _register_connector_admission(self, seq: Sequence) -> None:
         # Register every logical P request, including those behind a capacity
