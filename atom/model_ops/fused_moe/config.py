@@ -398,12 +398,12 @@ def moe_kernel_token_capacity(
         tokens = ((tokens + tp - 1) // tp) * tp
     sp_size = getattr(atom_config, "sequence_parallel_size", 1)
     if sp_size > 1:
-        # The scheduler budget is global under SP. Routed dispatch reserves
-        # only the local shard; gather/scatter needs the padded global rows.
-        # Rounding up also protects topK metadata at nondivisible budgets.
+        # The scheduler budget is global under SP; the gather/scatter needs
+        # the padded global rows. Rounding up also protects topK metadata at
+        # nondivisible budgets.
         tokens = ((tokens + sp_size - 1) // sp_size) * sp_size
     if use_all2all:
-        return tokens // sp_size
+        return tokens
     repeat = max(int(dp_logical_ratio), 1)
     if atom_config.enable_dp_attention and dp_size > 1:
         return tokens * dp_size * repeat

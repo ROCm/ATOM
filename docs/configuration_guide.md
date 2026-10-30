@@ -366,7 +366,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--trust-remote-code` | | flag | `False` | Trust remote code when loading model |
 | `--tensor-parallel-size` | `-tp` | `int` | `1` | Tensor parallel size |
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
-| `--sequence-parallel-size` | `-sp` | `int` | `1` | Ulysses sequence parallel size; requires `-tp 1`, `-pp 1` and an MHA model |
+| `--sequence-parallel-size` | `-sp` | `int` | `1` | Ulysses sequence parallel size; requires `-tp 1`, `-pp 1`, no expert parallelism and an MHA model |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
 | `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
