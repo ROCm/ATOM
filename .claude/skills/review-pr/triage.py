@@ -1375,6 +1375,68 @@ def derive(files, title="", raw_diff=""):
     if any(p in STATEFUL_CACHE_PATHS for p in paths):
         hit("stateful-prefix-cache", "I1")
 
+    # P1-P5 -- ATOM's own directory contract (rules.md section P), not a correctness defect
+    # family: a misplaced file doesn't compute a wrong answer, it violates how ATOM is meant
+    # to be built. Each trigger below is scoped to the directory/path shape its own ATOM
+    # citation actually landed in, per rules.md's "P" section.
+
+    # P1 -- a new ATOM_* var read via os.getenv/os.environ outside atom/utils/envs.py.
+    # Anchored on ATOM#2535 (follow-up 35218f381): six MONO_* scheduling switches read
+    # straight from os.environ in atom/models/glm52/mono/kernels/{kernel,layout}.py, flagged
+    # by valarLip as "outside atom/utils/envs.py" and fixed by registering them in envs.py.
+    if any(p != "atom/utils/envs.py"
+           and re.search(r'os\.getenv\(\s*["\']ATOM_|os\.environ\[\s*["\']ATOM_', "\n".join(f["add"]))
+           for p, f in files.items()):
+        hit("atom-env-var-outside-registry", "P1")
+
+    # P2 -- a new ATOM_* env var in envs.py itself defaults falsy. Anchored on ATOM#741
+    # ("Enable prefix caching by default", CLOSED): the PR's own motivation was that an
+    # off-by-default flag had shipped a feature nobody ran.
+    if any(p == "atom/utils/envs.py"
+           and re.search(r'"ATOM_\w+"\s*:.*(?:,\s*"0"\)|,\s*False\)|,\s*None\)|,\s*""\))',
+                         "\n".join(f["add"]))
+           for p, f in files.items()):
+        hit("new-env-var-defaults-off", "P2")
+
+    # P3 -- model-specific logic landed in common path (atom/model_ops/, atom/model_engine/,
+    # atom/spec_decode/). Anchored on ATOM#2116, atom/spec_decode/eagle_proposer.py:102,
+    # valarLip: "this file is for common path!!" (a DeepSeek-V4-only change in the shared
+    # MTP proposer). Token list derived from `ls atom/models/` (2026-10-30) -- re-derive it
+    # rather than hardcode a new one once atom/models/ grows a family this doesn't name.
+    MODEL_FAMILY_TOKENS = ("deepseek", "eagle3", "glm4", "glm5", "glm52", "gpt_oss", "kimi",
+                           "llama", "mimo", "minimax", "mistral3", "mixtral", "qwen3", "qwen4",
+                           "dspark")
+    COMMON_PATH_DIRS = ("atom/model_ops/", "atom/model_engine/", "atom/spec_decode/")
+    if any(p.startswith(COMMON_PATH_DIRS) for p in paths) \
+            and re.search(r"\b(?:" + "|".join(MODEL_FAMILY_TOKENS) + r")", add, re.I):
+        # No trailing \b: model-family tokens routinely continue straight into a version
+        # suffix or class-name tail with no word break (DeepseekV4MTPModel, Qwen3MoeModel),
+        # so a trailing boundary would silently miss exactly the identifiers this exists to
+        # catch. A leading \b still keeps this from matching a token embedded mid-identifier.
+        hit("model-specific-logic-in-common-path", "P3")
+
+    # P4 -- the same change repeated once per model file instead of once at the shared
+    # layer. Anchored on ATOM#126 (valarLip: "can we find a better way... instead of modify
+    # all the model files"), ATOM#262 (valarLip: "instead of every model..."), ATOM#401
+    # (valarLip: "we have to do this for every new model?"). Pure file-count trigger --
+    # rules.md's own body says to fall back to count alone when the "same shape" judgment
+    # can't be made mechanically, which is the case here.
+    if len([p for p in paths if p.startswith("atom/models/")]) >= 3:
+        hit("repeated-per-model-change", "P4")
+
+    # P5 -- a vLLM/SGLang symbol introduced outside atom/plugin/. Anchored on ATOM#1910
+    # (atom/models/kimi_k3_dspark.py, review-time path, removed from the final diff):
+    # valarLip: "why can't plugin follow the same way?" on a vLLM-plugin-only kwarg added to
+    # the shared model file. Scoped to atom/models/ and atom/model_ops/ specifically (not
+    # "anywhere outside atom/plugin/"): atom/config.py and the entrypoints already do
+    # legitimate framework detection as part of the dispatch layer itself, the same
+    # exemption C3 carves out for a centralized arch-detection function.
+    PLUGIN_SYMBOL_SCOPE = ("atom/models/", "atom/model_ops/")
+    if any(p.startswith(PLUGIN_SYMBOL_SCOPE)
+           and re.search(r"\b(?:vllm|sglang)\b", "\n".join(f["add"]), re.I)
+           for p, f in files.items()):
+        hit("plugin-symbol-outside-plugin-dir", "P5")
+
     # Triton family (T1 T3 T6 T8), ported from aiter's own review-pr skill. Gated so it
     # only looks at Triton PRs: either the diff adds a `@triton.jit`-decorated kernel, or it
     # touches one of the directories that hold ATOM's Triton kernels today. v4_kernels and
@@ -1413,7 +1475,7 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
 )}
 
 ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 B7 C1 C2 D1 D4 D10 D11 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
-             "I1 HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8")
+             "I1 HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8 P1 P2 P3 P4 P5")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert

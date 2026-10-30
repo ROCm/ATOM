@@ -495,6 +495,136 @@ Independent confirmation: `docs/scheduling_kv_cache_guide.md` (~line 320) states
 
 ---
 
+### P — ATOM Directory Contract
+_"A file in the wrong directory does not corrupt output. It is still the single most
+frequent thing ATOM's lead reviewer actually comments on."_
+
+Every rule below is `⚠️` or `📝`, **never `🔴`**, on purpose, and that is a property of the
+whole family, not a per-rule judgment call to be revisited: a misplaced env var, a
+model-specific branch in a common file, or a plugin symbol in native code does not compute a
+wrong answer, read out of bounds, or fail silently the way A-through-I's 🔴 findings do. It
+violates how ATOM is meant to be built — a structural convention `atom-patterns/SKILL.md`
+already states — and several rules here enforce exactly what that skill already says rather
+than something inferred from a bug. Nobody should "upgrade" one of these to `🔴` later: if a
+finding under this header asserts a wrong computed value, it belongs in A-I, not here.
+
+**P1 — a new `ATOM_*` env var is read outside `atom/utils/envs.py`** ⚠️
+`atom-patterns/SKILL.md`: "Authoritative list: `atom/utils/envs.py` (all `ATOM_*` defined as
+lazy lambdas)." An `os.getenv("ATOM_...")` / `os.environ["ATOM_..."]` anywhere else bypasses
+that registry — the var is settable in production but absent from the one file anyone would
+grep to find out what it does or what it defaults to.
+Trigger: an added line matching `os.getenv(` or `os.environ[` with an `ATOM_` name, in a path
+that is not `atom/utils/envs.py`.
+Real example (ATOM#2535, "feat(mono): GLM-5.2 and Kimi-K3 mono decode", follow-up fixed in
+`35218f381`): `atom/models/glm52/mono/kernels/kernel.py` and `layout.py` read six scheduling
+switches straight from `os.environ`. valarLip: "This... read[s] six undocumented scheduling
+switches from `os.environ`... outside `atom/utils/envs.py`." gbyu-amd, confirming rather than
+dismissing it: "the six `MONO_*` switches... stay readable from `os.environ` and absent from
+`envs.py` and `docs/environment_variables.md`, so they are settable in production while being
+undiscoverable there." Fixed by registering all six in `envs.py` with the same names and
+defaults. The switches were named `MONO_*`, not `ATOM_MONO_*` — the review thread's concern
+(registry bypass, undiscoverable default) is exactly P1's, but this rule's trigger, scoped to
+the `ATOM_` prefix because that is the only prefix `envs.py` itself claims, is narrower than
+what was actually flagged here.
+→ `⚠️ P1: [NAME] read via os.getenv/os.environ in [file] — move the definition into atom/utils/envs.py so it is discoverable`
+
+**P2 — a new env switch leaves the new behaviour off by default** 📝
+A flag that ships off by default ships code nobody runs until someone separately flips it and
+re-validates. Not every off-by-default var is wrong — some need a staged rollout — so this is
+a question the PR body should answer, not a defect to fix on sight.
+Trigger: an added line in `atom/utils/envs.py` defining an `ATOM_*` entry whose default is
+falsy (`"0"`, `False`, `None`, `""`).
+Real example (ATOM#741, "[feat][breaking] Enable prefix caching by default", CLOSED): the PR
+flips `enable_prefix_caching`'s default from `False` to `True` because the off-by-default
+value had shipped a feature nobody ran by default — "aligning ATOM with every other major
+serving runtime" — and had to add an explicit auto-disable fallback for the two MTP variants
+that cannot support it. The PR itself was closed, not merged, but its own title and stated
+motivation are exactly the question P2 asks a new off-by-default switch to answer up front.
+→ `📝 P2: [NAME] defaults off — why not on by default, or what's the plan to flip it?`
+
+**P3 — model-specific logic added to a shared path** ⚠️
+`atom/model_ops/`, `atom/model_engine/`, and `atom/spec_decode/` are common path: every model
+that dispatches through them inherits whatever any one model's change does there. A branch
+keyed to one model family belongs in that model's own file under `atom/models/`, not in the
+shared layer.
+Trigger: added lines under `atom/model_ops/`, `atom/model_engine/`, or `atom/spec_decode/`
+containing a model-family token. Derived from `atom/models/`'s current file list (`ls
+atom/models/`, checked 2026-10-30), not hardcoded from memory: `deepseek`, `eagle3`, `glm4`,
+`glm5`, `glm52`, `gpt_oss`, `kimi`, `llama`, `mimo`, `minimax`, `mistral3`, `mixtral`, `qwen3`,
+`qwen4`, `dspark`. Re-derive this list the same way rather than reuse it verbatim once
+`atom/models/` grows a new family.
+Real example (ATOM#2116, "perf: capture DeepSeek-V4 MTP step zero", OPEN,
+`atom/spec_decode/eagle_proposer.py:102`): valarLip: **"this file is for common path!!"** — a
+DeepSeek-V4-specific MTP step-zero change had landed inside `EagleProposer`, the shared
+speculative-decoding proposer every MTP model dispatches through. Fixed in `f881de73` (not yet
+on `main` as of this writing, since #2116 itself has not merged): the author moved the
+DSv4-specific step-0 graph declaration, full-q staging, and decode-only eligibility checks into
+a new, dedicated `DeepseekV4Proposer`, routed to it only from the factory for
+`DeepseekV4MTPModel`, and left `EagleProposer` holding only the model-agnostic step-0 hooks and
+the shared loop.
+→ `⚠️ P3: [model]-specific [logic] added to [shared file] — this file is common path for every model that dispatches through it; move this into the model's own file`
+
+**P4 — the same change repeated once per model instead of once at the top** 📝
+When a fix or feature needs the identical change copied into three or more model files, the
+shared base layer usually already has (or should grow) the hook the change should have gone
+through instead — the repetition is itself the signal, independent of whether any one copy is
+individually correct.
+Trigger: three or more files under `atom/models/` changed in one PR with the same shape of
+addition. "Same shape" is read off the diff itself: near-identical statements across the
+files, differing only in the receiver name or a literal (an attribute override, a constructor
+kwarg, an identical conditional) — not merely "these files all changed." Where the shape
+cannot be pinned down precisely, fall back to the file count alone and say so in the finding
+rather than asserting a shape match that isn't there.
+Real example (ATOM#126, "[1/N][feat] Make ATOM work with vLLM and SGLang", MERGED,
+`atom/models/deepseek_v2.py`): valarLip: "can we find a better way... instead of modify all the
+model files." zejunchen-zejun, agreeing and fixing: "I change the code here and hide the
+attention selection logic into the base_attention file, as a result, there is no code changes
+to all model files. The developers can construct the model and call `self.attn = Attention(...)`
+like before."
+Real example (ATOM#262, "[feat](gpt-oss): support gpt-oss for vllm plugin", MERGED,
+`atom/models/gpt_oss.py`): valarLip: "let's overide this at top level maybe in loader.py
+instead of every model..." wuhuikx, agreeing: "Then add a new model in OOT mode, we just need
+to modify the regiter.py and wrapper.py in plugin folder, which will be much more clean."
+PerryZhang01's fix, same thread: "moved it to base class" / "moved it to ATOMModelBase."
+Real example (ATOM#401, "[plugin][oot] Add Kimi-K2.5 support", MERGED,
+`atom/plugin/vllm/models/kimi_k25.py`): valarLip, the same question one layer down in the
+plugin tree: "we have to do this for every new model?" zejunchen-zejun, independently on the
+same PR: "Can we have a dict or set to store which model should be excluded for processing
+config here? So that the new OOT multi-model will not frequently introduce code change here."
+→ `📝 P4: [change] repeated across [N] files under atom/models/ — does a shared hook (base class, loader, factory) belong here instead of one copy per model?`
+
+**P5 — a vLLM or SGLang symbol introduced outside `atom/plugin/`** ⚠️
+`atom-patterns/SKILL.md` assigns `atom/plugin/` to "vLLM/SGLang plugin adapters" specifically
+so native ATOM code never has to know which serving framework, if any, it is running under. A
+literal `vllm`/`sglang` reference or framework-specific branching landing in `atom/models/` or
+`atom/model_ops/` reintroduces that coupling one file at a time.
+Trigger: an added line referencing `vllm` or `sglang` (case-insensitive token) in a path under
+`atom/models/` or `atom/model_ops/` — scoped to those two directories, not "anywhere outside
+`atom/plugin/`", because that is where the cited instance actually landed and where
+`atom-patterns`'s own model-file contract applies; `atom/config.py` and the entrypoints
+already do legitimate framework detection (`is_plugin_mode()`, `is_vllm`) as part of the
+dispatch layer itself, the same kind of exemption C3 carves out for a centralized detection
+function.
+Real example (ATOM#1910, "feat(k3): Kimi-K3 vLLM plugin vision + DSpark draft support", MERGED,
+review-time path `atom/models/kimi_k3_dspark.py` — removed from the PR's final diff): a
+`slot_mapping=None` parameter was added to `write_context_kv` in the shared model file to
+serve vLLM-plugin-only behaviour. sajandhy, explaining the vLLM-specific need in that same
+native file: "In the vLLM plugin, context KV is written from the speculator via
+`precompute_and_store_context_kv(..., slot_mappings=...)`... vLLM builds those slots from
+block tables." valarLip: "why can't plugin follow the same way?" By the version that merged,
+this logic lives in `atom/plugin/vllm/models/kimi_k3.py`, not `atom/models/`.
+Checked and dropped: PR #582 ("[Acc] remove flatten in dpsk fp4 by quantizing mla weights",
+MERGED) was the other citation under consideration for this rule, but its entire diff sits
+inside `atom/plugin/sglang/attention_backend/sgl_attention_mla.py` — it mimics vLLM's weight
+layout to fix a performance regression, it does not place a vLLM/SGLang symbol outside
+`atom/plugin/`. Not cited; #1910 alone carries this rule. Note also that #1910's own citation
+is a vLLM-plugin-specific *kwarg* name (`slot_mapping`), not a literal `vllm`/`sglang` token —
+the trigger above, which looks for the literal token, is narrower than the review comment that
+motivates it.
+→ `⚠️ P5: [vllm/sglang reference] introduced in [file] under atom/models or atom/model_ops — framework-specific logic belongs in atom/plugin/, not the native path`
+
+---
+
 ### T — Triton Kernel Review
 
 Ported from aiter's own `.claude/skills/review-pr/rules.md`, graded individually rather
