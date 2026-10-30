@@ -535,6 +535,19 @@ def test_kda_slot_regions_publish_their_tp_shards():
             assert sum(seg) == region.unit_bytes
 
 
+def test_a_slot_unit_without_a_tp_split_is_refused_at_startup():
+    """A conv unit of an unexpected width gets no segments, so a decode at a
+    larger TP could not receive it. That is known once the caches exist, not
+    first on a transfer."""
+    builder = kimi_builder({"kv_connector": "mooncake"})
+    builder.model_runner.config.hf_config.linear_conv_kernel_dim += 1
+
+    with pytest.raises(
+        RuntimeError, match=r"slot regions \[0, 1, 2\] have no TP split"
+    ):
+        builder.get_kv_transfer_tensors()
+
+
 def test_without_replayssm_no_slot_region_is_tp_replicated():
     builder = kimi_builder({"kv_connector": "mooncake"})
 

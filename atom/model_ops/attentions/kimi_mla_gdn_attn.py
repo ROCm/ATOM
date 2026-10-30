@@ -174,6 +174,23 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         tensors.slot_region_tp_replicated = [False] * len(tensors.slot_regions)
         if self.replayssm and tensors.slot_regions:
             tensors.slot_region_tp_replicated[-1] = True
+        # Only a decode at a larger TP reads the split, but the layout is the
+        # model's and fixed by now: refuse here, on every deployment, rather
+        # than on the first mixed-TP transfer.
+        undescribed = [
+            idx
+            for idx, (segments, replicated) in enumerate(
+                zip(tensors.slot_region_tp_segments, tensors.slot_region_tp_replicated)
+            )
+            if segments is None and not replicated
+        ]
+        if undescribed:
+            raise RuntimeError(
+                f"{model_type} slot regions {undescribed} have no TP split: "
+                "`_kda_slot_tp_segments` does not recognise their unit layout "
+                "(a conv unit is linear_conv_kernel_dim - 1 + num_spec rows of "
+                "[q | k | v]), which a decode at another TP needs"
+            )
         if getattr(config, "pipeline_parallel_size", 1) > 1:
             # `_consumer_region_map` shifts a stage's regions onto the peer's
             # list group-major over `num_hidden_layers`, but the MLA rows and
@@ -193,9 +210,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         `(heads, dv, dk)` and a ReplaySSM record unit `(heads, cache_len, d)`,
         all sharded by contiguous head blocks, so a peer at k times this TP
         holds the same k-th of every q, k and v run and of the head axis. A
-        conv unit not shaped as above is left undescribed, which keeps it on
-        equal TP sizes only. ReplaySSM's cursor, the last region, is the same
-        on every rank; `slot_region_tp_replicated` says so.
+        conv unit not shaped as above is left undescribed, and
+        `get_kv_transfer_tensors` refuses it. ReplaySSM's cursor, the last
+        region, is the same on every rank; `slot_region_tp_replicated` says so.
         """
         runner = self.model_runner
         segments: list = [None] * num_regions
