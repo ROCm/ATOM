@@ -899,6 +899,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM_GDN_GRAPH_MAX_SEQS, runs eagerly as before. 0 keeps every GDN
     # prefill eager.
     "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1") == "1",
+    # Drain the compute stream before a step's state maintenance copies
+    # (checkpoint stores / restores, slot relocations). 1 (the default) keeps
+    # the host from running ahead of the GPU across them; see
+    # `AttentionMetadataBuilder.build`.
+    "ATOM_STATE_OPS_DRAIN": lambda: os.getenv("ATOM_STATE_OPS_DRAIN", "1") == "1",
     "ATOM_GDN_GRAPH_MAX_SEQS": lambda: int(os.getenv("ATOM_GDN_GRAPH_MAX_SEQS", "8")),
     # Prefill token graphs for the GDN/MHA builder (Qwen3.5 / Qwen3-Next) under
     # DP attention. A DP group replays a prefill bucket only on a step every

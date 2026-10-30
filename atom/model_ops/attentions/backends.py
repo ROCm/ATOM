@@ -36,7 +36,7 @@ from atom.model_ops.attentions.token_layout.batch_ids import (
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, AttnState, ForwardMode
 from atom.utils.h2d import h2d_producer
@@ -1042,6 +1042,17 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
+        if envs.ATOM_STATE_OPS_DRAIN and (
+            state_ops.relocations
+            or state_ops.checkpoint_stores
+            or state_ops.checkpoint_restores
+        ):
+            # Let the GPU finish the forwards already queued before this step's
+            # state copies and the metadata built after them. With the host far
+            # ahead (graphed prefill steps, cached launch paths), c2048 DP turns
+            # some requests that resume a prefix checkpoint into garbage; this
+            # drain clears it. The race it closes is not yet identified.
+            torch.cuda.current_stream().synchronize()
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:
