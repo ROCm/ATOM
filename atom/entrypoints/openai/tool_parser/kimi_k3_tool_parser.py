@@ -22,6 +22,8 @@ import json
 import re
 from typing import ClassVar
 
+from atom.sampling_params import RequiredChannel
+
 from .. import kimi_k3_tokens as k3
 from .schema import build_param_types
 from .tool_parser import (
@@ -225,6 +227,40 @@ class KimiK3Parser(ToolCallParser):
         return (
             f'{k3.TOOLS_START}<|open|>call tool="{name}" index="0"{sep}'
             f"{body}{k3.CALL_END}{sep}{k3.TOOLS_END}{sep}"
+        )
+
+    @classmethod
+    def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
+        """Open the tools channel where the response channel closes.
+
+        After `<|close|>response<|sep|>` K3 either writes
+        `<|open|>tools<|sep|>` or closes the message. Told it MUST call a tool,
+        it still closed the message on 85-100% of the Kimi-Vendor-Verifier
+        failures, writing the arguments as its answer. So the opening is
+        forced through the call's name attribute, which is where vLLM's K3
+        structural tag also commits to a call, and the message cannot end
+        before it. The tool name and arguments stay the model's.
+
+        None, constraining nothing, if this tokenizer does not read a control
+        token as a single id: forcing a split spelling would hand the model a
+        sequence it never writes.
+        """
+        controls = ("<|open|>", "<|close|>", "<|sep|>", k3.END_OF_MSG)
+        if any(
+            len(tokenizer.encode(c, add_special_tokens=False)) != 1 for c in controls
+        ):
+            return None
+
+        def ids(text: str) -> tuple[int, ...]:
+            return tuple(tokenizer.encode(text, add_special_tokens=False))
+
+        end_ids = set(ids(k3.END_OF_MSG))
+        if tokenizer.eos_token_id is not None:
+            end_ids.add(tokenizer.eos_token_id)
+        return RequiredChannel(
+            after=ids(k3.RESPONSE_END),
+            opening=ids(k3.TOOLS_START + KIMI_K3_CALL_PREFIX),
+            end_ids=tuple(sorted(end_ids)),
         )
 
     @classmethod

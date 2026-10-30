@@ -20,6 +20,8 @@ been given the startup answer. One question, one place to ask it.
 import logging
 from typing import Any
 
+from atom.sampling_params import RequiredChannel
+
 from ..chat_encoders import render_probe_prompt
 from .deepseekv4_tool_parser import DsmlParser
 from .deepseekv41_tool_parser import DsmlV41Parser
@@ -141,6 +143,23 @@ TOOL_CALL_PARSER_HELP = (
     "resolves, tool calls are delivered as plain text and the startup log "
     "says so \u2014 the format is never guessed from output."
 )
+
+
+def required_call_channel(
+    parser_cls: type[ToolCallParser] | None,
+    tokenizer: Any,
+    tool_choice: Any,
+    tools: list | None,
+) -> RequiredChannel | None:
+    """The channel this request's output must open, or None.
+
+    Only a string ``tool_choice="required"`` with tools to call, and only
+    where the format defines one (`ToolCallParser.required_call_channel`):
+    Kimi-K3 today. Every other request samples exactly as before.
+    """
+    if parser_cls is None or tool_choice != "required" or not tools:
+        return None
+    return parser_cls.required_call_channel(tokenizer)
 
 
 def forbids_tool_calls(tool_choice: Any) -> bool:
