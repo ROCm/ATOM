@@ -12,6 +12,17 @@ Reusing layers still own target K/V and share the per-forward top-k memo.
 Explicit patterns, offsets and stage-local model walks retain the model's
 layer-selection semantics. This change does not add cross-PP-stage top-k reuse.
 
+Compact index-row allocation is always active and has no separate opt-in flag.
+The existing `use_index_cache` / `index_topk_freq` HF overrides choose which
+layers reuse top-k; they do not enable the allocation optimization. Every layer
+that computes top-k gets an index row, and every reusing layer omits one.
+
+The evaluated M3.1 checkpoint (`0a00e0e39fc00499b23efccc18a8ea63fce5c44c`)
+does not declare `index_share` or `indexer_types` shared-layer markers. Its
+weight manifest contains index Q/K projections and norms for all 60 layers.
+Here, freq4 is an optional inference reuse schedule, with accuracy to be
+validated; compact allocation follows that schedule without changing it.
+
 The base recipe rejected top-k reuse with NVFP4 KV. Reusing layers now call
 AITER's existing `skip_index_branch` path with no index output/cache, then run
 the same NVFP4 target K/V store as computing layers. Both modes use the same
