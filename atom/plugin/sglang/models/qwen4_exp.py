@@ -24,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.runtime_context import get_parallel
 from torch import nn
 
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
@@ -36,7 +37,6 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     plugin_runtime_scope,
 )
-from atom.plugin.sglang.sglang_compat import get_pp_group
 
 try:
     from atom.models.qwen4_exp import (
@@ -251,7 +251,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 f"got {logger_name}. Do not route Qwen4Exp through Qwen3_5*."
             )
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = atom_lm.config
         self.atom_config = atom_lm.atom_config
         self.quant_config = quant_config or atom_lm.atom_config.quant_config

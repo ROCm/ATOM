@@ -20,6 +20,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 from torch import nn
 
 from atom.config import SpeculativeConfig
@@ -36,7 +37,6 @@ from atom.plugin.sglang.runtime import (
     plugin_runtime_scope,
 )
 from atom.plugin.sglang.runtime.attention_backend_resolver import resolve_sglang_runtime
-from atom.plugin.sglang.sglang_compat import get_pp_group
 
 logger = logging.getLogger("atom.plugin.sglang.models")
 
@@ -89,7 +89,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
             apply_prepare_qwen4_exp_adaptations,
         )
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.config = config
         self.vocab_size = config.vocab_size

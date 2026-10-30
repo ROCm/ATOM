@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       build_rocm7:
-        description: "Build the ROCm 7 line -> rocm/atom-dev:latest + :nightly_<ts>, and the plugin images vllm-latest / sglang-latest (scheduled nightly runs always build every live line; default enabled)"
+        description: "Build the ROCm 7 line -> rocm/atom-dev:latest + :nightly_<ts>, and the plugin image sglang-latest (scheduled nightly runs always build every live line; default enabled)"
         type: boolean
         default: true
       build_rocm10:
-        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.0 + :nightly_<ts>-rocm10.0, and the plugin images vllm-latest-rocm10.0 / sglang-latest-rocm10.0 (scheduled nightly runs always build every live line; default enabled)"
+        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.0 + :nightly_<ts>-rocm10.0, and the plugin image sglang-latest-rocm10.0 (scheduled nightly runs always build every live line; default enabled)"
         type: boolean
         default: true
       base_image_override:
@@ -83,10 +83,10 @@ on:
 
 # The live lines, defined once for the whole workflow. LINE_STABLE owns the
 # unsuffixed tags (latest, nightly_<ts>, vllm-latest, sglang-latest);
-# LINE_NEXT publishes the same set, including the vLLM and SGLang plugin
-# images, suffixed with the ROCm version read out of its image. Promoting
-# ROCm 10 is these two values and nothing else: `latest` follows, and the
-# line that used to be stable simply stops being built.
+# LINE_NEXT publishes the native tags and the SGLang plugin image, suffixed
+# with the ROCm version read out of its image. The vLLM plugin image stays
+# on LINE_STABLE. Promoting ROCm 10 is these two values and nothing else:
+# `latest` follows, and the line that used to be stable simply stops being built.
 env:
   LINE_STABLE: rocm7
   LINE_NEXT: rocm10.0
@@ -116,10 +116,13 @@ jobs:
           lines=""
           add() { lines="${lines:+${lines},}\"$1\""; }
 
-          # only_release_oot / only_release_sglang rebuild the plugin layer on
-          # the native image. They use the same line set as a full release, so
-          # a ROCm 10 run still publishes vllm-latest-rocm10.0 and
-          # sglang-latest-rocm10.0 instead of replacing the unsuffixed tags.
+          # vLLM stays on the stable line, so a vLLM-only rebuild has nothing
+          # to publish on LINE_NEXT. SGLang is built on every selected line.
+          if [ "${{ inputs.only_release_oot }}" = "true" ] && [ "${{ inputs.only_release_sglang }}" != "true" ]; then
+            printf 'lines=["%s"]\n' "${LINE_STABLE}" >> "${GITHUB_OUTPUT}"
+            echo "Lines: ${LINE_STABLE} (only_release_oot)"
+            exit 0
+          fi
 
           if [ "${{ github.event_name }}" = "schedule" ]; then
             # Like the OOT and SGLang layers, a scheduled run builds every
@@ -581,9 +584,12 @@ jobs:
         continue-on-error: true
         timeout-minutes: 180
         run: |
-          # Built from this line's native image. The push step appends
-          # TAG_SUFFIX, so the ROCm 10 image is vllm-latest-rocm10.0 and does
-          # not replace vllm-latest.
+          # The vLLM layer belongs to the stable line only. A second line must
+          # not build it, and must not publish over vllm-latest.
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM layer (owned by the ROCm 7 line)."
+            exit 0
+          fi
           OOT_BASE_IMAGE="${CI_IMAGE}"
           echo "Using OOT base image: ${OOT_BASE_IMAGE}"
           docker build --network=host -t "${CI_OOT_IMAGE}" \
@@ -615,6 +621,10 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           set -euo pipefail
+          if [ "${FLAVOR}" != "${LINE_STABLE}" ]; then
+            echo "${FLAVOR} is not the stable line: skipping the OOT vLLM push layer (owned by the ROCm 7 line)."
+            exit 0
+          fi
           # Record every tag this job creates, so Clean Up can remove exactly
           # those. The old cleanup removed by glob (nightly_*, latest*), which
           # with two lines in one run means one job deleting the other's
@@ -625,8 +635,8 @@ jobs:
           }
           VLLM_VER="${VLLM_VERSION}"
           OOT_TAG_SUFFIX="${{ inputs.oot_tag_suffix || '' }}"
-          OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)${TAG_SUFFIX}"
-          OOT_LATEST_TAG="vllm-latest${TAG_SUFFIX}"
+          OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
+          OOT_LATEST_TAG="vllm-latest"
           if [ -n "${OOT_TAG_SUFFIX}" ]; then
             if [[ ! "${OOT_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
               echo "Invalid oot_tag_suffix '${OOT_TAG_SUFFIX}'. Allowed characters: letters, numbers, '.', '_' and '-'."

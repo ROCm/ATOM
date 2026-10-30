@@ -98,10 +98,10 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
     ):
         if tensor is None or not input_scattered:
             return tensor
-        from atom.plugin.sglang.sglang_compat import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
         output = tensor.new_empty((total_tokens, *tensor.shape[1:]))
-        get_tp_group().all_gather_into_tensor(output, tensor)
+        get_parallel().tp_group.all_gather_into_tensor(output, tensor)
         return output
 
     def forward(
@@ -116,7 +116,9 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
         del kwargs
         forward_batch = self._get_forward_batch()
 
-        from atom.plugin.sglang.sglang_compat import get_attn_tp_context
+        from sglang.srt.layers.layer_boundary.adapters.attention import (
+            get_attn_tp_context,
+        )
 
         attn_tp_context = get_attn_tp_context()
         with attn_tp_context.maybe_input_scattered(forward_batch):

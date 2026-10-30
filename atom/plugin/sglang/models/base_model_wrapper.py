@@ -15,6 +15,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.runtime_context import get_parallel
 from torch import nn
 
 from atom.plugin.sglang.runtime import (
@@ -26,7 +27,6 @@ from atom.plugin.sglang.runtime import (
     get_model_arch_spec,
     plugin_runtime_scope,
 )
-from atom.plugin.sglang.sglang_compat import get_pp_group
 from atom.plugin.sglang.tbo import (
     SGLangPluginUBatchWrapper,
     prepare_sglang_tbo_forward_inputs,
@@ -82,7 +82,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         super().__init__()
         logger.info("Initializing ATOM backend for %s", self.__class__.__name__)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.config = config
         vocab_size = getattr(config, "vocab_size", None)

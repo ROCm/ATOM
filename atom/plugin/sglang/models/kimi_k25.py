@@ -10,6 +10,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.models.kimi_k25 import (
     KimiK25ForConditionalGeneration as _SglangKimiK25ForConditionalGeneration,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import LazyValue
 from torch import nn
 
@@ -19,7 +20,6 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     plugin_runtime_scope,
 )
-from atom.plugin.sglang.sglang_compat import get_pp_group
 
 _KIMI_K25_PACKED_MODULES_MAPPING = {
     "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -74,7 +74,7 @@ class _AtomKimiK25LanguageModelAdapter(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.atom_config = atom_lm.atom_config
         self.config = atom_lm.config
         self.quant_config = quant_config or self.atom_config.quant_config

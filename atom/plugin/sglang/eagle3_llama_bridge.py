@@ -1055,9 +1055,8 @@ def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
         import sglang.srt.speculative.eagle_worker_v2 as eagle_worker_module
         from sglang.srt.distributed.parallel_state import get_attn_tp_group
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+        from sglang.srt.runtime_context import get_parallel
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
-        from atom.plugin.sglang.sglang_compat import get_tp_group
 
         if not hasattr(EagleVerifyInput, "sample"):
             import sglang.srt.speculative.eagle_utils as eagle_utils  # noqa: PLR0402
@@ -1078,7 +1077,11 @@ def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
 
     def _broadcast_sample_result(result):
         predict, accept_lens, accept_index = result
-        tp_group = get_attn_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        tp_group = (
+            get_attn_tp_group()
+            if is_dp_attention_enabled()
+            else get_parallel().tp_group
+        )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_lens, src=0)
