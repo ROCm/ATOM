@@ -99,8 +99,17 @@ class MemoryRecoveryTest(unittest.TestCase):
                                  'rdma_registration_enomem')
 
 
-class THPPreparationTest(unittest.TestCase):
-    def test_partial_timeout_helper_failure_and_bad_results_continue_to_next_node(self):
+class HostMemoryUntouched(unittest.TestCase):
+    """Never let a test drop the host page cache, even when run as root."""
+
+    def setUp(self):
+        stub = patch.object(memory, 'drop_and_compact_host', return_value={'status': 'unavailable', 'nodes': {}})
+        stub.start()
+        self.addCleanup(stub.stop)
+
+
+class THPPreparationTest(HostMemoryUntouched):
+    def test_failed_node_continues_and_moves_the_pool_to_nodes_that_compacted(self):
         for mode in ('partial', 'timeout', 'nonzero', 'missing', 'malformed'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -111,6 +120,7 @@ class THPPreparationTest(unittest.TestCase):
                     node = int(cmd[2])
                     probes.append(node)
                     output = Path(cmd[cmd.index('--output') + 1])
+                    requested = int(cmd[cmd.index('--gib') + 1]) * memory.GIB
                     if node == 0:
                         if mode == 'timeout':
                             raise subprocess.TimeoutExpired(cmd, kwargs['timeout'])
@@ -121,8 +131,8 @@ class THPPreparationTest(unittest.TestCase):
                         if mode == 'malformed':
                             output.write_text('[]')
                             return subprocess.CompletedProcess(cmd, 0)
-                    memory.write_json(output, {'requested_bytes': memory.GIB,
-                        'huge_bytes': memory.GIB // 2 if node == 0 else memory.GIB})
+                    memory.write_json(output, {'requested_bytes': requested,
+                        'huge_bytes': requested // 2 if node == 0 else requested})
                     return subprocess.CompletedProcess(cmd, 0)
                 with patch.object(memory, 'cpu_numa_nodes', return_value=[0, 1]), \
                      patch('numa_memory_budget.node_meminfo', return_value={
@@ -130,9 +140,15 @@ class THPPreparationTest(unittest.TestCase):
                      patch.object(memory.subprocess, 'run', side_effect=run), \
                      patch.object(memory, 'memory_failure') as failure:
                     state = memory.prepare({'global_segment_size': memory.GIB // 2}, '/snapshot', root)
-                self.assertEqual(probes, [0, 1])
+                # Node 1 compacts its share, then the whole pool once node 0 failed.
+                self.assertEqual(probes, [0, 1, 1])
                 self.assertEqual(state['status'], 'completed_with_warnings')
+                self.assertEqual([(row['node'], row['attempt']) for row in state['nodes']],
+                                 [(0, 'share'), (1, 'share'), (1, 'pool')])
                 self.assertEqual(state['nodes'][1]['status'], 'completed')
+                self.assertEqual(state['nodes'][2]['status'], 'completed')
+                self.assertEqual(state['nodes'][2]['requested_bytes'], 2 * memory.GIB)
+                self.assertEqual(state['store_nodes'], [1])
                 expected = {'partial': 'thp_shortfall', 'timeout': 'thp_timeout',
                             'nonzero': 'probe_failed', 'missing': 'probe_result_unavailable',
                             'malformed': 'probe_result_unavailable'}[mode]
@@ -211,9 +227,9 @@ class THPPreparationTest(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text())['huge_bytes'], memory.GIB // 2)
 
 
-class PostLoadPreparationTest(unittest.TestCase):
+class PostLoadPreparationTest(HostMemoryUntouched):
     def test_both_roles_arrive_before_one_preparation_and_all_continue(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare', return_value={'status': 'completed', 'nodes': [{'node': 0, 'status': 'completed'}]}) as prepare:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(memory, 'prepare', return_value={'status': 'completed', 'nodes': [{'node': 0, 'status': 'completed'}], 'store_nodes': [0]}) as prepare:
             root = Path(tmp)
             participants = [(role, rank) for role in ('prefill', 'decode') for rank in range(4)]
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -232,6 +248,7 @@ class PostLoadPreparationTest(unittest.TestCase):
             prepare.assert_called_once_with({}, '/snapshot', root)
             result = json.loads((root / 'store-memory-gate/result.json').read_text())
             self.assertEqual(result['status'], 'completed')
+            self.assertEqual(result['store_nodes'], [0])
             self.assertEqual(len(result['workers']), 8)
 
     def test_partial_thp_and_timeout_block_store_initialization(self):
@@ -309,14 +326,22 @@ class PostLoadPreparationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / 'store.json'
             config.write_text('{}')
+            def gate(*args, **kwargs):
+                events.append('prepare')
+                return {'status': 'completed', 'store_nodes': [0]}
             with patch.dict(os.environ, {'ATOMESH_VLLM_STORE_CONFIG_PATH': str(config),
                     'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill',
                     'HIP_VISIBLE_DEVICES': '0,1,2,3', 'ROCR_VISIBLE_DEVICES': ''}), \
                  patch.object(Path, 'exists', return_value=True), \
                  patch.object(worker_module, 'probe'), \
-                 patch.object(worker_module, 'prepare_after_load', side_effect=lambda *args, **kw: events.append('prepare')):
+                 patch.object(worker_module, 'cpu_numa_nodes', return_value=[0]), \
+                 patch.object(worker_module, 'bind_thread_memory') as bind, \
+                 patch.object(worker_module, 'prefer_own_store_segment',
+                              side_effect=lambda path: events.append('own-segment')), \
+                 patch.object(worker_module, 'prepare_after_load', side_effect=gate):
                 self.assertIs(worker.initialize_from_config(kv_config), kv_config)
-                self.assertEqual(events, ['prepare', 'store-init'])
+                self.assertEqual(events, ['prepare', 'store-init', 'own-segment'])
+                bind.assert_not_called()
                 precision = json.loads((Path(tmp) / 'prefill-rank-0-kv-precision.json').read_text())
                 self.assertFalse(precision['needs_kv_cache_zeroing'])
             events.clear()
@@ -328,6 +353,41 @@ class PostLoadPreparationTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'unexpected preparation error'):
                     worker.initialize_from_config(kv_config)
                 self.assertEqual(events, [])
+
+    def test_prefill_binds_store_init_to_a_strict_subset_of_nodes_then_restores(self):
+        events = []
+        class NativeWorker:
+            def initialize_from_config(self, config):
+                events.append('store-init')
+                return config
+        spec = importlib.util.spec_from_file_location('m31_bind_test_worker', SCRIPTS / 'pd_vllm_worker.py')
+        worker_module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'vllm.v1.worker.gpu_worker': SimpleNamespace(Worker=NativeWorker)}):
+            spec.loader.exec_module(worker_module)
+        worker = worker_module.StoreMemoryWorker()
+        worker.local_rank = 0
+        worker.parallel_config = SimpleNamespace(tensor_parallel_size=4)
+        worker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model='/snapshot'))
+        kv_config = SimpleNamespace(has_mamba_layers=False, has_mixed_precision_kv_cache=False,
+                                    needs_kv_cache_zeroing=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'store.json'
+            config.write_text('{}')
+            with patch.dict(os.environ, {'ATOMESH_VLLM_STORE_CONFIG_PATH': str(config),
+                    'ATOMESH_VLLM_MEMORY_DIR': tmp, 'ATOMESH_VLLM_ROLE': 'prefill',
+                    'ATOMESH_VLLM_STORE_OWN_SEGMENT': '0',
+                    'HIP_VISIBLE_DEVICES': '0,1,2,3', 'ROCR_VISIBLE_DEVICES': ''}), \
+                 patch.object(Path, 'exists', return_value=True), \
+                 patch.object(worker_module, 'probe'), \
+                 patch.object(worker_module, 'cpu_numa_nodes', return_value=[0, 1]), \
+                 patch.object(worker_module, 'bind_thread_memory',
+                              side_effect=lambda nodes: events.append(('bind', nodes))), \
+                 patch.object(worker_module, 'prepare_after_load',
+                              return_value={'status': 'completed', 'store_nodes': [1]}):
+                worker.initialize_from_config(kv_config)
+            self.assertEqual(events, [('bind', [1]), 'store-init', ('bind', None)])
+            self.assertEqual(json.loads((Path(tmp) / 'prefill-rank-0-store-numa.json').read_text()),
+                             {'store_nodes': [1], 'bound': True})
 
     def test_worker_uses_physical_gpu_rail_for_both_tp_groups(self):
         spec = importlib.util.spec_from_file_location('m31_hca_test_worker', SCRIPTS / 'pd_vllm_worker.py')
