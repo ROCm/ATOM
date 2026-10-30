@@ -111,7 +111,6 @@ class Mega:
     def from_recipe(cls, recipe, geometry, communicator, situ_beta, situ_linear_beta):
         mega = cls()
         mega.recipe, mega.geometry, mega.communicator = recipe, geometry, communicator
-        mega.situ_beta, mega.situ_linear_beta = situ_beta, situ_linear_beta
         mega.close = communicator.log.call(f"mega{len(cls.built)}.close")
         cls.built.append(mega)
         return mega
@@ -157,7 +156,9 @@ def fresh_state(monkeypatch):
     return SimpleNamespace(log=log, own=own, gathered=gathered, manager=Manager(log))
 
 
-def _build(state, max_tokens=MAX_TOKENS, situ_beta=None, activation="silu"):
+def _build(
+    state, max_tokens=MAX_TOKENS, situ_beta=None, activation="silu", combine_wire="fp4"
+):
     return mv2.init_mega_transport(
         ep_rank=0,
         ep_size=WORLD,
@@ -166,7 +167,6 @@ def _build(state, max_tokens=MAX_TOKENS, situ_beta=None, activation="silu"):
         max_num_inp_token_per_rank=max_tokens,
         num_experts=EPR * WORLD,
         num_experts_per_token=TOPK,
-        data_type_itemsize=2,
         inter_dim=32,
         activation=activation,
         gate_mode="interleave",
@@ -175,7 +175,7 @@ def _build(state, max_tokens=MAX_TOKENS, situ_beta=None, activation="silu"):
         intermediate_pad=0,
         swiglu_limit=0.0,
         situ_beta=situ_beta,
-        combine_wire="fp4",
+        combine_wire=combine_wire,
         all2all_manager=state.manager,
     )
 
@@ -192,6 +192,10 @@ def test_layers_share_one_megamoe_on_the_borrowed_communicator(fresh_state):
     assert first._atom_dev_comm is fresh_state.manager.comm.dev_comms[0]
     assert first._atom_per_rank_size == ARENA_BYTES
     assert not fresh_state.own
+
+
+def test_the_default_wire_builds_bf16_once(fresh_state):
+    assert _build(fresh_state, combine_wire="bf16").recipe.combine_wires == ("bf16",)
 
 
 @pytest.mark.parametrize("other", [torch.tensor([2.5]), None])
