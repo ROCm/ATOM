@@ -273,7 +273,7 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 
 | Routing Function | Kernel | Used For |
 |---|---|---|
-| `rocm_aiter_topk_softmax` | Triton `triton_topk_softmax` for layers `triton_topk_softmax_rows` accepts when they are built (renormalized, 32-512 experts), in launches of up to 20 rows per CU on gfx950 (other architectures: never), eager and captured alike; `aiter.topk_softmax` otherwise or with `ATOM_TRITON_TOPK_SOFTMAX=0` | Softmax top-k (Mixtral, Qwen3 MoE, Qwen3.8-Flash-Next) |
+| `rocm_aiter_topk_softmax` | Triton `triton_topk_softmax` for layers `triton_topk_softmax_rows` accepts when they are built (renormalized, 32-512 experts), in launches of up to 20 rows per CU on gfx950 (per CU of the stream under RapidServe's CU-masked `--disagg-constrained`; other architectures: never), eager and captured alike; `aiter.topk_softmax` otherwise or with `ATOM_TRITON_TOPK_SOFTMAX=0` | Softmax top-k (Mixtral, Qwen3 MoE, Qwen3.8-Flash-Next) |
 | `rocm_aiter_grouped_topk` | `aiter.grouped_topk` | Grouped top-k (DeepSeek) |
 | `rocm_aiter_biased_grouped_topk` | `aiter.biased_grouped_topk` | Biased grouped top-k (DeepSeek V3) |
 
