@@ -250,6 +250,11 @@ class StateOffloadIndex:
         if h not in self.hashes:
             return
         if not resident:
+            # Confirmed after the latest touch was sent (its store landed since,
+            # or the hash was forgotten and stored again): the touch looked
+            # before those bytes were there, so its verdict is stale.
+            if self._verified_at.get(h, -1e18) > self._touch_sent_at.get(h, -1e18):
+                return
             self.touch_misses += 1
             self.forget(h)
             return
@@ -286,7 +291,9 @@ class StateOffloadIndex:
         existed until any evidence about `h` arrives.
         """
         defer_s = self.defer_s
-        if not self.refresh_hits or defer_s <= 0 or h not in self.hashes:
+        # `could_serve`, not `h in hashes`: a store-only role (`kv_producer`)
+        # indexes its own stores but never loads them.
+        if not self.refresh_hits or defer_s <= 0 or not self.could_serve(h):
             return False
         now = monotonic()
         verified = self._verified_at.get(h)

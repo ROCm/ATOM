@@ -34,42 +34,36 @@ class TouchResult(enum.IntEnum):
 
 def _local_cpu_lru(storage_manager):
     """LMCache's LocalCPU backend, checked once for what a touch needs, or
-    None when the storage manager has none.
+    None when a touch cannot refresh anything.
 
     `cpu_lock`, `hot_cache` and `cache_policy.update_on_hit` are LMCache
-    internals (written against 0.5.6), not API. A LocalCPU backend missing one
-    is an LMCache this code does not know, so raise: degrading every touch to
-    a presence check would keep every load "succeeding" while no image is
-    refreshed.
+    internals (written against 0.5.6), not API. Without one of them, touches
+    only confirm presence, like a storage manager with no LocalCPU backend:
+    loads still work, only the refresh is lost. Not silent: it warns here and
+    every touch is counted in `state_offload_touches_unrefreshed`.
     """
-    if not hasattr(storage_manager, "local_cpu_backend"):
-        raise RuntimeError(
-            "state offload: LMCache's storage manager has no `local_cpu_backend`; "
-            "state images cannot be refreshed in its LRU"
-        )
-    backend = storage_manager.local_cpu_backend
+    backend = getattr(storage_manager, "local_cpu_backend", None)
     if backend is None:
-        logger.warning(
-            "state offload: LMCache has no LocalCPU backend, so state touches "
-            "only confirm presence and refresh no eviction order (counted as "
-            "state_offload_touches_unrefreshed)"
-        )
-        return None
-    missing = [
-        name
-        for name in ("cpu_lock", "hot_cache", "cache_policy")
-        if getattr(backend, name, None) is None
-    ]
-    if not missing and not callable(
-        getattr(backend.cache_policy, "update_on_hit", None)
-    ):
-        missing.append("cache_policy.update_on_hit")
-    if missing:
-        raise RuntimeError(
-            "state offload: LMCache's LocalCPUBackend has no "
-            f"{', '.join(missing)}; state images cannot be refreshed in its LRU"
-        )
-    return backend
+        missing = ["local_cpu_backend"]
+    else:
+        missing = [
+            f"local_cpu_backend.{name}"
+            for name in ("cpu_lock", "hot_cache", "cache_policy")
+            if getattr(backend, name, None) is None
+        ]
+        if not missing and not callable(
+            getattr(backend.cache_policy, "update_on_hit", None)
+        ):
+            missing.append("local_cpu_backend.cache_policy.update_on_hit")
+    if not missing:
+        return backend
+    logger.warning(
+        "state offload: LMCache's storage manager has no %s, so state touches "
+        "only confirm presence and refresh no eviction order (every touch is "
+        "counted in state_offload_touches_unrefreshed)",
+        ", ".join(missing),
+    )
+    return None
 
 
 class StateByteCodec:

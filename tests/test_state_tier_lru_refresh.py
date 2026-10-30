@@ -293,36 +293,47 @@ class TestCodecRefresh:
         pool.local_cpu_backend = None
         with caplog.at_level(logging.WARNING, logger="atom"):
             codec, _ = _codec(pool, max_entries=None)
-        assert any("no LocalCPU backend" in r.message for r in caplog.records)
+        assert any("no local_cpu_backend" in r.message for r in caplog.records)
         pool.hot[codec.key(1)] = _Obj()
         assert codec.touch(1) is TouchResult.PRESENT
         pool.hot.clear()
         assert codec.touch(1) is TouchResult.GONE
 
+    def _assert_degrades(self, pool, missing, caplog):
+        """Bind warns once naming what is missing; touches then only confirm
+        presence, and each one is counted rather than passing as a refresh."""
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            codec, _ = _codec(pool, max_entries=None)
+        bind = [r.message for r in caplog.records if missing in r.message]
+        assert len(bind) == 1 and "state_offload_touches_unrefreshed" in bind[0]
+        assert codec.put(1, [])
+        assert codec.touch(1) is TouchResult.PRESENT
+        assert codec.touch(1) is TouchResult.PRESENT
+        assert codec._unrefreshed_touches == 2
+
     @pytest.mark.parametrize("dropped", ["cpu_lock", "hot_cache", "cache_policy"])
-    def test_a_local_cpu_without_the_lru_internals_fails_at_bind(
-        self, lmcache_key, dropped
+    def test_a_local_cpu_without_the_lru_internals_degrades_to_presence(
+        self, lmcache_key, dropped, caplog
     ):
-        """An LMCache whose names moved must not degrade every touch to a
-        presence check that keeps every load "succeeding"."""
+        """An LMCache whose internals moved keeps serving loads; the lost
+        refresh shows in the stats instead of taking the engine down."""
         pool = _LocalCPU()
         setattr(pool.local_cpu_backend, dropped, None)
-        with pytest.raises(RuntimeError, match=dropped):
-            _codec(pool, max_entries=None)
+        self._assert_degrades(pool, f"local_cpu_backend.{dropped}", caplog)
 
-    def test_a_policy_without_update_on_hit_fails_at_bind(self, lmcache_key):
+    def test_a_policy_without_update_on_hit_degrades_to_presence(
+        self, lmcache_key, caplog
+    ):
         pool = _LocalCPU()
         pool.local_cpu_backend.cache_policy = SimpleNamespace()
-        with pytest.raises(RuntimeError, match="update_on_hit"):
-            _codec(pool, max_entries=None)
+        self._assert_degrades(pool, "cache_policy.update_on_hit", caplog)
 
-    def test_a_storage_manager_without_local_cpu_backend_fails_at_bind(
-        self, lmcache_key
+    def test_a_storage_manager_without_local_cpu_backend_degrades_to_presence(
+        self, lmcache_key, caplog
     ):
         pool = _LocalCPU()
         del pool.local_cpu_backend
-        with pytest.raises(RuntimeError, match="local_cpu_backend"):
-            _codec(pool, max_entries=None)
+        self._assert_degrades(pool, "no local_cpu_backend", caplog)
 
     def test_the_lru_is_resolved_once_at_bind(self, lmcache_key):
         pool = _LocalCPU()
@@ -420,10 +431,47 @@ class TestIndexTouches:
 
     def test_a_gone_verdict_drops_the_hash(self, clock):
         idx = _index(7)
+        clock[0] += 1
+        idx.want_touch(7)
+        assert idx.take_touches() == [7]
         idx.apply_touch_verdict(7, False)
         assert not idx.could_serve(7)
         assert idx.touch_misses == 1
         assert idx.stats()["touch_misses"] == 1
+
+    def test_a_gone_verdict_older_than_a_store_is_ignored(self, clock):
+        """The touch looked before the store's bytes landed; its verdict must
+        not erase the image that store just indexed."""
+        idx = _index(7)
+        clock[0] += 1
+        idx.want_touch(7)
+        assert idx.take_touches() == [7]
+        clock[0] += 0.01
+        idx.note_stored(7)
+        idx.apply_touch_verdict(7, False)
+        assert idx.could_serve(7)
+        assert idx.touch_misses == 0
+
+    def test_a_gone_verdict_for_a_forgotten_then_restored_hash_is_ignored(self, clock):
+        idx = _index(7)
+        clock[0] += 1
+        idx.want_touch(7)
+        assert idx.take_touches() == [7]
+        idx.forget(7)
+        clock[0] += 0.01
+        idx.note_stored(7)
+        idx.apply_touch_verdict(7, False)
+        assert idx.could_serve(7)
+
+    def test_a_gone_verdict_after_a_store_and_a_newer_touch_applies(self, clock):
+        idx = _index(7)
+        clock[0] += 1
+        idx.note_stored(7)
+        clock[0] += 1
+        idx.want_touch(7)
+        assert idx.take_touches() == [7]
+        idx.apply_touch_verdict(7, False)
+        assert not idx.could_serve(7)
 
     def test_a_resident_verdict_refreshes_the_cap_order(self, clock):
         idx = StateOffloadIndex(max_cpu_entries=19, refresh_hits=True)  # cap 3
@@ -450,6 +498,13 @@ class TestIndexTouches:
 class TestNeedsVerify:
     def test_a_fresh_store_needs_no_verdict(self, clock):
         assert not _index(7).needs_verify(7)
+
+    def test_a_store_only_role_holds_nothing(self, clock):
+        """A `kv_producer` indexes its own stores but never loads them."""
+        idx = _index(7, can_load=False)
+        clock[0] += STALE
+        assert not idx.needs_verify(7)
+        assert idx.take_touches() == []
 
     def test_a_stale_hash_waits_for_its_touch(self, clock):
         idx = _index(7)
@@ -803,6 +858,10 @@ class TestSchedulerPlumbing:
 
     def test_verdicts_are_applied_to_the_index(self, clock):
         idx = _index(7, 8)
+        clock[0] += 1
+        idx.want_touch(7)
+        idx.want_touch(8)
+        assert sorted(idx.take_touches()) == [7, 8]
         s = self._sched(
             SimpleNamespace(take_state_touch_verdicts=lambda: {7: False, 8: True}),
             idx,

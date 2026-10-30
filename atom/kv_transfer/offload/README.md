@@ -129,8 +129,13 @@ every hit the index votes for is also sent to the workers as a *touch*
 end of LMCache's LRU (`StateByteCodec.touch`) and reports whether it was still
 there on the `k3_state_touch` channel. A prefix that hits every turn keeps its
 image as warm as its KV, and an image LMCache evicted leaves the index when its
-verdict lands. An admission about to load an image not confirmed recently is
-held for a pass (at most `OFFLOAD_LOOKUP_DEFER_S`) while that verdict comes
+verdict lands. An image only another backend (LocalDisk) still holds is
+present but outside the hot cache: the touch cannot refresh it, reports that on
+`k3_state_touch_refresh`, and it is counted in
+`state_offload_touches_unrefreshed` (0 when every touch refreshed the LRU); the
+next store of it puts it back into the CPU tier. A gone verdict from a touch
+sent before the image's latest store is ignored as stale. An admission about to
+load an image not confirmed recently is held for a pass (at most `OFFLOAD_LOOKUP_DEFER_S`) while that verdict comes
 back, so it plans a lower boundary instead of parking on a miss and
 recomputing the whole prompt. "Recently" scales with the pool the image has to
 age out of: 0.25 s per GiB of `LMCACHE_MAX_LOCAL_CPU_SIZE`, within 5-60 s
@@ -1461,6 +1466,7 @@ LMCache version, these are what to re-check.**
 | `get_or_create(…, lambda t,s: None, lambda o,s: o)` | LMCache's trailing token-processing / output-transform callbacks | We don't use LMCache's token-shaping hooks — our codec moves raw bytes | Passed as no-op / identity callables |
 | `cfg.lookup_server_worker_ids = [0]` | default: every rank answers lookup, client takes `min()` | At TP>1 a non-rank-0 shard returning 0 would zero out a real hit; rank 0 is made authoritative | `config.py` (see [TP > 1 Notes](#tp--1-notes)) |
 | `cfg.use_gds = False` | LMCache may enable cufile GDS | cufile init hangs without NVMe-GDS hardware here | `config.py` |
+| `StateByteCodec.touch` | `LocalCPUBackend.touch_cache()` after `contains(pin=True)` | A state hit is answered by ATOM's index, so no LMCache lookup refreshes the image; the pin would need a paired unpin, and `keys_in_request` belongs to the concurrent KV lookup | Calls `cache_policy.update_on_hit(key, hot_cache)` under `cpu_lock`. `bind_storage_manager` resolves `local_cpu_backend` and those three internals once. If one is missing, touches only confirm presence (loads still work, nothing is refreshed): it warns once at bind and every touch is counted in `state_offload_touches_unrefreshed` |
 
 ### 3. Fully delegated to LMCache (we never touch the implementation)
 
