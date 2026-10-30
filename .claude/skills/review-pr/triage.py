@@ -1380,14 +1380,35 @@ def derive(files, title="", raw_diff=""):
     # to be built. Each trigger below is scoped to the directory/path shape its own ATOM
     # citation actually landed in, per rules.md's "P" section.
 
-    # P1 -- a new ATOM_* var read via os.getenv/os.environ outside atom/utils/envs.py.
-    # Anchored on ATOM#2535 (follow-up 35218f381): six MONO_* scheduling switches read
-    # straight from os.environ in atom/models/glm52/mono/kernels/{kernel,layout}.py, flagged
-    # by valarLip as "outside atom/utils/envs.py" and fixed by registering them in envs.py.
-    if any(p != "atom/utils/envs.py"
-           and re.search(r'os\.getenv\(\s*["\']ATOM_|os\.environ\[\s*["\']ATOM_', "\n".join(f["add"]))
-           for p, f in files.items()):
-        hit("atom-env-var-outside-registry", "P1")
+    # P1 -- a new engine tunable read straight from the environment instead of being
+    # registered in atom/utils/envs.py, which atom-patterns calls the authoritative list.
+    # Anchored on ATOM#2535 (follow-up 35218f381): six MONO_* scheduling switches read from
+    # os.environ in atom/models/glm52/mono/kernels/{kernel,layout}.py, flagged by valarLip as
+    # "outside atom/utils/envs.py" and fixed by registering them.
+    #
+    # Keyed on PATH, not on an ATOM_ prefix. The first cut required the name to start with
+    # ATOM_ and so would not have fired on its own citation -- the real vars were MONO_*,
+    # and a tunable that misses the naming convention as well as the registry is the worse
+    # case, not the excluded one. Measured on main: 141 env reads live under atom/ outside
+    # envs.py, but only 40 are in engine code; the rest are benchmark and CI harness
+    # scripts, where reading the environment directly is correct. Hence the path gate.
+    # Well-known external variables are let through by name: MASTER_ADDR and friends are
+    # torch/CI contracts, not ATOM knobs, and registering them would be wrong.
+    ENGINE = ("atom/model_ops/", "atom/model_engine/", "atom/models/",
+              "atom/spec_decode/", "atom/mono/")
+    EXTERNAL = (r"MASTER|GITHUB|CUDA|HIP|ROCM|NCCL|RCCL|OMP|PYTORCH|PYTHON|TORCH|HF_|"
+                r"HUGGING|TRANSFORMERS|VLLM|SGLANG|AITER|TRITON|LD_|PATH|HOME|USER|"
+                r"TMPDIR|RANK|WORLD|LOCAL_|NVTE")
+    for p_, f_ in files.items():
+        if not p_.startswith(ENGINE) or p_ == "atom/utils/envs.py":
+            continue
+        names = re.findall(r'os\.(?:getenv|environ\.get)\(\s*["\']([A-Z][A-Z0-9_]{2,})'
+                           r'|os\.environ\[\s*["\']([A-Z][A-Z0-9_]{2,})',
+                           "\n".join(f_["add"]))
+        flat = [n for pair in names for n in pair if n]
+        if any(not re.match(EXTERNAL, n) for n in flat):
+            hit("atom-env-var-outside-registry", "N1")
+            break
 
     # P2 -- a new ATOM_* env var in envs.py itself defaults falsy. Anchored on ATOM#741
     # ("Enable prefix caching by default", CLOSED): the PR's own motivation was that an
@@ -1396,7 +1417,7 @@ def derive(files, title="", raw_diff=""):
            and re.search(r'"ATOM_\w+"\s*:.*(?:,\s*"0"\)|,\s*False\)|,\s*None\)|,\s*""\))',
                          "\n".join(f["add"]))
            for p, f in files.items()):
-        hit("new-env-var-defaults-off", "P2")
+        hit("new-env-var-defaults-off", "N2")
 
     # P3 -- model-specific logic landed in common path (atom/model_ops/, atom/model_engine/,
     # atom/spec_decode/). Anchored on ATOM#2116, atom/spec_decode/eagle_proposer.py:102,
@@ -1413,7 +1434,7 @@ def derive(files, title="", raw_diff=""):
         # suffix or class-name tail with no word break (DeepseekV4MTPModel, Qwen3MoeModel),
         # so a trailing boundary would silently miss exactly the identifiers this exists to
         # catch. A leading \b still keeps this from matching a token embedded mid-identifier.
-        hit("model-specific-logic-in-common-path", "P3")
+        hit("model-specific-logic-in-common-path", "N3")
 
     # P4 -- the same change repeated once per model file instead of once at the shared
     # layer. Anchored on ATOM#126 (valarLip: "can we find a better way... instead of modify
@@ -1422,7 +1443,7 @@ def derive(files, title="", raw_diff=""):
     # rules.md's own body says to fall back to count alone when the "same shape" judgment
     # can't be made mechanically, which is the case here.
     if len([p for p in paths if p.startswith("atom/models/")]) >= 3:
-        hit("repeated-per-model-change", "P4")
+        hit("repeated-per-model-change", "N4")
 
     # P5 -- a vLLM/SGLang symbol introduced outside atom/plugin/. Anchored on ATOM#1910
     # (atom/models/kimi_k3_dspark.py, review-time path, removed from the final diff):
@@ -1435,7 +1456,7 @@ def derive(files, title="", raw_diff=""):
     if any(p.startswith(PLUGIN_SYMBOL_SCOPE)
            and re.search(r"\b(?:vllm|sglang)\b", "\n".join(f["add"]), re.I)
            for p, f in files.items()):
-        hit("plugin-symbol-outside-plugin-dir", "P5")
+        hit("plugin-symbol-outside-plugin-dir", "N5")
 
     # Triton family (T1 T3 T6 T8), ported from aiter's own review-pr skill. Gated so it
     # only looks at Triton PRs: either the diff adds a `@triton.jit`-decorated kernel, or it

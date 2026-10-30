@@ -33,11 +33,11 @@ disagreement between this file and the deriver is caught.
 | `production-kernel-belongs-in-aiter`  | E4 |
 | `parallel-linear-missing-prefix`      | B7 |
 | `stateful-prefix-cache`               | I1 |
-| `atom-env-var-outside-registry`       | P1 |
-| `new-env-var-defaults-off`            | P2 |
-| `model-specific-logic-in-common-path` | P3 |
-| `repeated-per-model-change`           | P4 |
-| `plugin-symbol-outside-plugin-dir`    | P5 |
+| `atom-env-var-outside-registry`       | N1 |
+| `new-env-var-defaults-off`            | N2 |
+| `model-specific-logic-in-common-path` | N3 |
+| `repeated-per-model-change`           | N4 |
+| `plugin-symbol-outside-plugin-dir`    | N5 |
 | `triton-launch-knob-hardcoded`        | T8 |
 | `generic-code`                        | A1 B1 D4 |
 | `triton-mask-bounds`                  | T1 |

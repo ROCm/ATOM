@@ -508,13 +508,19 @@ already states — and several rules here enforce exactly what that skill alread
 than something inferred from a bug. Nobody should "upgrade" one of these to `🔴` later: if a
 finding under this header asserts a wrong computed value, it belongs in A-I, not here.
 
-**P1 — a new `ATOM_*` env var is read outside `atom/utils/envs.py`** ⚠️
+**N1 — a new engine tunable is read from the environment instead of `atom/utils/envs.py`** ⚠️
 `atom-patterns/SKILL.md`: "Authoritative list: `atom/utils/envs.py` (all `ATOM_*` defined as
 lazy lambdas)." An `os.getenv("ATOM_...")` / `os.environ["ATOM_..."]` anywhere else bypasses
 that registry — the var is settable in production but absent from the one file anyone would
 grep to find out what it does or what it defaults to.
-Trigger: an added line matching `os.getenv(` or `os.environ[` with an `ATOM_` name, in a path
-that is not `atom/utils/envs.py`.
+Trigger: an added `os.getenv` / `os.environ` read under `atom/{model_ops,model_engine,models,
+spec_decode,mono}/`, for a variable that is not a well-known external one (`MASTER_*`, `CUDA_*`,
+`GITHUB_*`, `AITER_*`, …). Keyed on **path, not on an `ATOM_` prefix**: the first version of this
+rule required the name to start with `ATOM_` and so would not have fired on its own citation
+below, whose variables were `MONO_*`. A tunable that misses the naming convention as well as the
+registry is the worse case, not the excluded one. Measured on `main`: 141 reads live under
+`atom/` outside `envs.py`, but only 40 are in engine code — the rest are benchmark and CI
+harness scripts, where reading the environment directly is correct. Hence the path gate.
 Real example (ATOM#2535, "feat(mono): GLM-5.2 and Kimi-K3 mono decode", follow-up fixed in
 `35218f381`): `atom/models/glm52/mono/kernels/kernel.py` and `layout.py` read six scheduling
 switches straight from `os.environ`. valarLip: "This... read[s] six undocumented scheduling
@@ -526,9 +532,9 @@ defaults. The switches were named `MONO_*`, not `ATOM_MONO_*` — the review thr
 (registry bypass, undiscoverable default) is exactly P1's, but this rule's trigger, scoped to
 the `ATOM_` prefix because that is the only prefix `envs.py` itself claims, is narrower than
 what was actually flagged here.
-→ `⚠️ P1: [NAME] read via os.getenv/os.environ in [file] — move the definition into atom/utils/envs.py so it is discoverable`
+→ `⚠️ N1: [NAME] read via os.getenv/os.environ in [file] — move the definition into atom/utils/envs.py so it is discoverable`
 
-**P2 — a new env switch leaves the new behaviour off by default** 📝
+**N2 — a new env switch leaves the new behaviour off by default** 📝
 A flag that ships off by default ships code nobody runs until someone separately flips it and
 re-validates. Not every off-by-default var is wrong — some need a staged rollout — so this is
 a question the PR body should answer, not a defect to fix on sight.
@@ -540,9 +546,9 @@ value had shipped a feature nobody ran by default — "aligning ATOM with every 
 serving runtime" — and had to add an explicit auto-disable fallback for the two MTP variants
 that cannot support it. The PR itself was closed, not merged, but its own title and stated
 motivation are exactly the question P2 asks a new off-by-default switch to answer up front.
-→ `📝 P2: [NAME] defaults off — why not on by default, or what's the plan to flip it?`
+→ `📝 N2: [NAME] defaults off — why not on by default, or what's the plan to flip it?`
 
-**P3 — model-specific logic added to a shared path** ⚠️
+**N3 — model-specific logic added to a shared path** ⚠️
 `atom/model_ops/`, `atom/model_engine/`, and `atom/spec_decode/` are common path: every model
 that dispatches through them inherits whatever any one model's change does there. A branch
 keyed to one model family belongs in that model's own file under `atom/models/`, not in the
@@ -562,9 +568,9 @@ DSv4-specific step-0 graph declaration, full-q staging, and decode-only eligibil
 a new, dedicated `DeepseekV4Proposer`, routed to it only from the factory for
 `DeepseekV4MTPModel`, and left `EagleProposer` holding only the model-agnostic step-0 hooks and
 the shared loop.
-→ `⚠️ P3: [model]-specific [logic] added to [shared file] — this file is common path for every model that dispatches through it; move this into the model's own file`
+→ `⚠️ N3: [model]-specific [logic] added to [shared file] — this file is common path for every model that dispatches through it; move this into the model's own file`
 
-**P4 — the same change repeated once per model instead of once at the top** 📝
+**N4 — the same change repeated once per model instead of once at the top** 📝
 When a fix or feature needs the identical change copied into three or more model files, the
 shared base layer usually already has (or should grow) the hook the change should have gone
 through instead — the repetition is itself the signal, independent of whether any one copy is
@@ -591,9 +597,9 @@ Real example (ATOM#401, "[plugin][oot] Add Kimi-K2.5 support", MERGED,
 plugin tree: "we have to do this for every new model?" zejunchen-zejun, independently on the
 same PR: "Can we have a dict or set to store which model should be excluded for processing
 config here? So that the new OOT multi-model will not frequently introduce code change here."
-→ `📝 P4: [change] repeated across [N] files under atom/models/ — does a shared hook (base class, loader, factory) belong here instead of one copy per model?`
+→ `📝 N4: [change] repeated across [N] files under atom/models/ — does a shared hook (base class, loader, factory) belong here instead of one copy per model?`
 
-**P5 — a vLLM or SGLang symbol introduced outside `atom/plugin/`** ⚠️
+**N5 — a vLLM or SGLang symbol introduced outside `atom/plugin/`** ⚠️
 `atom-patterns/SKILL.md` assigns `atom/plugin/` to "vLLM/SGLang plugin adapters" specifically
 so native ATOM code never has to know which serving framework, if any, it is running under. A
 literal `vllm`/`sglang` reference or framework-specific branching landing in `atom/models/` or
@@ -621,7 +627,7 @@ layout to fix a performance regression, it does not place a vLLM/SGLang symbol o
 is a vLLM-plugin-specific *kwarg* name (`slot_mapping`), not a literal `vllm`/`sglang` token —
 the trigger above, which looks for the literal token, is narrower than the review comment that
 motivates it.
-→ `⚠️ P5: [vllm/sglang reference] introduced in [file] under atom/models or atom/model_ops — framework-specific logic belongs in atom/plugin/, not the native path`
+→ `⚠️ N5: [vllm/sglang reference] introduced in [file] under atom/models or atom/model_ops — framework-specific logic belongs in atom/plugin/, not the native path`
 
 ---
 
