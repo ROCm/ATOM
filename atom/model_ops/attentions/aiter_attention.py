@@ -1202,9 +1202,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         block_tables = batch.block_tables
 
         if max_seqlen_q > 1:
-            shift = self.model_runner.tokenID_processor.verify_context_shift()
-            if shift is not None:
-                context_lens -= shift
+            context_lens = self.model_runner.tokenID_processor.verify_ctx_lens(
+                context_lens
+            )
         positions = decode_positions(context_lens, max_seqlen_q)
         max_seqlen_k = np.max(context_lens)
 

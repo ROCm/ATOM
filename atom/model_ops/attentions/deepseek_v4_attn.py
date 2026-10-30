@@ -2356,7 +2356,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # when shrunk). positions/attn use this so the (running_bs, q) graph is
         # selected. See `ForwardMode.max_seqlen_q`.
         # MTP: `seq.num_tokens` runs past this fwd's window by
-        # `verify_context_shift()` (`num_rejected` deferred, 1 undeferred/PP);
+        # `verify_ctx_lens()` (`num_rejected` deferred, 1 undeferred/PP);
         # roll ctx back so positions overwrite last fwd's rejected-draft slots.
         # None on dummy runs and before the first sampler output.
         # The rolled-back ctx is also what anchors `positions` (at `ctx -
@@ -2364,9 +2364,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # a rejected slot's KV falls out of range on its own — `block_tables`
         # needs no truncation here.
         if not batch.is_dummy_run and max_seqlen_q > 1:
-            shift = self.model_runner.tokenID_processor.verify_context_shift()
-            if shift is not None:
-                context_lens_np = context_lens_np - shift.astype(np.int32)
+            context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
+                context_lens_np
+            )
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never
         # OOB); dropped tail slots are re-drafted next step (lossless). No-op when

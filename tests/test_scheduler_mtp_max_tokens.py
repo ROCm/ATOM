@@ -166,7 +166,7 @@ class TestMTPMaxTokens:
 class TestUndeferredSpecPlaceholders:
     """PP output is undeferred: every step leaves ONE run of `mtp_k + 1`.
 
-    `verify_context_shift` is 1 under undeferred output only because of this:
+    `verify_ctx_lens` shifts by 1 under undeferred output only because of this:
     the verify window starts `mtp_k + 1` placeholders back from the end, no
     matter how many drafts the previous step rejected.
     """

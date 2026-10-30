@@ -224,11 +224,11 @@ def _decode_batch(*, num_spec_step: int) -> ScheduledBatch:
 
 
 def _recurrent_producer_processor() -> tokenIDProcessor:
-    """Non-deferred, and `use_spec` still on: the runner keeps the drafter."""
+    """Non-deferred, and `has_drafter` still on: the runner keeps the drafter."""
     processor = _processor()
     processor.is_deferred_out = False
     processor.is_pipeline_parallel = False
-    processor.use_spec = True
+    processor.has_drafter = True
     return processor
 
 
@@ -379,7 +379,7 @@ def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
     )
     processor.is_deferred_out = True
     processor.prev_batch = object()
-    processor.use_spec = True
+    processor.has_drafter = True
     processor.prev_rejected_num = None
     processor.prev_bonus_num = None
     processor.pre_num_decode_token_per_seq = 1
@@ -453,7 +453,7 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
 
 
 def test_a_producer_dp_dummy_stages_without_a_draft_table():
-    """A producer keeps `use_spec` (its drafter writes context KV) but its DP
+    """A producer keeps `has_drafter` (its drafter writes context KV) but its DP
     dummy is q=1 with `num_spec_step=0`, so the batch has no
     `scheduled_spec_decode_tokens`. The dummy is always a new sequence; reading
     the draft table for it raised AttributeError on every idle DPA rank."""

@@ -1180,10 +1180,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if self.geometry.speculative_tokens and not batch.is_dummy_run:
             # The scheduler reserves a full draft span, including placeholders
             # from the previous step. Ragged verification takes its head.
-            starts = np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
-            shift = self.model_runner.tokenID_processor.verify_context_shift()
-            if shift is not None:
-                starts = starts - shift
+            starts = self.model_runner.tokenID_processor.verify_ctx_lens(
+                np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
+            )
         return self._prepare(
             batch,
             running_bs,

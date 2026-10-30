@@ -86,7 +86,7 @@ def make_runner(
         ),
     )
     runner.tokenID_processor = SimpleNamespace(
-        num_rejected=None, verify_context_shift=lambda: None
+        num_rejected=None, verify_ctx_lens=lambda ctx: ctx
     )
     runner.forward_vars = {
         name: CpuGpuBuffer(64, dtype=torch.int32, device=runner.device)

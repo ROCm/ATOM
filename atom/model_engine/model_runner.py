@@ -70,7 +70,6 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     SubPoolSpec,
     plan_pools,
 )
-from atom.model_ops.attentions.token_layout import decode as token_decode
 from atom.model_ops.decode_input_ids import (
     NEW_SEQUENCE,
     fill_deferred_decode_ids,
@@ -173,9 +172,9 @@ class tokenIDProcessor:
         self,
         runner: "ModelRunner",
         max_num_batched_tokens: int,
-        use_spec: bool = False,
+        has_drafter: bool = False,
         num_spec_tokens: int = 0,
-        spec_enabled: bool | None = None,
+        is_spec_run: bool | None = None,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
         kv_cfg = getattr(runner.config, "kv_transfer_config", {}) or {}
@@ -221,11 +220,12 @@ class tokenIDProcessor:
         self.batch_info = CpuGpuBuffer(
             3, dtype=torch.int32, device=device, publication_group="input_ids"
         )
-        self.use_spec = use_spec
-        # `use_spec`: this stage drafts/samples (PP: last stage only).
-        # `spec_enabled`: the run is speculative; every stage needs it for
-        # draft-id staging and state rollback.
-        self.spec_enabled = use_spec if spec_enabled is None else spec_enabled
+        self.has_drafter = has_drafter
+        # `is_spec_run`: speculative decoding is configured, so every PP stage
+        # runs verify windows (draft-id staging, state rollback).
+        # `has_drafter`: this stage also owns the drafter and the rejection
+        # sampler, which under PP is the last stage only.
+        self.is_spec_run = has_drafter if is_spec_run is None else is_spec_run
         self.num_spec_tokens = num_spec_tokens
         # The drafter's `draft_tokens_per_seq`, set once it is loaded.
         self.draft_tokens_per_seq = 0
@@ -330,11 +330,19 @@ class tokenIDProcessor:
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
 
-    def verify_context_shift(self) -> np.ndarray | None:
-        """This step's `token_decode.verify_context_shift`, read off self."""
-        return token_decode.verify_context_shift(
-            self.num_rejected, self.is_deferred_out
-        )
+    def verify_ctx_lens(self, context_lens: np.ndarray) -> np.ndarray:
+        """`batch.context_lens` moved back to the start of this verify window.
+
+        Deferred output: the last step's `num_rejected` slots are still in
+        `context_lens`. Undeferred (PP): postprocess already left one run of
+        `mtp_k + 1` placeholders, so the shift is 1. Before any sampler output
+        there is nothing to shift. Only a verify step has a window, so every
+        caller sits behind `max_seqlen_q > 1`.
+        """
+        if self.num_rejected is None:
+            return context_lens
+        shift = self.num_rejected if self.is_deferred_out else 1
+        return context_lens - np.asarray(shift, dtype=context_lens.dtype)
 
     @staticmethod
     def _batch_process_token_ids(token_ids: list) -> list[tuple[int, ...]]:
@@ -566,10 +574,10 @@ class tokenIDProcessor:
                     self._publish_input_ids(total_tokens_decode, publication_group),
                     None,
                 )
-            if self.spec_enabled:
+            if self.is_spec_run:
                 # PP: the host already holds each row's anchor, so fill only
-                # the draft columns. Gated on `spec_enabled` because the
-                # embedding runs on the first stage, not the (use_spec) last.
+                # the draft columns. Gated on `is_spec_run` because the
+                # embedding runs on the first stage, not the (has_drafter) last.
                 _, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
                 spec = batch.scheduled_spec_decode_tokens
                 for i in range(len(lens)):
@@ -580,7 +588,7 @@ class tokenIDProcessor:
             # Previous step's acceptance counts, read off the batch so every
             # stage (not just the sampling one) rolls its linear-attention
             # state back correctly; unset, GDN assumes 1 accepted token.
-            if self.spec_enabled:
+            if self.is_spec_run:
                 self.num_rejected = batch.num_rejected
                 self.num_bonus = batch.num_bonus
             return (
@@ -609,7 +617,7 @@ class tokenIDProcessor:
 
         # The GRAPH's row stride, for sizing the padded tail only. NOT a
         # per-request length: dp>1 raises it to the DP-wide maximum.
-        tokens_per_seq = max_seqlen_q if self.use_spec else 1
+        tokens_per_seq = max_seqlen_q if self.has_drafter else 1
 
         # ---- One path for every decode step -------------------------------
         # `num_scheduled_tokens` is the one statement of the per-request
@@ -634,7 +642,7 @@ class tokenIDProcessor:
         # per step (1.2us at 2) and a ragged scatter is a flat ~8us; above it
         # the scatter wins (12us vs 88us at bs=256). Swap if admissions stop
         # being few.
-        if self.use_spec and batch.num_spec_step > 0 and num_new_seqs > 0:
+        if self.has_drafter and batch.num_spec_step > 0 and num_new_seqs > 0:
             spec = batch.scheduled_spec_decode_tokens
             for i in new_curr_indices:
                 n_draft = int(lens[i]) - 1
@@ -809,22 +817,22 @@ class ModelRunner:
         default_dtype = self.config.torch_dtype
         torch.set_default_dtype(default_dtype)
         torch.set_default_device(self.device)
-        spec_enabled = bool(self.config.speculative_config)
-        use_spec = spec_enabled and get_pp_group().is_last_rank
+        is_spec_run = bool(self.config.speculative_config)
+        has_drafter = is_spec_run and get_pp_group().is_last_rank
         # Verify-window width, which every PP stage runs; it sizes the KDA conv
-        # state and MLA work metadata, so key it on `spec_enabled`, not
-        # `use_spec`, or drafterless stages overflow those buffers.
+        # state and MLA work metadata, so key it on `is_spec_run`, not
+        # `has_drafter`, or drafterless stages overflow those buffers.
         self.num_spec_tokens = (
-            self.config.speculative_config.num_speculative_tokens if spec_enabled else 0
+            self.config.speculative_config.num_speculative_tokens if is_spec_run else 0
         )
 
         self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
-            use_spec,
+            has_drafter,
             self.num_spec_tokens,
-            spec_enabled,
+            is_spec_run,
         )
         self.sampler = Sampler()
         self.arange_np = np.arange(

@@ -272,7 +272,7 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
         # Deferred output (pp == 1): the verify window's shift is num_rejected.
         tokenID_processor=SimpleNamespace(
             num_rejected=np.array([0, 4]),
-            verify_context_shift=lambda: np.array([0, 4]),
+            verify_ctx_lens=lambda ctx: ctx - np.array([0, 4]),
         ),
         forward_vars=metadata_buffers(2, 4, 10, geometry=builder.geometry),
     )
