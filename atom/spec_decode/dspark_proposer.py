@@ -239,8 +239,16 @@ class DSparkProposer(Drafter):
         # at max_model_len - 1, so each request contributes up to
         # max_model_len + T entries -- pad by max_bs * T so the unchecked
         # kv_indices_generate_triton write can never run past the buffer.
+        # Only an MLA block plan fills it: a non-MLA draft returns from
+        # `_build_paged_block_metadata` before the CSR build, so it gets an
+        # empty placeholder rather than max_bs * max_model_len ints.
         self._blk_kv_indices = torch.zeros(
-            max_bs * (self.config.max_model_len + t), **i32
+            (
+                max_bs * (self.config.max_model_len + t)
+                if getattr(self.model, "block_attention_is_mla", True)
+                else 0
+            ),
+            **i32,
         )
 
         if self._draft_uses_dflash_pool:

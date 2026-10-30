@@ -207,11 +207,17 @@ class KimiK3DFlashAttention(nn.Module):
         # The GQA-tolerant form, not a bare divisibility assert: below TP the kv
         # heads replicate rather than shard, and QKVParallelLinear already does
         # that. With 16 kv heads this only bites past TP16. Mirrors the same
-        # pair of asserts in `models/dflash.py:161-171`.
+        # pair of checks in `models/dflash.py:161-171`, raised rather than
+        # asserted so `python -O` keeps them.
         if self.total_num_kv_heads >= tp_full:
-            assert self.total_num_kv_heads % tp_full == 0
+            sharded = self.total_num_kv_heads % tp_full == 0
         else:
-            assert tp_full % self.total_num_kv_heads == 0
+            sharded = tp_full % self.total_num_kv_heads == 0
+        if not sharded:
+            raise ValueError(
+                f"DFlash draft has {self.total_num_kv_heads} KV heads, which "
+                f"neither divide nor are divided by TP size {tp_full}."
+            )
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_full)
 
         # The block's read, built on the first forward that has a pool --

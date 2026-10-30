@@ -311,9 +311,11 @@ class MhaKvPool:
         the span it was given. At `blocks_per_entry == 1` the two coincide,
         which is exactly how that would go unnoticed.
 
-        Same bytes as `kv_views`, re-shaped rather than converted -- the pool
-        charges per byte (`mha_kv_fields`), so the element order costs nothing
-        and only the reader's requirements decide it.
+        The same BYTES as `kv_views`, not the same element order: the pool
+        charges per byte (`mha_kv_fields`), so either layout fits, but a row
+        written through `kv_views` (SHUFFLE) is not readable through this view,
+        nor the reverse. Use it only on a pool every writer fills in FLASH order
+        -- the DFlash draft writes and reads through `fa_views` alone.
 
         This is the layout the DFlash draft's block read takes: it folds the
         block into one `qlen == 1` row per request, so `unified_attention`'s

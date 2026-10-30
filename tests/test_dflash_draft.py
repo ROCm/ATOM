@@ -453,8 +453,8 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
         per_tensor_scales=True,
     )
     assert pool.scale_fields == []
+    pool.allocate(4, "cpu")
     with pytest.raises(KeyError):
-        pool.allocate(4, "cpu")
         pool.scale_views(0)
 
 
@@ -1238,3 +1238,29 @@ def test_dflash_draft_declares_a_non_mla_block():
     """KimiK3DFlash takes the proposer's non-MLA path, not the MLA plan."""
     dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
     assert dflash.KimiK3DFlash.block_attention_is_mla is False
+
+
+@pytest.mark.parametrize("is_mla", [True, False])
+def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(is_mla):
+    """Only the MLA block plan fills `_blk_kv_indices` (max_bs x max_model_len).
+
+    A non-MLA draft (DFlash, MiniMax-M3.1) returns from
+    `_build_paged_block_metadata` before the CSR build, so it gets an empty
+    placeholder instead of the full buffer.
+    """
+    torch = pytest.importorskip("torch")
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+
+    p = proposer.DSparkProposer.__new__(proposer.DSparkProposer)
+    p.config = types.SimpleNamespace(
+        max_num_seqs=8, max_model_len=4096, max_num_batched_tokens=1024
+    )
+    p.device = torch.device("cpu")
+    p.mtp_k = 7
+    p.model = types.SimpleNamespace(block_attention_is_mla=is_mla)
+    p._init_draft_block_buffers()
+
+    if is_mla:
+        assert p._blk_kv_indices.numel() == 8 * (4096 + 7)
+    else:
+        assert p._blk_kv_indices.numel() == 0

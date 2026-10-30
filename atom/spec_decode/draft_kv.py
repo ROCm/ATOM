@@ -86,9 +86,11 @@ def draft_kv_builder(model_runner, draft_hf):
     # exist yet (`atom/distributed/dcp_utils.py`).
     tp_full = model_runner.config.tensor_parallel_size
     dcp_size = model_runner.config.decode_context_parallel_size
-    assert (
-        tp_full % dcp_size == 0
-    ), f"draft KV pool needs TP ({tp_full}) divisible by DCP ({dcp_size})"
+    # Raised, not asserted: `python -O` drops asserts.
+    if tp_full % dcp_size:
+        raise ValueError(
+            f"draft KV pool needs TP ({tp_full}) divisible by DCP ({dcp_size})"
+        )
     # ONE TARGET BLOCK ID, `dcp_size` BLOCKS. The draft rides the target's block
     # ids (that is what `allocate_kv_cache_tensors` enforces), and under DCP a
     # target block id addresses `block_size` LOCAL tokens, i.e.
