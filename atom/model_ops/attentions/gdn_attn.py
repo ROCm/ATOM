@@ -2021,6 +2021,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=var["max_qlen"],
+            # the capture wrapper fills each of the `bs` rows to `max_qlen`
+            equal_seqlen_q=self._equal_seqlen_q(
+                bs * int(var["max_qlen"]), bs, int(var["max_qlen"])
+            ),
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],

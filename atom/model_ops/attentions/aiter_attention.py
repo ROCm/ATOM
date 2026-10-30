@@ -200,6 +200,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
     fuse_mtp_decode_position_update = True
 
+    @staticmethod
+    def _equal_seqlen_q(num_tokens: int, num_seqs: int, max_seqlen_q: int) -> bool:
+        """Whether every sequence holds exactly `max_seqlen_q` queries.
+
+        `max_seqlen_q` bounds every row, so the rows fill it exactly when their
+        sum reaches it. Short of that (a DSpark ragged step, a DP dummy) the
+        unified_attention kernel has to search `cu_seqlens_q`.
+        """
+        return num_tokens == num_seqs * max_seqlen_q
+
     def __init__(
         self,
         kv_cache_spec=None,
@@ -1283,6 +1293,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
+            equal_seqlen_q=self._equal_seqlen_q(
+                scheduled_tokens, scheduled_bs, max_seqlen_q
+            ),
             max_seqlen_k=max_seqlen_k,
             min_seqlen_q=min_seqlen_q,
             **ctx,
@@ -1538,6 +1551,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=max_q_len,
+            equal_seqlen_q=self._equal_seqlen_q(scheduled_tokens, bs, max_q_len),
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
