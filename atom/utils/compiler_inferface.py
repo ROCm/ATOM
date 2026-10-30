@@ -281,6 +281,22 @@ class AlwaysHitShapeEnv:
         return ""
 
 
+def _initialize_inductor_cache_dirs(base_cache_dir: str) -> None:
+    """Keep lower-level compiler artifacts beside ATOM's graph cache.
+
+    Saving a standalone graph does not persist Triton kernels compiled inside
+    eager/custom-op regions. Without these directories they can land under
+    /tmp/torchinductor_<user> and be recompiled in each fresh container.
+    Use the same rank-owned directory for the regular and standalone adaptors.
+    """
+    inductor_cache = os.path.join(base_cache_dir, "inductor_cache")
+    os.makedirs(inductor_cache, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
+    triton_cache = os.path.join(base_cache_dir, "triton_cache")
+    os.makedirs(triton_cache, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = triton_cache
+
+
 def get_inductor_factors() -> list[Any]:
     factors: list[Any] = []
     # summarize system state
@@ -312,22 +328,6 @@ def set_inductor_config(config, runtime_shape):
             config["compile_threads"] = 1
     except Exception:
         pass
-
-
-def _initialize_inductor_cache_dirs(base_cache_dir: str) -> None:
-    """Keep lower-level compiler artifacts beside ATOM's graph cache.
-
-    Saving a standalone graph does not persist Triton kernels compiled inside
-    eager/custom-op regions. Without these directories they can land under
-    /tmp/torchinductor_<user> and be recompiled in each fresh container.
-    Use the same rank-owned directory for the regular and standalone adaptors.
-    """
-    inductor_cache = os.path.join(base_cache_dir, "inductor_cache")
-    os.makedirs(inductor_cache, exist_ok=True)
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
-    triton_cache = os.path.join(base_cache_dir, "triton_cache")
-    os.makedirs(triton_cache, exist_ok=True)
-    os.environ["TRITON_CACHE_DIR"] = triton_cache
 
 
 class InductorAdaptor(CompilerInterface):
