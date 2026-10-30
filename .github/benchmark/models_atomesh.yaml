@@ -1468,7 +1468,7 @@ models:
 
   # PR #2747 at 7742552f: high-concurrency NVFP4 recipe, adapted to P/D.
   # Runtime dependencies: #2686, #2743, #2744, #2745, #2746.
-  MiniMax-M3.1-Flash-Quark-MXFP4:
+  MiniMax-M3.1-Flash-Quark-MXFP4: &m31_flash_model
     backend: atom
     image: rocm/atom-dev:nightly_202610261558
     model_path: amd/MiniMax-M3.1-Flash-Quark-MXFP4
@@ -2509,3 +2509,112 @@ models:
       # V3 is not a reasoning model, so gsm8k answers are short.
       max_gen_toks: 512
       apply_chat_template: true
+
+  # All cells below evaluate the same integrated MXFP4 runtime with real DSpark.
+  MiniMax-M3.1-Flash-MXFP4-Stack:
+    <<: *m31_flash_model
+    image: rocm/atom-dev:nightly_202610291449
+    env:
+      common: &m31_stack_env
+        AITER_LOG_LEVEL: WARNING
+        ATOM_M3_SPARSE_KV_MXFP4: "1"
+        ATOM_M3_SPARSE_KV_NVFP4: "0"
+        ATOM_M3_INDEX_Q_FP8: "1"
+        ATOM_M3_FUSED_VERIFY_TOPK: "0"
+        ATOM_M3_DSPARK_DRAFT_PTPC: "0"
+        ATOM_MONO_ENABLE: "0"
+        ATOM_M3_INDEXER_CP: "0"
+        ATOM_DSPARK_DRAFT_KV_WINDOW: "0"
+        ATOM_PD_MHA_LANDING: "0"
+        ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "1"
+        MC_DISABLE_HIP: "1"
+        MC_NUM_QP_PER_EP: "1"
+        HF_HUB_CACHE: "${ATOMESH_MODEL_ROOT}/.huggingface/hub"
+        HF_HUB_DOWNLOAD_TIMEOUT: "120"
+    server:
+      common_args:
+        served_model_name: MiniMaxAI/MiniMax-M3.1-Flash
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 128
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.9
+        max_model_len: 262144
+        max_num_seqs: 64
+        max_num_batched_tokens: 32768
+        online_quant_config: >-
+          {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","vision_tower","multi_modal_projector","patch_merge_mlp","*block_sparse_moe"]}
+        method: dspark
+        draft_model: amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark
+        num_speculative_tokens: 7
+        hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        extra_args: "--index-cache-dtype mxfp4"
+    accuracy:
+      task: gsm8k
+      fewshot: 20
+      limit: null
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      max_gen_toks: 16384
+      apply_chat_template: true
+      fewshot_as_multiturn: true
+      threshold: 0.94
+    suites:
+      accuracy:
+        - &m31_stack_tp
+          <<: *m31_flash_accuracy
+          name: m31-stack-mxfp4-tp4-baseline-gsm8k20
+          nodes: []
+          env: &m31_stack_direct
+            prefill: *m31_flash_pp4_direct_prefill_env
+            decode: *m31_flash_pp4_direct_decode_env
+        - <<: *m31_stack_tp
+          name: m31-stack-mxfp4-tp4-chunk-gsm8k20
+          env:
+            prefill:
+              <<: *m31_flash_pp4_direct_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_pp4_direct_decode_env
+        - <<: *m31_stack_tp
+          name: m31-stack-mxfp4-tp4-index-freq4-gsm8k20
+          server:
+            common_args:
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+        - <<: *m31_stack_tp
+          name: m31-stack-mxfp4-tp4-draft-window-gsm8k20
+          env:
+            <<: *m31_stack_direct
+            common:
+              ATOM_DSPARK_DRAFT_KV_WINDOW: "1"
+        - <<: *m31_stack_tp
+          name: m31-stack-mxfp4-tp4-store-gsm8k20
+          env:
+            prefill:
+              <<: *m31_flash_pp4_direct_prefill_env
+              MOONCAKE_STORE: "1"
+              MOONCAKE_STORE_OWNERS: "0:32:rdma4,rdma5;1:32:rdma6,rdma7"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+            decode: *m31_flash_pp4_direct_decode_env
+        - &m31_stack_pp
+          <<: *m31_stack_tp
+          name: m31-stack-mxfp4-pp4-tp4-gsm8k20
+          prefill: *m31_flash_pp4_prefill
+        - &m31_stack_landing
+          <<: *m31_stack_pp
+          name: m31-stack-mxfp4-pp4-tp4-landing-gsm8k20
+          env:
+            <<: *m31_stack_direct
+            common:
+              ATOM_PD_MHA_LANDING: "1"
+        - <<: *m31_stack_landing
+          name: m31-stack-mxfp4-pp4-tp4-landing-chunk-gsm8k20
+          env:
+            common:
+              ATOM_PD_MHA_LANDING: "1"
+            prefill:
+              <<: *m31_flash_pp4_direct_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_pp4_direct_decode_env
