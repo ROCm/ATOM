@@ -146,6 +146,7 @@ class EngineArgs:
     enable_log_stats: bool = True
     enable_request_context_metrics: bool = False
     throughput_log_interval: float = 10.0
+    throughput_log_interval_steps: int = 0
     cache_hit_rate_window: int = 1000
     enable_dynamic_chunking: bool = False
     # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
@@ -597,7 +598,24 @@ class EngineArgs:
             type=float,
             default=10.0,
             help="Seconds between engine-status lines (default: 10, matching "
-            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats, and "
+            "superseded by --throughput-log-interval-steps when that is set.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval-steps",
+            type=int,
+            default=0,
+            help="Forwards between engine-status lines, replacing the "
+            "--throughput-log-interval clock when > 0 (default: 0, use the "
+            "clock). For offline / MLPerf runs that compare one DP rank's "
+            "lines against another's: wall-clock sampling lands on a "
+            "different step number on each rank, a cumulative forward count "
+            "lands on the same one. The window can then span any amount of "
+            "wall clock, so time with no forward running is kept out of the "
+            "tokens/s divisor. Base and DP engines only -- pipeline parallel "
+            "replaces the busy loop that counts, and RapidServe and P/D are "
+            "not covered yet; all three fall back to the clock with a "
+            "warning. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--cache-hit-rate-window",
