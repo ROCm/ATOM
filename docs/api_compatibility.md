@@ -59,6 +59,11 @@ using V4.1 aliases.
 
 ## Wire contracts
 
+- Responses validates a supplied model name against the served alias before
+  rendering or enqueueing, using the same rule as Chat (including trailing-slash
+  normalization). Unknown names return HTTP 400 with an OpenAI `error` object
+  instead of silently using the loaded model; omitted/null model keeps the
+  existing single-model default.
 - Chat validates `stream_options` together with `stream=true` and a boolean
   `include_usage`. DeepSeek-compatible Chat includes usage on the last finish
   chunk; other adapters retain the separate usage-only chunk. Chat retains

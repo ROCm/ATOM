@@ -2567,6 +2567,7 @@ async def responses_create(raw_request: Request):
     try:
         body, codex_context = normalize_codex_request(body)
         request = ResponsesRequest.model_validate(body)
+        validate_model(request.model)
         openai_tools = responses_tools_to_openai(request.tools)
         validate_tool_list(openai_tools)
     except ValueError as exc:
