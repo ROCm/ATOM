@@ -13,6 +13,7 @@ import pytest
 
 pytest.importorskip("aiter", reason="model_runner and gdn_attn import aiter")
 
+from atom.model_engine import model_runner as model_runner_module
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointStoreOp,
@@ -38,9 +39,9 @@ def _stage_spec(unit_bytes: int, slot_bytes: int, stage: int):
     )
 
 
-def _agree(monkeypatch, stage: int, geometry=K3_PP8, tp: int = 1):
+def _agree(monkeypatch, stage: int, geometry=K3_PP8):
     specs = [_stage_spec(u, s, i) for i, (u, s) in enumerate(geometry)]
-    per_rank = [
+    per_stage = [
         (
             spec.layout_id,
             spec.image_bytes,
@@ -48,26 +49,23 @@ def _agree(monkeypatch, stage: int, geometry=K3_PP8, tp: int = 1):
             spec.units_per_checkpoint,
         )
         for spec in specs
-        for _ in range(tp)
     ]
+    pp_group = SimpleNamespace(world_size=len(geometry), cpu_group="pp-cpu")
 
-    def all_gather_object(out, _mine):
-        out[:] = per_rank
+    def all_gather_object(out, _mine, group=None):
+        assert group == "pp-cpu" and len(out) == len(per_stage)
+        out[:] = per_stage
 
     dist = pytest.importorskip("torch").distributed
-    monkeypatch.setattr(dist, "get_world_size", lambda: len(per_rank))
     monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
-    runner = SimpleNamespace(
-        config=SimpleNamespace(pipeline_parallel_size=len(geometry))
-    )
+    monkeypatch.setattr(model_runner_module, "get_pp_group", lambda: pp_group)
     return specs[stage], ModelRunner._agree_pipeline_checkpoint_spec(
-        runner, specs[stage]
+        SimpleNamespace(), specs[stage]
     )
 
 
-@pytest.mark.parametrize("tp", [1, 2])
-def test_stages_take_the_largest_unit_count(monkeypatch, tp):
-    own, agreed = _agree(monkeypatch, stage=7, tp=tp)
+def test_stages_take_the_largest_unit_count(monkeypatch):
+    own, agreed = _agree(monkeypatch, stage=7)
 
     assert own.units_per_checkpoint == 80
     assert agreed.units_per_checkpoint == 206

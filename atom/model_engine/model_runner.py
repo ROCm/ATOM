@@ -1856,22 +1856,21 @@ class ModelRunner:
         its own unit size, so the stages need different counts; all take the
         largest, and a stage needing fewer leaves its tail units unwritten. An
         op is checked against the joint layout id and the summed image bytes,
-        which change whenever any stage's geometry does. Collective: every
-        rank calls it.
+        which change whenever any stage's geometry does. Collective over the
+        PP group, which holds one rank per stage in stage order.
         """
-        world = torch.distributed.get_world_size()
-        gathered: list = [None] * world
+        pp = get_pp_group()
+        stages: list = [None] * pp.world_size
         torch.distributed.all_gather_object(
-            gathered,
+            stages,
             (
                 spec.layout_id,
                 spec.image_bytes,
                 spec.page_unit_bytes,
                 spec.units_per_checkpoint,
             ),
+            group=pp.cpu_group,
         )
-        stage_span = world // self.config.pipeline_parallel_size
-        stages = gathered[::stage_span]
         units = max(entry[3] for entry in stages)
         op_bytes = sum(entry[1] for entry in stages)
         digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
