@@ -166,6 +166,9 @@ DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
 DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-}"
 ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
+# pd_submit.sh sets each role's from its online_quant_extra_exclude_layer.
+PREFILL_ONLINE_QUANT_CONFIG="${PREFILL_ONLINE_QUANT_CONFIG:-${ONLINE_QUANT_CONFIG}}"
+DECODE_ONLINE_QUANT_CONFIG="${DECODE_ONLINE_QUANT_CONFIG:-${ONLINE_QUANT_CONFIG}}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
@@ -757,9 +760,6 @@ if [[ -n "${MAX_MODEL_LEN}" ]]; then
 fi
 if [[ -n "${MAX_NUM_BATCHED_TOKENS}" ]]; then
   server_common+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
-fi
-if [[ -n "${ONLINE_QUANT_CONFIG}" ]]; then
-  server_common+=(--online_quant_config "${ONLINE_QUANT_CONFIG}")
 fi
 if [[ -n "${HF_OVERRIDES}" ]]; then
   server_common+=(--hf-overrides "${HF_OVERRIDES}")
@@ -1861,6 +1861,16 @@ EOF
 # passes its own torch_profiler_dir (None by default), which overrides the env
 # default in Config, so the profiler is off unless the flag is on the command.
 # One directory per worker keeps P/D ranks that share a node apart.
+# Goes right after server_common, where the shared flag used to be, so a
+# --online_quant_config in a role's extra_args still wins.
+build_online_quant_args() {
+  local config="$1"
+  local -n out_args="$2"
+  out_args=()
+  [[ -n "${config}" ]] || return 0
+  out_args=(--online_quant_config "${config}")
+}
+
 build_torch_profiler_args() {
   local log_name="$1"
   local -n out_args="$2"
@@ -1902,10 +1912,13 @@ start_prefill() {
   prefill_kv_transfer_config="$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a prefill_profiler_args=()
   build_torch_profiler_args "${log_name}" prefill_profiler_args
+  local -a prefill_quant_args=()
+  build_online_quant_args "${PREFILL_ONLINE_QUANT_CONFIG}" prefill_quant_args
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
+    "${prefill_quant_args[@]}"
     --server-port "${server_port}"
     "${prefill_parallel[@]}"
     --max-num-seqs "${MAX_NUM_SEQS}"
@@ -1965,10 +1978,13 @@ start_decode() {
   decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a decode_profiler_args=()
   build_torch_profiler_args "${log_name}" decode_profiler_args
+  local -a decode_quant_args=()
+  build_online_quant_args "${DECODE_ONLINE_QUANT_CONFIG}" decode_quant_args
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
+    "${decode_quant_args[@]}"
     --server-port "${server_port}"
     "${decode_parallel[@]}"
     --max-num-seqs "${decode_max_num_seqs}"
@@ -2021,10 +2037,13 @@ start_aggregated() {
   fi
   local -a server_profiler_args=()
   build_torch_profiler_args "${log_name}" server_profiler_args
+  local -a server_quant_args=()
+  build_online_quant_args "${DECODE_ONLINE_QUANT_CONFIG}" server_quant_args
   echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a server_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
+    "${server_quant_args[@]}"
     --server-port "${server_port}"
     "${decode_parallel[@]}"
     --max-num-seqs "${server_max_num_seqs}"

@@ -105,6 +105,35 @@ def csv_value(value):
 def q(value):
     return shlex.quote(str(shell_value(value)))
 
+def fail(reason):
+    # A non-zero exit here is swallowed by `eval "$(...)"`, so fail via the shell.
+    print(f"echo {shlex.quote(reason)} >&2")
+    print("exit 1")
+    raise SystemExit(0)
+
+def role_online_quant_config(role, role_cfg):
+    """The role's --online_quant_config: the shared one, with the shared and
+    the role's `online_quant_extra_exclude_layer` appended to its exclude_layer.
+    A role's own key keeps its exclusions off the other role's command line."""
+    config = server_args.get("online_quant_config", "")
+    extra = [
+        *(server_args.get("online_quant_extra_exclude_layer") or []),
+        *(role_cfg.get("online_quant_extra_exclude_layer") or []),
+    ]
+    if not extra:
+        return config
+    if not config:
+        fail(
+            f"ERROR: {cell['id']} {role} sets online_quant_extra_exclude_layer "
+            "without an online_quant_config to extend"
+        )
+    try:
+        parsed = json.loads(config) if isinstance(config, str) else dict(config)
+    except ValueError as exc:
+        fail(f"ERROR: {cell['id']} online_quant_config is not JSON: {exc}")
+    parsed["exclude_layer"] = [*parsed.get("exclude_layer", []), *extra]
+    return json.dumps(parsed, separators=(",", ":"))
+
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
 is_crusoe_v2 = slurm_submit_runner == "atomesh-cicd-mi355-crusoe"
 spur_controller_addr = runner.get("spur_controller_addr")
@@ -214,6 +243,8 @@ exports = {
         "decode_max_num_batched_tokens", ""
     ),
     "ONLINE_QUANT_CONFIG": server_args.get("online_quant_config", ""),
+    "PREFILL_ONLINE_QUANT_CONFIG": role_online_quant_config("prefill", prefill),
+    "DECODE_ONLINE_QUANT_CONFIG": role_online_quant_config("decode", decode),
     "HF_OVERRIDES": server_args.get("hf_overrides", ""),
     "SPEC_METHOD": server_args.get("method", ""),
     "DRAFT_MODEL_PATH": server_args.get("draft_model", ""),
@@ -266,14 +297,10 @@ exports = {
 server_args.get("trust_remote_code")
 dropped = sorted(set(server_args) - server_args.seen)
 if dropped:
-    reason = (
+    fail(
         f"ERROR: {cell['id']} sets unsupported server_args {dropped}; "
         "raw server flags belong in extra_args"
     )
-    # A non-zero exit here is swallowed by `eval "$(...)"`, so fail via the shell.
-    print(f"echo {shlex.quote(reason)} >&2")
-    print("exit 1")
-    raise SystemExit(0)
 
 for key, value in exports.items():
     print(f"export {key}={q(value)}")
