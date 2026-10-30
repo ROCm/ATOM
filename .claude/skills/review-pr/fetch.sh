@@ -805,7 +805,20 @@ else:
 PY
 fi
 
-# Inline review comments (line-level code comments — often more specific than top-level)
+# Inline review comments (line-level code comments — often more specific than top-level).
+#
+# REVIEW_OMIT_INLINE_COMMENTS=1 suppresses them. It exists for ONE purpose: measuring what
+# the reviewer finds on its own. Feeding it the human review is correct in production --
+# a reviewer who does not know what was already said duplicates it -- but it makes a
+# human-vs-bot comparison meaningless, and one was run on ATOM#2727 before anyone noticed:
+# the card reproduced a human comment's probe parameters verbatim (dp=2, stall_ticks=3,
+# target_fill=0.9) and read as independent discovery. Default off; never set it for a
+# review whose output anyone will act on.
+if [ "${REVIEW_OMIT_INLINE_COMMENTS:-0}" = 1 ]; then
+  echo "[INLINE COMMENTS WITHHELD] REVIEW_OMIT_INLINE_COMMENTS=1 -- the human review on this"
+  echo "  PR was deliberately kept out of this context. This review is a blind-discovery"
+  echo "  measurement, not a production review: it may repeat points already made."
+else
 gh api "repos/$REPO/pulls/$PR/comments" | python3 -c "
 import json,sys
 comments = json.load(sys.stdin)
@@ -818,6 +831,7 @@ for c in comments:
         print(f'[INLINE {author}] {path}:{line}')
         print(f'  {body[:250]}')
 " 2>/dev/null
+fi
 
 # Which rule families this diff actually triggers. Step 3 used to be a prose
 # checklist the model ticked itself; measured over 597 open aiter PRs that meant
