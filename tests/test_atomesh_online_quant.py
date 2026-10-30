@@ -127,11 +127,12 @@ class SubmitOnlineQuantTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-c", self.mapping],
             env=dict(os.environ, CELL_JSON=json.dumps(cell)),
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             timeout=30,
         )
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("without an online_quant_config", result.stdout)
         self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
 

@@ -92,6 +92,26 @@ class WaitForTorchTracesTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 4 rank traces on disk", result.stdout)
 
+    def test_dirs_not_named_like_a_rank_are_ignored(self):
+        rank_dirs, stop_files = self.pp_prefill_and_tp_decode()
+        for rank_dir in rank_dirs:
+            self.write_trace(rank_dir)
+        (self.root / "prefill-rank-0" / "tmp").mkdir()
+        (self.root / "decode-rank-1" / "rank_0.cache").mkdir()
+        result = self.run_wait(*stop_files)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 4 rank traces on disk", result.stdout)
+
+    def test_dp_rank_dirs_count_as_ranks(self):
+        worker = self.root / "decode-rank-1"
+        rank_dirs = [worker / f"dp{d}_tp0" for d in range(2)]
+        stop_file = self.write_stop_file("decode", rank_dirs[:1])
+        self.write_trace(rank_dirs[0])
+        rank_dirs[1].mkdir(parents=True)
+        result = self.run_wait(stop_file)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("1/2 rank traces still missing", result.stdout)
+
     def test_raw_json_keeps_a_stage_pending(self):
         rank_dirs, stop_files = self.pp_prefill_and_tp_decode()
         for rank_dir in rank_dirs:

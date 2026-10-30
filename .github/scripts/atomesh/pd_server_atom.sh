@@ -2367,12 +2367,14 @@ run_torch_profile_window() {
 # stop_profile returns once TP rank 0 has exported, while the other ranks may
 # still be writing. Each rank writes a raw .pt.trace.json, gzips it, then
 # removes the raw file, so a rank is done once it holds a .gz newer than the
-# window start and no raw .json. Every subdirectory of a worker dir is one
-# rank: ModelRunner names it rank_<tp>, dp<d>_tp<tp>, or pp<k>_<either> under PP.
+# window start and no raw .json. A rank's dir under its worker dir is named by
+# ModelRunner, rank_<tp> or dp<d>_tp<tp>, prefixed pp<k>_ under PP; any other
+# subdir there is not a rank and must not hold the wait open.
 wait_for_torch_traces() {
   local marker="$1"
   shift
-  local stop_file trace_dir worker_dir rank_dir
+  local stop_file trace_dir worker_dir rank_dir worker_ranks
+  local rank_dir_re='^(pp[0-9]+_)?(rank_[0-9]+|dp[0-9]+_tp[0-9]+)$'
   local -A worker_dirs=()
   for stop_file in "$@"; do
     if ! grep -qE '"status" *: *"success"' "${stop_file}" 2>/dev/null; then
@@ -2395,15 +2397,22 @@ wait_for_torch_traces() {
     pending=0
     ranks=0
     for worker_dir in "${!worker_dirs[@]}"; do
+      worker_ranks=0
       for rank_dir in "${worker_dir}"/*/; do
-        ranks=$(( ranks + 1 ))
-        if [[ ! -d "${rank_dir}" ]] \
-          || [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
+        [[ "$(basename "${rank_dir}")" =~ ${rank_dir_re} ]] || continue
+        worker_ranks=$(( worker_ranks + 1 ))
+        if [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
           || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' \
             -newer "${marker}" -print -quit)" ]]; then
           pending=$(( pending + 1 ))
         fi
       done
+      # A worker with no rank dir yet still owes its traces.
+      if (( worker_ranks == 0 )); then
+        worker_ranks=1
+        pending=$(( pending + 1 ))
+      fi
+      ranks=$(( ranks + worker_ranks ))
     done
     if (( pending == 0 )); then
       echo "[profile] all ${ranks} rank traces on disk at $(date -Is): ${!worker_dirs[*]}"
@@ -2763,11 +2772,13 @@ PY
   fi
 }
 
-# A role's expect_log is a line every one of its servers must have logged by
-# the time they are healthy. It is for a feature that, when a deployment rules
-# it out, logs why at INFO and serves without it: the cell would otherwise
-# publish numbers under a name that says the feature ran. RUN_DIR is shared, so
-# node 0 reads the logs of servers on the other nodes too.
+# A role's expect_log is a line every one of its servers must have logged while
+# starting: it is checked once they are healthy and before any request, warmup
+# included, so a line first logged while serving fails a healthy cell. It is
+# for a feature that, when a deployment rules it out, logs why at INFO and
+# serves without it: the cell would otherwise publish numbers under a name that
+# says the feature ran. RUN_DIR is shared, so node 0 reads the logs of servers
+# on the other nodes too.
 PREFILL_EXPECT_LOG="${PREFILL_EXPECT_LOG:-}"
 DECODE_EXPECT_LOG="${DECODE_EXPECT_LOG:-}"
 ATOMESH_EXPECT_LOG_TIMEOUT="${ATOMESH_EXPECT_LOG_TIMEOUT:-60}"

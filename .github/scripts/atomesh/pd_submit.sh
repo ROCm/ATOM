@@ -106,10 +106,11 @@ def q(value):
     return shlex.quote(str(shell_value(value)))
 
 def fail(reason):
-    # A non-zero exit here is swallowed by `eval "$(...)"`, so fail via the shell.
+    # `eval "$(...)"` ignores this script's status, so the printed `exit 1` is
+    # what stops pd_submit.sh; the status fails any caller that checks it.
     print(f"echo {shlex.quote(reason)} >&2")
     print("exit 1")
-    raise SystemExit(0)
+    raise SystemExit(1)
 
 def role_online_quant_config(role, role_cfg):
     """The role's --online_quant_config: the shared one, with the shared and
