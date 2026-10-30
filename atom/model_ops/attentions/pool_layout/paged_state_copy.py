@@ -291,10 +291,14 @@ class UnitZeroer:
 
     Used on the raw units a released state checkpoint held
     (`BlockPool.take_released_units`). `regions` is `mha_page_unit_regions`:
-    base address and per-block byte size of each region. Ids go up through
-    one pinned buffer sized for the whole pool, so a launch never allocates;
-    the buffer is fenced on its own upload like `DescriptorStaging`.
+    base address and per-block byte size of each region. Ids go up through a
+    ring of pinned buffers sized for the whole pool, so a launch never
+    allocates. Each buffer is fenced on its own upload like
+    `DescriptorStaging`; with `RING` of them the host only waits when the GPU
+    is that many zero launches behind, not on every launch.
     """
+
+    RING = 4
 
     def __init__(self, regions, num_blocks: int, device) -> None:
         base, size = regions
@@ -307,10 +311,18 @@ class UnitZeroer:
         self._size = torch.as_tensor(np.asarray(size, dtype=np.int64)).to(self.device)
         self._num_regions = len(size)
         self._tiles = max(1, -(-int(np.max(size)) // _TILE_BYTES))
-        self._host = torch.zeros(self.num_blocks, dtype=torch.int64, pin_memory=cuda)
+        self._host = [
+            torch.zeros(self.num_blocks, dtype=torch.int64, pin_memory=cuda)
+            for _ in range(self.RING)
+        ]
+        # One device buffer is enough: its upload and the kernel reading it
+        # are ordered on the same stream.
         self._dev = torch.zeros(self.num_blocks, dtype=torch.int64, device=self.device)
-        self._uploaded = torch.cuda.Event() if cuda else None
-        self._pending = False
+        self._uploaded = [
+            torch.cuda.Event() if cuda else None for _ in range(self.RING)
+        ]
+        self._pending = [False] * self.RING
+        self._next = 0
 
     def launch(self, unit_ids) -> int:
         """Enqueue the zero on the current stream; returns how many ids."""
@@ -326,14 +338,19 @@ class UnitZeroer:
             raise ValueError(f"{n} units to zero in a {self.num_blocks}-block pool")
         if _zero_unit_regions_kernel is None:
             raise RuntimeError("PAGE unit zeroing requires Triton")
-        if self._pending:
-            self._uploaded.synchronize()
-            self._pending = False
-        self._host.numpy()[:n] = ids
-        dev = self._dev[:n].copy_(self._host[:n], non_blocking=True)
-        if self._uploaded is not None:
-            self._uploaded.record()
-            self._pending = True
+        slot = self._next
+        self._next = (slot + 1) % self.RING
+        if self._pending[slot]:
+            # Only blocks when this buffer's upload, RING launches ago, has
+            # not run yet.
+            self._uploaded[slot].synchronize()
+            self._pending[slot] = False
+        host = self._host[slot]
+        host.numpy()[:n] = ids
+        dev = self._dev[:n].copy_(host[:n], non_blocking=True)
+        if self._uploaded[slot] is not None:
+            self._uploaded[slot].record()
+            self._pending[slot] = True
         _zero_unit_regions_kernel[(n * self._num_regions * self._tiles,)](
             dev,
             self._base,

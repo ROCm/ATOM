@@ -457,10 +457,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pages there), and zero every raw PAGE unit a released state checkpoint
     # held before the id can be written again. Without it a released GDN image
     # leaves bf16 state bytes (fp8 NaN patterns) in KV slots masked lanes read.
-    # 0 restores the old behaviour, for A/B only.
-    "ATOM_ZERO_EVICTED_BLOCKS": lambda: (
-        os.getenv("ATOM_ZERO_EVICTED_BLOCKS", "1") == "1"
-    ),
+    # 0 / false / no / off restores the old behaviour, for A/B only.
+    "ATOM_ZERO_EVICTED_BLOCKS": lambda: _flag_env("ATOM_ZERO_EVICTED_BLOCKS", "1"),
     # vLLM plugin, state checkpoints: overrides the native checkpoint interval
     # (tokens; 0 = publish no state checkpoint, -1 = no rungs, anchor and demand only).
     # Unset: the model's native default.

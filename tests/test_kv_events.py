@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import msgspec
 import pytest
-from conftest import MockConfig
+from conftest import MockConfig, kv_blocks
 
 from atom.config import KVEventsConfig
 from atom.distributed.kv_events import (
@@ -244,7 +244,7 @@ class TestBlockManagerHooks:
     def test_eviction_emits_block_removed(self, seq_factory):
         # Pool with a single block so the free FIFO has no choice but to
         # recycle the block that still carries s1's stale hash → eviction.
-        bm = _bm_with_events(num_kvcache_blocks=1, kv_cache_block_size=4)
+        bm = _bm_with_events(num_kvcache_blocks=kv_blocks(1), kv_cache_block_size=4)
         s1 = seq_factory([1, 2, 3, 4])
         _admit(bm, s1)
         bm.deallocate(s1)

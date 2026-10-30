@@ -324,15 +324,15 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Zero every published byte of these PAGE ids, on the current stream.
 
         The ids are raw units a released state checkpoint held
-        (`StateMaintenanceOps.zero_units`). A builder whose pool can hold such
-        images overrides this; the default only says once that it cannot.
+        (`StateMaintenanceOps.zero_units`). The scheduler queues them only for
+        a layout `state_runtime.zeroes_released_units` names, whose builder
+        overrides this; ids reaching the default are a wiring error, not
+        something to drop silently.
         """
-        if unit_ids and not getattr(self, "_warned_no_zero_units", False):
-            self._warned_no_zero_units = True
-            logger.warning(
-                "%s does not zero released PAGE units; ATOM_ZERO_EVICTED_BLOCKS "
-                "has no effect for this backend",
-                type(self).__name__,
+        if len(unit_ids):
+            raise NotImplementedError(
+                f"{type(self).__name__} has no PAGE unit zero, but the "
+                f"scheduler queued {len(unit_ids)} released units for it"
             )
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:

@@ -3575,8 +3575,9 @@ class ModelRunner:
         """Zero released state-checkpoint PAGE units ahead of a KV load.
 
         `build()` does this for a batch's `zero_units`; the engine calls it
-        directly only when the batch also dispatches connector loads, which
-        must be ordered after the zero (see `EngineCore`).
+        directly before dispatching connector loads, which must be ordered
+        after the zero (`EngineCore._zero_released_units_before_loads`). Runs
+        on the current stream, the one `start_load_kv` records its event on.
         """
         self.attn_metadata_builder.zero_page_units(unit_ids)
 

@@ -78,8 +78,9 @@ class BlockPool:
     whose bf16 bytes read as fp8 NaN patterns in the K/V/scale slots a KV
     block's masked tail exposes; a KV block keeps finite KV when freed, so
     plain `free` is not scrubbed. The queue rides the next built batch and is
-    executed first on the compute stream, so every later writer of the id --
-    which can only be in that batch or a later one -- is ordered after it.
+    executed first on the compute stream, or is zeroed by the engine ahead of
+    a KV connector dispatch, so every later writer of the id -- which can only
+    be in that batch, a later one, or that dispatch -- is ordered after it.
     """
 
     def __init__(
@@ -110,8 +111,13 @@ class BlockPool:
         if not 0 <= num_blocks <= self.max_blocks:
             raise ValueError(f"{num_blocks} blocks outside 0..{self.max_blocks}")
         self.num_blocks: int = num_blocks
+        if null_block and num_blocks == 1:
+            raise ValueError(
+                "a 1-block pool has no usable block once block 0 is the null "
+                "page; give it at least 2 blocks or set ATOM_ZERO_EVICTED_BLOCKS=0"
+            )
         # First id the pool may hand out: 1 when block 0 is the null page.
-        self.first_block: int = 1 if null_block and num_blocks > 0 else 0
+        self.first_block: int = 1 if null_block else 0
         self.scrub_released: bool = scrub_released
         # Raw units released since the last `take_released_units`, in order;
         # the set mirrors the list for `cancel_scrub`.
@@ -351,7 +357,7 @@ class BlockPool:
     def allocate(self, block_id: int) -> Block:
         """Take `block_id` for fresh content, evicting whatever it held."""
         if block_id < self.first_block:
-            raise AssertionError(f"block {block_id} is the reserved null page")
+            raise ValueError(f"block {block_id} is the reserved null page")
         block = self.blocks[block_id]
         assert block.ref_count == 0
         if self._unindex(block_id):
@@ -473,6 +479,14 @@ class BlockPool:
         units outside any batch; a zero queued before that write but executed
         after it would wipe the image. Those units are overwritten anyway and
         are scrubbed again when they are released.
+
+        Only the queue is touched. A zero already drained by
+        `take_released_units` is not cancelled and does not need to be: the
+        drain is the last step of building a batch, after admission (where
+        transfers reserve) and after the connector metadata, so a drained zero
+        belongs to a batch the runner receives before any later connector
+        dispatch, and that dispatch's loads wait on an event recorded on the
+        stream the zero was enqueued on.
         """
         drop = self._unscrubbed_set.intersection(unit_ids)
         if drop:
@@ -516,7 +530,9 @@ class BlockPool:
         — beyond it there is nothing to hand out even if the caller has bytes.
         """
         taken = min(count, self.max_blocks - self.num_blocks)
-        for block_id in range(self.num_blocks, self.num_blocks + taken):
+        # A pool grown from empty still keeps its null page out.
+        start = max(self.num_blocks, self.first_block)
+        for block_id in range(start, self.num_blocks + taken):
             self._free.add(block_id)
             heappush(self._vacant, block_id)
         self.num_blocks += taken

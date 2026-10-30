@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
 import pytest
-from conftest import MockConfig
+from conftest import MockConfig, kv_blocks
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -681,7 +681,7 @@ def engine_scheduler(monkeypatch, *, adapter=None, **overrides):
         mp_scheduler, "_make_scheduler_adapter", lambda _config, **kwargs: adapter
     )
     config = MockConfig(
-        num_kvcache_blocks=40,
+        num_kvcache_blocks=kv_blocks(40),
         enable_prefix_caching=True,
         pool_entries={"state": 4},
         state_checkpoint_interval_tokens=0,

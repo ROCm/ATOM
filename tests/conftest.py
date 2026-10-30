@@ -12,7 +12,6 @@
 # import here is a declared dependency, so a plain CPU runner has them.
 
 import dataclasses
-import os
 import sys
 from itertools import count
 from pathlib import Path
@@ -26,13 +25,6 @@ ATOM_ROOT = str(Path(__file__).resolve().parent.parent)
 if ATOM_ROOT not in sys.path:
     sys.path.insert(0, ATOM_ROOT)
 
-# The block-pool and scheduler suites hard-code pools of 1-10 blocks and the
-# ids they hand out; ATOM_ZERO_EVICTED_BLOCKS (default on) keeps block 0 out of
-# circulation, which shifts both by one. They test the pool's policy, not the
-# null page, so they run with it off unless a run exports it;
-# `test_zero_evicted_blocks.py` sets it explicitly per test.
-os.environ.setdefault("ATOM_ZERO_EVICTED_BLOCKS", "0")
-
 # ── 2. Import atom submodules ──────────────────────────────────────────────
 
 from atom.config import Config
@@ -40,7 +32,19 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils import envs
 from atom.utils.region_graph import ReqGraph
+
+
+def kv_blocks(usable: int) -> int:
+    """KV pool size that leaves `usable` blocks to hand out.
+
+    With ATOM_ZERO_EVICTED_BLOCKS (default on) block 0 is the null page and
+    never handed out, so a test that sizes its pool by what it can allocate
+    asks for one more block.
+    """
+    return usable + (1 if envs.ATOM_ZERO_EVICTED_BLOCKS else 0)
+
 
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
 

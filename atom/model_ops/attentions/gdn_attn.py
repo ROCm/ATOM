@@ -14,7 +14,12 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
+from atom.model_engine.state_runtime import (
+    GDN_PAGED_LAYOUT_PREFIX,
+    StateTransfer,
+    midstep_checkpoint_targets,
+    zeroes_released_units,
+)
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
@@ -918,8 +923,9 @@ class GDNStateMixin(PoolRowsMixin):
 
         Slot 0 into the pool's first units. Both are real addresses, which is
         the point: a warmup on scratch would compile a kernel and fill nothing.
-        The bytes it writes are read by nobody -- a KV block is written before
-        it is read, and this runs before any block has been handed out.
+        A KV block is written before it is read and this runs before any block
+        has been handed out, so the only reader of these bytes is a masked lane
+        sent to block 0 -- which is why they are zeroed straight after.
         """
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
@@ -936,9 +942,12 @@ class GDNStateMixin(PoolRowsMixin):
         )
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
         # The copy above put slot 0's bytes into units 0..n-1, and block 0 is
-        # the null page every masked lane reads. Zero them back (this also
-        # compiles the zero kernel before the first request).
-        if envs.ATOM_ZERO_EVICTED_BLOCKS:
+        # the null page every masked lane reads. Zero them back whatever
+        # ATOM_ZERO_EVICTED_BLOCKS says, so the switch's off arm starts from
+        # the same all-zero pool (this also compiles the zero kernel before
+        # the first request). Only a layout with a zero kernel can: Kimi's
+        # MLA pool shares this warmup but not `zero_page_units`.
+        if zeroes_released_units(spec.layout_id):
             self.zero_page_units(list(range(spec.units_per_checkpoint)))
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
@@ -1667,7 +1676,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # the one fact the shapes cannot say. ``spec`` changes the conv
         # window. ``tp`` is in the id because the heads are sharded.
         layout_id = (
-            "gdn-paged-state-v1"
+            f"{GDN_PAGED_LAYOUT_PREFIX}v1"
             f":layers={self.num_state_layers()}"
             f":conv={tuple(shape_k)},{dtype_k}"
             f":ssm={tuple(shape_v)},{dtype_v}"
