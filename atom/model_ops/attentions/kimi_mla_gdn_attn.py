@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
+
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
@@ -24,7 +26,7 @@ from .aiter_mla import (
     aligned_index_cache_dim,
 )
 from .backends import AttentionBackend
-from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin
+from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin, slot_indexed_caches
 from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .triton_mla import TritonMLAMetadataBuilder
@@ -213,20 +215,23 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         conv unit not shaped as above is left undescribed, and
         `get_kv_transfer_tensors` refuses it. ReplaySSM's cursor, the last
         region, is the same on every rank; `slot_region_tp_replicated` says so.
+
+        Units are read off the cache shapes, not a slot: a PP stage that holds
+        no KDA layer has caches with a zero layer axis.
         """
         runner = self.model_runner
         segments: list = [None] * num_regions
-        n_kda = runner.mamba_k_cache.shape[0]
-        conv = runner.mamba_k_cache[0, 0]
-        width, channels = conv.shape
+        conv_cache = runner.mamba_k_cache
+        n_kda = conv_cache.shape[0]
+        width, channels = conv_cache.shape[2:]
         expected_width = (
             runner.config.hf_config.linear_conv_kernel_dim - 1 + self.num_spec
         )
         if width == expected_width and channels % 3 == 0:
-            run = channels // 3 * conv.element_size()
+            run = channels // 3 * conv_cache.element_size()
             for i in range(min(n_kda, num_regions)):
                 segments[i] = (run,) * (3 * width)
-        ssm_bytes = runner.mamba_v_cache[0, 0].numel() * (
+        ssm_bytes = math.prod(runner.mamba_v_cache.shape[2:]) * (
             runner.mamba_v_cache.element_size()
         )
         for i in range(n_kda, min(2 * n_kda, num_regions)):
@@ -238,7 +243,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 runner.replayssm_buf_g,
             )
             for group, buf in enumerate(records, start=2):
-                unit = buf[0, 0].numel() * buf.element_size()
+                unit = math.prod(buf.shape[2:]) * buf.element_size()
                 for i in range(group * n_kda, min((group + 1) * n_kda, num_regions)):
                     segments[i] = (unit,)
         return segments
@@ -295,13 +300,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 "MLA rows; PP disaggregation places one region per row"
             )
         kda = place(LINEAR_STATE_ROWS, kda_pos, None)
-        if not kda:
-            return mla, []
-        groups, cursor = divmod(num_slot_regions, len(kda))
-        if cursor != int(bool(self.replayssm)):
+        # Counted from the caches, not from the regions: a stage without a
+        # KDA layer publishes no per-layer group, only ReplaySSM's cursor.
+        groups = len(slot_indexed_caches(runner, self.replayssm))
+        cursor = int(bool(self.replayssm))
+        if num_slot_regions != groups * len(kda) + cursor:
             raise RuntimeError(
                 f"{num_slot_regions} slot regions over {len(kda)} KDA rows "
-                f"(replayssm={self.replayssm}) are not whole per-layer groups"
+                f"(replayssm={self.replayssm}) are not {groups} per-layer "
+                f"groups of {len(kda)} plus {cursor} cursor"
             )
         slots = [g * len(kda_pos) + pos for g in range(groups) for pos in kda]
         if cursor:

@@ -509,6 +509,28 @@ def test_a_single_stage_leaves_region_placement_to_the_connector():
     assert tensors.slot_region_consumer_indices is None
 
 
+@pytest.mark.parametrize("replayssm", [False, True], ids=["plain", "replayssm"])
+def test_a_pp_stage_without_kda_layers_sends_only_what_it_holds(replayssm):
+    """A stage of full-attention layers only has state caches with a zero
+    layer axis: no per-layer region, and under ReplaySSM just the cursor,
+    placed after the peer's five per-layer groups."""
+    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2, replayssm=replayssm)
+    runner = builder.model_runner
+    for name in ("mamba_k_cache", "mamba_v_cache") + (
+        ("replayssm_buf_k", "replayssm_buf_u", "replayssm_buf_g") if replayssm else ()
+    ):
+        setattr(runner, name, getattr(runner, name)[:0])
+    builder._pool_rows = {K3.MLA_ROWS: {_Layer(7): 0}}
+
+    tensors = builder.get_kv_transfer_tensors()
+
+    assert tensors.block_region_consumer_indices == [1]
+    assert tensors.num_slots == SLOTS
+    assert len(tensors.slot_regions) == int(replayssm)
+    assert tensors.slot_region_tp_replicated == [True] * int(replayssm)
+    assert tensors.slot_region_consumer_indices == [30] * int(replayssm)
+
+
 def test_kda_slot_regions_publish_their_tp_shards():
     """A conv unit is rows of [q | k | v], each run sharded by head blocks; an
     SSM unit and a ReplaySSM record unit are sharded along their leading head

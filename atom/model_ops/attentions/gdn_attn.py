@@ -1031,7 +1031,7 @@ class GDNStateMixin(PoolRowsMixin):
                 f"state caches disagree on slot count: {cache.shape[1]} != "
                 f"{num_slots}; one slot index has to address all of them"
             )
-            slot_bytes = cache[0, 0].numel() * cache.element_size()
+            slot_bytes = math.prod(cache.shape[2:]) * cache.element_size()
             layer_bytes = num_slots * slot_bytes
             for layer in range(cache.shape[0]):
                 regions.append(
