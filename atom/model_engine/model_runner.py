@@ -3225,6 +3225,10 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # ATOM_DSPARK_PROB_DRAFT=1: the drafter samples at these temperatures,
+        # or greedily (None) when the next verification would not use its q.
+        prob_state = self._dspark_prob_state(top_ks)
+        self._dspark_draft_temps = temperatures if prob_state is not None else None
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3259,7 +3263,12 @@ class ModelRunner:
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
             target_token_ids = None
-            if not all_greedy:
+            # ATOM_DSPARK_PROB_DRAFT=1: probability-ratio verification against
+            # the drafter's stored q (None => the existing path, unchanged).
+            prob_src = None
+            if not all_greedy and prob_state is not None:
+                prob_src = prob_state.src_for(batch.req_ids, bs)
+            if not all_greedy and prob_src is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3277,12 +3286,53 @@ class ModelRunner:
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
             )
-            sampled_tokens, verdict = self.rejection_sampler.forward(
-                spec_decode_metadata,
-                target_logits,
-                bonus_token_ids,
-                target_token_ids=target_token_ids,
-            )
+            if prob_src is not None:
+                from atom.model_ops.dspark_prob_sample import (
+                    BLOCK_VERIFY,
+                    PROB_DEBUG,
+                    debug_acceptance,
+                    prob_rejection_sample,
+                )
+
+                sampled_tokens, verdict = prob_rejection_sample(
+                    spec_decode_metadata.input_ids,
+                    spec_decode_metadata.target_logits_indices,
+                    spec_decode_metadata.num_spec_steps,
+                    spec_decode_metadata.cu_num_draft_tokens,
+                    target_logits,
+                    bonus_token_ids,
+                    spec_decode_metadata.bonus_logits_indices,
+                    temperatures,
+                    top_ps,
+                    prob_src,
+                    prob_state,
+                    use_block=BLOCK_VERIFY,
+                    tp_group=get_tp_group(),
+                    use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
+                )
+                if PROB_DEBUG and prob_state.verify_step % PROB_DEBUG == 0:
+                    debug_acceptance(
+                        target_logits,
+                        spec_decode_metadata.cu_num_draft_tokens,
+                        spec_decode_metadata.input_ids,
+                        spec_decode_metadata.target_logits_indices,
+                        temperatures,
+                        top_ps,
+                        prob_src,
+                        prob_state,
+                    )
+                # Every rank computes the same verdict from identical inputs;
+                # align it with rank 0 anyway (sampled_tokens is broadcast
+                # below), as the synthetic path's num_bonus_tokens must be.
+                if get_tp_group().world_size > 1:
+                    verdict = get_tp_group().broadcast(verdict, src=0)
+            else:
+                sampled_tokens, verdict = self.rejection_sampler.forward(
+                    spec_decode_metadata,
+                    target_logits,
+                    bonus_token_ids,
+                    target_token_ids=target_token_ids,
+                )
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced
             # below, outside this branch.
@@ -3602,6 +3652,19 @@ class ModelRunner:
             finished_sending=done_sending, finished_recving=done_recving
         )
 
+    def _dspark_prob_state(self, top_ks):
+        """The drafter's ``ProbDraftState`` when probability-ratio verification
+        applies to this batch, else None (feature off, top-k set, synthetic
+        acceptance, PCP > 1, no DSpark drafter)."""
+        prob_state = getattr(getattr(self, "drafter", None), "prob_state", None)
+        if prob_state is None or top_ks is not None:
+            return None
+        if self.rejection_sampler.synthetic_acceptance_rates is not None:
+            return None
+        if get_pcp_world_size() > 1:
+            return None
+        return prob_state
+
     def propose_draft_token_ids(
         self,
         batch: ScheduledBatch,
@@ -3666,6 +3729,14 @@ class ModelRunner:
         # same count.
         if draft_token is not None and get_pcp_world_size() > 1:
             draft_token = get_pcp_group().broadcast(draft_token.contiguous(), src=0)
+        prob_state = getattr(self.drafter, "prob_state", None)
+        if prob_state is not None:
+            # Which request each row of the stored q belongs to; verification
+            # of the next step uses it only if no other draft ran in between.
+            if align_only or draft_token is None:
+                prob_state.owner = None
+            else:
+                prob_state.record_owner(batch.req_ids[: batch.total_seqs_num])
         if align_only:
             return None
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,

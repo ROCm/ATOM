@@ -67,6 +67,46 @@ class DSparkProposer(Drafter):
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
+        # Opt-in probabilistic drafting (ATOM_DSPARK_PROB_DRAFT=1); allocated in
+        # `load_model`, once the shared LM head is bound.
+        self._prob_state = None
+
+    @property
+    def prob_state(self):
+        """The ``ProbDraftState`` shared with the runner's verification, or
+        None when probabilistic drafting is off."""
+        return self._prob_state
+
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        if (
+            envs.ATOM_DSPARK_PROB_DRAFT
+            and not self._with_draft
+            and hasattr(type(self.model), "_head_and_sample_prob")
+        ):
+            self._init_prob_state()
+
+    def _init_prob_state(self) -> None:
+        """Allocated before warmup and any draft graph capture: the memory
+        profile counts it and the graphs bake its addresses; the model's head
+        reads it through ``_prob_draft``. With the sharded draft head only this
+        rank's vocab columns are kept."""
+        from atom.model_ops.dspark_prob_sample import SHARDED_DRAFT, ProbDraftState
+
+        cols = int(self.model.vocab_size)
+        if SHARDED_DRAFT and self.model._sharded_markov_sample():
+            cols = int(self.model.head.weight.shape[0])
+        self._prob_state = ProbDraftState.allocate(
+            int(self.config.max_num_seqs),
+            int(self.draft_tokens_per_seq),
+            cols,
+            self.device,
+        )
+        self.model._prob_draft = self._prob_state
+        logger.info(
+            "DSpark probabilistic drafting ON (q buffer %s)",
+            tuple(self._prob_state.q.shape),
+        )
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.
@@ -725,6 +765,10 @@ class DSparkProposer(Drafter):
             running_tokens_are_unified=True,
             scheduled_tokens_gpu=self.runner.forward_vars["batch_info"].gpu[2:3],
         )
+        if self._prob_state is not None:
+            self._prob_state.begin_draft(
+                getattr(self.runner, "_dspark_draft_temps", None), scheduled_bs
+            )
         label = self.block.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
             draft_token_ids, confidence = self.block.run(running_bs, **staged)

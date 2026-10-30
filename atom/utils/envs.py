@@ -660,6 +660,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # DSpark probabilistic drafting (atom/model_ops/dspark_prob_sample.py):
+    # sample the block from q = softmax(z / T) instead of its argmax and verify
+    # with the p/q ratio test (lossless). Off by default; read when the drafter
+    # is built and at import of the sampling module.
+    "ATOM_DSPARK_PROB_DRAFT": lambda: os.getenv("ATOM_DSPARK_PROB_DRAFT", "0") == "1",
+    # With ATOM_DSPARK_PROB_DRAFT=1: block verification (Sun et al. 2024,
+    # vLLM's rejection_sample_method=block) instead of per-token min(1, p/q).
+    "ATOM_DSPARK_BLOCK_VERIFY": lambda: (
+        os.getenv("ATOM_DSPARK_BLOCK_VERIFY", "0") == "1"
+    ),
+    # Draft temperature = request temperature x this (greedy rows unchanged).
+    "ATOM_DSPARK_PROB_DRAFT_TSCALE": lambda: float(
+        os.getenv("ATOM_DSPARK_PROB_DRAFT_TSCALE", "1.0")
+    ),
+    # 1 => probabilistic drafting uses the sharded LM head whenever the greedy
+    # sampler would; 0 => always sample the all-gathered vocab.
+    "ATOM_DSPARK_PROB_SHARDED": lambda: (
+        os.getenv("ATOM_DSPARK_PROB_SHARDED", "1") == "1"
+    ),
+    # N > 0: every N verify steps log the expected acceptance of alternative
+    # drafting rules on the same rows (host syncs; diagnostics only).
+    "ATOM_DSPARK_PROB_DEBUG": lambda: int(
+        os.getenv("ATOM_DSPARK_PROB_DEBUG", "0") or 0
+    ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft
