@@ -440,7 +440,7 @@ Validation (advisory): [<what, where> — one run, this box, unverified | N/A �
 were — write it only when `$WORK/validation_report.json` exists.** Only `fetch.sh` writes
 that file, after its own identity gate confirms `repo.head`/`repo.base`/`patch_sha256`
 match this exact PR; the card gate checks for its presence the instant you write anything
-but `N/A`/`NOT RUN` there. **P0 ships no validator, so that file will not exist today —
+but `N/A`/`NOT RUN` there. **`validate-atom-pr` exists, but `REVIEW_AUTO_VALIDATE` is 0 by default, so that file is usually absent —
 do not run a test yourself and label the result `(deterministic)`.** Running one yourself
 is real evidence, just unreproducible from the card and unverified against the PR head by
 anything but your own say-so — report it as `Validation (advisory): <what, where> — one
