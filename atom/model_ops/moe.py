@@ -651,11 +651,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         if moe.use_mori_kernels and envs.ATOM_MORI_V2:
             from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
                 make_mori_v2_prepare_finalize,
-                mori_v2_all2all_manager,
             )
 
             return make_mori_v2_prepare_finalize(
-                moe, mori_v2_all2all_manager(ep_group.device_communicator)
+                moe,
+                ep_group.device_communicator.get_or_create_all2all_manager("mori_v2"),
             )
 
         all2all_manager = ep_group.device_communicator.all2all_manager

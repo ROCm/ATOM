@@ -203,29 +203,6 @@ _BORROWED_COMMUNICATOR: Any = None
 _SETTINGS_AGREED = False
 
 
-def mori_v2_all2all_manager(device_communicator: Any) -> Any:
-    """The EP group's MoRI v2 all2all manager, whose cco communicator MegaMoE
-    borrows.
-
-    Asked for by name before anything reads
-    ``device_communicator.all2all_manager``: that property creates the default
-    ("mori", v1) manager, and the backend cannot change afterwards. An aiter
-    without ``get_or_create_all2all_manager`` (before ROCm/aiter#6517) or
-    without the "mori_v2" backend (before ROCm/aiter#6618) has none to lend; it
-    gets the default manager, and MegaMoE a communicator of its own.
-    """
-    get_manager = getattr(device_communicator, "get_or_create_all2all_manager", None)
-    if get_manager is None:
-        return device_communicator.all2all_manager
-    try:
-        from aiter.dist.device_communicators.all2all import (  # noqa: F401
-            MoriV2All2AllManager,
-        )
-    except ImportError:
-        return device_communicator.all2all_manager
-    return get_manager("mori_v2")
-
-
 def _mega_communicator(
     all2all_manager: Any,
     *,
@@ -236,23 +213,21 @@ def _mega_communicator(
 ) -> Any:
     """The cco communicator a MegaMoE allocates its arena on.
 
-    The EP group's all2all manager owns it where it offers one (aiter's
-    MoriV2All2AllManager): it is created once, at the capacity asked for, and
-    destroyed with the process groups -- after close_mega_transports(). It
-    cannot grow, so it serves the first MegaMoE only; a second, differently
-    shaped one gets a communicator of its own, as does any MegaMoE on an aiter
-    whose manager lends none.
+    The EP group's MoriV2All2AllManager owns one: it is created once, at the
+    capacity asked for, and destroyed with the process groups -- after
+    close_mega_transports(). It cannot grow, so it serves the first MegaMoE
+    only; a second, differently shaped one gets a communicator of its own.
     """
     global _BORROWED_COMMUNICATOR
-    borrow = getattr(all2all_manager, "get_or_create_cco_communicator", None)
-    if borrow is not None and _BORROWED_COMMUNICATOR is None:
-        _BORROWED_COMMUNICATOR = borrow(per_rank_vmm)
-        return _BORROWED_COMMUNICATOR
-    if borrow is not None:
-        logger.warning(
-            "[MegaMoEGfx1250] the EP group's cco communicator is sized for the "
-            "first MegaMoE; this differently shaped one gets its own"
+    if _BORROWED_COMMUNICATOR is None:
+        _BORROWED_COMMUNICATOR = all2all_manager.get_or_create_cco_communicator(
+            per_rank_vmm
         )
+        return _BORROWED_COMMUNICATOR
+    logger.warning(
+        "[MegaMoEGfx1250] the EP group's cco communicator is sized for the "
+        "first MegaMoE; this differently shaped one gets its own"
+    )
     comm = _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
     _OWN_COMMUNICATORS.append(comm)
     return comm
@@ -451,8 +426,8 @@ def init_mega_transport(
     MegaMoE builds a combine for it and for bf16, and every forward then names
     the one it wants -- bf16 unless it says otherwise. See combine_wire_for_step.
 
-    ``all2all_manager`` is the EP group's; its cco communicator carries the
-    arena where it lends one (see _mega_communicator).
+    ``all2all_manager`` is the EP group's MoriV2All2AllManager; its cco
+    communicator carries the first MegaMoE's arena (see _mega_communicator).
     """
     _check_settings_agree(gate_mode)
     api = _import_mega_recipe()

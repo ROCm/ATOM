@@ -157,7 +157,7 @@ def fresh_state(monkeypatch):
     return SimpleNamespace(log=log, own=own, gathered=gathered, manager=Manager(log))
 
 
-def _build(state, max_tokens=MAX_TOKENS, situ_beta=None, activation="silu", lends=True):
+def _build(state, max_tokens=MAX_TOKENS, situ_beta=None, activation="silu"):
     return mv2.init_mega_transport(
         ep_rank=0,
         ep_size=WORLD,
@@ -176,8 +176,7 @@ def _build(state, max_tokens=MAX_TOKENS, situ_beta=None, activation="silu", lend
         swiglu_limit=0.0,
         situ_beta=situ_beta,
         combine_wire="fp4",
-        # An aiter whose manager lends no communicator: every MegaMoE owns one.
-        all2all_manager=state.manager if lends else SimpleNamespace(),
+        all2all_manager=state.manager,
     )
 
 
@@ -213,18 +212,13 @@ def test_a_second_shape_gets_its_own_communicator(fresh_state):
 
 def test_megamoes_of_equal_size_never_share_a_communicator(fresh_state):
     # Different recipes, the same arena size: each is sized for one arena.
-    first = _build(fresh_state, lends=False)
-    second = _build(fresh_state, activation="gelu", lends=False)
-    assert first is not second
-    assert first.communicator is not second.communicator
-    assert (
-        mv2._OWN_COMMUNICATORS
-        == fresh_state.own
-        == [
-            first.communicator,
-            second.communicator,
-        ]
-    )
+    first = _build(fresh_state)
+    second = _build(fresh_state, activation="gelu")
+    third = _build(fresh_state, activation="relu")
+    assert first.communicator is fresh_state.manager.comm
+    assert second.communicator is not third.communicator
+    assert mv2._OWN_COMMUNICATORS == fresh_state.own
+    assert fresh_state.own == [second.communicator, third.communicator]
 
 
 def test_ranks_with_different_settings_are_refused(fresh_state, monkeypatch):
