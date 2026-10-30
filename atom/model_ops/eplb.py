@@ -1549,9 +1549,23 @@ class ExpertLoadMonitor:
         self._step_load_window: torch.Tensor | None = None
         self._step_slot = 0
         self._step_filled = 0
+        # Who a step's load belongs to. Routed locally (all2all MoE) each rank
+        # records its own rows, so a rank commits its pass when it prefilled.
+        # Routed after a DP gather every rank records the group's rows alike:
+        # one owner commits that histogram each step, prefilling itself or
+        # not, so the group sum counts a step once however many ranks prefill.
+        self._routes_gathered = False
+        self._step_owner = True
 
     def set_load_group(self, group: Any) -> None:
         self._load_group = group
+
+    def set_step_ownership(self, *, routes_gathered: bool, is_owner: bool) -> None:
+        """Declare whether routing is recorded after a DP gather, and whether
+        this rank is the one that commits the gathered steps (see
+        ``commit_step``)."""
+        self._routes_gathered = routes_gathered
+        self._step_owner = is_owner
 
     def initialize(
         self,
@@ -1711,11 +1725,14 @@ class ExpertLoadMonitor:
     def commit_step(self, local_load: bool) -> None:
         """Commit one global prefill step to the step-aligned window. Every rank
         of the group calls this on the same steps; ``local_load`` says whether
-        this rank's pass load belongs to it (a real pure-prefill pass)."""
+        this rank's pass load is its own prefill (a real pure-prefill pass).
+        With gathered routing the pass holds the group's load on every rank, so
+        only the step owner commits it, whatever ``local_load`` says."""
         if not self.enabled or self._step_gpu_window is None:
             return
         slot = self._step_slot
-        local = local_load and self._cur_pass_count is not None
+        owns = self._step_owner if self._routes_gathered else local_load
+        local = owns and self._cur_pass_count is not None
         gpu_row = self._step_gpu_window[slot]
         if local:
             gpu_row.copy_(
@@ -1850,6 +1867,19 @@ def _replica_spread(gathered: bool = False) -> tuple[int, int]:
     if gathered or _MANAGER is None:
         return 1, 0
     return _MANAGER.replica_spread
+
+
+def _routes_gathered(layer: Any) -> bool:
+    """Whether `layer` routes rows a DP gather made the group's, held alike by
+    every EP rank: DP attention with gather/scatter MoE instead of all2all
+    kernels (`FusedMoE.forward_impl_graph`'s `use_dp_gather_scatter`)."""
+    parallel = getattr(layer, "moe_parallel_config", None)
+    return (
+        int(getattr(layer, "dp_size", 1)) > 1
+        and parallel is not None
+        and not parallel.use_all2all_kernels
+        and bool(getattr(get_current_atom_config(), "enable_dp_attention", False))
+    )
 
 
 def collect_ep_moe_layers(model: Any) -> dict[int, Any]:
@@ -2052,6 +2082,10 @@ class EPLBManager:
             self.monitor.set_load_group(ep)
             self._ep_group = ep.device_group
             self._ep_rank = int(ep.rank_in_group)
+            self.monitor.set_step_ownership(
+                routes_gathered=_routes_gathered(layers[first_id]),
+                is_owner=self._ep_rank == 0,
+            )
             # Dedicated communicator for migration P2P (same members/order as the
             # EP group, so the ep-relative peer ranks in the migration plan stay
             # valid). Isolating migration off the EP communicator prevents its

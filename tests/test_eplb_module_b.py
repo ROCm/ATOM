@@ -631,3 +631,74 @@ def test_manual_rebalance_refuses_a_frozen_step_window(monkeypatch, caplog):
         manager.trigger_offline_rebalance(reason="test")
     assert len(plans) == 1 and shapes == []
     assert "would plan on old hotspots" in caplog.text
+
+
+def _step_rank_monitor(*, gathered, owner):
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=2)
+    monitor.track_step_load = True
+    monitor.initialize(
+        num_layers=1, num_physical=2, device=torch.device("cpu"), num_gpus=2
+    )
+    monitor.set_step_ownership(routes_gathered=gathered, is_owner=owner)
+    return monitor
+
+
+def _commit(monitor, counts, local_load):
+    monitor.on_forward_start()
+    pairs = [e for e, n in enumerate(counts) for _ in range(n)]
+    topk = torch.tensor(pairs, dtype=torch.int32).view(-1, 1)
+    monitor.record(layer_id=0, topk_physical=topk, num_physical=2)
+    monitor.commit_step(local_load)
+
+
+def _summed_step_gpu_window(monitors):
+    """What the group reduction of the per-step GPU windows yields."""
+    return sum(m._step_gpu_window[: m._step_filled].to(torch.int64) for m in monitors)
+
+
+@pytest.mark.parametrize("gathered", [True, False])
+def test_step_window_counts_each_step_once(gathered):
+    # Two ranks, one physical slot per GPU. The true per-step GPU load is
+    # [[100, 100], [100, 0]]: both ranks prefill step 1, only rank 1 step 2.
+    # Gathered routing: every rank records the group's histogram, so a commit
+    # per prefilling rank would weight step 1 double ([[200, 200], [100, 0]],
+    # balancedness 0.75 -> 0.833, skipping a rebalance at 0.8).
+    owner = _step_rank_monitor(gathered=gathered, owner=True)
+    peer = _step_rank_monitor(gathered=gathered, owner=False)
+    if gathered:  # each rank holds the group's rows: the same histogram
+        _commit(owner, [100, 100], local_load=True)
+        _commit(peer, [100, 100], local_load=True)
+        _commit(owner, [100, 0], local_load=False)  # rank 0 has no prefill
+        _commit(peer, [100, 0], local_load=True)
+    else:  # each rank records its own rows
+        _commit(owner, [50, 50], local_load=True)
+        _commit(peer, [50, 50], local_load=True)
+        _commit(owner, [0, 0], local_load=False)
+        _commit(peer, [100, 0], local_load=True)
+    window = _summed_step_gpu_window([owner, peer])
+    assert window[:, 0].tolist() == [[100, 100], [100, 0]]
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=owner,
+        rebalance_interval=2,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+        placement_policy="step_peak",
+    )
+    assert manager._step_balancedness(window) == pytest.approx(0.75)
+
+
+def test_routes_gathered_only_for_dp_attention_gather_scatter(monkeypatch):
+    def layer(dp_size, all2all):
+        return types.SimpleNamespace(
+            dp_size=dp_size,
+            moe_parallel_config=types.SimpleNamespace(use_all2all_kernels=all2all),
+        )
+
+    config = types.SimpleNamespace(enable_dp_attention=True)
+    monkeypatch.setattr(eplb, "get_current_atom_config", lambda: config)
+    assert eplb._routes_gathered(layer(4, False))
+    assert not eplb._routes_gathered(layer(4, True))  # all2all: routed locally
+    assert not eplb._routes_gathered(layer(1, False))  # no DP: nothing gathered
+    config.enable_dp_attention = False
+    assert not eplb._routes_gathered(layer(4, False))
