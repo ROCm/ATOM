@@ -1466,6 +1466,232 @@ models:
       fewshot: 3
       limit: null
 
+  # PR #2747 at 7742552f: high-concurrency NVFP4 recipe, adapted to P/D.
+  # Runtime dependencies: #2686, #2743, #2744, #2745, #2746.
+  MiniMax-M3.1-Flash-Quark-MXFP4:
+    backend: atom
+    image: rocm/atom-dev:nightly_202610261558
+    model_path: amd/MiniMax-M3.1-Flash-Quark-MXFP4
+    precision: MXFP4
+    env:
+      common:
+        AITER_LOG_LEVEL: WARNING
+        ATOM_FORCE_ATTN_TRITON: "1"
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "1"
+        ATOM_MONO_ENABLE: "1"
+        ATOM_M3_DSPARK_DRAFT_PTPC: "1"
+        # NVFP4 uses the vendored SGLang sparse kernel, not FlyDSL PA.
+        ATOM_M3_SPARSE_KV_NVFP4: "1"
+        ATOM_M3_FUSED_VERIFY_TOPK: "1"
+        MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
+        HF_HUB_CACHE: "${ATOMESH_MODEL_ROOT}/.huggingface/hub"
+        HF_HUB_DOWNLOAD_TIMEOUT: "120"
+    server:
+      common_args:
+        served_model_name: MiniMaxAI/MiniMax-M3.1-Flash
+        trust_remote_code: true
+        # The sparse target uses NVFP4 via the env; the draft retains FP8 KV.
+        kv_cache_dtype: fp8
+        block_size: 128
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.9
+        max_model_len: 1048576
+        max_num_seqs: 64
+        max_num_batched_tokens: 32768
+        online_quant_config: >-
+          {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","vision_tower","multi_modal_projector","patch_merge_mlp","*block_sparse_moe"]}
+        method: dspark
+        draft_model: amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark
+        num_speculative_tokens: 7
+        extra_args: "--index-cache-dtype fp4"
+    service:
+      prefill:
+        cudagraph: &m31_capture_c32 "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64]"
+      decode:
+        cudagraph: *m31_capture_c32
+    suites:
+      accuracy:
+        - name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-gsm8k-5shot-c32
+          topology: 1p1d
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [4096]
+          osl: 1024
+          concurrency: [32]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          env:
+            common:
+              MC_DISABLE_HIP: "1"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32]
+      mooncake_store:
+        - &m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32
+          topology: 1p1d
+          display_topology: 1P1D-TP4-DSPARK7-NVFP4-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [32]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 1
+            tp: 4
+          server:
+            common_args:
+              # Recipe #2747: SGLang golden AL; performance only.
+              spec_decode_acceptance_length: 4.04
+          env:
+            common: &m31_flash_mcstore_common_env
+              MC_DISABLE_HIP: "1"
+              MC_NUM_QP_PER_EP: "1"
+              PYTHONNOUSERSITE: "1"
+              PYTHONHASHSEED: "0"
+              ATOMESH_TORCH_PROFILE_DURATION: "0"
+            prefill: &m31_flash_mcstore_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              MOONCAKE_STORE: "1"
+              # TW MI355X: 1 TiB Store, two owners; reserve host RAM for traces.
+              MOONCAKE_STORE_OWNERS: "0:512:rdma4,rdma5;1:512:rdma6,rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            decode: &m31_flash_mcstore_decode_env
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          benchmark:
+            kind: aiperf_agentic
+            agentx_harness_version: "1.0.12"
+            agentx_recipe_defaults: true
+            scenario: agentx
+            max_context_length: 1048576
+            public_dataset: semianalysis_cc_traces_weka_062126
+            benchmark_duration: 3600
+            http_tcp_user_timeout: 900000
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+          run_eval: false
+
+        # Same C32 recipe and prefill budget; isolate incremental P->D transfer.
+        - &m31_flash_mcstore_chunked_c32
+          <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32
+          env:
+            common: *m31_flash_mcstore_common_env
+            prefill:
+              <<: *m31_flash_mcstore_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_mcstore_decode_env
+
+        # C32 chunked transfer with a smaller per-step token budget.
+        - <<: *m31_flash_mcstore_chunked_c32
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-chunked-mbt8192-c32
+          server:
+            common_args:
+              max_num_batched_tokens: 8192
+              spec_decode_acceptance_length: 4.04
+
+        - <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c48
+          concurrency: [48]
+          server:
+            common_args:
+              max_num_seqs: 96
+              spec_decode_acceptance_length: 4.04
+          prefill:
+            workers: 1
+            tp: 4
+            cudagraph: &m31_capture_c48 "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96]"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: *m31_capture_c48
+
+        # C64 extends the recipe's >=32 band; the published ladder stops at C48.
+        - <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c64
+          concurrency: [64]
+          server:
+            common_args:
+              max_num_seqs: 128
+              spec_decode_acceptance_length: 4.04
+          prefill:
+            workers: 1
+            tp: 4
+            cudagraph: &m31_capture_c64 "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128]"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: *m31_capture_c64
+
+        # C88 extends the same band, keeping max-num-seqs at twice client concurrency.
+        - <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c88
+          concurrency: [88]
+          server:
+            common_args:
+              max_num_seqs: 176
+              spec_decode_acceptance_length: 4.04
+          prefill:
+            workers: 1
+            tp: 4
+            cudagraph: &m31_capture_c88 "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176]"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: *m31_capture_c88
+
+      profile:
+        - <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32-profile
+          env:
+            common:
+              <<: *m31_flash_mcstore_common_env
+              # Relative to the formal Profiling phase, after warmup.
+              ATOMESH_TORCH_PROFILE_START: "1800"
+              ATOMESH_TORCH_PROFILE_DURATION: "30"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_RECORD_SHAPES: "0"
+              ATOM_PROFILER_WITH_STACK: "0"
+              ATOM_PROFILER_PROFILE_MEMORY: "0"
+              ATOM_PROFILER_TIMEOUT: "3600"
+            prefill: *m31_flash_mcstore_prefill_env
+            decode: *m31_flash_mcstore_decode_env
+    accuracy:
+      task: gsm8k
+      fewshot: 5
+      limit: null
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      batch_size: 65
+      max_gen_toks: 16384
+      apply_chat_template: true
+      fewshot_as_multiturn: true
+
   MiniMax-M3-MXFP4:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3-MXFP4"
