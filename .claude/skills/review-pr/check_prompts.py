@@ -277,6 +277,40 @@ def check_publish_needs_post_flag():
     return 0
 
 
+def check_publish_review_is_advisory():
+    """The card goes up as a PR review, and a review carries an `event`. COMMENT leaves the
+    bot advisory; APPROVE or REQUEST_CHANGES would make it a merge gate -- which is a
+    different thing from what the workflow's `contents: read` was reasoned about, and a
+    change no one would see in a diff that only touches a JSON literal. Pin the event, and
+    pin that the one POST in the file is the review call."""
+    miss = _missing(HERE / "_publish.py")
+    if miss:
+        print(f"⏭️  check_publish_review_is_advisory: skipped — not yet built: "
+              f"{[p.name for p in miss]}")
+        return 0
+    src = (HERE / "_publish.py").read_text(encoding="utf-8")
+    bad = 0
+    for verdict in ("APPROVE", "REQUEST_CHANGES"):
+        if f'"{verdict}"' in src or f"'{verdict}'" in src:
+            print(f"❌ _publish.py names {verdict}; this bot is advisory and must only ever "
+                  f"send event COMMENT -- a review that gates merge changes what the "
+                  f"workflow's permissions mean")
+            bad += 1
+    posts = re.findall(r'_api\(\s*f?"([^"]+)"\s*,\s*method="POST"', src)
+    if posts != ["pulls/{pr}/reviews"]:
+        print(f"❌ _publish.py's POST call sites are {posts}; expected exactly one, "
+              f"pulls/{{pr}}/reviews -- the card is published as a review with inline "
+              f"comments, not as a top-level issue comment")
+        bad += 1
+    if '"event": "COMMENT"' not in src:
+        print("❌ _publish.py does not set event COMMENT on the review it builds")
+        bad += 1
+    if not bad:
+        print("✅ _publish.py posts exactly one review, event COMMENT, never APPROVE/"
+              "REQUEST_CHANGES")
+    return bad
+
+
 def main():
     skill = _skill_md()
     bad = 0
@@ -298,6 +332,7 @@ def main():
     bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
     bad += check_publish_needs_post_flag()
+    bad += check_publish_review_is_advisory()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
 
