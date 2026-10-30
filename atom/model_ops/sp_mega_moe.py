@@ -185,6 +185,7 @@ class SPMegaMoE:
         post_weight,
         gate_weight,
         next_weight,
+        post_eps,
         next_eps,
         fp8_output,
     ):
@@ -199,7 +200,7 @@ class SPMegaMoE:
 
         rows = attention.shape[0]
         hidden, _, post_res = _norm_input(
-            attention, residual, post_weight, self.runtime.cfg.tail_eps, False
+            attention, residual, post_weight, post_eps, False
         )
         logits = torch.nn.functional.linear(hidden, gate_weight)
         if not self.supports(layer, rows):
@@ -273,6 +274,7 @@ def _block_fake(
     gate_weight: torch.Tensor,
     next_weight: torch.Tensor,
     layer_name: str,
+    post_eps: float,
     next_eps: float,
     fp8_output: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -296,6 +298,7 @@ def sp_mega_moe_block(
     gate_weight: torch.Tensor,
     next_weight: torch.Tensor,
     layer_name: str,
+    post_eps: float,
     next_eps: float,
     fp8_output: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -311,6 +314,7 @@ def sp_mega_moe_block(
         post_weight,
         gate_weight,
         next_weight,
+        post_eps,
         next_eps,
         fp8_output,
     )
@@ -361,7 +365,8 @@ def _model_layers(model, config):
 
     The model runs each layer's FFN region through `sp_mega_moe_block`: the
     post-attention GemmaRMSNorm, the router, the experts, and the next layer's
-    input GemmaRMSNorm, all with `norm_eps`.
+    input GemmaRMSNorm, each with its own eps. The fused tail is built for
+    `norm_eps`; a next norm with another eps runs unfused.
     """
     from atom.models.registry import sp_mega_moe_layers
     from atom.utils import resolve_obj_by_qualname

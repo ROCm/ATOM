@@ -983,6 +983,7 @@ class MiniMaxM3Model(nn.Module):
                         layer.block_sparse_moe.gate.weight,
                         next_norm.weight,
                         layer.block_sparse_moe.experts.layer_name,
+                        layer.post_attention_layernorm.variance_epsilon,
                         next_norm.variance_epsilon,
                         next_fp8,
                     )

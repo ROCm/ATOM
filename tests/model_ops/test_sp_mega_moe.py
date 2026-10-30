@@ -58,7 +58,10 @@ def test_small_batches_keep_the_native_moe(monkeypatch, sp_modules, rows, use_me
     if use_mega:
         return
 
+    eps_used = []
+
     def norm(x, residual, weight, eps, fp8):
+        eps_used.append(eps)
         return x + residual, torch.ones(x.shape[0], 1), x + residual
 
     monkeypatch.setattr(fusion, "_norm_input", norm)
@@ -67,8 +70,10 @@ def test_small_batches_keep_the_native_moe(monkeypatch, sp_modules, rows, use_me
     gate = torch.zeros(128, 8, dtype=torch.bfloat16)
     weight = torch.ones(8, dtype=torch.bfloat16)
     normalized, _, residual = backend.forward_block(
-        layer, attention, attention * 3, weight, gate, weight, 1e-6, False
+        layer, attention, attention * 3, weight, gate, weight, 1e-5, 1e-6, False
     )
+    # Each norm uses its own eps, never the runtime's tail eps.
+    assert eps_used == [1e-5, 1e-6]
     x, logits = layer.forward_impl.call_args.args
     torch.testing.assert_close(x, attention * 4)
     assert logits.shape == (rows, 128)
@@ -156,10 +161,10 @@ def test_full_op_preserves_rank_rows_residual_and_output_ownership(
     before_x, before_res = x.clone(), residual.clone()
     with use_custom_atom_config(config):
         first = fusion.sp_mega_moe_block(
-            x, residual, weight, gate, weight, "e", 1e-6, fp8
+            x, residual, weight, gate, weight, "e", 1e-6, 1e-6, fp8
         )
         second = fusion.sp_mega_moe_block(
-            x, residual, weight, gate, weight, "e", 1e-6, fp8
+            x, residual, weight, gate, weight, "e", 1e-6, 1e-6, fp8
         )
     second[0].zero_()
     second[2].zero_()
