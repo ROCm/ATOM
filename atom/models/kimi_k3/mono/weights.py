@@ -125,6 +125,10 @@ def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
 
     w = _param(module, name)
     scale = getattr(module, "weight_scale", None)
+    # Since #2776 an online quant that excludes the latent projections leaves
+    # them bf16, as the checkpoint stores them; the kernels read that as is.
+    if scale is None and w.dtype == BF16:
+        return _plain_bf16(module, name, shape)
     rows, cols = shape
     _need(scale is not None, f"{name}: no weight_scale")
     _need(w.element_size() == 1, f"{name} is {w.dtype}, expected packed FP4")
@@ -256,7 +260,9 @@ def bind_kda(layer, layer_id: int, dims: Dims) -> KdaLayer:
         ),
         a_log=_as_f32(attn.A_log, dims.heads, f"{name} A_log"),
         dt_bias=_as_f32(attn.dt_bias, dims.proj, f"{name} dt_bias"),
-        on_w=_vec(attn.o_norm.weight, HEAD_DIM, f"{name} o_norm"),
+        # The model keeps o_norm in fp32 (#2776); the kernels read it as bf16,
+        # as the model itself did before.
+        on_w=_vec(attn.o_norm.weight.data.to(BF16), HEAD_DIM, f"{name} o_norm"),
         onorm_eps=_eps(attn.o_norm, f"{name} o_norm"),
         lower_bound=float(lower),
     )

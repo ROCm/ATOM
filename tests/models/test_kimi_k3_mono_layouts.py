@@ -126,6 +126,21 @@ def test_shuffled_scale_is_still_inverse_permuted():
     assert torch.equal(got, _reference(packed, scale))
 
 
+def test_an_unquantized_latent_projection_is_read_as_bf16():
+    """Since #2776 an online quant that excludes the latent projections leaves
+    them bf16, as the checkpoint stores them: no ``weight_scale`` to dequantize
+    by, so the bind reads the weight as is instead of refusing mono."""
+    from atom.models.kimi_k3.mono.weights import _mxfp4_to_bf16
+
+    weight = torch.nn.Parameter(
+        torch.randn(GATE_ROWS, GATE_COLS, dtype=torch.bfloat16), requires_grad=False
+    )
+    got = _mxfp4_to_bf16(
+        types.SimpleNamespace(weight=weight), "w_up", (GATE_ROWS, GATE_COLS)
+    )
+    assert torch.equal(got, weight.data)
+
+
 def _bf16(*shape):
     return torch.zeros(*shape, dtype=torch.bfloat16)
 
