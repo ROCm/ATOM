@@ -30,7 +30,7 @@ name: ATOM Release Package
 # segment, the way torch spells it (2.11.0+rocm10.0.0):
 #
 #   atom-0.1.7+rocm10.0.0-cp312-cp312-linux_x86_64.whl
-#   atom-0.1.7+rocm7.2.4-cp312-cp312-linux_x86_64.whl
+#   atom-0.1.7+rocm7.14.1-cp312-cp312-linux_x86_64.whl
 #
 # Both hang off the single v0.1.7 tag: the flavor that runs first creates the
 # Release, the next one uploads into it. pip keeps them apart by filename, and
@@ -246,7 +246,7 @@ jobs:
           fi
           # Published wheels already spell this as major.minor -- v0.1.5 shipped
           # atom-0.1.5+rocm7.0, +rocm7.1 and +rocm7.2 -- so keep two components
-          # rather than the SDK's full 7.2.4, or the same line would appear
+          # rather than the SDK's full 7.14.1, or the same line would appear
           # under two different names across releases.
           ROCM_VER_FULL="${ROCM_VER}"
           ROCM_VER="$(echo "${ROCM_VER}" | cut -d. -f1,2)"
@@ -466,12 +466,12 @@ jobs:
           for flavor in ${want}; do
             # The ROCm line is not always right after the "+": a build off a
             # commit that is not a tag puts the sha first, so the local segment
-            # reads +g2462800c.rocm7.2 rather than +rocm7.2. Anchor on either
+            # reads +g2462800c.rocm7.14 rather than +rocm7.14. Anchor on either
             # separator instead of the "+" alone, or every dispatch that is not
             # a release build fails this check with "found 0".
             # The flavor can be a whole version segment (rocm10.0, ending at
             # the "-" before the python tag) or a prefix of one (rocm7, which
-            # the wheel spells rocm7.2), so accept either boundary after it.
+            # the wheel spells rocm7.14), so accept either boundary after it.
             n=$(find release-wheels -type f -name "*[+.]${flavor}[-.]*.whl" | wc -l | tr -d ' ')
             if [ "${n}" -ne 1 ]; then
               echo "Expected one ${flavor} wheel, found ${n}."

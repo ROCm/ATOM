@@ -3,9 +3,6 @@ ARG BASE_IMAGE="rocm/pytorch:latest"
 ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
-# LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
-# LMCache section of atom_image.
-ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torch210@sha256:deee808c0b7c461459acffc3fafd45c7bc994e886874c18e92a09d3e95ebf98c"
 
 # OOT image extends an ATOM base image that already contains atom/aiter/mori.
 FROM ${OOT_BASE_IMAGE} AS atom_oot
@@ -330,59 +327,6 @@ RUN pip install --upgrade pip && \
         libpci-dev cmake libdw1 locales && \
     rm -rf /var/lib/apt/lists/*
 
-# ROCm 7.2.4 runtime backport used by vllm-project/vllm#55099.
-# Drop this stage once the official base image includes ordering-edge signals.
-FROM base AS build_rocm_runtime
-ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
-ARG ROCM_RUNTIME_COMMIT="b539bf7eebfd99ad0a69668caa1f4037034d501f"
-
-RUN mkdir -p /staging/lib && \
-    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then \
-        echo "Keeping the stock runtime for this non-7.2.4 base image"; exit 0; \
-    fi && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        git cmake ninja-build g++ pkg-config \
-        libelf-dev libdrm-dev libnuma-dev libdw-dev xxd && \
-    pip install --no-cache-dir CppHeaderParser==2.7.4 ply==3.11 && \
-    git init -q /src && cd /src && \
-    git remote add origin "${ROCM_SYSTEMS_REPO}" && \
-    git config remote.origin.promisor true && \
-    git config remote.origin.partialclonefilter blob:none && \
-    git sparse-checkout init --cone && \
-    git sparse-checkout set projects/rocr-runtime projects/clr projects/hip shared cmake && \
-    git fetch --filter=blob:none --depth 1 origin "${ROCM_RUNTIME_COMMIT}" && \
-    git checkout -q FETCH_HEAD && \
-    mkdir -p /opt/rocm-cmake-shim && \
-    printf 'if(NOT TARGET clang)\n  add_executable(clang IMPORTED GLOBAL)\n  set_target_properties(clang PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/clang")\nendif()\nset(Clang_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/ClangConfig.cmake && \
-    printf 'if(NOT TARGET llvm-objcopy)\n  add_executable(llvm-objcopy IMPORTED GLOBAL)\n  set_target_properties(llvm-objcopy PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/llvm-objcopy")\nendif()\nset(LLVM_FOUND TRUE)\nset(LLVM_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/LLVMConfig.cmake && \
-    cmake -S /src/projects/rocr-runtime -B /src/build-rocr -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm \
-        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
-        -DClang_DIR=/opt/rocm-cmake-shim -DLLVM_DIR=/opt/rocm-cmake-shim && \
-    cmake --build /src/build-rocr --parallel ${MAX_JOBS:-$(nproc)} && \
-    cmake --install /src/build-rocr && \
-    cmake --install /src/build-rocr --prefix /rocr-install --strip && \
-    cmake -S /src/projects/clr -B /src/build-clr -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release -DCLR_BUILD_HIP=ON -DCLR_BUILD_OCL=OFF \
-        -DHIP_COMMON_DIR=/src/projects/hip -DROCM_PATH=/opt/rocm \
-        -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_INSTALL_PREFIX=/opt/rocm \
-        -DLLVM_DIR=/opt/rocm-cmake-shim -DHIP_LLVM_ROOT=/opt/rocm/llvm && \
-    cmake --build /src/build-clr --parallel ${MAX_JOBS:-$(nproc)} && \
-    cmake --install /src/build-clr --prefix /clr-install --strip && \
-    cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ && \
-    cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ && \
-    mkdir -p /staging/.info && \
-    git rev-parse HEAD > /staging/.info/atom-rocm-runtime-commit && \
-    # Record the sonames this commit actually produced. The install step must
-    # not assume .so.1/.so.7: if a future ROCM_RUNTIME_COMMIT bumps a major the
-    # cp above succeeds under the new name while a hardcoded readlink resolves
-    # to the still-present stock symlink, and the fixup then hard-links stock
-    # onto stock and reports success.
-    ( cd /staging/lib && ls -1 libhsa-runtime64.so.* libamdhip64.so.* \
-        | grep -E '\.so\.[0-9]+$' ) > /staging/.info/atom-rocm-runtime-sonames && \
-    test -s /staging/.info/atom-rocm-runtime-sonames
-
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
 # --------------------------------------------------------------------
@@ -415,9 +359,6 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     pip install -r requirements.txt && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
-
-# The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
-FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 
 # --------------------------------------------------------------------
 # Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
@@ -566,55 +507,41 @@ RUN echo "========== Install atomesh binary ==========" && \
     cp target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
 
-# ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
-# Install a wheel built for the image's exact PyTorch ABI. Keep --no-deps so
-# pip cannot replace the preinstalled ROCm torch stack. The wheel comes from
-# LMCACHE_WHEEL_IMAGE, a FROM scratch image holding only the wheel, which
-# .github/workflows/lmcache-rocm-wheel.yaml pushes to Docker Hub; the same
-# workflow opens the PR that moves the pin. The expected lmcache.__version__
-# follows from the wheel name; the ABI suffix and wheel tag are the workflow's
-# ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
-# image's torch.
-ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45eb6164cc03
-RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
-    echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
-    set -- /tmp/lmcache-wheel/*.whl && \
-    { [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "Expected one wheel in LMCACHE_WHEEL_IMAGE, found: $*"; exit 1; }; } && \
-    lmcache_wheel="$1" && \
-    lmcache_version="$(basename "${lmcache_wheel}" | sed -nE \
-        's/^lmcache-([^-]+\.rocm7\.2\.4\.torch2\.10\.git3d3aa833\.cxx11abi1)-cp312-cp312-manylinux_2_39_x86_64\.whl$/\1/p')" && \
-    { [ -n "${lmcache_version}" ] || { echo "Unexpected LMCache wheel ${lmcache_wheel}"; exit 1; }; } && \
-    echo "${LMCACHE_WHEEL_SHA256}  ${lmcache_wheel}" | sha256sum -c - && \
+# ========== LMCache for KV offload ==========
+# LMCache publishes no ROCm wheel for this torch (every rocm asset on their
+# releases is built for ROCm 7.2 / torch 2.10), so build the pinned commit here
+# against the image's torch, with the HIP recipe of LMCache's own
+# .github/scripts/build_rocm_torch210_wheel.sh. The commit must carry the ATOM
+# MP adapters (lmcache.integration.atom) that atom/kv_transfer/offload/mp runs
+# on; validate_lmcache_wheel_for_atom.py fails the build otherwise.
+# LMCACHE_VERSION is what setuptools-scm derives for LMCACHE_COMMIT from full
+# history (last stable tag + distance); the shallow fetch has no tags, so it is
+# passed explicitly and has to move with the commit. hipcc is on PATH via
+# /opt/rocm/bin. Docker builds do not expose a GPU, so the validator overrides
+# LMCache's torch.cuda.is_available() backend predicate.
+ARG LMCACHE_COMMIT=f22dec2832124ea4ffeb464553b819a6369d4a30
+ARG LMCACHE_VERSION=0.5.6.dev139+gf22dec28
+RUN echo "========== [ATOM] LMCache ${LMCACHE_VERSION} HIP build (arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+    git init -q /opt/LMCache && cd /opt/LMCache && \
+    git remote add origin https://github.com/LMCache/LMCache.git && \
+    git fetch --depth 1 origin "${LMCACHE_COMMIT}" && \
+    git checkout -q FETCH_HEAD && \
+    "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
+    PATH="${PATH}:/opt/rocm/bin" BUILD_WITH_HIP=1 CXX=hipcc \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${LMCACHE_VERSION}" \
+        "${VENV_PYTHON}" -m pip wheel . --no-build-isolation --no-deps \
+            --wheel-dir /tmp/lmcache-dist && \
     "${VENV_PYTHON}" -m pip install \
-        prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
-        blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
-        cachetools cryptography numba openai \
-        opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
-        opentelemetry-exporter-otlp==1.40.0 \
-        opentelemetry-exporter-prometheus==0.61b0 \
-        "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
-    "${VENV_PYTHON}" -m pip install --no-deps "${lmcache_wheel}" && \
-    "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
-from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
-from lmcache.v1.memory_management import MemoryFormat; \
-from lmcache.v1.lookup_client.factory import LookupClientFactory; \
-from lmcache.v1.config import LMCacheEngineConfig; \
-from lmcache.v1.metadata import LMCacheMetadata; \
-from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPTransferSpec, AtomMPWorkerAdapter; \
-from lmcache.utils import EngineType; \
-from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
-assert 'rocm' in torch.__version__, torch.__version__; \
-assert lmcache.__version__ == '${lmcache_version}', lmcache.__version__; \
-assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
-assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
-assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
-assert EngineType.ATOM.value == 'atom'; \
-assert DeviceMessagingFuture.__module__ == 'lmcache.v1.multiprocess.futures'; \
-assert AtomMPTransferSpec.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)"
+        ${ROCM_INDEX_URL:+--extra-index-url "${ROCM_INDEX_URL}"} \
+        -r requirements/common.txt \
+        cupy-rocm-7-0 && \
+    "${VENV_PYTHON}" -m pip install --no-deps /tmp/lmcache-dist/lmcache-*.whl && \
+    # common.txt pins prometheus_client<=0.24.1, downgrading ATOM's required
+    # >=0.25; restore ATOM's pin (lmcache only uses it for optional metrics).
+    "${VENV_PYTHON}" -m pip install "prometheus_client==0.25.0" && \
+    cd / && rm -rf /opt/LMCache /tmp/lmcache-dist && \
+    "${VENV_PYTHON}" /app/ATOM/.github/scripts/validate_lmcache_wheel_for_atom.py \
+        --expected-version "${LMCACHE_VERSION}"
 
 # ========== AgentX harness (agentic benchmark client) ==========
 # agentx-harness is the client InferenceX benchmarks with: every one of its
@@ -638,42 +565,5 @@ RUN if [ "${INSTALL_AGENTX_HARNESS}" = "1" ]; then \
     else \
         echo "========== Skipped agentx-harness (INSTALL_AGENTX_HARNESS=0) =========="; \
     fi
-
-# Install the paired runtime after dependency installation. Preserve old image
-# tags for rollback; changing ROCM_RUNTIME_COMMIT selects a different backport.
-COPY --from=build_rocm_runtime /staging/ /opt/rocm/
-# Hard links rather than symlinks: ldconfig rewrites SONAME symlinks but cannot
-# re-point an inode, so absolute-path loads of the old versioned filenames have
-# to land on the new inode. This is upstream vLLM's replacement method.
-RUN set -eux; \
-    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then exit 0; fi; \
-    # The builder ran for this flavor, so its outputs have to be here. Failing
-    # closed is the point: publishing an image that silently carries the stock
-    # runtime is the failure this stage exists to prevent.
-    test -s /opt/rocm/.info/atom-rocm-runtime-commit; \
-    test -s /opt/rocm/.info/atom-rocm-runtime-sonames; \
-    cd /opt/rocm/lib; \
-    while read -r soname; do \
-        [ -n "$soname" ] || continue; \
-        # readlink -f exits 0 and prints the would-be path for a DANGLING link.
-        # Without this guard a COPY that did not deliver the target makes the
-        # touch below CREATE a 0-byte file, which the loop then hard-links over
-        # the real runtime. set -eux cannot see any of that.
-        if [ -L "$soname" ]; then [ -e "$soname" ]; fi; \
-        ours="$(readlink -f "$soname")"; \
-        [ -s "$ours" ]; \
-        # touch forces the overlayfs copy-up that lets the layer tar record the
-        # hard links below as aliases instead of as separate copies.
-        touch "$ours"; \
-        for f in "$soname".*; do \
-            [ -f "$f" ] && [ ! -L "$f" ] || continue; \
-            [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
-        done; \
-    done < /opt/rocm/.info/atom-rocm-runtime-sonames; \
-    ldconfig; \
-    # Prove the swap landed. Until this exists every failure path above ends in
-    # a successfully published image carrying the stock runtime.
-    hsa="$(grep -m1 '^libhsa-runtime64\.so\.' /opt/rocm/.info/atom-rocm-runtime-sonames)"; \
-    nm -D "/opt/rocm/lib/$hsa" | grep -q hsa_amd_signal_create_v2
 
 CMD ["/bin/bash"]

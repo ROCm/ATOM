@@ -14,7 +14,7 @@ on:
         type: boolean
         default: true
       base_image_override:
-        description: "Build one literal base image instead of the lines above, e.g. rocm/pytorch:latest or rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0. Publishes under a suffix read from the image."
+        description: "Build one literal base image instead of the lines above, e.g. rocm/pytorch:latest or rocm/pytorch:rocm7.14.1_ubuntu24.04_py3.12_pytorch_release_2.11.0. Publishes under a suffix read from the image."
         default: ""
       atom_repo:
         description: "ATOM repo"
@@ -229,14 +229,17 @@ jobs:
           EXTRA_BUILD_ARGS=""
 
           case "${FLAVOR}" in
+            # rocm-sdk-base is a stage inside atom_release.dockerfile, not an
+            # image to pull: the ROCm stack is assembled from AMD's wheel
+            # channels on plain ubuntu:24.04. Its defaults are the rocm7 line
+            # (ROCm 7.14.1 from repo.amd.com/rocm/whl-multi-arch); other lines
+            # override the SDK version and index.
             rocm7)
-              BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
+              BASE_IMAGE="rocm-sdk-base"
               ;;
             rocm10.0)
-              # rocm10-base is a stage inside atom_release.dockerfile, not an
-              # image to pull: the ROCm 10 stack is assembled from the AMD
-              # stable wheel channel on plain ubuntu:24.04.
-              BASE_IMAGE="rocm10-base"
+              BASE_IMAGE="rocm-sdk-base"
+              EXTRA_BUILD_ARGS="--build-arg ROCM_SDK_VERSION=10.0.0 --build-arg ROCM_INDEX_URL=https://stable.repo.amd.com/rocm/whl-next/"
               ;;
             */*|*:*)
               # A literal image reference, for a one-off build on something

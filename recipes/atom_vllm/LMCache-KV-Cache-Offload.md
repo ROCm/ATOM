@@ -38,34 +38,23 @@ LMCache CPU offload delivers **1.8× lower avg TTFT** and **59% more requests** 
 docker pull rocm/atom-dev:vllm-latest
 ```
 
-## Step 2: Build LMCache from Source
+## Step 2: Verify the Bundled LMCache
 
-The PyPI `lmcache` wheel ships CUDA-linked binaries that do not work on ROCm. Build from source with `BUILD_WITH_HIP=1` to get native HIP KV transfer kernels:
+The PyPI `lmcache` wheel ships CUDA-linked binaries that do not work on ROCm, so the image builds LMCache from source with `BUILD_WITH_HIP=1` against its own torch (`0.5.6.dev139+gf22dec28`, see the LMCache step of [`docker/atom_release.dockerfile`](../../docker/atom_release.dockerfile)). Nothing needs to be installed; check that the native HIP KV transfer kernels are there:
 
 ```bash
 # Inside the container
-git clone --depth 1 https://github.com/LMCache/LMCache.git /tmp/LMCache
-cd /tmp/LMCache && BUILD_WITH_HIP=1 pip install -e . --no-build-isolation --no-deps
-
-# Install required runtime dependencies (skip CUDA-only packages)
-pip install aiofile aiofiles blake3 msgspec sortedcontainers redis pyzmq
-
-# Uninstall any CUDA transitive deps that may have been pulled in
-pip uninstall -y nixl nixl-cu12 nixl-cu13 cupy-cuda12x cupy-cuda13x \
-    cufile-python cuda-pathfinder cuda-bindings cuda-toolkit 2>/dev/null
+python3 -c "import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; print(lmcache.__version__, lmcache.cuda_ops.__file__)"
+# Expected: 0.5.6.dev139+gf22dec28 .../site-packages/lmcache/cuda_ops<...>.so
 ```
 
-Verify the HIP backend loads:
+The ROCm 10 images (`*-rocm10.0` tags) ship LMCache 0.4.5 instead, whose HIP extension is `lmcache.c_ops`: check it with `python3 -c "import lmcache, lmcache.c_ops; print(lmcache.__version__, lmcache.c_ops.__file__)"`.
 
-```bash
-python3 -c "import lmcache" 2>&1 | grep "Using backend"
-# Expected: Using backend: lmcache.c_ops
-# NOT:      Fallback to python backend lmcache.non_cuda_equivalents
-```
-
-> **Important:** If you see `non_cuda_equivalents`, the source build did not compile the HIP
-> kernels. Re-run the build step and check for compilation errors. The Python fallback
-> backend adds significant serialization overhead that negates the caching benefit.
+> **Important:** An `ImportError` here, or the server log warning
+> `lmcache.cuda_ops compiled extension not found; CudaDeviceOps stays on the torch baseline for all ops.`,
+> means the HIP kernels are missing. The torch baseline adds significant overhead that negates the
+> caching benefit. For a custom image, build LMCache the way the Dockerfile step above does (pinned
+> commit, `BUILD_WITH_HIP=1 CXX=hipcc`, `SETUPTOOLS_SCM_PRETEND_VERSION`).
 
 ## Step 3: Launch vLLM Server with LMCache
 
@@ -119,11 +108,11 @@ Create the disk directory before launching: `mkdir -p /path/to/nvme/lmcache_disk
 
 ## Step 4: Verify LMCache is Active
 
-Check the server log for LMCache initialization on each TP worker:
+Check the server log for LMCache selecting the ROCm backend on each TP worker, with no `lmcache.cuda_ops compiled extension not found` warning after it:
 
 ```
-(Worker_TP0) LMCache INFO: Using backend: lmcache.c_ops
-(Worker_TP1) LMCache INFO: Using backend: lmcache.c_ops
+(Worker_TP0) LMCache INFO: Auto-selected backend [rocm] for accelerator 'cuda' from candidate backends [cuda, rocm].
+(Worker_TP1) LMCache INFO: Auto-selected backend [rocm] for accelerator 'cuda' from candidate backends [cuda, rocm].
 ```
 
 Send the same prompt twice and verify cache hits:
