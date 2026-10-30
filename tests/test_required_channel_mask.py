@@ -28,7 +28,7 @@ from atom.sampling_params import UNCONSTRAINED, RequiredChannel
 
 V = 64
 # after = 10 11 12, opening = 20 21, end ids 2 and 3. States: 0-2 matching,
-# 3 forces 20, 4 forces 21, 5 open.
+# 3 forces 20, 4 forces 21; written, the channel is open and UNCONSTRAINED.
 CH = RequiredChannel(after=(10, 11, 12), opening=(20, 21), end_ids=(2, 3))
 NEG_INF = float("-inf")
 
@@ -53,19 +53,28 @@ def _kind(row, original):
 
 
 def test_decode_rows_follow_their_state():
-    states = torch.tensor([0, 2, 3, 4, CH.open_state, UNCONSTRAINED], dtype=torch.int32)
+    states = torch.tensor([0, 2, 3, 4, UNCONSTRAINED], dtype=torch.int32)
     logits = _logits(len(states))
     original = logits.clone()
     base = constrain_logits_reference(CH, states, logits)
     assert base.tolist() == states.tolist()
     kinds = [_kind(logits[i], original[i]) for i in range(len(states))]
-    assert kinds == ["ban", "ban", ("force", 20), ("force", 21), "free", "free"]
+    assert kinds == ["ban", "ban", ("force", 20), ("force", 21), "free"]
+
+
+def test_a_forced_id_the_model_ruled_out_still_leaves_a_finite_row():
+    """All -inf would be a NaN softmax: the forced logit is then 0."""
+    logits = _logits(1)
+    logits[0, 20] = NEG_INF
+    constrain_logits_reference(CH, torch.tensor([3], dtype=torch.int32), logits)
+    assert torch.isfinite(logits[0]).nonzero().view(-1).tolist() == [20]
+    assert logits[0, 20] == 0
 
 
 def test_verification_rows_walk_the_drafts_before_them():
     """Request 0 starts after `10 11` and drafts `12 20 21`: its rows are
-    constrained at states 2, 3, 4 and its bonus row at 5. Request 1 has no
-    drafts; request 2 is unconstrained."""
+    constrained at states 2, 3, 4, and its bonus row comes after the opening,
+    unconstrained. Request 1 has no drafts; request 2 is unconstrained."""
     states = torch.tensor([2, 0, UNCONSTRAINED], dtype=torch.int32)
     # Row layout of the step: request 0 holds rows 0-3, request 1 row 4,
     # request 2 rows 5-6. A row's draft is the input id after it.
@@ -110,24 +119,24 @@ def test_carried_requests_start_from_the_previous_forward():
 
 
 def test_state_after_a_step_counts_only_emitted_ids():
-    base = torch.tensor([1, 0, CH.open_state, UNCONSTRAINED], dtype=torch.int32)
+    base = torch.tensor([1, 0, 4, UNCONSTRAINED], dtype=torch.int32)
     sampled = torch.tensor(
-        [[11, 12, -1, -1], [10, -1, -1, -1], [10, 11, 12, 20], [10, 11, 12, -1]],
+        [[11, 12, -1, -1], [10, -1, -1, -1], [21, 10, 11, 12], [10, 11, 12, -1]],
         dtype=torch.int32,
     )
     assert advance_states_reference(CH, base, sampled).tolist() == [
         3,
         1,
-        CH.open_state,
+        UNCONSTRAINED,  # the last forced id opens the channel, for good
         UNCONSTRAINED,
     ]
     # A single id per row; `10` after `10` restarts the match rather than
     # dropping it.
-    plain = torch.tensor([10, 20, 2, 7], dtype=torch.int32)
+    plain = torch.tensor([10, 20, 21, 7], dtype=torch.int32)
     assert advance_states_reference(CH, base, plain).tolist() == [
         1,
         0,
-        CH.open_state,
+        UNCONSTRAINED,
         UNCONSTRAINED,
     ]
 
@@ -145,11 +154,11 @@ def _random_step(rng, device, dtype, bs, max_drafts):
         input_ids += span
         pos += n + 1
     input_ids.append(0)
-    states = [rng.choice([UNCONSTRAINED, *range(CH.open_state + 1)]) for _ in range(bs)]
+    states = [rng.choice([UNCONSTRAINED, *range(CH.open_state)]) for _ in range(bs)]
     num_prev = bs + 2
     carried_from = [rng.choice([-1, *range(num_prev)]) for _ in range(bs)]
     carried = [
-        rng.choice([UNCONSTRAINED, *range(CH.open_state + 1)]) for _ in range(num_prev)
+        rng.choice([UNCONSTRAINED, *range(CH.open_state)]) for _ in range(num_prev)
     ]
 
     def t(x):
@@ -204,3 +213,40 @@ def test_kernels_match_reference(dtype, seed):
             out.cpu().tolist()
             == advance_states_reference(CH, ref_base, sampled).tolist()
         )
+
+
+# Kimi-K3's own ids and vocabulary: forced ids far past one `BLOCK_V` tile,
+# rows wider than one, and no request carried over.
+K3 = RequiredChannel(
+    after=(163588, 12092, 163589),
+    opening=(163587, 25385, 163589, 163587, 10257, 4453, 878),
+    end_ids=(163585, 163586),
+)
+K3_VOCAB = 163840
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_kernels_match_reference_on_k3s_vocab_without_a_carry(dtype):
+    device_channel = DeviceChannel.of(K3, "cuda")
+    states = [UNCONSTRAINED, *range(K3.open_state)]
+    logits = torch.randn(len(states), K3_VOCAB, device="cuda").to(dtype)
+    logits[-1, K3.opening[-1]] = NEG_INF  # a forced id the model ruled out
+    ref = logits.cpu().clone()
+    st = torch.tensor(states, dtype=torch.int32)
+
+    base = constrain_logits(device_channel, st.cuda(), logits)
+    ref_base = constrain_logits_reference(K3, st, ref)
+    assert base.cpu().tolist() == ref_base.tolist() == states
+    assert torch.equal(logits.cpu(), ref)
+    assert torch.isfinite(logits.float()).any(dim=1).all()
+
+    # Each row writes its own next id: every state steps, the last opens.
+    sampled = torch.tensor(
+        [[5]] + [[K3.table[s]] for s in range(K3.open_state)], dtype=torch.int32
+    )
+    out = advance_states(device_channel, base, sampled.cuda())
+    assert (
+        out.cpu().tolist() == advance_states_reference(K3, ref_base, sampled).tolist()
+    )
+    assert out.cpu().tolist()[-1] == UNCONSTRAINED

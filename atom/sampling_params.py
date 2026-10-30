@@ -23,9 +23,12 @@ class RequiredChannel:
 
     A sequence's state is how far its output has got. ``0 .. len(after) - 1``
     is how much of ``after`` it currently ends with; ``len(after) + i`` means
-    the next token is ``opening[i]``; ``open_state`` means the channel is open
-    and nothing is constrained any more. The state counts generated tokens
-    only, so a sequence starts at 0 whatever its prompt ends with.
+    the next token is ``opening[i]``. Once ``opening`` is written the channel
+    is open, nothing is constrained any more, and the state becomes
+    ``UNCONSTRAINED``: the sequence drops out of its batch's channel, so a
+    batch whose requests have all opened theirs costs nothing. The state
+    counts generated tokens only, so a sequence starts at 0 whatever its
+    prompt ends with.
     """
 
     after: tuple[int, ...]
@@ -45,6 +48,8 @@ class RequiredChannel:
 
     @property
     def open_state(self) -> int:
+        """Where writing ``opening`` would take the state; ``step`` returns
+        ``UNCONSTRAINED`` instead, so no sequence is ever in it."""
         return len(self.after) + len(self.opening)
 
     @property
@@ -65,7 +70,8 @@ class RequiredChannel:
             return 1 if token_id == self.after[0] else 0
         # Forced tokens advance the state whatever they are: a row that saw a
         # different one is a rejected draft, whose state nobody reads.
-        return min(state + 1, self.open_state)
+        state += 1
+        return state if state < self.open_state else UNCONSTRAINED
 
     def advance(self, state: int, token_ids: Iterable[int]) -> int:
         for token_id in token_ids:

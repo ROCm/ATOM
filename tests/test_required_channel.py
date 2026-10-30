@@ -22,7 +22,10 @@ from atom.entrypoints.openai.tool_parser import (
     MiniMaxParser,
     QwenXmlParser,
 )
-from atom.entrypoints.openai.tool_parser.registry import required_call_channel
+from atom.entrypoints.openai.tool_parser.registry import (
+    channel_for_request,
+    required_call_channel,
+)
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -131,20 +134,9 @@ def test_k3_constrains_nothing_when_its_control_tokens_split():
     assert KimiK3Parser.required_call_channel(K3Tokenizer(split_controls=True)) is None
 
 
-def test_k3_channel_is_encoded_once_per_tokenizer():
-    class CountingTokenizer(K3Tokenizer):
-        calls = 0
-
-        def encode(self, text, add_special_tokens=False):
-            CountingTokenizer.calls += 1
-            return super().encode(text, add_special_tokens)
-
-    tokenizer = CountingTokenizer()
-    first = required_call_channel(KimiK3Parser, tokenizer, "required", TOOLS_ARG)
-    calls = CountingTokenizer.calls
-    again = required_call_channel(KimiK3Parser, tokenizer, "required", TOOLS_ARG)
-    assert again is first == K3_CHANNEL
-    assert CountingTokenizer.calls == calls
+def test_the_server_derives_k3s_channel_once_beside_its_parser():
+    assert required_call_channel(KimiK3Parser, K3Tokenizer()) == K3_CHANNEL
+    assert required_call_channel(None, K3Tokenizer()) is None
 
 
 @pytest.mark.parametrize(
@@ -152,7 +144,9 @@ def test_k3_channel_is_encoded_once_per_tokenizer():
     [DsmlParser, DsmlV41Parser, GlmParser, KimiParser, MiniMaxParser, QwenXmlParser],
 )
 def test_other_formats_stay_unconstrained_even_when_a_call_is_required(parser):
-    assert required_call_channel(parser, K3Tokenizer(), "required", TOOLS_ARG) is None
+    channel = required_call_channel(parser, K3Tokenizer())
+    assert channel is None
+    assert channel_for_request(channel, "required", TOOLS_ARG) is None
 
 
 @pytest.mark.parametrize(
@@ -160,25 +154,20 @@ def test_other_formats_stay_unconstrained_even_when_a_call_is_required(parser):
     [None, "auto", "none", {"type": "function", "function": {"name": "f"}}],
 )
 def test_k3_constrains_only_a_required_call(tool_choice):
-    assert (
-        required_call_channel(KimiK3Parser, K3Tokenizer(), tool_choice, TOOLS_ARG)
-        is None
-    )
+    assert channel_for_request(K3_CHANNEL, tool_choice, TOOLS_ARG) is None
 
 
 def test_k3_required_call_needs_tools_to_call():
-    assert required_call_channel(KimiK3Parser, K3Tokenizer(), "required", []) is None
-    assert required_call_channel(None, K3Tokenizer(), "required", TOOLS_ARG) is None
-    assert (
-        required_call_channel(KimiK3Parser, K3Tokenizer(), "required", TOOLS_ARG)
-        == K3_CHANNEL
-    )
+    assert channel_for_request(K3_CHANNEL, "required", []) is None
+    assert channel_for_request(None, "required", TOOLS_ARG) is None
+    assert channel_for_request(K3_CHANNEL, "required", TOOLS_ARG) is K3_CHANNEL
 
 
 # ── the endpoints that build a chat request's sampling params ────────────
 #
-# Each chat entrypoint resolves the channel itself; a site that stops passing
-# it samples a required request unconstrained, and nothing else would notice.
+# Each chat entrypoint gates the server's channel itself; a site that stops
+# passing it samples a required request unconstrained, and nothing else
+# would notice.
 
 
 class _Submitted(Exception):
@@ -218,6 +207,7 @@ def test_openai_chat_endpoint_hands_the_channel_to_sampling(monkeypatch, tool_ch
     monkeypatch.setattr(api_server, "reasoning_toggle", None)
     monkeypatch.setattr(api_server, "custom_message_encoder", None)
     monkeypatch.setattr(api_server, "tool_call_parser_cls", KimiK3Parser)
+    monkeypatch.setattr(api_server, "required_tool_channel", K3_CHANNEL)
     monkeypatch.setattr(api_server, "tokenizer", K3Tokenizer())
     monkeypatch.setattr(api_server, "apply_chat_template", lambda *a, **k: "prompt")
     monkeypatch.setattr(api_server, "generate_async", generate)
@@ -248,6 +238,7 @@ def test_atomesh_chat_endpoints_hand_the_channel_to_sampling(
     service.default_chat_template_kwargs = {}
     service.custom_message_encoder = None
     service.tool_parser_cls = KimiK3Parser
+    service.required_tool_channel = K3_CHANNEL
     service.tokenizer = K3Tokenizer()
     service.engine_service = types.SimpleNamespace(generate=submit, start_stream=submit)
     monkeypatch.setattr(standalone, "apply_chat_template", lambda *a, **k: "prompt")
@@ -271,11 +262,11 @@ def test_states_walk_the_failure_this_fixes():
     state = ch.advance(0, [CLOSE, RESPONSE, SEP])
     assert state == len(ch.after)  # the next token is forced
     forced = []
-    while state < ch.open_state:
+    while state >= 0:
         forced.append(ch.table[state])
         state = ch.step(state, ch.table[state])
     assert forced == list(ch.opening)
-    assert state == ch.open_state
+    assert state == UNCONSTRAINED  # open: held to nothing more
 
 
 def test_thinking_and_the_response_open_do_not_trigger():
@@ -292,9 +283,10 @@ def test_a_repeated_close_still_matches():
     assert ch.advance(0, [CLOSE, RESPONSE, CLOSE, RESPONSE, SEP]) == len(ch.after)
 
 
-def test_open_is_absorbing_and_unconstrained_never_moves():
+def test_an_opened_channel_is_unconstrained_for_good():
     ch = _toy_channel()
-    assert ch.advance(ch.open_state, [10, 11, 12, 20]) == ch.open_state
+    assert ch.advance(0, [10, 11, 12, 20, 21]) == UNCONSTRAINED
+    assert ch.advance(0, [10, 11, 12, 20, 21, 10, 11, 12]) == UNCONSTRAINED
     assert ch.advance(UNCONSTRAINED, [10, 11, 12]) == UNCONSTRAINED
 
 
@@ -353,6 +345,19 @@ def test_batch_without_a_channel_carries_none(seq_factory):
         seqs={s.id: s}, num_scheduled_tokens=[1], total_tokens_num=1, total_seqs_num=1
     )
     assert batch.required_channel is None
+    assert batch.required_channel_states is None
+
+
+def test_a_batch_whose_channels_are_all_open_carries_none(seq_factory):
+    """No states, no kernels, once every request has opened its channel."""
+    s = seq_factory([3, 4], sampling_params=_channel_params(_toy_channel()))
+    s.type = SequenceType.DECODE
+    s.required_channel_state = s.required_channel.advance(0, [10, 11, 12, 20, 21])
+    batch = ScheduledBatch(
+        seqs={s.id: s}, num_scheduled_tokens=[1], total_tokens_num=1, total_seqs_num=1
+    )
+    assert batch.required_channel is None
+    assert batch.required_channel_states is None
 
 
 def test_batch_refuses_two_channels(seq_factory):

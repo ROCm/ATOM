@@ -146,20 +146,29 @@ TOOL_CALL_PARSER_HELP = (
 
 
 def required_call_channel(
-    parser_cls: type[ToolCallParser] | None,
-    tokenizer: Any,
-    tool_choice: Any,
-    tools: list | None,
+    parser_cls: type[ToolCallParser] | None, tokenizer: Any
 ) -> RequiredChannel | None:
-    """The channel this request's output must open, or None.
+    """The channel this server holds a request that must call a tool to, in
+    its tool-call format's token ids; None where the format defines none
+    (`ToolCallParser.required_call_channel`: every format but Kimi-K3).
 
-    Only a string ``tool_choice="required"`` with tools to call, and only
-    where the format defines one (`ToolCallParser.required_call_channel`):
-    Kimi-K3 today. Every other request samples exactly as before.
+    Derived once, at startup beside `resolve_tool_call_parser`: it is fixed
+    for the server, and each request only asks `channel_for_request`.
     """
-    if parser_cls is None or tool_choice != "required" or not tools:
+    if parser_cls is None:
         return None
     return parser_cls.required_call_channel(tokenizer)
+
+
+def channel_for_request(
+    channel: RequiredChannel | None, tool_choice: Any, tools: list | None
+) -> RequiredChannel | None:
+    """The server's channel for a string ``tool_choice="required"`` with
+    tools to call; None for every other request, which samples exactly as
+    before."""
+    if channel is None or tool_choice != "required" or not tools:
+        return None
+    return channel
 
 
 def forbids_tool_calls(tool_choice: Any) -> bool:
