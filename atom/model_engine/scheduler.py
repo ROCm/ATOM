@@ -2075,6 +2075,21 @@ class Scheduler:
         if not self.running and not self.waiting and not self._rejected:
             return None
 
+        # One fresh/partial prefill per rank only on a full-group align.
+        # Escapes and the 3/4 quorum keep the normal token budget: capping
+        # those at one sequence would drain a cold queue one request per tick.
+        # DP=1 never caps; the delayer does not enter sync mode there either.
+        prefill_seq_limit = self.max_num_seqs
+        delayer = self.prefill_delayer
+        if (
+            delayer_allows
+            and delayer is not None
+            and delayer.sync_prefill
+            and delayer.dp_size > 1
+            and delayer.last_fire_aligned
+        ):
+            prefill_seq_limit = 1
+
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `delayer_allows` so cross-DP alignment still holds when one
         # rank is mid-chunked-prefill: a delayer veto skips both Phase 1 and
@@ -2083,7 +2098,7 @@ class Scheduler:
         # using the counter maintained by postprocess / preempt / finished-removal.
         if delayer_allows and self._partial_prefill_count > 0:
             for seq in self.running:
-                if num_seqs_prefill >= self.max_num_seqs:
+                if num_seqs_prefill >= prefill_seq_limit:
                     break
                 if not seq.is_partial_prefill:
                     continue
@@ -2115,7 +2130,7 @@ class Scheduler:
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
-            and num_seqs_prefill < self.max_num_seqs
+            and num_seqs_prefill < prefill_seq_limit
             and num_batched_tokens < self.max_num_batched_tokens
             and self._tick_cost < self._tick_cost_limit
         ):
