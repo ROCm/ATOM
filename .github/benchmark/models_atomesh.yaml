@@ -1574,7 +1574,8 @@ models:
         cudagraph: *m31_capture_c32
     suites:
       accuracy:
-        - name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-gsm8k-5shot-c32
+        - &m31_flash_gsm8k
+          name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-gsm8k-5shot-c32
           topology: 1p1d
           pd_worker_layout: single_node
           nodes: "${ATOMESH_1P1D_NODES}"
@@ -1602,6 +1603,36 @@ models:
           run_eval: true
           eval_only: true
           eval_concurrency: [32]
+        - <<: *m31_flash_gsm8k
+          name: minimax-m31-flash-mxfp4-tp4-index-freq1-gsm8k-c32
+          server:
+            common_args:
+              hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        - <<: *m31_flash_gsm8k
+          name: minimax-m31-flash-mxfp4-tp4-index-freq4-gsm8k-c32
+          server:
+            common_args:
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+        - <<: *m31_flash_gsm8k
+          name: minimax-m31-flash-mxfp4-tp4-index-freq1-aime24-c32
+          server:
+            common_args:
+              hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+          accuracy:
+            task: aime24
+            fewshot: 0
+            fewshot_as_multiturn: false
+            max_gen_toks: 32768
+        - <<: *m31_flash_gsm8k
+          name: minimax-m31-flash-mxfp4-tp4-index-freq4-aime24-c32
+          server:
+            common_args:
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+          accuracy:
+            task: aime24
+            fewshot: 0
+            fewshot_as_multiturn: false
+            max_gen_toks: 32768
       mooncake_store:
         - &m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32
@@ -1655,6 +1686,19 @@ models:
             wait_server_timeout: 7200
             wait_router_timeout: 600
           run_eval: false
+
+        - <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-tp4-index-freq1-mcstore-agentx-c32
+          server:
+            common_args:
+              spec_decode_acceptance_length: 4.04
+              hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        - <<: *m31_flash_mcstore_dspark7
+          name: minimax-m31-flash-mxfp4-tp4-index-freq4-mcstore-agentx-c32
+          server:
+            common_args:
+              spec_decode_acceptance_length: 4.04
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
 
         # Same C32 recipe and prefill budget; isolate incremental P->D transfer.
         - &m31_flash_mcstore_chunked_c32

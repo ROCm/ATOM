@@ -158,7 +158,7 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
         ),
         "revision": str(getattr(hf, "_commit_hash", None)),
         "codec": (
-            "m3-complete-page-v1"
+            "m3-compute-index-page-v2"
             if offcfg.select_offload_layout(config) == "m3"
             else CODEC_ID
         ),

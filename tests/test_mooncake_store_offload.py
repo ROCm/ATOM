@@ -3783,3 +3783,21 @@ def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatc
     m3_namespace = keys.store_namespace(config, CHUNK)
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: "dense")
     assert keys.store_namespace(config, CHUNK) != m3_namespace
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("use_index_cache", True),
+        ("index_topk_freq", 4),
+        ("index_topk_pattern", ["C", "S", "S", "S"]),
+        ("index_skip_topk_offset", 2),
+        ("sparse_attention_config", {"sparse_attention_freq": [1, 0, 1]}),
+    ],
+)
+def test_m3_store_namespace_fingerprints_checkpoint_index_schedule(field, value):
+    config = _config()
+    config.hf_config.model_type = "minimax_m3"
+    base = keys.store_namespace(config, CHUNK)
+    setattr(config.hf_config, field, value)
+    assert keys.store_namespace(config, CHUNK) != base

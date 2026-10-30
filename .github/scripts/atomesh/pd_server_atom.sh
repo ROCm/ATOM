@@ -783,9 +783,9 @@ if [[ -n "${NUM_SPEC_TOKENS}" ]]; then
   server_common+=(--num-speculative-tokens "${NUM_SPEC_TOKENS}")
 fi
 spec_decode_acceptance_for_server="${SPEC_DECODE_ACCEPTANCE_LENGTH}"
-if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" && "${EVAL_TASK}" == "gsm8k" ]]; then
+if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
   spec_decode_acceptance_for_server=""
-  echo "[runtime] omitting spec-decode-acceptance-length for gsm8k eval phase"
+  echo "[runtime] omitting spec-decode-acceptance-length for ${EVAL_TASK} eval phase"
 fi
 if [[ -n "${spec_decode_acceptance_for_server}" ]]; then
   server_common+=(
@@ -2663,9 +2663,9 @@ run_eval() {
     run_swebench_lite_eval
     return
   fi
-  if [[ "${EVAL_TASK}" != "gsm8k" ]]; then
-    echo "[eval] unsupported task ${EVAL_TASK}; skipping"
-    return 0
+  if [[ "${EVAL_TASK}" != "gsm8k" && "${EVAL_TASK}" != "aime24" ]]; then
+    echo "[eval] unsupported task ${EVAL_TASK}" >&2
+    return 1
   fi
   if ! command -v lm_eval >/dev/null 2>&1; then
     python3 -m pip install 'lm-eval[api]'
@@ -2702,17 +2702,17 @@ run_eval() {
   for eval_conc in "${eval_concs[@]}"; do
     eval_conc="${eval_conc//[[:space:]]/}"
     [[ -n "${eval_conc}" ]] || continue
-    tag="$(date +%Y%m%d%H%M%S)_gsm8k_${TOPOLOGY}_c${eval_conc}"
+    tag="$(date +%Y%m%d%H%M%S)_${EVAL_TASK}_${TOPOLOGY}_c${eval_conc}"
     result_dir="${RUN_DIR}/eval_results/${tag}"
 
     echo ""
     echo "========================================="
-    echo "[eval] gsm8k concurrent=${eval_conc}"
+    echo "[eval] ${EVAL_TASK} concurrent=${eval_conc}"
     echo "========================================="
 
     lm_eval --model "${EVAL_MODEL_TYPE}" \
       --model_args "${eval_model_args_base}${eval_conc},max_retries=3${eval_model_args_extra}" \
-      --tasks gsm8k \
+      --tasks "${EVAL_TASK}" \
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
@@ -2734,23 +2734,25 @@ if not json_files:
 
 result_file = max(json_files, key=lambda path: path.stat().st_mtime)
 data = json.loads(result_file.read_text(encoding="utf-8"))
-score = (
-    data.get("results", {})
-    .get("gsm8k", {})
-    .get("exact_match,flexible-extract", "N/A")
-)
+results = data.get("results", {})
+# One task per invocation; retain compatibility with standalone score checks.
+task = "aime24" if "aime24" in results else "gsm8k"
+metric = "exact_match,none" if task == "aime24" else "exact_match,flexible-extract"
+score = results.get(task, {}).get(metric, "N/A")
+if not isinstance(score, (int, float)):
+    raise SystemExit(f"[eval] FAIL: missing numeric {task} {metric}")
 print("=========================================")
-print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
+print(f"[eval] concurrent={eval_conc} {task} {metric} = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
 if threshold:
     if not isinstance(score, (int, float)) or score < float(threshold):
         raise SystemExit(
-            f"[eval] FAIL: concurrent={eval_conc} gsm8k score {score} "
+            f"[eval] FAIL: concurrent={eval_conc} {task} score {score} "
             f"is below threshold {float(threshold):.4f}"
         )
     print(
-        f"[eval] PASS: concurrent={eval_conc} gsm8k score {score:.4f} "
+        f"[eval] PASS: concurrent={eval_conc} {task} score {score:.4f} "
         f">= threshold {float(threshold):.4f}"
     )
 PY
@@ -2759,7 +2761,7 @@ PY
     fi
   done
 
-  echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
+  echo "[eval] ${EVAL_TASK} runs done, results saved to ${RUN_DIR}/eval_results"
   if (( ${#below[@]} )); then
     echo "[eval] FAIL: concurrency ${below[*]} did not pass" >&2
     return 1
@@ -2776,7 +2778,7 @@ run_benchmark_and_eval() {
     return
   fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
-    && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \
+    && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" || "${EVAL_TASK}" == "aime24" ) \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
     # Agentic performance cases require a fresh prefix/state-cache state. Run
     # their trace benchmark before any independent accuracy workload.
