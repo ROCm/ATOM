@@ -16,6 +16,8 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compressed_slots,
     qsa_draft_decode_metadata,
+    qsa_expand_block_indices,
+    qsa_select_paged_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
@@ -596,3 +598,73 @@ def test_qsa_verification_is_causal_and_matches_individual_queries(k, start):
         torch.testing.assert_close(
             batched[row : row + 1], reference, rtol=0.001, atol=0.001
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("tp", [2, 4])
+def test_qsa_row_sharded_selection_matches_whole_batch(tp):
+    """Sequence-parallel prefill selects each rank's rows and gathers the
+    groups before expanding; the result must equal the whole-batch selection."""
+    torch.manual_seed(7)
+    device, block, ratio, budget = "cuda", 64, 4, 2048
+    # A prefixed chunk and a fresh request; 2503 rows do not split evenly.
+    prefixes, query_lens = (5000, 0), (1500, 1003)
+    seq_lens = [p + q for p, q in zip(prefixes, query_lens)]
+    pages_per_req = [-(-s // block) for s in seq_lens]
+    width = max(pages_per_req)
+    pool = torch.randperm(sum(pages_per_req) + width, device=device)
+    tables = pool[: len(seq_lens) * width].view(len(seq_lens), width).to(torch.int32)
+    positions = torch.cat(
+        [torch.arange(p, p + q, device=device) for p, q in zip(prefixes, query_lens)]
+    )
+    requests = torch.cat(
+        [
+            torch.full((q,), r, dtype=torch.int32, device=device)
+            for r, q in enumerate(query_lens)
+        ]
+    )
+    lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    rows = positions.numel()
+    index_q = torch.randn(rows, 4, 128, dtype=torch.bfloat16, device=device)
+    compressed = torch.randn(
+        pool.numel(), block // ratio, 1, 128, dtype=torch.bfloat16, device=device
+    )
+    common = {
+        "token_topk": budget,
+        "compress_ratio": ratio,
+        "max_seq_len": max(seq_lens),
+    }
+    whole = qsa_select_paged_tokens(
+        index_q, compressed, tables, requests, positions, lengths, **common
+    )
+
+    chunk = -(-rows // tp)
+    shards = []
+    for rank in range(tp):
+        local = slice(rank * chunk, min((rank + 1) * chunk, rows))
+        groups, output_width = qsa_select_paged_groups(
+            index_q[local],
+            compressed,
+            tables,
+            requests[local],
+            positions[local],
+            lengths,
+            # Several logits chunks per shard: chunking must not change rows.
+            logits_workspace_bytes=200 * width * (block // ratio) * 4,
+            **common,
+        )
+        shards.append(
+            torch.nn.functional.pad(groups, (0, 0, 0, chunk - groups.shape[0]))
+        )
+    gathered = torch.cat(shards)[:rows]
+    sharded = qsa_expand_block_indices(
+        gathered,
+        positions,
+        lengths,
+        requests,
+        ratio,
+        budget,
+        output_width=output_width,
+    )
+    assert sharded.shape == whole.shape
+    assert torch.equal(sharded, whole)

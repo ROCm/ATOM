@@ -823,7 +823,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             sub_output = self.linear_attn(mixed, quantized)
         else:
-            sub_output = self.self_attn(positions, mixed, quantized)
+            sub_output = self.self_attn(positions, mixed, quantized, rows=sp)
         if sp is not None:
             sub_output = sp.scatter(sub_output)
         elif self.tp_size > 1:

@@ -56,6 +56,8 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_cache_formats,
     qsa_cache_row_layout,
     qsa_compress_groups,
+    qsa_expand_block_indices,
+    qsa_select_paged_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,
@@ -394,8 +396,16 @@ class Qwen4ExpAttention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         qsa,
+        rows=None,
     ) -> torch.Tensor:
-        """Update both index caches, then return the per-token selection."""
+        """Update both index caches, then return the per-token selection.
+
+        The indexer is replicated, so with `rows` (the caller's token sharding:
+        `start`, `chunk`, `num_tokens` and a row `gather`) each rank scores and
+        selects only its own query rows and the selected groups are
+        all-gathered before the (cheap) expansion. Every row's selection
+        depends only on its own query, so the result is the same.
+        """
         index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
         qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
         if self.rope_position_cache is not None:
@@ -429,18 +439,45 @@ class Qwen4ExpAttention(nn.Module):
                 normalized,
             )
 
-        return qsa_select_paged_tokens(
-            index_q,
+        allow_flydsl = get_forward_context().context.is_prefill
+        if rows is None:
+            return qsa_select_paged_tokens(
+                index_q,
+                self.compressed_key_cache,
+                qsa.block_tables,
+                qsa.token_to_req,
+                qsa.logical_positions,
+                qsa.seq_lens,
+                self.indexer.token_topk,
+                self.indexer.compress_ratio,
+                max_seq_len=qsa.max_seq_len,
+                allow_flydsl=allow_flydsl,
+                compressed_k_scale=self.compressed_key_scale,
+            )
+        local = slice(rows.start, min(rows.start + rows.chunk, rows.num_tokens))
+        groups, width = qsa_select_paged_groups(
+            index_q[local],
             self.compressed_key_cache,
             qsa.block_tables,
-            qsa.token_to_req,
-            qsa.logical_positions,
+            qsa.token_to_req[local],
+            qsa.logical_positions[local],
             qsa.seq_lens,
             self.indexer.token_topk,
             self.indexer.compress_ratio,
             max_seq_len=qsa.max_seq_len,
-            allow_flydsl=get_forward_context().context.is_prefill,
+            allow_flydsl=allow_flydsl,
             compressed_k_scale=self.compressed_key_scale,
+        )
+        if groups.shape[0] < rows.chunk:
+            groups = nn.functional.pad(groups, (0, 0, 0, rows.chunk - groups.shape[0]))
+        return qsa_expand_block_indices(
+            rows.gather(groups),
+            qsa.logical_positions,
+            qsa.seq_lens,
+            qsa.token_to_req,
+            self.indexer.compress_ratio,
+            self.indexer.token_topk,
+            output_width=width,
         )
 
     def forward(
@@ -448,10 +485,12 @@ class Qwen4ExpAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rows=None,
     ) -> torch.Tensor:
         """`quantized` is an optional `(fp8, scale)` copy of `hidden_states`
         that an FP8 `qkv_proj` takes instead of quantizing it again; the
-        indexer still reads the BF16 `hidden_states`."""
+        indexer still reads the BF16 `hidden_states`. `rows`: the decoder's
+        token sharding, see `_select_tokens`."""
         num_tokens = hidden_states.shape[0]
         qkv = (
             self.qkv_proj(hidden_states)
@@ -479,7 +518,7 @@ class Qwen4ExpAttention(nn.Module):
         else:
             qsa = qsa.for_tokens(num_tokens)
             self._store_kv(key, value, qsa.slot_mapping)
-            selected = self._select_tokens(hidden_states, positions, qsa)
+            selected = self._select_tokens(hidden_states, positions, qsa, rows)
             attn_out = None
             if forward_context.context.is_prefill:
                 attn_out = self._flydsl_attention(query, key, value, selected, qsa)
