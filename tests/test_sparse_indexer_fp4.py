@@ -827,7 +827,7 @@ def test_prefill_striped_rows_select_as_the_whole_batch(
 ):
     """A rank's rows of a striped TP split -- every `world`-th row, planned a
     sequence's together from its own counts -- select exactly as those rows
-    do in the whole batch, and come back at their own rows: a row grouped
+    do in the whole batch, in the rank's own slot: a row grouped
     under the wrong sequence scores another request's keys. Ragged prefix
     hits leave a rank one row of a sequence, or none; three rows in all
     leave a rank a single row, or no rows. One GPU holds one rank's slot, so
@@ -849,7 +849,9 @@ def test_prefill_striped_rows_select_as_the_whole_batch(
             batch, 512, stripe=(rank, world), new_rows=new_rows
         )
         got = score_topk(query, weights, cache, rows, **kwargs)
-        assert torch.equal(got[rank:tokens:world], full[rank::world]), rank
+        split = rows.split
+        mine = got[split.slot : split.slot + split.end]
+        assert torch.equal(mine, full[rank:tokens:world]), rank
 
 
 def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):

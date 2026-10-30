@@ -97,8 +97,7 @@ class RowSplit(NamedTuple):
         """This rank's rows of `rows` dealt round-robin: rows rank,
         rank + world, ... A prefill row's cost grows with its position, so
         contiguous shares leave the last rank the most work; striped ones
-        even it out. The gathered slots are rank-major, so the scorer
-        transposes them back to row order."""
+        even it out. The gathered slots stay rank-major (`score_topk`)."""
         _check_split_group(group)
         stride = -(-rows // world)
         count = len(range(rank, rows, world))
@@ -141,8 +140,8 @@ class IndexRows(NamedTuple):
     @property
     def out_rows(self) -> int:
         """Rows of the selection: every rank's whole slot. Under a split those
-        past the step's rows are slots' unscored tails, never used; a
-        striped split's land there once transposed back to row order."""
+        past the step's rows are slots' unscored tails, never used --
+        between slots, under a striped split, whose rows stay rank-major."""
         return self.split.stride * self.split.world
 
 

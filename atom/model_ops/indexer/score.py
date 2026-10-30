@@ -14,7 +14,7 @@ soon as it is scored, so nothing wider than one band is ever live. The result
 is `[rows, topk]` int32 column ids local to the row's request, `-1` past a
 row's bound; split across ranks (`RowSplit`: DCP, or TP for a TP-replicated
 indexer) each rank scores its share of the rows and the selections are
-all-gathered in place -- striped shares transposed back to row order.
+all-gathered in place -- striped shares left rank-major, slot after slot.
 
 Under a token graph only the FP4 launch breaks: its plan follows the step's
 requests, which a token bucket does not fix. Everything else -- the bands, the
@@ -78,14 +78,16 @@ def score_topk(
     shards); gathered here from `cache` otherwise.
 
     A striped split (`RowSplit.striped`) scores this rank's rows of `query`
-    and `weights` into its slot and returns the gathered slots in row order,
-    a new tensor: `out`, `on_band`, `keys` and `request_local=False`, which
-    read the rows in place, do not apply."""
+    and `weights` into its slot and returns the gathered slots rank-major:
+    slot r holds rows r, r + world, ..., so row i sits at
+    `(i % world) * stride + i // world` (`csa_translate_pack` reads it
+    there). `out`, `on_band`, `keys` and `request_local=False`, which assume
+    rows in order, do not apply."""
     split = rows.split
     if split.stripe:
         if not (out is None and on_band is None and keys is None and request_local):
             raise ValueError(
-                "a striped split returns its rows in a new tensor, not in place"
+                "a striped split returns its rows rank-major, not in place"
             )
         query, weights = _stripe_rows(query, weights, cache, split)
     if out is None:
@@ -100,11 +102,6 @@ def score_topk(
             query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
         )
     _gather_split(out, split)
-    if split.stripe:
-        # Slot r holds rows r, r + world, ...: row j * world + r is its j-th.
-        return (
-            out.view(split.world, split.stride, topk).transpose(0, 1).reshape(-1, topk)
-        )
     return out
 
 

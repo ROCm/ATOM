@@ -1521,7 +1521,8 @@ class Indexer(nn.Module):
             sentinels (kernel-native: prefill `top_k_per_row_prefill` and
             decode `top_k_per_row_decode` both write -1 in the tail).
             Consumer (`csa_translate_pack`) skips negative entries via its
-            `topk >= 0` write mask.
+            `topk >= 0` write mask. Rank-major under a striped row split
+            (`indexer_score_topk`).
         """
         q_quant, weights, q_scale = self.forward_pre(
             x_full, qr_full, positions, qr_full_scale
@@ -1634,7 +1635,9 @@ class Indexer(nn.Module):
         host-side short-circuit for an empty context: a row whose bound is 0
         gets all -1 from the top-k itself, so nothing is baked into a graph.
         Under the TP row split the selection carries up to tp-1 tail rows past
-        `T` (`IndexRows.out_rows`), dropped here.
+        `T` (`IndexRows.out_rows`), dropped here; a striped split's rows stay
+        rank-major, the `[:T]` view over all of its slots, which
+        `csa_translate_pack` reads through the split.
         """
         return score_topk(
             q_quant if q_scale is None else (q_quant, q_scale),
@@ -2668,6 +2671,8 @@ class DeepseekV4Attention(nn.Module):
             output of `Indexer.forward_batched`. The leading `valid_k[t]`
             cells are always >= 0; trailing cells are -1 sentinels never
             read by csa_translate_pack (filtered by `k_offs < valid_k`).
+            Rank-major under a striped row split, read through
+            `attn_md.index_rows.split`.
           positions: [total_tokens] int — global token positions; forwarded
             to csa_translate_pack so the kernel can compute per-token
             `valid_k` inline.
@@ -2695,6 +2700,8 @@ class DeepseekV4Attention(nn.Module):
             # — kernel loads from the per-token buffer.
             skip_buf = attn_md.skip_prefix_len_csa
             window_size = 0
+        index_rows = getattr(attn_md, "index_rows", None)
+        stripe = index_rows.split if index_rows is not None else None
 
         csa_translate_pack(
             topk_local_raw,
@@ -2707,6 +2714,7 @@ class DeepseekV4Attention(nn.Module):
             envelope_rows=attn_md.envelope_rows,
             csa_block_capacity=csa_block_capacity,
             window_size=window_size,
+            stripe=stripe,
             prefix=f"{self.layer_name}.csa_translate_pack",
         )
 

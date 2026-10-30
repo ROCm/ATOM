@@ -59,7 +59,8 @@ def _gathers(rank, world):
 
 def _fp8_striped_matches_whole(rank, world, committed, new_rows):
     """A V4 FP8 prefill's rows scored striped across the ranks select as the
-    whole batch on one rank, back in row order. At this size both take the
+    whole batch on one rank, row i at `(i % world) * stride + i // world` of
+    the rank-major slots. At this size both take the
     same logits kernel config, so the selections match exactly."""
     from aiter import QuantType, dtypes, get_hip_quant, indexer_k_quant_and_cache
 
@@ -131,7 +132,9 @@ def _fp8_striped_matches_whole(rank, world, committed, new_rows):
         topk=topk,
         stable=True,
     )
-    got, want = striped[:tokens].cpu(), whole.cpu()
+    row = torch.arange(tokens, device="cuda")
+    got = striped[row % world * split.stride + row // world].cpu()
+    want = whole.cpu()
     # Not vacuous: every row picks as many keys as it sees, up to top-k.
     if not torch.equal((want >= 0).sum(1), ends.cpu().long().clamp(max=topk)):
         return False

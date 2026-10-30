@@ -246,10 +246,10 @@ def test_striped_split_deals_every_row_once(world, count):
     ids=["fp8", "fp8_concat", "fp4"],
 )
 @pytest.mark.parametrize("count, world", [(13, 4), (16, 4), (3, 4), (4097, 8)])
-def test_striped_rows_come_back_in_row_order(monkeypatch, fp4, concat, count, world):
+def test_striped_rows_come_back_rank_major(monkeypatch, fp4, concat, count, world):
     """Each rank scores its rows of the step's query, every `world`-th from
-    its rank, into its slot; the slots gather rank-major, and every rank gets
-    the rows back in row order, the last slots' tails past them. A row scores
+    its rank, into its slot; the slots gather rank-major and every rank gets
+    them as they are, row i at `(i % world) * stride + i // world`. A row scores
     as its own id here, so the selection says which row landed where; its
     weights, and FP4's scales, are the same rows. FP4's kernels address their
     rows densely, so it scores copies."""
@@ -326,10 +326,13 @@ def test_striped_rows_come_back_in_row_order(monkeypatch, fp4, concat, count, wo
     for thread in threads:
         thread.join()
     assert not errors, errors
-    want = torch.arange(count, dtype=torch.int32).unsqueeze(1).expand(-1, topk)
+    stride = -(-count // world)
+    row = torch.arange(count)
+    at = row % world * stride + row // world
+    want = row.to(torch.int32).unsqueeze(1).expand(-1, topk)
     for rank in range(world):
-        assert results[rank].shape == (-(-count // world) * world, topk)
-        assert torch.equal(results[rank][:count], want), rank
+        assert results[rank].shape == (stride * world, topk)
+        assert torch.equal(results[rank][at], want), rank
 
 
 @pytest.mark.parametrize(
@@ -343,9 +346,8 @@ def test_striped_rows_come_back_in_row_order(monkeypatch, fp4, concat, count, wo
     ids=["out", "on_band", "keys", "request_global"],
 )
 def test_striped_split_refuses_to_read_its_rows_in_place(kwargs):
-    """A striped split hands its selection back transposed, in a new tensor:
-    `out` would hold rank-major slots, and the rest read rows where they are
-    scored."""
+    """A striped split hands its selection back rank-major: `out`,
+    `on_band`, `keys` and request-global ids all assume rows in order."""
     split = rows_module.RowSplit.striped(4, 0, 2)
     rows = rows_module.IndexRows(
         torch.zeros(split.end, dtype=torch.int32), 1, ((0, split.end),), split
@@ -362,11 +364,14 @@ def test_striped_split_refuses_to_read_its_rows_in_place(kwargs):
     [(13, 4), (16, 4), (3, 4), (1, 2), (4097, 8)],
     ids=["max_tail", "no_tail", "short_tail", "one_row_max_tail", "tp8_max_tail"],
 )
-def test_the_model_s_entry_returns_the_step_s_rows_in_order(monkeypatch, count, world):
-    """A striped split's selection carries its slots' tails past the step's
-    rows (`IndexRows.out_rows`), from none to world - 1 rows; the V4
-    indexer's op entry hands back the step's rows alone, row i at row i, in
-    the shape its fake promises a compiled graph."""
+def test_the_model_s_entry_keeps_every_slot_behind_the_step_s_rows(
+    monkeypatch, count, world
+):
+    """A striped split's selection is `IndexRows.out_rows` rank-major rows,
+    its slots' tails among them; the V4 indexer's op entry hands back a
+    view of the step's row count, in the shape its fake promises a compiled
+    graph, whose storage still holds every slot for `csa_translate_pack` to
+    read through the split."""
     import atom.models.deepseek_v4 as v4
     from atom.model_ops.module_dispatch_ops import _indexer_score_topk_fake
 
@@ -376,9 +381,13 @@ def test_the_model_s_entry_returns_the_step_s_rows_in_order(monkeypatch, count, 
         torch.zeros(split.end, dtype=torch.int32), 1, ((0, split.end),), split
     )
 
+    scored = []
+
     def score_topk(query, weights, cache, rows, *, topk, weight_scale):
         # Each row's selection tagged with its row.
-        return torch.arange(rows.out_rows, dtype=torch.int32)[:, None].repeat(1, topk)
+        tags = torch.arange(rows.out_rows, dtype=torch.int32)
+        scored.append(tags[:, None].repeat(1, topk))
+        return scored[-1]
 
     monkeypatch.setattr(v4, "score_topk", score_topk)
     monkeypatch.setattr(
@@ -391,4 +400,54 @@ def test_the_model_s_entry_returns_the_step_s_rows_in_order(monkeypatch, count, 
     got = v4.Indexer.indexer_score_topk(layer, query, weights, None, topk)
     fake = _indexer_score_topk_fake(query, weights, None, "layer", topk)
     assert got.shape == fake.shape == (count, topk)
-    assert torch.equal(got[:, 0], torch.arange(count, dtype=torch.int32))
+    # A view of the selection itself, every slot behind it.
+    assert got.data_ptr() == scored[0].data_ptr() and got.is_contiguous()
+    held = got.untyped_storage().nbytes() // got.element_size()
+    assert held >= rows.out_rows * topk
+
+
+@pytest.mark.parametrize(
+    "state, split",
+    [
+        ("PREFILL_NATIVE", rows_module.RowSplit.striped(13, 1, 4)),
+        ("PREFILL_NATIVE", rows_module.RowSplit.of(13)),
+        ("DECODE", rows_module.RowSplit.of(13)),
+    ],
+    ids=["prefill_striped", "prefill_whole", "decode"],
+)
+def test_the_csa_pack_reads_the_selection_through_the_step_s_split(
+    monkeypatch, state, split
+):
+    """The CSA pack is handed the split the indexer scored under -- the same
+    `attn_metadata.index_rows` -- so a striped split's rank-major rows are
+    read as rows, and rows in order as they are."""
+    import atom.models.deepseek_v4 as v4
+
+    seen = {}
+    monkeypatch.setattr(
+        v4, "csa_translate_pack", lambda *args, **kwargs: seen.update(kwargs)
+    )
+    rows = rows_module.IndexRows(
+        torch.zeros(split.end, dtype=torch.int32), 1, ((0, split.end),), split
+    )
+    attn_md = SimpleNamespace(
+        state=getattr(v4.AttnState, state),
+        index_rows=rows,
+        **dict.fromkeys(
+            (
+                "kv_indptr_csa",
+                "kv_indices_csa",
+                "kv_indptr_prefix_csa",
+                "kv_indices_prefix_csa",
+                "skip_prefix_len_csa",
+                "block_tables",
+                "batch_id_per_q_token",
+            )
+        ),
+        envelope_rows=8,
+    )
+    layer = SimpleNamespace(window_size=128, layer_name="layer")
+    v4.DeepseekV4Attention._fill_csa_paged_compress(
+        layer, attn_md, torch.zeros(13, 4), torch.zeros(13), 13
+    )
+    assert seen["stripe"] is split
