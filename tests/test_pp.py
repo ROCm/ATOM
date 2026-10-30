@@ -1213,3 +1213,25 @@ def test_hold_is_released_even_if_the_seq_left_running(filer):
         )
         sched.postprocess([], out, batch=batch)
     assert seq.id not in sched._pp_checkpoint_hold
+
+
+def test_hold_is_released_even_if_hashing_raises():
+    # The head loop logs a failed filing and carries on; the seqs after the
+    # one that raised must not stay out of the prefill scan forever.
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=512,
+            kv_cache_block_size=16,
+            enable_prefix_caching=True,
+        )
+    )
+    seqs = [_make_seq(400), _make_seq(400)]
+    for seq in seqs:
+        sched.add(seq)
+    batch, by_id = sched.schedule()
+    assert all(seq.id in batch.req_ids for seq in seqs)
+    sched._pp_checkpoint_hold.update(batch.req_ids)
+    sched.block_manager.hash_blocks = MagicMock(side_effect=RuntimeError("boom"))
+    with pytest.raises(RuntimeError, match="boom"):
+        sched.register_prefill_hashes(batch, by_id.values())
+    assert not sched._pp_checkpoint_hold

@@ -4021,14 +4021,15 @@ class Scheduler:
         self, batch: ScheduledBatch, seqs: Iterable[Sequence] | None = None
     ) -> None:
         """Hash blocks for middle chunked-prefill chunks that skip postprocess."""
+        # Before any bail-out or hashing that can raise, so no seq of this
+        # batch (preempted, or after a failing one) is held forever.
+        self._pp_checkpoint_hold.difference_update(batch.req_ids)
         if not self.block_manager.enable_prefix_caching:
             return
         if batch.is_final_chunk is None:
             return
         seq_by_id = self._batch_seq_lookup(seqs)
         for i, req_id in enumerate(batch.req_ids):
-            # Before the bail-outs, so a preempted held seq is not held forever.
-            self._pp_checkpoint_hold.discard(req_id)
             seq = seq_by_id.get(req_id)
             if seq is None or not seq.block_table:
                 logger.warning(
@@ -4104,9 +4105,9 @@ class Scheduler:
             # See _batch_seq_lookup: seq may have left running.
             seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
+            # Before the loop; see register_prefill_hashes.
+            self._pp_checkpoint_hold.difference_update(batch.req_ids)
             for i, req_id in enumerate(batch.req_ids):
-                # Before the bail-out; see register_prefill_hashes.
-                self._pp_checkpoint_hold.discard(req_id)
                 seq = seq_by_id.get(req_id)
                 if seq is None or final is None or not seq.block_table:
                     continue
