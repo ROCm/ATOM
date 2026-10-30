@@ -122,7 +122,8 @@ QSA retains native projections, selection/index-cache preparation and sparse
 attention. Batch Q/K norm, mRoPE and K/V publication share one kernel; TP1
 uses the native attention reduction and output gate, while TP8 stages the gate
 into output projection LDS. Collectives retain their native implementation.
-MTP and plugin serving are outside this Mono deployment contract.
+For the TP1 Quark MTP3 service, see [Mono service](Qwen3.8-Flash-Next-Mono.md).
+Plugin serving is outside this Mono deployment contract.
 Use prefix caching disabled for the validated configuration. Mono sizes its
 QSA scores and candidate lists from `--max-model-len`, within
 the checkpoint's context capacity. TP1 uses a fixed-LDS exact selection tree
