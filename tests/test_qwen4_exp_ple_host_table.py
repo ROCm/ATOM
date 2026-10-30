@@ -93,8 +93,15 @@ def _load(table, host, start=0, end=TABLE_ROWS, shards=None):
             host.load_rows(index, lo, shard[lo - first : hi - first])
 
 
+def _weight(dtype=torch.bfloat16):
+    """The module's placeholder parameter: `[0, dim]`, on the CPU."""
+    return torch.nn.Parameter(torch.empty(0, DIM, dtype=dtype), requires_grad=False)
+
+
 def _host(start=0, end=TABLE_ROWS, dtype=torch.bfloat16, device="cpu"):
-    return PleHostTable(start, end, DIM, dtype, SHARD_ROWS, torch.device(device), "ple")
+    return PleHostTable(
+        start, end, _weight(dtype), SHARD_ROWS, torch.device(device), "ple"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -140,6 +147,8 @@ def test_refused_page_lock_moves_the_table_to_device_memory(fake_pin, fail_at):
     assert host.pinned_bytes == 0
     # Shards after the refusal are not offered for page-locking at all.
     assert fake_pin.calls == fail_at
+    # The table is the module's parameter now, as an HBM embedding's is.
+    assert _bitwise_equal(host.weight.data, table)
     ids = _probe_ids(TABLE_ROWS)
     assert _bitwise_equal(_follow(bases, ids, 0, TABLE_ROWS, table.dtype), table[ids])
 
@@ -156,7 +165,75 @@ def test_missing_shard_is_an_error_and_an_empty_load_is_not(fake_pin):
     dummy = _host()
     bases = dummy.shard_bases(NUM_SHARDS)
     assert not dummy.on_host and fake_pin.calls == NUM_SHARDS - 1
-    assert int(bases[0]) == dummy._hbm.data_ptr()
+    assert dummy.weight.shape == (TABLE_ROWS, DIM)
+    assert int(bases[0]) == dummy.weight.data_ptr()
+
+
+class _Embedding(torch.nn.Module):
+    """`_Qwen4ExpHostEmbedding` as the weight lifecycle sees it: the
+    parameter, the table and the addresses the kernel reads."""
+
+    def __init__(self, device="cpu"):
+        super().__init__()
+        self.weight = _weight()
+        self.register_buffer(
+            "shard_bases",
+            torch.zeros(NUM_SHARDS, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        self.table = PleHostTable(
+            0, TABLE_ROWS, self.weight, SHARD_ROWS, torch.device(device), "ple"
+        )
+
+    def rebind_weight_addresses(self):
+        self.shard_bases.copy_(self.table.shard_bases(NUM_SHARDS))
+
+
+def _runner(model, device="cpu"):
+    from atom.rollout.memory_manager import MemoryManagerMixin
+
+    runner = MemoryManagerMixin()
+    runner.model, runner.device, runner.label = model, torch.device(device), "ple"
+    runner.enforce_eager = True
+    return runner
+
+
+@pytest.mark.parametrize("fail_at", [None, 1, 4])
+def test_releasing_the_weights_releases_an_hbm_fallback(fake_pin, monkeypatch, fail_at):
+    """`MemoryManagerMixin` releases `named_parameters()`: a table that fell
+    back to HBM goes with them, comes back at a new address on resume, and
+    the kernel's addresses follow it. One on the host is not in HBM and
+    stays put."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    fake_pin.fail_at = fail_at
+    table = _table()
+    emb = _Embedding()
+    _load(table, emb.table)
+    emb.rebind_weight_addresses()
+    runner = _runner(emb)
+    before = emb.shard_bases.clone()
+
+    runner.release_memory(tags=["weights"])
+    assert emb.weight.numel() == 0
+    if fail_at is not None:
+        # Nothing else holds the rows: the table keeps no tensor of its own.
+        assert all(pinned is None for _, pinned in emb.table._rows.values())
+    # Someone else takes the freed memory, so the resumed table cannot come
+    # back where it was.
+    squatter = torch.empty_like(table)
+
+    runner.resume_memory(tags=["weights"])
+    if fail_at is None:
+        assert torch.equal(emb.shard_bases, before)
+    else:
+        assert emb.weight.shape == table.shape
+        assert int(emb.shard_bases[0]) == emb.weight.data_ptr() != before[0]
+        emb.weight.data.copy_(table)  # the weight sync that follows a resume
+    del squatter
+    ids = _probe_ids(TABLE_ROWS)
+    got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, table.dtype)
+    assert _bitwise_equal(got, table[ids])
 
 
 def test_shards_are_copied_even_with_uva_copy_off(fake_pin, monkeypatch):
@@ -290,11 +367,21 @@ def test_uva_lookup_replays_in_a_cuda_graph(monkeypatch, tmp_path):
     del graph, host
 
 
-@_gpu
-def test_ngram_embedding_on_host_matches_hbm_embedding(monkeypatch):
-    """The model's n-gram embedding: built on the device it goes to the host,
-    with ATOM_ENGRAM_UVA=0 it is the HBM `VocabParallelEmbedding`; both
-    load the same shards and return the same bytes."""
+_NGRAM_CONFIG = SimpleNamespace(
+    ngram_size=3,
+    heads_per_ngram=8,
+    eos_token_id=0,
+    vocab_size=4096,
+    split_ngram_parts=16,
+    ngram_vocab_size_base=997,
+    make_ngram_vocab_size_divisible_by=128,
+)
+
+
+@pytest.fixture
+def ngram_layer(monkeypatch):
+    """Builds the model's n-gram embedding on the device, BF16, at TP 1: on
+    the host path (`uva`) or the HBM `VocabParallelEmbedding`."""
     pytest.importorskip("aiter.dist.parallel_state", exc_type=ImportError)
     from atom.model_ops import embed_head
     from atom.model_ops.qwen4_exp import ple_layer
@@ -302,51 +389,100 @@ def test_ngram_embedding_on_host_matches_hbm_embedding(monkeypatch):
     group = SimpleNamespace(world_size=1, rank_in_group=0)
     monkeypatch.setattr(embed_head, "get_tp_group", lambda: group)
     monkeypatch.setattr(ple_layer, "get_tp_group", lambda: group)
-    config = SimpleNamespace(
-        ngram_size=3,
-        heads_per_ngram=8,
-        eos_token_id=0,
-        vocab_size=4096,
-        split_ngram_parts=16,
-        ngram_vocab_size_base=997,
-        make_ngram_vocab_size_divisible_by=128,
-    )
 
     def build(uva):
         monkeypatch.setenv("ATOM_ENGRAM_UVA", "1" if uva else "0")
         with torch.device("cuda"):
-            layer = ple_layer.Qwen4ExpNGramEmbedding(
-                config, 16 * 32, 0, 1024, 8, prefix="ple"
+            return ple_layer.Qwen4ExpNGramEmbedding(
+                _NGRAM_CONFIG, 16 * 32, 0, 1024, 8, prefix="ple"
             )
-        return layer
 
     previous = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
-        host_layer, hbm_layer = build(True), build(False)
-        assert isinstance(host_layer.ngram_embedding, ple_layer._Qwen4ExpHostEmbedding)
-        assert isinstance(hbm_layer.ngram_embedding, embed_head.VocabParallelEmbedding)
-        rows = host_layer.table_rows
-        gen = torch.Generator().manual_seed(2)
-        table = torch.randn(rows, host_layer.head_dim, generator=gen).bfloat16()
-        for layer in (host_layer, hbm_layer):
-            weight = layer.ngram_embedding.weight
-            for index, shard in enumerate(table.split(layer.checkpoint_shard_rows)):
-                weight.weight_loader(weight, shard, index)
-            if hasattr(layer.ngram_embedding, "process_weights_after_loading"):
-                layer.ngram_embedding.process_weights_after_loading()
-        assert host_layer.ngram_embedding.weight.numel() == 0
-        assert host_layer.ngram_embedding.table.on_host
-        tokens = torch.randint(0, config.vocab_size, (300,), generator=gen).cuda()
-        starts = torch.tensor([0, 7, 120, 300], dtype=torch.int32, device="cuda")
-        context = torch.randint(0, config.vocab_size, (3, 2), generator=gen).cuda()
-        got = host_layer(tokens, starts, context)
-        expected = hbm_layer(tokens, starts, context)
-        assert _bitwise_equal(got, expected)
-        # Padding rows of the table are reachable by id, and as checkpointed.
-        tail = torch.arange(rows - 130, rows, device="cuda")
-        assert _bitwise_equal(
-            host_layer.ngram_embedding(tail), hbm_layer.ngram_embedding(tail)
-        )
+        yield build
     finally:
         torch.set_default_dtype(previous)
+
+
+def _load_layer(layer, table):
+    weight = layer.ngram_embedding.weight
+    for index, shard in enumerate(table.split(layer.checkpoint_shard_rows)):
+        weight.weight_loader(weight, shard, index)
+    if hasattr(layer.ngram_embedding, "process_weights_after_loading"):
+        layer.ngram_embedding.process_weights_after_loading()
+
+
+def _layer_table(layer):
+    gen = torch.Generator().manual_seed(2)
+    return torch.randn(layer.table_rows, layer.head_dim, generator=gen).bfloat16()
+
+
+def _layer_inputs():
+    gen = torch.Generator().manual_seed(3)
+    vocab = _NGRAM_CONFIG.vocab_size
+    tokens = torch.randint(0, vocab, (300,), generator=gen).cuda()
+    starts = torch.tensor([0, 7, 120, 300], dtype=torch.int32, device="cuda")
+    context = torch.randint(0, vocab, (3, 2), generator=gen).cuda()
+    return tokens, starts, context
+
+
+@_gpu
+def test_ngram_embedding_on_host_matches_hbm_embedding(ngram_layer):
+    """The model's n-gram embedding: built on the device it goes to the host,
+    with ATOM_ENGRAM_UVA=0 it is the HBM `VocabParallelEmbedding`; both
+    load the same shards and return the same bytes."""
+    from atom.model_ops import embed_head
+    from atom.model_ops.qwen4_exp import ple_layer
+
+    host_layer, hbm_layer = ngram_layer(True), ngram_layer(False)
+    assert isinstance(host_layer.ngram_embedding, ple_layer._Qwen4ExpHostEmbedding)
+    assert isinstance(hbm_layer.ngram_embedding, embed_head.VocabParallelEmbedding)
+    rows = host_layer.table_rows
+    table = _layer_table(host_layer)
+    for layer in (host_layer, hbm_layer):
+        _load_layer(layer, table)
+    assert host_layer.ngram_embedding.weight.numel() == 0
+    assert host_layer.ngram_embedding.table.on_host
+    inputs = _layer_inputs()
+    assert _bitwise_equal(host_layer(*inputs), hbm_layer(*inputs))
+    # Padding rows of the table are reachable by id, and as checkpointed.
+    tail = torch.arange(rows - 130, rows, device="cuda")
+    assert _bitwise_equal(
+        host_layer.ngram_embedding(tail), hbm_layer.ngram_embedding(tail)
+    )
+
+
+@_gpu
+def test_released_weights_free_the_hbm_fallback(ngram_layer, monkeypatch):
+    """A refused page-lock leaves the table in HBM as the module's `weight`:
+    releasing the weights frees it, and after resuming and syncing the
+    weights the lookups read the new allocation."""
+    monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
+    host_layer, hbm_layer = ngram_layer(True), ngram_layer(False)
+    table = _layer_table(host_layer)
+    for layer in (host_layer, hbm_layer):
+        _load_layer(layer, table)
+    embedding = host_layer.ngram_embedding
+    assert not embedding.table.on_host
+    table_bytes = embedding.weight.nbytes
+    assert table_bytes == table.nbytes
+    synced = {n: p.detach().cpu() for n, p in host_layer.named_parameters()}
+    inputs = _layer_inputs()
+    expected = hbm_layer(*inputs)
+    runner = _runner(host_layer, "cuda")
+    old_base = int(embedding.shard_bases[0])
+
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    runner.release_memory(tags=["weights"])
+    assert allocated - torch.cuda.memory_allocated() >= table_bytes
+    squatter = torch.empty(table_bytes, dtype=torch.uint8, device="cuda")
+
+    runner.resume_memory(tags=["weights"])
+    assert embedding.weight.is_cuda and embedding.weight.shape == table.shape
+    for name, param in host_layer.named_parameters():
+        param.data.copy_(synced[name])
+    assert int(embedding.shard_bases[0]) == embedding.weight.data_ptr() != old_base
+    assert _bitwise_equal(host_layer(*inputs), expected)
+    del squatter

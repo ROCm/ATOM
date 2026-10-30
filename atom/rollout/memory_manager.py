@@ -271,6 +271,12 @@ class MemoryManagerMixin:
                 param.data = param.data.to(self.device, non_blocking=False)
             torch.cuda.synchronize()
             logger.info(f"{self.label}: Weights restored to {self.device}")
+        # A module whose kernel is handed its weight's address, not the tensor
+        # (the Qwen3.8 PLE table in HBM), re-reads it: every one has moved.
+        for module in self.model.modules():
+            rebind = getattr(module, "rebind_weight_addresses", None)
+            if callable(rebind):
+                rebind()
 
     def _release_kv_cache(self) -> None:
         if not hasattr(self, "kv_cache") or self.kv_cache is None:

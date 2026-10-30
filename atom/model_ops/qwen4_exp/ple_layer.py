@@ -182,7 +182,9 @@ class _Qwen4ExpHostEmbedding(nn.Module):
     bus through `shard_bases`. Those addresses are fixed from load to exit, so
     the lookup can be captured in a CUDA graph. If page-locking fails the
     table moves to HBM and the same kernel reads it there; either way the rows
-    returned are the checkpoint's, bit for bit.
+    returned are the checkpoint's, bit for bit. In HBM the table is `weight`,
+    released and resumed with the other weights, and the addresses follow it
+    (`rebind_weight_addresses`; resuming recaptures the graphs).
     """
 
     def __init__(
@@ -207,7 +209,8 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         self.output_dtype = torch.get_default_dtype()
         dtype = torch.float8_e4m3fn if fp8 else self.output_dtype
         # The loader's handle on the table: the dtype the shard loader checks
-        # and the `weight_loader`, holding no rows.
+        # and the `weight_loader`, holding no rows -- unless the table falls
+        # back to HBM, where it holds them all (`PleHostTable`).
         self.weight = atom_parameter(
             torch.empty(0, embedding_dim, dtype=dtype, device="cpu")
         )
@@ -224,17 +227,21 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         self.table = PleHostTable(
             self.vocab_start_idx,
             self.vocab_end_idx,
-            embedding_dim,
-            dtype,
+            self.weight,
             shard_rows,
             self.shard_bases.device,
             prefix,
         )
 
+    def rebind_weight_addresses(self) -> None:
+        """`MemoryManagerMixin` resumed the weights: a table that fell back
+        to HBM is `weight`, now at a new address."""
+        self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
+
     def process_weights_after_loading(self) -> None:
         if self.fp8:
             _check_global_scale(self.prefix, self.weight_scale)
-        self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
+        self.rebind_weight_addresses()
         if self.table.on_host:
             logger.info(
                 "%s: n-gram table in page-locked host memory, %.1f GiB read "

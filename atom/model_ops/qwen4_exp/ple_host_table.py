@@ -71,35 +71,39 @@ class PleHostTable:
 
     One shard that cannot be page-locked moves the table to `device` -- the
     rows already pinned are copied over -- and the addresses point there
-    instead. Loader threads may call `load_rows` concurrently.
+    instead. There it is the data of `weight`, the module's parameter, so
+    releasing and resuming the weights frees and reallocates it as they would
+    an HBM embedding; `shard_bases` then has to be asked again. Loader threads
+    may call `load_rows` concurrently.
     """
 
     def __init__(
         self,
         vocab_start: int,
         vocab_end: int,
-        dim: int,
-        dtype: torch.dtype,
+        weight: torch.nn.Parameter,
         shard_rows: int,
         device: torch.device,
         prefix: str,
     ):
         self.vocab_start, self.vocab_end = vocab_start, vocab_end
-        self.dim, self.dtype = dim, dtype
+        # `[0, dim]` until the table falls back to HBM.
+        self.weight = weight
+        self.dim, self.dtype = weight.shape[1], weight.dtype
         self.shard_rows = shard_rows
         self.device = device
         self.prefix = prefix
         # The shards holding this rank's rows.
         self.shards = range(vocab_start // shard_rows, -(-vocab_end // shard_rows))
         # Per shard: (first global row held, page-locked rows, or None once
-        # they are in `_hbm`).
+        # they are in `weight`).
         self._rows: dict[int, tuple[int, torch.Tensor | None]] = {}
-        self._hbm: torch.Tensor | None = None
+        self._in_hbm = False
         self._lock = threading.Lock()
 
     @property
     def on_host(self) -> bool:
-        return self._hbm is None
+        return not self._in_hbm
 
     @property
     def pinned_bytes(self) -> int:
@@ -117,46 +121,49 @@ class PleHostTable:
                 f"of shard {shard} are outside [{self.vocab_start}, "
                 f"{self.vocab_end})"
             )
-        hbm = self._hbm
-        if hbm is None:
+        if not self._in_hbm:
             pinned = host_memory.pin_rows([rows.contiguous()], copy=True)
             with self._lock:
-                if pinned is not None and self._hbm is None:
+                if pinned is not None and not self._in_hbm:
                     self._rows[shard] = (row_start, pinned[0])
                     return
-                hbm = self._to_hbm()
-        hbm.narrow(0, row_start - self.vocab_start, rows.shape[0]).copy_(rows)
+                self._to_hbm()
+        local = row_start - self.vocab_start
+        self.weight.data.narrow(0, local, rows.shape[0]).copy_(rows)
         with self._lock:
             self._rows[shard] = (row_start, None)
 
-    def _to_hbm(self) -> torch.Tensor:
-        """The table on `device`, holding every row pinned so far; under `_lock`."""
-        if self._hbm is None:
+    def _to_hbm(self) -> None:
+        """Make `weight` the table on `device`, holding every row pinned so
+        far; under `_lock`."""
+        if not self._in_hbm:
             logger.warning(
                 "%s: page-locking the n-gram table on the host failed; "
                 "falling back to HBM",
                 self.prefix,
             )
-            self._hbm = torch.empty(
+            hbm = torch.empty(
                 self.vocab_end - self.vocab_start,
                 self.dim,
                 dtype=self.dtype,
                 device=self.device,
             )
+            self.weight.data = hbm
+            self._in_hbm = True
             for shard, (row_start, pinned) in list(self._rows.items()):
                 if pinned is not None:
                     local = row_start - self.vocab_start
-                    self._hbm.narrow(0, local, pinned.shape[0]).copy_(pinned)
+                    hbm.narrow(0, local, pinned.shape[0]).copy_(pinned)
                     self._rows[shard] = (row_start, None)
-        return self._hbm
 
     def shard_bases(self, num_shards: int) -> torch.Tensor:
         """`[num_shards]` int64 on the CPU: the address of each local shard's
         first global row (0 for another rank's shards).
 
-        Call once loading is done. A table that received nothing (a dummy
-        load) is allocated on `device` uninitialized, as an HBM embedding
-        would be; one missing only some shards is an error.
+        Call once loading is done, and again whenever `weight` has been
+        reallocated. A table that received nothing (a dummy load) is
+        allocated in `weight` uninitialized, as an HBM embedding would be;
+        one missing only some shards is an error.
         """
         missing = [shard for shard in self.shards if shard not in self._rows]
         if len(missing) == len(self.shards):
@@ -171,8 +178,8 @@ class PleHostTable:
         bases = torch.zeros(num_shards, dtype=torch.int64)
         for shard in self.shards:
             first = shard * self.shard_rows
-            if self._hbm is not None:
-                address = self._hbm.data_ptr()
+            if self._in_hbm:
+                address = self.weight.data_ptr()
                 address += (first - self.vocab_start) * row_bytes
             else:
                 row_start, pinned = self._rows[shard]
