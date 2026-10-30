@@ -1637,6 +1637,41 @@ models:
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
             decode: *m31_flash_pp4_direct_decode_env
+        # Matched non-P/D baseline for the PP4 -> DCP4 accuracy comparison.
+        - <<: *m31_flash_pp4_accuracy
+          name: minimax-m31-flash-mxfp4-agg-tp4-dspark7-nvfp4-gsm8k-5shot-c32
+          topology: agg
+          display_topology: AGG-TP4-DSPARK7-NVFP4
+          prefill: {}
+          decode:
+            workers: 1
+            tp: 4
+            extra_args: "--max-num-batched-tokens 8192"
+          env:
+            common: *m31_flash_pp4_accuracy_env
+            prefill: {}
+            decode:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+
+        # PP4 -> all-head DCP4, S=128. Real DSpark acceptance and full GSM8K.
+        - &m31_flash_pp4_dcp4_accuracy
+          <<: *m31_flash_pp4_accuracy
+          name: minimax-m31-flash-mxfp4-1p1d-pp4-dcp4-dspark7-nvfp4-gsm8k-5shot-c32
+          display_topology: 1P1D-PP4-DCP4-DSPARK7-NVFP4
+          decode:
+            workers: 1
+            tp: 4
+            dcp: 4
+            extra_args: '--dcp-config {"interleave_size":128,"enable_query_replication":false,"enable_project_before_merge":false}'
+        - <<: *m31_flash_pp4_dcp4_accuracy
+          name: minimax-m31-flash-mxfp4-1p1d-pp4-dcp4-dspark7-nvfp4-gsm8k-5shot-chunked-c32
+          env:
+            common: *m31_flash_pp4_accuracy_env
+            prefill:
+              <<: *m31_flash_pp4_direct_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_pp4_direct_decode_env
       mooncake_store:
         - &m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-1p1d-tp4-dspark7-nvfp4-mcstore-agentx-c32
@@ -1710,6 +1745,27 @@ models:
             decode: *m31_flash_mcstore_decode_env
         - <<: *m31_flash_pp4_mcstore
           name: minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32
+          env:
+            common: *m31_flash_pp4_mcstore_common_env
+            prefill:
+              <<: *m31_flash_pp4_mcstore_prefill_env
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_mcstore_decode_env
+
+        # Issue #314: C56 transfer-wait validation after real DCP accuracy passes.
+        - &m31_flash_pp4_dcp4_mcstore
+          <<: *m31_flash_pp4_mcstore
+          name: minimax-m31-flash-mxfp4-1p1d-pp4-dcp4-dspark7-nvfp4-mcstore-agentx-c56
+          display_topology: 1P1D-PP4-DCP4-DSPARK7-NVFP4-MCSTORE
+          concurrency: [56]
+          decode:
+            workers: 1
+            tp: 4
+            dcp: 4
+            extra_args: '--dcp-config {"interleave_size":128,"enable_query_replication":false,"enable_project_before_merge":false}'
+        - <<: *m31_flash_pp4_dcp4_mcstore
+          name: minimax-m31-flash-mxfp4-1p1d-pp4-dcp4-dspark7-nvfp4-mcstore-agentx-chunked-c56
           env:
             common: *m31_flash_pp4_mcstore_common_env
             prefill:

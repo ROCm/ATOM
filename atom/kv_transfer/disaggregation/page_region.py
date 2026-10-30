@@ -21,6 +21,7 @@ def page_region(
     unit_bytes: int | None = None,
     total_bytes: int | None = None,
     head_major_runs: tuple[int, int] | None = None,
+    token_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
 ) -> PageRegion:
     """The region of ``tensor``'s PAGE blocks and a byte view aliasing them.
 
@@ -55,6 +56,7 @@ def page_region(
         ),
         view=byte_view.view(-1, 1, unit_bytes),
         head_major_runs=head_major_runs,
+        token_layout=token_layout,
     )
 
 

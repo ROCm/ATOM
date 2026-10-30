@@ -1935,8 +1935,8 @@ def indexer_cp_unsupported_reason(
 
     Note the DCP relationship is EXCLUSIVE, not a prerequisite. This shards the
     indexer's block scoring; real DCP shards the KV cache itself (BlockManager
-    scales the prefix-cache hash granularity by dcp_world_size), and M3 has no
-    DCP-aware attention path at all. The two cannot both own the context axis.
+    scales the prefix-cache hash granularity by dcp_world_size). M3 KV-cache
+    DCP has its own all-head attention path; both cannot own the context axis.
 
     ``plugin_mode`` belongs here rather than only in ``indexer_cp_enabled``
     because this gate is what clears the FLAG. Leaving it set under a bridge
@@ -2355,13 +2355,6 @@ class Config:
                 "dcp_config.interleave_size > 1 only applies under DCP "
                 f"(decode_context_parallel_size={self.decode_context_parallel_size})"
             )
-            assert self.speculative_config is None, (
-                "dcp_config.interleave_size > 1 (block-level DCP interleave) is "
-                "incompatible with speculative decode (MTP/eagle/dspark): the q>1 "
-                "verify cprr MLA kernel assumes token-level interleave. Use "
-                "dcp_config.interleave_size=1 with speculative decode, or disable "
-                "speculative decode for block-level interleave."
-            )
 
         # DCP Query Replication (QREP) gating: turn the flag OFF (warn, not
         # error) for combinations that cannot use it, so it can default to on
@@ -2381,6 +2374,12 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        if self.dcp_config.interleave_size > 1 and self.speculative_config is not None:
+            assert (
+                _is_minimax_m3_config(self.hf_config)
+                and self.dcp_config.interleave_size == self.kv_cache_block_size == 128
+                and self.speculative_config.use_dspark_with_draft()
+            ), "Block-interleaved speculative DCP currently requires MiniMax-M3 DSpark and S=B=128"
         num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", None)
         if num_hidden_layers is not None:
             assert num_hidden_layers >= self.pipeline_parallel_size, (

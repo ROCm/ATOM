@@ -250,9 +250,9 @@ def test_block_sparse_attention_is_bidirectional_within_block():
     kv2[:, -1] = 0.0
     out2 = _block_attn(q, kv2, sink, valid_target, D**-0.5)
     for t in range(T):
-        assert not torch.allclose(
-            out_full[:, t], out2[:, t]
-        ), f"draft position {t} did not see the last draft column (causal leak)"
+        assert not torch.allclose(out_full[:, t], out2[:, t]), (
+            f"draft position {t} did not see the last draft column (causal leak)"
+        )
     # Symmetrically, perturbing the FIRST draft column must move every position.
     kv3 = kv.clone()
     kv3[:, W] = 0.0
@@ -2143,7 +2143,9 @@ def test_paged_mla_drafts_keep_the_historical_layer_num_lookup():
     )
 
 
-def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
+def _paged_proposer(
+    monkeypatch, *, max_model_len, block_size, bound_pool=True, device="cpu", mha=False
+):
     """A DSparkProposer carrying only what `_build_paged_block_metadata` reads.
 
     The two calls in it that need a GPU are replaced: the Triton index
@@ -2151,12 +2153,11 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
     the tests below look at -- slots, context lengths, the borrowed column -- is
     decided before either runs.
     """
-    import atom.model_ops.attentions.aiter_mla as mod_mla
     import atom.spec_decode.dspark_proposer as mod
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     p = DSparkProposer.__new__(DSparkProposer)
-    p.device = torch.device("cpu")
+    p.device = torch.device(device)
     p.mtp_k = 7
     p.dcp_world_size = 1
     p.dcp_rank = 0
@@ -2166,9 +2167,11 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
         kv_cache_dtype="auto",
     )
     p.dtype = torch.bfloat16
-    p.model = types.SimpleNamespace(window_size=None, block_attention_is_mla=True)
+    p.model = types.SimpleNamespace(window_size=None, block_attention_is_mla=not mha)
     n_cols = max_model_len // block_size
-    block_tables = torch.zeros(p.config.max_num_seqs, n_cols, dtype=torch.int32)
+    block_tables = torch.zeros(
+        p.config.max_num_seqs, n_cols, dtype=torch.int32, device=p.device
+    )
     p.runner = types.SimpleNamespace(
         block_size=block_size,
         forward_vars={
@@ -2214,7 +2217,10 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
             {"col0": tables[:, 0].clone(), "indptr": indptr.clone()}
         ),
     )
-    monkeypatch.setattr(mod_mla, "get_mla_metadata_v1", lambda *a, **k: None)
+    if not mha:
+        import atom.model_ops.attentions.aiter_mla as mod_mla
+
+        monkeypatch.setattr(mod_mla, "get_mla_metadata_v1", lambda *a, **k: None)
     return p, block_tables, calls
 
 
@@ -2223,6 +2229,62 @@ def _paged_fc(*, is_dummy_run=False, max_seqlen_k=64):
         context=types.SimpleNamespace(is_dummy_run=is_dummy_run),
         attn_metadata=types.SimpleNamespace(max_seqlen_k=max_seqlen_k),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("interleave", [1, 16, 128])
+@pytest.mark.parametrize("rank", range(4))
+def test_dcp_block_metadata_matches_owned_tokens(monkeypatch, interleave, rank):
+    """Run the real proposer metadata path with GPU lengths and boundary rows."""
+    p, tables, _ = _paged_proposer(
+        monkeypatch, max_model_len=512, block_size=128, device="cuda", mha=True
+    )
+    import atom.spec_decode.dspark_proposer as mod
+
+    monkeypatch.setattr(
+        mod, "block_table_state", lambda _: types.SimpleNamespace(lengths=[4] * 8)
+    )
+    draft_calls = []
+    p.model.prepare_paged_block = lambda *args: draft_calls.append(args)
+    p.dcp_world_size = 4
+    p.dcp_rank = rank
+    p.config.dcp_config = types.SimpleNamespace(interleave_size=interleave)
+    tables.copy_(torch.arange(tables.numel(), device="cuda").view_as(tables) + 7)
+    original_tables = tables.clone()
+    owned = [position for position in range(2048) if position // interleave % 4 == rank]
+    local_indices = {position: index for index, position in enumerate(owned)}
+    T = p.draft_tokens_per_seq
+    for anchors in ([124, 508, 1020, 2044, 2044], [125, 127, 511, 1023, 1023]):
+        md = types.SimpleNamespace(max_seqlen_k=max(anchors) + 1 + T)
+        p._build_paged_block_metadata(
+            _paged_fc(),
+            md,
+            torch.tensor(anchors, device="cuda"),
+            scheduled_bs=4,
+            max_seqlen_k=md.max_seqlen_k,
+        )
+        expected_slots, expected_lengths = [], []
+        for req, anchor in enumerate(anchors[:4]):
+            row = []
+            for position in range(anchor + 1, anchor + 1 + T):
+                if position not in local_indices:
+                    row.append(-1)
+                else:
+                    local = local_indices[position]
+                    page = int(original_tables[req, local // 128])
+                    row.append(page * 128 + local % 128)
+            expected_slots.append(row)
+            expected_lengths.append(
+                sum(position < anchor + 1 + T for position in owned)
+            )
+        expected_slots.append([-1] * T)
+        assert md.slot_mapping.view(5, T).cpu().tolist() == expected_slots
+        assert md.context_lens[:4].cpu().tolist() == expected_lengths
+        assert 1 <= int(md.context_lens[4]) <= 128
+        torch.testing.assert_close(tables, original_tables)
+        assert draft_calls[-1][4].cpu().tolist() == [
+            anchor + 1 + T for anchor in anchors
+        ]
 
 
 def test_a_block_position_past_the_block_table_is_dropped_not_clamped():

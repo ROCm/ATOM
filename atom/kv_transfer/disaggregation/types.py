@@ -224,6 +224,8 @@ class PageRegion:
     # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
     # `heads` KV heads one after another. None: not per head (replicated).
     head_major_runs: tuple[int, int] | None = None
+    # Physical byte shape and ordered token axes within a PAGE.
+    token_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
 
 
 @dataclass

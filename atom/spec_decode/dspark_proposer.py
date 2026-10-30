@@ -839,38 +839,40 @@ class DSparkProposer(Drafter):
         ctx_lens = self._blk_ctx_lens[:running_bs]  # stable
         global_lens = anchor_positions + (1 + T)
         if self.dcp_world_size > 1:
-            # DCP shards KV token-wise round-robin: one block table entry covers
-            # block_size*dcp_world_size GLOBAL tokens, and rank r holds the
-            # positions p with p % dcp_world_size == r, packed densely into its
-            # page. Rows this rank does not own go to -1 (dropped).
+            # One block-table entry covers block_size*dcp_world_size global
+            # tokens. Interleave-sized chunks rotate across ranks and each
+            # rank packs its owned tokens into one local page. Unowned rows
+            # go to slot -1 (dropped).
             virtual_block = block_size * self.dcp_world_size
             page_idx, in_table = self._block_page_idx(
                 block_positions, virtual_block, block_tables
             )
-            local_off = torch.div(
-                torch.remainder(block_positions, virtual_block),
-                self.dcp_world_size,
-                rounding_mode="floor",
+            from atom.distributed.dcp_layout import dcp_local_index, dcp_owner_rank
+
+            interleave = self.config.dcp_config.interleave_size
+            local_off = (
+                dcp_local_index(block_positions, self.dcp_world_size, interleave)
+                % block_size
             )
             slots.copy_(
                 torch.where(
                     in_table
                     & (
-                        torch.remainder(block_positions, self.dcp_world_size)
+                        dcp_owner_rank(block_positions, self.dcp_world_size, interleave)
                         == self.dcp_rank
                     ),
                     torch.gather(block_tables, 1, page_idx) * block_size + local_off,
                     -1,
                 )
             )
-            # Of L global tokens this rank stores ceil((L - r) / dcp_world_size).
-            ctx_lens.copy_(
-                torch.div(
-                    global_lens + (self.dcp_world_size - 1 - self.dcp_rank),
-                    self.dcp_world_size,
-                    rounding_mode="floor",
-                )
-            )
+            # Keep this on-device: the host metadata helper uses NumPy and
+            # cannot accept the GPU anchor lengths used by the block pass.
+            group_tokens = interleave * self.dcp_world_size
+            local_lens = (global_lens // group_tokens) * interleave
+            local_lens += (
+                global_lens % group_tokens - self.dcp_rank * interleave
+            ).clamp(min=0, max=interleave)
+            ctx_lens.copy_(local_lens)
         else:
             # slot = page_id * block_size + offset_in_page, derived on-device
             # from the block table so there is no host sync.
@@ -963,7 +965,7 @@ class DSparkProposer(Drafter):
                 block_tables,
                 block_positions,
                 slots,
-                ctx_lens,
+                global_lens if self.dcp_world_size > 1 else ctx_lens,
                 block_table_state(self.runner.forward_vars["block_tables"]).lengths,
                 scheduled_bs,
             )

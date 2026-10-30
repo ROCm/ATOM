@@ -349,6 +349,9 @@ class MiniMaxM3Attention(nn.Module):
         self.num_heads = self.total_num_heads // self.tp_size
         self.total_num_kv_heads = config.num_key_value_heads
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        from atom.model_ops.minimax_m3.dcp import M3DCPProjection
+
+        self.dcp = M3DCPProjection(self.tp_size, self.total_num_kv_heads)
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -382,11 +385,13 @@ class MiniMaxM3Attention(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None),
         )
         _minimax_m3_cos_sin_cache(self.rotary_emb, self.q_norm.weight)
+        from atom.model_ops.minimax_m3.dcp import MiniMaxM3DCPAttentionImpl
+
         self.attn = Attention(
-            self.num_heads,
+            self.num_heads * self.dcp.world,
             self.head_dim,
             self.scaling,
-            self.num_kv_heads,
+            self.num_kv_heads * self.dcp.world,
             kv_cache_dtype=cache_config,
             layer_num=layer_id,
             use_mla=False,
@@ -394,6 +399,7 @@ class MiniMaxM3Attention(nn.Module):
             q_norm=self.q_norm,
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
+            **({"impl_cls": MiniMaxM3DCPAttentionImpl} if self.dcp.world > 1 else {}),
         )
 
     def forward(
@@ -404,8 +410,11 @@ class MiniMaxM3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.dcp.world > 1:
+            q, k, v = (self.dcp.gather(x, self.head_dim) for x in (q, k, v))
+            qkv = torch.cat((q, k, v), dim=-1)
         attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
-        return self.o_proj(attn_output)
+        return self.o_proj(self.dcp.local_output(attn_output))
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -437,6 +446,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         elif self.tp_size % self.total_num_kv_heads != 0:
             raise ValueError("TP size must divide num_key_value_heads replication.")
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        from atom.model_ops.minimax_m3.dcp import M3DCPProjection
+
+        self.dcp = M3DCPProjection(self.tp_size, self.total_num_kv_heads)
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -519,11 +531,13 @@ class MiniMaxM3SparseAttention(nn.Module):
         # PA in dispatch_backend). The standard AiterAttentionMetadataBuilder binds
         # the page-16 SHUFFLE KV cache + scales (KVCacheTensor) and the page-128
         # index cache (onto the impl). All indexer state lives on the impl.
+        from atom.model_ops.minimax_m3.dcp import MiniMaxM3DCPSparseAttentionImpl
+
         self.attn = Attention(
-            self.num_heads,
+            self.num_heads * self.dcp.world,
             self.head_dim,
             self.scaling,
-            self.num_kv_heads,
+            self.num_kv_heads * self.dcp.world,
             kv_cache_dtype=cache_config,
             layer_num=layer_id,
             use_mla=False,
@@ -531,12 +545,16 @@ class MiniMaxM3SparseAttention(nn.Module):
             q_norm=self.q_norm,
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
-            impl_cls=SparseMHAPagedAttentionImpl,
+            impl_cls=(
+                MiniMaxM3DCPSparseAttentionImpl
+                if self.dcp.world > 1
+                else SparseMHAPagedAttentionImpl
+            ),
             # --- MiniMax-M3 sparse-attention indexer kwargs (impl-local) ---
             index_q_norm=self.index_q_norm,
             index_k_norm=self.index_k_norm,
             index_rotary_emb=self.index_rotary_emb,
-            index_q_size=self.index_q_size,
+            index_q_size=self.index_q_size * self.dcp.world,
             index_head_dim=self.idx_head_dim,
             topk=self.topk_blocks,
             init_blocks=self.init_blocks,
@@ -555,7 +573,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
-        q, k, v, _, _ = qkv.split(
+        q, k, v, iq, ik = qkv.split(
             [
                 self.q_size,
                 self.kv_size,
@@ -565,8 +583,13 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
+        if self.dcp.world > 1:
+            q, k, v = (self.dcp.gather(x, self.head_dim) for x in (q, k, v))
+            iq = self.dcp.gather(iq, self.idx_head_dim)
+            # Index K is already replicated by the projection.
+            qkv = torch.cat((q, k, v, iq, ik), dim=-1)
         attn_output = self.attn(q, k, v, positions, qkv=qkv)
-        return self.o_proj(attn_output)
+        return self.o_proj(self.dcp.local_output(attn_output))
 
 
 class MiniMaxM3DecoderLayer(nn.Module):

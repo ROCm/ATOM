@@ -31,10 +31,15 @@ def draft_kv_builder(model_runner, draft_hf):
     backend = get_attn_backend(attn_family(draft_hf))
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
+    from atom.config import _is_minimax_m3_config
+
+    world_size = model_runner.world_size
+    if _is_minimax_m3_config(draft_hf):
+        world_size //= model_runner.config.decode_context_parallel_size
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
-        world_size=model_runner.world_size,
+        world_size=world_size,
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
@@ -206,6 +211,12 @@ class DraftKvBuilder(PoolRowsMixin):
                 page_region(
                     t,
                     semantic_role=f"draft.{role}",
+                    token_layout=pool.page_token_layout(
+                        role.split(".layer_", 1)[0],
+                        page_tokens=pages.get(
+                            int(role.rsplit(".layer_", 1)[1]), pool.block_size
+                        ),
+                    ),
                     head_major_runs=(
                         pool.block_size
                         // pages.get(

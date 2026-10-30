@@ -119,6 +119,7 @@ class MhaKvPool:
                 f"an entry holds at least one block, not {blocks_per_entry}"
             )
         self.block_size = block_size
+        self.blocks_per_entry = blocks_per_entry
         # "nvfp4": per (token, kv head) a D/2-byte e2m1 payload and D/16 E4M3
         # block scales, token-major (minimax_m3/sparse_attn_nvfp4.py), instead
         # of SHUFFLE values plus one fp32 scale per token.
@@ -273,7 +274,9 @@ class MhaKvPool:
         """
         return self._views[name][layer].view(dtype).view(shape)
 
-    def kv_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def kv_views(
+        self, layer: int, *, page_tokens=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k, v)`, aliasing the pool, in SHUFFLE.
 
         The one place the element order is written: the fused writer produces
@@ -283,7 +286,12 @@ class MhaKvPool:
         already split by the pack -- which fp8 hides, `x == block_size`
         collapsing V's outer half to one.
         """
-        x, nh, hd, bs = self.x, self.num_kv_heads, self.head_dim, self.block_size
+        x, nh, hd = self.x, self.num_kv_heads, self.head_dim
+        bs = self.block_size if page_tokens is None else page_tokens
+        if bs <= 0 or self.block_size % bs or bs % x:
+            raise ValueError(
+                "Physical KV page size must divide the pool block and pack"
+            )
         if self.kv_format == "nvfp4":
             shape = (-1, nh, bs, hd // 2)
             return (
@@ -295,23 +303,47 @@ class MhaKvPool:
             self.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
         )
 
-    def scale_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def scale_views(
+        self, layer: int, *, page_tokens=None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k_scale, v_scale)`, one fp32 per (kv head, token).
 
         An fp8 cache only, which is the only kind that declares them: a
         `KeyError` here is a binder asking for a scale this dtype never needed.
         """
+        bs = self.block_size if page_tokens is None else page_tokens
+        if bs <= 0 or self.block_size % bs:
+            raise ValueError("Physical scale page size must divide the pool block")
         if self.kv_format == "nvfp4":
-            shape = (-1, self.num_kv_heads, self.block_size, self.head_dim // 16)
+            shape = (-1, self.num_kv_heads, bs, self.head_dim // 16)
             return (
                 self.field_view("k_scale", layer, torch.uint8, shape),
                 self.field_view("v_scale", layer, torch.uint8, shape),
             )
-        shape = (-1, self.num_kv_heads, self.block_size)
+        shape = (-1, self.num_kv_heads, bs)
         return (
             self.field_view("k_scale", layer, torch.float32, shape),
             self.field_view("v_scale", layer, torch.float32, shape),
         )
+
+    def page_token_layout(self, field: str, *, page_tokens=None):
+        """Byte layout of a PAGE, derived from the same views as its reader."""
+        bs = self.block_size if page_tokens is None else page_tokens
+        if field in {"k", "v"}:
+            view = self.kv_views(0, page_tokens=bs)[field == "v"]
+            axes = (
+                (0, 2)
+                if self.kv_format == "nvfp4"
+                else ((0, 3) if field == "k" else (0, 2, 4))
+            )
+        elif field in {"k_scale", "v_scale"}:
+            view = self.scale_views(0, page_tokens=bs)[field == "v_scale"]
+            axes = (0, 2)
+        else:
+            view = self._views[field][0]
+            width = view.shape[-1] // (self.block_size * self.blocks_per_entry)
+            return ((self.block_size, width), (0,))
+        return ((self.block_size // bs, *view.shape[1:], view.element_size()), axes)
 
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
         """One `(role, tensor)` per (field, layer), in declared field order.

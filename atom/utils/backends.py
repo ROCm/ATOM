@@ -460,9 +460,11 @@ def _hash_traced_files(files) -> str:
     content = []
     for filepath in files:
         content.append(filepath)
-        if filepath == "<string>" or filepath == "<frozen os>":
-            # This means the function was dynamically generated, with
-            # e.g. exec() or frozen os module. We can't actually check these.
+        if filepath == "<string>" or (
+            filepath.startswith("<frozen ") and filepath.endswith(">")
+        ):
+            # CPython's frozen modules use synthetic co_filename values.
+            # Keep their identity in the key without opening them as files.
             continue
         with open(filepath) as f:
             content.append(f.read())
