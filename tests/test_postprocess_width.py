@@ -156,7 +156,13 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
         hidden_states=None,
     )
 
-    assert captured["logprobs"].shape == (scheduled_bs,)
+    values, candidates, ranks = captured["logprobs"]
+    assert values.shape == (scheduled_bs, 1, 1)
+    assert candidates.shape == (scheduled_bs, 1, 0)
+    assert ranks.shape == (scheduled_bs, 1)
+    torch.testing.assert_close(
+        values.flatten(), torch.full((scheduled_bs,), -__import__("math").log(8))
+    )
 
 
 def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
@@ -174,6 +180,7 @@ def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
     batch = _batch(2)
     batch.return_logprobs = [True, True]
     batch.required_channel = object()
+    batch.top_logprobs = [3, 3]
     captured = {}
     runner = _runner({})
 
@@ -197,7 +204,12 @@ def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
         hidden_states=None,
     )
 
-    torch.testing.assert_close(captured["logprobs"], expected)
+    values, candidates, ranks = captured["logprobs"]
+    torch.testing.assert_close(values[:, 0, 0], expected)
+    expected_top, expected_ids = torch.topk(torch.log_softmax(logits, dim=-1), 3)
+    torch.testing.assert_close(values[:, 0, 1:], expected_top)
+    torch.testing.assert_close(candidates[:, 0].long(), expected_ids)
+    torch.testing.assert_close(ranks[:, 0].long(), (logits > logits[:, :1]).sum(-1) + 1)
 
 
 def test_prefill_really_does_run_wider_than_it_scheduled():

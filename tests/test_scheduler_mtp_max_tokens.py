@@ -8,6 +8,7 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.token_logprobs import TokenLogprob
 from atom.sampling_params import SamplingParams
 
 
@@ -40,8 +41,6 @@ class TestMTPMaxTokens:
         seq.num_placeholder_tokens = sched.mtp_k
         for token in (87, 88, 89, 90, 91, 92, 93):
             seq.append_token(token)
-            if seq.return_logprobs:
-                seq.logprobs.append(-0.1 * len(seq.logprobs))
         return sched.postprocess(
             list(sched.running),
             ScheduledBatchOutput(
@@ -50,6 +49,15 @@ class TestMTPMaxTokens:
                 num_rejected=np.asarray([0]),
                 num_bonus=np.asarray([0]),
                 draft_token_ids=np.asarray([[20, 21, 22]]),
+                logprobs=(
+                    {
+                        seq.id: [
+                            TokenLogprob(-0.1 * (i + 1), 1) for i in range(len(tokens))
+                        ]
+                    }
+                    if seq.return_logprobs
+                    else None
+                ),
             ),
             stream_output_queue=stream_queue,
         )
@@ -74,6 +82,7 @@ class TestMTPMaxTokens:
         assert len(finished[0].logprobs) == finished[0].num_completion_tokens
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
         assert emitted.output_tokens == [10, 11]
+        assert [p.logprob for p in emitted.logprobs] == [-0.1, -0.2]
         assert emitted.finish_reason == "max_tokens"
 
     @pytest.mark.parametrize(
