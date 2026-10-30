@@ -2077,6 +2077,22 @@ def test_pp_stage_relayouts_kv_and_splits_kda_state_for_a_dcp_tp_consumer():
     assert (nic.mem[~written] == before[~written]).all()
 
 
+def test_a_same_tp_consumer_with_a_larger_slot_unit_is_refused_before_any_write():
+    """Writing this unit into a wider one would leave the rest of each slot
+    stale; the size check refuses any mismatch, larger as well as smaller."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    nic = _ByteNic()
+    connector = _pp_stage_connector(mc, nic)
+    request = _dcp_tp_request(consumer_tp_size=1, consumer_tp_rank=0)
+    request["consumer_slot_bps"][2] += 8
+
+    with pytest.raises(RuntimeError, match="State slot size mismatch"):
+        _run_slot_transfer(mc, connector, request)
+    assert nic.descriptors == 0
+
+
 def test_a_consumer_outside_this_rank_s_head_group_is_refused():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"

@@ -3989,11 +3989,8 @@ class MooncakeConnector(KVConnectorBase):
                     f"{dst_bps} B there"
                 )
             if not split or replicated:
-                if dst_bps < bps:
-                    raise RuntimeError(
-                        f"Slot region {region_idx} would overrun its consumer "
-                        f"unit for req {req_id}: {bps} B into {dst_bps} B"
-                    )
+                # Both units are this one's size: an unsplit region was held
+                # to it before Phase 1, a replicated one just above.
                 slot_src.append(src_base + src_slot * bps)
                 slot_dst.append(dst_base + dst_slot * dst_bps)
                 slot_sizes.append(bps)
