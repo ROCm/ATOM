@@ -1441,6 +1441,8 @@ class ModelRunner:
             self.forward_vars["draft_next_tokens"] = CpuGpuBuffer(
                 self.max_bs, publication_group="draft_anchors", **i32_kwargs
             )
+        if hasattr(self, "draft_kv_builder"):
+            self.forward_vars.update(self.draft_kv_builder.step_buffers())
 
     def _init_forward_vars_ring(self):
         """Build a ring of independent ``forward_vars`` copies, one per possible
@@ -1677,13 +1679,19 @@ class ModelRunner:
         return specs
 
     def _state_pool_names(self) -> list[str]:
-        """The per-request STATE classes the attached builders declare.
+        """The per-request STATE classes the target builder declares.
 
         Named rather than counted because both callers want to say which: one
         refuses a model whose `model_type` is missing from the per-req-cache
-        set, the other refuses P/D for it.
+        set, the other refuses P/D for it. The target's alone, because both are
+        about per-request slots: a draft's STATE class (a windowed draft KV
+        pool, `draft_window.py`) is sized per request but hands out blocks.
         """
-        return [s.name for s in self._sub_pool_specs() if s.pool is Pool.STATE]
+        return [
+            s.name
+            for s in self.attn_metadata_builder.sub_pool_specs()
+            if s.pool is Pool.STATE
+        ]
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -2053,11 +2061,18 @@ class ModelRunner:
         # BlockManager. Ship the whole per-class entry table across instead of
         # a hand-picked field per architecture; consumers over there look up
         # the class they declared.
+        draft = getattr(self, "draft_kv_builder", None)
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_runtime": state_runtime.to_wire(),
+            # What the block manager frees a windowed draft's blocks by.
+            "draft_window": (
+                draft.window.to_wire()
+                if draft is not None and draft.window is not None
+                else None
+            ),
         }
 
     def _carve_paged_pool(self, blocks: int, buf=None):
@@ -2226,9 +2241,7 @@ class ModelRunner:
             # place the builder and the connector are both in scope.
             transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
-            transfer_tensors.merge_pages(
-                self.draft_kv_builder.get_kv_transfer_tensors()
-            )
+            self.draft_kv_builder.attach_transfer_tensors(transfer_tensors)
         if transfer_tensors is not None:
             # After the draft's regions are in, and here because this is the
             # only place holding both the complete region list and the
@@ -2561,6 +2574,7 @@ class ModelRunner:
             max_seqlen_q=forward_mode.max_seqlen_q,
             ubatch_split_bs=forward_mode.ubatch_split_bs,
         )
+        self._prepare_draft_window(batch, attn_metadata, is_prefill, forward_mode)
         self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(
             positions=positions,
@@ -2608,6 +2622,42 @@ class ModelRunner:
             ubatch_slices=ubatch_slices,
             ub_max_tokens_across_dp=sync.ub_max_tokens_across_dp,
             ub_tokens_across_dp=sync.ub_tokens_across_dp,
+        )
+
+    def _prepare_draft_window(
+        self,
+        batch: ScheduledBatch,
+        attn_metadata,
+        is_prefill: bool,
+        forward_mode: ForwardMode,
+    ) -> None:
+        """Stage a windowed draft pool's tables for this forward.
+
+        Off the positions the target builder just laid out, so the draft's
+        context rows land where the target's own rows say they are. Inside the
+        staging window, like every other per-forward upload.
+        """
+        draft = getattr(self, "draft_kv_builder", None)
+        if draft is None or draft.window is None:
+            return
+        if batch.is_dummy_run:
+            seqlens = np.zeros(0, dtype=np.int64)
+        elif is_prefill:
+            seqlens = np.asarray(
+                batch.num_scheduled_tokens[: batch.total_seqs_num_prefill],
+                dtype=np.int64,
+            )
+        else:
+            seqlens = np.full(
+                batch.total_seqs_num_decode, forward_mode.max_seqlen_q, dtype=np.int64
+            )
+        draft.prepare_step(
+            batch,
+            attn_metadata,
+            positions=self.forward_vars["positions"].np[: int(seqlens.sum())],
+            seqlens=seqlens,
+            running_bs=forward_mode.running_bs,
+            decode=not is_prefill,
         )
 
     @h2d_producer("sampling")

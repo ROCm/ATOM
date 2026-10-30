@@ -399,8 +399,14 @@ class DSparkProposer(Drafter):
         # its own config resolves to -- a draft whose rows are the target's
         # latent binds into the target's pool and answers None. ModelRunner
         # keys its draft-pool allocation and per-module binding off the
-        # presence of this attribute, so None simply never sets it.
-        builder = draft_kv_builder(self.runner, draft_hf)
+        # presence of this attribute, so None simply never sets it. A draft
+        # whose block pass reads a sliding window may keep only that window.
+        builder = draft_kv_builder(
+            self.runner,
+            draft_hf,
+            read_window=getattr(model, "kv_read_window", None),
+            spec_tokens=self.mtp_k,
+        )
         if builder is not None:
             self.runner.draft_kv_builder = builder
         return model
@@ -606,6 +612,11 @@ class DSparkProposer(Drafter):
         rows are harmless -- they land on future positions, unread until the
         step that accepts them rewrites them.
 
+        A draft KV pool that holds only its window writes only the rows that
+        land in it (`DraftKvBuilder.kept_context`): of a long prefill, the last
+        window's worth. The rest are never read, so they are not projected
+        either.
+
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
         del next_token_ids
@@ -614,6 +625,21 @@ class DSparkProposer(Drafter):
             return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
+        draft_pool = getattr(self.runner, "draft_kv_builder", None)
+        kept = (
+            draft_pool.kept_context(
+                forward_context.attn_metadata, aux_hidden_states[0].shape[0]
+            )
+            if draft_pool is not None
+            else None
+        )
+        if kept is not None:
+            rows, num_rows = kept
+            if not num_rows:
+                return
+            if rows is not None:
+                aux_hidden_states = [a.index_select(0, rows) for a in aux_hidden_states]
+                positions = positions.index_select(0, rows)
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
         with record_function(
             f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
@@ -957,7 +983,9 @@ class DSparkProposer(Drafter):
         if not self.model.block_attention_is_mla:
             # A draft that attends its block another way (MiniMax-M3.1's per-row
             # MHA decode) builds what it reads itself; there is no MLA decode
-            # to plan.
+            # to plan. A draft pool of its own that holds only the window hands
+            # over its own tables instead of the target's.
+            draft_pool = getattr(self.runner, "draft_kv_builder", None)
             self.model.prepare_paged_block(
                 attn_metadata,
                 block_tables,
@@ -966,6 +994,11 @@ class DSparkProposer(Drafter):
                 ctx_lens,
                 block_table_state(self.runner.forward_vars["block_tables"]).lengths,
                 scheduled_bs,
+                window=(
+                    draft_pool.block_window(running_bs)
+                    if draft_pool is not None
+                    else None
+                ),
             )
             return
 

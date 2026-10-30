@@ -2534,6 +2534,110 @@ def test_window_rows_start_each_row_at_its_own_window(window):
         assert tables[row].tolist() == list(range(first, first + P))
 
 
+def test_window_rows_read_a_windowed_table_from_its_first_page():
+    """A windowed draft pool's table holds each request's run of blocks from
+    its first held one. Every row has to read the same pages through it that
+    it would through the request's full table: same length, same page ids."""
+    import torch
+
+    from atom.models.minimax_m3.dspark import _window_rows
+
+    window, T, rb = 35, 3, 2
+    # Request 0 anchors at 296; request 1 is padding.
+    ctx_eff = torch.tensor([300, 16], dtype=torch.int32)
+    positions = torch.tensor([297, 298, 299, 299, 299, 299])
+    row_req = torch.arange(rb).repeat_interleave(T)
+
+    def rows(bt16, first16):
+        P = bt16.shape[1]
+        flat = torch.zeros((rb + 1) * P, dtype=torch.int32)
+        flat[: rb * P] = bt16.reshape(-1)
+        tables = torch.empty(rb * T, P, dtype=torch.int32)
+        lens = torch.empty(rb * T, dtype=torch.int32)
+        _window_rows(
+            flat,
+            ctx_eff,
+            positions,
+            row_req,
+            window,
+            T,
+            torch.empty(rb * T, dtype=torch.int64),
+            tables,
+            lens,
+            first16,
+        )
+        return tables, lens
+
+    full = torch.arange(rb * 40, dtype=torch.int32).view(rb, 40) + 1000
+    # Request 0 holds blocks 2-4 (page-16s 16-39); the pad row's run starts at 0.
+    run = torch.stack([full[0, 16:40], full[1, :24]])
+    full_tables, full_lens = rows(full, None)
+    run_tables, run_lens = rows(run, torch.tensor([16, 0], dtype=torch.int32))
+    assert torch.equal(run_lens, full_lens)
+    for row in range(rb * T):
+        pages = -(-int(full_lens[row]) // 16)
+        assert torch.equal(run_tables[row, :pages], full_tables[row, :pages])
+
+
+def test_window_rows_keep_a_row_anchored_below_its_run_inside_it():
+    """A prefill chunk that does not end its prompt still gets block rows,
+    anchored at the chunk's end; their drafts are thrown away. Its request
+    holds only the window the prompt's end reads, so the row's own window
+    starts before the run: it must start at the run's first page and read at
+    least one key -- never a negative column, which is another request's
+    table or no memory at all."""
+    import torch
+
+    from atom.models.minimax_m3.dspark import _window_rows
+
+    window, T, rb, P = 35, 3, 2, 24
+    # Request 0's chunk ends at 99 (rows 100-102) but it holds blocks 2-4 of a
+    # 300-token prompt; request 1 is padding.
+    ctx_eff = torch.tensor([103, 16], dtype=torch.int32)
+    positions = torch.tensor([100, 101, 102, 102, 102, 102])
+    row_req = torch.arange(rb).repeat_interleave(T)
+    flat = torch.arange((rb + 1) * P, dtype=torch.int32) + 1000
+    tables = torch.empty(rb * T, P, dtype=torch.int32)
+    lens = torch.empty(rb * T, dtype=torch.int32)
+    _window_rows(
+        flat,
+        ctx_eff,
+        positions,
+        row_req,
+        window,
+        T,
+        torch.empty(rb * T, dtype=torch.int64),
+        tables,
+        lens,
+        torch.tensor([16, 0], dtype=torch.int32),
+    )
+    for row in range(T):
+        assert tables[row].tolist() == list(range(1000, 1000 + P))
+    assert lens.tolist() == [1, 1, 1, 16, 16, 16]
+
+
+def test_window_slots_address_each_request_run():
+    """A block position's draft slot is in its request's run: its block less
+    the run's first, as a column. Below the run, and on a pad row, nothing."""
+    import torch
+
+    from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
+
+    tables = torch.tensor([[7, 9, 2], [5, 6, 1]], dtype=torch.int32)
+    first = torch.tensor([3, 0], dtype=torch.int32)
+    block_positions = torch.tensor([[11, 17, 22], [4, 5, 6]])
+    slots = torch.empty(2, 3, dtype=torch.int64)
+    MiniMaxM3DSpark._window_slots(
+        types.SimpleNamespace(block_size=4),
+        tables,
+        first,
+        block_positions,
+        slots,
+        scheduled_bs=1,
+    )
+    assert slots.tolist() == [[-1, 9 * 4 + 1, 2 * 4 + 2], [-1, -1, -1]]
+
+
 @pytest.mark.parametrize("tp", [1, 2])
 def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
     """The MiniMax-M3.1 draft decodes its block per row with one KV head per

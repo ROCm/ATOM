@@ -309,6 +309,16 @@ class KVTransferTensors:
     # and a backend counts in its own page -- a different unit even where it is
     # the same number. Set through `set_block_count`.
     num_blocks: int = field(init=False, default=0)
+    # How a speculative draft with a pool of its own lays its KV out: None for
+    # no such pool, "full" for regions riding the target's blocks (merged into
+    # `pages`), "window" for a pool of its own ids holding each request's
+    # sliding window (`atom/model_engine/draft_window.py`). The two ends of a
+    # transfer have to agree; a request between disagreeing ones fails.
+    draft_layout: str | None = None
+    # The "window" layout's regions, addressed by the draft pool's own block
+    # ids, `num_draft_blocks` of them; never walked by a target-block path.
+    draft_pages: list[PageRegion] = field(default_factory=list)
+    num_draft_blocks: int = 0
 
     @property
     def block_regions(self) -> tuple[KVTransferRegion, ...]:
@@ -470,6 +480,11 @@ class ReqMeta:
     prefill_handoff: dict | None = None
     prefill_aborted: bool = False
     prompt_digest: str | None = None
+    # A windowed draft pool's blocks, aligned with the block ids above and -1
+    # outside each side's window (`Sequence.draft_block_table`). Empty when
+    # the draft rides the target's blocks or has no pool of its own.
+    local_draft_block_ids: list[int] = field(default_factory=list)
+    remote_draft_block_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -568,6 +583,8 @@ class ConnectorMetadata:
             prefill_handoff=kv_transfer_params.get("prefill_handoff"),
             prefill_aborted=kv_transfer_params.get("prefill_aborted", False),
             prompt_digest=kv_transfer_params.get("prompt_digest"),
+            local_draft_block_ids=kv_transfer_params.get("local_draft_block_ids", []),
+            remote_draft_block_ids=kv_transfer_params.get("remote_draft_block_ids", []),
         )
 
     def add_new_req_to_save(
